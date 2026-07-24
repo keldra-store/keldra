@@ -1089,8 +1089,8 @@ impl CoreStore {
         validate_logical_id(&batch.transaction_id, "transaction id")?;
         validate_logical_id(&batch.scope_partition, "transaction scope partition")?;
         validate_logical_id(&batch.committed_by_principal, "transaction principal")?;
-        if batch.operations.is_empty() {
-            bail!("CoreStore explicit transaction stage must include at least one operation");
+        if batch.operations.is_empty() && batch.preconditions.is_empty() {
+            bail!("CoreStore explicit transaction stage must include an operation or precondition");
         }
         let _operation_guards = self.acquire_batch_locks(&batch).await?;
         let mut transaction = self
@@ -1130,14 +1130,16 @@ impl CoreStore {
         self.validate_mutation_root_publications_unlocked(&batch, true)?;
         let generation_bindings = BTreeMap::from([(transaction.root_key_hash.clone(), 0)]);
         self.bind_mutation_batch_to_generations(&mut batch, &generation_bindings)?;
-        transaction.writer_families.extend(
-            batch
-                .root_publications
-                .iter()
-                .flat_map(|publication| publication.writer_families.iter().cloned()),
-        );
-        transaction.writer_families.sort();
-        transaction.writer_families.dedup();
+        if !batch.operations.is_empty() {
+            transaction.writer_families.extend(
+                batch
+                    .root_publications
+                    .iter()
+                    .flat_map(|publication| publication.writer_families.iter().cloned()),
+            );
+            transaction.writer_families.sort();
+            transaction.writer_families.dedup();
+        }
         self.validate_mutation_preconditions_unlocked(
             &batch.preconditions,
             &batch.committed_by_principal,
@@ -1244,13 +1246,15 @@ impl CoreStore {
                 transaction.visible_updates.push(update.clone());
             }
         }
-        let staged_batch_hash =
-            core_mutation_operations_hash(&batch.operations, &batch.root_publications)?;
-        transaction.operations_hash = descriptor_hash(&[
-            "anvil.explicit_transaction.operations.v1",
-            &transaction.operations_hash,
-            &staged_batch_hash,
-        ]);
+        if !batch.operations.is_empty() {
+            let staged_batch_hash =
+                core_mutation_operations_hash(&batch.operations, &batch.root_publications)?;
+            transaction.operations_hash = descriptor_hash(&[
+                "anvil.explicit_transaction.operations.v1",
+                &transaction.operations_hash,
+                &staged_batch_hash,
+            ]);
+        }
         transaction.outcome = "open".to_string();
         self.write_pending_transaction_with_staged_rows_unlocked(
             &transaction,
@@ -1414,8 +1418,8 @@ impl CoreStore {
     ) -> Result<CoreMutationBatchReceipt> {
         validate_logical_id(transaction_id, "transaction id")?;
         validate_logical_id(principal, "transaction principal")?;
-        if additions.operations.is_empty() {
-            bail!("CoreStore transaction additions must include an operation");
+        if additions.operations.is_empty() && additions.preconditions.is_empty() {
+            bail!("CoreStore transaction additions must include an operation or precondition");
         }
         if !additions.root_publications.is_empty() {
             bail!("explicit transaction additions cannot introduce publication roots");
