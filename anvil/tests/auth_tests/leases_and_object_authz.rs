@@ -44,6 +44,10 @@ async fn test_coordination_task_lease_grpc_flow() {
         fence_token: acquired.fence_token,
         checkpoint_cursor_low: 42,
         checkpoint_cursor_high: 0,
+        expected_root_generation: acquired.root_generation,
+        expected_lease_epoch: acquired.lease_epoch,
+        expected_expires_at_nanos: acquired.expires_at_nanos,
+        expected_lease_hash: acquired.lease_hash.clone(),
     });
     add_bearer(&mut checkpoint, &token);
     let checkpointed = coordination_client
@@ -70,9 +74,13 @@ async fn test_coordination_task_lease_grpc_flow() {
 
     let mut commit = Request::new(CommitTaskLeaseRequest {
         task_id: task_id.to_string(),
-        fence_token: acquired.fence_token,
+        fence_token: checkpointed.fence_token,
         committed_cursor_low: 50,
         committed_cursor_high: 0,
+        expected_root_generation: checkpointed.root_generation,
+        expected_lease_epoch: checkpointed.lease_epoch,
+        expected_expires_at_nanos: checkpointed.expires_at_nanos,
+        expected_lease_hash: checkpointed.lease_hash.clone(),
     });
     add_bearer(&mut commit, &token);
     let committed = coordination_client
@@ -115,7 +123,9 @@ async fn test_coordination_task_lease_security_invariants() {
         },
     )
     .await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
 
     let (lease_app_a_id, lease_app_a_client, lease_app_a_secret) =
         create_app_with_id(&cluster, "lease-app-a").await;
@@ -221,6 +231,10 @@ async fn test_coordination_task_lease_security_invariants() {
         fence_token: first.fence_token,
         checkpoint_cursor_low: 8,
         checkpoint_cursor_high: 0,
+        expected_root_generation: first.root_generation,
+        expected_lease_epoch: first.lease_epoch,
+        expected_expires_at_nanos: first.expires_at_nanos,
+        expected_lease_hash: first.lease_hash.clone(),
     });
     add_bearer(&mut wrong_owner_checkpoint, &token_b);
     let err = client
@@ -332,6 +346,10 @@ async fn test_coordination_task_lease_security_invariants() {
         fence_token: stale_first.fence_token,
         checkpoint_cursor_low: 3,
         checkpoint_cursor_high: 0,
+        expected_root_generation: stale_first.root_generation,
+        expected_lease_epoch: stale_first.lease_epoch,
+        expected_expires_at_nanos: stale_first.expires_at_nanos,
+        expected_lease_hash: stale_first.lease_hash.clone(),
     });
     add_bearer(&mut stale_checkpoint, &token_a);
     let err = client
@@ -346,6 +364,10 @@ async fn test_coordination_task_lease_security_invariants() {
         fence_token: stale_first.fence_token,
         committed_cursor_low: 3,
         committed_cursor_high: 0,
+        expected_root_generation: stale_first.root_generation,
+        expected_lease_epoch: stale_first.lease_epoch,
+        expected_expires_at_nanos: stale_first.expires_at_nanos,
+        expected_lease_hash: stale_first.lease_hash.clone(),
     });
     add_bearer(&mut stale_commit, &token_a);
     let err = client.commit_task_lease(stale_commit).await.unwrap_err();
@@ -382,6 +404,10 @@ async fn test_coordination_task_lease_security_invariants() {
         fence_token: tenant_b_lease.fence_token,
         checkpoint_cursor_low: 2,
         checkpoint_cursor_high: 0,
+        expected_root_generation: tenant_b_lease.root_generation,
+        expected_lease_epoch: tenant_b_lease.lease_epoch,
+        expected_expires_at_nanos: tenant_b_lease.expires_at_nanos,
+        expected_lease_hash: tenant_b_lease.lease_hash.clone(),
     });
     add_bearer(&mut tenant_a_checkpoint, &token_a);
     assert!(
@@ -464,7 +490,9 @@ async fn test_authz_tuple_rejects_invalid_caveat_hash_before_writing() {
         &["test-region-1"],
     )
     .await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
 
     let token = cluster.token.clone();
     let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
@@ -520,7 +548,7 @@ async fn test_authz_tuple_rejects_invalid_caveat_hash_before_writing() {
 async fn test_authz_permission_resolves_nested_usersets() {
     let cluster = shared_docker_test_cluster().await;
     let actor = create_docker_storage_test_actor(&cluster, "authz-nested-usersets").await;
-    grant_docker_authz_realm(&cluster, &actor, "default").await;
+    let schema_revision = prepare_docker_default_authz_realm(&cluster, &actor).await;
 
     let token = actor.token.clone();
     let mut auth_client = AuthServiceClient::connect(actor.grpc_addr.clone())
@@ -636,7 +664,9 @@ async fn test_authz_permission_resolves_nested_usersets() {
         .await
         .unwrap()
         .into_inner();
-    for expected_revision in 1..=4 {
+    let target_revision = schema_revision + 4;
+    let mut previous_revision = 0;
+    loop {
         let event = tokio::time::timeout(Duration::from_secs(5), lag_stream.next())
             .await
             .unwrap()
@@ -644,9 +674,19 @@ async fn test_authz_permission_resolves_nested_usersets() {
             .unwrap();
         assert_eq!(event.derived_index_id, DEFAULT_DERIVED_USERSET_INDEX_ID);
         assert_eq!(event.derived_index_kind, "userset");
-        assert_eq!(event.processed_revision, expected_revision);
-        assert_eq!(event.latest_revision, expected_revision);
-        assert_eq!(event.revision_lag, 0);
+        assert!(event.processed_revision > previous_revision);
+        assert!(event.processed_revision <= target_revision);
+        assert!(event.latest_revision >= event.processed_revision);
+        assert_eq!(
+            event.revision_lag,
+            event.latest_revision - event.processed_revision
+        );
+        previous_revision = event.processed_revision;
+        if previous_revision == target_revision {
+            assert_eq!(event.latest_revision, target_revision);
+            assert_eq!(event.revision_lag, 0);
+            break;
+        }
     }
 }
 

@@ -688,8 +688,8 @@ async fn handle_object_link_command(
                 bucket_name: bucket,
                 prefix,
                 page: Some(api::PageRequest {
-                    cursor: String::new(),
-                    limit: *limit,
+                    page_token: String::new(),
+                    page_size: *limit,
                 }),
 
                 ..Default::default()

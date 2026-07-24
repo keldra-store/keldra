@@ -201,7 +201,7 @@ async fn test_reset_app_secret() {
     )
     .await;
     cluster
-        .start_and_converge_no_new_token(Duration::from_secs(5), false)
+        .start_and_converge_no_new_token(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT, false)
         .await;
 
     let app_name = unique_test_name("app-reset");

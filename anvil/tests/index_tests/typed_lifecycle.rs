@@ -363,6 +363,7 @@ async fn test_index_definition_lifecycle() {
             ListIndexesRequest {
                 bucket_name: bucket_name.clone(),
                 include_disabled: false,
+                page: None,
             },
             &token,
         ))
@@ -425,6 +426,7 @@ async fn test_index_definition_lifecycle() {
             ListIndexesRequest {
                 bucket_name: bucket_name.clone(),
                 include_disabled: false,
+                page: None,
             },
             &token,
         ))
@@ -439,6 +441,7 @@ async fn test_index_definition_lifecycle() {
             ListIndexesRequest {
                 bucket_name: bucket_name.clone(),
                 include_disabled: true,
+                page: None,
             },
             &token,
         ))
@@ -467,6 +470,7 @@ async fn test_index_definition_lifecycle() {
             ListIndexesRequest {
                 bucket_name: bucket_name.clone(),
                 include_disabled: true,
+                page: None,
             },
             &token,
         ))

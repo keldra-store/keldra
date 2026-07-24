@@ -110,9 +110,9 @@ pub async fn read_personaldb_row_index(
 ) -> Result<DecodedPersonalDbRowIndex> {
     let (tenant_id, database_id, _generation, _source_hash) =
         parse_personaldb_row_index_data_id(row_index_data_id)?;
-    let row =
-        read_personaldb_data_locator_row(storage, tenant_id, &database_id, row_index_data_id)?
-            .ok_or_else(|| anyhow!("personaldb row index CoreMeta row is missing"))?;
+    let row = read_personaldb_data_locator_row(storage, tenant_id, &database_id, row_index_data_id)
+        .await?
+        .ok_or_else(|| anyhow!("personaldb row index CoreMeta row is missing"))?;
     if row.data_kind != PERSONALDB_ROW_INDEX_KIND {
         return Err(anyhow!("personaldb row index CoreMeta row kind mismatch"));
     }
@@ -391,6 +391,7 @@ mod tests {
         .await
         .unwrap();
         let row = read_personaldb_data_locator_row(&storage, 4, "db-alpha", &row_index_data_id)
+            .await
             .unwrap()
             .expect("row index CoreMeta row exists");
         let mut bytes = read_personaldb_data_locator_bytes(&storage, &row)

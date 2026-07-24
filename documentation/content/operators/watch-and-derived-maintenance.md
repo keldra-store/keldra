@@ -103,7 +103,7 @@ This proves the caller has `index:watch` on the `documents` bucket and can see d
 If a source record repeatedly fails extraction, the index builder should record diagnostics rather than advancing silently. The public diagnostic helper reads those records:
 
 ```bash
-anvil --profile acme index diagnostics documents invoices_by_due --severity warning --limit 50
+anvil --profile acme index diagnostics documents invoices_by_due --severity warning --page-size 50
 ```
 
 This proves diagnostics can be read for that bucket/index. It does not prove the index is healthy. A page with no returned diagnostics can still miss records because the selector is wrong, the caller lacks visibility, the builder is behind, or diagnostics are outside the requested severity/page. Use diagnostics together with source proof and lag evidence.

@@ -243,34 +243,36 @@ pub async fn list_package_versions(
     let registry_kind = normalize_gateway_identifier(registry_kind, "registry kind")?;
     let namespace = normalize_gateway_identifier(namespace, "namespace")?;
     let package_name = normalize_gateway_identifier(package_name, "package name")?;
-    let offset = if page_token.is_empty() {
-        0
+    let mut after_tuple_key = if page_token.is_empty() {
+        None
     } else {
-        page_token
-            .parse::<usize>()
-            .map_err(|_| anyhow!("registry page_token is invalid"))?
+        Some(hex::decode(page_token).map_err(|_| anyhow!("registry page_token is invalid"))?)
     };
     let effective_limit = limit.clamp(1, 1000);
-    let mut rows = list_record_rows::<GatewayTagRecord>(storage, GATEWAY_ROW_TAG).await?;
-    rows.retain(|row| {
-        row.record.tenant_id == tenant_id
-            && row.record.gateway == registry_kind
-            && row.record.registry_instance_id == namespace
-            && row.record.repository == package_name
-    });
-    rows.sort_by(|left, right| left.record.tag.cmp(&right.record.tag));
-    let total = rows.len();
-    let versions = rows
-        .into_iter()
-        .skip(offset)
-        .take(effective_limit)
-        .map(|row| package_version_from_tag(row.record, row.generation))
-        .collect::<Vec<_>>();
-    let next = offset
-        .checked_add(versions.len())
-        .filter(|next| *next < total)
-        .map(|next| next.to_string());
-    Ok((versions, next))
+    let mut versions = Vec::with_capacity(effective_limit);
+    loop {
+        let page = list_record_rows::<GatewayTagRecord>(
+            storage,
+            GATEWAY_ROW_TAG,
+            after_tuple_key.as_deref(),
+            1,
+        )
+        .await?;
+        for row in page.records {
+            if row.record.tenant_id == tenant_id
+                && row.record.gateway == registry_kind
+                && row.record.registry_instance_id == namespace
+                && row.record.repository == package_name
+            {
+                versions.push(package_version_from_tag(row.record, row.generation));
+            }
+        }
+        after_tuple_key = page.next_tuple_key;
+        if versions.len() == effective_limit || after_tuple_key.is_none() {
+            let next = after_tuple_key.as_deref().map(hex::encode);
+            return Ok((versions, next));
+        }
+    }
 }
 
 async fn ensure_registry_repository(
@@ -539,7 +541,7 @@ async fn update_gateway_tag_in_transaction(
     })
 }
 
-fn registry_blob_locator_exists(
+async fn registry_blob_locator_exists(
     storage: &Storage,
     tenant_id: i64,
     registry_kind: &str,
@@ -552,7 +554,8 @@ fn registry_blob_locator_exists(
         registry_kind,
         namespace,
         digest,
-    )?
+    )
+    .await?
     .is_some())
 }
 
@@ -567,7 +570,7 @@ async fn registry_blob_exists_for_transaction(
     principal: &str,
     transaction_id: Option<&str>,
 ) -> Result<bool> {
-    if registry_blob_locator_exists(storage, tenant_id, registry_kind, namespace, digest)? {
+    if registry_blob_locator_exists(storage, tenant_id, registry_kind, namespace, digest).await? {
         return Ok(true);
     }
     let Some(transaction_id) = transaction_id else {

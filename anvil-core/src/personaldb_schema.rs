@@ -45,7 +45,8 @@ pub async fn read_personaldb_schema_sql(
     schema_hash: &str,
 ) -> Result<Option<String>> {
     let ref_name = personaldb_schema_ref_name(tenant_id, database_id)?;
-    let Some(row) = read_personaldb_data_locator_row(storage, tenant_id, database_id, &ref_name)?
+    let Some(row) =
+        read_personaldb_data_locator_row(storage, tenant_id, database_id, &ref_name).await?
     else {
         return Ok(None);
     };

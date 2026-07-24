@@ -8,10 +8,10 @@ pub enum DiagnosticsCommands {
     List {
         bucket: String,
         index: String,
-        #[clap(long, default_value_t = 0)]
-        after_cursor: u64,
         #[clap(long, default_value_t = 100)]
-        limit: u32,
+        page_size: u32,
+        #[clap(long, default_value = "")]
+        page_token: String,
         #[clap(long, default_value = "")]
         severity: String,
     },
@@ -27,30 +27,34 @@ pub async fn handle_diagnostics_command(
         DiagnosticsCommands::List {
             bucket,
             index,
-            after_cursor,
-            limit,
+            page_size,
+            page_token,
             severity,
         } => {
             let mut request = tonic::Request::new(api::ListIndexDiagnosticsRequest {
                 bucket_name: bucket.clone(),
                 index_name: index.clone(),
-                after_cursor: *after_cursor,
-                limit: *limit,
                 severity: severity.clone(),
+                page: Some(api::PageRequest {
+                    page_size: *page_size,
+                    page_token: page_token.clone(),
+                }),
             });
             request
                 .metadata_mut()
                 .insert("authorization", format!("Bearer {token}").parse().unwrap());
-            for diagnostic in client
-                .list_index_diagnostics(request)
-                .await?
-                .into_inner()
-                .diagnostics
-            {
+            let response = client.list_index_diagnostics(request).await?.into_inner();
+            for diagnostic in response.diagnostics {
                 println!(
                     "{}\t{}\t{}\t{}",
                     diagnostic.cursor, diagnostic.severity, diagnostic.code, diagnostic.message
                 );
+            }
+            if let Some(page) = response
+                .page
+                .filter(|page| !page.next_page_token.is_empty())
+            {
+                println!("next_page_token={}", page.next_page_token);
             }
         }
     }

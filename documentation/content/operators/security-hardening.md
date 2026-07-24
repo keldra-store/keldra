@@ -13,7 +13,7 @@ Read this with [Production Model](/operators/production-model/), [Network and Po
 
 ## Start with the trust surfaces
 
-Anvil runs as one server process per node, but it exposes different trust surfaces. The public listener handles tenant native API traffic and the S3/static gateway. The admin listener handles private operator API traffic. The cluster listener handles node-to-node mesh traffic. Putting all three on the same machine does not make them the same security boundary.
+Anvil runs as one server process per node with two listeners and three authorisation contexts. The public listener handles tenant native API traffic, the S3/static gateway, and internal node gRPC. The admin listener handles private operator API traffic. Internal RPC shares the public transport listener but is not tenant authority: it requires a node bearer credential and built-in system-realm permission.
 
 A hardened deployment keeps the boundaries visible in configuration and network policy:
 
@@ -21,8 +21,10 @@ A hardened deployment keeps the boundaries visible in configuration and network 
 | --- | --- | --- |
 | Public plane | Tenant applications, approved public clients, S3/static callers, and public-read readers where deliberate. | Bearer-token authentication for authenticated calls, public policy scopes, relationship authorisation, reserved namespace rejection, gateway routing checks, TLS/proxy controls. |
 | Admin plane | Operators and trusted automation on private networks. | Private reachability, bearer-token authentication, built-in system-realm authorisation, generation checks, audit reasons, diagnostics and audit evidence. |
-| Cluster plane | Anvil nodes in the same mesh. | Private routing, `CLUSTER_SECRET`, libp2p/QUIC addressing, peer metadata validation, and topology diagnostics. |
+| Internal node gRPC | Equal Anvil nodes named by committed CoreMeta lifecycle topology. | Per-node bearer credentials, system-realm authorisation, committed `public_api_addr` routing, Ed25519 evidence verification, TLS/private routing, and topology diagnostics. |
 | Durable storage | The Anvil server process and backup/restore tooling under operator control. | Filesystem permissions, secret key history, CoreStore invariants, backups, restore drills, and a policy of no direct application writers. |
+
+There is no independent membership-discovery path. A reachable process is not eligible for distributed work unless its lifecycle descriptor is committed with the expected node id, signing public key, endpoint, capabilities, and active state. Network policy should restrict internal gRPC paths, but correctness and authority come from authenticated RPC plus committed topology rather than address discovery.
 
 The admin API must not be internet-facing. It still checks authentication and system-realm authorisation, but network privacy is another layer. Publishing `50052` merely because `50051` is public is a deployment bug. If `ADMIN_LISTEN_ADDR` is bound off loopback, `ALLOW_PUBLIC_ADMIN_LISTENER=true` is only an explicit operator acknowledgement that private networking, firewall rules, service mesh policy, or a bastion protects that listener.
 
@@ -89,7 +91,7 @@ That means there should be no permanent API bypass for administration. No specia
 
 ## Secrets and key material are separate layers
 
-Several secrets protect different parts of Anvil. `JWT_SECRET` signs bearer tokens. `ANVIL_SECRET_ENCRYPTION_KEY`, `ANVIL_SECRET_ENCRYPTION_KEY_ID`, and `ANVIL_SECRET_ENCRYPTION_PREVIOUS_KEYS` protect server-side encrypted secret envelopes and related encrypted data. `CLUSTER_SECRET` protects cluster metadata. First-admin and tenant app credentials mint bearer tokens. Bearer tokens authorise requests for a short period.
+Several secrets protect different parts of Anvil. `JWT_SECRET` signs bearer tokens. `ANVIL_SECRET_ENCRYPTION_KEY`, `ANVIL_SECRET_ENCRYPTION_KEY_ID`, and `ANVIL_SECRET_ENCRYPTION_PREVIOUS_KEYS` protect server-side encrypted secret envelopes and related encrypted data. Each node has its own internal bearer credential and a locally persisted Ed25519 signing key. First-admin and tenant app credentials mint bearer tokens. Bearer tokens authorise requests for a bounded period.
 
 Do not mix their runbooks. Rotating an app secret does not rotate server-side encrypted envelopes. Changing `JWT_SECRET` can invalidate active tokens but does not decrypt stored secrets. Losing `ANVIL_SECRET_ENCRYPTION_KEY` can make encrypted records in backups unreadable. Losing every system admin credential after the system realm exists is not fixed by restarting with first-boot variables.
 
@@ -208,7 +210,7 @@ Some current surfaces are coarser or less complete than the ideal model. Design 
 | CoreStore verification | There is no general `corestore fsck` command. Use feature diagnostics, repair findings, logs, backups, restore drills, and source-specific smoke tests. |
 | Lifecycle | Region activation checkpoint generation and drain-completion workflows are still coarse. Do not work around them with storage edits. |
 
-The conservative posture is straightforward: keep admin private, keep cluster private, grant public scopes narrowly, model product sharing with tenant relationship tuples, keep tenants out of the system realm, reject reserved namespaces on every public and gateway path, protect server secrets and key history, use CoreStore preconditions and fences instead of direct writes, log evidence without secrets, and run release gates before deploying.
+The conservative posture is straightforward: keep admin private, restrict internal node gRPC to authorised nodes, grant public scopes narrowly, model product sharing with tenant relationship tuples, keep tenants out of the system realm, reject reserved namespaces on every public and gateway path, protect server secrets and key history, use CoreStore preconditions and fences instead of direct writes, log evidence without secrets, and run release gates before deploying.
 
 ## Review questions
 

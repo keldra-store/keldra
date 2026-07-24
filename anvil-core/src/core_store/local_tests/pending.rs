@@ -2,6 +2,18 @@ use super::local_stream_control::control_record_proto::encode_object_manifest_re
 use super::*;
 use crate::core_store::meta::{CF_INLINE_PAYLOADS, TABLE_INLINE_PAYLOAD_ROW};
 
+fn mutation_root_publication(
+    root_anchor_key: impl Into<String>,
+    writer_family: WriterFamily,
+    transaction_coordinator: bool,
+) -> CoreMutationRootPublication {
+    CoreMutationRootPublication {
+        root_anchor_key: root_anchor_key.into(),
+        writer_families: vec![writer_family.as_str().to_string()],
+        transaction_coordinator,
+    }
+}
+
 #[tokio::test]
 async fn core_store_pending_mutation_records_never_inline_large_payloads_before_finalisation() {
     let tmp = tempfile::tempdir().unwrap();
@@ -38,6 +50,7 @@ async fn core_store_pending_mutation_records_never_inline_large_payloads_before_
     );
     store
         .verify_landed_bytes_ref_row(
+            &pending_mutation_records[0].0.target.admission_shard().hash,
             &landed.landing_id,
             "large-payload-admission",
             &landed.sha256,
@@ -60,7 +73,7 @@ async fn core_store_pending_mutation_records_never_inline_large_payloads_before_
 }
 
 #[tokio::test]
-async fn core_store_landed_bytes_are_removed_only_after_last_coremeta_reference() {
+async fn core_store_landed_bytes_are_reclaimed_after_finalised_shard_refs_leave_recovery_state() {
     let tmp = tempfile::tempdir().unwrap();
     let storage = Storage::new_at(tmp.path()).await.unwrap();
     let store = CoreStore::new(storage.clone()).await.unwrap();
@@ -99,16 +112,25 @@ async fn core_store_landed_bytes_are_removed_only_after_last_coremeta_reference(
         .unwrap();
 
     store
-        .remove_finalised_landed_bytes(&records[0].0)
+        .mark_pending_mutation_finalised_unlocked(&records[0].0, "committed")
         .await
         .unwrap();
     assert!(landed_path.exists());
 
     store
-        .remove_finalised_landed_bytes(&records[1].0)
+        .mark_pending_mutation_finalised_unlocked(&records[1].0, "committed")
         .await
         .unwrap();
+    assert!(
+        landed_path.exists(),
+        "foreground finalisation must not scan other admission shards before reclaiming shared content"
+    );
+    store.unregister_process_instance_for_tests();
+    drop(store);
+
+    let recovered = CoreStore::new(storage).await.unwrap();
     assert!(!landed_path.exists());
+    recovered.unregister_process_instance_for_tests();
 }
 
 #[tokio::test]
@@ -136,10 +158,12 @@ async fn corestore_rocksdb_records_never_inline_large_payloads() {
 
     let rows = store
         .meta
-        .scan_prefix(
+        .scan_prefix_page(
             CF_STREAM_RECORDS,
             TABLE_STREAM_RECORD_INDEX_ROW,
             &stream_record_prefix(&stream_id),
+            None,
+            2,
         )
         .unwrap();
     assert_eq!(rows.len(), 1);
@@ -215,7 +239,13 @@ async fn corestore_rocksdb_records_never_inline_large_payloads() {
     );
     let object_rows = store
         .meta
-        .scan_prefix(CF_OBJECT_VERSIONS, TABLE_OBJECT_VERSION_META_ROW, b"")
+        .scan_prefix_page(
+            CF_OBJECT_VERSIONS,
+            TABLE_OBJECT_VERSION_META_ROW,
+            b"",
+            None,
+            CORE_META_MAX_SCAN_PAGE_ROWS,
+        )
         .unwrap();
     assert!(!object_rows.is_empty());
     assert!(
@@ -226,7 +256,13 @@ async fn corestore_rocksdb_records_never_inline_large_payloads() {
     );
     let inline_rows = store
         .meta
-        .scan_prefix(CF_INLINE_PAYLOADS, TABLE_INLINE_PAYLOAD_ROW, b"")
+        .scan_prefix_page(
+            CF_INLINE_PAYLOADS,
+            TABLE_INLINE_PAYLOAD_ROW,
+            b"",
+            None,
+            CORE_META_MAX_SCAN_PAGE_ROWS,
+        )
         .unwrap();
     assert!(
         inline_rows.iter().all(|row| row.payload != object_payload),
@@ -320,7 +356,10 @@ async fn core_store_pending_mutation_records_include_boundary_values() {
         .get(
             CF_MATERIALISATION,
             TABLE_LANDED_BYTE_REF_ROW,
-            &meta_tuple_key(&[b"landed-byte", landed.landing_id.as_bytes()]),
+            &landed_byte_ref_key(
+                &pending_mutation_records[0].0.target.admission_shard().hash,
+                &landed.landing_id,
+            ),
         )
         .unwrap()
         .expect("landed byte metadata row");
@@ -333,7 +372,7 @@ async fn core_store_pending_mutation_header_uses_deterministic_protobuf() {
     let tmp = tempfile::tempdir().unwrap();
     let storage = Storage::new_at(tmp.path()).await.unwrap();
     let store = CoreStore::new(storage).await.unwrap();
-    store
+    let record = store
         .admit_core_mutation(
             "stream.append",
             "stream",
@@ -355,7 +394,7 @@ async fn core_store_pending_mutation_header_uses_deterministic_protobuf() {
         .get(
             CF_TRANSACTIONS,
             TABLE_PENDING_MUTATION_ROW,
-            &admission_record_key(1),
+            &admission_record_key(&record.target.admission_shard().hash, 1),
         )
         .unwrap()
         .expect("pending mutation row");
@@ -397,7 +436,7 @@ async fn core_store_admission_records_are_not_file_backed() {
 }
 
 #[tokio::test]
-async fn core_store_pending_mutation_admission_writes_signed_commit_certificate() {
+async fn core_store_pending_mutation_admission_writes_signed_local_evidence() {
     let tmp = tempfile::tempdir().unwrap();
     let storage = Storage::new_at(tmp.path()).await.unwrap();
     let store = CoreStore::new(storage).await.unwrap();
@@ -419,53 +458,58 @@ async fn core_store_pending_mutation_admission_writes_signed_commit_certificate(
         .unwrap();
 
     let pending_mutation_hash_input = encode_pending_mutation_hash_input(&record, &[]).unwrap();
-    let certificate = store
-        .verify_local_pending_mutation_commit_certificate(&record, &pending_mutation_hash_input)
-        .await
+    let evidence = store
+        .verify_local_admission_evidence(&record, &pending_mutation_hash_input)
         .unwrap();
     assert_eq!(
-        certificate.local_receipt.local_metadata_fsync_sequence,
-        LOCAL_SHARD_FSYNC_SEQUENCE
+        evidence.local_receipt.local_metadata_fsync_sequence,
+        record.sequence
     );
-    assert_eq!(certificate.local_receipt.landed_byte_hashes.len(), 1);
-    assert_eq!(certificate.local_receipt.descriptor_hashes.len(), 1);
+    assert_eq!(evidence.local_receipt.landed_byte_hashes.len(), 1);
+    assert_eq!(evidence.local_receipt.descriptor_hashes.len(), 1);
     assert!(
-        certificate
+        evidence
             .local_receipt
             .signed_payload_hash
             .starts_with("sha256:")
     );
-    assert!(certificate.signed_payload_hash.starts_with("sha256:"));
-    assert!(!certificate.local_receipt.source_signature.is_empty());
-    assert!(!certificate.source_signature.is_empty());
+    assert!(evidence.signed_payload_hash.starts_with("sha256:"));
+    assert!(!evidence.local_receipt.source_signature.is_empty());
+    assert!(!evidence.source_signature.is_empty());
 
-    let certificate_bytes = store
+    let evidence_bytes = store
         .meta
         .get(
             CF_TRANSACTIONS,
-            TABLE_ADMISSION_COMMIT_CERTIFICATE_ROW,
-            &admission_certificate_key(record.sequence),
+            TABLE_LOCAL_ADMISSION_EVIDENCE_ROW,
+            &admission_evidence_key(&record.target.admission_shard().hash, record.sequence),
         )
         .unwrap()
-        .expect("pending mutation certificate row");
-    assert!(decode_admission_commit_certificate(&certificate_bytes).is_ok());
-    assert!(serde_json::from_slice::<serde_json::Value>(&certificate_bytes).is_err());
+        .expect("pending mutation evidence row");
+    assert!(decode_local_admission_evidence(&evidence_bytes).is_ok());
+    assert!(serde_json::from_slice::<serde_json::Value>(&evidence_bytes).is_err());
 }
 
 #[tokio::test]
-async fn core_store_recovery_rejects_uncertified_pending_mutation_record() {
+async fn core_store_recovery_rejects_pending_mutation_without_local_evidence() {
     let tmp = tempfile::tempdir().unwrap();
     let storage = Storage::new_at(tmp.path()).await.unwrap();
     let store = CoreStore::new(storage.clone()).await.unwrap();
-    write_test_pending_mutation_records(
-        &store,
-        vec![test_pending_mutation_record(
-            "uncertified-pending_mutation-record",
-            unix_timestamp_nanos(),
-            1,
-        )],
-    )
-    .await;
+    let record = test_pending_mutation_record(
+        "uncertified-pending_mutation-record",
+        unix_timestamp_nanos(),
+        1,
+    );
+    let shard = record.target.admission_shard();
+    write_test_pending_mutation_records(&store, vec![record]).await;
+    store
+        .meta
+        .delete(
+            CF_TRANSACTIONS,
+            TABLE_LOCAL_ADMISSION_EVIDENCE_ROW,
+            &admission_evidence_key(&shard.hash, 1),
+        )
+        .unwrap();
     store.unregister_process_instance_for_tests();
     drop(store);
 
@@ -474,7 +518,7 @@ async fn core_store_recovery_rejects_uncertified_pending_mutation_record() {
             .await
             .unwrap_err()
             .to_string()
-            .contains("admission commit certificate"),
+            .contains("local admission evidence"),
         "recovery must not replay a pending mutation that lacks committed admission evidence"
     );
 }
@@ -514,7 +558,7 @@ async fn core_store_object_manifest_includes_boundary_values() {
     for placement in &manifest.placements {
         assert_ne!(placement.written_at_unix_nanos, 0);
         assert!(placement.signed_payload_hash.starts_with("sha256:"));
-        assert_eq!(placement.signature_algorithm, "ed25519-libp2p");
+        assert_eq!(placement.signature_algorithm, "ed25519");
         assert!(!placement.receipt_signature.is_empty());
     }
 
@@ -564,6 +608,7 @@ async fn core_store_recovers_unfinalised_put_blob_pending_mutation_on_startup() 
                 compression: none_compression_descriptor(&bytes),
                 writer_generation: 0_u64,
                 block_ordinal: 0_u64,
+                logical_offset: 0,
             },
             "recover-object-from-pending_mutation".to_string(),
             None,
@@ -656,6 +701,14 @@ async fn core_store_recovers_unfinalised_mutation_batch_pending_mutation_on_star
         transaction_id: "recover-mutation-batch".to_string(),
         scope_partition: "tenant:t/bucket:b".to_string(),
         committed_by_principal: "principal:recovery".to_string(),
+        root_publications: vec![
+            mutation_root_publication(
+                "stream/object_metadata:t:b:batch-recovered",
+                WriterFamily::Stream,
+                false,
+            ),
+            mutation_root_publication("tenant:t/bucket:b", WriterFamily::CoreControl, true),
+        ],
         preconditions: Vec::new(),
         operations: vec![CoreMutationOperation::StreamAppend {
             partition_id: "tenant:t/bucket:b".to_string(),
@@ -690,7 +743,12 @@ async fn core_store_recovers_unfinalised_mutation_batch_pending_mutation_on_star
         .await
         .unwrap()
         .expect("recovered transaction");
-    assert_eq!(transaction.state, CoreTransactionState::Committed);
+    assert_eq!(
+        transaction.state,
+        CoreTransactionState::Committed,
+        "recovery finalisation error: {:?}",
+        transaction.finalisation_error
+    );
     let records = recovered
         .read_stream(ReadStream {
             stream_id: "object_metadata:t:b:batch-recovered".to_string(),
@@ -701,11 +759,152 @@ async fn core_store_recovers_unfinalised_mutation_batch_pending_mutation_on_star
         .unwrap();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].record_kind, "object.put");
+    let stream_anchor = recovered
+        .read_latest_root_anchor("stream/object_metadata:t:b:batch-recovered")
+        .await
+        .unwrap()
+        .expect("recovered canonical stream root");
+    assert_eq!(stream_anchor.root_generation, 1);
+    assert_eq!(
+        stream_anchor.mutation_last.as_deref(),
+        Some("recover-mutation-batch")
+    );
     assert!(
         read_test_pending_mutation_records(&recovered)
             .await
             .is_empty(),
         "startup recovery must checkpoint recovered mutation batch pending mutation rows"
+    );
+}
+
+#[tokio::test]
+async fn core_store_recovery_finalises_admitted_delete_after_winning_delete() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = Storage::new_at(tmp.path()).await.unwrap();
+    let store = CoreStore::new(storage.clone()).await.unwrap();
+    let scope_partition = "tenant:t/bucket:b/task-queue";
+    let row_root = "tenant:t/bucket:b/task-row";
+    let row_key = core_meta_tuple_key(&[CoreMetaTuplePart::Utf8("stale-delete")]).unwrap();
+    let seed_transaction = "seed-stale-delete";
+    let row_payload = encode_core_meta_inline_payload_row(
+        b"stale-delete",
+        core_meta_committed_row_common(
+            scope_partition,
+            core_meta_root_key_hash(row_root),
+            1,
+            seed_transaction,
+            1,
+        ),
+    )
+    .unwrap();
+    store
+        .commit_coremeta_root_groups(
+            seed_transaction,
+            &[CoreMetaBatchOp {
+                cf: CF_INLINE_PAYLOADS,
+                table_id: TABLE_INLINE_PAYLOAD_ROW,
+                tuple_key: &row_key,
+                common: None,
+                kind: CoreMetaBatchOpKind::Put(&row_payload),
+            }],
+            &[CoreMetaRootPublication::new(
+                row_root,
+                WriterFamily::CoreControl,
+            )],
+        )
+        .await
+        .unwrap();
+
+    let stale_transaction = "recover-superseded-rooted-delete";
+    let stale_batch = CoreMutationBatch {
+        transaction_id: stale_transaction.to_string(),
+        scope_partition: scope_partition.to_string(),
+        committed_by_principal: "principal:recovery".to_string(),
+        root_publications: vec![
+            mutation_root_publication(row_root, WriterFamily::CoreControl, false),
+            mutation_root_publication(scope_partition, WriterFamily::CoreControl, true),
+        ],
+        preconditions: vec![CoreMutationPrecondition::CoreMetaRow {
+            cf: CF_INLINE_PAYLOADS.to_string(),
+            table_id: TABLE_INLINE_PAYLOAD_ROW,
+            tuple_key: row_key.clone(),
+            expected_payload_hash: Some(core_meta_payload_digest(
+                TABLE_INLINE_PAYLOAD_ROW,
+                &row_payload,
+            )),
+            require_absent: false,
+            require_present: true,
+        }],
+        operations: vec![CoreMutationOperation::CoreMetaDelete {
+            partition_id: scope_partition.to_string(),
+            cf: CF_INLINE_PAYLOADS.to_string(),
+            table_id: TABLE_INLINE_PAYLOAD_ROW,
+            tuple_key: row_key.clone(),
+        }],
+    };
+    store
+        .validate_mutation_root_publications_unlocked(&stale_batch, false)
+        .unwrap();
+    store
+        .admit_core_mutation(
+            "mutation.batch",
+            WriterFamily::CoreControl.as_str(),
+            CorePendingMutationTarget::MutationBatch {
+                transaction_id: stale_transaction.to_string(),
+                scope_partition: scope_partition.to_string(),
+                operation_count: 1,
+            },
+            stale_transaction.to_string(),
+            Some(stale_transaction.to_string()),
+            CorePendingMutationPayload::Inline(&encode_core_mutation_batch(&stale_batch).unwrap()),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+    let winning_receipt = store
+        .commit_mutation_batch(CoreMutationBatch {
+            transaction_id: "winning-rooted-delete".to_string(),
+            scope_partition: scope_partition.to_string(),
+            committed_by_principal: "principal:winner".to_string(),
+            root_publications: stale_batch.root_publications.clone(),
+            preconditions: stale_batch.preconditions.clone(),
+            operations: stale_batch.operations.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(winning_receipt.state, CoreTransactionState::Committed);
+    assert!(
+        store
+            .read_coremeta_row(CF_INLINE_PAYLOADS, TABLE_INLINE_PAYLOAD_ROW, &row_key)
+            .unwrap()
+            .is_none()
+    );
+
+    store.unregister_process_instance_for_tests();
+    drop(store);
+    let recovered = CoreStore::new(storage).await.unwrap();
+    let transaction = recovered
+        .read_transaction(stale_transaction)
+        .await
+        .unwrap()
+        .expect("recovered stale delete transaction");
+    assert_eq!(transaction.state, CoreTransactionState::FinalisationFailed);
+    assert!(transaction.visible_updates.is_empty());
+    assert!(transaction.finalisation_error.is_some());
+    let winning_anchor = recovered
+        .read_latest_root_anchor(scope_partition)
+        .await
+        .unwrap()
+        .expect("winning root remains visible");
+    assert_eq!(
+        winning_anchor.mutation_last.as_deref(),
+        Some("winning-rooted-delete")
+    );
+    assert!(
+        read_test_pending_mutation_records(&recovered)
+            .await
+            .is_empty()
     );
 }
 
@@ -733,6 +932,15 @@ async fn core_store_recovery_finalises_materialised_stream_without_operation_ide
         transaction_id: transaction_id.to_string(),
         scope_partition: scope_partition.to_string(),
         committed_by_principal: "principal:recovery".to_string(),
+        root_publications: vec![
+            mutation_root_publication(format!("stream/{stream_id}"), WriterFamily::Stream, false),
+            mutation_root_publication(
+                "tenant:t/bucket:b/mixed-recovered",
+                WriterFamily::CoreControl,
+                false,
+            ),
+            mutation_root_publication(scope_partition, WriterFamily::CoreControl, true),
+        ],
         preconditions: vec![
             CoreMutationPrecondition::StreamHead {
                 stream_id: stream_id.to_string(),
@@ -792,21 +1000,24 @@ async fn core_store_recovery_finalises_materialised_stream_without_operation_ide
         unreachable!();
     };
     store
-        .append_stream_unlocked(AppendStreamRecord {
-            stream_id: stream_id.clone(),
-            partition_id: partition_id.clone(),
-            record_kind: record_kind.clone(),
-            payload: payload.clone(),
-            content_type: None,
-            user_metadata_json: "{}".to_string(),
-            fence: None,
-            transaction_id: Some(batch.transaction_id.clone()),
-            idempotency_key: idempotency_key.clone(),
-        })
+        .append_stream_unlocked_for_principal(
+            AppendStreamRecord {
+                stream_id: stream_id.clone(),
+                partition_id: partition_id.clone(),
+                record_kind: record_kind.clone(),
+                payload: payload.clone(),
+                content_type: None,
+                user_metadata_json: "{}".to_string(),
+                fence: None,
+                transaction_id: Some(batch.transaction_id.clone()),
+                idempotency_key: idempotency_key.clone(),
+            },
+            batch.committed_by_principal.clone(),
+        )
         .await
         .unwrap();
     store
-        .commit_coremeta_batch_by_embedded_roots(
+        .commit_coremeta_root_groups(
             transaction_id,
             &[CoreMetaBatchOp {
                 cf: CF_INLINE_PAYLOADS,
@@ -815,6 +1026,10 @@ async fn core_store_recovery_finalises_materialised_stream_without_operation_ide
                 common: None,
                 kind: CoreMetaBatchOpKind::Put(&row_payload),
             }],
+            &[CoreMetaRootPublication::new(
+                "tenant:t/bucket:b/mixed-recovered",
+                WriterFamily::CoreControl,
+            )],
         )
         .await
         .unwrap();
@@ -827,7 +1042,12 @@ async fn core_store_recovery_finalises_materialised_stream_without_operation_ide
         .await
         .unwrap()
         .expect("recovered mixed transaction");
-    assert_eq!(transaction.state, CoreTransactionState::Committed);
+    assert_eq!(
+        transaction.state,
+        CoreTransactionState::Committed,
+        "recovery finalisation error: {:?}",
+        transaction.finalisation_error
+    );
     assert_eq!(transaction.visible_updates.len(), 2);
     assert_eq!(
         recovered
@@ -881,6 +1101,15 @@ async fn core_store_recovery_completes_partially_materialised_mutation_batch() {
         transaction_id: transaction_id.to_string(),
         scope_partition: scope_partition.to_string(),
         committed_by_principal: "principal:recovery".to_string(),
+        root_publications: vec![
+            mutation_root_publication(format!("stream/{stream_id}"), WriterFamily::Stream, false),
+            mutation_root_publication(
+                "tenant:t/bucket:b/partial-row",
+                WriterFamily::CoreControl,
+                false,
+            ),
+            mutation_root_publication(scope_partition, WriterFamily::CoreControl, true),
+        ],
         preconditions: vec![
             CoreMutationPrecondition::StreamHead {
                 stream_id: stream_id.to_string(),
@@ -930,7 +1159,7 @@ async fn core_store_recovery_completes_partially_materialised_mutation_batch() {
         .await
         .unwrap();
     store
-        .commit_coremeta_batch_by_embedded_roots(
+        .commit_coremeta_root_groups(
             transaction_id,
             &[CoreMetaBatchOp {
                 cf: CF_INLINE_PAYLOADS,
@@ -939,6 +1168,10 @@ async fn core_store_recovery_completes_partially_materialised_mutation_batch() {
                 common: None,
                 kind: CoreMetaBatchOpKind::Put(&row_payload),
             }],
+            &[CoreMetaRootPublication::new(
+                "tenant:t/bucket:b/partial-row",
+                WriterFamily::CoreControl,
+            )],
         )
         .await
         .unwrap();
@@ -1003,7 +1236,7 @@ async fn core_store_recovery_finalises_unapplied_batch_after_precondition_confli
         core_meta_committed_row_common(
             scope_partition,
             core_meta_root_key_hash("tenant:t/bucket:b/conflicted-row"),
-            2,
+            1,
             "other-transaction",
             2,
         ),
@@ -1013,6 +1246,15 @@ async fn core_store_recovery_finalises_unapplied_batch_after_precondition_confli
         transaction_id: transaction_id.to_string(),
         scope_partition: scope_partition.to_string(),
         committed_by_principal: "principal:recovery".to_string(),
+        root_publications: vec![
+            mutation_root_publication(format!("stream/{stream_id}"), WriterFamily::Stream, false),
+            mutation_root_publication(
+                "tenant:t/bucket:b/conflicted-row",
+                WriterFamily::CoreControl,
+                false,
+            ),
+            mutation_root_publication(scope_partition, WriterFamily::CoreControl, true),
+        ],
         preconditions: vec![CoreMutationPrecondition::CoreMetaRow {
             cf: CF_INLINE_PAYLOADS.to_string(),
             table_id: TABLE_INLINE_PAYLOAD_ROW,
@@ -1055,7 +1297,7 @@ async fn core_store_recovery_finalises_unapplied_batch_after_precondition_confli
         .await
         .unwrap();
     store
-        .commit_coremeta_batch_by_embedded_roots(
+        .commit_coremeta_root_groups(
             "other-transaction",
             &[CoreMetaBatchOp {
                 cf: CF_INLINE_PAYLOADS,
@@ -1064,6 +1306,10 @@ async fn core_store_recovery_finalises_unapplied_batch_after_precondition_confli
                 common: None,
                 kind: CoreMetaBatchOpKind::Put(&conflicting_payload),
             }],
+            &[CoreMetaRootPublication::new(
+                "tenant:t/bucket:b/conflicted-row",
+                WriterFamily::CoreControl,
+            )],
         )
         .await
         .unwrap();
@@ -1116,6 +1362,10 @@ async fn core_store_recovery_finalises_a_materialised_batch_after_its_stream_adv
         transaction_id: "recover-materialised-mutation-batch".to_string(),
         scope_partition: "tenant:t/bucket:b".to_string(),
         committed_by_principal: "principal:recovery".to_string(),
+        root_publications: vec![
+            mutation_root_publication(format!("stream/{stream_id}"), WriterFamily::Stream, false),
+            mutation_root_publication("tenant:t/bucket:b", WriterFamily::CoreControl, true),
+        ],
         preconditions: vec![CoreMutationPrecondition::StreamHead {
             stream_id: stream_id.to_string(),
             expected_last_sequence: 0,
@@ -1237,17 +1487,15 @@ async fn core_store_admission_rejects_when_pending_mutation_hard_limit_would_be_
     let tmp = tempfile::tempdir().unwrap();
     let storage = Storage::new_at(tmp.path()).await.unwrap();
     let store = CoreStore::new(storage).await.unwrap();
+    let capacity_record = test_pending_mutation_record("capacity-row", 1, 1);
+    let capacity_shard_hash = capacity_record.target.admission_shard().hash;
     store
         .meta
         .put(
             CF_TRANSACTIONS,
             TABLE_PENDING_MUTATION_ROW,
-            &admission_record_key(1),
-            &encode_stored_pending_mutation_row(
-                &test_pending_mutation_record("capacity-row", 1, 1),
-                b"capacity-payload",
-            )
-            .unwrap(),
+            &admission_record_key(&capacity_shard_hash, 1),
+            &encode_stored_pending_mutation_row(&capacity_record, b"capacity-payload").unwrap(),
         )
         .unwrap();
     store
@@ -1255,20 +1503,23 @@ async fn core_store_admission_rejects_when_pending_mutation_hard_limit_would_be_
         .put(
             CF_MATERIALISATION,
             TABLE_MATERIALISATION_CURSOR_ROW,
-            &admission_sequence_key(),
-            &encode_materialisation_cursor_row(1).unwrap(),
+            &admission_sequence_key(&capacity_shard_hash),
+            &encode_admission_sequence_cursor_row(&capacity_shard_hash, 1).unwrap(),
         )
         .unwrap();
+    store.install_admission_point_state_for_tests().unwrap();
+    let current_pending_bytes = store.pending_mutation_bytes().await.unwrap();
 
     let err = store
         .enforce_admission_capacity_with_limits(
+            &capacity_shard_hash,
             16,
             0,
             CoreAdmissionCapacityLimits {
                 pending_mutation_soft_limit_rows: 1_000_000,
                 pending_mutation_hard_limit_rows: 2_000_000,
-                pending_mutation_soft_limit_bytes: 32,
-                pending_mutation_hard_limit_bytes: 40,
+                pending_mutation_soft_limit_bytes: current_pending_bytes.saturating_add(128),
+                pending_mutation_hard_limit_bytes: current_pending_bytes.saturating_add(15),
                 pending_mutation_soft_lag_seconds: 60,
                 pending_mutation_hard_lag_seconds: 300,
                 landed_bytes_soft_limit_bytes: 1024,
@@ -1289,17 +1540,28 @@ async fn core_store_admission_rejects_when_landed_hard_limit_would_be_exceeded()
     let tmp = tempfile::tempdir().unwrap();
     let storage = Storage::new_at(tmp.path()).await.unwrap();
     let store = CoreStore::new(storage).await.unwrap();
-    let landed_dir = store
-        .admission_landed_bytes_root()
-        .join("sha256")
-        .join("aa");
-    fs::create_dir_all(&landed_dir).await.unwrap();
-    fs::write(landed_dir.join("aa-existing.landed"), vec![0_u8; 64])
+    let existing_landed = vec![0_u8; 64];
+    let existing = store
+        .admit_core_mutation(
+            "stream.append",
+            "stream",
+            test_stream_append_target(
+                "tenant:t/bucket:b/landed-capacity",
+                "tenant:t/bucket:b",
+                "event.created",
+            ),
+            "landed-capacity-existing".to_string(),
+            None,
+            CorePendingMutationPayload::Landed(&existing_landed),
+            Vec::new(),
+        )
         .await
         .unwrap();
+    let admission_shard_hash = existing.target.admission_shard().hash;
 
     let err = store
         .enforce_admission_capacity_with_limits(
+            &admission_shard_hash,
             0,
             64,
             CoreAdmissionCapacityLimits {
@@ -1327,18 +1589,17 @@ async fn core_store_admission_rejects_when_pending_mutation_materialisation_lag_
     let tmp = tempfile::tempdir().unwrap();
     let storage = Storage::new_at(tmp.path()).await.unwrap();
     let store = CoreStore::new(storage).await.unwrap();
-    write_test_pending_mutation_records(
-        &store,
-        vec![test_pending_mutation_record(
-            "old-lag-mutation",
-            unix_timestamp_nanos().saturating_sub(301_000_000_000),
-            1,
-        )],
-    )
-    .await;
+    let old_record = test_pending_mutation_record(
+        "old-lag-mutation",
+        unix_timestamp_nanos().saturating_sub(301_000_000_000),
+        1,
+    );
+    let admission_shard_hash = old_record.target.admission_shard().hash;
+    write_test_pending_mutation_records(&store, vec![old_record]).await;
 
     let err = store
         .enforce_admission_capacity_with_limits(
+            &admission_shard_hash,
             0,
             0,
             CoreAdmissionCapacityLimits {
@@ -1379,6 +1640,7 @@ async fn core_store_admission_lag_ignores_finalised_pending_mutation_records() {
 
     store
         .enforce_admission_capacity_with_limits(
+            &record.target.admission_shard().hash,
             0,
             0,
             CoreAdmissionCapacityLimits {
@@ -1398,7 +1660,13 @@ async fn core_store_admission_lag_ignores_finalised_pending_mutation_records() {
         read_test_pending_mutation_records(&store).await.is_empty(),
         "a fully finalised admission prefix must be checkpointed out of RocksDB metadata"
     );
-    assert_eq!(store.next_core_mutation_sequence().await.unwrap(), 2);
+    assert_eq!(
+        store
+            .next_core_mutation_sequence(&record.target)
+            .await
+            .unwrap(),
+        2
+    );
 }
 
 #[tokio::test]
@@ -1407,6 +1675,7 @@ async fn core_store_pending_mutation_finalisation_is_idempotent_for_same_record(
     let storage = Storage::new_at(tmp.path()).await.unwrap();
     let store = CoreStore::new(storage).await.unwrap();
     let record = test_pending_mutation_record("same-finalisation", unix_timestamp_nanos(), 1);
+    write_test_pending_mutation_records(&store, vec![record.clone()]).await;
 
     store
         .mark_pending_mutation_finalised_unlocked(&record, "committed")
@@ -1423,17 +1692,96 @@ async fn core_store_pending_mutation_finalisation_is_idempotent_for_same_record(
         .unwrap()
         .into_iter()
         .filter(|record| record.record_kind == CORE_PENDING_MUTATION_FINALISATION_RECORD_KIND)
-        .count();
-    assert_eq!(finalisations, 1);
+        .collect::<Vec<_>>();
+    assert_eq!(finalisations.len(), 1);
+    assert!(
+        finalisations[0].transaction_id.is_none(),
+        "a finalisation event must not reuse the source mutation publication id"
+    );
 
-    let conflicting =
-        test_pending_mutation_record("different-finalisation", unix_timestamp_nanos(), 1);
+    let mut conflicting = record.clone();
+    conflicting.mutation_id = "different-finalisation".to_string();
     assert!(
         store
             .mark_pending_mutation_finalised_unlocked(&conflicting, "committed")
             .await
             .is_err(),
         "same pending mutation node/epoch/sequence with a different mutation must fail closed"
+    );
+}
+
+#[tokio::test]
+async fn pending_mutation_finalisation_recovers_a_published_event_without_a_local_marker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = Storage::new_at(tmp.path()).await.unwrap();
+    let store = CoreStore::new(storage).await.unwrap();
+    let record = test_pending_mutation_record("lost-finalisation-marker", 41, 1);
+    write_test_pending_mutation_records(&store, vec![record.clone()]).await;
+    let published = CorePendingMutationFinalisationRecord {
+        schema: CORE_PENDING_MUTATION_FINALISATION_SCHEMA.to_string(),
+        node_id: record.node_id.clone(),
+        mutation_epoch: record.mutation_epoch,
+        mutation_sequence: record.sequence,
+        mutation_id: record.mutation_id.clone(),
+        operation_family: record.operation_family.clone(),
+        writer_family: record.writer_family.clone(),
+        target: record.target.clone(),
+        boundary_values: record.boundary_values.clone(),
+        landed_bytes: record.landed_bytes.clone(),
+        state: "committed".to_string(),
+        result: None,
+        finalised_at_unix_nanos: 0,
+    };
+    let published = store
+        .publish_pending_mutation_finalisation_transaction_record(&published)
+        .await
+        .unwrap();
+    assert_ne!(published.finalised_at_unix_nanos, 0);
+    assert!(
+        store
+            .read_pending_mutation_finalisation_record(&CorePendingMutationKey::from(&record))
+            .unwrap()
+            .is_none(),
+        "the test must model a committed stream event with a lost local marker"
+    );
+    assert_eq!(
+        store
+            .read_pending_mutation_records_with_payload()
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "canonical publication must not remove source admission state before local finalisation"
+    );
+
+    store
+        .mark_pending_mutation_finalised_unlocked(&record, "committed")
+        .await
+        .unwrap();
+
+    let recovered = store
+        .read_pending_mutation_finalisation_record(&CorePendingMutationKey::from(&record))
+        .unwrap()
+        .expect("local finalisation marker");
+    assert_eq!(
+        recovered.finalised_at_unix_nanos,
+        published.finalised_at_unix_nanos
+    );
+    let finalisations = store
+        .read_direct_stream_records(CORE_TRANSACTION_STREAM_ID)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|record| record.record_kind == CORE_PENDING_MUTATION_FINALISATION_RECORD_KIND)
+        .count();
+    assert_eq!(finalisations, 1);
+    assert!(
+        store
+            .read_pending_mutation_records_with_payload()
+            .await
+            .unwrap()
+            .is_empty(),
+        "local finalisation must remove source admission state after canonical publication"
     );
 }
 
@@ -1447,7 +1795,7 @@ async fn concurrent_pending_mutation_finalisations_publish_one_contiguous_root_s
         pending.push(
             store
                 .admit_core_mutation(
-                    "test.concurrent",
+                    "mutation.batch",
                     "core_control",
                     test_mutation_target(),
                     format!("concurrent-finalisation-{index}"),
@@ -1519,7 +1867,10 @@ async fn core_store_pending_mutation_checkpoint_preserves_high_watermark_when_pr
         "checkpointing may remove independently finalised pending mutation rows once the high watermark is persisted"
     );
     assert_eq!(
-        store.next_core_mutation_sequence().await.unwrap(),
+        store
+            .next_core_mutation_sequence(&second.target)
+            .await
+            .unwrap(),
         3,
         "pending mutation sequence allocation must not reuse a finalised sequence that remains after an unfinalised prefix"
     );

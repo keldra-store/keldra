@@ -32,7 +32,7 @@ A quick public index diagnostic reads tenant-owned findings:
 ```bash
 anvil --profile acme diagnostics list documents body_text \
   --severity warning \
-  --limit 50
+  --page-size 50
 ```
 
 This proves the tenant profile can authenticate, has authority to read diagnostics for the `documents/body_text` index, and can receive diagnostic records from the public index diagnostic surface. It does not prove the index is complete, that other indexes are healthy, or that the source object exists.
@@ -229,7 +229,7 @@ Do not edit CoreStore files to fix a diagnostic. Direct edits bypass authenticat
 Repair findings are durable evidence that a repair or diagnostic path found something worth tracking. The public CLI can list findings when you know the scope kind and scope id returned by repair or diagnostics:
 
 ```bash
-anvil --profile acme repair findings index "$REPAIR_SCOPE_ID" --limit 20
+anvil --profile acme repair findings index "$REPAIR_SCOPE_ID" --page-size 20
 ```
 
 This proves the caller can read repair findings for the exact scope id returned by the repair or diagnostic flow. It does not apply repair, and it does not prove the current symptom still exists. Findings should be paired with the failing request, the repair response, and a post-repair verification command.

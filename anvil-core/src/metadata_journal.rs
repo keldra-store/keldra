@@ -1,11 +1,12 @@
 use crate::bucket_journal;
 use crate::core_store::{
-    CF_OBJECT_HEADS, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaRowCommonProto, CoreMetaStore,
-    CoreMetaTuplePart, CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
-    CorePipelinePolicy, CoreStore, CoreTraceContext, CoreTransaction, CoreTransactionUpdate,
-    ReadStream, TABLE_OBJECT_METADATA_PARTITION_MANIFEST_ROW, WriteLogicalFileRequest,
-    core_meta_committed_row_common, core_meta_root_key_hash, core_meta_tuple_key,
-    decode_deterministic_proto, is_stream_head_mismatch,
+    CF_OBJECT_HEADS, CoreMetaRowCommonProto, CoreMetaTuplePart, CoreMutationBatch,
+    CoreMutationOperation, CoreMutationPrecondition, CorePipelinePolicy, CoreStore,
+    CoreTraceContext, CoreTransaction, CoreTransactionState, CoreTransactionUpdate, ReadStream,
+    TABLE_OBJECT_METADATA_PARTITION_MANIFEST_ROW, WriteLogicalFileRequest,
+    core_meta_committed_row_common, core_meta_payload_digest, core_meta_root_key_hash,
+    core_meta_tuple_key, core_mutation_publication_attempt_id, decode_deterministic_proto,
+    is_stream_head_mismatch,
 };
 use crate::formats::{
     FileFamily, Hash32, decode_writer_segment, encode_writer_segment_header, hash32,
@@ -21,6 +22,7 @@ use crate::object_links;
 use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
 use crate::persistence::{Bucket, Object, ObjectVersion, ObjectVersionsPage};
 use crate::storage::Storage;
+use crate::task_execution_guard::TaskExecutionGuard;
 use crate::writer_segment_catalog::{
     WriterSegmentCatalogRecord, read_writer_segment_catalog_record,
     write_writer_segment_catalog_record,
@@ -40,7 +42,6 @@ const OBJECT_METADATA_PARTITION_MANIFEST_ROW_SCHEMA: &str =
     "anvil.coremeta.object_metadata_partition_manifest.v1";
 const OBJECT_VERSION_RECORD_KIND: &str = "object_metadata.object_version";
 const DELETE_MARKER_RECORD_KIND: &str = "object_metadata.delete_marker";
-const DIRECTORY_ENTRY_RECORD_KIND: &str = "object_metadata.directory_entry";
 const OBJECT_METADATA_BODY_SCHEMA: &str = "anvil.object_metadata.body.v1";
 const PARTITION_MANIFEST_SCHEMA: &str = "anvil.object_metadata.partition_manifest.v1";
 
@@ -49,6 +50,7 @@ type HmacSha256 = Hmac<Sha256>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectJournalMutation {
     Put,
+    Copy,
     DeleteMarker,
     DeleteVersion,
 }
@@ -57,6 +59,7 @@ impl ObjectJournalMutation {
     fn from_event_name(value: &str) -> Result<Self> {
         match value {
             "put" => Ok(Self::Put),
+            "copy" => Ok(Self::Copy),
             "delete_marker" => Ok(Self::DeleteMarker),
             "delete_version" => Ok(Self::DeleteVersion),
             other => Err(anyhow!("unknown object metadata mutation event {other}")),
@@ -66,6 +69,7 @@ impl ObjectJournalMutation {
     fn event_name(self) -> &'static str {
         match self {
             Self::Put => "put",
+            Self::Copy => "copy",
             Self::DeleteMarker => "delete_marker",
             Self::DeleteVersion => "delete_version",
         }
@@ -73,13 +77,22 @@ impl ObjectJournalMutation {
 
     fn object_record_kind(self) -> &'static str {
         match self {
-            Self::Put | Self::DeleteVersion => OBJECT_VERSION_RECORD_KIND,
+            Self::Put | Self::Copy | Self::DeleteVersion => OBJECT_VERSION_RECORD_KIND,
             Self::DeleteMarker => DELETE_MARKER_RECORD_KIND,
         }
     }
 
     fn is_delete_marker(self) -> bool {
         matches!(self, Self::DeleteMarker)
+    }
+
+    fn watch_event_name(self) -> &'static str {
+        match self {
+            Self::Put => "put",
+            Self::Copy => "copy",
+            Self::DeleteMarker => "delete",
+            Self::DeleteVersion => "delete_version",
+        }
     }
 }
 
@@ -223,7 +236,6 @@ struct ObjectLinkTargetProto {
 enum ObjectMetadataRecordKind {
     ObjectVersion,
     DeleteMarker,
-    DirectoryEntry,
 }
 
 impl ObjectMetadataRecordKind {
@@ -231,7 +243,6 @@ impl ObjectMetadataRecordKind {
         match value {
             OBJECT_VERSION_RECORD_KIND => Ok(Self::ObjectVersion),
             DELETE_MARKER_RECORD_KIND => Ok(Self::DeleteMarker),
-            DIRECTORY_ENTRY_RECORD_KIND => Ok(Self::DirectoryEntry),
             other => Err(anyhow!("unknown object metadata record kind {other}")),
         }
     }
@@ -256,13 +267,6 @@ impl ObjectMetadataRecord {
             return Err(anyhow!("object metadata record is not an object version"));
         }
         Ok(self.body.clone())
-    }
-
-    fn directory_entry_body(&self) -> Result<DirectoryEntryBody> {
-        if self.record_kind != ObjectMetadataRecordKind::DirectoryEntry {
-            return Err(anyhow!("object metadata record is not a directory entry"));
-        }
-        Ok(directory_entry_from_object_version_body(&self.body))
     }
 }
 
@@ -512,231 +516,6 @@ fn link_target_from_proto(value: ObjectLinkTargetProto) -> Result<object_links::
     })
 }
 
-#[cfg(test)]
-async fn append_object_mutation(
-    storage: &Storage,
-    bucket: &Bucket,
-    object: &Object,
-    mutation: ObjectJournalMutation,
-) -> Result<()> {
-    append_object_mutation_inner(storage, bucket, object, mutation, 0, None, None, None).await
-}
-
-pub(crate) async fn append_object_mutation_with_permit(
-    storage: &Storage,
-    bucket: &Bucket,
-    object: &Object,
-    mutation: ObjectJournalMutation,
-    permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
-) -> Result<()> {
-    append_object_mutation_with_permit_in_transaction(
-        storage,
-        bucket,
-        object,
-        mutation,
-        permit,
-        partition_owner_signing_key,
-        None,
-        None,
-    )
-    .await
-}
-
-pub(crate) async fn append_object_mutation_with_permit_in_transaction(
-    storage: &Storage,
-    bucket: &Bucket,
-    object: &Object,
-    mutation: ObjectJournalMutation,
-    permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
-    transaction_id: Option<&str>,
-    transaction_principal: Option<&str>,
-) -> Result<()> {
-    require_object_metadata_permit(bucket, permit)?;
-    let partition_precondition =
-        partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
-    append_object_mutation_inner(
-        storage,
-        bucket,
-        object,
-        mutation,
-        permit.fence_token,
-        Some(partition_precondition),
-        transaction_id,
-        transaction_principal,
-    )
-    .await
-}
-
-async fn append_object_mutation_inner(
-    storage: &Storage,
-    bucket: &Bucket,
-    object: &Object,
-    mutation: ObjectJournalMutation,
-    fence_token: u64,
-    partition_precondition: Option<CoreMutationPrecondition>,
-    transaction_id: Option<&str>,
-    transaction_principal: Option<&str>,
-) -> Result<()> {
-    const MAX_STREAM_HEAD_RETRIES: usize = 64;
-
-    for attempt in 0..MAX_STREAM_HEAD_RETRIES {
-        let result = append_object_mutation_inner_once(
-            storage,
-            bucket,
-            object,
-            mutation,
-            fence_token,
-            partition_precondition.clone(),
-            transaction_id,
-            transaction_principal,
-        )
-        .await;
-        match result {
-            Ok(()) => return Ok(()),
-            Err(error)
-                if is_stream_head_mismatch(&error) && attempt + 1 < MAX_STREAM_HEAD_RETRIES =>
-            {
-                tokio::task::yield_now().await;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-
-    unreachable!("metadata journal stream-head retry loop always returns")
-}
-
-async fn append_object_mutation_inner_once(
-    storage: &Storage,
-    bucket: &Bucket,
-    object: &Object,
-    mutation: ObjectJournalMutation,
-    fence_token: u64,
-    partition_precondition: Option<CoreMutationPrecondition>,
-    transaction_id: Option<&str>,
-    transaction_principal: Option<&str>,
-) -> Result<()> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let stream_id = object_metadata_stream_id(bucket.tenant_id, bucket.id);
-    let raw_stream_head = core_store.raw_stream_head(&stream_id).await?;
-
-    let object_body = ObjectVersionBody {
-        fence_token,
-        id: object.id,
-        tenant_id: object.tenant_id,
-        bucket_id: object.bucket_id,
-        bucket_name: bucket.name.clone(),
-        object_key: object.key.clone(),
-        event: mutation.event_name().to_string(),
-        kind: object.kind,
-        version_id: object.version_id.to_string(),
-        mutation_id: object.mutation_id.to_string(),
-        content_hash: object.content_hash.clone(),
-        size: object.size,
-        etag: object.etag.clone(),
-        content_type: object.content_type.clone(),
-        user_metadata_hash: object.user_metadata_hash.clone(),
-        authz_revision: object.authz_revision,
-        index_policy_snapshot: object.index_policy_snapshot.clone(),
-        record_hash: object.record_hash.clone(),
-        storage_class: object.storage_class.clone(),
-        user_meta: object.user_meta.clone(),
-        shard_map: object.shard_map.clone(),
-        checksum: object.checksum.clone(),
-        link: object.link.clone(),
-        delete_marker: mutation.is_delete_marker(),
-        created_at: object.created_at.to_rfc3339(),
-        deleted_at: object.deleted_at.map(|ts| ts.to_rfc3339()),
-    };
-    let object_payload = encode_object_version_body(&object_body)?;
-
-    let directory_body = DirectoryEntryBody {
-        fence_token,
-        tenant_id: object.tenant_id,
-        bucket_id: object.bucket_id,
-        bucket_name: bucket.name.clone(),
-        object_key: object.key.clone(),
-        event: mutation.event_name().to_string(),
-        kind: object.kind,
-        id: object.id,
-        version_id: object.version_id.to_string(),
-        mutation_id: object.mutation_id.to_string(),
-        content_hash: object.content_hash.clone(),
-        size: object.size,
-        etag: object.etag.clone(),
-        content_type: object.content_type.clone(),
-        user_metadata_hash: object.user_metadata_hash.clone(),
-        authz_revision: object.authz_revision,
-        index_policy_snapshot: object.index_policy_snapshot.clone(),
-        record_hash: object.record_hash.clone(),
-        storage_class: object.storage_class.clone(),
-        user_meta: object.user_meta.clone(),
-        shard_map: object.shard_map.clone(),
-        checksum: object.checksum.clone(),
-        link: object.link.clone(),
-        delete_marker: mutation.is_delete_marker(),
-        created_at: object.created_at.to_rfc3339(),
-        deleted_at: object.deleted_at.map(|ts| ts.to_rfc3339()),
-    };
-    let directory_payload = encode_directory_entry_body(&directory_body)?;
-
-    let partition_id = hex::encode(object_metadata_partition_id(bucket.tenant_id, bucket.id));
-    let mut preconditions = partition_precondition.into_iter().collect::<Vec<_>>();
-    preconditions.push(CoreMutationPrecondition::StreamHead {
-        stream_id: stream_id.clone(),
-        expected_last_sequence: raw_stream_head.0,
-        expected_last_event_hash: raw_stream_head.1,
-    });
-    let metadata_batch = CoreMutationBatch {
-        transaction_id: transaction_id.map(ToOwned::to_owned).unwrap_or_else(|| {
-            format!(
-                "object-metadata:{}:{}",
-                object.mutation_id,
-                mutation.event_name()
-            )
-        }),
-        scope_partition: partition_id.clone(),
-        committed_by_principal: transaction_principal
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| object_metadata_partition_principal(bucket)),
-        preconditions,
-        operations: vec![
-            CoreMutationOperation::StreamAppend {
-                partition_id: partition_id.clone(),
-                stream_id: stream_id.clone(),
-                record_kind: mutation.object_record_kind().to_string(),
-                payload: object_payload,
-                idempotency_key: Some(format!(
-                    "object-metadata:{}:{}:object",
-                    object.mutation_id,
-                    mutation.event_name()
-                )),
-            },
-            CoreMutationOperation::StreamAppend {
-                partition_id: partition_id.clone(),
-                stream_id: stream_id.clone(),
-                record_kind: DIRECTORY_ENTRY_RECORD_KIND.to_string(),
-                payload: directory_payload,
-                idempotency_key: Some(format!(
-                    "object-metadata:{}:{}:directory",
-                    object.mutation_id,
-                    mutation.event_name()
-                )),
-            },
-        ],
-    };
-    if transaction_id.is_some() {
-        core_store
-            .stage_explicit_transaction_batch(metadata_batch)
-            .await?;
-    } else {
-        core_store.commit_mutation_batch(metadata_batch).await?;
-        materialize_object_metadata_projection(&core_store, bucket, object, mutation).await?;
-    }
-    Ok(())
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SealedObjectMetadataSegments {
     pub generation: u64,
@@ -907,6 +686,26 @@ struct WrittenSegment {
     ref_name: String,
     record_count: u64,
     file_hash: String,
+    catalog_record: WriterSegmentCatalogRecord,
+}
+
+#[derive(Debug)]
+struct StagedPartitionManifest {
+    manifest: PartitionManifest,
+    manifest_ref: String,
+    manifest_payload: Vec<u8>,
+    manifest_tuple_key: Vec<u8>,
+    manifest_root_anchor_key: String,
+    transaction_id: String,
+}
+
+#[derive(Debug)]
+struct StagedObjectMetadataCompaction {
+    segments: Vec<WrittenSegment>,
+    partition_manifest: StagedPartitionManifest,
+    metadata_record_count: usize,
+    directory_record_count: usize,
+    payload_bytes: u64,
 }
 
 pub(super) fn encode_partition_manifest(manifest: &PartitionManifest) -> Result<Vec<u8>> {
@@ -1033,7 +832,10 @@ async fn seal_object_journal_segments(
     bucket: &Bucket,
     manifest_signing_key: &[u8],
 ) -> Result<SealedObjectMetadataSegments> {
-    seal_object_journal_segments_inner(storage, bucket, manifest_signing_key, 0, None).await
+    let compaction_started_at = std::time::Instant::now();
+    let staged = stage_object_journal_segments(storage, bucket, manifest_signing_key, 0).await?;
+    publish_staged_compaction(storage, bucket, &staged, &[]).await?;
+    complete_staged_compaction(staged, "object_metadata_seal", compaction_started_at)
 }
 
 pub(crate) async fn seal_object_journal_segments_with_permit(
@@ -1046,24 +848,46 @@ pub(crate) async fn seal_object_journal_segments_with_permit(
     require_object_metadata_permit(bucket, permit)?;
     let partition_precondition =
         partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
-    seal_object_journal_segments_inner(
-        storage,
-        bucket,
-        manifest_signing_key,
-        permit.fence_token,
-        Some(partition_precondition),
-    )
-    .await
+    let compaction_started_at = std::time::Instant::now();
+    let staged =
+        stage_object_journal_segments(storage, bucket, manifest_signing_key, permit.fence_token)
+            .await?;
+    publish_staged_compaction(storage, bucket, &staged, &[partition_precondition]).await?;
+    complete_staged_compaction(staged, "object_metadata_seal", compaction_started_at)
 }
 
-async fn seal_object_journal_segments_inner(
+pub(crate) async fn seal_object_journal_segments_with_task_guard(
+    storage: &Storage,
+    bucket: &Bucket,
+    manifest_signing_key: &[u8],
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+    task_guard: &TaskExecutionGuard,
+) -> Result<SealedObjectMetadataSegments> {
+    require_object_metadata_permit(bucket, permit)?;
+    let partition_precondition =
+        partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
+    let compaction_started_at = std::time::Instant::now();
+    let staged =
+        stage_object_journal_segments(storage, bucket, manifest_signing_key, permit.fence_token)
+            .await?;
+    publish_staged_compaction_for_task(
+        storage,
+        bucket,
+        &staged,
+        &partition_precondition,
+        task_guard,
+    )
+    .await?;
+    complete_staged_compaction(staged, "object_metadata_seal", compaction_started_at)
+}
+
+async fn stage_object_journal_segments(
     storage: &Storage,
     bucket: &Bucket,
     manifest_signing_key: &[u8],
     fence_token: u64,
-    partition_precondition: Option<CoreMutationPrecondition>,
-) -> Result<SealedObjectMetadataSegments> {
-    let compaction_started_at = std::time::Instant::now();
+) -> Result<StagedObjectMetadataCompaction> {
     let records = read_all_metadata_journal_records(storage, bucket).await?;
     let generation = records
         .last()
@@ -1073,19 +897,16 @@ async fn seal_object_journal_segments_inner(
     let mut metadata_records = Vec::new();
     let mut directory_latest = std::collections::BTreeMap::<Vec<u8>, Vec<u8>>::new();
     for record in &records {
-        match record.record_kind {
-            ObjectMetadataRecordKind::ObjectVersion | ObjectMetadataRecordKind::DeleteMarker => {
-                let body = record.object_version_body()?;
-                metadata_records.push(SegmentRecord::new(
-                    metadata_segment_key(&body),
-                    record.payload.clone(),
-                ));
-            }
-            ObjectMetadataRecordKind::DirectoryEntry => {
-                let body = record.directory_entry_body()?;
-                directory_latest.insert(directory_segment_key(&body), record.payload.clone());
-            }
-        }
+        let body = record.object_version_body()?;
+        metadata_records.push(SegmentRecord::new(
+            metadata_segment_key(&body),
+            record.payload.clone(),
+        ));
+        let directory = directory_entry_from_object_version_body(&body);
+        directory_latest.insert(
+            directory_segment_key(&directory),
+            encode_directory_entry_body(&directory)?,
+        );
     }
     metadata_records.sort_by(|left, right| left.key.cmp(&right.key));
     let directory_records = directory_latest
@@ -1093,7 +914,43 @@ async fn seal_object_journal_segments_inner(
         .map(|(key, value)| SegmentRecord::new(key, value))
         .collect::<Vec<_>>();
 
-    let metadata_segment = write_segment_file(
+    stage_object_metadata_compaction(
+        storage,
+        bucket,
+        generation,
+        &records,
+        &metadata_records,
+        &directory_records,
+        manifest_signing_key,
+        fence_token,
+    )
+    .await
+}
+
+async fn stage_object_metadata_compaction(
+    storage: &Storage,
+    bucket: &Bucket,
+    generation: u64,
+    records: &[ObjectMetadataRecord],
+    metadata_records: &[SegmentRecord],
+    directory_records: &[SegmentRecord],
+    manifest_signing_key: &[u8],
+    fence_token: u64,
+) -> Result<StagedObjectMetadataCompaction> {
+    // Derive publication time from the immutable source journal so retries of
+    // the same generation produce byte-identical segment and manifest rows.
+    let source_timestamp = records
+        .last()
+        .map(|record| parse_body_timestamp(&record.body.created_at))
+        .transpose()?
+        .ok_or_else(|| anyhow!("object metadata compaction requires source records"))?;
+    let source_timestamp_nanos = source_timestamp
+        .timestamp_nanos_opt()
+        .ok_or_else(|| anyhow!("object metadata source timestamp cannot be represented"))?;
+    let created_at_unix_nanos = u64::try_from(source_timestamp_nanos)
+        .map_err(|_| anyhow!("object metadata source timestamp must be nonnegative"))?;
+    let published_at = source_timestamp.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    let metadata_segment = stage_segment_file(
         storage,
         bucket,
         generation,
@@ -1104,48 +961,121 @@ async fn seal_object_journal_segments_inner(
             "object_metadata",
             "tenant_bucket_key_version",
         ),
-        &metadata_records,
+        metadata_records,
+        created_at_unix_nanos,
     )
     .await?;
-    let directory_segment = write_segment_file(
+    let directory_segment = stage_segment_file(
         storage,
         bucket,
         generation,
         FileFamily::DirectorySegment,
         segment_header(bucket, generation, "directory", "tenant_bucket_prefix_key"),
-        &directory_records,
+        directory_records,
+        created_at_unix_nanos,
     )
     .await?;
-    let (manifest, manifest_ref) = write_partition_manifest(
+    let segments = vec![metadata_segment, directory_segment];
+    let partition_manifest = stage_partition_manifest(
         storage,
         bucket,
         generation,
-        &records,
-        &[metadata_segment, directory_segment],
+        records,
+        &segments,
         manifest_signing_key,
         fence_token,
-        partition_precondition,
+        published_at,
     )
     .await?;
-    crate::perf::record_compaction_duration(
-        "object_metadata_seal",
-        "object_blob",
-        "ok",
-        segment_payload_bytes(&metadata_records)
-            .saturating_add(segment_payload_bytes(&directory_records)),
-        compaction_started_at.elapsed(),
-    );
-
-    Ok(SealedObjectMetadataSegments {
-        generation,
-        metadata_ref: manifest.segments[0].path.clone(),
-        directory_ref: manifest.segments[1].path.clone(),
+    Ok(StagedObjectMetadataCompaction {
+        segments,
+        partition_manifest,
         metadata_record_count: metadata_records.len(),
         directory_record_count: directory_records.len(),
+        payload_bytes: segment_payload_bytes(metadata_records)
+            .saturating_add(segment_payload_bytes(directory_records)),
+    })
+}
+
+async fn publish_staged_compaction(
+    storage: &Storage,
+    bucket: &Bucket,
+    staged: &StagedObjectMetadataCompaction,
+    additional_preconditions: &[CoreMutationPrecondition],
+) -> Result<()> {
+    for segment in &staged.segments {
+        publish_segment_catalog(storage, segment, additional_preconditions).await?;
+    }
+    publish_partition_manifest(
+        storage,
+        bucket,
+        &staged.partition_manifest,
+        additional_preconditions,
+    )
+    .await
+}
+
+async fn publish_staged_compaction_for_task(
+    storage: &Storage,
+    bucket: &Bucket,
+    staged: &StagedObjectMetadataCompaction,
+    partition_precondition: &CoreMutationPrecondition,
+    task_guard: &TaskExecutionGuard,
+) -> Result<()> {
+    for segment in &staged.segments {
+        let permit = task_guard.publication_permit().await?;
+        permit
+            .publish_with(|task_precondition| async move {
+                let preconditions = [partition_precondition.clone(), task_precondition];
+                publish_segment_catalog(storage, segment, &preconditions).await
+            })
+            .await?;
+    }
+
+    let permit = task_guard.publication_permit().await?;
+    permit
+        .publish_with(|task_precondition| async move {
+            let preconditions = [partition_precondition.clone(), task_precondition];
+            publish_partition_manifest(storage, bucket, &staged.partition_manifest, &preconditions)
+                .await
+        })
+        .await
+}
+
+fn complete_staged_compaction(
+    staged: StagedObjectMetadataCompaction,
+    operation: &'static str,
+    started_at: std::time::Instant,
+) -> Result<SealedObjectMetadataSegments> {
+    crate::perf::record_compaction_duration(
+        operation,
+        "object_blob",
+        "ok",
+        staged.payload_bytes,
+        started_at.elapsed(),
+    );
+    let StagedObjectMetadataCompaction {
+        partition_manifest,
+        metadata_record_count,
+        directory_record_count,
+        ..
+    } = staged;
+    let StagedPartitionManifest {
+        manifest,
+        manifest_ref,
+        ..
+    } = partition_manifest;
+    Ok(SealedObjectMetadataSegments {
+        generation: manifest.generation,
+        metadata_ref: manifest.segments[0].path.clone(),
+        directory_ref: manifest.segments[1].path.clone(),
+        metadata_record_count,
+        directory_record_count,
         manifest_ref,
         manifest_hash: manifest
             .manifest_hash
-            .clone()
+            .as_ref()
+            .cloned()
             .ok_or_else(|| anyhow!("partition manifest hash was not set"))?,
     })
 }
@@ -1227,22 +1157,17 @@ pub async fn recover_object_metadata_partition(
             return Err(anyhow!("active journal manifest reference mismatch"));
         }
         for record in records {
-            match record.record_kind {
-                ObjectMetadataRecordKind::ObjectVersion
-                | ObjectMetadataRecordKind::DeleteMarker => {
-                    let body = record.object_version_body()?;
-                    metadata_records.push(SegmentRecord::new(
-                        metadata_segment_key(&body),
-                        record.payload.clone(),
-                    ));
-                }
-                ObjectMetadataRecordKind::DirectoryEntry => {
-                    let body = record.directory_entry_body()?;
-                    let segment_record =
-                        SegmentRecord::new(directory_segment_key(&body), record.payload);
-                    directory_latest.insert(segment_record.key.clone(), segment_record);
-                }
-            }
+            let body = record.object_version_body()?;
+            metadata_records.push(SegmentRecord::new(
+                metadata_segment_key(&body),
+                record.payload.clone(),
+            ));
+            let directory = directory_entry_from_object_version_body(&body);
+            let segment_record = SegmentRecord::new(
+                directory_segment_key(&directory),
+                encode_directory_entry_body(&directory)?,
+            );
+            directory_latest.insert(segment_record.key.clone(), segment_record);
         }
     }
 
@@ -1310,10 +1235,8 @@ async fn recover_object_directory_partition(
             return Err(anyhow!("active journal manifest reference mismatch"));
         }
         for record in records {
-            if record.record_kind == ObjectMetadataRecordKind::DirectoryEntry {
-                let body = record.directory_entry_body()?;
-                directory_latest.insert(directory_segment_key(&body), body);
-            }
+            let body = directory_entry_from_object_version_body(&record.object_version_body()?);
+            directory_latest.insert(directory_segment_key(&body), body);
         }
     }
 
@@ -1549,61 +1472,19 @@ pub async fn rebuild_directory_index_from_metadata_with_permit(
         .map(|(key, body)| Ok(SegmentRecord::new(key, encode_directory_entry_body(&body)?)))
         .collect::<Result<Vec<_>>>()?;
 
-    let metadata_segment = write_segment_file(
-        storage,
-        bucket,
-        generation,
-        FileFamily::MetadataSegment,
-        segment_header(
-            bucket,
-            generation,
-            "object_metadata",
-            "tenant_bucket_key_version",
-        ),
-        &metadata_records,
-    )
-    .await?;
-    let directory_segment = write_segment_file(
-        storage,
-        bucket,
-        generation,
-        FileFamily::DirectorySegment,
-        segment_header(bucket, generation, "directory", "tenant_bucket_prefix_key"),
-        &directory_records,
-    )
-    .await?;
-    let (manifest, manifest_ref) = write_partition_manifest(
+    let staged = stage_object_metadata_compaction(
         storage,
         bucket,
         generation,
         &records,
-        &[metadata_segment, directory_segment],
+        &metadata_records,
+        &directory_records,
         manifest_signing_key,
         permit.fence_token,
-        Some(partition_precondition),
     )
     .await?;
-    crate::perf::record_compaction_duration(
-        "directory_index_rebuild",
-        "object_blob",
-        "ok",
-        segment_payload_bytes(&metadata_records)
-            .saturating_add(segment_payload_bytes(&directory_records)),
-        compaction_started_at.elapsed(),
-    );
-
-    Ok(SealedObjectMetadataSegments {
-        generation,
-        metadata_ref: manifest.segments[0].path.clone(),
-        directory_ref: manifest.segments[1].path.clone(),
-        metadata_record_count: metadata_records.len(),
-        directory_record_count: directory_records.len(),
-        manifest_ref,
-        manifest_hash: manifest
-            .manifest_hash
-            .clone()
-            .ok_or_else(|| anyhow!("partition manifest hash was not set"))?,
-    })
+    publish_staged_compaction(storage, bucket, &staged, &[partition_precondition]).await?;
+    complete_staged_compaction(staged, "directory_index_rebuild", compaction_started_at)
 }
 
 fn current_objects_from_version_bodies(
@@ -1874,10 +1755,8 @@ async fn current_directory_entries_from_index(
         if record.partition_sequence <= compacted_through_sequence {
             continue;
         }
-        if record.record_kind == ObjectMetadataRecordKind::DirectoryEntry {
-            let body = record.directory_entry_body()?;
-            directory_records.insert(directory_segment_key(&body), body);
-        }
+        let body = directory_entry_from_object_version_body(&record.object_version_body()?);
+        directory_records.insert(directory_segment_key(&body), body);
     }
     Ok(directory_records)
 }
@@ -1974,8 +1853,18 @@ use self::object_data_target::{
     object_data_target_bytes, object_data_target_kind, shard_map_from_object_data_target,
 };
 
+mod object_mutation;
+#[cfg(test)]
+pub(crate) use self::object_mutation::append_object_mutation;
+#[cfg(test)]
+use self::object_mutation::append_object_mutation_inner;
+pub(crate) use self::object_mutation::{
+    append_object_mutation_with_permit, append_object_mutation_with_permit_in_transaction,
+    append_object_put_mutations_with_permit_in_transaction,
+    commit_object_put_mutations_with_permit,
+};
+
 mod transaction_projection;
-use self::transaction_projection::materialize_object_metadata_projection;
 pub use transaction_projection::*;
 
 mod version_sort;
@@ -1985,6 +1874,12 @@ use self::version_sort::{
 
 mod helpers;
 pub use helpers::*;
+
+#[cfg(test)]
+mod atomicity_tests;
+
+#[cfg(test)]
+mod task_compaction_tests;
 
 #[cfg(test)]
 mod tests;

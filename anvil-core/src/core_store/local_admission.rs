@@ -5,6 +5,15 @@ use crate::formats::{
     writer::{WriterFamily, canonical_logical_file_id},
 };
 
+#[path = "local_admission/finalisation.rs"]
+mod finalisation;
+#[path = "local_admission/point_state.rs"]
+mod point_state;
+#[path = "local_admission/publication.rs"]
+mod publication;
+
+use point_state::*;
+
 impl CoreStore {
     pub(super) async fn admit_core_mutation(
         &self,
@@ -16,6 +25,37 @@ impl CoreStore {
         payload: CorePendingMutationPayload<'_>,
         boundary_values: Vec<CoreBoundaryValue>,
     ) -> Result<CorePendingMutationRecord> {
+        let mutation_id_for_error = mutation_id.clone();
+        match self
+            .admit_core_mutation_outcome(
+                operation_family,
+                writer_family,
+                target,
+                mutation_id,
+                idempotency_key,
+                payload,
+                boundary_values,
+            )
+            .await?
+        {
+            CoreAdmissionOutcome::Pending(record) => Ok(record),
+            CoreAdmissionOutcome::Finalised(finalisation) => bail!(
+                "CoreStore mutation {mutation_id_for_error} has already been finalised in state {}",
+                finalisation.state
+            ),
+        }
+    }
+
+    pub(super) async fn admit_core_mutation_outcome(
+        &self,
+        operation_family: &str,
+        writer_family: &str,
+        target: CorePendingMutationTarget,
+        mutation_id: String,
+        idempotency_key: Option<String>,
+        payload: CorePendingMutationPayload<'_>,
+        boundary_values: Vec<CoreBoundaryValue>,
+    ) -> Result<CoreAdmissionOutcome> {
         let admission_started_at = Instant::now();
         let boundary_schema_generation = boundary_values
             .iter()
@@ -27,7 +67,9 @@ impl CoreStore {
         record_corestore_trace_event("admission.boundary_extract", "ok");
         validate_writer_family(writer_family, "pending_mutation writer family")?;
         validate_logical_id(&mutation_id, "pending_mutation mutation id")?;
+        let admission_shard = target.admission_shard();
         let mut landed_source_bytes = None;
+        let mut landed_guard = None;
         let (inline_payload, landed_bytes) = match payload {
             CorePendingMutationPayload::Empty => (Vec::new(), Vec::new()),
             CorePendingMutationPayload::Inline(bytes)
@@ -38,8 +80,10 @@ impl CoreStore {
             CorePendingMutationPayload::Inline(bytes)
             | CorePendingMutationPayload::Landed(bytes) => {
                 landed_source_bytes = Some(bytes);
+                let hash = sha256_hex(bytes);
+                landed_guard = Some(self.acquire_named_lock("landed-bytes", &hash).await?);
                 let landed = self
-                    .land_core_bytes(bytes, &mutation_id, &boundary_values)
+                    .land_core_bytes_unlocked(bytes, &admission_shard.hash, &mutation_id)
                     .await?;
                 (Vec::new(), vec![landed])
             }
@@ -63,8 +107,10 @@ impl CoreStore {
             if result.is_ok() { "ok" } else { "error" },
             admission_started_at.elapsed(),
         );
-        let record = result?;
-        if let Some(bytes) = landed_source_bytes {
+        let outcome = result?;
+        if let (Some(bytes), CoreAdmissionOutcome::Pending(record)) =
+            (landed_source_bytes, &outcome)
+        {
             for landed in &record.landed_bytes {
                 let hash = strip_sha256_prefix(&landed.sha256)?.to_string();
                 let final_path = self.landed_bytes_path(&hash);
@@ -76,181 +122,31 @@ impl CoreStore {
                             landed.landing_id,
                             final_path.display()
                         )
-                    })?;
+                })?;
             }
         }
-        Ok(record)
+        drop(landed_guard);
+        Ok(outcome)
     }
 
-    pub(super) async fn append_core_pending_mutation_record(
-        &self,
-        operation_family: &str,
-        writer_family: &str,
-        target: CorePendingMutationTarget,
-        mutation_id: String,
-        idempotency_key: Option<String>,
-        landed_bytes: Vec<CorePendingLandedByte>,
-        payload: &[u8],
-        boundary_values: Vec<CoreBoundaryValue>,
-    ) -> Result<CorePendingMutationRecord> {
-        if payload.len() > CORE_PENDING_MUTATION_MAX_INLINE_PAYLOAD_BYTES {
-            bail!(
-                "CoreStore pending mutation payload exceeds {} bytes",
-                CORE_PENDING_MUTATION_MAX_INLINE_PAYLOAD_BYTES
-            );
-        }
-        let _pending_mutation_guard = self
-            .acquire_named_lock("pending_mutation", "active")
-            .await?;
-        self.enforce_admission_capacity(0, 0).await?;
-        let sequence = self.next_core_mutation_sequence().await?;
-        let record = CorePendingMutationRecord {
-            schema: CORE_PENDING_MUTATION_RECORD_SCHEMA.to_string(),
-            node_id: CORE_PENDING_MUTATION_NODE_ID.to_string(),
-            mutation_epoch: CORE_PENDING_MUTATION_EPOCH,
-            sequence,
-            mutation_id,
-            idempotency_key_hash: idempotency_key
-                .map(|value| format!("sha256:{}", sha256_hex(value.as_bytes()))),
-            anvil_storage_tenant_id: "local".to_string(),
-            authz_scope: CorePendingAuthzScope {
-                realm_id: "system".to_string(),
-                revision: None,
-            },
-            operation_family: operation_family.to_string(),
-            writer_family: writer_family.to_string(),
-            target,
-            precondition_fingerprints: Vec::new(),
-            boundary_values,
-            landed_bytes,
-            created_at_unix_nanos: unix_timestamp_nanos(),
-        };
-        let hash_input = encode_pending_mutation_hash_input(&record, payload)?;
-        self.enforce_admission_capacity(hash_input.len() as u64, 0)
-            .await?;
-        let payload_bytes = encode_stored_pending_mutation_row(&record, payload)?;
-        let sequence_bytes = encode_materialisation_cursor_row(record.sequence)?;
-        let pending_key = admission_record_key(record.sequence);
-        let sequence_key = admission_sequence_key();
-        let ops = vec![
-            CoreMetaBatchOp {
-                cf: CF_TRANSACTIONS,
-                table_id: TABLE_PENDING_MUTATION_ROW,
-                tuple_key: &pending_key,
-                common: None,
-                kind: CoreMetaBatchOpKind::Put(&payload_bytes),
-            },
-            CoreMetaBatchOp {
-                cf: CF_MATERIALISATION,
-                table_id: TABLE_MATERIALISATION_CURSOR_ROW,
-                tuple_key: &sequence_key,
-                common: None,
-                kind: CoreMetaBatchOpKind::Put(&sequence_bytes),
-            },
-        ];
-        let root_key = root_key_hash(CORE_TRANSACTION_ROOT_ANCHOR_KEY);
-        let metadata_commit = self
-            .commit_coremeta_batch_for_root(
-                &root_key,
-                record.sequence.saturating_sub(1),
-                record.sequence,
-                &record.mutation_id,
-                &ops,
-            )
-            .await?;
-        let certificate_bytes = self.local_pending_mutation_commit_certificate_bytes(
-            &record,
-            &hash_input,
-            metadata_commit.metadata_replica_node_ids,
-            metadata_commit.certificate_hash,
-            metadata_commit.certificate_persist_receipt_hashes,
-        )?;
-        let write_batch_started_at = Instant::now();
-        let certificate_key = admission_certificate_key(record.sequence);
-        let result = self
-            .commit_coremeta_batch_by_embedded_roots(
-                &record.mutation_id,
-                &[CoreMetaBatchOp {
-                    cf: CF_TRANSACTIONS,
-                    table_id: TABLE_ADMISSION_COMMIT_CERTIFICATE_ROW,
-                    tuple_key: &certificate_key,
-                    common: None,
-                    kind: CoreMetaBatchOpKind::Put(&certificate_bytes),
-                }],
-            )
-            .await;
-        record_corestore_trace_event(
-            "admission.commit_evidence_write_batch",
-            if result.is_ok() { "ok" } else { "error" },
-        );
-        crate::perf::record_duration(
-            "anvil_rocksdb_write_batch_duration_ms",
-            &[
-                ("node_id", CORE_PENDING_MUTATION_NODE_ID),
-                ("column_family_group", "admission_commit_evidence"),
-                ("fsync_mode", "rocksdb_wal"),
-                ("status", if result.is_ok() { "ok" } else { "error" }),
-            ],
-            write_batch_started_at.elapsed(),
-        );
-        result?;
-        Ok(record)
-    }
-
-    pub(super) async fn land_core_bytes(
+    async fn land_core_bytes_unlocked(
         &self,
         bytes: &[u8],
+        admission_shard_hash: &str,
         mutation_id: &str,
-        boundary_values: &[CoreBoundaryValue],
     ) -> Result<CorePendingLandedByte> {
         let hash = sha256_hex(bytes);
-        let _landed_guard = self.acquire_named_lock("landed-bytes", &hash).await?;
         let final_path = self.landed_bytes_path(&hash);
-        let landing_id = format!("{mutation_id}:{hash}");
+        let landing_id = format!("{admission_shard_hash}:{mutation_id}:{hash}");
         self.ensure_landed_bytes_file(&final_path, bytes, &hash)
             .await?;
         let relative_path = self.storage.relative_storage_path(&final_path)?;
-        let created_at_unix_nanos = unix_timestamp_nanos();
         let landed = CorePendingLandedByte {
             sha256: format!("sha256:{hash}"),
             length: bytes.len() as u64,
             landing_id,
             relative_path,
         };
-        let stored = CoreStoredLandedByteRef {
-            schema: "anvil.core.landed_byte_ref.v1".to_string(),
-            landed: landed.clone(),
-            mutation_id: mutation_id.to_string(),
-            boundary_values: boundary_values.to_vec(),
-            created_at_unix_nanos,
-        };
-        let landed_key = meta_tuple_key(&[b"landed-byte", landed.landing_id.as_bytes()]);
-        let landed_row = encode_landed_byte_ref_row(&stored)?;
-        self.commit_coremeta_batch_by_embedded_roots(
-            mutation_id,
-            &[CoreMetaBatchOp {
-                cf: CF_MATERIALISATION,
-                table_id: TABLE_LANDED_BYTE_REF_ROW,
-                tuple_key: &landed_key,
-                common: None,
-                kind: CoreMetaBatchOpKind::Put(&landed_row),
-            }],
-        )
-        .await?;
-        // A finaliser for another pending mutation with the same content hash can
-        // remove a content-addressed landed file between the initial existence
-        // check and this mutation's durable reference row. Re-ensuring the file
-        // after the row is committed closes that TOCTOU window without changing
-        // landed-byte semantics.
-        self.ensure_landed_bytes_file(&final_path, bytes, &hash)
-            .await
-            .with_context(|| {
-                format!(
-                    "verify CoreStore landed bytes after admission landing_id={} path={}",
-                    landed.landing_id,
-                    final_path.display()
-                )
-            })?;
         Ok(landed)
     }
 
@@ -277,8 +173,6 @@ impl CoreStore {
                 Ok(())
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                self.enforce_admission_capacity(0, bytes.len() as u64)
-                    .await?;
                 if let Some(parent) = final_path.parent() {
                     fs::create_dir_all(parent).await?;
                 }
@@ -346,118 +240,33 @@ impl CoreStore {
         }
     }
 
-    pub(super) fn local_pending_mutation_commit_certificate_bytes(
-        &self,
-        record: &CorePendingMutationRecord,
-        pending_mutation_hash_input: &[u8],
-        metadata_replica_node_ids: Vec<String>,
-        core_meta_commit_certificate_hash: String,
-        certificate_persist_receipt_hashes: Vec<String>,
-    ) -> Result<Vec<u8>> {
-        let mut certificate = build_local_pending_mutation_commit_certificate(
-            record,
-            pending_mutation_hash_input,
-            unix_timestamp_nanos(),
-            LOCAL_SHARD_FSYNC_SEQUENCE,
-            metadata_replica_node_ids,
-            core_meta_commit_certificate_hash,
-            certificate_persist_receipt_hashes,
-        )?;
-        certificate.local_receipt.source_signature =
-            self.sign_core_receipt(&certificate.local_receipt.signed_payload_hash)?;
-        certificate.source_signature = self.sign_core_receipt(&certificate.signed_payload_hash)?;
-        validate_local_pending_mutation_commit_certificate(&certificate)?;
-        self.verify_core_admission_signature(
-            &record.node_id,
-            &certificate.local_receipt.signed_payload_hash,
-            &certificate.local_receipt.source_signature,
-        )?;
-        self.verify_core_admission_signature(
-            &record.node_id,
-            &certificate.signed_payload_hash,
-            &certificate.source_signature,
-        )?;
-        encode_admission_commit_certificate(&certificate)
-    }
-
-    pub(super) async fn verify_local_pending_mutation_commit_certificate(
-        &self,
-        record: &CorePendingMutationRecord,
-        pending_mutation_hash_input: &[u8],
-    ) -> Result<CoreAdmissionCommitCertificate> {
-        let mut bytes = None;
-        for _ in 0..CORE_CONTROL_READ_RETRY_ATTEMPTS {
-            if let Some(read) = self.meta.get(
-                CF_TRANSACTIONS,
-                TABLE_ADMISSION_COMMIT_CERTIFICATE_ROW,
-                &admission_certificate_key(record.sequence),
-            )? {
-                bytes = Some(read);
-                break;
-            }
-            tokio::time::sleep(CORE_PROCESS_LOCK_RETRY_DELAY).await;
-        }
-        let bytes = bytes.ok_or_else(|| {
-            anyhow!(
-                "read CoreStore admission commit certificate for pending mutation sequence {}",
-                record.sequence
-            )
-        })?;
-        let certificate = decode_admission_commit_certificate(&bytes)?;
-        validate_local_pending_mutation_commit_certificate(&certificate)?;
-        let expected_pending_mutation_hash = domain_hash_bytes(
-            "anvil.admission.pending_mutation_hash_input.v1",
-            pending_mutation_hash_input,
-        );
-        if certificate.local_receipt.pending_mutation_hash != expected_pending_mutation_hash {
-            bail!(
-                "CoreStore admission commit certificate pending mutation hash input hash mismatch"
-            );
-        }
-        let expected_attempt = admission_attempt_id_with_metadata_replicas(
-            record,
-            certificate.attempt_id.metadata_replica_node_ids.clone(),
-        )?;
-        if certificate.attempt_id != expected_attempt
-            || certificate.local_receipt.attempt_id != expected_attempt
-        {
-            bail!("CoreStore admission commit certificate attempt id mismatch");
-        }
-        self.verify_core_admission_signature(
-            &record.node_id,
-            &certificate.local_receipt.signed_payload_hash,
-            &certificate.local_receipt.source_signature,
-        )?;
-        self.verify_core_admission_signature(
-            &record.node_id,
-            &certificate.signed_payload_hash,
-            &certificate.source_signature,
-        )?;
-        Ok(certificate)
-    }
-
-    pub(super) async fn enforce_admission_capacity(
-        &self,
-        incoming_pending_mutation_bytes: u64,
-        incoming_landed_bytes: u64,
-    ) -> Result<()> {
-        self.enforce_admission_capacity_with_limits(
-            incoming_pending_mutation_bytes,
-            incoming_landed_bytes,
-            CoreAdmissionCapacityLimits::production(),
-        )
-        .await
-    }
-
     pub(super) async fn enforce_admission_capacity_with_limits(
         &self,
+        admission_shard_hash: &str,
         incoming_pending_mutation_bytes: u64,
         incoming_landed_bytes: u64,
         limits: CoreAdmissionCapacityLimits,
     ) -> Result<()> {
-        let pending_mutation_rows = self.pending_mutation_count().await?;
-        let pending_mutation_bytes = self.pending_mutation_bytes().await?;
-        let landed_bytes = self.admission_landed_bytes().await?;
+        let state = self.load_admission_point_state_foreground(admission_shard_hash)?;
+        self.enforce_admission_capacity_for_state(
+            &state,
+            incoming_pending_mutation_bytes,
+            incoming_landed_bytes,
+            limits,
+        )
+        .await
+    }
+
+    async fn enforce_admission_capacity_for_state(
+        &self,
+        state: &AdmissionPointState,
+        incoming_pending_mutation_bytes: u64,
+        incoming_landed_bytes: u64,
+        limits: CoreAdmissionCapacityLimits,
+    ) -> Result<()> {
+        let pending_mutation_rows = state.pending_rows;
+        let pending_mutation_bytes = state.pending_bytes;
+        let landed_bytes = state.landed_bytes;
         let projected_pending_mutation_rows = pending_mutation_rows.saturating_add(1);
         let projected_pending_mutation_bytes =
             pending_mutation_bytes.saturating_add(incoming_pending_mutation_bytes);
@@ -517,7 +326,7 @@ impl CoreStore {
             i64::try_from(projected_landed_bytes).unwrap_or(i64::MAX),
         );
         crate::perf::record_pending_state(
-            CORE_PENDING_MUTATION_NODE_ID,
+            &self.node_identity.node_id,
             "pending_mutations",
             pending_mutation_rows,
             pending_mutation_bytes,
@@ -554,7 +363,7 @@ impl CoreStore {
             );
         }
 
-        let pending_mutation_lag_seconds = self.admission_materialisation_lag_seconds().await?;
+        let pending_mutation_lag_seconds = state.lag_seconds(unix_timestamp_nanos());
         if let Some(lag_seconds) = pending_mutation_lag_seconds {
             crate::perf::record_gauge(
                 "anvil_materialisation_lag_seconds",
@@ -589,397 +398,101 @@ impl CoreStore {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) async fn pending_mutation_count(&self) -> Result<u64> {
-        Ok(self
-            .meta
-            .scan_prefix(
-                CF_TRANSACTIONS,
-                TABLE_PENDING_MUTATION_ROW,
-                &admission_record_prefix(),
-            )?
-            .len() as u64)
+        Ok(self.admission_accounting_totals_for_tests()?.0)
     }
 
+    pub(super) fn has_pending_mutations(&self) -> Result<bool> {
+        Ok(!self.read_all_pending_mutation_page(None, 1)?.is_empty())
+    }
+
+    #[cfg(test)]
     pub(super) async fn pending_mutation_bytes(&self) -> Result<u64> {
-        Ok(self
-            .meta
-            .scan_prefix(
-                CF_TRANSACTIONS,
-                TABLE_PENDING_MUTATION_ROW,
-                &admission_record_prefix(),
-            )?
-            .into_iter()
-            .map(|record| record.payload.len() as u64)
-            .sum())
+        Ok(self.admission_accounting_totals_for_tests()?.1)
     }
 
+    #[cfg(test)]
     pub(super) async fn admission_landed_bytes(&self) -> Result<u64> {
-        sum_files_with_extension(&self.admission_landed_bytes_root(), &["landed"])
-            .await
-            .with_context(|| {
-                format!(
-                    "measure CoreStore admission landed bytes under {}",
-                    self.admission_landed_bytes_root().display()
-                )
-            })
+        Ok(self.admission_accounting_totals_for_tests()?.2)
     }
 
+    #[cfg(test)]
     pub(super) async fn admission_materialisation_lag_seconds(&self) -> Result<Option<u64>> {
-        let records = self.read_pending_mutation_records().await?;
-        if records.is_empty() {
-            return Ok(None);
-        }
-
-        let finalised = self.read_pending_mutation_finalisation_keys().await?;
-        let oldest_unfinalised = records
-            .iter()
-            .filter(|record| !finalised.contains(&CorePendingMutationKey::from(*record)))
-            .map(|record| record.created_at_unix_nanos)
-            .min();
-
-        let Some(oldest_unfinalised) = oldest_unfinalised else {
-            return Ok(None);
-        };
-
-        let now = unix_timestamp_nanos();
-        let lag_nanos = now.saturating_sub(oldest_unfinalised);
-        Ok(Some(lag_nanos / 1_000_000_000))
+        Ok(self.admission_accounting_totals_for_tests()?.3)
     }
 
-    pub(super) async fn read_pending_mutation_records(
+    #[cfg(test)]
+    pub(super) fn admission_point_state_for_tests(
         &self,
-    ) -> Result<Vec<CorePendingMutationRecord>> {
-        self.read_pending_mutation_records_with_payload()
-            .await
-            .map(|records| {
-                records
-                    .into_iter()
-                    .map(|(record, _payload)| record)
-                    .collect()
-            })
+        admission_shard_hash: &str,
+    ) -> Result<(u64, u64, u64, u64, Option<u64>, Option<u64>)> {
+        let state = self.load_admission_point_state_foreground(admission_shard_hash)?;
+        Ok((
+            state.last_sequence,
+            state.pending_rows,
+            state.pending_bytes,
+            state.landed_bytes,
+            state.oldest_pending_sequence,
+            state.oldest_pending_created_at_unix_nanos,
+        ))
     }
 
+    #[cfg(test)]
+    pub(super) fn landed_byte_reference_count_for_tests(
+        &self,
+        admission_shard_hash: &str,
+        sha256: &str,
+    ) -> Result<Option<u64>> {
+        Ok(self
+            .read_landed_byte_head(admission_shard_hash, sha256)?
+            .map(|head| head.reference_count))
+    }
+
+    #[cfg(test)]
+    pub(super) fn validate_admission_recovery_state_for_tests(&self) -> Result<usize> {
+        Ok(self.validate_admission_recovery_state()?.len())
+    }
+
+    #[cfg(test)]
     pub(super) async fn read_pending_mutation_records_with_payload(
         &self,
     ) -> Result<Vec<(CorePendingMutationRecord, Vec<u8>)>> {
         let mut out = Vec::new();
-        let prefix = admission_record_prefix();
-        for item in self
-            .meta
-            .scan_prefix(CF_TRANSACTIONS, TABLE_PENDING_MUTATION_ROW, &prefix)?
-        {
-            out.push(decode_stored_pending_mutation_row(&item.payload)?);
+        let mut after = None;
+        loop {
+            let page = self
+                .read_all_pending_mutation_page(after.as_deref(), ADMISSION_RECOVERY_PAGE_ROWS)?;
+            if page.is_empty() {
+                break;
+            }
+            let page_len = page.len();
+            after = page.last().map(|row| row.tuple_key.clone());
+            out.extend(page.into_iter().map(|row| (row.record, row.inline_payload)));
+            if page_len < ADMISSION_RECOVERY_PAGE_ROWS {
+                break;
+            }
         }
-        out.sort_by_key(|(record, _)| record.sequence);
+        out.sort_by_key(|(record, _)| (record.target.admission_shard().hash, record.sequence));
         Ok(out)
     }
 
-    pub(super) async fn read_pending_mutation_finalisation_keys(
-        &self,
-    ) -> Result<BTreeSet<CorePendingMutationKey>> {
-        let mut keys = BTreeSet::new();
-        for item in self.meta.scan_prefix(
-            CF_MATERIALISATION,
-            TABLE_MATERIALISATION_CURSOR_ROW,
-            &admission_finalisation_prefix(),
-        )? {
-            let finalisation = decode_pending_mutation_finalisation_index_row(&item.payload)?;
-            if finalisation.schema != CORE_PENDING_MUTATION_FINALISATION_INDEX_SCHEMA {
-                bail!("CoreStore pending mutation finalisation index row has invalid schema");
-            }
-            keys.insert(CorePendingMutationKey {
-                node_id: finalisation.node_id,
-                mutation_epoch: finalisation.mutation_epoch,
-                mutation_sequence: finalisation.mutation_sequence,
-            });
-        }
-        Ok(keys)
-    }
-
-    pub(super) fn read_pending_mutation_finalisation_record(
-        &self,
-        key: &CorePendingMutationKey,
-    ) -> Result<Option<CorePendingMutationFinalisationRecord>> {
-        self.meta
-            .get(
-                CF_MATERIALISATION,
-                TABLE_MATERIALISATION_CURSOR_ROW,
-                &admission_finalisation_record_key(key),
-            )?
-            .map(|bytes| decode_pending_mutation_finalisation_record(&bytes))
-            .transpose()
-    }
-
-    pub(super) async fn mark_pending_mutation_finalised_unlocked(
-        &self,
-        admission: &CorePendingMutationRecord,
-        state: &str,
-    ) -> Result<()> {
-        self.mark_pending_mutation_finalised_with_result_unlocked(admission, state, None)
-            .await
-    }
-
-    pub(super) async fn mark_pending_mutation_finalised_with_result_unlocked(
-        &self,
-        admission: &CorePendingMutationRecord,
-        state: &str,
-        result: Option<CorePendingMutationFinalisationResult>,
-    ) -> Result<()> {
-        self.mark_pending_mutation_finalised_with_result_and_ops_unlocked(
-            admission,
-            state,
-            result,
-            Vec::new(),
-        )
-        .await
-    }
-
-    pub(super) async fn mark_pending_mutation_finalised_with_result_and_ops_unlocked(
-        &self,
-        admission: &CorePendingMutationRecord,
-        state: &str,
-        result: Option<CorePendingMutationFinalisationResult>,
-        mut preceding_ops: Vec<OwnedCoreMetaBatchOp>,
-    ) -> Result<()> {
-        let admission_key = CorePendingMutationKey::from(admission);
-        let finalisation_lock_id = format!(
-            "{}:{}:{}",
-            admission_key.node_id, admission_key.mutation_epoch, admission_key.mutation_sequence
-        );
-        let _finalisation_guard = self
-            .acquire_named_lock("pending_mutation_finalisation", &finalisation_lock_id)
-            .await?;
-        let result_hash = finalisation_result_hash(&result)?;
-        let index_key = admission_finalisation_key(&admission_key);
-        if let Some(existing_bytes) = self.meta.get(
-            CF_MATERIALISATION,
-            TABLE_MATERIALISATION_CURSOR_ROW,
-            &index_key,
-        )? {
-            let existing = decode_pending_mutation_finalisation_index_row(&existing_bytes)?;
-            if existing.schema != CORE_PENDING_MUTATION_FINALISATION_INDEX_SCHEMA {
-                bail!("CoreStore pending mutation finalisation index row has invalid schema");
-            }
-            if existing.mutation_id == admission.mutation_id
-                && existing.state == state
-                && existing.result_hash == result_hash
-            {
-                if !preceding_ops.is_empty() {
-                    let ops = borrow_owned_coremeta_batch_ops(&preceding_ops);
-                    self.commit_coremeta_batch_by_embedded_roots(&admission.mutation_id, &ops)
-                        .await?;
-                }
-                if let Some(record) =
-                    self.read_pending_mutation_finalisation_record(&admission_key)?
-                {
-                    if record.mutation_id != admission.mutation_id
-                        || record.state != state
-                        || finalisation_result_hash(&record.result)? != result_hash
-                    {
-                        bail!(
-                            "CoreStore pending mutation finalisation record/index mismatch for sequence {}",
-                            admission.sequence
-                        );
-                    }
-                    let payload = encode_pending_mutation_finalisation_record(&record)?;
-                    self.append_pending_mutation_finalisation_transaction_record(&record, &payload)
-                        .await?;
-                }
-                self.checkpoint_pending_mutations_unlocked().await?;
-                return Ok(());
-            }
-            bail!(
-                "CoreStore pending mutation finalisation conflict for sequence {}: existing mutation/state {}/{}, new mutation/state {}/{}",
-                admission.sequence,
-                existing.mutation_id,
-                existing.state,
-                admission.mutation_id,
-                state
-            );
-        }
-        let finalisation = CorePendingMutationFinalisationRecord {
-            schema: CORE_PENDING_MUTATION_FINALISATION_SCHEMA.to_string(),
-            node_id: admission.node_id.clone(),
-            mutation_epoch: admission.mutation_epoch,
-            mutation_sequence: admission.sequence,
-            mutation_id: admission.mutation_id.clone(),
-            operation_family: admission.operation_family.clone(),
-            writer_family: admission.writer_family.clone(),
-            target: admission.target.clone(),
-            boundary_values: admission.boundary_values.clone(),
-            landed_bytes: admission.landed_bytes.clone(),
-            state: state.to_string(),
-            result,
-            finalised_at_unix_nanos: unix_timestamp_nanos(),
-        };
-        let finalisation_index = CorePendingMutationFinalisationIndexRow {
-            schema: CORE_PENDING_MUTATION_FINALISATION_INDEX_SCHEMA.to_string(),
-            node_id: admission.node_id.clone(),
-            mutation_epoch: admission.mutation_epoch,
-            mutation_sequence: admission.sequence,
-            mutation_id: admission.mutation_id.clone(),
-            state: state.to_string(),
-            result_hash,
-        };
-        let record_key = admission_finalisation_record_key(&admission_key);
-        let finalisation_payload = encode_pending_mutation_finalisation_record(&finalisation)?;
-        let finalisation_index_payload =
-            encode_pending_mutation_finalisation_index_row(&finalisation_index)?;
-        preceding_ops.extend([
-            OwnedCoreMetaBatchOp::Put {
-                cf: CF_MATERIALISATION,
-                table_id: TABLE_MATERIALISATION_CURSOR_ROW,
-                tuple_key: record_key,
-                payload: finalisation_payload.clone(),
-                common: None,
-            },
-            OwnedCoreMetaBatchOp::Put {
-                cf: CF_MATERIALISATION,
-                table_id: TABLE_MATERIALISATION_CURSOR_ROW,
-                tuple_key: index_key,
-                payload: finalisation_index_payload,
-                common: None,
-            },
-        ]);
-        let cleanup_common = core_meta_committed_row_common(
-            "system",
-            root_key_hash(CORE_TRANSACTION_ROOT_ANCHOR_KEY),
-            admission.sequence,
-            admission.mutation_id.clone(),
-            unix_timestamp_nanos(),
-        );
-        preceding_ops.extend([
-            OwnedCoreMetaBatchOp::Delete {
-                cf: CF_TRANSACTIONS,
-                table_id: TABLE_PENDING_MUTATION_ROW,
-                tuple_key: admission_record_key(admission.sequence),
-                common: Some(cleanup_common.clone()),
-            },
-            OwnedCoreMetaBatchOp::Delete {
-                cf: CF_TRANSACTIONS,
-                table_id: TABLE_ADMISSION_COMMIT_CERTIFICATE_ROW,
-                tuple_key: admission_certificate_key(admission.sequence),
-                common: Some(cleanup_common.clone()),
-            },
-        ]);
-        for landed in &admission.landed_bytes {
-            preceding_ops.push(OwnedCoreMetaBatchOp::Delete {
-                cf: CF_MATERIALISATION,
-                table_id: TABLE_LANDED_BYTE_REF_ROW,
-                tuple_key: meta_tuple_key(&[b"landed-byte", landed.landing_id.as_bytes()]),
-                common: Some(cleanup_common.clone()),
-            });
-        }
-        let finalisation_idempotency_key = format!(
-            "pending-finalisation:{}:{}:{}",
-            finalisation.node_id, finalisation.mutation_epoch, finalisation.mutation_sequence
-        );
-        let finalisation_idempotency_hash = format!(
-            "sha256:{}",
-            sha256_hex(finalisation_idempotency_key.as_bytes())
-        );
-        let _stream_guard = self
-            .acquire_named_lock("stream", CORE_TRANSACTION_STREAM_ID)
-            .await?;
-        // The finalisation index is written atomically with (or before) this
-        // stream record. Its absence proves this is a new append, so a replay
-        // scan of the ever-growing transaction stream is unnecessary here.
-        let prepared_stream = Box::pin(
-            self.prepare_new_stream_append_unlocked_with_idempotency_hash(
-                AppendStreamRecord {
-                    stream_id: CORE_TRANSACTION_STREAM_ID.to_string(),
-                    partition_id: "system/core-control".to_string(),
-                    record_kind: CORE_PENDING_MUTATION_FINALISATION_RECORD_KIND.to_string(),
-                    payload: finalisation_payload.clone(),
-                    content_type: Some("application/protobuf".to_string()),
-                    user_metadata_json: "{}".to_string(),
-                    fence: None,
-                    transaction_id: Some(finalisation.mutation_id.clone()),
-                    idempotency_key: Some(finalisation_idempotency_key),
-                },
-                Some(finalisation_idempotency_hash),
-                String::new(),
-            ),
-        )
-        .await?;
-        let combine_stream_metadata = prepared_stream
-            .record
-            .as_ref()
-            .is_some_and(|record| record.sequence == admission.sequence);
-        let stream_transaction_id = prepared_stream.metadata.transaction_id.clone();
-        let mut stream_metadata_ops = prepared_stream.metadata.owned_ops;
-        if combine_stream_metadata {
-            preceding_ops.append(&mut stream_metadata_ops);
-        }
-        let finalisation_ops = borrow_owned_coremeta_batch_ops(&preceding_ops);
-        let step_started_at = Instant::now();
-        let metadata_commits = self
-            .commit_coremeta_batch_by_embedded_roots(&admission.mutation_id, &finalisation_ops)
-            .await?;
-        crate::emit_test_timing(
-            "core_store.pending_finalisation write_rows",
-            step_started_at.elapsed(),
-        );
-        let step_started_at = Instant::now();
-        if let Some(record) = prepared_stream.record.as_ref() {
-            let stream_metadata_commits = if combine_stream_metadata {
-                metadata_commits
-            } else {
-                let ops = borrow_owned_coremeta_batch_ops(&stream_metadata_ops);
-                self.commit_coremeta_batch_by_embedded_roots(&stream_transaction_id, &ops)
-                    .await?
-            };
-            self.write_core_transaction_stream_records(
-                std::slice::from_ref(record),
-                &stream_metadata_commits,
-            )
-            .await?;
-        }
-        self.remove_finalised_landed_byte_files_after_metadata_cleanup(admission)
-            .await?;
-        crate::emit_test_timing(
-            "core_store.pending_finalisation append_transaction_record",
-            step_started_at.elapsed(),
-        );
-        Ok(())
-    }
-
-    async fn remove_finalised_landed_byte_files_after_metadata_cleanup(
-        &self,
-        admission: &CorePendingMutationRecord,
-    ) -> Result<()> {
-        for landed in &admission.landed_bytes {
-            let landed_hash = strip_sha256_prefix(&landed.sha256)?.to_string();
-            let _landed_guard = self
-                .acquire_named_lock("landed-bytes", &landed_hash)
-                .await?;
-            if self.landed_bytes_has_live_references(&landed.relative_path)? {
-                continue;
-            }
-            let landed_path = self
-                .storage
-                .resolve_relative_storage_path(&landed.relative_path)?;
-            match fs::remove_file(&landed_path).await {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!(
-                            "remove finalised CoreStore landed bytes {}",
-                            landed_path.display()
-                        )
-                    });
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn append_pending_mutation_finalisation_transaction_record(
+    pub(in crate::core_store::local) async fn publish_pending_mutation_finalisation_transaction_record_locally(
         &self,
         finalisation: &CorePendingMutationFinalisationRecord,
-        payload: &[u8],
-    ) -> Result<()> {
+    ) -> Result<CorePendingMutationFinalisationRecord> {
+        if let Some(existing) = self
+            .read_published_pending_mutation_finalisation(finalisation)
+            .await?
+        {
+            return Ok(existing);
+        }
+
+        if finalisation.finalised_at_unix_nanos != 0 {
+            bail!(
+                "CoreStore pending mutation finalisation proposal already has an owner timestamp"
+            );
+        }
         // Finalisations from unrelated mutations can run concurrently. They
         // still append to one root-anchored stream, so sequence allocation and
         // root publication must share the same cross-process stream lock as a
@@ -987,118 +500,72 @@ impl CoreStore {
         let _stream_guard = self
             .acquire_named_lock("stream", CORE_TRANSACTION_STREAM_ID)
             .await?;
-        Box::pin(self.append_stream_unlocked(AppendStreamRecord {
+        if let Some(existing) = self
+            .read_published_pending_mutation_finalisation(finalisation)
+            .await?
+        {
+            return Ok(existing);
+        }
+        let mut canonical = finalisation.clone();
+        canonical.finalised_at_unix_nanos = unix_timestamp_nanos();
+        let payload = encode_pending_mutation_finalisation_record(&canonical)?;
+        let append_result = Box::pin(self.append_stream_unlocked(AppendStreamRecord {
             stream_id: CORE_TRANSACTION_STREAM_ID.to_string(),
             partition_id: "system/core-control".to_string(),
             record_kind: CORE_PENDING_MUTATION_FINALISATION_RECORD_KIND.to_string(),
-            payload: payload.to_vec(),
+            payload,
             content_type: Some("application/protobuf".to_string()),
             user_metadata_json: "{}".to_string(),
             fence: None,
-            transaction_id: Some(finalisation.mutation_id.clone()),
-            idempotency_key: Some(format!(
-                "pending-finalisation:{}:{}:{}",
-                finalisation.node_id, finalisation.mutation_epoch, finalisation.mutation_sequence
-            )),
+            // This event records the outcome of the source mutation; it is not
+            // another write in that mutation's publication plan. Reusing the
+            // source mutation id here lets two distinct root plans collide if
+            // the first plan is being resumed after a lost acknowledgement.
+            transaction_id: None,
+            idempotency_key: Some(pending_mutation_finalisation_idempotency_key(&canonical)),
         }))
-        .await?;
-        Ok(())
-    }
-
-    pub(super) async fn checkpoint_pending_mutations_unlocked(&self) -> Result<()> {
-        let _pending_mutation_guard = self.acquire_named_lock("admission", "active").await?;
-        let records = self.read_pending_mutation_records().await?;
-        if records.is_empty() {
-            return Ok(());
-        }
-        let finalised = self.read_pending_mutation_finalisation_keys().await?;
-        for record in records {
-            let key = CorePendingMutationKey::from(&record);
-            if !finalised.contains(&key) {
-                continue;
-            }
-            self.remove_finalised_landed_bytes(&record).await?;
-            let pending_key = admission_record_key(record.sequence);
-            let certificate_key = admission_certificate_key(record.sequence);
-            let common = core_meta_committed_row_common(
-                "system",
-                root_key_hash(CORE_TRANSACTION_ROOT_ANCHOR_KEY),
-                record.sequence,
-                record.mutation_id.clone(),
-                unix_timestamp_nanos(),
-            );
-            self.commit_coremeta_batch_by_embedded_roots(
-                &record.mutation_id,
-                &[
-                    CoreMetaBatchOp {
-                        cf: CF_TRANSACTIONS,
-                        table_id: TABLE_PENDING_MUTATION_ROW,
-                        tuple_key: &pending_key,
-                        common: Some(common.clone()),
-                        kind: CoreMetaBatchOpKind::Delete,
-                    },
-                    CoreMetaBatchOp {
-                        cf: CF_TRANSACTIONS,
-                        table_id: TABLE_ADMISSION_COMMIT_CERTIFICATE_ROW,
-                        tuple_key: &certificate_key,
-                        common: Some(common),
-                        kind: CoreMetaBatchOpKind::Delete,
-                    },
-                ],
-            )
-            .await?;
-        }
-        Ok(())
-    }
-
-    pub(super) async fn remove_finalised_landed_bytes(
-        &self,
-        record: &CorePendingMutationRecord,
-    ) -> Result<()> {
-        for landed in &record.landed_bytes {
-            let landed_hash = strip_sha256_prefix(&landed.sha256)?.to_string();
-            let _landed_guard = self
-                .acquire_named_lock("landed-bytes", &landed_hash)
-                .await?;
-            let landed_key = meta_tuple_key(&[b"landed-byte", landed.landing_id.as_bytes()]);
-            let common = core_meta_committed_row_common(
-                "system",
-                root_key_hash(CORE_TRANSACTION_ROOT_ANCHOR_KEY),
-                record.sequence,
-                record.mutation_id.clone(),
-                unix_timestamp_nanos(),
-            );
-            self.commit_coremeta_batch_by_embedded_roots(
-                &record.mutation_id,
-                &[CoreMetaBatchOp {
-                    cf: CF_MATERIALISATION,
-                    table_id: TABLE_LANDED_BYTE_REF_ROW,
-                    tuple_key: &landed_key,
-                    common: Some(common),
-                    kind: CoreMetaBatchOpKind::Delete,
-                }],
-            )
-            .await?;
-            if self.landed_bytes_has_live_references(&landed.relative_path)? {
-                continue;
-            }
-            let landed_path = self
-                .storage
-                .resolve_relative_storage_path(&landed.relative_path)?;
-            match fs::remove_file(&landed_path).await {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    return Err(err).with_context(|| {
-                        format!(
-                            "remove finalised CoreStore landed bytes {}",
-                            landed_path.display()
-                        )
-                    });
+        .await;
+        match append_result {
+            Ok(_) => Ok(canonical),
+            Err(append_error) => {
+                // The stream publication may have committed while the caller
+                // lost its acknowledgement or before the shard-local marker
+                // landed. Recover the canonical event rather than rebuilding
+                // it with a different wall-clock timestamp.
+                if let Some(existing) = self
+                    .read_published_pending_mutation_finalisation(finalisation)
+                    .await?
+                {
+                    return Ok(existing);
                 }
+                Err(append_error)
             }
         }
-        Ok(())
+    }
+
+    async fn read_published_pending_mutation_finalisation(
+        &self,
+        requested: &CorePendingMutationFinalisationRecord,
+    ) -> Result<Option<CorePendingMutationFinalisationRecord>> {
+        let idempotency_key = pending_mutation_finalisation_idempotency_key(requested);
+        let Some(record) = self
+            .read_stream_record_by_idempotency_key(CORE_TRANSACTION_STREAM_ID, &idempotency_key)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if record.record_kind != CORE_PENDING_MUTATION_FINALISATION_RECORD_KIND
+            || record.transaction_id.is_some()
+        {
+            bail!("CoreStore pending mutation finalisation stream identity conflict");
+        }
+        let existing = decode_pending_mutation_finalisation_record(&record.payload)?;
+        if !same_pending_mutation_finalisation(requested, &existing) {
+            bail!(
+                "CoreStore pending mutation finalisation stream payload conflicts with source identity"
+            );
+        }
+        Ok(Some(existing))
     }
 
     pub(super) async fn read_landed_bytes(
@@ -1106,6 +573,15 @@ impl CoreStore {
         landed: &CorePendingLandedByte,
     ) -> Result<Vec<u8>> {
         validate_hash(&landed.sha256, "landed bytes hash")?;
+        let (admission_shard_hash, mutation_id) = landed_admission_scope(&landed.landing_id)?;
+        self.verify_landed_bytes_ref_row(
+            admission_shard_hash,
+            &landed.landing_id,
+            mutation_id,
+            &landed.sha256,
+            landed.length,
+            &[],
+        )?;
         let path = self
             .storage
             .resolve_relative_storage_path(&landed.relative_path)?;
@@ -1126,92 +602,84 @@ impl CoreStore {
         if actual != landed.sha256 {
             bail!("CoreStore landed bytes hash mismatch");
         }
-        self.verify_landed_bytes_ref_row(
-            &landed.landing_id,
-            landed
-                .landing_id
-                .rsplit_once(':')
-                .map(|(mutation_id, _)| mutation_id)
-                .unwrap_or_default(),
-            &landed.sha256,
-            landed.length,
-            &[],
-        )?;
         Ok(bytes)
     }
 
-    pub(super) async fn recover_pending_mutations(&self) -> Result<()> {
+    pub(super) async fn recover_pending_mutations(
+        &self,
+        _startup_guard: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<()> {
         let recovery_started_at = Instant::now();
         let _recovery_guard = self
             .acquire_named_lock("pending_mutation", "recovery")
             .await?;
-        let _guard = self.write_lock.lock().await;
         let result = async {
-            let records = self.read_pending_mutation_records_with_payload().await?;
-            let referenced_landed_bytes = referenced_landed_byte_paths(&records);
+            let referenced_landed_bytes = self.validate_admission_recovery_state()?;
             self.reconcile_landed_bytes_after_rocksdb_recovery(&referenced_landed_bytes)
                 .await?;
-            if records.is_empty() {
-                return Ok(());
-            }
-            let finalised = self.read_pending_mutation_finalisation_keys().await?;
-            for (record, payload) in records {
-                let record_key = CorePendingMutationKey::from(&record);
-                if finalised.contains(&record_key) {
-                    continue;
+            let mut after = None;
+            loop {
+                let page = self.read_all_pending_mutation_page(
+                    after.as_deref(),
+                    ADMISSION_RECOVERY_PAGE_ROWS,
+                )?;
+                if page.is_empty() {
+                    break;
                 }
-                let pending_mutation_hash_input =
-                    encode_pending_mutation_hash_input(&record, &payload)?;
-                if let Err(error) = self
-                    .verify_local_pending_mutation_commit_certificate(
-                        &record,
-                        &pending_mutation_hash_input,
-                    )
-                    .await
-                {
-                    if self
-                        .wait_for_pending_mutation_finalisation(&record_key)
-                        .await?
+                after = page.last().map(|row| row.tuple_key.clone());
+                for row in page {
+                    let record = row.record;
+                    let payload = row.inline_payload;
+                    let record_key = CorePendingMutationKey::from(&record);
+                    let pending_mutation_hash_input =
+                        encode_pending_mutation_hash_input(&record, &payload)?;
+                    if let Err(error) =
+                        self.verify_local_admission_evidence(&record, &pending_mutation_hash_input)
                     {
-                        continue;
-                    }
-                    return Err(error);
-                }
-                let replay = match self
-                    .replay_pending_mutation_record_unlocked(&record, &payload)
-                    .await
-                {
-                    Ok(replay) => replay,
-                    Err(error) => {
                         if self
                             .wait_for_pending_mutation_finalisation(&record_key)
                             .await?
                         {
                             continue;
                         }
-                        return Err(error).with_context(|| {
-                            format!(
-                                "replay CoreStore pending mutation mutation {} sequence {}",
-                                record.mutation_id, record.sequence
-                            )
-                        });
+                        return Err(error);
                     }
-                };
-                if let Err(error) = self
-                    .mark_pending_mutation_finalised_with_result_unlocked(
-                        &record,
-                        replay.state,
-                        replay.result,
-                    )
-                    .await
-                {
-                    if self
-                        .wait_for_pending_mutation_finalisation(&record_key)
-                        .await?
+                    let replay = match self
+                        .replay_pending_mutation_record_unlocked(&record, &payload)
+                        .await
                     {
-                        continue;
+                        Ok(replay) => replay,
+                        Err(error) => {
+                            if self
+                                .wait_for_pending_mutation_finalisation(&record_key)
+                                .await?
+                            {
+                                continue;
+                            }
+                            return Err(error).with_context(|| {
+                                format!(
+                                    "replay CoreStore pending mutation mutation {} sequence {}",
+                                    record.mutation_id, record.sequence
+                                )
+                            });
+                        }
+                    };
+                    if let Err(error) = self
+                        .mark_pending_mutation_finalised_with_result_unlocked(
+                            &record,
+                            replay.state,
+                            replay.result,
+                        )
+                        .await
+                    {
+                        if self
+                            .wait_for_pending_mutation_finalisation(&record_key)
+                            .await?
+                        {
+                            continue;
+                        }
+                        return Err(error);
                     }
-                    return Err(error);
                 }
             }
             Ok(())
@@ -1231,9 +699,8 @@ impl CoreStore {
     ) -> Result<bool> {
         for _ in 0..CORE_CONTROL_READ_RETRY_ATTEMPTS {
             if self
-                .read_pending_mutation_finalisation_keys()
-                .await?
-                .contains(key)
+                .pending_mutation_finalisation_index_point(key)?
+                .is_some()
             {
                 return Ok(true);
             }
@@ -1258,6 +725,7 @@ impl CoreStore {
                 compression,
                 writer_generation,
                 block_ordinal,
+                logical_offset,
                 region_id: _,
             } => {
                 if record.operation_family != "object.put" {
@@ -1290,27 +758,43 @@ impl CoreStore {
                             &hash32(&materialised_bytes),
                         )
                     };
-                self.materialise_object_blob_bytes(
-                    &replay_logical_file_id,
-                    *writer_generation,
-                    *block_ordinal,
-                    block_plain_hash,
-                    &hash,
-                    &materialised_bytes,
-                    object_hash,
-                    *object_logical_size,
-                    compression.clone(),
-                    &record.boundary_values,
-                    &record.mutation_id,
-                    profile,
-                    encryption,
-                    &record.writer_family,
-                )
-                .await?;
-                Ok(CorePendingMutationReplayOutcome {
-                    state: "committed",
-                    result: None,
-                })
+                let materialisation = self
+                    .materialise_object_blob_bytes(
+                        &replay_logical_file_id,
+                        *writer_generation,
+                        *block_ordinal,
+                        *logical_offset,
+                        block_plain_hash,
+                        &hash,
+                        &materialised_bytes,
+                        object_hash,
+                        *object_logical_size,
+                        compression.clone(),
+                        &record.boundary_values,
+                        &record.mutation_id,
+                        profile,
+                        encryption,
+                        &record.writer_family,
+                    )
+                    .await;
+                match materialisation {
+                    Ok(object_ref) => Ok(CorePendingMutationReplayOutcome {
+                        state: "committed",
+                        result: Some(CorePendingMutationFinalisationResult::ObjectRef(object_ref)),
+                    }),
+                    Err(error) => {
+                        if super::local_root_publication_recovery::publication_terminal_reason(
+                            &error,
+                        ) == Some("PublicationSupersededByCommittedRoot")
+                        {
+                            return Ok(CorePendingMutationReplayOutcome {
+                                state: "superseded",
+                                result: None,
+                            });
+                        }
+                        Err(error)
+                    }
+                }
             }
             CorePendingMutationTarget::StreamAppend {
                 stream_id,
@@ -1351,7 +835,7 @@ impl CoreStore {
                 }
                 let payload = self.pending_mutation_payload_bytes(record, payload).await?;
                 let batch = decode_core_mutation_batch(&payload)?;
-                let receipt = self.recover_admitted_mutation_batch_unlocked(batch).await?;
+                let receipt = self.recover_admitted_mutation_batch(batch, record).await?;
                 Ok(CorePendingMutationReplayOutcome {
                     state: core_transaction_state_name(receipt.state),
                     result: None,
@@ -1360,23 +844,85 @@ impl CoreStore {
         }
     }
 
-    async fn reconcile_landed_bytes_after_rocksdb_recovery(
+    pub(in crate::core_store::local) async fn reconcile_landed_bytes_after_rocksdb_recovery(
         &self,
-        referenced_relative_paths: &BTreeSet<String>,
+        referenced_relative_paths: &BTreeMap<String, (String, u64)>,
     ) -> Result<()> {
+        let mut missing_referenced_paths = referenced_relative_paths.clone();
         let files = collect_landed_byte_files(&self.storage.core_store_landed_bytes_path()).await?;
         for path in files {
             let relative = self.storage.relative_storage_path(&path)?;
-            if referenced_relative_paths.contains(&relative) {
+            if let Some((expected_hash, expected_len)) = referenced_relative_paths.get(&relative) {
                 let actual = read_file(&path, "core_store", "landed_recovery_read").await?;
-                let expected_hash = format!("sha256:{}", sha256_hex(&actual));
-                let expected_len = actual.len() as u64;
-                self.verify_referenced_landed_bytes_row(&relative, &expected_hash, expected_len)?;
+                if format!("sha256:{}", sha256_hex(&actual)) != *expected_hash
+                    || actual.len() as u64 != *expected_len
+                {
+                    bail!("CoreStore referenced landed bytes failed recovery validation");
+                }
+                missing_referenced_paths.remove(&relative);
+                continue;
+            }
+            let hash = landed_bytes_file_hash(&path)?;
+            let _landed_guard = self.acquire_named_lock("landed-bytes", &hash).await?;
+            let actual = read_file(&path, "core_store", "landed_recovery_recheck").await?;
+            let actual_hash = format!("sha256:{}", sha256_hex(&actual));
+            if actual_hash != format!("sha256:{hash}") {
+                bail!("CoreStore unreferenced landed bytes filename/hash mismatch");
+            }
+            if self.live_landed_bytes_reference(&relative, &actual_hash, actual.len() as u64)? {
                 continue;
             }
             quarantine_landed_bytes_file(&path).await?;
         }
+        if !missing_referenced_paths.is_empty() {
+            bail!("CoreStore recovery found a missing referenced landed byte file");
+        }
         Ok(())
+    }
+
+    fn live_landed_bytes_reference(
+        &self,
+        relative_path: &str,
+        expected_hash: &str,
+        expected_len: u64,
+    ) -> Result<bool> {
+        let prefix = landed_byte_ref_prefix();
+        let mut after = None;
+        loop {
+            let rows = self.meta.scan_prefix_page(
+                CF_MATERIALISATION,
+                TABLE_LANDED_BYTE_REF_ROW,
+                &prefix,
+                after.as_deref(),
+                ADMISSION_RECOVERY_PAGE_ROWS,
+            )?;
+            if rows.is_empty() {
+                return Ok(false);
+            }
+            for record in &rows {
+                let row = decode_landed_byte_ref_row(&record.payload)?;
+                if core_meta_record_tuple_key(&record.key)?
+                    != landed_byte_ref_key(&row.admission_shard_hash, &row.landed.landing_id)
+                        .as_slice()
+                {
+                    bail!("CoreStore landed byte reference row has invalid key scope");
+                }
+                if row.landed.relative_path != relative_path {
+                    continue;
+                }
+                if row.landed.sha256 != expected_hash || row.landed.length != expected_len {
+                    bail!("CoreStore live landed byte reference descriptor mismatch");
+                }
+                return Ok(true);
+            }
+            after = rows
+                .last()
+                .map(|row| core_meta_record_tuple_key(&row.key).map(|key| key.to_vec()))
+                .transpose()?;
+            if rows.len() < ADMISSION_RECOVERY_PAGE_ROWS {
+                return Ok(false);
+            }
+        }
     }
 
     pub(super) async fn pending_mutation_payload_bytes(
@@ -1394,70 +940,84 @@ impl CoreStore {
         Ok(bytes)
     }
 
-    pub(super) async fn next_core_mutation_sequence(&self) -> Result<u64> {
-        let persisted = self
-            .meta
-            .get(
-                CF_MATERIALISATION,
-                TABLE_MATERIALISATION_CURSOR_ROW,
-                &admission_sequence_key(),
-            )?
-            .map(|bytes| decode_materialisation_cursor_row(&bytes))
-            .transpose()?
-            .unwrap_or(0);
-        let active = self
-            .read_pending_mutation_records()
-            .await?
-            .into_iter()
-            .map(|record| record.sequence)
-            .max()
-            .unwrap_or(0);
-        Ok(persisted.max(active).saturating_add(1))
+    pub(super) async fn next_core_mutation_sequence(
+        &self,
+        target: &CorePendingMutationTarget,
+    ) -> Result<u64> {
+        self.load_admission_point_state_foreground(&target.admission_shard().hash)?
+            .last_sequence
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("CoreStore pending mutation sequence overflow"))
     }
 }
 
-fn referenced_landed_byte_paths(
-    records: &[(CorePendingMutationRecord, Vec<u8>)],
-) -> BTreeSet<String> {
-    records
-        .iter()
-        .flat_map(|(record, _)| record.landed_bytes.iter())
-        .map(|landed| landed.relative_path.clone())
-        .collect()
+fn pending_mutation_finalisation_idempotency_key(
+    finalisation: &CorePendingMutationFinalisationRecord,
+) -> String {
+    format!(
+        "pending-finalisation:{}:{}:{}:{}",
+        finalisation.target.admission_shard().hash,
+        finalisation.node_id,
+        finalisation.mutation_epoch,
+        finalisation.mutation_sequence
+    )
+}
+
+pub(in crate::core_store::local) fn same_pending_mutation_finalisation(
+    requested: &CorePendingMutationFinalisationRecord,
+    existing: &CorePendingMutationFinalisationRecord,
+) -> bool {
+    let mut requested = requested.clone();
+    let mut existing = existing.clone();
+    requested.finalised_at_unix_nanos = 0;
+    existing.finalised_at_unix_nanos = 0;
+    requested == existing
 }
 
 impl CoreStore {
-    fn landed_bytes_has_live_references(&self, relative_path: &str) -> Result<bool> {
-        let rows = self.meta.scan_prefix(
-            CF_MATERIALISATION,
-            TABLE_LANDED_BYTE_REF_ROW,
-            &meta_tuple_key(&[b"landed-byte"]),
-        )?;
-        for record in rows {
-            let row = decode_landed_byte_ref_row(&record.payload)?;
-            if row.landed.relative_path == relative_path {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
     pub(super) fn verify_landed_bytes_ref_row(
         &self,
+        admission_shard_hash: &str,
         landing_id: &str,
         mutation_id: &str,
         sha256: &str,
         length: u64,
         boundary_values: &[CoreBoundaryValue],
     ) -> Result<()> {
-        let landed_key = meta_tuple_key(&[b"landed-byte", landing_id.as_bytes()]);
+        let landed_key = landed_byte_ref_key(admission_shard_hash, landing_id);
+        // Landed-byte references are node-local admission staging and must be
+        // verified before any rooted mutation is eligible for publication.
         let Some(bytes) =
             self.meta
                 .get(CF_MATERIALISATION, TABLE_LANDED_BYTE_REF_ROW, &landed_key)?
         else {
             bail!("CoreStore landed byte CoreMeta row is missing");
         };
-        let row = decode_landed_byte_ref_row(&bytes)?;
+        self.verify_landed_bytes_ref_payload(
+            admission_shard_hash,
+            landing_id,
+            mutation_id,
+            sha256,
+            length,
+            boundary_values,
+            &bytes,
+        )
+    }
+
+    pub(in crate::core_store::local) fn verify_landed_bytes_ref_payload(
+        &self,
+        admission_shard_hash: &str,
+        landing_id: &str,
+        mutation_id: &str,
+        sha256: &str,
+        length: u64,
+        boundary_values: &[CoreBoundaryValue],
+        bytes: &[u8],
+    ) -> Result<()> {
+        let row = decode_landed_byte_ref_row(bytes)?;
+        if row.admission_shard_hash != admission_shard_hash || row.admission_sequence == 0 {
+            bail!("CoreStore landed byte CoreMeta row has invalid admission scope");
+        }
         if !mutation_id.is_empty() && row.mutation_id != mutation_id {
             bail!("CoreStore landed byte CoreMeta mutation id mismatch");
         }
@@ -1478,30 +1038,38 @@ impl CoreStore {
         }
         Ok(())
     }
+}
 
-    fn verify_referenced_landed_bytes_row(
-        &self,
-        relative_path: &str,
-        sha256: &str,
-        length: u64,
-    ) -> Result<()> {
-        let rows = self.meta.scan_prefix(
-            CF_MATERIALISATION,
-            TABLE_LANDED_BYTE_REF_ROW,
-            &meta_tuple_key(&[b"landed-byte"]),
-        )?;
-        for record in rows {
-            let row = decode_landed_byte_ref_row(&record.payload)?;
-            if row.landed.relative_path != relative_path {
-                continue;
-            }
-            if row.landed.sha256 != sha256 || row.landed.length != length {
-                bail!("CoreStore referenced landed bytes failed recovery validation");
-            }
-            return Ok(());
-        }
-        bail!("CoreStore referenced landed byte CoreMeta row is missing")
+fn landed_admission_scope(landing_id: &str) -> Result<(&str, &str)> {
+    const SHA256_TEXT_LENGTH: usize = "sha256:".len() + 64;
+    if landing_id.len() <= SHA256_TEXT_LENGTH + 2 {
+        bail!("CoreStore landed byte landing id is missing admission scope");
     }
+    let (shard_hash, remainder) = landing_id.split_at(SHA256_TEXT_LENGTH);
+    validate_hash(shard_hash, "landed byte admission shard hash")?;
+    let remainder = remainder
+        .strip_prefix(':')
+        .ok_or_else(|| anyhow!("CoreStore landed byte landing id has invalid shard delimiter"))?;
+    let (mutation_id, content_hash) = remainder
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow!("CoreStore landed byte landing id is missing content hash"))?;
+    validate_logical_id(mutation_id, "landed byte mutation id")?;
+    if content_hash.len() != 64 || !content_hash.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+        bail!("CoreStore landed byte landing id has invalid content hash");
+    }
+    Ok((shard_hash, mutation_id))
+}
+
+fn admission_contention_retry_delay(admission_shard_hash: &str, attempt: usize) -> Duration {
+    let base_micros = 25_u64.saturating_mul(1_u64 << attempt.min(8));
+    let shard_jitter = admission_shard_hash
+        .as_bytes()
+        .iter()
+        .rev()
+        .take(8)
+        .fold(0_u64, |value, byte| value.rotate_left(5) ^ u64::from(*byte))
+        % base_micros.max(1);
+    Duration::from_micros(base_micros.saturating_add(shard_jitter))
 }
 
 async fn collect_landed_byte_files(root: &PathBuf) -> Result<Vec<PathBuf>> {
@@ -1530,6 +1098,20 @@ async fn collect_landed_byte_files(root: &PathBuf) -> Result<Vec<PathBuf>> {
         }
     }
     Ok(files)
+}
+
+fn landed_bytes_file_hash(path: &std::path::Path) -> Result<String> {
+    let filename = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow!("CoreStore landed bytes path has no UTF-8 filename"))?;
+    let hash = filename
+        .strip_suffix(".landed")
+        .ok_or_else(|| anyhow!("CoreStore landed bytes filename has invalid suffix"))?;
+    if hash.len() != 64 || !hash.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+        bail!("CoreStore landed bytes filename has invalid SHA-256 hash");
+    }
+    Ok(hash.to_ascii_lowercase())
 }
 
 async fn quarantine_landed_bytes_file(path: &PathBuf) -> Result<()> {

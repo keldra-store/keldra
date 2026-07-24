@@ -2,6 +2,45 @@ use super::local_stream_control::control_record_proto::{
     decode_object_manifest_record, decode_stream_head_record, decode_stream_record_index_row,
 };
 use super::*;
+use crate::core_store::TABLE_TASK_LEASE_ROW;
+
+#[test]
+fn coremeta_lease_preconditions_round_trip_with_their_deadline() {
+    let lease = CoreMutationPrecondition::CoreMetaLease {
+        cf: CF_LEASES_FENCES.to_string(),
+        table_id: TABLE_TASK_LEASE_ROW,
+        tuple_key: b"task-lease:tenant-0:task-42".to_vec(),
+        expected_payload_hash: format!("sha256:{}", "ab".repeat(32)),
+        expires_at_unix_nanos: 1_900_000_000_000_000_000,
+    };
+    let batch = CoreMutationBatch {
+        transaction_id: "txn-coremeta-lease-codec".to_string(),
+        scope_partition: "task-queue".to_string(),
+        committed_by_principal: "node:test".to_string(),
+        root_publications: Vec::new(),
+        preconditions: vec![lease.clone()],
+        operations: Vec::new(),
+    };
+
+    let encoded = encode_core_mutation_batch(&batch).unwrap();
+    let decoded = decode_core_mutation_batch(&encoded).unwrap();
+    assert_eq!(decoded, batch);
+
+    let original_hash = core_mutation_preconditions_hash(&[lease.clone()]).unwrap();
+    let mut changed_deadline = lease;
+    let CoreMutationPrecondition::CoreMetaLease {
+        expires_at_unix_nanos,
+        ..
+    } = &mut changed_deadline
+    else {
+        unreachable!("test constructs a CoreMeta lease precondition");
+    };
+    *expires_at_unix_nanos += 1;
+    assert_ne!(
+        core_mutation_preconditions_hash(&[changed_deadline]).unwrap(),
+        original_hash
+    );
+}
 
 #[tokio::test]
 async fn core_store_internal_control_records_written_by_store_are_binary_not_json_or_cbor() {
@@ -143,6 +182,13 @@ async fn core_store_internal_control_records_written_by_store_are_binary_not_jso
             transaction_id: "txn-format-proof".to_string(),
             scope_partition: "tenant:t/bucket:b".to_string(),
             committed_by_principal: "principal:writer".to_string(),
+            root_publications: vec![
+                CoreMutationRootPublication::new(
+                    "tenant:t/bucket:b",
+                    WriterFamily::CoreControl.as_str(),
+                )
+                .coordinator(),
+            ],
             preconditions: Vec::new(),
             operations: vec![CoreMutationOperation::StreamAppend {
                 partition_id: "tenant:t/bucket:b".to_string(),
@@ -200,7 +246,7 @@ async fn core_store_internal_control_records_written_by_store_are_binary_not_jso
         .get(
             CF_TRANSACTIONS,
             TABLE_PENDING_MUTATION_ROW,
-            &admission_record_key(pending.sequence),
+            &admission_record_key(&pending.target.admission_shard().hash, pending.sequence),
         )
         .unwrap()
         .expect("pending mutation row");

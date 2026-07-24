@@ -275,7 +275,7 @@ anvil --profile acme index query documents by_status \
   --require-caught-up-to-watch-cursor "$WATCH_CURSOR" \
   --lag-timeout-ms 2000
 
-anvil --profile acme index diagnostics documents by_status --severity warning --after-cursor 0 --limit 100
+anvil --profile acme index diagnostics documents by_status --severity warning --page-size 100
 ```
 
 Purpose: create/update/drop definitions, list definitions, query path/metadata/typed/full-text/vector/hybrid indexes, and inspect diagnostics.
@@ -402,23 +402,24 @@ Public diagnostics and repair are tenant-scoped. System-wide repair belongs to t
 ```bash
 anvil --profile acme diagnostics list documents by_status \
   --severity warning \
-  --after-cursor 0 \
-  --limit 100
+  --page-size 100
 
 anvil --profile acme index diagnostics documents by_status \
   --severity warning \
-  --after-cursor 0 \
-  --limit 100
+  --page-size 100
 ```
 
 `diagnostics list` and `index diagnostics` currently call the same index diagnostic API shape.
+Both commands print `next_page_token=...` when another page exists. Pass that
+opaque value back with `--page-token` while keeping the caller, bucket, index,
+severity, and page size unchanged.
 
 ```bash
 anvil --profile acme repair run index documents by_status --rebuild
 anvil --profile acme repair run directory documents --rebuild
 anvil --profile acme repair run authz-derived derived-userset-acme-docs --rebuild
 anvil --profile acme repair run personal-db customer-notes
-anvil --profile acme repair findings index "$REPAIR_SCOPE_ID" --limit 100
+anvil --profile acme repair findings index "$REPAIR_SCOPE_ID" --page-size 100
 ```
 
 Purpose: read index diagnostics, rebuild or validate tenant-derived state, and list repair findings for a known scope id.
@@ -432,16 +433,17 @@ Limitations: there is no general public CoreStore fsck, no universal append-stre
 Tenant audit events record tenant-facing actions that Anvil chooses to audit.
 
 ```bash
-anvil --profile acme audit list --limit 100
+anvil --profile acme audit list --page-size 100
 anvil --profile acme audit list \
   --principal app:docs-writer \
   --resource documents/tutorial/welcome.txt \
   --action object.put \
-  --cursor "$NEXT_CURSOR" \
-  --limit 100
+  --page-token "$NEXT_PAGE_TOKEN" \
+  --page-size 100
 ```
 
-Purpose: list tenant audit events with optional principal, resource, action, cursor, and limit filters.
+Purpose: list tenant audit events with optional principal, resource, action,
+opaque page-token, and page-size filters.
 
 Auth/scope shape: tenant audit listing requires the public authority granted for audit reading in the current service policy. Audit records are tenant-scoped; admin audit is separate and uses `anvil-admin`.
 

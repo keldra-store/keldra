@@ -191,7 +191,7 @@ Diagnostics tell you why expected text might not be present in the index:
 ```bash
 anvil --profile acme index diagnostics documents tutorial_text \
   --severity warning \
-  --limit 20
+  --page-size 20
 ```
 
 This calls `IndexService.ListIndexDiagnostics`. A successful response proves the caller has `index:read` on `documents` and that Anvil could read diagnostic records for the bucket/index filter. The CLI prints `cursor`, `severity`, `code`, and `message`.

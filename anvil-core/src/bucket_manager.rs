@@ -112,9 +112,12 @@ impl BucketManager {
         Ok(bucket)
     }
 
-    pub async fn list_buckets(&self, claims: &auth::Claims) -> Result<Vec<Bucket>, Status> {
+    pub async fn authorize_bucket_list(&self, claims: &auth::Claims) -> Result<(), Status> {
         let tenant_id = claims.tenant_id;
-        tracing::debug!("[manager] ENTERING list_buckets for tenant: {}", tenant_id);
+        tracing::debug!(
+            "[manager] authorizing bucket list for tenant: {}",
+            tenant_id
+        );
         access_control::require_action(
             &self.storage,
             &self.persistence,
@@ -123,20 +126,7 @@ impl BucketManager {
             "*",
         )
         .await?;
-
-        tracing::debug!(
-            "[manager] Reading bucket metadata journal for tenant: {}",
-            tenant_id
-        );
-        let buckets = bucket_journal::read_current_buckets(&self.storage, tenant_id)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        tracing::debug!(
-            "[manager] EXITING list_buckets, found {} buckets",
-            buckets.len()
-        );
-        Ok(buckets)
+        Ok(())
     }
 
     pub async fn get_bucket_policy(

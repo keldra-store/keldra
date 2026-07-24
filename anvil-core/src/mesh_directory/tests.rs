@@ -8,6 +8,25 @@ use tempfile::tempdir;
 const NOW: &str = "2026-07-02T00:00:00Z";
 const TEST_SIGNING_KEY: &[u8] = b"mesh-directory-control-stream-test-key";
 
+async fn collect_routing_records_for_test(
+    storage: &Storage,
+    family: RoutingRecordFamily,
+) -> Vec<RoutingRecordDescriptor> {
+    let mut cursor = None;
+    let mut records = Vec::new();
+    loop {
+        let page = page_projected_routing_records(storage, family, cursor.as_deref(), 128)
+            .await
+            .unwrap();
+        records.extend(page.records);
+        let Some(next_cursor) = page.next_tuple_key else {
+            break;
+        };
+        cursor = Some(next_cursor);
+    }
+    records
+}
+
 async fn mesh_permit(
     storage: &Storage,
     family: RoutingRecordFamily,
@@ -190,10 +209,12 @@ async fn tenant_name_reservation_is_create_once_and_promoted_by_generation() {
     assert_eq!(active_retry.status, TenantNameStatus::Active);
     assert_eq!(active_retry.generation, 2);
 
-    let stream = mesh_control_stream::read_control_stream_log(
+    let stream = mesh_control_stream::read_control_stream_page(
         &storage,
         RoutingRecordFamily::TenantName.stream_family(),
         &reserved.partition(),
+        0,
+        8,
     )
     .await
     .unwrap();
@@ -278,9 +299,7 @@ async fn routing_reads_and_lists_use_control_stream_when_projection_is_stale_or_
             .is_some()
     );
 
-    let listed = list_routing_records(&storage, Some(RoutingRecordFamily::TenantName))
-        .await
-        .unwrap();
+    let listed = collect_routing_records_for_test(&storage, RoutingRecordFamily::TenantName).await;
     let listed_acme = listed
         .iter()
         .find(|record| record.record_key == "acme")
@@ -438,9 +457,7 @@ async fn tenant_name_recovery_tombstones_expired_reserved_name_without_locator()
     assert_eq!(recovered.status, TenantNameStatus::Tombstoned);
     assert_eq!(recovered.generation, 2);
 
-    let listed = list_routing_records(&storage, Some(RoutingRecordFamily::TenantName))
-        .await
-        .unwrap();
+    let listed = collect_routing_records_for_test(&storage, RoutingRecordFamily::TenantName).await;
     assert!(listed.iter().any(|record| {
         record.record_key == tenant_name.as_str()
             && record.payload_json.contains("\"status\":\"tombstoned\"")

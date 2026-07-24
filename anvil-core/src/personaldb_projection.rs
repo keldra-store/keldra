@@ -2,9 +2,10 @@ use crate::{
     core_store::{decode_deterministic_proto, encode_deterministic_proto},
     formats::hash32,
     personaldb_coremeta::{
-        list_personaldb_data_locator_rows, list_personaldb_data_locator_rows_for_tenant,
-        personaldb_payload_hash, read_personaldb_data_locator_bytes,
-        read_personaldb_data_locator_row, write_personaldb_bytes_as_data_locator,
+        PERSONALDB_DATA_LOCATOR_PAGE_MAX, list_personaldb_data_locator_rows,
+        list_personaldb_data_locator_rows_for_tenant, personaldb_payload_hash,
+        read_personaldb_data_locator_bytes, read_personaldb_data_locator_row,
+        write_personaldb_bytes_as_data_locator,
     },
     storage::Storage,
 };
@@ -251,7 +252,8 @@ pub async fn write_projection_definition(
     ensure_scope(tenant_id, database_id, definition)?;
     let data_id = projection_definition_data_id(tenant_id, database_id, &definition.projection_id)?;
     let bytes = encode_projection_definition(definition)?;
-    let generation = read_personaldb_data_locator_row(storage, tenant_id, database_id, &data_id)?
+    let generation = read_personaldb_data_locator_row(storage, tenant_id, database_id, &data_id)
+        .await?
         .map(|row| row.generation.saturating_add(1))
         .unwrap_or(1);
     write_personaldb_bytes_as_data_locator(
@@ -298,22 +300,37 @@ pub async fn list_projection_definitions_for_source(
     source_database_id: &str,
 ) -> Result<Vec<ProjectionDefinition>> {
     let mut definitions = Vec::new();
-    for row in list_personaldb_data_locator_rows_for_tenant(storage, tenant_id)? {
-        if row.data_kind != PERSONALDB_PROJECTION_DEFINITION_KIND {
-            continue;
+    let mut after_tuple_key = None;
+    loop {
+        let page = list_personaldb_data_locator_rows_for_tenant(
+            storage,
+            tenant_id,
+            after_tuple_key.as_deref(),
+            PERSONALDB_DATA_LOCATOR_PAGE_MAX,
+        )
+        .await?;
+        for row in page.rows {
+            if row.data_kind != PERSONALDB_PROJECTION_DEFINITION_KIND {
+                continue;
+            }
+            let Some(definition) =
+                read_projection_definition_row(storage, tenant_id, &row.group_id, &row.data_id)
+                    .await?
+            else {
+                continue;
+            };
+            if definition
+                .source_database_ids
+                .iter()
+                .any(|source| source == source_database_id)
+            {
+                definitions.push(definition);
+            }
         }
-        let Some(definition) =
-            read_projection_definition_row(storage, tenant_id, &row.group_id, &row.data_id).await?
-        else {
-            continue;
+        let Some(next_tuple_key) = page.next_tuple_key else {
+            break;
         };
-        if definition
-            .source_database_ids
-            .iter()
-            .any(|source| source == source_database_id)
-        {
-            definitions.push(definition);
-        }
+        after_tuple_key = Some(next_tuple_key);
     }
     definitions.sort_by(|left, right| {
         left.database_id
@@ -329,15 +346,31 @@ pub async fn list_projection_definitions_for_database(
     database_id: &str,
 ) -> Result<Vec<ProjectionDefinition>> {
     let mut definitions = Vec::new();
-    for row in list_personaldb_data_locator_rows(storage, tenant_id, database_id)? {
-        if row.data_kind != PERSONALDB_PROJECTION_DEFINITION_KIND {
-            continue;
+    let mut after_tuple_key = None;
+    loop {
+        let page = list_personaldb_data_locator_rows(
+            storage,
+            tenant_id,
+            database_id,
+            after_tuple_key.as_deref(),
+            PERSONALDB_DATA_LOCATOR_PAGE_MAX,
+        )
+        .await?;
+        for row in page.rows {
+            if row.data_kind != PERSONALDB_PROJECTION_DEFINITION_KIND {
+                continue;
+            }
+            if let Some(definition) =
+                read_projection_definition_row(storage, tenant_id, database_id, &row.data_id)
+                    .await?
+            {
+                definitions.push(definition);
+            };
         }
-        if let Some(definition) =
-            read_projection_definition_row(storage, tenant_id, database_id, &row.data_id).await?
-        {
-            definitions.push(definition);
+        let Some(next_tuple_key) = page.next_tuple_key else {
+            break;
         };
+        after_tuple_key = Some(next_tuple_key);
     }
     definitions.sort_by(|left, right| left.projection_id.cmp(&right.projection_id));
     Ok(definitions)
@@ -349,7 +382,8 @@ async fn read_projection_definition_row(
     database_id: &str,
     data_id: &str,
 ) -> Result<Option<ProjectionDefinition>> {
-    let Some(row) = read_personaldb_data_locator_row(storage, tenant_id, database_id, data_id)?
+    let Some(row) =
+        read_personaldb_data_locator_row(storage, tenant_id, database_id, data_id).await?
     else {
         return Ok(None);
     };

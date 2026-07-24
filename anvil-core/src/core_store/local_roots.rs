@@ -200,12 +200,7 @@ pub(super) fn validate_root_anchor_record(anchor: &CoreRootAnchorRecord) -> Resu
     if anchor.schema != "anvil.core.root_anchor.v1" {
         bail!("CoreStore root anchor has invalid schema");
     }
-    if anchor.root_anchor_key != core_transaction_root_anchor_key() {
-        bail!(
-            "CoreStore unsupported root anchor key {}",
-            anchor.root_anchor_key
-        );
-    }
+    validate_root_anchor_key(&anchor.root_anchor_key)?;
     let expected_root_key_hash = root_key_hash(&anchor.root_anchor_key);
     if anchor.root_key_hash != expected_root_key_hash {
         bail!("CoreStore root anchor key hash mismatch");
@@ -216,6 +211,9 @@ pub(super) fn validate_root_anchor_record(anchor: &CoreRootAnchorRecord) -> Resu
         bail!("CoreStore root anchor state must be committed");
     }
     if anchor.root_generation == 0 {
+        if anchor.root_anchor_key != core_transaction_root_anchor_key() {
+            bail!("CoreStore generation-zero root anchor is reserved for system bootstrap");
+        }
         if anchor.previous_root_hash != ZERO_HASH {
             bail!("CoreStore genesis root anchor previous hash must be zero");
         }
@@ -289,6 +287,20 @@ pub(super) fn validate_root_anchor_record(anchor: &CoreRootAnchorRecord) -> Resu
     Ok(())
 }
 
+fn validate_root_anchor_key(root_anchor_key: &str) -> Result<()> {
+    if root_anchor_key.is_empty()
+        || root_anchor_key.len() > 1024
+        || root_anchor_key.starts_with('/')
+        || root_anchor_key.ends_with('/')
+        || root_anchor_key
+            .split('/')
+            .any(|part| part.is_empty() || part.chars().any(char::is_control))
+    {
+        bail!("CoreStore root anchor key is not canonical");
+    }
+    Ok(())
+}
+
 pub(super) fn validate_transaction_manifest_record(
     transaction: &CoreTransactionManifestRecord,
     expected_root_generation: u64,
@@ -302,14 +314,48 @@ pub(super) fn validate_transaction_manifest_record(
     if transaction.post_root_generation != transaction.pre_root_generation.saturating_add(1) {
         bail!("CoreStore transaction manifest root generations must be contiguous");
     }
-    if transaction.logical_manifests.is_empty() {
-        bail!("CoreStore transaction manifest must include logical manifests");
-    }
-    validate_coremeta_digest(
-        &transaction.core_meta_commit_certificate_hash,
-        "transaction manifest commit certificate hash",
+    validate_hash(
+        &transaction.root_key_hash,
+        "transaction manifest root key hash",
     )?;
-    validate_certificate_persist_receipts(&transaction.certificate_persist_receipt_hashes)?;
+    match (
+        transaction.coordinator_root_key_hash.as_deref(),
+        transaction.coordinator_root_generation,
+    ) {
+        (Some(root_key_hash), Some(root_generation)) => {
+            validate_hash(
+                root_key_hash,
+                "transaction manifest coordinator root key hash",
+            )?;
+            if root_generation == 0 {
+                bail!("CoreStore transaction manifest coordinator generation must be nonzero");
+            }
+        }
+        (None, None) => {}
+        _ => {
+            bail!(
+                "CoreStore transaction manifest coordinator root hash and generation must be specified together"
+            );
+        }
+    }
+    if transaction.mutation_ids.is_empty() {
+        bail!("CoreStore transaction manifest must include at least one mutation id");
+    }
+    let mut mutation_ids = transaction.mutation_ids.clone();
+    mutation_ids.sort();
+    mutation_ids.dedup();
+    if mutation_ids != transaction.mutation_ids {
+        bail!("CoreStore transaction manifest mutation ids must be sorted and unique");
+    }
+    let mut idempotency_hashes = transaction.idempotency_key_hashes.clone();
+    idempotency_hashes.sort();
+    idempotency_hashes.dedup();
+    if idempotency_hashes != transaction.idempotency_key_hashes {
+        bail!("CoreStore transaction manifest idempotency hashes must be sorted and unique");
+    }
+    for hash in &transaction.idempotency_key_hashes {
+        validate_hash(hash, "transaction manifest idempotency key hash")?;
+    }
     for locator in &transaction.logical_manifests {
         validate_manifest_locator(locator)?;
     }
@@ -408,7 +454,7 @@ pub(super) fn hash_root_anchor_record(anchor: &CoreRootAnchorRecord) -> Result<S
     ))
 }
 
-pub(super) fn encode_root_anchor_record(anchor: &CoreRootAnchorRecord) -> Result<Vec<u8>> {
+pub(crate) fn encode_root_anchor_record(anchor: &CoreRootAnchorRecord) -> Result<Vec<u8>> {
     validate_root_anchor_record(anchor)?;
     let (header_proto, body_proto) = encode_root_anchor_proto(anchor)?;
     let mut out = Vec::with_capacity(

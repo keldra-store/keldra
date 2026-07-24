@@ -165,15 +165,6 @@ pub(super) fn parse_optional_uuid(
         .map_err(|_| Status::invalid_argument(format!("Invalid {field_name}")))
 }
 
-pub(super) fn page_limit(page: Option<&PageRequest>) -> usize {
-    let requested = page.map(|page| page.limit).unwrap_or(100);
-    if requested == 0 {
-        100
-    } else {
-        requested.clamp(1, 1000) as usize
-    }
-}
-
 pub(super) fn object_link_status(err: object_links::ObjectLinkError) -> Status {
     match err {
         object_links::ObjectLinkError::InvalidLinkKey

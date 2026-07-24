@@ -66,19 +66,19 @@ impl MutationOptions {
 #[derive(Args, Debug, Clone, Default)]
 pub struct PageOptions {
     #[clap(long)]
-    pub(super) cursor: Option<String>,
+    pub(super) page_token: Option<String>,
     #[clap(long)]
-    pub(super) limit: Option<u32>,
+    pub(super) page_size: Option<u32>,
 }
 impl PageOptions {
     pub(super) fn to_page_request(&self) -> Option<api::PageRequest> {
-        if self.cursor.is_none() && self.limit.is_none() {
+        if self.page_token.is_none() && self.page_size.is_none() {
             return None;
         }
 
         Some(api::PageRequest {
-            cursor: self.cursor.clone().unwrap_or_default(),
-            limit: self.limit.unwrap_or_default(),
+            page_token: self.page_token.clone().unwrap_or_default(),
+            page_size: self.page_size.unwrap_or_default(),
         })
     }
 }

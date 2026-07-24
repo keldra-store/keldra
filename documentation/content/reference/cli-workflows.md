@@ -196,7 +196,7 @@ anvil --profile acme index query documents tutorial_by_status \
   --typed-order-json '[{"field":"title","direction":"asc"}]' \
   --limit 10
 
-anvil --profile acme index diagnostics documents tutorial_by_status --limit 20
+anvil --profile acme index diagnostics documents tutorial_by_status --page-size 20
 ```
 
 `index create` proves the definition validates and is accepted. In this example, `selector_json` narrows the source set by object-key prefix, `build_policy_json` defines the typed fields, and `extractor_json` is empty because typed JSON uses the build policy for field extraction. `index query` proves the query path can read materialised rows and apply an equality predicate. `index diagnostics` proves the caller can inspect build warnings and errors for the definition.
@@ -239,8 +239,8 @@ Diagnostics are read-only evidence. Repair mutates or rebuilds derived state. St
 For a tenant index issue:
 
 ```bash
-anvil --profile acme diagnostics list documents tutorial_by_status --limit 20
-anvil --profile acme repair findings index documents/tutorial_by_status --limit 20
+anvil --profile acme diagnostics list documents tutorial_by_status --page-size 20
+anvil --profile acme repair findings index documents/tutorial_by_status --page-size 20
 anvil --profile acme repair run index documents tutorial_by_status
 ```
 

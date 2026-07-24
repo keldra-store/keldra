@@ -94,11 +94,7 @@ async fn admin_lifecycle_rejects_invalid_region_cell_and_node_transitions() {
                 node_id: "node-a".to_string(),
                 region: "eu-west-1".to_string(),
                 cell_id: "cell-a".to_string(),
-                libp2p_peer_id: "peer-a".to_string(),
-                receipt_signing_public_key_proto: libp2p::identity::Keypair::generate_ed25519()
-                    .public()
-                    .encode_protobuf(),
-                public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7443/quic-v1".to_string()],
+                receipt_signing_public_key: test_receipt_signing_public_key(),
                 public_api_addr: "http://127.0.0.1:50051".to_string(),
                 capabilities: vec![1, 6],
                 capacity_json: "{}".to_string(),
@@ -434,11 +430,10 @@ async fn admin_region_drain_applies_bucket_dispositions_and_exceptions() {
                 node_id: local_node_id.clone(),
                 region: "eu-west-1".to_string(),
                 cell_id: "cell-a".to_string(),
-                libp2p_peer_id: "peer-a".to_string(),
-                receipt_signing_public_key_proto: libp2p::identity::Keypair::generate_ed25519()
-                    .public()
-                    .encode_protobuf(),
-                public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7443/quic-v1".to_string()],
+                receipt_signing_public_key: node
+                    .state
+                    .core_store
+                    .local_receipt_signing_public_key(),
                 public_api_addr: "http://127.0.0.1:50051".to_string(),
                 capabilities: vec![1, 6],
                 capacity_json: "{}".to_string(),

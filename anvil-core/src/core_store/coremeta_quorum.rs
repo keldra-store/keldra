@@ -443,7 +443,13 @@ where
         replicas.insert(receipt.replica_node_id.as_str());
     }
     if replicas.len() < profile.certificate_persist_quorum {
-        bail!("CoreMeta certificate persist quorum was not reached");
+        bail!(
+            "CoreMeta certificate persist quorum was not reached: profile={} required={} received={} replica_node_ids={:?}",
+            profile.profile_id,
+            profile.certificate_persist_quorum,
+            replicas.len(),
+            replicas
+        );
     }
     Ok(())
 }

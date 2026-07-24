@@ -3,7 +3,7 @@ title: Anvil 0.3.0: CoreStore, hardened administration, and book-quality operati
 slug: /blog/corestore-unified-storage/
 description: Anvil 0.3.0 turns CoreStore into the durable centre of objects, metadata, search, authorisation, watches, PersonalDB, mesh lifecycle, and gateway records.
 release: v0.3.0
-release_date: 2026-07-13
+release_date: 2026-07-23
 artifacts:
   rust_crate: anvil-storage 0.3.0
 ---

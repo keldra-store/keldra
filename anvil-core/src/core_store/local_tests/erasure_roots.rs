@@ -1,5 +1,6 @@
 use super::*;
 use crate::core_store::local::local_stream_control::control_record_proto::decode_stream_idempotency_row;
+use crate::formats::hash32;
 
 #[tokio::test]
 async fn core_store_round_trips_an_empty_inline_blob() {
@@ -30,6 +31,55 @@ async fn core_store_round_trips_an_empty_inline_blob() {
     );
     let manifest = store.read_object_manifest(&object_ref).await.unwrap();
     assert_eq!(manifest.logical_size, 0);
+}
+
+#[tokio::test]
+async fn inline_manifest_body_is_content_addressed_without_an_independent_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = Storage::new_at(tmp.path()).await.unwrap();
+    let store = CoreStore::new(storage).await.unwrap();
+    let body = b"immutable inline manifest body".to_vec();
+    let writer_generation = 37;
+    let logical_file_id = canonical_logical_file_id(
+        WriterFamily::CoreControl,
+        writer_generation,
+        "inline-manifest-local-content",
+        &hash32(&body),
+    );
+
+    let locator = store
+        .publish_inline_manifest_body(
+            WriterFamily::CoreControl.as_str(),
+            logical_file_id,
+            writer_generation,
+            body.clone(),
+        )
+        .await
+        .unwrap();
+
+    let stored = store
+        .meta
+        .get(
+            CF_TRANSACTIONS,
+            TABLE_INLINE_MANIFEST_BODY_ROW,
+            &inline_manifest_body_key(&locator.manifest_hash).unwrap(),
+        )
+        .unwrap()
+        .expect("inline manifest body row");
+    let common = core_meta_row_common_from_payload(&stored).unwrap();
+    assert!(common.realm_id.is_empty());
+    assert!(common.root_key_hash.is_empty());
+    assert_eq!(common.root_generation, 0);
+    assert!(common.transaction_id.is_empty());
+    assert_eq!(store.read_inline_manifest_body(&locator).unwrap(), body);
+    assert!(
+        store
+            .read_latest_root_anchor(&format!("inline-manifest-body/{}", locator.manifest_hash))
+            .await
+            .unwrap()
+            .is_none(),
+        "content-addressed inline bodies must not create a root at their writer generation"
+    );
 }
 
 #[tokio::test]
@@ -88,6 +138,25 @@ async fn core_store_deduplicates_large_content_across_logical_names_and_boundari
 
     assert_eq!(first.hash, second.hash);
     assert_eq!(first.encoding.block_id, second.encoding.block_id);
+    let manifest_root = format!("object-manifest/{}", first.hash);
+    let latest_manifest_root = store
+        .read_latest_root_anchor(&manifest_root)
+        .await
+        .unwrap()
+        .expect("deduplicated object manifest root");
+    assert_eq!(latest_manifest_root.root_generation, 2);
+    let manifest_payload = store
+        .meta
+        .get(
+            CF_OBJECT_VERSIONS,
+            TABLE_OBJECT_VERSION_META_ROW,
+            &object_manifest_meta_key(&second),
+        )
+        .unwrap()
+        .expect("deduplicated object manifest row");
+    let manifest_common = core_meta_row_common_from_payload(&manifest_payload).unwrap();
+    assert_eq!(manifest_common.root_generation, 2);
+    assert_eq!(manifest_common.transaction_id, "dedupe-mut-2");
     assert_eq!(
         store.get_blob(GetBlob { object_ref: first }).await.unwrap(),
         payload
@@ -440,7 +509,7 @@ async fn core_store_streams_are_gap_free_hash_chained_and_idempotent() {
     assert_eq!(records.len(), 2);
     assert_eq!(records[1].previous_event_hash, records[0].event_hash);
     let stream_ids = store
-        .list_stream_ids("object_metadata:")
+        .list_stream_ids_page("object_metadata:", None, 10)
         .await
         .expect("list stream ids");
     assert_eq!(stream_ids, vec!["object_metadata:tenant:b".to_string()]);
@@ -473,34 +542,45 @@ async fn core_store_read_stream_page_uses_corestore_stream_metadata() {
             .unwrap();
     }
 
-    let raw_records = store
-        .read_raw_stream("tenant:t/bucket:b/ranged-stream")
+    let raw_record = store
+        .read_raw_stream_record(
+            "tenant:t/bucket:b/ranged-stream",
+            3,
+            &store
+                .read_stream_record_from_meta("tenant:t/bucket:b/ranged-stream", 3)
+                .await
+                .unwrap()
+                .unwrap()
+                .event_hash,
+        )
         .await
         .unwrap();
-    assert_eq!(raw_records.len(), 3);
-    assert_eq!(raw_records[2].record_kind, "event.3");
+    assert_eq!(raw_record.unwrap().record_kind, "event.3");
 
     let page = store
-        .read_stream(ReadStream {
+        .read_stream_page(ReadStream {
             stream_id: "tenant:t/bucket:b/ranged-stream".to_string(),
             after_sequence: 0,
             limit: 2,
         })
         .await
         .unwrap();
-    assert_eq!(page.len(), 2);
-    assert_eq!(page[0].record_kind, "event.1");
-    assert_eq!(page[1].record_kind, "event.2");
+    assert_eq!(page.records.len(), 2);
+    assert_eq!(page.records[0].record_kind, "event.1");
+    assert_eq!(page.records[1].record_kind, "event.2");
+    assert!(page.has_more);
 
-    let full = store
-        .read_stream(ReadStream {
+    let tail = store
+        .read_stream_page(ReadStream {
             stream_id: "tenant:t/bucket:b/ranged-stream".to_string(),
-            after_sequence: 0,
-            limit: 0,
+            after_sequence: page.next_sequence,
+            limit: 2,
         })
         .await
         .unwrap();
-    assert_eq!(full.len(), 3);
+    assert_eq!(tail.records.len(), 1);
+    assert_eq!(tail.records[0].record_kind, "event.3");
+    assert!(!tail.has_more);
 }
 
 #[tokio::test]
@@ -540,13 +620,20 @@ async fn core_store_transaction_stream_is_root_anchored() {
         count_root_cache_generations(&store, &root_key_hash) >= 2,
         "CoreStore root anchors must be committed as CoreMeta generation rows"
     );
+    let latest_anchor = store
+        .read_latest_root_anchor(core_transaction_root_anchor_key())
+        .await
+        .unwrap()
+        .expect("latest transaction root anchor");
+    let register = store
+        .inspect_root_register_generation(&root_key_hash, latest_anchor.root_generation)
+        .await
+        .unwrap()
+        .expect("latest transaction root-register generation");
     assert_eq!(
-        count_files_with_extension(
-            &tmp.path().join("corestore").join("blocks").join("register"),
-            "anr"
-        ),
-        0,
-        "CoreStore must not create root-anchor sidecar shard files"
+        register.shard_indexes,
+        BTreeSet::from([0, 1, 2]),
+        "normal root publication must durably prepare the root-register-r3 cohort"
     );
 
     drop(store);
@@ -592,7 +679,10 @@ async fn core_store_transaction_stream_is_root_anchored() {
         transaction_manifest.post_root_generation,
         latest_anchor.root_generation
     );
-    assert_eq!(transaction_manifest.logical_manifests.len(), 1);
+    assert!(
+        transaction_manifest.logical_manifests.is_empty(),
+        "an all-CoreMeta transaction has no writer logical manifest"
+    );
     let records = recovered
         .read_direct_stream_records(CORE_TRANSACTION_STREAM_ID)
         .await
@@ -727,10 +817,12 @@ async fn core_store_root_anchor_uses_coremeta_rows_not_shard_files() {
 
     let rows = store
         .meta
-        .scan_prefix(
+        .scan_prefix_page(
             CF_ROOT_CACHE,
             TABLE_ROOT_CACHE_ROW,
             &root_anchor_generation_prefix(&root_key_hash),
+            None,
+            2,
         )
         .unwrap();
     assert_eq!(rows.len(), 1);
@@ -786,39 +878,50 @@ async fn core_store_root_anchor_has_single_concurrent_winner() {
     let evidence_payload = encode_materialisation_cursor_row(next_generation).unwrap();
     let evidence_key_a =
         core_meta_tuple_key(&[CoreMetaTuplePart::Utf8("root-cas-evidence-a")]).unwrap();
+    let evidence_a_operations = [CoreMetaBatchOp {
+        cf: CF_MATERIALISATION,
+        table_id: TABLE_MATERIALISATION_CURSOR_ROW,
+        tuple_key: &evidence_key_a,
+        common: None,
+        kind: CoreMetaBatchOpKind::Put(&evidence_payload),
+    }];
+    let evidence_a_rows = store.meta.encode_batch_ops(&evidence_a_operations).unwrap();
     let evidence_a = store
-        .commit_coremeta_batch_for_root(
+        .commit_coremeta_encoded_rows_for_root(
             &root_key_hash_value,
             current.root_generation,
             next_generation,
             "root-cas-evidence-a",
-            &[CoreMetaBatchOp {
-                cf: CF_MATERIALISATION,
-                table_id: TABLE_MATERIALISATION_CURSOR_ROW,
-                tuple_key: &evidence_key_a,
-                common: None,
-                kind: CoreMetaBatchOpKind::Put(&evidence_payload),
-            }],
+            evidence_a_rows,
         )
         .await
         .unwrap();
     let evidence_key_b =
         core_meta_tuple_key(&[CoreMetaTuplePart::Utf8("root-cas-evidence-b")]).unwrap();
+    let evidence_b_operations = [CoreMetaBatchOp {
+        cf: CF_MATERIALISATION,
+        table_id: TABLE_MATERIALISATION_CURSOR_ROW,
+        tuple_key: &evidence_key_b,
+        common: None,
+        kind: CoreMetaBatchOpKind::Put(&evidence_payload),
+    }];
+    let evidence_b_rows = store.meta.encode_batch_ops(&evidence_b_operations).unwrap();
     let evidence_b = store
-        .commit_coremeta_batch_for_root(
+        .commit_coremeta_encoded_rows_for_root(
             &root_key_hash_value,
             current.root_generation,
             next_generation,
             "root-cas-evidence-b",
-            &[CoreMetaBatchOp {
-                cf: CF_MATERIALISATION,
-                table_id: TABLE_MATERIALISATION_CURSOR_ROW,
-                tuple_key: &evidence_key_b,
-                common: None,
-                kind: CoreMetaBatchOpKind::Put(&evidence_payload),
-            }],
+            evidence_b_rows,
         )
         .await
+        .unwrap();
+    let owner_terms = store
+        .root_owner_terms_for_publication(
+            &root_key_hash_value,
+            next_generation,
+            &store.node_identity.node_id,
+        )
         .unwrap();
 
     let anchor = |mutation_id: &str,
@@ -836,9 +939,9 @@ async fn core_store_root_anchor_has_single_concurrent_winner() {
             checkpoint_manifest: None,
             core_meta_commit_certificate_hash: Some(certificate_hash.to_string()),
             certificate_persist_receipt_hashes: receipt_hashes.to_vec(),
-            publisher_node_id: CORE_PENDING_MUTATION_NODE_ID.to_string(),
-            publisher_epoch: LOCAL_PLACEMENT_EPOCH,
-            partition_owner_fence: LOCAL_PLACEMENT_EPOCH,
+            publisher_node_id: owner_terms.owner_node_id.clone(),
+            publisher_epoch: owner_terms.owner_epoch,
+            partition_owner_fence: owner_terms.owner_fence,
             created_at_unix_nanos: unix_timestamp_nanos(),
             root_state: "committed".to_string(),
             mutation_first: Some(mutation_id.to_string()),

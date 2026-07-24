@@ -1,11 +1,10 @@
 use crate::core_store::{
-    CF_OBJECT_HEADS, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaStore, CoreMetaTuplePart,
-    CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition, CoreStore, CoreTransaction,
-    CoreTransactionUpdate, TABLE_MANIFEST_CAS_CURRENT_ROW, commit_coremeta_batch_for_storage,
-    core_meta_committed_row_common, core_meta_payload_digest, core_meta_root_key_hash,
-    core_meta_tuple_key,
+    CF_OBJECT_HEADS, CoreMetaTuplePart, CoreMutationBatch, CoreMutationOperation,
+    CoreMutationPrecondition, CoreMutationRootPublication, CoreStore, CoreTransaction,
+    CoreTransactionUpdate, TABLE_MANIFEST_CAS_CURRENT_ROW, core_meta_committed_row_common,
+    core_meta_payload_digest, core_meta_root_key_hash, core_meta_tuple_key,
 };
-use crate::formats::{Hash32, hash32};
+use crate::formats::{Hash32, hash32, writer::WriterFamily};
 use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
 use crate::persistence::{ManifestCasResult, MetadataMutationReceipt};
 use crate::storage::Storage;
@@ -81,6 +80,7 @@ struct ManifestCurrentRow {
     bucket_id: i64,
     object_key: String,
     revision: i64,
+    root_generation: u64,
     manifest_hash: String,
     updated_at: DateTime<Utc>,
     transaction_id: String,
@@ -236,10 +236,8 @@ async fn current_revision(
     object_key: &str,
     transaction: Option<(&str, &str)>,
 ) -> Result<i64> {
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
     let payload = manifest_current_payload_for_optional_transaction(
         storage,
-        &meta,
         tenant_id,
         bucket_id,
         object_key,
@@ -262,10 +260,22 @@ async fn append_manifest(
     transaction_principal: Option<&str>,
 ) -> Result<MetadataMutationReceipt> {
     let core_store = CoreStore::new(storage.clone()).await?;
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
     let stream_id = manifest_cas_stream_id(body.tenant_id, body.bucket_id);
     let mutation_id = uuid::Uuid::new_v4();
     let staged_transaction = transaction_id.is_some();
+    let explicit_transaction = match (transaction_id, transaction_principal) {
+        (Some(transaction_id), Some(transaction_principal)) => Some(
+            core_store
+                .read_explicit_transaction_for_principal(transaction_id, transaction_principal)
+                .await?,
+        ),
+        (None, None) => None,
+        _ => {
+            return Err(anyhow!(
+                "manifest transaction id and principal must be provided together"
+            ));
+        }
+    };
     let transaction_id = transaction_id.map(ToOwned::to_owned).unwrap_or_else(|| {
         format!(
             "manifest-cas:{}:{}:{mutation_id}",
@@ -275,30 +285,56 @@ async fn append_manifest(
     let body_bytes = encode_manifest_body(&body, fence_token, mutation_id)?;
     let payload_hash = hex::encode(hash32(&body_bytes));
     let partition_id = hex::encode(manifest_cas_partition_id(body.tenant_id, body.bucket_id));
+    let data_root = manifest_cas_current_root_key(body.tenant_id, body.bucket_id);
+    if explicit_transaction
+        .as_ref()
+        .is_some_and(|transaction| transaction.root_anchor_key != data_root)
+    {
+        return Err(anyhow!(
+            "manifest transaction targets a different CoreMeta root"
+        ));
+    }
+    let scope_partition = explicit_transaction
+        .as_ref()
+        .map(|transaction| transaction.scope_partition.clone())
+        .unwrap_or_else(|| partition_id.clone());
+    let root_generation = match explicit_transaction.as_ref() {
+        Some(transaction) => {
+            core_store
+                .infer_explicit_transaction_commit_root_generation(transaction)
+                .await?
+        }
+        None => next_manifest_cas_root_generation(&core_store, &data_root).await?,
+    };
+    let root_publications = manifest_root_publications(data_root, scope_partition.clone());
     let current_payload = manifest_current_payload_for_optional_transaction(
         storage,
-        &meta,
         body.tenant_id,
         body.bucket_id,
         &body.object_key,
         Some(transaction_id.as_str()).zip(transaction_principal),
     )
     .await?;
-    let current_update =
-        manifest_current_row_update_from_payload(&body, &transaction_id, current_payload)?;
+    let current_update = manifest_current_row_update_from_payload(
+        &body,
+        root_generation,
+        &transaction_id,
+        current_payload,
+    )?;
     let current_payload = encode_manifest_current_row(&current_update.row)?;
     let mut preconditions: Vec<_> = partition_precondition.into_iter().collect();
     preconditions.push(current_update.precondition.clone());
     let batch = CoreMutationBatch {
         transaction_id: transaction_id.clone(),
-        scope_partition: partition_id.clone(),
+        scope_partition: scope_partition.clone(),
         committed_by_principal: transaction_principal
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| manifest_cas_partition_principal(body.tenant_id, body.bucket_id)),
+        root_publications,
         preconditions,
         operations: vec![
             CoreMutationOperation::StreamAppend {
-                partition_id: partition_id.clone(),
+                partition_id: scope_partition.clone(),
                 stream_id,
                 record_kind: "manifest_cas".to_string(),
                 payload: body_bytes,
@@ -308,7 +344,7 @@ async fn append_manifest(
                 )),
             },
             CoreMutationOperation::CoreMetaPut {
-                partition_id,
+                partition_id: scope_partition,
                 cf: CF_OBJECT_HEADS.to_string(),
                 table_id: TABLE_MANIFEST_CAS_CURRENT_ROW,
                 tuple_key: manifest_current_row_key(
@@ -354,18 +390,28 @@ async fn read_manifest_bodies(
     bucket_id: i64,
 ) -> Result<Vec<ManifestBody>> {
     let core_store = CoreStore::new(storage.clone()).await?;
-    let records = core_store
-        .read_stream(crate::core_store::ReadStream {
-            stream_id: manifest_cas_stream_id(tenant_id, bucket_id),
-            after_sequence: 0,
-            limit: 0,
-        })
-        .await?;
-    records
-        .into_iter()
-        .filter(|record| record.record_kind == "manifest_cas")
-        .map(|record| decode_manifest_body(&record.payload))
-        .collect()
+    let stream_id = manifest_cas_stream_id(tenant_id, bucket_id);
+    let mut after_sequence = 0;
+    let mut bodies = Vec::new();
+    loop {
+        let page = core_store
+            .read_stream_page(crate::core_store::ReadStream {
+                stream_id: stream_id.clone(),
+                after_sequence,
+                limit: 256,
+            })
+            .await?;
+        for record in page.records {
+            if record.record_kind == "manifest_cas" {
+                bodies.push(decode_manifest_body(&record.payload)?);
+            }
+        }
+        if !page.has_more {
+            break;
+        }
+        after_sequence = page.next_sequence;
+    }
+    Ok(bodies)
 }
 
 pub async fn materialize_committed_manifest_cas_transaction(
@@ -373,13 +419,13 @@ pub async fn materialize_committed_manifest_cas_transaction(
     transaction: &CoreTransaction,
 ) -> Result<usize> {
     let core_store = CoreStore::new(storage.clone()).await?;
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
     let mut materialized = 0usize;
     for update in &transaction.visible_updates {
         let CoreTransactionUpdate::StreamAppend {
             stream_id,
             visible_sequence,
             prepared_record_hash,
+            ..
         } = update
         else {
             continue;
@@ -412,17 +458,20 @@ pub async fn materialize_committed_manifest_cas_transaction(
                 transaction.transaction_id
             ));
         }
-        if let Some(current) =
-            read_manifest_current_row(&meta, tenant_id, bucket_id, &body.object_key)?
-            && current.revision == body.revision
-            && current.manifest_hash == body.manifest_hash
-        {
-            materialized += 1;
-            continue;
+        let current =
+            read_manifest_current_row(&core_store, tenant_id, bucket_id, &body.object_key)?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "manifest CAS transaction {} committed without its current projection",
+                        transaction.transaction_id
+                    )
+                })?;
+        if current.revision != body.revision || current.manifest_hash != body.manifest_hash {
+            return Err(anyhow!(
+                "manifest CAS transaction {} current projection does not match committed stream record",
+                transaction.transaction_id
+            ));
         }
-        let row_update = manifest_current_row_update(&meta, &body, &transaction.transaction_id)?;
-        write_manifest_current_row(storage, &meta, &row_update.row, &row_update.precondition)
-            .await?;
         materialized += 1;
     }
     Ok(materialized)
@@ -453,17 +502,28 @@ pub(crate) async fn read_manifest_frame_fences_for_test(
     bucket_id: i64,
 ) -> Result<Vec<u64>> {
     let core_store = CoreStore::new(storage.clone()).await?;
-    Ok(core_store
-        .read_stream(crate::core_store::ReadStream {
-            stream_id: manifest_cas_stream_id(tenant_id, bucket_id),
-            after_sequence: 0,
-            limit: 0,
-        })
-        .await?
-        .into_iter()
-        .filter(|record| record.record_kind == "manifest_cas")
-        .map(|record| decode_manifest_body_fence(&record.payload))
-        .collect::<Result<Vec<_>>>()?)
+    let stream_id = manifest_cas_stream_id(tenant_id, bucket_id);
+    let mut after_sequence = 0;
+    let mut fences = Vec::new();
+    loop {
+        let page = core_store
+            .read_stream_page(crate::core_store::ReadStream {
+                stream_id: stream_id.clone(),
+                after_sequence,
+                limit: 256,
+            })
+            .await?;
+        for record in page.records {
+            if record.record_kind == "manifest_cas" {
+                fences.push(decode_manifest_body_fence(&record.payload)?);
+            }
+        }
+        if !page.has_more {
+            break;
+        }
+        after_sequence = page.next_sequence;
+    }
+    Ok(fences)
 }
 
 fn encode_manifest_body(
@@ -525,21 +585,17 @@ struct ManifestCurrentRowUpdate {
     row: ManifestCurrentRow,
 }
 
-fn manifest_current_row_update(
-    meta: &CoreMetaStore,
-    body: &ManifestBody,
-    transaction_id: &str,
-) -> Result<ManifestCurrentRowUpdate> {
-    let current_payload =
-        read_manifest_current_payload(meta, body.tenant_id, body.bucket_id, &body.object_key)?;
-    manifest_current_row_update_from_payload(body, transaction_id, current_payload)
-}
-
 fn manifest_current_row_update_from_payload(
     body: &ManifestBody,
+    root_generation: u64,
     transaction_id: &str,
     current_payload: Option<Vec<u8>>,
 ) -> Result<ManifestCurrentRowUpdate> {
+    if root_generation == 0 {
+        return Err(anyhow!(
+            "manifest current CoreMeta row root generation must be positive"
+        ));
+    }
     let current = current_payload
         .as_deref()
         .map(decode_manifest_current_row)
@@ -565,6 +621,7 @@ fn manifest_current_row_update_from_payload(
             bucket_id: body.bucket_id,
             object_key: body.object_key.clone(),
             revision: body.revision,
+            root_generation,
             manifest_hash: body.manifest_hash.clone(),
             updated_at: body.updated_at,
             transaction_id: transaction_id.to_string(),
@@ -575,19 +632,19 @@ fn manifest_current_row_update_from_payload(
 
 async fn manifest_current_payload_for_optional_transaction(
     storage: &Storage,
-    meta: &CoreMetaStore,
     tenant_id: i64,
     bucket_id: i64,
     object_key: &str,
     transaction: Option<(&str, &str)>,
 ) -> Result<Option<Vec<u8>>> {
     let key = manifest_current_row_key(tenant_id, bucket_id, object_key)?;
-    let mut current = meta.get(CF_OBJECT_HEADS, TABLE_MANIFEST_CAS_CURRENT_ROW, &key)?;
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let mut current =
+        core_store.read_coremeta_row(CF_OBJECT_HEADS, TABLE_MANIFEST_CAS_CURRENT_ROW, &key)?;
     let Some((transaction_id, transaction_principal)) = transaction else {
         return Ok(current);
     };
-    let transaction = CoreStore::new(storage.clone())
-        .await?
+    let transaction = core_store
         .read_explicit_transaction_for_principal(transaction_id, transaction_principal)
         .await?;
     for update in transaction.visible_updates {
@@ -622,12 +679,12 @@ async fn manifest_current_payload_for_optional_transaction(
 }
 
 fn read_manifest_current_payload(
-    meta: &CoreMetaStore,
+    store: &CoreStore,
     tenant_id: i64,
     bucket_id: i64,
     object_key: &str,
 ) -> Result<Option<Vec<u8>>> {
-    meta.get(
+    store.read_coremeta_row(
         CF_OBJECT_HEADS,
         TABLE_MANIFEST_CAS_CURRENT_ROW,
         &manifest_current_row_key(tenant_id, bucket_id, object_key)?,
@@ -635,12 +692,12 @@ fn read_manifest_current_payload(
 }
 
 fn read_manifest_current_row(
-    meta: &CoreMetaStore,
+    store: &CoreStore,
     tenant_id: i64,
     bucket_id: i64,
     object_key: &str,
 ) -> Result<Option<ManifestCurrentRow>> {
-    let Some(payload) = read_manifest_current_payload(meta, tenant_id, bucket_id, object_key)?
+    let Some(payload) = read_manifest_current_payload(store, tenant_id, bucket_id, object_key)?
     else {
         return Ok(None);
     };
@@ -651,78 +708,23 @@ fn read_manifest_current_row(
     Ok(Some(row))
 }
 
-async fn write_manifest_current_row(
-    storage: &Storage,
-    meta: &CoreMetaStore,
-    row: &ManifestCurrentRow,
-    precondition: &CoreMutationPrecondition,
-) -> Result<()> {
-    validate_manifest_current_precondition(meta, precondition)?;
-    let key = manifest_current_row_key(row.tenant_id, row.bucket_id, &row.object_key)?;
-    let payload = encode_manifest_current_row(row)?;
-    let op = CoreMetaBatchOp {
-        cf: CF_OBJECT_HEADS,
-        table_id: TABLE_MANIFEST_CAS_CURRENT_ROW,
-        tuple_key: &key,
-        common: None,
-        kind: CoreMetaBatchOpKind::Put(&payload),
-    };
-    commit_coremeta_batch_for_storage(
-        storage,
-        &format!(
-            "manifest-current:{}:{}:{}",
-            row.tenant_id, row.bucket_id, row.revision
-        ),
-        &[op],
-    )
-    .await?;
-    Ok(())
-}
-
-fn validate_manifest_current_precondition(
-    meta: &CoreMetaStore,
-    precondition: &CoreMutationPrecondition,
-) -> Result<()> {
-    let CoreMutationPrecondition::CoreMetaRow {
-        cf,
-        table_id,
-        tuple_key,
-        expected_payload_hash,
-        require_absent,
-        require_present,
-    } = precondition
-    else {
-        return Err(anyhow!(
-            "manifest current writer received unsupported precondition"
-        ));
-    };
-    let current = meta.get_named(cf, *table_id, tuple_key)?;
-    if *require_absent && current.is_some() {
-        return Err(anyhow!("manifest current CoreMeta row must be absent"));
-    }
-    if *require_present && current.is_none() {
-        return Err(anyhow!("manifest current CoreMeta row must be present"));
-    }
-    if let (Some(expected), Some(current)) = (expected_payload_hash.as_ref(), current.as_ref()) {
-        let actual = core_meta_payload_digest(*table_id, current);
-        if actual != *expected {
-            return Err(anyhow!(
-                "manifest current CoreMeta row payload hash mismatch"
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn encode_manifest_current_row(row: &ManifestCurrentRow) -> Result<Vec<u8>> {
-    let revision = u64::try_from(row.revision)
-        .map_err(|_| anyhow!("manifest current CoreMeta row revision is negative"))?;
+    if row.revision < 0 {
+        return Err(anyhow!(
+            "manifest current CoreMeta row revision is negative"
+        ));
+    }
+    if row.root_generation == 0 {
+        return Err(anyhow!(
+            "manifest current CoreMeta row root generation must be positive"
+        ));
+    }
     let proto = ManifestCurrentRowProto {
         schema: MANIFEST_CAS_CURRENT_ROW_SCHEMA.to_string(),
         common: Some(core_meta_committed_row_common(
             manifest_cas_realm_id(row.tenant_id),
             core_meta_root_key_hash(&manifest_cas_current_root_key(row.tenant_id, row.bucket_id)),
-            revision,
+            row.root_generation,
             &row.transaction_id,
             row.created_at_unix_nanos,
         )),
@@ -766,11 +768,17 @@ fn decode_manifest_current_row(bytes: &[u8]) -> Result<ManifestCurrentRow> {
     if common.visibility_state != crate::core_store::CoreMetaVisibilityState::Committed as i32 {
         return Err(anyhow!("manifest CAS current row is not committed"));
     }
+    if common.root_generation == 0 {
+        return Err(anyhow!(
+            "manifest CAS current row has an invalid root generation"
+        ));
+    }
     Ok(ManifestCurrentRow {
         tenant_id: proto.tenant_id,
         bucket_id: proto.bucket_id,
         object_key: proto.object_key,
         revision: proto.revision,
+        root_generation: common.root_generation,
         manifest_hash: proto.manifest_hash,
         updated_at: DateTime::parse_from_rfc3339(&proto.updated_at)?.with_timezone(&Utc),
         transaction_id: common.transaction_id,
@@ -793,6 +801,53 @@ fn manifest_cas_realm_id(tenant_id: i64) -> String {
 
 fn manifest_cas_current_root_key(tenant_id: i64, bucket_id: i64) -> String {
     format!("tenant/{tenant_id}/bucket/{bucket_id}/manifest_cas/current")
+}
+
+async fn next_manifest_cas_root_generation(
+    core_store: &CoreStore,
+    root_anchor_key: &str,
+) -> Result<u64> {
+    let current = match core_store
+        .read_internal_root_anchor(root_anchor_key, 0)
+        .await
+    {
+        Ok(anchor) => anchor.generation,
+        Err(error) if manifest_cas_root_anchor_is_missing(&error) => 0,
+        Err(error) => return Err(error),
+    };
+    current
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("manifest CAS CoreMeta root generation overflow"))
+}
+
+fn manifest_cas_root_anchor_is_missing(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains("CoreStore root anchor not found")
+    })
+}
+
+fn manifest_root_publications(
+    data_root: String,
+    coordinator_root: String,
+) -> Vec<CoreMutationRootPublication> {
+    if data_root == coordinator_root {
+        return vec![CoreMutationRootPublication {
+            root_anchor_key: data_root,
+            writer_families: vec![
+                WriterFamily::CoreControl.as_str().to_string(),
+                WriterFamily::ObjectBlob.as_str().to_string(),
+            ],
+            transaction_coordinator: true,
+        }];
+    }
+
+    vec![
+        CoreMutationRootPublication::new(coordinator_root, WriterFamily::CoreControl.as_str())
+            .coordinator(),
+        CoreMutationRootPublication::new(data_root, WriterFamily::ObjectBlob.as_str()),
+    ]
 }
 
 fn current_unix_nanos() -> Result<u64> {
@@ -885,6 +940,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manifest_journal_advances_one_bucket_root_generation_per_mutation() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+
+        let first_object = compare_and_swap_manifest(
+            &storage,
+            1,
+            2,
+            "first.json",
+            0,
+            json!({"revision": 1}),
+            "first-1",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let second_object = compare_and_swap_manifest(
+            &storage,
+            1,
+            2,
+            "second.json",
+            0,
+            json!({"revision": 1}),
+            "second-1",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let first_object_again = compare_and_swap_manifest(
+            &storage,
+            1,
+            2,
+            "first.json",
+            1,
+            json!({"revision": 2}),
+            "first-2",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(first_object.revision, 1);
+        assert_eq!(second_object.revision, 1);
+        assert_eq!(first_object_again.revision, 2);
+
+        let store = CoreStore::new(storage.clone()).await.unwrap();
+        let first = read_manifest_current_row(&store, 1, 2, "first.json")
+            .unwrap()
+            .unwrap();
+        let second = read_manifest_current_row(&store, 1, 2, "second.json")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.revision, 2);
+        assert_eq!(first.root_generation, 3);
+        assert_eq!(second.revision, 1);
+        assert_eq!(second.root_generation, 2);
+
+        let root = CoreStore::new(storage.clone())
+            .await
+            .unwrap()
+            .read_internal_root_anchor(&manifest_cas_current_root_key(1, 2), 0)
+            .await
+            .unwrap();
+        assert_eq!(root.generation, 3);
+    }
+
+    #[test]
+    fn manifest_current_row_keeps_domain_revision_separate_from_root_generation() {
+        let row = ManifestCurrentRow {
+            tenant_id: 1,
+            bucket_id: 2,
+            object_key: "manifest.json".to_string(),
+            revision: 41,
+            root_generation: 7,
+            manifest_hash: "manifest-hash".to_string(),
+            updated_at: Utc::now(),
+            transaction_id: "manifest-transaction".to_string(),
+            created_at_unix_nanos: 1,
+        };
+
+        let decoded =
+            decode_manifest_current_row(&encode_manifest_current_row(&row).unwrap()).unwrap();
+        assert_eq!(decoded.revision, 41);
+        assert_eq!(decoded.root_generation, 7);
+    }
+
+    #[test]
+    fn manifest_transaction_scope_keeps_one_canonical_root_publication() {
+        let root = manifest_cas_current_root_key(1, 2);
+        let publications = manifest_root_publications(root.clone(), root.clone());
+
+        assert_eq!(publications.len(), 1);
+        assert_eq!(publications[0].root_anchor_key, root);
+        assert_eq!(
+            publications[0].writer_families,
+            vec![
+                WriterFamily::CoreControl.as_str().to_string(),
+                WriterFamily::ObjectBlob.as_str().to_string(),
+            ]
+        );
+        assert!(publications[0].transaction_coordinator);
+    }
+
+    #[tokio::test]
     pub(crate) async fn manifest_cas_with_permit_writes_fenced_protobuf_record_and_current_row() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
@@ -916,11 +1075,12 @@ mod tests {
             .unwrap();
         assert_eq!(fences, vec![permit.fence_token]);
 
-        let meta = CoreMetaStore::open(storage.core_store_meta_path()).unwrap();
-        let current = read_manifest_current_row(&meta, 1, 2, "manifest.json")
+        let store = CoreStore::new(storage.clone()).await.unwrap();
+        let current = read_manifest_current_row(&store, 1, 2, "manifest.json")
             .unwrap()
             .expect("manifest CAS current row");
         assert_eq!(current.revision, 1);
+        assert_eq!(current.root_generation, 1);
         assert_eq!(current.manifest_hash, "hash-a");
     }
 
@@ -981,7 +1141,9 @@ mod tests {
         .unwrap_err();
         let message = err.to_string();
         assert!(
-            message.contains("generation mismatch") || message.contains("target mismatch"),
+            message.contains("generation mismatch")
+                || message.contains("target mismatch")
+                || message.contains("precondition failed"),
             "unexpected stale precondition error: {message}"
         );
 

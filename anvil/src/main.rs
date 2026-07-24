@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 use anvil::run;
 use clap::Parser;
 use std::net::SocketAddr;

@@ -7,7 +7,6 @@ use super::types::{
 };
 use crate::core_store::{
     CoreMetaRowCommonProto, CoreMetaVisibilityState, core_meta_committed_row_common,
-    core_meta_root_key_hash,
 };
 
 #[derive(Clone, PartialEq, Message)]
@@ -316,36 +315,30 @@ pub(super) fn decode_inline_manifest_body_row(bytes: &[u8]) -> Result<CoreInline
     Ok(row)
 }
 
-fn inline_manifest_body_common(row: &CoreInlineManifestBodyRow) -> CoreMetaRowCommonProto {
-    core_meta_committed_row_common(
-        "core/inline-manifest",
-        inline_manifest_body_root_key_hash(&row.manifest_hash),
-        row.writer_generation,
-        format!("{}/{}", row.logical_file_id, row.writer_family),
-        0,
-    )
+fn inline_manifest_body_common(_row: &CoreInlineManifestBodyRow) -> CoreMetaRowCommonProto {
+    core_meta_committed_row_common("", "", 0, "", 0)
 }
 
 fn validate_inline_manifest_body_common(
-    row: &CoreInlineManifestBodyRow,
+    _row: &CoreInlineManifestBodyRow,
     common: &CoreMetaRowCommonProto,
 ) -> Result<()> {
-    if common.realm_id != "core/inline-manifest" {
+    if !common.realm_id.is_empty() {
         return Err(anyhow!(
             "CoreStore inline manifest body CoreMeta realm mismatch"
         ));
     }
-    if common.root_key_hash != inline_manifest_body_root_key_hash(&row.manifest_hash) {
+    if !common.root_key_hash.is_empty() {
         return Err(anyhow!(
             "CoreStore inline manifest body CoreMeta root mismatch"
         ));
     }
-    if common.root_generation != row.writer_generation {
+    if common.root_generation != 0 {
         return Err(anyhow!(
             "CoreStore inline manifest body CoreMeta generation mismatch"
         ));
     }
-    if common.transaction_id != format!("{}/{}", row.logical_file_id, row.writer_family) {
+    if !common.transaction_id.is_empty() {
         return Err(anyhow!(
             "CoreStore inline manifest body CoreMeta transaction mismatch"
         ));
@@ -356,10 +349,6 @@ fn validate_inline_manifest_body_common(
         ));
     }
     Ok(())
-}
-
-fn inline_manifest_body_root_key_hash(manifest_hash: &str) -> String {
-    core_meta_root_key_hash(&format!("inline-manifest-body/{manifest_hash}"))
 }
 
 fn logical_file_manifest_to_proto(value: &CoreLogicalFileManifest) -> CoreLogicalFileManifestProto {

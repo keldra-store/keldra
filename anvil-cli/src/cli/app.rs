@@ -12,7 +12,12 @@ pub enum AppCommands {
     /// Delete an application credential in the authenticated tenant.
     Delete { app_name: String },
     /// List application credentials in the authenticated tenant.
-    List,
+    List {
+        #[clap(long, default_value_t = 100)]
+        page_size: u32,
+        #[clap(long, default_value = "")]
+        page_token: String,
+    },
 }
 
 pub async fn handle_app_command(command: &AppCommands, ctx: &Context) -> anyhow::Result<()> {
@@ -65,12 +70,26 @@ pub async fn handle_app_command(command: &AppCommands, ctx: &Context) -> anyhow:
                 .into_inner();
             println!("deleted app_id={}", response.app_id);
         }
-        AppCommands::List => {
-            let mut request = tonic::Request::new(api::ListApplicationsRequest {});
+        AppCommands::List {
+            page_size,
+            page_token,
+        } => {
+            let mut request = tonic::Request::new(api::ListApplicationsRequest {
+                page: Some(api::PageRequest {
+                    page_size: *page_size,
+                    page_token: page_token.clone(),
+                }),
+            });
             add_auth(&mut request, &token);
             let response = client.list_applications(request).await?.into_inner();
             for app in response.applications {
                 println!("{}\t{}\t{}", app.app_id, app.app_name, app.client_id);
+            }
+            if let Some(page) = response
+                .page
+                .filter(|page| !page.next_page_token.is_empty())
+            {
+                println!("next_page_token={}", page.next_page_token);
             }
         }
     }

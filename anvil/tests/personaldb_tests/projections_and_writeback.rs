@@ -78,9 +78,8 @@ async fn personaldb_projection_definition_create_get_and_watch_are_native_api_ba
         1,
         &projection_database_id,
         "projection-items",
-        77,
         *uuid::Uuid::new_v4().as_bytes(),
-        12,
+        77,
         payload,
     )
     .await

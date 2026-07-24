@@ -155,7 +155,11 @@ fn query_planner_forbids_unbounded_index_candidates_before_range_plans() {
 
 #[test]
 fn authz_writer_segments_are_live_query_candidate_sources() {
-    let journal = repo_file("anvil-core/src/authz_journal.rs");
+    let journal = format!(
+        "{}\n{}",
+        repo_file("anvil-core/src/authz_journal.rs"),
+        repo_file("anvil-core/src/authz_journal/materialization.rs")
+    );
     let segment = repo_file("anvil-core/src/authz_segment.rs");
     let persistence_tasks = repo_file("anvil-core/src/persistence/tasks.rs");
     let worker = repo_file("anvil-core/src/worker.rs");
@@ -163,8 +167,8 @@ fn authz_writer_segments_are_live_query_candidate_sources() {
     for expected in [
         "record_authz_materialization_deferred(",
         "materialize_authz_derived_state_at_revision",
-        "read_all_authz_tuple_records_from_journal(storage, tenant_id)",
-        "write_authz_tuple_segment_with_derived",
+        "collect_source_records_for_rebuild(",
+        "write_authz_tuple_checkpoint_segment(",
     ] {
         assert!(journal.contains(expected), "missing {expected}");
     }

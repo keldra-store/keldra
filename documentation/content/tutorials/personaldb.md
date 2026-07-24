@@ -278,7 +278,7 @@ This proves that the caller has `repair:run` on `tenant-<tenant_id>/customer-not
 If a repair finding is written, list findings with the scope id used by the current PersonalDB repair code:
 
 ```bash
-anvil --profile acme repair findings personaldb tenant-1-database-customer-notes --limit 20
+anvil --profile acme repair findings personaldb tenant-1-database-customer-notes --page-size 20
 ```
 
 This proves only that findings can be read for that scope. It does not prove a client replica is safe to continue; clients should still catch up from a verified local head or restore from a snapshot when instructed.

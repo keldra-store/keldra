@@ -1,0 +1,69 @@
+name: CoreMeta Performance Baseline
+
+on:
+  schedule:
+    - cron: '17 3 * * 0'
+  workflow_dispatch:
+
+concurrency:
+  group: coremeta-performance-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TARGET_DIR: /home/github-runner/.cache/anvil/cargo-target
+
+jobs:
+  release-profile:
+    name: CoreMeta ordered-access release profile
+    runs-on: [self-hosted, linux, x64, worka-builder-2]
+    timeout-minutes: 180
+    env:
+      CARGO_BUILD_JOBS: "1"
+      ANVIL_MACHINE_CLASS: "worka-builder-2-linux-x64"
+      ANVIL_GATE_STEP_TIMEOUT_SECONDS: "9900"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            cmake \
+            libclang-dev \
+            pkg-config \
+            libssl-dev \
+            protobuf-compiler
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-coremeta-release-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-coremeta-release-cargo-v2-
+            ${{ runner.os }}-cargo-v2-
+
+      - name: Run release CoreMeta performance gate
+        run: ./scripts/release-gates.sh perf-release
+
+      - name: Upload CoreMeta performance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coremeta-performance-release-${{ github.run_id }}
+          path: target/anvil/perf/coremeta/release/
+          if-no-files-found: error
+          retention-days: 90

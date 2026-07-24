@@ -126,27 +126,6 @@ fn run_anvil_expect_failure(config_dir: &TempDir, args: &[&str]) -> Output {
 
 async fn start_cluster_for_public_cli() -> (TestCluster, TempDir) {
     let mut cluster = TestCluster::new(&["test-region-1"]).await;
-    let region = cluster.states[0]
-        .persistence
-        .create_region_descriptor(anvil::mesh_lifecycle::CreateRegionDescriptor {
-            mesh_id: "default".to_string(),
-            region: "test-region-1".to_string(),
-            public_base_url: "https://test-region-1.anvil-storage.test".to_string(),
-            virtual_host_suffix: "test-region-1.anvil-storage.test".to_string(),
-            placement_weight: 100,
-            default_cell: None,
-        })
-        .await
-        .unwrap();
-    cluster.states[0]
-        .persistence
-        .transition_region_descriptor(
-            "test-region-1",
-            region.generation,
-            anvil::mesh_lifecycle::LifecycleState::Active,
-        )
-        .await
-        .unwrap();
     cluster.start_and_converge(Duration::from_secs(10)).await;
 
     let config_dir = tempdir().unwrap();
@@ -377,7 +356,7 @@ async fn tenant_tutorial_commands_run_without_admin_port_e2e() {
     );
     let indexes = run_anvil(&config_dir, &["index", "list", &bucket]);
     assert!(stdout(&indexes).contains("by-path"));
-    run_anvil_eventually(
+    let query = run_anvil_eventually(
         &config_dir,
         &[
             "index",
@@ -391,9 +370,19 @@ async fn tenant_tutorial_commands_run_without_admin_port_e2e() {
         ],
         Duration::from_secs(30),
     );
+    let query_output = stdout(&query);
+    assert!(query_output.contains("app-v1.txt"), "{query_output}");
+    assert!(query_output.contains("app-v2.txt"), "{query_output}");
     run_anvil(
         &config_dir,
-        &["diagnostics", "list", &bucket, "by-path", "--limit", "5"],
+        &[
+            "diagnostics",
+            "list",
+            &bucket,
+            "by-path",
+            "--page-size",
+            "5",
+        ],
     );
     run_anvil(
         &config_dir,
@@ -502,7 +491,7 @@ async fn tenant_tutorial_commands_run_without_admin_port_e2e() {
     let alias_list = run_anvil(&config_dir, &["host-alias", "list"]);
     assert!(stdout(&alias_list).contains(&host));
 
-    let audit = run_anvil(&config_dir, &["audit", "list", "--limit", "20"]);
+    let audit = run_anvil(&config_dir, &["audit", "list", "--page-size", "20"]);
     assert!(stdout(&audit).contains("object_link") || stdout(&audit).contains("host_alias"));
 
     let bad_admin = run_anvil_expect_failure(&config_dir, &["admin", "node", "list"]);

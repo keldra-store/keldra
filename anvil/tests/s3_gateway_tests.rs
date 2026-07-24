@@ -144,7 +144,7 @@ async fn set_bucket_public_for_docker_app(actor: &DockerTestStorageActor, bucket
 async fn grant_storage_tenant_owner_for_test(cluster: &TestCluster, app_name: &str) {
     let app = cluster.states[0]
         .persistence
-        .get_app_by_name(app_name)
+        .get_app_by_tenant_name(1, app_name)
         .await
         .unwrap()
         .expect("test app should exist before granting storage tenant owner");
@@ -177,6 +177,8 @@ fn s3_client(http_base: &str, client_id: &str, client_secret: &str) -> Client {
     Client::from_conf(config)
 }
 
+#[path = "s3_gateway_tests/bucket_listing.rs"]
+mod bucket_listing;
 #[path = "s3_gateway_tests/public_private_large_object.rs"]
 mod public_private_large_object;
 #[path = "s3_gateway_tests/routing_public_alias.rs"]

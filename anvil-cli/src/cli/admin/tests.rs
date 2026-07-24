@@ -48,13 +48,9 @@ async fn spawn_admin_cli_node() -> AdminCliNode {
     let admin_addr = admin_listener.local_addr().unwrap();
 
     let config = anvil::config::Config {
-        cluster_secret: Some("cli-test-cluster-secret".to_string()),
         jwt_secret: "cli-test-secret".to_string(),
         anvil_secret_encryption_key:
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-        cluster_listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".to_string(),
-        public_cluster_addrs: vec![],
-        metadata_cache_ttl_secs: 1,
         public_api_addr: format!("http://{public_addr}"),
         api_listen_addr: public_addr.to_string(),
         admin_listen_addr: admin_addr.to_string(),
@@ -64,30 +60,21 @@ async fn spawn_admin_cli_node() -> AdminCliNode {
         region: "eu-west-1".to_string(),
         cell_id: "cell-a".to_string(),
         public_region_base_domain: "eu-west-1.anvil-storage.test".to_string(),
-        bootstrap_addrs: vec![],
-        init_cluster: false,
-        enable_mdns: false,
         storage_path: storage_path.to_string_lossy().into_owned(),
         personaldb_snapshot_entry_threshold: 1024,
         personaldb_snapshot_payload_bytes_threshold: 64 * 1024 * 1024,
         ..anvil::config::Config::default()
     };
 
-    let state = anvil::AppState::new(config, None, personaldb_test_protocol_keyring())
-        .await
-        .unwrap();
-    let swarm = anvil::cluster::create_swarm(state.config.clone())
+    let state = anvil::AppState::new(config, personaldb_test_protocol_keyring())
         .await
         .unwrap();
     let state_for_handle = state.clone();
     let handle = tokio::spawn(async move {
-        let (_tx, rx) = tokio::sync::mpsc::channel(1);
         anvil::start_node_with_admin_listener(
             public_listener,
             Some(admin_listener),
             state_for_handle,
-            swarm,
-            rx,
         )
         .await
         .unwrap();
@@ -144,23 +131,33 @@ async fn write_activation_checkpoint_from_existing_streams(
         .map(|family| family.stream_family())
         .chain(anvil::mesh_lifecycle::lifecycle_control_stream_families().into_iter());
     for stream_family in stream_families {
-        let partitions = anvil::mesh_control_stream::list_control_stream_partitions(
+        let partitions = anvil::mesh_control_stream::list_control_stream_partitions_page(
             &node.state.storage,
             stream_family,
+            None,
+            1_024,
         )
         .await
         .unwrap();
-        for partition in partitions {
-            let log = anvil::mesh_control_stream::read_control_stream_log(
+        assert!(partitions.next_stream_id.is_none());
+        for partition in partitions.partitions {
+            let cursor = anvil::mesh_control_stream::control_stream_append_cursor(
                 &node.state.storage,
                 stream_family,
                 &partition,
             )
             .await
             .unwrap();
-            let Some(record) = log.records.last() else {
-                continue;
-            };
+            let log = anvil::mesh_control_stream::read_control_stream_page(
+                &node.state.storage,
+                stream_family,
+                &partition,
+                cursor.sequence.get().saturating_sub(2),
+                1,
+            )
+            .await
+            .unwrap();
+            let record = log.records.last().unwrap();
             anvil::mesh_control_stream::write_control_checkpoint(
                 &node.state.storage,
                 &anvil::mesh_control_stream::ControlCheckpointRecord::new(
@@ -600,7 +597,7 @@ fn routing_commands_parse_family_and_mutation_context() {
         "list",
         "--family",
         "bucket-locator",
-        "--limit",
+        "--page-size",
         "25",
     ])
     .unwrap();
@@ -611,7 +608,7 @@ fn routing_commands_parse_family_and_mutation_context() {
         panic!("expected routing list command");
     };
     assert_eq!(family.unwrap().to_proto(), 3);
-    assert_eq!(page.limit, Some(25));
+    assert_eq!(page.page_size, Some(25));
 
     let repair_cli = TestAdminCli::try_parse_from([
         "admin",
@@ -698,7 +695,7 @@ fn repair_diagnostics_and_audit_commands_parse() {
         "releases",
         "--severity",
         "warning",
-        "--limit",
+        "--page-size",
         "10",
     ])
     .unwrap();
@@ -722,7 +719,7 @@ fn repair_diagnostics_and_audit_commands_parse() {
     assert_eq!(tenant_id.as_deref(), Some("acme"));
     assert_eq!(bucket_name.as_deref(), Some("releases"));
     assert_eq!(severity.as_deref(), Some("warning"));
-    assert_eq!(page.limit, Some(10));
+    assert_eq!(page.page_size, Some(10));
 
     let audit_cli = TestAdminCli::try_parse_from([
         "admin",
@@ -940,8 +937,8 @@ async fn admin_repair_diagnostics_and_audit_handlers_return_structured_responses
                     index_name: String::new(),
                     severity: String::new(),
                     page: Some(api::PageRequest {
-                        cursor: String::new(),
-                        limit: 5,
+                        page_token: String::new(),
+                        page_size: 5,
                     }),
                 },
                 &token,
@@ -954,7 +951,7 @@ async fn admin_repair_diagnostics_and_audit_handlers_return_structured_responses
     assert_eq!(diagnostics.request_id, "req-admin-diagnostics");
     assert_eq!(diagnostics.data_source, "index_diagnostic_journal");
     assert!(diagnostics.diagnostics.is_empty());
-    assert!(!diagnostics.page.unwrap().has_more);
+    assert!(diagnostics.page.unwrap().next_page_token.is_empty());
 
     let audit = client
         .list_audit_events(
@@ -965,8 +962,8 @@ async fn admin_repair_diagnostics_and_audit_handlers_return_structured_responses
                     resource_id: String::new(),
                     action: "admin.repair.run".to_string(),
                     page: Some(api::PageRequest {
-                        cursor: String::new(),
-                        limit: 5,
+                        page_token: String::new(),
+                        page_size: 5,
                     }),
                 },
                 &token,
@@ -981,7 +978,7 @@ async fn admin_repair_diagnostics_and_audit_handlers_return_structured_responses
     assert_eq!(audit.events.len(), 1);
     assert_eq!(audit.events[0].request_id, "req-admin-directory-repair");
     assert_eq!(audit.events[0].action, "admin.repair.run");
-    assert!(!audit.page.unwrap().has_more);
+    assert!(audit.page.unwrap().next_page_token.is_empty());
 }
 
 #[tokio::test]
@@ -1048,15 +1045,10 @@ async fn missing_lifecycle_cli_handlers_call_admin_service_and_persist_state() {
             node_id: "node-a".to_string(),
             region: "eu-west-1".to_string(),
             cell_id: "cell-a".to_string(),
-            libp2p_peer_id: "peer-a".to_string(),
             public_api_addr: "http://127.0.0.1:50051".to_string(),
-            public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7443/quic-v1".to_string()],
             capabilities: vec![NodeCapabilityArg::Object, NodeCapabilityArg::Admin],
-            receipt_signing_public_key_proto_b64: base64::engine::general_purpose::STANDARD.encode(
-                node.state
-                    .core_store
-                    .local_receipt_signing_public_key_proto(),
-            ),
+            receipt_signing_public_key_b64: base64::engine::general_purpose::STANDARD
+                .encode(node.state.core_store.local_receipt_signing_public_key()),
             capacity_json: "{}".to_string(),
         },
         &mut client,

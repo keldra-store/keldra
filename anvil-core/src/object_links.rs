@@ -256,7 +256,7 @@ mod tests {
 
     async fn seeded() -> (tempfile::TempDir, Persistence, crate::persistence::Bucket) {
         let temp = tempdir().unwrap();
-        let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+        let persistence = Persistence::new(&test_config(temp.path())).unwrap();
         persistence.create_region("test-region").await.unwrap();
         let tenant = persistence
             .create_tenant("tenant-a", "unused")

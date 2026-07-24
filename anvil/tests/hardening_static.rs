@@ -174,16 +174,21 @@ fn release_workflow_uses_shared_release_gates() {
         "release workflow must opt into release-profile image builds explicitly"
     );
     assert!(
-        release.contains("linux/amd64") && release.contains("linux/arm64"),
-        "release workflow must build both amd64 and arm64 images"
+        release.contains("platform: linux/amd64")
+            && release.contains("arch: amd64")
+            && !release.contains("platform: linux/arm64"),
+        "release workflow must intentionally build only the amd64 release image"
     );
     assert!(
-        release.contains("anvil-test-image-amd64") && release.contains("anvil-test-image-arm64"),
-        "release workflow must pass both architecture image artifacts forward"
+        release.contains("artifact: anvil-test-image-amd64")
+            && !release.contains("anvil-test-image-arm64"),
+        "release workflow must pass only the amd64 image artifact forward"
     );
     assert!(
-        release.contains("docker buildx imagetools create"),
-        "release workflow must publish a multi-arch Docker manifest"
+        release.contains("docker tag \"$ANVIL_AMD64_IMAGE\" \"$image\"")
+            && release.contains("docker push \"$image\"")
+            && !release.contains("docker buildx imagetools create"),
+        "release workflow must publish the tested amd64 image directly without a multi-arch manifest"
     );
     assert!(
         !release.contains("build-test-image-fast.sh"),
@@ -296,12 +301,25 @@ fn production_authorisation_has_no_scope_or_policy_bypass() {
         "\"*|*\"",
     ];
     let mut violations = Vec::new();
-    for (path, source) in production_rust_sources(&[
+    for (path, mut source) in production_rust_sources(&[
         "anvil-core/src",
         "anvil/src",
         "anvil-cli/src",
         "clients/rust/src",
     ]) {
+        if path == std::path::Path::new("anvil-core/src/core_store/local_coremeta_recovery.rs") {
+            const PUBLICATION_SCOPE_CHECK: &str = "bundle.scopes.contains(scope)";
+            assert_eq!(
+                source.matches("scopes.contains(").count(),
+                1,
+                "CoreMeta recovery scope checks changed; review them before excluding any from the authorization scan"
+            );
+            assert!(
+                source.contains(PUBLICATION_SCOPE_CHECK),
+                "expected CoreMeta root-publication scope membership check is missing"
+            );
+            source = source.replacen(PUBLICATION_SCOPE_CHECK, "", 1);
+        }
         for term in forbidden {
             if source.contains(term) {
                 violations.push(format!("{} contains {term}", path.display()));

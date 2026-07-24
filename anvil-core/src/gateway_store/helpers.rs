@@ -1,5 +1,9 @@
 use super::*;
 
+pub(super) const GATEWAY_MOUNT_MAX_HOSTS: usize = 64;
+pub(super) const GATEWAY_MOUNT_MAX_PATH_PREFIXES: usize = 64;
+pub(super) const GATEWAY_MOUNT_MAX_PATH_BYTES: usize = 4_096;
+
 pub(super) fn gateway_upload_ref_name(record: &GatewayUploadSessionRecord) -> Result<String> {
     validate_tenant(record.tenant_id)?;
     gateway_upload_ref_name_parts(
@@ -266,13 +270,30 @@ pub(super) fn validate_mount_record_shape(record: &GatewayMountRecord) -> Result
     if record.hosts.is_empty() && record.path_prefixes.is_empty() {
         bail!("gateway mount must define at least one host or path prefix");
     }
+    if record.hosts.len() > GATEWAY_MOUNT_MAX_HOSTS {
+        bail!("gateway mount has too many host aliases");
+    }
+    if record.path_prefixes.len() > GATEWAY_MOUNT_MAX_PATH_PREFIXES {
+        bail!("gateway mount has too many path prefixes");
+    }
+    let mut unique_hosts = std::collections::BTreeSet::new();
     for host in &record.hosts {
         if normalize_gateway_host(host)? != *host {
             bail!("gateway mount host must be canonical");
         }
+        if !unique_hosts.insert(host) {
+            bail!("gateway mount host aliases must be unique");
+        }
     }
+    let mut unique_prefixes = std::collections::BTreeSet::new();
     for prefix in &record.path_prefixes {
         validate_gateway_path_prefix(prefix)?;
+        if prefix != "/" && !prefix.ends_with('/') {
+            bail!("gateway mount path prefixes must end with /");
+        }
+        if !unique_prefixes.insert(prefix) {
+            bail!("gateway mount path prefixes must be unique");
+        }
     }
     if !record.record_hash.is_empty() {
         validate_hash(record, &record.record_hash)?;
@@ -471,6 +492,9 @@ pub(super) fn normalize_gateway_path(input: &str) -> Result<String> {
 pub(super) fn validate_gateway_path_prefix(value: &str) -> Result<()> {
     if !value.starts_with('/') {
         bail!("gateway path prefix must start with /");
+    }
+    if value.len() > GATEWAY_MOUNT_MAX_PATH_BYTES {
+        bail!("gateway path prefix is too long");
     }
     if value.contains('\\') || value.contains('%') || value.contains(char::is_control) {
         bail!("gateway path prefix contains an unsafe character");

@@ -1,5 +1,6 @@
 use super::*;
 use prost::Message;
+use sha2::{Digest, Sha256};
 
 #[derive(Clone, PartialEq, Message)]
 struct TestFullTextDocumentTableProto {
@@ -30,39 +31,124 @@ fn derived_index_proof_head_tuple_key(index_id: &str) -> Vec<u8> {
     .unwrap()
 }
 
-fn index_segment_tuple_key(record: &anvil::index_coremeta::IndexSegmentCoreMetaRecord) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&5u16.to_le_bytes());
-    push_index_tuple_str(&mut out, "index_segment");
-    push_index_tuple_str(&mut out, &record.index_id);
-    push_index_tuple_str(&mut out, &record.index_kind);
-    out.push(0x03);
-    out.push(0);
-    out.extend_from_slice(&8u16.to_le_bytes());
-    out.extend_from_slice(&record.generation.to_le_bytes());
-    push_index_tuple_str(&mut out, &record.segment_hash);
-    out
-}
+fn index_segment_tuple_keys(
+    record: &anvil::index_coremeta::IndexSegmentCoreMetaRecord,
+) -> Vec<Vec<u8>> {
+    use anvil::core_store::{CoreMetaTuplePart, core_meta_tuple_key};
 
-fn push_index_tuple_str(out: &mut Vec<u8>, value: &str) {
-    out.push(0x01);
-    out.push(0);
-    out.extend_from_slice(&(value.len() as u16).to_le_bytes());
-    out.extend_from_slice(value.as_bytes());
+    let segment_ref_hash = format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(record.segment_ref.as_bytes()))
+    );
+    [
+        vec![
+            CoreMetaTuplePart::Utf8("index_segment"),
+            CoreMetaTuplePart::Utf8(&record.index_id),
+            CoreMetaTuplePart::Utf8(&record.index_kind),
+            CoreMetaTuplePart::U64(record.generation),
+            CoreMetaTuplePart::Utf8(&record.segment_hash),
+        ],
+        vec![
+            CoreMetaTuplePart::Utf8("index_segment_latest"),
+            CoreMetaTuplePart::Utf8(&record.index_id),
+        ],
+        vec![
+            CoreMetaTuplePart::Utf8("index_segment_family_latest"),
+            CoreMetaTuplePart::Utf8(&record.index_id),
+            CoreMetaTuplePart::Utf8(&record.writer_family),
+        ],
+        vec![
+            CoreMetaTuplePart::Utf8("index_segment_generation"),
+            CoreMetaTuplePart::Utf8(&record.index_id),
+            CoreMetaTuplePart::Utf8(&record.writer_family),
+            CoreMetaTuplePart::U64(record.generation),
+        ],
+        vec![
+            CoreMetaTuplePart::Utf8("index_segment_ref"),
+            CoreMetaTuplePart::Utf8(&record.index_id),
+            CoreMetaTuplePart::Hash(&segment_ref_hash),
+        ],
+    ]
+    .into_iter()
+    .map(|parts| core_meta_tuple_key(&parts).unwrap())
+    .collect()
 }
 
 fn delete_index_segment_coremeta_row(
     storage: &anvil::storage::Storage,
     record: &anvil::index_coremeta::IndexSegmentCoreMetaRecord,
 ) {
-    anvil::core_store::CoreMetaStore::open(storage.core_store_meta_path())
-        .unwrap()
-        .delete(
-            anvil::core_store::CF_INDEX_ROWS,
-            anvil::core_store::TABLE_INDEX_ROW,
-            &index_segment_tuple_key(record),
+    let store = anvil::core_store::CoreMetaStore::open(storage.core_store_meta_path()).unwrap();
+    for tuple_key in index_segment_tuple_keys(record) {
+        store
+            .delete(
+                anvil::core_store::CF_INDEX_ROWS,
+                anvil::core_store::TABLE_INDEX_ROW,
+                &tuple_key,
+            )
+            .unwrap();
+    }
+}
+
+async fn collect_index_segments_for_test(
+    storage: &anvil::storage::Storage,
+    index_id: &str,
+) -> Vec<anvil::index_coremeta::IndexSegmentCoreMetaRecord> {
+    let mut cursor: Option<Vec<u8>> = None;
+    let mut records = Vec::new();
+    loop {
+        let page = anvil::index_coremeta::page_index_segment_coremeta_records(
+            storage,
+            index_id,
+            cursor.as_deref(),
+            256,
         )
+        .await
         .unwrap();
+        records.extend(page.records);
+        let Some(next_cursor) = page.next_tuple_key else {
+            break;
+        };
+        assert!(
+            match cursor {
+                None => true,
+                Some(current) => current.as_slice() < next_cursor.as_slice(),
+            },
+            "index segment page cursor must advance"
+        );
+        cursor = Some(next_cursor);
+    }
+    records
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_index_definition_for_test(
+    persistence: &anvil::persistence::Persistence,
+    bucket: &anvil::persistence::Bucket,
+    name: &str,
+    kind: &str,
+    selector: serde_json::Value,
+    extractor: serde_json::Value,
+    authorization_mode: &str,
+    build_policy: serde_json::Value,
+) -> anvil::persistence::IndexDefinition {
+    let mutation = anvil::persistence::IndexDefinitionMutation::Create {
+        name: name.to_string(),
+        kind: kind.to_string(),
+        selector,
+        extractor,
+        authorization_mode: authorization_mode.to_string(),
+        build_policy,
+    };
+    let outcome = persistence
+        .apply_index_definition_mutation(bucket, &mutation, None, None)
+        .await
+        .unwrap();
+    let anvil::persistence::IndexDefinitionMutationOutcome::Published { index, .. } = outcome
+    else {
+        panic!("test index definition create should publish");
+    };
+    index
 }
 
 #[tokio::test]
@@ -354,23 +440,17 @@ async fn test_full_text_index_build_uses_source_cursor_snapshot() {
         .create_bucket(tenant_id, &bucket_name, "test-region-1")
         .await
         .unwrap();
-    let index = persistence
-        .create_index_definition(
-            tenant_id,
-            bucket.id,
-            "body",
-            "full_text",
-            serde_json::json!({"prefix": "docs/"}),
-            serde_json::json!({"source": "object_body_utf8"}),
-            "index_only",
-            serde_json::json!({"positions": true}),
-        )
-        .await
-        .unwrap();
-    persistence
-        .create_index_definition_event(tenant_id, bucket.id, &bucket.name, &index, "create")
-        .await
-        .unwrap();
+    let index = create_index_definition_for_test(
+        persistence,
+        &bucket,
+        "body",
+        "full_text",
+        serde_json::json!({"prefix": "docs/"}),
+        serde_json::json!({"source": "object_body_utf8"}),
+        "index_only",
+        serde_json::json!({"positions": true}),
+    )
+    .await;
 
     put_index_object_bytes(
         &cluster,
@@ -383,9 +463,10 @@ async fn test_full_text_index_build_uses_source_cursor_snapshot() {
     )
     .await;
     let source_cursor = persistence
-        .list_tasks()
+        .list_tasks_page(None, 1_000)
         .await
         .unwrap()
+        .tasks
         .into_iter()
         .find(|task| {
             task.task_type == anvil::tasks::TaskType::IndexBuild
@@ -407,9 +488,10 @@ async fn test_full_text_index_build_uses_source_cursor_snapshot() {
     )
     .await;
     let index_tasks = persistence
-        .list_tasks()
+        .list_tasks_page(None, 1_000)
         .await
         .unwrap()
+        .tasks
         .into_iter()
         .filter(|task| {
             task.task_type == anvil::tasks::TaskType::IndexBuild
@@ -440,7 +522,7 @@ async fn test_full_text_index_build_uses_source_cursor_snapshot() {
     );
 
     persistence
-        .build_index_task(
+        .rebuild_index_direct(
             tenant_id,
             bucket.id,
             index.id,
@@ -546,23 +628,17 @@ async fn test_index_build_requires_current_rfc_ownership_fence() {
         .create_bucket(tenant_id, &bucket_name, "test-region-1")
         .await
         .unwrap();
-    let index = persistence
-        .create_index_definition(
-            tenant_id,
-            bucket.id,
-            "body",
-            "full_text",
-            serde_json::json!({"prefix": "docs/"}),
-            serde_json::json!({"source": "object_body_utf8"}),
-            "index_only",
-            serde_json::json!({"positions": true}),
-        )
-        .await
-        .unwrap();
-    persistence
-        .create_index_definition_event(tenant_id, bucket.id, &bucket.name, &index, "create")
-        .await
-        .unwrap();
+    let index = create_index_definition_for_test(
+        persistence,
+        &bucket,
+        "body",
+        "full_text",
+        serde_json::json!({"prefix": "docs/"}),
+        serde_json::json!({"source": "object_body_utf8"}),
+        "index_only",
+        serde_json::json!({"positions": true}),
+    )
+    .await;
     put_index_object_bytes(
         &cluster,
         tenant_id,
@@ -574,9 +650,10 @@ async fn test_index_build_requires_current_rfc_ownership_fence() {
     )
     .await;
     let source_cursor = persistence
-        .list_tasks()
+        .list_tasks_page(None, 1_000)
         .await
         .unwrap()
+        .tasks
         .into_iter()
         .find(|task| {
             task.task_type == anvil::tasks::TaskType::IndexBuild
@@ -622,7 +699,7 @@ async fn test_index_build_requires_current_rfc_ownership_fence() {
     .unwrap();
 
     let err = persistence
-        .build_index_task(
+        .rebuild_index_direct(
             tenant_id,
             bucket.id,
             index.id,
@@ -651,23 +728,17 @@ async fn test_index_enqueue_rebuilds_when_checkpoint_exists_but_proof_is_missing
         .create_bucket(tenant_id, &bucket_name, "test-region-1")
         .await
         .unwrap();
-    let index = persistence
-        .create_index_definition(
-            tenant_id,
-            bucket.id,
-            "body",
-            "full_text",
-            serde_json::json!({"prefix": "docs/"}),
-            serde_json::json!({"source": "object_body_utf8"}),
-            "index_only",
-            serde_json::json!({"positions": true}),
-        )
-        .await
-        .unwrap();
-    persistence
-        .create_index_definition_event(tenant_id, bucket.id, &bucket.name, &index, "create")
-        .await
-        .unwrap();
+    let index = create_index_definition_for_test(
+        persistence,
+        &bucket,
+        "body",
+        "full_text",
+        serde_json::json!({"prefix": "docs/"}),
+        serde_json::json!({"source": "object_body_utf8"}),
+        "index_only",
+        serde_json::json!({"positions": true}),
+    )
+    .await;
     put_index_object_bytes(
         &cluster,
         tenant_id,
@@ -680,9 +751,10 @@ async fn test_index_enqueue_rebuilds_when_checkpoint_exists_but_proof_is_missing
     .await;
 
     let initial_task = persistence
-        .list_tasks()
+        .list_tasks_page(None, 1_000)
         .await
         .unwrap()
+        .tasks
         .into_iter()
         .find(|task| {
             task.task_type == anvil::tasks::TaskType::IndexBuild
@@ -698,7 +770,7 @@ async fn test_index_enqueue_rebuilds_when_checkpoint_exists_but_proof_is_missing
         .expect("initial index build task records source cursor");
 
     persistence
-        .build_index_task(
+        .rebuild_index_direct(
             tenant_id,
             bucket.id,
             index.id,
@@ -743,9 +815,10 @@ async fn test_index_enqueue_rebuilds_when_checkpoint_exists_but_proof_is_missing
         "missing proof must schedule a rebuild even when checkpoint cursor is current"
     );
     let rebuild_task = persistence
-        .list_tasks()
+        .list_tasks_page(None, 1_000)
         .await
         .unwrap()
+        .tasks
         .into_iter()
         .find(|task| {
             task.task_type == anvil::tasks::TaskType::IndexBuild
@@ -801,23 +874,17 @@ async fn test_repair_rebuilds_missing_full_text_segment_from_base_journal() {
         .await
         .unwrap()
         .expect("object metadata compaction writes manifest segments");
-    let index = persistence
-        .create_index_definition(
-            tenant_id,
-            bucket.id,
-            "body",
-            "full_text",
-            serde_json::json!({"prefix": "docs/"}),
-            serde_json::json!({"source": "object_body_utf8"}),
-            "index_only",
-            serde_json::json!({"positions": true}),
-        )
-        .await
-        .unwrap();
-    persistence
-        .create_index_definition_event(tenant_id, bucket.id, &bucket.name, &index, "create")
-        .await
-        .unwrap();
+    let index = create_index_definition_for_test(
+        persistence,
+        &bucket,
+        "body",
+        "full_text",
+        serde_json::json!({"prefix": "docs/"}),
+        serde_json::json!({"source": "object_body_utf8"}),
+        "index_only",
+        serde_json::json!({"positions": true}),
+    )
+    .await;
     let signing_key = hex::decode(&cluster.states[0].config.anvil_secret_encryption_key).unwrap();
     let stats = anvil::metadata_journal::active_object_journal_stats(
         &cluster.states[0].storage,
@@ -833,7 +900,7 @@ async fn test_repair_rebuilds_missing_full_text_segment_from_base_journal() {
     );
 
     persistence
-        .build_index_task(tenant_id, bucket.id, index.id, index.version, source_cursor)
+        .rebuild_index_direct(tenant_id, bucket.id, index.id, index.version, source_cursor)
         .await
         .unwrap()
         .expect("initial index build succeeds");
@@ -848,13 +915,10 @@ async fn test_repair_rebuilds_missing_full_text_segment_from_base_journal() {
     .unwrap()
     .expect("proof exists before deleting segment");
     assert!(!proof.segment_hashes.is_empty());
-    for segment in anvil::index_coremeta::list_index_segment_coremeta_records(
-        &cluster.states[0].storage,
-        &index_storage_id,
-    )
-    .unwrap()
-    .into_iter()
-    .filter(|record| record.index_kind == "full_text")
+    for segment in collect_index_segments_for_test(&cluster.states[0].storage, &index_storage_id)
+        .await
+        .into_iter()
+        .filter(|record| record.index_kind == "full_text")
     {
         delete_index_segment_coremeta_row(&cluster.states[0].storage, &segment);
     }
@@ -927,7 +991,10 @@ async fn test_repair_rebuilds_missing_full_text_segment_from_base_journal() {
             ListRepairFindingsRequest {
                 scope_kind: "bucket".to_string(),
                 scope_id: format!("tenant-{tenant_id}-bucket-{}", bucket.id),
-                limit: 10,
+                page: Some(anvil::anvil_api::PageRequest {
+                    page_size: 10,
+                    page_token: String::new(),
+                }),
             },
             &token,
         ))
@@ -968,30 +1035,24 @@ async fn test_repair_rebuilds_missing_vector_segment_from_base_journal() {
         .await
         .unwrap()
         .expect("object metadata compaction writes manifest segments");
-    let index = persistence
-        .create_index_definition(
-            tenant_id,
-            bucket.id,
-            "embedding",
-            "vector",
-            serde_json::json!({"prefix": "vectors/"}),
-            serde_json::json!({}),
-            "index_only",
-            rfc_vector_policy(
-                "object_body_json_vector",
-                "caller_supplied",
-                "test-explicit-vector",
-                2,
-                "text",
-                "cosine",
-            ),
-        )
-        .await
-        .unwrap();
-    persistence
-        .create_index_definition_event(tenant_id, bucket.id, &bucket.name, &index, "create")
-        .await
-        .unwrap();
+    let index = create_index_definition_for_test(
+        persistence,
+        &bucket,
+        "embedding",
+        "vector",
+        serde_json::json!({"prefix": "vectors/"}),
+        serde_json::json!({}),
+        "index_only",
+        rfc_vector_policy(
+            "object_body_json_vector",
+            "caller_supplied",
+            "test-explicit-vector",
+            2,
+            "text",
+            "cosine",
+        ),
+    )
+    .await;
     let signing_key = hex::decode(&cluster.states[0].config.anvil_secret_encryption_key).unwrap();
     let stats = anvil::metadata_journal::active_object_journal_stats(
         &cluster.states[0].storage,
@@ -1007,7 +1068,7 @@ async fn test_repair_rebuilds_missing_vector_segment_from_base_journal() {
     );
 
     persistence
-        .build_index_task(tenant_id, bucket.id, index.id, index.version, source_cursor)
+        .rebuild_index_direct(tenant_id, bucket.id, index.id, index.version, source_cursor)
         .await
         .unwrap()
         .expect("initial vector index build succeeds");
@@ -1021,13 +1082,10 @@ async fn test_repair_rebuilds_missing_vector_segment_from_base_journal() {
     .unwrap()
     .expect("proof exists before deleting segment");
     assert!(!proof.segment_hashes.is_empty());
-    for segment in anvil::index_coremeta::list_index_segment_coremeta_records(
-        &cluster.states[0].storage,
-        &index_storage_id,
-    )
-    .unwrap()
-    .into_iter()
-    .filter(|record| record.index_kind == "vector")
+    for segment in collect_index_segments_for_test(&cluster.states[0].storage, &index_storage_id)
+        .await
+        .into_iter()
+        .filter(|record| record.index_kind == "vector")
     {
         delete_index_segment_coremeta_row(&cluster.states[0].storage, &segment);
     }
@@ -1117,23 +1175,17 @@ async fn test_index_build_followup_waits_for_running_build_and_catches_up_after_
         .create_bucket(tenant_id, &bucket_name, "test-region-1")
         .await
         .unwrap();
-    let index = persistence
-        .create_index_definition(
-            tenant_id,
-            bucket.id,
-            "body",
-            "full_text",
-            serde_json::json!({"prefix": "docs/"}),
-            serde_json::json!({"source": "object_body_utf8"}),
-            "index_only",
-            serde_json::json!({"positions": true}),
-        )
-        .await
-        .unwrap();
-    persistence
-        .create_index_definition_event(tenant_id, bucket.id, &bucket.name, &index, "create")
-        .await
-        .unwrap();
+    let index = create_index_definition_for_test(
+        persistence,
+        &bucket,
+        "body",
+        "full_text",
+        serde_json::json!({"prefix": "docs/"}),
+        serde_json::json!({"source": "object_body_utf8"}),
+        "index_only",
+        serde_json::json!({"positions": true}),
+    )
+    .await;
 
     put_index_object_bytes(
         &cluster,
@@ -1169,9 +1221,9 @@ async fn test_index_build_followup_waits_for_running_build_and_catches_up_after_
         "follow-up for a running index build must wait for the active build"
     );
 
-    let restarted = anvil::persistence::Persistence::new(&cluster.states[0].config, None).unwrap();
+    let restarted = anvil::persistence::Persistence::new(&cluster.states[0].config).unwrap();
     restarted
-        .build_index_task(
+        .rebuild_index_direct(
             tenant_id,
             bucket.id,
             index.id,
@@ -1191,7 +1243,7 @@ async fn test_index_build_followup_waits_for_running_build_and_catches_up_after_
     let followup_cursor = followup[0].payload["source_cursor"].as_u64().unwrap();
     assert!(followup_cursor > first_cursor);
     restarted
-        .build_index_task(
+        .rebuild_index_direct(
             tenant_id,
             bucket.id,
             index.id,

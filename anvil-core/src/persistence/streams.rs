@@ -311,62 +311,29 @@ impl Persistence {
         .await
     }
 
-    pub async fn create_object_watch_event(
-        &self,
-        tenant_id: i64,
-        bucket_id: i64,
-        bucket_name: &str,
-        object: &Object,
-        event_type: &str,
-        is_delete_marker: bool,
-    ) -> Result<ObjectWatchEvent> {
-        Ok(ObjectWatchEvent {
-            id: 0,
-            tenant_id,
-            bucket_id,
-            bucket_name: bucket_name.to_string(),
-            key: object.key.clone(),
-            event_type: event_type.to_string(),
-            version_id: Some(object.version_id),
-            mutation_id: object.mutation_id,
-            payload_hash: object.content_hash.clone(),
-            etag: Some(object.etag.clone()),
-            size: object.size,
-            is_delete_marker,
-            created_at: object.created_at,
-        })
-    }
-
     pub async fn latest_object_watch_cursor(&self, tenant_id: i64, bucket_id: i64) -> Result<i64> {
-        Ok(
-            watch_log::list_object_watch_events(&self.storage, tenant_id, bucket_id, "", 0, 0)
-                .await?
-                .into_iter()
-                .map(|event| event.id)
-                .max()
-                .unwrap_or(0),
+        i64::try_from(
+            watch_log::latest_object_watch_stream_cursor(&self.storage, tenant_id, bucket_id)
+                .await?,
         )
+        .map_err(|_| anyhow!("object watch cursor exceeds i64"))
     }
 
-    pub async fn list_object_watch_events(
+    pub async fn list_object_watch_event_page(
         &self,
         tenant_id: i64,
         bucket_id: i64,
         prefix: &str,
         after_cursor: i64,
-        limit: i32,
-    ) -> Result<Vec<ObjectWatchEvent>> {
-        watch_log::list_object_watch_events(
+        limit: usize,
+    ) -> Result<watch_log::ObjectWatchEventPage> {
+        watch_log::list_object_watch_event_page(
             &self.storage,
             tenant_id,
             bucket_id,
             prefix,
             after_cursor,
-            if limit == 0 {
-                1000
-            } else {
-                limit.max(1) as usize
-            },
+            limit,
         )
         .await
     }
@@ -461,7 +428,7 @@ impl Persistence {
         &self,
         tenant_id: i64,
         bucket_id: i64,
-        stream_row_id: i64,
+        stream: &AppendStream,
         payload_object_ref: CoreObjectRef,
         payload_size: i64,
         content_type: Option<String>,
@@ -475,7 +442,7 @@ impl Persistence {
             &self.storage,
             tenant_id,
             bucket_id,
-            stream_row_id,
+            stream,
             payload_object_ref,
             payload_size,
             content_type,
@@ -491,7 +458,7 @@ impl Persistence {
         &self,
         tenant_id: i64,
         bucket_id: i64,
-        stream_row_id: i64,
+        stream: &AppendStream,
         payload_object_ref: CoreObjectRef,
         payload_size: i64,
         content_type: Option<String>,
@@ -506,7 +473,7 @@ impl Persistence {
             &self.storage,
             tenant_id,
             bucket_id,
-            stream_row_id,
+            stream,
             payload_object_ref,
             payload_size,
             content_type,
@@ -521,52 +488,49 @@ impl Persistence {
 
     pub async fn list_append_stream_records(
         &self,
-        tenant_id: i64,
-        bucket_id: i64,
-        stream_row_id: i64,
-    ) -> Result<Vec<AppendStreamRecord>> {
-        append_journal::list_append_stream_records_for_stream(
+        stream: &AppendStream,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Result<append_journal::AppendStreamRecordPage> {
+        append_journal::list_append_stream_records_page(
             &self.storage,
-            tenant_id,
-            bucket_id,
-            stream_row_id,
+            stream,
+            after_sequence,
+            limit,
         )
         .await
     }
 
-    pub async fn list_append_stream_records_in_transaction(
+    pub async fn append_stream_has_records(
+        &self,
+        stream: &AppendStream,
+        transaction: Option<(&str, &str)>,
+    ) -> Result<bool> {
+        append_journal::append_stream_has_records(&self.storage, stream, transaction).await
+    }
+
+    pub async fn list_append_streams_page(
         &self,
         tenant_id: i64,
         bucket_id: i64,
-        stream_row_id: i64,
-        transaction_id: &str,
-        transaction_principal: &str,
-    ) -> Result<Vec<AppendStreamRecord>> {
-        append_journal::list_append_stream_records_in_transaction(
+        after_stream_id: Option<&str>,
+        limit: usize,
+    ) -> Result<append_journal::AppendStreamPage> {
+        append_journal::list_append_streams_page(
             &self.storage,
             tenant_id,
             bucket_id,
-            stream_row_id,
-            transaction_id,
-            transaction_principal,
+            after_stream_id,
+            limit,
         )
         .await
-    }
-
-    pub async fn list_append_stream_records_for_bucket(
-        &self,
-        tenant_id: i64,
-        bucket_id: i64,
-    ) -> Result<Vec<(AppendStream, AppendStreamRecord)>> {
-        append_journal::list_append_stream_records_for_bucket(&self.storage, tenant_id, bucket_id)
-            .await
     }
 
     pub async fn seal_append_stream(
         &self,
         tenant_id: i64,
         bucket_id: i64,
-        stream_row_id: i64,
+        stream: &AppendStream,
         segment_hash: &str,
     ) -> Result<SealAppendStreamMutation> {
         let permit = self
@@ -576,7 +540,7 @@ impl Persistence {
             &self.storage,
             tenant_id,
             bucket_id,
-            stream_row_id,
+            stream,
             segment_hash,
             &permit,
             &self.partition_owner_signing_key,
@@ -588,7 +552,7 @@ impl Persistence {
         &self,
         tenant_id: i64,
         bucket_id: i64,
-        stream_row_id: i64,
+        stream: &AppendStream,
         segment_hash: &str,
         transaction_id: &str,
         transaction_principal: &str,
@@ -600,7 +564,7 @@ impl Persistence {
             &self.storage,
             tenant_id,
             bucket_id,
-            stream_row_id,
+            stream,
             segment_hash,
             &permit,
             &self.partition_owner_signing_key,
@@ -700,6 +664,24 @@ impl Persistence {
         self.enqueue_authz_materialization_after_write(tenant_id, record.revision)
             .await;
         Ok(record)
+    }
+
+    pub(crate) async fn materialize_authz_through_revision(
+        &self,
+        tenant_id: i64,
+        revision: i64,
+    ) -> Result<authz_journal::AuthzMaterializationOutcome> {
+        let target_revision = u64::try_from(revision)
+            .map_err(|_| anyhow!("authorization revision must be nonnegative"))?;
+        let source_fence_token =
+            authz_journal::latest_authz_journal_fence_token(&self.storage, tenant_id).await?;
+        authz_journal::materialize_authz_derived_state_through_revision(
+            &self.storage,
+            tenant_id,
+            target_revision,
+            source_fence_token,
+        )
+        .await
     }
 
     pub async fn write_authz_tuple_batch(

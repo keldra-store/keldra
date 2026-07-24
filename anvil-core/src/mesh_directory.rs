@@ -4,7 +4,6 @@ use crate::core_store::{
 };
 use crate::mesh_control_stream::{
     self, ControlMutationHeaderInput, ControlRecordDigest, ControlStreamFrame,
-    ControlStreamSequence,
 };
 use crate::partition_fence::{self, PartitionWritePermit};
 use crate::storage::Storage;
@@ -16,8 +15,12 @@ use std::fmt;
 use thiserror::Error;
 
 mod helpers;
+mod listing;
 mod record_proto;
 use helpers::*;
+pub use listing::{
+    BucketLocatorPage, RoutingRecordPage, page_bucket_locators, page_projected_routing_records,
+};
 use record_proto::{
     DESCRIPTOR_FILE_EXTENSION, DecodeRoutingRecord, StoredRoutingRecord,
     routing_record_descriptor_from_proto, routing_record_descriptor_from_record,
@@ -970,28 +973,16 @@ async fn append_control_mutation<T: StoredRoutingRecord>(
         reason: rejection.reason,
     })?;
 
-    let existing_log =
-        mesh_control_stream::read_control_stream_log(storage, stream_family, partition)
+    let cursor =
+        mesh_control_stream::control_stream_append_cursor(storage, stream_family, partition)
             .await
             .map_err(|err| MeshDirectoryError::ControlStreamWrite {
                 stream_family: stream_family.to_string(),
                 partition: partition.to_string(),
                 message: format!("{err:#}"),
             })?;
-    let sequence = existing_log
-        .records
-        .last()
-        .map(|record| record.metadata.sequence.get().saturating_add(1))
-        .unwrap_or(1);
     let payload_proto = payload.encode_routing_payload_proto()?;
     let digest = ControlRecordDigest::blake3(&payload_proto);
-    let sequence = ControlStreamSequence::new(sequence).map_err(|err| {
-        MeshDirectoryError::ControlStreamWrite {
-            stream_family: stream_family.to_string(),
-            partition: partition.to_string(),
-            message: format!("{err:#}"),
-        }
-    })?;
     let created_at = Utc::now().to_rfc3339();
     let mesh_id = payload.routing_mesh_id();
     let header_proto =
@@ -1000,7 +991,7 @@ async fn append_control_mutation<T: StoredRoutingRecord>(
             mesh_id: &mesh_id,
             stream_family,
             partition,
-            sequence,
+            sequence: cursor.sequence,
             record_key,
             operation,
             expected_generation,
@@ -1010,14 +1001,14 @@ async fn append_control_mutation<T: StoredRoutingRecord>(
             idempotency_key,
             record_digest: &digest,
             created_at: &created_at,
+            byte_offset: cursor.byte_offset,
         });
     let frame = ControlStreamFrame::new(header_proto, payload_proto);
-    mesh_control_stream::append_control_stream_frame_with_log(
+    mesh_control_stream::append_control_stream_frame(
         storage,
         stream_family,
         partition,
         &frame,
-        existing_log,
         Some(partition_precondition),
     )
     .await
@@ -1347,178 +1338,6 @@ pub async fn read_bucket_locator(
     read_typed_routing_descriptor(storage, RoutingRecordFamily::BucketLocator, &record_key).await
 }
 
-pub async fn list_routing_records(
-    storage: &Storage,
-    family_filter: Option<RoutingRecordFamily>,
-) -> MeshDirectoryResult<Vec<RoutingRecordDescriptor>> {
-    Ok(list_routing_record_sources(storage, family_filter)
-        .await?
-        .into_iter()
-        .map(|source| source.descriptor)
-        .collect())
-}
-
-pub async fn list_bucket_locators(
-    storage: &Storage,
-) -> MeshDirectoryResult<Vec<BucketLocatorDescriptor>> {
-    let mut locators = Vec::new();
-    for source in
-        list_routing_record_sources(storage, Some(RoutingRecordFamily::BucketLocator)).await?
-    {
-        let locator: BucketLocatorDescriptor =
-            record_proto::decode_typed_routing_descriptor(&source.payload_proto)?;
-        if locator.routing_record_key() != source.descriptor.record_key {
-            return Err(MeshDirectoryError::InvalidIdentifier {
-                field: "bucket locator record key",
-                value: format!(
-                    "expected {}, got {}",
-                    source.descriptor.record_key,
-                    locator.routing_record_key()
-                ),
-            });
-        }
-        locators.push(locator);
-    }
-    locators.sort_by_key(|locator| locator.routing_record_key());
-    Ok(locators)
-}
-
-async fn list_routing_record_sources(
-    storage: &Storage,
-    family_filter: Option<RoutingRecordFamily>,
-) -> MeshDirectoryResult<Vec<RoutingRecordSource>> {
-    let mut records = BTreeMap::new();
-    let families: Vec<_> = family_filter
-        .map(|family| vec![family])
-        .unwrap_or_else(|| RoutingRecordFamily::all().into_iter().collect());
-
-    for family in families {
-        for source in list_projected_routing_record_sources(storage, family).await? {
-            records.insert(
-                (
-                    source.descriptor.family,
-                    source.descriptor.record_key.clone(),
-                ),
-                source,
-            );
-        }
-        overlay_control_stream_routing_sources(storage, family, &mut records).await?;
-    }
-
-    Ok(records.into_values().collect())
-}
-
-pub async fn list_projected_routing_records(
-    storage: &Storage,
-    family: RoutingRecordFamily,
-) -> MeshDirectoryResult<Vec<RoutingRecordDescriptor>> {
-    Ok(list_projected_routing_record_sources(storage, family)
-        .await?
-        .into_iter()
-        .map(|source| source.descriptor)
-        .collect())
-}
-
-async fn list_projected_routing_record_sources(
-    storage: &Storage,
-    family: RoutingRecordFamily,
-) -> MeshDirectoryResult<Vec<RoutingRecordSource>> {
-    let mut records = Vec::new();
-    let store = CoreStore::new(storage.clone()).await?;
-    let prefix = routing_projection_row_prefix(family)?;
-    for row in store.scan_coremeta_prefix(CF_MESH, TABLE_MESH_PARTITION_ROW, &prefix)? {
-        let projected = record_proto::decode_routing_projection_row(&row.payload)?;
-        if projected.descriptor.family != family {
-            return Err(MeshDirectoryError::InvalidIdentifier {
-                field: "mesh directory projection family",
-                value: format!("{:?}", projected.descriptor.family),
-            });
-        }
-        records.push(RoutingRecordSource {
-            descriptor: projected.descriptor,
-            payload_proto: projected.payload_proto,
-        });
-    }
-    records.sort_by(|left, right| {
-        (left.descriptor.family, left.descriptor.record_key.as_str()).cmp(&(
-            right.descriptor.family,
-            right.descriptor.record_key.as_str(),
-        ))
-    });
-    Ok(records)
-}
-
-async fn overlay_control_stream_routing_sources(
-    storage: &Storage,
-    family: RoutingRecordFamily,
-    records: &mut BTreeMap<(RoutingRecordFamily, String), RoutingRecordSource>,
-) -> MeshDirectoryResult<()> {
-    let stream_family = family.stream_family();
-    for partition in mesh_control_stream::list_control_stream_partitions(storage, stream_family)
-        .await
-        .map_err(|err| MeshDirectoryError::ControlStreamWrite {
-            stream_family: stream_family.to_string(),
-            partition: String::new(),
-            message: format!("{err:#}"),
-        })?
-    {
-        let log = mesh_control_stream::read_control_stream_log(storage, stream_family, &partition)
-            .await
-            .map_err(|err| MeshDirectoryError::ControlStreamWrite {
-                stream_family: stream_family.to_string(),
-                partition: partition.clone(),
-                message: format!("{err:#}"),
-            })?;
-        if log.partial_final_frame.is_some() {
-            return Err(MeshDirectoryError::ControlStreamWrite {
-                stream_family: stream_family.to_string(),
-                partition,
-                message: "control stream has a partial final frame".to_string(),
-            });
-        }
-        for record in log.records {
-            let header =
-                mesh_control_stream::decode_control_mutation_header(&record.frame.header_proto)
-                    .map_err(|err| MeshDirectoryError::ControlStreamWrite {
-                        stream_family: stream_family.to_string(),
-                        partition: partition.clone(),
-                        message: format!("{err:#}"),
-                    })?;
-            if header.stream_family != stream_family || header.partition != partition {
-                return Err(MeshDirectoryError::ControlStreamWrite {
-                    stream_family: stream_family.to_string(),
-                    partition: partition.clone(),
-                    message: "control stream header scope does not match path".to_string(),
-                });
-            }
-            if header.record_key.trim().is_empty() {
-                return Err(MeshDirectoryError::ControlStreamWrite {
-                    stream_family: stream_family.to_string(),
-                    partition: partition.clone(),
-                    message: "control stream header missing record_key".to_string(),
-                });
-            }
-            if matches!(header.operation.as_str(), "delete" | "deleted") {
-                records.remove(&(family, header.record_key.clone()));
-                continue;
-            }
-            let descriptor = routing_record_descriptor_from_proto(
-                family,
-                &header.record_key,
-                &record.frame.payload_proto,
-            )?;
-            records.insert(
-                (family, header.record_key),
-                RoutingRecordSource {
-                    descriptor,
-                    payload_proto: record.frame.payload_proto,
-                },
-            );
-        }
-    }
-    Ok(())
-}
-
 pub fn routing_record_partition_for_key(
     family: RoutingRecordFamily,
     record_key: &str,
@@ -1583,8 +1402,10 @@ async fn read_routing_record_from_source_of_truth(
 ) -> MeshDirectoryResult<Option<RoutingRecordDescriptor>> {
     let projected = read_projected_routing_record_source(storage, family, record_key).await?;
     let streamed = latest_routing_record_from_control_stream(storage, family, record_key).await?;
-    let Some(streamed) = streamed else {
-        return Ok(projected.map(|source| source.descriptor));
+    let streamed = match streamed {
+        None => return Ok(projected.map(|source| source.descriptor)),
+        Some(RoutingControlStreamState::Deleted) => return Ok(None),
+        Some(RoutingControlStreamState::Present(streamed)) => streamed,
     };
     if projected.as_ref().is_none_or(|projected| {
         projected.descriptor.generation != streamed.descriptor.generation
@@ -1601,62 +1422,44 @@ async fn read_routing_record_from_source_of_truth(
     Ok(Some(streamed.descriptor))
 }
 
+enum RoutingControlStreamState {
+    Present(RoutingRecordSource),
+    Deleted,
+}
+
 async fn latest_routing_record_from_control_stream(
     storage: &Storage,
     family: RoutingRecordFamily,
     record_key: &str,
-) -> MeshDirectoryResult<Option<RoutingRecordSource>> {
+) -> MeshDirectoryResult<Option<RoutingControlStreamState>> {
     let partition = routing_record_partition_for_key(family, record_key)?;
     let stream_family = family.stream_family();
-    let log = mesh_control_stream::read_control_stream_log(storage, stream_family, &partition)
-        .await
-        .map_err(|err| MeshDirectoryError::ControlStreamWrite {
-            stream_family: stream_family.to_string(),
-            partition: partition.clone(),
-            message: format!("{err:#}"),
-        })?;
-    if log.partial_final_frame.is_some() {
-        return Err(MeshDirectoryError::ControlStreamWrite {
-            stream_family: stream_family.to_string(),
-            partition,
-            message: "control stream has a partial final frame".to_string(),
-        });
+    let latest = mesh_control_stream::latest_projected_record_from_control_stream(
+        storage,
+        stream_family,
+        &partition,
+        record_key,
+    )
+    .await
+    .map_err(|err| MeshDirectoryError::ControlStreamWrite {
+        stream_family: stream_family.to_string(),
+        partition: partition.clone(),
+        message: format!("{err:#}"),
+    })?;
+    let Some(latest) = latest else {
+        return Ok(None);
+    };
+    if latest.deleted {
+        return Ok(Some(RoutingControlStreamState::Deleted));
     }
-
-    let mut latest = None;
-    for record in log.records {
-        let header =
-            mesh_control_stream::decode_control_mutation_header(&record.frame.header_proto)
-                .map_err(|err| MeshDirectoryError::ControlStreamWrite {
-                    stream_family: stream_family.to_string(),
-                    partition: partition.clone(),
-                    message: format!("{err:#}"),
-                })?;
-        if header.stream_family != stream_family || header.partition != partition {
-            return Err(MeshDirectoryError::ControlStreamWrite {
-                stream_family: stream_family.to_string(),
-                partition: partition.clone(),
-                message: "control stream header scope does not match path".to_string(),
-            });
-        }
-        if header.record_key != record_key {
-            continue;
-        }
-        if matches!(header.operation.as_str(), "delete" | "deleted") {
-            latest = None;
-            continue;
-        }
-        let descriptor = routing_record_descriptor_from_proto(
-            family,
-            &header.record_key,
-            &record.frame.payload_proto,
-        )?;
-        latest = Some(RoutingRecordSource {
+    let payload_proto = encode_control_payload_from_operator_json(family, &latest.payload_json)?;
+    let descriptor = routing_record_descriptor_from_proto(family, record_key, &payload_proto)?;
+    Ok(Some(RoutingControlStreamState::Present(
+        RoutingRecordSource {
             descriptor,
-            payload_proto: record.frame.payload_proto,
-        });
-    }
-    Ok(latest)
+            payload_proto,
+        },
+    )))
 }
 
 async fn read_projected_routing_record_descriptor(

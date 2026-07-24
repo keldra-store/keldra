@@ -1,5 +1,19 @@
 use super::*;
 
+const MAX_NODE_RUNTIME_BLOCKERS: usize = 256;
+const TASK_LEASE_PAGE_SIZE: usize = 256;
+
+fn push_runtime_blocker(blockers: &mut Vec<String>, blocker: String) -> bool {
+    blockers.push(blocker);
+    blockers.len() == MAX_NODE_RUNTIME_BLOCKERS
+}
+
+fn runtime_cursor_error(kind: &str) -> crate::mesh_lifecycle::LifecycleError {
+    crate::mesh_lifecycle::LifecycleError::InvalidArgument(format!(
+        "{kind} page cursor did not advance"
+    ))
+}
+
 impl Persistence {
     pub async fn create_region(&self, name: &str) -> Result<bool> {
         let permit = self.control_write_permit().await?;
@@ -13,9 +27,19 @@ impl Persistence {
     }
 
     pub async fn list_regions(&self) -> Result<Vec<String>> {
-        Ok(control_journal::read_control_state(&self.storage)
-            .await?
-            .regions())
+        let revision = control_journal::current_control_collection_revision(&self.storage).await?;
+        let mut cursor = None;
+        let mut regions = Vec::new();
+        loop {
+            let page =
+                control_journal::page_regions(&self.storage, &revision, cursor.as_deref(), 512)
+                    .await?;
+            regions.extend(page.regions);
+            let Some(next) = page.next_tuple_key else {
+                return Ok(regions);
+            };
+            cursor = Some(next);
+        }
     }
 
     pub async fn create_region_descriptor(
@@ -193,7 +217,7 @@ impl Persistence {
     ) -> crate::mesh_lifecycle::LifecycleResult<crate::mesh_lifecycle::NodeDescriptor> {
         let record_key = format!("{}/{}/{}", input.region, input.cell_id, input.node_id);
         let node_id = input.node_id.clone();
-        let receipt_signing_public_key_proto = input.receipt_signing_public_key_proto.clone();
+        let receipt_signing_public_key = input.receipt_signing_public_key.clone();
         let partition = crate::mesh_lifecycle::lifecycle_control_partition(
             crate::mesh_lifecycle::NODE_DESCRIPTOR_STREAM_FAMILY,
             &record_key,
@@ -220,7 +244,7 @@ impl Persistence {
             .await
             .map_err(|err| crate::mesh_lifecycle::LifecycleError::Other(err.into()))?;
         store
-            .register_node_receipt_signing_public_key(&node_id, &receipt_signing_public_key_proto)
+            .register_node_receipt_signing_public_key(&node_id, &receipt_signing_public_key)
             .map_err(|err| crate::mesh_lifecycle::LifecycleError::Other(err.into()))?;
         Ok(descriptor)
     }
@@ -328,52 +352,121 @@ impl Persistence {
         now_nanos: i64,
     ) -> crate::mesh_lifecycle::LifecycleResult<Vec<String>> {
         let mut blockers = Vec::new();
-        let partition_owners = list_partition_owners_for_node(
-            &self.storage,
-            node_id,
-            &self.partition_owner_signing_key,
-        )
-        .await
-        .map_err(|err| crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string()))?;
-        blockers.extend(partition_owners.into_iter().map(|owner| {
-            format!(
-                "partition_owner:{}/{}:{:?}:fence={}",
-                owner.partition_family, owner.partition_id, owner.status, owner.fence_token
+        let mut partition_cursor = None;
+        loop {
+            let page = list_partition_owners_for_node_page(
+                &self.storage,
+                node_id,
+                partition_cursor.as_ref(),
+                MAX_PARTITION_FENCE_PAGE_SIZE,
+                &self.partition_owner_signing_key,
             )
-        }));
+            .await
+            .map_err(|err| {
+                crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
+            })?;
+            for owner in page.owners {
+                if push_runtime_blocker(
+                    &mut blockers,
+                    format!(
+                        "partition_owner:{}/{}:{:?}:fence={}",
+                        owner.partition_family, owner.partition_id, owner.status, owner.fence_token
+                    ),
+                ) {
+                    blockers.sort();
+                    return Ok(blockers);
+                }
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            if partition_cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.as_str() >= next_cursor.as_str())
+            {
+                return Err(runtime_cursor_error("partition owner"));
+            }
+            partition_cursor = Some(next_cursor);
+        }
 
-        let ownership_fences = list_active_ownership_fences_for_node(
-            &self.storage,
-            node_id,
-            now_nanos,
-            &self.partition_owner_signing_key,
-        )
-        .await
-        .map_err(|err| crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string()))?;
-        blockers.extend(ownership_fences.into_iter().map(|record| {
-            format!(
-                "ownership_fence:{}/{}:{:?}:fence={}",
-                record.resource.resource_kind.as_str(),
-                record.resource.resource_id,
-                record.state,
-                record.fence
+        let mut ownership_cursor = None;
+        loop {
+            let page = list_active_ownership_fences_for_node_page(
+                &self.storage,
+                node_id,
+                now_nanos,
+                ownership_cursor.as_ref(),
+                MAX_PARTITION_FENCE_PAGE_SIZE,
+                &self.partition_owner_signing_key,
             )
-        }));
+            .await
+            .map_err(|err| {
+                crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
+            })?;
+            for record in page.fences {
+                if push_runtime_blocker(
+                    &mut blockers,
+                    format!(
+                        "ownership_fence:{}/{}:{:?}:fence={}",
+                        record.resource.resource_kind.as_str(),
+                        record.resource.resource_id,
+                        record.state,
+                        record.fence
+                    ),
+                ) {
+                    blockers.sort();
+                    return Ok(blockers);
+                }
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            if ownership_cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.as_str() >= next_cursor.as_str())
+            {
+                return Err(runtime_cursor_error("ownership fence"));
+            }
+            ownership_cursor = Some(next_cursor);
+        }
 
-        let task_leases = task_lease::list_active_task_leases_for_node(
-            &self.storage,
-            node_id,
-            now_nanos,
-            &self.partition_owner_signing_key,
-        )
-        .await
-        .map_err(|err| crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string()))?;
-        blockers.extend(task_leases.into_iter().map(|lease| {
-            format!(
-                "task_lease:{}:{}:fence={}",
-                lease.task_kind, lease.task_id, lease.fence_token
+        let mut task_cursor: Option<Vec<u8>> = None;
+        loop {
+            let page = task_lease::list_active_task_leases_for_node_page(
+                &self.storage,
+                node_id,
+                now_nanos,
+                &self.partition_owner_signing_key,
+                task_cursor.as_deref(),
+                TASK_LEASE_PAGE_SIZE,
             )
-        }));
+            .await
+            .map_err(|err| {
+                crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
+            })?;
+            for lease in page.leases {
+                if push_runtime_blocker(
+                    &mut blockers,
+                    format!(
+                        "task_lease:{}:{}:fence={}",
+                        lease.task_kind, lease.task_id, lease.fence_token
+                    ),
+                ) {
+                    blockers.sort();
+                    return Ok(blockers);
+                }
+            }
+            let Some(next_cursor) = page.next_tuple_key else {
+                break;
+            };
+            if task_cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.as_slice() >= next_cursor.as_slice())
+            {
+                return Err(runtime_cursor_error("task lease"));
+            }
+            task_cursor = Some(next_cursor);
+        }
         blockers.sort();
         Ok(blockers)
     }
@@ -385,36 +478,45 @@ impl Persistence {
         let now_nanos = current_time_nanos().map_err(|err| {
             crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
         })?;
-        let partition_owners = list_partition_owners_for_node(
-            &self.storage,
-            node_id,
-            &self.partition_owner_signing_key,
-        )
-        .await
-        .map_err(|err| crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string()))?;
-        for owner in partition_owners {
-            force_expire_partition_owner_for_node(
+        let mut partition_cursor = None;
+        loop {
+            let page = list_partition_owners_for_node_page(
                 &self.storage,
-                &owner.partition_family,
-                &owner.partition_id,
                 node_id,
-                now_nanos,
+                partition_cursor.as_ref(),
+                MAX_PARTITION_FENCE_PAGE_SIZE,
                 &self.partition_owner_signing_key,
             )
             .await
             .map_err(|err| {
                 crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
             })?;
+            for owner in page.owners {
+                force_expire_partition_owner_for_node(
+                    &self.storage,
+                    &owner.partition_family,
+                    &owner.partition_id,
+                    node_id,
+                    now_nanos,
+                    &self.partition_owner_signing_key,
+                )
+                .await
+                .map_err(|err| {
+                    crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
+                })?;
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            if partition_cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.as_str() >= next_cursor.as_str())
+            {
+                return Err(runtime_cursor_error("partition owner"));
+            }
+            partition_cursor = Some(next_cursor);
         }
 
-        let ownership_fences = list_active_ownership_fences_for_node(
-            &self.storage,
-            node_id,
-            now_nanos,
-            &self.partition_owner_signing_key,
-        )
-        .await
-        .map_err(|err| crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string()))?;
         let admin = OwnershipPrincipal {
             tenant_id: 0,
             principal_kind: "node_admin".to_string(),
@@ -424,53 +526,97 @@ impl Persistence {
             region: self.region.clone(),
             cell: self.cell_id.clone(),
         };
-        for record in ownership_fences {
-            let mut admin = admin.clone();
-            admin.tenant_id = record.owner.tenant_id;
-            force_expire_ownership(
+        let mut ownership_cursor = None;
+        loop {
+            let page = list_active_ownership_fences_for_node_page(
                 &self.storage,
-                ForceExpireOwnership {
-                    request_id: format!(
-                        "node-force-expire-{}-{}",
-                        node_id,
-                        record.resource.resource_id.replace('/', "-")
-                    ),
-                    idempotency_key: format!(
-                        "node-force-expire-{}-{}-{}",
-                        node_id, record.resource.resource_id, record.fence
-                    ),
-                    resource: record.resource,
-                    admin: admin.clone(),
-                    reason: format!("node {node_id} transitioned to non-owning lifecycle state"),
-                    now_nanos,
-                },
+                node_id,
+                now_nanos,
+                ownership_cursor.as_ref(),
+                MAX_PARTITION_FENCE_PAGE_SIZE,
                 &self.partition_owner_signing_key,
             )
             .await
             .map_err(|err| {
                 crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
             })?;
+            for record in page.fences {
+                let mut admin = admin.clone();
+                admin.tenant_id = record.owner.tenant_id;
+                force_expire_ownership(
+                    &self.storage,
+                    ForceExpireOwnership {
+                        request_id: format!(
+                            "node-force-expire-{}-{}",
+                            node_id,
+                            record.resource.resource_id.replace('/', "-")
+                        ),
+                        idempotency_key: format!(
+                            "node-force-expire-{}-{}-{}",
+                            node_id, record.resource.resource_id, record.fence
+                        ),
+                        resource: record.resource,
+                        admin: admin.clone(),
+                        reason: format!(
+                            "node {node_id} transitioned to non-owning lifecycle state"
+                        ),
+                        now_nanos,
+                    },
+                    &self.partition_owner_signing_key,
+                )
+                .await
+                .map_err(|err| {
+                    crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
+                })?;
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            if ownership_cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.as_str() >= next_cursor.as_str())
+            {
+                return Err(runtime_cursor_error("ownership fence"));
+            }
+            ownership_cursor = Some(next_cursor);
         }
 
-        let task_leases = task_lease::list_active_task_leases_for_node(
-            &self.storage,
-            node_id,
-            now_nanos,
-            &self.partition_owner_signing_key,
-        )
-        .await
-        .map_err(|err| crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string()))?;
-        for lease in task_leases {
-            task_lease::force_release_task_lease(
+        let mut task_cursor: Option<Vec<u8>> = None;
+        loop {
+            let page = task_lease::list_active_task_leases_for_node_page(
                 &self.storage,
-                lease.owner.tenant_id,
-                &lease.task_id,
+                node_id,
+                now_nanos,
                 &self.partition_owner_signing_key,
+                task_cursor.as_deref(),
+                TASK_LEASE_PAGE_SIZE,
             )
             .await
             .map_err(|err| {
                 crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
             })?;
+            for lease in page.leases {
+                task_lease::force_release_task_lease(
+                    &self.storage,
+                    lease.owner.tenant_id,
+                    &lease.task_id,
+                    &self.partition_owner_signing_key,
+                )
+                .await
+                .map_err(|err| {
+                    crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
+                })?;
+            }
+            let Some(next_cursor) = page.next_tuple_key else {
+                break;
+            };
+            if task_cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.as_slice() >= next_cursor.as_slice())
+            {
+                return Err(runtime_cursor_error("task lease"));
+            }
+            task_cursor = Some(next_cursor);
         }
         Ok(())
     }

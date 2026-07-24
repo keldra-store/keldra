@@ -100,7 +100,7 @@ Diagnostics are the first read-only surface to inspect:
 ```bash
 anvil --profile acme index diagnostics documents invoices_by_due \
   --severity warning \
-  --limit 50
+  --page-size 50
 ```
 
 This calls `IndexService.ListIndexDiagnostics`. A successful response proves the caller has `index:read` on `documents` and that diagnostics for the requested bucket/index can be read. It does not prove the index is complete. No output means no matching diagnostic records were returned in that page; it does not prove every selected source record was indexed or visible.

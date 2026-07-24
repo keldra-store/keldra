@@ -32,13 +32,9 @@ async fn spawn_admin_node() -> AdminNode {
     let admin_addr = admin_listener.local_addr().unwrap();
 
     let config = anvil::config::Config {
-        cluster_secret: Some("test-cluster-secret".to_string()),
         jwt_secret: "test-secret".to_string(),
         anvil_secret_encryption_key:
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-        cluster_listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".to_string(),
-        public_cluster_addrs: vec![],
-        metadata_cache_ttl_secs: 1,
         public_api_addr: format!("http://{public_addr}"),
         api_listen_addr: public_addr.to_string(),
         admin_listen_addr: admin_addr.to_string(),
@@ -48,30 +44,25 @@ async fn spawn_admin_node() -> AdminNode {
         region: "eu-west-1".to_string(),
         cell_id: "cell-a".to_string(),
         public_region_base_domain: "eu-west-1.anvil-storage.test".to_string(),
-        bootstrap_addrs: vec![],
-        init_cluster: false,
-        enable_mdns: false,
         storage_path: storage_path.to_string_lossy().into_owned(),
         personaldb_snapshot_entry_threshold: 1024,
         personaldb_snapshot_payload_bytes_threshold: 64 * 1024 * 1024,
+        // These tests exercise synchronous administrative lifecycle APIs.
+        // Background task execution is covered separately and would leave
+        // detached workers competing across the nodes created by this binary.
+        run_background_worker: false,
         ..anvil::config::Config::default()
     };
 
-    let state = anvil::AppState::new(config, None, personaldb_test_protocol_keyring())
-        .await
-        .unwrap();
-    let swarm = anvil::cluster::create_swarm(state.config.clone())
+    let state = anvil::AppState::new(config, personaldb_test_protocol_keyring())
         .await
         .unwrap();
     let state_for_handle = state.clone();
     let handle = tokio::spawn(async move {
-        let (_tx, rx) = tokio::sync::mpsc::channel(1);
         anvil::start_node_with_admin_listener(
             public_listener,
             Some(admin_listener),
             state_for_handle,
-            swarm,
-            rx,
         )
         .await
         .unwrap();
@@ -119,6 +110,13 @@ fn context(label: &str, expected_generation: u64) -> AdminRequestContext {
     }
 }
 
+fn test_receipt_signing_public_key() -> Vec<u8> {
+    anvil::node_signing::NodeSigningKeypair::generate()
+        .unwrap()
+        .public_key_bytes()
+        .to_vec()
+}
+
 async fn activation_checkpoint_json_from_existing_streams(
     node: &AdminNode,
     region: &str,
@@ -129,23 +127,33 @@ async fn activation_checkpoint_json_from_existing_streams(
         .map(|family| family.stream_family())
         .chain(anvil::mesh_lifecycle::lifecycle_control_stream_families().into_iter());
     for stream_family in stream_families {
-        let partitions = anvil::mesh_control_stream::list_control_stream_partitions(
+        let partitions = anvil::mesh_control_stream::list_control_stream_partitions_page(
             &node.state.storage,
             stream_family,
+            None,
+            1_024,
         )
         .await
         .unwrap();
-        for partition in partitions {
-            let log = anvil::mesh_control_stream::read_control_stream_log(
+        assert!(partitions.next_stream_id.is_none());
+        for partition in partitions.partitions {
+            let cursor = anvil::mesh_control_stream::control_stream_append_cursor(
                 &node.state.storage,
                 stream_family,
                 &partition,
             )
             .await
             .unwrap();
-            let Some(record) = log.records.last() else {
-                continue;
-            };
+            let log = anvil::mesh_control_stream::read_control_stream_page(
+                &node.state.storage,
+                stream_family,
+                &partition,
+                cursor.sequence.get().saturating_sub(2),
+                1,
+            )
+            .await
+            .unwrap();
+            let record = log.records.last().unwrap();
             anvil::mesh_control_stream::write_control_checkpoint(
                 &node.state.storage,
                 &anvil::mesh_control_stream::ControlCheckpointRecord::new(
@@ -243,11 +251,7 @@ async fn prepare_active_region_dependencies(
                 node_id: node_id.to_string(),
                 region: region.to_string(),
                 cell_id: cell_id.to_string(),
-                libp2p_peer_id: format!("peer-{label}"),
-                receipt_signing_public_key_proto: libp2p::identity::Keypair::generate_ed25519()
-                    .public()
-                    .encode_protobuf(),
-                public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7443/quic-v1".to_string()],
+                receipt_signing_public_key: test_receipt_signing_public_key(),
                 public_api_addr: "http://127.0.0.1:50051".to_string(),
                 capabilities: vec![1, 6],
                 capacity_json: "{}".to_string(),

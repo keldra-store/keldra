@@ -212,11 +212,12 @@ async fn test_authz_namespace_watch_streams_snapshot_and_new_events() {
         &["test-region-1"],
     )
     .await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
 
     append_authz_namespace_watch_record(
         &cluster.states[0].storage,
-        1,
         1,
         [1; 16],
         namespace_watch_payload(10),
@@ -257,7 +258,6 @@ async fn test_authz_namespace_watch_streams_snapshot_and_new_events() {
     append_authz_namespace_watch_record(
         &cluster.states[0].storage,
         1,
-        2,
         [2; 16],
         namespace_watch_payload(11),
     )
@@ -799,14 +799,16 @@ async fn test_authz_derived_lag_watch_streams_snapshot_and_new_events() {
         &["test-region-1"],
     )
     .await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
 
     append_authz_derived_lag_watch_record(
         &cluster.states[0].storage,
         1,
-        1,
         [1; 16],
         derived_lag_watch_payload(90, 100, 1),
+        &[],
     )
     .await
     .unwrap();
@@ -846,9 +848,9 @@ async fn test_authz_derived_lag_watch_streams_snapshot_and_new_events() {
     append_authz_derived_lag_watch_record(
         &cluster.states[0].storage,
         1,
-        2,
         [2; 16],
         derived_lag_watch_payload(100, 100, 2),
+        &[],
     )
     .await
     .unwrap();
@@ -871,7 +873,9 @@ async fn test_repair_authz_derived_index_rebuilds_from_tuple_log() {
         &["test-region-1"],
     )
     .await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
 
     let token = cluster.token.clone();
     let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
@@ -948,7 +952,10 @@ async fn test_repair_authz_derived_index_rebuilds_from_tuple_log() {
     let mut list_findings = Request::new(ListRepairFindingsRequest {
         scope_kind: "authz".to_string(),
         scope_id: "tenant-1".to_string(),
-        limit: 10,
+        page: Some(anvil::anvil_api::PageRequest {
+            page_size: 10,
+            page_token: String::new(),
+        }),
     });
     add_bearer(&mut list_findings, &token);
     let findings = repair_client

@@ -55,18 +55,16 @@ pub async fn append_git_source_watch_record(
     storage: &Storage,
     tenant_id: i64,
     repository_id: &str,
-    cursor: u128,
     mutation_id: [u8; 16],
     authz_revision: u64,
     payload: GitSourceWatchPayload,
-) -> Result<()> {
+) -> Result<u128> {
     validate_payload(repository_id, &payload)?;
     let core_store = CoreStore::new(storage.clone()).await?;
     let stream_id = git_source_watch_stream_id(tenant_id, repository_id);
-    ensure_cursor_is_monotonic(&core_store, &stream_id, cursor).await?;
 
     let record = WatchRecord::new(
-        cursor,
+        0,
         GIT_SOURCE_PARTITION_FAMILY,
         partition_id(tenant_id, repository_id),
         mutation_id,
@@ -76,7 +74,7 @@ pub async fn append_git_source_watch_record(
         0,
         encode_git_source_watch_payload(&payload)?,
     );
-    core_store
+    let receipt = core_store
         .append_stream(AppendStreamRecord {
             stream_id,
             partition_id: hex::encode(partition_id(tenant_id, repository_id)),
@@ -87,11 +85,12 @@ pub async fn append_git_source_watch_record(
             fence: None,
             transaction_id: None,
             idempotency_key: Some(format!(
-                "git-source-watch:{tenant_id}:{repository_id}:{cursor}"
+                "git-source-watch:{tenant_id}:{repository_id}:{}",
+                hex::encode(mutation_id)
             )),
         })
         .await?;
-    Ok(())
+    Ok(u128::from(receipt.sequence))
 }
 
 pub async fn list_git_source_watch_events(
@@ -101,22 +100,52 @@ pub async fn list_git_source_watch_events(
     after_cursor: u128,
     limit: usize,
 ) -> Result<Vec<GitSourceWatchEvent>> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let records = read_watch_or_empty(
-        &core_store,
-        &git_source_watch_stream_id(tenant_id, repository_id),
+    Ok(
+        list_git_source_watch_event_page(storage, tenant_id, repository_id, after_cursor, limit)
+            .await?
+            .events,
     )
-    .await?;
-    let mut events = Vec::new();
-    for record in records {
-        if record.cursor <= after_cursor {
-            continue;
+}
+
+#[derive(Debug, Clone)]
+pub struct GitSourceWatchEventPage {
+    pub events: Vec<GitSourceWatchEvent>,
+    pub next_cursor: u128,
+    pub has_more: bool,
+}
+
+pub async fn list_git_source_watch_event_page(
+    storage: &Storage,
+    tenant_id: i64,
+    repository_id: &str,
+    after_cursor: u128,
+    limit: usize,
+) -> Result<GitSourceWatchEventPage> {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let after_sequence =
+        u64::try_from(after_cursor).map_err(|_| anyhow!("git source watch cursor exceeds u64"))?;
+    let page = core_store
+        .read_stream_page(ReadStream {
+            stream_id: git_source_watch_stream_id(tenant_id, repository_id),
+            after_sequence,
+            limit,
+        })
+        .await?;
+    let mut events = Vec::with_capacity(page.records.len());
+    for source in page.records {
+        if source.record_kind != "git_source_watch" {
+            return Err(anyhow!("git source watch stream record kind mismatch"));
         }
+        let (mut record, used) = WatchRecord::decode(&source.payload)?;
+        if used != source.payload.len() {
+            return Err(anyhow!("git source watch record has trailing bytes"));
+        }
+        record.cursor = u128::from(source.sequence);
         if record.partition_family != GIT_SOURCE_PARTITION_FAMILY
             || record.record_kind != GIT_SOURCE_RECORD_KIND
             || record.partition_id != partition_id(tenant_id, repository_id)
         {
-            continue;
+            return Err(anyhow!("git source watch record scope mismatch"));
         }
         let payload: GitSourceWatchPayload = decode_git_source_watch_payload(&record.payload)?;
         validate_payload(repository_id, &payload)?;
@@ -127,11 +156,12 @@ pub async fn list_git_source_watch_events(
             index_generation: record.index_generation,
             payload,
         });
-        if limit > 0 && events.len() >= limit {
-            break;
-        }
     }
-    Ok(events)
+    Ok(GitSourceWatchEventPage {
+        events,
+        next_cursor: u128::from(page.next_sequence),
+        has_more: page.has_more,
+    })
 }
 
 pub async fn latest_git_source_watch_cursor(
@@ -140,20 +170,10 @@ pub async fn latest_git_source_watch_cursor(
     repository_id: &str,
 ) -> Result<Option<u128>> {
     let core_store = CoreStore::new(storage.clone()).await?;
-    let records = read_watch_or_empty(
-        &core_store,
-        &git_source_watch_stream_id(tenant_id, repository_id),
-    )
-    .await?;
-    Ok(records
-        .into_iter()
-        .filter(|record| {
-            record.partition_family == GIT_SOURCE_PARTITION_FAMILY
-                && record.record_kind == GIT_SOURCE_RECORD_KIND
-                && record.partition_id == partition_id(tenant_id, repository_id)
-        })
-        .map(|record| record.cursor)
-        .max())
+    let sequence = core_store
+        .stream_head_sequence(&git_source_watch_stream_id(tenant_id, repository_id))
+        .await?;
+    Ok((sequence != 0).then_some(u128::from(sequence)))
 }
 
 fn encode_git_source_watch_payload(payload: &GitSourceWatchPayload) -> Result<Vec<u8>> {
@@ -182,39 +202,6 @@ fn decode_git_source_watch_payload(bytes: &[u8]) -> Result<GitSourceWatchPayload
         pack_object_version_id: proto.pack_object_version_id,
         emitted_at: proto.emitted_at,
     })
-}
-
-async fn ensure_cursor_is_monotonic(
-    core_store: &CoreStore,
-    stream_id: &str,
-    cursor: u128,
-) -> Result<()> {
-    let records = read_watch_or_empty(core_store, stream_id).await?;
-    if let Some(latest) = records.iter().map(|record| record.cursor).max()
-        && cursor <= latest
-    {
-        return Err(anyhow!("git source watch cursor must be monotonic"));
-    }
-    Ok(())
-}
-
-async fn read_watch_or_empty(core_store: &CoreStore, stream_id: &str) -> Result<Vec<WatchRecord>> {
-    let records = core_store
-        .read_stream(ReadStream {
-            stream_id: stream_id.to_string(),
-            after_sequence: 0,
-            limit: 0,
-        })
-        .await?;
-    records
-        .into_iter()
-        .filter(|record| record.record_kind == "git_source_watch")
-        .map(|record| {
-            WatchRecord::decode(&record.payload)
-                .map(|(record, _)| record)
-                .map_err(Into::into)
-        })
-        .collect()
 }
 
 fn validate_payload(repository_id: &str, payload: &GitSourceWatchPayload) -> Result<()> {
@@ -249,7 +236,7 @@ fn partition_id(tenant_id: i64, repository_id: &str) -> Hash32 {
     hash32(format!("tenant:{tenant_id}:git:{repository_id}:watch:source").as_bytes())
 }
 
-fn git_source_watch_stream_id(tenant_id: i64, repository_id: &str) -> String {
+pub(crate) fn git_source_watch_stream_id(tenant_id: i64, repository_id: &str) -> String {
     format!("watch:git_source:tenant:{tenant_id}:repository:{repository_id}")
 }
 
@@ -262,10 +249,10 @@ mod tests {
     async fn git_source_watch_appends_lists_and_tracks_latest_cursor() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        append_git_source_watch_record(&storage, 9, "repo-alpha", 5, [1; 16], 2, payload(1))
+        append_git_source_watch_record(&storage, 9, "repo-alpha", [1; 16], 2, payload(1))
             .await
             .unwrap();
-        append_git_source_watch_record(&storage, 9, "repo-alpha", 6, [2; 16], 3, payload(2))
+        append_git_source_watch_record(&storage, 9, "repo-alpha", [2; 16], 3, payload(2))
             .await
             .unwrap();
 
@@ -273,30 +260,30 @@ mod tests {
             git_source_watch_stream_id(9, "repo-alpha"),
             "watch:git_source:tenant:9:repository:repo-alpha"
         );
-        let events = list_git_source_watch_events(&storage, 9, "repo-alpha", 5, 10)
+        let events = list_git_source_watch_events(&storage, 9, "repo-alpha", 1, 10)
             .await
             .unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].cursor, 6);
+        assert_eq!(events[0].cursor, 2);
         assert_eq!(events[0].index_generation, 2);
         assert_eq!(events[0].payload.generation, 2);
         assert_eq!(
             latest_git_source_watch_cursor(&storage, 9, "repo-alpha")
                 .await
                 .unwrap(),
-            Some(6)
+            Some(2)
         );
     }
 
     #[tokio::test]
-    async fn git_source_watch_rejects_non_monotonic_cursor_and_bad_payload() {
+    async fn git_source_watch_rejects_idempotency_conflicts_and_bad_payload() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        append_git_source_watch_record(&storage, 9, "repo-alpha", 5, [1; 16], 2, payload(1))
+        append_git_source_watch_record(&storage, 9, "repo-alpha", [1; 16], 2, payload(1))
             .await
             .unwrap();
         assert!(
-            append_git_source_watch_record(&storage, 9, "repo-alpha", 5, [2; 16], 2, payload(2))
+            append_git_source_watch_record(&storage, 9, "repo-alpha", [1; 16], 2, payload(2))
                 .await
                 .is_err()
         );
@@ -304,7 +291,7 @@ mod tests {
         let mut bad = payload(3);
         bad.repository_id = "repo-beta".to_string();
         assert!(
-            append_git_source_watch_record(&storage, 9, "repo-alpha", 6, [3; 16], 2, bad)
+            append_git_source_watch_record(&storage, 9, "repo-alpha", [3; 16], 2, bad)
                 .await
                 .is_err()
         );

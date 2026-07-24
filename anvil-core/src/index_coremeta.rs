@@ -1,9 +1,11 @@
 use crate::{
     core_store::{
         CF_INDEX_DEFS, CF_INDEX_ROWS, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaRowCommonProto,
-        CoreMetaStore, CoreMetaTuplePart, CoreMetaVisibilityState, CoreStore,
-        TABLE_INDEX_DEFINITION_ROW, TABLE_INDEX_ROW, core_meta_root_key_hash, core_meta_tuple_key,
-        decode_deterministic_proto, encode_deterministic_proto,
+        CoreMetaTuplePart, CoreMetaVisibilityState, CoreMutationBatch, CoreMutationOperation,
+        CoreMutationPrecondition, CoreMutationRootPublication, CoreStore, CoreTransactionState,
+        TABLE_INDEX_DEFINITION_ROW, TABLE_INDEX_ROW, core_meta_record_tuple_key,
+        core_meta_root_key_hash, core_meta_tuple_key, core_mutation_publication_attempt_id,
+        decode_deterministic_proto, encode_deterministic_proto, sha256_hex,
     },
     storage::Storage,
 };
@@ -14,6 +16,10 @@ const INDEX_SEGMENT_ROW_SCHEMA: &str = "anvil.coremeta.index_segment_row.v1";
 const INDEX_SEGMENT_AUTHZ_SCOPE_SCHEMA: &str = "anvil.index.segment_authz_scope.v1";
 const INDEX_DEFINITION_CURRENT_ROW_SCHEMA: &str = "anvil.coremeta.index_definition_current.v1";
 const INDEX_DEFINITION_STATE_ROW_SCHEMA: &str = "anvil.coremeta.index_definition_state.v1";
+pub const INDEX_SEGMENT_COREMETA_PAGE_MAX: usize = 1000;
+
+const DETERMINISTIC_TIME_BASE_NANOS: u64 = 946_684_800_000_000_000;
+const DETERMINISTIC_TIME_WINDOW_NANOS: u64 = 3_155_760_000_000_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexSegmentCoreMetaRecord {
@@ -54,6 +60,12 @@ pub struct IndexDefinitionStateCoreMetaRecord {
     pub latest_cursor: i64,
     pub max_index_id: i64,
     pub updated_at_unix_nanos: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexSegmentCoreMetaPage {
+    pub records: Vec<IndexSegmentCoreMetaRecord>,
+    pub next_tuple_key: Option<Vec<u8>>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -156,120 +168,310 @@ pub fn typed_segment_index_kind(source_kind: &str) -> &'static str {
 pub async fn write_index_segment_coremeta_record(
     storage: &Storage,
     record: &IndexSegmentCoreMetaRecord,
+    additional_preconditions: &[CoreMutationPrecondition],
 ) -> Result<()> {
     validate_index_segment_record(record)?;
     let payload = encode_index_segment_record(record);
-    let tuple_key = index_segment_tuple_key(record)?;
+    let tuple_keys = [
+        index_segment_tuple_key(record)?,
+        index_segment_order_tuple_key(record)?,
+        index_segment_generation_tuple_key(
+            &record.index_id,
+            &record.writer_family,
+            record.generation,
+        )?,
+        index_segment_ref_tuple_key(&record.index_id, &record.segment_ref)?,
+    ];
     let store = CoreStore::new(storage.clone()).await?;
-    let op = CoreMetaBatchOp {
-        cf: CF_INDEX_ROWS,
-        table_id: TABLE_INDEX_ROW,
-        tuple_key: &tuple_key,
-        common: None,
-        kind: CoreMetaBatchOpKind::Put(&payload),
-    };
-    store
-        .commit_coremeta_batch_by_embedded_roots(
-            &format!("index-segment:{}:{}", record.index_id, record.generation),
-            &[op],
-        )
+    for tuple_key in &tuple_keys {
+        if let Some(existing) =
+            store.read_coremeta_row(CF_INDEX_ROWS, TABLE_INDEX_ROW, tuple_key)?
+        {
+            if decode_index_segment_record(&existing)? != *record {
+                bail!("index segment locator already identifies different immutable bytes");
+            }
+        }
+    }
+    if tuple_keys.iter().all(|tuple_key| {
+        store
+            .read_coremeta_row(CF_INDEX_ROWS, TABLE_INDEX_ROW, tuple_key)
+            .ok()
+            .flatten()
+            .is_some()
+    }) {
+        return Ok(());
+    }
+
+    let mut preconditions = tuple_keys
+        .iter()
+        .map(|tuple_key| CoreMutationPrecondition::CoreMetaRow {
+            cf: CF_INDEX_ROWS.to_string(),
+            table_id: TABLE_INDEX_ROW,
+            tuple_key: tuple_key.clone(),
+            expected_payload_hash: None,
+            require_absent: true,
+            require_present: false,
+        })
+        .collect::<Vec<_>>();
+    preconditions.extend_from_slice(additional_preconditions);
+    let operations = tuple_keys
+        .into_iter()
+        .map(|tuple_key| CoreMutationOperation::CoreMetaPut {
+            partition_id: format!("index/{}/segments", record.index_id),
+            cf: CF_INDEX_ROWS.to_string(),
+            table_id: TABLE_INDEX_ROW,
+            tuple_key,
+            payload: payload.clone(),
+        })
+        .collect();
+    let logical_transaction_id = format!(
+        "index-segment:{}:{}:{}",
+        record.index_id, record.generation, record.segment_hash
+    );
+    let transaction_id =
+        core_mutation_publication_attempt_id(&logical_transaction_id, &preconditions)?;
+    let receipt = store
+        .commit_mutation_batch(CoreMutationBatch {
+            transaction_id,
+            scope_partition: format!("index/{}/segments", record.index_id),
+            committed_by_principal: format!("index-builder:{}", record.index_id),
+            root_publications: vec![
+                CoreMutationRootPublication::with_writer_families(
+                    format!("index/{}/segments", record.index_id),
+                    vec![
+                        crate::formats::writer::WriterFamily::CoreControl
+                            .as_str()
+                            .to_string(),
+                        crate::formats::writer::WriterFamily::TypedMetadata
+                            .as_str()
+                            .to_string(),
+                    ],
+                )
+                .coordinator(),
+            ],
+            preconditions,
+            operations,
+        })
         .await?;
+    if receipt.state != CoreTransactionState::Committed {
+        bail!(
+            "index segment locator publication {} did not commit: {}",
+            receipt.transaction_id,
+            receipt
+                .finalisation_error
+                .as_deref()
+                .unwrap_or("unknown finalisation failure")
+        );
+    }
     Ok(())
 }
 
-pub fn latest_index_segment_coremeta_record(
+/// Produces a stable timestamp for task-derived index payloads.
+///
+/// Wall-clock time makes a replay produce different segment, proof, watch, and
+/// diagnostic bytes. This maps immutable build inputs into a bounded RFC3339
+/// range while retaining deterministic divergence detection.
+pub(crate) fn deterministic_index_publication_nanos(
+    index_scope: &str,
+    publication_kind: &str,
+    generation: u64,
+    source_cursor: u128,
+    content_digest: &str,
+) -> i64 {
+    let mut input = Vec::new();
+    let generation = generation.to_string();
+    let source_cursor = source_cursor.to_string();
+    for part in [
+        index_scope,
+        publication_kind,
+        &generation,
+        &source_cursor,
+        content_digest,
+    ] {
+        input.extend_from_slice(part.as_bytes());
+        input.push(0);
+    }
+    let hash = blake3::hash(&input);
+    let mut prefix = [0_u8; 8];
+    prefix.copy_from_slice(&hash.as_bytes()[..8]);
+    let nanos = DETERMINISTIC_TIME_BASE_NANOS
+        + u64::from_be_bytes(prefix) % DETERMINISTIC_TIME_WINDOW_NANOS;
+    i64::try_from(nanos).expect("bounded deterministic index timestamp fits i64")
+}
+
+pub(crate) fn deterministic_index_mutation_id(
+    index_scope: &str,
+    publication_kind: &str,
+    generation: u64,
+    source_cursor: u128,
+    content_digest: &str,
+) -> [u8; 16] {
+    let mut input = Vec::new();
+    let generation = generation.to_string();
+    let source_cursor = source_cursor.to_string();
+    for part in [
+        index_scope,
+        publication_kind,
+        &generation,
+        &source_cursor,
+        content_digest,
+    ] {
+        input.extend_from_slice(part.as_bytes());
+        input.push(0);
+    }
+    let hash = blake3::hash(&input);
+    let mut mutation_id = [0_u8; 16];
+    mutation_id.copy_from_slice(&hash.as_bytes()[..16]);
+    mutation_id
+}
+
+pub async fn latest_index_segment_coremeta_record(
     storage: &Storage,
     index_id: &str,
 ) -> Result<Option<IndexSegmentCoreMetaRecord>> {
-    latest_index_segment_coremeta_record_matching(storage, index_id, None)
+    latest_index_segment_coremeta_record_matching(storage, index_id, None).await
 }
 
-pub fn latest_index_segment_coremeta_record_for_family(
+pub async fn latest_index_segment_coremeta_record_for_family(
     storage: &Storage,
     index_id: &str,
     writer_family: &str,
 ) -> Result<Option<IndexSegmentCoreMetaRecord>> {
-    latest_index_segment_coremeta_record_matching(storage, index_id, Some(writer_family))
+    latest_index_segment_coremeta_record_matching(storage, index_id, Some(writer_family)).await
 }
 
-pub fn index_segment_coremeta_record_for_family_generation(
+pub async fn index_segment_coremeta_record_for_family_generation(
     storage: &Storage,
     index_id: &str,
     writer_family: &str,
     generation: u64,
 ) -> Result<Option<IndexSegmentCoreMetaRecord>> {
-    let mut selected = None;
-    for record in list_index_segment_coremeta_records(storage, index_id)? {
-        if record.writer_family != writer_family || record.generation != generation {
-            continue;
-        }
-        if selected
-            .as_ref()
-            .is_none_or(|current: &IndexSegmentCoreMetaRecord| {
-                record.created_at_unix_nanos > current.created_at_unix_nanos
-            })
-        {
-            selected = Some(record);
-        }
+    let store = CoreStore::new(storage.clone()).await?;
+    let record = read_index_segment_point(
+        &store,
+        &index_segment_generation_tuple_key(index_id, writer_family, generation)?,
+    )?;
+    if record.as_ref().is_some_and(|record| {
+        record.index_id != index_id
+            || record.writer_family != writer_family
+            || record.generation != generation
+    }) {
+        bail!("CoreMeta index segment generation point row scope mismatch");
     }
-    Ok(selected)
+    Ok(record)
 }
 
-fn latest_index_segment_coremeta_record_matching(
+async fn latest_index_segment_coremeta_record_matching(
     storage: &Storage,
     index_id: &str,
     writer_family: Option<&str>,
 ) -> Result<Option<IndexSegmentCoreMetaRecord>> {
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
-    let prefix = index_segment_tuple_prefix(index_id)?;
-    let mut latest = None;
-    for row in meta.scan_prefix(CF_INDEX_ROWS, TABLE_INDEX_ROW, &prefix)? {
-        let record = decode_index_segment_record(&row.payload)?;
-        if record.index_id != index_id {
-            bail!("CoreMeta index segment row scope mismatch");
-        }
-        if writer_family.is_some_and(|family| record.writer_family != family) {
-            continue;
-        }
-        if latest
-            .as_ref()
-            .is_none_or(|current: &IndexSegmentCoreMetaRecord| {
-                (record.generation, record.created_at_unix_nanos)
-                    > (current.generation, current.created_at_unix_nanos)
-            })
-        {
-            latest = Some(record);
-        }
+    let tuple_prefix = match writer_family {
+        Some(writer_family) => index_segment_generation_tuple_prefix(index_id, writer_family)?,
+        None => index_segment_order_tuple_prefix(index_id)?,
+    };
+    let store = CoreStore::new(storage.clone()).await?;
+    let record = store
+        .scan_coremeta_prefix_reverse_page(CF_INDEX_ROWS, TABLE_INDEX_ROW, &tuple_prefix, None, 1)?
+        .into_iter()
+        .next()
+        .map(|row| decode_index_segment_record(&row.payload))
+        .transpose()?;
+    if record.as_ref().is_some_and(|record| {
+        record.index_id != index_id
+            || writer_family.is_some_and(|family| record.writer_family != family)
+    }) {
+        bail!("CoreMeta latest index segment point row scope mismatch");
     }
-    Ok(latest)
+    Ok(record)
 }
 
-pub fn read_index_segment_coremeta_record_by_ref(
+pub async fn read_index_segment_coremeta_record_by_ref(
     storage: &Storage,
     index_id: &str,
     segment_ref: &str,
 ) -> Result<Option<IndexSegmentCoreMetaRecord>> {
-    for record in list_index_segment_coremeta_records(storage, index_id)? {
-        if record.segment_ref == segment_ref {
-            return Ok(Some(record));
-        }
+    let store = CoreStore::new(storage.clone()).await?;
+    let record =
+        read_index_segment_point(&store, &index_segment_ref_tuple_key(index_id, segment_ref)?)?;
+    if record
+        .as_ref()
+        .is_some_and(|record| record.index_id != index_id || record.segment_ref != segment_ref)
+    {
+        bail!("CoreMeta index segment ref point row scope mismatch");
     }
-    Ok(None)
+    Ok(record)
 }
 
-pub fn list_index_segment_coremeta_records(
+pub async fn page_index_segment_coremeta_records(
     storage: &Storage,
     index_id: &str,
-) -> Result<Vec<IndexSegmentCoreMetaRecord>> {
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
+    after_tuple_key: Option<&[u8]>,
+    page_size: usize,
+) -> Result<IndexSegmentCoreMetaPage> {
+    if !(1..=INDEX_SEGMENT_COREMETA_PAGE_MAX).contains(&page_size) {
+        bail!(
+            "index segment CoreMeta page size must be between 1 and {INDEX_SEGMENT_COREMETA_PAGE_MAX}"
+        );
+    }
+    let store = CoreStore::new(storage.clone()).await?;
     let prefix = index_segment_tuple_prefix(index_id)?;
-    let mut records = meta
-        .scan_prefix(CF_INDEX_ROWS, TABLE_INDEX_ROW, &prefix)?
+    if after_tuple_key
+        .is_some_and(|cursor| cursor.len() <= prefix.len() || !cursor.starts_with(&prefix))
+    {
+        bail!("index segment CoreMeta cursor is outside the index prefix");
+    }
+    let mut rows = store.scan_coremeta_prefix_page(
+        CF_INDEX_ROWS,
+        TABLE_INDEX_ROW,
+        &prefix,
+        after_tuple_key,
+        page_size + 1,
+    )?;
+    let has_more = rows.len() > page_size;
+    if has_more {
+        rows.truncate(page_size);
+    }
+    let next_tuple_key = if has_more {
+        Some(
+            core_meta_record_tuple_key(
+                &rows
+                    .last()
+                    .ok_or_else(|| anyhow!("index segment CoreMeta page is empty"))?
+                    .key,
+            )?
+            .to_vec(),
+        )
+    } else {
+        None
+    };
+    let records = rows
         .into_iter()
-        .map(|row| decode_index_segment_record(&row.payload))
+        .map(|row| {
+            let record = decode_index_segment_record(&row.payload)?;
+            let expected_key = index_segment_tuple_key(&record)?;
+            if record.index_id != index_id
+                || core_meta_record_tuple_key(&row.key)? != expected_key.as_slice()
+            {
+                bail!("CoreMeta index segment history row scope mismatch");
+            }
+            Ok(record)
+        })
         .collect::<Result<Vec<_>>>()?;
-    records.sort_by_key(|record| (record.generation, record.created_at_unix_nanos));
-    Ok(records)
+    Ok(IndexSegmentCoreMetaPage {
+        records,
+        next_tuple_key,
+    })
+}
+
+fn read_index_segment_point(
+    store: &CoreStore,
+    tuple_key: &[u8],
+) -> Result<Option<IndexSegmentCoreMetaRecord>> {
+    store
+        .read_coremeta_row(CF_INDEX_ROWS, TABLE_INDEX_ROW, tuple_key)?
+        .map(|payload| decode_index_segment_record(&payload))
+        .transpose()
 }
 
 pub async fn write_index_definition_current_coremeta_record(
@@ -289,24 +491,29 @@ pub async fn write_index_definition_current_coremeta_record(
         kind: CoreMetaBatchOpKind::Put(&payload),
     };
     store
-        .commit_coremeta_batch_by_embedded_roots(
+        .commit_coremeta_root_groups(
             &format!(
                 "index-definition-current:{}:{}:{}",
                 record.tenant_id, record.bucket_id, record.cursor
             ),
             &[op],
+            &[crate::core_store::CoreMetaRootPublication::new(
+                index_definition_root_anchor_key(record.tenant_id, record.bucket_id),
+                crate::formats::writer::WriterFamily::TypedMetadata,
+            )],
         )
         .await?;
     Ok(())
 }
 
-pub fn read_index_definition_current_coremeta_record(
+pub async fn read_index_definition_current_coremeta_record(
     storage: &Storage,
     tenant_id: i64,
     bucket_id: i64,
     index_name: &str,
 ) -> Result<Option<IndexDefinitionCurrentCoreMetaRecord>> {
-    let Some(payload) = CoreMetaStore::open(storage.core_store_meta_path())?.get(
+    let store = CoreStore::new(storage.clone()).await?;
+    let Some(payload) = store.read_coremeta_row(
         CF_INDEX_DEFS,
         TABLE_INDEX_DEFINITION_ROW,
         &index_definition_current_tuple_key(tenant_id, bucket_id, index_name)?,
@@ -317,26 +524,6 @@ pub fn read_index_definition_current_coremeta_record(
     let record = decode_index_definition_current_record(&payload)?;
     validate_index_definition_current_scope(&record, tenant_id, bucket_id, index_name)?;
     Ok(Some(record))
-}
-
-pub fn list_index_definition_current_coremeta_records(
-    storage: &Storage,
-    tenant_id: i64,
-    bucket_id: i64,
-) -> Result<Vec<IndexDefinitionCurrentCoreMetaRecord>> {
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
-    let mut records = Vec::new();
-    for row in meta.scan_prefix(
-        CF_INDEX_DEFS,
-        TABLE_INDEX_DEFINITION_ROW,
-        &index_definition_current_tuple_prefix(tenant_id, bucket_id)?,
-    )? {
-        let record = decode_index_definition_current_record(&row.payload)?;
-        validate_index_definition_current_bucket_scope(&record, tenant_id, bucket_id)?;
-        records.push(record);
-    }
-    records.sort_by(|left, right| left.index_name.cmp(&right.index_name));
-    Ok(records)
 }
 
 pub async fn write_index_definition_state_coremeta_record(
@@ -355,23 +542,28 @@ pub async fn write_index_definition_state_coremeta_record(
         kind: CoreMetaBatchOpKind::Put(&payload),
     };
     store
-        .commit_coremeta_batch_by_embedded_roots(
+        .commit_coremeta_root_groups(
             &format!(
                 "index-definition-state:{}:{}:{}",
                 record.tenant_id, record.bucket_id, record.latest_cursor
             ),
             &[op],
+            &[crate::core_store::CoreMetaRootPublication::new(
+                index_definition_root_anchor_key(record.tenant_id, record.bucket_id),
+                crate::formats::writer::WriterFamily::TypedMetadata,
+            )],
         )
         .await?;
     Ok(())
 }
 
-pub fn read_index_definition_state_coremeta_record(
+pub async fn read_index_definition_state_coremeta_record(
     storage: &Storage,
     tenant_id: i64,
     bucket_id: i64,
 ) -> Result<Option<IndexDefinitionStateCoreMetaRecord>> {
-    let Some(payload) = CoreMetaStore::open(storage.core_store_meta_path())?.get(
+    let store = CoreStore::new(storage.clone()).await?;
+    let Some(payload) = store.read_coremeta_row(
         CF_INDEX_DEFS,
         TABLE_INDEX_DEFINITION_ROW,
         &index_definition_state_tuple_key(tenant_id, bucket_id)?,
@@ -638,15 +830,6 @@ fn index_segment_root_key_hash(index_id: &str) -> String {
     core_meta_root_key_hash(&format!("index/{index_id}/segments"))
 }
 
-fn index_definition_current_tuple_prefix(tenant_id: i64, bucket_id: i64) -> Result<Vec<u8>> {
-    validate_index_definition_scope(tenant_id, bucket_id)?;
-    core_meta_tuple_key(&[
-        CoreMetaTuplePart::Utf8("index_definition_current"),
-        CoreMetaTuplePart::I64(tenant_id),
-        CoreMetaTuplePart::I64(bucket_id),
-    ])
-}
-
 fn index_definition_current_tuple_key(
     tenant_id: i64,
     bucket_id: i64,
@@ -674,53 +857,79 @@ fn index_definition_state_tuple_key(tenant_id: i64, bucket_id: i64) -> Result<Ve
 }
 
 fn index_segment_tuple_prefix(index_id: &str) -> Result<Vec<u8>> {
-    tuple_key(&[TuplePart::Str("index_segment"), TuplePart::Str(index_id)])
-}
-
-fn index_segment_tuple_key(record: &IndexSegmentCoreMetaRecord) -> Result<Vec<u8>> {
-    tuple_key(&[
-        TuplePart::Str("index_segment"),
-        TuplePart::Str(&record.index_id),
-        TuplePart::Str(&record.index_kind),
-        TuplePart::U64(record.generation),
-        TuplePart::Str(&record.segment_hash),
+    require_nonempty(index_id, "index_id")?;
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("index_segment"),
+        CoreMetaTuplePart::Utf8(index_id),
     ])
 }
 
-enum TuplePart<'a> {
-    Str(&'a str),
-    U64(u64),
+fn index_segment_tuple_key(record: &IndexSegmentCoreMetaRecord) -> Result<Vec<u8>> {
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("index_segment"),
+        CoreMetaTuplePart::Utf8(&record.index_id),
+        CoreMetaTuplePart::Utf8(&record.index_kind),
+        CoreMetaTuplePart::U64(record.generation),
+        CoreMetaTuplePart::Utf8(&record.segment_hash),
+    ])
 }
 
-fn tuple_key(parts: &[TuplePart<'_>]) -> Result<Vec<u8>> {
-    if parts.len() > u16::MAX as usize {
-        bail!("CoreMeta tuple key has too many parts");
-    }
-    let mut out = Vec::new();
-    out.extend_from_slice(&(parts.len() as u16).to_le_bytes());
-    for part in parts {
-        match part {
-            TuplePart::Str(value) => {
-                if value.as_bytes().contains(&0) {
-                    bail!("CoreMeta tuple string part contains NUL");
-                }
-                push_tuple_part(&mut out, 0x01, value.as_bytes())?;
-            }
-            TuplePart::U64(value) => push_tuple_part(&mut out, 0x03, &value.to_le_bytes())?,
-        }
-    }
-    Ok(out)
+fn index_segment_order_tuple_prefix(index_id: &str) -> Result<Vec<u8>> {
+    require_nonempty(index_id, "index_id")?;
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("index_segment_order"),
+        CoreMetaTuplePart::Utf8(index_id),
+    ])
 }
 
-fn push_tuple_part(out: &mut Vec<u8>, kind: u8, value: &[u8]) -> Result<()> {
-    if value.len() > u16::MAX as usize {
-        return Err(anyhow!("CoreMeta tuple part exceeds u16 length"));
+fn index_segment_order_tuple_key(record: &IndexSegmentCoreMetaRecord) -> Result<Vec<u8>> {
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("index_segment_order"),
+        CoreMetaTuplePart::Utf8(&record.index_id),
+        CoreMetaTuplePart::U64(record.generation),
+        CoreMetaTuplePart::U64(record.created_at_unix_nanos),
+        CoreMetaTuplePart::Utf8(&record.writer_family),
+        CoreMetaTuplePart::Hash(&record.segment_hash),
+    ])
+}
+
+fn index_segment_generation_tuple_prefix(index_id: &str, writer_family: &str) -> Result<Vec<u8>> {
+    require_nonempty(index_id, "index_id")?;
+    require_nonempty(writer_family, "writer_family")?;
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("index_segment_generation"),
+        CoreMetaTuplePart::Utf8(index_id),
+        CoreMetaTuplePart::Utf8(writer_family),
+    ])
+}
+
+fn index_segment_generation_tuple_key(
+    index_id: &str,
+    writer_family: &str,
+    generation: u64,
+) -> Result<Vec<u8>> {
+    require_nonempty(index_id, "index_id")?;
+    require_nonempty(writer_family, "writer_family")?;
+    if generation == 0 {
+        bail!("index segment generation must be nonzero");
     }
-    out.push(kind);
-    out.push(0);
-    out.extend_from_slice(&(value.len() as u16).to_le_bytes());
-    out.extend_from_slice(value);
-    Ok(())
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("index_segment_generation"),
+        CoreMetaTuplePart::Utf8(index_id),
+        CoreMetaTuplePart::Utf8(writer_family),
+        CoreMetaTuplePart::U64(generation),
+    ])
+}
+
+fn index_segment_ref_tuple_key(index_id: &str, segment_ref: &str) -> Result<Vec<u8>> {
+    require_nonempty(index_id, "index_id")?;
+    require_nonempty(segment_ref, "segment_ref")?;
+    let ref_hash = format!("sha256:{}", sha256_hex(segment_ref.as_bytes()));
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("index_segment_ref"),
+        CoreMetaTuplePart::Utf8(index_id),
+        CoreMetaTuplePart::Hash(&ref_hash),
+    ])
 }
 
 fn validate_hex32(value: &str, field: &'static str) -> Result<()> {

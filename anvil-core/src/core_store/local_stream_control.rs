@@ -1,6 +1,7 @@
 #[path = "control_record_proto.rs"]
 pub(in crate::core_store::local) mod control_record_proto;
 
+use super::local_transaction_visibility::StreamWatchVisibility;
 use super::local_tx_rows::borrow_owned_coremeta_batch_ops;
 use super::*;
 use crate::formats::{
@@ -22,6 +23,13 @@ struct CoreControlCurrentRowProto {
     payload_hash: String,
 }
 
+fn validate_stream_page_limit(limit: usize) -> Result<()> {
+    if !(1..=CORE_META_MAX_SCAN_PAGE_ROWS).contains(&limit) {
+        bail!("CoreStore stream page limit must be between 1 and {CORE_META_MAX_SCAN_PAGE_ROWS}");
+    }
+    Ok(())
+}
+
 impl CoreStore {
     pub async fn put_boundary_schema(
         &self,
@@ -37,24 +45,39 @@ impl CoreStore {
             schema.created_at = now_rfc3339();
         }
 
-        let _guard = self.write_lock.lock().await;
+        let _schema_guard = self
+            .acquire_named_lock("boundary-schema", &schema.bucket)
+            .await?;
         let current_schema = self.read_latest_boundary_schema_unlocked(&schema.bucket)?;
         validate_boundary_schema(&schema, current_schema.as_ref(), input.expected_generation)?;
 
         let bytes = encode_boundary_schema_record(&schema)?;
         let schema_hash = format!("sha256:{}", sha256_hex(&bytes));
         let schema_key = boundary_schema_coremeta_key(&schema.bucket, schema.generation)?;
-        self.commit_coremeta_batch_by_embedded_roots(
-            &format!("boundary-schema:{}:{}", schema.bucket, schema.generation),
-            &[CoreMetaBatchOp {
+        let current_key = boundary_schema_current_coremeta_key(&schema.bucket)?;
+        let transaction_id = format!("boundary-schema:{}:{}", schema.bucket, schema.generation);
+        let operations = [
+            CoreMetaBatchOp {
                 cf: CF_BOUNDARY,
                 table_id: TABLE_BOUNDARY_SCHEMA_ROW,
                 tuple_key: &schema_key,
                 common: None,
                 kind: CoreMetaBatchOpKind::Put(&bytes),
-            }],
-        )
-        .await?;
+            },
+            CoreMetaBatchOp {
+                cf: CF_BOUNDARY,
+                table_id: TABLE_BOUNDARY_SCHEMA_CURRENT_ROW,
+                tuple_key: &current_key,
+                common: None,
+                kind: CoreMetaBatchOpKind::Put(&bytes),
+            },
+        ];
+        let publications = [coordinated_root_publication(
+            boundary_root_anchor_key(&schema.bucket),
+            WriterFamily::TypedMetadata,
+        )];
+        self.commit_coremeta_root_groups(&transaction_id, &operations, &publications)
+            .await?;
 
         Ok(BoundarySchemaReceipt {
             bucket: schema.bucket,
@@ -82,14 +105,17 @@ impl CoreStore {
             schema.created_at = now_rfc3339();
         }
 
-        let (bytes, schema_hash, schema_key) = {
-            let _guard = self.write_lock.lock().await;
+        let (bytes, schema_hash, schema_key, current_key) = {
+            let _schema_guard = self
+                .acquire_named_lock("boundary-schema", &schema.bucket)
+                .await?;
             let current_schema = self.read_latest_boundary_schema_unlocked(&schema.bucket)?;
             validate_boundary_schema(&schema, current_schema.as_ref(), input.expected_generation)?;
             let bytes = encode_boundary_schema_record(&schema)?;
             let schema_hash = format!("sha256:{}", sha256_hex(&bytes));
             let schema_key = boundary_schema_coremeta_key(&schema.bucket, schema.generation)?;
-            (bytes, schema_hash, schema_key)
+            let current_key = boundary_schema_current_coremeta_key(&schema.bucket)?;
+            (bytes, schema_hash, schema_key, current_key)
         };
         self.stage_coremeta_put_in_transaction(
             transaction_id,
@@ -97,6 +123,18 @@ impl CoreStore {
             CF_BOUNDARY,
             TABLE_BOUNDARY_SCHEMA_ROW,
             schema_key,
+            bytes.clone(),
+            None,
+            true,
+            false,
+        )
+        .await?;
+        self.stage_coremeta_put_in_transaction(
+            transaction_id,
+            principal,
+            CF_BOUNDARY,
+            TABLE_BOUNDARY_SCHEMA_CURRENT_ROW,
+            current_key,
             bytes,
             None,
             true,
@@ -124,9 +162,7 @@ impl CoreStore {
     ) -> Result<Option<CoreBoundarySchema>> {
         validate_logical_id(bucket, "boundary schema bucket")?;
         let key = boundary_schema_coremeta_key(bucket, generation)?;
-        let Some(bytes) = self
-            .meta
-            .get(CF_BOUNDARY, TABLE_BOUNDARY_SCHEMA_ROW, &key)?
+        let Some(bytes) = self.read_coremeta_row(CF_BOUNDARY, TABLE_BOUNDARY_SCHEMA_ROW, &key)?
         else {
             return Ok(None);
         };
@@ -161,7 +197,11 @@ impl CoreStore {
     ) -> Result<()> {
         validate_logical_id(bucket, "boundary value bucket")?;
         validate_logical_id(object_ref, "boundary value object ref")?;
-        let _guard = self.write_lock.lock().await;
+        if values.is_empty() {
+            return Ok(());
+        }
+        let lock_id = format!("{bucket}:{}", sha256_hex(object_ref.as_bytes()));
+        let _values_guard = self.acquire_named_lock("boundary-values", &lock_id).await?;
         let mut keys = Vec::with_capacity(values.len());
         let mut rows = Vec::with_capacity(values.len());
         for value in values {
@@ -184,9 +224,14 @@ impl CoreStore {
                 kind: CoreMetaBatchOpKind::Put(row),
             })
             .collect::<Vec<_>>();
-        self.commit_coremeta_batch_by_embedded_roots(
+        let publications = [coordinated_root_publication(
+            boundary_root_anchor_key(bucket),
+            WriterFamily::TypedMetadata,
+        )];
+        self.commit_coremeta_root_groups(
             &Self::boundary_values_transaction_id(bucket, object_ref),
             &ops,
+            &publications,
         )
         .await?;
         Ok(())
@@ -204,27 +249,19 @@ impl CoreStore {
         bucket: &str,
     ) -> Result<Option<CoreBoundarySchema>> {
         validate_logical_id(bucket, "boundary schema bucket")?;
-        let prefix = boundary_schema_coremeta_prefix(bucket)?;
-        let mut latest = None;
-        for row in self
-            .meta
-            .scan_prefix(CF_BOUNDARY, TABLE_BOUNDARY_SCHEMA_ROW, &prefix)?
-        {
-            let schema = decode_boundary_schema_record(&row.payload)?;
-            if schema.schema != CORE_BOUNDARY_SCHEMA_SCHEMA {
-                bail!("CoreStore boundary schema has invalid schema");
-            }
-            if schema.bucket != bucket {
-                bail!("CoreStore boundary schema bucket mismatch");
-            }
-            if latest
-                .as_ref()
-                .is_none_or(|current: &CoreBoundarySchema| schema.generation > current.generation)
-            {
-                latest = Some(schema);
-            }
+        let Some(bytes) = self.read_coremeta_row(
+            CF_BOUNDARY,
+            TABLE_BOUNDARY_SCHEMA_CURRENT_ROW,
+            &boundary_schema_current_coremeta_key(bucket)?,
+        )?
+        else {
+            return Ok(None);
+        };
+        let schema = decode_boundary_schema_record(&bytes)?;
+        if schema.schema != CORE_BOUNDARY_SCHEMA_SCHEMA || schema.bucket != bucket {
+            bail!("CoreStore current boundary schema row has invalid scope");
         }
-        Ok(latest)
+        Ok(Some(schema))
     }
 
     pub async fn append_stream(&self, input: AppendStreamRecord) -> Result<StreamAppendReceipt> {
@@ -250,8 +287,75 @@ impl CoreStore {
             crate::perf::guard("anvil_core_store_op", &[("operation", "append_stream")]);
         validate_logical_id(&input.stream_id, "stream id")?;
         validate_logical_id(&input.partition_id, "partition id")?;
+        if let Some(transaction_id) = input.transaction_id.clone() {
+            let transaction = self
+                .read_transaction_unlocked(&transaction_id)
+                .await?
+                .ok_or_else(|| anyhow!("TransactionNotFound"))?;
+            let principal = if authenticated_principal.is_empty() {
+                transaction.committed_by_principal.clone()
+            } else {
+                authenticated_principal
+            };
+            if transaction.committed_by_principal != principal {
+                bail!("TransactionPrincipalMismatch");
+            }
+            let mut writer_families = transaction.writer_families.clone();
+            writer_families.push(WriterFamily::Stream.as_str().to_string());
+            writer_families.push(WriterFamily::CoreControl.as_str().to_string());
+            writer_families.sort();
+            writer_families.dedup();
+            let receipt = self
+                .stage_explicit_transaction_batch(CoreMutationBatch {
+                    transaction_id,
+                    scope_partition: transaction.scope_partition,
+                    committed_by_principal: principal,
+                    root_publications: vec![CoreMutationRootPublication {
+                        root_anchor_key: input.partition_id.clone(),
+                        writer_families,
+                        transaction_coordinator: true,
+                    }],
+                    preconditions: input
+                        .fence
+                        .as_ref()
+                        .map(|fence| CoreMutationPrecondition::Fence {
+                            fence_name: fence.fence_name.clone(),
+                            fence_token: fence.fence_token,
+                        })
+                        .into_iter()
+                        .collect(),
+                    operations: vec![CoreMutationOperation::StreamAppend {
+                        partition_id: input.partition_id,
+                        stream_id: input.stream_id.clone(),
+                        record_kind: input.record_kind,
+                        payload: input.payload,
+                        idempotency_key: input.idempotency_key,
+                    }],
+                })
+                .await?;
+            let update = receipt
+                .visible_updates
+                .into_iter()
+                .find_map(|update| match update {
+                    CoreTransactionUpdate::StreamAppend {
+                        stream_id,
+                        visible_sequence,
+                        prepared_record_hash,
+                        ..
+                    } if stream_id == input.stream_id => Some(StreamAppendReceipt {
+                        stream_id,
+                        sequence: visible_sequence,
+                        cursor: format!("{}:{visible_sequence:020}", input.stream_id),
+                        event_hash: prepared_record_hash,
+                        idempotent_replay: false,
+                    }),
+                    _ => None,
+                })
+                .ok_or_else(|| anyhow!("CoreStore staged stream append produced no receipt"))?;
+            return Ok(update);
+        }
+        let stream_id = input.stream_id.clone();
         let _stream_guard = self.acquire_named_lock("stream", &input.stream_id).await?;
-        let _guard = self.write_lock.lock().await;
         if let Some(receipt) = self
             .stream_idempotent_replay_unlocked(&input, &authenticated_principal)
             .await?
@@ -300,6 +404,7 @@ impl CoreStore {
                     result,
                 )
                 .await?;
+                self.storage.notify_stream(&stream_id);
                 Ok(outcome.receipt)
             }
             Err(error) => {
@@ -311,11 +416,6 @@ impl CoreStore {
         }
     }
 
-    pub(crate) async fn read_raw_stream(&self, stream_id: &str) -> Result<Vec<StreamRecord>> {
-        validate_logical_id(stream_id, "stream id")?;
-        self.read_all_stream_records(stream_id).await
-    }
-
     pub(crate) async fn read_raw_stream_record(
         &self,
         stream_id: &str,
@@ -323,11 +423,11 @@ impl CoreStore {
         event_hash: &str,
     ) -> Result<Option<StreamRecord>> {
         validate_logical_id(stream_id, "stream id")?;
+        validate_hash(event_hash, "stream event hash")?;
         Ok(self
-            .read_all_stream_records(stream_id)
+            .read_stream_record_from_meta(stream_id, sequence)
             .await?
-            .into_iter()
-            .find(|record| record.sequence == sequence && record.event_hash == event_hash))
+            .filter(|record| record.event_hash == event_hash))
     }
 
     pub(crate) async fn raw_stream_head(&self, stream_id: &str) -> Result<(u64, String)> {
@@ -413,12 +513,15 @@ impl CoreStore {
         sequence: u64,
     ) -> Result<()> {
         let key = stream_record_key(stream_id, sequence);
+        // Corruption tests intentionally bypass publication filtering to alter
+        // the physical row whose integrity checks are under test.
         let Some(bytes) = self
             .meta
             .get(CF_STREAM_RECORDS, TABLE_STREAM_RECORD_INDEX_ROW, &key)?
         else {
             bail!("CoreStore stream record metadata row not found");
         };
+        let common = core_meta_row_common_from_payload(&bytes)?;
         let mut record = decode_stream_record_index_row(&bytes)?;
         if record.payload_hash.len() < "sha256:".len() + 1 {
             bail!("CoreStore stream record payload hash is invalid");
@@ -434,7 +537,7 @@ impl CoreStore {
             CF_STREAM_RECORDS,
             TABLE_STREAM_RECORD_INDEX_ROW,
             &key,
-            &encode_stream_record_index_row(&record)?,
+            &encode_stream_record_index_row(&record, common)?,
         )?;
         Ok(())
     }
@@ -483,6 +586,10 @@ impl CoreStore {
         idempotency_key_hash: Option<String>,
         authenticated_principal: String,
     ) -> Result<StreamAppendOutcome> {
+        if input.transaction_id.is_none() {
+            self.resume_pending_direct_stream_publication_unlocked(&input.stream_id)
+                .await?;
+        }
         let prepared = self
             .prepare_stream_append_unlocked_with_idempotency_hash_for_principal(
                 input,
@@ -494,20 +601,12 @@ impl CoreStore {
             return Ok(prepared.outcome);
         }
         let ops = borrow_owned_coremeta_batch_ops(&prepared.metadata.owned_ops);
-        let metadata_commits = self
-            .commit_coremeta_batch_by_embedded_roots(&prepared.metadata.transaction_id, &ops)
-            .await?;
-        if let Some(record) = prepared
-            .record
-            .as_ref()
-            .filter(|record| record.stream_id == CORE_TRANSACTION_STREAM_ID)
-        {
-            self.write_core_transaction_stream_records(
-                std::slice::from_ref(record),
-                &metadata_commits,
-            )
-            .await?;
-        }
+        self.commit_coremeta_root_groups(
+            &prepared.metadata.transaction_id,
+            &ops,
+            &prepared.metadata.root_publications,
+        )
+        .await?;
         Ok(prepared.outcome)
     }
 
@@ -552,6 +651,7 @@ impl CoreStore {
                 metadata: PreparedStreamMetadataWrite {
                     transaction_id: String::new(),
                     owned_ops: Vec::new(),
+                    root_publications: Vec::new(),
                 },
             });
         }
@@ -569,37 +669,22 @@ impl CoreStore {
         idempotency_key_hash: Option<String>,
         authenticated_principal: String,
     ) -> Result<PreparedStreamAppend> {
-        let payload_hash = format!("sha256:{}", sha256_hex(&input.payload));
         let head = self.read_stream_head_from_meta(&input.stream_id)?;
         let (last_sequence, previous_event_hash) = head
             .as_ref()
             .map(|head| (head.last_sequence, head.last_event_hash.clone()))
             .unwrap_or_else(|| (0, ZERO_HASH.to_string()));
-        let sequence = last_sequence
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("CoreStore stream sequence overflow"))?;
-        let cursor = format!("{}:{sequence:020}", input.stream_id);
-        let mut record = StreamRecord {
-            schema: CORE_WATCH_EVENT_SCHEMA.to_string(),
-            stream_id: input.stream_id.clone(),
-            partition_id: input.partition_id,
-            sequence,
-            cursor,
-            previous_event_hash,
-            event_hash: String::new(),
-            record_kind: input.record_kind,
-            payload_hash,
-            payload: input.payload,
-            content_type: input.content_type,
-            user_metadata_json: input.user_metadata_json,
-            authenticated_principal,
-            transaction_id: input.transaction_id,
+        let stream_id = input.stream_id.clone();
+        let record = build_stream_record_after_head(
+            input,
             idempotency_key_hash,
-            created_at: now_rfc3339(),
-        };
-        record.event_hash = format!("sha256:{}", sha256_hex(&event_hash_input(&record)?));
+            authenticated_principal,
+            last_sequence,
+            previous_event_hash,
+            now_rfc3339(),
+        )?;
         let metadata = self
-            .prepare_stream_metadata_rows(&input.stream_id, std::slice::from_ref(&record))
+            .prepare_stream_metadata_rows(&stream_id, std::slice::from_ref(&record))
             .await?;
         let receipt = StreamAppendReceipt {
             stream_id: record.stream_id.clone(),
@@ -652,99 +737,86 @@ impl CoreStore {
         let head = self.read_stream_head_from_meta(stream_id)?;
         if head
             .as_ref()
-            .is_some_and(|head| head.idempotency_index_complete)
+            .is_some_and(|head| !head.idempotency_index_complete)
         {
-            let Some(bytes) = self.meta.get(
-                CF_STREAM_RECORDS,
-                TABLE_STREAM_IDEMPOTENCY_ROW,
-                &stream_idempotency_key(stream_id, idempotency_key_hash),
-            )?
-            else {
-                return Ok(None);
-            };
-            let existing = decode_stream_idempotency_row(&bytes)?;
-            if existing.schema != "anvil.core.stream_idempotency.v1"
-                || existing.stream_id != stream_id
-                || existing.idempotency_key_hash != idempotency_key_hash
-            {
-                bail!("CoreStore stream idempotency index row has invalid key scope");
-            }
-            return self
-                .stream_idempotent_receipt_from_idempotency_row_unlocked(
-                    stream_id,
-                    &payload_hash,
-                    idempotency_key_hash,
-                    transaction_id,
-                    authenticated_principal,
-                    existing,
-                )
-                .await;
+            bail!("CoreStore stream head is missing its required idempotency projection");
         }
-        // Streams created before the direct idempotency index retain the
-        // historical lookup path. New streams never pay this scan cost.
-        let head_sequence = head.map(|head| head.last_sequence);
-        if let Some(sequence) = head_sequence
-            && let Some(bytes) = self.meta.get(
-                CF_STREAM_RECORDS,
-                TABLE_STREAM_RECORD_INDEX_ROW,
-                &stream_record_key(stream_id, sequence),
-            )?
+        let Some(bytes) = self.read_coremeta_row(
+            CF_STREAM_RECORDS,
+            TABLE_STREAM_IDEMPOTENCY_ROW,
+            &stream_idempotency_key(stream_id, idempotency_key_hash),
+        )?
+        else {
+            return Ok(None);
+        };
+        let existing = decode_stream_idempotency_row(&bytes)?;
+        if existing.schema != "anvil.core.stream_idempotency.v1"
+            || existing.stream_id != stream_id
+            || existing.idempotency_key_hash != idempotency_key_hash
         {
-            let existing = decode_stream_record_index_row(&bytes)?;
-            validate_stream_record_index_row_metadata(stream_id, &existing)?;
-            if let Some(existing) = StoredStreamIdempotencyRow::from_record_index(&existing) {
-                if let Some(receipt) = self
-                    .stream_idempotent_receipt_from_idempotency_row_unlocked(
-                        stream_id,
-                        &payload_hash,
-                        idempotency_key_hash,
-                        transaction_id,
-                        authenticated_principal,
-                        existing,
-                    )
-                    .await?
-                {
-                    return Ok(Some(receipt));
-                }
-            }
+            bail!("CoreStore stream idempotency index row has invalid key scope");
         }
-        const REPLAY_SCAN_BATCH_SIZE: u64 = 256;
-        let mut end_sequence = head_sequence.unwrap_or_default().saturating_sub(1);
-        while end_sequence > 0 {
-            let start_sequence = end_sequence
-                .saturating_sub(REPLAY_SCAN_BATCH_SIZE - 1)
-                .max(1);
-            for item in self.meta.scan_range_reverse(
-                CF_STREAM_RECORDS,
-                TABLE_STREAM_RECORD_INDEX_ROW,
-                &stream_record_key(stream_id, start_sequence),
-                &stream_record_key(stream_id, end_sequence),
-                REPLAY_SCAN_BATCH_SIZE as usize,
-            )? {
-                let existing = decode_stream_record_index_row(&item.payload)?;
-                validate_stream_record_index_row_metadata(stream_id, &existing)?;
-                if let Some(existing) = StoredStreamIdempotencyRow::from_record_index(&existing) {
-                    if let Some(receipt) = self
-                        .stream_idempotent_receipt_from_idempotency_row_unlocked(
-                            stream_id,
-                            &payload_hash,
-                            idempotency_key_hash,
-                            transaction_id,
-                            authenticated_principal,
-                            existing,
-                        )
-                        .await?
-                    {
-                        return Ok(Some(receipt));
-                    }
-                }
-            }
-            if start_sequence == 1 {
-                break;
-            }
-            end_sequence = start_sequence - 1;
+        self.stream_idempotent_receipt_from_idempotency_row_unlocked(
+            stream_id,
+            &payload_hash,
+            idempotency_key_hash,
+            transaction_id,
+            authenticated_principal,
+            existing,
+        )
+        .await
+    }
+
+    pub async fn read_stream_record_by_idempotency_key(
+        &self,
+        stream_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<StreamRecord>> {
+        validate_logical_id(stream_id, "stream id")?;
+        if idempotency_key.is_empty() {
+            bail!("CoreStore stream idempotency key must not be empty");
         }
-        Ok(None)
+        let Some(head) = self.read_stream_head_from_meta(stream_id)? else {
+            return Ok(None);
+        };
+        if !head.idempotency_index_complete {
+            bail!("CoreStore stream head is missing its required idempotency projection");
+        }
+        let idempotency_key_hash = format!("sha256:{}", sha256_hex(idempotency_key.as_bytes()));
+        let Some(bytes) = self.read_coremeta_row(
+            CF_STREAM_RECORDS,
+            TABLE_STREAM_IDEMPOTENCY_ROW,
+            &stream_idempotency_key(stream_id, &idempotency_key_hash),
+        )?
+        else {
+            return Ok(None);
+        };
+        let indexed = decode_stream_idempotency_row(&bytes)?;
+        if indexed.schema != "anvil.core.stream_idempotency.v1"
+            || indexed.stream_id != stream_id
+            || indexed.idempotency_key_hash != idempotency_key_hash
+        {
+            bail!("CoreStore stream idempotency index row has invalid key scope");
+        }
+        let records = self
+            .read_stream_records_from_meta_range(
+                stream_id,
+                indexed.sequence.saturating_sub(1),
+                indexed.sequence,
+                1,
+            )
+            .await?;
+        let mut visible = self.filter_committed_stream_records(records).await?;
+        let Some(record) = visible.pop() else {
+            return Ok(None);
+        };
+        if record.sequence != indexed.sequence
+            || record.event_hash != indexed.event_hash
+            || record.idempotency_key_hash.as_deref() != Some(idempotency_key_hash.as_str())
+        {
+            bail!("CoreStore stream idempotency projection target mismatch");
+        }
+        Ok(Some(record))
     }
 
     async fn stream_idempotent_receipt_from_idempotency_row_unlocked(
@@ -774,6 +846,7 @@ impl CoreStore {
                                     stream_id: visible_stream_id,
                                     visible_sequence,
                                     prepared_record_hash,
+                                    ..
                                 } if visible_stream_id == &existing.stream_id
                                     && *visible_sequence == existing.sequence
                                     && prepared_record_hash == &existing.event_hash
@@ -809,10 +882,113 @@ impl CoreStore {
         let _perf_guard =
             crate::perf::guard("anvil_core_store_op", &[("operation", "read_stream")]);
         validate_logical_id(&input.stream_id, "stream id")?;
+        validate_stream_page_limit(input.limit)?;
         let records = self
             .read_stream_records_after(&input.stream_id, input.after_sequence, input.limit)
             .await?;
         self.filter_committed_stream_records(records).await
+    }
+
+    pub async fn stream_head_sequence(&self, stream_id: &str) -> Result<u64> {
+        validate_logical_id(stream_id, "stream id")?;
+        Ok(self
+            .read_stream_head_from_meta(stream_id)?
+            .map(|head| head.last_sequence)
+            .unwrap_or_default())
+    }
+
+    pub(crate) async fn stream_head_precondition(
+        &self,
+        stream_id: &str,
+    ) -> Result<CoreMutationPrecondition> {
+        self.stream_head_precondition_visible_to_transaction(stream_id, None)
+            .await
+    }
+
+    pub(crate) async fn stream_head_precondition_visible_to_transaction(
+        &self,
+        stream_id: &str,
+        transaction: Option<&CoreTransaction>,
+    ) -> Result<CoreMutationPrecondition> {
+        validate_logical_id(stream_id, "stream id")?;
+        let (expected_last_sequence, expected_last_event_hash) =
+            self.stream_head_visible_to_transaction_unlocked(stream_id, transaction)?;
+        Ok(CoreMutationPrecondition::StreamHead {
+            stream_id: stream_id.to_string(),
+            expected_last_sequence,
+            expected_last_event_hash,
+        })
+    }
+
+    pub(super) fn stream_head_visible_to_transaction_unlocked(
+        &self,
+        stream_id: &str,
+        transaction: Option<&CoreTransaction>,
+    ) -> Result<(u64, String)> {
+        let committed_head = self
+            .read_stream_head_from_meta(stream_id)?
+            .map(|head| (head.last_sequence, head.last_event_hash))
+            .unwrap_or_else(|| (0, ZERO_HASH.to_string()));
+        let Some(transaction) = transaction else {
+            return Ok(committed_head);
+        };
+        transaction
+            .visible_updates
+            .iter()
+            .rev()
+            .find_map(|update| match update {
+                CoreTransactionUpdate::StreamAppend {
+                    stream_id: update_stream_id,
+                    visible_sequence,
+                    prepared_record_hash,
+                    ..
+                } if update_stream_id == stream_id => {
+                    Some((*visible_sequence, prepared_record_hash.clone()))
+                }
+                _ => None,
+            })
+            .map_or(Ok(committed_head), Ok)
+    }
+
+    pub async fn read_stream_page(&self, input: ReadStream) -> Result<ReadStreamPage> {
+        let _perf_guard =
+            crate::perf::guard("anvil_core_store_op", &[("operation", "read_stream_page")]);
+        validate_logical_id(&input.stream_id, "stream id")?;
+        validate_stream_page_limit(input.limit)?;
+
+        let snapshot_head = self.stream_head_sequence(&input.stream_id).await?;
+        let source_records = self
+            .read_stream_records_after(&input.stream_id, input.after_sequence, input.limit)
+            .await?;
+        let source_has_more = source_records
+            .last()
+            .map(|record| record.sequence < snapshot_head)
+            .unwrap_or(snapshot_head > input.after_sequence);
+
+        let mut records = Vec::with_capacity(source_records.len());
+        let mut next_sequence = input.after_sequence;
+        let mut stopped_on_pending = false;
+        for record in source_records {
+            match self.stream_record_watch_visibility(&record).await? {
+                StreamWatchVisibility::Visible => {
+                    next_sequence = record.sequence;
+                    records.push(record);
+                }
+                StreamWatchVisibility::TerminalInvisible => {
+                    next_sequence = record.sequence;
+                }
+                StreamWatchVisibility::Pending => {
+                    stopped_on_pending = true;
+                    break;
+                }
+            }
+        }
+
+        Ok(ReadStreamPage {
+            records,
+            next_sequence,
+            has_more: source_has_more || stopped_on_pending,
+        })
     }
 
     pub async fn read_stream_at_generation(
@@ -825,6 +1001,7 @@ impl CoreStore {
             &[("operation", "read_stream_at_generation")],
         );
         validate_logical_id(&input.stream_id, "stream id")?;
+        validate_stream_page_limit(input.limit)?;
         if root_generation <= input.after_sequence {
             return Ok(Vec::new());
         }
@@ -954,43 +1131,70 @@ impl CoreStore {
         Ok(records)
     }
 
-    pub async fn watch(&self, input: WatchRequest) -> Result<Vec<WatchEvent>> {
-        let stream_ids = self.list_stream_ids(&input.stream_prefix).await?;
-        let after_cursor = input.after_cursor.as_deref();
-        let mut events = Vec::new();
-        for stream_id in stream_ids {
-            for record in self
-                .filter_committed_stream_records(self.read_all_stream_records(&stream_id).await?)
-                .await?
-            {
-                if after_cursor.is_some_and(|cursor| record.cursor.as_str() <= cursor) {
-                    continue;
+    pub async fn watch(&self, input: WatchRequest) -> Result<WatchPage> {
+        if !(1..=CORE_META_MAX_SCAN_PAGE_ROWS).contains(&input.limit) {
+            bail!("CoreStore watch limit must be between 1 and {CORE_META_MAX_SCAN_PAGE_ROWS}");
+        }
+        let tuple_prefix = stream_record_prefix(&input.stream_prefix);
+        let after_key = input
+            .after_cursor
+            .as_deref()
+            .map(parse_stream_cursor)
+            .transpose()?
+            .map(|(stream_id, sequence)| {
+                if !stream_id.starts_with(&input.stream_prefix) {
+                    bail!("CoreStore watch cursor is outside the requested stream prefix");
                 }
-                events.push(WatchEvent {
-                    stream_id: record.stream_id,
-                    sequence: record.sequence,
-                    cursor: record.cursor,
-                    previous_event_hash: record.previous_event_hash,
-                    event_hash: record.event_hash,
-                    event_type: record.record_kind.clone(),
-                    record_kind: record.record_kind,
-                    payload_hash: record.payload_hash,
-                    transaction_id: record.transaction_id,
-                    created_at: record.created_at,
-                });
+                Ok(stream_record_key(&stream_id, sequence))
+            })
+            .transpose()?;
+        let rows = self.scan_coremeta_prefix_page(
+            CF_STREAM_RECORDS,
+            TABLE_STREAM_RECORD_INDEX_ROW,
+            &tuple_prefix,
+            after_key.as_deref(),
+            input.limit,
+        )?;
+        let has_pending_staged_transaction =
+            self.has_pending_transaction_stream_prefix(&input.stream_prefix)?;
+        let source_page_full = rows.len() == input.limit;
+        let mut events = Vec::with_capacity(rows.len());
+        let mut next_cursor = None;
+        let mut stopped_on_pending = false;
+        for row in rows {
+            let record = self
+                .stream_record_from_index_row(decode_stream_record_index_row(&row.payload)?)
+                .await?;
+            match self.stream_record_watch_visibility(&record).await? {
+                StreamWatchVisibility::Visible => {
+                    next_cursor = Some(record.cursor.clone());
+                    events.push(WatchEvent {
+                        stream_id: record.stream_id,
+                        sequence: record.sequence,
+                        cursor: record.cursor,
+                        previous_event_hash: record.previous_event_hash,
+                        event_hash: record.event_hash,
+                        event_type: record.record_kind.clone(),
+                        record_kind: record.record_kind,
+                        payload_hash: record.payload_hash,
+                        transaction_id: record.transaction_id,
+                        created_at: record.created_at,
+                    });
+                }
+                StreamWatchVisibility::TerminalInvisible => {
+                    next_cursor = Some(record.cursor);
+                }
+                StreamWatchVisibility::Pending => {
+                    stopped_on_pending = true;
+                    break;
+                }
             }
         }
-        events.sort_by(|left, right| {
-            (left.cursor.as_str(), left.stream_id.as_str(), left.sequence).cmp(&(
-                right.cursor.as_str(),
-                right.stream_id.as_str(),
-                right.sequence,
-            ))
-        });
-        if input.limit > 0 && events.len() > input.limit {
-            events.truncate(input.limit);
-        }
-        Ok(events)
+        Ok(WatchPage {
+            events,
+            next_cursor,
+            has_more: source_page_full || stopped_on_pending || has_pending_staged_transaction,
+        })
     }
 
     pub async fn acquire_fence(&self, input: AcquireFence) -> Result<FencedPermit> {
@@ -1012,11 +1216,19 @@ impl CoreStore {
             );
         }
 
-        let _guard = self.write_lock.lock().await;
+        let _fence_guard = self.acquire_named_lock("fence", &input.fence_name).await?;
         let row_key = core_fence_row_key(&input.fence_name)?;
+        // Fence mutation planning must compare the exact canonical row that
+        // commit will revalidate, including a concurrently staged candidate.
         let current = self
             .meta
             .get(CF_LEASES_FENCES, TABLE_CORE_FENCE_ROW, &row_key)?;
+        let current_root_generation = current
+            .as_deref()
+            .map(core_meta_row_common_from_payload)
+            .transpose()?
+            .map(|common| common.root_generation)
+            .unwrap_or(0);
         let now_ms = Utc::now().timestamp_millis();
         let current_record = match current {
             Some(bytes) => Some(decode_core_fence_record(&decode_control_current_row(
@@ -1039,6 +1251,9 @@ impl CoreStore {
             .as_ref()
             .map(|record| record.fence_token.saturating_add(1))
             .unwrap_or(1);
+        let next_root_generation = current_root_generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("CoreStore fence root generation is exhausted"))?;
         let record = CoreFenceRecord {
             schema: CORE_FENCE_SCHEMA.to_string(),
             fence_name: input.fence_name.clone(),
@@ -1047,25 +1262,29 @@ impl CoreStore {
             expires_at_ms: now_ms.saturating_add(input.ttl_ms as i64),
             updated_at: now_rfc3339(),
         };
+        let root_anchor_key = core_fence_root_anchor_key(&input.fence_name);
+        let transaction_id = format!("core-fence:{}:{next_token}", input.fence_name);
         let payload = encode_control_current_row(
             "system",
-            core_meta_root_key_hash(&format!("core-fence/{}", input.fence_name)),
-            next_token,
-            format!("core-fence:{}:{next_token}", input.fence_name),
+            core_meta_root_key_hash(&root_anchor_key),
+            next_root_generation,
+            &transaction_id,
             CORE_FENCE_SCHEMA,
             encode_core_fence_record(&record)?,
         );
-        self.commit_coremeta_batch_by_embedded_roots(
-            &format!("core-fence:{}:{next_token}", input.fence_name),
-            &[CoreMetaBatchOp {
-                cf: CF_LEASES_FENCES,
-                table_id: TABLE_CORE_FENCE_ROW,
-                tuple_key: &row_key,
-                common: None,
-                kind: CoreMetaBatchOpKind::Put(&payload),
-            }],
-        )
-        .await?;
+        let operations = [CoreMetaBatchOp {
+            cf: CF_LEASES_FENCES,
+            table_id: TABLE_CORE_FENCE_ROW,
+            tuple_key: &row_key,
+            common: None,
+            kind: CoreMetaBatchOpKind::Put(&payload),
+        }];
+        let publications = [coordinated_root_publication(
+            root_anchor_key,
+            WriterFamily::CoreControl,
+        )];
+        self.commit_coremeta_root_groups(&transaction_id, &operations, &publications)
+            .await?;
         Ok(FencedPermit {
             fence_name: record.fence_name,
             owner_principal: record.owner_principal,
@@ -1082,14 +1301,17 @@ impl CoreStore {
             &input.authenticated_principal,
             "fence authenticated principal",
         )?;
-        let _guard = self.write_lock.lock().await;
+        let _fence_guard = self.acquire_named_lock("fence", &input.fence_name).await?;
         let row_key = core_fence_row_key(&input.fence_name)?;
+        // Release is a write precondition over the exact canonical fence row,
+        // not a product read of the currently published projection.
         let Some(current) = self
             .meta
             .get(CF_LEASES_FENCES, TABLE_CORE_FENCE_ROW, &row_key)?
         else {
             bail!("CoreStore fence {} is not held", input.fence_name);
         };
+        let current_root_generation = core_meta_row_common_from_payload(&current)?.root_generation;
         let record =
             decode_core_fence_record(&decode_control_current_row(&current, CORE_FENCE_SCHEMA)?)?;
         if record.owner_principal != input.authenticated_principal
@@ -1108,31 +1330,35 @@ impl CoreStore {
             expires_at_ms: Utc::now().timestamp_millis(),
             updated_at: now_rfc3339(),
         };
+        let next_root_generation = current_root_generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("CoreStore fence root generation is exhausted"))?;
+        let root_anchor_key = core_fence_root_anchor_key(&input.fence_name);
+        let transaction_id = format!(
+            "core-fence-release:{}:{}",
+            input.fence_name, input.fence_token
+        );
         let payload = encode_control_current_row(
             "system",
-            core_meta_root_key_hash(&format!("core-fence/{}", input.fence_name)),
-            input.fence_token,
-            format!(
-                "core-fence-release:{}:{}",
-                input.fence_name, input.fence_token
-            ),
+            core_meta_root_key_hash(&root_anchor_key),
+            next_root_generation,
+            &transaction_id,
             CORE_FENCE_SCHEMA,
             encode_core_fence_record(&released)?,
         );
-        self.commit_coremeta_batch_by_embedded_roots(
-            &format!(
-                "core-fence-release:{}:{}",
-                input.fence_name, input.fence_token
-            ),
-            &[CoreMetaBatchOp {
-                cf: CF_LEASES_FENCES,
-                table_id: TABLE_CORE_FENCE_ROW,
-                tuple_key: &row_key,
-                common: None,
-                kind: CoreMetaBatchOpKind::Put(&payload),
-            }],
-        )
-        .await?;
+        let operations = [CoreMetaBatchOp {
+            cf: CF_LEASES_FENCES,
+            table_id: TABLE_CORE_FENCE_ROW,
+            tuple_key: &row_key,
+            common: None,
+            kind: CoreMetaBatchOpKind::Put(&payload),
+        }];
+        let publications = [coordinated_root_publication(
+            root_anchor_key,
+            WriterFamily::CoreControl,
+        )];
+        self.commit_coremeta_root_groups(&transaction_id, &operations, &publications)
+            .await?;
         Ok(())
     }
 
@@ -1185,26 +1411,30 @@ impl CoreStore {
         verify_root_catalog(&catalog, signing_key)?;
         let catalog_hash = hash_root_catalog(&catalog)?;
         let catalog_payload = encode_root_catalog_record(&catalog)?;
+        let root_anchor_key = root_catalog_root_anchor_key(&catalog.mesh_id);
+        let transaction_id = format!("root-catalog:{}:{}", catalog.mesh_id, catalog.generation);
         let catalog_row_payload = encode_control_current_row(
             format!("mesh/{}", catalog.mesh_id),
-            core_meta_root_key_hash(&format!("root-catalog/{}", catalog.mesh_id)),
+            core_meta_root_key_hash(&root_anchor_key),
             catalog.generation,
-            format!("root-catalog:{}:{}", catalog.mesh_id, catalog.generation),
+            &transaction_id,
             CORE_ROOT_CATALOG_SCHEMA,
             catalog_payload.clone(),
         );
         let catalog_row_key = root_catalog_row_key(&catalog.mesh_id)?;
-        self.commit_coremeta_batch_by_embedded_roots(
-            &format!("root-catalog:{}:{}", catalog.mesh_id, catalog.generation),
-            &[CoreMetaBatchOp {
-                cf: CF_MESH,
-                table_id: TABLE_ROOT_CATALOG_CURRENT_ROW,
-                tuple_key: &catalog_row_key,
-                common: None,
-                kind: CoreMetaBatchOpKind::Put(&catalog_row_payload),
-            }],
-        )
-        .await?;
+        let operations = [CoreMetaBatchOp {
+            cf: CF_MESH,
+            table_id: TABLE_ROOT_CATALOG_CURRENT_ROW,
+            tuple_key: &catalog_row_key,
+            common: None,
+            kind: CoreMetaBatchOpKind::Put(&catalog_row_payload),
+        }];
+        let publications = [coordinated_root_publication(
+            root_anchor_key,
+            WriterFamily::MeshControl,
+        )];
+        self.commit_coremeta_root_groups(&transaction_id, &operations, &publications)
+            .await?;
         let watch = self
             .append_stream(AppendStreamRecord {
                 stream_id: root_catalog_stream_id(&catalog.mesh_id),
@@ -1236,7 +1466,7 @@ impl CoreStore {
         signing_key: &[u8],
     ) -> Result<Option<CoreRootCatalog>> {
         validate_logical_id(mesh_id, "mesh id")?;
-        let Some(bytes) = self.meta.get(
+        let Some(bytes) = self.read_coremeta_row(
             CF_MESH,
             TABLE_ROOT_CATALOG_CURRENT_ROW,
             &root_catalog_row_key(mesh_id)?,
@@ -1255,20 +1485,29 @@ impl CoreStore {
         Ok(Some(catalog))
     }
 
-    pub async fn list_root_catalog_history(&self, mesh_id: &str) -> Result<Vec<CoreRootCatalog>> {
+    pub async fn list_root_catalog_history_page(
+        &self,
+        mesh_id: &str,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Result<CoreHistoryPage<CoreRootCatalog>> {
         validate_logical_id(mesh_id, "mesh id")?;
-        let records = self
-            .read_stream(ReadStream {
+        let page = self
+            .read_stream_page(ReadStream {
                 stream_id: root_catalog_stream_id(mesh_id),
-                after_sequence: 0,
-                limit: 0,
+                after_sequence,
+                limit,
             })
             .await?;
-        let mut catalogs = Vec::new();
-        for record in records {
+        let mut catalogs = Vec::with_capacity(page.records.len());
+        for record in page.records {
             catalogs.push(decode_root_catalog_record(&record.payload)?);
         }
-        Ok(catalogs)
+        Ok(CoreHistoryPage {
+            records: catalogs,
+            next_sequence: page.next_sequence,
+            has_more: page.has_more,
+        })
     }
 
     pub async fn commit_quorum_profile(
@@ -1298,32 +1537,33 @@ impl CoreStore {
 
         let profile_bytes = encode_quorum_profile_record(&profile)?;
         let profile_hash = format!("sha256:{}", sha256_hex(&profile_bytes));
+        let root_anchor_key = quorum_profile_root_anchor_key(&profile.placement_group);
+        let transaction_id = format!(
+            "quorum-profile:{}:{}",
+            profile.placement_group, profile.epoch
+        );
         let profile_row_payload = encode_control_current_row(
             format!("placement-group/{}", profile.placement_group),
-            core_meta_root_key_hash(&format!("quorum-profile/{}", profile.placement_group)),
+            core_meta_root_key_hash(&root_anchor_key),
             profile.epoch,
-            format!(
-                "quorum-profile:{}:{}",
-                profile.placement_group, profile.epoch
-            ),
+            &transaction_id,
             CORE_QUORUM_PROFILE_SCHEMA,
             profile_bytes.clone(),
         );
         let profile_row_key = quorum_profile_row_key(&profile.placement_group)?;
-        self.commit_coremeta_batch_by_embedded_roots(
-            &format!(
-                "quorum-profile:{}:{}",
-                profile.placement_group, profile.epoch
-            ),
-            &[CoreMetaBatchOp {
-                cf: CF_MESH,
-                table_id: TABLE_QUORUM_PROFILE_CURRENT_ROW,
-                tuple_key: &profile_row_key,
-                common: None,
-                kind: CoreMetaBatchOpKind::Put(&profile_row_payload),
-            }],
-        )
-        .await?;
+        let operations = [CoreMetaBatchOp {
+            cf: CF_MESH,
+            table_id: TABLE_QUORUM_PROFILE_CURRENT_ROW,
+            tuple_key: &profile_row_key,
+            common: None,
+            kind: CoreMetaBatchOpKind::Put(&profile_row_payload),
+        }];
+        let publications = [coordinated_root_publication(
+            root_anchor_key,
+            WriterFamily::MeshControl,
+        )];
+        self.commit_coremeta_root_groups(&transaction_id, &operations, &publications)
+            .await?;
         let watch = self
             .append_stream(AppendStreamRecord {
                 stream_id: quorum_profile_stream_id(&profile.placement_group),
@@ -1355,7 +1595,7 @@ impl CoreStore {
         placement_group: &str,
     ) -> Result<Option<CoreQuorumProfile>> {
         validate_logical_id(placement_group, "placement group")?;
-        let Some(bytes) = self.meta.get(
+        let Some(bytes) = self.read_coremeta_row(
             CF_MESH,
             TABLE_QUORUM_PROFILE_CURRENT_ROW,
             &quorum_profile_row_key(placement_group)?,
@@ -1374,20 +1614,22 @@ impl CoreStore {
         Ok(Some(profile))
     }
 
-    pub async fn list_quorum_profile_history(
+    pub async fn list_quorum_profile_history_page(
         &self,
         placement_group: &str,
-    ) -> Result<Vec<CoreQuorumProfile>> {
+        after_sequence: u64,
+        limit: usize,
+    ) -> Result<CoreHistoryPage<CoreQuorumProfile>> {
         validate_logical_id(placement_group, "placement group")?;
-        let records = self
-            .read_stream(ReadStream {
+        let page = self
+            .read_stream_page(ReadStream {
                 stream_id: quorum_profile_stream_id(placement_group),
-                after_sequence: 0,
-                limit: 0,
+                after_sequence,
+                limit,
             })
             .await?;
-        let mut profiles = Vec::new();
-        for record in records {
+        let mut profiles = Vec::with_capacity(page.records.len());
+        for record in page.records {
             let profile = decode_quorum_profile_record(&record.payload)?;
             validate_quorum_profile(&profile)?;
             if profile.placement_group != placement_group {
@@ -1395,7 +1637,11 @@ impl CoreStore {
             }
             profiles.push(profile);
         }
-        Ok(profiles)
+        Ok(CoreHistoryPage {
+            records: profiles,
+            next_sequence: page.next_sequence,
+            has_more: page.has_more,
+        })
     }
 }
 
@@ -1404,6 +1650,8 @@ pub(super) fn read_core_fence_current_row(
     fence_name: &str,
 ) -> Result<Option<CoreFenceRecord>> {
     let row_key = core_fence_row_key(fence_name)?;
+    // Commit-time fence validation must inspect the exact canonical bytes that
+    // the mutation precondition protects, even while publication is pending.
     let Some(bytes) = store
         .meta
         .get(CF_LEASES_FENCES, TABLE_CORE_FENCE_ROW, &row_key)?
@@ -1421,6 +1669,35 @@ pub(super) fn core_fence_row_key(fence_name: &str) -> Result<Vec<u8>> {
         CoreMetaTuplePart::Utf8("core-fence"),
         CoreMetaTuplePart::Utf8(fence_name),
     ])
+}
+
+fn boundary_root_anchor_key(bucket: &str) -> String {
+    format!("boundary/{bucket}")
+}
+
+fn core_fence_root_anchor_key(fence_name: &str) -> String {
+    format!("core-fence/{fence_name}")
+}
+
+fn root_catalog_root_anchor_key(mesh_id: &str) -> String {
+    format!("root-catalog/{mesh_id}")
+}
+
+fn quorum_profile_root_anchor_key(placement_group: &str) -> String {
+    format!("quorum-profile/{placement_group}")
+}
+
+fn coordinated_root_publication(
+    root_anchor_key: impl Into<String>,
+    writer_family: WriterFamily,
+) -> CoreMetaRootPublication {
+    let mut writer_families = vec![
+        WriterFamily::CoreControl.as_str().to_string(),
+        writer_family.as_str().to_string(),
+    ];
+    writer_families.sort();
+    writer_families.dedup();
+    CoreMetaRootPublication::with_writer_families(root_anchor_key, writer_families).coordinator()
 }
 
 fn validate_authenticated_principal(principal: &str) -> Result<()> {
@@ -1481,15 +1758,15 @@ fn decode_control_current_row(bytes: &[u8], schema: &'static str) -> Result<Vec<
     Ok(row.payload)
 }
 
-fn boundary_schema_coremeta_prefix(bucket: &str) -> Result<Vec<u8>> {
-    core_meta_tuple_key(&[CoreMetaTuplePart::Utf8(bucket)])
-}
-
 fn boundary_schema_coremeta_key(bucket: &str, generation: u64) -> Result<Vec<u8>> {
     core_meta_tuple_key(&[
         CoreMetaTuplePart::Utf8(bucket),
         CoreMetaTuplePart::U64(generation),
     ])
+}
+
+fn boundary_schema_current_coremeta_key(bucket: &str) -> Result<Vec<u8>> {
+    core_meta_tuple_key(&[CoreMetaTuplePart::Utf8(bucket)])
 }
 
 fn boundary_value_coremeta_key(

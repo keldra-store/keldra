@@ -7,11 +7,13 @@ use std::path::{Path, PathBuf};
 use anvil::core_store::{
     AcquireFence, AppendStreamRecord, AuthzScopeRef, CF_INLINE_PAYLOADS,
     CORE_QUORUM_PROFILE_SCHEMA, CORE_ROOT_CATALOG_SCHEMA, CoreMetaRowCommonProto, CoreMetaStore,
-    CoreMetaVisibilityState, CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
-    CoreQuorumProfile, CoreRootCatalog, CoreRootPartition, CoreStore, CoreTransactionState,
-    GetBlob, PutBlob, ReadStream, SealStreamSegment, TABLE_INLINE_PAYLOAD_ROW, WatchRequest,
-    core_meta_committed_row_common, core_meta_payload_digest, encode_core_meta_inline_payload_row,
+    CoreMetaTuplePart, CoreMetaVisibilityState, CoreMutationBatch, CoreMutationOperation,
+    CoreMutationPrecondition, CoreMutationRootPublication, CoreQuorumProfile, CoreRootCatalog,
+    CoreRootPartition, CoreStore, CoreTransactionState, GetBlob, PutBlob, ReadStream,
+    SealStreamSegment, TABLE_INLINE_PAYLOAD_ROW, WatchRequest, core_meta_committed_row_common,
+    core_meta_payload_digest, core_meta_tuple_key, encode_core_meta_inline_payload_row,
 };
+use anvil::formats::writer::WriterFamily;
 use anvil::gateway_store::{
     GatewayMountMatchKind, GatewayMountRecord, GatewayMountState, put_gateway_mount_record,
     resolve_gateway_mount,
@@ -150,13 +152,8 @@ fn coremeta_test_payload(body_len: usize) -> Vec<u8> {
 }
 
 fn coremeta_test_tuple_key(part: &[u8]) -> Vec<u8> {
-    let mut key = Vec::new();
-    key.extend_from_slice(&1u16.to_le_bytes());
-    key.push(0x05);
-    key.push(0);
-    key.extend_from_slice(&(part.len() as u16).to_le_bytes());
-    key.extend_from_slice(part);
-    key
+    core_meta_tuple_key(&[CoreMetaTuplePart::Raw(part)])
+        .expect("test tuple key uses canonical CoreMeta encoding")
 }
 
 fn block_shard_path(storage: &Storage, node_id: &str, block_id: &str, shard_index: u16) -> PathBuf {
@@ -175,6 +172,32 @@ fn block_shard_path(storage: &Storage, node_id: &str, block_id: &str, shard_inde
 
 fn production_source(relative: &str) -> String {
     strip_cfg_test_modules(&read_workspace_file(relative))
+}
+
+fn production_sources(relatives: &[&str]) -> String {
+    relatives
+        .iter()
+        .map(|relative| production_source(relative))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn protected_writer_source(relative: &str) -> String {
+    match relative {
+        "anvil-core/src/metadata_journal.rs" => production_sources(&[
+            relative,
+            "anvil-core/src/metadata_journal/helpers.rs",
+            "anvil-core/src/metadata_journal/object_mutation.rs",
+            "anvil-core/src/metadata_journal/transaction_projection.rs",
+        ]),
+        "anvil-core/src/task_journal.rs" => production_sources(&[
+            relative,
+            "anvil-core/src/task_journal/model.rs",
+            "anvil-core/src/task_journal/queue.rs",
+            "anvil-core/src/task_journal/store.rs",
+        ]),
+        _ => production_source(relative),
+    }
 }
 
 fn strip_cfg_test_modules(source: &str) -> String {
@@ -241,10 +264,15 @@ fn rfc_0006_local_storage_guard_prevents_authoritative_feature_file_writes() {
         "anvil-core/src/core_store/local_admission.rs",
         "anvil-core/src/core_store/local_io.rs",
         "anvil-core/src/core_store/local_roots_layout.rs",
+        // Root-register shards and crash-safe quarantine intents are CoreStore
+        // recovery primitives, not feature-owned durable state.
+        "anvil-core/src/core_store/local_coremeta_recovery/register_quarantine.rs",
+        "anvil-core/src/core_store/local_root_register.rs",
+        // External publication markers are feature-gated test control and are
+        // expendable local operational state.
+        "anvil-core/src/core_store/local_root_publication_test_control.rs",
         // Storage owns transient upload staging only; object payloads are moved into CoreStore.
         "anvil-core/src/storage.rs",
-        // Node identity/keypair are operator bootstrap files; config rejects paths below storage.
-        "anvil-core/src/cluster_identity.rs",
         // System realm bootstrap writes the first-admin credential file for the operator once;
         // system realm state itself is still committed through CoreStore-authz paths.
         "anvil-core/src/system_realm.rs",
@@ -253,6 +281,9 @@ fn rfc_0006_local_storage_guard_prevents_authoritative_feature_file_writes() {
         // Performance tracing writes optional external telemetry files and never owns
         // authoritative Anvil state.
         "anvil-core/src/perf.rs",
+        // HuggingFace target indexes are assembled in feature-writer scratch
+        // before the resulting bytes enter CoreStore.
+        "anvil-core/src/worker/hf_index.rs",
     ]);
 
     let forbidden_write_patterns = [
@@ -591,9 +622,11 @@ fn rfc_0007_bucket_current_state_is_not_replayed_from_bucket_history() {
         &source,
         &[
             "BucketCurrentRowProto",
+            "BucketIdAllocatorRowProto",
             "BucketJournalBodyProto",
             "read_current_bucket_for_tenant_row",
-            "read_max_bucket_id_from_current_rows",
+            "read_bucket_id_allocator",
+            "bucket_id_allocator_put",
             "encode_bucket_journal_body",
             "decode_bucket_journal_body",
         ],
@@ -613,18 +646,25 @@ fn rfc_0007_bucket_current_state_is_not_replayed_from_bucket_history() {
 
 #[test]
 fn rfc_0007_task_live_state_is_not_replayed_from_task_audit_history() {
-    let source = production_source("anvil-core/src/task_journal.rs");
+    let source = production_sources(&[
+        "anvil-core/src/task_journal.rs",
+        "anvil-core/src/task_journal/model.rs",
+        "anvil-core/src/task_journal/queue.rs",
+        "anvil-core/src/task_journal/store.rs",
+    ]);
 
     assert_source_contains_all(
         "task CoreStore current-state encoding",
         &source,
         &[
-            "TaskCurrentRowProto",
-            "TaskJournalBodyProto",
-            "read_task_queue_state",
-            "encode_task_current_row",
-            "encode_task_journal_body",
-            "TASK_QUEUE_AUDIT_RECORD_KIND",
+            "TaskQueueRowProto",
+            "TaskAuditProto",
+            "QueueStore",
+            "visible_snapshot",
+            "encode_queue_row",
+            "encode_task_audit",
+            "TABLE_TASK_CURRENT_ROW",
+            "CoreMutationOperation::CoreMetaPut",
         ],
     );
 
@@ -643,16 +683,24 @@ fn rfc_0007_task_live_state_is_not_replayed_from_task_audit_history() {
 
 #[test]
 fn rfc_0007_object_metadata_live_state_uses_coremeta_rows() {
-    let metadata = production_source("anvil-core/src/metadata_journal.rs")
-        + &production_source("anvil-core/src/metadata_journal/transaction_projection.rs");
-    let coremeta = production_source("anvil-core/src/core_store/local_object_metadata.rs");
+    let metadata = production_sources(&[
+        "anvil-core/src/metadata_journal.rs",
+        "anvil-core/src/metadata_journal/object_mutation.rs",
+        "anvil-core/src/metadata_journal/transaction_projection.rs",
+    ]);
+    let coremeta = production_sources(&[
+        "anvil-core/src/core_store/local_object_metadata.rs",
+        "anvil-core/src/core_store/local_object_metadata/mutation.rs",
+        "anvil-core/src/core_store/local_object_metadata/projections.rs",
+    ]);
 
     assert_source_contains_all(
         "object metadata live-state CoreMeta implementation",
         &metadata,
         &[
-            "put_object_metadata(bucket, object)",
-            "record_object_metadata_mutation_id(bucket, object.id)",
+            "prepare_object_metadata_projection(",
+            "ObjectMetadataProjectionMutation::Upsert",
+            "ObjectMetadataProjectionMutation::DeleteVersion",
             "read_current_object_metadata(bucket, object_key)",
             "read_object_version_metadata(bucket, object_key, version_id)",
             "read_object_version_metadata_by_id(bucket, version_id)",
@@ -669,18 +717,28 @@ fn rfc_0007_object_metadata_live_state_uses_coremeta_rows() {
             "CF_OBJECT_VERSIONS",
             "TABLE_OBJECT_VERSION_META_ROW",
             "object-id-counter",
+            "object-version-id",
+            "object-page-current",
+            "object-page-version",
+            "scan_coremeta_prefix_page",
+            "scan_range_reverse_inclusive",
         ],
     );
 
     for forbidden in [
         "parse_current_object_ref_target",
         "current object ref points at missing metadata stream record",
+        "record_object_metadata_mutation_id",
     ] {
         assert!(
             !metadata.contains(forbidden),
             "object metadata live state must not retain stream/segment replay path: {forbidden}"
         );
     }
+    assert!(
+        !coremeta.contains(".scan_prefix("),
+        "object metadata projections must use point reads or bounded page/range reads"
+    );
 
     let tests = read_workspace_file("anvil-core/src/metadata_journal/tests.rs");
     assert_source_contains_all(
@@ -818,7 +876,10 @@ fn rfc_0007_conformance_audit_reserved_paths_have_external_coverage() {
 
 #[test]
 fn rfc_0007_conformance_audit_control_current_state_uses_coremeta_rows_and_protobuf() {
-    let source = production_source("anvil-core/src/control_journal.rs");
+    let source = production_sources(&[
+        "anvil-core/src/control_journal.rs",
+        "anvil-core/src/control_journal/current.rs",
+    ]);
     assert!(
         !source.contains("serde_json"),
         "control current state and history payloads must use deterministic protobuf, not JSON"
@@ -831,7 +892,8 @@ fn rfc_0007_conformance_audit_control_current_state_uses_coremeta_rows_and_proto
         "control current state CoreMeta row/protobuf implementation",
         &source,
         &[
-            "read_control_state_from_coremeta_rows",
+            "pub async fn read_control_state",
+            "scan_current_page",
             "encode_control_current_row",
             "decode_control_current_row",
             "TABLE_CONTROL_CURRENT_ROW",
@@ -948,12 +1010,12 @@ fn rfc_0006_protected_writers_use_commit_time_partition_preconditions() {
         "anvil-core/src/multipart_journal.rs",
         "anvil-core/src/task_journal.rs",
         "anvil-core/src/mesh_directory.rs",
-        "anvil-core/src/mesh_lifecycle/helpers.rs",
+        "anvil-core/src/mesh_lifecycle/topology_mutation.rs",
         "anvil-core/src/services/personaldb.rs",
     ];
 
     for relative in protected_writers {
-        let source = production_source(relative);
+        let source = protected_writer_source(relative);
         assert!(
             !source.contains("validate_partition_write("),
             "{relative} must not prevalidate a partition write and then perform a separate visible write"
@@ -979,9 +1041,10 @@ fn rfc_0006_protected_writers_use_commit_time_partition_preconditions() {
         "anvil-core/src/multipart_journal.rs",
         "anvil-core/src/task_journal.rs",
         "anvil-core/src/mesh_control_stream.rs",
+        "anvil-core/src/mesh_lifecycle/topology_mutation.rs",
         "anvil-core/src/personaldb_heads.rs",
     ] {
-        let source = production_source(relative);
+        let source = protected_writer_source(relative);
         assert!(
             source.contains("CoreMutationBatch") && source.contains(".commit_mutation_batch"),
             "{relative} must make protected visible writes through CoreMutationBatch"
@@ -1057,9 +1120,10 @@ async fn rfc_0006_root_catalog_is_signed_generationed_and_recoverable() {
     );
     assert_eq!(
         store
-            .list_root_catalog_history("mesh-rfc0006")
+            .list_root_catalog_history_page("mesh-rfc0006", 0, 10)
             .await
             .unwrap()
+            .records
             .len(),
         1
     );
@@ -1126,9 +1190,10 @@ async fn rfc_0006_quorum_profile_requires_intersection_and_monotonic_epochs() {
         .await
         .expect("next quorum profile epoch commits");
     let history = store
-        .list_quorum_profile_history("pg-rfc0006")
+        .list_quorum_profile_history_page("pg-rfc0006", 0, 10)
         .await
-        .unwrap();
+        .unwrap()
+        .records;
     assert_eq!(history.len(), 2);
     assert_eq!(history[0].epoch, 1);
     assert_eq!(history[1].epoch, 2);
@@ -1161,6 +1226,13 @@ async fn rfc_0006_corestore_transactions_gate_coremeta_stream_and_watch_visibili
             transaction_id: "txn-rfc0006-visible".to_string(),
             scope_partition: "tenant:t/bucket:b".to_string(),
             committed_by_principal: "principal:rfc0006".to_string(),
+            root_publications: vec![
+                CoreMutationRootPublication::new(
+                    "tenant:t/bucket:b",
+                    WriterFamily::CoreControl.as_str(),
+                )
+                .coordinator(),
+            ],
             preconditions: vec![CoreMutationPrecondition::CoreMetaRow {
                 cf: CF_INLINE_PAYLOADS.to_string(),
                 table_id: TABLE_INLINE_PAYLOAD_ROW,
@@ -1221,7 +1293,10 @@ async fn rfc_0006_corestore_transactions_gate_coremeta_stream_and_watch_visibili
         1
     );
     assert_eq!(
-        store.list_stream_ids("object_metadata:").await.unwrap(),
+        store
+            .list_stream_ids_page("object_metadata:", None, 10)
+            .await
+            .unwrap(),
         vec!["object_metadata:t:b".to_string()],
         "CoreStore stream ids must be listed from RocksDB-backed stream metadata"
     );
@@ -1234,6 +1309,7 @@ async fn rfc_0006_corestore_transactions_gate_coremeta_stream_and_watch_visibili
             })
             .await
             .unwrap()
+            .events
             .len(),
         1
     );
@@ -1244,6 +1320,13 @@ async fn rfc_0006_corestore_transactions_gate_coremeta_stream_and_watch_visibili
             transaction_id: "txn-rfc0006-failed".to_string(),
             scope_partition: "tenant:t/bucket:b".to_string(),
             committed_by_principal: "principal:rfc0006".to_string(),
+            root_publications: vec![
+                CoreMutationRootPublication::new(
+                    "tenant:t/bucket:b",
+                    WriterFamily::CoreControl.as_str(),
+                )
+                .coordinator(),
+            ],
             preconditions: vec![CoreMutationPrecondition::CoreMetaRow {
                 cf: CF_INLINE_PAYLOADS.to_string(),
                 table_id: TABLE_INLINE_PAYLOAD_ROW,
@@ -1525,13 +1608,13 @@ async fn rfc_0006_corestore_streams_are_chained_and_idempotent() {
         })
         .await
         .unwrap();
-    assert_eq!(watched.len(), 1);
-    assert_eq!(watched[0].cursor, second.cursor);
-    assert_eq!(watched[0].previous_event_hash, records[0].event_hash);
-    assert_eq!(watched[0].event_hash, records[1].event_hash);
-    assert_eq!(watched[0].event_type, "audit.updated");
-    assert_eq!(watched[0].transaction_id, None);
-    assert_eq!(watched[0].payload_hash, records[1].payload_hash);
+    assert_eq!(watched.events.len(), 1);
+    assert_eq!(watched.events[0].cursor, second.cursor);
+    assert_eq!(watched.events[0].previous_event_hash, records[0].event_hash);
+    assert_eq!(watched.events[0].event_hash, records[1].event_hash);
+    assert_eq!(watched.events[0].event_type, "audit.updated");
+    assert_eq!(watched.events[0].transaction_id, None);
+    assert_eq!(watched.events[0].payload_hash, records[1].payload_hash);
 }
 
 #[tokio::test]
@@ -1737,6 +1820,13 @@ async fn rfc_0006_fenced_mutations_use_authenticated_principal_not_request_owner
             transaction_id: "txn-rfc0006-wrong-principal".to_string(),
             scope_partition: "tenant:t/bucket:b".to_string(),
             committed_by_principal: "principal:impersonator".to_string(),
+            root_publications: vec![
+                CoreMutationRootPublication::new(
+                    "tenant:t/bucket:b",
+                    WriterFamily::CoreControl.as_str(),
+                )
+                .coordinator(),
+            ],
             preconditions: vec![CoreMutationPrecondition::Fence {
                 fence_name: "tenant:t/bucket:b/object:secure".to_string(),
                 fence_token: fence.fence_token,
@@ -1772,6 +1862,13 @@ async fn rfc_0006_fenced_mutations_use_authenticated_principal_not_request_owner
             transaction_id: "txn-rfc0006-right-principal".to_string(),
             scope_partition: "tenant:t/bucket:b".to_string(),
             committed_by_principal: "principal:legitimate-worker".to_string(),
+            root_publications: vec![
+                CoreMutationRootPublication::new(
+                    "tenant:t/bucket:b",
+                    WriterFamily::CoreControl.as_str(),
+                )
+                .coordinator(),
+            ],
             preconditions: vec![CoreMutationPrecondition::Fence {
                 fence_name: "tenant:t/bucket:b/object:secure".to_string(),
                 fence_token: fence.fence_token,

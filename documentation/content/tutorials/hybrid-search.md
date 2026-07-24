@@ -173,7 +173,7 @@ Diagnostics are the first place to look when one side of the hybrid index is mis
 
 ```bash
 anvil --profile acme index diagnostics documents tutorial_hybrid \
-  --limit 20
+  --page-size 20
 ```
 
 This calls `IndexService.ListIndexDiagnostics`. A successful response proves the caller has `index:read` on `documents` and that Anvil could read diagnostic records for the bucket/index filter. The CLI prints `cursor`, `severity`, `code`, and `message`.

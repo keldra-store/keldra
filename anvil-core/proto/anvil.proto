@@ -103,13 +103,12 @@ message AdminError {
 }
 
 message PageRequest {
-  string cursor = 1;
-  uint32 limit = 2;
+  uint32 page_size = 1;
+  string page_token = 2;
 }
 
 message PageResponse {
-  string next_cursor = 1;
-  bool has_more = 2;
+  string next_page_token = 1;
 }
 
 message StorageClassDescriptor {
@@ -141,12 +140,14 @@ message StorageClassDescriptor {
 message ListStorageClassesRequest {
   string request_id = 1;
   bool include_operator_only = 2;
+  PageRequest page = 3;
 }
 
 message ListStorageClassesResponse {
   string request_id = 1;
   repeated StorageClassDescriptor storage_classes = 2;
   string default_class_id = 3;
+  PageResponse page = 4;
 }
 
 message GetStorageClassRequest {
@@ -232,10 +233,8 @@ message NodeDescriptor {
   string node_id = 3;
   string region = 4;
   string cell_id = 5;
-  string libp2p_peer_id = 6;
   string public_api_addr = 7;
-  bytes receipt_signing_public_key_proto = 16;
-  repeated string public_cluster_addrs = 8;
+  bytes receipt_signing_public_key = 16;
   repeated NodeCapability capabilities = 9;
   LifecycleState state = 10;
   NodeDrainDescriptor drain = 11;
@@ -416,7 +415,7 @@ message ImportPersonalDbSigningKeyRequest {
   string status = 10;
 }
 
-message ListPersonalDbSigningKeysRequest {}
+message ListPersonalDbSigningKeysRequest { PageRequest page = 1; }
 
 message SetPersonalDbSigningKeyStatusRequest {
   AdminRequestContext context = 1;
@@ -451,6 +450,7 @@ message PersonalDbSigningKeyResponse {
 
 message ListPersonalDbSigningKeysResponse {
   repeated PersonalDbSigningKeyRecord keys = 1;
+  PageResponse page = 2;
 }
 
 message CreateBucketAdminRequest {
@@ -682,11 +682,9 @@ message RegisterNodeRequest {
   string node_id = 2;
   string region = 3;
   string cell_id = 4;
-  string libp2p_peer_id = 5;
-  repeated string public_cluster_addrs = 6;
   string public_api_addr = 7;
   repeated NodeCapability capabilities = 8;
-  bytes receipt_signing_public_key_proto = 9;
+  bytes receipt_signing_public_key = 9;
   string capacity_json = 10;
 }
 
@@ -885,7 +883,7 @@ message DeleteBucketRequest {
 
 message DeleteBucketResponse {}
 
-message ListBucketsRequest {}
+message ListBucketsRequest { PageRequest page = 1; }
 
 message Bucket {
     string name = 1;
@@ -898,6 +896,7 @@ message Bucket {
 
 message ListBucketsResponse {
     repeated Bucket buckets = 1;
+    PageResponse page = 2;
 }
 
 message GetBucketPolicyRequest {
@@ -1005,10 +1004,12 @@ message PutGitPackResponse {
 message GetGitObjectRequest {
     string repository_id = 1;
     string object_id = 2;
+    PageRequest page = 3;
 }
 
 message GetGitObjectResponse {
     repeated GitBlobLocation locations = 1;
+    PageResponse page = 2;
 }
 
 message GetGitBlobByPathRequest {
@@ -1025,11 +1026,12 @@ message ListGitTreeRequest {
     string repository_id = 1;
     string commit_id = 2;
     string prefix = 3;
-    uint32 limit = 4;
+    PageRequest page = 4;
 }
 
 message ListGitTreeResponse {
     repeated GitTreeEntryRecord entries = 1;
+    PageResponse page = 2;
 }
 
 message GitBlobLocation {
@@ -1100,6 +1102,7 @@ message DropIndexResponse {}
 message ListIndexesRequest {
     string bucket_name = 1;
     bool include_disabled = 2;
+    PageRequest page = 3;
 }
 
 message IndexDefinitionRecord {
@@ -1123,6 +1126,7 @@ message IndexDefinitionResponse {
 
 message ListIndexesResponse {
     repeated IndexDefinitionRecord indexes = 1;
+    PageResponse page = 2;
 }
 
 message QueryIndexRequest {
@@ -1181,7 +1185,6 @@ message QuerySpecResponse {
     QueryIndexResponse result = 1;
     string canonical_query_hash = 2;
     string plan_json = 3;
-    repeated string diagnostics = 4;
 }
 
 message WatchIndexDefinitionRequest {
@@ -1228,9 +1231,8 @@ message WatchIndexPartitionResponse {
 message ListIndexDiagnosticsRequest {
     string bucket_name = 1;
     string index_name = 2;
-    uint64 after_cursor = 3;
-    uint32 limit = 4;
-    string severity = 5;
+    string severity = 3;
+    PageRequest page = 4;
 }
 
 message IndexDiagnosticRecord {
@@ -1248,6 +1250,7 @@ message IndexDiagnosticRecord {
 
 message ListIndexDiagnosticsResponse {
     repeated IndexDiagnosticRecord diagnostics = 1;
+    PageResponse page = 2;
 }
 
 message RepairIndexRequest {
@@ -1320,11 +1323,12 @@ message RepairPersonalDbLogChainResponse {
 message ListRepairFindingsRequest {
     string scope_kind = 1;
     string scope_id = 2;
-    uint32 limit = 3;
+    PageRequest page = 3;
 }
 
 message ListRepairFindingsResponse {
     repeated RepairFindingRecord findings = 1;
+    PageResponse page = 2;
 }
 
 message RepairFindingRecord {
@@ -2489,9 +2493,7 @@ message PutNodeRequest {
     string state = 5;
     string capacity_json = 6;
     WriteOptions options = 7;
-    string libp2p_peer_id = 8;
-    bytes receipt_signing_public_key_proto = 9;
-    repeated string cluster_addrs = 10;
+    bytes receipt_signing_public_key = 9;
     repeated string capabilities = 11;
 }
 
@@ -2517,11 +2519,13 @@ message MoveBucketRequest {
 
 message GetPartitionMapRequest {
     string scope = 1;
+    PageRequest page = 2;
 }
 
 message PartitionMap {
     uint64 epoch = 1;
     repeated string partition_rows = 2;
+    PageResponse page = 3;
 }
 
 message PutPackageBlobRequest {
@@ -2633,6 +2637,10 @@ message MutationBatchCheckpointTaskLease {
     uint64 fence_token = 2;
     uint64 checkpoint_cursor_low = 3;
     uint64 checkpoint_cursor_high = 4;
+    uint64 expected_root_generation = 5;
+    uint64 expected_lease_epoch = 6;
+    int64 expected_expires_at_nanos = 7;
+    string expected_lease_hash = 8;
 }
 
 message MutationBatchCommitTaskLease {
@@ -2640,6 +2648,10 @@ message MutationBatchCommitTaskLease {
     uint64 fence_token = 2;
     uint64 committed_cursor_low = 3;
     uint64 committed_cursor_high = 4;
+    uint64 expected_root_generation = 5;
+    uint64 expected_lease_epoch = 6;
+    int64 expected_expires_at_nanos = 7;
+    string expected_lease_hash = 8;
 }
 
 message MutationBatchCompareAndSwapManifest {
@@ -2719,13 +2731,20 @@ message ProxyRequestHeader {
   uint64 bucket_locator_generation = 10;
   repeated ProxyHeader headers = 11;
   bytes authz_context = 12;
+  optional ObjectMetadata native_object_metadata = 13;
 }
 
 message ProxyRequestChunk {
   oneof part {
     ProxyRequestHeader header = 1;
     bytes body = 2;
+    ProxyStreamFailure failure = 3;
   }
+}
+
+message ProxyStreamFailure {
+  int32 grpc_code = 1;
+  string message = 2;
 }
 
 message ProxyResponseHeader {
@@ -2734,6 +2753,7 @@ message ProxyResponseHeader {
   repeated ProxyHeader headers = 3;
   repeated ProxyHeader trailers = 4;
   bool committed = 5;
+  optional PutObjectResponse native_put_response = 6;
 }
 
 message ProxyResponseChunk {
@@ -2817,14 +2837,17 @@ message CreateHfKeyResponse {
 }
 message DeleteHfKeyRequest { string name = 1; }
 message DeleteHfKeyResponse {}
-message ListHfKeysRequest {}
+message ListHfKeysRequest { PageRequest page = 1; }
 message HfKey {
   string name = 1;
   string note = 2;
   string created_at = 3;
   string updated_at = 4;
 }
-message ListHfKeysResponse { repeated HfKey keys = 1; }
+message ListHfKeysResponse {
+  repeated HfKey keys = 1;
+  PageResponse page = 2;
+}
 
 // Ingestion (public API, policy enforced)
 service HfIngestionService {
@@ -2894,7 +2917,7 @@ message DeleteApplicationCredentialResponse {
   string app_id = 2;
 }
 
-message ListApplicationsRequest {}
+message ListApplicationsRequest { PageRequest page = 1; }
 
 message ApplicationDescriptor {
   string tenant_id = 1;
@@ -2905,6 +2928,7 @@ message ApplicationDescriptor {
 
 message ListApplicationsResponse {
   repeated ApplicationDescriptor applications = 1;
+  PageResponse page = 2;
 }
 
 message GrantAccessRequest {
@@ -2932,10 +2956,12 @@ message AccessGrantRecord {
 
 message ListAccessGrantsRequest {
   string app = 1;
+  PageRequest page = 2;
 }
 
 message ListAccessGrantsResponse {
   repeated AccessGrantRecord grants = 1;
+  PageResponse page = 2;
 }
 
 message SetPublicAccessRequest {
@@ -3229,6 +3255,10 @@ message CheckpointTaskLeaseRequest {
     uint64 fence_token = 3;
     uint64 checkpoint_cursor_low = 4;
     uint64 checkpoint_cursor_high = 5;
+    uint64 expected_root_generation = 6;
+    uint64 expected_lease_epoch = 7;
+    int64 expected_expires_at_nanos = 8;
+    string expected_lease_hash = 9;
 }
 
 message CommitTaskLeaseRequest {
@@ -3238,6 +3268,10 @@ message CommitTaskLeaseRequest {
     uint64 fence_token = 3;
     uint64 committed_cursor_low = 4;
     uint64 committed_cursor_high = 5;
+    uint64 expected_root_generation = 6;
+    uint64 expected_lease_epoch = 7;
+    int64 expected_expires_at_nanos = 8;
+    string expected_lease_hash = 9;
 }
 
 message ReadTaskLeaseRequest {
@@ -3269,6 +3303,7 @@ message TaskLease {
     string owner_principal_kind = 18;
     string owner_principal_id = 19;
     string owner_actor_instance_id = 20;
+    uint64 root_generation = 21;
 }
 
 message TaskLeaseResponse {
@@ -3830,6 +3865,7 @@ service RootRegisterInternal {
   rpc CompareAndSwapRoot(CompareAndSwapRootRequest) returns (RootAnchorWrite);
   rpc VoteFailover(VoteFailoverRequest) returns (FailoverVoteReceipt);
   rpc ExchangeRootInventory(ExchangeRootInventoryRequest) returns (RootInventory);
+  rpc ExchangeRootDirectory(ExchangeRootDirectoryRequest) returns (RootDirectoryPage);
 }
 
 service CoreMetaReplicationInternal {
@@ -3837,9 +3873,9 @@ service CoreMetaReplicationInternal {
   rpc PersistCommitCertificates(CoreMetaPersistCommitGroupRequest) returns (CoreMetaCertificatePersistReceiptGroup);
   rpc CoreMetaStream(stream CoreMetaStreamRequest) returns (stream CoreMetaStreamResponse);
   rpc AbortPendingBatch(CoreMetaAbortRequest) returns (CoreMetaPrepareReceipt);
-  rpc ReadRows(CoreMetaReadRowsRequest) returns (CoreMetaReadRowsResponse);
   rpc CatchUpPartition(CoreMetaCatchUpRequest) returns (stream CoreMetaBatchFrame);
   rpc ExchangeCoreMetaInventory(CoreMetaInventoryRequest) returns (CoreMetaInventory);
+  rpc PublishPendingMutationFinalisation(PublishPendingMutationFinalisationRequest) returns (PublishPendingMutationFinalisationResponse);
 }
 
 service AntiEntropyInternal {
@@ -3861,6 +3897,17 @@ message InternalRequestHeader {
   uint64 membership_epoch = 4;
   uint64 source_node_fence = 5;
   bytes signature = 6;
+}
+
+message PublishPendingMutationFinalisationRequest {
+  InternalRequestHeader header = 1;
+  bytes finalisation_record = 2;
+  string payload_hash = 3;
+  bytes source_signature = 4;
+}
+
+message PublishPendingMutationFinalisationResponse {
+  bytes finalisation_record = 1;
 }
 
 message CoreMetaRowMutation {
@@ -3885,6 +3932,7 @@ message CoreMetaBatchRequest {
 message CoreMetaBatchGroupRequest {
   InternalRequestHeader header = 1;
   repeated CoreMetaBatchRequest batches = 2;
+  bytes publication_intent = 3;
 }
 
 message CoreMetaPrepareReceiptGroup {
@@ -3965,48 +4013,103 @@ message CoreMetaAbortRequest {
   string reason_code = 7;
 }
 
-message CoreMetaReadRowsRequest {
-  InternalRequestHeader header = 1;
-  string root_key_hash = 2;
-  uint64 root_generation = 3;
-  repeated bytes core_meta_keys = 4;
-  string column_family = 5;
+// A catch-up cursor identifies the last mutation accepted by the caller. The
+// next page starts at the following ordinal, or the next generation when the
+// identified generation is complete.
+message CoreMetaHistoryCursor {
+  uint64 generation = 1;
+  uint64 ordinal = 2;
 }
 
-message CoreMetaReadRowsResponse {
-  repeated CoreMetaRowMutation rows = 1;
-  uint64 root_generation = 2;
-  string inventory_hash = 3;
+message CoreMetaCertificateEvidence {
+  string evidence_hash = 1;
+  bytes evidence = 2;
+}
+
+message CoreMetaColumnFamilySummary {
+  string column_family = 1;
+  uint64 mutation_count = 2;
+  uint64 mutation_bytes = 3;
+  string slice_hash = 4;
+}
+
+// Generation descriptors are immutable commit records. A descriptor is
+// discoverable only after its complete mutation journal is durably installed.
+message CoreMetaGenerationDescriptor {
+  string root_key_hash = 1;
+  uint64 generation = 2;
+  string transaction_id = 3;
+  string pending_batch_hash = 4;
+  string committed_batch_hash = 5;
+  string certificate_hash = 6;
+  bytes commit_certificate = 7;
+  repeated CoreMetaCertificateEvidence certificate_persist_evidence = 8;
+  uint64 mutation_count = 9;
+  uint64 mutation_bytes = 10;
+  string generation_hash = 11;
+  bool complete = 12;
+  uint64 created_at_unix_nanos = 13;
+  optional string coordinator_root_key_hash = 14;
+  optional uint64 coordinator_root_generation = 15;
+  repeated CoreMetaColumnFamilySummary column_families = 16;
+  // Canonical replica publication intent with outcome hashes omitted. The
+  // same immutable bytes are carried by every participant generation so a
+  // lagging equal peer can recover the complete atomic publication group.
+  bytes publication_bundle = 17;
+}
+
+message CoreMetaGenerationMutation {
+  string root_key_hash = 1;
+  uint64 generation = 2;
+  uint64 ordinal = 3;
+  CoreMetaRowMutation mutation = 4;
 }
 
 message CoreMetaCatchUpRequest {
   InternalRequestHeader header = 1;
   string root_key_hash = 2;
-  uint64 after_generation = 3;
-  uint32 limit = 4;
+  CoreMetaHistoryCursor after = 3;
+  // Zero captures the latest complete generation when the request begins.
+  uint64 through_generation = 4;
+  uint32 max_rows = 5;
+  uint64 max_bytes = 6;
 }
 
 message CoreMetaBatchFrame {
-  string root_key_hash = 1;
-  uint64 root_generation = 2;
-  repeated CoreMetaRowMutation committed_rows = 3;
-  CoreMetaCommitCertificate commit_certificate = 4;
-  repeated CoreMetaCertificatePersistReceipt certificate_persist_receipts = 5;
+  CoreMetaGenerationDescriptor descriptor = 1;
+  repeated CoreMetaGenerationMutation mutations = 2;
+  CoreMetaHistoryCursor next_cursor = 3;
+  bool generation_complete = 4;
+  bool history_complete = 5;
+  uint64 final_generation = 6;
+  uint64 retention_floor_generation = 7;
+  uint64 encoded_bytes = 8;
+  string frame_hash = 9;
+}
+
+message CoreMetaInventoryCursor {
+  uint64 generation = 1;
 }
 
 message CoreMetaInventoryRequest {
   InternalRequestHeader header = 1;
   string root_key_hash = 2;
-  uint64 from_generation = 3;
-  uint64 to_generation = 4;
+  CoreMetaInventoryCursor after = 3;
+  // Zero captures the latest complete generation when the request begins.
+  uint64 through_generation = 4;
+  uint32 max_entries = 5;
+  uint64 max_bytes = 6;
 }
 
 message CoreMetaInventory {
   string root_key_hash = 1;
-  uint64 from_generation = 2;
-  uint64 to_generation = 3;
-  string inventory_hash = 4;
-  repeated string generation_hashes = 5;
+  repeated CoreMetaGenerationDescriptor descriptors = 2;
+  CoreMetaInventoryCursor next_cursor = 3;
+  bool inventory_complete = 4;
+  uint64 retention_floor_generation = 5;
+  uint64 final_generation = 6;
+  string page_hash = 7;
+  uint64 encoded_bytes = 8;
 }
 
 message PutShardRequest {
@@ -4022,6 +4125,9 @@ message PutShardRequest {
   string mutation_id = 10;
   string logical_file_id = 11;
   string boundary_values_b64 = 12;
+  uint64 logical_offset = 13;
+  string encryption_algorithm = 14;
+  string compression_algorithm = 15;
 }
 
 message GetShardRequest {
@@ -4060,6 +4166,9 @@ message RepairShardRequest {
   string mutation_id = 11;
   string logical_file_id = 12;
   string boundary_values_b64 = 13;
+  uint64 logical_offset = 14;
+  string encryption_algorithm = 15;
+  string compression_algorithm = 16;
 }
 
 message ShardReceipt {
@@ -4086,6 +4195,15 @@ message ReadRootRequest {
   InternalRequestHeader header = 1;
   string root_key_hash = 2;
   uint64 min_generation = 3;
+  // When set, return this physical root-register generation rather than the
+  // latest locally indexed head. Recovery uses exact reads to assemble a
+  // matching register quorum for every historical generation it installs.
+  optional uint64 exact_generation = 4;
+  // Exact reads normally address the physical root register. A participant in
+  // a coordinated multi-root publication has no independent register entry;
+  // recovery reads its exact, atomically committed CoreMeta root-cache row
+  // from a metadata quorum and separately proves the coordinator register.
+  bool committed_cache = 5;
 }
 
 message RootAnchorRead {
@@ -4093,6 +4211,13 @@ message RootAnchorRead {
   uint64 generation = 2;
   bytes root_anchor_record = 3;
   string root_anchor_hash = 4;
+  // Physical register provenance is present for exact-generation reads. It
+  // lets a recovering peer prove that two distinct members of the same R3
+  // cohort durably hold identical anchor bytes before exposing the root.
+  uint32 shard_index = 5;
+  repeated string register_cohort_node_ids = 6;
+  string register_cohort_hash = 7;
+  uint64 placement_epoch = 8;
 }
 
 message PrepareRootRequest {
@@ -4102,6 +4227,10 @@ message PrepareRootRequest {
   string expected_root_hash = 4;
   bytes new_root_anchor_record = 5;
   uint64 partition_owner_fence = 6;
+  repeated string register_cohort_node_ids = 7;
+  string register_cohort_hash = 8;
+  uint32 shard_index = 9;
+  uint64 placement_epoch = 10;
 }
 
 message RootPrepareReceipt {
@@ -4110,7 +4239,19 @@ message RootPrepareReceipt {
   uint64 expected_generation = 3;
   uint64 post_generation = 4;
   string new_root_hash = 5;
-  bytes signature = 6;
+  uint32 shard_index = 6;
+  string register_cohort_hash = 7;
+  uint64 fsync_sequence = 8;
+  string signed_payload_hash = 9;
+  bytes signature = 10;
+  uint64 placement_epoch = 11;
+}
+
+message CoreMetaRootPublicationEvidence {
+  bytes root_anchor_record = 1;
+  CoreMetaCommitCertificate commit_certificate = 2;
+  string committed_batch_hash = 3;
+  repeated CoreMetaCertificatePersistReceipt certificate_persist_receipts = 4;
 }
 
 message CompareAndSwapRootRequest {
@@ -4124,6 +4265,10 @@ message CompareAndSwapRootRequest {
   string core_meta_commit_certificate_hash = 8;
   repeated CoreMetaCertificatePersistReceipt certificate_persist_receipts = 9;
   repeated RootPrepareReceipt prepare_receipts = 10;
+  repeated CoreMetaRootPublicationEvidence participant_commit_evidence = 11;
+  repeated string register_cohort_node_ids = 12;
+  string register_cohort_hash = 13;
+  uint64 placement_epoch = 14;
 }
 
 message RootAnchorWrite {
@@ -4139,14 +4284,14 @@ message VoteFailoverRequest {
   string failed_owner_node_id = 3;
   uint64 observed_owner_fence = 4;
   string candidate_owner_node_id = 5;
+  uint64 observed_generation = 6;
+  string observed_root_hash = 7;
+  bytes observed_root_anchor_record = 8;
+  string register_cohort_hash = 9;
 }
 
 message FailoverVoteReceipt {
-  string replica_node_id = 1;
-  string root_key_hash = 2;
-  string candidate_owner_node_id = 3;
-  uint64 new_owner_fence = 4;
-  bytes signature = 5;
+  bytes vote_record = 1;
 }
 
 message ExchangeRootInventoryRequest {
@@ -4161,6 +4306,29 @@ message RootInventory {
   uint64 from_generation = 2;
   uint64 to_generation = 3;
   string inventory_hash = 4;
+}
+
+message ExchangeRootDirectoryRequest {
+  InternalRequestHeader header = 1;
+  // Exclusive, opaque ordering cursor returned by the previous page. An empty
+  // value starts a new bounded pass over the local committed-root directory.
+  string after_root_key_hash = 2;
+  uint32 max_entries = 3;
+  uint64 max_bytes = 4;
+}
+
+message RootDirectoryEntry {
+  string root_key_hash = 1;
+  uint64 root_generation = 2;
+  string root_anchor_hash = 3;
+}
+
+message RootDirectoryPage {
+  repeated RootDirectoryEntry entries = 1;
+  string next_root_key_hash = 2;
+  bool directory_complete = 3;
+  string page_hash = 4;
+  uint64 encoded_bytes = 5;
 }
 
 message ExchangeInventoryRequest {

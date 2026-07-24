@@ -1060,45 +1060,85 @@ pub(super) async fn rotate_application_secret_envelopes(
     dry_run: bool,
     stats: &mut SecretEncryptionRotationStats,
 ) -> Result<(), Status> {
-    let tenants = state
-        .persistence
-        .list_tenants()
-        .await
-        .map_err(|err| Status::internal(err.to_string()))?;
-    for tenant in tenants {
-        let apps = state
+    const ROTATION_PAGE_SIZE: usize = 256;
+    let mut tenant_cursor = None;
+    loop {
+        let revision = state
             .persistence
-            .list_apps_for_tenant(tenant.id)
+            .current_control_collection_revision()
             .await
             .map_err(|err| Status::internal(err.to_string()))?;
-        for app in apps {
-            let Some(details) = state
-                .persistence
-                .get_app_by_client_id(&app.client_id)
-                .await
-                .map_err(|err| Status::internal(err.to_string()))?
-            else {
-                continue;
-            };
-            stats.app_secrets_examined += 1;
-            match state
-                .secret_keyring
-                .reencrypt_if_needed(&details.client_secret_encrypted)
-                .map_err(|err| Status::internal(err.to_string()))?
-            {
-                Some(rotated) => {
-                    stats.app_secrets_rotated += 1;
-                    if !dry_run {
-                        state
-                            .persistence
-                            .update_app_secret(details.id, &rotated)
-                            .await
-                            .map_err(|err| Status::internal(err.to_string()))?;
+        let tenant_page = state
+            .persistence
+            .page_tenants(&revision, tenant_cursor.as_deref(), ROTATION_PAGE_SIZE)
+            .await
+            .map_err(|err| Status::internal(err.to_string()))?;
+        for tenant in tenant_page.tenants {
+            let mut app_cursor = None;
+            loop {
+                let revision = state
+                    .persistence
+                    .current_control_collection_revision()
+                    .await
+                    .map_err(|err| Status::internal(err.to_string()))?;
+                let app_page = state
+                    .persistence
+                    .page_apps_for_tenant(
+                        tenant.id,
+                        &revision,
+                        app_cursor.as_deref(),
+                        ROTATION_PAGE_SIZE,
+                    )
+                    .await
+                    .map_err(|err| Status::internal(err.to_string()))?;
+                for app in app_page.apps {
+                    let Some(details) = state
+                        .persistence
+                        .get_app_by_client_id(&app.client_id)
+                        .await
+                        .map_err(|err| Status::internal(err.to_string()))?
+                    else {
+                        continue;
+                    };
+                    stats.app_secrets_examined += 1;
+                    match state
+                        .secret_keyring
+                        .reencrypt_if_needed(&details.client_secret_encrypted)
+                        .map_err(|err| Status::internal(err.to_string()))?
+                    {
+                        Some(rotated) => {
+                            stats.app_secrets_rotated += 1;
+                            if !dry_run {
+                                state
+                                    .persistence
+                                    .update_app_secret(details.id, &rotated)
+                                    .await
+                                    .map_err(|err| Status::internal(err.to_string()))?;
+                            }
+                        }
+                        None => stats.already_active += 1,
                     }
                 }
-                None => stats.already_active += 1,
+                let Some(next) = app_page.next_tuple_key else {
+                    break;
+                };
+                if app_cursor.as_ref() == Some(&next) {
+                    return Err(Status::internal(
+                        "application secret rotation cursor did not advance",
+                    ));
+                }
+                app_cursor = Some(next);
             }
         }
+        let Some(next) = tenant_page.next_tuple_key else {
+            break;
+        };
+        if tenant_cursor.as_ref() == Some(&next) {
+            return Err(Status::internal(
+                "application secret tenant cursor did not advance",
+            ));
+        }
+        tenant_cursor = Some(next);
     }
     Ok(())
 }
@@ -1108,30 +1148,37 @@ pub(super) async fn rotate_hf_secret_envelopes(
     dry_run: bool,
     stats: &mut SecretEncryptionRotationStats,
 ) -> Result<(), Status> {
-    let keys = state
-        .persistence
-        .hf_list_encrypted_keys()
-        .await
-        .map_err(|err| Status::internal(err.to_string()))?;
-    for key in keys {
-        stats.hf_keys_examined += 1;
-        match state
-            .secret_keyring
-            .reencrypt_if_needed(&key.token_encrypted)
-            .map_err(|err| Status::internal(err.to_string()))?
-        {
-            Some(rotated) => {
-                stats.hf_keys_rotated += 1;
-                if !dry_run {
-                    state
-                        .persistence
-                        .hf_update_key_encrypted(key.id, &rotated)
-                        .await
-                        .map_err(|err| Status::internal(err.to_string()))?;
+    let mut cursor = None;
+    loop {
+        let page = state
+            .persistence
+            .hf_list_encrypted_key_page(cursor.as_deref(), 256)
+            .await
+            .map_err(|err| Status::internal(err.to_string()))?;
+        for key in page.keys {
+            stats.hf_keys_examined += 1;
+            match state
+                .secret_keyring
+                .reencrypt_if_needed(&key.token_encrypted)
+                .map_err(|err| Status::internal(err.to_string()))?
+            {
+                Some(rotated) => {
+                    stats.hf_keys_rotated += 1;
+                    if !dry_run {
+                        state
+                            .persistence
+                            .hf_update_key_encrypted(key.id, &rotated)
+                            .await
+                            .map_err(|err| Status::internal(err.to_string()))?;
+                    }
                 }
+                None => stats.already_active += 1,
             }
-            None => stats.already_active += 1,
         }
+        let Some(next_cursor) = page.next_cursor else {
+            break;
+        };
+        cursor = Some(next_cursor);
     }
     Ok(())
 }
@@ -1187,9 +1234,7 @@ pub(super) fn node_audit_details(node: &mesh_lifecycle::NodeDescriptor) -> serde
         "node_id": &node.node_id,
         "region": &node.region,
         "cell_id": &node.cell_id,
-        "libp2p_peer_id": &node.libp2p_peer_id,
         "public_api_addr": &node.public_api_addr,
-        "public_cluster_addrs": &node.public_cluster_addrs,
         "capabilities": &node.capabilities,
         "capacity_json_hash": &node.capacity_json_hash,
         "state": node.state,
@@ -1305,10 +1350,6 @@ pub(super) fn region_drain_disposition_name(value: i32) -> &'static str {
     }
 }
 
-pub(super) fn audit_cursor_position(event: &AdminAuditEvent) -> String {
-    admin_audit::audit_event_position(event)
-}
-
 pub(super) fn audit_event_to_proto(event: AdminAuditEvent) -> AuditEventRecord {
     AuditEventRecord {
         audit_event_id: event.audit_event_id,
@@ -1381,11 +1422,9 @@ pub(super) async fn resolve_tenant_app(
     }
     state
         .persistence
-        .list_apps_for_tenant(tenant_id)
+        .get_app_by_tenant_name(tenant_id, app_name)
         .await
         .map_err(|err| Status::internal(err.to_string()))?
-        .into_iter()
-        .find(|app| app.name == app_name)
         .ok_or_else(|| Status::not_found("Application not found"))
 }
 
@@ -1425,13 +1464,8 @@ pub(super) fn base_domain_from_region_suffix(
         .to_string())
 }
 
-pub(super) fn page_limit(page: Option<&PageRequest>) -> usize {
-    let requested = page.map(|page| page.limit).unwrap_or(100);
-    if requested == 0 {
-        100
-    } else {
-        requested.clamp(1, 1000) as usize
-    }
+pub(super) fn page_limit(page: Option<&PageRequest>) -> Result<usize, Status> {
+    crate::services::collection_cursor::page_size(page)
 }
 
 pub(super) fn lifecycle_status(err: LifecycleError) -> Status {
@@ -1570,10 +1604,8 @@ pub(super) fn node_descriptor_to_proto(value: mesh_lifecycle::NodeDescriptor) ->
         node_id: value.node_id,
         region: value.region,
         cell_id: value.cell_id,
-        libp2p_peer_id: value.libp2p_peer_id,
-        receipt_signing_public_key_proto: value.receipt_signing_public_key_proto,
+        receipt_signing_public_key: value.receipt_signing_public_key,
         public_api_addr: value.public_api_addr,
-        public_cluster_addrs: value.public_cluster_addrs,
         capabilities: value
             .capabilities
             .into_iter()

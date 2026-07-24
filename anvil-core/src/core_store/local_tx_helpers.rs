@@ -61,6 +61,69 @@ pub(super) fn validate_transaction_root_scope(transaction: &CoreTransaction) -> 
     )
 }
 
+pub(super) fn staged_stream_record_from_update(
+    transaction: &CoreTransaction,
+    update: &CoreTransactionUpdate,
+) -> Result<Option<StreamRecord>> {
+    retained_stream_record_from_update(transaction, update, true)
+}
+
+pub(super) fn publication_stream_record_from_update(
+    transaction: &CoreTransaction,
+    update: &CoreTransactionUpdate,
+) -> Result<Option<StreamRecord>> {
+    retained_stream_record_from_update(transaction, update, false)
+}
+
+fn retained_stream_record_from_update(
+    transaction: &CoreTransaction,
+    update: &CoreTransactionUpdate,
+    require_transaction_scope: bool,
+) -> Result<Option<StreamRecord>> {
+    let CoreTransactionUpdate::StreamAppend {
+        partition_id,
+        stream_id,
+        record_kind,
+        payload,
+        idempotency_key_hash,
+        visible_sequence,
+        previous_event_hash,
+        prepared_record_hash,
+        created_at,
+    } = update
+    else {
+        return Ok(None);
+    };
+    if require_transaction_scope && partition_id != &transaction.root_anchor_key {
+        bail!("TransactionScopeMismatch");
+    }
+    let previous_sequence = visible_sequence
+        .checked_sub(1)
+        .ok_or_else(|| anyhow!("CoreStore staged stream sequence must be nonzero"))?;
+    let record = build_stream_record_after_head(
+        AppendStreamRecord {
+            stream_id: stream_id.clone(),
+            partition_id: partition_id.clone(),
+            record_kind: record_kind.clone(),
+            payload: payload.clone(),
+            content_type: None,
+            user_metadata_json: "{}".to_string(),
+            fence: None,
+            transaction_id: Some(transaction.transaction_id.clone()),
+            idempotency_key: None,
+        },
+        idempotency_key_hash.clone(),
+        transaction.committed_by_principal.clone(),
+        previous_sequence,
+        previous_event_hash.clone(),
+        created_at.clone(),
+    )?;
+    if record.sequence != *visible_sequence || record.event_hash != *prepared_record_hash {
+        bail!("CoreStore staged stream append hash does not match retained intent");
+    }
+    Ok(Some(record))
+}
+
 pub(super) fn transaction_with_state(
     mut transaction: CoreTransaction,
     state: CoreTransactionState,
@@ -83,33 +146,8 @@ pub(super) fn transaction_with_state(
     ) {
         transaction.committed_at = now_rfc3339();
     }
-    if state == CoreTransactionState::Committed && transaction.committed_root_generation.is_none() {
-        transaction.committed_root_generation =
-            committed_root_generation_from_updates(&transaction.visible_updates)?;
-    }
+    transaction.committed_root_generation = None;
     Ok(transaction)
-}
-
-pub(super) fn committed_root_generation_from_updates(
-    updates: &[CoreTransactionUpdate],
-) -> Result<Option<u64>> {
-    let mut max_generation = None;
-    for update in updates {
-        let generation = match update {
-            CoreTransactionUpdate::StreamAppend {
-                visible_sequence, ..
-            } => *visible_sequence,
-            CoreTransactionUpdate::CoreMetaPut { payload, .. } => {
-                core_meta_row_common_from_payload(payload)?.root_generation
-            }
-            CoreTransactionUpdate::CoreMetaDelete { .. } => continue,
-        };
-        if generation == 0 {
-            continue;
-        }
-        max_generation = Some(max_generation.unwrap_or(0).max(generation));
-    }
-    Ok(max_generation)
 }
 
 pub(super) fn current_unix_nanos_u64() -> Result<u64> {

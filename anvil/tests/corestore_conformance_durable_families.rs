@@ -91,7 +91,10 @@ fn rfc_0006_no_durable_bypass_feature_families_are_corestore_backed() {
         },
         DurableFeatureFamily {
             name: "object_metadata",
-            source_files: &["anvil-core/src/metadata_journal.rs"],
+            source_files: &[
+                "anvil-core/src/metadata_journal.rs",
+                "anvil-core/src/metadata_journal/object_mutation.rs",
+            ],
             required_terms: &["ObjectMetadataRecord", "append_object_mutation"],
             corestore_terms: &["CoreStore", "CoreMutationBatch", ".commit_mutation_batch"],
         },
@@ -107,6 +110,7 @@ fn rfc_0006_no_durable_bypass_feature_families_are_corestore_backed() {
                 "anvil-core/src/object_links.rs",
                 "anvil-core/src/persistence/objects.rs",
                 "anvil-core/src/metadata_journal.rs",
+                "anvil-core/src/metadata_journal/object_mutation.rs",
             ],
             required_terms: &[
                 "put_object_link",
@@ -131,9 +135,11 @@ fn rfc_0006_no_durable_bypass_feature_families_are_corestore_backed() {
             source_files: &["anvil-core/src/task_lease.rs"],
             required_terms: &["TaskLease", "TaskLeaseOwner", "fence_token"],
             corestore_terms: &[
-                "CoreMetaStore",
+                "CoreStore",
+                "CoreMutationBatch",
+                "CoreMutationOperation::CoreMetaPut",
+                ".commit_mutation_batch",
                 "TABLE_TASK_LEASE_ROW",
-                "encode_task_lease_record",
             ],
         },
         DurableFeatureFamily {
@@ -144,7 +150,7 @@ fn rfc_0006_no_durable_bypass_feature_families_are_corestore_backed() {
             ],
             required_terms: &["AuthzNamespaceSchemaRecord", "write_authz_namespace_schema"],
             corestore_terms: &[
-                "CoreMetaStore",
+                "CoreStore",
                 "CoreMetaBatchOp",
                 "commit_coremeta_batch_for_storage",
             ],
@@ -243,6 +249,7 @@ fn rfc_0006_no_durable_bypass_feature_families_are_corestore_backed() {
             name: "package_repository",
             source_files: &[
                 "anvil-core/src/gateway_store.rs",
+                "anvil-core/src/gateway_store/metadata_rows.rs",
                 "anvil-core/src/gateway_store/record_codec.rs",
             ],
             required_terms: &[
@@ -250,19 +257,44 @@ fn rfc_0006_no_durable_bypass_feature_families_are_corestore_backed() {
                 "GatewayRepositoryRecordProto",
                 "create_gateway_repository",
             ],
-            corestore_terms: &["CoreStore", ".write_logical_file", "CoreMetaStore"],
+            corestore_terms: &[
+                "CoreStore",
+                "CoreMetaBatchOp",
+                ".commit_coremeta_root_groups",
+            ],
         },
         DurableFeatureFamily {
             name: "package_blob",
-            source_files: &["anvil-core/src/gateway_store.rs"],
+            source_files: &[
+                "anvil-core/src/gateway_store.rs",
+                "anvil-core/src/gateway_store/metadata_rows.rs",
+            ],
             required_terms: &["GatewayBlobRecord", "put_gateway_blob"],
-            corestore_terms: &["CoreStore", ".write_logical_file", "CoreMetaStore"],
+            corestore_terms: &[
+                "CoreStore",
+                ".write_logical_file_with_locator",
+                "CoreMetaBatchOp",
+                ".commit_coremeta_root_groups",
+            ],
         },
         DurableFeatureFamily {
             name: "gateway_mount",
-            source_files: &["anvil-core/src/gateway_store.rs"],
-            required_terms: &["GatewayMountRecord", "resolve_gateway_mount"],
-            corestore_terms: &["CoreStore", ".write_logical_file", "CoreMetaStore"],
+            source_files: &[
+                "anvil-core/src/gateway_store.rs",
+                "anvil-core/src/gateway_store/mount_routes.rs",
+            ],
+            required_terms: &[
+                "GatewayMountRecord",
+                "put_gateway_mount_record",
+                "resolve_gateway_mount",
+            ],
+            corestore_terms: &[
+                "CoreStore",
+                "CoreMutationBatch",
+                "CoreMutationOperation::CoreMetaPut",
+                ".commit_mutation_batch",
+                ".scan_coremeta_prefix_page",
+            ],
         },
         DurableFeatureFamily {
             name: "mesh_route",
@@ -287,8 +319,17 @@ fn rfc_0006_no_durable_bypass_feature_families_are_corestore_backed() {
         },
         DurableFeatureFamily {
             name: "region_lifecycle",
-            source_files: &["anvil-core/src/mesh_lifecycle.rs"],
-            required_terms: &["RegionDescriptor", "region_drain"],
+            source_files: &[
+                "anvil-core/src/mesh_lifecycle.rs",
+                "anvil-core/src/mesh_lifecycle/region.rs",
+                "anvil-core/src/mesh_lifecycle/topology_mutation.rs",
+            ],
+            required_terms: &[
+                "RegionDescriptor",
+                "transition_region_with_control",
+                "ensure_region_drain_completion_is_supported",
+                "commit_topology_mutation",
+            ],
             corestore_terms: &["CoreStore", "CoreMutationBatch", ".commit_mutation_batch"],
         },
         DurableFeatureFamily {
@@ -326,7 +367,13 @@ fn rfc_0006_no_durable_bypass_feature_families_are_corestore_backed() {
             name: "audit_record",
             source_files: &["anvil-core/src/admin_audit.rs"],
             required_terms: &["AdminAuditEvent", "append_audit_event"],
-            corestore_terms: &["CoreStore", ".append_stream", ".read_stream"],
+            corestore_terms: &[
+                "CoreStore",
+                "CoreMutationOperation::StreamAppend",
+                ".commit_mutation_batch",
+                ".scan_coremeta_prefix_page",
+                ".stream_head_sequence",
+            ],
         },
     ];
 

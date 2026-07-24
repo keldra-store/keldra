@@ -58,7 +58,7 @@ These commands prove the image is pullable, has a resolved digest, and contains 
 
 Start by reading the release notes and the matching documentation as a change log for operators, not as marketing text. Look for storage format changes, new required environment variables, changed defaults, authz scope changes, public or admin API shape changes, gateway behaviour changes, index rebuild requirements, PersonalDB changes, and topology lifecycle notes. If the release touches any of those, write the validation evidence you expect before the rollout starts.
 
-Confirm backups before upgrading. A useful backup has the node volume under `STORAGE_PATH`, node identity and cluster keypair files, server secret versions, previous secret-encryption keys, `JWT_SECRET`, `CLUSTER_SECRET`, first-admin or named admin credentials, and the redacted configuration snapshot. If a release may write one-way storage records, run an isolated restore drill from a backup taken before the upgrade. A backup that has not been restored is only a hope.
+Confirm backups before upgrading. A useful backup has each node volume under `STORAGE_PATH` containing its local identity and Ed25519 signing key, server secret versions, previous secret-encryption keys, `JWT_SECRET`, internal node credential references, first-admin or named admin credentials, and the redacted configuration snapshot. If a release may write one-way storage records, run an isolated restore drill from a backup taken before the upgrade. A backup that has not been restored is only a hope.
 
 Check capacity and lag. An upgrade can cause a burst of derived work: indexes rebuild, object metadata compaction resumes, PersonalDB projections catch up, routing projections repair, or watch consumers replay. If the cluster is already close to disk, CPU, memory, or I/O limits, the upgrade may fail because there is no room to recover. Check index lag, watch lag, PersonalDB lag, diagnostics, repair findings, and gateway error rates before the first node changes.
 
@@ -68,7 +68,7 @@ Check the public and admin planes. The admin API must remain private even during
 
 A rolling upgrade changes one node or cell at a time while the rest of the mesh continues serving. The safe shape is: remove the node from user traffic, record lifecycle intent where the current surface supports it, stop the old container, start the new image with the same durable storage and secret configuration, verify the node, then return traffic. Repeat only after the previous scope is healthy.
 
-For a Docker or Compose deployment, the exact command depends on your orchestrator. The storage rule is the same: mount the same node's durable volume at the same `STORAGE_PATH`, keep the same server secret versions, and do not accidentally initialise a new cluster on a joining node. A Compose-style single-service replacement looks like this:
+For a Docker or Compose deployment, the exact command depends on your orchestrator. The storage rule is the same: mount the same node's durable volume at the same `STORAGE_PATH`, keep the same server secret versions and node credential, preserve its committed endpoint, and do not start the volume under a different node identity. A Compose-style single-service replacement looks like this:
 
 ```bash
 ANVIL_IMAGE="registry.example.com/anvil:v2026.07.07"
@@ -122,7 +122,7 @@ A node that starts is not yet upgraded. `/ready` is a useful first signal, but i
 curl -fsS http://127.0.0.1:50051/ready
 ```
 
-A successful response proves the public HTTP gateway accepted a readiness request and the node has at least itself in the peer table. It does not prove the admin plane works, the storage volume was mounted correctly, object reads are durable, indexes are caught up, or gateways route correctly.
+A successful response proves the listener accepted a readiness request and CoreMeta startup recovery is ready. It does not prove the admin plane works, the storage volume was mounted correctly, object reads are durable, indexes are caught up, authenticated distributed calls work, or gateways route correctly.
 
 Follow readiness with an admin diagnostic from the private plane:
 

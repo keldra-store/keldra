@@ -9,6 +9,8 @@ use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 
 const CORE_PAYLOAD_REFERENCE_SCHEMA: &str = "anvil.core.payload_reference.v1";
+#[cfg(test)]
+const TEST_PAYLOAD_REFERENCE_PAGE_ROWS: usize = 128;
 
 #[derive(Clone, PartialEq, Message)]
 struct PayloadReferenceRowProto {
@@ -79,9 +81,9 @@ impl CoreStore {
         bucket: &Bucket,
         object: &Object,
         transaction_id: &str,
-    ) -> Result<Vec<OwnedCoreMetaBatchOp>> {
-        if !object_has_payload_reference_edges(object) {
-            return Ok(Vec::new());
+    ) -> Result<(Vec<OwnedCoreMetaBatchOp>, Vec<CoreMetaRootPublication>)> {
+        if !object_has_live_payload_reference_edges(object) {
+            return Ok((Vec::new(), Vec::new()));
         }
         validate_payload_reference_scope(bucket, object)?;
         let descriptors = self
@@ -96,9 +98,9 @@ impl CoreStore {
         bucket: &Bucket,
         object: &Object,
         transaction_id: &str,
-    ) -> Result<Vec<OwnedCoreMetaBatchOp>> {
-        if !object_has_payload_reference_edges(object) {
-            return Ok(Vec::new());
+    ) -> Result<(Vec<OwnedCoreMetaBatchOp>, Vec<CoreMetaRootPublication>)> {
+        if !object_has_payload_reference_target(object) {
+            return Ok((Vec::new(), Vec::new()));
         }
         validate_payload_reference_scope(bucket, object)?;
         let descriptors = self
@@ -174,12 +176,14 @@ impl CoreStore {
         descriptors: Vec<PayloadReferenceDescriptor>,
         transaction_id: &str,
         put: bool,
-    ) -> Result<Vec<OwnedCoreMetaBatchOp>> {
+    ) -> Result<(Vec<OwnedCoreMetaBatchOp>, Vec<CoreMetaRootPublication>)> {
         let mut ops = Vec::with_capacity(descriptors.len());
+        let mut publications = Vec::with_capacity(descriptors.len());
         let created_at = now_rfc3339();
         let created_at_nanos =
             u64::try_from(Utc::now().timestamp_nanos_opt().unwrap_or_default()).unwrap_or_default();
         for descriptor in descriptors {
+            let root_anchor_key = payload_reference_root_anchor_key(&descriptor.payload_identity);
             let root_generation = self
                 .next_payload_reference_root_generation(&descriptor.payload_identity)
                 .await?;
@@ -229,8 +233,12 @@ impl CoreStore {
                     common: Some(common),
                 });
             }
+            publications.push(CoreMetaRootPublication::new(
+                root_anchor_key,
+                WriterFamily::ObjectBlob,
+            ));
         }
-        Ok(ops)
+        Ok((ops, publications))
     }
 
     async fn next_payload_reference_root_generation(&self, payload_identity: &str) -> Result<u64> {
@@ -245,24 +253,43 @@ impl CoreStore {
     #[cfg(test)]
     fn payload_reference_count(&self, payload_identity: &str) -> Result<usize> {
         let mut count = 0_usize;
-        for row in self.meta.scan_prefix(
-            CF_REFCOUNTS,
-            TABLE_REFCOUNT_ROW,
-            &payload_reference_prefix(payload_identity)?,
-        )? {
-            let decoded = decode_payload_reference_row(&row.payload)?;
-            if decoded.payload_identity == payload_identity {
-                count = count.saturating_add(1);
+        let prefix = payload_reference_prefix(payload_identity)?;
+        let mut after = None;
+        loop {
+            let rows = self.scan_coremeta_prefix_page(
+                CF_REFCOUNTS,
+                TABLE_REFCOUNT_ROW,
+                &prefix,
+                after.as_deref(),
+                TEST_PAYLOAD_REFERENCE_PAGE_ROWS,
+            )?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in &rows {
+                let decoded = decode_payload_reference_row(&row.payload)?;
+                if decoded.payload_identity == payload_identity {
+                    count = count.saturating_add(1);
+                }
+            }
+            after = rows
+                .last()
+                .map(|row| core_meta_record_tuple_key(&row.key).map(ToOwned::to_owned))
+                .transpose()?;
+            if rows.len() < TEST_PAYLOAD_REFERENCE_PAGE_ROWS {
+                break;
             }
         }
         Ok(count)
     }
 }
 
-fn object_has_payload_reference_edges(object: &Object) -> bool {
-    object.kind == object_links::ObjectEntryKind::Blob
-        && object.deleted_at.is_none()
-        && object.shard_map.is_some()
+fn object_has_live_payload_reference_edges(object: &Object) -> bool {
+    object_has_payload_reference_target(object) && object.deleted_at.is_none()
+}
+
+fn object_has_payload_reference_target(object: &Object) -> bool {
+    object.kind == object_links::ObjectEntryKind::Blob && object.shard_map.is_some()
 }
 
 fn validate_payload_reference_scope(bucket: &Bucket, object: &Object) -> Result<()> {

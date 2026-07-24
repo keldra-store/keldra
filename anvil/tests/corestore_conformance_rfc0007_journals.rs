@@ -156,10 +156,11 @@ fn rfc_0007_manifest_cas_uses_corestore_stream_payloads_and_current_rows() {
             "TABLE_MANIFEST_CAS_CURRENT_ROW",
             "encode_manifest_body(&body, fence_token, mutation_id)",
             "decode_manifest_body(&record.payload)",
-            "CoreMetaStore::open(storage.core_store_meta_path())",
+            "CoreStore::new(storage.clone()).await?",
+            "manifest_current_row_update_from_payload",
             "CoreMutationPrecondition::CoreMetaRow",
-            "write_manifest_current_row",
             "CoreMutationOperation::StreamAppend",
+            "CoreMutationOperation::CoreMetaPut",
         ],
     );
     assert_contains_none(
@@ -295,9 +296,13 @@ fn rfc_0007_model_metadata_uses_direct_protobuf_stream_payloads() {
             "fence_token",
             "mutation_id",
             "encode_model_event_body(&event, fence_token, mutation_id)",
-            "decode_model_event_body(&record.payload)",
+            "fn decode_model_event_body(bytes: &[u8])",
+            "let proto = ModelEventBodyProto::decode(bytes)?;",
+            "ensure_deterministic_proto(&proto, bytes, \"model metadata body\")?",
             "decode_model_event_body_fence(&record.payload)",
             "CoreMutationOperation::StreamAppend",
+            "model_projection_operations",
+            "CoreMutationOperation::CoreMetaPut",
         ],
     );
     assert_contains_none(
@@ -350,9 +355,10 @@ fn rfc_0007_bucket_metadata_uses_direct_protobuf_stream_payloads_and_current_ref
 #[test]
 fn rfc_0007_object_metadata_uses_direct_protobuf_stream_payloads_and_current_refs() {
     let source = format!(
-        "{}\n{}",
+        "{}\n{}\n{}",
         production_source("anvil-core/src/metadata_journal.rs"),
-        production_source("anvil-core/src/metadata_journal/helpers.rs")
+        production_source("anvil-core/src/metadata_journal/helpers.rs"),
+        production_source("anvil-core/src/metadata_journal/object_mutation.rs")
     );
 
     assert_contains_all(
@@ -364,10 +370,12 @@ fn rfc_0007_object_metadata_uses_direct_protobuf_stream_payloads_and_current_ref
             "ObjectMetadataRecord",
             "fence_token",
             "mutation_id",
-            "encode_object_version_body(&object_body)",
-            "encode_directory_entry_body(&directory_body)",
+            "encode_object_version_body(&object_version_body(",
+            "encode_directory_entry_body(&directory)?",
             "decode_object_metadata_body_proto(&record.payload)",
             "read_all_metadata_journal_records",
+            "prepare_object_metadata_projection",
+            "operations.extend(projection.operations)",
             "CoreMutationOperation::StreamAppend",
         ],
     );
@@ -391,22 +399,32 @@ fn rfc_0007_object_metadata_uses_direct_protobuf_stream_payloads_and_current_ref
 }
 
 #[test]
-fn rfc_0007_task_queue_uses_direct_protobuf_stream_payloads_and_current_rows() {
-    let source = production_source("anvil-core/src/task_journal.rs");
+fn rfc_0007_task_queue_uses_deterministic_protobuf_coremeta_rows() {
+    let source = format!(
+        "{}\n{}\n{}\n{}",
+        production_source("anvil-core/src/task_journal.rs"),
+        production_source("anvil-core/src/task_journal/model.rs"),
+        production_source("anvil-core/src/task_journal/queue.rs"),
+        production_source("anvil-core/src/task_journal/store.rs")
+    );
 
     assert_contains_all(
         "task queue RFC 0007 path",
         &source,
         &[
-            "TaskJournalBodyProto",
-            "TaskCurrentRowProto",
+            "TaskQueueRowProto",
+            "TaskJournalEntryProto",
+            "TaskAuditProto",
+            "TaskQueueRow::Journal",
             "fence_token",
             "mutation_id",
-            "TASK_QUEUE_AUDIT_RECORD_KIND",
-            "encode_task_journal_body(&event, fence_token, mutation_id)",
-            "decode_task_journal_body(&record.payload)",
-            "decode_task_journal_body_fence(&record.payload)",
-            "CoreMutationOperation::StreamAppend",
+            "encode_task_audit(&event, self.fence_token, &mutation_id)?",
+            "decode_task_audit(&entry.payload)?",
+            "decode_task_audit_fence(&entry.payload)?",
+            "TABLE_TASK_CURRENT_ROW",
+            "CoreMutationPrecondition::CoreMetaRow",
+            "CoreMutationOperation::CoreMetaPut",
+            "CoreMutationOperation::CoreMetaDelete",
         ],
     );
     assert_contains_none(
@@ -421,6 +439,7 @@ fn rfc_0007_task_queue_uses_direct_protobuf_stream_payloads_and_current_rows() {
             "serde_json::from_slice(&frame.body)",
             "frame.encode()",
             "frame.body",
+            "CoreMutationOperation::StreamAppend",
         ],
     );
 }
@@ -517,7 +536,12 @@ fn rfc_0007_control_plane_uses_direct_protobuf_stream_payloads_and_current_refs(
 
 #[test]
 fn rfc_0007_multipart_metadata_uses_direct_protobuf_stream_payloads_and_current_rows() {
-    let source = production_source("anvil-core/src/multipart_journal.rs");
+    let source = format!(
+        "{}\n{}\n{}",
+        production_source("anvil-core/src/multipart_journal.rs"),
+        production_source("anvil-core/src/multipart_journal/codec.rs"),
+        production_source("anvil-core/src/multipart_journal/current_rows.rs")
+    );
 
     assert_contains_all(
         "multipart metadata RFC 0007 path",
@@ -531,10 +555,10 @@ fn rfc_0007_multipart_metadata_uses_direct_protobuf_stream_payloads_and_current_
             "fence_token",
             "mutation_id",
             "encode_multipart_event(",
-            "decode_multipart_event(&record.payload)",
-            "decode_multipart_event_fence(&record.payload)",
-            "read_events_from_store",
-            "read_state_from_current_rows",
+            "decode_deterministic_proto::<MultipartEventProto>",
+            "current_upload_payload(",
+            "current_part_payload(",
+            "multipart_current_row_update(",
             "multipart_current_row_operations",
             "CoreMutationPrecondition::CoreMetaRow",
             "CoreTransactionUpdate::StreamAppend",
@@ -559,7 +583,11 @@ fn rfc_0007_multipart_metadata_uses_direct_protobuf_stream_payloads_and_current_
 
 #[test]
 fn rfc_0007_authz_tuples_use_direct_protobuf_stream_payloads_and_coremeta_rows() {
-    let source = production_source("anvil-core/src/authz_journal.rs");
+    let source = format!(
+        "{}\n{}",
+        production_source("anvil-core/src/authz_journal.rs"),
+        production_source("anvil-core/src/authz_journal/projection.rs")
+    );
 
     assert_contains_all(
         "authz tuple RFC 0007 path",
@@ -574,7 +602,11 @@ fn rfc_0007_authz_tuples_use_direct_protobuf_stream_payloads_and_coremeta_rows()
             "decode_authz_tuple_journal_body(&stream_record.payload)",
             "decode_authz_tuple_journal_body_fence(&record.payload)",
             "CoreMutationOperation::StreamAppend",
-            "CoreMetaStore::open(storage.core_store_meta_path())",
+            "CoreStore::new(storage.clone()).await?",
+            "projection::current_operations(",
+            "CoreMutationOperation::CoreMetaPut",
+            "TABLE_AUTHZ_TUPLE_OBJECT_CURRENT_ROW",
+            "TABLE_AUTHZ_TUPLE_SUBJECT_CURRENT_ROW",
         ],
     );
     assert_contains_none(
@@ -721,9 +753,11 @@ fn rfc_0007_tenant_audit_payloads_are_deterministic_protobuf() {
             "fn encode_tenant_audit_event",
             "fn decode_tenant_audit_event",
             "payload: encode_tenant_audit_event(event)",
-            "decode_tenant_audit_event(&record.payload)",
-            "encode_deterministic_proto(&TenantAuditEventProto",
+            "encode_deterministic_proto(&tenant_audit_event_to_proto(event))",
             "decode_deterministic_proto::<TenantAuditEventProto>",
+            "decode_tenant_audit_projection(&row.payload)",
+            "CoreMutationOperation::StreamAppend",
+            "CoreMutationOperation::CoreMetaPut",
         ],
     );
     assert_contains_none(
@@ -862,7 +896,7 @@ fn rfc_0007_index_segments_publish_coremeta_rows() {
         &[
             "write_index_segment_coremeta_record",
             "IndexSegmentCoreMetaRecord",
-            "list_index_segment_coremeta_records",
+            "index_segment_coremeta_record_for_family_generation",
             "latest_index_segment_coremeta_record",
         ],
     );
@@ -872,7 +906,7 @@ fn rfc_0007_index_segments_publish_coremeta_rows() {
         &[
             "write_index_segment_coremeta_record",
             "IndexSegmentCoreMetaRecord",
-            "list_index_segment_coremeta_records",
+            "index_segment_coremeta_record_for_family_generation",
             "latest_index_segment_coremeta_record",
         ],
     );
@@ -1006,38 +1040,6 @@ fn rfc_0007_git_source_watch_payloads_are_deterministic_protobuf() {
 }
 
 #[test]
-fn rfc_0007_cluster_gossip_uses_deterministic_protobuf_control_messages() {
-    let source = production_source("anvil-core/src/cluster.rs");
-
-    assert_contains_all(
-        "cluster gossip deterministic protobuf control messages",
-        &source,
-        &[
-            "struct ClusterMessageProto",
-            "struct MetadataEventProto",
-            "fn encode_cluster_message",
-            "fn decode_cluster_message",
-            "fn encode_metadata_event",
-            "fn decode_metadata_event",
-            "encode_deterministic_proto(&ClusterMessageProto",
-            "decode_deterministic_proto::<ClusterMessageProto>",
-            "encode_deterministic_proto(&MetadataEventProto",
-            "decode_deterministic_proto::<MetadataEventProto>",
-        ],
-    );
-    assert_contains_none(
-        "cluster gossip JSON control message transport",
-        &source,
-        &[
-            "serde_json::to_vec(&message)",
-            "serde_json::to_vec(&event)",
-            "serde_json::from_slice::<ClusterMessage>",
-            "serde_json::from_slice::<MetadataEvent>",
-        ],
-    );
-}
-
-#[test]
 fn rfc_0007_mesh_control_payloads_are_protobuf_with_operator_json_only_at_boundary() {
     let control = production_source("anvil-core/src/mesh_control_stream.rs");
     let directory = production_source("anvil-core/src/mesh_directory/record_proto.rs");
@@ -1089,37 +1091,79 @@ fn rfc_0007_mesh_control_payloads_are_protobuf_with_operator_json_only_at_bounda
 }
 
 #[test]
-fn rfc_0007_admission_commit_certificates_preserve_coremeta_evidence() {
-    let source = production_source("anvil-core/src/core_store/pending_mutation.rs");
-
+fn rfc_0007_coremeta_commit_certificates_preserve_quorum_evidence() {
+    let quorum = production_source("anvil-core/src/core_store/coremeta_quorum.rs");
     assert_contains_all(
-        "admission commit certificate CoreMeta evidence support",
-        &source,
+        "CoreMeta quorum certificate construction and validation",
+        &quorum,
+        &[
+            "pub struct CoreMetaCommitCertificate",
+            "pub prepare_receipts: Vec<CoreMetaPrepareReceipt>",
+            "pub struct CoreMetaCertificatePersistReceipt",
+            "pub fn build_commit_certificate(",
+            "pub fn commit_certificate_hash(",
+            "pub fn validate_commit_evidence_with_verifier",
+            "CORE_META_COMMIT_CERTIFICATE_HASH_DOMAIN",
+            "CORE_META_CERTIFICATE_PERSIST_RECEIPT_HASH_DOMAIN",
+        ],
+    );
+
+    let commit = production_source("anvil-core/src/core_store/local_coremeta_quorum.rs");
+    assert_contains_all(
+        "CoreMeta commit evidence persistence and publication",
+        &commit,
+        &[
+            "pub(crate) struct CoreMetaQuorumCommitOutcome",
+            "certificate_persist_receipt_hashes: Vec<String>",
+            "metadata_replica_node_ids: Vec<String>",
+            "validate_commit_evidence_with_verifier(",
+            "encode_deterministic_proto(&core_commit_certificate_to_api",
+            "self.coremeta_commit_evidence_encoded_row_at(",
+            "self.record_root_publication_outcomes(&intent, &outcomes)?",
+            "self.publish_recorded_root_publication_intent(&recorded)",
+        ],
+    );
+
+    let publication = production_source("anvil-core/src/core_store/local_root_publication.rs");
+    assert_contains_none(
+        "CoreMeta root publication without certificate evidence",
+        &publication,
+        &[
+            "core_meta_commit_certificate_hash: None",
+            "certificate_persist_receipt_hashes: Vec::new()",
+        ],
+    );
+    assert_contains_all(
+        "CoreMeta root anchor certificate evidence",
+        &publication,
+        &[
+            "core_meta_commit_certificate_hash: Some(outcome.certificate_hash.clone())",
+            "certificate_persist_receipt_hashes: outcome.certificate_persist_receipt_hashes.clone()",
+        ],
+    );
+
+    let proto = production_source("anvil-core/proto/anvil.proto");
+    assert_contains_all(
+        "CoreMeta certificate wire evidence",
+        &proto,
+        &[
+            "message CoreMetaCommitCertificate {",
+            "repeated CoreMetaPrepareReceipt prepare_receipts = 6;",
+            "message CoreMetaCertificatePersistReceipt {",
+            "CoreMetaCommitCertificate core_meta_commit_certificate = 7;",
+            "string core_meta_commit_certificate_hash = 8;",
+            "repeated CoreMetaCertificatePersistReceipt certificate_persist_receipts = 9;",
+        ],
+    );
+
+    assert_contains_none(
+        "removed admission-specific commit certificate",
+        &(quorum + &commit + &publication),
         &[
             "CoreAdmissionCommitCertificate",
-            "metadata_replica_node_ids: Vec<String>",
             "admission_attempt_id_with_metadata_replicas",
-            "core_meta_commit_certificate_hash",
-            "certificate_persist_receipt_hashes",
             "CORE_META_ADMISSION_PROFILE",
-            "#[prost(string, repeated, tag = \"10\")]",
-            "#[prost(string, repeated, tag = \"9\")]",
+            "do not support CoreMeta evidence yet",
         ],
-    );
-    let admission = production_source("anvil-core/src/core_store/local_admission.rs");
-    assert_contains_all(
-        "CoreMeta evidence rows are persisted before and after certificate construction",
-        &admission,
-        &[
-            "commit_coremeta_batch_by_embedded_roots",
-            "metadata_commit.metadata_replica_node_ids",
-            "local_pending_mutation_commit_certificate_bytes",
-            "verify_local_pending_mutation_commit_certificate",
-        ],
-    );
-    assert_contains_none(
-        "CoreMeta evidence unsupported bypass",
-        &(source + &admission),
-        &["do not support CoreMeta evidence yet"],
     );
 }

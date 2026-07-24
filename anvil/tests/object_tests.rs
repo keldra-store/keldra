@@ -11,9 +11,9 @@ use anvil::anvil_api::{
     ComposeObjectRequest, ComposeObjectSource, CopyObjectRequest, CreateAppendStreamRequest,
     CreateBucketRequest, CreateIndexRequest, DeleteObjectRequest, GetObjectRequest,
     HeadObjectRequest, IndexKind, InitiateMultipartRequest, LeaseFencePrecondition,
-    ListObjectVersionsRequest, ListObjectsRequest, MutationBatchAppendStreamRecord,
-    MutationBatchOperation, MutationBatchPatchJsonObject, MutationBatchPutObject,
-    MutationBatchRequest, NativeMutationContext, ObjectMetadata, PatchJsonObjectRequest,
+    ListObjectVersionsRequest, ListObjectsRequest, MutationBatchOperation,
+    MutationBatchPatchJsonObject, MutationBatchPutObject, MutationBatchRequest,
+    NativeMutationContext, ObjectMetadata, ObjectVersionPrecondition, PatchJsonObjectRequest,
     PutObjectRequest, ReadAppendStreamRequest, RepairDirectoryIndexRequest,
     SealAppendStreamSegmentRequest, TailAppendStreamRequest, UploadPartMetadata, UploadPartRequest,
     WatchPrefixRequest, WritePrecondition, WriteVisibilityOptions,
@@ -467,6 +467,8 @@ macro_rules! assert_native_mutation_response {
 mod batch_cas_multipart;
 #[path = "object_tests/copy_private_watch_stream.rs"]
 mod copy_private_watch_stream;
+#[path = "object_tests/mutation_batch_transactions.rs"]
+mod mutation_batch_transactions;
 #[path = "object_tests/native_delete_listing.rs"]
 mod native_delete_listing;
 #[path = "object_tests/patch_and_list.rs"]

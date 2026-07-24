@@ -1,6 +1,7 @@
 use crate::{
     core_store::{
-        CoreBoundaryValue, CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob,
+        CoreBoundaryValue, CoreMutationPrecondition, CoreObjectRef, CorePipelinePolicy, CoreStore,
+        CoreTraceContext, GetBlob,
     },
     formats::{
         FileFamily, Hash32, decode_writer_segment, encode_writer_segment_header,
@@ -21,6 +22,7 @@ use crate::{
     },
     index_coremeta::{self, IndexSegmentCoreMetaRecord},
     storage::Storage,
+    writer_segment_catalog::{WriterSegmentCatalogRecord, write_writer_segment_catalog_record},
     writer_segment_range::RangeAddressedWriterSegment,
 };
 use anyhow::{Context, Result, anyhow};
@@ -199,10 +201,28 @@ pub struct FullTextSegmentWrite<'a> {
     pub document_table: &'a [u8],
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct StagedFullTextSegment {
+    pub(crate) segment_ref: String,
+    pub(crate) segment_hash: String,
+    locator: IndexSegmentCoreMetaRecord,
+    catalog: WriterSegmentCatalogRecord,
+}
+
 pub async fn write_full_text_segment(
     storage: &Storage,
     write: FullTextSegmentWrite<'_>,
 ) -> Result<String> {
+    let staged = stage_full_text_segment(storage, write).await?;
+    publish_full_text_segment_catalog(storage, &staged, &[]).await?;
+    publish_full_text_segment_locator(storage, &staged, &[]).await?;
+    Ok(staged.segment_ref)
+}
+
+pub(crate) async fn stage_full_text_segment(
+    storage: &Storage,
+    write: FullTextSegmentWrite<'_>,
+) -> Result<StagedFullTextSegment> {
     let encoded_terms = encode_terms(&write.built_postings.terms);
     let encoded_postings_block = encode_postings_block(
         &write.built_postings.postings,
@@ -210,6 +230,18 @@ pub async fn write_full_text_segment(
     )?;
     let postings_bytes = zstd::stream::encode_all(&encoded_postings_block[..], 3)
         .context("compress full text postings block")?;
+    let mut timestamp_seed = Vec::new();
+    timestamp_seed.extend_from_slice(&encoded_terms);
+    timestamp_seed.extend_from_slice(&postings_bytes);
+    timestamp_seed.extend_from_slice(write.document_table);
+    let timestamp_digest = blake3::hash(&timestamp_seed).to_hex().to_string();
+    let created_at_unix_nanos = index_coremeta::deterministic_index_publication_nanos(
+        write.index_id,
+        "full_text_segment",
+        write.generation,
+        u128::from(write.source_cursor),
+        &timestamp_digest,
+    );
     let header = FullTextSegmentHeader {
         index_id: write.index_id.to_string(),
         generation: write.generation,
@@ -222,7 +254,8 @@ pub async fn write_full_text_segment(
         postings_bytes_len: postings_bytes.len() as u64,
         posting_count: write.built_postings.postings.len() as u64,
         codec: "zstd".to_string(),
-        created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+        created_at: chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(created_at_unix_nanos)
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
     };
     let body = encode_full_text_body(
         &header,
@@ -275,6 +308,7 @@ pub async fn write_full_text_segment(
         .write_format_build_output(WriterBuildOutput {
             logical_files: vec![built_segment.logical_file],
             core_meta_mutations: Vec::new(),
+            core_meta_root_publications: Vec::new(),
         })
         .await?;
     let object_ref = receipt
@@ -283,32 +317,63 @@ pub async fn write_full_text_segment(
         .cloned()
         .ok_or_else(|| anyhow!("CoreFormatWriter returned no full text object"))?;
     let core_object_ref_target = encode_core_object_ref_target(&object_ref)?;
+    let locator = IndexSegmentCoreMetaRecord {
+        index_id: write.index_id.to_string(),
+        index_kind: "full_text".to_string(),
+        writer_family: WriterFamily::FullText.as_str().to_string(),
+        segment_ref: ref_name.clone(),
+        core_object_ref_target: core_object_ref_target.clone(),
+        segment_hash: segment_file_hash.clone(),
+        segment_length,
+        generation: write.generation,
+        source_kind: "object_current".to_string(),
+        source_cursor: write.source_cursor,
+        authz_realm_id: "default".to_string(),
+        authz_scope_hash: index_coremeta::segment_authz_scope_hash("full_text", "per_row_label"),
+        authz_revision: write.authz_revision,
+        row_count: write.built_postings.terms.len() as u64,
+        field_names: Vec::new(),
+        created_at_unix_nanos: u64::try_from(created_at_unix_nanos)
+            .map_err(|_| anyhow!("full text segment timestamp is negative"))?,
+    };
+    let catalog = WriterSegmentCatalogRecord {
+        family: WriterFamily::FullText.as_str().to_string(),
+        scope: write.index_id.to_string(),
+        segment_ref: ref_name.clone(),
+        core_object_ref_target,
+        segment_hash: segment_file_hash.clone(),
+        segment_length,
+        generation: write.generation,
+        source_cursor: write.source_cursor,
+        created_at_unix_nanos: locator.created_at_unix_nanos,
+    };
+    Ok(StagedFullTextSegment {
+        segment_ref: ref_name,
+        segment_hash: segment_file_hash,
+        locator,
+        catalog,
+    })
+}
+
+pub(crate) async fn publish_full_text_segment_catalog(
+    storage: &Storage,
+    staged: &StagedFullTextSegment,
+    additional_preconditions: &[CoreMutationPrecondition],
+) -> Result<()> {
+    write_writer_segment_catalog_record(storage, &staged.catalog, additional_preconditions).await
+}
+
+pub(crate) async fn publish_full_text_segment_locator(
+    storage: &Storage,
+    staged: &StagedFullTextSegment,
+    additional_preconditions: &[CoreMutationPrecondition],
+) -> Result<()> {
     index_coremeta::write_index_segment_coremeta_record(
         storage,
-        &IndexSegmentCoreMetaRecord {
-            index_id: write.index_id.to_string(),
-            index_kind: "full_text".to_string(),
-            writer_family: WriterFamily::FullText.as_str().to_string(),
-            segment_ref: ref_name.clone(),
-            core_object_ref_target,
-            segment_hash: segment_file_hash,
-            segment_length,
-            generation: write.generation,
-            source_kind: "object_current".to_string(),
-            source_cursor: write.source_cursor,
-            authz_realm_id: "default".to_string(),
-            authz_scope_hash: index_coremeta::segment_authz_scope_hash(
-                "full_text",
-                "per_row_label",
-            ),
-            authz_revision: write.authz_revision,
-            row_count: write.built_postings.terms.len() as u64,
-            field_names: Vec::new(),
-            created_at_unix_nanos: unix_nanos_from_rfc3339(&header.created_at),
-        },
+        &staged.locator,
+        additional_preconditions,
     )
-    .await?;
-    Ok(ref_name)
+    .await
 }
 
 pub async fn read_full_text_segment(
@@ -323,7 +388,8 @@ pub async fn read_full_text_segment_bytes(storage: &Storage, segment_ref: &str) 
     let store = CoreStore::new(storage.clone()).await?;
     let index_id = full_text_index_id_from_segment_ref(segment_ref)?;
     let segment =
-        index_coremeta::read_index_segment_coremeta_record_by_ref(storage, &index_id, segment_ref)?
+        index_coremeta::read_index_segment_coremeta_record_by_ref(storage, &index_id, segment_ref)
+            .await?
             .ok_or_else(|| anyhow!("full text segment CoreMeta row is missing"))?;
     store
         .get_blob(GetBlob {
@@ -440,7 +506,8 @@ pub async fn latest_full_text_segment_ref(
             storage,
             index_id,
             WriterFamily::FullText.as_str(),
-        )?
+        )
+        .await?
         .map(|record| record.segment_ref),
     )
 }
@@ -453,15 +520,16 @@ pub(crate) async fn full_text_segment_hash_exists(
 ) -> Result<bool> {
     require_safe_component(index_id, "full text index id")?;
     validate_hex32(expected_segment_hash, "full text expected segment hash")?;
-    for record in index_coremeta::list_index_segment_coremeta_records(storage, index_id)? {
-        if record.generation != generation {
-            continue;
-        }
-        if record.segment_hash == expected_segment_hash {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Ok(
+        index_coremeta::index_segment_coremeta_record_for_family_generation(
+            storage,
+            index_id,
+            WriterFamily::FullText.as_str(),
+            generation,
+        )
+        .await?
+        .is_some_and(|record| record.segment_hash == expected_segment_hash),
+    )
 }
 
 pub fn decode_full_text_segment(bytes: &[u8]) -> Result<DecodedFullTextSegment> {

@@ -274,23 +274,31 @@ pub(super) async fn list_object_links(
             authorized_links.push(link);
         }
     }
-    let mut links = authorized_links;
-    links.sort_by(|a, b| a.link_key.cmp(&b.link_key));
-    let limit = page_limit(req.page.as_ref());
-    let has_more = links.len() > limit;
-    if has_more {
-        links.truncate(limit);
-    }
+    let links = authorized_links
+        .into_iter()
+        .map(object_link_descriptor_to_proto)
+        .collect::<Vec<_>>();
+    let filters = [
+        ("tenant_id", req.tenant_id.as_str()),
+        ("bucket_name", req.bucket_name.as_str()),
+        ("prefix", req.prefix.as_str()),
+    ];
+    let principal_scope = format!("tenant:{}/subject:{}", claims.tenant_id, claims.sub);
+    let (links, page) = crate::services::collection_cursor::paginate(
+        links,
+        req.page.as_ref(),
+        "anvil.ObjectService/ListObjectLinks",
+        &filters,
+        &principal_scope,
+        "link_key.asc",
+        state.config.jwt_secret.as_bytes(),
+        |link| link.link_key.as_str(),
+        |link| link.generation,
+    )?;
 
     Ok(Response::new(ListObjectLinksResponse {
-        page: Some(PageResponse {
-            next_cursor: String::new(),
-            has_more,
-        }),
-        links: links
-            .into_iter()
-            .map(object_link_descriptor_to_proto)
-            .collect(),
+        page: Some(page),
+        links,
     }))
 }
 pub(super) async fn create_host_alias(
@@ -568,21 +576,26 @@ pub(super) async fn list_host_aliases(
             host_aliases.push(alias);
         }
     }
-    host_aliases.sort_by(|left, right| left.hostname.cmp(&right.hostname));
-    let limit = page_limit(req.page.as_ref());
-    let has_more = host_aliases.len() > limit;
-    if has_more {
-        host_aliases.truncate(limit);
-    }
+    let host_aliases = host_aliases
+        .into_iter()
+        .map(host_alias_descriptor_to_proto)
+        .collect::<Vec<_>>();
+    let filters = [("region", req.region.as_str())];
+    let principal_scope = format!("tenant:{}/subject:{}", claims.tenant_id, claims.sub);
+    let (host_aliases, page) = crate::services::collection_cursor::paginate(
+        host_aliases,
+        req.page.as_ref(),
+        "anvil.ObjectService/ListHostAliases",
+        &filters,
+        &principal_scope,
+        "hostname.asc",
+        state.config.jwt_secret.as_bytes(),
+        |alias| alias.hostname.as_str(),
+        |alias| alias.generation,
+    )?;
 
     Ok(Response::new(ListHostAliasesResponse {
-        page: Some(PageResponse {
-            next_cursor: String::new(),
-            has_more,
-        }),
-        host_aliases: host_aliases
-            .into_iter()
-            .map(host_alias_descriptor_to_proto)
-            .collect(),
+        page: Some(page),
+        host_aliases,
     }))
 }

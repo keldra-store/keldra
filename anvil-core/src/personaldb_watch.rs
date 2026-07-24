@@ -105,18 +105,16 @@ pub async fn append_personaldb_group_watch_record(
     storage: &Storage,
     tenant_id: i64,
     database_id: &str,
-    cursor: u128,
     mutation_id: [u8; 16],
     authz_revision: u64,
     payload: PersonalDbGroupWatchPayload,
-) -> Result<()> {
+) -> Result<u128> {
     validate_payload(database_id, &payload)?;
     let core_store = CoreStore::new(storage.clone()).await?;
     let stream_id = personaldb_group_watch_stream_id(tenant_id, database_id);
-    ensure_cursor_is_monotonic(&core_store, &stream_id, "personaldb_group_watch", cursor).await?;
 
     let record = WatchRecord::new(
-        cursor,
+        0,
         PERSONALDB_GROUP_PARTITION_FAMILY,
         partition_id(tenant_id, database_id),
         mutation_id,
@@ -126,7 +124,7 @@ pub async fn append_personaldb_group_watch_record(
         payload.log_index,
         encode_group_watch_payload(&payload),
     );
-    core_store
+    let receipt = core_store
         .append_stream(AppendStreamRecord {
             stream_id,
             partition_id: hex::encode(partition_id(tenant_id, database_id)),
@@ -137,11 +135,12 @@ pub async fn append_personaldb_group_watch_record(
             fence: None,
             transaction_id: None,
             idempotency_key: Some(format!(
-                "personaldb-group-watch:{tenant_id}:{database_id}:{cursor}"
+                "personaldb-group-watch:{tenant_id}:{database_id}:{}",
+                hex::encode(mutation_id)
             )),
         })
         .await?;
-    Ok(())
+    Ok(u128::from(receipt.sequence))
 }
 
 pub async fn append_personaldb_projection_watch_record(
@@ -149,24 +148,16 @@ pub async fn append_personaldb_projection_watch_record(
     tenant_id: i64,
     database_id: &str,
     projection_id: &str,
-    cursor: u128,
     mutation_id: [u8; 16],
     authz_revision: u64,
     payload: PersonalDbProjectionWatchPayload,
-) -> Result<()> {
+) -> Result<u128> {
     validate_projection_payload(database_id, projection_id, &payload)?;
     let core_store = CoreStore::new(storage.clone()).await?;
     let stream_id = personaldb_projection_watch_stream_id(tenant_id, database_id, projection_id);
-    ensure_cursor_is_monotonic(
-        &core_store,
-        &stream_id,
-        "personaldb_projection_watch",
-        cursor,
-    )
-    .await?;
 
     let record = WatchRecord::new(
-        cursor,
+        0,
         PERSONALDB_PROJECTION_PARTITION_FAMILY,
         projection_partition_id(tenant_id, database_id, projection_id),
         mutation_id,
@@ -176,7 +167,7 @@ pub async fn append_personaldb_projection_watch_record(
         payload.projection_log_index,
         encode_projection_watch_payload(&payload),
     );
-    core_store
+    let receipt = core_store
         .append_stream(AppendStreamRecord {
             stream_id,
             partition_id: hex::encode(projection_partition_id(
@@ -191,11 +182,12 @@ pub async fn append_personaldb_projection_watch_record(
             fence: None,
             transaction_id: None,
             idempotency_key: Some(format!(
-                "personaldb-projection-watch:{tenant_id}:{database_id}:{projection_id}:{cursor}"
+                "personaldb-projection-watch:{tenant_id}:{database_id}:{projection_id}:{}",
+                hex::encode(mutation_id)
             )),
         })
         .await?;
-    Ok(())
+    Ok(u128::from(receipt.sequence))
 }
 
 pub async fn list_personaldb_group_watch_events(
@@ -205,23 +197,49 @@ pub async fn list_personaldb_group_watch_events(
     after_cursor: u128,
     limit: usize,
 ) -> Result<Vec<PersonalDbGroupWatchEvent>> {
+    Ok(
+        list_personaldb_group_watch_event_page(
+            storage,
+            tenant_id,
+            database_id,
+            after_cursor,
+            limit,
+        )
+        .await?
+        .events,
+    )
+}
+
+#[derive(Debug, Clone)]
+pub struct PersonalDbGroupWatchEventPage {
+    pub events: Vec<PersonalDbGroupWatchEvent>,
+    pub next_cursor: u128,
+    pub has_more: bool,
+}
+
+pub async fn list_personaldb_group_watch_event_page(
+    storage: &Storage,
+    tenant_id: i64,
+    database_id: &str,
+    after_cursor: u128,
+    limit: usize,
+) -> Result<PersonalDbGroupWatchEventPage> {
     let core_store = CoreStore::new(storage.clone()).await?;
-    let records = read_watch_or_empty(
+    let (records, next_cursor, has_more) = read_watch_page(
         &core_store,
         &personaldb_group_watch_stream_id(tenant_id, database_id),
         "personaldb_group_watch",
+        after_cursor,
+        limit,
     )
     .await?;
-    let mut events = Vec::new();
+    let mut events = Vec::with_capacity(records.len());
     for record in records {
-        if record.cursor <= after_cursor {
-            continue;
-        }
         if record.partition_family != PERSONALDB_GROUP_PARTITION_FAMILY
             || record.record_kind != PERSONALDB_GROUP_RECORD_KIND
             || record.partition_id != partition_id(tenant_id, database_id)
         {
-            continue;
+            return Err(anyhow!("personaldb group watch record scope mismatch"));
         }
         let payload = decode_group_watch_payload(&record.payload)?;
         validate_payload(database_id, &payload)?;
@@ -231,11 +249,12 @@ pub async fn list_personaldb_group_watch_events(
             authz_revision: record.authz_revision,
             payload,
         });
-        if limit > 0 && events.len() >= limit {
-            break;
-        }
     }
-    Ok(events)
+    Ok(PersonalDbGroupWatchEventPage {
+        events,
+        next_cursor,
+        has_more,
+    })
 }
 
 pub async fn list_personaldb_projection_watch_events(
@@ -246,23 +265,49 @@ pub async fn list_personaldb_projection_watch_events(
     after_cursor: u128,
     limit: usize,
 ) -> Result<Vec<PersonalDbProjectionWatchEvent>> {
+    Ok(list_personaldb_projection_watch_event_page(
+        storage,
+        tenant_id,
+        database_id,
+        projection_id,
+        after_cursor,
+        limit,
+    )
+    .await?
+    .events)
+}
+
+#[derive(Debug, Clone)]
+pub struct PersonalDbProjectionWatchEventPage {
+    pub events: Vec<PersonalDbProjectionWatchEvent>,
+    pub next_cursor: u128,
+    pub has_more: bool,
+}
+
+pub async fn list_personaldb_projection_watch_event_page(
+    storage: &Storage,
+    tenant_id: i64,
+    database_id: &str,
+    projection_id: &str,
+    after_cursor: u128,
+    limit: usize,
+) -> Result<PersonalDbProjectionWatchEventPage> {
     let core_store = CoreStore::new(storage.clone()).await?;
-    let records = read_watch_or_empty(
+    let (records, next_cursor, has_more) = read_watch_page(
         &core_store,
         &personaldb_projection_watch_stream_id(tenant_id, database_id, projection_id),
         "personaldb_projection_watch",
+        after_cursor,
+        limit,
     )
     .await?;
-    let mut events = Vec::new();
+    let mut events = Vec::with_capacity(records.len());
     for record in records {
-        if record.cursor <= after_cursor {
-            continue;
-        }
         if record.partition_family != PERSONALDB_PROJECTION_PARTITION_FAMILY
             || record.record_kind != PERSONALDB_PROJECTION_RECORD_KIND
             || record.partition_id != projection_partition_id(tenant_id, database_id, projection_id)
         {
-            continue;
+            return Err(anyhow!("personaldb projection watch record scope mismatch"));
         }
         let payload = decode_projection_watch_payload(&record.payload)?;
         validate_projection_payload(database_id, projection_id, &payload)?;
@@ -272,11 +317,12 @@ pub async fn list_personaldb_projection_watch_events(
             authz_revision: record.authz_revision,
             payload,
         });
-        if limit > 0 && events.len() >= limit {
-            break;
-        }
     }
-    Ok(events)
+    Ok(PersonalDbProjectionWatchEventPage {
+        events,
+        next_cursor,
+        has_more,
+    })
 }
 
 pub async fn latest_personaldb_group_watch_cursor(
@@ -285,21 +331,10 @@ pub async fn latest_personaldb_group_watch_cursor(
     database_id: &str,
 ) -> Result<Option<u128>> {
     let core_store = CoreStore::new(storage.clone()).await?;
-    let records = read_watch_or_empty(
-        &core_store,
-        &personaldb_group_watch_stream_id(tenant_id, database_id),
-        "personaldb_group_watch",
-    )
-    .await?;
-    Ok(records
-        .into_iter()
-        .filter(|record| {
-            record.partition_family == PERSONALDB_GROUP_PARTITION_FAMILY
-                && record.record_kind == PERSONALDB_GROUP_RECORD_KIND
-                && record.partition_id == partition_id(tenant_id, database_id)
-        })
-        .map(|record| record.cursor)
-        .max())
+    let sequence = core_store
+        .stream_head_sequence(&personaldb_group_watch_stream_id(tenant_id, database_id))
+        .await?;
+    Ok((sequence != 0).then_some(u128::from(sequence)))
 }
 
 pub async fn latest_personaldb_projection_watch_cursor(
@@ -309,60 +344,45 @@ pub async fn latest_personaldb_projection_watch_cursor(
     projection_id: &str,
 ) -> Result<Option<u128>> {
     let core_store = CoreStore::new(storage.clone()).await?;
-    let records = read_watch_or_empty(
-        &core_store,
-        &personaldb_projection_watch_stream_id(tenant_id, database_id, projection_id),
-        "personaldb_projection_watch",
-    )
-    .await?;
-    Ok(records
-        .into_iter()
-        .filter(|record| {
-            record.partition_family == PERSONALDB_PROJECTION_PARTITION_FAMILY
-                && record.record_kind == PERSONALDB_PROJECTION_RECORD_KIND
-                && record.partition_id
-                    == projection_partition_id(tenant_id, database_id, projection_id)
-        })
-        .map(|record| record.cursor)
-        .max())
+    let sequence = core_store
+        .stream_head_sequence(&personaldb_projection_watch_stream_id(
+            tenant_id,
+            database_id,
+            projection_id,
+        ))
+        .await?;
+    Ok((sequence != 0).then_some(u128::from(sequence)))
 }
 
-async fn ensure_cursor_is_monotonic(
+async fn read_watch_page(
     core_store: &CoreStore,
     stream_id: &str,
     record_kind: &str,
-    cursor: u128,
-) -> Result<()> {
-    let records = read_watch_or_empty(core_store, stream_id, record_kind).await?;
-    if let Some(latest) = records.iter().map(|record| record.cursor).max()
-        && cursor <= latest
-    {
-        return Err(anyhow!("personaldb watch cursor must be monotonic"));
-    }
-    Ok(())
-}
-
-async fn read_watch_or_empty(
-    core_store: &CoreStore,
-    stream_id: &str,
-    record_kind: &str,
-) -> Result<Vec<WatchRecord>> {
-    let records = core_store
-        .read_stream(ReadStream {
+    after_cursor: u128,
+    limit: usize,
+) -> Result<(Vec<WatchRecord>, u128, bool)> {
+    let after_sequence =
+        u64::try_from(after_cursor).map_err(|_| anyhow!("personaldb watch cursor exceeds u64"))?;
+    let page = core_store
+        .read_stream_page(ReadStream {
             stream_id: stream_id.to_string(),
-            after_sequence: 0,
-            limit: 0,
+            after_sequence,
+            limit,
         })
         .await?;
-    records
-        .into_iter()
-        .filter(|record| record.record_kind == record_kind)
-        .map(|record| {
-            WatchRecord::decode(&record.payload)
-                .map(|(record, _)| record)
-                .map_err(Into::into)
-        })
-        .collect()
+    let mut records = Vec::with_capacity(page.records.len());
+    for source in page.records {
+        if source.record_kind != record_kind {
+            return Err(anyhow!("personaldb watch stream record kind mismatch"));
+        }
+        let (mut record, used) = WatchRecord::decode(&source.payload)?;
+        if used != source.payload.len() {
+            return Err(anyhow!("personaldb watch record has trailing bytes"));
+        }
+        record.cursor = u128::from(source.sequence);
+        records.push(record);
+    }
+    Ok((records, u128::from(page.next_sequence), page.has_more))
 }
 
 fn validate_payload(database_id: &str, payload: &PersonalDbGroupWatchPayload) -> Result<()> {
@@ -483,11 +503,11 @@ fn projection_partition_id(tenant_id: i64, database_id: &str, projection_id: &st
     )
 }
 
-fn personaldb_group_watch_stream_id(tenant_id: i64, database_id: &str) -> String {
+pub(crate) fn personaldb_group_watch_stream_id(tenant_id: i64, database_id: &str) -> String {
     format!("watch:personaldb_group:tenant:{tenant_id}:database:{database_id}")
 }
 
-fn personaldb_projection_watch_stream_id(
+pub(crate) fn personaldb_projection_watch_stream_id(
     tenant_id: i64,
     database_id: &str,
     projection_id: &str,
@@ -506,10 +526,10 @@ mod tests {
     async fn personaldb_group_watch_appends_lists_and_tracks_latest_cursor() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        append_personaldb_group_watch_record(&storage, 4, "db-alpha", 10, [1; 16], 7, payload(1))
+        append_personaldb_group_watch_record(&storage, 4, "db-alpha", [1; 16], 7, payload(1))
             .await
             .unwrap();
-        append_personaldb_group_watch_record(&storage, 4, "db-alpha", 11, [2; 16], 8, payload(2))
+        append_personaldb_group_watch_record(&storage, 4, "db-alpha", [2; 16], 8, payload(2))
             .await
             .unwrap();
 
@@ -517,46 +537,38 @@ mod tests {
             personaldb_group_watch_stream_id(4, "db-alpha"),
             "watch:personaldb_group:tenant:4:database:db-alpha"
         );
-        let events = list_personaldb_group_watch_events(&storage, 4, "db-alpha", 10, 10)
+        let events = list_personaldb_group_watch_events(&storage, 4, "db-alpha", 1, 10)
             .await
             .unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].cursor, 11);
+        assert_eq!(events[0].cursor, 2);
         assert_eq!(events[0].authz_revision, 8);
         assert_eq!(events[0].payload.log_index, 2);
         assert_eq!(
             latest_personaldb_group_watch_cursor(&storage, 4, "db-alpha")
                 .await
                 .unwrap(),
-            Some(11)
+            Some(2)
         );
     }
 
     #[tokio::test]
-    async fn personaldb_group_watch_rejects_non_monotonic_cursor_and_bad_payload() {
+    async fn personaldb_group_watch_rejects_idempotency_conflicts_and_bad_payload() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        append_personaldb_group_watch_record(&storage, 4, "db-alpha", 10, [1; 16], 7, payload(1))
+        append_personaldb_group_watch_record(&storage, 4, "db-alpha", [1; 16], 7, payload(1))
             .await
             .unwrap();
         assert!(
-            append_personaldb_group_watch_record(
-                &storage,
-                4,
-                "db-alpha",
-                10,
-                [2; 16],
-                7,
-                payload(2),
-            )
-            .await
-            .is_err()
+            append_personaldb_group_watch_record(&storage, 4, "db-alpha", [1; 16], 7, payload(2),)
+                .await
+                .is_err()
         );
 
         let mut bad = payload(3);
         bad.database_id = "db-beta".to_string();
         assert!(
-            append_personaldb_group_watch_record(&storage, 4, "db-alpha", 11, [3; 16], 7, bad)
+            append_personaldb_group_watch_record(&storage, 4, "db-alpha", [3; 16], 7, bad)
                 .await
                 .is_err()
         );
@@ -571,7 +583,6 @@ mod tests {
             4,
             "projection-db",
             "projection-a",
-            20,
             [1; 16],
             9,
             projection_payload(1),
@@ -583,7 +594,6 @@ mod tests {
             4,
             "projection-db",
             "projection-a",
-            21,
             [2; 16],
             10,
             projection_payload(2),
@@ -600,25 +610,25 @@ mod tests {
             4,
             "projection-db",
             "projection-a",
-            20,
+            1,
             10,
         )
         .await
         .unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].cursor, 21);
+        assert_eq!(events[0].cursor, 2);
         assert_eq!(events[0].authz_revision, 10);
         assert_eq!(events[0].payload.projection_log_index, 2);
         assert_eq!(
             latest_personaldb_projection_watch_cursor(&storage, 4, "projection-db", "projection-a")
                 .await
                 .unwrap(),
-            Some(21)
+            Some(2)
         );
     }
 
     #[tokio::test]
-    async fn personaldb_projection_watch_rejects_non_monotonic_cursor_and_bad_payload() {
+    async fn personaldb_projection_watch_rejects_idempotency_conflicts_and_bad_payload() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         append_personaldb_projection_watch_record(
@@ -626,7 +636,6 @@ mod tests {
             4,
             "projection-db",
             "projection-a",
-            20,
             [1; 16],
             9,
             projection_payload(1),
@@ -639,8 +648,7 @@ mod tests {
                 4,
                 "projection-db",
                 "projection-a",
-                20,
-                [2; 16],
+                [1; 16],
                 9,
                 projection_payload(2),
             )
@@ -656,7 +664,6 @@ mod tests {
                 4,
                 "projection-db",
                 "projection-a",
-                21,
                 [3; 16],
                 9,
                 bad,

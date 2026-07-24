@@ -4,7 +4,7 @@ use crate::routing::CrossRegionRoutingPolicy;
 use anyhow::Result;
 
 /// A distributed storage and compute system.
-#[derive(Parser, Debug, Clone, Default)]
+#[derive(Parser, Debug, Clone, PartialEq, Eq)]
 #[command(version, about, long_about = None)]
 pub struct Config {
     /// The secret key used for signing JWTs.
@@ -28,14 +28,6 @@ pub struct Config {
     /// placement will fail rather than silently degrading to local-only storage.
     #[arg(long, env, default_value = "")]
     pub corestore_internal_bearer_token: String,
-
-    /// The address to bind the QUIC peer-to-peer endpoint to.
-    #[arg(long, env, default_value = "/ip4/0.0.0.0/udp/7443/quic-v1")]
-    pub cluster_listen_addr: String,
-
-    /// The publicly reachable addresses for this node.
-    #[arg(long, env, use_value_delimiter = true, value_delimiter = ',')]
-    pub public_cluster_addrs: Vec<String>,
 
     /// The publicly reachable gRPC address for this node.
     #[arg(long, env)]
@@ -103,26 +95,6 @@ pub struct Config {
     #[arg(long, env, default_value = "")]
     pub node_id: String,
 
-    /// A list of bootstrap addresses for joining a cluster.
-    #[arg(long, env, use_value_delimiter = true, value_delimiter = ',')]
-    pub bootstrap_addrs: Vec<String>,
-
-    /// Initialize a new cluster.
-    #[arg(long, env, default_value_t = false)]
-    pub init_cluster: bool,
-
-    /// Enable mDNS for local peer discovery.
-    #[arg(long, env, default_value_t = true)]
-    pub enable_mdns: bool,
-
-    /// The shared secret for cluster authentication.
-    #[arg(long, env)]
-    pub cluster_secret: Option<String>,
-
-    /// TTL for metadata cache entries in seconds.
-    #[arg(long, env, default_value_t = 300)]
-    pub metadata_cache_ttl_secs: u64,
-
     /// Directory used for Anvil-owned object bytes, metadata journals, indexes, and manifests.
     #[arg(long, env, default_value = "anvil-data")]
     pub storage_path: String,
@@ -169,6 +141,44 @@ pub struct Config {
     pub task_lease_ttl_secs: u64,
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            jwt_secret: String::new(),
+            anvil_secret_encryption_key: String::new(),
+            anvil_secret_encryption_key_id: "primary".to_string(),
+            anvil_secret_encryption_previous_keys: String::new(),
+            corestore_internal_bearer_token: String::new(),
+            public_api_addr: String::new(),
+            api_listen_addr: "0.0.0.0:50051".to_string(),
+            admin_listen_addr: "127.0.0.1:50052".to_string(),
+            allow_public_admin_listener: false,
+            mesh_id: "default".to_string(),
+            bootstrap_system_admin_app_name: String::new(),
+            bootstrap_system_admin_credential_output_path: String::new(),
+            bootstrap_system_admin_subject_kind: String::new(),
+            bootstrap_system_admin_subject_id: String::new(),
+            bootstrap_node_ids: Vec::new(),
+            region: String::new(),
+            cell_id: "default".to_string(),
+            public_region_base_domain: String::new(),
+            trusted_proxy_source_ranges: Vec::new(),
+            cross_region_routing_policy: CrossRegionRoutingPolicy::RedirectPreferred,
+            node_id: String::new(),
+            storage_path: "anvil-data".to_string(),
+            personaldb_snapshot_entry_threshold: 1024,
+            personaldb_snapshot_payload_bytes_threshold: 64 * 1024 * 1024,
+            allow_test_only_embedding_provider: false,
+            vector_embedding_providers_json: String::new(),
+            object_metadata_compaction_frame_threshold: 4096,
+            object_metadata_compaction_bytes_threshold: 64 * 1024 * 1024,
+            run_background_worker: true,
+            background_worker_concurrency: 4,
+            task_lease_ttl_secs: 300,
+        }
+    }
+}
+
 fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
     let parsed = value
         .parse::<usize>()
@@ -185,6 +195,15 @@ impl Config {
         let mut me = Self::default();
         args.clone_into(&mut me);
         me
+    }
+
+    /// Whether this node participates in a multi-node CoreMeta topology.
+    ///
+    /// Distributed topology is installed through the administrative bootstrap
+    /// path before data-plane readiness. A node restart must not try to mutate
+    /// that topology while constructing its local application state.
+    pub fn requires_distributed_coremeta_recovery(&self) -> bool {
+        self.bootstrap_node_ids.len() > 1
     }
 
     pub fn secret_keyring(&self) -> Result<crate::crypto::EncryptionKeyring> {
@@ -226,11 +245,22 @@ impl Config {
 
     pub async fn with_persisted_identity(mut self) -> Result<Self> {
         let requested_node_id = (!self.node_id.trim().is_empty()).then_some(self.node_id.as_str());
-        let identity = crate::cluster_identity::load_or_create_cluster_identity_with_node_id(
-            &self.storage_path,
-            requested_node_id,
-        )
-        .await?;
+        let identity =
+            crate::node_identity::load_or_create_node_identity_with_core_store_configuration(
+                &self.storage_path,
+                requested_node_id,
+                self.core_pipeline_keyring()?,
+                crate::core_store::CoreStoreNodeIdentity {
+                    mesh_id: self.mesh_id.clone(),
+                    node_id: String::new(),
+                    region_id: self.region.clone(),
+                    cell_id: self.cell_id.clone(),
+                    public_api_addr: self.public_api_addr.clone(),
+                    internal_bearer_token: (!self.corestore_internal_bearer_token.is_empty())
+                        .then(|| self.corestore_internal_bearer_token.clone()),
+                },
+            )
+            .await?;
         self.node_id = identity.node_id;
 
         Ok(self)
@@ -295,6 +325,29 @@ mod tests {
     }
 
     #[test]
+    fn rust_default_matches_cli_defaults() {
+        let mut cli_default = Config::try_parse_from(required_args()).unwrap();
+        cli_default.jwt_secret.clear();
+        cli_default.anvil_secret_encryption_key.clear();
+        cli_default.public_api_addr.clear();
+        cli_default.region.clear();
+
+        assert_eq!(Config::default(), cli_default);
+    }
+
+    #[test]
+    fn distributed_coremeta_is_derived_from_committed_topology_bootstrap_configuration() {
+        assert!(!Config::default().requires_distributed_coremeta_recovery());
+        assert!(
+            Config {
+                bootstrap_node_ids: vec!["node-a".into(), "node-b".into()],
+                ..Config::default()
+            }
+            .requires_distributed_coremeta_recovery()
+        );
+    }
+
+    #[test]
     fn production_config_has_no_personaldb_signer_process_or_private_key_input() {
         let command = Config::command();
         let exposed_inputs = command
@@ -350,14 +403,17 @@ mod tests {
     async fn persisted_identity_is_coremeta_owned_and_reloads() {
         let temp = tempdir().unwrap();
         let storage_path = temp.path().join("storage");
+        let pipeline_key = "00".repeat(32);
         let config = Config {
             storage_path: storage_path.to_string_lossy().into_owned(),
+            anvil_secret_encryption_key: pipeline_key.clone(),
             ..Config::default()
         };
 
         let first = config.with_persisted_identity().await.unwrap();
         let restarted = Config {
             storage_path: storage_path.to_string_lossy().into_owned(),
+            anvil_secret_encryption_key: pipeline_key,
             ..Config::default()
         }
         .with_persisted_identity()
@@ -366,7 +422,6 @@ mod tests {
 
         assert_eq!(first.node_id, restarted.node_id);
         assert!(!storage_path.join("node-id").exists());
-        assert!(!storage_path.join("cluster-keypair.pb").exists());
         assert!(
             storage_path
                 .join("corestore")

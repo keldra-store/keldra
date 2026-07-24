@@ -449,72 +449,105 @@ pub(super) async fn build_typed_json_append_rows(
     Vec<IndexBuildDiagnostic>,
     Vec<CoreBoundaryValue>,
 )> {
-    let records = crate::append_journal::list_append_stream_records_for_bucket(
-        core_store.storage(),
-        bucket.tenant_id,
-        bucket.id,
-    )
-    .await?;
     let mut rows = Vec::new();
     let mut diagnostics = Vec::new();
     let mut boundary_values = BTreeSet::new();
-    for (stream, record) in records {
-        if (record.id.max(0) as u128) > source_cursor {
-            continue;
-        }
-        if !selector_matches_append(&index.selector, &stream, &record) {
-            continue;
-        }
-        if let Ok(manifest) = core_store
-            .read_object_manifest(&record.payload_object_ref)
-            .await
-        {
-            boundary_values.extend(manifest.boundary_values.into_iter());
-        }
-        let payload = match core_store
-            .get_blob(GetBlob {
-                object_ref: record.payload_object_ref.clone(),
-            })
-            .await
-        {
-            Ok(payload) => payload,
-            Err(error) => {
-                diagnostics.push(IndexBuildDiagnostic {
-                    object_key: stream.stream_key.clone(),
-                    version_id: None,
-                    severity: "error".to_string(),
-                    code: "TypedJsonAppendPayloadUnavailable".to_string(),
-                    message: error.to_string(),
-                    details: serde_json::json!({ "record_sequence": record.record_sequence }),
-                });
-                continue;
+    let mut after_stream_id = None;
+    loop {
+        let stream_page = crate::append_journal::list_append_streams_page(
+            core_store.storage(),
+            bucket.tenant_id,
+            bucket.id,
+            after_stream_id.as_deref(),
+            128,
+        )
+        .await?;
+        for stream in stream_page.streams {
+            let mut after_sequence = 0;
+            loop {
+                let record_page = crate::append_journal::list_append_stream_records_page(
+                    core_store.storage(),
+                    &stream,
+                    after_sequence,
+                    512,
+                )
+                .await?;
+                for record in record_page.records {
+                    if (record.id.max(0) as u128) > source_cursor {
+                        continue;
+                    }
+                    if !selector_matches_append(&index.selector, &stream, &record) {
+                        continue;
+                    }
+                    if let Ok(manifest) = core_store
+                        .read_object_manifest(&record.payload_object_ref)
+                        .await
+                    {
+                        boundary_values.extend(manifest.boundary_values.into_iter());
+                    }
+                    let payload = match core_store
+                        .get_blob(GetBlob {
+                            object_ref: record.payload_object_ref.clone(),
+                        })
+                        .await
+                    {
+                        Ok(payload) => payload,
+                        Err(error) => {
+                            diagnostics.push(IndexBuildDiagnostic {
+                                object_key: stream.stream_key.clone(),
+                                version_id: None,
+                                severity: "error".to_string(),
+                                code: "TypedJsonAppendPayloadUnavailable".to_string(),
+                                message: error.to_string(),
+                                details: serde_json::json!({
+                                    "record_sequence": record.record_sequence
+                                }),
+                            });
+                            continue;
+                        }
+                    };
+                    let json = match serde_json::from_slice::<JsonValue>(&payload) {
+                        Ok(json) => json,
+                        Err(error) => {
+                            diagnostics.push(IndexBuildDiagnostic {
+                                object_key: stream.stream_key.clone(),
+                                version_id: None,
+                                severity: "error".to_string(),
+                                code: "TypedJsonAppendPayloadInvalid".to_string(),
+                                message: error.to_string(),
+                                details: serde_json::json!({
+                                    "content_type": record.content_type
+                                }),
+                            });
+                            continue;
+                        }
+                    };
+                    match typed_json_row_from_append_record(
+                        bucket, definition, &stream, &record, &json,
+                    ) {
+                        Ok(row) => rows.push(row),
+                        Err(error) => diagnostics.push(IndexBuildDiagnostic {
+                            object_key: stream.stream_key.clone(),
+                            version_id: None,
+                            severity: "error".to_string(),
+                            code: "TypedJsonAppendRowExtractionFailed".to_string(),
+                            message: error.to_string(),
+                            details: serde_json::json!({
+                                "fields": index.build_policy.get("fields")
+                            }),
+                        }),
+                    }
+                }
+                if !record_page.has_more {
+                    break;
+                }
+                after_sequence = record_page.next_sequence;
             }
-        };
-        let json = match serde_json::from_slice::<JsonValue>(&payload) {
-            Ok(json) => json,
-            Err(error) => {
-                diagnostics.push(IndexBuildDiagnostic {
-                    object_key: stream.stream_key.clone(),
-                    version_id: None,
-                    severity: "error".to_string(),
-                    code: "TypedJsonAppendPayloadInvalid".to_string(),
-                    message: error.to_string(),
-                    details: serde_json::json!({ "content_type": record.content_type }),
-                });
-                continue;
-            }
-        };
-        match typed_json_row_from_append_record(bucket, definition, &stream, &record, &json) {
-            Ok(row) => rows.push(row),
-            Err(error) => diagnostics.push(IndexBuildDiagnostic {
-                object_key: stream.stream_key.clone(),
-                version_id: None,
-                severity: "error".to_string(),
-                code: "TypedJsonAppendRowExtractionFailed".to_string(),
-                message: error.to_string(),
-                details: serde_json::json!({ "fields": index.build_policy.get("fields") }),
-            }),
         }
+        let Some(next_stream_id) = stream_page.next_stream_id else {
+            break;
+        };
+        after_stream_id = Some(next_stream_id);
     }
     Ok((rows, diagnostics, boundary_values.into_iter().collect()))
 }

@@ -29,7 +29,7 @@ The native API remains the richer contract. Use it when a workflow needs Anvil-s
 
 ## Keep the planes separate
 
-The public plane is for tenant applications, native public API calls, S3-compatible traffic, static object delivery, public-read reads, and tenant-owned host aliases. The admin plane is for operators managing system bootstrap, topology, routing repair, secret rotation, diagnostics, repair, and system-realm authorisation. The cluster plane is node-to-node traffic. A gateway belongs on the public side unless it is an operator-only administrative lifecycle command.
+The public plane is for tenant applications, native public API calls, S3-compatible traffic, static object delivery, public-read reads, and tenant-owned host aliases. The admin plane is for operators managing system bootstrap, topology, routing repair, secret rotation, diagnostics, repair, and system-realm authorisation. Internal node services also use the public gRPC listener, but require node credentials and are never gateway routes. A gateway belongs on the public side unless it is an operator-only administrative lifecycle command.
 
 The current server exposes the native public gRPC API and the S3/static HTTP gateway from the same public listener. Requests with a gRPC content type go to public services; ordinary HTTP requests are handled by the S3/static gateway path. This is why exposing the public listener can make native clients, S3 tools, and browser static reads work through one application-facing endpoint.
 

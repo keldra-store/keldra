@@ -39,7 +39,7 @@ async fn hf_keys_are_tenant_scoped() {
 
     let first_keys = client
         .list_keys(authorized(
-            tonic::Request::new(anvil::anvil_api::ListHfKeysRequest {}),
+            tonic::Request::new(anvil::anvil_api::ListHfKeysRequest { page: None }),
             &first.token,
         ))
         .await
@@ -48,7 +48,7 @@ async fn hf_keys_are_tenant_scoped() {
         .keys;
     let second_keys = client
         .list_keys(authorized(
-            tonic::Request::new(anvil::anvil_api::ListHfKeysRequest {}),
+            tonic::Request::new(anvil::anvil_api::ListHfKeysRequest { page: None }),
             &second.token,
         ))
         .await
@@ -83,7 +83,7 @@ async fn hf_keys_are_tenant_scoped() {
         .unwrap();
     let second_keys = client
         .list_keys(authorized(
-            tonic::Request::new(anvil::anvil_api::ListHfKeysRequest {}),
+            tonic::Request::new(anvil::anvil_api::ListHfKeysRequest { page: None }),
             &second.token,
         ))
         .await

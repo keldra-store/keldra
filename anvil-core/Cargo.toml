@@ -19,9 +19,17 @@ publish = false
 name = "anvil_core"
 path = "src/lib.rs"
 
+[[bench]]
+name = "coremeta_release_gate"
+path = "benches/coremeta_release_gate/main.rs"
+harness = false
+required-features = ["coremeta-perf-gate"]
+
 [features]
 #Declare an enterprise feature, doesn't activate any depdendencies so leave it with an empty array
 enterprise = []
+coremeta-perf-gate = []
+root-publication-test-control = []
 test-in-process-personaldb-signers = []
 gcp = ["dep:prost-types", "tonic/tls-ring"]
 routeguide = ["dep:async-stream", "dep:tokio-stream", "dep:rand"]
@@ -97,11 +105,12 @@ globset = "0.4"
 local-ip-address = "0.6.5"
 reqwest = { version = "0.12.23", default-features = false, features = ["rustls-tls"] }
 trust-dns-resolver = "0.23.2"
-libp2p = { version = "0.56.0", features = ["gossipsub", "mdns", "tcp", "tokio", "macros", "noise", "yamux", "quic"] }
 reed-solomon-erasure = "6.0.0"
 ahash = "0.8.12"
 futures ="0.3.31"
 fallible-streaming-iterator = "0.1"
+fs2 = "0.4"
+ed25519-dalek = "2.2"
 flate2 = "1"
 jsonwebtoken = "9.3.1"
 argon2 = "0.5.3"
@@ -133,7 +142,6 @@ aes-gcm-siv = "0.11.1"
 constant_time_eq = "0.4.2"
 http-body-util = "0.1.1"
 subtle = "2.6.1"
-moka = { version = "0.12.11", features = ["future"] }
 hnsw_rs = "0.3.4"
 rocksdb = { version = "0.24.0", default-features = false, features = ["bindgen-runtime", "lz4", "zstd"] }
 

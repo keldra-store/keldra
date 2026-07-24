@@ -22,7 +22,7 @@ async fn local_node_descriptors(
     descriptors
 }
 
-async fn connect_docker_mesh_control(addr: &str) -> MeshControlServiceClient<Channel> {
+pub(super) async fn connect_docker_mesh_control(addr: &str) -> MeshControlServiceClient<Channel> {
     let mut last_error = None;
     for attempt in 1..=20 {
         match MeshControlServiceClient::connect(addr.to_string()).await {
@@ -47,9 +47,7 @@ fn put_node_request(
         state: "active".to_string(),
         capacity_json: "{}".to_string(),
         options: None,
-        libp2p_peer_id: descriptor.libp2p_peer_id.clone(),
-        receipt_signing_public_key_proto: descriptor.receipt_signing_public_key_proto.clone(),
-        cluster_addrs: descriptor.public_cluster_addrs.clone(),
+        receipt_signing_public_key: descriptor.receipt_signing_public_key.clone(),
         capabilities: vec![
             "object".to_string(),
             "index".to_string(),
@@ -99,6 +97,31 @@ pub(super) async fn ensure_docker_topology(
     admin_token: &str,
     region: &str,
 ) {
+    let deferred = prepare_docker_topology(admin_addrs, admin_token, region, None).await;
+    debug_assert!(deferred.is_none());
+}
+
+pub(super) async fn prepare_docker_topology_with_deferred_peer(
+    admin_addrs: &[String],
+    admin_token: &str,
+    region: &str,
+    deferred_ordinal: u8,
+) -> anvil::anvil_api::BootstrapMeshTopologyRequest {
+    assert!(
+        (2..=admin_addrs.len()).contains(&usize::from(deferred_ordinal)),
+        "deferred Docker peer must be a non-seed topology participant"
+    );
+    prepare_docker_topology(admin_addrs, admin_token, region, Some(deferred_ordinal))
+        .await
+        .expect("fresh Docker topology produced a deferred peer admission request")
+}
+
+async fn prepare_docker_topology(
+    admin_addrs: &[String],
+    admin_token: &str,
+    region: &str,
+    deferred_ordinal: Option<u8>,
+) -> Option<anvil::anvil_api::BootstrapMeshTopologyRequest> {
     let descriptors = local_node_descriptors(admin_addrs, admin_token).await;
     if std::env::var_os("ANVIL_TEST_TIMINGS").is_some() {
         eprintln!(
@@ -124,17 +147,27 @@ pub(super) async fn ensure_docker_topology(
         .expect("Docker seed BootstrapMeshTopology")
         .into_inner();
     if seed.already_initialised {
-        return;
+        assert!(
+            deferred_ordinal.is_none(),
+            "cannot defer a peer after Docker topology is already initialised"
+        );
+        return None;
     }
     assert!(
         !seed.canonical_coremeta_rows.is_empty(),
         "Docker seed topology bootstrap must return a canonical CoreMeta snapshot"
     );
 
-    for admin_addr in admin_addrs.iter().skip(1) {
-        let mut client = connect_docker_mesh_control(admin_addr).await;
+    let mut deferred_request = None;
+    for (index, admin_addr) in admin_addrs.iter().enumerate().skip(1) {
+        let ordinal = u8::try_from(index + 1).expect("Docker peer ordinal fits in u8");
         let mut join = topology.clone();
         join.canonical_coremeta_rows = seed.canonical_coremeta_rows.clone();
+        if deferred_ordinal == Some(ordinal) {
+            deferred_request = Some(join);
+            continue;
+        }
+        let mut client = connect_docker_mesh_control(admin_addr).await;
         let mut request = tonic::Request::new(join);
         add_docker_admin_bearer(&mut request, admin_token);
         let response = client
@@ -147,4 +180,5 @@ pub(super) async fn ensure_docker_topology(
             "fresh Docker joining node unexpectedly had an existing mesh topology"
         );
     }
+    deferred_request
 }

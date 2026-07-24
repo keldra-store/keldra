@@ -17,7 +17,9 @@ A region is the placement and routing boundary visible to tenants. In production
 
 A cell is a smaller boundary inside one region. It is typically a rack, rack-like failure domain, zone slice, storage pool, Kubernetes node pool, or other capacity unit an operator can drain and reason about independently. A cell should describe correlated risk: shared power, shared top-of-rack switch, shared maintenance window, shared storage pressure, or another condition that makes its nodes fail or fill together.
 
-A node is one Anvil server process. It may advertise capabilities such as `object`, `index`, `personaldb`, `gateway`, and `admin`, and it may run background responsibilities inside that same process. Do not design a topology that assumes separate worker-node binaries for those responsibilities. If you want to isolate gateway traffic from index-heavy work, you do that by choosing which Anvil processes advertise which capabilities and how traffic is routed to them.
+A node is one Anvil server process. It may advertise capabilities such as `object`, `index`, `personaldb`, `metadata`, `gateway`, and `admin`, and it may run background responsibilities inside that same process. Do not design a topology that assumes separate worker-node binaries for those responsibilities. If you want to isolate gateway traffic from index-heavy work, do it through committed capabilities and deliberate routing.
+
+The committed CoreMeta lifecycle descriptor is the authoritative membership record. Plan a stable node id, a `public_api_addr` that routes to exactly that identity, and durable Ed25519 signing identity for every node. There is no separate discovery registry to reconcile later.
 
 ## Regions And Bucket Distribution
 
@@ -39,7 +41,7 @@ Capacity headroom belongs in topology planning, not only in alerts. Keep enough 
 
 ## Nodes And Capabilities
 
-A node descriptor should say what the process is intended and resourced to do. `object` means the process is eligible for object-serving responsibilities, including current remote object proxy selection where supported. `index` means it is intended for index work. `personaldb` means it is intended for PersonalDB witnessing, snapshots, or projection work. `gateway` means it is intended to serve gateway traffic. `admin` means it participates in admin-plane responsibilities.
+A node descriptor should say what the process is intended and resourced to do. `object` means the process is eligible for object-serving responsibilities, including current remote object proxy selection where supported. `index` means it is intended for index work. `personaldb` means it is intended for PersonalDB witnessing, snapshots, or projection work. `metadata` means it can participate in CoreMeta responsibilities. `gateway` means it is intended to serve gateway traffic. `admin` means it participates in admin-plane responsibilities.
 
 Keep these capabilities honest. A small all-in-one deployment can advertise every capability because the same process does everything. A gateway-heavy deployment may run some public-edge Anvil processes with `gateway` and `object` capability, while keeping index-heavy work on processes with more CPU and memory. An index-heavy deployment should not advertise `index` on underpowered gateway nodes merely because the binary supports it.
 
@@ -67,7 +69,7 @@ Drain completion also needs caution. Admin commands can start region, cell, and 
 
 ## Planning Examples
 
-A small single-region deployment might use one region called `local` or `eu-west-1`, one cell such as `eu-west-1-a`, and one or two all-in-one nodes advertising `object,index,personaldb,gateway,admin`. This is easy to understand and useful for early production or internal systems. Its main risk is concentration: one cell failure or one saturated process affects everything. The runbook should say whether the deployment accepts that risk or whether a second cell is required before external tenants arrive.
+A small single-region deployment might use one region called `local` or `eu-west-1`, one cell such as `eu-west-1-a`, and one or two all-in-one nodes advertising `object,index,personaldb,metadata,gateway,admin`. This is easy to understand and useful for early production or internal systems. Its main risk is concentration: one cell failure or one saturated process affects everything. The runbook should say whether the deployment accepts that risk or whether a second cell is required before external tenants arrive.
 
 A multi-region deployment might use `eu-west-1` and `us-east-1`, each with its own public regional endpoint. Tenants or buckets are placed in the region that matches data residency and latency needs. Clients discover or store the bucket home region and use that endpoint for normal traffic. Generic routing can redirect or proxy some wrong-region requests, but it should not be the hot path for every read. Operators should compare bucket locator counts, object bytes, index lag, and gateway traffic per region before deciding a region is balanced.
 
@@ -102,6 +104,6 @@ Those signals should appear in dashboards and release checks before a production
 
 ## Pre-activation checklist
 
-Before activating a region, cell, or node, verify durable identity paths, public API address reachability, cluster address reachability, capability list, placement weight, expected region/cell membership, and backup coverage. For regions, also verify public base URL and virtual-host suffix because gateways and redirects will expose those values to clients.
+Before activating a region, cell, or node, verify that the node-local identity and Ed25519 public key match the committed descriptor, authenticated gRPC can reach the committed `public_api_addr`, the capability list and placement weight are correct, region/cell membership is expected, and the node volume is covered by backup. For regions, also verify public base URL and virtual-host suffix because gateways and redirects expose those values to clients.
 
 Activation should be a confirmation that the resource is ready, not the first time the operator learns whether it can be reached.

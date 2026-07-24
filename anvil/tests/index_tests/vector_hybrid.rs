@@ -119,8 +119,10 @@ async fn test_vector_index_builds_from_object_write_task() {
                 bucket_name: bucket_name.clone(),
                 index_name: "embedding".to_string(),
                 severity: String::new(),
-                after_cursor: 0,
-                limit: 100,
+                page: Some(anvil::anvil_api::PageRequest {
+                    page_size: 100,
+                    page_token: String::new(),
+                }),
             },
             &token,
         ))
@@ -547,8 +549,10 @@ async fn test_hybrid_index_builds_text_and_vector_segments_from_object_write_tas
                 bucket_name: bucket_name.clone(),
                 index_name: "body-and-vector".to_string(),
                 severity: String::new(),
-                after_cursor: 0,
-                limit: 100,
+                page: Some(anvil::anvil_api::PageRequest {
+                    page_size: 100,
+                    page_token: String::new(),
+                }),
             },
             &token,
         ))

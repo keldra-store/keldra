@@ -13,7 +13,7 @@ Read this chapter with [Production Model](/operators/production-model/), [Networ
 
 A useful Anvil dashboard or incident note should answer four questions.
 
-First, can requests reach the right trust surface? Public API traffic, S3/static gateway traffic, admin API traffic, and cluster traffic have different security meanings. A public endpoint being healthy does not prove the admin listener is private. An admin token working does not prove tenant credentials can use the public API. A gateway responding does not prove native object reads are authorised correctly.
+First, can requests reach the right trust surface? Tenant API traffic, S3/static gateway traffic, admin API traffic, and authenticated internal node gRPC have different security meanings. A public endpoint being healthy does not prove the admin listener is private or that node RPC authorisation works. An admin token working does not prove tenant credentials can use the public API. A gateway responding does not prove native object reads or distributed CoreStore operations are authorised correctly.
 
 Second, did the source record commit? For object storage this means an object version, delete marker, link, bucket record, or metadata update exists as durable CoreStore-backed state. For append streams it means a sequence record is present. For PersonalDB it means a changeset was witnessed and committed into the group log. For task leases it means ownership and fence state changed under the expected principal.
 
@@ -64,7 +64,7 @@ Consider a stale search incident. A user uploads `contracts/acme-2026.pdf` and i
 The tenant-facing diagnostic command is a safe first check for one index:
 
 ```bash
-anvil diagnostics list documents body_text --severity warning --limit 50
+anvil diagnostics list documents body_text --severity warning --page-size 50
 ```
 
 This reads diagnostics for the `body_text` index in the `documents` bucket using the current public CLI profile. It proves that the caller can authenticate to the public API and read diagnostics for that tenant-scoped index. It does not prove the whole bucket is indexed, that search is caught up, or that another index has no findings.

@@ -58,8 +58,28 @@ fn public_object_listing_fails_closed_when_planner_candidate_path_is_missing() {
     );
     assert!(
         guard_body.contains("execute_object_listing_plan")
-            && guard_body.contains("list_current_object_metadata"),
+            && guard_body.contains("list_current_object_metadata_page")
+            && !guard_body.contains(".list_current_object_metadata(bucket"),
         "ListObjects must read object-list candidates only inside the planner-backed path"
+    );
+    assert!(
+        !guard_body.contains("i32::MAX"),
+        "ListObjects must keep source and result pages explicitly bounded"
+    );
+    assert!(
+        guard_body.contains("if bucket_wide_read && !delimiter.is_empty()")
+            && guard_body.contains("after_current_prefix"),
+        "delimiter listings must seek past each emitted prefix instead of scanning its subtree"
+    );
+    let versions_body = function_body(
+        &source,
+        "pub async fn list_object_versions_for_tenant(",
+        "async fn object_listing_authz_revision(",
+    );
+    assert!(
+        versions_body.contains("list_object_versions_metadata_page")
+            && !versions_body.contains("i32::MAX"),
+        "ListObjectVersions must use bounded ordered source pages"
     );
     let planner_body = function_body(
         &source,

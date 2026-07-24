@@ -1,16 +1,23 @@
 use crate::core_store::{
-    CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition, CoreStore, ReadStream,
+    CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
+    CoreMutationRootPublication, CoreStore,
 };
-use crate::formats::{Hash32, hash32};
+use crate::formats::{Hash32, hash32, writer::WriterFamily};
 use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
 use crate::persistence::{HfIngestion, HfIngestionItem, HfIngestionJob, HfKey};
 use crate::storage::Storage;
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use prost::{Message, Oneof};
-use std::collections::{BTreeMap, HashSet};
 
-const HF_METADATA_BODY_SCHEMA: &str = "anvil.core.hf_metadata.v2";
+mod projection;
+pub(crate) use projection::HfKeyPage;
+pub use projection::{HfIngestionStatus, HfStoredItem, HfStoredItemPage};
+
+#[cfg(test)]
+mod bounded_read_tests;
+
+const HF_METADATA_BODY_SCHEMA: &str = "anvil.core.hf_metadata.v3";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HfMutationKind {
@@ -39,6 +46,7 @@ enum HfBody {
     },
     KeyDelete {
         tenant_id: i64,
+        key_id: i64,
         key_name: String,
         emitted_at: DateTime<Utc>,
     },
@@ -106,6 +114,8 @@ struct HfKeyDeleteProto {
     tenant_id: i64,
     #[prost(string, tag = "2")]
     key_name: String,
+    #[prost(int64, tag = "3")]
+    key_id: i64,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -189,13 +199,6 @@ enum HfIngestionItemStateProto {
 }
 
 #[derive(Debug, Clone, Default)]
-struct HfState {
-    keys: BTreeMap<i64, HfKey>,
-    ingestions: BTreeMap<i64, HfIngestion>,
-    items: BTreeMap<i64, HfIngestionItem>,
-}
-
-#[derive(Debug, Clone, Default)]
 struct HfWriteGuard {
     fence_token: u64,
     partition_precondition: Option<CoreMutationPrecondition>,
@@ -241,20 +244,17 @@ async fn create_key_inner(
     note: Option<&str>,
     guard: HfWriteGuard,
 ) -> Result<()> {
-    let state = read_state(storage).await?;
-    if state
-        .keys
-        .values()
-        .any(|key| key.tenant_id == tenant_id && key.name == name)
-    {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    if projection::get_key_by_name(&core_store, tenant_id, name)?.is_some() {
         return Err(anyhow!("hugging face key already exists"));
     }
+    let (stream_precondition, id) = next_hf_entity_id(storage).await?;
     let now = Utc::now();
     append_body(
         storage,
         HfMutationKind::KeyUpsert,
         Some(HfKey {
-            id: next_key_id(&state)?,
+            id,
             tenant_id,
             name: name.to_string(),
             token_encrypted: token_encrypted.to_vec(),
@@ -266,6 +266,7 @@ async fn create_key_inner(
         None,
         None,
         guard,
+        Some(stream_precondition),
     )
     .await
 }
@@ -292,24 +293,23 @@ async fn delete_key_inner(
     name: &str,
     guard: HfWriteGuard,
 ) -> Result<u64> {
-    let state = read_state(storage).await?;
-    let deleted = state
-        .keys
-        .values()
-        .any(|key| key.tenant_id == tenant_id && key.name == name);
-    if deleted {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let key = projection::get_key_by_name(&core_store, tenant_id, name)?;
+    if let Some(key) = key {
         append_body(
             storage,
             HfMutationKind::KeyDelete,
             None,
-            Some((tenant_id, name.to_string())),
+            Some((tenant_id, key.id, name.to_string())),
             None,
             None,
             guard,
+            None,
         )
         .await?;
+        return Ok(1);
     }
-    Ok(u64::from(deleted))
+    Ok(0)
 }
 
 pub async fn get_key_encrypted(
@@ -317,11 +317,8 @@ pub async fn get_key_encrypted(
     tenant_id: i64,
     name: &str,
 ) -> Result<Option<(i64, Vec<u8>)>> {
-    Ok(read_state(storage)
-        .await?
-        .keys
-        .into_values()
-        .find(|key| key.tenant_id == tenant_id && key.name == name)
+    let core_store = CoreStore::new(storage.clone()).await?;
+    Ok(projection::get_key_by_name(&core_store, tenant_id, name)?
         .map(|key| (key.id, key.token_encrypted)))
 }
 
@@ -330,22 +327,19 @@ pub async fn get_key_encrypted_by_id(
     tenant_id: i64,
     id: i64,
 ) -> Result<Option<Vec<u8>>> {
-    Ok(read_state(storage)
-        .await?
-        .keys
-        .remove(&id)
+    let core_store = CoreStore::new(storage.clone()).await?;
+    Ok(projection::get_key_by_id(&core_store, id)?
         .filter(|key| key.tenant_id == tenant_id)
         .map(|key| key.token_encrypted))
 }
 
-pub(crate) async fn list_encrypted_keys(storage: &Storage) -> Result<Vec<HfKey>> {
-    let mut keys = read_state(storage)
-        .await?
-        .keys
-        .into_values()
-        .collect::<Vec<_>>();
-    keys.sort_by_key(|key| key.id);
-    Ok(keys)
+pub(crate) async fn list_encrypted_key_page(
+    storage: &Storage,
+    after_cursor: Option<&[u8]>,
+    limit: usize,
+) -> Result<HfKeyPage> {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    projection::list_all_keys(&core_store, after_cursor, limit)
 }
 
 pub(crate) async fn update_key_encrypted_with_permit(
@@ -356,11 +350,8 @@ pub(crate) async fn update_key_encrypted_with_permit(
     partition_owner_signing_key: &[u8],
 ) -> Result<()> {
     let guard = hf_write_guard(storage, permit, partition_owner_signing_key).await?;
-    let state = read_state(storage).await?;
-    let mut key = state
-        .keys
-        .get(&id)
-        .cloned()
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let mut key = projection::get_key_by_id(&core_store, id)?
         .ok_or_else(|| anyhow!("hugging face key not found"))?;
     key.token_encrypted = token_encrypted.to_vec();
     key.updated_at = Utc::now();
@@ -372,23 +363,27 @@ pub(crate) async fn update_key_encrypted_with_permit(
         None,
         None,
         guard,
+        None,
     )
     .await
 }
 
-pub async fn list_keys(
+pub(crate) async fn list_key_page(
     storage: &Storage,
     tenant_id: i64,
-) -> Result<Vec<(String, Option<String>, DateTime<Utc>, DateTime<Utc>)>> {
-    let mut keys = read_state(storage)
+    after_cursor: Option<&[u8]>,
+    limit: usize,
+) -> Result<HfKeyPage> {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    projection::list_tenant_keys(&core_store, tenant_id, after_cursor, limit)
+}
+
+pub(crate) async fn hf_collection_revision(storage: &Storage) -> Result<String> {
+    Ok(CoreStore::new(storage.clone())
         .await?
-        .keys
-        .into_values()
-        .filter(|key| key.tenant_id == tenant_id)
-        .map(|key| (key.name, key.note, key.created_at, key.updated_at))
-        .collect::<Vec<_>>();
-    keys.sort_by(|left, right| left.0.cmp(&right.0));
-    Ok(keys)
+        .stream_head_sequence(&hf_metadata_stream_id())
+        .await?
+        .to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -472,8 +467,7 @@ async fn create_ingestion_inner(
     exclude_globs: &[String],
     guard: HfWriteGuard,
 ) -> Result<i64> {
-    let state = read_state(storage).await?;
-    let id = next_ingestion_id(&state)?;
+    let (stream_precondition, id) = next_hf_entity_id(storage).await?;
     append_body(
         storage,
         HfMutationKind::IngestionUpsert,
@@ -499,17 +493,16 @@ async fn create_ingestion_inner(
         }),
         None,
         guard,
+        Some(stream_precondition),
     )
     .await?;
     Ok(id)
 }
 
 pub async fn get_ingestion_job(storage: &Storage, id: i64) -> Result<Option<HfIngestionJob>> {
-    Ok(read_state(storage)
-        .await?
-        .ingestions
-        .remove(&id)
-        .map(|job| HfIngestionJob {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    Ok(
+        projection::get_ingestion(&core_store, id)?.map(|job| HfIngestionJob {
             key_id: job.key_id,
             tenant_id: job.tenant_id,
             requester_app_id: job.requester_app_id,
@@ -520,7 +513,8 @@ pub async fn get_ingestion_job(storage: &Storage, id: i64) -> Result<Option<HfIn
             target_prefix: job.target_prefix,
             include_globs: job.include_globs,
             exclude_globs: job.exclude_globs,
-        }))
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -552,7 +546,8 @@ async fn update_ingestion_state_inner(
     error: Option<&str>,
     guard: HfWriteGuard,
 ) -> Result<()> {
-    let Some(mut job) = read_state(storage).await?.ingestions.remove(&id) else {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let Some(mut job) = projection::get_ingestion(&core_store, id)? else {
         return Ok(());
     };
     job.state = state_value;
@@ -576,6 +571,7 @@ async fn update_ingestion_state_inner(
         Some(job),
         None,
         guard,
+        None,
     )
     .await
 }
@@ -591,7 +587,8 @@ pub(crate) async fn cancel_ingestion_with_permit(
 }
 
 async fn cancel_ingestion_inner(storage: &Storage, id: i64, guard: HfWriteGuard) -> Result<u64> {
-    let Some(mut job) = read_state(storage).await?.ingestions.remove(&id) else {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let Some(mut job) = projection::get_ingestion(&core_store, id)? else {
         return Ok(0);
     };
     if !matches!(
@@ -610,6 +607,7 @@ async fn cancel_ingestion_inner(storage: &Storage, id: i64, guard: HfWriteGuard)
         Some(job),
         None,
         guard,
+        None,
     )
     .await?;
     Ok(1)
@@ -655,27 +653,26 @@ async fn add_item_inner(
     etag: Option<&str>,
     guard: HfWriteGuard,
 ) -> Result<i64> {
-    let state = read_state(storage).await?;
-    let mut item = state
-        .items
-        .values()
-        .find(|item| item.ingestion_id == ingestion_id && item.path == path)
-        .cloned()
-        .unwrap_or_else(|| HfIngestionItem {
-            id: 0,
-            ingestion_id,
-            path: path.to_string(),
-            size,
-            etag: etag.map(ToOwned::to_owned),
-            state: crate::tasks::HFIngestionItemState::Queued,
-            error: None,
-            created_at: Utc::now(),
-            started_at: None,
-            finished_at: None,
-        });
-    if item.id == 0 {
-        item.id = next_item_id(&state)?;
-    }
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let existing = projection::get_item_by_path(&core_store, ingestion_id, path)?;
+    let (stream_precondition, id) = if let Some(item) = existing.as_ref() {
+        (None, item.id)
+    } else {
+        let (precondition, id) = next_hf_entity_id(storage).await?;
+        (Some(precondition), id)
+    };
+    let mut item = existing.unwrap_or_else(|| HfIngestionItem {
+        id,
+        ingestion_id,
+        path: path.to_string(),
+        size,
+        etag: etag.map(ToOwned::to_owned),
+        state: crate::tasks::HFIngestionItemState::Queued,
+        error: None,
+        created_at: Utc::now(),
+        started_at: None,
+        finished_at: None,
+    });
     item.size = size;
     item.etag = etag.map(ToOwned::to_owned);
     let id = item.id;
@@ -687,6 +684,7 @@ async fn add_item_inner(
         None,
         Some(item),
         guard,
+        stream_precondition,
     )
     .await?;
     Ok(id)
@@ -711,7 +709,8 @@ async fn update_item_state_inner(
     error: Option<&str>,
     guard: HfWriteGuard,
 ) -> Result<()> {
-    let Some(mut item) = read_state(storage).await?.items.remove(&id) else {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let Some(mut item) = projection::get_item(&core_store, id)? else {
         return Ok(());
     };
     item.state = state_value;
@@ -735,6 +734,7 @@ async fn update_item_state_inner(
         None,
         Some(item),
         guard,
+        None,
     )
     .await
 }
@@ -763,7 +763,8 @@ async fn update_item_success_inner(
     etag: &str,
     guard: HfWriteGuard,
 ) -> Result<()> {
-    let Some(mut item) = read_state(storage).await?.items.remove(&id) else {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let Some(mut item) = projection::get_item(&core_store, id)? else {
         return Ok(());
     };
     item.state = crate::tasks::HFIngestionItemState::Stored;
@@ -778,132 +779,54 @@ async fn update_item_success_inner(
         None,
         Some(item),
         guard,
+        None,
     )
     .await
 }
 
-pub async fn get_ingestion_items(
+pub async fn list_stored_ingestion_item_page(
     storage: &Storage,
     ingestion_id: i64,
-) -> Result<Vec<(String, Option<i64>, Option<String>, Option<DateTime<Utc>>)>> {
-    Ok(read_state(storage)
-        .await?
-        .items
-        .into_values()
-        .filter(|item| {
-            item.ingestion_id == ingestion_id
-                && item.state == crate::tasks::HFIngestionItemState::Stored
-        })
-        .map(|item| (item.path, item.size, item.etag, item.finished_at))
-        .collect())
+    after_cursor: Option<&[u8]>,
+    limit: usize,
+) -> Result<HfStoredItemPage> {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    projection::list_stored_items_for_ingestion(&core_store, ingestion_id, after_cursor, limit)
 }
 
-pub async fn get_all_items_for_prefix(
+pub async fn list_stored_target_item_page(
     storage: &Storage,
     tenant_id: i64,
     bucket: &str,
     prefix: &str,
-) -> Result<Vec<(String, Option<i64>, Option<String>, Option<DateTime<Utc>>)>> {
-    let state = read_state(storage).await?;
-    let ingestion_ids = state
-        .ingestions
-        .values()
-        .filter(|job| {
-            job.tenant_id == tenant_id && job.target_bucket == bucket && job.target_prefix == prefix
-        })
-        .map(|job| job.id)
-        .collect::<HashSet<_>>();
-    Ok(state
-        .items
-        .into_values()
-        .filter(|item| {
-            ingestion_ids.contains(&item.ingestion_id)
-                && item.state == crate::tasks::HFIngestionItemState::Stored
-        })
-        .map(|item| (item.path, item.size, item.etag, item.finished_at))
-        .collect())
+    after_cursor: Option<&[u8]>,
+    limit: usize,
+) -> Result<HfStoredItemPage> {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    projection::list_stored_items_for_target(
+        &core_store,
+        tenant_id,
+        bucket,
+        prefix,
+        after_cursor,
+        limit,
+    )
 }
 
-pub async fn status_summary(
-    storage: &Storage,
-    id: i64,
-) -> Result<(
-    String,
-    i64,
-    i64,
-    i64,
-    i64,
-    Option<String>,
-    Option<DateTime<Utc>>,
-    Option<DateTime<Utc>>,
-    DateTime<Utc>,
-)> {
-    let state = read_state(storage).await?;
-    let job = state
-        .ingestions
-        .get(&id)
-        .ok_or_else(|| anyhow!("ingestion not found"))?;
-    let queued = count_items(&state, id, crate::tasks::HFIngestionItemState::Queued);
-    let downloading = count_items(&state, id, crate::tasks::HFIngestionItemState::Downloading);
-    let stored = count_items(&state, id, crate::tasks::HFIngestionItemState::Stored);
-    let failed = count_items(&state, id, crate::tasks::HFIngestionItemState::Failed);
-    Ok((
-        job.state.as_str().to_string(),
-        queued,
-        downloading,
-        stored,
-        failed,
-        job.error.clone(),
-        job.started_at,
-        job.finished_at,
-        job.created_at,
-    ))
-}
-
-fn count_items(state: &HfState, id: i64, item_state: crate::tasks::HFIngestionItemState) -> i64 {
-    state
-        .items
-        .values()
-        .filter(|item| item.ingestion_id == id && item.state == item_state)
-        .count() as i64
-}
-
-async fn read_state(storage: &Storage) -> Result<HfState> {
-    let bodies = read_hf_bodies(storage).await?;
-    let mut state = HfState::default();
-    for body in bodies {
-        match body {
-            HfBody::KeyUpsert { key, .. } => {
-                state.keys.insert(key.id, key);
-            }
-            HfBody::KeyDelete {
-                tenant_id,
-                key_name,
-                ..
-            } => {
-                state
-                    .keys
-                    .retain(|_, key| key.tenant_id != tenant_id || key.name != key_name);
-            }
-            HfBody::IngestionUpsert { ingestion, .. } => {
-                state.ingestions.insert(ingestion.id, ingestion);
-            }
-            HfBody::ItemUpsert { item, .. } => {
-                state.items.insert(item.id, item);
-            }
-        }
-    }
-    Ok(state)
+pub async fn get_ingestion_status(storage: &Storage, id: i64) -> Result<HfIngestionStatus> {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    projection::get_ingestion_status(&core_store, id)?.ok_or_else(|| anyhow!("ingestion not found"))
 }
 
 async fn append_body(
     storage: &Storage,
     event: HfMutationKind,
     key: Option<HfKey>,
-    key_delete: Option<(i64, String)>,
+    key_delete: Option<(i64, i64, String)>,
     ingestion: Option<HfIngestion>,
     item: Option<HfIngestionItem>,
     guard: HfWriteGuard,
+    stream_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<()> {
     let core_store = CoreStore::new(storage.clone()).await?;
     let mutation_id = uuid::Uuid::new_v4();
@@ -913,7 +836,7 @@ async fn append_body(
         .or_else(|| {
             key_delete
                 .as_ref()
-                .map(|(tenant_id, name)| format!("tenant/{tenant_id}/key-name/{name}"))
+                .map(|(tenant_id, _, name)| format!("tenant/{tenant_id}/key-name/{name}"))
         })
         .or_else(|| {
             ingestion
@@ -925,44 +848,55 @@ async fn append_body(
     let body = hf_body_from_parts(event, key, key_delete, ingestion, item, Utc::now())?;
     let payload = encode_hf_body(&body, guard.fence_token, mutation_id)?;
     let partition_id = hex::encode(hf_partition_id());
+    let stream_id = hf_metadata_stream_id();
+    let stream_precondition = match stream_precondition {
+        Some(precondition) => precondition,
+        None => core_store.stream_head_precondition(&stream_id).await?,
+    };
+    let root_generation = next_stream_generation(&stream_precondition)?;
+    let transaction_id = format!("hf-metadata:{key_text}:{mutation_id}");
+    let mut operations = vec![CoreMutationOperation::StreamAppend {
+        partition_id: partition_id.clone(),
+        stream_id: stream_id.clone(),
+        record_kind: "hf_metadata".to_string(),
+        payload,
+        idempotency_key: Some(transaction_id.clone()),
+    }];
+    operations.extend(projection::projection_operations(
+        &core_store,
+        &body,
+        &stream_id,
+        root_generation,
+        &transaction_id,
+        &partition_id,
+    )?);
+    let projection_root = projection::projection_root_anchor_key(&stream_id);
+    let mut preconditions: Vec<_> = guard.partition_precondition.into_iter().collect();
+    preconditions.push(stream_precondition);
     core_store
         .commit_mutation_batch(CoreMutationBatch {
-            transaction_id: format!("hf-metadata:{key_text}:{mutation_id}"),
+            transaction_id,
             scope_partition: partition_id.clone(),
             committed_by_principal: hf_partition_principal(),
-            preconditions: guard.partition_precondition.into_iter().collect(),
-            operations: vec![CoreMutationOperation::StreamAppend {
-                partition_id,
-                stream_id: hf_metadata_stream_id(),
-                record_kind: "hf_metadata".to_string(),
-                payload,
-                idempotency_key: Some(format!("hf-metadata:{key_text}:{mutation_id}")),
-            }],
+            root_publications: vec![
+                CoreMutationRootPublication::new(partition_id, WriterFamily::CoreControl.as_str())
+                    .coordinator(),
+                CoreMutationRootPublication::new(
+                    projection_root,
+                    WriterFamily::ObjectBlob.as_str(),
+                ),
+            ],
+            preconditions,
+            operations,
         })
         .await?;
     Ok(())
 }
 
-async fn read_hf_bodies(storage: &Storage) -> Result<Vec<HfBody>> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let records = core_store
-        .read_stream(ReadStream {
-            stream_id: hf_metadata_stream_id(),
-            after_sequence: 0,
-            limit: 0,
-        })
-        .await?;
-    records
-        .into_iter()
-        .filter(|record| record.record_kind == "hf_metadata")
-        .map(|record| decode_hf_body(&record.payload))
-        .collect()
-}
-
 fn hf_body_from_parts(
     event: HfMutationKind,
     key: Option<HfKey>,
-    key_delete: Option<(i64, String)>,
+    key_delete: Option<(i64, i64, String)>,
     ingestion: Option<HfIngestion>,
     item: Option<HfIngestionItem>,
     emitted_at: DateTime<Utc>,
@@ -973,10 +907,11 @@ fn hf_body_from_parts(
             emitted_at,
         }),
         HfMutationKind::KeyDelete => {
-            let (tenant_id, key_name) = key_delete
+            let (tenant_id, key_id, key_name) = key_delete
                 .ok_or_else(|| anyhow!("hf key delete body is missing tenant and key name"))?;
             Ok(HfBody::KeyDelete {
                 tenant_id,
+                key_id,
                 key_name,
                 emitted_at,
             })
@@ -1020,6 +955,7 @@ fn hf_body_to_proto(
         },
         HfBody::KeyDelete {
             tenant_id,
+            key_id,
             key_name,
             emitted_at,
         } => HfJournalBodyProto {
@@ -1030,6 +966,7 @@ fn hf_body_to_proto(
             event: Some(hf_journal_body_proto::Event::KeyDelete(HfKeyDeleteProto {
                 tenant_id: *tenant_id,
                 key_name: key_name.clone(),
+                key_id: *key_id,
             })),
         },
         HfBody::IngestionUpsert {
@@ -1073,6 +1010,7 @@ fn hf_body_from_proto(proto: HfJournalBodyProto) -> Result<HfBody> {
         }),
         hf_journal_body_proto::Event::KeyDelete(key) => Ok(HfBody::KeyDelete {
             tenant_id: key.tenant_id,
+            key_id: key.key_id,
             key_name: key.key_name,
             emitted_at,
         }),
@@ -1277,37 +1215,29 @@ fn ensure_deterministic_proto(message: &impl Message, bytes: &[u8], label: &str)
     Ok(())
 }
 
-fn next_key_id(state: &HfState) -> Result<i64> {
-    state
-        .keys
-        .keys()
-        .copied()
-        .max()
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(|| anyhow!("hf key id overflow"))
+async fn next_hf_entity_id(storage: &Storage) -> Result<(CoreMutationPrecondition, i64)> {
+    let precondition = CoreStore::new(storage.clone())
+        .await?
+        .stream_head_precondition(&hf_metadata_stream_id())
+        .await?;
+    let generation = next_stream_generation(&precondition)?;
+    Ok((
+        precondition,
+        i64::try_from(generation).map_err(|_| anyhow!("hf entity id exceeds i64"))?,
+    ))
 }
 
-fn next_ingestion_id(state: &HfState) -> Result<i64> {
-    state
-        .ingestions
-        .keys()
-        .copied()
-        .max()
-        .unwrap_or(0)
+fn next_stream_generation(precondition: &CoreMutationPrecondition) -> Result<u64> {
+    let CoreMutationPrecondition::StreamHead {
+        expected_last_sequence,
+        ..
+    } = precondition
+    else {
+        return Err(anyhow!("hf stream precondition has wrong kind"));
+    };
+    expected_last_sequence
         .checked_add(1)
-        .ok_or_else(|| anyhow!("hf ingestion id overflow"))
-}
-
-fn next_item_id(state: &HfState) -> Result<i64> {
-    state
-        .items
-        .keys()
-        .copied()
-        .max()
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(|| anyhow!("hf item id overflow"))
+        .ok_or_else(|| anyhow!("hf stream sequence overflow"))
 }
 
 pub fn hf_partition_id() -> Hash32 {
@@ -1325,17 +1255,27 @@ fn hf_partition_principal() -> String {
 #[cfg(test)]
 pub(crate) async fn read_hf_frame_fences_for_test(storage: &Storage) -> Result<Vec<u64>> {
     let core_store = CoreStore::new(storage.clone()).await?;
-    Ok(core_store
-        .read_stream(ReadStream {
-            stream_id: hf_metadata_stream_id(),
-            after_sequence: 0,
-            limit: 0,
-        })
-        .await?
-        .into_iter()
-        .filter(|record| record.record_kind == "hf_metadata")
-        .map(|record| decode_hf_body_fence(&record.payload))
-        .collect::<Result<Vec<_>>>()?)
+    let mut after_sequence = 0;
+    let mut fences = Vec::new();
+    loop {
+        let page = core_store
+            .read_stream_page(crate::core_store::ReadStream {
+                stream_id: hf_metadata_stream_id(),
+                after_sequence,
+                limit: 256,
+            })
+            .await?;
+        for record in page.records {
+            if record.record_kind == "hf_metadata" {
+                fences.push(decode_hf_body_fence(&record.payload)?);
+            }
+        }
+        if !page.has_more || page.next_sequence == after_sequence {
+            break;
+        }
+        after_sequence = page.next_sequence;
+    }
+    Ok(fences)
 }
 
 async fn hf_write_guard(
@@ -1414,14 +1354,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            get_ingestion_items(&storage, ingestion_id)
+            list_stored_ingestion_item_page(&storage, ingestion_id, None, 10)
                 .await
                 .unwrap()
+                .items
                 .len(),
             1
         );
-        let summary = status_summary(&storage, ingestion_id).await.unwrap();
-        assert_eq!(summary.3, 1);
+        let status = get_ingestion_status(&storage, ingestion_id).await.unwrap();
+        assert_eq!(status.stored, 1);
         assert_eq!(delete_key(&storage, 1, "primary").await.unwrap(), 1);
         assert!(
             get_key_encrypted_by_id(&storage, 1, key_id)
@@ -1454,8 +1395,22 @@ mod tests {
         assert_ne!(tenant_11_key_id, tenant_12_key_id);
         assert_eq!(tenant_11_secret, b"tenant-11");
         assert_eq!(tenant_12_secret, b"tenant-12");
-        assert_eq!(list_keys(&storage, 11).await.unwrap().len(), 1);
-        assert_eq!(list_keys(&storage, 12).await.unwrap().len(), 1);
+        assert_eq!(
+            list_key_page(&storage, 11, None, 10)
+                .await
+                .unwrap()
+                .keys
+                .len(),
+            1
+        );
+        assert_eq!(
+            list_key_page(&storage, 12, None, 10)
+                .await
+                .unwrap()
+                .keys
+                .len(),
+            1
+        );
 
         assert_eq!(delete_key(&storage, 11, "shared-name").await.unwrap(), 1);
         assert!(
@@ -1472,6 +1427,37 @@ mod tests {
                 .1,
             b"tenant-12"
         );
+    }
+
+    #[tokio::test]
+    async fn hf_key_pages_do_not_read_unrelated_tenant_history() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        for index in 0..48 {
+            create_key(
+                &storage,
+                99,
+                &format!("unrelated-{index:03}"),
+                b"secret",
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        for index in 0..3 {
+            create_key(&storage, 11, &format!("target-{index:03}"), b"secret", None)
+                .await
+                .unwrap();
+        }
+
+        let first = list_key_page(&storage, 11, None, 2).await.unwrap();
+        assert_eq!(first.keys.len(), 2);
+        let second = list_key_page(&storage, 11, first.next_cursor.as_deref(), 2)
+            .await
+            .unwrap();
+        assert_eq!(second.keys.len(), 1);
+        assert!(second.next_cursor.is_none());
+        assert!(second.keys.iter().all(|key| key.tenant_id == 11));
     }
 
     #[tokio::test]
@@ -1511,10 +1497,10 @@ mod tests {
 
         let core_store = CoreStore::new(storage.clone()).await.unwrap();
         let records = core_store
-            .read_stream(ReadStream {
+            .read_stream(crate::core_store::ReadStream {
                 stream_id: hf_metadata_stream_id(),
                 after_sequence: 0,
-                limit: 0,
+                limit: 5,
             })
             .await
             .unwrap();
@@ -1575,6 +1561,7 @@ mod tests {
     fn hf_metadata_body_rejects_invalid_schema_and_unknown_fields() {
         let body = HfBody::KeyDelete {
             tenant_id: 1,
+            key_id: 7,
             key_name: "primary".to_string(),
             emitted_at: fixed_hf_time(),
         };
@@ -1748,7 +1735,9 @@ mod tests {
         .unwrap_err();
         let message = err.to_string();
         assert!(
-            message.contains("generation mismatch") || message.contains("target mismatch"),
+            message.contains("generation mismatch")
+                || message.contains("target mismatch")
+                || message.contains("precondition failed"),
             "unexpected stale precondition error: {message}"
         );
 

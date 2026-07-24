@@ -114,6 +114,7 @@ pub async fn write_git_source_index(
         .write_format_build_output(WriterBuildOutput {
             logical_files: vec![built_segment.logical_file],
             core_meta_mutations: Vec::new(),
+            core_meta_root_publications: Vec::new(),
         })
         .await?;
     let object_ref = receipt
@@ -134,6 +135,7 @@ pub async fn write_git_source_index(
             source_cursor: input.generation,
             created_at_unix_nanos: unix_nanos_from_rfc3339(&header.created_at),
         },
+        &[],
     )
     .await?;
     Ok(ref_name)
@@ -153,8 +155,10 @@ pub async fn read_git_source_index_bytes(storage: &Storage, index_ref: &str) -> 
         storage,
         GIT_SOURCE_INDEX_CATALOG_FAMILY,
         &git_source_index_scope(parsed.tenant_id, &parsed.repository_id)?,
+        parsed.generation,
         index_ref,
-    )?
+    )
+    .await?
     .ok_or_else(|| anyhow!("git source index catalog row is missing"))?;
     let store = CoreStore::new(storage.clone()).await?;
     store
@@ -173,7 +177,8 @@ pub async fn latest_git_source_index_ref(
         storage,
         GIT_SOURCE_INDEX_CATALOG_FAMILY,
         &git_source_index_scope(tenant_id, repository_id)?,
-    )?
+    )
+    .await?
     .map(|record| record.segment_ref))
 }
 
@@ -354,6 +359,7 @@ fn git_source_index_ref_prefix(tenant_id: i64, repository_id: &str) -> Result<St
 struct ParsedGitSourceIndexRef {
     tenant_id: i64,
     repository_id: String,
+    generation: u64,
 }
 
 fn parse_git_source_index_ref(index_ref: &str) -> Result<ParsedGitSourceIndexRef> {
@@ -384,6 +390,7 @@ fn parse_git_source_index_ref(index_ref: &str) -> Result<ParsedGitSourceIndexRef
     Ok(ParsedGitSourceIndexRef {
         tenant_id,
         repository_id: parts[4].to_string(),
+        generation,
     })
 }
 

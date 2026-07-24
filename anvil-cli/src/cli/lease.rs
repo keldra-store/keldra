@@ -72,11 +72,16 @@ pub async fn handle_lease_command(command: &LeaseCommands, ctx: &Context) -> any
             checkpoint_cursor_low,
             checkpoint_cursor_high,
         } => {
+            let lease = read_current_task_lease(&mut client, task_id, *fence_token, &token).await?;
             let mut request = tonic::Request::new(api::CheckpointTaskLeaseRequest {
                 task_id: task_id.clone(),
-                fence_token: *fence_token,
+                fence_token: lease.fence_token,
                 checkpoint_cursor_low: *checkpoint_cursor_low,
                 checkpoint_cursor_high: *checkpoint_cursor_high,
+                expected_root_generation: lease.root_generation,
+                expected_lease_epoch: lease.lease_epoch,
+                expected_expires_at_nanos: lease.expires_at_nanos,
+                expected_lease_hash: lease.lease_hash,
             });
             add_auth(&mut request, &token);
             print_lease(
@@ -93,11 +98,16 @@ pub async fn handle_lease_command(command: &LeaseCommands, ctx: &Context) -> any
             committed_cursor_low,
             committed_cursor_high,
         } => {
+            let lease = read_current_task_lease(&mut client, task_id, *fence_token, &token).await?;
             let mut request = tonic::Request::new(api::CommitTaskLeaseRequest {
                 task_id: task_id.clone(),
-                fence_token: *fence_token,
+                fence_token: lease.fence_token,
                 committed_cursor_low: *committed_cursor_low,
                 committed_cursor_high: *committed_cursor_high,
+                expected_root_generation: lease.root_generation,
+                expected_lease_epoch: lease.lease_epoch,
+                expected_expires_at_nanos: lease.expires_at_nanos,
+                expected_lease_hash: lease.lease_hash,
             });
             add_auth(&mut request, &token);
             let response = client.commit_task_lease(request).await?.into_inner();
@@ -124,6 +134,32 @@ pub async fn handle_lease_command(command: &LeaseCommands, ctx: &Context) -> any
         }
     }
     Ok(())
+}
+
+async fn read_current_task_lease(
+    client: &mut CoordinationServiceClient<tonic::transport::Channel>,
+    task_id: &str,
+    expected_fence_token: u64,
+    token: &str,
+) -> anyhow::Result<api::TaskLease> {
+    let mut request = tonic::Request::new(api::ReadTaskLeaseRequest {
+        task_id: task_id.to_string(),
+    });
+    add_auth(&mut request, token);
+    let response = client.read_task_lease(request).await?.into_inner();
+    if !response.found {
+        anyhow::bail!("task lease {task_id:?} does not exist");
+    }
+    let lease = response
+        .lease
+        .ok_or_else(|| anyhow::anyhow!("task lease {task_id:?} response omitted the lease"))?;
+    if lease.fence_token != expected_fence_token {
+        anyhow::bail!(
+            "task lease {task_id:?} has fence token {}, not expected fence token {expected_fence_token}",
+            lease.fence_token
+        );
+    }
+    Ok(lease)
 }
 
 fn print_lease(lease: Option<api::TaskLease>) {

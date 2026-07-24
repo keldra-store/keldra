@@ -1,11 +1,9 @@
 use crate::core_store::{
-    CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition, CoreStore, CoreTransaction,
+    CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
+    CoreMutationRootPublication, CoreStore, CoreTransaction, CoreTransactionState,
     CoreTransactionUpdate, ReadStream,
 };
-use crate::formats::{Hash32, hash32};
-use crate::index_coremeta::{
-    self, IndexDefinitionCurrentCoreMetaRecord, IndexDefinitionStateCoreMetaRecord,
-};
+use crate::formats::{Hash32, hash32, writer::WriterFamily};
 use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
 #[cfg(test)]
 use crate::persistence::Bucket;
@@ -15,6 +13,8 @@ use anyhow::{Context, Result, anyhow};
 use prost::Message;
 use serde_json::Value as JsonValue;
 use serde_json::json;
+
+mod current_definitions;
 
 const INDEX_EVENT_BODY_SCHEMA: &str = "anvil.core.index_definition_event.v1";
 const INDEX_DEFINITION_RECORD_KIND: &str = "index_definition";
@@ -73,7 +73,6 @@ struct IndexEventBodyProto {
 
 #[derive(Debug, Clone)]
 struct IndexCurrentRef {
-    deleted: bool,
     event: IndexDefinitionEvent,
 }
 
@@ -81,6 +80,14 @@ struct IndexCurrentRef {
 struct IndexCurrentState {
     latest_cursor: i64,
     max_index_id: i64,
+}
+
+#[derive(Debug)]
+pub(crate) struct CurrentIndexDefinitionPage {
+    pub(crate) events: Vec<IndexDefinitionEvent>,
+    pub(crate) next_tuple_key: Option<Vec<u8>>,
+    #[cfg(test)]
+    pub(crate) rows_visited: usize,
 }
 
 #[cfg(test)]
@@ -140,40 +147,110 @@ async fn append_index_definition_event_inner(
 ) -> Result<()> {
     let core_store = CoreStore::new(storage.clone()).await?;
     let stream_id = index_definition_stream_id(event.tenant_id, event.bucket_id);
+    let effective_transaction_id = transaction_id.map(ToOwned::to_owned).unwrap_or_else(|| {
+        format!(
+            "index-definition:{}:{}:{}",
+            event.tenant_id, event.bucket_id, event.mutation_id
+        )
+    });
+    if transaction_id.is_none()
+        && core_store
+            .read_transaction(&effective_transaction_id)
+            .await?
+            .is_some_and(|transaction| transaction.state == CoreTransactionState::Committed)
+    {
+        return Ok(());
+    }
+    let stream_head = core_store.stream_head_sequence(&stream_id).await?;
+    let expected_cursor = stream_head
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("index definition stream cursor overflow"))?;
+    if u64::try_from(event.id)? != expected_cursor {
+        return Err(anyhow!(
+            "index definition event cursor {} does not follow durable stream head {}",
+            event.id,
+            stream_head
+        ));
+    }
     let payload = encode_index_event_body(event, fence_token)?;
     let partition_id = hex::encode(index_definition_partition_id(
         event.tenant_id,
         event.bucket_id,
     ));
+    let data_root =
+        current_definitions::projection_root_anchor_key(event.tenant_id, event.bucket_id);
+    let explicit_transaction = match (transaction_id, transaction_principal) {
+        (Some(transaction_id), Some(transaction_principal)) => Some(
+            core_store
+                .read_explicit_transaction_for_principal(transaction_id, transaction_principal)
+                .await?,
+        ),
+        (None, None) => None,
+        _ => {
+            return Err(anyhow!(
+                "index definition transaction id and principal must be provided together"
+            ));
+        }
+    };
+    if explicit_transaction
+        .as_ref()
+        .is_some_and(|transaction| transaction.root_anchor_key != data_root)
+    {
+        return Err(anyhow!(
+            "index definition transaction targets a different CoreMeta root"
+        ));
+    }
+    let scope_partition = explicit_transaction
+        .as_ref()
+        .map(|transaction| transaction.scope_partition.clone())
+        .unwrap_or_else(|| partition_id.clone());
+    let root_publications = index_definition_root_publications(data_root, scope_partition.clone());
+    let projection = current_definitions::prepare_projection_mutation(
+        storage,
+        event,
+        &payload,
+        &scope_partition,
+        &effective_transaction_id,
+    )
+    .await?;
+    let mut preconditions: Vec<_> = partition_precondition.into_iter().collect();
+    preconditions.push(projection.precondition);
+    let mut operations = vec![CoreMutationOperation::StreamAppend {
+        partition_id: scope_partition.clone(),
+        stream_id,
+        record_kind: INDEX_DEFINITION_RECORD_KIND.to_string(),
+        payload,
+        idempotency_key: Some(format!(
+            "index-definition:{}:{}:{}",
+            event.tenant_id, event.bucket_id, event.mutation_id
+        )),
+    }];
+    operations.extend(projection.operations);
     let batch =
         CoreMutationBatch {
-            transaction_id: transaction_id.map(ToOwned::to_owned).unwrap_or_else(|| {
-                format!(
-                    "index-definition:{}:{}:{}",
-                    event.tenant_id, event.bucket_id, event.mutation_id
-                )
-            }),
-            scope_partition: partition_id.clone(),
+            transaction_id: effective_transaction_id,
+            scope_partition,
             committed_by_principal: transaction_principal.map(ToOwned::to_owned).unwrap_or_else(
                 || index_definition_partition_principal(event.tenant_id, event.bucket_id),
             ),
-            preconditions: partition_precondition.into_iter().collect(),
-            operations: vec![CoreMutationOperation::StreamAppend {
-                partition_id: partition_id.clone(),
-                stream_id,
-                record_kind: INDEX_DEFINITION_RECORD_KIND.to_string(),
-                payload: payload.clone(),
-                idempotency_key: Some(format!(
-                    "index-definition:{}:{}:{}",
-                    event.tenant_id, event.bucket_id, event.mutation_id
-                )),
-            }],
+            root_publications,
+            preconditions,
+            operations,
         };
     if transaction_id.is_some() {
         core_store.stage_explicit_transaction_batch(batch).await?;
     } else {
-        core_store.commit_mutation_batch(batch).await?;
-        write_index_current_coremeta_rows(storage, event, &payload).await?;
+        let receipt = core_store.commit_mutation_batch(batch).await?;
+        if receipt.state != CoreTransactionState::Committed {
+            return Err(anyhow!(
+                "index definition mutation {} did not commit: {}",
+                receipt.transaction_id,
+                receipt
+                    .finalisation_error
+                    .as_deref()
+                    .unwrap_or("unknown finalisation failure")
+            ));
+        }
     }
     Ok(())
 }
@@ -189,6 +266,7 @@ pub async fn materialize_committed_index_definition_transaction(
             stream_id,
             visible_sequence,
             prepared_record_hash,
+            ..
         } = update
         else {
             continue;
@@ -221,7 +299,6 @@ pub async fn materialize_committed_index_definition_transaction(
                 transaction.transaction_id
             ));
         }
-        write_index_current_coremeta_rows(storage, &event, &record.payload).await?;
         materialized.push(event);
     }
     Ok(materialized)
@@ -307,13 +384,63 @@ pub async fn read_index_definition_events(
     after_cursor: i64,
     limit: usize,
 ) -> Result<Vec<IndexDefinitionEvent>> {
-    let mut events = read_all_index_definition_events(storage, tenant_id, bucket_id).await?;
-    events.retain(|event| event.id > after_cursor);
-    events.sort_by_key(|event| event.id);
-    if limit > 0 && events.len() > limit {
-        events.truncate(limit);
+    Ok(
+        read_index_definition_event_page(storage, tenant_id, bucket_id, after_cursor, limit)
+            .await?
+            .events,
+    )
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexDefinitionEventPage {
+    pub events: Vec<IndexDefinitionEvent>,
+    pub next_cursor: i64,
+    pub has_more: bool,
+}
+
+pub async fn read_index_definition_event_page(
+    storage: &Storage,
+    tenant_id: i64,
+    bucket_id: i64,
+    after_cursor: i64,
+    limit: usize,
+) -> Result<IndexDefinitionEventPage> {
+    if after_cursor < 0 {
+        return Err(anyhow!(
+            "index definition watch cursor must be non-negative"
+        ));
     }
-    Ok(events)
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let page = core_store
+        .read_stream_page(ReadStream {
+            stream_id: index_definition_stream_id(tenant_id, bucket_id),
+            after_sequence: u64::try_from(after_cursor)?,
+            limit,
+        })
+        .await?;
+    let next_cursor = i64::try_from(page.next_sequence)
+        .map_err(|_| anyhow!("index definition watch cursor exceeds i64"))?;
+    let mut events = Vec::with_capacity(page.records.len());
+    for record in page.records {
+        if record.record_kind != INDEX_DEFINITION_RECORD_KIND {
+            return Err(anyhow!("index definition stream record kind mismatch"));
+        }
+        let event = index_event_body_from_proto(decode_index_event_body(&record.payload)?)?;
+        if event.tenant_id != tenant_id
+            || event.bucket_id != bucket_id
+            || event.id != i64::try_from(record.sequence)?
+        {
+            return Err(anyhow!(
+                "index definition stream record scope or cursor mismatch"
+            ));
+        }
+        events.push(event);
+    }
+    Ok(IndexDefinitionEventPage {
+        events,
+        next_cursor,
+        has_more: page.has_more,
+    })
 }
 
 pub async fn read_current_index_definition_events(
@@ -322,28 +449,80 @@ pub async fn read_current_index_definition_events(
     bucket_id: i64,
     include_disabled: bool,
 ) -> Result<Vec<IndexDefinitionEvent>> {
+    let revision =
+        current_index_definition_collection_revision(storage, tenant_id, bucket_id).await?;
     let mut events = Vec::new();
-    for row in index_coremeta::list_index_definition_current_coremeta_records(
-        storage, tenant_id, bucket_id,
-    )? {
+    let mut after_tuple_key = None;
+    loop {
+        let page = page_current_index_definition_events(
+            storage,
+            tenant_id,
+            bucket_id,
+            include_disabled,
+            revision,
+            after_tuple_key.as_deref(),
+            1_000,
+        )
+        .await?;
+        events.extend(page.events);
+        let Some(next_tuple_key) = page.next_tuple_key else {
+            break;
+        };
+        after_tuple_key = Some(next_tuple_key);
+    }
+    Ok(events)
+}
+
+pub(crate) async fn current_index_definition_collection_revision(
+    storage: &Storage,
+    tenant_id: i64,
+    bucket_id: i64,
+) -> Result<i64> {
+    current_definitions::collection_revision(storage, tenant_id, bucket_id).await
+}
+
+pub(crate) async fn page_current_index_definition_events(
+    storage: &Storage,
+    tenant_id: i64,
+    bucket_id: i64,
+    include_disabled: bool,
+    expected_revision: i64,
+    after_tuple_key: Option<&[u8]>,
+    page_size: usize,
+) -> Result<CurrentIndexDefinitionPage> {
+    let page = current_definitions::page(
+        storage,
+        tenant_id,
+        bucket_id,
+        include_disabled,
+        expected_revision,
+        after_tuple_key,
+        page_size,
+    )
+    .await?;
+    let mut events = Vec::with_capacity(page.records.len());
+    for row in page.records {
         let current = index_current_from_coremeta_row(row)?;
         ensure_index_event_scope_matches(&current.event, tenant_id, bucket_id)?;
-        if current.deleted {
-            continue;
+        let enabled = current
+            .event
+            .definition
+            .get("enabled")
+            .and_then(JsonValue::as_bool)
+            .ok_or_else(|| anyhow!("CoreMeta index definition row is missing enabled state"))?;
+        if !include_disabled && !enabled {
+            return Err(anyhow!(
+                "CoreMeta enabled index projection contains a disabled definition"
+            ));
         }
         events.push(current.event);
     }
-    if !include_disabled {
-        events.retain(|event| {
-            event
-                .definition
-                .get("enabled")
-                .and_then(JsonValue::as_bool)
-                .unwrap_or(false)
-        });
-    }
-    events.sort_by(|left, right| left.index_name.cmp(&right.index_name));
-    Ok(events)
+    Ok(CurrentIndexDefinitionPage {
+        events,
+        next_tuple_key: page.next_tuple_key,
+        #[cfg(test)]
+        rows_visited: page.rows_visited,
+    })
 }
 
 pub async fn read_current_index_definitions(
@@ -370,9 +549,6 @@ pub async fn read_current_index_definition(
         return Ok(None);
     };
     ensure_index_event_name_matches(&current.event, tenant_id, bucket_id, name)?;
-    if current.deleted {
-        return Ok(None);
-    }
     index_definition_from_event(&current.event).map(Some)
 }
 
@@ -389,45 +565,63 @@ pub async fn next_index_definition_id(
         .ok_or_else(|| anyhow::anyhow!("index definition id overflow"))
 }
 
+pub async fn next_index_definition_cursor(
+    storage: &Storage,
+    tenant_id: i64,
+    bucket_id: i64,
+) -> Result<i64> {
+    let projected_cursor = read_index_current_state(storage, tenant_id, bucket_id)
+        .await?
+        .map(|state| state.latest_cursor)
+        .unwrap_or_default();
+    let stream_cursor = CoreStore::new(storage.clone())
+        .await?
+        .stream_head_sequence(&index_definition_stream_id(tenant_id, bucket_id))
+        .await?;
+    if u64::try_from(projected_cursor)? != stream_cursor {
+        return Err(anyhow!(
+            "index definition projection cursor {} differs from durable stream head {}",
+            projected_cursor,
+            stream_cursor
+        ));
+    }
+    projected_cursor
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("index definition cursor overflow"))
+}
+
 pub fn index_storage_id(tenant_id: i64, bucket_id: i64, index_id: i64) -> String {
     format!("tenant-{tenant_id}-bucket-{bucket_id}-index-{index_id}")
 }
 
-async fn read_all_index_definition_events(
-    storage: &Storage,
-    tenant_id: i64,
-    bucket_id: i64,
-) -> Result<Vec<IndexDefinitionEvent>> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let bodies = read_index_journal_bodies(
-        &core_store,
-        &index_definition_stream_id(tenant_id, bucket_id),
-    )
-    .await?;
-    let mut events = Vec::new();
-    for body in bodies {
-        events.push(index_event_body_from_proto(body)?);
-    }
-    Ok(events)
-}
-
+#[cfg(test)]
 async fn read_index_journal_bodies(
     core_store: &CoreStore,
     stream_id: &str,
 ) -> Result<Vec<IndexEventBodyProto>> {
-    let records = core_store
-        .read_stream(ReadStream {
-            stream_id: stream_id.to_string(),
-            after_sequence: 0,
-            limit: 0,
-        })
-        .await?;
     let mut bodies = Vec::new();
-    for record in records {
-        if record.record_kind != INDEX_DEFINITION_RECORD_KIND {
-            continue;
+    let mut after_sequence = 0;
+    loop {
+        let page = core_store
+            .read_stream_page(ReadStream {
+                stream_id: stream_id.to_string(),
+                after_sequence,
+                limit: 1_000,
+            })
+            .await?;
+        for record in page.records {
+            if record.record_kind != INDEX_DEFINITION_RECORD_KIND {
+                continue;
+            }
+            bodies.push(decode_index_event_body(&record.payload)?);
         }
-        bodies.push(decode_index_event_body(&record.payload)?);
+        if !page.has_more {
+            break;
+        }
+        if page.next_sequence <= after_sequence {
+            return Err(anyhow!("index definition journal cursor did not advance"));
+        }
+        after_sequence = page.next_sequence;
     }
     Ok(bodies)
 }
@@ -436,7 +630,7 @@ pub fn index_definition_partition_id(tenant_id: i64, bucket_id: i64) -> Hash32 {
     hash32(format!("tenant/{tenant_id}/bucket/{bucket_id}/index_definition").as_bytes())
 }
 
-fn index_definition_stream_id(tenant_id: i64, bucket_id: i64) -> String {
+pub(crate) fn index_definition_stream_id(tenant_id: i64, bucket_id: i64) -> String {
     format!("index_definition:tenant:{tenant_id}:bucket:{bucket_id}")
 }
 
@@ -482,49 +676,69 @@ fn require_index_definition_permit(
     Ok(())
 }
 
+#[cfg(test)]
 async fn write_index_current_coremeta_rows(
     storage: &Storage,
     event: &IndexDefinitionEvent,
     event_payload: &[u8],
 ) -> Result<()> {
-    let existing = read_index_current_state(storage, event.tenant_id, event.bucket_id).await?;
-    let state = IndexCurrentState {
-        latest_cursor: existing
-            .map(|state| state.latest_cursor)
-            .unwrap_or(0)
-            .max(event.id),
-        max_index_id: existing
-            .map(|state| state.max_index_id)
-            .unwrap_or(0)
-            .max(event.index_id),
-    };
-    let updated_at_unix_nanos = event_time_unix_nanos(event.created_at)?;
-    index_coremeta::write_index_definition_current_coremeta_record(
+    let partition_id = hex::encode(index_definition_partition_id(
+        event.tenant_id,
+        event.bucket_id,
+    ));
+    let transaction_id = format!(
+        "index-definition-projection-test:{}:{}:{}",
+        event.tenant_id, event.bucket_id, event.id
+    );
+    let projection = current_definitions::prepare_projection_mutation(
         storage,
-        &IndexDefinitionCurrentCoreMetaRecord {
-            tenant_id: event.tenant_id,
-            bucket_id: event.bucket_id,
-            index_name: event.index_name.clone(),
-            deleted: event.event_type == "drop",
-            cursor: event.id,
-            index_version: event.index_version,
-            event_payload: event_payload.to_vec(),
-            updated_at_unix_nanos,
-        },
+        event,
+        event_payload,
+        &partition_id,
+        &transaction_id,
     )
     .await?;
-    index_coremeta::write_index_definition_state_coremeta_record(
-        storage,
-        &IndexDefinitionStateCoreMetaRecord {
-            tenant_id: event.tenant_id,
-            bucket_id: event.bucket_id,
-            latest_cursor: state.latest_cursor,
-            max_index_id: state.max_index_id,
-            updated_at_unix_nanos,
-        },
-    )
-    .await?;
+    let root_publications = index_definition_root_publications(
+        current_definitions::projection_root_anchor_key(event.tenant_id, event.bucket_id),
+        partition_id.clone(),
+    );
+    CoreStore::new(storage.clone())
+        .await?
+        .commit_mutation_batch(CoreMutationBatch {
+            transaction_id,
+            scope_partition: partition_id,
+            committed_by_principal: index_definition_partition_principal(
+                event.tenant_id,
+                event.bucket_id,
+            ),
+            root_publications,
+            preconditions: vec![projection.precondition],
+            operations: projection.operations,
+        })
+        .await?;
     Ok(())
+}
+
+fn index_definition_root_publications(
+    data_root: String,
+    coordinator_root: String,
+) -> Vec<CoreMutationRootPublication> {
+    if data_root == coordinator_root {
+        return vec![CoreMutationRootPublication {
+            root_anchor_key: data_root,
+            writer_families: vec![
+                WriterFamily::CoreControl.as_str().to_string(),
+                WriterFamily::TypedMetadata.as_str().to_string(),
+            ],
+            transaction_coordinator: true,
+        }];
+    }
+
+    vec![
+        CoreMutationRootPublication::new(coordinator_root, WriterFamily::CoreControl.as_str())
+            .coordinator(),
+        CoreMutationRootPublication::new(data_root, WriterFamily::TypedMetadata.as_str()),
+    ]
 }
 
 async fn read_index_current_row(
@@ -533,9 +747,8 @@ async fn read_index_current_row(
     bucket_id: i64,
     index_name: &str,
 ) -> Result<Option<IndexCurrentRef>> {
-    let Some(row) = index_coremeta::read_index_definition_current_coremeta_record(
-        storage, tenant_id, bucket_id, index_name,
-    )?
+    let Some(row) =
+        current_definitions::read_current(storage, tenant_id, bucket_id, index_name).await?
     else {
         return Ok(None);
     };
@@ -547,10 +760,7 @@ async fn read_index_current_state(
     tenant_id: i64,
     bucket_id: i64,
 ) -> Result<Option<IndexCurrentState>> {
-    Ok(
-        index_coremeta::read_index_definition_state_coremeta_record(storage, tenant_id, bucket_id)?
-            .map(index_state_from_coremeta_row),
-    )
+    current_definitions::read_state(storage, tenant_id, bucket_id).await
 }
 
 fn encode_index_event_body(event: &IndexDefinitionEvent, fence_token: u64) -> Result<Vec<u8>> {
@@ -599,7 +809,7 @@ fn index_event_body_from_proto(proto: IndexEventBodyProto) -> Result<IndexDefini
 }
 
 fn index_current_from_coremeta_row(
-    row: IndexDefinitionCurrentCoreMetaRecord,
+    row: current_definitions::CurrentDefinitionRecord,
 ) -> Result<IndexCurrentRef> {
     let event = index_event_body_from_proto(decode_index_event_body(&row.event_payload)?)?;
     if event.tenant_id != row.tenant_id
@@ -612,22 +822,10 @@ fn index_current_from_coremeta_row(
             "CoreMeta index definition current row payload scope mismatch"
         ));
     }
-    if row.deleted != (event.event_type == "drop") {
-        return Err(anyhow!(
-            "CoreMeta index definition current row deletion marker mismatch"
-        ));
+    if event.event_type == "drop" {
+        return Err(anyhow!("CoreMeta current table contains a dropped index"));
     }
-    Ok(IndexCurrentRef {
-        deleted: row.deleted,
-        event,
-    })
-}
-
-fn index_state_from_coremeta_row(row: IndexDefinitionStateCoreMetaRecord) -> IndexCurrentState {
-    IndexCurrentState {
-        latest_cursor: row.latest_cursor,
-        max_index_id: row.max_index_id,
-    }
+    Ok(IndexCurrentRef { event })
 }
 
 fn index_definition_to_proto(index: &IndexDefinition) -> Result<IndexDefinitionFieldsProto> {
@@ -970,7 +1168,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
 
-        let create = event(7, "body", "create", true);
+        let create = event(1, "body", "create", true);
         let create_payload = encode_index_event_body(&create, 0).unwrap();
         write_index_current_coremeta_rows(&storage, &create, &create_payload)
             .await
@@ -993,14 +1191,13 @@ mod tests {
             101
         );
 
-        let row =
-            index_coremeta::read_index_definition_current_coremeta_record(&storage, 42, 7, "body")
-                .unwrap()
-                .expect("current index row should exist");
+        let row = current_definitions::read_current(&storage, 42, 7, "body")
+            .await
+            .unwrap()
+            .expect("current index row should exist");
         assert_eq!(row.event_payload, create_payload);
-        assert!(!row.deleted);
 
-        let drop = event(8, "body", "drop", true);
+        let drop = event(2, "body", "drop", true);
         let drop_payload = encode_index_event_body(&drop, 0).unwrap();
         write_index_current_coremeta_rows(&storage, &drop, &drop_payload)
             .await
@@ -1012,10 +1209,141 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        assert!(
+            current_definitions::read_current(&storage, 42, 7, "body")
+                .await
+                .unwrap()
+                .is_none(),
+            "dropped definitions must be physically absent from the current table"
+        );
         assert_eq!(
             next_index_definition_id(&storage, 42, 7).await.unwrap(),
             101
         );
+    }
+
+    #[tokio::test]
+    async fn current_definition_pages_follow_physical_name_order() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        for (cursor, name) in [(1, "charlie"), (2, "alpha"), (3, "bravo")] {
+            append_index_definition_event(&storage, &event(cursor, name, "create", true))
+                .await
+                .unwrap();
+        }
+
+        let revision = current_index_definition_collection_revision(&storage, 42, 7)
+            .await
+            .unwrap();
+        let first = page_current_index_definition_events(&storage, 42, 7, true, revision, None, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            first
+                .events
+                .iter()
+                .map(|event| event.index_name.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "bravo"]
+        );
+        assert_eq!(first.rows_visited, 3);
+
+        let second = page_current_index_definition_events(
+            &storage,
+            42,
+            7,
+            true,
+            revision,
+            first.next_tuple_key.as_deref(),
+            2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            second
+                .events
+                .iter()
+                .map(|event| event.index_name.as_str())
+                .collect::<Vec<_>>(),
+            ["charlie"]
+        );
+        assert!(second.next_tuple_key.is_none());
+        assert_eq!(second.rows_visited, 1);
+    }
+
+    #[tokio::test]
+    async fn current_definition_page_rejects_stale_revision() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        append_index_definition_event(&storage, &event(1, "alpha", "create", true))
+            .await
+            .unwrap();
+        let stale_revision = current_index_definition_collection_revision(&storage, 42, 7)
+            .await
+            .unwrap();
+        append_index_definition_event(&storage, &event(2, "bravo", "create", true))
+            .await
+            .unwrap();
+
+        let error =
+            page_current_index_definition_events(&storage, 42, 7, true, stale_revision, None, 10)
+                .await
+                .unwrap_err();
+        assert!(error.to_string().contains("collection revision changed"));
+    }
+
+    #[tokio::test]
+    async fn enabled_projection_keeps_each_page_read_bounded() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        for (cursor, name, enabled) in [
+            (1, "alpha", false),
+            (2, "bravo", false),
+            (3, "charlie", true),
+            (4, "delta", true),
+        ] {
+            append_index_definition_event(&storage, &event(cursor, name, "create", enabled))
+                .await
+                .unwrap();
+        }
+
+        let revision = current_index_definition_collection_revision(&storage, 42, 7)
+            .await
+            .unwrap();
+        let first = page_current_index_definition_events(&storage, 42, 7, false, revision, None, 1)
+            .await
+            .unwrap();
+        assert_eq!(first.events[0].index_name, "charlie");
+        assert!(first.next_tuple_key.is_some());
+        assert_eq!(first.rows_visited, 2);
+
+        let second = page_current_index_definition_events(
+            &storage,
+            42,
+            7,
+            false,
+            revision,
+            first.next_tuple_key.as_deref(),
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.events[0].index_name, "delta");
+        assert!(second.next_tuple_key.is_none());
+        assert_eq!(second.rows_visited, 1);
+
+        let all = page_current_index_definition_events(&storage, 42, 7, true, revision, None, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            all.events
+                .iter()
+                .map(|event| event.index_name.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "bravo"]
+        );
+        assert!(all.next_tuple_key.is_some());
+        assert_eq!(all.rows_visited, 3);
     }
 
     #[tokio::test]
@@ -1093,8 +1421,26 @@ mod tests {
         .unwrap_err();
         let message = rejected.to_string();
         assert!(
-            message.contains("generation mismatch") || message.contains("target mismatch"),
+            message.contains("generation mismatch")
+                || message.contains("target mismatch")
+                || message.contains("precondition failed"),
             "unexpected stale precondition error: {message}"
+        );
+        assert!(
+            read_current_index_definition(&storage, 42, 7, "body")
+                .await
+                .unwrap()
+                .is_none(),
+            "a rejected stream append must not publish its current projection"
+        );
+        assert_eq!(
+            CoreStore::new(storage.clone())
+                .await
+                .unwrap()
+                .stream_head_sequence(&index_definition_stream_id(42, 7))
+                .await
+                .unwrap(),
+            0
         );
 
         append_index_definition_event_with_permit(

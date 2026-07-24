@@ -20,9 +20,11 @@ struct TransactionManifestHeaderProto {
     #[prost(uint64, tag = "5")]
     logical_manifest_count: u64,
     #[prost(string, tag = "6")]
-    core_meta_commit_certificate_hash: String,
-    #[prost(uint64, tag = "7")]
-    certificate_persist_receipt_count: u64,
+    root_key_hash: String,
+    #[prost(string, optional, tag = "7")]
+    coordinator_root_key_hash: Option<String>,
+    #[prost(uint64, optional, tag = "8")]
+    coordinator_root_generation: Option<u64>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -40,9 +42,11 @@ struct TransactionManifestBodyProto {
     #[prost(message, repeated, tag = "6")]
     logical_manifests: Vec<CoreManifestLocatorProto>,
     #[prost(string, tag = "7")]
-    core_meta_commit_certificate_hash: String,
-    #[prost(string, repeated, tag = "8")]
-    certificate_persist_receipt_hashes: Vec<String>,
+    root_key_hash: String,
+    #[prost(string, optional, tag = "8")]
+    coordinator_root_key_hash: Option<String>,
+    #[prost(uint64, optional, tag = "9")]
+    coordinator_root_generation: Option<u64>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -184,9 +188,9 @@ pub(super) fn encode_transaction_manifest_header_proto(
         post_root_generation: transaction.post_root_generation,
         mutation_count: transaction.mutation_ids.len() as u64,
         logical_manifest_count: transaction.logical_manifests.len() as u64,
-        core_meta_commit_certificate_hash: transaction.core_meta_commit_certificate_hash.clone(),
-        certificate_persist_receipt_count: transaction.certificate_persist_receipt_hashes.len()
-            as u64,
+        root_key_hash: transaction.root_key_hash.clone(),
+        coordinator_root_key_hash: transaction.coordinator_root_key_hash.clone(),
+        coordinator_root_generation: transaction.coordinator_root_generation,
     };
     let mut bytes = Vec::new();
     proto.encode(&mut bytes)?;
@@ -207,8 +211,9 @@ pub(super) fn encode_transaction_manifest_body_proto(
             .iter()
             .map(manifest_locator_to_proto)
             .collect(),
-        core_meta_commit_certificate_hash: transaction.core_meta_commit_certificate_hash.clone(),
-        certificate_persist_receipt_hashes: transaction.certificate_persist_receipt_hashes.clone(),
+        root_key_hash: transaction.root_key_hash.clone(),
+        coordinator_root_key_hash: transaction.coordinator_root_key_hash.clone(),
+        coordinator_root_generation: transaction.coordinator_root_generation,
     };
     let mut bytes = Vec::new();
     proto.encode(&mut bytes)?;
@@ -228,14 +233,17 @@ pub(super) fn decode_transaction_manifest_proto(
         || header.post_root_generation != body.post_root_generation
         || header.mutation_count != body.mutation_ids.len() as u64
         || header.logical_manifest_count != body.logical_manifests.len() as u64
-        || header.core_meta_commit_certificate_hash != body.core_meta_commit_certificate_hash
-        || header.certificate_persist_receipt_count
-            != body.certificate_persist_receipt_hashes.len() as u64
+        || header.root_key_hash != body.root_key_hash
+        || header.coordinator_root_key_hash != body.coordinator_root_key_hash
+        || header.coordinator_root_generation != body.coordinator_root_generation
     {
         bail!("CoreStore transaction manifest header/body mismatch");
     }
     Ok(CoreTransactionManifestRecord {
         schema: body.schema,
+        root_key_hash: body.root_key_hash,
+        coordinator_root_key_hash: body.coordinator_root_key_hash,
+        coordinator_root_generation: body.coordinator_root_generation,
         mutation_ids: body.mutation_ids,
         idempotency_key_hashes: body.idempotency_key_hashes,
         pre_root_generation: body.pre_root_generation,
@@ -245,8 +253,6 @@ pub(super) fn decode_transaction_manifest_proto(
             .into_iter()
             .map(manifest_locator_from_proto)
             .collect::<Result<Vec<_>>>()?,
-        core_meta_commit_certificate_hash: body.core_meta_commit_certificate_hash,
-        certificate_persist_receipt_hashes: body.certificate_persist_receipt_hashes,
     })
 }
 

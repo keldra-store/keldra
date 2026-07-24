@@ -1,6 +1,9 @@
 #![recursion_limit = "256"]
 
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -12,6 +15,37 @@ fn workspace_root() -> PathBuf {
 fn workspace_file(path: &str) -> String {
     fs::read_to_string(workspace_root().join(path))
         .unwrap_or_else(|err| panic!("read {path}: {err}"))
+}
+
+fn collect_rust_files(directory: &Path, files: &mut Vec<PathBuf>) {
+    let mut entries = fs::read_dir(directory)
+        .unwrap_or_else(|err| panic!("read directory {}: {err}", directory.display()))
+        .map(|entry| entry.expect("read Rust module directory entry").path())
+        .collect::<Vec<_>>();
+    entries.sort();
+
+    for path in entries {
+        if path.is_dir() {
+            collect_rust_files(&path, files);
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            files.push(path);
+        }
+    }
+}
+
+fn workspace_rust_module(root_file: &str, module_directory: &str) -> String {
+    let root = workspace_root();
+    let mut files = vec![root.join(root_file)];
+    collect_rust_files(&root.join(module_directory), &mut files);
+
+    files
+        .into_iter()
+        .map(|path| {
+            fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("read Rust module {}: {err}", path.display()))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn assert_contains_all(label: &str, source: &str, terms: &[&str]) {
@@ -125,7 +159,11 @@ fn native_gateway_stream_registry_boundary_and_mesh_services_are_declared() {
 #[test]
 fn internal_block_coremeta_and_root_services_are_registered_without_string_dispatch() {
     let services = workspace_file("anvil-core/src/services/mod.rs");
-    let internal = workspace_file("anvil-core/src/services/corestore_internal.rs");
+    let internal = workspace_rust_module(
+        "anvil-core/src/services/corestore_internal.rs",
+        "anvil-core/src/services/corestore_internal",
+    );
+    let internal_auth = workspace_file("anvil-core/src/services/internal_proxy.rs");
 
     assert_contains_all(
         "registered CoreStore internal services",
@@ -151,14 +189,18 @@ fn internal_block_coremeta_and_root_services_are_registered_without_string_dispa
             "impl AntiEntropyInternal for AppState",
             "impl CrossRegionProxyInternal for AppState",
             "put_internal_shard(CoreInternalPutShard",
-            "coremeta_commit_evidence_encoded_row(",
-            "write_coremeta_encoded_rows(&rows)",
-            "catch_up_coremeta_rows(",
-            "compare_and_swap_internal_root_anchor(",
+            "coremeta_commit_evidence_encoded_row_at(",
+            "write_coremeta_encoded_rows(&borrowed)",
+            "catch_up_coremeta_generation_history(",
+            "compare_and_swap_internal_root_anchor_from_register_quorum(",
             "validate_commit_evidence_with_verifier(",
             "ensure_internal_node_request",
-            "system realm manage_nodes relation required",
         ],
+    );
+    assert_contains_all(
+        "CoreStore internal service authorisation",
+        &internal_auth,
+        &["system realm manage_nodes relation required"],
     );
     assert_contains_none(
         "CoreStore internal service placeholders",
@@ -237,7 +279,7 @@ fn root_register_persists_through_coremeta_not_sidecar_files() {
             "TABLE_ROOT_CACHE_ROW",
             "root_anchor_generation_key",
             "root_cache_key",
-            "commit_coremeta_batch_by_embedded_roots",
+            "commit_coremeta_root_groups",
         ],
     );
     assert_contains_none(

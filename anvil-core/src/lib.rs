@@ -2,12 +2,11 @@
 
 use crate::auth::JwtManager;
 use crate::config::Config;
-use anyhow::Result;
-use cluster::ClusterState;
+use anyhow::{Context, Result};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::sync::Mutex;
 use tracing::warn;
 
 pub(crate) fn emit_test_timing(label: impl AsRef<str>, elapsed: Duration) {
@@ -31,6 +30,7 @@ pub mod anvil_personaldb_sqlite_changeset;
 pub mod auth;
 pub(crate) mod authz_coremeta_payload;
 pub mod authz_derived_lag_watch;
+mod authz_head;
 pub mod authz_journal;
 pub mod authz_namespace_watch;
 pub mod authz_realm_schema;
@@ -42,9 +42,6 @@ pub mod authz_segment;
 pub mod authz_userset_index;
 pub mod bucket_journal;
 pub mod bucket_manager;
-pub mod cache;
-pub mod cluster;
-pub mod cluster_identity;
 pub mod config;
 pub mod control_journal;
 pub mod core_store;
@@ -82,6 +79,8 @@ pub mod middleware;
 pub mod model_journal;
 pub mod multipart_journal;
 pub mod native_idempotency;
+pub mod node_identity;
+pub mod node_signing;
 pub mod object_links;
 pub mod object_manager;
 pub mod observability;
@@ -111,7 +110,6 @@ pub mod personaldb_snapshot_builder;
 pub mod personaldb_snapshot_store;
 pub mod personaldb_submit;
 pub mod personaldb_watch;
-pub mod placement;
 pub mod query_planner;
 pub mod registry_segment;
 pub mod repair_finding;
@@ -121,6 +119,7 @@ pub mod services;
 pub mod sharding;
 pub mod storage;
 pub mod system_realm;
+pub(crate) mod task_execution_guard;
 pub mod task_journal;
 pub mod task_lease;
 pub mod tasks;
@@ -152,9 +151,7 @@ pub struct AppState {
     pub persistence: persistence::Persistence,
     pub storage: storage::Storage,
     pub core_store: core_store::CoreStore,
-    pub cluster: ClusterState,
     pub sharder: sharding::ShardManager,
-    pub placer: placement::PlacementManager,
     pub jwt_manager: Arc<JwtManager>,
     pub region: String,
     pub bucket_manager: bucket_manager::BucketManager,
@@ -163,21 +160,14 @@ pub struct AppState {
     pub secret_keyring: Arc<crypto::EncryptionKeyring>,
     pub personaldb_signing_key_store: Arc<personaldb_signing_store::PersonalDbSigningKeyStore>,
     pub personaldb_protocol_keyring: Arc<personaldb_signing::PersonalDbProtocolKeyring>,
-    pub bucket_watch_tx: broadcast::Sender<persistence::BucketMetadataEvent>,
-    pub authz_watch_tx: broadcast::Sender<persistence::AuthzTupleRecord>,
-    pub index_watch_tx: broadcast::Sender<persistence::IndexDefinitionEvent>,
-    pub personaldb_watch_tx: broadcast::Sender<personaldb_watch::PersonalDbGroupWatchEvent>,
-    pub personaldb_projection_watch_tx:
-        broadcast::Sender<personaldb_watch::PersonalDbProjectionWatchEvent>,
-    pub personaldb_commit_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
-    pub native_mutation_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    pub personaldb_commit_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
+    pub native_mutation_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     pub observability: observability::Observability,
 }
 
 impl AppState {
     pub async fn new(
         config: Config,
-        event_publisher: Option<tokio::sync::mpsc::Sender<cluster::MetadataEvent>>,
         personaldb_protocol_keyring: personaldb_signing::PersonalDbProtocolKeyring,
     ) -> Result<Self> {
         let config = config.with_persisted_identity().await?;
@@ -188,9 +178,28 @@ impl AppState {
         let arc_config = Arc::new(config);
         let jwt_manager = Arc::new(JwtManager::new(arc_config.jwt_secret.clone()));
         let storage = storage::Storage::new_at(&arc_config.storage_path).await?;
+        let core_store = core_store::CoreStore::new_with_pipeline_keyring_and_identity(
+            storage.clone(),
+            arc_config.core_pipeline_keyring()?,
+            core_store::CoreStoreNodeIdentity {
+                mesh_id: arc_config.mesh_id.clone(),
+                node_id: arc_config.node_id.clone(),
+                region_id: arc_config.region.clone(),
+                cell_id: arc_config.cell_id.clone(),
+                public_api_addr: arc_config.public_api_addr.clone(),
+                internal_bearer_token: (!arc_config.corestore_internal_bearer_token.is_empty())
+                    .then(|| arc_config.corestore_internal_bearer_token.clone()),
+            },
+            if arc_config.requires_distributed_coremeta_recovery() {
+                core_store::CoreStoreStartupRecovery::Distributed
+            } else {
+                core_store::CoreStoreStartupRecovery::Immediate
+            },
+        )
+        .await?;
         let personaldb_signing_key_store =
             Arc::new(personaldb_signing_store::PersonalDbSigningKeyStore::new(
-                storage.clone(),
+                core_store.clone(),
                 secret_keyring.clone(),
             ));
         let personaldb_protocol_keyring = if has_personaldb_keyring_override {
@@ -208,34 +217,19 @@ impl AppState {
             }
         };
         let personaldb_protocol_keyring = Arc::new(personaldb_protocol_keyring);
-        let core_store = core_store::CoreStore::new_with_pipeline_keyring_and_identity(
-            storage.clone(),
-            arc_config.core_pipeline_keyring()?,
-            core_store::CoreStoreNodeIdentity {
-                mesh_id: arc_config.mesh_id.clone(),
-                node_id: arc_config.node_id.clone(),
-                region_id: arc_config.region.clone(),
-                cell_id: arc_config.cell_id.clone(),
-                public_api_addr: arc_config.public_api_addr.clone(),
-                internal_bearer_token: (!arc_config.corestore_internal_bearer_token.is_empty())
-                    .then(|| arc_config.corestore_internal_bearer_token.clone()),
-            },
-        )
-        .await?;
-        let cluster_state = Arc::new(RwLock::new(HashMap::new()));
-        let persistence = persistence::Persistence::new(&arc_config, event_publisher)?;
-        if !arc_config.region.is_empty() {
-            persistence.create_region(&arc_config.region).await?;
+        let persistence = persistence::Persistence::new(&arc_config)?;
+        core_store.install_repair_task_scheduler(persistence.clone())?;
+        if !arc_config.region.is_empty() && !arc_config.requires_distributed_coremeta_recovery() {
+            // A standalone node owns its local region bootstrap. Distributed
+            // regions are installed through the admin topology bootstrap and
+            // recovered through CoreMeta; re-creating one on every process
+            // start can observe a prepared-but-not-yet-recovered fence row.
+            persistence
+                .create_region(&arc_config.region)
+                .await
+                .context("bootstrap standalone region")?;
         }
         let sharder = sharding::ShardManager::new();
-        let placer = placement::PlacementManager::default();
-        let (object_watch_tx, _object_watch_rx) = tokio::sync::broadcast::channel(1024);
-        let (bucket_watch_tx, _bucket_watch_rx) = tokio::sync::broadcast::channel(1024);
-        let (authz_watch_tx, _authz_watch_rx) = tokio::sync::broadcast::channel(1024);
-        let (index_watch_tx, _index_watch_rx) = tokio::sync::broadcast::channel(1024);
-        let (personaldb_watch_tx, _personaldb_watch_rx) = tokio::sync::broadcast::channel(1024);
-        let (personaldb_projection_watch_tx, _personaldb_projection_watch_rx) =
-            tokio::sync::broadcast::channel(1024);
         let personaldb_commit_locks = Arc::new(Mutex::new(HashMap::new()));
         let native_mutation_locks = Arc::new(Mutex::new(HashMap::new()));
         let observability = observability::Observability::default();
@@ -249,24 +243,24 @@ impl AppState {
             arc_config.region.clone(),
             arc_config.cross_region_routing_policy,
             partition_signing_key,
-            object_watch_tx,
             observability.clone(),
         );
-        system_realm::ensure_bootstrapped(
-            &arc_config,
-            &persistence,
-            &storage,
-            secret_keyring.as_ref(),
-        )
-        .await?;
+        if !core_store.startup_recovery_deferred() {
+            system_realm::ensure_bootstrapped(
+                &arc_config,
+                &persistence,
+                &storage,
+                secret_keyring.as_ref(),
+            )
+            .await
+            .context("bootstrap system realm")?;
+        }
 
         Ok(Self {
             persistence,
             storage,
             core_store,
-            cluster: cluster_state,
             sharder,
-            placer,
             jwt_manager,
             region: arc_config.region.clone(),
             bucket_manager,
@@ -275,15 +269,21 @@ impl AppState {
             secret_keyring,
             personaldb_signing_key_store,
             personaldb_protocol_keyring,
-            bucket_watch_tx,
-            authz_watch_tx,
-            index_watch_tx,
-            personaldb_watch_tx,
-            personaldb_projection_watch_tx,
             personaldb_commit_locks,
             native_mutation_locks,
             observability,
         })
+    }
+
+    pub async fn ensure_system_realm_bootstrapped(&self) -> Result<()> {
+        system_realm::ensure_bootstrapped(
+            &self.config,
+            &self.persistence,
+            &self.storage,
+            self.secret_keyring.as_ref(),
+        )
+        .await
+        .context("bootstrap system realm")
     }
 }
 
@@ -298,16 +298,11 @@ mod app_state_tests {
             jwt_secret: "test-secret".to_string(),
             anvil_secret_encryption_key:
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            cluster_secret: Some("test-cluster-secret".to_string()),
-            cluster_listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".to_string(),
             public_api_addr: "127.0.0.1:0".to_string(),
             api_listen_addr: "127.0.0.1:0".to_string(),
             region: "local".to_string(),
             bootstrap_system_admin_subject_kind: "app".to_string(),
             bootstrap_system_admin_subject_id: "admin-principal".to_string(),
-            bootstrap_addrs: Vec::new(),
-            init_cluster: false,
-            enable_mdns: false,
             storage_path: directory
                 .path()
                 .join("storage")
@@ -318,7 +313,6 @@ mod app_state_tests {
 
         let state = AppState::new(
             config,
-            None,
             personaldb_signing::PersonalDbProtocolKeyring::disabled(),
         )
         .await
@@ -332,5 +326,36 @@ mod app_state_tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn distributed_startup_leaves_region_creation_to_topology_bootstrap() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config {
+            jwt_secret: "test-secret".to_string(),
+            anvil_secret_encryption_key:
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            public_api_addr: "127.0.0.1:0".to_string(),
+            api_listen_addr: "127.0.0.1:0".to_string(),
+            region: "distributed-region".to_string(),
+            bootstrap_system_admin_subject_kind: "app".to_string(),
+            bootstrap_system_admin_subject_id: "admin-principal".to_string(),
+            bootstrap_node_ids: vec!["node-a".to_string(), "node-b".to_string()],
+            storage_path: directory
+                .path()
+                .join("storage")
+                .to_string_lossy()
+                .into_owned(),
+            ..Config::default()
+        };
+
+        let state = AppState::new(
+            config,
+            personaldb_signing::PersonalDbProtocolKeyring::disabled(),
+        )
+        .await
+        .unwrap();
+
+        assert!(state.persistence.list_regions().await.unwrap().is_empty());
     }
 }

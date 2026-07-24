@@ -1,9 +1,8 @@
 use crate::{
     core_store::{
-        CF_REGISTRY, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaStore, CoreMetaTuplePart,
-        CoreStore, TABLE_GIT_SOURCE_MANIFEST_ROW, core_meta_committed_row_common,
-        core_meta_root_key_hash, core_meta_tuple_key, decode_deterministic_proto,
-        encode_deterministic_proto,
+        CF_REGISTRY, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaTuplePart, CoreStore,
+        TABLE_GIT_SOURCE_MANIFEST_ROW, core_meta_committed_row_common, core_meta_root_key_hash,
+        core_meta_tuple_key, decode_deterministic_proto, encode_deterministic_proto,
     },
     formats::unix_nanos_from_rfc3339,
     storage::Storage,
@@ -83,7 +82,17 @@ pub async fn write_git_source_repository_manifest(
         kind: CoreMetaBatchOpKind::Put(&payload),
     };
     store
-        .commit_coremeta_batch_by_embedded_roots(&mutation_id, &[op])
+        .commit_coremeta_root_groups(
+            &mutation_id,
+            &[op],
+            &[crate::core_store::CoreMetaRootPublication::new(
+                format!(
+                    "git-source-manifest/{}/{}",
+                    manifest.tenant_id, manifest.repository_id
+                ),
+                crate::formats::writer::WriterFamily::GitSource,
+            )],
+        )
         .await?;
     Ok(())
 }
@@ -93,8 +102,8 @@ pub async fn read_git_source_repository_manifest(
     tenant_id: i64,
     repository_id: &str,
 ) -> Result<Option<GitSourceRepositoryManifest>> {
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
-    let Some(payload) = meta.get(
+    let store = CoreStore::new(storage.clone()).await?;
+    let Some(payload) = store.read_coremeta_row(
         CF_REGISTRY,
         TABLE_GIT_SOURCE_MANIFEST_ROW,
         &manifest_tuple_key(tenant_id, repository_id)?,

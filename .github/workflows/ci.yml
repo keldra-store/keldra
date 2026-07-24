@@ -22,13 +22,78 @@ env:
 
 jobs:
   build-image:
-    name: Docker image smoke deferred for 0.3.0
+    name: Build Anvil test image
     runs-on: [self-hosted, linux, x64, worka-builder-2]
-    timeout-minutes: 5
+    timeout-minutes: 45
+    env:
+      ANVIL_DOCKER_PLATFORM: linux/amd64
+      ANVIL_IMAGE: anvil:test-amd64-${{ github.run_id }}-${{ github.run_attempt }}
+      ANVIL_USE_NATIVE_CARGO: "1"
+      ANVIL_BUILD_PROFILE: ci
+      ANVIL_INCLUDE_TEST_TOOLS: "1"
+      ANVIL_RUNTIME_BASE: ubuntu:24.04
+      CARGO_BUILD_JOBS: "8"
     steps:
-      - name: Defer PR Docker image smoke for 0.3.0
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system build dependencies
         run: |
-          echo "::notice title=Docker image smoke deferred::0.3.0 PR validation is limited to non-Docker gates; release tags still build and publish the Docker image."
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            cmake \
+            libclang-dev \
+            pkg-config \
+            libssl-dev \
+            protobuf-compiler \
+            ripgrep
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-v2-pr-image-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-v2-pr-image-
+            ${{ runner.os }}-cargo-v2-
+
+      - name: Build Docker image from host-built binaries
+        run: ./scripts/build-image.sh
+
+      - name: Smoke check image binaries and test tooling
+        run: |
+          timeout 30s docker run --platform linux/amd64 --rm "$ANVIL_IMAGE" anvil-server --version
+          timeout 30s docker run --platform linux/amd64 --rm "$ANVIL_IMAGE" anvil --version
+          timeout 30s docker run --platform linux/amd64 --rm "$ANVIL_IMAGE" anvil-admin --version
+          timeout 30s docker run --platform linux/amd64 --rm "$ANVIL_IMAGE" ip -Version
+
+      - name: Export Docker image artifact
+        run: docker save "$ANVIL_IMAGE" -o "${{ runner.temp }}/anvil-test-image-amd64.tar"
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: anvil-test-image-amd64
+          path: ${{ runner.temp }}/anvil-test-image-amd64.tar
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+      - name: Remove local Docker image
+        if: always()
+        run: |
+          if docker image inspect "$ANVIL_IMAGE" >/dev/null 2>&1; then
+            docker image rm "$ANVIL_IMAGE" || echo "::warning::Failed to remove $ANVIL_IMAGE"
+          fi
 
   static:
     name: Static, docs, and packaging gates
@@ -81,11 +146,11 @@ jobs:
     runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 120
     env:
-      CARGO_BUILD_JOBS: "1"
+      CARGO_BUILD_JOBS: "8"
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       ANVIL_GATE_STEP_TIMEOUT_SECONDS: "5400"
-      ANVIL_RUST_TEST_THREADS: "1"
+      ANVIL_RUST_TEST_THREADS: "8"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -121,16 +186,68 @@ jobs:
       - name: Run Rust unit release gates
         run: ./scripts/release-gates.sh rust
 
-  server-core:
-    name: Server core integration tests
+  coremeta-performance:
+    name: CoreMeta ordered-access performance gate
     needs: rust-unit
     runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 60
     env:
-      CARGO_BUILD_JOBS: "1"
+      CARGO_BUILD_JOBS: "8"
+      ANVIL_MACHINE_CLASS: "worka-builder-2-linux-x64"
+      ANVIL_GATE_STEP_TIMEOUT_SECONDS: "3300"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            cmake \
+            libclang-dev \
+            pkg-config \
+            libssl-dev \
+            protobuf-compiler
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-v2-
+
+      - name: Run quick CoreMeta performance gate
+        run: ./scripts/release-gates.sh perf-quick
+
+      - name: Upload CoreMeta performance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coremeta-performance-quick
+          path: target/anvil/perf/coremeta/quick/
+          if-no-files-found: error
+          retention-days: 14
+
+  server-core:
+    name: Server core integration tests
+    needs: coremeta-performance
+    runs-on: [self-hosted, linux, x64, worka-builder-2]
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: "8"
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
-      ANVIL_RUST_TEST_THREADS: "1"
+      ANVIL_RUST_TEST_THREADS: "8"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -171,16 +288,73 @@ jobs:
 
   docker-integration:
     name: Docker integration tests (${{ matrix.group }})
-    needs: [build-image, server-core]
+    # Docker/distributed validation only consumes the test image. Keep it on an
+    # independent lane so it can run alongside Rust, performance, and
+    # server-core validation instead of waiting for that entire chain.
+    needs: build-image
     runs-on: [self-hosted, linux, x64, worka-builder-2]
-    timeout-minutes: 10
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: "8"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      # The runner has 16 cores. Shared-cluster tests can fan out while the
+      # test-utils semaphore continues to cap isolated clusters at two.
+      ANVIL_DOCKER_TEST_THREADS: "8"
+      ANVIL_IMAGE: anvil:test-amd64-${{ github.run_id }}-${{ github.run_attempt }}
+      ANVIL_DOCKER_TEST_PROJECT: anvil-ci-${{ matrix.group }}-${{ github.run_id }}-${{ github.run_attempt }}
+      ANVIL_GATE_STEP_TIMEOUT_SECONDS: "5400"
     strategy:
-      fail-fast: false
+      fail-fast: true
       max-parallel: 1
       matrix:
         group: [docker-auth, docker-storage, docker-index, docker-mesh]
     steps:
-      - name: Defer Docker integration gates for 0.3.0
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system build dependencies
         run: |
-          echo "::notice title=Docker integration deferred::0.3.0 release is shipping without Docker integration gates; follow-up will restore these tests after release."
-          echo "Deferred group: ${{ matrix.group }}"
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            cmake \
+            libclang-dev \
+            pkg-config \
+            libssl-dev \
+            protobuf-compiler
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-v2-
+
+      - name: Prebuild Docker integration test binaries
+        run: cargo test --no-run -p anvil-server -p anvil-storage-cli --tests
+
+      - name: Download amd64 Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: anvil-test-image-amd64
+          path: ${{ runner.temp }}/anvil-image-amd64
+
+      - name: Load amd64 Docker image
+        run: docker load -i "${{ runner.temp }}/anvil-image-amd64/anvil-test-image-amd64.tar"
+
+      - name: Run Docker integration release gates
+        run: ./scripts/release-gates.sh ${{ matrix.group }}
+
+      - name: Clean up Docker integration resources
+        if: always()
+        run: ./scripts/release-gates.sh docker-cleanup

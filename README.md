@@ -139,13 +139,15 @@ docker run --rm \
   -p 127.0.0.1:50051:50051 \
   -v anvil-local-data:/var/lib/anvil \
   -e STORAGE_PATH=/var/lib/anvil \
+  -e MESH_ID=local \
+  -e NODE_ID=anvil-local \
   -e REGION=local \
+  -e CELL_ID=local \
   -e API_LISTEN_ADDR=0.0.0.0:50051 \
   -e PUBLIC_API_ADDR=http://127.0.0.1:50051 \
   -e ADMIN_LISTEN_ADDR=127.0.0.1:50052 \
   -e JWT_SECRET="local-jwt-secret-change-me" \
   -e ANVIL_SECRET_ENCRYPTION_KEY="$ANVIL_SECRET_ENCRYPTION_KEY" \
-  -e CLUSTER_SECRET="local-cluster-secret-change-me" \
   -e BOOTSTRAP_SYSTEM_ADMIN_APP_NAME=ops-admin \
   -e BOOTSTRAP_SYSTEM_ADMIN_CREDENTIAL_OUTPUT_PATH=/var/lib/anvil/first-admin.json \
   "$ANVIL_IMAGE"

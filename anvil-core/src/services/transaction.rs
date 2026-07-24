@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::anvil_api::transaction_service_server::TransactionService;
 use crate::anvil_api::*;
-use crate::core_store::{CoreBeginTransaction, CoreTransaction, CoreTransactionState};
+use crate::core_store::{
+    CoreBeginTransaction, CoreTransaction, CoreTransactionState, is_retryable_mutation_conflict,
+};
 use crate::{
     AppState, auth, index_journal, manifest_journal, mesh_lifecycle, metadata_journal, middleware,
     services::object::enforce_write_precondition,
@@ -109,7 +111,6 @@ impl TransactionService for AppState {
                 .await
                 .map_err(core_store_status)?;
             }
-            let _ = self.bucket_watch_tx.send(event);
         }
         let object_projections =
             metadata_journal::materialize_committed_object_metadata_transaction(
@@ -130,7 +131,7 @@ impl TransactionService for AppState {
         let mut changed_object_keys_by_bucket = BTreeMap::new();
         for projection in object_projections {
             self.object_manager
-                .publish_object_watch_event(
+                .verify_committed_object_watch_event(
                     projection.object.tenant_id,
                     &projection.bucket,
                     &projection.object,
@@ -210,7 +211,6 @@ impl TransactionService for AppState {
             )
             .await
             .map_err(core_store_status)?;
-            let _ = self.index_watch_tx.send(event);
             self.persistence
                 .enqueue_index_build_for_index(&bucket, &index)
                 .await
@@ -424,6 +424,13 @@ fn transaction_state_name(state: CoreTransactionState) -> &'static str {
 }
 
 fn core_store_status(error: anyhow::Error) -> Status {
+    if let Some(status) = crate::services::core_store_status::availability_status(&error) {
+        return status;
+    }
+    if is_retryable_mutation_conflict(&error) {
+        tracing::warn!(error = %error, "explicit transaction conflicted");
+        return Status::aborted("TransactionConflict");
+    }
     let message = error.to_string();
     if message.contains("TransactionConflict") {
         tracing::warn!(error = %message, "explicit transaction conflicted");
@@ -466,11 +473,15 @@ mod tests {
     use crate::config::Config;
     use crate::core_store::{
         CF_TRANSACTIONS, CoreMetaRowCommonProto, CoreMetaStore, CoreMetaTuplePart,
-        CoreMetaVisibilityState, CoreMutationBatch, CoreMutationOperation, CoreStore, ReadStream,
+        CoreMetaVisibilityState, CoreMutationBatch, CoreMutationOperation,
+        CoreMutationRootPublication, CoreStore, CoreStoreCommitError, ReadStream,
         TABLE_NATIVE_IDEMPOTENCY_ROW, core_meta_committed_row_common, core_meta_tuple_key,
     };
+    use crate::formats::writer::WriterFamily;
     use tempfile::TempDir;
     use tokio::time::{Duration, sleep};
+
+    const TEST_TRANSACTION_TTL_MS: u64 = 3_600_000;
 
     #[derive(Clone, PartialEq, Message)]
     struct ExplicitTransactionStateRowProto {
@@ -504,26 +515,17 @@ mod tests {
             jwt_secret: "test-secret".to_string(),
             anvil_secret_encryption_key:
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            cluster_secret: Some("test-cluster-secret".to_string()),
-            cluster_listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".to_string(),
             public_api_addr: "127.0.0.1:0".to_string(),
             api_listen_addr: "127.0.0.1:0".to_string(),
             region: "local".to_string(),
             bootstrap_system_admin_subject_kind: "app".to_string(),
             bootstrap_system_admin_subject_id: "admin-principal".to_string(),
-            bootstrap_addrs: Vec::new(),
-            init_cluster: false,
-            enable_mdns: false,
             storage_path: temp.path().join("storage").to_string_lossy().into_owned(),
             ..Config::default()
         };
-        let state = AppState::new(
-            config,
-            None,
-            crate::test_support::personaldb_protocol_keyring(),
-        )
-        .await
-        .unwrap();
+        let state = AppState::new(config, crate::test_support::personaldb_protocol_keyring())
+            .await
+            .unwrap();
         (temp, state)
     }
 
@@ -726,7 +728,7 @@ mod tests {
                 scope: Some(scope("tenant/1/root/rollback")),
                 preconditions: Vec::new(),
                 boundary_values: Vec::new(),
-                ttl_ms: 60_000,
+                ttl_ms: TEST_TRANSACTION_TTL_MS,
                 purpose: "service test rollback".to_string(),
             }))
             .await
@@ -801,7 +803,7 @@ mod tests {
                 scope: Some(scope(root)),
                 preconditions: Vec::new(),
                 boundary_values: Vec::new(),
-                ttl_ms: 60_000,
+                ttl_ms: TEST_TRANSACTION_TTL_MS,
                 purpose: "service test scope mismatch".to_string(),
             }))
             .await
@@ -814,6 +816,10 @@ mod tests {
                 transaction_id: begin.transaction_id,
                 scope_partition: root.to_string(),
                 committed_by_principal: transaction_principal(&with_claims(())).unwrap(),
+                root_publications: vec![
+                    CoreMutationRootPublication::new(root, WriterFamily::CoreControl.as_str())
+                        .coordinator(),
+                ],
                 preconditions: Vec::new(),
                 operations: vec![CoreMutationOperation::StreamAppend {
                     partition_id: "tenant/1/root/scope-b".to_string(),
@@ -868,7 +874,7 @@ mod tests {
                     scope: Some(scope(&root)),
                     preconditions: vec![precondition.clone()],
                     boundary_values: Vec::new(),
-                    ttl_ms: 60_000,
+                    ttl_ms: TEST_TRANSACTION_TTL_MS,
                     purpose: "service object mutation test".to_string(),
                 },
                 &claims,
@@ -910,12 +916,10 @@ mod tests {
             .into_inner();
         assert_eq!(committed.state, WriteState::Committed as i32);
 
-        let object_default_records = crate::authz_journal::list_authz_tuple_log(
+        let object_default_records = crate::authz_journal::collect_authz_tuple_log_for_rebuild(
             &state.storage,
             crate::system_realm::SYSTEM_STORAGE_TENANT_ID,
-            0,
-            "",
-            0,
+            None,
         )
         .await
         .unwrap()
@@ -956,7 +960,7 @@ mod tests {
                     scope: Some(scope(&root)),
                     preconditions: vec![rollback_precondition.clone()],
                     boundary_values: Vec::new(),
-                    ttl_ms: 60_000,
+                    ttl_ms: TEST_TRANSACTION_TTL_MS,
                     purpose: "service object rollback test".to_string(),
                 },
                 &claims,
@@ -1001,7 +1005,7 @@ mod tests {
                     scope: Some(scope(&root)),
                     preconditions: vec![successor_precondition.clone()],
                     boundary_values: Vec::new(),
-                    ttl_ms: 60_000,
+                    ttl_ms: TEST_TRANSACTION_TTL_MS,
                     purpose: "service object after rollback test".to_string(),
                 },
                 &claims,
@@ -1058,7 +1062,7 @@ mod tests {
                     scope: Some(scope(&root)),
                     preconditions: vec![open_precondition.clone()],
                     boundary_values: Vec::new(),
-                    ttl_ms: 60_000,
+                    ttl_ms: TEST_TRANSACTION_TTL_MS,
                     purpose: "service open predecessor test".to_string(),
                 },
                 &claims,
@@ -1080,40 +1084,68 @@ mod tests {
         open_request.extensions_mut().insert(claims.clone());
         state.mutation_batch(open_request).await.unwrap();
 
-        let blocked_precondition = absent_objects(&bucket.name, &["blocked-successor.json"]);
-        let blocked_successor = state
+        let successor_precondition = absent_objects(&bucket.name, &["competing-successor.json"]);
+        let competing_successor = state
             .begin_transaction(with_exact_claims(
                 BeginTransactionRequest {
-                    idempotency_key: "service-object-blocked-successor".to_string(),
+                    idempotency_key: "service-object-competing-successor".to_string(),
                     scope: Some(scope(&root)),
-                    preconditions: vec![blocked_precondition.clone()],
+                    preconditions: vec![successor_precondition.clone()],
                     boundary_values: Vec::new(),
-                    ttl_ms: 60_000,
-                    purpose: "service blocked successor test".to_string(),
+                    ttl_ms: TEST_TRANSACTION_TTL_MS,
+                    purpose: "service competing successor test".to_string(),
                 },
                 &claims,
             ))
             .await
             .unwrap()
             .into_inner();
-        let mut blocked_request = Request::new(MutationBatchRequest {
+        let mut successor_request = Request::new(MutationBatchRequest {
             bucket_name: bucket.name.clone(),
             mutation_context: Some(mutation_context(
                 &claims,
                 bucket.id,
-                "service-object-blocked-successor",
-                &blocked_successor.transaction_id,
+                "service-object-competing-successor",
+                &competing_successor.transaction_id,
             )),
-            precondition: Some(blocked_precondition),
-            operations: vec![put_json("blocked-successor.json", br#"{"value":6}"#)],
+            precondition: Some(successor_precondition),
+            operations: vec![put_json("competing-successor.json", br#"{"value":6}"#)],
         });
-        blocked_request.extensions_mut().insert(claims.clone());
-        state.mutation_batch(blocked_request).await.unwrap();
+        successor_request.extensions_mut().insert(claims.clone());
+        state.mutation_batch(successor_request).await.unwrap();
 
-        let blocked = state
+        // Explicit transactions use optimistic first-committer-wins ordering.
+        let committed_successor = state
             .commit_transaction(with_exact_claims(
                 CommitTransactionRequest {
-                    transaction_id: blocked_successor.transaction_id,
+                    transaction_id: competing_successor.transaction_id,
+                    consistency: ConsistencyMode::Committed as i32,
+                    wait_for_finalization: false,
+                    final_preconditions: Vec::new(),
+                },
+                &claims,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(committed_successor.state, WriteState::Committed as i32);
+        state
+            .head_object(with_exact_claims(
+                HeadObjectRequest {
+                    bucket_name: bucket.name.clone(),
+                    object_key: "competing-successor.json".to_string(),
+                    version_id: None,
+                    consistency: None,
+                },
+                &claims,
+            ))
+            .await
+            .unwrap();
+
+        let stale_predecessor = state
+            .commit_transaction(with_exact_claims(
+                CommitTransactionRequest {
+                    transaction_id: open_predecessor.transaction_id,
                     consistency: ConsistencyMode::Committed as i32,
                     wait_for_finalization: false,
                     final_preconditions: Vec::new(),
@@ -1122,7 +1154,8 @@ mod tests {
             ))
             .await
             .unwrap_err();
-        assert_eq!(blocked.code(), tonic::Code::Aborted);
+        assert_eq!(stale_predecessor.code(), tonic::Code::Aborted);
+        assert_object_not_found(&state, &claims, &bucket.name, "open-predecessor.json").await;
     }
 
     #[tokio::test]
@@ -1166,10 +1199,7 @@ mod tests {
                     scope: Some(scope(&root)),
                     preconditions: vec![predecessor_precondition.clone()],
                     boundary_values: Vec::new(),
-                    // This transaction must remain open long enough for the
-                    // staged write to finish on slow CI, then expire before the
-                    // successor commit validates stream predecessor ordering.
-                    ttl_ms: 5_000,
+                    ttl_ms: TEST_TRANSACTION_TTL_MS,
                     purpose: "stage an abandoned predecessor".to_string(),
                 },
                 &claims,
@@ -1190,7 +1220,14 @@ mod tests {
         });
         predecessor_request.extensions_mut().insert(claims.clone());
         state.mutation_batch(predecessor_request).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(5_500)).await;
+        state
+            .core_store
+            .expire_explicit_transaction_for_tests(
+                &predecessor.transaction_id,
+                &transaction_principal_from_claims(&claims),
+            )
+            .await
+            .unwrap();
 
         let successor_precondition = absent_objects(&bucket.name, &["successor.json"]);
         let successor = state
@@ -1200,7 +1237,7 @@ mod tests {
                     scope: Some(scope(&root)),
                     preconditions: vec![successor_precondition.clone()],
                     boundary_values: Vec::new(),
-                    ttl_ms: 60_000,
+                    ttl_ms: TEST_TRANSACTION_TTL_MS,
                     purpose: "commit after an expired predecessor".to_string(),
                 },
                 &claims,
@@ -1260,7 +1297,7 @@ mod tests {
                 scope: Some(scope("tenant/1/root/principal-scope")),
                 preconditions: Vec::new(),
                 boundary_values: Vec::new(),
-                ttl_ms: 60_000,
+                ttl_ms: TEST_TRANSACTION_TTL_MS,
                 purpose: "service test principal scoping".to_string(),
             }))
             .await
@@ -1289,7 +1326,7 @@ mod tests {
                 scope: Some(scope(root)),
                 preconditions: Vec::new(),
                 boundary_values: Vec::new(),
-                ttl_ms: 60_000,
+                ttl_ms: TEST_TRANSACTION_TTL_MS,
                 purpose: "service test commit".to_string(),
             }))
             .await
@@ -1311,6 +1348,10 @@ mod tests {
                 transaction_id: begin.transaction_id.clone(),
                 scope_partition: root.to_string(),
                 committed_by_principal: transaction_principal(&with_claims(())).unwrap(),
+                root_publications: vec![
+                    CoreMutationRootPublication::new(root, WriterFamily::CoreControl.as_str())
+                        .coordinator(),
+                ],
                 preconditions: Vec::new(),
                 operations: vec![
                     CoreMutationOperation::CoreMetaPut {
@@ -1419,5 +1460,22 @@ mod tests {
             .into_inner();
         assert_eq!(status.state, "expired");
         assert!(status.error.is_some());
+    }
+
+    #[test]
+    fn transaction_service_maps_stream_head_race_to_retryable_conflict() {
+        let status = core_store_status(
+            CoreStoreCommitError::StreamHeadMismatch {
+                stream_id: "object_metadata:tenant:2:bucket:1".to_string(),
+                expected_last_sequence: 4,
+                expected_last_event_hash: "sha256:expected".to_string(),
+                actual_sequence: 5,
+                actual_event_hash: "sha256:actual".to_string(),
+            }
+            .into(),
+        );
+
+        assert_eq!(status.code(), tonic::Code::Aborted);
+        assert_eq!(status.message(), "TransactionConflict");
     }
 }

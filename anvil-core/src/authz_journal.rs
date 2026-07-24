@@ -1,54 +1,36 @@
-use crate::authz_coremeta_payload::{decode_authz_payload_row, encode_authz_payload_row};
+use crate::authz_head::{self, AuthzHeadMutation, AuthzHeadSnapshot};
 use crate::authz_realm_schema;
 use crate::authz_schema_contract::{
     AuthzSchemaContractError, AuthzTupleShape, validate_tuple_batch,
 };
 use crate::authz_scope::{DEFAULT_AUTHZ_REALM_ID, split_realm_namespace};
 use crate::authz_segment;
-use crate::authz_userset_index::{
-    AuthzDerivedUsersetEntry, DEFAULT_DERIVED_USERSET_INDEX_ID,
-    list_derived_userset_objects_at_revision, lookup_derived_userset_index_at_revision,
-};
 use crate::core_store::{
-    CF_AUTHZ, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaStore, CoreMetaTuplePart,
-    CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition, CoreStore, ReadStream,
-    TABLE_AUTHZ_TUPLE_PAGE_ROW, core_meta_committed_row_common, core_meta_root_key_hash,
-    core_meta_tuple_key,
+    CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
+    CoreMutationRootPublication, CoreStore, ReadStream,
 };
-use crate::formats::{Hash32, hash32};
+use crate::formats::{Hash32, hash32, writer::WriterFamily};
 use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
 use crate::persistence::AuthzTupleRecord;
 use crate::storage::Storage;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use prost::Message;
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::{Arc, LazyLock},
-};
+use std::collections::BTreeSet;
 
 mod idempotency;
+mod materialization;
+mod projection;
 pub(crate) mod resolver;
+mod storage_resolver;
+
+pub(crate) use projection::{AuthzProjectionPageError, AuthzTupleProjectionPage};
+#[cfg(test)]
+pub(crate) use storage_resolver::AuthzResolutionOutcome;
 
 const AUTHZ_TUPLE_JOURNAL_BODY_SCHEMA: &str = "anvil.authz_tuple.journal_body.v1";
 const AUTHZ_TUPLE_BATCH_JOURNAL_BODY_SCHEMA: &str = "anvil.authz_tuple.batch_journal_body.v1";
-const AUTHZ_TUPLE_CURRENT_ROW_SCHEMA: &str = "anvil.authz_tuple.current_row.v1";
-const AUTHZ_TUPLE_PAGE_PAYLOAD_KIND: &str = "authz_tuple_page";
 const AUTHZ_TUPLE_RECORD_KIND: &str = "authz_tuple";
 const AUTHZ_TUPLE_BATCH_RECORD_KIND: &str = "authz_tuple_batch";
-
-static AUTHZ_TUPLE_WRITE_LOCKS: LazyLock<
-    std::sync::Mutex<BTreeMap<i64, Arc<tokio::sync::Mutex<()>>>>,
-> = LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
-
-fn authz_tuple_write_lock(tenant_id: i64) -> Result<Arc<tokio::sync::Mutex<()>>> {
-    let mut locks = AUTHZ_TUPLE_WRITE_LOCKS
-        .lock()
-        .map_err(|_| anyhow!("authz tuple write lock is poisoned"))?;
-    Ok(locks
-        .entry(tenant_id)
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone())
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
 enum AuthzTupleOperationProto {
@@ -119,16 +101,6 @@ struct AuthzTupleBatchJournalBodyProto {
     mutation_id: String,
 }
 
-#[derive(Clone, PartialEq, Message)]
-struct AuthzTupleCurrentRowProto {
-    #[prost(message, optional, tag = "1")]
-    common: Option<crate::core_store::CoreMetaRowCommonProto>,
-    #[prost(string, tag = "2")]
-    schema: String,
-    #[prost(message, optional, tag = "3")]
-    record: Option<AuthzTupleRecordProto>,
-}
-
 #[derive(Clone, Copy)]
 pub struct AuthzTupleWrite<'a> {
     pub tenant_id: i64,
@@ -145,6 +117,7 @@ pub struct AuthzTupleWrite<'a> {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AuthzTupleFilter {
+    pub realm_id: Option<String>,
     pub namespace: Option<String>,
     pub object_id: Option<String>,
     pub relation: Option<String>,
@@ -153,11 +126,47 @@ pub struct AuthzTupleFilter {
     pub caveat_hash: Option<String>,
 }
 
+pub(crate) async fn page_current_authz_tuples(
+    storage: &Storage,
+    tenant_id: i64,
+    filter: &AuthzTupleFilter,
+    expected_revision: i64,
+    after_tuple_key: Option<&[u8]>,
+    page_size: usize,
+) -> std::result::Result<AuthzTupleProjectionPage, AuthzProjectionPageError> {
+    projection::page_current_records(
+        storage,
+        tenant_id,
+        filter,
+        expected_revision,
+        after_tuple_key,
+        page_size,
+    )
+    .await
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AuthzSubjectRef {
     pub subject_kind: String,
     pub subject_id: String,
     pub caveat_hash: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AuthzObjectListPage {
+    pub object_ids: Vec<String>,
+    pub next_object_id: Option<String>,
+    pub tuple_rows_visited: usize,
+    pub resolution_rows_visited: usize,
+    pub graph_nodes_visited: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AuthzSubjectListPage {
+    pub subjects: Vec<AuthzSubjectRef>,
+    pub next_subject_position: Option<String>,
+    pub tuple_rows_visited: usize,
+    pub graph_nodes_visited: usize,
 }
 
 pub(crate) async fn write_authz_tuple_with_permit(
@@ -168,7 +177,7 @@ pub(crate) async fn write_authz_tuple_with_permit(
 ) -> Result<AuthzTupleRecord> {
     require_authz_permit(input.tenant_id, permit)?;
     validate_optional_caveat_hash(input.caveat_hash)?;
-    let write_lock = authz_tuple_write_lock(input.tenant_id)?;
+    let write_lock = authz_head::tenant_write_lock(input.tenant_id)?;
     let _guard = write_lock.lock().await;
     let schema_binding_precondition =
         validate_writes_against_bound_schema(storage, std::slice::from_ref(&input), None).await?;
@@ -201,7 +210,7 @@ pub(crate) async fn write_authz_tuple_batch_with_permit(
         }
         validate_optional_caveat_hash(input.caveat_hash)?;
     }
-    let write_lock = authz_tuple_write_lock(tenant_id)?;
+    let write_lock = authz_head::tenant_write_lock(tenant_id)?;
     let _guard = write_lock.lock().await;
     let schema_binding_precondition =
         validate_writes_against_bound_schema(storage, &inputs, None).await?;
@@ -246,7 +255,7 @@ pub(crate) async fn write_authz_tuple_batch_conditionally_with_permit(
     if let Some(operation_id) = options.operation_id.as_deref() {
         idempotency::validate_operation_id(operation_id)?;
     }
-    let write_lock = authz_tuple_write_lock(tenant_id)?;
+    let write_lock = authz_head::tenant_write_lock(tenant_id)?;
     let _guard = write_lock.lock().await;
     let partition_precondition =
         partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
@@ -329,8 +338,8 @@ async fn write_authz_tuple_inner(
     schema_binding_precondition: crate::persistence::AuthzSchemaBindingPrecondition,
 ) -> Result<AuthzTupleRecord> {
     validate_optional_caveat_hash(input.caveat_hash)?;
-    let revision = latest_authz_revision(storage, input.tenant_id)
-        .await?
+    let head_snapshot = authz_head::read(storage, input.tenant_id).await?;
+    let revision = i64::try_from(head_snapshot.head.committed_revision)?
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("authz revision overflow"))?;
     let record = build_authz_tuple_record(input, revision, 0)?;
@@ -340,6 +349,7 @@ async fn write_authz_tuple_inner(
         fence_token,
         partition_precondition,
         Some(&schema_binding_precondition),
+        &head_snapshot,
     )
     .await;
     handle_schema_fenced_write_result(storage, &schema_binding_precondition, write_result)?;
@@ -357,8 +367,8 @@ async fn write_authz_tuple_batch_inner(
         .first()
         .ok_or_else(|| anyhow!("authz tuple batch must not be empty"))?
         .tenant_id;
-    let revision = latest_authz_revision(storage, tenant_id)
-        .await?
+    let head_snapshot = authz_head::read(storage, tenant_id).await?;
+    let revision = i64::try_from(head_snapshot.head.committed_revision)?
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("authz revision overflow"))?;
     let mut records = Vec::with_capacity(inputs.len());
@@ -377,6 +387,7 @@ async fn write_authz_tuple_batch_inner(
         partition_precondition,
         None,
         Some(&schema_binding_precondition),
+        &head_snapshot,
     )
     .await;
     handle_schema_fenced_write_result(storage, &schema_binding_precondition, write_result)?;
@@ -403,7 +414,9 @@ async fn write_authz_tuple_batch_conditionally_inner(
         .first()
         .ok_or_else(|| anyhow!("authz tuple batch must not be empty"))?
         .tenant_id;
-    let current_revision = latest_authz_revision(storage, tenant_id).await?;
+    let head_snapshot = authz_head::read(storage, tenant_id).await?;
+    let current_revision = i64::try_from(head_snapshot.head.committed_revision)
+        .context("authorization revision exceeds i64")?;
     if let Some(expected) = options.expected_revision
         && expected != current_revision
     {
@@ -434,6 +447,7 @@ async fn write_authz_tuple_batch_conditionally_inner(
         partition_precondition,
         receipt.as_ref(),
         Some(&schema_binding_precondition),
+        &head_snapshot,
     )
     .await;
     if let Err(error) = write_result {
@@ -498,7 +512,8 @@ pub(crate) async fn test_append_authz_tuple_record_unfenced(
     storage: &Storage,
     record: &AuthzTupleRecord,
 ) -> Result<()> {
-    append_authz_tuple_record_inner(storage, record, 0, None, None).await
+    let head_snapshot = authz_head::read(storage, record.tenant_id).await?;
+    append_authz_tuple_record_inner(storage, record, 0, None, None, &head_snapshot).await
 }
 
 #[cfg(test)]
@@ -511,12 +526,14 @@ pub(crate) async fn append_authz_tuple_record_with_permit(
     require_authz_permit(record.tenant_id, permit)?;
     let partition_precondition =
         partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
+    let head_snapshot = authz_head::read(storage, record.tenant_id).await?;
     append_authz_tuple_record_inner(
         storage,
         record,
         permit.fence_token,
         Some(partition_precondition),
         None,
+        &head_snapshot,
     )
     .await
 }
@@ -527,39 +544,67 @@ async fn append_authz_tuple_record_inner(
     fence_token: u64,
     partition_precondition: Option<CoreMutationPrecondition>,
     schema_binding_precondition: Option<&crate::persistence::AuthzSchemaBindingPrecondition>,
+    head_snapshot: &AuthzHeadSnapshot,
 ) -> Result<()> {
     let core_store = CoreStore::new(storage.clone()).await?;
     let stream_id = authz_tuple_stream_id(record.tenant_id);
     let payload = encode_authz_tuple_journal_body(record, fence_token)?;
-
-    let partition_id = hex::encode(authz_partition_id(record.tenant_id));
+    let transaction_id = format!("authz-tuple:{}", record.mutation_id);
+    let partition_id = authz_head::transaction_partition(record.tenant_id);
+    let head = authz_head::advance(
+        head_snapshot,
+        &transaction_id,
+        AuthzHeadMutation::TupleBatch {
+            journal_payload: &payload,
+            fence_token,
+        },
+    )?;
+    if i64::try_from(head.committed_revision)? != record.revision {
+        return Err(anyhow!(
+            "authorization tuple revision does not advance the authorization head"
+        ));
+    }
+    let mut preconditions = partition_precondition.into_iter().collect::<Vec<_>>();
+    if let Some(schema_binding_precondition) = schema_binding_precondition {
+        preconditions.push(idempotency::schema_binding_precondition(
+            schema_binding_precondition,
+        ));
+    }
+    preconditions.push(authz_head::precondition(head_snapshot)?);
+    let mut operations = vec![CoreMutationOperation::StreamAppend {
+        partition_id: partition_id.clone(),
+        stream_id,
+        record_kind: AUTHZ_TUPLE_RECORD_KIND.to_string(),
+        payload,
+        idempotency_key: Some(transaction_id.clone()),
+    }];
+    operations.extend(
+        projection::current_operations(
+            storage,
+            std::slice::from_ref(record),
+            &partition_id,
+            &transaction_id,
+        )
+        .await?,
+    );
+    operations.push(authz_head::put_operation(
+        &partition_id,
+        &transaction_id,
+        &head,
+    )?);
     let step_started_at = std::time::Instant::now();
     core_store
         .commit_mutation_batch(CoreMutationBatch {
-            transaction_id: format!("authz-tuple:{}", record.mutation_id),
+            transaction_id,
             scope_partition: partition_id.clone(),
-            committed_by_principal: authz_partition_principal(record.tenant_id),
-            preconditions: partition_precondition
-                .into_iter()
-                .chain(schema_binding_precondition.map(idempotency::schema_binding_precondition))
-                .collect(),
-            operations: vec![CoreMutationOperation::StreamAppend {
-                partition_id,
-                stream_id,
-                record_kind: AUTHZ_TUPLE_RECORD_KIND.to_string(),
-                payload,
-                idempotency_key: Some(format!("authz-tuple:{}", record.mutation_id)),
-            }],
+            committed_by_principal: authz_head::transaction_principal(record.tenant_id),
+            root_publications: authz_mutation_root_publications(&partition_id, record.tenant_id),
+            preconditions,
+            operations,
         })
         .await?;
     crate::emit_test_timing(
         "authz_journal.append_record commit_mutation_batch",
-        step_started_at.elapsed(),
-    );
-    let step_started_at = std::time::Instant::now();
-    write_authz_tuple_records_to_current_rows(storage, std::slice::from_ref(record)).await?;
-    crate::emit_test_timing(
-        "authz_journal.append_record write_current_rows",
         step_started_at.elapsed(),
     );
     record_authz_materialization_deferred(
@@ -578,6 +623,7 @@ async fn append_authz_tuple_batch_inner(
     partition_precondition: Option<CoreMutationPrecondition>,
     idempotency_receipt: Option<&idempotency::PreparedAuthzIdempotencyReceipt>,
     schema_binding_precondition: Option<&crate::persistence::AuthzSchemaBindingPrecondition>,
+    head_snapshot: &AuthzHeadSnapshot,
 ) -> Result<()> {
     if records.is_empty() {
         return Err(anyhow!("authz tuple batch must not be empty"));
@@ -595,11 +641,24 @@ async fn append_authz_tuple_batch_inner(
     let stream_id = authz_tuple_stream_id(tenant_id);
     let payload = encode_authz_tuple_batch_journal_body(tenant_id, revision, records, fence_token)?;
 
-    let partition_id = hex::encode(authz_partition_id(tenant_id));
+    let partition_id = authz_head::transaction_partition(tenant_id);
     let step_started_at = std::time::Instant::now();
     let transaction_id = idempotency_receipt
         .map(|receipt| receipt.transaction_id.clone())
         .unwrap_or_else(|| format!("authz-tuple-batch:{tenant_id}:{revision}"));
+    let head = authz_head::advance(
+        head_snapshot,
+        &transaction_id,
+        AuthzHeadMutation::TupleBatch {
+            journal_payload: &payload,
+            fence_token,
+        },
+    )?;
+    if i64::try_from(head.committed_revision)? != revision {
+        return Err(anyhow!(
+            "authorization tuple batch revision does not advance the authorization head"
+        ));
+    }
     let mut preconditions = partition_precondition.into_iter().collect::<Vec<_>>();
     if let Some(schema_binding_precondition) = schema_binding_precondition {
         preconditions.push(idempotency::schema_binding_precondition(
@@ -609,6 +668,7 @@ async fn append_authz_tuple_batch_inner(
     if let Some(receipt) = idempotency_receipt {
         preconditions.push(idempotency::receipt_precondition(receipt));
     }
+    preconditions.push(authz_head::precondition(head_snapshot)?);
     let mut operations = vec![CoreMutationOperation::StreamAppend {
         partition_id: partition_id.clone(),
         stream_id,
@@ -619,11 +679,20 @@ async fn append_authz_tuple_batch_inner(
     if let Some(receipt) = idempotency_receipt {
         operations.push(idempotency::receipt_operation(&partition_id, receipt));
     }
+    operations.extend(
+        projection::current_operations(storage, records, &partition_id, &transaction_id).await?,
+    );
+    operations.push(authz_head::put_operation(
+        &partition_id,
+        &transaction_id,
+        &head,
+    )?);
     core_store
         .commit_mutation_batch(CoreMutationBatch {
             transaction_id,
-            scope_partition: partition_id,
-            committed_by_principal: authz_partition_principal(tenant_id),
+            scope_partition: partition_id.clone(),
+            committed_by_principal: authz_head::transaction_principal(tenant_id),
+            root_publications: authz_mutation_root_publications(&partition_id, tenant_id),
             preconditions,
             operations,
         })
@@ -632,14 +701,22 @@ async fn append_authz_tuple_batch_inner(
         "authz_journal.append_batch commit_mutation_batch",
         step_started_at.elapsed(),
     );
-    let step_started_at = std::time::Instant::now();
-    write_authz_tuple_records_to_current_rows(storage, records).await?;
-    crate::emit_test_timing(
-        "authz_journal.append_batch write_current_rows",
-        step_started_at.elapsed(),
-    );
     record_authz_materialization_deferred(tenant_id, revision, records.len());
     Ok(())
+}
+
+fn authz_mutation_root_publications(
+    coordinator_root: &str,
+    tenant_id: i64,
+) -> Vec<CoreMutationRootPublication> {
+    vec![
+        CoreMutationRootPublication::new(coordinator_root, WriterFamily::CoreControl.as_str())
+            .coordinator(),
+        CoreMutationRootPublication::new(
+            authz_head::root_anchor_key(tenant_id),
+            WriterFamily::Authz.as_str(),
+        ),
+    ]
 }
 
 fn record_authz_materialization_deferred(tenant_id: i64, revision: i64, record_count: usize) {
@@ -656,269 +733,30 @@ fn record_authz_materialization_deferred(tenant_id: i64, revision: i64, record_c
     );
 }
 
-pub(crate) async fn materialize_authz_tuple_segment(
-    storage: &Storage,
-    tenant_id: i64,
-    source_fence_token: u64,
-) -> Result<String> {
-    let target_revision = latest_authz_revision(storage, tenant_id).await?.max(0) as u64;
-    materialize_authz_tuple_segment_at_revision(
-        storage,
-        tenant_id,
-        target_revision,
-        source_fence_token,
-    )
-    .await
-}
-
-pub(crate) async fn materialize_authz_tuple_segment_at_revision(
-    storage: &Storage,
-    tenant_id: i64,
-    target_revision: u64,
-    source_fence_token: u64,
-) -> Result<String> {
-    materialize_authz_tuple_segment_at_revision_with_derived(
-        storage,
-        tenant_id,
-        target_revision,
-        source_fence_token,
-        None,
-    )
-    .await
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AuthzMaterializationOutcome {
-    pub processed_revision: u64,
-    pub source_record_count: u64,
-    pub source_records_hash: String,
-    pub generation: u64,
-    pub segment_ref: String,
-}
-
-pub(crate) async fn materialize_authz_derived_state_at_revision(
-    storage: &Storage,
-    tenant_id: i64,
-    target_revision: u64,
-    source_fence_token: u64,
-) -> Result<AuthzMaterializationOutcome> {
-    let derived = crate::authz_userset_index::build_expected_derived_userset_index_at_revision(
-        storage,
-        tenant_id,
-        DEFAULT_DERIVED_USERSET_INDEX_ID,
-        target_revision,
-    )
-    .await?;
-    crate::authz_userset_index::write_derived_userset_index(storage, &derived).await?;
-    let segment_ref = materialize_authz_tuple_segment_at_revision_with_derived(
-        storage,
-        tenant_id,
-        target_revision,
-        source_fence_token,
-        Some(derived.entries.clone()),
-    )
-    .await?;
-    Ok(AuthzMaterializationOutcome {
-        processed_revision: derived.processed_revision,
-        source_record_count: derived.source_record_count,
-        source_records_hash: derived.source_records_hash,
-        generation: derived.generation,
-        segment_ref,
-    })
-}
-
-async fn materialize_authz_tuple_segment_at_revision_with_derived(
-    storage: &Storage,
-    tenant_id: i64,
-    target_revision: u64,
-    source_fence_token: u64,
-    derived_entries: Option<Vec<AuthzDerivedUsersetEntry>>,
-) -> Result<String> {
-    if let Some(segment_ref) =
-        authz_segment::existing_authz_tuple_segment_ref(storage, tenant_id, target_revision)?
-    {
-        return Ok(segment_ref);
-    }
-    let write_checkpoint = authz_segment::authz_tuple_segment_requires_checkpoint(
-        storage,
-        tenant_id,
-        target_revision,
-    )?;
-    let step_started_at = std::time::Instant::now();
-    let derived_entries = if let Some(derived_entries) = derived_entries {
-        derived_entries
-    } else {
-        crate::authz_userset_index::build_expected_derived_userset_index_at_revision(
-            storage,
-            tenant_id,
-            DEFAULT_DERIVED_USERSET_INDEX_ID,
-            target_revision,
-        )
-        .await?
-        .entries
-    };
-    let previous_derived_entries = if !write_checkpoint && target_revision > 1 {
-        crate::authz_userset_index::build_expected_derived_userset_index_at_revision(
-            storage,
-            tenant_id,
-            DEFAULT_DERIVED_USERSET_INDEX_ID,
-            target_revision - 1,
-        )
-        .await?
-        .entries
-    } else {
-        Vec::new()
-    };
-    crate::emit_test_timing(
-        "authz_journal.materialize_segment build_derived_usersets",
-        step_started_at.elapsed(),
-    );
-    let step_started_at = std::time::Instant::now();
-    let target_revision = i64::try_from(target_revision)
-        .context("authorization segment revision exceeds supported range")?;
-    let records = read_authz_tuple_records_for_segment_materialization(storage, tenant_id)
-        .await?
-        .into_iter()
-        .filter(|record| record.revision <= target_revision)
-        .collect::<Vec<_>>();
-    crate::emit_test_timing(
-        "authz_journal.materialize_segment read_segment_source_records",
-        step_started_at.elapsed(),
-    );
-    let step_started_at = std::time::Instant::now();
-    let target_revision = u64::try_from(target_revision)?;
-    let segment_ref = write_authz_tuple_segment_with_derived(
-        storage,
-        tenant_id,
-        &records,
-        &derived_entries,
-        &previous_derived_entries,
-        target_revision,
-        source_fence_token,
-        write_checkpoint,
-    )
-    .await?;
-    crate::emit_test_timing(
-        if write_checkpoint {
-            "authz_journal.materialize_segment write_checkpoint_segment"
-        } else {
-            "authz_journal.materialize_segment write_delta_segment"
-        },
-        step_started_at.elapsed(),
-    );
-    Ok(segment_ref)
-}
-
-async fn write_authz_tuple_segment_with_derived(
-    storage: &Storage,
-    tenant_id: i64,
-    records: &[AuthzTupleRecord],
-    derived_entries: &[AuthzDerivedUsersetEntry],
-    previous_derived_entries: &[AuthzDerivedUsersetEntry],
-    target_revision: u64,
-    source_fence_token: u64,
-    write_checkpoint: bool,
-) -> Result<String> {
-    if write_checkpoint {
-        authz_segment::write_authz_tuple_checkpoint_segment(
-            storage,
-            tenant_id,
-            records,
-            derived_entries,
-            source_fence_token,
-        )
-        .await
-    } else {
-        authz_segment::write_authz_tuple_delta_segment(
-            storage,
-            tenant_id,
-            records,
-            derived_entries,
-            previous_derived_entries,
-            target_revision,
-            source_fence_token,
-        )
-        .await
-    }
-}
-
-#[allow(dead_code)]
-async fn advance_authz_materialization(
-    storage: &Storage,
-    tenant_id: i64,
-    batch_records: &[AuthzTupleRecord],
-    source_fence_token: u64,
-) -> Result<()> {
-    debug_assert!(!batch_records.is_empty());
-    let revision = batch_records
-        .iter()
-        .map(|record| record.revision)
-        .max()
-        .unwrap_or_default();
-    let revision = u64::try_from(revision).context("authorization revision must be nonnegative")?;
-    let derived_entries = crate::authz_userset_index::advance_derived_userset_index_from_batch(
-        storage,
-        tenant_id,
-        DEFAULT_DERIVED_USERSET_INDEX_ID,
-        batch_records,
-    )
-    .await?
-    .entries;
-    materialize_authz_tuple_segment_at_revision_with_derived(
-        storage,
-        tenant_id,
-        revision,
-        source_fence_token,
-        Some(derived_entries),
-    )
-    .await?;
-    Ok(())
-}
+pub(crate) use materialization::{
+    AuthzMaterializationOutcome, materialize_authz_derived_state_at_revision,
+    materialize_authz_derived_state_through_revision, materialize_authz_tuple_segment,
+    materialize_authz_tuple_segment_at_revision, rebuild_authz_materialization_at_revision,
+};
 
 pub async fn latest_authz_revision(storage: &Storage, tenant_id: i64) -> Result<i64> {
-    let tuple_revision = latest_authz_tuple_revision(storage, tenant_id).await?;
-    let schema_revision = crate::authz_realm_schema::list_schema_revisions(storage, tenant_id)
-        .await?
-        .into_iter()
-        .map(|record| record.authz_revision)
-        .chain(
-            crate::authz_realm_schema::list_schema_bindings(storage, tenant_id)
-                .await?
-                .into_iter()
-                .map(|record| record.authz_revision),
-        )
-        .max()
-        .unwrap_or(0);
-    Ok(tuple_revision.max(i64::try_from(schema_revision)?))
+    i64::try_from(
+        authz_head::read(storage, tenant_id)
+            .await?
+            .head
+            .committed_revision,
+    )
+    .context("authorization revision exceeds i64")
 }
 
 pub(crate) async fn latest_authz_tuple_revision(storage: &Storage, tenant_id: i64) -> Result<i64> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let stream_id = authz_tuple_stream_id(tenant_id);
-    let (sequence, _) = store.raw_stream_head(&stream_id).await?;
-    if sequence == 0 {
-        return Ok(0);
-    }
-    let record = store
-        .read_stream(ReadStream {
-            stream_id,
-            after_sequence: sequence.saturating_sub(1),
-            limit: 1,
-        })
-        .await?
-        .pop()
-        .ok_or_else(|| anyhow!("authorization journal head record is missing"))?;
-    match record.record_kind.as_str() {
-        AUTHZ_TUPLE_RECORD_KIND => Ok(decode_authz_tuple_journal_body(&record.payload)?.revision),
-        AUTHZ_TUPLE_BATCH_RECORD_KIND => decode_authz_tuple_batch_journal_body(&record.payload)?
-            .into_iter()
-            .map(|record| record.revision)
-            .max()
-            .ok_or_else(|| anyhow!("authorization journal head batch is empty")),
-        other => Err(anyhow!(
-            "authorization journal head has unsupported record kind {other}"
-        )),
-    }
+    i64::try_from(
+        authz_head::read(storage, tenant_id)
+            .await?
+            .head
+            .tuple_revision,
+    )
+    .context("authorization tuple revision exceeds i64")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -969,23 +807,72 @@ pub async fn check_authz_tuple_at_revision(
     caveat_hash: &str,
     revision: i64,
 ) -> Result<Option<AuthzTupleRecord>> {
-    let records = if revision == i64::MAX {
-        read_all_authz_tuple_records(storage, tenant_id).await?
-    } else {
-        read_all_authz_tuple_records_from_journal(storage, tenant_id).await?
-    };
-    Ok(records
-        .into_iter()
-        .filter(|record| {
-            record.revision <= revision
-                && record.namespace == namespace
-                && record.object_id == object_id
-                && record.relation == relation
-                && record.subject_kind == subject_kind
-                && record.subject_id == subject_id
-                && record.caveat_hash == caveat_hash
-        })
-        .max_by_key(|record| (record.revision, record.revision_ordinal)))
+    if revision < 0 {
+        return Err(anyhow!("authorization revision must be non-negative"));
+    }
+    let current_revision = latest_authz_revision(storage, tenant_id).await?;
+    if revision != i64::MAX && revision > current_revision {
+        return Err(anyhow!(
+            "AuthzRevisionUnavailable: current authorization revision is {current_revision}, requested {revision}"
+        ));
+    }
+    if revision == i64::MAX || revision >= latest_authz_tuple_revision(storage, tenant_id).await? {
+        return projection::read_current_record(
+            storage,
+            tenant_id,
+            namespace,
+            object_id,
+            relation,
+            subject_kind,
+            subject_id,
+            caveat_hash,
+        )
+        .await;
+    }
+    Ok(authz_segment::lookup_materialized_tuple_at_revision(
+        storage,
+        tenant_id,
+        namespace,
+        object_id,
+        relation,
+        subject_kind,
+        subject_id,
+        caveat_hash,
+        u64::try_from(revision)?,
+    )
+    .await?
+    .record)
+}
+
+/// Resolve an exact current tuple through an already-open CoreStore. Internal
+/// node authentication uses this point lookup because its grant is a direct
+/// system-realm edge; invoking the general Zanzibar graph resolver for every
+/// replication frame would add no authorization semantics and can recursively
+/// contend with the recovery traffic it is authorizing.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn check_current_authz_tuple_with_core_store(
+    storage: &Storage,
+    core_store: &CoreStore,
+    tenant_id: i64,
+    namespace: &str,
+    object_id: &str,
+    relation: &str,
+    subject_kind: &str,
+    subject_id: &str,
+    caveat_hash: &str,
+) -> Result<Option<AuthzTupleRecord>> {
+    projection::read_current_record_with_core_store(
+        storage,
+        core_store,
+        tenant_id,
+        namespace,
+        object_id,
+        relation,
+        subject_kind,
+        subject_id,
+        caveat_hash,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1000,55 +887,50 @@ pub async fn resolve_permission_at_revision(
     caveat_hash: &str,
     revision: i64,
 ) -> Result<bool> {
-    if revision >= 0 {
-        match lookup_derived_userset_index_at_revision(
+    if revision == i64::MAX {
+        return resolve_current_permission(
             storage,
             tenant_id,
-            DEFAULT_DERIVED_USERSET_INDEX_ID,
             namespace,
             object_id,
             relation,
             subject_kind,
             subject_id,
             caveat_hash,
-            revision as u64,
+        )
+        .await;
+    }
+    if revision < 0 {
+        return Err(anyhow!("authorization revision must be non-negative"));
+    }
+
+    let current_revision = latest_authz_revision(storage, tenant_id).await?;
+    if revision > current_revision {
+        return Err(anyhow!(
+            "AuthzRevisionUnavailable: current authorization revision is {current_revision}, requested {revision}"
+        ));
+    }
+    if revision == current_revision {
+        match resolve_current_permission_at_expected_revision(
+            storage,
+            tenant_id,
+            namespace,
+            object_id,
+            relation,
+            subject_kind,
+            subject_id,
+            caveat_hash,
+            revision,
         )
         .await
         {
-            Ok(Some(true)) => return Ok(true),
-            Ok(_) => {}
-            Err(error) => {
-                tracing::warn!(
-                    tenant_id,
-                    revision,
-                    error = %error,
-                    "derived userset index lookup failed; falling back to revision resolver"
-                );
-            }
-        }
-
-        // The current materialized rows are substantially cheaper than replaying the
-        // append journal. Double-check the revision around the read so an update racing
-        // this lookup falls back to the historical resolver instead of mixing revisions.
-        if latest_authz_revision(storage, tenant_id).await? == revision {
-            let allowed = resolve_current_permission(
-                storage,
-                tenant_id,
-                namespace,
-                object_id,
-                relation,
-                subject_kind,
-                subject_id,
-                caveat_hash,
-            )
-            .await?;
-            if latest_authz_revision(storage, tenant_id).await? == revision {
-                return Ok(allowed);
-            }
+            Ok(outcome) => return Ok(outcome.allowed),
+            Err(_error) if latest_authz_revision(storage, tenant_id).await? != revision => {}
+            Err(error) => return Err(error),
         }
     }
 
-    resolve_permission_from_current_view_at_revision(
+    Ok(authz_segment::resolve_materialized_permission_at_revision(
         storage,
         tenant_id,
         namespace,
@@ -1057,7 +939,38 @@ pub async fn resolve_permission_at_revision(
         subject_kind,
         subject_id,
         caveat_hash,
-        revision,
+        u64::try_from(revision)?,
+    )
+    .await?
+    .allowed)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_current_permission_at_expected_revision(
+    storage: &Storage,
+    tenant_id: i64,
+    namespace: &str,
+    object_id: &str,
+    relation: &str,
+    subject_kind: &str,
+    subject_id: &str,
+    caveat_hash: &str,
+    expected_revision: i64,
+) -> Result<storage_resolver::AuthzResolutionOutcome> {
+    storage_resolver::resolve_at_current_revision(
+        storage,
+        tenant_id,
+        resolver::UsersetRef {
+            namespace: namespace.to_string(),
+            object_id: object_id.to_string(),
+            relation: relation.to_string(),
+        },
+        resolver::SubjectRef {
+            kind: subject_kind.to_string(),
+            id: subject_id.to_string(),
+            caveat_hash: caveat_hash.to_string(),
+        },
+        expected_revision,
     )
     .await
 }
@@ -1073,22 +986,34 @@ pub async fn resolve_current_permission(
     subject_id: &str,
     caveat_hash: &str,
 ) -> Result<bool> {
-    resolve_permission_from_current_view_at_revision(
-        storage,
-        tenant_id,
-        namespace,
-        object_id,
-        relation,
-        subject_kind,
-        subject_id,
-        caveat_hash,
-        i64::MAX,
-    )
-    .await
+    for _ in 0..3 {
+        let revision = latest_authz_revision(storage, tenant_id).await?;
+        match resolve_current_permission_at_expected_revision(
+            storage,
+            tenant_id,
+            namespace,
+            object_id,
+            relation,
+            subject_kind,
+            subject_id,
+            caveat_hash,
+            revision,
+        )
+        .await
+        {
+            Ok(outcome) => return Ok(outcome.allowed),
+            Err(_error) if latest_authz_revision(storage, tenant_id).await? != revision => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(anyhow!(
+        "AuthzRevisionUnavailable: authorization revision changed during three resolution attempts"
+    ))
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-pub async fn resolve_permission_from_current_view_at_revision(
+pub(crate) async fn resolve_current_permission_with_stats(
     storage: &Storage,
     tenant_id: i64,
     namespace: &str,
@@ -1097,22 +1022,20 @@ pub async fn resolve_permission_from_current_view_at_revision(
     subject_kind: &str,
     subject_id: &str,
     caveat_hash: &str,
-    revision: i64,
-) -> Result<bool> {
-    let current = current_authz_view_at_revision(storage, tenant_id, revision).await?;
-    let subject = resolver::SubjectRef {
-        kind: subject_kind.to_string(),
-        id: subject_id.to_string(),
-        caveat_hash: caveat_hash.to_string(),
-    };
-    let userset = resolver::UsersetRef {
-        namespace: namespace.to_string(),
-        object_id: object_id.to_string(),
-        relation: relation.to_string(),
-    };
-    let schema_index =
-        resolver::SchemaRuleIndex::load(storage, tenant_id, &current, [namespace]).await?;
-    resolver::resolve_userset(&current, &schema_index, &userset, &subject)
+) -> Result<AuthzResolutionOutcome> {
+    let revision = latest_authz_revision(storage, tenant_id).await?;
+    resolve_current_permission_at_expected_revision(
+        storage,
+        tenant_id,
+        namespace,
+        object_id,
+        relation,
+        subject_kind,
+        subject_id,
+        caveat_hash,
+        revision,
+    )
+    .await
 }
 
 pub async fn list_authz_tuple_log(
@@ -1122,51 +1045,80 @@ pub async fn list_authz_tuple_log(
     namespace: &str,
     limit: usize,
 ) -> Result<Vec<AuthzTupleRecord>> {
-    let mut records = read_all_authz_tuple_records_from_journal(storage, tenant_id).await?;
-    records.retain(|record| {
-        record.revision > after_revision && (namespace.is_empty() || record.namespace == namespace)
-    });
-    records.sort_by_key(|record| (record.revision, record.revision_ordinal));
-    if limit > 0 && records.len() > limit {
-        records.truncate(limit);
-    }
-    Ok(records)
+    Ok(
+        list_authz_tuple_log_page(storage, tenant_id, after_revision, namespace, limit)
+            .await?
+            .records,
+    )
 }
 
-pub async fn read_current_authz_tuples_at_revision(
+pub(crate) async fn collect_authz_tuple_log_for_rebuild(
     storage: &Storage,
     tenant_id: i64,
-    filter: AuthzTupleFilter,
-    revision: i64,
+    through_revision: Option<i64>,
 ) -> Result<Vec<AuthzTupleRecord>> {
-    let mut records: Vec<_> = current_authz_view_at_revision(storage, tenant_id, revision)
-        .await?
-        .into_values()
-        .filter(|record| record.operation == "add")
-        .filter(|record| matches_authz_tuple_filter(record, &filter))
-        .collect();
-    records.sort_by(|left, right| {
-        (
-            &left.namespace,
-            &left.object_id,
-            &left.relation,
-            &left.subject_kind,
-            &left.subject_id,
-            &left.caveat_hash,
-        )
-            .cmp(&(
-                &right.namespace,
-                &right.object_id,
-                &right.relation,
-                &right.subject_kind,
-                &right.subject_id,
-                &right.caveat_hash,
-            ))
-    });
-    Ok(records)
+    if through_revision.is_some_and(|revision| revision < 0) {
+        bail!("authorization rebuild revision must be non-negative");
+    }
+    materialization::collect_authz_tuple_records_for_rebuild(
+        storage,
+        tenant_id,
+        through_revision.map(u64::try_from).transpose()?,
+    )
+    .await
 }
 
-pub async fn list_current_authz_objects_at_revision(
+#[derive(Debug, Clone)]
+pub struct AuthzTupleLogPage {
+    pub records: Vec<AuthzTupleRecord>,
+    pub next_revision: i64,
+    pub has_more: bool,
+}
+
+pub async fn list_authz_tuple_log_page(
+    storage: &Storage,
+    tenant_id: i64,
+    after_revision: i64,
+    namespace: &str,
+    limit: usize,
+) -> Result<AuthzTupleLogPage> {
+    if after_revision < 0 {
+        return Err(anyhow!("authorization watch revision must be non-negative"));
+    }
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let page = core_store
+        .read_stream_page(ReadStream {
+            stream_id: authz_tuple_stream_id(tenant_id),
+            after_sequence: u64::try_from(after_revision)?,
+            limit,
+        })
+        .await?;
+    let next_revision = i64::try_from(page.next_sequence)
+        .map_err(|_| anyhow!("authorization watch revision exceeds i64"))?;
+    let mut records = Vec::new();
+    for stream_record in page.records {
+        let mut decoded = match stream_record.record_kind.as_str() {
+            AUTHZ_TUPLE_RECORD_KIND => {
+                vec![decode_authz_tuple_journal_body(&stream_record.payload)?]
+            }
+            AUTHZ_TUPLE_BATCH_RECORD_KIND => {
+                decode_authz_tuple_batch_journal_body(&stream_record.payload)?
+            }
+            _ => return Err(anyhow!("authorization tuple stream record kind mismatch")),
+        };
+        decoded.retain(|record| namespace.is_empty() || record.namespace == namespace);
+        records.extend(decoded);
+    }
+    records.sort_by_key(|record| (record.revision, record.revision_ordinal));
+    Ok(AuthzTupleLogPage {
+        records,
+        next_revision,
+        has_more: page.has_more,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn list_current_authz_objects_page(
     storage: &Storage,
     tenant_id: i64,
     namespace: &str,
@@ -1175,74 +1127,125 @@ pub async fn list_current_authz_objects_at_revision(
     subject_id: &str,
     caveat_hash: &str,
     revision: i64,
-) -> Result<Vec<String>> {
-    let mut objects = BTreeSet::new();
-    if revision >= 0 {
-        match list_derived_userset_objects_at_revision(
-            storage,
-            tenant_id,
-            DEFAULT_DERIVED_USERSET_INDEX_ID,
-            namespace,
-            relation,
-            subject_kind,
-            subject_id,
-            caveat_hash,
-            revision as u64,
-        )
-        .await
-        {
-            Ok(Some(index_objects)) => objects.extend(index_objects),
-            Ok(None) => {}
-            Err(error) => {
-                tracing::warn!(
-                    tenant_id,
-                    revision,
-                    error = %error,
-                    "derived userset object listing failed; falling back to revision resolver"
-                );
-            }
-        }
+    after_object_id: Option<&str>,
+    page_size: usize,
+) -> Result<AuthzObjectListPage> {
+    const SOURCE_CHUNK_ROWS: usize = 256;
+    const MAX_PAGE_CANDIDATES: usize = 16_384;
+    const MAX_LIST_RESOLUTION_ROWS: usize = 16_384;
+    const MAX_LIST_GRAPH_NODES: usize = 4_096;
+
+    if !(1..=1000).contains(&page_size) {
+        return Err(anyhow!("authz object page size must be between 1 and 1000"));
     }
 
-    let filter = AuthzTupleFilter {
-        namespace: Some(namespace.to_string()),
-        relation: Some(relation.to_string()),
-        subject_kind: Some(subject_kind.to_string()),
-        subject_id: Some(subject_id.to_string()),
-        caveat_hash: Some(caveat_hash.to_string()),
-        ..AuthzTupleFilter::default()
-    };
-    let records =
-        read_current_authz_tuples_at_revision(storage, tenant_id, filter, revision).await?;
-    objects.extend(records.into_iter().map(|record| record.object_id));
-
-    let current = current_authz_view_at_revision(storage, tenant_id, revision).await?;
     let subject = resolver::SubjectRef {
         kind: subject_kind.to_string(),
         id: subject_id.to_string(),
         caveat_hash: caveat_hash.to_string(),
     };
-    let candidates = current
-        .values()
-        .filter(|record| record.namespace == namespace && record.operation == "add")
-        .map(|record| resolver::UsersetRef {
-            namespace: record.namespace.clone(),
-            object_id: record.object_id.clone(),
-            relation: relation.to_string(),
-        })
-        .collect::<BTreeSet<_>>();
-    let schema_index =
-        resolver::SchemaRuleIndex::load(storage, tenant_id, &current, [namespace]).await?;
-    for userset in candidates {
-        if resolver::resolve_userset(&current, &schema_index, &userset, &subject)? {
-            objects.insert(userset.object_id);
+    let candidate_budget = page_size
+        .saturating_mul(16)
+        .saturating_add(1)
+        .clamp(page_size.saturating_add(1), MAX_PAGE_CANDIDATES);
+    let mut object_ids = Vec::with_capacity(page_size);
+    let mut scan_after = after_object_id.map(str::to_string);
+    let mut last_processed = None;
+    let mut tuple_rows_visited = 0_usize;
+    let mut resolution_rows_visited = 0_usize;
+    let mut graph_nodes_visited = 0_usize;
+    let mut source_has_more = false;
+
+    'source: while tuple_rows_visited < candidate_budget && object_ids.len() < page_size {
+        let source_limit = (candidate_budget - tuple_rows_visited).min(SOURCE_CHUNK_ROWS);
+        let candidates = projection::page_current_object_candidates(
+            storage,
+            tenant_id,
+            namespace,
+            revision,
+            scan_after.as_deref(),
+            source_limit,
+        )
+        .await
+        .map_err(anyhow::Error::new)?;
+        tuple_rows_visited = tuple_rows_visited
+            .checked_add(candidates.candidates_visited)
+            .ok_or_else(|| anyhow!("authorization list tuple row count overflow"))?;
+        let candidate_count = candidates.object_ids.len();
+        for (candidate_index, object_id) in candidates.object_ids.into_iter().enumerate() {
+            let outcome = storage_resolver::resolve_at_current_revision(
+                storage,
+                tenant_id,
+                resolver::UsersetRef {
+                    namespace: namespace.to_string(),
+                    object_id: object_id.clone(),
+                    relation: relation.to_string(),
+                },
+                subject.clone(),
+                revision,
+            )
+            .await?;
+            let next_resolution_rows = resolution_rows_visited
+                .checked_add(outcome.stats.projection_rows_visited)
+                .ok_or_else(|| anyhow!("authorization list resolution row count overflow"))?;
+            let next_graph_nodes = graph_nodes_visited
+                .checked_add(outcome.stats.graph_nodes_visited)
+                .ok_or_else(|| anyhow!("authorization list graph node count overflow"))?;
+            if (next_resolution_rows > MAX_LIST_RESOLUTION_ROWS
+                || next_graph_nodes > MAX_LIST_GRAPH_NODES)
+                && last_processed.is_some()
+            {
+                source_has_more = true;
+                break 'source;
+            }
+            if next_resolution_rows > MAX_LIST_RESOLUTION_ROWS
+                || next_graph_nodes > MAX_LIST_GRAPH_NODES
+            {
+                return Err(anyhow!(
+                    "AuthzGraphBreadthExceeded: one object exceeds the authorization list resolution budget"
+                ));
+            }
+            resolution_rows_visited = next_resolution_rows;
+            graph_nodes_visited = next_graph_nodes;
+            last_processed = Some(object_id.clone());
+            if outcome.allowed {
+                object_ids.push(object_id);
+                if object_ids.len() == page_size {
+                    source_has_more = candidate_index + 1 < candidate_count
+                        || candidates.next_object_id.is_some();
+                    break 'source;
+                }
+            }
         }
+        let Some(next_object_id) = candidates.next_object_id else {
+            source_has_more = false;
+            break;
+        };
+        if scan_after.as_ref() == Some(&next_object_id) {
+            return Err(anyhow!(
+                "authorization object source did not advance its continuation"
+            ));
+        }
+        scan_after = Some(next_object_id);
+        source_has_more = true;
+    }
+    let next_object_id = source_has_more.then_some(last_processed).flatten();
+    if source_has_more && next_object_id.is_none() {
+        return Err(anyhow!(
+            "authorization object page stopped without a continuation"
+        ));
     }
 
-    Ok(objects.into_iter().collect())
+    Ok(AuthzObjectListPage {
+        object_ids,
+        next_object_id,
+        tuple_rows_visited,
+        resolution_rows_visited,
+        graph_nodes_visited,
+    })
 }
 
-pub async fn list_current_authz_subjects_at_revision(
+pub(crate) async fn list_current_authz_subjects_page(
     storage: &Storage,
     tenant_id: i64,
     namespace: &str,
@@ -1250,30 +1253,74 @@ pub async fn list_current_authz_subjects_at_revision(
     relation: &str,
     subject_kind: Option<&str>,
     revision: i64,
-) -> Result<Vec<AuthzSubjectRef>> {
-    let current = current_authz_view_at_revision(storage, tenant_id, revision).await?;
-    let userset = resolver::UsersetRef {
-        namespace: namespace.to_string(),
-        object_id: object_id.to_string(),
-        relation: relation.to_string(),
-    };
-    let schema_index =
-        resolver::SchemaRuleIndex::load(storage, tenant_id, &current, [namespace]).await?;
-    Ok(
-        resolver::collect_subjects_for_userset(&current, &schema_index, &userset)?
-            .into_iter()
-            .filter(|subject| subject_kind.is_none_or(|kind| subject.kind == kind))
-            .map(|subject| AuthzSubjectRef {
-                subject_kind: subject.kind,
-                subject_id: subject.id,
-                caveat_hash: subject.caveat_hash,
-            })
-            .collect(),
+    after_subject_position: Option<&str>,
+    page_size: usize,
+) -> Result<AuthzSubjectListPage> {
+    if !(1..=1000).contains(&page_size) {
+        return Err(anyhow!(
+            "authz subject page size must be between 1 and 1000"
+        ));
+    }
+    let outcome = storage_resolver::collect_subjects_at_current_revision(
+        storage,
+        tenant_id,
+        resolver::UsersetRef {
+            namespace: namespace.to_string(),
+            object_id: object_id.to_string(),
+            relation: relation.to_string(),
+        },
+        revision,
+    )
+    .await?;
+    let subjects = outcome
+        .subjects
+        .into_iter()
+        .filter(|subject| subject_kind.is_none_or(|kind| subject.kind == kind))
+        .map(|subject| AuthzSubjectRef {
+            subject_kind: subject.kind,
+            subject_id: subject.id,
+            caveat_hash: subject.caveat_hash,
+        })
+        .collect::<Vec<_>>();
+    let start = after_subject_position
+        .map(|position| {
+            subjects.partition_point(|subject| authz_subject_position(subject).as_str() <= position)
+        })
+        .unwrap_or_default();
+    let mut page = subjects
+        .into_iter()
+        .skip(start)
+        .take(page_size.saturating_add(1))
+        .collect::<Vec<_>>();
+    let has_more = page.len() > page_size;
+    if has_more {
+        page.truncate(page_size);
+    }
+    let next_subject_position = has_more
+        .then(|| page.last().map(authz_subject_position))
+        .flatten();
+    Ok(AuthzSubjectListPage {
+        subjects: page,
+        next_subject_position,
+        tuple_rows_visited: outcome.stats.projection_rows_visited,
+        graph_nodes_visited: outcome.stats.graph_nodes_visited,
+    })
+}
+
+fn authz_subject_position(subject: &AuthzSubjectRef) -> String {
+    format!(
+        "{}\0{}\0{}",
+        subject.subject_kind, subject.subject_id, subject.caveat_hash
     )
 }
 
 fn matches_authz_tuple_filter(record: &AuthzTupleRecord, filter: &AuthzTupleFilter) -> bool {
-    filter
+    filter.realm_id.as_ref().is_none_or(|value| {
+        split_realm_namespace(&record.namespace)
+            .map(|(realm_id, _)| realm_id)
+            .unwrap_or_else(|| DEFAULT_AUTHZ_REALM_ID.to_string())
+            == *value
+    }) && filter
         .namespace
         .as_ref()
         .is_none_or(|value| record.namespace == *value)
@@ -1297,26 +1344,6 @@ fn matches_authz_tuple_filter(record: &AuthzTupleRecord, filter: &AuthzTupleFilt
             .caveat_hash
             .as_ref()
             .is_none_or(|value| record.caveat_hash == *value)
-}
-
-async fn current_authz_view_at_revision(
-    storage: &Storage,
-    tenant_id: i64,
-    revision: i64,
-) -> Result<BTreeMap<TupleViewKey, AuthzTupleRecord>> {
-    let tuple_revision = latest_authz_tuple_revision(storage, tenant_id).await?;
-    let mut records = if revision >= tuple_revision {
-        read_all_authz_tuple_records(storage, tenant_id).await?
-    } else {
-        read_all_authz_tuple_records_from_journal(storage, tenant_id).await?
-    };
-    records.retain(|record| record.revision <= revision);
-    records.sort_by_key(|record| (record.revision, record.revision_ordinal));
-    let mut current = BTreeMap::new();
-    for record in records {
-        current.insert(TupleViewKey::from(&record), record);
-    }
-    Ok(current)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1439,152 +1466,6 @@ fn decode_authz_tuple_batch_journal_body_fence(bytes: &[u8]) -> Result<u64> {
     Ok(body.fence_token)
 }
 
-async fn write_authz_tuple_records_to_current_rows(
-    storage: &Storage,
-    records: &[AuthzTupleRecord],
-) -> Result<()> {
-    if records.is_empty() {
-        return Ok(());
-    }
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let mut keys = Vec::with_capacity(records.len());
-    let mut payloads = Vec::with_capacity(records.len());
-    for record in records {
-        keys.push(authz_tuple_current_row_key(record)?);
-        let record_payload = encode_authz_tuple_current_row(record)?;
-        payloads.push(
-            encode_authz_payload_row(
-                storage,
-                authz_tuple_current_common(record),
-                AUTHZ_TUPLE_PAGE_PAYLOAD_KIND,
-                &format!(
-                    "tenant/{}/tuple/{}/{}/{}/{}",
-                    record.tenant_id,
-                    record.namespace,
-                    record.object_id,
-                    record.relation,
-                    record.revision
-                ),
-                record.revision.max(0) as u64,
-                &record.mutation_id.to_string(),
-                record_payload,
-            )
-            .await?,
-        );
-    }
-    let ops = keys
-        .iter()
-        .zip(payloads.iter())
-        .map(|(key, payload)| CoreMetaBatchOp {
-            cf: CF_AUTHZ,
-            table_id: TABLE_AUTHZ_TUPLE_PAGE_ROW,
-            tuple_key: key,
-            common: None,
-            kind: CoreMetaBatchOpKind::Put(payload),
-        })
-        .collect::<Vec<_>>();
-    let tenant_id = records[0].tenant_id;
-    let revision = records
-        .iter()
-        .map(|record| record.revision)
-        .max()
-        .unwrap_or(0);
-    core_store
-        .commit_coremeta_batch_by_embedded_roots(
-            &format!("authz-current:{tenant_id}:{revision}"),
-            &ops,
-        )
-        .await?;
-    Ok(())
-}
-
-async fn read_authz_tuple_records_from_current_rows(
-    storage: &Storage,
-    tenant_id: i64,
-) -> Result<Vec<AuthzTupleRecord>> {
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
-    let mut records = Vec::new();
-    for row in meta.scan_prefix(
-        CF_AUTHZ,
-        TABLE_AUTHZ_TUPLE_PAGE_ROW,
-        &authz_tuple_current_row_prefix(tenant_id)?,
-    )? {
-        let record_payload = decode_authz_payload_row(
-            storage,
-            tenant_id,
-            &row.payload,
-            AUTHZ_TUPLE_PAGE_PAYLOAD_KIND,
-        )
-        .await?;
-        let record = decode_authz_tuple_current_row(&record_payload)?;
-        if record.tenant_id != tenant_id {
-            return Err(anyhow!("authz tuple current row tenant mismatch"));
-        }
-        records.push(record);
-    }
-    records.sort_by_key(|record| (record.revision, record.revision_ordinal));
-    Ok(records)
-}
-
-fn encode_authz_tuple_current_row(record: &AuthzTupleRecord) -> Result<Vec<u8>> {
-    encode_deterministic_proto(&AuthzTupleCurrentRowProto {
-        common: Some(authz_tuple_current_common(record)),
-        schema: AUTHZ_TUPLE_CURRENT_ROW_SCHEMA.to_string(),
-        record: Some(authz_record_to_proto(record)?),
-    })
-}
-
-fn authz_tuple_current_common(
-    record: &AuthzTupleRecord,
-) -> crate::core_store::CoreMetaRowCommonProto {
-    core_meta_committed_row_common(
-        format!("tenant/{}", record.tenant_id),
-        core_meta_root_key_hash(&format!("authz/{}", record.tenant_id)),
-        record.revision.max(0) as u64,
-        record.mutation_id.to_string(),
-        record
-            .written_at
-            .timestamp_nanos_opt()
-            .unwrap_or_default()
-            .max(0) as u64,
-    )
-}
-
-fn decode_authz_tuple_current_row(bytes: &[u8]) -> Result<AuthzTupleRecord> {
-    let row = AuthzTupleCurrentRowProto::decode(bytes)?;
-    ensure_deterministic_proto(&row, bytes, "authz tuple current row")?;
-    if row.schema != AUTHZ_TUPLE_CURRENT_ROW_SCHEMA {
-        return Err(anyhow!("authz tuple current row schema mismatch"));
-    }
-    row.common
-        .as_ref()
-        .ok_or_else(|| anyhow!("authz tuple current row missing CoreMeta common"))?;
-    authz_record_from_proto(
-        row.record
-            .ok_or_else(|| anyhow!("authz tuple current row is missing record"))?,
-    )
-}
-
-fn authz_tuple_current_row_key(record: &AuthzTupleRecord) -> Result<Vec<u8>> {
-    core_meta_tuple_key(&[
-        CoreMetaTuplePart::Utf8("authz-current"),
-        CoreMetaTuplePart::I64(record.tenant_id),
-        CoreMetaTuplePart::Utf8(&record.namespace),
-        CoreMetaTuplePart::Utf8(&record.object_id),
-        CoreMetaTuplePart::Utf8(&record.relation),
-        CoreMetaTuplePart::Utf8(&record.subject_kind),
-        CoreMetaTuplePart::Utf8(&record.subject_id),
-        CoreMetaTuplePart::Utf8(&record.caveat_hash),
-    ])
-}
-
-fn authz_tuple_current_row_prefix(tenant_id: i64) -> Result<Vec<u8>> {
-    core_meta_tuple_key(&[
-        CoreMetaTuplePart::Utf8("authz-current"),
-        CoreMetaTuplePart::I64(tenant_id),
-    ])
-}
-
 fn authz_record_to_proto(record: &AuthzTupleRecord) -> Result<AuthzTupleRecordProto> {
     let written_at_unix_nanos = record
         .written_at
@@ -1664,93 +1545,22 @@ fn ensure_deterministic_proto(message: &impl Message, bytes: &[u8], label: &str)
     Ok(())
 }
 
-async fn read_all_authz_tuple_records(
-    storage: &Storage,
-    tenant_id: i64,
-) -> Result<Vec<AuthzTupleRecord>> {
-    read_authz_tuple_records_from_current_rows(storage, tenant_id).await
-}
-
-async fn read_all_authz_tuple_records_from_journal(
-    storage: &Storage,
-    tenant_id: i64,
-) -> Result<Vec<AuthzTupleRecord>> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let stream_records = core_store
-        .read_stream(ReadStream {
-            stream_id: authz_tuple_stream_id(tenant_id),
-            after_sequence: 0,
-            limit: 0,
-        })
-        .await?;
-    let mut records = Vec::new();
-    for stream_record in stream_records {
-        match stream_record.record_kind.as_str() {
-            AUTHZ_TUPLE_RECORD_KIND => {
-                records.push(decode_authz_tuple_journal_body(&stream_record.payload)?);
-            }
-            AUTHZ_TUPLE_BATCH_RECORD_KIND => {
-                records.extend(decode_authz_tuple_batch_journal_body(
-                    &stream_record.payload,
-                )?);
-            }
-            _ => {}
-        }
-    }
-    Ok(records)
-}
-
-async fn read_authz_tuple_records_at_revision_from_journal(
-    storage: &Storage,
-    tenant_id: i64,
-    revision: i64,
-) -> Result<Vec<AuthzTupleRecord>> {
-    let mut records = read_all_authz_tuple_records_from_journal(storage, tenant_id)
-        .await?
-        .into_iter()
-        .filter(|record| record.revision == revision)
-        .collect::<Vec<_>>();
-    records.sort_by_key(|record| record.revision_ordinal);
-    Ok(records)
-}
-
-async fn read_authz_tuple_records_for_segment_materialization(
-    storage: &Storage,
-    tenant_id: i64,
-) -> Result<Vec<AuthzTupleRecord>> {
-    let mut by_mutation = BTreeMap::<String, AuthzTupleRecord>::new();
-    for record in read_all_authz_tuple_records_from_journal(storage, tenant_id).await? {
-        by_mutation.insert(record.mutation_id.to_string(), record);
-    }
-    for record in read_authz_tuple_records_from_current_rows(storage, tenant_id).await? {
-        by_mutation.insert(record.mutation_id.to_string(), record);
-    }
-    let mut records = by_mutation.into_values().collect::<Vec<_>>();
-    records.sort_by_key(|record| (record.revision, record.revision_ordinal));
-    Ok(records)
-}
-
 pub fn authz_partition_id(tenant_id: i64) -> Hash32 {
     hash32(format!("tenant/{tenant_id}/authz_tuple").as_bytes())
 }
 
-fn authz_tuple_stream_id(tenant_id: i64) -> String {
+pub(crate) fn authz_tuple_stream_id(tenant_id: i64) -> String {
     format!("authz_tuple:tenant:{tenant_id}")
-}
-
-fn authz_partition_principal(tenant_id: i64) -> String {
-    format!("partition-owner:authz_tuple:{tenant_id}")
 }
 
 pub(crate) async fn latest_authz_journal_fence_token(
     storage: &Storage,
     tenant_id: i64,
 ) -> Result<u64> {
-    Ok(read_authz_journal_payload_fences(storage, tenant_id)
+    Ok(authz_head::read(storage, tenant_id)
         .await?
-        .into_iter()
-        .max()
-        .unwrap_or(0))
+        .head
+        .tuple_fence_token)
 }
 
 #[cfg(test)]
@@ -1761,24 +1571,39 @@ pub(crate) async fn read_authz_frame_fences_for_test(
     read_authz_journal_payload_fences(storage, tenant_id).await
 }
 
+#[cfg(test)]
 async fn read_authz_journal_payload_fences(storage: &Storage, tenant_id: i64) -> Result<Vec<u64>> {
     let core_store = CoreStore::new(storage.clone()).await?;
-    Ok(core_store
-        .read_stream(ReadStream {
-            stream_id: authz_tuple_stream_id(tenant_id),
-            after_sequence: 0,
-            limit: 0,
-        })
-        .await?
-        .into_iter()
-        .filter_map(|record| match record.record_kind.as_str() {
-            AUTHZ_TUPLE_RECORD_KIND => Some(decode_authz_tuple_journal_body_fence(&record.payload)),
-            AUTHZ_TUPLE_BATCH_RECORD_KIND => {
-                Some(decode_authz_tuple_batch_journal_body_fence(&record.payload))
-            }
-            _ => None,
-        })
-        .collect::<Result<Vec<_>>>()?)
+    let mut fences = Vec::new();
+    let mut after_sequence = 0;
+    loop {
+        let page = core_store
+            .read_stream_page(ReadStream {
+                stream_id: authz_tuple_stream_id(tenant_id),
+                after_sequence,
+                limit: 1_000,
+            })
+            .await?;
+        fences.extend(page.records.into_iter().filter_map(
+            |record| match record.record_kind.as_str() {
+                AUTHZ_TUPLE_RECORD_KIND => {
+                    Some(decode_authz_tuple_journal_body_fence(&record.payload))
+                }
+                AUTHZ_TUPLE_BATCH_RECORD_KIND => {
+                    Some(decode_authz_tuple_batch_journal_body_fence(&record.payload))
+                }
+                _ => None,
+            },
+        ));
+        if !page.has_more {
+            break;
+        }
+        if page.next_sequence <= after_sequence {
+            bail!("authorization fence page did not advance its continuation");
+        }
+        after_sequence = page.next_sequence;
+    }
+    fences.into_iter().collect()
 }
 
 fn require_authz_permit(tenant_id: i64, permit: &PartitionWritePermit) -> Result<()> {

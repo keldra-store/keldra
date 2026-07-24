@@ -27,14 +27,25 @@ fn core_fence_records_are_protobuf_not_json_or_cbor() {
 #[test]
 fn object_manifest_records_are_protobuf_not_json_or_cbor() {
     let hash = "a".repeat(64);
-    let object_ref =
+    let mut object_ref =
         CoreObjectRef::test_unlocated(format!("sha256:{hash}"), 42, encode_manifest_ref(&hash));
+    object_ref.encoding.encryption = "aes_gcm_siv".to_string();
+    let logical_file_id = canonical_logical_file_id(
+        WriterFamily::Stream,
+        9,
+        "stream/tenant-a/events/block-3",
+        b"stream-block-3",
+    );
     let manifest = CoreObjectManifest {
         schema: CORE_OBJECT_MANIFEST_SCHEMA.to_string(),
         mesh_id: "local-mesh".to_string(),
         region_id: "local".to_string(),
         object_hash: object_ref.hash.clone(),
         logical_size: object_ref.logical_size,
+        logical_file_id: logical_file_id.clone(),
+        logical_offset: 16_384,
+        writer_family: WriterFamily::Stream.as_str().to_string(),
+        encryption_algorithm: "aes_gcm_siv".to_string(),
         boundary_values: vec![CoreBoundaryValue {
             schema_generation: 1,
             name: "customer_tenant".to_string(),
@@ -56,9 +67,15 @@ fn object_manifest_records_are_protobuf_not_json_or_cbor() {
     };
 
     let bytes = encode_object_manifest_record(&manifest).unwrap();
+    let decoded = decode_object_manifest_record(&bytes).unwrap();
 
     assert_control_record_not_json_or_cbor("object manifest", &bytes);
-    assert_eq!(decode_object_manifest_record(&bytes).unwrap(), manifest);
+    assert_eq!(bytes, encode_object_manifest_record(&manifest).unwrap());
+    assert_eq!(decoded.logical_file_id, logical_file_id);
+    assert_eq!(decoded.logical_offset, 16_384);
+    assert_eq!(decoded.writer_family, WriterFamily::Stream.as_str());
+    assert_eq!(decoded.encryption_algorithm, "aes_gcm_siv");
+    assert_eq!(decoded, manifest);
 }
 
 #[test]

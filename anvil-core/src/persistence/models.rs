@@ -37,13 +37,13 @@ impl Persistence {
         .await
     }
 
-    pub async fn list_tensors(
+    pub async fn list_tensor_page(
         &self,
         artifact_id: &str,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<crate::anvil_api::TensorIndexRow>> {
-        model_journal::list_tensors(&self.storage, artifact_id, limit, offset).await
+        after_cursor: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<model_journal::ModelTensorPage> {
+        model_journal::list_tensor_page(&self.storage, artifact_id, after_cursor, limit).await
     }
 
     pub async fn get_tensor_metadata(

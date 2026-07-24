@@ -123,7 +123,9 @@ async fn native_object_routes_report_proxy_required_as_unavailable_when_proxy_is
         },
     )
     .await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
 
     let bucket_name = unique_test_name("remote-proxy");
     write_remote_bucket_locator_for_node0(&cluster, &bucket_name, "test-region-2").await;

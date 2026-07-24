@@ -1,13 +1,17 @@
-use super::{GatewayBlobRecord, GatewayTagRecord};
+use super::{
+    GATEWAY_METADATA_CANDIDATE_GENERATION, GATEWAY_METADATA_CANDIDATE_TRANSACTION_ID,
+    GatewayBlobRecord, GatewayTagRecord,
+};
 use crate::{
     core_store::{
         CF_REGISTRY, CORE_LOGICAL_FILE_LOCATOR_REF_PREFIX, CoreMetaBatchOp, CoreMetaBatchOpKind,
-        CoreMetaLocatorProto, CoreMetaStore, CoreMetaTuplePart, CoreStore,
-        TABLE_REGISTRY_BLOB_LOCATOR_ROW, TABLE_REGISTRY_VERSION_ROW,
-        core_meta_committed_row_common, core_meta_locator_from_manifest_locator,
-        core_meta_locator_to_manifest_locator, core_meta_root_key_hash, core_meta_tuple_key,
-        decode_deterministic_proto, decode_manifest_locator_proto, encode_deterministic_proto,
+        CoreMetaLocatorProto, CoreMetaTuplePart, CoreStore, TABLE_REGISTRY_BLOB_LOCATOR_ROW,
+        TABLE_REGISTRY_VERSION_ROW, core_meta_committed_row_common,
+        core_meta_locator_from_manifest_locator, core_meta_locator_to_manifest_locator,
+        core_meta_root_key_hash, core_meta_tuple_key, decode_deterministic_proto,
+        decode_manifest_locator_proto, encode_deterministic_proto,
     },
+    formats::hash32,
     storage::Storage,
 };
 use anyhow::{Result, anyhow, bail};
@@ -46,6 +50,8 @@ struct RegistryVersionRowProto {
     manifest_locator: Option<CoreMetaLocatorProto>,
     #[prost(string, tag = "8")]
     published_by_principal: String,
+    #[prost(uint64, tag = "9")]
+    tag_generation: u64,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -77,8 +83,8 @@ pub(super) async fn write_registry_blob_locator_row(
         common: Some(core_meta_committed_row_common(
             registry_realm_id(record.tenant_id),
             registry_root_key_hash(record.tenant_id, &record.gateway, &record.repository),
-            1,
-            format!("registry-blob:{}", record.digest),
+            GATEWAY_METADATA_CANDIDATE_GENERATION,
+            GATEWAY_METADATA_CANDIDATE_TRANSACTION_ID,
             current_unix_nanos()?,
         )),
         registry_kind: record.gateway.clone(),
@@ -105,9 +111,16 @@ pub(super) async fn write_registry_blob_locator_row(
         kind: CoreMetaBatchOpKind::Put(&payload),
     };
     store
-        .commit_coremeta_batch_by_embedded_roots(
+        .commit_coremeta_root_groups(
             &format!("registry-blob:{}:{}", record.gateway, record.digest),
             &[op],
+            &[crate::core_store::CoreMetaRootPublication::new(
+                format!(
+                    "registry/{}/{}/{}",
+                    record.tenant_id, record.gateway, record.repository
+                ),
+                crate::formats::writer::WriterFamily::Registry,
+            )],
         )
         .await?;
     Ok(())
@@ -121,14 +134,14 @@ pub(super) async fn write_registry_blob_locator_row_from_record(
     write_registry_blob_locator_row(storage, record, &locator).await
 }
 
-pub(super) fn read_registry_blob_locator_row(
+pub(super) async fn read_registry_blob_locator_row(
     storage: &Storage,
     tenant_id: i64,
     registry_kind: &str,
     namespace: &str,
     blob_hash: &str,
 ) -> Result<Option<RegistryBlobLocatorCoreMetaRow>> {
-    let Some(bytes) = CoreMetaStore::open(storage.core_store_meta_path())?.get(
+    let Some(bytes) = CoreStore::new(storage.clone()).await?.read_coremeta_row(
         CF_REGISTRY,
         TABLE_REGISTRY_BLOB_LOCATOR_ROW,
         &registry_blob_tuple_key(tenant_id, registry_kind, namespace, blob_hash)?,
@@ -173,6 +186,9 @@ pub(super) async fn write_registry_version_row_for_tag(
     blob: &RegistryBlobLocatorCoreMetaRow,
     tag_generation: u64,
 ) -> Result<()> {
+    if tag_generation == 0 {
+        bail!("registry tag logical generation must be nonzero");
+    }
     if tag.tenant_id != blob.tenant_id
         || tag.gateway != blob.registry_kind
         || tag.registry_instance_id != blob.namespace
@@ -184,8 +200,8 @@ pub(super) async fn write_registry_version_row_for_tag(
         common: Some(core_meta_committed_row_common(
             registry_realm_id(tag.tenant_id),
             registry_root_key_hash(tag.tenant_id, &tag.gateway, &tag.repository),
-            tag_generation,
-            format!("registry-version:{}:{}", tag.repository, tag.tag),
+            GATEWAY_METADATA_CANDIDATE_GENERATION,
+            GATEWAY_METADATA_CANDIDATE_TRANSACTION_ID,
             current_unix_nanos()?,
         )),
         registry_kind: tag.gateway.clone(),
@@ -195,6 +211,7 @@ pub(super) async fn write_registry_version_row_for_tag(
         manifest_hash: tag.target_digest.clone(),
         manifest_locator: Some(core_meta_locator_from_manifest_locator(&blob.blob_locator)?),
         published_by_principal: tag.updated_by_principal.clone(),
+        tag_generation,
     };
     let tuple_key = registry_version_tuple_key(
         tag.tenant_id,
@@ -213,9 +230,16 @@ pub(super) async fn write_registry_version_row_for_tag(
         kind: CoreMetaBatchOpKind::Put(&payload),
     };
     store
-        .commit_coremeta_batch_by_embedded_roots(
-            &format!("registry-version:{}:{}", tag.repository, tag.tag),
+        .commit_coremeta_root_groups(
+            &format!("registry-version:{}", hex::encode(hash32(&payload))),
             &[op],
+            &[crate::core_store::CoreMetaRootPublication::new(
+                format!(
+                    "registry/{}/{}/{}",
+                    tag.tenant_id, tag.gateway, tag.repository
+                ),
+                crate::formats::writer::WriterFamily::Registry,
+            )],
         )
         .await?;
     Ok(())

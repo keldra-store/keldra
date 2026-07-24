@@ -19,8 +19,7 @@ use crate::media_extraction::{
 use crate::metadata_journal;
 use crate::partition_fence::{
     AcquireOwnership, MAX_OWNERSHIP_LEASE_MS, OwnershipPrincipal, OwnershipResource,
-    OwnershipResourceKind, RenewOwnership, acquire_ownership, read_ownership_fence,
-    renew_ownership,
+    OwnershipResourceKind, acquire_ownership,
 };
 use crate::persistence::{AppendStream, AppendStreamRecord, Bucket, IndexDefinition, Object};
 use crate::storage::Storage;
@@ -39,6 +38,10 @@ use prost::Message;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet};
+
+mod authority;
+use authority::IndexBuildOwnership;
+pub(crate) use authority::{DirectRepairIndexBuildAuthority, IndexBuildAuthority};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexBuildOutcome {
@@ -216,21 +219,23 @@ fn encode_deterministic_proto(message: &impl Message) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn latest_index_segment_generation(storage: &Storage, index_storage_id: &str) -> Result<u64> {
+async fn latest_index_segment_generation(storage: &Storage, index_storage_id: &str) -> Result<u64> {
     Ok(
-        index_coremeta::latest_index_segment_coremeta_record(storage, index_storage_id)?
+        index_coremeta::latest_index_segment_coremeta_record(storage, index_storage_id)
+            .await?
             .map(|record| record.generation)
             .unwrap_or(0),
     )
 }
 
-pub async fn build_full_text_index(
+pub(crate) async fn build_full_text_index(
     storage: &Storage,
     bucket: &Bucket,
     index: &IndexDefinition,
     partition_owner_signing_key: &[u8],
     source_cursor: u128,
     builder_node_id: &str,
+    authority: IndexBuildAuthority<'_>,
 ) -> Result<IndexBuildOutcome> {
     if index.kind != "full_text" {
         return Err(anyhow!("index build only supports full_text indexes"));
@@ -242,19 +247,10 @@ pub async fn build_full_text_index(
         .map_err(|error| anyhow!("invalid full text index definition: {error}"))?;
     let index_storage_id =
         index_journal::index_storage_id(index.tenant_id, index.bucket_id, index.id);
-    let latest_generation = latest_index_segment_generation(storage, &index_storage_id)?;
+    let latest_generation = latest_index_segment_generation(storage, &index_storage_id).await?;
     let latest_checkpoint_generation =
         latest_index_checkpoint_generation(storage, &index_storage_id, partition_owner_signing_key)
             .await?;
-    ensure_index_build_authority(
-        storage,
-        index.tenant_id,
-        index.bucket_id,
-        &index_storage_id,
-        builder_node_id,
-        partition_owner_signing_key,
-    )
-    .await?;
     let generation = latest_generation
         .max(latest_checkpoint_generation)
         .saturating_add(1)
@@ -340,7 +336,7 @@ pub async fn build_full_text_index(
         })
         .collect::<Vec<_>>();
     let document_table = full_text_segment::encode_full_text_document_table(&document_table_rows)?;
-    let segment_ref = full_text_segment::write_full_text_segment(
+    let staged_segment = full_text_segment::stage_full_text_segment(
         storage,
         FullTextSegmentWrite {
             index_id: &index_storage_id,
@@ -355,9 +351,48 @@ pub async fn build_full_text_index(
         },
     )
     .await?;
-    let segment_bytes =
-        full_text_segment::read_full_text_segment_bytes(storage, &segment_ref).await?;
-    let segment_hash = blake3::hash(&segment_bytes).to_hex().to_string();
+    let ownership = IndexBuildOwnership::acquire(
+        storage,
+        index.tenant_id,
+        index.bucket_id,
+        &index_storage_id,
+        builder_node_id,
+        partition_owner_signing_key,
+    )
+    .await?;
+    let staged_for_catalog = &staged_segment;
+    authority
+        .publish_with(
+            storage,
+            &ownership,
+            partition_owner_signing_key,
+            |preconditions| async move {
+                full_text_segment::publish_full_text_segment_catalog(
+                    storage,
+                    staged_for_catalog,
+                    &preconditions,
+                )
+                .await
+            },
+        )
+        .await?;
+    let staged_for_locator = &staged_segment;
+    authority
+        .publish_with(
+            storage,
+            &ownership,
+            partition_owner_signing_key,
+            |preconditions| async move {
+                full_text_segment::publish_full_text_segment_locator(
+                    storage,
+                    staged_for_locator,
+                    &preconditions,
+                )
+                .await
+            },
+        )
+        .await?;
+    let segment_hash = staged_segment.segment_hash.clone();
     let partition_id = hex::encode(hash32(index_storage_id.as_bytes()));
     let source_manifest_hash = metadata_journal::object_metadata_source_checkpoint_hash(
         storage,
@@ -378,15 +413,8 @@ pub async fn build_full_text_index(
         &[segment_hash.clone()],
         builder_node_id,
         partition_owner_signing_key,
-    )
-    .await?;
-    let watch_cursor = next_index_watch_cursor(
-        storage,
-        index.tenant_id,
-        index.bucket_id,
-        &index_storage_id,
-        &partition_id,
-        source_cursor.max(u128::from(generation)),
+        authority,
+        &ownership,
     )
     .await?;
     let watch_payload = IndexPartitionWatchPayload {
@@ -401,29 +429,19 @@ pub async fn build_full_text_index(
             .clone()
             .ok_or_else(|| anyhow!("derived index proof was not sealed"))?,
         segment_hashes: vec![segment_hash.clone()],
-        emitted_at: chrono::Utc::now().to_rfc3339(),
+        emitted_at: String::new(),
     };
-    let watch_authority = acquire_index_partition_watch_authority(
+    publish_index_build_watch(
         storage,
         index.tenant_id,
         index.bucket_id,
         &partition_id,
-        &watch_payload,
-        builder_node_id,
-        partition_owner_signing_key,
-    )
-    .await?;
-    index_partition_watch::append_index_partition_watch_record(
-        storage,
-        index.tenant_id,
-        index.bucket_id,
-        &partition_id,
-        watch_cursor,
-        *uuid::Uuid::new_v4().as_bytes(),
         latest_authz_revision_for_documents(&owned_documents),
         watch_payload,
-        watch_authority,
+        builder_node_id,
         partition_owner_signing_key,
+        authority,
+        &ownership,
     )
     .await?;
 
@@ -438,13 +456,14 @@ pub async fn build_full_text_index(
     })
 }
 
-pub async fn build_typed_json_index(
+pub(crate) async fn build_typed_json_index(
     storage: &Storage,
     bucket: &Bucket,
     index: &IndexDefinition,
     partition_owner_signing_key: &[u8],
     source_cursor: u128,
     builder_node_id: &str,
+    authority: IndexBuildAuthority<'_>,
 ) -> Result<IndexBuildOutcome> {
     if index.kind != "typed_json" {
         return Err(anyhow!("index build only supports typed_json indexes"));
@@ -455,19 +474,10 @@ pub async fn build_typed_json_index(
     let definition = parse_typed_json_build_definition(index)?;
     let index_storage_id =
         index_journal::index_storage_id(index.tenant_id, index.bucket_id, index.id);
-    let latest_generation = latest_index_segment_generation(storage, &index_storage_id)?;
+    let latest_generation = latest_index_segment_generation(storage, &index_storage_id).await?;
     let latest_checkpoint_generation =
         latest_index_checkpoint_generation(storage, &index_storage_id, partition_owner_signing_key)
             .await?;
-    ensure_index_build_authority(
-        storage,
-        index.tenant_id,
-        index.bucket_id,
-        &index_storage_id,
-        builder_node_id,
-        partition_owner_signing_key,
-    )
-    .await?;
     let generation = latest_generation
         .max(latest_checkpoint_generation)
         .saturating_add(1)
@@ -506,7 +516,7 @@ pub async fn build_typed_json_index(
         &index.extractor,
         &index.build_policy,
     )?;
-    let segment_ref = typed_field_segment::write_typed_field_segment(
+    let staged_segment = typed_field_segment::stage_typed_field_segment(
         storage,
         TypedFieldSegmentWrite {
             index_id: &index_storage_id,
@@ -521,9 +531,48 @@ pub async fn build_typed_json_index(
         },
     )
     .await?;
-    let segment_bytes =
-        typed_field_segment::read_typed_field_segment_bytes(storage, &segment_ref).await?;
-    let segment_hash = blake3::hash(&segment_bytes).to_hex().to_string();
+    let ownership = IndexBuildOwnership::acquire(
+        storage,
+        index.tenant_id,
+        index.bucket_id,
+        &index_storage_id,
+        builder_node_id,
+        partition_owner_signing_key,
+    )
+    .await?;
+    let staged_for_catalog = &staged_segment;
+    authority
+        .publish_with(
+            storage,
+            &ownership,
+            partition_owner_signing_key,
+            |preconditions| async move {
+                typed_field_segment::publish_typed_field_segment_catalog(
+                    storage,
+                    staged_for_catalog,
+                    &preconditions,
+                )
+                .await
+            },
+        )
+        .await?;
+    let staged_for_locator = &staged_segment;
+    authority
+        .publish_with(
+            storage,
+            &ownership,
+            partition_owner_signing_key,
+            |preconditions| async move {
+                typed_field_segment::publish_typed_field_segment_locator(
+                    storage,
+                    staged_for_locator,
+                    &preconditions,
+                )
+                .await
+            },
+        )
+        .await?;
+    let segment_hash = staged_segment.segment_hash.clone();
     let partition_id = hex::encode(hash32(index_storage_id.as_bytes()));
     let source_manifest_hash = typed_json_source_manifest_hash(
         storage,
@@ -545,15 +594,8 @@ pub async fn build_typed_json_index(
         &[segment_hash.clone()],
         builder_node_id,
         partition_owner_signing_key,
-    )
-    .await?;
-    let watch_cursor = next_index_watch_cursor(
-        storage,
-        index.tenant_id,
-        index.bucket_id,
-        &index_storage_id,
-        &partition_id,
-        source_cursor.max(u128::from(generation)),
+        authority,
+        &ownership,
     )
     .await?;
     let watch_payload = IndexPartitionWatchPayload {
@@ -568,29 +610,19 @@ pub async fn build_typed_json_index(
             .clone()
             .ok_or_else(|| anyhow!("derived index proof was not sealed"))?,
         segment_hashes: vec![segment_hash.clone()],
-        emitted_at: chrono::Utc::now().to_rfc3339(),
+        emitted_at: String::new(),
     };
-    let watch_authority = acquire_index_partition_watch_authority(
+    publish_index_build_watch(
         storage,
         index.tenant_id,
         index.bucket_id,
         &partition_id,
-        &watch_payload,
-        builder_node_id,
-        partition_owner_signing_key,
-    )
-    .await?;
-    index_partition_watch::append_index_partition_watch_record(
-        storage,
-        index.tenant_id,
-        index.bucket_id,
-        &partition_id,
-        watch_cursor,
-        *uuid::Uuid::new_v4().as_bytes(),
         latest_authz_revision_for_typed_rows(&rows),
         watch_payload,
-        watch_authority,
+        builder_node_id,
         partition_owner_signing_key,
+        authority,
+        &ownership,
     )
     .await?;
 
@@ -605,13 +637,14 @@ pub async fn build_typed_json_index(
     })
 }
 
-pub async fn build_metadata_backed_index(
+pub(crate) async fn build_metadata_backed_index(
     storage: &Storage,
     bucket: &Bucket,
     index: &IndexDefinition,
     partition_owner_signing_key: &[u8],
     source_cursor: u128,
     builder_node_id: &str,
+    authority: IndexBuildAuthority<'_>,
 ) -> Result<IndexBuildOutcome> {
     if !matches!(index.kind.as_str(), "path" | "metadata_filter") {
         return Err(anyhow!(
@@ -623,19 +656,10 @@ pub async fn build_metadata_backed_index(
     }
     let index_storage_id =
         index_journal::index_storage_id(index.tenant_id, index.bucket_id, index.id);
-    let latest_generation = latest_index_segment_generation(storage, &index_storage_id)?;
+    let latest_generation = latest_index_segment_generation(storage, &index_storage_id).await?;
     let latest_checkpoint_generation =
         latest_index_checkpoint_generation(storage, &index_storage_id, partition_owner_signing_key)
             .await?;
-    ensure_index_build_authority(
-        storage,
-        index.tenant_id,
-        index.bucket_id,
-        &index_storage_id,
-        builder_node_id,
-        partition_owner_signing_key,
-    )
-    .await?;
     let generation = latest_generation
         .max(latest_checkpoint_generation)
         .saturating_add(1)
@@ -670,7 +694,7 @@ pub async fn build_metadata_backed_index(
         &index.extractor,
         &index.build_policy,
     )?;
-    let segment_ref = typed_field_segment::write_typed_field_segment(
+    let staged_segment = typed_field_segment::stage_typed_field_segment(
         storage,
         TypedFieldSegmentWrite {
             index_id: &index_storage_id,
@@ -685,9 +709,48 @@ pub async fn build_metadata_backed_index(
         },
     )
     .await?;
-    let segment_bytes =
-        typed_field_segment::read_typed_field_segment_bytes(storage, &segment_ref).await?;
-    let segment_hash = blake3::hash(&segment_bytes).to_hex().to_string();
+    let ownership = IndexBuildOwnership::acquire(
+        storage,
+        index.tenant_id,
+        index.bucket_id,
+        &index_storage_id,
+        builder_node_id,
+        partition_owner_signing_key,
+    )
+    .await?;
+    let staged_for_catalog = &staged_segment;
+    authority
+        .publish_with(
+            storage,
+            &ownership,
+            partition_owner_signing_key,
+            |preconditions| async move {
+                typed_field_segment::publish_typed_field_segment_catalog(
+                    storage,
+                    staged_for_catalog,
+                    &preconditions,
+                )
+                .await
+            },
+        )
+        .await?;
+    let staged_for_locator = &staged_segment;
+    authority
+        .publish_with(
+            storage,
+            &ownership,
+            partition_owner_signing_key,
+            |preconditions| async move {
+                typed_field_segment::publish_typed_field_segment_locator(
+                    storage,
+                    staged_for_locator,
+                    &preconditions,
+                )
+                .await
+            },
+        )
+        .await?;
+    let segment_hash = staged_segment.segment_hash.clone();
     let partition_id = hex::encode(hash32(index_storage_id.as_bytes()));
     let source_manifest_hash = metadata_journal::object_metadata_source_checkpoint_hash(
         storage,
@@ -708,15 +771,8 @@ pub async fn build_metadata_backed_index(
         &[segment_hash.clone()],
         builder_node_id,
         partition_owner_signing_key,
-    )
-    .await?;
-    let watch_cursor = next_index_watch_cursor(
-        storage,
-        index.tenant_id,
-        index.bucket_id,
-        &index_storage_id,
-        &partition_id,
-        source_cursor.max(u128::from(generation)),
+        authority,
+        &ownership,
     )
     .await?;
     let watch_payload = IndexPartitionWatchPayload {
@@ -731,29 +787,19 @@ pub async fn build_metadata_backed_index(
             .clone()
             .ok_or_else(|| anyhow!("derived index proof was not sealed"))?,
         segment_hashes: vec![segment_hash.clone()],
-        emitted_at: chrono::Utc::now().to_rfc3339(),
+        emitted_at: String::new(),
     };
-    let watch_authority = acquire_index_partition_watch_authority(
+    publish_index_build_watch(
         storage,
         index.tenant_id,
         index.bucket_id,
         &partition_id,
-        &watch_payload,
-        builder_node_id,
-        partition_owner_signing_key,
-    )
-    .await?;
-    index_partition_watch::append_index_partition_watch_record(
-        storage,
-        index.tenant_id,
-        index.bucket_id,
-        &partition_id,
-        watch_cursor,
-        *uuid::Uuid::new_v4().as_bytes(),
         latest_authz_revision_for_typed_rows(&rows),
         watch_payload,
-        watch_authority,
+        builder_node_id,
         partition_owner_signing_key,
+        authority,
+        &ownership,
     )
     .await?;
 
@@ -768,7 +814,7 @@ pub async fn build_metadata_backed_index(
     })
 }
 
-pub async fn build_vector_index(
+pub(crate) async fn build_vector_index(
     storage: &Storage,
     bucket: &Bucket,
     index: &IndexDefinition,
@@ -776,6 +822,7 @@ pub async fn build_vector_index(
     source_cursor: u128,
     builder_node_id: &str,
     embedding_providers: &EmbeddingProviderRegistry,
+    authority: IndexBuildAuthority<'_>,
 ) -> Result<IndexBuildOutcome> {
     if index.kind != "vector" {
         return Err(anyhow!("index build only supports vector indexes"));
@@ -791,11 +838,12 @@ pub async fn build_vector_index(
         builder_node_id,
         "vector",
         embedding_providers,
+        authority,
     )
     .await
 }
 
-pub async fn build_hybrid_index(
+pub(crate) async fn build_hybrid_index(
     storage: &Storage,
     bucket: &Bucket,
     index: &IndexDefinition,
@@ -803,6 +851,7 @@ pub async fn build_hybrid_index(
     source_cursor: u128,
     builder_node_id: &str,
     embedding_providers: &EmbeddingProviderRegistry,
+    authority: IndexBuildAuthority<'_>,
 ) -> Result<IndexBuildOutcome> {
     if index.kind != "hybrid" {
         return Err(anyhow!("index build only supports hybrid indexes"));
@@ -834,6 +883,7 @@ pub async fn build_hybrid_index(
         partition_owner_signing_key,
         source_cursor,
         builder_node_id,
+        authority,
     )
     .await?;
     let vector_outcome = build_vector_index_with_policy(
@@ -847,6 +897,7 @@ pub async fn build_hybrid_index(
         builder_node_id,
         "hybrid",
         embedding_providers,
+        authority,
     )
     .await?;
 
@@ -878,6 +929,7 @@ async fn build_vector_index_with_policy(
     builder_node_id: &str,
     outcome_kind: &str,
     embedding_providers: &EmbeddingProviderRegistry,
+    authority: IndexBuildAuthority<'_>,
 ) -> Result<IndexBuildOutcome> {
     if !index.enabled {
         return Err(anyhow!("index build requires an enabled index"));
@@ -886,19 +938,10 @@ async fn build_vector_index_with_policy(
         .map_err(|error| anyhow!("invalid vector index definition: {error}"))?;
     let index_storage_id =
         index_journal::index_storage_id(index.tenant_id, index.bucket_id, index.id);
-    let latest_generation = latest_index_segment_generation(storage, &index_storage_id)?;
+    let latest_generation = latest_index_segment_generation(storage, &index_storage_id).await?;
     let latest_checkpoint_generation =
         latest_index_checkpoint_generation(storage, &index_storage_id, partition_owner_signing_key)
             .await?;
-    ensure_index_build_authority(
-        storage,
-        index.tenant_id,
-        index.bucket_id,
-        &index_storage_id,
-        builder_node_id,
-        partition_owner_signing_key,
-    )
-    .await?;
     let generation = latest_generation
         .max(latest_checkpoint_generation)
         .saturating_add(1)
@@ -1003,7 +1046,7 @@ async fn build_vector_index_with_policy(
         .collect::<Vec<_>>();
     let deleted_bitset = vec![0; entries.len().div_ceil(8)];
     let definition_hash = definition.definition_hash.clone();
-    let segment_ref = vector_segment::write_vector_segment(
+    let staged_segment = vector_segment::stage_vector_segment(
         storage,
         VectorSegmentWrite {
             index_id: &index_storage_id,
@@ -1029,8 +1072,48 @@ async fn build_vector_index_with_policy(
         },
     )
     .await?;
-    let segment_bytes = vector_segment::read_vector_segment_bytes(storage, &segment_ref).await?;
-    let segment_hash = blake3::hash(&segment_bytes).to_hex().to_string();
+    let ownership = IndexBuildOwnership::acquire(
+        storage,
+        index.tenant_id,
+        index.bucket_id,
+        &index_storage_id,
+        builder_node_id,
+        partition_owner_signing_key,
+    )
+    .await?;
+    let staged_for_catalog = &staged_segment;
+    authority
+        .publish_with(
+            storage,
+            &ownership,
+            partition_owner_signing_key,
+            |preconditions| async move {
+                vector_segment::publish_vector_segment_catalog(
+                    storage,
+                    staged_for_catalog,
+                    &preconditions,
+                )
+                .await
+            },
+        )
+        .await?;
+    let staged_for_locator = &staged_segment;
+    authority
+        .publish_with(
+            storage,
+            &ownership,
+            partition_owner_signing_key,
+            |preconditions| async move {
+                vector_segment::publish_vector_segment_locator(
+                    storage,
+                    staged_for_locator,
+                    &preconditions,
+                )
+                .await
+            },
+        )
+        .await?;
+    let segment_hash = staged_segment.segment_hash.clone();
     let partition_id = hex::encode(hash32(index_storage_id.as_bytes()));
     let source_manifest_hash = metadata_journal::object_metadata_source_checkpoint_hash(
         storage,
@@ -1051,15 +1134,8 @@ async fn build_vector_index_with_policy(
         &[segment_hash.clone()],
         builder_node_id,
         partition_owner_signing_key,
-    )
-    .await?;
-    let watch_cursor = next_index_watch_cursor(
-        storage,
-        index.tenant_id,
-        index.bucket_id,
-        &index_storage_id,
-        &partition_id,
-        source_cursor.max(u128::from(generation)),
+        authority,
+        &ownership,
     )
     .await?;
     let watch_payload = IndexPartitionWatchPayload {
@@ -1074,29 +1150,19 @@ async fn build_vector_index_with_policy(
             .clone()
             .ok_or_else(|| anyhow!("derived index proof was not sealed"))?,
         segment_hashes: vec![segment_hash.clone()],
-        emitted_at: chrono::Utc::now().to_rfc3339(),
+        emitted_at: String::new(),
     };
-    let watch_authority = acquire_index_partition_watch_authority(
+    publish_index_build_watch(
         storage,
         index.tenant_id,
         index.bucket_id,
         &partition_id,
-        &watch_payload,
-        builder_node_id,
-        partition_owner_signing_key,
-    )
-    .await?;
-    index_partition_watch::append_index_partition_watch_record(
-        storage,
-        index.tenant_id,
-        index.bucket_id,
-        &partition_id,
-        watch_cursor,
-        *uuid::Uuid::new_v4().as_bytes(),
         latest_authz_revision_for_vectors(&vector_documents),
         watch_payload,
-        watch_authority,
+        builder_node_id,
         partition_owner_signing_key,
+        authority,
+        &ownership,
     )
     .await?;
 
@@ -1124,12 +1190,19 @@ async fn publish_index_build_proof_and_checkpoint(
     segment_hashes: &[String],
     builder_node_id: &str,
     signing_key: &[u8],
+    authority: IndexBuildAuthority<'_>,
+    ownership: &IndexBuildOwnership,
 ) -> Result<derived_index_proof::DerivedIndexProof> {
-    let built_at_nanos = chrono::Utc::now()
-        .timestamp_nanos_opt()
-        .ok_or_else(|| anyhow!("timestamp cannot be represented in nanoseconds"))?;
-    let proof = derived_index_proof::write_derived_index_proof(
-        storage,
+    let payload_actor = authority.deterministic_payload_actor(builder_node_id).await;
+    let publication_digest = deterministic_build_digest(source_manifest_hash, segment_hashes);
+    let built_at_nanos = index_coremeta::deterministic_index_publication_nanos(
+        index_storage_id,
+        "proof_checkpoint",
+        generation,
+        source_cursor,
+        &publication_digest,
+    );
+    let prepared_proof = derived_index_proof::prepare_derived_index_proof(
         DerivedIndexProofWrite {
             index_id: index_storage_id.to_string(),
             index_kind: index_kind.to_string(),
@@ -1140,12 +1213,27 @@ async fn publish_index_build_proof_and_checkpoint(
             source_manifest_hash: source_manifest_hash.to_string(),
             generation,
             segment_hashes: segment_hashes.to_vec(),
-            built_by_node: builder_node_id.to_string(),
+            built_by_node: payload_actor.clone(),
             built_at_nanos,
         },
         signing_key,
-    )
-    .await?;
+    )?;
+    let proof_for_publication = &prepared_proof;
+    let proof = authority
+        .publish_with(
+            storage,
+            ownership,
+            signing_key,
+            |preconditions| async move {
+                derived_index_proof::publish_prepared_derived_index_proof(
+                    storage,
+                    proof_for_publication,
+                    &preconditions,
+                )
+                .await
+            },
+        )
+        .await?;
     let checkpoint_update = WatchCheckpointUpdate {
         watch_stream_id: "object_metadata".to_string(),
         partition_family: "object_metadata".to_string(),
@@ -1159,24 +1247,122 @@ async fn publish_index_build_proof_and_checkpoint(
         lag_record_count_hint: 0,
         source_manifest_hash: source_manifest_hash.to_string(),
         generation,
-        updated_by_node: builder_node_id.to_string(),
+        updated_by_node: payload_actor.clone(),
         updated_at_nanos: built_at_nanos,
     };
     let checkpoint_authority = acquire_watch_checkpoint_authority(
         storage,
         &checkpoint_update,
-        builder_node_id,
+        &payload_actor,
         signing_key,
     )
     .await?;
-    watch_checkpoint::checkpoint_watch_consumer(
+    let prepared_checkpoint = watch_checkpoint::prepare_watch_checkpoint(
         storage,
         checkpoint_update,
         checkpoint_authority,
         signing_key,
     )
     .await?;
+    let checkpoint_for_publication = &prepared_checkpoint;
+    let checkpoint = authority
+        .publish_with(
+            storage,
+            ownership,
+            signing_key,
+            |preconditions| async move {
+                watch_checkpoint::publish_prepared_watch_checkpoint(
+                    storage,
+                    checkpoint_for_publication,
+                    &preconditions,
+                )
+                .await
+            },
+        )
+        .await?;
+    watch_checkpoint::record_watch_checkpoint_lag(storage, &checkpoint).await?;
     Ok(proof)
+}
+
+fn deterministic_build_digest(source_manifest_hash: &str, segment_hashes: &[String]) -> String {
+    let mut input = Vec::new();
+    input.extend_from_slice(source_manifest_hash.as_bytes());
+    input.push(0);
+    for segment_hash in segment_hashes {
+        input.extend_from_slice(segment_hash.as_bytes());
+        input.push(0);
+    }
+    blake3::hash(&input).to_hex().to_string()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_index_build_watch(
+    storage: &Storage,
+    tenant_id: i64,
+    bucket_id: i64,
+    partition_id: &str,
+    authz_revision: u64,
+    mut payload: IndexPartitionWatchPayload,
+    builder_node_id: &str,
+    signing_key: &[u8],
+    authority: IndexBuildAuthority<'_>,
+    ownership: &IndexBuildOwnership,
+) -> Result<()> {
+    let digest = deterministic_build_digest(&payload.proof_hash, &payload.segment_hashes);
+    let emitted_at_nanos = index_coremeta::deterministic_index_publication_nanos(
+        &payload.index_id,
+        "partition_watch",
+        payload.generation,
+        payload.source_cursor,
+        &digest,
+    );
+    payload.emitted_at = chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(emitted_at_nanos)
+        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    let mutation_id = index_coremeta::deterministic_index_mutation_id(
+        &payload.index_id,
+        "partition_watch",
+        payload.generation,
+        payload.source_cursor,
+        &digest,
+    );
+    let watch_authority = acquire_index_partition_watch_authority(
+        storage,
+        tenant_id,
+        bucket_id,
+        partition_id,
+        &payload,
+        builder_node_id,
+        signing_key,
+    )
+    .await?;
+    let prepared = index_partition_watch::prepare_index_partition_watch_record(
+        storage,
+        tenant_id,
+        bucket_id,
+        partition_id,
+        mutation_id,
+        authz_revision,
+        payload,
+        watch_authority,
+        signing_key,
+    )
+    .await?;
+    authority
+        .publish_with(
+            storage,
+            ownership,
+            signing_key,
+            |preconditions| async move {
+                index_partition_watch::publish_prepared_index_partition_watch(
+                    storage,
+                    prepared,
+                    &preconditions,
+                )
+                .await
+                .map(|_| ())
+            },
+        )
+        .await
 }
 
 async fn latest_index_checkpoint_generation(
@@ -1193,65 +1379,6 @@ async fn latest_index_checkpoint_generation(
     .await?
     .map(|checkpoint| checkpoint.generation)
     .unwrap_or(0))
-}
-
-async fn ensure_index_build_authority(
-    storage: &Storage,
-    tenant_id: i64,
-    bucket_id: i64,
-    index_storage_id: &str,
-    builder_node_id: &str,
-    signing_key: &[u8],
-) -> Result<()> {
-    let resource = OwnershipResource {
-        resource_kind: OwnershipResourceKind::IndexPartition,
-        resource_id: format!(
-            "tenant/{tenant_id}/bucket/{bucket_id}/index_build/{index_storage_id}"
-        ),
-    };
-    let owner = OwnershipPrincipal::node(builder_node_id);
-    let now_nanos = chrono::Utc::now()
-        .timestamp_nanos_opt()
-        .ok_or_else(|| anyhow!("timestamp cannot be represented in nanoseconds"))?;
-    let ttl_nanos = i64::try_from(MAX_OWNERSHIP_LEASE_MS)
-        .unwrap_or(i64::MAX)
-        .saturating_mul(1_000_000);
-
-    if let Some(record) =
-        read_ownership_fence(storage, owner.tenant_id, &resource, signing_key).await?
-        && record.owner.same_security_owner(&owner)
-        && record.is_active_unexpired(now_nanos)
-    {
-        renew_ownership(
-            storage,
-            RenewOwnership {
-                request_id: format!("index-build-renew-{}", resource.resource_id),
-                resource,
-                owner,
-                current_fence: record.fence,
-                now_nanos,
-                ttl_nanos,
-            },
-            signing_key,
-        )
-        .await?;
-        return Ok(());
-    }
-
-    acquire_ownership(
-        storage,
-        AcquireOwnership {
-            request_id: format!("index-build-acquire-{}", resource.resource_id),
-            idempotency_key: format!("index-build-owner-{}", resource.resource_id),
-            resource,
-            owner,
-            now_nanos,
-            ttl_nanos,
-        },
-        signing_key,
-    )
-    .await?;
-    Ok(())
 }
 
 async fn acquire_watch_checkpoint_authority(
@@ -1335,26 +1462,6 @@ async fn acquire_index_partition_watch_authority(
         fence: outcome.record.fence,
         resource_id,
     })
-}
-
-async fn next_index_watch_cursor(
-    storage: &Storage,
-    tenant_id: i64,
-    bucket_id: i64,
-    index_storage_id: &str,
-    partition_id: &str,
-    preferred_cursor: u128,
-) -> Result<u128> {
-    let latest = index_partition_watch::latest_index_partition_watch_cursor(
-        storage,
-        tenant_id,
-        bucket_id,
-        index_storage_id,
-        partition_id,
-    )
-    .await?
-    .unwrap_or(0);
-    Ok(preferred_cursor.max(latest.saturating_add(1)))
 }
 
 #[derive(Debug, Clone)]

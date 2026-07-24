@@ -734,7 +734,9 @@ async fn personaldb_submit_builds_snapshot_when_threshold_is_reached() {
         },
     )
     .await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
 
     let token = cluster.token.clone();
     let mut client = PersonalDbServiceClient::connect(cluster.grpc_addrs[0].clone())

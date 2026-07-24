@@ -45,7 +45,7 @@ A ref CAS failure is not automatically a storage outage. It usually means anothe
 - transaction records;
 - staging and lock files used while writes are being coordinated.
 
-By default, node identity files such as `node-id` and `cluster-keypair.pb` live in an operator identity directory beside `STORAGE_PATH`; configured identity paths must also stay outside `STORAGE_PATH`. Those are not tenant feature records, but they are operationally important: losing them can change node identity and cluster behaviour.
+Node identity and the Ed25519 receipt-signing private key are node-local CoreMeta records inside `STORAGE_PATH`. They are not tenant feature records, but they are operationally critical: losing the volume loses the identity, while duplicating the volume across live processes duplicates it. The signing public key committed in lifecycle topology must match the private identity held by that node.
 
 Treat `STORAGE_PATH` as a stateful volume, not a cache. It needs persistent storage, backup, free-space alerts, inode alerts, permissions that prevent ordinary application containers from writing it, and placement on disks that match your durability expectations. It should not be shared as a writable directory between unrelated Anvil processes unless the deployment model is explicitly designed and tested for that access pattern.
 
@@ -140,7 +140,7 @@ Bypass detection is part release review, part runtime hygiene. In code review, a
 | --- | --- |
 | `CoreStore::put_blob`, `compare_and_swap_ref`, `append_stream`, or `commit_mutation_batch` | Durable CoreStore-backed state. Review schema, preconditions, idempotency, and repair story. |
 | Writes to `Storage::temp_dir_path()` or `_core/staging` | Temporary staging. Review cleanup and crash retry behaviour. |
-| Node identity, cluster keypair, bootstrap credential output | Operator/bootstrap state. Review secret handling and backup implications. |
+| Node-local identity/signing rows and bootstrap credential output | Operator/bootstrap state. Review secret handling, lifecycle consistency, and backup implications. |
 | `tokio::fs`, `std::fs`, or `OpenOptions` writing feature data elsewhere under `STORAGE_PATH` | Potential bypass. Require a clear reason or move the state behind CoreStore. |
 
 A practical release review can search for filesystem writes and then classify each hit. That search proves only that you looked for suspicious write paths; it does not prove correctness by itself:

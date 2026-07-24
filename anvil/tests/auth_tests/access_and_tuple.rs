@@ -109,7 +109,7 @@ async fn test_grant_and_revoke_access() {
 async fn test_authz_tuple_write_check_and_watch() {
     let cluster = shared_docker_test_cluster().await;
     let actor = create_docker_storage_test_actor(&cluster, "authz-tuple-watch").await;
-    grant_docker_authz_realm(&cluster, &actor, "default").await;
+    let schema_revision = prepare_docker_default_authz_realm(&cluster, &actor).await;
 
     let token = actor.token.clone();
     let mut auth_client = AuthServiceClient::connect(actor.grpc_addr.clone())
@@ -139,8 +139,8 @@ async fn test_authz_tuple_write_check_and_watch() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(add.revision, 1);
-    assert_eq!(add.zookie, "authz:1");
+    assert_eq!(add.revision, schema_revision + 1);
+    assert_eq!(add.zookie, format!("authz:{}", add.revision));
     assert!(!add.record_hash.is_empty());
 
     let mut watch_req = Request::new(WatchAuthzTupleLogRequest {
@@ -240,7 +240,7 @@ async fn test_authz_tuple_write_check_and_watch() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(remove.revision, 2);
+    assert_eq!(remove.revision, add.revision + 1);
 
     let watched_remove = tokio::time::timeout(Duration::from_secs(5), stream.next())
         .await
@@ -281,7 +281,7 @@ async fn test_authz_tuple_write_check_and_watch() {
         subject_id: "alice".to_string(),
         caveat_hash: String::new(),
         consistency: "at_least".to_string(),
-        zookie: add.zookie,
+        zookie: add.zookie.clone(),
         scope: None,
     });
     at_least_add_req.metadata_mut().insert(
@@ -296,6 +296,37 @@ async fn test_authz_tuple_write_check_and_watch() {
     assert!(!at_least_add.allowed);
     assert_eq!(at_least_add.revision, remove.revision);
 
+    // Historical point checks are served from materialized segments. Wait on
+    // the lag stream rather than assuming the asynchronous worker has already
+    // caught up when the tuple mutation returns.
+    let mut lag_request = Request::new(WatchAuthzDerivedLagRequest {
+        derived_index_id: DEFAULT_DERIVED_USERSET_INDEX_ID.to_string(),
+        after_cursor_low: 0,
+        after_cursor_high: 0,
+    });
+    add_bearer(&mut lag_request, &token);
+    let mut lag_stream = auth_client
+        .watch_authz_derived_lag(lag_request)
+        .await
+        .unwrap()
+        .into_inner();
+    tokio::time::timeout(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT, async {
+        loop {
+            let event = lag_stream
+                .next()
+                .await
+                .expect("derived-lag stream ended before materialization caught up")
+                .expect("derived-lag stream returned an error");
+            if event.derived_index_id == DEFAULT_DERIVED_USERSET_INDEX_ID
+                && event.processed_revision >= remove.revision
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("authorization materialization did not catch up");
+
     let mut exact_add_after_remove_req = Request::new(CheckPermissionRequest {
         namespace: "document".to_string(),
         object_id: "alpha".to_string(),
@@ -304,7 +335,7 @@ async fn test_authz_tuple_write_check_and_watch() {
         subject_id: "alice".to_string(),
         caveat_hash: String::new(),
         consistency: "exact".to_string(),
-        zookie: "authz:1".to_string(),
+        zookie: add.zookie.clone(),
         scope: None,
     });
     exact_add_after_remove_req.metadata_mut().insert(
@@ -317,7 +348,7 @@ async fn test_authz_tuple_write_check_and_watch() {
         .unwrap()
         .into_inner();
     assert!(exact_add_after_remove.allowed);
-    assert_eq!(exact_add_after_remove.revision, 1);
+    assert_eq!(exact_add_after_remove.revision, add.revision);
 
     let mut unavailable_req = Request::new(CheckPermissionRequest {
         namespace: "document".to_string(),
@@ -345,7 +376,7 @@ async fn test_authz_tuple_write_check_and_watch() {
 async fn test_authz_batch_read_and_list_operations() {
     let cluster = shared_docker_test_cluster().await;
     let actor = create_docker_storage_test_actor(&cluster, "authz-batch-read").await;
-    grant_docker_authz_realm(&cluster, &actor, "default").await;
+    let schema_revision = prepare_docker_default_authz_realm(&cluster, &actor).await;
 
     let token = actor.token.clone();
     let mut auth_client = AuthServiceClient::connect(actor.grpc_addr.clone())
@@ -369,9 +400,14 @@ async fn test_authz_batch_read_and_list_operations() {
         .unwrap()
         .into_inner();
     assert_eq!(written.results.len(), 4);
-    assert!(written.results.iter().all(|result| result.revision == 1));
-    assert_eq!(written.revision, 1);
-    assert_eq!(written.zookie, "authz:1");
+    assert!(
+        written
+            .results
+            .iter()
+            .all(|result| result.revision == schema_revision + 1)
+    );
+    assert_eq!(written.revision, schema_revision + 1);
+    assert_eq!(written.zookie, format!("authz:{}", written.revision));
 
     let mut first_page = Request::new(ReadAuthzTuplesRequest {
         namespace: "document".to_string(),
@@ -442,7 +478,7 @@ async fn test_authz_batch_read_and_list_operations() {
             .collect::<Vec<_>>(),
         vec![true, false]
     );
-    assert_eq!(checks.revision, 1);
+    assert_eq!(checks.revision, written.revision);
 
     let mut objects = Request::new(ListAuthzObjectsRequest {
         namespace: "document".to_string(),
@@ -480,10 +516,10 @@ async fn test_authz_batch_read_and_list_operations() {
 }
 
 #[tokio::test]
-async fn test_authz_batch_watch_and_pagination_are_revision_bound() {
+async fn test_authz_batch_watch_and_current_pagination_rejects_stale_revision() {
     let cluster = shared_docker_test_cluster().await;
     let actor = create_docker_storage_test_actor(&cluster, "authz-batch-watch").await;
-    grant_docker_authz_realm(&cluster, &actor, "default").await;
+    let schema_revision = prepare_docker_default_authz_realm(&cluster, &actor).await;
 
     let token = actor.token.clone();
     let mut auth_client = AuthServiceClient::connect(actor.grpc_addr.clone())
@@ -504,7 +540,7 @@ async fn test_authz_batch_watch_and_pagination_are_revision_bound() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(first_batch.revision, 1);
+    assert_eq!(first_batch.revision, schema_revision + 1);
     assert_eq!(first_batch.results.len(), 3);
 
     let mut watch_client = AuthServiceClient::connect(actor.grpc_addr.clone())
@@ -534,7 +570,9 @@ async fn test_authz_batch_watch_and_pagination_are_revision_bound() {
     }
     assert_eq!(watched.len(), 3);
     assert!(
-        watched.iter().all(|event| event.revision == 1),
+        watched
+            .iter()
+            .all(|event| event.revision == first_batch.revision),
         "batch watch events must become visible only as one committed revision"
     );
     assert_eq!(
@@ -557,7 +595,7 @@ async fn test_authz_batch_watch_and_pagination_are_revision_bound() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(first_page.revision, 1);
+    assert_eq!(first_page.revision, first_batch.revision);
     assert!(!first_page.next_page_token.is_empty());
 
     let mut second_batch = Request::new(WriteAuthzTuplesRequest {
@@ -573,11 +611,11 @@ async fn test_authz_batch_watch_and_pagination_are_revision_bound() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(second_batch.revision, 2);
+    assert_eq!(second_batch.revision, first_batch.revision + 1);
 
     let mut revision_bound_page = Request::new(ReadAuthzTuplesRequest {
         namespace: "document".to_string(),
-        page_size: 100,
+        page_size: 1,
         page_token: first_page.next_page_token,
         scope: None,
         ..Default::default()
@@ -586,15 +624,12 @@ async fn test_authz_batch_watch_and_pagination_are_revision_bound() {
     let revision_bound_page = auth_client
         .read_authz_tuples(revision_bound_page)
         .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(revision_bound_page.revision, 1);
+        .unwrap_err();
+    assert_eq!(revision_bound_page.code(), tonic::Code::FailedPrecondition);
     assert!(
         revision_bound_page
-            .tuples
-            .iter()
-            .all(|tuple| tuple.object_id != "delta"),
-        "a follow-up page must keep reading the original revision"
+            .message()
+            .contains("historical authz list reads are not supported")
     );
 
     let mut latest_page = Request::new(ReadAuthzTuplesRequest {
@@ -609,7 +644,7 @@ async fn test_authz_batch_watch_and_pagination_are_revision_bound() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(latest_page.revision, 2);
+    assert_eq!(latest_page.revision, second_batch.revision);
     assert!(
         latest_page
             .tuples
@@ -627,7 +662,9 @@ async fn test_authz_tuple_batch_failure_is_atomic() {
         &["test-region-1"],
     )
     .await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
 
     let token = cluster.token.clone();
     let mut auth_client = AuthServiceClient::connect(cluster.grpc_addrs[0].clone())
@@ -692,6 +729,16 @@ async fn test_authz_tuple_batch_failure_is_atomic() {
         "failed authz batches with unsafe components must not advance the tenant revision"
     );
 
+    let tenant_id = cluster.states[0]
+        .persistence
+        .get_tenant_by_name("default")
+        .await
+        .unwrap()
+        .expect("default test tenant exists")
+        .id;
+    let schema_revision =
+        bind_default_authz_schema(&cluster.grpc_addrs[0], tenant_id, &token).await;
+
     let mut valid_batch = Request::new(WriteAuthzTuplesRequest {
         mutations: vec![
             authz_mutation("document", "alpha", "viewer", "user", "alice", "add"),
@@ -706,15 +753,20 @@ async fn test_authz_tuple_batch_failure_is_atomic() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(valid.revision, 1);
-    assert!(valid.results.iter().all(|result| result.revision == 1));
+    assert_eq!(valid.revision, schema_revision + 1);
+    assert!(
+        valid
+            .results
+            .iter()
+            .all(|result| result.revision == valid.revision)
+    );
 }
 
 #[tokio::test]
 async fn test_conditional_authz_batch_idempotency_and_revision_conflicts() {
     let cluster = shared_docker_test_cluster().await;
     let actor = create_docker_storage_test_actor(&cluster, "authz-batch-idempotency").await;
-    grant_docker_authz_realm(&cluster, &actor, "default").await;
+    prepare_docker_default_authz_realm(&cluster, &actor).await;
 
     let mut auth_client = AuthServiceClient::connect(actor.grpc_addr.clone())
         .await
@@ -843,7 +895,7 @@ async fn test_conditional_authz_batch_idempotency_and_revision_conflicts() {
 async fn test_authz_accepts_arbitrary_safe_subject_kind() {
     let cluster = shared_docker_test_cluster().await;
     let actor = create_docker_storage_test_actor(&cluster, "authz-safe-subject").await;
-    grant_docker_authz_realm(&cluster, &actor, "default").await;
+    let schema_revision = prepare_docker_default_authz_realm(&cluster, &actor).await;
 
     let token = actor.token.clone();
     let mut auth_client = AuthServiceClient::connect(actor.grpc_addr.clone())
@@ -863,7 +915,7 @@ async fn test_authz_accepts_arbitrary_safe_subject_kind() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(written.revision, 1);
+    assert_eq!(written.revision, schema_revision + 1);
 
     let mut check = Request::new(check_permission_request(
         "document", "doc-1", "viewer", "folder", "folder-1", "latest", "",

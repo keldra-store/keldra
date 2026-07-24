@@ -1,13 +1,14 @@
 use crate::{
     core_store::{
         AuthzScopeRef, CF_PERSONALDB, CoreByteRange, CoreManifestLocator, CoreMetaBatchOp,
-        CoreMetaBatchOpKind, CoreMetaLocatorProto, CoreMetaStore, CoreMetaTuplePart,
-        CoreMutationOperation, CoreMutationPrecondition, CorePrefetchPolicy, CoreStore,
-        CoreTraceContext, ReadLogicalRangeRequest, TABLE_PERSONALDB_DATA_LOCATOR_ROW,
+        CoreMetaBatchOpKind, CoreMetaLocatorProto, CoreMetaRootPublication, CoreMetaStore,
+        CoreMetaTuplePart, CoreMutationOperation, CoreMutationPrecondition, CorePrefetchPolicy,
+        CoreStore, CoreTraceContext, ReadLogicalRangeRequest, TABLE_PERSONALDB_DATA_LOCATOR_ROW,
         TABLE_PERSONALDB_GROUP_ROW, WriteLogicalFileRequest, core_meta_committed_row_common,
         core_meta_locator_from_manifest_locator, core_meta_locator_to_manifest_locator,
-        core_meta_payload_digest, core_meta_root_key_hash, core_meta_row_common_from_payload,
-        core_meta_tuple_key, decode_deterministic_proto, encode_deterministic_proto,
+        core_meta_payload_digest, core_meta_record_tuple_key, core_meta_root_key_hash,
+        core_meta_row_common_from_payload, core_meta_tuple_key, decode_deterministic_proto,
+        encode_deterministic_proto,
     },
     formats::{
         hash32,
@@ -17,6 +18,8 @@ use crate::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 use prost::Message;
+
+pub const PERSONALDB_DATA_LOCATOR_PAGE_MAX: usize = 1000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersonalDbGroupCoreMetaRow {
@@ -37,12 +40,21 @@ pub struct PersonalDbDataLocatorCoreMetaRow {
     pub group_id: String,
     pub data_id: String,
     pub data_kind: String,
+    /// PersonalDB's logical source/writer generation.
     pub generation: u64,
+    /// Contiguous CoreMeta publication generation for the group root.
+    pub root_generation: u64,
     pub sqlite_changeset_hash: String,
     pub payload_locator: CoreManifestLocator,
     pub projection_keys: Vec<String>,
     pub transaction_id: String,
     pub created_at_unix_nanos: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PersonalDbDataLocatorPage {
+    pub rows: Vec<PersonalDbDataLocatorCoreMetaRow>,
+    pub next_tuple_key: Option<Vec<u8>>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -176,14 +188,21 @@ pub async fn write_personaldb_logical_file_as_data_locator_with_preconditions(
     require_tuple_string(&request.logical_file_id, "logical_file_id")?;
     validate_coremeta_preconditions(storage, preconditions)?;
     let store = CoreStore::new(storage.clone()).await?;
-    let generation = request.generation;
+    let writer_generation = request.generation;
     let logical = store.write_logical_file_with_locator(request).await?;
+    // The writer generation is the PersonalDB source cursor and may begin
+    // above one. CoreMeta root generations instead describe publication order
+    // and must advance contiguously from the current group root.
+    let root_generation = store
+        .next_root_generation_for_anchor(&personaldb_root_anchor_key(tenant_id, group_id))
+        .await?;
     let row = PersonalDbDataLocatorCoreMetaRow {
         tenant_id,
         group_id: group_id.to_string(),
         data_id: data_id.to_string(),
         data_kind: data_kind.to_string(),
-        generation,
+        generation: writer_generation,
+        root_generation,
         sqlite_changeset_hash,
         payload_locator: logical.locator,
         projection_keys,
@@ -211,30 +230,6 @@ pub fn personaldb_partition_id(tenant_id: i64, group_id: &str) -> String {
     format!("personaldb:tenant:{tenant_id}:group:{group_id}")
 }
 
-pub fn latest_personaldb_group_row(
-    storage: &Storage,
-    tenant_id: i64,
-    group_id: &str,
-) -> Result<Option<PersonalDbGroupCoreMetaRow>> {
-    validate_personaldb_scope(tenant_id, group_id)?;
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
-    let prefix = personaldb_group_tuple_prefix(tenant_id, group_id)?;
-    let mut latest = None;
-    for record in meta.scan_prefix(CF_PERSONALDB, TABLE_PERSONALDB_GROUP_ROW, &prefix)? {
-        let row = decode_group_row(&record.payload)?;
-        if row.tenant_id != tenant_id || row.group_id != group_id {
-            bail!("PersonalDB group CoreMeta row scope mismatch");
-        }
-        if latest
-            .as_ref()
-            .is_none_or(|current: &PersonalDbGroupCoreMetaRow| row.generation > current.generation)
-        {
-            latest = Some(row);
-        }
-    }
-    Ok(latest)
-}
-
 pub async fn write_personaldb_data_locator_row(
     storage: &Storage,
     row: &PersonalDbDataLocatorCoreMetaRow,
@@ -253,15 +248,19 @@ pub async fn write_personaldb_data_locator_row(
         kind: CoreMetaBatchOpKind::Put(&payload),
     };
     store
-        .commit_coremeta_batch_by_embedded_roots(
-            &format!("personaldb-data:{}:{}", row.group_id, row.generation),
+        .commit_coremeta_root_groups(
+            &row.transaction_id,
             &[op],
+            &[CoreMetaRootPublication::new(
+                personaldb_root_anchor_key(row.tenant_id, &row.group_id),
+                crate::formats::writer::WriterFamily::PersonalDb,
+            )],
         )
         .await?;
     Ok(())
 }
 
-pub fn read_personaldb_data_locator_row(
+pub async fn read_personaldb_data_locator_row(
     storage: &Storage,
     tenant_id: i64,
     group_id: &str,
@@ -270,8 +269,10 @@ pub fn read_personaldb_data_locator_row(
     validate_personaldb_scope(tenant_id, group_id)?;
     require_coremeta_ref_id(data_id, "data_id")?;
     let key = personaldb_data_locator_tuple_key(tenant_id, group_id, data_id)?;
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
-    let Some(payload) = meta.get(CF_PERSONALDB, TABLE_PERSONALDB_DATA_LOCATOR_ROW, &key)? else {
+    let store = CoreStore::new(storage.clone()).await?;
+    let Some(payload) =
+        store.read_coremeta_row(CF_PERSONALDB, TABLE_PERSONALDB_DATA_LOCATOR_ROW, &key)?
+    else {
         return Ok(None);
     };
     let row = decode_data_locator_row(&payload)?;
@@ -292,16 +293,19 @@ pub async fn delete_personaldb_data_locator_row(
     require_coremeta_ref_id(data_id, "data_id")?;
     require_tuple_string(mutation_id, "mutation_id")?;
     let key = personaldb_data_locator_tuple_key(tenant_id, group_id, data_id)?;
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
+    let store = CoreStore::new(storage.clone()).await?;
     let deleted_at_unix_nanos = current_unix_nanos()?;
-    let delete_common = meta
-        .get(CF_PERSONALDB, TABLE_PERSONALDB_DATA_LOCATOR_ROW, &key)?
+    let next_root_generation = store
+        .next_root_generation_for_anchor(&personaldb_root_anchor_key(tenant_id, group_id))
+        .await?;
+    let delete_common = store
+        .read_coremeta_row(CF_PERSONALDB, TABLE_PERSONALDB_DATA_LOCATOR_ROW, &key)?
         .map(|payload| {
             core_meta_row_common_from_payload(&payload).map(|common| {
                 core_meta_committed_row_common(
                     common.realm_id,
                     common.root_key_hash,
-                    common.root_generation.saturating_add(1),
+                    next_root_generation,
                     mutation_id.to_string(),
                     deleted_at_unix_nanos,
                 )
@@ -315,56 +319,107 @@ pub async fn delete_personaldb_data_locator_row(
         common: delete_common,
         kind: CoreMetaBatchOpKind::Delete,
     };
-    CoreStore::new(storage.clone())
-        .await?
-        .commit_coremeta_batch_by_embedded_roots(mutation_id, &[op])
+    store
+        .commit_coremeta_root_groups(
+            mutation_id,
+            &[op],
+            &[CoreMetaRootPublication::new(
+                personaldb_root_anchor_key(tenant_id, group_id),
+                crate::formats::writer::WriterFamily::PersonalDb,
+            )],
+        )
         .await?;
     Ok(())
 }
 
-pub fn list_personaldb_data_locator_rows(
+pub async fn list_personaldb_data_locator_rows(
     storage: &Storage,
     tenant_id: i64,
     group_id: &str,
-) -> Result<Vec<PersonalDbDataLocatorCoreMetaRow>> {
+    after_tuple_key: Option<&[u8]>,
+    page_size: usize,
+) -> Result<PersonalDbDataLocatorPage> {
     validate_personaldb_scope(tenant_id, group_id)?;
     let prefix = personaldb_data_locator_tuple_prefix(tenant_id, group_id)?;
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
-    let mut rows = Vec::new();
-    for record in meta.scan_prefix(CF_PERSONALDB, TABLE_PERSONALDB_DATA_LOCATOR_ROW, &prefix)? {
-        let row = decode_data_locator_row(&record.payload)?;
+    let store = CoreStore::new(storage.clone()).await?;
+    page_personaldb_data_locator_rows(&store, &prefix, after_tuple_key, page_size, |row| {
         if row.tenant_id != tenant_id || row.group_id != group_id {
             bail!("PersonalDB data locator CoreMeta row scope mismatch");
         }
-        rows.push(row);
-    }
-    Ok(rows)
+        Ok(())
+    })
 }
 
-pub fn list_personaldb_data_locator_rows_for_tenant(
+pub async fn list_personaldb_data_locator_rows_for_tenant(
     storage: &Storage,
     tenant_id: i64,
-) -> Result<Vec<PersonalDbDataLocatorCoreMetaRow>> {
+    after_tuple_key: Option<&[u8]>,
+    page_size: usize,
+) -> Result<PersonalDbDataLocatorPage> {
     if tenant_id < 0 {
         bail!("PersonalDB tenant id must be nonnegative");
     }
     let prefix = core_meta_tuple_key(&[CoreMetaTuplePart::Utf8(&personaldb_realm_id(tenant_id))])?;
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
-    let mut rows = Vec::new();
-    for record in meta.scan_prefix(CF_PERSONALDB, TABLE_PERSONALDB_DATA_LOCATOR_ROW, &prefix)? {
-        let row = decode_data_locator_row(&record.payload)?;
+    let store = CoreStore::new(storage.clone()).await?;
+    page_personaldb_data_locator_rows(&store, &prefix, after_tuple_key, page_size, |row| {
         if row.tenant_id != tenant_id {
             bail!("PersonalDB data locator CoreMeta tenant scope mismatch");
         }
+        Ok(())
+    })
+}
+
+fn page_personaldb_data_locator_rows(
+    store: &CoreStore,
+    prefix: &[u8],
+    after_tuple_key: Option<&[u8]>,
+    page_size: usize,
+    validate_scope: impl Fn(&PersonalDbDataLocatorCoreMetaRow) -> Result<()>,
+) -> Result<PersonalDbDataLocatorPage> {
+    if !(1..=PERSONALDB_DATA_LOCATOR_PAGE_MAX).contains(&page_size) {
+        bail!(
+            "PersonalDB data locator page size must be between 1 and {PERSONALDB_DATA_LOCATOR_PAGE_MAX}"
+        );
+    }
+    let mut records = store.scan_coremeta_prefix_page(
+        CF_PERSONALDB,
+        TABLE_PERSONALDB_DATA_LOCATOR_ROW,
+        prefix,
+        after_tuple_key,
+        page_size + 1,
+    )?;
+    let has_more = records.len() > page_size;
+    if has_more {
+        records.truncate(page_size);
+    }
+    let next_tuple_key = if has_more {
+        Some(
+            core_meta_record_tuple_key(
+                &records
+                    .last()
+                    .ok_or_else(|| anyhow!("PersonalDB locator page continuation has no row"))?
+                    .key,
+            )?
+            .to_vec(),
+        )
+    } else {
+        None
+    };
+    let mut rows = Vec::with_capacity(records.len());
+    for record in records {
+        let row = decode_data_locator_row(&record.payload)?;
+        validate_scope(&row)?;
+        if core_meta_record_tuple_key(&record.key)?
+            != personaldb_data_locator_tuple_key(row.tenant_id, &row.group_id, &row.data_id)?
+        {
+            bail!("PersonalDB data locator CoreMeta physical row key mismatch");
+        }
         rows.push(row);
     }
-    rows.sort_by(|left, right| {
-        left.group_id
-            .cmp(&right.group_id)
-            .then_with(|| left.data_id.cmp(&right.data_id))
-            .then_with(|| left.generation.cmp(&right.generation))
-    });
-    Ok(rows)
+    Ok(PersonalDbDataLocatorPage {
+        rows,
+        next_tuple_key,
+    })
 }
 
 pub async fn read_personaldb_data_locator_bytes(
@@ -401,6 +456,8 @@ pub fn personaldb_data_locator_precondition(
     data_id: &str,
 ) -> Result<CoreMutationPrecondition> {
     let key = personaldb_data_locator_tuple_key(tenant_id, group_id, data_id)?;
+    // A write precondition must compare the exact canonical bytes admitted by
+    // the publication protocol, including absence, before staging a mutation.
     let payload = CoreMetaStore::open(storage.core_store_meta_path())?.get(
         CF_PERSONALDB,
         TABLE_PERSONALDB_DATA_LOCATOR_ROW,
@@ -425,6 +482,8 @@ pub fn personaldb_group_precondition(
     generation: u64,
 ) -> Result<CoreMutationPrecondition> {
     let key = personaldb_group_tuple_key(tenant_id, group_id, generation)?;
+    // This is a write-precondition snapshot, not a product read; the commit
+    // protocol revalidates the same canonical row before publication.
     let payload = CoreMetaStore::open(storage.core_store_meta_path())?.get(
         CF_PERSONALDB,
         TABLE_PERSONALDB_GROUP_ROW,
@@ -492,7 +551,7 @@ fn encode_data_locator_row(row: &PersonalDbDataLocatorCoreMetaRow) -> Result<Vec
         common: Some(core_meta_committed_row_common(
             personaldb_realm_id(row.tenant_id),
             personaldb_root_key_hash(row.tenant_id, &row.group_id),
-            row.generation,
+            row.root_generation,
             &row.transaction_id,
             row.created_at_unix_nanos,
         )),
@@ -520,12 +579,14 @@ fn decode_data_locator_row(bytes: &[u8]) -> Result<PersonalDbDataLocatorCoreMeta
         .as_ref()
         .ok_or_else(|| anyhow!("PersonalDB data locator row missing locator"))
         .and_then(core_meta_locator_to_manifest_locator)?;
+    let generation = payload_locator.manifest_ref.writer_generation;
     let row = PersonalDbDataLocatorCoreMetaRow {
         tenant_id: tenant_id_from_realm(&common.realm_id)?,
         group_id: proto.group_id,
         data_id: proto.data_id,
         data_kind: proto.data_kind,
-        generation: common.root_generation,
+        generation,
+        root_generation: common.root_generation,
         sqlite_changeset_hash: proto.sqlite_changeset_hash,
         payload_locator,
         projection_keys: proto.projection_keys,
@@ -540,6 +601,8 @@ fn validate_coremeta_preconditions(
     storage: &Storage,
     preconditions: &[CoreMutationPrecondition],
 ) -> Result<()> {
+    // These raw reads form local write preconditions. Candidate rows remain in
+    // staging, and commit revalidates the same canonical bytes atomically.
     let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
     for precondition in preconditions {
         let CoreMutationPrecondition::CoreMetaRow {
@@ -592,6 +655,12 @@ fn validate_data_locator_row(row: &PersonalDbDataLocatorCoreMetaRow) -> Result<(
     if row.generation == 0 {
         bail!("PersonalDB data locator generation must be nonzero");
     }
+    if row.root_generation == 0 {
+        bail!("PersonalDB data locator root generation must be nonzero");
+    }
+    if row.payload_locator.manifest_ref.writer_generation != row.generation {
+        bail!("PersonalDB data locator writer generation mismatch");
+    }
     require_nonempty(&row.transaction_id, "transaction_id")?;
     if !row.sqlite_changeset_hash.is_empty() {
         validate_optional_hash(&row.sqlite_changeset_hash, "sqlite_changeset_hash")?;
@@ -605,14 +674,6 @@ fn personaldb_group_tuple_key(tenant_id: i64, group_id: &str, generation: u64) -
         CoreMetaTuplePart::Utf8(&personaldb_realm_id(tenant_id)),
         CoreMetaTuplePart::Utf8(group_id),
         CoreMetaTuplePart::U64(generation),
-    ])
-}
-
-fn personaldb_group_tuple_prefix(tenant_id: i64, group_id: &str) -> Result<Vec<u8>> {
-    validate_personaldb_scope(tenant_id, group_id)?;
-    core_meta_tuple_key(&[
-        CoreMetaTuplePart::Utf8(&personaldb_realm_id(tenant_id)),
-        CoreMetaTuplePart::Utf8(group_id),
     ])
 }
 
@@ -727,3 +788,6 @@ fn validate_optional_hash(value: &str, field: &'static str) -> Result<()> {
 pub fn personaldb_payload_hash(bytes: &[u8]) -> String {
     hex::encode(hash32(bytes))
 }
+
+#[cfg(test)]
+mod tests;

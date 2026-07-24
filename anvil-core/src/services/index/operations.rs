@@ -100,7 +100,6 @@ impl AppState {
             authz_scope,
             canonical_query_hash: stable_json_hash(&spec.canonical_json()?),
             plan_json,
-            diagnostics: Vec::new(),
             query_text: shape.query_text.unwrap_or_default(),
             query_vector: shape.query_vector.unwrap_or_default(),
             phrase: shape.phrase,
@@ -346,6 +345,7 @@ impl AppState {
                 WriterFamily::FullText.as_str(),
                 token.index_generation,
             )
+            .await
             .map_err(|e| Status::internal(e.to_string()))?
             .map(|record| record.segment_ref)
             .ok_or_else(|| Status::invalid_argument("PageTokenScopeMismatch"))?
@@ -630,6 +630,7 @@ impl AppState {
                     WriterFamily::TypedMetadata.as_str(),
                     token.index_generation,
                 )
+                .await
                 .map_err(|e| Status::internal(e.to_string()))?
                 .map(|record| record.segment_ref)
                 .ok_or_else(|| Status::invalid_argument("PageTokenScopeMismatch"))?,
@@ -1295,6 +1296,7 @@ impl AppState {
                     &index_storage_id,
                     WriterFamily::Vector.as_str(),
                 )
+                .await
                 .map_err(|e| Status::internal(e.to_string()))?
             else {
                 return Err(Status::failed_precondition("IndexUnavailable"));
@@ -1609,6 +1611,7 @@ impl AppState {
                 WriterFamily::Vector.as_str(),
                 token.index_generation,
             )
+            .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::invalid_argument("PageTokenScopeMismatch"))?
         } else {
@@ -1617,6 +1620,7 @@ impl AppState {
                 &index_storage_id,
                 WriterFamily::Vector.as_str(),
             )
+            .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::failed_precondition("IndexUnavailable"))?
         };
@@ -1916,7 +1920,7 @@ impl AppState {
                         crate::system_realm::SYSTEM_STORAGE_TENANT_ID,
                     )
                     .await
-                    .map_err(|e| Status::internal(e.to_string()))?
+                    .map_err(crate::services::authz_status::consistency_status)?
                 };
                 if let Some(scope) = authz_scope {
                     let revision = i64::try_from(authz_revision)
@@ -1949,7 +1953,7 @@ impl AppState {
                     Some(system_revision),
                 )
                 .await
-                .map_err(|e| Status::internal(e.to_string()))?
+                .map_err(crate::services::authz_status::consistency_status)?
                     || access_control::system_realm_relationship_allows(
                         &self.storage,
                         claims,
@@ -1959,7 +1963,7 @@ impl AppState {
                         Some(system_revision),
                     )
                     .await
-                    .map_err(|e| Status::internal(e.to_string()))?)
+                    .map_err(crate::services::authz_status::consistency_status)?)
             }
             "index_only" | "public" => Ok(true),
             _ => Ok(false),

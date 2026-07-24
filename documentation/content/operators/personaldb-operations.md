@@ -176,7 +176,7 @@ When a repair writes a finding, list the PersonalDB repair findings for the gene
 
 ```bash
 anvil --profile acme repair findings personaldb "tenant-${TENANT_ID}-database-customer-notes" \
-  --limit 20
+  --page-size 20
 ```
 
 This proves the caller can read repair findings for that scope. It does not fix the condition. Use the finding's subject, severity, status, message, expected/actual hashes, and cursor information to decide whether the next step is client catch-up, projection rebuild, backup restore, or escalation to the product team.

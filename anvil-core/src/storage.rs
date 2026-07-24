@@ -2,19 +2,29 @@ use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use sha2::Digest;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::Instant;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::broadcast;
 use tracing::info;
 
 const STORAGE_DIR: &str = "anvil-data";
 const CORESTORE_DIR: &str = "corestore";
 const CORESTORE_STAGING_DIR: &str = "staging";
 const CORESTORE_TMP_DIR: &str = "tmp";
+
+type StreamNotifierMap = Mutex<std::collections::BTreeMap<String, broadcast::Sender<()>>>;
+
+static STREAM_NOTIFIER_REGISTRIES: LazyLock<
+    Mutex<std::collections::BTreeMap<PathBuf, Weak<StreamNotifierMap>>>,
+> = LazyLock::new(|| Mutex::new(std::collections::BTreeMap::new()));
+
 #[derive(Debug, Clone)]
 pub struct Storage {
     storage_path: PathBuf,
     temp_path: PathBuf,
+    stream_notifiers: Arc<StreamNotifierMap>,
 }
 
 impl Storage {
@@ -27,9 +37,11 @@ impl Storage {
         let temp_path = core_store_staging_tmp_path(&storage_path);
         fs::create_dir_all(&storage_path).await?;
         fs::create_dir_all(&temp_path).await?;
+        let stream_notifiers = stream_notifiers_for_path(&storage_path)?;
         Ok(Self {
             storage_path,
             temp_path,
+            stream_notifiers,
         })
     }
 
@@ -38,10 +50,41 @@ impl Storage {
         let temp_path = core_store_staging_tmp_path(&storage_path);
         std::fs::create_dir_all(&storage_path)?;
         std::fs::create_dir_all(&temp_path)?;
+        let stream_notifiers = stream_notifiers_for_path(&storage_path)?;
         Ok(Self {
             storage_path,
             temp_path,
+            stream_notifiers,
         })
+    }
+
+    pub fn subscribe_stream(&self, stream_id: &str) -> broadcast::Receiver<()> {
+        let mut notifiers = self
+            .stream_notifiers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        notifiers
+            .entry(stream_id.to_string())
+            .or_insert_with(|| broadcast::channel(1).0)
+            .subscribe()
+    }
+
+    pub fn notify_stream(&self, stream_id: &str) {
+        let mut notifiers = self
+            .stream_notifiers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let remove = notifiers.get(stream_id).is_some_and(|notifier| {
+            if notifier.receiver_count() == 0 {
+                true
+            } else {
+                let _ = notifier.send(());
+                false
+            }
+        });
+        if remove {
+            notifiers.remove(stream_id);
+        }
     }
 
     pub fn temp_dir_path(&self) -> &Path {
@@ -172,6 +215,21 @@ impl Storage {
         );
         Ok((temp_path, total_bytes, content_hash))
     }
+}
+
+fn stream_notifiers_for_path(storage_path: &Path) -> Result<Arc<StreamNotifierMap>> {
+    let registry_key = std::fs::canonicalize(storage_path)
+        .with_context(|| format!("canonicalize storage path {}", storage_path.display()))?;
+    let mut registries = STREAM_NOTIFIER_REGISTRIES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    registries.retain(|_, registry| registry.strong_count() > 0);
+    if let Some(registry) = registries.get(&registry_key).and_then(Weak::upgrade) {
+        return Ok(registry);
+    }
+    let registry = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
+    registries.insert(registry_key, Arc::downgrade(&registry));
+    Ok(registry)
 }
 
 fn core_store_staging_tmp_path(storage_path: &Path) -> PathBuf {

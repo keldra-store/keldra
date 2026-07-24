@@ -99,7 +99,7 @@ impl ObjectListingAuthzCandidateReader {
             });
         }
 
-        let Some(segment) = crate::authz_segment::ensure_authz_tuple_segment_at_revision(
+        let Some(segment) = crate::authz_segment::read_required_authz_tuple_segment_at_revision(
             &self.storage,
             self.tenant_id,
             request.system_revision,
@@ -277,7 +277,8 @@ impl IndexCandidateReader for ObjectListingCandidateReader {
             .candidates
             .scope
             .ensure_compatible_with(&self.scope)?;
-        let limit = usize::try_from(request.limit).unwrap_or(usize::MAX);
+        let limit = usize::try_from(request.limit)
+            .map_err(|_| anyhow!("object listing limit exceeds usize"))?;
         Ok(self
             .docs
             .iter()
@@ -500,7 +501,7 @@ mod tests {
             ..crate::config::Config::default()
         };
         let storage = crate::storage::Storage::new_at(temp.path()).await.unwrap();
-        let persistence = crate::persistence::Persistence::new(&config, None).unwrap();
+        let persistence = crate::persistence::Persistence::new(&config).unwrap();
         crate::system_realm::ensure_bootstrapped(
             &config,
             &persistence,
@@ -555,6 +556,7 @@ mod tests {
                 crate::system_realm::SYSTEM_STORAGE_TENANT_ID,
                 revision,
             )
+            .await
             .unwrap()
             .is_none()
         );
@@ -606,6 +608,7 @@ mod tests {
                 crate::system_realm::SYSTEM_STORAGE_TENANT_ID,
                 revision,
             )
+            .await
             .unwrap()
             .is_none()
         );

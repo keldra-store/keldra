@@ -19,7 +19,12 @@ pub enum BucketCommands {
         transaction_id: Option<String>,
     },
     /// List buckets
-    Ls,
+    Ls {
+        #[clap(long, default_value_t = 100)]
+        page_size: u32,
+        #[clap(long, default_value = "")]
+        page_token: String,
+    },
     /// Set public access for a bucket
     SetPublic {
         name: String,
@@ -67,15 +72,29 @@ pub async fn handle_bucket_command(command: &BucketCommands, ctx: &Context) -> a
             client.delete_bucket(request).await?;
             println!("Bucket {} deleted", name);
         }
-        BucketCommands::Ls => {
-            let mut request = tonic::Request::new(api::ListBucketsRequest {});
+        BucketCommands::Ls {
+            page_size,
+            page_token,
+        } => {
+            let mut request = tonic::Request::new(api::ListBucketsRequest {
+                page: Some(api::PageRequest {
+                    page_size: *page_size,
+                    page_token: page_token.clone(),
+                }),
+            });
             request.metadata_mut().insert(
                 "authorization",
                 format!("Bearer {}", token).parse().unwrap(),
             );
-            let resp = client.list_buckets(request).await?;
-            for bucket in resp.into_inner().buckets {
+            let response = client.list_buckets(request).await?.into_inner();
+            for bucket in response.buckets {
                 println!("{}\t{}", bucket.name, bucket.creation_date);
+            }
+            if let Some(page) = response
+                .page
+                .filter(|page| !page.next_page_token.is_empty())
+            {
+                println!("next_page_token={}", page.next_page_token);
             }
         }
         BucketCommands::SetPublic {

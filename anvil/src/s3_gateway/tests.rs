@@ -82,7 +82,6 @@ async fn seeded_remote_bucket_route(
     let storage_path = temp.path().join("storage");
     let state = AppState::new(
         routing_config_with_policy(&storage_path, policy),
-        None,
         personaldb_test_protocol_keyring(),
     )
     .await
@@ -154,12 +153,11 @@ async fn seed_active_proxy_node(state: &AppState, region: &str, endpoint: &str) 
             node_id: "remote-object-node".to_string(),
             region: region.to_string(),
             cell_id: "default".to_string(),
-            libp2p_peer_id: "remote-peer".to_string(),
-            receipt_signing_public_key_proto: libp2p::identity::Keypair::generate_ed25519()
-                .public()
-                .encode_protobuf(),
+            receipt_signing_public_key: anvil_core::node_signing::NodeSigningKeypair::generate()
+                .unwrap()
+                .public_key_bytes()
+                .to_vec(),
             public_api_addr: endpoint.to_string(),
-            public_cluster_addrs: Vec::new(),
             capabilities: vec![NodeCapability::Object],
             capacity_json: "{}".to_string(),
         })
@@ -179,7 +177,6 @@ async fn seeded_remote_bucket_locator_only(
     let storage_path = temp.path().join("storage");
     let state = AppState::new(
         routing_config_with_policy(&storage_path, policy),
-        None,
         personaldb_test_protocol_keyring(),
     )
     .await
@@ -270,7 +267,6 @@ async fn seeded_local_object_link() -> (tempfile::TempDir, AppState, Claims, Str
     let storage_path = temp.path().join("storage");
     let state = AppState::new(
         routing_config_with_policy(&storage_path, CrossRegionRoutingPolicy::RedirectPreferred),
-        None,
         personaldb_test_protocol_keyring(),
     )
     .await
@@ -859,7 +855,7 @@ fn reserved_namespace_guard_detects_native_routed_keys_before_auth() {
         let mut config =
             routing_config_with_policy(&storage_path, CrossRegionRoutingPolicy::RedirectPreferred);
         config.public_region_base_domain = "us-east-1.anvil-storage.test".to_string();
-        let state = AppState::new(config, None, personaldb_test_protocol_keyring())
+        let state = AppState::new(config, personaldb_test_protocol_keyring())
             .await
             .unwrap();
 

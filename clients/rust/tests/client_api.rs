@@ -238,6 +238,25 @@ fn write_options_helper_uses_execution_oneof() {
 }
 
 #[test]
+fn bounded_collection_page_types_are_public() {
+    let request = proto::ListBucketsRequest {
+        page: Some(proto::PageRequest {
+            page_size: 64,
+            page_token: "next".into(),
+        }),
+    };
+    let response = proto::ListBucketsResponse {
+        buckets: Vec::new(),
+        page: Some(proto::PageResponse {
+            next_page_token: "after".into(),
+        }),
+    };
+
+    assert_eq!(request.page.unwrap().page_size, 64);
+    assert_eq!(response.page.unwrap().next_page_token, "after");
+}
+
+#[test]
 fn packaged_proto_omits_internal_node_service() {
     let packaged_proto = include_str!("../proto/anvil.proto");
     assert!(packaged_proto.contains("optional string operation_id = 3;"));

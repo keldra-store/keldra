@@ -168,6 +168,30 @@ def analyze_summary(path: Path) -> None:
         print(f"{sample['duration_ms']:.3f} ms\t{sample['name']}")
 
 
+def analyze_coremeta_report(path: Path) -> None:
+    data = json.loads(path.read_text())
+    print(f"CoreMeta gate: {path}")
+    print(
+        f"profile={data.get('profile')} pass={data.get('pass')} "
+        f"elapsed_ms={data.get('elapsed_ms')} manifest={data.get('gate_manifest_hash')}"
+    )
+    print("p95_ms\twork_per_op\tsamples\tscenario")
+    for scenario in data.get("scenarios", []):
+        print(
+            f"{scenario['p95_ms']:.3f}\t"
+            f"{scenario['logical_work_per_operation']:.2f}\t"
+            f"{scenario['sample_count']}\t{scenario['name']}"
+        )
+    failed = [gate for gate in data.get("gates", []) if not gate.get("pass")]
+    if failed:
+        print("failed gates:")
+        for gate in failed:
+            print(
+                f"{gate['name']} observed={gate.get('observed')} "
+                f"expected={gate['expectation']} {gate['effective_threshold']} {gate['unit']}"
+            )
+
+
 def analyze_release_gate(path: Path, limit: int) -> None:
     text = path.read_text(errors="replace")
     started = len(re.findall(r"^     Running .+", text, re.MULTILINE))
@@ -190,12 +214,19 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--line", type=Path, default=Path("target/anvil/perf/anvil.line"))
     parser.add_argument("--summary", type=Path, default=Path("target/anvil/perf/performance-summary.json"))
+    parser.add_argument(
+        "--coremeta-report",
+        type=Path,
+        default=Path("target/anvil/perf/coremeta/quick/report.json"),
+    )
     parser.add_argument("--release-log", type=Path, default=Path("target/anvil/logs/release-gates.log"))
     parser.add_argument("--limit", type=int, default=25)
     args = parser.parse_args()
 
     if args.summary.exists():
         analyze_summary(args.summary)
+    if args.coremeta_report.exists():
+        analyze_coremeta_report(args.coremeta_report)
     if args.line.exists():
         analyze_line_file(args.line, args.limit)
     if args.release_log.exists():

@@ -12,13 +12,10 @@ on:
         type: string
 
 permissions:
-  contents: write
-  packages: write
-  pages: write
-  id-token: write
+  contents: read
 
 concurrency:
-  group: anvil-release-${{ github.ref_name }}
+  group: anvil-release
   cancel-in-progress: false
 
 env:
@@ -28,10 +25,80 @@ env:
   CARGO_TARGET_DIR: /home/github-runner/.cache/anvil/cargo-target
 
 jobs:
+  release-context:
+    name: Resolve immutable release context
+    runs-on: [self-hosted, linux, x64, worka-builder-2]
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      commit: ${{ steps.release.outputs.commit }}
+    steps:
+      - name: Checkout workflow revision
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve and validate release tag
+        id: release
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          tag="$REQUESTED_TAG"
+          if [[ ! "$tag" =~ ^v[0-9A-Za-z][0-9A-Za-z._-]{0,126}$ ]]; then
+            echo "release tag must be a v-prefixed Docker-compatible tag" >&2
+            exit 1
+          fi
+
+          git fetch --force --no-tags origin "refs/tags/${tag}:refs/tags/${tag}"
+          commit="$(git rev-parse --verify "refs/tags/${tag}^{commit}")"
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            event_commit="$(git rev-parse --verify "${GITHUB_SHA}^{commit}")"
+            if [[ "$tag" != "$GITHUB_REF_NAME" || "$commit" != "$event_commit" ]]; then
+              echo "tag-push context does not match resolved release tag" >&2
+              exit 1
+            fi
+          fi
+
+          workspace_version="$(
+            git show "${commit}:Cargo.toml" |
+              python3 -c 'import re, sys; text = sys.stdin.read(); print(re.search(r"(?ms)^\[workspace\.package\].*?^version\s*=\s*\"([^\"]+)\"", text).group(1))'
+          )"
+          if [[ "$tag" != "v${workspace_version}" ]]; then
+            echo "release tag $tag does not match workspace version ${workspace_version}" >&2
+            exit 1
+          fi
+
+          printf 'tag=%s\ncommit=%s\n' "$tag" "$commit" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout resolved release commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.release.outputs.commit }}
+
+      - name: Validate coordinated release metadata
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_COMMIT: ${{ steps.release.outputs.commit }}
+        run: |
+          scripts/render-release-notes.py \
+            --tag "$RELEASE_TAG" \
+            --docker-image "ghcr.io/${GITHUB_REPOSITORY}:${RELEASE_TAG}" \
+            --image-digest "sha256:preflight" \
+            --crate-version "anvil-storage ${RELEASE_TAG#v}" \
+            --commit-sha "$RELEASE_COMMIT" \
+            --docs-url "https://${GITHUB_REPOSITORY_OWNER}.github.io/anvil/" \
+            --output "${{ runner.temp }}/release-notes-preflight.md"
+
   build-image:
     name: Build release image (${{ matrix.platform }})
-    runs-on: [self-hosted, linux, x64]
+    needs: release-context
+    runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 90
+    env:
+      ANVIL_BUILD_IMAGE: anvil:test-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+      ANVIL_INTEGRATION_IMAGE: anvil:test-integration-amd64-${{ github.run_id }}-${{ github.run_attempt }}
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -39,19 +106,13 @@ jobs:
         include:
           - platform: linux/amd64
             arch: amd64
-            image: anvil:test-amd64
             artifact: anvil-test-image-amd64
             native_cargo: "1"
-          - platform: linux/arm64
-            arch: arm64
-            image: anvil:test-arm64
-            artifact: anvil-test-image-arm64
-            native_cargo: "0"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag || github.ref_name }}
+          ref: ${{ needs.release-context.outputs.commit }}
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -69,12 +130,6 @@ jobs:
             protobuf-compiler \
             ripgrep
 
-      - name: Set up QEMU for cross-architecture image smoke checks
-        uses: docker/setup-qemu-action@v3
-
-      - name: Install Zig for release-shaped Rust builds
-        uses: mlugg/setup-zig@v2
-
       - name: Cache Cargo dependencies
         uses: actions/cache@v4
         with:
@@ -89,47 +144,81 @@ jobs:
             ${{ runner.os }}-release-cargo-v2-
             ${{ runner.os }}-cargo-v2-
 
-      - name: Install cargo-zigbuild for release-shaped Rust builds
-        run: |
-          if ! command -v cargo-zigbuild >/dev/null 2>&1; then
-            cargo install cargo-zigbuild --locked
-          fi
-
       - name: Build Docker image from host-built binaries
         env:
-          ANVIL_IMAGE: ${{ matrix.image }}
+          ANVIL_IMAGE: ${{ env.ANVIL_BUILD_IMAGE }}
           ANVIL_DOCKER_PLATFORM: ${{ matrix.platform }}
           ANVIL_BUILD_PROFILE: release
           ANVIL_USE_NATIVE_CARGO: ${{ matrix.native_cargo }}
-          CARGO_BUILD_JOBS: "1"
+          CARGO_BUILD_JOBS: "8"
         run: ./scripts/build-image.sh
 
       - name: Smoke check image binaries
         run: |
-          timeout 30s docker run --platform ${{ matrix.platform }} --rm ${{ matrix.image }} anvil-server --version
-          timeout 30s docker run --platform ${{ matrix.platform }} --rm ${{ matrix.image }} anvil --version
-          timeout 30s docker run --platform ${{ matrix.platform }} --rm ${{ matrix.image }} anvil-admin --version
+          timeout 30s docker run --platform ${{ matrix.platform }} --rm "$ANVIL_BUILD_IMAGE" anvil-server --version
+          timeout 30s docker run --platform ${{ matrix.platform }} --rm "$ANVIL_BUILD_IMAGE" anvil --version
+          timeout 30s docker run --platform ${{ matrix.platform }} --rm "$ANVIL_BUILD_IMAGE" anvil-admin --version
 
       - name: Export Docker image artifact
-        run: docker save ${{ matrix.image }} -o /tmp/${{ matrix.artifact }}.tar
+        run: docker save "$ANVIL_BUILD_IMAGE" -o "${{ runner.temp }}/${{ matrix.artifact }}.tar"
 
       - name: Upload Docker image artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: /tmp/${{ matrix.artifact }}.tar
+          path: ${{ runner.temp }}/${{ matrix.artifact }}.tar
+          if-no-files-found: error
           compression-level: 0
           retention-days: 1
 
+      - name: Build amd64 Docker integration image
+        if: matrix.arch == 'amd64'
+        env:
+          ANVIL_IMAGE: ${{ env.ANVIL_INTEGRATION_IMAGE }}
+          ANVIL_DOCKER_PLATFORM: linux/amd64
+          ANVIL_BUILD_PROFILE: release
+          ANVIL_INCLUDE_TEST_TOOLS: "1"
+          ANVIL_USE_NATIVE_CARGO: "1"
+          CARGO_BUILD_JOBS: "8"
+        run: ./scripts/build-image.sh
+
+      - name: Smoke check Docker integration tooling
+        if: matrix.arch == 'amd64'
+        run: timeout 30s docker run --platform linux/amd64 --rm "$ANVIL_INTEGRATION_IMAGE" ip -Version
+
+      - name: Export Docker integration image artifact
+        if: matrix.arch == 'amd64'
+        run: docker save "$ANVIL_INTEGRATION_IMAGE" -o "${{ runner.temp }}/anvil-integration-image-amd64.tar"
+
+      - name: Upload Docker integration image artifact
+        if: matrix.arch == 'amd64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: anvil-integration-image-amd64
+          path: ${{ runner.temp }}/anvil-integration-image-amd64.tar
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+      - name: Remove local Docker images
+        if: always()
+        run: |
+          for image in "$ANVIL_BUILD_IMAGE" "$ANVIL_INTEGRATION_IMAGE"; do
+            if docker image inspect "$image" >/dev/null 2>&1; then
+              docker image rm "$image" || echo "::warning::Failed to remove $image"
+            fi
+          done
+
   static-and-docs:
     name: Static gates and docs artifact
-    runs-on: [self-hosted, linux, x64]
+    needs: release-context
+    runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 45
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag || github.ref_name }}
+          ref: ${{ needs.release-context.outputs.commit }}
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -176,20 +265,20 @@ jobs:
 
   rust-unit:
     name: Rust unit and client tests
-    needs: [build-image, static-and-docs]
-    runs-on: [self-hosted, linux, x64]
+    needs: [release-context, build-image, static-and-docs]
+    runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 120
     env:
-      CARGO_BUILD_JOBS: "1"
+      CARGO_BUILD_JOBS: "8"
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       ANVIL_GATE_STEP_TIMEOUT_SECONDS: "5400"
-      ANVIL_RUST_TEST_THREADS: "1"
+      ANVIL_RUST_TEST_THREADS: "8"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag || github.ref_name }}
+          ref: ${{ needs.release-context.outputs.commit }}
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -223,21 +312,77 @@ jobs:
       - name: Run Rust unit release gates
         run: ./scripts/release-gates.sh rust
 
-  server-core:
-    name: Server core integration tests
-    needs: rust-unit
-    runs-on: [self-hosted, linux, x64]
-    timeout-minutes: 60
+  coremeta-performance:
+    name: CoreMeta ordered-access release performance gate
+    needs: [release-context, rust-unit]
+    runs-on: [self-hosted, linux, x64, worka-builder-2]
+    timeout-minutes: 180
     env:
-      CARGO_BUILD_JOBS: "1"
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      CARGO_PROFILE_TEST_DEBUG: "0"
-      ANVIL_RUST_TEST_THREADS: "1"
+      CARGO_BUILD_JOBS: "8"
+      ANVIL_MACHINE_CLASS: "worka-builder-2-linux-x64"
+      ANVIL_GATE_STEP_TIMEOUT_SECONDS: "9900"
+      ANVIL_EXPECTED_GIT_COMMIT: ${{ needs.release-context.outputs.commit }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag || github.ref_name }}
+          ref: ${{ needs.release-context.outputs.commit }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            cmake \
+            libclang-dev \
+            pkg-config \
+            libssl-dev \
+            protobuf-compiler
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-release-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-release-cargo-v2-
+            ${{ runner.os }}-cargo-v2-
+
+      - name: Run release CoreMeta performance gate
+        run: ./scripts/release-gates.sh perf-release
+
+      - name: Upload CoreMeta release performance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coremeta-performance-release
+          path: target/anvil/perf/coremeta/release/
+          if-no-files-found: error
+          retention-days: 90
+
+  server-core:
+    name: Server core integration tests
+    needs: [release-context, coremeta-performance]
+    runs-on: [self-hosted, linux, x64, worka-builder-2]
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: "8"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      ANVIL_RUST_TEST_THREADS: "8"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-context.outputs.commit }}
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -276,33 +421,119 @@ jobs:
 
   docker-integration:
     name: Docker integration tests (${{ matrix.group }})
-    needs: [build-image, server-core]
-    runs-on: [self-hosted, linux, x64]
-    timeout-minutes: 10
+    needs: [release-context, build-image, server-core]
+    runs-on: [self-hosted, linux, x64, worka-builder-2]
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: "8"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      # The runner has 16 cores. Shared-cluster tests can fan out while the
+      # test-utils semaphore continues to cap isolated clusters at two.
+      ANVIL_DOCKER_TEST_THREADS: "8"
+      ANVIL_IMAGE: anvil:test-integration-amd64-${{ github.run_id }}-${{ github.run_attempt }}
+      ANVIL_DOCKER_TEST_PROJECT: anvil-release-${{ matrix.group }}-${{ github.run_id }}-${{ github.run_attempt }}
+      ANVIL_GATE_STEP_TIMEOUT_SECONDS: "5400"
     strategy:
       fail-fast: false
       max-parallel: 1
       matrix:
         group: [docker-auth, docker-storage, docker-index, docker-mesh]
     steps:
-      - name: Defer Docker integration gates for 0.3.0
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-context.outputs.commit }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system build dependencies
         run: |
-          echo "::notice title=Docker integration deferred::0.3.0 release is shipping without Docker integration gates; follow-up will restore these tests after release."
-          echo "Deferred group: ${{ matrix.group }}"
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            cmake \
+            libclang-dev \
+            pkg-config \
+            libssl-dev \
+            protobuf-compiler
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-release-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-release-cargo-v2-
+            ${{ runner.os }}-cargo-v2-
+
+      - name: Prebuild Docker integration test binaries
+        run: cargo test --no-run -p anvil-server -p anvil-storage-cli --tests
+
+      - name: Download amd64 Docker integration image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: anvil-integration-image-amd64
+          path: ${{ runner.temp }}/anvil-integration-image-amd64
+
+      - name: Load amd64 Docker integration image
+        run: docker load -i "${{ runner.temp }}/anvil-integration-image-amd64/anvil-integration-image-amd64.tar"
+
+      - name: Run Docker integration release gates
+        run: ./scripts/release-gates.sh ${{ matrix.group }}
+
+      - name: Clean up Docker integration resources
+        if: always()
+        run: ./scripts/release-gates.sh docker-cleanup
 
   publish:
     name: Publish release artifacts
-    needs: [build-image, static-and-docs, rust-unit, server-core, docker-integration]
-    runs-on: [self-hosted, linux, x64]
+    needs: [release-context, build-image, static-and-docs, rust-unit, coremeta-performance, server-core, docker-integration]
+    runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 45
     environment:
       name: github-pages
       url: ${{ steps.docs-deployment.outputs.page_url }}
+    permissions:
+      contents: write
+      packages: write
+      pages: write
+      id-token: write
+    env:
+      ANVIL_AMD64_IMAGE: anvil:test-amd64-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag || github.ref_name }}
+          ref: ${{ needs.release-context.outputs.commit }}
+
+      - name: Verify release tag is still pinned
+        env:
+          RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.release-context.outputs.commit }}
+        run: |
+          git fetch --force --no-tags origin \
+            "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          actual_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
+          if [[ "$actual_commit" != "$RELEASE_COMMIT" ]]; then
+            echo "release tag moved after validation" >&2
+            exit 1
+          fi
+
+      - name: Require publishing credentials
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
+            echo "CARGO_REGISTRY_TOKEN is required to publish anvil-storage" >&2
+            exit 1
+          fi
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -320,32 +551,14 @@ jobs:
             ${{ runner.os }}-release-cargo-v2-
             ${{ runner.os }}-cargo-v2-
 
-      - name: Determine release tag
-        id: release-tag
-        shell: bash
-        run: |
-          if [[ -n "${{ github.event.inputs.tag || '' }}" ]]; then
-            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Download amd64 Docker image artifact
         uses: actions/download-artifact@v4
         with:
           name: anvil-test-image-amd64
-          path: /tmp/anvil-image-amd64
-
-      - name: Download arm64 Docker image artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: anvil-test-image-arm64
-          path: /tmp/anvil-image-arm64
+          path: ${{ runner.temp }}/anvil-image-amd64
 
       - name: Load tested Docker image artifacts
-        run: |
-          docker load -i /tmp/anvil-image-amd64/anvil-test-image-amd64.tar
-          docker load -i /tmp/anvil-image-arm64/anvil-test-image-arm64.tar
+        run: docker load -i "${{ runner.temp }}/anvil-image-amd64/anvil-test-image-amd64.tar"
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
@@ -364,24 +577,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Push tested multi-arch Docker image
+      - name: Push tested amd64 Docker image
         id: docker-push
         shell: bash
         run: |
-          tag="${{ steps.release-tag.outputs.tag }}"
+          tag="${{ needs.release-context.outputs.tag }}"
           repo="ghcr.io/${{ github.repository }}"
           image="${repo}:${tag}"
           amd64_image="${repo}:${tag}-amd64"
-          arm64_image="${repo}:${tag}-arm64"
-          docker tag anvil:test-amd64 "$amd64_image"
-          docker tag anvil:test-arm64 "$arm64_image"
+          docker tag "$ANVIL_AMD64_IMAGE" "$amd64_image"
+          docker tag "$ANVIL_AMD64_IMAGE" "$image"
+          docker tag "$ANVIL_AMD64_IMAGE" "${repo}:latest"
           docker push "$amd64_image"
-          docker push "$arm64_image"
-          docker buildx imagetools create \
-            -t "$image" \
-            -t "${repo}:latest" \
-            "$amd64_image" \
-            "$arm64_image"
+          docker push "$image"
+          docker push "${repo}:latest"
           digest="$(docker buildx imagetools inspect "$image" --format '{{.Manifest.Digest}}')"
           if [[ -z "$digest" || "$digest" != sha256:* ]]; then
             echo "failed to resolve published image digest for $image" >&2
@@ -409,17 +618,32 @@ jobs:
       - name: Render release notes from blog post
         run: |
           scripts/render-release-notes.py \
-            --tag "${{ steps.release-tag.outputs.tag }}" \
+            --tag "${{ needs.release-context.outputs.tag }}" \
             --docker-image "${{ steps.docker-push.outputs.image }}" \
             --image-digest "${{ steps.docker-push.outputs.digest }}" \
             --crate-version "anvil-storage $(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="anvil-storage") | .version')" \
-            --commit-sha "$(git rev-parse HEAD)" \
+            --commit-sha "${{ needs.release-context.outputs.commit }}" \
             --docs-url "https://${{ github.repository_owner }}.github.io/anvil/" \
             --output release-notes.md
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.release-tag.outputs.tag }}
+          tag_name: ${{ needs.release-context.outputs.tag }}
           body_path: release-notes.md
           make_latest: true
+
+      - name: Remove local Docker images
+        if: always()
+        run: |
+          tag="${{ needs.release-context.outputs.tag }}"
+          repo="ghcr.io/${{ github.repository }}"
+          for image in \
+            "$ANVIL_AMD64_IMAGE" \
+            "${repo}:${tag}" \
+            "${repo}:${tag}-amd64" \
+            "${repo}:latest"; do
+            if docker image inspect "$image" >/dev/null 2>&1; then
+              docker image rm "$image" || echo "::warning::Failed to remove $image"
+            fi
+          done

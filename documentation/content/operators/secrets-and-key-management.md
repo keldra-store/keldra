@@ -20,7 +20,8 @@ Operators should be able to name every secret in a running deployment and answer
 | `ANVIL_SECRET_ENCRYPTION_KEY_ID` | Anvil server configuration and operator records | Labels new encrypted envelopes; changing it without changing the key mostly changes metadata, but it must remain consistent and meaningful. |
 | `ANVIL_SECRET_ENCRYPTION_PREVIOUS_KEYS` | Anvil server processes during rotation | Allows old envelopes to decrypt while rotation rewrites them to the active key id. |
 | Purpose-scoped PersonalDB Ed25519 key | The in-process PersonalDB signing provider | Signs one allowed class of PersonalDB control evidence. Private material is held in encrypted System Realm records and is never returned by the admin plane. Loss prevents new signatures for the affected scope; leakage can forge evidence within that key's purpose, generation, scope, and log boundaries. |
-| `CLUSTER_SECRET` | Anvil server processes in the same mesh | Protects cluster gossip metadata; a mismatch can make peers reject each other's signed cluster messages. |
+| `CORESTORE_INTERNAL_BEARER_TOKEN` | One Anvil node process | Authenticates that node's calls to internal gRPC services. A missing or invalid credential makes remote writes, quorum, proxying, and recovery fail closed. |
+| Local node Ed25519 signing key | One Anvil node's local CoreMeta store | Signs storage receipts and evidence. The private key remains in that node's `STORAGE_PATH`; its public key is committed in the lifecycle descriptor. |
 | Bootstrap first-admin credential | Initial system administrators or provisioning automation | Can mint a token for a powerful system principal until rotated, deleted, or access is otherwise removed. |
 | Tenant/app client secrets | The service or automation that owns the app credential | Can mint short-lived bearer tokens with that app's delegated public policy scopes. |
 | Bearer tokens | Processes making API calls | Authorise one caller for a short period; current tokens are minted with a one-hour expiry. |
@@ -181,13 +182,15 @@ The current server rotates application secret envelopes and configured integrati
 
 If the old key leaked, shorten the overlap window. If the old key was lost before records were rotated, encrypted records that still require it may be unrecoverable from backup. That is why key history is part of the backup boundary.
 
-## `CLUSTER_SECRET`: Node-To-Node Trust
+## Internal Node Credentials And Signing Identity
 
-The current server environment variable is `CLUSTER_SECRET`; older snippets that use a different cluster-secret env name are stale. It is the shared secret used to sign and verify cluster gossip metadata between Anvil nodes. If it is absent, the current code can run without this shared-secret verification path, but production deployments should configure it and keep cluster traffic on private networks.
+Nodes communicate through authenticated gRPC at the `public_api_addr` committed in CoreMeta lifecycle topology. `CORESTORE_INTERNAL_BEARER_TOKEN` is the credential one node presents when it calls another node's internal CoreStore, proxy, quorum, or recovery services. It must identify a node principal with the built-in system-realm relation for internal RPCs. Tenant and ordinary operator credentials must not be reused for this purpose.
 
-The blast radius is mesh coordination, peer metadata, and routing freshness rather than direct tenant API credentials. If two nodes use different cluster secrets, signed cluster messages can be rejected and the mesh may look split or stale even though each process still answers local requests. If the secret leaks, rotate it with a planned rolling deployment that keeps peer compatibility in mind for the version you operate. Also check network policy; a cluster secret is not a substitute for private node-to-node reachability.
+This credential is per node, not a mesh-wide shared secret. Provision it through the same protected credential workflow used for other service principals, keep it out of logs and images, and rotate one node deliberately. An empty value disables remote internal writes; distributed work fails instead of silently degrading to local-only storage.
 
-Do not confuse `CLUSTER_SECRET` with the persisted libp2p cluster keypair. The cluster keypair defaults to an operator identity directory beside `STORAGE_PATH`, not below it; it is part of stable node identity. `CLUSTER_SECRET` is configuration supplied to server processes.
+Each node also has a durable Ed25519 receipt-signing identity. Anvil generates the private key and stores it as node-local CoreMeta inside that node's `STORAGE_PATH`. The corresponding 32-byte public key is committed in the lifecycle descriptor beside the node id and `public_api_addr`. Remote nodes verify signed evidence against that committed key. The private key is neither shared nor supplied as an environment variable.
+
+Restoring the same node means restoring its volume and therefore its node id and signing key. Replacing a node means registering a new identity and public key through lifecycle control. Do not copy one live node's volume to another live process or edit descriptors to paper over an identity mismatch.
 
 ## Bootstrap First-Admin Credential
 
@@ -239,9 +242,9 @@ If an operator script needs direct storage access to rotate a secret, it is bypa
 
 Generate server-side encryption keys with the helper, store all server secrets in a secret manager, and keep key ids tied to calendar or release events. Inject secrets into containers or pods at runtime; do not bake them into images. Keep the admin API private, and keep the network admin CLI away from server key material.
 
-Rotate when a secret leaks, when staff or automation with access leaves the trust boundary, before old key history becomes too large, or as part of scheduled security maintenance. For `ANVIL_SECRET_ENCRYPTION_KEY`, rotate with previous keys configured and verify the admin rotation response before removing old keys. For `JWT_SECRET` and `CLUSTER_SECRET`, plan coordinated node rollout because there is no current documented multi-key overlap workflow equivalent to envelope rotation. For app credentials, rotate the specific app and update only the service that owns it.
+Rotate when a secret leaks, when staff or automation with access leaves the trust boundary, before old key history becomes too large, or as part of scheduled security maintenance. For `ANVIL_SECRET_ENCRYPTION_KEY`, rotate with previous keys configured and verify the admin rotation response before removing old keys. For `JWT_SECRET`, plan a coordinated node rollout because there is no current documented multi-key overlap workflow equivalent to envelope rotation. Rotate each internal node credential independently and verify authenticated distributed operations before retiring its predecessor. For app credentials, rotate the specific app and update only the service that owns it.
 
-Finally, test recovery. A restore drill should prove that Anvil can start with restored `STORAGE_PATH`, the active and previous encryption keys needed for that backup, the expected JWT and cluster secret configuration, and at least one authorised admin credential. A backup that cannot decrypt app secrets or cannot authenticate an operator is not a complete recovery plan.
+Finally, test recovery. A restore drill should prove that Anvil can start with restored `STORAGE_PATH`, the active and previous encryption keys needed for that backup, the expected JWT configuration, the restored local node identity and signing key, and at least one authorised admin credential. A distributed drill must also prove that each restored node can authenticate to internal gRPC and that its local descriptor matches committed topology. A backup that cannot decrypt app secrets or authenticate an operator is not a complete recovery plan.
 
 ## Rotation evidence
 

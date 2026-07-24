@@ -9,6 +9,13 @@ use crate::formats::{
 };
 use futures_util::{StreamExt, stream::FuturesUnordered};
 
+struct PreparedInlineBlob {
+    object_ref: CoreObjectRef,
+    mutation_id: String,
+    operations: Vec<OwnedCoreMetaBatchOp>,
+    publication: CoreMetaRootPublication,
+}
+
 fn core_store_instance_registry_key(storage: &Storage) -> PathBuf {
     storage.core_store_root_path()
 }
@@ -18,17 +25,26 @@ impl CoreStore {
         if let Some(store) = Self::registered_for_storage(&storage) {
             return Ok(store);
         }
-        Self::new_with_optional_pipeline_keyring(storage, None).await
+        Self::initialise_registered_store(
+            storage,
+            None,
+            CoreStoreNodeIdentity::default(),
+            false,
+            CoreStoreStartupRecovery::Immediate,
+        )
+        .await
     }
 
     pub async fn new_with_pipeline_keyring(
         storage: Storage,
         pipeline_keyring: CorePipelineKeyring,
     ) -> Result<Self> {
-        Self::new_with_optional_pipeline_keyring_and_identity(
+        Self::initialise_registered_store(
             storage,
             Some(Arc::new(pipeline_keyring)),
             CoreStoreNodeIdentity::default(),
+            true,
+            CoreStoreStartupRecovery::Immediate,
         )
         .await
     }
@@ -37,58 +53,100 @@ impl CoreStore {
         storage: Storage,
         pipeline_keyring: CorePipelineKeyring,
         node_identity: CoreStoreNodeIdentity,
+        startup_recovery: CoreStoreStartupRecovery,
     ) -> Result<Self> {
-        Self::new_with_optional_pipeline_keyring_and_identity(
+        Self::initialise_registered_store(
             storage,
             Some(Arc::new(pipeline_keyring)),
             node_identity,
+            true,
+            startup_recovery,
         )
         .await
     }
 
-    pub(super) async fn new_with_optional_pipeline_keyring(
-        storage: Storage,
-        pipeline_keyring: Option<Arc<CorePipelineKeyring>>,
-    ) -> Result<Self> {
-        Self::new_with_optional_pipeline_keyring_and_identity(
-            storage,
-            pipeline_keyring,
-            CoreStoreNodeIdentity::default(),
-        )
-        .await
-    }
-
-    pub(super) async fn new_with_optional_pipeline_keyring_and_identity(
+    async fn initialise_registered_store(
         storage: Storage,
         pipeline_keyring: Option<Arc<CorePipelineKeyring>>,
         node_identity: CoreStoreNodeIdentity,
+        require_matching_configuration: bool,
+        startup_recovery: CoreStoreStartupRecovery,
     ) -> Result<Self> {
-        clear_stale_process_locks_once(&storage)?;
+        // Only one constructor may recover and publish a process-local store for
+        // a storage root. Without the second registry check, concurrent callers
+        // could replay a live admitted mutation while the first instance was
+        // finalising it.
+        let startup_recovery_lock = startup_recovery_lock(storage.core_store_root_path());
+        let startup_guard = startup_recovery_lock.lock().await;
+        if let Some(store) = Self::registered_for_storage(&storage) {
+            if require_matching_configuration
+                && (store.pipeline_keyring != pipeline_keyring
+                    || store.node_identity != node_identity)
+            {
+                bail!("CoreStore is already open with different process configuration");
+            }
+            return Ok(store);
+        }
+
         let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
+        // Node signing identity is needed to verify publication evidence before
+        // a visibility-aware CoreStore instance can finish initialising.
         let node_signing_keypair = Arc::new(load_or_create_node_signing_keypair(&meta)?);
+        let receipt_signing_public_key = node_signing_keypair.public_key_bytes().to_vec();
+        let admission_mutation_epoch = node_admission_mutation_epoch(&receipt_signing_public_key);
         store_node_receipt_signing_public_key(
             &meta,
             &node_identity.node_id,
-            &node_signing_keypair.public().encode_protobuf(),
+            &receipt_signing_public_key,
         )?;
-        let write_lock = process_write_lock(storage.core_store_root_path());
+        // Before a mesh exists, the local quorum models control replicas with
+        // synthetic identities. Their public verification keys are portable
+        // bootstrap evidence, even though their private key is node-local. A
+        // portable bootstrap can already bind them to the signer that produced
+        // historical evidence, so startup must not replace that identity.
+        for replica_node_id in local_control_node_ids() {
+            seed_node_receipt_signing_public_key_if_absent(
+                &meta,
+                &replica_node_id,
+                &receipt_signing_public_key,
+            )?;
+        }
         let storage_classes = CoreStorageClassCatalog::release_defaults();
-        let store = Self {
+        let mut store = Self {
             storage,
             meta,
-            write_lock,
+            startup_recovery_lock: startup_recovery_lock.clone(),
             internal_channels: Arc::new(Mutex::new(BTreeMap::new())),
             coremeta_streams: Arc::new(Mutex::new(BTreeMap::new())),
+            coremeta_recovery: Arc::new(
+                super::local_coremeta_recovery::CoreMetaRecoveryState::default(),
+            ),
+            root_owner_failure_tracker: Arc::new(Mutex::new(
+                super::local_root_failover::RootOwnerFailureTracker::default(),
+            )),
+            repair_task_scheduler: Arc::new(OnceLock::new()),
             pipeline_keyring,
             storage_classes,
             node_signing_keypair,
+            admission_mutation_epoch,
             node_identity,
+            startup_recovery_deferred: false,
         };
         store.ensure_layout().await?;
         store.bootstrap_system_root_anchor().await?;
-        store.recover_pending_mutations().await?;
+        store.startup_recovery_deferred = startup_recovery == CoreStoreStartupRecovery::Distributed
+            && (store.has_owned_pending_root_publication_intents()?
+                || store.has_pending_mutations()?);
+        if !store.startup_recovery_deferred {
+            store.recover_root_publication_intents().await?;
+            store.recover_pending_mutations(&startup_guard).await?;
+        }
         store.register_process_instance();
         Ok(store)
+    }
+
+    pub fn startup_recovery_deferred(&self) -> bool {
+        self.startup_recovery_deferred
     }
 
     pub fn storage(&self) -> &Storage {
@@ -119,14 +177,14 @@ impl CoreStore {
         }
     }
 
-    pub fn local_receipt_signing_public_key_proto(&self) -> Vec<u8> {
-        self.node_signing_keypair.public().encode_protobuf()
+    pub fn local_receipt_signing_public_key(&self) -> Vec<u8> {
+        self.node_signing_keypair.public_key_bytes().to_vec()
     }
 
     pub(super) fn sign_core_receipt(&self, signed_payload_hash: &str) -> Result<Vec<u8>> {
-        self.node_signing_keypair
-            .sign(signed_payload_hash.as_bytes())
-            .map_err(|error| anyhow!("sign CoreStore shard receipt: {error}"))
+        Ok(self
+            .node_signing_keypair
+            .sign(signed_payload_hash.as_bytes()))
     }
 
     pub(super) fn verify_core_receipt_signature(
@@ -137,16 +195,19 @@ impl CoreStore {
     ) -> Result<()> {
         let public_key = if is_local_shard_node_id(node_id) || node_id == self.node_identity.node_id
         {
-            self.node_signing_keypair.public()
+            self.node_signing_keypair.public_key()
         } else {
+            // Receipt identity is required during startup and recovery before
+            // the corresponding mesh root can be publication-visible.
             load_node_receipt_signing_public_key(&self.meta, node_id)?.ok_or_else(|| {
                 anyhow!("CoreStore shard receipt references unknown node {node_id}")
             })?
         };
-        if !public_key.verify(signed_payload_hash.as_bytes(), receipt_signature) {
-            bail!("CoreStore shard receipt signature verification failed for node {node_id}");
-        }
-        Ok(())
+        public_key
+            .verify(signed_payload_hash.as_bytes(), receipt_signature)
+            .with_context(|| {
+                format!("CoreStore shard receipt signature verification failed for node {node_id}")
+            })
     }
 
     pub(super) fn verify_core_admission_signature(
@@ -155,19 +216,17 @@ impl CoreStore {
         signed_payload_hash: &str,
         receipt_signature: &[u8],
     ) -> Result<()> {
-        if node_id != CORE_PENDING_MUTATION_NODE_ID {
+        if node_id != self.node_identity.node_id {
             bail!("CoreStore admission receipt references unknown source node {node_id}");
         }
-        if !self
-            .node_signing_keypair
-            .public()
+        self.node_signing_keypair
+            .public_key()
             .verify(signed_payload_hash.as_bytes(), receipt_signature)
-        {
-            bail!(
-                "CoreStore admission receipt signature verification failed for source node {node_id}"
-            );
-        }
-        Ok(())
+            .with_context(|| {
+                format!(
+                    "CoreStore admission receipt signature verification failed for source node {node_id}"
+                )
+            })
     }
 
     pub(super) fn verify_object_placement_receipt(
@@ -264,6 +323,52 @@ impl CoreStore {
         .await
     }
 
+    pub async fn put_blobs_with_storage_classes(
+        &self,
+        inputs: Vec<(PutBlob, Option<String>)>,
+    ) -> Result<Vec<CoreObjectRef>> {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let all_inline = inputs.iter().all(|(input, storage_class_id)| {
+            self.select_storage_class(storage_class_id.as_deref())
+                .is_ok_and(|storage_class| {
+                    let policy = &storage_class.inline_payload_policy;
+                    policy.enabled
+                        && input.bytes.len() <= policy.effective_raw_payload_cap_bytes() as usize
+                })
+        });
+        let payloads_are_unique = inputs
+            .iter()
+            .map(|(input, _)| sha256_hex(&input.bytes))
+            .collect::<BTreeSet<_>>()
+            .len()
+            == inputs.len();
+
+        if all_inline && payloads_are_unique {
+            let mut prepared = Vec::with_capacity(inputs.len());
+            for (input, storage_class_id) in inputs {
+                let storage_class = self.select_storage_class(storage_class_id.as_deref())?;
+                prepared.push(self.prepare_inline_blob(
+                    input,
+                    WriterFamily::ObjectBlob.as_str(),
+                    storage_class.inline_payload_policy.clone(),
+                )?);
+            }
+            return self.commit_prepared_inline_blobs(prepared).await;
+        }
+
+        let mut objects = Vec::with_capacity(inputs.len());
+        for (input, storage_class_id) in inputs {
+            objects.push(
+                self.put_blob_with_storage_class(input, storage_class_id.as_deref())
+                    .await?,
+            );
+        }
+        Ok(objects)
+    }
+
     pub(crate) async fn put_format_blob(
         &self,
         input: PutBlob,
@@ -300,6 +405,7 @@ impl CoreStore {
         &self,
         request: &WriteLogicalFileRequest,
         block_index: usize,
+        logical_offset: u64,
         bytes: Vec<u8>,
         block_plain_hash: String,
         encryption_algorithm: String,
@@ -327,8 +433,8 @@ impl CoreStore {
         let stored_hash = format!("sha256:{}", sha256_hex(&input.bytes));
         let stored_len = input.bytes.len() as u64;
         let compression = none_compression_descriptor(&input.bytes);
-        let admission = self
-            .admit_core_mutation(
+        let admission = match self
+            .admit_core_mutation_outcome(
                 "object.put",
                 &request.writer_family,
                 CorePendingMutationTarget::ObjectPut {
@@ -342,6 +448,7 @@ impl CoreStore {
                     compression: compression.clone(),
                     writer_generation: request.generation,
                     block_ordinal: block_index as u64,
+                    logical_offset,
                 },
                 input.mutation_id.clone(),
                 None,
@@ -354,7 +461,13 @@ impl CoreStore {
                     "admit CoreStore logical-file block mutation logical_file_id={} block_index={} mutation_id={}",
                     request.logical_file_id, block_index, input.mutation_id
                 )
-            })?;
+            })?
+        {
+            CoreAdmissionOutcome::Pending(admission) => admission,
+            CoreAdmissionOutcome::Finalised(finalisation) => {
+                return self.finalised_object_put_result(finalisation).await;
+            }
+        };
         let landed =
             admission.landed_bytes.first().cloned().ok_or_else(|| {
                 anyhow!("CoreStore put_blob admission did not produce landed bytes")
@@ -366,6 +479,7 @@ impl CoreStore {
                 &input.logical_name,
                 request.generation,
                 block_index as u64,
+                logical_offset,
                 &block_plain_hash,
                 &hash,
                 &materialised_bytes,
@@ -404,7 +518,13 @@ impl CoreStore {
                 return Err(error);
             }
         };
-        self.mark_pending_mutation_finalised_unlocked(&admission, "committed")
+        self.mark_pending_mutation_finalised_with_result_unlocked(
+            &admission,
+            "committed",
+            Some(CorePendingMutationFinalisationResult::ObjectRef(
+                object_ref.clone(),
+            )),
+        )
             .await
             .with_context(|| {
                 format!(
@@ -490,8 +610,8 @@ impl CoreStore {
         } else {
             canonical_logical_file_id(writer, 0, &input.logical_name, &hash32(&stored_bytes))
         };
-        let admission = self
-            .admit_core_mutation(
+        let admission = match self
+            .admit_core_mutation_outcome(
                 "object.put",
                 writer_family,
                 CorePendingMutationTarget::ObjectPut {
@@ -505,13 +625,20 @@ impl CoreStore {
                     compression: compression.clone(),
                     writer_generation: 0_u64,
                     block_ordinal: 0_u64,
+                    logical_offset: 0,
                 },
                 input.mutation_id.clone(),
                 None,
                 CorePendingMutationPayload::Landed(&stored_bytes),
                 input.boundary_values,
             )
-            .await?;
+            .await?
+        {
+            CoreAdmissionOutcome::Pending(admission) => admission,
+            CoreAdmissionOutcome::Finalised(finalisation) => {
+                return self.finalised_object_put_result(finalisation).await;
+            }
+        };
         let landed =
             admission.landed_bytes.first().cloned().ok_or_else(|| {
                 anyhow!("CoreStore put_blob admission did not produce landed bytes")
@@ -524,6 +651,7 @@ impl CoreStore {
             let stored_hash_hex = strip_sha256_prefix(&landed.sha256)?.to_string();
             self.materialise_object_blob_bytes(
                 &logical_file_id,
+                0,
                 0,
                 0,
                 &logical_hash,
@@ -558,9 +686,63 @@ impl CoreStore {
                 return Err(error);
             }
         };
-        self.mark_pending_mutation_finalised_unlocked(&admission, "committed")
-            .await?;
+        self.mark_pending_mutation_finalised_with_result_unlocked(
+            &admission,
+            "committed",
+            Some(CorePendingMutationFinalisationResult::ObjectRef(
+                object_ref.clone(),
+            )),
+        )
+        .await?;
         Ok(object_ref)
+    }
+
+    async fn finalised_object_put_result(
+        &self,
+        finalisation: CorePendingMutationFinalisationRecord,
+    ) -> Result<CoreObjectRef> {
+        if finalisation.state != "committed" || finalisation.operation_family != "object.put" {
+            bail!(
+                "CoreStore object mutation {} was finalised in state {}",
+                finalisation.mutation_id,
+                finalisation.state
+            );
+        }
+        let CorePendingMutationTarget::ObjectPut {
+            logical_name,
+            region_id,
+            erasure_profile_id,
+            encryption,
+            object_hash,
+            object_logical_size,
+            compression,
+            logical_offset,
+            ..
+        } = &finalisation.target
+        else {
+            bail!("CoreStore finalised object mutation has a non-object target");
+        };
+        let Some(CorePendingMutationFinalisationResult::ObjectRef(object_ref)) =
+            finalisation.result.as_ref()
+        else {
+            bail!("CoreStore committed object mutation has no object result");
+        };
+        let manifest = self.read_object_manifest(&object_ref).await?;
+        if manifest.mutation_id != finalisation.mutation_id
+            || manifest.logical_file_id != *logical_name
+            || manifest.region_id != *region_id
+            || manifest.writer_family != finalisation.writer_family
+            || manifest.object_hash != *object_hash
+            || manifest.logical_size != *object_logical_size
+            || manifest.logical_offset != *logical_offset
+            || manifest.encryption_algorithm != *encryption
+            || manifest.encoding.profile_id != *erasure_profile_id
+            || manifest.encoding.compression != *compression
+            || manifest.boundary_values != finalisation.boundary_values
+        {
+            bail!("CoreStore finalised object result does not match its admitted mutation");
+        }
+        Ok(object_ref.clone())
     }
 
     pub(crate) async fn put_inline_blob(
@@ -569,6 +751,26 @@ impl CoreStore {
         writer_family: &str,
         inline_policy: CoreInlinePayloadPolicy,
     ) -> Result<CoreObjectRef> {
+        let prepared = self.prepare_inline_blob(input, writer_family, inline_policy)?;
+        let mutation_id = prepared.mutation_id.clone();
+        let operations = borrow_owned_coremeta_batch_ops(&prepared.operations);
+        self.commit_coremeta_root_groups(
+            &mutation_id,
+            &operations,
+            std::slice::from_ref(&prepared.publication),
+        )
+        .await?;
+        self.read_inline_blob(&prepared.object_ref)?;
+        record_corestore_trace_event("byte_pipeline.inline_payload", "ok");
+        Ok(prepared.object_ref)
+    }
+
+    fn prepare_inline_blob(
+        &self,
+        input: PutBlob,
+        writer_family: &str,
+        inline_policy: CoreInlinePayloadPolicy,
+    ) -> Result<PreparedInlineBlob> {
         inline_policy.validate()?;
         let raw_cap =
             (inline_policy.max_raw_payload_bytes as usize).min(CORE_META_MAX_INLINE_PAYLOAD_BYTES);
@@ -581,6 +783,13 @@ impl CoreStore {
         }
         validate_logical_id(&input.logical_name, "inline blob logical name")?;
         validate_writer_family(writer_family, "inline blob writer family")?;
+        let writer = WriterFamily::from_name(writer_family)
+            .ok_or_else(|| anyhow!("CoreStore writer family is not registered"))?;
+        let logical_file_id = if is_canonical_logical_file_id(&input.logical_name) {
+            input.logical_name.clone()
+        } else {
+            canonical_logical_file_id(writer, 0, &input.logical_name, &hash32(&input.bytes))
+        };
         let hash = format!("sha256:{}", sha256_hex(&input.bytes));
         let hash_hex = strip_sha256_prefix(&hash)?;
         let block_id = local_inline_payload_block_id(hash_hex);
@@ -613,6 +822,10 @@ impl CoreStore {
             region_id: input.region_id,
             object_hash: hash,
             logical_size: input.bytes.len() as u64,
+            logical_file_id,
+            logical_offset: 0,
+            writer_family: writer_family.to_string(),
+            encryption_algorithm: "none".to_string(),
             boundary_values: input.boundary_values,
             encoding: object_ref.encoding.clone(),
             placements: Vec::new(),
@@ -621,9 +834,10 @@ impl CoreStore {
         };
         let inline_key = inline_payload_meta_key(&object_ref);
         let manifest_key = object_manifest_meta_key(&object_ref);
+        let root_anchor_key = object_manifest_root_anchor_key(&manifest.object_hash);
         let common = core_meta_committed_row_common(
             format!("mesh/{}/region/{}", manifest.mesh_id, manifest.region_id),
-            core_meta_root_key_hash(&format!("object-manifest/{}", manifest.object_hash)),
+            core_meta_root_key_hash(&root_anchor_key),
             object_manifest_root_generation(manifest.logical_size),
             manifest.mutation_id.clone(),
             unix_timestamp_nanos(),
@@ -637,29 +851,58 @@ impl CoreStore {
             );
         }
         let manifest_payload = encode_object_manifest_record(&manifest)?;
-        self.commit_coremeta_batch_by_embedded_roots(
-            &manifest.mutation_id,
-            &[
-                CoreMetaBatchOp {
+        Ok(PreparedInlineBlob {
+            object_ref,
+            mutation_id: manifest.mutation_id,
+            operations: vec![
+                OwnedCoreMetaBatchOp::Put {
                     cf: CF_INLINE_PAYLOADS,
                     table_id: TABLE_INLINE_PAYLOAD_ROW,
-                    tuple_key: &inline_key,
+                    tuple_key: inline_key,
                     common: Some(common),
-                    kind: CoreMetaBatchOpKind::Put(&inline_payload),
+                    payload: inline_payload,
                 },
-                CoreMetaBatchOp {
+                OwnedCoreMetaBatchOp::Put {
                     cf: CF_OBJECT_VERSIONS,
                     table_id: TABLE_OBJECT_VERSION_META_ROW,
-                    tuple_key: &manifest_key,
+                    tuple_key: manifest_key,
                     common: None,
-                    kind: CoreMetaBatchOpKind::Put(&manifest_payload),
+                    payload: manifest_payload,
                 },
             ],
-        )
-        .await?;
-        self.read_inline_blob(&object_ref)?;
-        record_corestore_trace_event("byte_pipeline.inline_payload", "ok");
-        Ok(object_ref)
+            publication: CoreMetaRootPublication::new(root_anchor_key, WriterFamily::ObjectBlob),
+        })
+    }
+
+    async fn commit_prepared_inline_blobs(
+        &self,
+        prepared: Vec<PreparedInlineBlob>,
+    ) -> Result<Vec<CoreObjectRef>> {
+        let mut transaction_hasher = blake3::Hasher::new();
+        let mut operations = Vec::with_capacity(prepared.len() * 2);
+        let mut publications = Vec::with_capacity(prepared.len());
+        let mut object_refs = Vec::with_capacity(prepared.len());
+        for blob in prepared {
+            transaction_hasher.update(blob.mutation_id.as_bytes());
+            operations.extend(blob.operations);
+            publications.push(blob.publication);
+            object_refs.push(blob.object_ref);
+        }
+        if publications.len() > 1 {
+            publications[0].transaction_coordinator = true;
+        }
+        let transaction_id = format!(
+            "inline-blob-batch:{}",
+            transaction_hasher.finalize().to_hex()
+        );
+        let operations = borrow_owned_coremeta_batch_ops(&operations);
+        self.commit_coremeta_root_groups(&transaction_id, &operations, &publications)
+            .await?;
+        for object_ref in &object_refs {
+            self.read_inline_blob(object_ref)?;
+        }
+        record_corestore_trace_event("byte_pipeline.inline_payload_batch", "ok");
+        Ok(object_refs)
     }
 
     pub(super) async fn materialise_object_blob_bytes(
@@ -667,6 +910,7 @@ impl CoreStore {
         logical_file_id: &str,
         writer_generation: u64,
         block_ordinal: u64,
+        logical_offset: u64,
         block_plain_hash: &str,
         stored_hash: &str,
         materialised_bytes: &[u8],
@@ -727,13 +971,13 @@ impl CoreStore {
         let block_id_ref = block_id.as_str();
         let boundary_summary_hash_ref = boundary_summary_hash.as_str();
         let boundary_values_b64_ref = boundary_values_b64.as_str();
+        let compression_algorithm = compression.algorithm.as_str();
         let mut shard_writes = FuturesUnordered::new();
         for (shard_index, shard) in shards.iter().enumerate() {
             let placement = placements.get(shard_index).ok_or_else(|| {
                 anyhow!("CoreStore missing local placement for shard {shard_index}")
             })?;
             let shard_hash = format!("sha256:{}", sha256_hex(shard));
-            let logical_offset = shard_index as u64 * shard.len() as u64;
             shard_writes.push(async move {
                 let written = self
                     .write_shard_to_placement(WriteShardToPlacement {
@@ -748,6 +992,7 @@ impl CoreStore {
                     boundary_summary_hash: boundary_summary_hash_ref,
                     boundary_values_b64: boundary_values_b64_ref,
                     mutation_id,
+                    compression_algorithm,
                     encryption_algorithm,
                     writer_family,
                 })
@@ -762,10 +1007,32 @@ impl CoreStore {
             });
         }
         let mut object_placements = Vec::with_capacity(shards.len());
+        let mut unavailable_shards = Vec::new();
+        let mut non_availability_failure = None;
         while let Some(result) = shard_writes.next().await {
-            object_placements.push(result?);
+            match result {
+                Ok(placement) => object_placements.push(placement),
+                Err(error) if is_core_store_unavailable(&error) => {
+                    unavailable_shards.push(format!("{error:#}"));
+                }
+                Err(error) => {
+                    non_availability_failure.get_or_insert(error);
+                }
+            }
         }
         drop(shard_writes);
+        if let Some(error) = non_availability_failure {
+            return Err(error);
+        }
+        if object_placements.len() < profile.minimum_write_ack_shards {
+            return Err(CoreStoreAvailabilityError::ShardQuorumUnavailable {
+                operation: "object_write",
+                required: profile.minimum_write_ack_shards,
+                received: object_placements.len(),
+                details: unavailable_shards.join("; "),
+            }
+            .into());
+        }
         object_placements.sort_by_key(|placement| placement.shard_index);
 
         let object_ref = CoreObjectRef {
@@ -797,6 +1064,10 @@ impl CoreStore {
             region_id: self.node_identity.region_id.clone(),
             object_hash: object_ref.hash.clone(),
             logical_size: object_ref.logical_size,
+            logical_file_id: logical_file_id.to_string(),
+            logical_offset,
+            writer_family: writer_family.to_string(),
+            encryption_algorithm: encryption_algorithm.to_string(),
             boundary_values: boundary_values.to_vec(),
             encoding: object_ref.encoding.clone(),
             placements: object_ref.placements.clone(),
@@ -805,7 +1076,7 @@ impl CoreStore {
         };
         let manifest_key = object_manifest_meta_key(&object_ref);
         let manifest_payload = encode_object_manifest_record(&manifest)?;
-        self.commit_coremeta_batch_by_embedded_roots(
+        self.commit_coremeta_root_groups(
             mutation_id,
             &[CoreMetaBatchOp {
                 cf: CF_OBJECT_VERSIONS,
@@ -814,6 +1085,10 @@ impl CoreStore {
                 common: None,
                 kind: CoreMetaBatchOpKind::Put(&manifest_payload),
             }],
+            &[CoreMetaRootPublication::new(
+                object_manifest_root_anchor_key(&manifest.object_hash),
+                WriterFamily::ObjectBlob,
+            )],
         )
         .await?;
         Ok(object_ref)
@@ -976,6 +1251,7 @@ impl CoreStore {
                 .put_logical_file_block_with_profile(
                     request,
                     index,
+                    logical_offset,
                     pipeline_block.stored,
                     block_plain_hash,
                     pipeline_block.encryption.algorithm.clone(),
@@ -1066,14 +1342,10 @@ impl CoreStore {
         )?;
         let owned_ops = [op];
         let ops = borrow_owned_coremeta_batch_ops(&owned_ops);
-        self.commit_coremeta_batch_by_embedded_roots(
-            &format!(
-                "inline-manifest:{}:{}",
-                locator.manifest_ref.logical_file_id, locator.manifest_ref.writer_generation
-            ),
-            &ops,
-        )
-        .await?;
+        // The manifest hash is the immutable identity. It is not an independently
+        // versioned root and therefore must not consume an arbitrary writer
+        // generation as its first root generation.
+        self.meta.write_local_committed_batch(&ops)?;
         Ok(locator)
     }
 
@@ -1322,6 +1594,10 @@ impl CoreStore {
             content_hash: manifest.content_hash.clone(),
         })
     }
+}
+
+fn object_manifest_root_anchor_key(object_hash: &str) -> String {
+    format!("object-manifest/{object_hash}")
 }
 
 fn put_inline_payload_row(raw_payload: &[u8], common: CoreMetaRowCommonProto) -> Result<Vec<u8>> {

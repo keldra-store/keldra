@@ -13,7 +13,9 @@ pub enum RepairCommands {
         scope_kind: String,
         scope_id: String,
         #[clap(long, default_value_t = 100)]
-        limit: u32,
+        page_size: u32,
+        #[clap(long, default_value = "")]
+        page_token: String,
     },
 }
 
@@ -107,24 +109,30 @@ pub async fn handle_repair_command(command: &RepairCommands, ctx: &Context) -> a
         RepairCommands::Findings {
             scope_kind,
             scope_id,
-            limit,
+            page_size,
+            page_token,
         } => {
             let mut request = tonic::Request::new(api::ListRepairFindingsRequest {
                 scope_kind: scope_kind.clone(),
                 scope_id: scope_id.clone(),
-                limit: *limit,
+                page: Some(api::PageRequest {
+                    page_size: *page_size,
+                    page_token: page_token.clone(),
+                }),
             });
             add_auth(&mut request, &token);
-            for finding in client
-                .list_repair_findings(request)
-                .await?
-                .into_inner()
-                .findings
-            {
+            let response = client.list_repair_findings(request).await?.into_inner();
+            for finding in response.findings {
                 println!(
                     "{}\t{}\t{}\t{}",
                     finding.finding_id, finding.severity, finding.status, finding.message
                 );
+            }
+            if let Some(page) = response
+                .page
+                .filter(|page| !page.next_page_token.is_empty())
+            {
+                println!("next_page_token={}", page.next_page_token);
             }
         }
     }

@@ -57,7 +57,7 @@ async fn rust_client_calls_live_native_api() {
 
     let listed = client
         .buckets()
-        .list_buckets(ListBucketsRequest {})
+        .list_buckets(ListBucketsRequest { page: None })
         .await
         .expect("rust client should list buckets")
         .into_inner();

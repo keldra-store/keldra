@@ -35,6 +35,9 @@ impl InternalProxyService for AppState {
                         "first proxy request chunk must be a header",
                     ));
                 }
+                Some(proxy_request_chunk::Part::Failure(failure)) => {
+                    return Err(proxy_stream_failure_status(failure));
+                }
                 None => return Err(Status::invalid_argument("empty proxy request chunk")),
             },
             Some(Err(status)) => return Err(status),
@@ -49,6 +52,7 @@ impl InternalProxyService for AppState {
             "GET" => proxy_get_or_head(self, header, original_claims, false).await,
             "HEAD" => proxy_get_or_head(self, header, original_claims, true).await,
             "PUT" => proxy_put(self, header, original_claims, stream).await,
+            "NATIVE_PUT" => proxy_native_put(self, header, original_claims, stream).await,
             "DELETE" => proxy_delete(self, header, original_claims).await,
             method => Err(Status::invalid_argument(format!(
                 "unsupported proxy method {method}"
@@ -65,6 +69,7 @@ async fn proxy_get_or_head(
 ) -> Result<Response<<AppState as InternalProxyService>::ProxyObjectStream>, Status> {
     let tenant_id = parse_proxy_tenant_id(&header)?;
     let version_id = parse_proxy_version_id(&header)?;
+    let consistency = parse_proxy_read_consistency(&header.headers)?;
     let result = if head_only {
         let object = state
             .object_manager
@@ -75,11 +80,12 @@ async fn proxy_get_or_head(
                 &header.object_key,
                 version_id,
                 ObjectLinkReadMode::Follow,
-                ObjectReadConsistency::Latest,
+                consistency,
             )
             .await?;
         ProxyReadEither::Head(object.object)
     } else {
+        let range = parse_proxy_read_range(&header.headers)?;
         ProxyReadEither::Get(
             state
                 .object_manager
@@ -89,9 +95,9 @@ async fn proxy_get_or_head(
                     header.bucket_name.clone(),
                     header.object_key.clone(),
                     version_id,
-                    None,
+                    range,
                     ObjectLinkReadMode::Follow,
-                    ObjectReadConsistency::Latest,
+                    consistency,
                 )
                 .await?,
         )
@@ -108,18 +114,25 @@ async fn proxy_get_or_head(
                         headers: object_response_headers(&object),
                         trailers: Vec::new(),
                         committed: false,
+                        native_put_response: None,
                     })))
                     .await;
             }
             ProxyReadEither::Get(result) => {
                 let object = result.object;
+                let mut headers = object_response_headers(&object);
+                headers.push(proxy_header(
+                    "x-anvil-range-start",
+                    result.range_start.to_string().as_bytes(),
+                ));
                 if tx
                     .send(Ok(proxy_header_chunk(ProxyResponseHeader {
                         request_id: header.request_id,
                         status: 200,
-                        headers: object_response_headers(&object),
+                        headers,
                         trailers: Vec::new(),
                         committed: false,
+                        native_put_response: None,
                     })))
                     .await
                     .is_err()
@@ -182,6 +195,9 @@ async fn proxy_put(
     let data_stream = stream.map(|chunk_result| match chunk_result {
         Ok(chunk) => match chunk.part {
             Some(proxy_request_chunk::Part::Body(bytes)) => Ok(bytes),
+            Some(proxy_request_chunk::Part::Failure(failure)) => {
+                Err(proxy_stream_failure_status(failure))
+            }
             Some(proxy_request_chunk::Part::Header(_)) => Err(Status::invalid_argument(
                 "proxy request may contain only one header chunk",
             )),
@@ -213,7 +229,58 @@ async fn proxy_put(
         200,
         true,
         object_response_headers(&object),
+        None,
     )
+}
+
+async fn proxy_native_put(
+    state: &AppState,
+    header: ProxyRequestHeader,
+    original_claims: auth::Claims,
+    stream: tonic::Streaming<ProxyRequestChunk>,
+) -> Result<Response<<AppState as InternalProxyService>::ProxyObjectStream>, Status> {
+    let tenant_id = parse_proxy_tenant_id(&header)?;
+    if tenant_id != original_claims.tenant_id {
+        return Err(Status::permission_denied(
+            "proxy tenant does not match original principal",
+        ));
+    }
+    let metadata = header
+        .native_object_metadata
+        .clone()
+        .ok_or_else(|| Status::invalid_argument("native proxy metadata is required"))?;
+    if metadata.bucket_name != header.bucket_name || metadata.object_key != header.object_key {
+        return Err(Status::permission_denied(
+            "native proxy metadata does not match its routing header",
+        ));
+    }
+    if metadata
+        .mutation_context
+        .as_ref()
+        .is_some_and(|context| context.idempotency_key != header.idempotency_key)
+    {
+        return Err(Status::permission_denied(
+            "native proxy idempotency identity does not match its routing header",
+        ));
+    }
+    // A routed write is already detached from its original client connection.
+    // Give the durable mutation its own task boundary as well: this keeps the
+    // large authorization/storage future chain off the proxy RPC stack and
+    // lets an admitted idempotent mutation finish if the forwarding peer loses
+    // its response connection.
+    let state = state.clone();
+    let response = tokio::spawn(async move {
+        crate::services::object::execute_native_put(
+            &state,
+            original_claims,
+            metadata,
+            stream.map(native_proxy_data_chunk),
+        )
+        .await
+    })
+    .await
+    .map_err(|error| Status::internal(format!("native proxy task failed: {error}")))??;
+    unary_proxy_response(header.request_id, 200, true, Vec::new(), Some(response))
 }
 
 async fn proxy_delete(
@@ -259,6 +326,7 @@ async fn proxy_delete(
         204,
         true,
         object_response_headers(&deleted),
+        None,
     )
 }
 
@@ -267,6 +335,7 @@ fn unary_proxy_response(
     status: u32,
     committed: bool,
     headers: Vec<ProxyHeader>,
+    native_put_response: Option<PutObjectResponse>,
 ) -> Result<Response<<AppState as InternalProxyService>::ProxyObjectStream>, Status> {
     let (tx, rx) = mpsc::channel(1);
     tokio::spawn(async move {
@@ -277,10 +346,53 @@ fn unary_proxy_response(
                 headers,
                 trailers: Vec::new(),
                 committed,
+                native_put_response,
             })))
             .await;
     });
     Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+}
+
+fn native_proxy_data_chunk(
+    chunk_result: Result<ProxyRequestChunk, Status>,
+) -> Result<Vec<u8>, Status> {
+    match chunk_result?.part {
+        Some(proxy_request_chunk::Part::Body(bytes)) => Ok(bytes),
+        Some(proxy_request_chunk::Part::Failure(failure)) => {
+            Err(proxy_stream_failure_status(failure))
+        }
+        Some(proxy_request_chunk::Part::Header(_)) => Err(Status::invalid_argument(
+            "proxy request may contain only one header chunk",
+        )),
+        None => Err(Status::invalid_argument("empty proxy request chunk")),
+    }
+}
+
+fn proxy_stream_failure_status(failure: ProxyStreamFailure) -> Status {
+    Status::new(grpc_code_from_i32(failure.grpc_code), failure.message)
+}
+
+fn grpc_code_from_i32(code: i32) -> tonic::Code {
+    match code {
+        0 => tonic::Code::Ok,
+        1 => tonic::Code::Cancelled,
+        2 => tonic::Code::Unknown,
+        3 => tonic::Code::InvalidArgument,
+        4 => tonic::Code::DeadlineExceeded,
+        5 => tonic::Code::NotFound,
+        6 => tonic::Code::AlreadyExists,
+        7 => tonic::Code::PermissionDenied,
+        8 => tonic::Code::ResourceExhausted,
+        9 => tonic::Code::FailedPrecondition,
+        10 => tonic::Code::Aborted,
+        11 => tonic::Code::OutOfRange,
+        12 => tonic::Code::Unimplemented,
+        13 => tonic::Code::Internal,
+        14 => tonic::Code::Unavailable,
+        15 => tonic::Code::DataLoss,
+        16 => tonic::Code::Unauthenticated,
+        _ => tonic::Code::Unknown,
+    }
 }
 
 fn proxy_header_chunk(header: ProxyResponseHeader) -> ProxyResponseChunk {
@@ -306,7 +418,21 @@ fn object_response_headers(object: &crate::persistence::Object) -> Vec<ProxyHead
             "x-anvil-created-at",
             object.created_at.to_rfc3339().as_bytes(),
         ),
+        proxy_header(
+            "x-anvil-authz-revision",
+            object.authz_revision.to_string().as_bytes(),
+        ),
+        proxy_header(
+            "x-anvil-index-policy-snapshot",
+            object.index_policy_snapshot.as_bytes(),
+        ),
     ];
+    if let Some(storage_class) = object.storage_class.as_deref() {
+        headers.push(proxy_header(
+            "x-anvil-storage-class",
+            storage_class.as_bytes(),
+        ));
+    }
     if let Some(content_type) = object.content_type.as_deref() {
         headers.push(proxy_header("content-type", content_type.as_bytes()));
     }
@@ -439,6 +565,61 @@ fn parse_proxy_version_id(header: &ProxyRequestHeader) -> Result<Option<uuid::Uu
         .map_err(|_| Status::invalid_argument("invalid x-anvil-version-id"))
 }
 
+fn parse_proxy_read_range(
+    headers: &[ProxyHeader],
+) -> Result<Option<crate::core_store::CoreByteRange>, Status> {
+    let start = proxy_header_u64(headers, "x-anvil-range-start")?;
+    let end_exclusive = proxy_header_u64(headers, "x-anvil-range-end-exclusive")?;
+    match (start, end_exclusive) {
+        (None, None) => Ok(None),
+        (Some(start), Some(end_exclusive)) if start <= end_exclusive => {
+            Ok(Some(crate::core_store::CoreByteRange {
+                start,
+                end_exclusive,
+            }))
+        }
+        (Some(_), Some(_)) => Err(Status::invalid_argument(
+            "proxy range start exceeds end_exclusive",
+        )),
+        _ => Err(Status::invalid_argument(
+            "proxy range requires start and end_exclusive",
+        )),
+    }
+}
+
+fn parse_proxy_read_consistency(headers: &[ProxyHeader]) -> Result<ObjectReadConsistency, Status> {
+    let root_generation = proxy_header_u64(headers, "x-anvil-consistency-root-generation")?;
+    let authz_revision = proxy_header_i64(headers, "x-anvil-consistency-authz-revision")?;
+    match (root_generation, authz_revision) {
+        (None, None) => Ok(ObjectReadConsistency::Latest),
+        (Some(generation), None) => Ok(ObjectReadConsistency::AtRootGeneration(generation)),
+        (None, Some(revision)) => Ok(ObjectReadConsistency::AtAuthzRevision(revision)),
+        (Some(_), Some(_)) => Err(Status::invalid_argument(
+            "proxy read consistency modes are mutually exclusive",
+        )),
+    }
+}
+
+fn proxy_header_u64(headers: &[ProxyHeader], name: &str) -> Result<Option<u64>, Status> {
+    proxy_header_string(headers, name)
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|_| Status::invalid_argument(format!("invalid proxy header {name}")))
+        })
+        .transpose()
+}
+
+fn proxy_header_i64(headers: &[ProxyHeader], name: &str) -> Result<Option<i64>, Status> {
+    proxy_header_string(headers, name)
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|_| Status::invalid_argument(format!("invalid proxy header {name}")))
+        })
+        .transpose()
+}
+
 fn proxy_header_string(headers: &[ProxyHeader], name: &str) -> Option<String> {
     headers
         .iter()
@@ -547,6 +728,7 @@ mod tests {
             bucket_locator_generation: 7,
             headers: Vec::new(),
             authz_context: encode_proxy_authz_context(&claims("app-a", 42)).unwrap(),
+            native_object_metadata: None,
         }
     }
 
@@ -579,6 +761,38 @@ mod tests {
                 .unwrap_err()
                 .code(),
             Code::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn proxy_read_options_preserve_range_and_consistency() {
+        let headers = vec![
+            proxy_header("x-anvil-range-start", b"10"),
+            proxy_header("x-anvil-range-end-exclusive", b"20"),
+            proxy_header("x-anvil-consistency-root-generation", b"7"),
+        ];
+        assert_eq!(
+            parse_proxy_read_range(&headers).unwrap(),
+            Some(crate::core_store::CoreByteRange {
+                start: 10,
+                end_exclusive: 20,
+            })
+        );
+        assert_eq!(
+            parse_proxy_read_consistency(&headers).unwrap(),
+            ObjectReadConsistency::AtRootGeneration(7)
+        );
+    }
+
+    #[test]
+    fn proxy_read_rejects_ambiguous_consistency() {
+        let headers = vec![
+            proxy_header("x-anvil-consistency-root-generation", b"7"),
+            proxy_header("x-anvil-consistency-authz-revision", b"9"),
+        ];
+        assert_eq!(
+            parse_proxy_read_consistency(&headers).unwrap_err().code(),
+            Code::InvalidArgument
         );
     }
 }

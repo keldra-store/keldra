@@ -933,13 +933,15 @@ pub async fn write_delegated_action_tuple(
     written_by: &str,
     reason: &str,
 ) -> Result<(), Status> {
-    let relation = delegated_relation_for_action(storage, tenant_id, action, resource).await?;
-    persistence
+    let relation =
+        delegated_relation_for_action(storage, tenant_id, action.clone(), resource).await?;
+    let assignment_relation = delegated_assignment_relation(&action, &relation);
+    let record = persistence
         .write_authz_tuple(
             SYSTEM_STORAGE_TENANT_ID,
             &relation.namespace,
             &relation.object_id,
-            &format!("{}_grant", relation.relation),
+            &assignment_relation,
             APP_SUBJECT_KIND,
             grantee_principal_id,
             "",
@@ -947,6 +949,10 @@ pub async fn write_delegated_action_tuple(
             written_by,
             reason,
         )
+        .await
+        .map_err(authz_tuple_write_status)?;
+    persistence
+        .materialize_authz_through_revision(SYSTEM_STORAGE_TENANT_ID, record.revision)
         .await
         .map_err(authz_tuple_write_status)?;
     Ok(())
@@ -977,10 +983,11 @@ pub async fn write_delegated_action_tuple_batch(
     for (action, resource) in policies {
         let relation =
             delegated_relation_for_action(storage, tenant_id, action.clone(), resource).await?;
+        let assignment_relation = delegated_assignment_relation(action, &relation);
         mutations.push(AuthzTupleBatchMutation {
             namespace: relation.namespace,
             object_id: relation.object_id,
-            relation: format!("{}_grant", relation.relation),
+            relation: assignment_relation,
             subject_kind: APP_SUBJECT_KIND.to_string(),
             subject_id: grantee_principal_id.to_string(),
             caveat_hash: String::new(),
@@ -989,11 +996,41 @@ pub async fn write_delegated_action_tuple_batch(
         });
     }
 
-    persistence
+    let records = persistence
         .write_authz_tuple_batch(SYSTEM_STORAGE_TENANT_ID, mutations, written_by)
         .await
         .map_err(authz_tuple_write_status)?;
+    let revision = records
+        .iter()
+        .map(|record| record.revision)
+        .max()
+        .ok_or_else(|| Status::internal("application policy batch produced no records"))?;
+    persistence
+        .materialize_authz_through_revision(SYSTEM_STORAGE_TENANT_ID, revision)
+        .await
+        .map_err(authz_tuple_write_status)?;
     Ok(())
+}
+
+fn delegated_assignment_relation(
+    action: &AnvilAction,
+    relation: &DelegatedSystemRelation,
+) -> String {
+    // Authz actions intentionally map to assignable realm roles. Other actions
+    // map to computed permissions whose generated direct edge uses `_grant`.
+    if matches!(
+        action,
+        AnvilAction::AuthzTupleWrite
+            | AnvilAction::AuthzTupleRead
+            | AnvilAction::AuthzCheck
+            | AnvilAction::AuthzWatch
+            | AnvilAction::AuthzSchemaRead
+            | AnvilAction::AuthzSchemaWrite
+    ) {
+        relation.relation.clone()
+    } else {
+        format!("{}_grant", relation.relation)
+    }
 }
 
 fn authz_tuple_write_status(error: anyhow::Error) -> Status {
@@ -1159,19 +1196,22 @@ pub async fn principal_has_any_system_realm_relation(
     principal_id: &str,
 ) -> Result<bool> {
     let revision = authz_journal::latest_authz_revision(storage, SYSTEM_STORAGE_TENANT_ID).await?;
-    let tuples = authz_journal::read_current_authz_tuples_at_revision(
+    let page = authz_journal::page_current_authz_tuples(
         storage,
         SYSTEM_STORAGE_TENANT_ID,
-        authz_journal::AuthzTupleFilter {
+        &authz_journal::AuthzTupleFilter {
             subject_kind: Some(APP_SUBJECT_KIND.to_string()),
             subject_id: Some(principal_id.to_string()),
             caveat_hash: Some(String::new()),
             ..authz_journal::AuthzTupleFilter::default()
         },
         revision,
+        None,
+        1,
     )
-    .await?;
-    Ok(!tuples.is_empty())
+    .await
+    .map_err(|error| anyhow::anyhow!(error))?;
+    Ok(!page.records.is_empty())
 }
 
 pub async fn grant_storage_tenant_owner(
@@ -1681,10 +1721,10 @@ mod tests {
     use chrono::Utc;
 
     use super::{
-        SYSTEM_BUCKET_NAMESPACE, USERSET_SUBJECT_KIND, object_parent_bucket_mutation,
-        split_bucket_key,
+        DelegatedSystemRelation, SYSTEM_BUCKET_NAMESPACE, USERSET_SUBJECT_KIND,
+        delegated_assignment_relation, object_parent_bucket_mutation, split_bucket_key,
     };
-    use crate::persistence::Bucket;
+    use crate::{permissions::AnvilAction, persistence::Bucket};
 
     #[test]
     fn split_bucket_key_treats_empty_prefix_as_bucket_scope() {
@@ -1714,5 +1754,33 @@ mod tests {
         assert_eq!(mutation.subject_kind, SYSTEM_BUCKET_NAMESPACE);
         assert_eq!(mutation.subject_id, "17");
         assert_ne!(mutation.subject_kind, USERSET_SUBJECT_KIND);
+    }
+
+    #[test]
+    fn delegated_authz_roles_are_assigned_directly() {
+        let relation = DelegatedSystemRelation {
+            namespace: "system/authz_realm".to_string(),
+            object_id: "7/default".to_string(),
+            relation: "tuple_writer".to_string(),
+        };
+
+        assert_eq!(
+            delegated_assignment_relation(&AnvilAction::AuthzTupleWrite, &relation),
+            "tuple_writer"
+        );
+    }
+
+    #[test]
+    fn delegated_permissions_use_their_generated_grant_relation() {
+        let relation = DelegatedSystemRelation {
+            namespace: "system/storage_tenant".to_string(),
+            object_id: "7".to_string(),
+            relation: "manage_tenant".to_string(),
+        };
+
+        assert_eq!(
+            delegated_assignment_relation(&AnvilAction::TenantManage, &relation),
+            "manage_tenant_grant"
+        );
     }
 }

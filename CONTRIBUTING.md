@@ -9,11 +9,15 @@
 
 Anvil uses native on-disk state below `STORAGE_PATH`; no external metadata database is required.
 
-Start a local cluster:
+Run the canonical six-peer Docker cluster acceptance test:
 
 ```bash
-./anvil/start-local-cluster.sh
+ANVIL_IMAGE=anvil:test ./scripts/release-gates.sh docker-mesh
 ```
+
+The Docker harness bootstraps the committed CoreMeta lifecycle topology and
+uses each peer's authenticated gRPC endpoint. There is no separate discovery or
+gossip process to start.
 
 Run focused checks:
 

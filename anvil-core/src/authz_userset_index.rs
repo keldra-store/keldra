@@ -22,6 +22,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const AUTHZ_DERIVED_USERSET_INDEX_ROW_SCHEMA: &str = "anvil.authz.derived_userset_index_row.v1";
 const AUTHZ_DERIVED_USERSET_INDEX_ROW_KIND: &str = "derived_userset_index";
+const AUTHZ_SOURCE_HASH_DOMAIN: &[u8] = b"anvil.authz.source-record-chain.v1\0";
 
 pub const DEFAULT_DERIVED_USERSET_INDEX_ID: &str = "derived-userset-primary";
 
@@ -113,12 +114,6 @@ struct AuthzDerivedUsersetEntryProto {
     subject_id: String,
     #[prost(string, tag = "6")]
     caveat_hash: String,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct AuthzTupleRecordHashSetProto {
-    #[prost(message, repeated, tag = "1")]
-    records: Vec<AuthzTupleRecordHashProto>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -305,10 +300,12 @@ pub async fn advance_derived_userset_index_from_batch(
             .ok_or_else(|| anyhow!("authorization userset index does not exist"));
     };
 
-    let all_records = authz_journal::list_authz_tuple_log(storage, tenant_id, 0, "", 0).await?;
     let existing = match read_derived_userset_index(storage, tenant_id, derived_index_id).await? {
         Some(existing) if existing.processed_revision + 1 >= target_revision => existing,
         _ => {
+            let all_records =
+                authz_journal::collect_authz_tuple_log_for_rebuild(storage, tenant_id, None)
+                    .await?;
             let rebuilt =
                 build_derived_userset_index_from_records(tenant_id, derived_index_id, all_records)?;
             write_derived_userset_index(storage, &rebuilt).await?;
@@ -320,21 +317,25 @@ pub async fn advance_derived_userset_index_from_batch(
         return Ok(existing);
     }
 
-    let current_records = authz_journal::read_current_authz_tuples_at_revision(
+    let impacted = impacted_usersets_from_projection(
         storage,
         tenant_id,
-        AuthzTupleFilter::default(),
         i64::try_from(target_revision)
             .map_err(|_| anyhow!("authorization userset revision exceeds supported range"))?,
+        batch_records,
     )
     .await?;
-    let current = current_tuple_map(current_records);
-    let impacted = impacted_usersets(&current, batch_records)?;
+    let source_record_count = existing
+        .source_record_count
+        .checked_add(u64::try_from(batch_records.len())?)
+        .ok_or_else(|| anyhow!("authorization source record count overflow"))?;
+    let source_records_hash =
+        advance_source_records_hash(&existing.source_records_hash, batch_records)?;
     if impacted.is_empty() {
         let mut advanced = existing;
         advanced.processed_revision = target_revision;
-        advanced.source_record_count = all_records.len() as u64;
-        advanced.source_records_hash = source_records_hash(&all_records)?;
+        advanced.source_record_count = source_record_count;
+        advanced.source_records_hash = source_records_hash;
         advanced.generation = target_revision;
         advanced.built_at = Utc::now().to_rfc3339();
         advanced.index_hash = hash_derived_userset_index(&advanced)?;
@@ -354,8 +355,15 @@ pub async fn advance_derived_userset_index_from_batch(
         })
         .collect::<BTreeSet<_>>();
     for userset in &impacted {
-        let mut visited = BTreeSet::new();
-        for subject in expand_userset_subjects(&current, userset, &mut visited)? {
+        for subject in collect_userset_subjects_from_projection(
+            storage,
+            tenant_id,
+            userset,
+            i64::try_from(target_revision)
+                .map_err(|_| anyhow!("authorization userset revision exceeds supported range"))?,
+        )
+        .await?
+        {
             entries.insert(AuthzDerivedUsersetEntry {
                 namespace: userset.namespace.clone(),
                 object_id: userset.object_id.clone(),
@@ -372,8 +380,8 @@ pub async fn advance_derived_userset_index_from_batch(
         tenant_id,
         derived_index_id: derived_index_id.to_string(),
         processed_revision: target_revision,
-        source_record_count: all_records.len() as u64,
-        source_records_hash: source_records_hash(&all_records)?,
+        source_record_count,
+        source_records_hash,
         generation: target_revision,
         entries: entries.into_iter().collect(),
         built_at: Utc::now().to_rfc3339(),
@@ -390,7 +398,8 @@ pub async fn build_expected_derived_userset_index(
     tenant_id: i64,
     derived_index_id: &str,
 ) -> Result<AuthzDerivedUsersetIndex> {
-    let records = authz_journal::list_authz_tuple_log(storage, tenant_id, 0, "", 0).await?;
+    let records =
+        authz_journal::collect_authz_tuple_log_for_rebuild(storage, tenant_id, None).await?;
     build_derived_userset_index_from_records(tenant_id, derived_index_id, records)
 }
 
@@ -402,11 +411,9 @@ pub(crate) async fn build_expected_derived_userset_index_at_revision(
 ) -> Result<AuthzDerivedUsersetIndex> {
     let revision = i64::try_from(revision)
         .map_err(|_| anyhow!("authorization userset revision exceeds supported range"))?;
-    let records = authz_journal::list_authz_tuple_log(storage, tenant_id, 0, "", 0)
-        .await?
-        .into_iter()
-        .filter(|record| record.revision <= revision)
-        .collect();
+    let records =
+        authz_journal::collect_authz_tuple_log_for_rebuild(storage, tenant_id, Some(revision))
+            .await?;
     build_derived_userset_index_from_records(tenant_id, derived_index_id, records)
 }
 
@@ -415,10 +422,10 @@ pub async fn read_derived_userset_index(
     tenant_id: i64,
     derived_index_id: &str,
 ) -> Result<Option<AuthzDerivedUsersetIndex>> {
-    let Some(row) = read_derived_userset_index_row(storage, tenant_id, derived_index_id)? else {
+    let store = CoreStore::new(storage.clone()).await?;
+    let Some(row) = read_derived_userset_index_row(&store, tenant_id, derived_index_id)? else {
         return Ok(None);
     };
-    let store = CoreStore::new(storage.clone()).await?;
     let bytes = store
         .get_blob(GetBlob {
             object_ref: decode_core_object_ref_target(&row.core_object_ref_target)?,
@@ -479,11 +486,11 @@ pub async fn write_derived_userset_index(
 }
 
 fn read_derived_userset_index_row(
-    storage: &Storage,
+    store: &CoreStore,
     tenant_id: i64,
     derived_index_id: &str,
 ) -> Result<Option<AuthzDerivedUsersetIndexRow>> {
-    let Some(payload) = CoreMetaStore::open(storage.core_store_meta_path())?.get(
+    let Some(payload) = store.read_coremeta_row(
         CF_AUTHZ,
         TABLE_AUTHZ_TUPLE_PAGE_ROW,
         &derived_userset_index_tuple_key(tenant_id, derived_index_id)?,
@@ -529,11 +536,12 @@ async fn write_derived_userset_index_row(
     };
     commit_coremeta_batch_for_storage(
         storage,
-        &format!(
-            "authz-derived-userset:{}:{}",
-            index.tenant_id, index.generation
-        ),
+        &derived_userset_index_transaction_id(index),
         &[op],
+        &[crate::core_store::CoreMetaRootPublication::new(
+            derived_userset_index_root_anchor_key(index.tenant_id, &index.derived_index_id),
+            crate::formats::writer::WriterFamily::Authz,
+        )],
     )
     .await?;
     Ok(())
@@ -603,28 +611,12 @@ fn current_tuple_map(records: Vec<AuthzTupleRecord>) -> BTreeMap<TupleViewKey, A
     current
 }
 
-fn impacted_usersets(
-    current: &BTreeMap<TupleViewKey, AuthzTupleRecord>,
+async fn impacted_usersets_from_projection(
+    storage: &Storage,
+    tenant_id: i64,
+    revision: i64,
     batch_records: &[AuthzTupleRecord],
 ) -> Result<BTreeSet<UsersetRef>> {
-    let mut reverse_edges = BTreeMap::<UsersetRef, BTreeSet<UsersetRef>>::new();
-    for record in current.values() {
-        if record.operation != "add"
-            || record.subject_kind != "userset"
-            || !record.caveat_hash.is_empty()
-        {
-            continue;
-        }
-        let Some(child) = parse_userset_subject(&record.subject_id)? else {
-            continue;
-        };
-        reverse_edges.entry(child).or_default().insert(UsersetRef {
-            namespace: record.namespace.clone(),
-            object_id: record.object_id.clone(),
-            relation: record.relation.clone(),
-        });
-    }
-
     let mut impacted = BTreeSet::new();
     let mut stack = Vec::new();
     for record in batch_records {
@@ -639,16 +631,94 @@ fn impacted_usersets(
     }
 
     while let Some(userset) = stack.pop() {
-        let Some(parents) = reverse_edges.get(&userset) else {
-            continue;
+        if impacted.len() > 4_096 {
+            return Err(anyhow!(
+                "AuthzGraphNodeLimitExceeded: derived userset impact exceeds 4096 nodes"
+            ));
+        }
+        let subject_id = format!(
+            "{}/{}#{}",
+            userset.namespace, userset.object_id, userset.relation
+        );
+        let filter = AuthzTupleFilter {
+            subject_kind: Some("userset".to_string()),
+            subject_id: Some(subject_id),
+            caveat_hash: Some(String::new()),
+            ..AuthzTupleFilter::default()
         };
-        for parent in parents {
-            if impacted.insert(parent.clone()) {
-                stack.push(parent.clone());
+        let mut after_tuple_key = None;
+        loop {
+            let page = authz_journal::page_current_authz_tuples(
+                storage,
+                tenant_id,
+                &filter,
+                revision,
+                after_tuple_key.as_deref(),
+                256,
+            )
+            .await
+            .map_err(anyhow::Error::new)?;
+            for record in page.records {
+                let parent = UsersetRef {
+                    namespace: record.namespace,
+                    object_id: record.object_id,
+                    relation: record.relation,
+                };
+                if impacted.insert(parent.clone()) {
+                    stack.push(parent);
+                }
             }
+            let Some(next_tuple_key) = page.next_tuple_key else {
+                break;
+            };
+            if after_tuple_key.as_ref() == Some(&next_tuple_key) {
+                return Err(anyhow!(
+                    "authorization userset impact page did not advance its continuation"
+                ));
+            }
+            after_tuple_key = Some(next_tuple_key);
         }
     }
     Ok(impacted)
+}
+
+async fn collect_userset_subjects_from_projection(
+    storage: &Storage,
+    tenant_id: i64,
+    userset: &UsersetRef,
+    revision: i64,
+) -> Result<BTreeSet<SubjectRef>> {
+    let mut subjects = BTreeSet::new();
+    let mut after_position = None;
+    loop {
+        let page = authz_journal::list_current_authz_subjects_page(
+            storage,
+            tenant_id,
+            &userset.namespace,
+            &userset.object_id,
+            &userset.relation,
+            None,
+            revision,
+            after_position.as_deref(),
+            1_000,
+        )
+        .await?;
+        subjects.extend(page.subjects.into_iter().map(|subject| SubjectRef {
+            kind: subject.subject_kind,
+            id: subject.subject_id,
+            caveat_hash: subject.caveat_hash,
+        }));
+        let Some(next_position) = page.next_subject_position else {
+            break;
+        };
+        if after_position.as_ref() == Some(&next_position) {
+            return Err(anyhow!(
+                "authorization userset subject page did not advance its continuation"
+            ));
+        }
+        after_position = Some(next_position);
+    }
+    Ok(subjects)
 }
 
 fn expand_userset_subjects(
@@ -777,6 +847,7 @@ fn validate_derived_userset_index_row_matches(
         || row.derived_index_id != index.derived_index_id
         || row.processed_revision != index.processed_revision
         || row.generation != index.generation
+        || row.writer_generation != index.generation.max(1)
         || row.source_records_hash != index.source_records_hash
         || row.index_hash != index.index_hash
         || row.built_at != index.built_at
@@ -851,14 +922,12 @@ fn decode_derived_userset_index_row(bytes: &[u8]) -> Result<AuthzDerivedUsersetI
 fn derived_userset_index_row_common(
     row: &AuthzDerivedUsersetIndexRow,
 ) -> Result<CoreMetaRowCommonProto> {
+    // CoreStore replaces the publication placeholders while committing the root.
     Ok(core_meta_committed_row_common(
         format!("tenant/{}", row.tenant_id),
         derived_userset_index_root_key_hash(row.tenant_id, &row.derived_index_id),
-        row.generation,
-        format!(
-            "authz-derived-userset/{}/{}",
-            row.derived_index_id, row.writer_generation
-        ),
+        1,
+        String::new(),
         rfc3339_unix_nanos(&row.built_at)?,
     ))
 }
@@ -879,19 +948,14 @@ fn validate_derived_userset_index_row_common(
             "authorization derived userset CoreMeta root mismatch"
         ));
     }
-    if common.root_generation != row.generation {
+    if common.root_generation == 0 {
         return Err(anyhow!(
-            "authorization derived userset CoreMeta generation mismatch"
+            "authorization derived userset CoreMeta publication generation must be nonzero"
         ));
     }
-    if common.transaction_id
-        != format!(
-            "authz-derived-userset/{}/{}",
-            row.derived_index_id, row.writer_generation
-        )
-    {
+    if common.transaction_id.is_empty() {
         return Err(anyhow!(
-            "authorization derived userset CoreMeta transaction mismatch"
+            "authorization derived userset CoreMeta transaction must not be empty"
         ));
     }
     if common.visibility_state_enum() != CoreMetaVisibilityState::Committed {
@@ -899,13 +963,32 @@ fn validate_derived_userset_index_row_common(
             "authorization derived userset CoreMeta row is not committed"
         ));
     }
+    if common.payload_schema_version
+        != derived_userset_index_row_common(row)?.payload_schema_version
+    {
+        return Err(anyhow!(
+            "authorization derived userset CoreMeta payload version mismatch"
+        ));
+    }
     Ok(())
 }
 
+fn derived_userset_index_root_anchor_key(tenant_id: i64, derived_index_id: &str) -> String {
+    format!("authz-derived-userset/tenant/{tenant_id}/index/{derived_index_id}")
+}
+
 fn derived_userset_index_root_key_hash(tenant_id: i64, derived_index_id: &str) -> String {
-    core_meta_root_key_hash(&format!(
-        "authz-derived-userset/tenant/{tenant_id}/index/{derived_index_id}"
+    core_meta_root_key_hash(&derived_userset_index_root_anchor_key(
+        tenant_id,
+        derived_index_id,
     ))
+}
+
+fn derived_userset_index_transaction_id(index: &AuthzDerivedUsersetIndex) -> String {
+    format!(
+        "authz-derived-userset:{}:{}:{}",
+        index.tenant_id, index.derived_index_id, index.generation
+    )
 }
 
 fn rfc3339_unix_nanos(value: &str) -> Result<u64> {
@@ -1007,6 +1090,21 @@ fn hash_derived_userset_index(index: &AuthzDerivedUsersetIndex) -> Result<String
 }
 
 fn source_records_hash(records: &[AuthzTupleRecord]) -> Result<String> {
+    let initial = hex::encode(hash32(AUTHZ_SOURCE_HASH_DOMAIN));
+    advance_source_records_hash(&initial, records)
+}
+
+fn advance_source_records_hash(
+    previous_hash: &str,
+    records: &[AuthzTupleRecord],
+) -> Result<String> {
+    let mut state = hex::decode(previous_hash)
+        .map_err(|_| anyhow!("authorization source records hash is not valid hex"))?;
+    if state.len() != 32 {
+        return Err(anyhow!(
+            "authorization source records hash must contain 32 bytes"
+        ));
+    }
     let mut records = records.to_vec();
     records.sort_by(|left, right| {
         left.revision
@@ -1014,10 +1112,17 @@ fn source_records_hash(records: &[AuthzTupleRecord]) -> Result<String> {
             .then(left.revision_ordinal.cmp(&right.revision_ordinal))
             .then(left.record_hash.cmp(&right.record_hash))
     });
-    let proto = AuthzTupleRecordHashSetProto {
-        records: records.iter().map(tuple_record_hash_to_proto).collect(),
-    };
-    Ok(hex::encode(hash32(&encode_deterministic_proto(&proto))))
+    for record in records {
+        let encoded = encode_deterministic_proto(&tuple_record_hash_to_proto(&record));
+        let mut input =
+            Vec::with_capacity(AUTHZ_SOURCE_HASH_DOMAIN.len() + state.len() + 8 + encoded.len());
+        input.extend_from_slice(AUTHZ_SOURCE_HASH_DOMAIN);
+        input.extend_from_slice(&state);
+        input.extend_from_slice(&(encoded.len() as u64).to_be_bytes());
+        input.extend_from_slice(&encoded);
+        state = hash32(&input).to_vec();
+    }
+    Ok(hex::encode(state))
 }
 
 fn derived_userset_index_logical_file_id(tenant_id: i64, derived_index_id: &str) -> Result<String> {
@@ -1114,6 +1219,25 @@ mod tests {
         }
     }
 
+    fn persistable_index(generation: u64) -> AuthzDerivedUsersetIndex {
+        let mut index = AuthzDerivedUsersetIndex {
+            version: 1,
+            tenant_id: 42,
+            derived_index_id: DEFAULT_DERIVED_USERSET_INDEX_ID.to_string(),
+            processed_revision: generation,
+            source_record_count: generation,
+            source_records_hash: hex::encode(hash32(
+                format!("userset-source-{generation}").as_bytes(),
+            )),
+            generation,
+            entries: Vec::new(),
+            built_at: "2026-01-02T03:04:05Z".to_string(),
+            index_hash: String::new(),
+        };
+        index.index_hash = hash_derived_userset_index(&index).unwrap();
+        index
+    }
+
     async fn ready_authz_permit(storage: &Storage, tenant_id: i64) -> PartitionWritePermit {
         let request = PartitionRecoveryAcquire {
             partition_family: "authz_tuple".to_string(),
@@ -1152,7 +1276,6 @@ mod tests {
                 test_namespace("document", &["viewer"]),
                 test_namespace("group", &["member"]),
             ],
-            0,
             "tester",
             "bind userset index test schema",
         )
@@ -1164,7 +1287,6 @@ mod tests {
             crate::authz_scope::DEFAULT_AUTHZ_REALM_ID,
             schema.schema_ref,
             None,
-            0,
             "tester",
             "bind userset index test schema",
         )
@@ -1285,6 +1407,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn derived_userset_index_separates_logical_and_physical_generations() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        write_derived_userset_index(&storage, &persistable_index(40))
+            .await
+            .unwrap();
+        let index = persistable_index(80);
+        write_derived_userset_index(&storage, &index).await.unwrap();
+
+        let store = CoreStore::new(storage.clone()).await.unwrap();
+        let row_payload = store
+            .read_coremeta_row(
+                CF_AUTHZ,
+                TABLE_AUTHZ_TUPLE_PAGE_ROW,
+                &derived_userset_index_tuple_key(42, DEFAULT_DERIVED_USERSET_INDEX_ID).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        let common = crate::core_store::core_meta_row_common_from_payload(&row_payload).unwrap();
+
+        assert_eq!(common.root_generation, 2);
+        assert_ne!(common.root_generation, index.generation);
+        assert_eq!(
+            common.transaction_id,
+            derived_userset_index_transaction_id(&index)
+        );
+        assert_eq!(
+            read_derived_userset_index(&storage, 42, DEFAULT_DERIVED_USERSET_INDEX_ID)
+                .await
+                .unwrap(),
+            Some(index)
+        );
+    }
+
+    #[test]
+    fn derived_userset_publication_keeps_scope_and_visibility_strict() {
+        let index = persistable_index(80);
+        let row = AuthzDerivedUsersetIndexRow {
+            tenant_id: index.tenant_id,
+            derived_index_id: index.derived_index_id,
+            processed_revision: index.processed_revision,
+            generation: index.generation,
+            writer_generation: index.generation,
+            source_records_hash: index.source_records_hash,
+            index_hash: index.index_hash,
+            core_object_ref_target: "core-object-ref:test".to_string(),
+            built_at: index.built_at,
+        };
+        let mut common = derived_userset_index_row_common(&row).unwrap();
+        common.root_generation = 91;
+        common.transaction_id = "corestore-assigned-transaction".to_string();
+        assert!(validate_derived_userset_index_row_common(&row, &common).is_ok());
+
+        let mut wrong_realm = common.clone();
+        wrong_realm.realm_id = "tenant/43".to_string();
+        assert!(validate_derived_userset_index_row_common(&row, &wrong_realm).is_err());
+
+        let mut wrong_root = common.clone();
+        wrong_root.root_key_hash = core_meta_root_key_hash("authz-derived-userset/other");
+        assert!(validate_derived_userset_index_row_common(&row, &wrong_root).is_err());
+
+        let mut pending = common;
+        pending.visibility_state = CoreMetaVisibilityState::Pending as i32;
+        assert!(validate_derived_userset_index_row_common(&row, &pending).is_err());
+    }
+
+    #[tokio::test]
     async fn derived_userset_index_persists_and_serves_exact_processed_revision() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
@@ -1301,7 +1490,7 @@ mod tests {
             "add",
         )
         .await;
-        write_tuple(
+        let document_userset = write_tuple(
             &storage,
             &permit,
             "document",
@@ -1316,7 +1505,8 @@ mod tests {
         let index = rebuild_derived_userset_index(&storage, 42, DEFAULT_DERIVED_USERSET_INDEX_ID)
             .await
             .unwrap();
-        assert_eq!(index.processed_revision, 2);
+        let processed_revision = document_userset.revision as u64;
+        assert_eq!(index.processed_revision, processed_revision);
 
         assert_eq!(
             lookup_derived_userset_index_at_revision(
@@ -1329,7 +1519,7 @@ mod tests {
                 "user",
                 "alice",
                 "",
-                2,
+                processed_revision,
             )
             .await
             .unwrap(),
@@ -1345,7 +1535,7 @@ mod tests {
                 "user",
                 "alice",
                 "",
-                2,
+                processed_revision,
             )
             .await
             .unwrap(),
@@ -1362,7 +1552,7 @@ mod tests {
                 "user",
                 "alice",
                 "",
-                1,
+                processed_revision - 1,
             )
             .await
             .unwrap(),
@@ -1396,7 +1586,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(first.processed_revision, 1);
+        assert_eq!(first.processed_revision, group_member.revision as u64);
         assert!(first.entries.iter().any(|entry| {
             entry.namespace == "group"
                 && entry.object_id == "engineering"
@@ -1423,7 +1613,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(second.processed_revision, 2);
+        assert_eq!(second.processed_revision, document_userset.revision as u64);
         assert!(second.entries.iter().any(|entry| {
             entry.namespace == "document"
                 && entry.object_id == "alpha"
@@ -1463,7 +1653,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(advanced.processed_revision, 4);
+        assert_eq!(advanced.processed_revision, remove_member.revision as u64);
         assert!(!advanced.entries.iter().any(|entry| {
             entry.namespace == "document"
                 && entry.object_id == "alpha"

@@ -61,7 +61,7 @@ pub(crate) fn decode_page_cursor(
     signing_key: &[u8],
 ) -> Result<Option<String>, Status> {
     let Some(cursor) = page
-        .map(|page| page.cursor.trim())
+        .map(|page| page.page_token.trim())
         .filter(|cursor| !cursor.is_empty())
     else {
         return Ok(None);
@@ -307,7 +307,10 @@ mod tests {
             sort: "link_key.asc",
         };
         let cursor = encode_next_cursor("photos/2026.jpg", &binding, KEY).unwrap();
-        let page = PageRequest { cursor, limit: 25 };
+        let page = PageRequest {
+            page_size: 25,
+            page_token: cursor,
+        };
 
         assert_eq!(
             decode_page_cursor(Some(&page), &binding, KEY).unwrap(),
@@ -386,7 +389,10 @@ mod tests {
         };
         let mut cursor = encode_next_cursor("example.com", &binding, KEY).unwrap();
         cursor.push('a');
-        let page = PageRequest { cursor, limit: 100 };
+        let page = PageRequest {
+            page_size: 100,
+            page_token: cursor,
+        };
 
         assert_eq!(
             decode_page_cursor(Some(&page), &binding, KEY)
@@ -398,8 +404,8 @@ mod tests {
         assert_eq!(
             decode_page_cursor(
                 Some(&PageRequest {
-                    cursor: String::new(),
-                    limit: 100,
+                    page_size: 100,
+                    page_token: String::new(),
                 }),
                 &binding,
                 KEY,

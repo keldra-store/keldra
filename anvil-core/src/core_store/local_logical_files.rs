@@ -721,7 +721,7 @@ pub(super) fn validate_shard_receipt_common(
         bail!("CoreStore shard receipt timestamp must be nonzero");
     }
     validate_hash(signed_payload_hash, "shard receipt payload hash")?;
-    if signature_algorithm != "ed25519-libp2p" {
+    if signature_algorithm != "ed25519" {
         bail!(
             "CoreStore shard receipt uses unsupported signature algorithm {}",
             signature_algorithm
@@ -1036,7 +1036,7 @@ pub(super) fn shard_receipt_summary_from_object_placement(
         "logical shard receipt payload hash",
     )?;
     validate_boundary_summary_fields(boundary_summary_hash, boundary_values_b64)?;
-    if shard.signature_algorithm != "ed25519-libp2p" {
+    if shard.signature_algorithm != "ed25519" {
         bail!(
             "CoreStore shard receipt uses unsupported signature algorithm {}",
             shard.signature_algorithm

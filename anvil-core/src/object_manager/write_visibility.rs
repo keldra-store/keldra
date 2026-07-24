@@ -101,6 +101,7 @@ impl ObjectWriteVisibility {
                 self.indexes,
                 IndexMaintenanceVisibility::Enqueued | IndexMaintenanceVisibility::CaughtUp
             ),
+            journal_mutation: crate::metadata_journal::ObjectJournalMutation::Put,
         }
     }
 

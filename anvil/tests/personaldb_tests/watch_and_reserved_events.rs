@@ -27,9 +27,8 @@ async fn personaldb_group_watch_streams_reserved_internal_events_through_native_
         &cluster.states[0].storage,
         1,
         &database_id,
-        42,
         *uuid::Uuid::new_v4().as_bytes(),
-        11,
+        42,
         payload,
     )
     .await

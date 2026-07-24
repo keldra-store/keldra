@@ -247,7 +247,7 @@ Diagnostics are the first place to look when an index definition exists but expe
 ```bash
 anvil --profile acme index diagnostics documents invoices_by_due \
   --severity error \
-  --limit 20
+  --page-size 20
 ```
 
 This calls `IndexService.ListIndexDiagnostics`. A successful response proves the caller has `index:read` on `documents` and that Anvil could read diagnostic records for the bucket/index filter. The CLI prints `cursor`, `severity`, `code`, and `message`. No output means no matching diagnostics were returned in that page; it does not prove every object was selected or visible to your query.

@@ -291,9 +291,8 @@ mod tests {
     use crate::{
         authz_journal::{AuthzTupleWrite, authz_partition_id, write_authz_tuple_with_permit},
         authz_userset_index::{
-            DEFAULT_DERIVED_USERSET_INDEX_ID, build_expected_derived_userset_index_at_revision,
-            lookup_derived_userset_index_at_revision, test_delete_derived_userset_index_row,
-            write_derived_userset_index,
+            DEFAULT_DERIVED_USERSET_INDEX_ID, lookup_derived_userset_index_at_revision,
+            test_delete_derived_userset_index_row,
         },
         partition_fence::{
             PartitionRecoveryAcquire, PartitionWritePermit, acquire_partition_recovery,
@@ -312,7 +311,7 @@ mod tests {
         bind_repair_test_schema(&storage, 42).await;
         let permit = ready_authz_permit(&storage, 42).await;
         write_tuple(&storage, &permit, "group", "eng", "member", "user", "alice").await;
-        write_tuple(
+        let latest_tuple = write_tuple(
             &storage,
             &permit,
             "doc",
@@ -340,7 +339,7 @@ mod tests {
             report.status,
             AuthzDerivedIndexRepairStatus::Rebuilt(AuthzDerivedIndexRepairReason::MissingIndex)
         ));
-        assert_eq!(report.latest_revision, 2);
+        assert_eq!(report.latest_revision, latest_tuple.revision as u64);
         assert!(report.finding.is_some());
         assert_eq!(
             lookup_derived_userset_index_at_revision(
@@ -353,7 +352,7 @@ mod tests {
                 "user",
                 "alice",
                 "",
-                2,
+                latest_tuple.revision as u64,
             )
             .await
             .unwrap(),
@@ -396,22 +395,13 @@ mod tests {
         let storage = Storage::new_at(temp.path()).await.unwrap();
         bind_repair_test_schema(&storage, 42).await;
         let permit = ready_authz_permit(&storage, 42).await;
-        write_tuple(&storage, &permit, "doc", "alpha", "viewer", "user", "alice").await;
+        let first_tuple =
+            write_tuple(&storage, &permit, "doc", "alpha", "viewer", "user", "alice").await;
         rebuild_derived_userset_index(&storage, 42, DEFAULT_DERIVED_USERSET_INDEX_ID)
             .await
             .unwrap();
-        let stale_index = build_expected_derived_userset_index_at_revision(
-            &storage,
-            42,
-            DEFAULT_DERIVED_USERSET_INDEX_ID,
-            1,
-        )
-        .await
-        .unwrap();
-        write_tuple(&storage, &permit, "doc", "beta", "viewer", "user", "bob").await;
-        write_derived_userset_index(&storage, &stale_index)
-            .await
-            .unwrap();
+        let latest_tuple =
+            write_tuple(&storage, &permit, "doc", "beta", "viewer", "user", "bob").await;
 
         let report = repair_authz_derived_userset_index(
             &storage,
@@ -428,10 +418,11 @@ mod tests {
             report.status,
             AuthzDerivedIndexRepairStatus::NeedsRepair(
                 AuthzDerivedIndexRepairReason::StaleRevision {
-                    processed_revision: 1,
-                    latest_revision: 2
+                    processed_revision,
+                    latest_revision
                 }
-            )
+            ) if processed_revision == first_tuple.revision as u64
+                && latest_revision == latest_tuple.revision as u64
         ));
         assert_eq!(
             report.finding.as_ref().unwrap().code,
@@ -477,7 +468,6 @@ mod tests {
                 test_namespace("doc", &["viewer"]),
                 test_namespace("group", &["member"]),
             ],
-            0,
             "tester",
             "bind repair test schema",
         )
@@ -489,7 +479,6 @@ mod tests {
             crate::authz_scope::DEFAULT_AUTHZ_REALM_ID,
             schema.schema_ref,
             None,
-            0,
             "tester",
             "bind repair test schema",
         )
@@ -543,7 +532,7 @@ mod tests {
         relation: &str,
         subject_kind: &str,
         subject_id: &str,
-    ) {
+    ) -> crate::persistence::AuthzTupleRecord {
         write_authz_tuple_with_permit(
             storage,
             AuthzTupleWrite {
@@ -562,6 +551,6 @@ mod tests {
             KEY,
         )
         .await
-        .unwrap();
+        .unwrap()
     }
 }

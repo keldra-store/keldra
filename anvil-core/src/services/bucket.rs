@@ -86,21 +86,67 @@ impl BucketService for AppState {
         let claims = request
             .extensions()
             .get::<auth::Claims>()
+            .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
 
-        let buckets = self.bucket_manager.list_buckets(claims).await?;
-
-        let response_buckets: Vec<crate::anvil_api::Bucket> = buckets
-            .into_iter()
-            .map(|b| crate::anvil_api::Bucket {
-                name: b.name,
-                creation_date: b.created_at.to_string(),
-                region: b.region,
-                is_public_read: b.is_public_read,
-                deleted: false,
-                bucket_id: b.id,
+        self.bucket_manager.authorize_bucket_list(&claims).await?;
+        let page_size = crate::services::collection_cursor::page_size(req.page.as_ref())?;
+        let revision =
+            bucket_journal::current_bucket_collection_revision(&self.storage, claims.tenant_id)
+                .await
+                .map_err(|error| Status::internal(error.to_string()))?;
+        let principal_scope = format!("tenant:{}/subject:{}", claims.tenant_id, claims.sub);
+        let binding = crate::services::collection_cursor::CollectionCursorBinding {
+            service_method: "anvil.BucketService/ListBuckets",
+            filters: &[],
+            principal_scope: &principal_scope,
+            page_size,
+            revision: &revision,
+            sort: "bucket_name.asc",
+        };
+        let position = crate::services::collection_cursor::decode_page_token(
+            req.page.as_ref(),
+            &binding,
+            self.config.jwt_secret.as_bytes(),
+        )?;
+        let after_tuple_key =
+            crate::services::collection_cursor::decode_binary_position(position.as_deref())?;
+        let bucket_page = bucket_journal::page_current_buckets(
+            &self.storage,
+            claims.tenant_id,
+            &revision,
+            after_tuple_key.as_deref(),
+            page_size,
+        )
+        .await
+        .map_err(|error| Status::aborted(error.to_string()))?;
+        let next_page_token = bucket_page
+            .next_tuple_key
+            .as_deref()
+            .map(crate::services::collection_cursor::encode_binary_position)
+            .transpose()?
+            .map(|position| {
+                crate::services::collection_cursor::encode_next_page_token(
+                    &position,
+                    &binding,
+                    self.config.jwt_secret.as_bytes(),
+                )
             })
-            .collect();
+            .transpose()?
+            .unwrap_or_default();
+        let response_buckets = bucket_page
+            .buckets
+            .into_iter()
+            .map(|bucket| crate::anvil_api::Bucket {
+                name: bucket.name,
+                creation_date: bucket.created_at.to_string(),
+                region: bucket.region,
+                is_public_read: bucket.is_public_read,
+                deleted: false,
+                bucket_id: bucket.id,
+            })
+            .collect::<Vec<_>>();
 
         tracing::debug!(
             "[service] EXITING list_buckets, found {} buckets",
@@ -108,6 +154,7 @@ impl BucketService for AppState {
         );
         Ok(Response::new(ListBucketsResponse {
             buckets: response_buckets,
+            page: Some(PageResponse { next_page_token }),
         }))
     }
 
@@ -191,41 +238,34 @@ impl BucketService for AppState {
         .await?;
         let after_cursor = i64::try_from(req.after_cursor)
             .map_err(|_| Status::invalid_argument("after_cursor exceeds supported range"))?;
-        let snapshot = bucket_journal::list_bucket_metadata_events(
-            &self.storage,
-            claims.tenant_id,
-            &req.bucket_name,
-            after_cursor,
-            1000,
-        )
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
-        let mut live = self.bucket_watch_tx.subscribe();
+        let stream_id = bucket_journal::tenant_bucket_metadata_stream_id(claims.tenant_id);
+        let mut live = self.storage.subscribe_stream(&stream_id);
+        let storage = self.storage.clone();
+        let tenant_id = claims.tenant_id;
+        let bucket_name = req.bucket_name;
 
         let (tx, rx) = mpsc::channel(32);
         tokio::spawn(async move {
             let mut last_cursor = after_cursor;
-            for event in snapshot {
-                last_cursor = last_cursor.max(event.id);
-                if tx
-                    .send(bucket_metadata_event_response(&event))
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-
             loop {
-                match live.recv().await {
-                    Ok(event) => {
-                        if event.tenant_id != claims.tenant_id
-                            || event.id <= last_cursor
-                            || (!req.bucket_name.is_empty() && event.bucket_name != req.bucket_name)
-                        {
-                            continue;
+                loop {
+                    let page = match bucket_journal::list_bucket_metadata_event_page(
+                        &storage,
+                        tenant_id,
+                        &bucket_name,
+                        last_cursor,
+                        256,
+                    )
+                    .await
+                    {
+                        Ok(page) => page,
+                        Err(error) => {
+                            let _ = tx.send(Err(Status::internal(error.to_string()))).await;
+                            return;
                         }
-                        last_cursor = event.id;
+                    };
+                    let previous_cursor = last_cursor;
+                    for event in page.events {
                         if tx
                             .send(bucket_metadata_event_response(&event))
                             .await
@@ -234,14 +274,14 @@ impl BucketService for AppState {
                             return;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        let _ = tx
-                            .send(Err(Status::data_loss(
-                                "Bucket metadata watch fell behind retained live event window",
-                            )))
-                            .await;
-                        return;
+                    last_cursor = page.next_cursor;
+                    if !page.has_more || last_cursor == previous_cursor {
+                        break;
                     }
+                }
+
+                match live.recv().await {
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
             }
@@ -415,7 +455,6 @@ impl AppState {
                 "bucket metadata journal event type differs from service hint"
             );
         }
-        let _ = self.bucket_watch_tx.send(event.clone());
         Ok(event)
     }
 }
@@ -477,6 +516,9 @@ fn json_string_field(value: &JsonValue, name: &str) -> Result<String, Status> {
 }
 
 fn bucket_core_store_status(error: anyhow::Error) -> Status {
+    if let Some(status) = crate::services::core_store_status::availability_status(&error) {
+        return status;
+    }
     let message = error.to_string();
     if message.contains("TransactionNotFound") {
         Status::not_found("TransactionNotFound")

@@ -40,7 +40,7 @@ A safe production shape is:
 
 - public API and gateway traffic reach the public listener through the public edge;
 - admin traffic reaches the admin listener only from operator networks and trusted automation;
-- cluster traffic remains node-to-node on the cluster plane;
+- internal node gRPC reaches the committed `public_api_addr` on the public listener with a node credential and system-realm authorisation;
 - tenants never need admin-plane reachability to read or write their own objects.
 
 A common misconfiguration is publishing both `50051` and `50052` from a container because both are gRPC ports. That makes incident response harder even though admin authentication still applies. Keep the port separation visible in Compose files, Kubernetes Services, firewall rules, load balancer listeners, and runbooks.

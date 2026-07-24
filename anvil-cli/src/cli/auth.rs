@@ -27,7 +27,13 @@ pub enum AuthCommands {
         resource: String,
     },
     /// List grants for an app in the authenticated tenant
-    ListGrants { app: String },
+    ListGrants {
+        app: String,
+        #[clap(long, default_value_t = 100)]
+        page_size: u32,
+        #[clap(long, default_value = "")]
+        page_token: String,
+    },
 }
 
 pub async fn handle_auth_command(command: &AuthCommands, ctx: &Context) -> anyhow::Result<()> {
@@ -106,10 +112,19 @@ pub async fn handle_auth_command(command: &AuthCommands, ctx: &Context) -> anyho
             client.revoke_access(request).await?;
             println!("Permission revoked.");
         }
-        AuthCommands::ListGrants { app } => {
+        AuthCommands::ListGrants {
+            app,
+            page_size,
+            page_token,
+        } => {
             let token = ctx.get_bearer_token().await?;
-            let mut request =
-                tonic::Request::new(api::ListAccessGrantsRequest { app: app.clone() });
+            let mut request = tonic::Request::new(api::ListAccessGrantsRequest {
+                app: app.clone(),
+                page: Some(api::PageRequest {
+                    page_size: *page_size,
+                    page_token: page_token.clone(),
+                }),
+            });
             request.metadata_mut().insert(
                 "authorization",
                 format!("Bearer {}", token).parse().unwrap(),
@@ -117,6 +132,12 @@ pub async fn handle_auth_command(command: &AuthCommands, ctx: &Context) -> anyho
             let response = client.list_access_grants(request).await?.into_inner();
             for grant in response.grants {
                 println!("{}\t{}\t{}", grant.app_name, grant.action, grant.resource);
+            }
+            if let Some(page) = response
+                .page
+                .filter(|page| !page.next_page_token.is_empty())
+            {
+                println!("next_page_token={}", page.next_page_token);
             }
         }
     }

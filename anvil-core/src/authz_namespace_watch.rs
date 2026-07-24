@@ -50,17 +50,15 @@ pub struct AuthzNamespaceWatchEvent {
 pub async fn append_authz_namespace_watch_record(
     storage: &Storage,
     tenant_id: i64,
-    cursor: u128,
     mutation_id: [u8; 16],
     payload: AuthzNamespaceWatchPayload,
-) -> Result<()> {
+) -> Result<u128> {
     validate_payload(&payload)?;
     let core_store = CoreStore::new(storage.clone()).await?;
     let stream_id = authz_namespace_watch_stream_id(tenant_id, &payload.namespace);
-    ensure_cursor_is_monotonic(&core_store, &stream_id, cursor).await?;
 
     let record = WatchRecord::new(
-        cursor,
+        0,
         AUTHZ_NAMESPACE_PARTITION_FAMILY,
         partition_id(tenant_id, &payload.namespace),
         mutation_id,
@@ -70,7 +68,7 @@ pub async fn append_authz_namespace_watch_record(
         0,
         encode_authz_namespace_watch_payload(&payload)?,
     );
-    core_store
+    let receipt = core_store
         .append_stream(AppendStreamRecord {
             stream_id,
             partition_id: hex::encode(partition_id(tenant_id, &payload.namespace)),
@@ -81,12 +79,13 @@ pub async fn append_authz_namespace_watch_record(
             fence: None,
             transaction_id: None,
             idempotency_key: Some(format!(
-                "authz-namespace-watch:{tenant_id}:{}:{cursor}",
-                payload.namespace
+                "authz-namespace-watch:{tenant_id}:{}:{}",
+                payload.namespace,
+                hex::encode(mutation_id)
             )),
         })
         .await?;
-    Ok(())
+    Ok(u128::from(receipt.sequence))
 }
 
 pub async fn list_authz_namespace_watch_events(
@@ -96,23 +95,59 @@ pub async fn list_authz_namespace_watch_events(
     after_cursor: u128,
     limit: usize,
 ) -> Result<Vec<AuthzNamespaceWatchEvent>> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let records = read_watch_or_empty(
-        &core_store,
-        &authz_namespace_watch_stream_id(tenant_id, namespace),
+    Ok(
+        list_authz_namespace_watch_event_page(storage, tenant_id, namespace, after_cursor, limit)
+            .await?
+            .events,
     )
-    .await?;
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthzNamespaceWatchEventPage {
+    pub events: Vec<AuthzNamespaceWatchEvent>,
+    pub next_cursor: u128,
+    pub has_more: bool,
+}
+
+pub async fn list_authz_namespace_watch_event_page(
+    storage: &Storage,
+    tenant_id: i64,
+    namespace: &str,
+    after_cursor: u128,
+    limit: usize,
+) -> Result<AuthzNamespaceWatchEventPage> {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let after_sequence = u64::try_from(after_cursor)
+        .map_err(|_| anyhow!("authorization namespace watch cursor exceeds u64"))?;
+    let page = core_store
+        .read_stream_page(ReadStream {
+            stream_id: authz_namespace_watch_stream_id(tenant_id, namespace),
+            after_sequence,
+            limit,
+        })
+        .await?;
     let expected_partition = partition_id(tenant_id, namespace);
-    let mut events = Vec::new();
-    for record in records {
-        if record.cursor <= after_cursor {
-            continue;
+    let mut events = Vec::with_capacity(page.records.len());
+    for source in page.records {
+        if source.record_kind != "authz_namespace_watch" {
+            return Err(anyhow!(
+                "authorization namespace watch stream record kind mismatch"
+            ));
         }
+        let (mut record, used) = WatchRecord::decode(&source.payload)?;
+        if used != source.payload.len() {
+            return Err(anyhow!(
+                "authorization namespace watch record has trailing bytes"
+            ));
+        }
+        record.cursor = u128::from(source.sequence);
         if record.partition_family != AUTHZ_NAMESPACE_PARTITION_FAMILY
             || record.record_kind != AUTHZ_NAMESPACE_RECORD_KIND
             || record.partition_id != expected_partition
         {
-            continue;
+            return Err(anyhow!(
+                "authorization namespace watch record scope mismatch"
+            ));
         }
         let payload: AuthzNamespaceWatchPayload =
             decode_authz_namespace_watch_payload(&record.payload)?;
@@ -128,11 +163,12 @@ pub async fn list_authz_namespace_watch_events(
             authz_revision: record.authz_revision,
             payload,
         });
-        if limit > 0 && events.len() >= limit {
-            break;
-        }
     }
-    Ok(events)
+    Ok(AuthzNamespaceWatchEventPage {
+        events,
+        next_cursor: u128::from(page.next_sequence),
+        has_more: page.has_more,
+    })
 }
 
 pub async fn latest_authz_namespace_watch_cursor(
@@ -140,13 +176,11 @@ pub async fn latest_authz_namespace_watch_cursor(
     tenant_id: i64,
     namespace: &str,
 ) -> Result<Option<u128>> {
-    Ok(
-        list_authz_namespace_watch_events(storage, tenant_id, namespace, 0, 0)
-            .await?
-            .into_iter()
-            .map(|event| event.cursor)
-            .max(),
-    )
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let sequence = core_store
+        .stream_head_sequence(&authz_namespace_watch_stream_id(tenant_id, namespace))
+        .await?;
+    Ok((sequence != 0).then_some(u128::from(sequence)))
 }
 
 fn encode_authz_namespace_watch_payload(payload: &AuthzNamespaceWatchPayload) -> Result<Vec<u8>> {
@@ -177,41 +211,6 @@ fn decode_authz_namespace_watch_payload(bytes: &[u8]) -> Result<AuthzNamespaceWa
     })
 }
 
-async fn ensure_cursor_is_monotonic(
-    core_store: &CoreStore,
-    stream_id: &str,
-    cursor: u128,
-) -> Result<()> {
-    let records = read_watch_or_empty(core_store, stream_id).await?;
-    if let Some(latest) = records.iter().map(|record| record.cursor).max()
-        && cursor <= latest
-    {
-        return Err(anyhow!(
-            "authorization namespace watch cursor must be monotonic"
-        ));
-    }
-    Ok(())
-}
-
-async fn read_watch_or_empty(core_store: &CoreStore, stream_id: &str) -> Result<Vec<WatchRecord>> {
-    let records = core_store
-        .read_stream(ReadStream {
-            stream_id: stream_id.to_string(),
-            after_sequence: 0,
-            limit: 0,
-        })
-        .await?;
-    records
-        .into_iter()
-        .filter(|record| record.record_kind == "authz_namespace_watch")
-        .map(|record| {
-            WatchRecord::decode(&record.payload)
-                .map(|(record, _)| record)
-                .map_err(Into::into)
-        })
-        .collect()
-}
-
 fn validate_payload(payload: &AuthzNamespaceWatchPayload) -> Result<()> {
     require_nonempty(&payload.namespace, "namespace")?;
     require_nonempty(&payload.event_type, "event_type")?;
@@ -229,7 +228,7 @@ fn partition_id(tenant_id: i64, namespace: &str) -> Hash32 {
     hash32(format!("tenant:{tenant_id}:authz-namespace:{namespace}").as_bytes())
 }
 
-fn authz_namespace_watch_stream_id(tenant_id: i64, namespace: &str) -> String {
+pub(crate) fn authz_namespace_watch_stream_id(tenant_id: i64, namespace: &str) -> String {
     format!("watch:authz_namespace:tenant:{tenant_id}:namespace:{namespace}")
 }
 
@@ -257,10 +256,10 @@ mod tests {
     async fn authz_namespace_watch_appends_lists_and_tracks_latest() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        append_authz_namespace_watch_record(&storage, 5, 1, [1; 16], payload(10))
+        append_authz_namespace_watch_record(&storage, 5, [1; 16], payload(10))
             .await
             .unwrap();
-        append_authz_namespace_watch_record(&storage, 5, 2, [2; 16], payload(11))
+        append_authz_namespace_watch_record(&storage, 5, [2; 16], payload(11))
             .await
             .unwrap();
         assert_eq!(
@@ -284,52 +283,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authz_namespace_watch_rejects_invalid_payloads_and_non_monotonic_cursors() {
+    async fn authz_namespace_watch_rejects_invalid_payloads_and_idempotency_conflicts() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        append_authz_namespace_watch_record(&storage, 5, 1, [1; 16], payload(10))
+        append_authz_namespace_watch_record(&storage, 5, [1; 16], payload(10))
             .await
             .unwrap();
         assert!(
-            append_authz_namespace_watch_record(&storage, 5, 1, [2; 16], payload(11))
+            append_authz_namespace_watch_record(&storage, 5, [1; 16], payload(11))
                 .await
                 .is_err()
         );
         let mut invalid = payload(12);
         invalid.schema_hash = "not-hex".to_string();
         assert!(
-            append_authz_namespace_watch_record(&storage, 5, 2, [3; 16], invalid)
+            append_authz_namespace_watch_record(&storage, 5, [3; 16], invalid)
                 .await
                 .is_err()
         );
         let mut invalid = payload(13);
         invalid.namespace = "../escape".to_string();
         assert!(
-            append_authz_namespace_watch_record(&storage, 5, 3, [4; 16], invalid)
+            append_authz_namespace_watch_record(&storage, 5, [4; 16], invalid)
                 .await
                 .is_err()
         );
     }
 
     #[tokio::test]
-    async fn authz_namespace_watch_limit_zero_means_unlimited() {
+    async fn authz_namespace_watch_requires_a_bounded_page_limit() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         for cursor in 1..=3 {
             append_authz_namespace_watch_record(
                 &storage,
                 5,
-                cursor,
                 [cursor as u8; 16],
                 payload(9 + cursor as u64),
             )
             .await
             .unwrap();
         }
-        let events = list_authz_namespace_watch_events(&storage, 5, "document", 0, 0)
+        let error = list_authz_namespace_watch_events(&storage, 5, "document", 0, 0)
             .await
-            .unwrap();
-        assert_eq!(events.len(), 3);
+            .unwrap_err();
+        assert!(error.to_string().contains("limit"));
     }
 
     fn payload(authz_revision: u64) -> AuthzNamespaceWatchPayload {

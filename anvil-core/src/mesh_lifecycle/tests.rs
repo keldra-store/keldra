@@ -3,6 +3,13 @@ use super::*;
 use std::collections::BTreeMap;
 use tempfile::tempdir;
 
+fn test_receipt_signing_public_key() -> Vec<u8> {
+    crate::node_signing::NodeSigningKeypair::generate()
+        .unwrap()
+        .public_key_bytes()
+        .to_vec()
+}
+
 #[test]
 fn node_state_machine_rejects_invalid_transitions() {
     validate_node_transition(LifecycleState::Joining, LifecycleState::Active).unwrap();
@@ -358,12 +365,8 @@ async fn lifecycle_store_persists_descriptors_and_enforces_transitions() {
             node_id: "node-a".to_string(),
             region: "eu-west-1".to_string(),
             cell_id: "cell-a".to_string(),
-            libp2p_peer_id: "peer-a".to_string(),
-            receipt_signing_public_key_proto: libp2p::identity::Keypair::generate_ed25519()
-                .public()
-                .encode_protobuf(),
+            receipt_signing_public_key: test_receipt_signing_public_key(),
             public_api_addr: "http://127.0.0.1:50051".to_string(),
-            public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7443/quic-v1".to_string()],
             capabilities: vec![NodeCapability::Object, NodeCapability::Admin],
             capacity_json: "{}".to_string(),
         },
@@ -498,12 +501,8 @@ async fn lifecycle_read_model_replays_control_streams_as_source_of_truth() {
         node_id: "node-a".to_string(),
         region: "eu-west-1".to_string(),
         cell_id: "cell-a".to_string(),
-        libp2p_peer_id: "peer-a".to_string(),
-        receipt_signing_public_key_proto: libp2p::identity::Keypair::generate_ed25519()
-            .public()
-            .encode_protobuf(),
+        receipt_signing_public_key: test_receipt_signing_public_key(),
         public_api_addr: "http://127.0.0.1:50051".to_string(),
-        public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7443/quic-v1".to_string()],
         capabilities: vec![NodeCapability::Object, NodeCapability::Admin],
         capacity_json_hash: blake3::hash(b"{}").to_hex().to_string(),
         state: LifecycleState::Active,
@@ -547,6 +546,171 @@ async fn lifecycle_read_model_replays_control_streams_as_source_of_truth() {
     assert_eq!(replayed_without_projection.nodes["node-a"].generation, 2);
 }
 
+#[tokio::test]
+async fn bootstrap_projection_is_visible_before_root_publication_begins() {
+    let temp = tempdir().unwrap();
+    let storage = Storage::new_at(temp.path()).await.unwrap();
+    let store = CoreStore::new(storage.clone()).await.unwrap();
+
+    install_bootstrap_lifecycle_projection(
+        &storage,
+        &store,
+        BootstrapMeshLifecycleProjection {
+            regions: vec![CreateRegionDescriptor {
+                mesh_id: "mesh-a".to_string(),
+                region: "eu-west-1".to_string(),
+                public_base_url: "https://eu-west-1.anvil-storage.test".to_string(),
+                virtual_host_suffix: "eu-west-1.anvil-storage.test".to_string(),
+                placement_weight: 100,
+                default_cell: Some("cell-a".to_string()),
+            }],
+            cells: vec![RegisterCellDescriptor {
+                mesh_id: "mesh-a".to_string(),
+                region: "eu-west-1".to_string(),
+                cell_id: "cell-a".to_string(),
+                placement_weight: 100,
+                failure_domain: "rack-a".to_string(),
+            }],
+            nodes: vec![RegisterNodeDescriptor {
+                mesh_id: "mesh-a".to_string(),
+                node_id: "node-a".to_string(),
+                region: "eu-west-1".to_string(),
+                cell_id: "cell-a".to_string(),
+                receipt_signing_public_key: test_receipt_signing_public_key(),
+                public_api_addr: "http://127.0.0.1:50051".to_string(),
+                capabilities: vec![NodeCapability::Metadata, NodeCapability::Object],
+                capacity_json: "{}".to_string(),
+            }],
+        },
+    )
+    .unwrap();
+
+    let state = read_state_with_core_store(&storage, &store).await.unwrap();
+    assert_eq!(state.regions.len(), 1);
+    assert_eq!(state.cells.len(), 1);
+    assert_eq!(state.nodes.len(), 1);
+    assert_eq!(state.regions["eu-west-1"].state, LifecycleState::Active);
+    assert_eq!(
+        state.cells["eu-west-1/cell-a"].state,
+        LifecycleState::Active
+    );
+    assert_eq!(state.nodes["node-a"].state, LifecycleState::Active);
+}
+
+#[tokio::test]
+async fn canonical_topology_activation_is_portable_and_cannot_be_removed() {
+    let source_temp = tempdir().unwrap();
+    let source_storage = Storage::new_at(source_temp.path()).await.unwrap();
+    let source_store = CoreStore::new(source_storage.clone()).await.unwrap();
+    let receipt_signing_public_keys = (0..3)
+        .map(|_| test_receipt_signing_public_key())
+        .collect::<Vec<_>>();
+    let cells = (0..3)
+        .map(|index| RegisterCellDescriptor {
+            mesh_id: "mesh-a".to_string(),
+            region: "eu-west-1".to_string(),
+            cell_id: format!("cell-{index}"),
+            placement_weight: 100,
+            failure_domain: format!("rack-{index}"),
+        })
+        .collect::<Vec<_>>();
+    let nodes = receipt_signing_public_keys
+        .iter()
+        .enumerate()
+        .map(
+            |(index, receipt_signing_public_key)| RegisterNodeDescriptor {
+                mesh_id: "mesh-a".to_string(),
+                node_id: format!("node-{index}"),
+                region: "eu-west-1".to_string(),
+                cell_id: format!("cell-{index}"),
+                receipt_signing_public_key: receipt_signing_public_key.clone(),
+                public_api_addr: format!("http://127.0.0.1:{}", 50_051 + index),
+                capabilities: vec![NodeCapability::Metadata, NodeCapability::Object],
+                capacity_json: "{}".to_string(),
+            },
+        )
+        .collect::<Vec<_>>();
+    let bootstrap = BootstrapMeshLifecycleProjection {
+        regions: vec![CreateRegionDescriptor {
+            mesh_id: "mesh-a".to_string(),
+            region: "eu-west-1".to_string(),
+            public_base_url: "https://eu-west-1.anvil-storage.test".to_string(),
+            virtual_host_suffix: "eu-west-1.anvil-storage.test".to_string(),
+            placement_weight: 100,
+            default_cell: Some("cell-0".to_string()),
+        }],
+        cells,
+        nodes,
+    };
+    let state =
+        install_bootstrap_lifecycle_projection(&source_storage, &source_store, bootstrap.clone())
+            .unwrap();
+    let activation = state
+        .canonical_topology_activation
+        .clone()
+        .expect("three metadata peers activate canonical mode");
+    assert_eq!(activation.metadata_node_ids.len(), 3);
+    assert!(
+        activation
+            .metadata_node_ids
+            .iter()
+            .all(|node| !is_synthetic_control_node_id(node))
+    );
+    let head = state
+        .topology_head
+        .as_ref()
+        .expect("canonical bootstrap writes a topology head");
+    assert_eq!(activation.mesh_id, "mesh-a");
+    assert_eq!(activation.pre_activation_topology_head_generation, 0);
+    assert_eq!(
+        activation.pre_activation_topology_head_hash,
+        topology_activation::empty_topology_hash().unwrap()
+    );
+    assert_eq!(activation.quorum_profile, CANONICAL_METADATA_QUORUM_PROFILE);
+    assert_eq!(activation.topology_hash, head.topology_hash);
+    assert!(activation.payload_hash.starts_with("sha256:"));
+
+    let replayed =
+        install_bootstrap_lifecycle_projection(&source_storage, &source_store, bootstrap.clone())
+            .unwrap();
+    assert_eq!(replayed, state);
+
+    let mut mismatch = bootstrap;
+    mismatch.nodes[2].public_api_addr = "http://127.0.0.1:59999".to_string();
+    let error = install_bootstrap_lifecycle_projection(&source_storage, &source_store, mismatch)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("already installed canonical topology")
+    );
+    assert_eq!(
+        read_lifecycle_state_projection_with_core_store(&source_store).unwrap(),
+        state
+    );
+
+    let rows = source_store
+        .export_portable_coremeta_bootstrap_rows(4096)
+        .unwrap();
+    let target_temp = tempdir().unwrap();
+    let target_storage = Storage::new_at(target_temp.path()).await.unwrap();
+    let target_store = CoreStore::new(target_storage).await.unwrap();
+    target_store
+        .install_portable_coremeta_bootstrap_rows(&rows)
+        .unwrap();
+    assert_eq!(
+        canonical_topology_activation_with_core_store(&target_store)
+            .unwrap()
+            .as_ref(),
+        Some(&activation)
+    );
+
+    let mut removal = state;
+    removal.canonical_topology_activation = None;
+    let error = write_state(&source_storage, &removal).await.unwrap_err();
+    assert!(error.to_string().contains("cannot be replaced or removed"));
+}
+
 async fn create_test_region(storage: &Storage) -> RegionDescriptor {
     create_region(
         storage,
@@ -586,12 +750,8 @@ async fn register_test_node(storage: &Storage) -> NodeDescriptor {
             node_id: "node-a".to_string(),
             region: "eu-west-1".to_string(),
             cell_id: "cell-a".to_string(),
-            libp2p_peer_id: "peer-a".to_string(),
-            receipt_signing_public_key_proto: libp2p::identity::Keypair::generate_ed25519()
-                .public()
-                .encode_protobuf(),
+            receipt_signing_public_key: test_receipt_signing_public_key(),
             public_api_addr: "http://127.0.0.1:50051".to_string(),
-            public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7443/quic-v1".to_string()],
             capabilities: vec![NodeCapability::Object, NodeCapability::Admin],
             capacity_json: "{}".to_string(),
         },
@@ -652,12 +812,8 @@ async fn create_active_placement_model(
             node_id: "node-a".to_string(),
             region: "eu-west-1".to_string(),
             cell_id: "cell-a".to_string(),
-            libp2p_peer_id: "peer-a".to_string(),
-            receipt_signing_public_key_proto: libp2p::identity::Keypair::generate_ed25519()
-                .public()
-                .encode_protobuf(),
+            receipt_signing_public_key: test_receipt_signing_public_key(),
             public_api_addr: "http://127.0.0.1:50051".to_string(),
-            public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7443/quic-v1".to_string()],
             capabilities: vec![NodeCapability::Object, NodeCapability::Admin],
             capacity_json: "{}".to_string(),
         },
@@ -707,6 +863,11 @@ async fn append_control_record(
     sequence: u64,
     digest: ControlRecordDigest,
 ) {
+    let cursor =
+        crate::mesh_control_stream::control_stream_append_cursor(storage, stream_family, partition)
+            .await
+            .unwrap();
+    assert_eq!(cursor.sequence.get(), sequence);
     let header_proto = crate::mesh_control_stream::encode_control_mutation_header(
         crate::mesh_control_stream::ControlMutationHeaderInput {
             schema: "anvil.mesh.control_mutation.v1",
@@ -723,6 +884,7 @@ async fn append_control_record(
             idempotency_key: Some("idem-a"),
             record_digest: &digest,
             created_at: "2026-07-02T00:00:00Z",
+            byte_offset: cursor.byte_offset,
         },
     );
     crate::mesh_control_stream::append_control_stream_frame(
@@ -771,6 +933,14 @@ async fn append_lifecycle_descriptor<T: record_proto::LifecycleControlPayload>(
     descriptor: &T,
 ) {
     let partition = lifecycle_control_partition(stream_family, record_key);
+    let cursor = crate::mesh_control_stream::control_stream_append_cursor(
+        storage,
+        stream_family,
+        &partition,
+    )
+    .await
+    .unwrap();
+    assert_eq!(cursor.sequence.get(), sequence);
     let payload_proto =
         record_proto::encode_lifecycle_control_payload(descriptor, stream_family).unwrap();
     let digest = ControlRecordDigest::blake3(&payload_proto);
@@ -790,6 +960,7 @@ async fn append_lifecycle_descriptor<T: record_proto::LifecycleControlPayload>(
             idempotency_key: Some("idem-a"),
             record_digest: &digest,
             created_at: "2026-07-02T00:00:00Z",
+            byte_offset: cursor.byte_offset,
         },
     );
     crate::mesh_control_stream::append_control_stream_frame(

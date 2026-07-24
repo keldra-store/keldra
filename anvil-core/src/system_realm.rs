@@ -4,16 +4,17 @@ use crate::{
         AuthzSchemaMemberKind, AuthzSubjectSelectorKind,
     },
     auth, authz_journal, authz_realm_schema,
-    authz_scope::{decode_realm_namespace, encode_realm_namespace, parse_userset_subject},
+    authz_scope::encode_realm_namespace,
     config::Config,
     core_store::{
-        AcquireFence, CF_MESH, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaStore,
-        CoreMetaTuplePart, CoreStore, TABLE_SYSTEM_BOOTSTRAP_MARKER_ROW,
-        commit_coremeta_batch_for_storage, core_meta_committed_row_common, core_meta_root_key_hash,
-        core_meta_tuple_key, encode_deterministic_proto,
+        AcquireFence, CF_MESH, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaTuplePart, CoreStore,
+        TABLE_SYSTEM_BOOTSTRAP_MARKER_ROW, commit_coremeta_batch_for_storage,
+        core_meta_committed_row_common, core_meta_root_key_hash, core_meta_tuple_key,
+        encode_deterministic_proto,
     },
     crypto::EncryptionKeyring,
     formats::unix_nanos_from_rfc3339,
+    mesh_lifecycle::{LifecycleState, NodeCapability},
     persistence::{App, AuthzTupleBatchMutation, Persistence},
     storage::Storage,
 };
@@ -238,12 +239,7 @@ pub async fn check_admin_relation(
 ) -> Result<bool> {
     let object_id = system_mesh_object_id(mesh_id);
     let revision = authz_journal::latest_authz_revision(storage, SYSTEM_STORAGE_TENANT_ID).await?;
-    // Internal CoreStore services call this path while serving shard/root/meta
-    // requests. Use the revision-aware row resolver directly so authorising an
-    // internal storage RPC cannot recursively issue more storage RPCs through
-    // the derived-userset acceleration path. This still uses the Zanzibar
-    // schema and tuple model; it only bypasses the optional derived cache.
-    authz_journal::resolve_permission_from_current_view_at_revision(
+    authz_journal::resolve_permission_at_revision(
         storage,
         SYSTEM_STORAGE_TENANT_ID,
         &system_namespace(),
@@ -255,6 +251,48 @@ pub async fn check_admin_relation(
         revision,
     )
     .await
+}
+
+pub(crate) async fn check_internal_node_access(
+    storage: &Storage,
+    core_store: &CoreStore,
+    mesh_id: &str,
+    claims: &auth::Claims,
+    node_id: &str,
+    required_capability: NodeCapability,
+) -> Result<bool> {
+    if claims.tenant_id != SYSTEM_STORAGE_TENANT_ID
+        || claims.sub != node_id
+        || node_id.trim().is_empty()
+    {
+        return Ok(false);
+    }
+
+    let granted = authz_journal::check_current_authz_tuple_with_core_store(
+        storage,
+        core_store,
+        SYSTEM_STORAGE_TENANT_ID,
+        &system_namespace(),
+        SYSTEM_OBJECT_ID,
+        "manage_nodes_grant",
+        SYSTEM_ADMIN_SUBJECT_KIND_APP,
+        node_id,
+        "",
+    )
+    .await?
+    .is_some();
+    if !granted {
+        return Ok(false);
+    }
+
+    let nodes =
+        crate::mesh_lifecycle::list_node_projections_with_core_store(core_store, None, None)?;
+    Ok(nodes.into_iter().any(|node| {
+        node.node_id == node_id
+            && node.mesh_id == mesh_id
+            && node.state == LifecycleState::Active
+            && node.capabilities.contains(&required_capability)
+    }))
 }
 
 pub async fn principal_has_any_admin_relation(
@@ -320,8 +358,9 @@ fn all_admin_relations() -> &'static [SystemAdminRelation] {
 }
 
 async fn bootstrap_marker_exists(storage: &Storage, mesh_id: &str) -> Result<bool> {
-    Ok(CoreMetaStore::open(storage.core_store_meta_path())?
-        .get(
+    Ok(CoreStore::new(storage.clone())
+        .await?
+        .read_coremeta_row(
             CF_MESH,
             TABLE_SYSTEM_BOOTSTRAP_MARKER_ROW,
             &bootstrap_marker_tuple_key(mesh_id)?,
@@ -405,10 +444,8 @@ async fn resolve_bootstrap_subject(
     let tenant_id = SYSTEM_STORAGE_TENANT_ID;
 
     let existing = persistence
-        .list_apps_for_tenant(tenant_id)
-        .await?
-        .into_iter()
-        .find(|app| app.name == app_name);
+        .get_app_by_tenant_name(tenant_id, app_name)
+        .await?;
     let app = match existing {
         Some(app) => app,
         None => {
@@ -489,22 +526,12 @@ fn write_bootstrap_credential(path: &Path, credential: &BootstrapCredentialFile<
 }
 
 async fn install_system_schema(storage: &Storage, persistence: &Persistence) -> Result<()> {
-    let latest_revision =
-        authz_journal::latest_authz_revision(storage, SYSTEM_STORAGE_TENANT_ID).await?;
-    let active_tuples = authz_journal::read_current_authz_tuples_at_revision(
-        storage,
-        SYSTEM_STORAGE_TENANT_ID,
-        authz_journal::AuthzTupleFilter::default(),
-        latest_revision,
-    )
-    .await?;
     let namespaces = system_mesh_schema();
     let revision = authz_realm_schema::put_schema_revision(
         storage,
         SYSTEM_STORAGE_TENANT_ID,
         SYSTEM_SCHEMA_ID,
         namespaces.clone(),
-        u64::try_from(latest_revision.max(0)).unwrap_or(0),
         "system-realm-bootstrap",
         "install built-in system realm schema",
     )
@@ -524,7 +551,6 @@ async fn install_system_schema(storage: &Storage, persistence: &Persistence) -> 
                 SYSTEM_REALM_ID,
                 revision.schema_ref,
                 Some(binding.binding_generation),
-                u64::try_from(latest_revision.max(0)).unwrap_or(0),
                 "system-realm-bootstrap",
                 "bind built-in system realm schema",
             )
@@ -537,7 +563,6 @@ async fn install_system_schema(storage: &Storage, persistence: &Persistence) -> 
                 SYSTEM_REALM_ID,
                 revision.schema_ref.clone(),
                 None,
-                u64::try_from(latest_revision.max(0)).unwrap_or(0),
                 "system-realm-bootstrap",
                 "bind built-in system realm schema",
             )
@@ -560,105 +585,6 @@ async fn install_system_schema(storage: &Storage, persistence: &Persistence) -> 
                 }
             }
         }
-    }
-    migrate_system_schema_tuples(persistence, &namespaces, active_tuples).await?;
-    Ok(())
-}
-
-async fn migrate_system_schema_tuples(
-    persistence: &Persistence,
-    namespaces: &[AuthzNamespaceSchema],
-    active_tuples: Vec<crate::persistence::AuthzTupleRecord>,
-) -> Result<()> {
-    let members = namespaces
-        .iter()
-        .flat_map(|namespace| {
-            namespace.relations.iter().map(move |member| {
-                (
-                    (namespace.namespace.as_str(), member.relation.as_str()),
-                    member,
-                )
-            })
-        })
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let existing = active_tuples
-        .iter()
-        .map(|record| {
-            (
-                record.namespace.as_str(),
-                record.object_id.as_str(),
-                record.relation.as_str(),
-                record.subject_kind.as_str(),
-                record.subject_id.as_str(),
-                record.caveat_hash.as_str(),
-            )
-        })
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut migrations = Vec::new();
-
-    for record in &active_tuples {
-        let Some(local_namespace) = decode_realm_namespace(SYSTEM_REALM_ID, &record.namespace)
-        else {
-            continue;
-        };
-        let Some(member) = members.get(&(local_namespace, record.relation.as_str())) else {
-            continue;
-        };
-
-        let (relation, subject_kind, subject_id) =
-            if member.member_kind == AuthzSchemaMemberKind::Permission as i32 {
-                (
-                    format!("{}_grant", record.relation),
-                    record.subject_kind.clone(),
-                    record.subject_id.clone(),
-                )
-            } else if record.subject_kind == crate::access_control::USERSET_SUBJECT_KIND {
-                let Some(subject) = parse_userset_subject(&record.subject_id) else {
-                    continue;
-                };
-                let Some(subject_namespace) =
-                    decode_realm_namespace(SYSTEM_REALM_ID, subject.namespace)
-                else {
-                    continue;
-                };
-                (
-                    record.relation.clone(),
-                    subject_namespace.to_string(),
-                    subject.object_id.to_string(),
-                )
-            } else {
-                continue;
-            };
-        if existing.contains(&(
-            record.namespace.as_str(),
-            record.object_id.as_str(),
-            relation.as_str(),
-            subject_kind.as_str(),
-            subject_id.as_str(),
-            record.caveat_hash.as_str(),
-        )) {
-            continue;
-        }
-        migrations.push(AuthzTupleBatchMutation {
-            namespace: record.namespace.clone(),
-            object_id: record.object_id.clone(),
-            relation,
-            subject_kind,
-            subject_id,
-            caveat_hash: record.caveat_hash.clone(),
-            operation: "add".to_string(),
-            reason: "migrate tuple to typed system schema".to_string(),
-        });
-    }
-
-    for chunk in migrations.chunks(1000) {
-        persistence
-            .write_authz_tuple_batch(
-                SYSTEM_STORAGE_TENANT_ID,
-                chunk.to_vec(),
-                "system-schema-migration",
-            )
-            .await?;
     }
     Ok(())
 }
@@ -1389,6 +1315,10 @@ async fn write_bootstrap_marker(storage: &Storage, mesh_id: &str) -> Result<()> 
         storage,
         &format!("system-realm-bootstrap:{}", uuid::Uuid::new_v4().simple()),
         &[op],
+        &[crate::core_store::CoreMetaRootPublication::new(
+            format!("system-realm-bootstrap/{mesh_id}"),
+            crate::formats::writer::WriterFamily::MeshControl,
+        )],
     )
     .await?;
     Ok(())
@@ -1423,6 +1353,78 @@ mod tests {
         }
     }
 
+    async fn install_active_internal_node(storage: &Storage, mesh_id: &str, node_id: &str) {
+        let region = crate::mesh_lifecycle::create_region(
+            storage,
+            crate::mesh_lifecycle::CreateRegionDescriptor {
+                mesh_id: mesh_id.to_string(),
+                region: "test-region".to_string(),
+                public_base_url: "https://test-region.anvil.invalid".to_string(),
+                virtual_host_suffix: "test-region.anvil.invalid".to_string(),
+                placement_weight: 100,
+                default_cell: Some("test-cell".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        let cell = crate::mesh_lifecycle::register_cell(
+            storage,
+            crate::mesh_lifecycle::RegisterCellDescriptor {
+                mesh_id: mesh_id.to_string(),
+                region: region.region.clone(),
+                cell_id: "test-cell".to_string(),
+                placement_weight: 100,
+                failure_domain: "test-rack".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        crate::mesh_lifecycle::transition_cell(
+            storage,
+            &region.region,
+            &cell.cell_id,
+            cell.generation,
+            LifecycleState::Active,
+        )
+        .await
+        .unwrap();
+        crate::mesh_lifecycle::transition_region(
+            storage,
+            &region.region,
+            region.generation,
+            LifecycleState::Active,
+        )
+        .await
+        .unwrap();
+        let node = crate::mesh_lifecycle::register_node(
+            storage,
+            crate::mesh_lifecycle::RegisterNodeDescriptor {
+                mesh_id: mesh_id.to_string(),
+                node_id: node_id.to_string(),
+                region: region.region,
+                cell_id: cell.cell_id,
+                receipt_signing_public_key: crate::node_signing::NodeSigningKeypair::generate()
+                    .unwrap()
+                    .public_key_bytes()
+                    .to_vec(),
+                public_api_addr: "http://127.0.0.1:50051".to_string(),
+                capabilities: vec![NodeCapability::Metadata, NodeCapability::Object],
+                capacity_json: "{}".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        crate::mesh_lifecycle::transition_node(
+            storage,
+            node_id,
+            node.generation,
+            LifecycleState::Active,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
     #[test]
     fn bootstrap_marker_encoding_is_canonical_protobuf_not_json() {
         let marker = BootstrapMarker {
@@ -1447,7 +1449,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let config = test_config(temp.path());
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        let persistence = Persistence::new(&config, None).unwrap();
+        let persistence = Persistence::new(&config).unwrap();
         let keyring = config.secret_keyring().unwrap();
 
         ensure_bootstrapped(&config, &persistence, &storage, &keyring)
@@ -1486,11 +1488,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn internal_node_access_requires_direct_grant_active_membership_and_capability() {
+        let temp = tempdir().unwrap();
+        let mut config = test_config(temp.path());
+        config.bootstrap_node_ids = vec!["node-a".to_string()];
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let persistence = Persistence::new(&config).unwrap();
+        let keyring = config.secret_keyring().unwrap();
+
+        install_active_internal_node(&storage, &config.mesh_id, "node-a").await;
+        ensure_bootstrapped(&config, &persistence, &storage, &keyring)
+            .await
+            .unwrap();
+        let core_store = CoreStore::new(storage.clone()).await.unwrap();
+        let claims = auth::Claims {
+            sub: "node-a".to_string(),
+            exp: usize::MAX,
+            tenant_id: SYSTEM_STORAGE_TENANT_ID,
+            jti: None,
+        };
+
+        assert!(
+            check_internal_node_access(
+                &storage,
+                &core_store,
+                &config.mesh_id,
+                &claims,
+                "node-a",
+                NodeCapability::Metadata,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !check_internal_node_access(
+                &storage,
+                &core_store,
+                &config.mesh_id,
+                &claims,
+                "node-a",
+                NodeCapability::Gateway,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !check_internal_node_access(
+                &storage,
+                &core_store,
+                "another-mesh",
+                &claims,
+                "node-a",
+                NodeCapability::Metadata,
+            )
+            .await
+            .unwrap()
+        );
+        let forged_claims = auth::Claims {
+            sub: "node-b".to_string(),
+            ..claims
+        };
+        assert!(
+            !check_internal_node_access(
+                &storage,
+                &core_store,
+                &config.mesh_id,
+                &forged_claims,
+                "node-a",
+                NodeCapability::Metadata,
+            )
+            .await
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn system_realm_bootstrap_existing_realm_does_not_grant_again() {
         let temp = tempdir().unwrap();
         let config = test_config(temp.path());
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        let persistence = Persistence::new(&config, None).unwrap();
+        let persistence = Persistence::new(&config).unwrap();
         let keyring = config.secret_keyring().unwrap();
 
         ensure_bootstrapped(&config, &persistence, &storage, &keyring)
@@ -1524,7 +1601,7 @@ mod tests {
         config.bootstrap_system_admin_subject_kind.clear();
         config.bootstrap_system_admin_subject_id.clear();
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        let persistence = Persistence::new(&config, None).unwrap();
+        let persistence = Persistence::new(&config).unwrap();
         let keyring = config.secret_keyring().unwrap();
 
         let err = ensure_bootstrapped(&config, &persistence, &storage, &keyring)
@@ -1547,7 +1624,7 @@ mod tests {
             credential_path.to_string_lossy().to_string();
 
         let storage = Storage::new_at(&storage_path).await.unwrap();
-        let persistence = Persistence::new(&config, None).unwrap();
+        let persistence = Persistence::new(&config).unwrap();
         let keyring = config.secret_keyring().unwrap();
 
         ensure_bootstrapped(&config, &persistence, &storage, &keyring)
@@ -1630,14 +1707,13 @@ mod tests {
         config.bootstrap_system_admin_subject_kind.clear();
         config.bootstrap_system_admin_subject_id.clear();
 
-        let err = crate::AppState::new(
-            config,
-            None,
-            crate::test_support::personaldb_protocol_keyring(),
-        )
-        .await
-        .unwrap_err();
-        assert!(err.to_string().contains("system realm is missing"));
+        let err = crate::AppState::new(config, crate::test_support::personaldb_protocol_keyring())
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("system realm is missing"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[tokio::test]
@@ -1645,7 +1721,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let config = test_config(temp.path());
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        let persistence = Persistence::new(&config, None).unwrap();
+        let persistence = Persistence::new(&config).unwrap();
         let keyring = config.secret_keyring().unwrap();
 
         let (left, right) = tokio::join!(
@@ -1680,7 +1756,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let config = test_config(temp.path());
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        let persistence = Persistence::new(&config, None).unwrap();
+        let persistence = Persistence::new(&config).unwrap();
         let keyring = config.secret_keyring().unwrap();
 
         install_system_schema(&storage, &persistence).await.unwrap();
@@ -1724,7 +1800,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let config = test_config(temp.path());
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        let persistence = Persistence::new(&config, None).unwrap();
+        let persistence = Persistence::new(&config).unwrap();
         let keyring = config.secret_keyring().unwrap();
 
         ensure_bootstrapped(&config, &persistence, &storage, &keyring)

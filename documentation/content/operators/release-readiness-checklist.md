@@ -198,7 +198,7 @@ Anvil is a storage system. A release is not ready for production operators until
 
 These questions are not bureaucracy. A Docker image can be rolled back only if durable state remains compatible. If a new release writes a one-way record and an older binary misreads it, restarting the old container is not rollback; it is another incident.
 
-For operator acceptance, collect backup evidence before upgrade: the `STORAGE_PATH` volume snapshot, node identity and cluster key material where applicable, `JWT_SECRET`, `CLUSTER_SECRET`, active and previous secret-encryption keys, bootstrap or named admin credentials, tenant/app credential rotation plan, and redacted configuration. A restore drill proves much more than a backup job succeeding. It proves the backup can become a running node or test deployment that serves source records.
+For operator acceptance, collect backup evidence before upgrade: every `STORAGE_PATH` volume snapshot containing its node-local identity and Ed25519 signing key, `JWT_SECRET`, active and previous secret-encryption keys, internal node credential references, bootstrap or named admin credentials, tenant/app credential rotation plan, and redacted configuration. A restore drill proves much more than a backup job succeeding. It proves the backup can become a running node or test deployment that serves source records.
 
 ## Smoke-test gate
 

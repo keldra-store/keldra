@@ -1,6 +1,9 @@
 use super::record_proto;
 use super::*;
 
+const MAX_DRAIN_BLOCKER_DETAILS: usize = 128;
+const ROUTING_PAGE_SIZE: usize = 256;
+
 pub(super) fn lifecycle_state_for_host_alias(state: HostAliasState) -> LifecycleState {
     match state {
         HostAliasState::PendingVerification => LifecycleState::Joining,
@@ -241,27 +244,101 @@ pub(super) async fn bucket_locators_blocking_region_drain(
     storage: &Storage,
     region: &str,
 ) -> LifecycleResult<Vec<String>> {
-    let locators = mesh_directory::list_bucket_locators(storage)
+    let mut blockers = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = page_bucket_locators_for_drain(storage, cursor.as_deref()).await?;
+        for locator in page.locators {
+            if locator.home_region.as_str() == region
+                && bucket_locator_blocks_region_drain(locator.status)
+            {
+                blockers.push(format!(
+                    "{}/{}:{:?}",
+                    locator.tenant_id.as_str(),
+                    locator.bucket_name.as_str(),
+                    locator.status
+                ));
+                if blockers.len() == MAX_DRAIN_BLOCKER_DETAILS {
+                    return Ok(blockers);
+                }
+            }
+        }
+        let Some(next_cursor) = page.next_tuple_key else {
+            break;
+        };
+        ensure_page_cursor_advanced(cursor.as_deref(), &next_cursor)?;
+        cursor = Some(next_cursor);
+    }
+    Ok(blockers)
+}
+
+async fn page_bucket_locators_for_drain(
+    storage: &Storage,
+    cursor: Option<&[u8]>,
+) -> LifecycleResult<mesh_directory::BucketLocatorPage> {
+    mesh_directory::page_bucket_locators(storage, cursor, ROUTING_PAGE_SIZE)
         .await
         .map_err(|err| {
             LifecycleError::InvalidArgument(format!(
                 "could not inspect bucket locators for region drain: {err}"
             ))
-        })?;
-    let mut blockers = Vec::new();
-    for locator in locators {
-        if locator.home_region.as_str() == region
-            && bucket_locator_blocks_region_drain(locator.status)
-        {
-            blockers.push(format!(
-                "{}/{}:{:?}",
-                locator.tenant_id.as_str(),
-                locator.bucket_name.as_str(),
-                locator.status
-            ));
-        }
+        })
+}
+
+fn ensure_page_cursor_advanced(current: Option<&[u8]>, next: &[u8]) -> LifecycleResult<()> {
+    if current.is_some_and(|current| current >= next) {
+        return Err(LifecycleError::InvalidArgument(
+            "bucket locator page cursor did not advance".to_string(),
+        ));
     }
-    Ok(blockers)
+    Ok(())
+}
+
+fn push_drain_blocker(blockers: &mut Vec<String>, blocker: String) -> bool {
+    blockers.push(blocker);
+    blockers.len() == MAX_DRAIN_BLOCKER_DETAILS
+}
+
+fn bucket_locator_drain_exception_blocker(
+    state: &MeshLifecycleState,
+    region: &str,
+    locator: &BucketLocatorDescriptor,
+) -> Option<String> {
+    if locator.home_region.as_str() != region || !bucket_locator_blocks_region_drain(locator.status)
+    {
+        return None;
+    }
+    let record_key = format!(
+        "{}/{}",
+        locator.tenant_id.as_str(),
+        locator.bucket_name.as_str()
+    );
+    let exception_key = bucket_drain_exception_key(
+        region,
+        locator.tenant_id.as_str(),
+        locator.bucket_name.as_str(),
+    );
+    let Some(exception) = state.bucket_drain_exceptions.get(&exception_key) else {
+        return Some(format!(
+            "{}:{:?}:missing_exception",
+            record_key, locator.status
+        ));
+    };
+    if locator.status != BucketLocatorStatus::ReadOnly {
+        return Some(format!(
+            "{}:{:?}:exception_requires_read_only_locator",
+            record_key, locator.status
+        ));
+    }
+    if !exception.disposition.allows_drained_exception() {
+        return Some(format!(
+            "{}:{:?}:invalid_exception_disposition:{}",
+            record_key,
+            locator.status,
+            exception.disposition.as_str()
+        ));
+    }
+    None
 }
 
 pub(super) fn bucket_locator_blocks_region_drain(status: BucketLocatorStatus) -> bool {
@@ -273,53 +350,22 @@ pub(super) async fn bucket_locators_without_valid_drain_exception(
     region: &str,
 ) -> LifecycleResult<Vec<String>> {
     let state = read_state(storage).await?;
-    let locators = mesh_directory::list_bucket_locators(storage)
-        .await
-        .map_err(|err| {
-            LifecycleError::InvalidArgument(format!(
-                "could not inspect bucket locators for region drain: {err}"
-            ))
-        })?;
     let mut blockers = Vec::new();
-    for locator in locators {
-        if locator.home_region.as_str() != region
-            || !bucket_locator_blocks_region_drain(locator.status)
-        {
-            continue;
+    let mut cursor = None;
+    loop {
+        let page = page_bucket_locators_for_drain(storage, cursor.as_deref()).await?;
+        for locator in page.locators {
+            if let Some(blocker) = bucket_locator_drain_exception_blocker(&state, region, &locator)
+                && push_drain_blocker(&mut blockers, blocker)
+            {
+                return Ok(blockers);
+            }
         }
-        let record_key = format!(
-            "{}/{}",
-            locator.tenant_id.as_str(),
-            locator.bucket_name.as_str()
-        );
-        let exception_key = bucket_drain_exception_key(
-            region,
-            locator.tenant_id.as_str(),
-            locator.bucket_name.as_str(),
-        );
-        let Some(exception) = state.bucket_drain_exceptions.get(&exception_key) else {
-            blockers.push(format!(
-                "{}:{:?}:missing_exception",
-                record_key, locator.status
-            ));
-            continue;
+        let Some(next_cursor) = page.next_tuple_key else {
+            break;
         };
-        if locator.status != BucketLocatorStatus::ReadOnly {
-            blockers.push(format!(
-                "{}:{:?}:exception_requires_read_only_locator",
-                record_key, locator.status
-            ));
-            continue;
-        }
-        if !exception.disposition.allows_drained_exception() {
-            blockers.push(format!(
-                "{}:{:?}:invalid_exception_disposition:{}",
-                record_key,
-                locator.status,
-                exception.disposition.as_str()
-            ));
-            continue;
-        }
+        ensure_page_cursor_advanced(cursor.as_deref(), &next_cursor)?;
+        cursor = Some(next_cursor);
     }
     Ok(blockers)
 }
@@ -344,92 +390,6 @@ pub fn lifecycle_control_stream_families() -> [&'static str; 3] {
         CELL_DESCRIPTOR_STREAM_FAMILY,
         NODE_DESCRIPTOR_STREAM_FAMILY,
     ]
-}
-
-pub(super) async fn append_lifecycle_control_mutation<T: record_proto::LifecycleControlPayload>(
-    storage: &Storage,
-    stream_family: &str,
-    partition: &str,
-    record_key: &str,
-    operation: &str,
-    expected_generation: Option<u64>,
-    new_generation: u64,
-    mesh_id: &str,
-    payload: &T,
-    authority: LifecycleControlWriteAuthority<'_>,
-) -> LifecycleResult<()> {
-    require_identifier(stream_family, "control stream family")?;
-    require_identifier(partition, "control stream partition")?;
-    require_control_record_key(record_key)?;
-    let expected_partition_id = mesh_directory::control_partition_id(stream_family, partition);
-    if authority.permit.partition_family != mesh_directory::CONTROL_PARTITION_FAMILY {
-        return Err(LifecycleError::InvalidArgument(format!(
-            "invalid lifecycle control write permit: expected partition family {}, got {}",
-            mesh_directory::CONTROL_PARTITION_FAMILY,
-            authority.permit.partition_family
-        )));
-    }
-    if authority.permit.partition_id != expected_partition_id {
-        return Err(LifecycleError::InvalidArgument(
-            "invalid lifecycle control write permit: partition id does not match stream"
-                .to_string(),
-        ));
-    }
-    let partition_precondition = partition_fence::partition_write_precondition(
-        storage,
-        authority.permit,
-        authority.signing_key,
-    )
-    .await
-    .map_err(|rejection| {
-        LifecycleError::InvalidArgument(format!(
-            "lifecycle control write fence rejected for {stream_family}/{partition}: {}: {}",
-            rejection.code.as_str(),
-            rejection.reason
-        ))
-    })?;
-
-    let existing_log = read_control_stream_log(storage, stream_family, partition)
-        .await
-        .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?;
-    let sequence = existing_log
-        .records
-        .last()
-        .map(|record| record.metadata.sequence.get().saturating_add(1))
-        .unwrap_or(1);
-    let payload_proto = record_proto::encode_lifecycle_control_payload(payload, stream_family)?;
-    let digest = ControlRecordDigest::blake3(&payload_proto);
-    let sequence = ControlStreamSequence::new(sequence)
-        .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?;
-    let created_at = Utc::now().to_rfc3339();
-    let header_proto =
-        crate::mesh_control_stream::encode_control_mutation_header(ControlMutationHeaderInput {
-            schema: CONTROL_MUTATION_SCHEMA,
-            mesh_id,
-            stream_family,
-            partition,
-            sequence,
-            record_key,
-            operation,
-            expected_generation,
-            new_generation,
-            writer_node_id: authority.permit.owner_node_id.as_str(),
-            writer_fence: authority.permit.fence_token,
-            idempotency_key: None,
-            record_digest: &digest,
-            created_at: &created_at,
-        });
-    let frame = ControlStreamFrame::new(header_proto, payload_proto);
-    crate::mesh_control_stream::append_control_stream_frame(
-        storage,
-        stream_family,
-        partition,
-        &frame,
-        Some(partition_precondition),
-    )
-    .await
-    .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?;
-    Ok(())
 }
 
 pub(super) fn cell_record_key(region: &str, cell_id: &str) -> LifecycleResult<String> {
@@ -594,33 +554,37 @@ pub(super) async fn validate_activation_checkpoint_streams(
             continue;
         }
 
-        let log = read_control_stream_log(storage, &required.stream_family, &required.partition)
-            .await
-            .map_err(|err| {
-                LifecycleError::InvalidArgument(format!(
-                    "activation checkpoint could not read control stream {}/{}: {err}",
-                    required.stream_family, required.partition
-                ))
-            })?;
-        let mut found_sequence = false;
-        for record in log.records {
-            if record.metadata.sequence == required.sequence {
-                found_sequence = true;
-                if record.metadata.record_digest.as_str() != required.digest.as_str() {
-                    return Err(activation_checkpoint_not_reached(
-                        required,
-                        format!("digest mismatch at sequence {}", required.sequence.get()),
-                    ));
-                }
-            }
-        }
-        if !found_sequence {
+        let page = crate::mesh_control_stream::read_control_stream_page(
+            storage,
+            &required.stream_family,
+            &required.partition,
+            required.sequence.get().saturating_sub(1),
+            1,
+        )
+        .await
+        .map_err(|err| {
+            LifecycleError::InvalidArgument(format!(
+                "activation checkpoint could not read control stream {}/{}: {err}",
+                required.stream_family, required.partition
+            ))
+        })?;
+        let Some(record) = page
+            .records
+            .into_iter()
+            .find(|record| record.metadata.sequence == required.sequence)
+        else {
             return Err(activation_checkpoint_not_reached(
                 required,
                 format!(
                     "regional checkpoint is beyond sequence {}, but the required stream position is not available for digest validation",
                     region_checkpoint.last_sequence.get()
                 ),
+            ));
+        };
+        if record.metadata.record_digest.as_str() != required.digest.as_str() {
+            return Err(activation_checkpoint_not_reached(
+                required,
+                format!("digest mismatch at sequence {}", required.sequence.get()),
             ));
         }
     }
@@ -636,12 +600,25 @@ pub(super) async fn existing_control_stream_partitions(
         .map(|family| family.stream_family())
         .chain(lifecycle_control_stream_families().into_iter());
     for stream_family in stream_families {
-        for partition in
-            crate::mesh_control_stream::list_control_stream_partitions(storage, stream_family)
-                .await
-                .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?
-        {
-            streams.push((stream_family.to_string(), partition));
+        let mut cursor = None;
+        loop {
+            let page = crate::mesh_control_stream::list_control_stream_partitions_page(
+                storage,
+                stream_family,
+                cursor.as_deref(),
+                256,
+            )
+            .await
+            .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?;
+            streams.extend(
+                page.partitions
+                    .into_iter()
+                    .map(|partition| (stream_family.to_string(), partition)),
+            );
+            let Some(next) = page.next_stream_id else {
+                break;
+            };
+            cursor = Some(next);
         }
     }
     Ok(streams)

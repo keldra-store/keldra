@@ -22,17 +22,21 @@ impl CoreStore {
                     stream_id,
                     visible_sequence,
                     prepared_record_hash,
+                    ..
                 } => {
-                    let records = self.read_all_stream_records(stream_id).await?;
-                    let Some(record) = records.iter().find(|record| {
-                        record.sequence == *visible_sequence
-                            && record.event_hash == *prepared_record_hash
-                            && record.transaction_id.as_deref() == Some(transaction_id)
-                    }) else {
+                    let Some(record) = self
+                        .read_stream_record_from_meta(stream_id, *visible_sequence)
+                        .await?
+                    else {
                         bail!("TransactionFinalisationMissingStreamRecord");
                     };
+                    if record.event_hash != *prepared_record_hash
+                        || record.transaction_id.as_deref() != Some(transaction_id)
+                    {
+                        bail!("TransactionFinalisationStreamRecordMismatch");
+                    }
                     if !self
-                        .transaction_makes_stream_record_visible(record, transaction_id)
+                        .transaction_makes_stream_record_visible(&record, transaction_id)
                         .await?
                     {
                         bail!("TransactionFinalisationStreamRecordNotVisible");
@@ -62,6 +66,8 @@ impl CoreStore {
                 }
             }
         }
+        // Finalisation verifies the exact physical write outcome. A
+        // publication-aware read could hide a malformed put or delete here.
         for ((cf, table_id, tuple_key), expected_hash) in expected_coremeta {
             match expected_hash {
                 Some(expected_hash) => {

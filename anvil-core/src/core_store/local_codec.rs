@@ -35,6 +35,8 @@ struct CoreMutationBatchProto {
     preconditions: Vec<CoreMutationPreconditionProto>,
     #[prost(message, repeated, tag = "5")]
     operations: Vec<CoreMutationOperationProto>,
+    #[prost(message, repeated, tag = "6")]
+    root_publications: Vec<CoreMutationRootPublicationProto>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -47,11 +49,23 @@ struct CoreMutationPreconditionsProto {
 struct CoreMutationOperationsProto {
     #[prost(message, repeated, tag = "1")]
     operations: Vec<CoreMutationOperationProto>,
+    #[prost(message, repeated, tag = "2")]
+    root_publications: Vec<CoreMutationRootPublicationProto>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct CoreMutationRootPublicationProto {
+    #[prost(string, tag = "1")]
+    root_anchor_key: String,
+    #[prost(string, repeated, tag = "2")]
+    writer_families: Vec<String>,
+    #[prost(bool, tag = "3")]
+    transaction_coordinator: bool,
 }
 
 #[derive(Clone, PartialEq, Message)]
 struct CoreMutationPreconditionProto {
-    #[prost(oneof = "mutation_precondition_proto::Kind", tags = "2, 3, 4")]
+    #[prost(oneof = "mutation_precondition_proto::Kind", tags = "2, 3, 4, 5")]
     kind: Option<mutation_precondition_proto::Kind>,
 }
 
@@ -66,6 +80,8 @@ mod mutation_precondition_proto {
         StreamHead(super::CoreMutationStreamHeadPreconditionProto),
         #[prost(message, tag = "4")]
         CoreMetaRow(super::CoreMutationCoreMetaRowPreconditionProto),
+        #[prost(message, tag = "5")]
+        CoreMetaLease(super::CoreMutationCoreMetaLeasePreconditionProto),
     }
 }
 
@@ -101,6 +117,20 @@ struct CoreMutationCoreMetaRowPreconditionProto {
     require_absent: bool,
     #[prost(bool, tag = "6")]
     require_present: bool,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct CoreMutationCoreMetaLeasePreconditionProto {
+    #[prost(string, tag = "1")]
+    cf: String,
+    #[prost(uint32, tag = "2")]
+    table_id: u32,
+    #[prost(bytes, tag = "3")]
+    tuple_key: Vec<u8>,
+    #[prost(string, tag = "4")]
+    expected_payload_hash: String,
+    #[prost(uint64, tag = "5")]
+    expires_at_unix_nanos: u64,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -286,6 +316,11 @@ fn core_mutation_batch_to_proto(batch: &CoreMutationBatch) -> Result<CoreMutatio
             .iter()
             .map(core_mutation_operation_to_proto)
             .collect::<Result<Vec<_>>>()?,
+        root_publications: batch
+            .root_publications
+            .iter()
+            .map(core_mutation_root_publication_to_proto)
+            .collect(),
     })
 }
 
@@ -304,6 +339,11 @@ fn core_mutation_batch_from_proto(proto: CoreMutationBatchProto) -> Result<CoreM
             .into_iter()
             .map(core_mutation_operation_from_proto)
             .collect::<Result<Vec<_>>>()?,
+        root_publications: proto
+            .root_publications
+            .into_iter()
+            .map(core_mutation_root_publication_from_proto)
+            .collect(),
     })
 }
 
@@ -324,17 +364,61 @@ pub(super) fn core_mutation_preconditions_hash(
 
 pub(super) fn core_mutation_operations_hash(
     operations: &[CoreMutationOperation],
+    root_publications: &[CoreMutationRootPublication],
 ) -> Result<String> {
     let proto = CoreMutationOperationsProto {
         operations: operations
             .iter()
             .map(core_mutation_operation_to_proto)
             .collect::<Result<Vec<_>>>()?,
+        root_publications: root_publications
+            .iter()
+            .map(core_mutation_root_publication_to_proto)
+            .collect(),
     };
     Ok(format!(
         "sha256:{}",
         sha256_hex(&encode_deterministic(proto)?)
     ))
+}
+
+/// Hash the caller's logical mutation plan independently of the publication
+/// generations and transaction id that CoreStore binds during admission.
+pub(super) fn core_mutation_logical_operations_hash(
+    operations: &[CoreMutationOperation],
+    root_publications: &[CoreMutationRootPublication],
+) -> Result<String> {
+    let mut logical_operations = operations.to_vec();
+    for operation in &mut logical_operations {
+        let CoreMutationOperation::CoreMetaPut { payload, .. } = operation else {
+            continue;
+        };
+        let mut common = core_meta_row_common_from_payload(payload)?;
+        common.root_generation = 0;
+        common.transaction_id.clear();
+        *payload = replace_core_meta_row_common(payload, &common)?;
+    }
+    core_mutation_operations_hash(&logical_operations, root_publications)
+}
+
+fn core_mutation_root_publication_to_proto(
+    publication: &CoreMutationRootPublication,
+) -> CoreMutationRootPublicationProto {
+    CoreMutationRootPublicationProto {
+        root_anchor_key: publication.root_anchor_key.clone(),
+        writer_families: publication.writer_families.clone(),
+        transaction_coordinator: publication.transaction_coordinator,
+    }
+}
+
+fn core_mutation_root_publication_from_proto(
+    publication: CoreMutationRootPublicationProto,
+) -> CoreMutationRootPublication {
+    CoreMutationRootPublication {
+        root_anchor_key: publication.root_anchor_key,
+        writer_families: publication.writer_families,
+        transaction_coordinator: publication.transaction_coordinator,
+    }
 }
 
 fn core_mutation_precondition_to_proto(
@@ -363,6 +447,21 @@ fn core_mutation_precondition_to_proto(
                 expected_payload_hash: expected_payload_hash.clone(),
                 require_absent: *require_absent,
                 require_present: *require_present,
+            },
+        ),
+        CoreMutationPrecondition::CoreMetaLease {
+            cf,
+            table_id,
+            tuple_key,
+            expected_payload_hash,
+            expires_at_unix_nanos,
+        } => mutation_precondition_proto::Kind::CoreMetaLease(
+            CoreMutationCoreMetaLeasePreconditionProto {
+                cf: cf.clone(),
+                table_id: u32::from(*table_id),
+                tuple_key: tuple_key.clone(),
+                expected_payload_hash: expected_payload_hash.clone(),
+                expires_at_unix_nanos: *expires_at_unix_nanos,
             },
         ),
         CoreMutationPrecondition::StreamHead {
@@ -401,6 +500,16 @@ fn core_mutation_precondition_from_proto(
                     expected_payload_hash: value.expected_payload_hash,
                     require_absent: value.require_absent,
                     require_present: value.require_present,
+                }
+            }
+            mutation_precondition_proto::Kind::CoreMetaLease(value) => {
+                CoreMutationPrecondition::CoreMetaLease {
+                    cf: value.cf,
+                    table_id: u16::try_from(value.table_id)
+                        .map_err(|_| anyhow!("CoreMeta lease precondition table id exceeds u16"))?,
+                    tuple_key: value.tuple_key,
+                    expected_payload_hash: value.expected_payload_hash,
+                    expires_at_unix_nanos: value.expires_at_unix_nanos,
                 }
             }
             mutation_precondition_proto::Kind::StreamHead(value) => {
@@ -552,6 +661,21 @@ pub(super) fn validate_batch_partitions(batch: &CoreMutationBatch) -> Result<()>
                 }
                 if let Some(hash) = expected_payload_hash {
                     validate_coremeta_digest(hash, "precondition CoreMeta payload hash")?;
+                }
+            }
+            CoreMutationPrecondition::CoreMetaLease {
+                cf,
+                expected_payload_hash,
+                expires_at_unix_nanos,
+                ..
+            } => {
+                validate_logical_id(cf, "precondition CoreMeta lease column family")?;
+                validate_coremeta_digest(
+                    expected_payload_hash,
+                    "precondition CoreMeta lease payload hash",
+                )?;
+                if *expires_at_unix_nanos == 0 {
+                    bail!("CoreMeta lease precondition expiry must be nonzero");
                 }
             }
             CoreMutationPrecondition::StreamHead {

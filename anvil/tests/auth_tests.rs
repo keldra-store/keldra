@@ -79,7 +79,7 @@ async fn grpc_error_responses_include_server_request_id() {
 
     let mut bucket_client = BucketServiceClient::connect(grpc_addr).await.unwrap();
     let err = bucket_client
-        .list_buckets(Request::new(ListBucketsRequest {}))
+        .list_buckets(Request::new(ListBucketsRequest { page: None }))
         .await
         .expect_err("unauthenticated request must fail");
 
@@ -147,6 +147,86 @@ async fn grant_docker_authz_realm(
     cluster
         .grant_application_policies(actor.tenant_id, &actor.app_name, &policies)
         .await;
+}
+
+fn test_default_authz_schema() -> Vec<AuthzNamespaceSchema> {
+    vec![
+        AuthzNamespaceSchema {
+            namespace: "document".to_string(),
+            relations: vec![
+                authz_direct_relation("viewer", &["user", "folder", "userset"]),
+                authz_direct_relation("editor", &["user"]),
+            ],
+            schema_json: r#"{"namespace":"document"}"#.to_string(),
+            schema_hash: String::new(),
+            schema_version: 0,
+            authz_revision: 0,
+            applied_at: String::new(),
+        },
+        AuthzNamespaceSchema {
+            namespace: "folder".to_string(),
+            relations: vec![authz_direct_relation("viewer", &["user", "userset"])],
+            schema_json: r#"{"namespace":"folder"}"#.to_string(),
+            schema_hash: String::new(),
+            schema_version: 0,
+            authz_revision: 0,
+            applied_at: String::new(),
+        },
+        AuthzNamespaceSchema {
+            namespace: "group".to_string(),
+            relations: vec![authz_direct_relation("member", &["user"])],
+            schema_json: r#"{"namespace":"group"}"#.to_string(),
+            schema_hash: String::new(),
+            schema_version: 0,
+            authz_revision: 0,
+            applied_at: String::new(),
+        },
+    ]
+}
+
+async fn prepare_docker_default_authz_realm(
+    cluster: &DockerTestCluster,
+    actor: &DockerTestStorageActor,
+) -> u64 {
+    grant_docker_authz_realm(cluster, actor, "default").await;
+    bind_default_authz_schema(&actor.grpc_addr, actor.tenant_id, &actor.token).await
+}
+
+async fn bind_default_authz_schema(grpc_addr: &str, tenant_id: i64, token: &str) -> u64 {
+    let mut auth_client = AuthServiceClient::connect(grpc_addr.to_string())
+        .await
+        .unwrap();
+    let mut put = Request::new(PutAuthzSchemaRequest {
+        anvil_storage_tenant_id: tenant_id.to_string(),
+        schema_id: "default".to_string(),
+        namespaces: test_default_authz_schema(),
+        reason: "install Docker test authorization schema".to_string(),
+    });
+    add_bearer(&mut put, token);
+    let schema_ref = auth_client
+        .put_authz_schema(put)
+        .await
+        .unwrap()
+        .into_inner()
+        .schema_ref
+        .expect("put default Docker test schema returns a schema reference");
+
+    let mut bind = Request::new(BindAuthzSchemaRequest {
+        scope: Some(AuthzScope {
+            anvil_storage_tenant_id: tenant_id.to_string(),
+            authz_realm_id: "default".to_string(),
+        }),
+        schema_ref: Some(schema_ref),
+        expected_binding_generation: None,
+        reason: "bind Docker test authorization schema".to_string(),
+    });
+    add_bearer(&mut bind, token);
+    auth_client
+        .bind_authz_schema(bind)
+        .await
+        .unwrap()
+        .into_inner()
+        .authz_revision
 }
 
 async fn get_token(grpc_addr: &str, client_id: &str, client_secret: &str) -> String {

@@ -10,6 +10,11 @@ use crate::system_realm::SystemAdminRelation;
 use crate::{AppState, access_control, auth, bucket_journal, middleware};
 use tonic::{Request, Response, Status};
 
+const MAX_BOOTSTRAP_REGIONS: usize = 256;
+const MAX_BOOTSTRAP_CELLS: usize = 1024;
+const MAX_BOOTSTRAP_NODES: usize = 4096;
+const MAX_BOOTSTRAP_COREMETA_ROWS: usize = 4096;
+
 fn mesh_transaction_id(options: Option<&WriteOptions>) -> Result<Option<&str>, Status> {
     crate::services::saga_reserved::write_options_transaction_id(options)
 }
@@ -23,6 +28,7 @@ impl MeshControlService for AppState {
         require_mesh_admin(&request, self, SystemAdminRelation::ManageNodes).await?;
         let request_id = request_id(&request);
         let req = request.into_inner();
+        validate_bootstrap_topology_size(&req)?;
         if req.regions.is_empty() || req.cells.is_empty() || req.nodes.is_empty() {
             return Err(Status::invalid_argument(
                 "bootstrap topology requires regions, cells, and nodes",
@@ -73,10 +79,8 @@ impl MeshControlService for AppState {
                     node_id: node.node_id,
                     region: node.region_id,
                     cell_id: node.cell_id,
-                    libp2p_peer_id: node.libp2p_peer_id,
-                    receipt_signing_public_key_proto: node.receipt_signing_public_key_proto,
+                    receipt_signing_public_key: node.receipt_signing_public_key,
                     public_api_addr: node.advertise_addr,
-                    public_cluster_addrs: node.cluster_addrs,
                     capabilities,
                     capacity_json: node.capacity_json,
                 })
@@ -87,7 +91,7 @@ impl MeshControlService for AppState {
                 self.core_store
                     .register_node_receipt_signing_public_key(
                         &node.node_id,
-                        &node.receipt_signing_public_key_proto,
+                        &node.receipt_signing_public_key,
                     )
                     .map_err(mesh_status)?;
             }
@@ -101,11 +105,11 @@ impl MeshControlService for AppState {
                 },
             )
             .map_err(mesh_status)?;
-            encode_bootstrap_snapshot_rows(
-                self.core_store
-                    .export_portable_coremeta_bootstrap_rows()
-                    .map_err(mesh_status)?,
-            )
+            let exported_rows = self
+                .core_store
+                .export_portable_coremeta_bootstrap_rows(MAX_BOOTSTRAP_COREMETA_ROWS)
+                .map_err(mesh_status)?;
+            encode_bootstrap_snapshot_rows(exported_rows)
         } else {
             let rows = decode_bootstrap_snapshot_rows(req.canonical_coremeta_rows)?;
             self.core_store
@@ -248,12 +252,8 @@ impl MeshControlService for AppState {
                         node_id: req.node_id.clone(),
                         region: req.region_id.clone(),
                         cell_id: req.cell_id.clone(),
-                        libp2p_peer_id: req.libp2p_peer_id.clone(),
-                        receipt_signing_public_key_proto: req
-                            .receipt_signing_public_key_proto
-                            .clone(),
+                        receipt_signing_public_key: req.receipt_signing_public_key.clone(),
                         public_api_addr: req.advertise_addr.clone(),
-                        public_cluster_addrs: req.cluster_addrs.clone(),
                         capabilities,
                         capacity_json: req.capacity_json.clone(),
                     })
@@ -395,6 +395,7 @@ impl MeshControlService for AppState {
         request: Request<GetPartitionMapRequest>,
     ) -> Result<Response<PartitionMap>, Status> {
         require_mesh_admin(&request, self, SystemAdminRelation::ViewSystem).await?;
+        let claims = admin_claims(&request)?;
         let req = request.into_inner();
         let mut rows = Vec::new();
         rows.extend(
@@ -439,9 +440,26 @@ impl MeshControlService for AppState {
         if !req.scope.is_empty() {
             rows.retain(|row| row.contains(&req.scope));
         }
+        let epoch = crate::services::collection_cursor::collection_revision(
+            rows.iter().map(|row| (row.as_str(), 0)),
+        );
+        let filters = [("scope", req.scope.as_str())];
+        let principal_scope = format!("tenant:{}/subject:{}", claims.tenant_id, claims.sub);
+        let (rows, page) = crate::services::collection_cursor::paginate(
+            rows,
+            req.page.as_ref(),
+            "anvil.MeshControlService/GetPartitionMap",
+            &filters,
+            &principal_scope,
+            "partition_row.asc",
+            self.config.jwt_secret.as_bytes(),
+            String::as_str,
+            |_| 0,
+        )?;
         Ok(Response::new(PartitionMap {
-            epoch: rows.len() as u64,
+            epoch: crate::services::collection_cursor::content_generation(&[epoch.as_bytes()]),
             partition_rows: rows,
+            page: Some(page),
         }))
     }
 }
@@ -621,10 +639,8 @@ async fn put_node_in_transaction(
             node_id: req.node_id.clone(),
             region: req.region_id.clone(),
             cell_id: req.cell_id.clone(),
-            libp2p_peer_id: req.libp2p_peer_id.clone(),
-            receipt_signing_public_key_proto: req.receipt_signing_public_key_proto.clone(),
+            receipt_signing_public_key: req.receipt_signing_public_key.clone(),
             public_api_addr: req.advertise_addr.clone(),
-            public_cluster_addrs: req.cluster_addrs.clone(),
             capabilities,
             capacity_json: req.capacity_json.clone(),
         },
@@ -738,10 +754,8 @@ fn ensure_node_put_matches(
     let capacity_hash = capacity_json_hash(&req.capacity_json).map_err(mesh_status)?;
     if node.region != req.region_id
         || node.cell_id != req.cell_id
-        || node.libp2p_peer_id != req.libp2p_peer_id
-        || node.receipt_signing_public_key_proto != req.receipt_signing_public_key_proto
+        || node.receipt_signing_public_key != req.receipt_signing_public_key
         || node.public_api_addr != req.advertise_addr
-        || node.public_cluster_addrs != req.cluster_addrs
         || node.capabilities != capabilities
         || node.capacity_json_hash != capacity_hash
     {
@@ -1060,10 +1074,8 @@ async fn ensure_bootstrap_topology_matches(
         if actual.mesh_id != expected.mesh_id
             || actual.region != expected.region
             || actual.cell_id != expected.cell_id
-            || actual.libp2p_peer_id != expected.libp2p_peer_id
-            || actual.receipt_signing_public_key_proto != expected.receipt_signing_public_key_proto
+            || actual.receipt_signing_public_key != expected.receipt_signing_public_key
             || actual.public_api_addr != expected.public_api_addr
-            || actual.public_cluster_addrs != expected.public_cluster_addrs
             || actual.capabilities != expected.capabilities
             || actual.capacity_json_hash
                 != capacity_json_hash(&expected.capacity_json).map_err(mesh_status)?
@@ -1099,12 +1111,51 @@ fn mesh_write_response(
     }
 }
 
+fn validate_bootstrap_topology_size(req: &BootstrapMeshTopologyRequest) -> Result<(), Status> {
+    for (actual, maximum, field) in [
+        (req.regions.len(), MAX_BOOTSTRAP_REGIONS, "regions"),
+        (req.cells.len(), MAX_BOOTSTRAP_CELLS, "cells"),
+        (req.nodes.len(), MAX_BOOTSTRAP_NODES, "nodes"),
+        (
+            req.canonical_coremeta_rows.len(),
+            MAX_BOOTSTRAP_COREMETA_ROWS,
+            "canonical_coremeta_rows",
+        ),
+    ] {
+        if actual > maximum {
+            return Err(Status::invalid_argument(format!(
+                "bootstrap topology {field} must not exceed {maximum} entries"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn request_id<T>(request: &Request<T>) -> String {
     request
         .extensions()
         .get::<middleware::AnvilRequestId>()
         .map(|request_id| request_id.0.clone())
         .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string())
+}
+
+#[cfg(test)]
+mod bootstrap_contract_tests {
+    use super::*;
+
+    #[test]
+    fn bootstrap_topology_collections_are_bounded() {
+        let request = BootstrapMeshTopologyRequest {
+            regions: vec![PutRegionRequest::default(); MAX_BOOTSTRAP_REGIONS + 1],
+            ..Default::default()
+        };
+        assert_eq!(
+            validate_bootstrap_topology_size(&request)
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+    }
 }
 
 fn mesh_status(error: impl std::fmt::Display) -> Status {

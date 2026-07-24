@@ -11,21 +11,21 @@ Anvil should be operated as a mesh of equal server processes. A node may adverti
 
 This page sets the model used by the rest of the [Operators](/operators/overview/) book. For the conceptual background, see [Learn Anvil](/learn/overview/), [CoreStore](/learn/corestore/), [Authorisation](/learn/authorisation/), [Gateways](/learn/gateways/), and [Mesh Routing and Lifecycle](/learn/mesh-routing-and-lifecycle/). For hands-on local setup, start with [Run Anvil Locally](/tutorials/setup-local-anvil/) and [Tenants, Apps, and Credentials](/tutorials/tenants-apps-and-credentials/).
 
-## One Mesh, Three Trust Surfaces
+## One Mesh, Distinct Trust Contexts
 
-An Anvil deployment has three trust surfaces. They may be served by the same binary, but they must not be treated as interchangeable endpoints.
+An Anvil deployment has two listeners and three authorisation contexts. They are served by the same binary, but they must not be treated as interchangeable authority.
 
 | Surface | Who uses it | What it is for |
 | --- | --- | --- |
 | Public plane | Tenant applications, tenant automation, public clients, and enabled gateways | Object, bucket, authz, index, watch, stream, lease, PersonalDB, S3, and static-hosting work. |
 | Admin plane | Operators and trusted automation | Storage-tenant bootstrap, first credentials, topology, routing repair, system-realm authority, secret-envelope operations, and admin diagnostics. |
-| Cluster plane | Anvil nodes | Node-to-node discovery and internal mesh traffic protected by cluster configuration and network policy. |
+| Internal node RPC | Equal Anvil nodes recorded in committed CoreMeta topology | Quorum, replication, recovery, proxying, and storage evidence over authenticated gRPC at each node's committed `public_api_addr`. |
 
 The public plane is not unsafe; it is the tenant-facing contract. It should be reachable by the clients the deployment intends to serve, and it should still authenticate callers, enforce public policy scopes, apply relationship authorisation where the feature requires it, reject reserved namespaces, and produce audit evidence. The `anvil` CLI is a manual helper over this plane; production applications should call the public API directly or through a deliberate client wrapper. The [public CLI reference](/reference/public-cli/) shows the current manual surface.
 
 The admin plane is more powerful because it changes the system boundary. It creates storage tenants before tenant credentials exist, changes mesh topology, and repairs system projections. Keep it on an internal network and require normal admin authentication and system-realm authorisation. The `anvil-admin` CLI is a network client over this plane, not a direct storage writer; see [Admin Plane](/operators/admin-plane/) and the [admin CLI reference](/reference/admin-cli/).
 
-The cluster plane is not a user API. It is for nodes participating in the mesh. Exposing it broadly, reusing application credentials for it, or relying on obscurity of addresses makes incident analysis harder and widens the blast radius of a node compromise. Design the listeners and network policy with [Network and Ports](/operators/network-and-ports/) before the first deployment.
+Internal node RPC is not a user API even though it is mounted on the public gRPC listener. Each caller uses a node bearer credential and must satisfy built-in system-realm authorisation. The committed lifecycle descriptor supplies the node id, endpoint, Ed25519 signing public key, capabilities, and state used for routing. Network policy and TLS should restrict these calls; application credentials and address obscurity are not substitutes for node authority.
 
 When the planes are blurred, the symptoms are subtle. A CI job may use an admin token to upload tenant content because it was convenient during bootstrap. A gateway may be exposed correctly while the admin listener is accidentally published beside it. A local script may write storage files directly because it can see `STORAGE_PATH`. Each shortcut bypasses the evidence path operators need during an incident.
 
@@ -48,6 +48,8 @@ Source records and derived views are deliberately different. Object versions, cu
 ## Topology Is An Operating Contract
 
 Topology is the map that turns a request into placement and routing decisions. A region is the placement and routing boundary visible to tenants. A cell is typically a rack, failure, or capacity boundary inside a region. A node is one Anvil server process with declared capabilities. A bucket has a home region, and routing records tell the mesh how tenant names, bucket locators, and host aliases should resolve.
+
+Committed CoreMeta lifecycle topology is the sole membership and routing authority. Anvil does not discover membership from running processes, DNS, network announcements, or a second registry. A node becomes eligible only through lifecycle mutation, and other nodes dial the exact `public_api_addr` committed for that identity.
 
 Design topology before deployment, not after traffic arrives. Region ids should represent durable operating commitments, not temporary hostnames. Cell boundaries should match failures or maintenance work you can actually reason about. Node capabilities should describe what a process is allowed and resourced to do; a node should not advertise index, PersonalDB, gateway, or object responsibility merely because the binary contains that code.
 
@@ -73,14 +75,14 @@ The operational signals should reflect that distinction. Watch and index diagnos
 
 ## What To Design Before Deployment
 
-Before deploying Anvil for real tenants, decide the model explicitly. Choose which networks can reach the public, admin, and cluster planes. Choose region ids, cell boundaries, node identities, capabilities, and bootstrap addresses. Decide where `STORAGE_PATH` lives and how it is backed up. Store the server encryption key, previous key history, cluster secret, first-admin credential, tenant app secrets, and bearer-token handling in an actual secret-management plan. Decide which gateways are exposed and which hostnames they serve. Decide the handover process from operator-created storage tenant to tenant-owned credentials and public API work.
+Before deploying Anvil for real tenants, decide the model explicitly. Choose which networks can reach the public and admin listeners and which nodes may call internal gRPC. Choose region ids, cell boundaries, node identities, capabilities, and stable node endpoints. Decide where `STORAGE_PATH` lives and how it is backed up. Store the server encryption key, previous key history, first-admin credential, per-node internal credentials, tenant app secrets, and bearer-token handling in an actual secret-management plan. Decide which gateways are exposed and which hostnames they serve. Decide the handover process from operator-created storage tenant to tenant-owned credentials and public API work.
 
-Those choices also define release and incident evidence. A ready deployment can prove that tenant principals can write and read through the public plane, that admin operations require private reachability plus system authorisation, that cluster traffic is not public user traffic, that CoreStore-backed state survives restore drills, that derived state reports lag rather than pretending to be fresh, that gateways respect the same object and authz model, and that repair starts from diagnostics instead of broad mutation.
+Those choices also define release and incident evidence. A ready deployment can prove that tenant principals can write and read through the public plane, that admin operations require private reachability plus system authorisation, that internal RPC rejects non-node principals, that committed topology drives node routing, that CoreStore-backed state survives restore drills, that derived state reports lag rather than pretending to be fresh, that gateways respect the same object and authz model, and that repair starts from diagnostics instead of broad mutation.
 
 If a current public CLI or admin CLI command does not expose a workflow at that level of detail, document the gap in your runbook and use the narrowest supported API or operator tool for your release. Do not replace a missing command with an unaudited storage edit. The production model is only useful if the deployment can explain how each state change happened.
 
 ## Production invariants
 
-Keep these invariants true during normal operation: one server process owns each writable storage path; admin traffic stays private; tenant traffic uses public APIs; server secrets are not mounted into tenant jobs; node identity files persist outside `STORAGE_PATH`; and backups restore the full storage path plus identity files together with the secret-manager state required to decrypt it.
+Keep these invariants true during normal operation: one server process owns each writable storage path; admin traffic stays private; tenant traffic uses public APIs; internal node RPC uses node credentials and committed endpoints; server secrets are not mounted into tenant jobs; node identity and signing keys remain in node-local CoreMeta under `STORAGE_PATH`; and backups restore that full storage path together with the secret-manager state required to decrypt it.
 
 When an incident response action would break one of those invariants, treat it as a break-glass action. Capture evidence first and document how the deployment returns to the normal model.

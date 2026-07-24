@@ -53,38 +53,38 @@ pub(super) fn decode_multipart_event_fence(bytes: &[u8]) -> Result<u64> {
 }
 
 pub(super) fn current_upload_payload(
-    meta: &CoreMetaStore,
+    store: &CoreStore,
     tenant_id: i64,
     bucket_id: i64,
     upload_row_id: i64,
 ) -> Result<(Option<Vec<u8>>, Option<MultipartUploadCurrentRow>)> {
-    let payload = meta.get(
+    let payload = store.read_coremeta_row(
         CF_OBJECT_HEADS,
         TABLE_MULTIPART_UPLOAD_CURRENT_ROW,
         &multipart_upload_row_key(tenant_id, bucket_id, upload_row_id)?,
     )?;
     let row = payload
         .as_deref()
-        .map(decode_upload_current_row)
+        .map(decode_committed_upload_current_row)
         .transpose()?;
     Ok((payload, row))
 }
 
 pub(super) fn current_part_payload(
-    meta: &CoreMetaStore,
+    store: &CoreStore,
     tenant_id: i64,
     bucket_id: i64,
     upload_row_id: i64,
     part_number: i32,
 ) -> Result<(Option<Vec<u8>>, Option<MultipartPartCurrentRow>)> {
-    let payload = meta.get(
+    let payload = store.read_coremeta_row(
         CF_OBJECT_HEADS,
         TABLE_MULTIPART_PART_CURRENT_ROW,
         &multipart_part_row_key(tenant_id, bucket_id, upload_row_id, part_number)?,
     )?;
     let row = payload
         .as_deref()
-        .map(decode_part_current_row)
+        .map(decode_committed_part_current_row)
         .transpose()?;
     Ok((payload, row))
 }
@@ -92,7 +92,7 @@ pub(super) fn current_part_payload(
 pub(super) fn decode_upload_current_record(
     record: &CoreMetaRecord,
 ) -> Result<MultipartUploadCurrentRow> {
-    let row = decode_upload_current_row(&record.payload)?;
+    let row = decode_committed_upload_current_row(&record.payload)?;
     let tuple_key = core_meta_record_tuple_key(&record.key)?;
     if tuple_key
         != multipart_upload_row_key(row.upload.tenant_id, row.upload.bucket_id, row.upload.id)?
@@ -107,7 +107,7 @@ pub(super) fn decode_upload_current_record(
 pub(super) fn decode_part_current_record(
     record: &CoreMetaRecord,
 ) -> Result<MultipartPartCurrentRow> {
-    let row = decode_part_current_row(&record.payload)?;
+    let row = decode_committed_part_current_row(&record.payload)?;
     let tuple_key = core_meta_record_tuple_key(&record.key)?;
     if tuple_key
         != multipart_part_row_key(
@@ -131,11 +131,12 @@ pub(super) fn encode_upload_current_row(row: &MultipartUploadCurrentRow) -> Resu
                 row.upload.tenant_id,
                 row.upload.bucket_id,
             )),
-            row.generation,
-            &row.transaction_id,
-            row.created_at_unix_nanos,
+            MULTIPART_CURRENT_ROW_CANDIDATE_GENERATION,
+            MULTIPART_CURRENT_ROW_CANDIDATE_TRANSACTION_ID,
+            0,
         )),
         upload: Some(upload_to_proto(&row.upload)?),
+        logical_revision: row.logical_revision,
     };
     let bytes = encode_proto(&proto, "multipart upload current CoreMeta row")?;
     ensure_current_payload_size(&bytes, "multipart upload current CoreMeta row")?;
@@ -143,6 +144,23 @@ pub(super) fn encode_upload_current_row(row: &MultipartUploadCurrentRow) -> Resu
 }
 
 pub(super) fn decode_upload_current_row(bytes: &[u8]) -> Result<MultipartUploadCurrentRow> {
+    decode_upload_current_row_with_common(bytes).map(|(row, _)| row)
+}
+
+pub(super) fn decode_committed_upload_current_row(
+    bytes: &[u8],
+) -> Result<MultipartUploadCurrentRow> {
+    let (row, common) = decode_upload_current_row_with_common(bytes)?;
+    validate_committed_current_row_common(&common)?;
+    Ok(row)
+}
+
+fn decode_upload_current_row_with_common(
+    bytes: &[u8],
+) -> Result<(
+    MultipartUploadCurrentRow,
+    crate::core_store::CoreMetaRowCommonProto,
+)> {
     ensure_current_payload_size(bytes, "multipart upload current CoreMeta row")?;
     let proto = decode_deterministic_proto::<MultipartUploadCurrentRowProto>(
         bytes,
@@ -160,12 +178,16 @@ pub(super) fn decode_upload_current_row(bytes: &[u8]) -> Result<MultipartUploadC
             .ok_or_else(|| anyhow!("multipart upload current CoreMeta row missing upload"))?,
     )?;
     validate_current_row_common(&common, upload.tenant_id, upload.bucket_id)?;
-    Ok(MultipartUploadCurrentRow {
-        upload,
-        generation: common.root_generation,
-        transaction_id: common.transaction_id,
-        created_at_unix_nanos: common.created_at_unix_nanos,
-    })
+    if proto.logical_revision == 0 {
+        anyhow::bail!("multipart upload current row logical revision is zero");
+    }
+    Ok((
+        MultipartUploadCurrentRow {
+            upload,
+            logical_revision: proto.logical_revision,
+        },
+        common,
+    ))
 }
 
 pub(super) fn encode_part_current_row(row: &MultipartPartCurrentRow) -> Result<Vec<u8>> {
@@ -174,13 +196,14 @@ pub(super) fn encode_part_current_row(row: &MultipartPartCurrentRow) -> Result<V
         common: Some(core_meta_committed_row_common(
             multipart_realm_id(row.tenant_id),
             core_meta_root_key_hash(&multipart_current_root_key(row.tenant_id, row.bucket_id)),
-            row.generation,
-            &row.transaction_id,
-            row.created_at_unix_nanos,
+            MULTIPART_CURRENT_ROW_CANDIDATE_GENERATION,
+            MULTIPART_CURRENT_ROW_CANDIDATE_TRANSACTION_ID,
+            0,
         )),
         tenant_id: row.tenant_id,
         bucket_id: row.bucket_id,
         part: Some(part_to_proto(&row.part)?),
+        logical_revision: row.logical_revision,
     };
     let bytes = encode_proto(&proto, "multipart part current CoreMeta row")?;
     ensure_current_payload_size(&bytes, "multipart part current CoreMeta row")?;
@@ -188,6 +211,21 @@ pub(super) fn encode_part_current_row(row: &MultipartPartCurrentRow) -> Result<V
 }
 
 pub(super) fn decode_part_current_row(bytes: &[u8]) -> Result<MultipartPartCurrentRow> {
+    decode_part_current_row_with_common(bytes).map(|(row, _)| row)
+}
+
+pub(super) fn decode_committed_part_current_row(bytes: &[u8]) -> Result<MultipartPartCurrentRow> {
+    let (row, common) = decode_part_current_row_with_common(bytes)?;
+    validate_committed_current_row_common(&common)?;
+    Ok(row)
+}
+
+fn decode_part_current_row_with_common(
+    bytes: &[u8],
+) -> Result<(
+    MultipartPartCurrentRow,
+    crate::core_store::CoreMetaRowCommonProto,
+)> {
     ensure_current_payload_size(bytes, "multipart part current CoreMeta row")?;
     let proto = decode_deterministic_proto::<MultipartPartCurrentRowProto>(
         bytes,
@@ -205,14 +243,18 @@ pub(super) fn decode_part_current_row(bytes: &[u8]) -> Result<MultipartPartCurre
             .part
             .ok_or_else(|| anyhow!("multipart part current CoreMeta row missing part"))?,
     )?;
-    Ok(MultipartPartCurrentRow {
-        tenant_id: proto.tenant_id,
-        bucket_id: proto.bucket_id,
-        part,
-        generation: common.root_generation,
-        transaction_id: common.transaction_id,
-        created_at_unix_nanos: common.created_at_unix_nanos,
-    })
+    if proto.logical_revision == 0 {
+        anyhow::bail!("multipart part current row logical revision is zero");
+    }
+    Ok((
+        MultipartPartCurrentRow {
+            tenant_id: proto.tenant_id,
+            bucket_id: proto.bucket_id,
+            part,
+            logical_revision: proto.logical_revision,
+        },
+        common,
+    ))
 }
 
 pub(super) fn validate_current_row_common(
@@ -230,6 +272,27 @@ pub(super) fn validate_current_row_common(
     }
     if common.visibility_state != crate::core_store::CoreMetaVisibilityState::Committed as i32 {
         anyhow::bail!("multipart current CoreMeta row is not committed");
+    }
+    let expected = core_meta_committed_row_common(
+        multipart_realm_id(tenant_id),
+        core_meta_root_key_hash(&multipart_current_root_key(tenant_id, bucket_id)),
+        MULTIPART_CURRENT_ROW_CANDIDATE_GENERATION,
+        MULTIPART_CURRENT_ROW_CANDIDATE_TRANSACTION_ID,
+        0,
+    );
+    if common.transaction_id.is_empty()
+        || common.payload_schema_version != expected.payload_schema_version
+    {
+        anyhow::bail!("multipart current CoreMeta row has invalid common metadata");
+    }
+    Ok(())
+}
+
+fn validate_committed_current_row_common(
+    common: &crate::core_store::CoreMetaRowCommonProto,
+) -> Result<()> {
+    if common.root_generation == 0 {
+        anyhow::bail!("multipart committed CoreMeta row has zero publication generation");
     }
     Ok(())
 }
@@ -554,16 +617,6 @@ pub(super) fn multipart_realm_id(tenant_id: i64) -> String {
 
 pub(super) fn multipart_current_root_key(tenant_id: i64, bucket_id: i64) -> String {
     format!("tenant/{tenant_id}/bucket/{bucket_id}/multipart/current")
-}
-
-pub(super) fn current_unix_nanos() -> Result<u64> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| anyhow!("system clock is before Unix epoch"))?;
-    Ok(now
-        .as_secs()
-        .saturating_mul(1_000_000_000)
-        .saturating_add(u64::from(now.subsec_nanos())))
 }
 
 pub(super) fn next_upload_id(state: &MultipartState) -> Result<i64> {

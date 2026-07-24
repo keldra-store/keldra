@@ -176,7 +176,7 @@ pub(super) async fn handle_personaldb_signing_key_command(
                 None,
                 None,
                 client.list_personal_db_signing_keys(with_auth(
-                    api::ListPersonalDbSigningKeysRequest {},
+                    api::ListPersonalDbSigningKeysRequest { page: None },
                     token,
                 )?),
             )

@@ -1,10 +1,10 @@
 #![recursion_limit = "512"]
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::net::SocketAddr;
 use std::ops::Deref;
 use std::path::PathBuf;
-use std::sync::{Arc, Once, OnceLock};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 
 use anvil::anvil_api::GetAccessTokenRequest;
@@ -15,21 +15,30 @@ use anvil_core::{AppState, access_control};
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::config::Credentials;
-use futures_util::StreamExt;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tonic::transport::Channel;
 use tracing_subscriber::{self, EnvFilter};
 
 mod coremeta_bootstrap;
+mod docker_cluster_control;
+mod docker_cluster_startup;
 mod docker_image;
+mod docker_observation;
 mod docker_process;
+mod docker_response_fault;
 mod docker_topology;
 
 use coremeta_bootstrap::*;
+pub use docker_cluster_control::{DockerNetworkPartition, DockerPeer};
+pub use docker_cluster_startup::{
+    isolated_docker_test_cluster, isolated_docker_test_cluster_with_deferred_peer,
+};
 use docker_image::require_docker_image;
+pub use docker_observation::DockerObjectObservation;
 use docker_process::*;
-use docker_topology::ensure_docker_topology;
+pub use docker_response_fault::GrpcLostResponseProxy;
+use docker_topology::{ensure_docker_topology, prepare_docker_topology_with_deferred_peer};
 
 static INIT_LOGGER: Once = Once::new();
 static TEST_CLUSTER_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
@@ -39,6 +48,7 @@ static SHARED_PUBLIC_REGION_CLUSTER: OnceLock<Arc<TestCluster>> = OnceLock::new(
 static SHARED_DOCKER_CLUSTER: OnceLock<Arc<DockerTestCluster>> = OnceLock::new();
 
 const DEFAULT_TEST_REGION: &str = "test-region-1";
+pub const ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const SHARED_CLUSTER_REGIONS: [&str; 6] = [
     DEFAULT_TEST_REGION,
     DEFAULT_TEST_REGION,
@@ -121,13 +131,18 @@ async fn connect_docker_admin(addr: &str) -> AdminServiceClient<Channel> {
 async fn wait_for_docker_admin_ready(addr: &str, token: &str, timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
-        if let Ok(mut client) = AdminServiceClient::connect(addr.to_string()).await {
+        let attempt = tokio::time::timeout(Duration::from_secs(2), async {
+            let Ok(mut client) = AdminServiceClient::connect(addr.to_string()).await else {
+                return false;
+            };
             let mut request =
                 tonic::Request::new(anvil::anvil_api::GetLocalNodeDescriptorRequest {});
             add_docker_admin_bearer(&mut request, token);
-            if client.get_local_node_descriptor(request).await.is_ok() {
-                return true;
-            }
+            client.get_local_node_descriptor(request).await.is_ok()
+        })
+        .await;
+        if matches!(attempt, Ok(true)) {
+            return true;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
@@ -230,27 +245,6 @@ pub async fn shared_docker_test_cluster() -> SharedDockerTestCluster {
         cluster,
         _debug_throttle: debug_throttle,
     }
-}
-
-/// Create a Docker-backed cluster with a unique compose project and host ports.
-/// Use this only for tests that intentionally stop/restart nodes, need a unique
-/// region, or otherwise cannot share the long-lived Docker cluster safely.
-pub async fn isolated_docker_test_cluster(label: &str, region: &str) -> DockerTestCluster {
-    let label = compact_resource_label(label, 24);
-    let region = if region.trim().is_empty() {
-        docker_test_region()
-    } else {
-        region.to_string()
-    };
-    tokio::task::spawn_blocking(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("build isolated Docker Anvil test-cluster runtime");
-        runtime.block_on(async move { DockerTestCluster::start_isolated(&label, &region).await })
-    })
-    .await
-    .expect("isolated Docker Anvil test cluster initialization panicked")
 }
 
 /// Shared default integration cluster for tests that only need normal Anvil
@@ -366,7 +360,10 @@ pub struct DockerTestCluster {
     pub public_region_host: String,
     admin_token: String,
     compose_env: Vec<(String, String)>,
+    deferred_topologies:
+        Mutex<std::collections::BTreeMap<u8, anvil::anvil_api::BootstrapMeshTopologyRequest>>,
     cleanup_on_drop: bool,
+    _cluster_permit: Option<OwnedSemaphorePermit>,
 }
 
 impl DockerTestCluster {
@@ -397,15 +394,6 @@ impl DockerTestCluster {
             .map(|port| format!("http://127.0.0.1:{port}"))
             .collect::<Vec<_>>();
 
-        let wait_start = Instant::now();
-        for addr in &grpc_addrs {
-            assert!(
-                wait_for_http_ready(addr, Duration::from_secs(90)).await,
-                "Docker Anvil test endpoint did not become ready: {addr}"
-            );
-        }
-        emit_test_timing("docker_shared_cluster ports_ready", wait_start.elapsed());
-
         let admin_addrs = ports
             .admin_ports
             .iter()
@@ -426,6 +414,17 @@ impl DockerTestCluster {
         );
         ensure_docker_topology(&admin_addrs, &admin_token, &docker_test_region()).await;
 
+        // Distributed CoreMeta readiness depends on the lifecycle projection
+        // installed through the pre-readiness admin plane.
+        let wait_start = Instant::now();
+        for addr in &grpc_addrs {
+            assert!(
+                wait_for_http_ready(addr, Duration::from_secs(90)).await,
+                "Docker Anvil test endpoint did not become ready: {addr}"
+            );
+        }
+        emit_test_timing("docker_shared_cluster ports_ready", wait_start.elapsed());
+
         Self {
             project_name,
             compose_file,
@@ -435,11 +434,18 @@ impl DockerTestCluster {
             public_region_host: format!("{}.anvil-storage.test", docker_test_region()),
             admin_token,
             compose_env,
+            deferred_topologies: Mutex::new(std::collections::BTreeMap::new()),
             cleanup_on_drop: false,
+            _cluster_permit: None,
         }
     }
 
-    async fn start_isolated(label: &str, region: &str) -> Self {
+    async fn start_isolated(
+        label: &str,
+        region: &str,
+        deferred_ordinal: Option<u8>,
+        cluster_permit: OwnedSemaphorePermit,
+    ) -> Self {
         let _port_guard = docker_test_port_allocation_lock();
         let docker_image = require_docker_image();
         let compose_file = docker_compose_file();
@@ -463,6 +469,11 @@ impl DockerTestCluster {
                 port.to_string(),
             ));
         }
+        let mut startup_cleanup = DockerStartupCleanupGuard::new(
+            compose_file.clone(),
+            project_name.clone(),
+            compose_env.clone(),
+        );
         docker_compose_create_then_start(&compose_file, &project_name, &compose_env);
 
         let grpc_addrs = api_ports
@@ -473,15 +484,6 @@ impl DockerTestCluster {
             .iter()
             .map(|port| format!("http://127.0.0.1:{port}"))
             .collect::<Vec<_>>();
-        let wait_start = Instant::now();
-        for addr in &grpc_addrs {
-            assert!(
-                wait_for_http_ready(addr, Duration::from_secs(90)).await,
-                "isolated Docker Anvil test endpoint did not become ready: {addr}"
-            );
-        }
-        emit_test_timing("docker_isolated_cluster ports_ready", wait_start.elapsed());
-
         let admin_token = mint_docker_system_admin_token("docker-system-admin");
         let wait_start = Instant::now();
         for addr in &admin_addrs {
@@ -494,9 +496,41 @@ impl DockerTestCluster {
             "docker_isolated_cluster admin_ports_ready",
             wait_start.elapsed(),
         );
-        ensure_docker_topology(&admin_addrs, &admin_token, region).await;
+        let deferred_topology = if let Some(ordinal) = deferred_ordinal {
+            Some((
+                ordinal,
+                prepare_docker_topology_with_deferred_peer(
+                    &admin_addrs,
+                    &admin_token,
+                    region,
+                    ordinal,
+                )
+                .await,
+            ))
+        } else {
+            ensure_docker_topology(&admin_addrs, &admin_token, region).await;
+            None
+        };
 
-        Self {
+        // Distributed CoreMeta readiness depends on the lifecycle projection
+        // installed through the pre-readiness admin plane.
+        let wait_start = Instant::now();
+        for (index, addr) in grpc_addrs.iter().enumerate() {
+            if deferred_ordinal == Some(u8::try_from(index + 1).unwrap()) {
+                continue;
+            }
+            if !wait_for_http_ready(addr, Duration::from_secs(90)).await {
+                dump_docker_cluster_diagnostics(&compose_file, &project_name, &compose_env);
+                panic!(
+                    "isolated Docker Anvil peer {} endpoint did not become ready: {addr}",
+                    index + 1
+                );
+            }
+        }
+        emit_test_timing("docker_isolated_cluster ports_ready", wait_start.elapsed());
+
+        let deferred_topologies = deferred_topology.into_iter().collect();
+        let cluster = Self {
             project_name,
             compose_file,
             grpc_addrs,
@@ -505,8 +539,12 @@ impl DockerTestCluster {
             public_region_host: format!("{region}.anvil-storage.test"),
             admin_token,
             compose_env,
+            deferred_topologies: Mutex::new(deferred_topologies),
             cleanup_on_drop: true,
-        }
+            _cluster_permit: Some(cluster_permit),
+        };
+        startup_cleanup.disarm();
+        cluster
     }
 
     pub fn admin_token(&self) -> &str {
@@ -794,6 +832,21 @@ impl DockerTestCluster {
 impl Drop for DockerTestCluster {
     fn drop(&mut self) {
         if self.cleanup_on_drop {
+            let failed = std::thread::panicking();
+            if failed {
+                dump_docker_cluster_diagnostics(
+                    &self.compose_file,
+                    &self.project_name,
+                    &self.compose_env,
+                );
+            }
+            if failed && std::env::var_os("ANVIL_TEST_PRESERVE_FAILED_DOCKER_CLUSTER").is_some() {
+                eprintln!(
+                    "[anvil-test] preserving failed Docker project {}",
+                    self.project_name
+                );
+                return;
+            }
             docker_compose_with_env(
                 &self.compose_file,
                 &self.project_name,
@@ -944,6 +997,13 @@ pub async fn get_access_token_for_test(
                         if status.code() == tonic::Code::Unauthenticated
                             && status.message().contains("Invalid client ID") =>
                     {
+                        last_error = Some(status.to_string());
+                    }
+                    Err(status) if status.code() == tonic::Code::Unavailable => {
+                        // A newly started distributed peer can accept gRPC
+                        // connections before CoreMeta recovery admits public
+                        // reads. Treat that explicit retryable response like
+                        // the connection races handled by this helper.
                         last_error = Some(status.to_string());
                     }
                     Err(status) => panic!("get access token failed: {status:?}"),
@@ -1176,6 +1236,8 @@ pub struct TestCluster {
     pub config: Arc<anvil_core::config::Config>,
     pub storage_path: PathBuf,
     cleanup_path: PathBuf,
+    pending_listeners: Vec<tokio::net::TcpListener>,
+    pending_admin_listeners: Vec<tokio::net::TcpListener>,
     _cluster_permit: Option<OwnedSemaphorePermit>,
 }
 
@@ -1244,25 +1306,32 @@ impl TestCluster {
         INIT_LOGGER.call_once(|| {
             let filter = std::env::var("ANVIL_TEST_LOG")
                 .or_else(|_| std::env::var("RUST_LOG"))
-                .unwrap_or_else(|_| {
-                    "warn,anvil=debug,anvil_core=debug,anvil_core::cluster=warn".to_string()
-                });
+                .unwrap_or_else(|_| "warn,anvil=debug,anvil_core=debug".to_string());
             let _ = tracing_subscriber::fmt()
                 .with_env_filter(EnvFilter::new(filter))
                 .try_init();
         });
 
+        let cluster_id = uuid::Uuid::new_v4().simple().to_string();
         let cluster_storage_root =
-            std::env::temp_dir().join(format!("anvil-test-storage-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("anvil-test-storage-{cluster_id}"));
+        let mut grpc_addrs = Vec::with_capacity(regions.len());
+        let mut admin_addrs = Vec::with_capacity(regions.len());
+        let mut pending_listeners = Vec::with_capacity(regions.len());
+        let mut pending_admin_listeners = Vec::with_capacity(regions.len());
+        for _ in regions {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            grpc_addrs.push(format!("http://{}", listener.local_addr().unwrap()));
+            admin_addrs.push(format!("http://{}", admin_listener.local_addr().unwrap()));
+            pending_listeners.push(listener);
+            pending_admin_listeners.push(admin_listener);
+        }
         let mut config = anvil_core::config::Config {
-            cluster_secret: Some("test-cluster-secret".to_string()),
             jwt_secret: "test-secret".to_string(),
             anvil_secret_encryption_key:
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            cluster_listen_addr: "/ip4/127.0.0.1/udp/0/quic-v1".to_string(),
-            public_cluster_addrs: vec![],
             corestore_internal_bearer_token: "test-corestore-internal-token".to_string(),
-            metadata_cache_ttl_secs: 1,
             public_api_addr: "127.0.0.1:0".to_string(),
             api_listen_addr: "127.0.0.1:0".to_string(),
             mesh_id: "test-mesh".to_string(),
@@ -1270,9 +1339,6 @@ impl TestCluster {
             cell_id: "test-cell-1".to_string(),
             bootstrap_system_admin_subject_kind: "app".to_string(),
             bootstrap_system_admin_subject_id: "admin-principal".to_string(),
-            bootstrap_addrs: vec![],
-            init_cluster: false,
-            enable_mdns: false,
             storage_path: cluster_storage_root
                 .join("template")
                 .to_string_lossy()
@@ -1292,14 +1358,25 @@ impl TestCluster {
         let mut states = Vec::new();
         for (node_index, region_name) in regions.iter().enumerate() {
             let mut node_config = config.deref().clone();
+            node_config.node_id = format!("test-{cluster_id}-node-{node_index:03}");
             node_config.region = (*region_name).to_string();
             node_config.cell_id = format!("test-cell-{}", node_index + 1);
-            node_config.metadata_cache_ttl_secs = 1;
             node_config.storage_path = cluster_storage_root
                 .join(format!("node-{node_index:03}-{region_name}"))
                 .to_string_lossy()
                 .into_owned();
-            let state = AppState::new(node_config, None, personaldb_test_protocol_keyring())
+            node_config.public_api_addr = grpc_addrs[node_index].clone();
+            node_config.api_listen_addr = grpc_addrs[node_index]
+                .trim_start_matches("http://")
+                .to_string();
+            node_config.admin_listen_addr = admin_addrs[node_index]
+                .trim_start_matches("http://")
+                .to_string();
+            node_config.corestore_internal_bearer_token =
+                anvil_core::auth::JwtManager::new(node_config.jwt_secret.clone())
+                    .mint_token(node_config.node_id.clone(), 0)
+                    .unwrap();
+            let state = AppState::new(node_config, personaldb_test_protocol_keyring())
                 .await
                 .unwrap();
             state.persistence.create_region(region_name).await.unwrap();
@@ -1352,13 +1429,15 @@ impl TestCluster {
         Self {
             nodes: Vec::new(),
             states,
-            grpc_addrs: Vec::new(),
-            admin_addrs: Vec::new(),
+            grpc_addrs,
+            admin_addrs,
             token: String::new(),
             admin_state_path: admin_state_path.to_string_lossy().into_owned(),
             config,
             storage_path: admin_state_path,
             cleanup_path: cluster_storage_root,
+            pending_listeners,
+            pending_admin_listeners,
             _cluster_permit: cluster_permit,
         }
     }
@@ -1375,99 +1454,35 @@ impl TestCluster {
         let total_start = Instant::now();
         let node_count = self.states.len();
 
-        let swarms_start = Instant::now();
-        let mut swarms = Vec::new();
-        for state in &self.states {
-            swarms.push(
-                anvil_core::cluster::create_swarm(state.config.clone())
-                    .await
-                    .unwrap(),
-            );
-        }
-        emit_test_timing(
-            format!("start_and_converge swarm_create nodes={node_count}"),
-            swarms_start.elapsed(),
-        );
-
-        let swarm_listen_start = Instant::now();
-        let mut listen_addrs = Vec::new();
-        for swarm in &mut swarms {
-            let address = loop {
-                if let Some(event) = swarm.next().await {
-                    if let libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } = event {
-                        break address;
-                    }
-                } else {
-                    panic!("Swarm stream ended before a listener was established");
-                }
-            };
-            listen_addrs.push(address);
-        }
-        emit_test_timing(
-            format!("start_and_converge swarm_listen nodes={node_count}"),
-            swarm_listen_start.elapsed(),
-        );
-
-        let swarm_dial_start = Instant::now();
-        for i in 0..swarms.len() {
-            for (j, addr) in listen_addrs.iter().enumerate() {
-                if i != j {
-                    swarms[i].dial(addr.clone()).unwrap();
-                }
+        let node_spawn_start = Instant::now();
+        let mut listeners = std::mem::take(&mut self.pending_listeners);
+        let mut admin_listeners = std::mem::take(&mut self.pending_admin_listeners);
+        if listeners.is_empty() && admin_listeners.is_empty() {
+            for (grpc_addr, admin_addr) in self.grpc_addrs.iter().zip(&self.admin_addrs) {
+                listeners.push(
+                    tokio::net::TcpListener::bind(grpc_addr.trim_start_matches("http://"))
+                        .await
+                        .unwrap(),
+                );
+                admin_listeners.push(
+                    tokio::net::TcpListener::bind(admin_addr.trim_start_matches("http://"))
+                        .await
+                        .unwrap(),
+                );
             }
         }
-        emit_test_timing(
-            format!("start_and_converge swarm_dial nodes={node_count}"),
-            swarm_dial_start.elapsed(),
-        );
-
-        let node_spawn_start = Instant::now();
-        let peer_ids = swarms
-            .iter()
-            .map(|swarm| swarm.local_peer_id().to_string())
-            .collect::<Vec<_>>();
-        let mut listeners = Vec::new();
-        let mut admin_listeners = Vec::new();
-        for _ in 0..self.states.len() {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            let admin_addr = admin_listener.local_addr().unwrap();
-            self.grpc_addrs.push(format!("http://{}", addr));
-            self.admin_addrs.push(format!("http://{}", admin_addr));
-            listeners.push(listener);
-            admin_listeners.push(admin_listener);
-        }
-
-        for i in 0..self.states.len() {
-            let mut cfg = anvil_core::config::Config::from_ref(self.states[i].config.deref());
-            cfg.public_api_addr = self.grpc_addrs[i].clone();
-            cfg.corestore_internal_bearer_token = self.states[i]
-                .jwt_manager
-                .mint_token(cfg.node_id.clone(), 0)
-                .unwrap();
-            self.states[i] = AppState::new(cfg, None, personaldb_test_protocol_keyring())
-                .await
-                .unwrap();
-        }
+        assert_eq!(listeners.len(), self.states.len());
+        assert_eq!(admin_listeners.len(), self.states.len());
 
         for i in 0..self.states.len() {
             let state = self.states[i].clone();
-            let swarm = swarms.remove(0);
             let listener = listeners.remove(0);
             let admin_listener = admin_listeners.remove(0);
 
             let handle = tokio::spawn(async move {
-                let (_tx, rx) = tokio::sync::mpsc::channel(1);
-                anvil::start_node_with_admin_listener(
-                    listener,
-                    Some(admin_listener),
-                    state,
-                    swarm,
-                    rx,
-                )
-                .await
-                .unwrap();
+                anvil::start_node_with_admin_listener(listener, Some(admin_listener), state)
+                    .await
+                    .unwrap();
             });
             self.nodes.push(handle);
         }
@@ -1526,8 +1541,7 @@ impl TestCluster {
                     http_ready_start.elapsed(),
                 );
                 let lifecycle_seed_start = Instant::now();
-                self.seed_corestore_mesh_lifecycle(&peer_ids, &listen_addrs)
-                    .await;
+                self.seed_corestore_mesh_lifecycle().await;
                 emit_test_timing(
                     format!("start_and_converge mesh_lifecycle_seed nodes={node_count}"),
                     lifecycle_seed_start.elapsed(),
@@ -1545,31 +1559,28 @@ impl TestCluster {
                 return;
             }
             if start.elapsed() >= timeout {
-                let mut cluster_sizes = Vec::with_capacity(self.states.len());
-                for state in &self.states {
-                    cluster_sizes.push(state.cluster.read().await.len());
-                }
+                let recovery = self
+                    .states
+                    .iter()
+                    .map(|state| state.core_store.coremeta_recovery_snapshot())
+                    .collect::<Vec<_>>();
                 panic!(
-                    "Cluster ports did not become ready in time; observed gossip membership sizes: {:?}",
-                    cluster_sizes
+                    "Cluster ports did not become ready in time; CoreMeta recovery snapshots: {:?}",
+                    recovery
                 );
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
-    async fn seed_corestore_mesh_lifecycle(
-        &self,
-        peer_ids: &[String],
-        listen_addrs: &[libp2p::Multiaddr],
-    ) {
+    async fn seed_corestore_mesh_lifecycle(&self) {
         let mut seen_regions = BTreeSet::new();
         let mut regions = Vec::new();
         let mut seen_cells = BTreeSet::new();
         let mut cells = Vec::new();
         let mut nodes = Vec::new();
 
-        for (index, source) in self.states.iter().enumerate() {
+        for source in &self.states {
             if seen_regions.insert(source.config.region.clone()) {
                 regions.push(anvil_core::mesh_lifecycle::CreateRegionDescriptor {
                     mesh_id: source.config.mesh_id.clone(),
@@ -1597,12 +1608,8 @@ impl TestCluster {
                 node_id: source.config.node_id.clone(),
                 region: source.config.region.clone(),
                 cell_id: source.config.cell_id.clone(),
-                libp2p_peer_id: peer_ids[index].clone(),
-                receipt_signing_public_key_proto: source
-                    .core_store
-                    .local_receipt_signing_public_key_proto(),
+                receipt_signing_public_key: source.core_store.local_receipt_signing_public_key(),
                 public_api_addr: source.config.public_api_addr.clone(),
-                public_cluster_addrs: vec![listen_addrs[index].to_string()],
                 capabilities: vec![
                     anvil_core::mesh_lifecycle::NodeCapability::Object,
                     anvil_core::mesh_lifecycle::NodeCapability::Index,
@@ -1641,7 +1648,7 @@ impl TestCluster {
                 .core_store
                 .register_node_receipt_signing_public_key(
                     &source.config.node_id,
-                    &source.core_store.local_receipt_signing_public_key_proto(),
+                    &source.core_store.local_receipt_signing_public_key(),
                 )
                 .unwrap();
         }
@@ -1687,11 +1694,13 @@ impl TestCluster {
 
     #[allow(unused)]
     pub async fn restart(&mut self, timeout: Duration) {
-        for node in self.nodes.drain(..) {
+        let nodes = self.nodes.drain(..).collect::<Vec<_>>();
+        for node in &nodes {
             node.abort();
         }
-        self.grpc_addrs.clear();
-        self.admin_addrs.clear();
+        for node in nodes {
+            let _ = node.await;
+        }
         self.start_and_converge(timeout).await;
     }
 
@@ -1881,12 +1890,28 @@ async fn wait_for_http_ready(base_url: &str, timeout: Duration) -> bool {
     let start = Instant::now();
     let ready_url = format!("{}/ready", base_url.trim_end_matches('/'));
     while start.elapsed() < timeout {
-        if let Ok(response) = reqwest::get(&ready_url).await
+        if let Ok(Ok(response)) =
+            tokio::time::timeout(Duration::from_secs(2), reqwest::get(&ready_url)).await
             && response.status().is_success()
         {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    false
+}
+
+async fn wait_for_http_reachable(base_url: &str, timeout: Duration) -> bool {
+    let start = Instant::now();
+    let health_url = format!("{}/health", base_url.trim_end_matches('/'));
+    while start.elapsed() < timeout {
+        if matches!(
+            tokio::time::timeout(Duration::from_secs(2), reqwest::get(&health_url)).await,
+            Ok(Ok(_))
+        ) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     false
 }
@@ -1897,8 +1922,8 @@ async fn wait_for_all_http_ready(base_urls: &[String], timeout: Duration) -> boo
         let mut all_ready = true;
         for base_url in base_urls {
             let ready_url = format!("{}/ready", base_url.trim_end_matches('/'));
-            match reqwest::get(&ready_url).await {
-                Ok(response) if response.status().is_success() => {}
+            match tokio::time::timeout(Duration::from_secs(2), reqwest::get(&ready_url)).await {
+                Ok(Ok(response)) if response.status().is_success() => {}
                 _ => {
                     all_ready = false;
                     break;

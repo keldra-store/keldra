@@ -25,6 +25,7 @@ path = "src/main.rs"
 
 [features]
 enterprise = []
+root-publication-test-control = ["anvil-core/root-publication-test-control"]
 gcp = ["dep:prost-types", "tonic/tls-ring"]
 routeguide = ["dep:async-stream", "dep:tokio-stream", "dep:rand"]
 reflection = ["dep:tonic-reflection"]
@@ -97,7 +98,6 @@ globset = "0.4"
 local-ip-address = "0.6.5"
 reqwest = { version = "0.12.23", default-features = false, features = ["rustls-tls"] }
 trust-dns-resolver = "0.23.2"
-libp2p = { version = "0.56.0", features = ["gossipsub", "mdns", "tcp", "tokio", "macros", "noise", "yamux", "quic"] }
 reed-solomon-erasure = "6.0.0"
 ahash = "0.8.12"
 futures ="0.3.31"

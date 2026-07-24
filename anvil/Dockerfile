@@ -56,10 +56,9 @@ ENV STORAGE_PATH=/var/lib/anvil
 USER anvil
 WORKDIR /var/lib/anvil
 
-# Expose the default gRPC/S3 port and a potential swarm port
+# Expose the public and administrative gRPC listeners.
 EXPOSE 50051
 EXPOSE 50052
-EXPOSE 7443
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=5 CMD curl -fsS http://127.0.0.1:50051/ready || exit 1
 

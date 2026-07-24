@@ -46,20 +46,37 @@ impl IndexService for AppState {
         let transaction_principal = transaction_id
             .map(|_| crate::object_manager::transaction_principal_from_claims(&claims));
 
-        let index = self
+        let mutation = crate::persistence::IndexDefinitionMutation::Create {
+            name: req.name,
+            kind: kind.to_string(),
+            selector,
+            extractor,
+            authorization_mode: req.authorization_mode,
+            build_policy,
+        };
+        let index = match self
             .persistence
-            .create_index_definition(
-                claims.tenant_id,
-                bucket.id,
-                &req.name,
-                kind,
-                selector,
-                extractor,
-                &req.authorization_mode,
-                build_policy,
+            .apply_index_definition_mutation(
+                &bucket,
+                &mutation,
+                transaction_id,
+                transaction_principal.as_deref(),
             )
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| Status::internal(e.to_string()))?
+        {
+            crate::persistence::IndexDefinitionMutationOutcome::Published { index, event } => {
+                debug_assert_eq!(event.index_id, index.id);
+                index
+            }
+            crate::persistence::IndexDefinitionMutationOutcome::AlreadyExists => {
+                return Err(Status::already_exists("Index definition already exists"));
+            }
+            crate::persistence::IndexDefinitionMutationOutcome::NotFound
+            | crate::persistence::IndexDefinitionMutationOutcome::KindChanged => {
+                return Err(Status::internal("invalid create-index mutation outcome"));
+            }
+        };
         if transaction_id.is_none() {
             access_control::grant_index_defaults(
                 &self.persistence,
@@ -71,16 +88,6 @@ impl IndexService for AppState {
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        }
-        self.publish_index_definition_event_with_transaction(
-            &bucket,
-            &index,
-            "create",
-            transaction_id,
-            transaction_principal.as_deref(),
-        )
-        .await?;
-        if transaction_id.is_none() {
             self.persistence
                 .enqueue_index_build_for_index(&bucket, &index)
                 .await
@@ -130,28 +137,39 @@ impl IndexService for AppState {
             .ok_or_else(|| Status::not_found("Index definition not found"))?;
         validate_index_definition_shape(&existing.kind, &build_policy, &extractor, &self.config)?;
 
-        let index = self
+        let mutation = crate::persistence::IndexDefinitionMutation::Update {
+            name: req.name,
+            expected_kind: existing.kind,
+            selector,
+            extractor,
+            authorization_mode: req.authorization_mode,
+            build_policy,
+        };
+        let index = match self
             .persistence
-            .update_index_definition(
-                claims.tenant_id,
-                bucket.id,
-                &req.name,
-                selector,
-                extractor,
-                &req.authorization_mode,
-                build_policy,
+            .apply_index_definition_mutation(
+                &bucket,
+                &mutation,
+                transaction_id,
+                transaction_principal.as_deref(),
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("Index definition not found"))?;
-        self.publish_index_definition_event_with_transaction(
-            &bucket,
-            &index,
-            "update",
-            transaction_id,
-            transaction_principal.as_deref(),
-        )
-        .await?;
+        {
+            crate::persistence::IndexDefinitionMutationOutcome::Published { index, event } => {
+                debug_assert_eq!(event.index_id, index.id);
+                index
+            }
+            crate::persistence::IndexDefinitionMutationOutcome::NotFound => {
+                return Err(Status::not_found("Index definition not found"));
+            }
+            crate::persistence::IndexDefinitionMutationOutcome::KindChanged => {
+                return Err(Status::aborted("Index definition changed during update"));
+            }
+            crate::persistence::IndexDefinitionMutationOutcome::AlreadyExists => {
+                return Err(Status::internal("invalid update-index mutation outcome"));
+            }
+        };
         if transaction_id.is_none() {
             self.persistence
                 .enqueue_index_build_for_index(&bucket, &index)
@@ -190,20 +208,30 @@ impl IndexService for AppState {
         let transaction_id = index_write_transaction_id(req.options.as_ref())?;
         let transaction_principal = transaction_id
             .map(|_| crate::object_manager::transaction_principal_from_claims(&claims));
-        let index = self
+        let mutation = crate::persistence::IndexDefinitionMutation::Disable { name: req.name };
+        let index = match self
             .persistence
-            .disable_index_definition(claims.tenant_id, bucket.id, &req.name)
+            .apply_index_definition_mutation(
+                &bucket,
+                &mutation,
+                transaction_id,
+                transaction_principal.as_deref(),
+            )
             .await
             .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("Index definition not found"))?;
-        self.publish_index_definition_event_with_transaction(
-            &bucket,
-            &index,
-            "disable",
-            transaction_id,
-            transaction_principal.as_deref(),
-        )
-        .await?;
+        {
+            crate::persistence::IndexDefinitionMutationOutcome::Published { index, event } => {
+                debug_assert_eq!(event.index_id, index.id);
+                index
+            }
+            crate::persistence::IndexDefinitionMutationOutcome::NotFound => {
+                return Err(Status::not_found("Index definition not found"));
+            }
+            crate::persistence::IndexDefinitionMutationOutcome::AlreadyExists
+            | crate::persistence::IndexDefinitionMutationOutcome::KindChanged => {
+                return Err(Status::internal("invalid disable-index mutation outcome"));
+            }
+        };
 
         Ok(Response::new(IndexDefinitionResponse {
             index: Some(index_record(&bucket.name, index)?),
@@ -236,20 +264,29 @@ impl IndexService for AppState {
         let transaction_id = index_write_transaction_id(req.options.as_ref())?;
         let transaction_principal = transaction_id
             .map(|_| crate::object_manager::transaction_principal_from_claims(&claims));
-        let index = self
+        let mutation = crate::persistence::IndexDefinitionMutation::Drop { name: req.name };
+        match self
             .persistence
-            .drop_index_definition(claims.tenant_id, bucket.id, &req.name)
+            .apply_index_definition_mutation(
+                &bucket,
+                &mutation,
+                transaction_id,
+                transaction_principal.as_deref(),
+            )
             .await
             .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("Index definition not found"))?;
-        self.publish_index_definition_event_with_transaction(
-            &bucket,
-            &index,
-            "drop",
-            transaction_id,
-            transaction_principal.as_deref(),
-        )
-        .await?;
+        {
+            crate::persistence::IndexDefinitionMutationOutcome::Published { index, event } => {
+                debug_assert_eq!(event.index_id, index.id);
+            }
+            crate::persistence::IndexDefinitionMutationOutcome::NotFound => {
+                return Err(Status::not_found("Index definition not found"));
+            }
+            crate::persistence::IndexDefinitionMutationOutcome::AlreadyExists
+            | crate::persistence::IndexDefinitionMutationOutcome::KindChanged => {
+                return Err(Status::internal("invalid drop-index mutation outcome"));
+            }
+        }
         Ok(Response::new(DropIndexResponse {}))
     }
 
@@ -274,19 +311,71 @@ impl IndexService for AppState {
         let bucket = self
             .get_index_bucket(claims.tenant_id, &req.bucket_name)
             .await?;
-        let indexes = index_journal::read_current_index_definition_events(
+        let page_size = crate::services::collection_cursor::page_size(req.page.as_ref())?;
+        let revision = index_journal::current_index_definition_collection_revision(
+            &self.storage,
+            claims.tenant_id,
+            bucket.id,
+        )
+        .await
+        .map_err(|error| Status::internal(error.to_string()))?;
+        let include_disabled = req.include_disabled.to_string();
+        let filters = [
+            ("bucket_name", req.bucket_name.as_str()),
+            ("include_disabled", include_disabled.as_str()),
+        ];
+        let principal_scope = format!("tenant:{}/subject:{}", claims.tenant_id, claims.sub);
+        let revision_string = revision.to_string();
+        let binding = crate::services::collection_cursor::CollectionCursorBinding {
+            service_method: "anvil.IndexService/ListIndexes",
+            filters: &filters,
+            principal_scope: &principal_scope,
+            page_size,
+            revision: &revision_string,
+            sort: "name.asc",
+        };
+        let position = crate::services::collection_cursor::decode_page_token(
+            req.page.as_ref(),
+            &binding,
+            self.config.jwt_secret.as_bytes(),
+        )?;
+        let after_tuple_key =
+            crate::services::collection_cursor::decode_binary_position(position.as_deref())?;
+        let page = index_journal::page_current_index_definition_events(
             &self.storage,
             claims.tenant_id,
             bucket.id,
             req.include_disabled,
+            revision,
+            after_tuple_key.as_deref(),
+            page_size,
         )
         .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .into_iter()
-        .map(|event| index_record_from_event(&event))
-        .collect::<Result<Vec<_>, _>>()?;
+        .map_err(|error| Status::aborted(error.to_string()))?;
+        let next_page_token = page
+            .next_tuple_key
+            .as_deref()
+            .map(crate::services::collection_cursor::encode_binary_position)
+            .transpose()?
+            .map(|position| {
+                crate::services::collection_cursor::encode_next_page_token(
+                    &position,
+                    &binding,
+                    self.config.jwt_secret.as_bytes(),
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let indexes = page
+            .events
+            .into_iter()
+            .map(|event| index_record_from_event(&event))
+            .collect::<Result<Vec<_>, _>>()?;
 
-        Ok(Response::new(ListIndexesResponse { indexes }))
+        Ok(Response::new(ListIndexesResponse {
+            indexes,
+            page: Some(PageResponse { next_page_token }),
+        }))
     }
 
     async fn query_index(
@@ -423,7 +512,6 @@ impl IndexService for AppState {
             result: Some(response),
             canonical_query_hash: plan.canonical_query_hash,
             plan_json: plan.plan_json,
-            diagnostics: plan.diagnostics,
         }))
     }
 
@@ -450,41 +538,34 @@ impl IndexService for AppState {
             .await?;
         let after_cursor = i64::try_from(req.after_cursor)
             .map_err(|_| Status::invalid_argument("after_cursor exceeds supported range"))?;
-        let snapshot = index_journal::read_index_definition_events(
-            &self.storage,
-            claims.tenant_id,
-            bucket.id,
-            after_cursor,
-            1000,
-        )
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
-        let mut live = self.index_watch_tx.subscribe();
+        let stream_id = index_journal::index_definition_stream_id(claims.tenant_id, bucket.id);
+        let mut live = self.storage.subscribe_stream(&stream_id);
+        let storage = self.storage.clone();
+        let tenant_id = claims.tenant_id;
+        let bucket_id = bucket.id;
 
         let (tx, rx) = mpsc::channel(32);
         tokio::spawn(async move {
             let mut last_cursor = after_cursor;
-            for event in snapshot {
-                last_cursor = last_cursor.max(event.id);
-                if tx
-                    .send(index_definition_event_response(&event))
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-
             loop {
-                match live.recv().await {
-                    Ok(event) => {
-                        if event.tenant_id != claims.tenant_id
-                            || event.bucket_id != bucket.id
-                            || event.id <= last_cursor
-                        {
-                            continue;
+                loop {
+                    let page = match index_journal::read_index_definition_event_page(
+                        &storage,
+                        tenant_id,
+                        bucket_id,
+                        last_cursor,
+                        256,
+                    )
+                    .await
+                    {
+                        Ok(page) => page,
+                        Err(error) => {
+                            let _ = tx.send(Err(Status::internal(error.to_string()))).await;
+                            return;
                         }
-                        last_cursor = event.id;
+                    };
+                    let previous_cursor = last_cursor;
+                    for event in page.events {
                         if tx
                             .send(index_definition_event_response(&event))
                             .await
@@ -493,14 +574,14 @@ impl IndexService for AppState {
                             return;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        let _ = tx
-                            .send(Err(Status::data_loss(
-                                "Index definition watch fell behind retained live event window",
-                            )))
-                            .await;
-                        return;
+                    last_cursor = page.next_cursor;
+                    if !page.has_more || last_cursor == previous_cursor {
+                        break;
                     }
+                }
+
+                match live.recv().await {
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
             }
@@ -549,78 +630,64 @@ impl IndexService for AppState {
             req.partition_id
         };
         let after_cursor = join_u128(req.after_cursor_low, req.after_cursor_high);
-        let snapshot = index_partition_watch::list_index_partition_watch_events(
-            &self.storage,
-            claims.tenant_id,
-            bucket.id,
-            &index_storage_id,
-            &partition_id,
-            after_cursor,
-            1000,
-        )
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
-
         let storage = self.storage.clone();
         let bucket_name = bucket.name.clone();
         let index_name = index.name.clone();
         let tenant_id = claims.tenant_id;
         let bucket_id = bucket.id;
+        let stream_id = index_partition_watch::index_partition_watch_stream_id_for_scope(
+            tenant_id,
+            bucket_id,
+            &index_storage_id,
+            &partition_id,
+        );
+        let mut live = self.storage.subscribe_stream(&stream_id);
         let (tx, rx) = mpsc::channel(32);
         tokio::spawn(async move {
             let mut last_cursor = after_cursor;
-            for event in snapshot {
-                last_cursor = last_cursor.max(event.cursor);
-                if tx
-                    .send(index_partition_event_response(
-                        &bucket_name,
-                        &index_name,
+            loop {
+                loop {
+                    let page = match index_partition_watch::list_index_partition_watch_event_page(
+                        &storage,
+                        tenant_id,
+                        bucket_id,
                         &index_storage_id,
                         &partition_id,
-                        event,
-                    ))
+                        last_cursor,
+                        256,
+                    )
                     .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-
-            let mut interval = tokio::time::interval(Duration::from_millis(500));
-            loop {
-                interval.tick().await;
-                let events = match index_partition_watch::list_index_partition_watch_events(
-                    &storage,
-                    tenant_id,
-                    bucket_id,
-                    &index_storage_id,
-                    &partition_id,
-                    last_cursor,
-                    1000,
-                )
-                .await
-                {
-                    Ok(events) => events,
-                    Err(error) => {
-                        let _ = tx.send(Err(Status::internal(error.to_string()))).await;
-                        return;
-                    }
-                };
-                for event in events {
-                    last_cursor = last_cursor.max(event.cursor);
-                    if tx
-                        .send(index_partition_event_response(
-                            &bucket_name,
-                            &index_name,
-                            &index_storage_id,
-                            &partition_id,
-                            event,
-                        ))
-                        .await
-                        .is_err()
                     {
-                        return;
+                        Ok(page) => page,
+                        Err(error) => {
+                            let _ = tx.send(Err(Status::internal(error.to_string()))).await;
+                            return;
+                        }
+                    };
+                    let previous_cursor = last_cursor;
+                    for event in page.events {
+                        if tx
+                            .send(index_partition_event_response(
+                                &bucket_name,
+                                &index_name,
+                                &index_storage_id,
+                                &partition_id,
+                                event,
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
                     }
+                    last_cursor = page.next_cursor;
+                    if !page.has_more || last_cursor == previous_cursor {
+                        break;
+                    }
+                }
+                match live.recv().await {
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
             }
         });
@@ -657,11 +724,37 @@ impl IndexService for AppState {
         let bucket = self
             .get_index_bucket(claims.tenant_id, &req.bucket_name)
             .await?;
-        let after_cursor = i64::try_from(req.after_cursor)
-            .map_err(|_| Status::invalid_argument("after_cursor exceeds supported range"))?;
-        let limit = i32::try_from(req.limit)
-            .map_err(|_| Status::invalid_argument("limit exceeds supported range"))?;
-        let diagnostics = self
+        let page_size = crate::services::collection_cursor::page_size(req.page.as_ref())?;
+        let filters = [
+            ("bucket_name", req.bucket_name.as_str()),
+            ("index_name", req.index_name.as_str()),
+            ("severity", req.severity.as_str()),
+        ];
+        let principal_scope = format!("tenant:{}/subject:{}", claims.tenant_id, claims.sub);
+        let revision = format!("append-only:{}:{}", claims.tenant_id, bucket.id);
+        let binding = crate::services::collection_cursor::CollectionCursorBinding {
+            service_method: "anvil.IndexService/ListIndexDiagnostics",
+            filters: &filters,
+            principal_scope: &principal_scope,
+            page_size,
+            revision: &revision,
+            sort: "cursor.asc",
+        };
+        let after_cursor = crate::services::collection_cursor::decode_page_token(
+            req.page.as_ref(),
+            &binding,
+            self.config.jwt_secret.as_bytes(),
+        )?
+        .map(|cursor| {
+            cursor
+                .parse::<i64>()
+                .map_err(|_| Status::invalid_argument("invalid diagnostic cursor"))
+        })
+        .transpose()?
+        .unwrap_or_default();
+        let query_limit = i32::try_from(page_size + 1)
+            .map_err(|_| Status::invalid_argument("page_size exceeds supported range"))?;
+        let mut diagnostics = self
             .persistence
             .list_index_diagnostics(
                 claims.tenant_id,
@@ -669,14 +762,36 @@ impl IndexService for AppState {
                 &req.index_name,
                 &req.severity,
                 after_cursor,
-                limit,
+                query_limit,
             )
             .await
-            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let has_more = diagnostics.len() > page_size;
+        if has_more {
+            diagnostics.truncate(page_size);
+        }
+        let next_page_token = if has_more {
+            let position = diagnostics
+                .last()
+                .ok_or_else(|| Status::internal("diagnostic page is unexpectedly empty"))?
+                .id
+                .to_string();
+            crate::services::collection_cursor::encode_next_page_token(
+                &position,
+                &binding,
+                self.config.jwt_secret.as_bytes(),
+            )?
+        } else {
+            String::new()
+        };
+        let diagnostics = diagnostics
             .into_iter()
             .map(index_diagnostic_record)
             .collect::<Result<Vec<_>, _>>()?;
 
-        Ok(Response::new(ListIndexDiagnosticsResponse { diagnostics }))
+        Ok(Response::new(ListIndexDiagnosticsResponse {
+            diagnostics,
+            page: Some(PageResponse { next_page_token }),
+        }))
     }
 }

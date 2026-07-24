@@ -1,7 +1,9 @@
 use super::*;
 use crate::object_manager;
 
-fn native_transaction_id(context: Option<&NativeMutationContext>) -> Result<Option<&str>, Status> {
+pub(super) fn native_transaction_id(
+    context: Option<&NativeMutationContext>,
+) -> Result<Option<&str>, Status> {
     crate::services::saga_reserved::native_context_transaction_id(context)
 }
 
@@ -28,7 +30,7 @@ fn object_storage_class(object: &crate::persistence::Object) -> String {
     object.storage_class.clone().unwrap_or_default()
 }
 
-fn write_state_for_transaction(transaction_id: Option<&str>) -> i32 {
+pub(super) fn write_state_for_transaction(transaction_id: Option<&str>) -> i32 {
     if transaction_id.is_some() {
         WriteState::Staged as i32
     } else {
@@ -36,7 +38,7 @@ fn write_state_for_transaction(transaction_id: Option<&str>) -> i32 {
     }
 }
 
-fn object_write_visibility(
+pub(super) fn object_write_visibility(
     context: Option<&NativeMutationContext>,
 ) -> Result<ObjectWriteVisibility, Status> {
     let Some(options) = context.and_then(|context| context.write_visibility.as_ref()) else {
@@ -85,37 +87,6 @@ fn object_write_visibility(
     })
 }
 
-fn ensure_transactional_mutation_batch_supported(
-    transaction_id: Option<&str>,
-    operations: &[MutationBatchOperation],
-) -> Result<(), Status> {
-    if transaction_id.is_none() {
-        return Ok(());
-    }
-    for operation in operations {
-        let Some(op) = operation.op.as_ref() else {
-            return Err(Status::invalid_argument(
-                "MutationBatch operation is missing op",
-            ));
-        };
-        let unsupported = match op {
-            mutation_batch_operation::Op::PutObject(_)
-            | mutation_batch_operation::Op::DeleteObject(_)
-            | mutation_batch_operation::Op::CompareAndSwapManifest(_)
-            | mutation_batch_operation::Op::PatchJsonObject(_)
-            | mutation_batch_operation::Op::AppendStreamRecord(_) => None,
-            mutation_batch_operation::Op::CheckpointTaskLease(_) => Some("checkpoint_task_lease"),
-            mutation_batch_operation::Op::CommitTaskLease(_) => Some("commit_task_lease"),
-        };
-        if let Some(operation) = unsupported {
-            return Err(Status::failed_precondition(format!(
-                "{operation} is a coordination-plane operation and cannot be staged inside an explicit object transaction"
-            )));
-        }
-    }
-    Ok(())
-}
-
 #[tonic::async_trait]
 impl ObjectService for AppState {
     type GetObjectStream = std::pin::Pin<
@@ -140,93 +111,20 @@ impl ObjectService for AppState {
 
         let mut stream = request.into_inner();
 
-        let (bucket_name, object_key, mutation_context, content_type, user_metadata, storage_class) =
-            match stream.next().await {
-                Some(Ok(chunk)) => match chunk.data {
-                    Some(put_object_request::Data::Metadata(meta)) => (
-                        meta.bucket_name,
-                        meta.object_key,
-                        meta.mutation_context,
-                        meta.content_type,
-                        parse_user_metadata_json(&meta.user_metadata_json)?,
-                        meta.storage_class,
-                    ),
-                    _ => return Err(Status::invalid_argument("First chunk must be metadata")),
-                },
-                _ => return Err(Status::invalid_argument("Empty stream")),
-            };
-        validate_native_mutation_context(self, &claims, &bucket_name, mutation_context.as_ref())
-            .await?;
-        let transaction_id = native_transaction_id(mutation_context.as_ref())?;
-        let write_visibility = object_write_visibility(mutation_context.as_ref())?;
-        let target = NativeIdempotencyTarget::new("PutObject", &bucket_name, &object_key);
-        let (attempt, replay) = begin_native_mutation::<PutObjectResponse>(
-            self,
-            mutation_context.as_ref(),
-            &target,
-            &claims,
-            AnvilAction::ObjectWrite,
-        )
-        .await?;
-        if let Some(response) = replay {
+        let metadata = match stream.next().await {
+            Some(Ok(chunk)) => match chunk.data {
+                Some(put_object_request::Data::Metadata(metadata)) => metadata,
+                _ => return Err(Status::invalid_argument("First chunk must be metadata")),
+            },
+            _ => return Err(Status::invalid_argument("Empty stream")),
+        };
+        if let Some(target) = native_put_route_target(self, &claims, &metadata).await? {
+            let response = proxy_native_put(self, &target, &claims, metadata, stream).await?;
             return Ok(Response::new(response));
         }
-        enforce_native_mutation_precondition(
-            self,
-            &claims,
-            &bucket_name,
-            &object_key,
-            mutation_context.as_ref(),
-            AnvilAction::ObjectWrite,
-        )
-        .await?;
 
-        let data_stream = stream.map(|chunk_result| match chunk_result {
-            Ok(chunk) => match chunk.data {
-                Some(put_object_request::Data::Chunk(bytes)) => Ok(bytes),
-                _ => Ok(vec![]), // Or handle as an error, but must be Vec<u8>
-            },
-            Err(e) => Err(e),
-        });
-
-        let object = self
-            .object_manager
-            .put_object(
-                &claims,
-                &bucket_name,
-                &object_key,
-                data_stream,
-                ObjectWriteOptions {
-                    content_type,
-                    user_metadata,
-                    transaction_id: transaction_id.map(ToOwned::to_owned),
-                    transaction_principal: transaction_id
-                        .map(|_| crate::object_manager::transaction_principal_from_claims(&claims)),
-                    storage_class_id: storage_class,
-                    visibility: write_visibility,
-                },
-            )
-            .await?;
-        let watch_cursor = if transaction_id.is_some() || !write_visibility.requires_watch_visible()
-        {
-            0
-        } else {
-            object_watch_cursor(self, &object).await?
-        };
-
-        let response = PutObjectResponse {
-            etag: object.etag,
-            version_id: object.version_id.to_string(),
-            mutation_id: object.mutation_id.to_string(),
-            payload_hash: object.content_hash,
-            record_hash: object.record_hash,
-            authz_revision: u64::try_from(object.authz_revision)
-                .map_err(|_| Status::internal("Invalid authz revision"))?,
-            index_policy_snapshot: object.index_policy_snapshot,
-            watch_cursor,
-            write_state: write_state_for_transaction(transaction_id),
-        };
-        complete_native_mutation(self, &attempt, &target, &response).await?;
+        let data_stream = stream.map(native_put_data_chunk);
+        let response = execute_native_put(self, claims, metadata, data_stream).await?;
         Ok(Response::new(response))
     }
 
@@ -238,6 +136,13 @@ impl ObjectService for AppState {
         let claims = request.extensions().get::<auth::Claims>().cloned();
         let req = request.into_inner();
         let consistency = object_read_consistency(req.consistency.as_ref())?;
+
+        if let Some(stream) =
+            proxy_get_object_if_needed(self, claims.as_ref(), route_tenant_id, &req, consistency)
+                .await?
+        {
+            return Ok(Response::new(stream));
+        }
 
         let result = self
             .object_manager
@@ -408,12 +313,22 @@ impl ObjectService for AppState {
         &self,
         request: Request<HeadObjectRequest>,
     ) -> Result<Response<HeadObjectResponse>, Status> {
+        let request_id = request
+            .extensions()
+            .get::<crate::middleware::AnvilRequestId>()
+            .cloned();
         let claims = request
             .extensions()
             .get::<auth::Claims>()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.get_ref();
         let consistency = object_read_consistency(req.consistency.as_ref())?;
+
+        if let Some(response) =
+            proxy_head_object_if_needed(self, claims, request_id.as_ref(), req, consistency).await?
+        {
+            return Ok(Response::new(response));
+        }
 
         let object = self
             .object_manager
@@ -479,6 +394,8 @@ impl ObjectService for AppState {
             .as_ref()
             .map(|token| token.last_key.as_str())
             .unwrap_or(req.start_after.as_str());
+        let source_limit = i32::try_from(limit.saturating_add(1))
+            .map_err(|_| Status::internal("Object listing limit exceeds i32"))?;
 
         let (mut objects, common_prefixes) = self
             .object_manager
@@ -488,7 +405,7 @@ impl ObjectService for AppState {
                 &req.bucket_name,
                 &req.prefix,
                 effective_start_after,
-                i32::try_from(limit.saturating_add(1)).unwrap_or(i32::MAX),
+                source_limit,
                 &req.delimiter,
                 consistency,
             )
@@ -568,6 +485,8 @@ impl ObjectService for AppState {
             .as_ref()
             .map(|token| token.last_version_id.as_str())
             .unwrap_or(req.version_id_marker.as_str());
+        let source_limit = i32::try_from(limit)
+            .map_err(|_| Status::internal("Object version listing limit exceeds i32"))?;
 
         let versions = self
             .object_manager
@@ -578,7 +497,7 @@ impl ObjectService for AppState {
                 &req.prefix,
                 effective_key_marker,
                 effective_version_marker,
-                i32::try_from(limit).unwrap_or(i32::MAX),
+                source_limit,
                 consistency,
             )
             .await?;
@@ -987,51 +906,53 @@ impl ObjectService for AppState {
         let req = request.into_inner();
         let tenant_id = claims.tenant_id;
         let prefix = req.prefix.clone();
-        let (bucket_id, snapshot, mut live) = self
+        let after_cursor = i64::try_from(req.after_cursor)
+            .map_err(|_| Status::invalid_argument("after_cursor exceeds supported range"))?;
+        let bucket_id = self
             .object_manager
-            .watch_prefix_snapshot(claims, &req.bucket_name, &req.prefix, req.after_cursor)
+            .resolve_prefix_watch_scope(claims, &req.bucket_name, &req.prefix)
             .await?;
+        let stream_id = watch_log::object_watch_stream_id(tenant_id, bucket_id);
+        let mut live = self.storage.subscribe_stream(&stream_id);
+        let storage = self.storage.clone();
 
         let (tx, rx) = mpsc::channel(32);
         tokio::spawn(async move {
-            let mut last_cursor = req.after_cursor;
-            for event in snapshot {
-                if let Some(response) = watch_event_response(&event) {
-                    last_cursor = last_cursor.max(response.cursor);
-                    if tx.send(Ok(response)).await.is_err() {
-                        return;
-                    }
-                }
-            }
-
+            let mut last_cursor = after_cursor;
             loop {
-                match live.recv().await {
-                    Ok(event) => {
-                        if event.tenant_id != tenant_id
-                            || event.bucket_id != bucket_id
-                            || !event.key.starts_with(&prefix)
+                loop {
+                    let page = match watch_log::list_object_watch_event_page(
+                        &storage,
+                        tenant_id,
+                        bucket_id,
+                        &prefix,
+                        last_cursor,
+                        256,
+                    )
+                    .await
+                    {
+                        Ok(page) => page,
+                        Err(error) => {
+                            let _ = tx.send(Err(Status::internal(error.to_string()))).await;
+                            return;
+                        }
+                    };
+                    let previous_cursor = last_cursor;
+                    for event in page.events {
+                        if let Some(response) = watch_event_response(&event)
+                            && tx.send(Ok(response)).await.is_err()
                         {
-                            continue;
-                        }
-                        let Some(response) = watch_event_response(&event) else {
-                            continue;
-                        };
-                        if response.cursor <= last_cursor {
-                            continue;
-                        }
-                        last_cursor = response.cursor;
-                        if tx.send(Ok(response)).await.is_err() {
                             return;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        let _ = tx
-                            .send(Err(Status::data_loss(
-                                "Watch cursor fell behind retained live event window",
-                            )))
-                            .await;
-                        return;
+                    last_cursor = page.next_cursor;
+                    if !page.has_more || last_cursor == previous_cursor {
+                        break;
                     }
+                }
+
+                match live.recv().await {
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
             }
@@ -1109,309 +1030,7 @@ impl ObjectService for AppState {
         &self,
         request: Request<MutationBatchRequest>,
     ) -> Result<Response<MutationBatchResponse>, Status> {
-        let claims = request
-            .extensions()
-            .get::<auth::Claims>()
-            .cloned()
-            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
-        let req = request.into_inner();
-        validate_native_mutation_context(
-            self,
-            &claims,
-            &req.bucket_name,
-            req.mutation_context.as_ref(),
-        )
-        .await?;
-        if req.operations.is_empty() {
-            return Err(Status::invalid_argument(
-                "MutationBatch requires at least one operation",
-            ));
-        }
-        validate_mutation_batch_operations(&req)?;
-        validate_mutation_batch_authorization(self, &claims, &req).await?;
-        let operation_digest = mutation_batch_digest(&req)?;
-        let context = req
-            .mutation_context
-            .as_ref()
-            .ok_or_else(|| Status::invalid_argument("Missing native mutation context"))?;
-        let transaction_id = native_transaction_id(Some(context))?;
-        let write_visibility = object_write_visibility(Some(context))?;
-        ensure_transactional_mutation_batch_supported(transaction_id, &req.operations)?;
-        let target =
-            NativeIdempotencyTarget::new("MutationBatch", &req.bucket_name, "mutation_batch")
-                .with_parameters(serde_json::json!({ "request_digest": operation_digest }));
-        let _idempotency_guard = acquire_native_mutation_lock(self, context).await?;
-        let replay = native_idempotency::load_response::<MutationBatchResponse>(
-            &self.storage,
-            context,
-            &target,
-        )
-        .await?;
-        if let Some(response) = replay {
-            return Ok(Response::new(response));
-        }
-        let _operation_guards =
-            acquire_mutation_batch_operation_locks(self, claims.tenant_id, &req).await?;
-        enforce_mutation_batch_native_preconditions(self, &claims, &req).await?;
-        enforce_write_precondition(self, &claims, req.precondition.as_ref()).await?;
-
-        let mut receipts = Vec::with_capacity(req.operations.len());
-        let mut max_watch_cursor = 0_u64;
-        for operation in req.operations {
-            let Some(op) = operation.op else {
-                return Err(Status::invalid_argument(
-                    "MutationBatch operation is missing op",
-                ));
-            };
-            match op {
-                mutation_batch_operation::Op::PutObject(op) => {
-                    let object = self
-                        .object_manager
-                        .put_object(
-                            &claims,
-                            &req.bucket_name,
-                            &op.object_key,
-                            futures_util::stream::iter(vec![Ok(op.payload)]),
-                            ObjectWriteOptions {
-                                content_type: op.content_type,
-                                user_metadata: parse_user_metadata_json(&op.user_metadata_json)?,
-                                transaction_id: transaction_id.map(ToOwned::to_owned),
-                                transaction_principal: transaction_id.map(|_| {
-                                    crate::object_manager::transaction_principal_from_claims(
-                                        &claims,
-                                    )
-                                }),
-                                storage_class_id: op.storage_class,
-                                visibility: write_visibility,
-                            },
-                        )
-                        .await?;
-                    let watch_cursor =
-                        if transaction_id.is_some() || !write_visibility.requires_watch_visible() {
-                            0
-                        } else {
-                            object_watch_cursor(self, &object).await?
-                        };
-                    max_watch_cursor = max_watch_cursor.max(watch_cursor);
-                    receipts.push(MutationBatchOperationReceipt {
-                        operation: "put_object".to_string(),
-                        object_key: object.key,
-                        version_id: object.version_id.to_string(),
-                        mutation_id: object.mutation_id.to_string(),
-                        payload_hash: object.content_hash,
-                        record_hash: object.record_hash,
-                        append_record_sequence: 0,
-                        manifest_revision: 0,
-                        lease_fence_token: 0,
-                    });
-                }
-                mutation_batch_operation::Op::PatchJsonObject(op) => {
-                    let object = self
-                        .object_manager
-                        .patch_json_object(
-                            claims.clone(),
-                            &req.bucket_name,
-                            &op.object_key,
-                            parse_optional_version_id(op.base_version_id.as_deref())?,
-                            &op.merge_patch_json,
-                            transaction_id,
-                        )
-                        .await?;
-                    if transaction_id.is_none() {
-                        let watch_cursor = object_watch_cursor(self, &object).await?;
-                        max_watch_cursor = max_watch_cursor.max(watch_cursor);
-                    }
-                    receipts.push(MutationBatchOperationReceipt {
-                        operation: "patch_json_object".to_string(),
-                        object_key: object.key,
-                        version_id: object.version_id.to_string(),
-                        mutation_id: object.mutation_id.to_string(),
-                        payload_hash: object.content_hash,
-                        record_hash: object.record_hash,
-                        append_record_sequence: 0,
-                        manifest_revision: 0,
-                        lease_fence_token: 0,
-                    });
-                }
-                mutation_batch_operation::Op::DeleteObject(op) => {
-                    let transaction_principal = transaction_id
-                        .map(|_| crate::object_manager::transaction_principal_from_claims(&claims));
-                    let deleted = if let Some(version_id) =
-                        parse_optional_version_id(op.version_id.as_deref())?
-                    {
-                        self.object_manager
-                            .delete_object_version(
-                                &claims,
-                                &req.bucket_name,
-                                &op.object_key,
-                                version_id,
-                                transaction_id,
-                                transaction_principal.as_deref(),
-                                write_visibility,
-                            )
-                            .await?
-                    } else {
-                        self.object_manager
-                            .delete_object(
-                                &claims,
-                                &req.bucket_name,
-                                &op.object_key,
-                                transaction_id,
-                                transaction_principal.as_deref(),
-                                write_visibility,
-                            )
-                            .await?
-                    };
-                    let watch_cursor =
-                        if transaction_id.is_some() || !write_visibility.requires_watch_visible() {
-                            0
-                        } else {
-                            object_watch_cursor(self, &deleted).await?
-                        };
-                    max_watch_cursor = max_watch_cursor.max(watch_cursor);
-                    receipts.push(MutationBatchOperationReceipt {
-                        operation: "delete_object".to_string(),
-                        object_key: deleted.key,
-                        version_id: deleted.version_id.to_string(),
-                        mutation_id: deleted.mutation_id.to_string(),
-                        payload_hash: deleted.content_hash,
-                        record_hash: deleted.record_hash,
-                        append_record_sequence: 0,
-                        manifest_revision: 0,
-                        lease_fence_token: 0,
-                    });
-                }
-                mutation_batch_operation::Op::AppendStreamRecord(op) => {
-                    let stream_id = uuid::Uuid::parse_str(&op.stream_id)
-                        .map_err(|_| Status::invalid_argument("Invalid stream_id"))?;
-                    let record = self
-                        .object_manager
-                        .append_stream_record(
-                            &claims,
-                            &req.bucket_name,
-                            &op.stream_key,
-                            stream_id,
-                            op.payload,
-                            op.content_type,
-                            parse_user_metadata_json(&op.user_metadata_json)?,
-                            transaction_id,
-                        )
-                        .await?;
-                    if transaction_id.is_none() {
-                        max_watch_cursor = max_watch_cursor.max(record.receipt.watch_cursor);
-                    }
-                    receipts.push(MutationBatchOperationReceipt {
-                        operation: "append_stream_record".to_string(),
-                        object_key: op.stream_key,
-                        version_id: record.record_sequence.to_string(),
-                        mutation_id: record.receipt.mutation_id.to_string(),
-                        payload_hash: record.payload_hash,
-                        record_hash: record.receipt.record_hash,
-                        append_record_sequence: record.record_sequence,
-                        manifest_revision: 0,
-                        lease_fence_token: 0,
-                    });
-                }
-                mutation_batch_operation::Op::CheckpointTaskLease(op) => {
-                    if transaction_id.is_some() {
-                        return Err(Status::failed_precondition(
-                            "checkpoint_task_lease is a coordination-plane operation and cannot be staged inside an explicit object transaction",
-                        ));
-                    }
-                    let owner = lease_owner_from_claims(&claims);
-                    let lease = self
-                        .persistence
-                        .checkpoint_named_task_lease(
-                            &op.task_id,
-                            &owner,
-                            op.fence_token,
-                            join_u128(op.checkpoint_cursor_low, op.checkpoint_cursor_high),
-                        )
-                        .await
-                        .map_err(lease_error_status)?;
-                    receipts.push(MutationBatchOperationReceipt {
-                        operation: "checkpoint_task_lease".to_string(),
-                        object_key: op.task_id,
-                        version_id: lease.lease_epoch.to_string(),
-                        mutation_id: String::new(),
-                        payload_hash: String::new(),
-                        record_hash: lease.lease_hash.unwrap_or_default(),
-                        append_record_sequence: 0,
-                        manifest_revision: 0,
-                        lease_fence_token: lease.fence_token,
-                    });
-                }
-                mutation_batch_operation::Op::CommitTaskLease(op) => {
-                    if transaction_id.is_some() {
-                        return Err(Status::failed_precondition(
-                            "commit_task_lease is a coordination-plane operation and cannot be staged inside an explicit object transaction",
-                        ));
-                    }
-                    let owner = lease_owner_from_claims(&claims);
-                    let lease = self
-                        .persistence
-                        .commit_named_task_lease(
-                            &op.task_id,
-                            &owner,
-                            op.fence_token,
-                            join_u128(op.committed_cursor_low, op.committed_cursor_high),
-                        )
-                        .await
-                        .map_err(lease_error_status)?;
-                    receipts.push(MutationBatchOperationReceipt {
-                        operation: "commit_task_lease".to_string(),
-                        object_key: op.task_id,
-                        version_id: lease.lease_epoch.to_string(),
-                        mutation_id: String::new(),
-                        payload_hash: String::new(),
-                        record_hash: lease.lease_hash.unwrap_or_default(),
-                        append_record_sequence: 0,
-                        manifest_revision: 0,
-                        lease_fence_token: lease.fence_token,
-                    });
-                }
-                mutation_batch_operation::Op::CompareAndSwapManifest(op) => {
-                    let transaction_principal = transaction_id
-                        .map(|_| object_manager::transaction_principal_from_claims(&claims));
-                    let result = self
-                        .object_manager
-                        .compare_and_swap_manifest(
-                            &claims,
-                            &req.bucket_name,
-                            &op.manifest_key,
-                            op.expected_revision,
-                            &op.manifest_json,
-                            transaction_id,
-                            transaction_principal.as_deref(),
-                        )
-                        .await?;
-                    if transaction_id.is_none() {
-                        max_watch_cursor = max_watch_cursor.max(result.receipt.watch_cursor);
-                    }
-                    receipts.push(MutationBatchOperationReceipt {
-                        operation: "compare_and_swap_manifest".to_string(),
-                        object_key: op.manifest_key,
-                        version_id: result.revision.to_string(),
-                        mutation_id: result.receipt.mutation_id.to_string(),
-                        payload_hash: result.manifest_hash,
-                        record_hash: result.receipt.record_hash,
-                        append_record_sequence: 0,
-                        manifest_revision: result.revision,
-                        lease_fence_token: 0,
-                    });
-                }
-            }
-        }
-
-        let response = MutationBatchResponse {
-            batch_id: operation_digest,
-            operation_receipts: receipts,
-            watch_cursor: max_watch_cursor,
-            mutation_id: context.request_id.clone(),
-            write_state: write_state_for_transaction(transaction_id),
-        };
-        native_idempotency::store_response(&self.storage, context, &target, &response).await?;
-        Ok(Response::new(response))
+        execute_mutation_batch(self, request).await
     }
 
     async fn initiate_multipart_upload(

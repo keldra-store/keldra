@@ -74,7 +74,6 @@ pub(super) struct QuerySpecPlan {
     pub(super) authz_scope: QueryAuthzScope,
     pub(super) canonical_query_hash: String,
     pub(super) plan_json: String,
-    pub(super) diagnostics: Vec<String>,
     pub(super) query_text: String,
     pub(super) query_vector: Vec<f32>,
     pub(super) phrase: bool,

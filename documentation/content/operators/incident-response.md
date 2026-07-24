@@ -43,7 +43,7 @@ Use this classification as the first triage pass:
 
 | Class | First evidence | Safer early mitigation |
 | --- | --- | --- |
-| Network plane | Which listener is reachable from which network; public, admin, and cluster routes; proxy and firewall changes. | Close unintended exposure, reroute traffic, or remove the node from the load balancer. |
+| Network boundary | Which listener is reachable from which network; tenant, admin, and internal node gRPC routes; proxy and firewall changes. | Close unintended exposure, reroute traffic, or remove the node from the load balancer. |
 | Authentication | Token minting, token expiry, credential rotation, S3 signature inputs, JWT secret consistency. | Rotate the affected credential or roll back the credential deployment. |
 | Public policy | Action/resource checked, app grant set, token scopes, recent grant/revoke audit. | Grant or revoke the narrow missing scope if policy is wrong; do not use wildcard grants. |
 | Relationship authorisation | Tuple revision, zookie, userset facts, schema binding, derived userset lag, object visibility. | Restore or write the precise tuple if missing; repair derived authz only after source facts are verified. |
@@ -123,7 +123,7 @@ Next inspect diagnostics for the affected index:
 ```bash
 anvil --profile acme diagnostics list documents body_text \
   --severity warning \
-  --limit 50
+  --page-size 50
 ```
 
 This proves tenant-facing diagnostics for `documents/body_text` can be read. It does not prove the index is caught up. Use query catch-up fields where the index family supports them, and inspect index or watch lag where it does not.
@@ -187,7 +187,7 @@ This checks the PersonalDB log chain for that tenant/database. It does not inven
 
 ## Incident: key or credential leak
 
-First identify which secret leaked. The mitigation is different for an app client secret, bearer token, `JWT_SECRET`, `ANVIL_SECRET_ENCRYPTION_KEY`, previous encryption key, `CLUSTER_SECRET`, or first-admin credential.
+First identify which secret leaked. The mitigation is different for an app client secret, bearer token, `JWT_SECRET`, `ANVIL_SECRET_ENCRYPTION_KEY`, previous encryption key, per-node internal bearer credential, local node signing key, or first-admin credential.
 
 For a tenant app secret, rotate the affected app and update only the service that owns it:
 
@@ -209,7 +209,9 @@ anvil-admin --host http://10.10.0.12:50052 secret-encryption-key rotate \
   --audit-reason 'dry-run envelope rotation after key leak INC-9142'
 ```
 
-This proves the restored or running server can inspect known encrypted envelopes with the configured keyring. It does not rotate records. Run the real rotation only after configuration is correct, then verify app token minting and affected integrations before removing previous keys. For `JWT_SECRET` and `CLUSTER_SECRET`, plan coordinated node rollout; there is no documented multi-key overlap workflow equivalent to envelope rotation.
+This proves the restored or running server can inspect known encrypted envelopes with the configured keyring. It does not rotate records. Run the real rotation only after configuration is correct, then verify app token minting and affected integrations before removing previous keys. For `JWT_SECRET`, plan a coordinated node rollout; there is no documented multi-key overlap workflow equivalent to envelope rotation.
+
+If an internal node credential leaks, replace that node's credential, update its protected runtime configuration, and verify that the old credential is rejected while distributed writes and recovery still succeed. If a node's Ed25519 signing private key leaks, remove or drain the compromised lifecycle identity, preserve audit evidence, and register a fresh node identity and public key. Do not overwrite the committed public key for an existing live identity as though ordinary key rotation had occurred.
 
 ## Incident: disk pressure or CoreStore errors
 

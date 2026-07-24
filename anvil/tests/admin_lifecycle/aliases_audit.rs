@@ -205,8 +205,8 @@ async fn admin_host_aliases_are_generation_checked_and_lifecycle_managed() {
             tonic::Request::new(ListHostAliasesRequest {
                 region: "eu-west-1".to_string(),
                 page: Some(PageRequest {
-                    cursor: String::new(),
-                    limit: 10,
+                    page_token: String::new(),
+                    page_size: 10,
                 }),
             }),
             &token,
@@ -379,8 +379,8 @@ async fn admin_mutations_are_returned_by_durable_audit_listing() {
                 resource_id: String::new(),
                 action: String::new(),
                 page: Some(PageRequest {
-                    cursor: String::new(),
-                    limit: 100,
+                    page_token: String::new(),
+                    page_size: 100,
                 }),
             }),
             &token,
@@ -397,8 +397,8 @@ async fn admin_mutations_are_returned_by_durable_audit_listing() {
                 resource_id: String::new(),
                 action: String::new(),
                 page: Some(PageRequest {
-                    cursor: String::new(),
-                    limit: 2,
+                    page_token: String::new(),
+                    page_size: 2,
                 }),
             }),
             &token,
@@ -407,7 +407,7 @@ async fn admin_mutations_are_returned_by_durable_audit_listing() {
         .unwrap()
         .into_inner();
     assert_eq!(first_page.events.len(), 2);
-    let first_page_cursor = first_page.page.unwrap().next_cursor;
+    let first_page_cursor = first_page.page.unwrap().next_page_token;
     assert!(!first_page_cursor.is_empty());
 
     let second_page = client
@@ -418,8 +418,8 @@ async fn admin_mutations_are_returned_by_durable_audit_listing() {
                 resource_id: String::new(),
                 action: String::new(),
                 page: Some(PageRequest {
-                    cursor: first_page_cursor.clone(),
-                    limit: 2,
+                    page_token: first_page_cursor.clone(),
+                    page_size: 2,
                 }),
             }),
             &token,
@@ -441,8 +441,8 @@ async fn admin_mutations_are_returned_by_durable_audit_listing() {
                 resource_id: String::new(),
                 action: "admin.tenant.create".to_string(),
                 page: Some(PageRequest {
-                    cursor: first_page_cursor.clone(),
-                    limit: 2,
+                    page_token: first_page_cursor.clone(),
+                    page_size: 2,
                 }),
             }),
             &token,
@@ -470,8 +470,8 @@ async fn admin_mutations_are_returned_by_durable_audit_listing() {
                 resource_id: String::new(),
                 action: String::new(),
                 page: Some(PageRequest {
-                    cursor: first_page_cursor,
-                    limit: 2,
+                    page_token: first_page_cursor,
+                    page_size: 2,
                 }),
             }),
             &token,

@@ -238,7 +238,7 @@ fn non_corestore_direct_persistence_paths_are_scratch_or_operator_exports() {
     let snapshot_store = workspace_file("anvil-core/src/personaldb_snapshot_store.rs");
     let system_realm = workspace_file("anvil-core/src/system_realm.rs");
     let worker = workspace_file("anvil-core/src/worker.rs");
-    let cluster_identity = workspace_file("anvil-core/src/cluster_identity.rs");
+    let node_identity = workspace_file("anvil-core/src/node_identity.rs");
 
     assert_contains_all(
         "upload staging is Class C scratch",
@@ -316,23 +316,28 @@ fn non_corestore_direct_persistence_paths_are_scratch_or_operator_exports() {
         ],
     );
     assert_contains_all(
-        "cluster identity writes through CoreStore CoreMeta commit path",
-        &cluster_identity,
+        "node identity writes through CoreStore CoreMeta commit path",
+        &node_identity,
         &[
             "CoreStore::new(storage.clone())",
-            "commit_coremeta_batch_by_embedded_roots(&record.node_id, &[op])",
+            "commit_coremeta_root_groups(",
         ],
     );
     assert_contains_none(
-        "cluster identity direct committed write bypass",
-        &cluster_identity,
+        "node identity direct committed write bypass",
+        &node_identity,
         &["write_local_committed_batch", "meta.put("],
     );
 }
 
 #[test]
 fn object_current_heads_and_version_rows_use_separate_coremeta_column_families() {
-    let object_metadata = workspace_file("anvil-core/src/core_store/local_object_metadata.rs");
+    let object_metadata = format!(
+        "{}\n{}\n{}",
+        workspace_file("anvil-core/src/core_store/local_object_metadata.rs"),
+        workspace_file("anvil-core/src/core_store/local_object_metadata/projections.rs"),
+        workspace_file("anvil-core/src/core_store/local_object_metadata/mutation.rs"),
+    );
     let meta = format!(
         "{}\n{}",
         workspace_file("anvil-core/src/core_store/meta.rs"),
@@ -347,8 +352,10 @@ fn object_current_heads_and_version_rows_use_separate_coremeta_column_families()
             "TABLE_OBJECT_HEAD_ROW",
             "CF_OBJECT_VERSIONS",
             "TABLE_OBJECT_VERSION_META_ROW",
-            "object_current_key(bucket",
-            "object_version_key(bucket",
+            "pub(super) fn object_current_key(",
+            "b\"object-current\"",
+            "pub(super) fn object_version_key(",
+            "b\"object-version\"",
         ],
     );
 }
@@ -356,7 +363,11 @@ fn object_current_heads_and_version_rows_use_separate_coremeta_column_families()
 #[test]
 fn boundary_values_are_indexed_in_coremeta_boundary_rows() {
     let object_manager = workspace_file("anvil-core/src/object_manager.rs");
-    let object_metadata = workspace_file("anvil-core/src/core_store/local_object_metadata.rs");
+    let object_metadata = format!(
+        "{}\n{}",
+        workspace_file("anvil-core/src/core_store/local_object_metadata.rs"),
+        workspace_file("anvil-core/src/core_store/local_object_metadata/mutation.rs"),
+    );
     let corestore = workspace_file("anvil-core/src/core_store/local_stream_control.rs");
     let proto = workspace_file("anvil-core/src/core_store/control_record_proto.rs");
 
@@ -370,8 +381,12 @@ fn boundary_values_are_indexed_in_coremeta_boundary_rows() {
         &object_metadata,
         &[
             "object_data_target_from_shard_map",
-            "read_logical_file_manifest(locator)",
-            "put_boundary_values_for_object",
+            "prepare_object_boundary_value_projections",
+            "self.read_logical_file_manifest(locator).await?",
+            "ancillary_boundary_value_key",
+            "encode_boundary_value_row",
+            "OwnedCoreMetaBatchOp::Put",
+            "table_id: TABLE_BOUNDARY_VALUE_ROW",
         ],
     );
     assert_contains_all(
@@ -688,8 +703,10 @@ fn coremeta_rocksdb_plane_defines_rfc_storage_model_tables_and_caps() {
 #[test]
 fn coremeta_tuple_keys_are_typed_and_prefix_scans_decode_tuple_parts() {
     let meta = format!(
-        "{}\n{}",
+        "{}\n{}\n{}\n{}",
         workspace_file("anvil-core/src/core_store/meta.rs"),
+        workspace_file("anvil-core/src/core_store/meta/key.rs"),
+        workspace_file("anvil-core/src/core_store/meta/scans.rs"),
         workspace_file("anvil-core/src/core_store/meta/payload_validation.rs"),
     );
     let helpers = workspace_file("anvil-core/src/core_store/local_key_helpers.rs");
@@ -698,16 +715,28 @@ fn coremeta_tuple_keys_are_typed_and_prefix_scans_decode_tuple_parts() {
         "CoreMeta typed tuple key implementation",
         &(meta.clone() + &helpers),
         &[
+            "pub enum CoreMetaTuplePart",
+            "pub fn core_meta_tuple_key(",
+            "encode_tuple_part(&mut key, *part)?",
+            "fn encode_escaped_value(",
+            "fn decode_escaped_value(",
+            "validate_core_meta_tuple_key(tuple_key)?",
+            "CoreMetaTuplePart::Raw(part)",
+            "core_meta_tuple_key(&parts)",
+            "exclusive_prefix_successor(&prefix)",
+            "set_iterate_lower_bound(start_key.clone())",
+            "set_iterate_upper_bound(upper_bound)",
+            "decode_core_meta_tuple_key(&key)?",
+        ],
+    );
+    assert_contains_none(
+        "removed length-delimited CoreMeta tuple layout",
+        &meta,
+        &[
             "CoreMetaTupleKey missing part_count",
             "CoreMetaTupleKey part has unsupported flags",
-            "validate_core_meta_tuple_part(kind",
-            "core_meta_tuple_key_has_prefix",
             "part_count.to_le_bytes()",
-            "key.push(kind)",
-            "key.push(0)",
-            "push_meta_tuple_part(&mut key, 0x01",
-            "push_meta_tuple_part(&mut key, 0x02",
-            "push_meta_tuple_part(key, 0x05",
+            "push_meta_tuple_part",
         ],
     );
 }
@@ -771,7 +800,15 @@ fn explicit_transaction_rows_store_large_payloads_as_corestore_locators() {
 
 #[test]
 fn corestore_admission_uses_pending_rows_and_materialisation_rows_not_transaction_table_overload() {
-    let admission = workspace_file("anvil-core/src/core_store/local_admission.rs");
+    let admission = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        workspace_file("anvil-core/src/core_store/meta.rs"),
+        workspace_file("anvil-core/src/core_store/local_key_helpers.rs"),
+        workspace_file("anvil-core/src/core_store/local_admission.rs"),
+        workspace_file("anvil-core/src/core_store/local_admission/publication.rs"),
+        workspace_file("anvil-core/src/core_store/local_admission/point_state.rs"),
+        workspace_file("anvil-core/src/core_store/local_admission/finalisation.rs"),
+    );
 
     assert_contains_all(
         "CoreStore admission table split",
@@ -780,9 +817,12 @@ fn corestore_admission_uses_pending_rows_and_materialisation_rows_not_transactio
             "TABLE_PENDING_MUTATION_ROW",
             "TABLE_MATERIALISATION_CURSOR_ROW",
             "CF_MATERIALISATION",
-            "admission_record_key(record.sequence)",
-            "admission_sequence_key()",
-            "admission_finalisation_key(&admission_key)",
+            "pub(super) fn admission_record_key(",
+            "admission_record_key(admission_shard_hash, sequence)",
+            "pub(super) fn admission_sequence_key(",
+            "admission_sequence_key(admission_shard_hash)",
+            "pub(super) fn admission_finalisation_key(",
+            "admission_finalisation_key(key)",
         ],
     );
     assert_contains_none(
@@ -880,7 +920,11 @@ fn corestore_source_has_no_custom_metadata_wal_or_sidecar_control_store() {
 fn feature_metadata_current_state_uses_coremeta_rows_not_legacy_refs() {
     let index_coremeta = workspace_file("anvil-core/src/index_coremeta.rs");
     let index_journal = workspace_file("anvil-core/src/index_journal.rs");
-    let authz_journal = workspace_file("anvil-core/src/authz_journal.rs");
+    let authz_journal = format!(
+        "{}\n{}",
+        workspace_file("anvil-core/src/authz_journal.rs"),
+        workspace_file("anvil-core/src/authz_journal/projection.rs")
+    );
     let authz_schema = workspace_file("anvil-core/src/authz_schema.rs");
     let authz_realm = workspace_file("anvil-core/src/authz_realm_schema.rs");
     let authz_payload = workspace_file("anvil-core/src/authz_coremeta_payload.rs");
@@ -908,7 +952,9 @@ fn feature_metadata_current_state_uses_coremeta_rows_not_legacy_refs() {
             "namespace_schema_tuple_key",
             "schema_revision_tuple_key",
             "schema_binding_tuple_key",
-            "CoreMetaStore::open",
+            "CoreStore::new(storage.clone()).await?",
+            "read_coremeta_row(",
+            "commit_coremeta_batch_for_storage(",
             "encode_authz_payload_row(",
             "decode_authz_payload_row(",
         ],
@@ -944,13 +990,14 @@ fn feature_metadata_current_state_uses_coremeta_rows_not_legacy_refs() {
         ],
     );
     assert_contains_all(
-        "authz tuple page rows use inline-or-locator payload wrapper",
+        "authz tuple current rows use inline-or-locator payload wrapper",
         &authz_journal,
         &[
-            "AUTHZ_TUPLE_PAGE_PAYLOAD_KIND",
+            "AUTHZ_TUPLE_CURRENT_PAYLOAD_KIND",
             "encode_authz_payload_row(",
             "decode_authz_payload_row(",
-            "TABLE_AUTHZ_TUPLE_PAGE_ROW",
+            "TABLE_AUTHZ_TUPLE_OBJECT_CURRENT_ROW",
+            "TABLE_AUTHZ_TUPLE_SUBJECT_CURRENT_ROW",
         ],
     );
     assert_contains_none(
@@ -1130,7 +1177,12 @@ fn object_upload_scratch_files_are_not_the_durability_boundary() {
 #[test]
 fn low_level_observability_names_cover_admission_pipeline_and_shards() {
     let io = workspace_file("anvil-core/src/core_store/local_io.rs");
-    let admission = workspace_file("anvil-core/src/core_store/local_admission.rs");
+    let admission = format!(
+        "{}\n{}",
+        workspace_file("anvil-core/src/core_store/local_admission.rs"),
+        workspace_file("anvil-core/src/core_store/local_admission/publication.rs"),
+    );
+    let perf = workspace_file("anvil-core/src/perf.rs");
     let blob = format!(
         "{}\n{}",
         workspace_file("anvil-core/src/core_store/local_init_blob.rs"),
@@ -1139,7 +1191,7 @@ fn low_level_observability_names_cover_admission_pipeline_and_shards() {
 
     assert_contains_all(
         "RFC 0007 low-level metric names",
-        &(io.clone() + &admission + &blob),
+        &(io.clone() + &admission + &blob + &perf),
         &[
             "anvil_admission_duration_ms",
             "anvil_landed_bytes_duration_ms",
@@ -1218,19 +1270,25 @@ fn gateway_metadata_uses_coremeta_rows_not_legacy_refs() {
 
 #[test]
 fn task_current_state_uses_coremeta_rows_not_legacy_refs() {
-    let task = workspace_file("anvil-core/src/task_journal.rs");
+    let task = format!(
+        "{}\n{}\n{}\n{}",
+        workspace_file("anvil-core/src/task_journal.rs"),
+        workspace_file("anvil-core/src/task_journal/model.rs"),
+        workspace_file("anvil-core/src/task_journal/queue.rs"),
+        workspace_file("anvil-core/src/task_journal/store.rs"),
+    );
 
     assert_contains_all(
         "task current CoreMeta row path",
         &task,
         &[
-            "TaskCurrentRowProto",
-            "TaskCurrentCoreMetaRow",
+            "TaskQueueRowProto",
+            "TaskQueueRow",
             "TABLE_TASK_CURRENT_ROW",
             "CoreMutationPrecondition::CoreMetaRow",
-            "meta.scan_prefix(",
-            "commit_coremeta_batch_for_storage(",
-            "CoreMetaBatchOpKind::Put(&payload)",
+            "scan_coremeta_prefix_page(",
+            "CoreMutationBatch",
+            "CoreMutationOperation::CoreMetaPut",
             "core_meta_payload_digest(TABLE_TASK_CURRENT_ROW, payload)",
         ],
     );
@@ -1264,7 +1322,13 @@ fn manifest_transactions_project_committed_current_rows() {
         &[
             "pub async fn materialize_committed_manifest_cas_transaction",
             "parse_manifest_cas_stream_id(stream_id)",
-            "write_manifest_current_row(storage, &meta, &row_update.row, &row_update.precondition)",
+            "preconditions.push(current_update.precondition.clone())",
+            "CoreMutationOperation::StreamAppend {",
+            "CoreMutationOperation::CoreMetaPut {",
+            "table_id: TABLE_MANIFEST_CAS_CURRENT_ROW",
+            "manifest_current_row_key(",
+            "read_manifest_current_row(&core_store",
+            "committed without its current projection",
             "manifest_journal::materialize_committed_manifest_cas_transaction",
         ],
     );
@@ -1312,9 +1376,12 @@ fn boundary_schemas_are_public_api_and_coremeta_rows_not_refs() {
         &[
             "CF_BOUNDARY",
             "TABLE_BOUNDARY_SCHEMA_ROW",
+            "TABLE_BOUNDARY_SCHEMA_CURRENT_ROW",
             "boundary_schema_coremeta_key",
-            "boundary_schema_coremeta_prefix",
-            "scan_prefix(CF_BOUNDARY, TABLE_BOUNDARY_SCHEMA_ROW",
+            "boundary_schema_current_coremeta_key",
+            "read_coremeta_row(",
+            "CoreMetaBatchOpKind::Put(&bytes)",
+            "commit_coremeta_root_groups(",
             "validate_boundary_schema(&schema, current_schema.as_ref(), input.expected_generation)",
         ],
     );

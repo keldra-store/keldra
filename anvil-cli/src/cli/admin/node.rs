@@ -18,13 +18,9 @@ pub enum NodeCommands {
         #[clap(long)]
         cell_id: String,
         #[clap(long)]
-        libp2p_peer_id: String,
-        #[clap(long)]
-        receipt_signing_public_key_proto_b64: String,
+        receipt_signing_public_key_b64: String,
         #[clap(long)]
         public_api_addr: String,
-        #[clap(long = "public-cluster-addr")]
-        public_cluster_addrs: Vec<String>,
         #[clap(long = "capability", value_delimiter = ',', required = true)]
         capabilities: Vec<NodeCapabilityArg>,
         #[clap(long, default_value = "{}")]
@@ -118,19 +114,17 @@ pub(super) async fn handle_node_command(
             node_id,
             region,
             cell_id,
-            libp2p_peer_id,
-            receipt_signing_public_key_proto_b64,
+            receipt_signing_public_key_b64,
             public_api_addr,
-            public_cluster_addrs,
             capabilities,
             capacity_json,
         } => {
             let admin_context = context.to_create_context()?;
-            let receipt_signing_public_key_proto = base64::engine::general_purpose::STANDARD
-                .decode(receipt_signing_public_key_proto_b64)
+            let receipt_signing_public_key = base64::engine::general_purpose::STANDARD
+                .decode(receipt_signing_public_key_b64)
                 .or_else(|_| {
                     base64::engine::general_purpose::URL_SAFE_NO_PAD
-                        .decode(receipt_signing_public_key_proto_b64)
+                        .decode(receipt_signing_public_key_b64)
                 })?;
             print_rpc_response(
                 "node",
@@ -142,14 +136,12 @@ pub(super) async fn handle_node_command(
                         node_id: node_id.clone(),
                         region: region.clone(),
                         cell_id: cell_id.clone(),
-                        libp2p_peer_id: libp2p_peer_id.clone(),
-                        public_cluster_addrs: public_cluster_addrs.clone(),
                         public_api_addr: public_api_addr.clone(),
                         capabilities: capabilities
                             .iter()
                             .map(|capability| capability.to_proto())
                             .collect(),
-                        receipt_signing_public_key_proto,
+                        receipt_signing_public_key,
                         capacity_json: capacity_json.clone(),
                     },
                     token,

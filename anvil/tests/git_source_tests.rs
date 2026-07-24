@@ -21,12 +21,13 @@ use std::io::Write;
 use std::time::Duration;
 use tonic::Request;
 
-fn writer_segment_catalog_tuple_key(family: &str, scope: &str, segment_ref: &str) -> Vec<u8> {
+fn writer_segment_catalog_tuple_key(family: &str, scope: &str, generation: u64) -> Vec<u8> {
+    let scope_hash =
+        anvil::core_store::core_meta_root_key_hash(&format!("writer-scope/{family}/{scope}"));
     core_meta_tuple_key(&[
-        CoreMetaTuplePart::Utf8("writer-segment"),
         CoreMetaTuplePart::Utf8(family),
-        CoreMetaTuplePart::Utf8(scope),
-        CoreMetaTuplePart::Utf8(segment_ref),
+        CoreMetaTuplePart::Hash(&scope_hash),
+        CoreMetaTuplePart::U64(generation),
     ])
     .unwrap()
 }
@@ -41,7 +42,6 @@ async fn test_git_source_watch_streams_snapshot_and_new_events() {
         &cluster.states[0].storage,
         1,
         &repository_id,
-        1,
         [1; 16],
         5,
         git_watch_payload(&repository_id, 1),
@@ -99,7 +99,6 @@ async fn test_git_source_watch_streams_snapshot_and_new_events() {
         &cluster.states[0].storage,
         1,
         &repository_id,
-        2,
         [2; 16],
         6,
         git_watch_payload(&repository_id, 2),
@@ -173,7 +172,10 @@ async fn test_git_source_query_apis_use_latest_index_and_enforce_read_authz() {
                 repository_id: repository_id.clone(),
                 commit_id: hex::encode([1_u8; 20]),
                 prefix: "src".to_string(),
-                limit: 10,
+                page: Some(anvil::anvil_api::PageRequest {
+                    page_size: 10,
+                    page_token: String::new(),
+                }),
             },
             &cluster.token,
         ))
@@ -193,6 +195,7 @@ async fn test_git_source_query_apis_use_latest_index_and_enforce_read_authz() {
             GetGitObjectRequest {
                 repository_id: repository_id.clone(),
                 object_id: hex::encode([10_u8; 20]),
+                page: None,
             },
             &cluster.token,
         ))
@@ -212,6 +215,7 @@ async fn test_git_source_query_apis_use_latest_index_and_enforce_read_authz() {
             GetGitObjectRequest {
                 repository_id: repository_id.clone(),
                 object_id: hex::encode([10_u8; 20]),
+                page: None,
             },
             &read_denied_token,
         ))
@@ -271,8 +275,10 @@ async fn test_put_git_pack_stores_normal_object_builds_index_and_is_s3_readable(
             &cluster.states[0].storage,
             "git_source_index",
             &index_scope,
+            response.generation,
             &response.index_path,
         )
+        .await
         .unwrap()
         .is_some()
     );
@@ -284,7 +290,7 @@ async fn test_put_git_pack_stores_normal_object_builds_index_and_is_s3_readable(
             &writer_segment_catalog_tuple_key(
                 "git_source_index",
                 &index_scope,
-                &response.index_path,
+                response.generation,
             ),
         )
         .unwrap();
@@ -293,8 +299,10 @@ async fn test_put_git_pack_stores_normal_object_builds_index_and_is_s3_readable(
             &cluster.states[0].storage,
             "git_source_index",
             &index_scope,
+            response.generation,
             &response.index_path,
         )
+        .await
         .unwrap()
         .is_none()
     );
@@ -320,8 +328,10 @@ async fn test_put_git_pack_stores_normal_object_builds_index_and_is_s3_readable(
             &cluster.states[0].storage,
             "git_source_index",
             &index_scope,
+            response.generation,
             &response.index_path,
         )
+        .await
         .unwrap()
         .is_some(),
         "git source query must rebuild a missing derived index catalog row from stored pack bytes"

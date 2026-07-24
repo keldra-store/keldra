@@ -6,7 +6,7 @@ use crate::core_store::{
     CORE_META_MAX_INLINE_PAYLOAD_BYTES, CoreBoundaryValue, CoreLogicalRangeHint, CoreMetaBatchOp,
     CoreMetaBatchOpKind, CoreMetaRowCommonProto, CoreMetaVisibilityState, CoreObjectRef,
     CorePipelinePolicy, CoreSharedRangeMarker, CoreTraceContext, WriteLogicalFilePathRequest,
-    WriteLogicalFileRequest, sha256_hex,
+    WriteLogicalFileRequest, core_meta_root_key_hash, sha256_hex,
 };
 
 use super::{EncodedWriterSegment, FileFamily, Hash32, RangeIndexEntry, encode_writer_segment};
@@ -299,6 +299,124 @@ pub enum CoreMetaMutationKind {
     Delete,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreMetaMutationScope {
+    root_anchor_key: Option<String>,
+    post_root_generation: u64,
+}
+
+impl CoreMetaMutationScope {
+    pub fn local() -> Self {
+        Self {
+            root_anchor_key: None,
+            post_root_generation: 0,
+        }
+    }
+
+    pub fn rooted(root_anchor_key: impl Into<String>, post_root_generation: u64) -> Result<Self> {
+        let root_anchor_key = root_anchor_key.into();
+        validate_canonical_root_anchor_key(&root_anchor_key)?;
+        if post_root_generation == 0 {
+            bail!("CoreFormatWriter rooted mutation generation must be nonzero");
+        }
+        Ok(Self {
+            root_anchor_key: Some(root_anchor_key),
+            post_root_generation,
+        })
+    }
+
+    pub fn root_anchor_key(&self) -> Option<&str> {
+        self.root_anchor_key.as_deref()
+    }
+
+    pub fn post_root_generation(&self) -> Option<u64> {
+        self.root_anchor_key
+            .as_ref()
+            .map(|_| self.post_root_generation)
+    }
+
+    pub fn root_key_hash(&self) -> Option<String> {
+        self.root_anchor_key().map(core_meta_root_key_hash)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriterRootPublication {
+    root_anchor_key: String,
+    writer_families: Vec<WriterFamily>,
+    transaction_coordinator: bool,
+}
+
+impl WriterRootPublication {
+    pub fn new(
+        root_anchor_key: impl Into<String>,
+        writer_families: Vec<WriterFamily>,
+    ) -> Result<Self> {
+        let root_anchor_key = root_anchor_key.into();
+        validate_canonical_root_anchor_key(&root_anchor_key)?;
+        validate_sorted_writer_families(&writer_families)?;
+        Ok(Self {
+            root_anchor_key,
+            writer_families,
+            transaction_coordinator: false,
+        })
+    }
+
+    pub fn coordinator(mut self) -> Self {
+        self.transaction_coordinator = true;
+        self
+    }
+
+    pub fn root_anchor_key(&self) -> &str {
+        &self.root_anchor_key
+    }
+
+    pub fn writer_families(&self) -> &[WriterFamily] {
+        &self.writer_families
+    }
+
+    pub fn is_transaction_coordinator(&self) -> bool {
+        self.transaction_coordinator
+    }
+}
+
+fn validate_canonical_root_anchor_key(root_anchor_key: &str) -> Result<()> {
+    if root_anchor_key.is_empty()
+        || root_anchor_key.len() > 1024
+        || root_anchor_key.starts_with('/')
+        || root_anchor_key.ends_with('/')
+        || root_anchor_key
+            .split('/')
+            .any(|part| part.is_empty() || part.chars().any(char::is_control))
+    {
+        bail!("CoreFormatWriter root anchor key is not canonical");
+    }
+    Ok(())
+}
+
+fn validate_sorted_writer_families(writer_families: &[WriterFamily]) -> Result<()> {
+    if writer_families.is_empty() {
+        bail!("CoreFormatWriter root publication must name at least one writer family");
+    }
+    let mut canonical = writer_families.to_vec();
+    canonical.sort_by_key(|family| family.as_str());
+    canonical.dedup();
+    if canonical != writer_families {
+        bail!("CoreFormatWriter root publication writer families must be sorted and unique");
+    }
+    Ok(())
+}
+
+fn validate_format_logical_id(value: &str, label: &str) -> Result<()> {
+    if value.is_empty() {
+        bail!("CoreFormatWriter {label} must not be empty");
+    }
+    if value.contains('\0') || value.contains("..") {
+        bail!("CoreFormatWriter {label} contains an invalid component");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CoreMetaMutation {
     pub column_family: &'static str,
@@ -306,10 +424,8 @@ pub struct CoreMetaMutation {
     pub tuple_key: Vec<u8>,
     pub kind: CoreMetaMutationKind,
     pub common: Option<CoreMetaRowCommonProto>,
-    pub visibility_state: CoreMetaVisibilityState,
-    pub root_key_hash: String,
-    pub post_root_generation: u64,
     pub transaction_id: String,
+    scope: CoreMetaMutationScope,
 }
 
 impl CoreMetaMutation {
@@ -319,29 +435,20 @@ impl CoreMetaMutation {
         tuple_key: Vec<u8>,
         payload: Vec<u8>,
         common: Option<CoreMetaRowCommonProto>,
+        scope: CoreMetaMutationScope,
         transaction_id: String,
-    ) -> Self {
-        let (root_key_hash, post_root_generation, visibility_state) = common
-            .as_ref()
-            .map(|common| {
-                (
-                    common.root_key_hash.clone(),
-                    common.root_generation,
-                    common.visibility_state_enum(),
-                )
-            })
-            .unwrap_or_else(|| (String::new(), 0, CoreMetaVisibilityState::Committed));
-        Self {
+    ) -> Result<Self> {
+        let mutation = Self {
             column_family,
             table_id,
             tuple_key,
             kind: CoreMetaMutationKind::Put(payload),
             common,
-            visibility_state,
-            root_key_hash,
-            post_root_generation,
             transaction_id,
-        }
+            scope,
+        };
+        mutation.validate()?;
+        Ok(mutation)
     }
 
     pub fn delete(
@@ -349,29 +456,75 @@ impl CoreMetaMutation {
         table_id: u16,
         tuple_key: Vec<u8>,
         common: Option<CoreMetaRowCommonProto>,
+        scope: CoreMetaMutationScope,
         transaction_id: String,
-    ) -> Self {
-        let (root_key_hash, post_root_generation, visibility_state) = common
-            .as_ref()
-            .map(|common| {
-                (
-                    common.root_key_hash.clone(),
-                    common.root_generation,
-                    common.visibility_state_enum(),
-                )
-            })
-            .unwrap_or_else(|| (String::new(), 0, CoreMetaVisibilityState::Committed));
-        Self {
+    ) -> Result<Self> {
+        let mutation = Self {
             column_family,
             table_id,
             tuple_key,
             kind: CoreMetaMutationKind::Delete,
             common,
-            visibility_state,
-            root_key_hash,
-            post_root_generation,
             transaction_id,
+            scope,
+        };
+        mutation.validate()?;
+        Ok(mutation)
+    }
+
+    pub fn scope(&self) -> &CoreMetaMutationScope {
+        &self.scope
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        validate_format_logical_id(&self.transaction_id, "mutation transaction id")?;
+        match self.scope.root_anchor_key() {
+            Some(root_anchor_key) => {
+                let common = self.common.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "CoreFormatWriter rooted mutation must carry explicit common metadata"
+                    )
+                })?;
+                if common.root_key_hash != core_meta_root_key_hash(root_anchor_key) {
+                    bail!(
+                        "CoreFormatWriter mutation common root hash does not match its canonical root anchor key"
+                    );
+                }
+                if Some(common.root_generation) != self.scope.post_root_generation() {
+                    bail!(
+                        "CoreFormatWriter mutation common generation does not match its declared root generation"
+                    );
+                }
+                if common.transaction_id != self.transaction_id {
+                    bail!(
+                        "CoreFormatWriter mutation common transaction id does not match its mutation transaction id"
+                    );
+                }
+                if common.visibility_state_enum() != CoreMetaVisibilityState::Committed {
+                    bail!("CoreFormatWriter rooted mutation must be committed");
+                }
+            }
+            None => {
+                if let Some(common) = self.common.as_ref() {
+                    if !common.root_key_hash.is_empty() || common.root_generation != 0 {
+                        bail!(
+                            "CoreFormatWriter local mutation must not carry rooted common metadata"
+                        );
+                    }
+                    if !common.transaction_id.is_empty()
+                        && common.transaction_id != self.transaction_id
+                    {
+                        bail!(
+                            "CoreFormatWriter local mutation common transaction id does not match its mutation transaction id"
+                        );
+                    }
+                    if common.visibility_state_enum() != CoreMetaVisibilityState::Committed {
+                        bail!("CoreFormatWriter local mutation must be committed");
+                    }
+                }
+            }
         }
+        Ok(())
     }
 
     pub fn as_batch_op(&self) -> CoreMetaBatchOp<'_> {
@@ -426,17 +579,20 @@ pub struct WriterRecoveryInput {
 pub struct WriterPlan {
     pub logical_files: Vec<LogicalFileWrite>,
     pub core_meta_mutations: Vec<CoreMetaMutation>,
+    pub core_meta_root_publications: Vec<WriterRootPublication>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WriterBuildOutput {
     pub logical_files: Vec<LogicalFileWrite>,
     pub core_meta_mutations: Vec<CoreMetaMutation>,
+    pub core_meta_root_publications: Vec<WriterRootPublication>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WriterRecoveryPlan {
     pub mutations_to_commit: Vec<CoreMetaMutation>,
+    pub core_meta_root_publications: Vec<WriterRootPublication>,
     pub logical_files_to_rewrite: Vec<LogicalFileWrite>,
     pub orphaned_logical_files: Vec<String>,
 }
@@ -553,6 +709,7 @@ impl CoreFormatWriter for OpaqueLogicalFileWriter {
                     .unwrap_or_else(|| "local".to_string()),
             }],
             core_meta_mutations: Vec::new(),
+            core_meta_root_publications: Vec::new(),
         })
     }
 
@@ -580,12 +737,14 @@ impl CoreFormatWriter for OpaqueLogicalFileWriter {
                 region_id: input.region_id,
             }],
             core_meta_mutations: Vec::new(),
+            core_meta_root_publications: Vec::new(),
         })
     }
 
     fn recover(&self, _input: WriterRecoveryInput) -> Result<WriterRecoveryPlan> {
         Ok(WriterRecoveryPlan {
             mutations_to_commit: Vec::new(),
+            core_meta_root_publications: Vec::new(),
             logical_files_to_rewrite: Vec::new(),
             orphaned_logical_files: Vec::new(),
         })
@@ -670,4 +829,102 @@ pub fn build_writer_segment_logical_file(
         logical_file,
         range_index_entries,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rooted_common(
+        root_anchor_key: &str,
+        generation: u64,
+        transaction_id: &str,
+    ) -> CoreMetaRowCommonProto {
+        CoreMetaRowCommonProto {
+            realm_id: "test".to_string(),
+            root_key_hash: core_meta_root_key_hash(root_anchor_key),
+            root_generation: generation,
+            transaction_id: transaction_id.to_string(),
+            visibility_state: CoreMetaVisibilityState::Committed as i32,
+            created_at_unix_nanos: 1,
+            payload_schema_version: 1,
+        }
+    }
+
+    #[test]
+    fn writer_root_publication_requires_canonical_sorted_families() {
+        let publication = WriterRootPublication::new(
+            "bucket/acme/index/orders",
+            vec![WriterFamily::CoreControl, WriterFamily::TypedMetadata],
+        )
+        .expect("canonical declaration");
+        assert_eq!(
+            publication.writer_families(),
+            &[WriterFamily::CoreControl, WriterFamily::TypedMetadata]
+        );
+
+        assert!(
+            WriterRootPublication::new("/bucket/acme", vec![WriterFamily::CoreControl]).is_err()
+        );
+        assert!(
+            WriterRootPublication::new(
+                "bucket/acme",
+                vec![WriterFamily::TypedMetadata, WriterFamily::CoreControl]
+            )
+            .is_err()
+        );
+        assert!(
+            WriterRootPublication::new(
+                "bucket/acme",
+                vec![WriterFamily::CoreControl, WriterFamily::CoreControl]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rooted_mutation_validates_canonical_scope_against_common_metadata() {
+        let root_anchor_key = "bucket/acme/index/orders";
+        let transaction_id = "format-write-1";
+        let mutation = CoreMetaMutation::put(
+            "cf_index_rows",
+            1,
+            b"orders/current".to_vec(),
+            b"payload".to_vec(),
+            Some(rooted_common(root_anchor_key, 7, transaction_id)),
+            CoreMetaMutationScope::rooted(root_anchor_key, 7).expect("rooted scope"),
+            transaction_id.to_string(),
+        )
+        .expect("rooted mutation");
+        assert_eq!(mutation.scope().root_anchor_key(), Some(root_anchor_key));
+        assert_eq!(mutation.scope().post_root_generation(), Some(7));
+
+        let mismatched = CoreMetaMutation::put(
+            "cf_index_rows",
+            1,
+            b"orders/current".to_vec(),
+            b"payload".to_vec(),
+            Some(rooted_common("bucket/other", 7, transaction_id)),
+            CoreMetaMutationScope::rooted(root_anchor_key, 7).expect("rooted scope"),
+            transaction_id.to_string(),
+        );
+        assert!(mismatched.is_err());
+    }
+
+    #[test]
+    fn local_mutation_rejects_rooted_common_metadata() {
+        let result = CoreMetaMutation::delete(
+            "cf_index_rows",
+            1,
+            b"orders/current".to_vec(),
+            Some(rooted_common(
+                "bucket/acme/index/orders",
+                1,
+                "format-write-2",
+            )),
+            CoreMetaMutationScope::local(),
+            "format-write-2".to_string(),
+        );
+        assert!(result.is_err());
+    }
 }

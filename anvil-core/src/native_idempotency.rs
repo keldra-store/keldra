@@ -2,7 +2,8 @@ use crate::{
     anvil_api::NativeMutationContext,
     core_store::{
         CF_TRANSACTIONS, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaRowCommonProto,
-        CoreMetaStore, CoreMetaTuplePart, CoreMetaVisibilityState, CoreStore, CoreTransactionState,
+        CoreMetaStore, CoreMetaTuplePart, CoreMetaVisibilityState, CoreMutationBatchAdditions,
+        CoreMutationOperation, CoreMutationPrecondition, CoreStore, CoreTransactionState,
         CoreTransactionUpdate, TABLE_NATIVE_IDEMPOTENCY_ROW, commit_coremeta_batch_for_storage,
         core_meta_committed_row_common, core_meta_root_key_hash, core_meta_tuple_key,
     },
@@ -12,6 +13,9 @@ use prost::Message;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value as JsonValue;
 use tonic::Status;
+
+const NATIVE_IDEMPOTENCY_CANDIDATE_GENERATION: u64 = 1;
+const NATIVE_IDEMPOTENCY_CANDIDATE_TRANSACTION_ID: &str = "native-idempotency-candidate";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NativeIdempotencyTarget {
@@ -47,6 +51,7 @@ struct NativeIdempotencyRecord {
     format_version: u16,
     tenant_id: i64,
     bucket_id: i64,
+    publication_root_anchor: String,
     principal: String,
     idempotency_key: String,
     transaction_id: Option<String>,
@@ -55,8 +60,6 @@ struct NativeIdempotencyRecord {
     response_json: JsonValue,
     response_hash: String,
     record_hash: String,
-    root_key_hash: String,
-    root_generation: u64,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -75,28 +78,36 @@ struct NativeIdempotencyTargetProto {
 struct NativeIdempotencyRecordProto {
     #[prost(message, optional, tag = "1")]
     common: Option<CoreMetaRowCommonProto>,
-    #[prost(uint32, tag = "2")]
+    #[prost(message, optional, tag = "2")]
+    body: Option<NativeIdempotencyRecordBodyProto>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct NativeIdempotencyRecordBodyProto {
+    #[prost(uint32, tag = "1")]
     format_version: u32,
-    #[prost(int64, tag = "3")]
+    #[prost(int64, tag = "2")]
     tenant_id: i64,
-    #[prost(int64, tag = "4")]
+    #[prost(int64, tag = "3")]
     bucket_id: i64,
-    #[prost(string, tag = "5")]
+    #[prost(string, tag = "4")]
     principal: String,
-    #[prost(string, tag = "6")]
+    #[prost(string, tag = "5")]
     idempotency_key: String,
-    #[prost(string, tag = "7")]
+    #[prost(string, tag = "6")]
     request_id: String,
-    #[prost(message, optional, tag = "8")]
+    #[prost(message, optional, tag = "7")]
     target: Option<NativeIdempotencyTargetProto>,
-    #[prost(bytes, tag = "9")]
+    #[prost(bytes, tag = "8")]
     response_json: Vec<u8>,
-    #[prost(string, tag = "10")]
+    #[prost(string, tag = "9")]
     response_hash: String,
-    #[prost(string, tag = "11")]
+    #[prost(string, tag = "10")]
     record_hash: String,
-    #[prost(string, optional, tag = "12")]
+    #[prost(string, optional, tag = "11")]
     transaction_id: Option<String>,
+    #[prost(string, tag = "12")]
+    publication_root_anchor: String,
 }
 
 pub async fn load_response<T>(
@@ -132,16 +143,15 @@ where
 
     let response_json = serde_json::to_value(response)
         .map_err(|e| Status::internal(format!("Serialize native idempotency response: {e}")))?;
-    let response_hash = blake3::hash(&serde_json::to_vec(&response_json).map_err(|e| {
-        Status::internal(format!("Serialize native idempotency response hash: {e}"))
-    })?)
-    .to_hex()
-    .to_string();
-    let (root_key_hash, root_generation) = native_idempotency_root(storage, context).await?;
+    let response_hash = native_response_hash(&response_json)?;
+    let publication_root_anchor =
+        native_idempotency_publication_root_anchor(storage, context, true).await?;
+    let root_key_hash = core_meta_root_key_hash(&publication_root_anchor);
     let mut record = NativeIdempotencyRecord {
-        format_version: 1,
+        format_version: 2,
         tenant_id: context.tenant_id,
         bucket_id: context.bucket_id,
+        publication_root_anchor,
         principal: context.principal.clone(),
         idempotency_key: context.idempotency_key.clone(),
         transaction_id: context.transaction_id.clone(),
@@ -150,12 +160,10 @@ where
         response_json,
         response_hash,
         record_hash: String::new(),
-        root_key_hash,
-        root_generation,
     };
     record.record_hash = record_hash(&record)?;
 
-    let bytes = encode_record(&record)?;
+    let bytes = encode_record(&record, native_idempotency_common(&record, root_key_hash))?;
     let row_key = record_tuple_key(context)?;
     let meta = CoreMetaStore::open(storage.core_store_meta_path())
         .map_err(|e| Status::internal(e.to_string()))?;
@@ -169,14 +177,158 @@ where
     Ok(())
 }
 
-async fn native_idempotency_root(
+pub(crate) async fn prepare_response_in_transaction<T>(
     storage: &Storage,
     context: &NativeMutationContext,
-) -> Result<(String, u64), Status> {
+    target: &NativeIdempotencyTarget,
+    response: &T,
+) -> Result<CoreMutationBatchAdditions, Status>
+where
+    T: Serialize,
+{
+    let transaction_id = context
+        .transaction_id
+        .as_deref()
+        .ok_or_else(|| Status::failed_precondition("TransactionRequired"))?;
+    if let Some(record) = read_record(storage, context).await? {
+        validate_record_context(&record, context, target)?;
+        return Err(Status::already_exists("NativeIdempotencyRecordExists"));
+    }
+
+    let core_store = CoreStore::new(storage.clone())
+        .await
+        .map_err(|error| Status::internal(error.to_string()))?;
+    let transaction = core_store
+        .read_explicit_transaction_for_principal(
+            transaction_id,
+            &native_transaction_principal_from_context(context),
+        )
+        .await
+        .map_err(|error| Status::internal(error.to_string()))?;
+    if transaction.state != CoreTransactionState::Open {
+        return Err(Status::failed_precondition("TransactionNotOpen"));
+    }
+
+    let response_json = serde_json::to_value(response).map_err(|error| {
+        Status::internal(format!("Serialize native idempotency response: {error}"))
+    })?;
+    let response_hash = native_response_hash(&response_json)?;
+    let mut record = NativeIdempotencyRecord {
+        format_version: 2,
+        tenant_id: context.tenant_id,
+        bucket_id: context.bucket_id,
+        publication_root_anchor: transaction.root_anchor_key.clone(),
+        principal: context.principal.clone(),
+        idempotency_key: context.idempotency_key.clone(),
+        transaction_id: context.transaction_id.clone(),
+        request_id: context.request_id.clone(),
+        target: target.clone(),
+        response_json,
+        response_hash,
+        record_hash: String::new(),
+    };
+    record.record_hash = record_hash(&record)?;
+    let payload = encode_record(
+        &record,
+        native_idempotency_common(&record, transaction.root_key_hash),
+    )?;
+    let tuple_key = record_tuple_key(context)?;
+
+    Ok(CoreMutationBatchAdditions {
+        root_publications: Vec::new(),
+        preconditions: vec![CoreMutationPrecondition::CoreMetaRow {
+            cf: CF_TRANSACTIONS.to_string(),
+            table_id: TABLE_NATIVE_IDEMPOTENCY_ROW,
+            tuple_key: tuple_key.clone(),
+            expected_payload_hash: None,
+            require_absent: true,
+            require_present: false,
+        }],
+        operations: vec![CoreMutationOperation::CoreMetaPut {
+            partition_id: transaction.scope_partition,
+            cf: CF_TRANSACTIONS.to_string(),
+            table_id: TABLE_NATIVE_IDEMPOTENCY_ROW,
+            tuple_key,
+            payload,
+        }],
+    })
+}
+
+pub(crate) async fn prepare_response_for_implicit_batch<T>(
+    storage: &Storage,
+    context: &NativeMutationContext,
+    target: &NativeIdempotencyTarget,
+    response: &T,
+    publication_root_anchor: &str,
+) -> Result<CoreMutationBatchAdditions, Status>
+where
+    T: Serialize,
+{
+    if context.transaction_id.is_some() {
+        return Err(Status::failed_precondition("ImplicitMutationBatchRequired"));
+    }
+    if let Some(record) = read_record(storage, context).await? {
+        validate_record_context(&record, context, target)?;
+        return Err(Status::already_exists("NativeIdempotencyRecordExists"));
+    }
+
+    if publication_root_anchor.is_empty() {
+        return Err(Status::invalid_argument(
+            "Native idempotency publication root is empty",
+        ));
+    }
+    let root_key_hash = core_meta_root_key_hash(publication_root_anchor);
+    let response_json = serde_json::to_value(response).map_err(|error| {
+        Status::internal(format!("Serialize native idempotency response: {error}"))
+    })?;
+    let response_hash = native_response_hash(&response_json)?;
+    let mut record = NativeIdempotencyRecord {
+        format_version: 2,
+        tenant_id: context.tenant_id,
+        bucket_id: context.bucket_id,
+        publication_root_anchor: publication_root_anchor.to_string(),
+        principal: context.principal.clone(),
+        idempotency_key: context.idempotency_key.clone(),
+        transaction_id: None,
+        request_id: context.request_id.clone(),
+        target: target.clone(),
+        response_json,
+        response_hash,
+        record_hash: String::new(),
+    };
+    record.record_hash = record_hash(&record)?;
+    let payload = encode_record(&record, native_idempotency_common(&record, root_key_hash))?;
+    let tuple_key = record_tuple_key(context)?;
+
+    Ok(CoreMutationBatchAdditions {
+        root_publications: Vec::new(),
+        preconditions: vec![CoreMutationPrecondition::CoreMetaRow {
+            cf: CF_TRANSACTIONS.to_string(),
+            table_id: TABLE_NATIVE_IDEMPOTENCY_ROW,
+            tuple_key: tuple_key.clone(),
+            expected_payload_hash: None,
+            require_absent: true,
+            require_present: false,
+        }],
+        operations: vec![CoreMutationOperation::CoreMetaPut {
+            partition_id: publication_root_anchor.to_string(),
+            cf: CF_TRANSACTIONS.to_string(),
+            table_id: TABLE_NATIVE_IDEMPOTENCY_ROW,
+            tuple_key,
+            payload,
+        }],
+    })
+}
+
+async fn native_idempotency_publication_root_anchor(
+    storage: &Storage,
+    context: &NativeMutationContext,
+    require_open: bool,
+) -> Result<String, Status> {
     let Some(transaction_id) = context.transaction_id.as_deref() else {
-        return Ok((
-            native_idempotency_root_key_hash(context.tenant_id, context.bucket_id),
-            1,
+        return Ok(native_idempotency_root_anchor(
+            context.tenant_id,
+            context.bucket_id,
         ));
     };
     let core_store = CoreStore::new(storage.clone())
@@ -189,30 +341,27 @@ async fn native_idempotency_root(
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
-    if transaction.state != CoreTransactionState::Open {
+    if require_open && transaction.state != CoreTransactionState::Open {
         return Err(Status::failed_precondition("TransactionNotOpen"));
     }
-    let root_generation = core_store
-        .infer_explicit_transaction_commit_root_generation(&transaction)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
-    Ok((transaction.root_key_hash, root_generation))
+    Ok(transaction.root_anchor_key)
 }
 
 async fn read_record(
     storage: &Storage,
     context: &NativeMutationContext,
 ) -> Result<Option<NativeIdempotencyRecord>, Status> {
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())
+    let store = CoreStore::new(storage.clone())
+        .await
         .map_err(|e| Status::internal(e.to_string()))?;
     let row_key = record_tuple_key(context)?;
-    let Some(bytes) = meta
-        .get(CF_TRANSACTIONS, TABLE_NATIVE_IDEMPOTENCY_ROW, &row_key)
+    let Some(bytes) = store
+        .read_coremeta_row(CF_TRANSACTIONS, TABLE_NATIVE_IDEMPOTENCY_ROW, &row_key)
         .map_err(|e| Status::internal(e.to_string()))?
     else {
         return read_staged_record(storage, context, &row_key).await;
     };
-    decode_record(&bytes).map(Some)
+    decode_committed_record(&bytes).map(Some)
 }
 
 fn validate_record_context(
@@ -296,7 +445,12 @@ async fn read_staged_record(
                 && *table_id == TABLE_NATIVE_IDEMPOTENCY_ROW
                 && tuple_key == row_key =>
             {
-                return decode_record(payload).map(Some);
+                return decode_staged_record(
+                    payload,
+                    &transaction.root_key_hash,
+                    &transaction.transaction_id,
+                )
+                .map(Some);
             }
             CoreTransactionUpdate::CoreMetaDelete {
                 cf,
@@ -322,6 +476,8 @@ async fn put_record_if_absent(
     record: &NativeIdempotencyRecord,
     payload: &[u8],
 ) -> Result<(), Status> {
+    // The absent/present check seeds the exact commit precondition; inspect the
+    // physical row so a concurrently staged candidate causes a CAS conflict.
     if meta
         .get(CF_TRANSACTIONS, TABLE_NATIVE_IDEMPOTENCY_ROW, row_key)
         .map_err(|e| Status::internal(e.to_string()))?
@@ -358,10 +514,19 @@ async fn put_record_if_absent(
         common: None,
         kind: CoreMetaBatchOpKind::Put(payload),
     };
-    commit_coremeta_batch_for_storage(storage, &record.idempotency_key, &[op])
-        .await
-        .map(|_| ())
-        .map_err(|e| Status::internal(e.to_string()))
+    let publication_transaction_id = format!("native-idempotency:{}", record.record_hash);
+    commit_coremeta_batch_for_storage(
+        storage,
+        &publication_transaction_id,
+        &[op],
+        &[crate::core_store::CoreMetaRootPublication::new(
+            record.publication_root_anchor.clone(),
+            crate::formats::writer::WriterFamily::CoreControl,
+        )],
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| Status::internal(e.to_string()))
 }
 
 fn native_transaction_principal(record: &NativeIdempotencyRecord) -> String {
@@ -375,8 +540,14 @@ fn native_transaction_principal_from_context(context: &NativeMutationContext) ->
     )
 }
 
-fn encode_record(record: &NativeIdempotencyRecord) -> Result<Vec<u8>, Status> {
-    let proto = record_to_proto(record)?;
+fn encode_record(
+    record: &NativeIdempotencyRecord,
+    common: CoreMetaRowCommonProto,
+) -> Result<Vec<u8>, Status> {
+    let proto = NativeIdempotencyRecordProto {
+        common: Some(common),
+        body: Some(record_to_proto(record)?),
+    };
     let mut bytes = Vec::new();
     proto
         .encode(&mut bytes)
@@ -384,24 +555,72 @@ fn encode_record(record: &NativeIdempotencyRecord) -> Result<Vec<u8>, Status> {
     Ok(bytes)
 }
 
-fn decode_record(bytes: &[u8]) -> Result<NativeIdempotencyRecord, Status> {
-    let proto = NativeIdempotencyRecordProto::decode(bytes)
-        .map_err(|e| Status::internal(format!("Invalid native idempotency record: {e}")))?;
-    let record = record_from_proto(proto)?;
-    if record.record_hash != record_hash(&record)? {
-        return Err(Status::data_loss("Native idempotency record hash mismatch"));
+fn decode_committed_record(bytes: &[u8]) -> Result<NativeIdempotencyRecord, Status> {
+    let (record, common) = decode_record_parts(bytes)?;
+    validate_native_idempotency_common(&record, &common)?;
+    if common.root_generation == 0 {
+        return Err(Status::data_loss(
+            "Native idempotency committed CoreMeta publication scope mismatch",
+        ));
     }
     Ok(record)
 }
 
+fn decode_staged_record(
+    bytes: &[u8],
+    expected_root_key_hash: &str,
+    expected_transaction_id: &str,
+) -> Result<NativeIdempotencyRecord, Status> {
+    let (record, common) = decode_record_parts(bytes)?;
+    validate_native_idempotency_common(&record, &common)?;
+    if common.root_key_hash != expected_root_key_hash
+        || common.root_generation != 0
+        || common.transaction_id != expected_transaction_id
+    {
+        return Err(Status::data_loss(
+            "Native idempotency staged CoreMeta publication scope mismatch",
+        ));
+    }
+    Ok(record)
+}
+
+fn decode_record_parts(
+    bytes: &[u8],
+) -> Result<(NativeIdempotencyRecord, CoreMetaRowCommonProto), Status> {
+    let proto = NativeIdempotencyRecordProto::decode(bytes)
+        .map_err(|e| Status::internal(format!("Invalid native idempotency record: {e}")))?;
+    let common = proto
+        .common
+        .ok_or_else(|| Status::data_loss("Native idempotency record missing CoreMeta common"))?;
+    let record = record_from_proto(
+        proto
+            .body
+            .ok_or_else(|| Status::data_loss("Native idempotency record missing domain body"))?,
+    )?;
+    if record.format_version != 2 {
+        return Err(Status::data_loss(
+            "Native idempotency format version is unsupported",
+        ));
+    }
+    if record.response_hash != native_response_hash(&record.response_json)? {
+        return Err(Status::data_loss(
+            "Native idempotency response hash mismatch",
+        ));
+    }
+    if record.record_hash != record_hash(&record)? {
+        return Err(Status::data_loss("Native idempotency record hash mismatch"));
+    }
+    Ok((record, common))
+}
+
 fn record_to_proto(
     record: &NativeIdempotencyRecord,
-) -> Result<NativeIdempotencyRecordProto, Status> {
-    Ok(NativeIdempotencyRecordProto {
-        common: Some(native_idempotency_common(record)),
+) -> Result<NativeIdempotencyRecordBodyProto, Status> {
+    Ok(NativeIdempotencyRecordBodyProto {
         format_version: u32::from(record.format_version),
         tenant_id: record.tenant_id,
         bucket_id: record.bucket_id,
+        publication_root_anchor: record.publication_root_anchor.clone(),
         principal: record.principal.clone(),
         idempotency_key: record.idempotency_key.clone(),
         transaction_id: record.transaction_id.clone(),
@@ -414,15 +633,8 @@ fn record_to_proto(
 }
 
 fn record_from_proto(
-    proto: NativeIdempotencyRecordProto,
+    proto: NativeIdempotencyRecordBodyProto,
 ) -> Result<NativeIdempotencyRecord, Status> {
-    let common = proto
-        .common
-        .as_ref()
-        .ok_or_else(|| Status::data_loss("Native idempotency record missing CoreMeta common"))?;
-    validate_native_idempotency_common(&proto, common)?;
-    let root_key_hash = common.root_key_hash.clone();
-    let root_generation = common.root_generation;
     Ok(NativeIdempotencyRecord {
         format_version: proto
             .format_version
@@ -430,6 +642,7 @@ fn record_from_proto(
             .map_err(|_| Status::internal("Native idempotency format version exceeds u16"))?,
         tenant_id: proto.tenant_id,
         bucket_id: proto.bucket_id,
+        publication_root_anchor: proto.publication_root_anchor,
         principal: proto.principal,
         idempotency_key: proto.idempotency_key,
         transaction_id: proto.transaction_id,
@@ -442,54 +655,36 @@ fn record_from_proto(
         response_json: vec_to_json(&proto.response_json, "native idempotency response")?,
         response_hash: proto.response_hash,
         record_hash: proto.record_hash,
-        root_key_hash,
-        root_generation,
     })
 }
 
-fn native_idempotency_common(record: &NativeIdempotencyRecord) -> CoreMetaRowCommonProto {
+fn native_idempotency_common(
+    record: &NativeIdempotencyRecord,
+    root_key_hash: String,
+) -> CoreMetaRowCommonProto {
     core_meta_committed_row_common(
         format!("tenant/{}", record.tenant_id),
-        record.root_key_hash.clone(),
-        record.root_generation,
-        record
-            .transaction_id
-            .clone()
-            .unwrap_or_else(|| record.idempotency_key.clone()),
+        root_key_hash,
+        NATIVE_IDEMPOTENCY_CANDIDATE_GENERATION,
+        NATIVE_IDEMPOTENCY_CANDIDATE_TRANSACTION_ID,
         0,
     )
 }
 
 fn validate_native_idempotency_common(
-    proto: &NativeIdempotencyRecordProto,
+    record: &NativeIdempotencyRecord,
     common: &CoreMetaRowCommonProto,
 ) -> Result<(), Status> {
-    if common.realm_id != format!("tenant/{}", proto.tenant_id) {
+    if common.realm_id != format!("tenant/{}", record.tenant_id) {
         return Err(Status::data_loss(
             "Native idempotency CoreMeta realm mismatch",
         ));
     }
-    if proto.transaction_id.is_none() {
-        if common.root_key_hash
-            != native_idempotency_root_key_hash(proto.tenant_id, proto.bucket_id)
-            || common.root_generation != 1
-        {
-            return Err(Status::data_loss(
-                "Native idempotency CoreMeta root mismatch",
-            ));
-        }
-    } else if common.root_key_hash.is_empty() || common.root_generation == 0 {
+    if record.publication_root_anchor.is_empty()
+        || common.root_key_hash != core_meta_root_key_hash(&record.publication_root_anchor)
+    {
         return Err(Status::data_loss(
-            "Transactional native idempotency CoreMeta root is missing",
-        ));
-    }
-    let expected_transaction_id = proto
-        .transaction_id
-        .clone()
-        .unwrap_or_else(|| proto.idempotency_key.clone());
-    if common.transaction_id != expected_transaction_id {
-        return Err(Status::data_loss(
-            "Native idempotency CoreMeta transaction mismatch",
+            "Native idempotency CoreMeta root mismatch",
         ));
     }
     if common.visibility_state_enum() != CoreMetaVisibilityState::Committed {
@@ -497,13 +692,29 @@ fn validate_native_idempotency_common(
             "Native idempotency CoreMeta row is not committed",
         ));
     }
+    let expected_shape = core_meta_committed_row_common(
+        format!("tenant/{}", record.tenant_id),
+        common.root_key_hash.clone(),
+        NATIVE_IDEMPOTENCY_CANDIDATE_GENERATION,
+        NATIVE_IDEMPOTENCY_CANDIDATE_TRANSACTION_ID,
+        0,
+    );
+    if common.transaction_id.is_empty()
+        || common.payload_schema_version != expected_shape.payload_schema_version
+    {
+        return Err(Status::data_loss(
+            "Native idempotency CoreMeta common metadata is invalid",
+        ));
+    }
     Ok(())
 }
 
 fn native_idempotency_root_key_hash(tenant_id: i64, bucket_id: i64) -> String {
-    core_meta_root_key_hash(&format!(
-        "native-idempotency/tenant/{tenant_id}/bucket/{bucket_id}"
-    ))
+    core_meta_root_key_hash(&native_idempotency_root_anchor(tenant_id, bucket_id))
+}
+
+fn native_idempotency_root_anchor(tenant_id: i64, bucket_id: i64) -> String {
+    format!("native-idempotency/tenant/{tenant_id}/bucket/{bucket_id}")
 }
 
 fn target_to_proto(
@@ -537,6 +748,13 @@ fn json_to_vec(value: &JsonValue, label: &str) -> Result<Vec<u8>, Status> {
 
 fn vec_to_json(bytes: &[u8], label: &str) -> Result<JsonValue, Status> {
     serde_json::from_slice(bytes).map_err(|e| Status::internal(format!("Invalid {label}: {e}")))
+}
+
+fn native_response_hash(response: &JsonValue) -> Result<String, Status> {
+    let bytes = serde_json::to_vec(response).map_err(|e| {
+        Status::internal(format!("Serialize native idempotency response hash: {e}"))
+    })?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
 fn record_hash(record: &NativeIdempotencyRecord) -> Result<String, Status> {
@@ -592,7 +810,10 @@ mod tests {
             )
             .unwrap()
             .expect("native idempotency record must be stored in CoreMeta");
-        assert_eq!(decode_record(&row).unwrap().response_json, response);
+        assert_eq!(
+            decode_committed_record(&row).unwrap().response_json,
+            response
+        );
 
         let replay: serde_json::Value = load_response(&storage, &context, &target)
             .await
@@ -618,6 +839,124 @@ mod tests {
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     }
 
+    #[test]
+    fn native_idempotency_hash_survives_physical_common_rebinding() {
+        let context = context();
+        let response = json!({"version_id": "v1", "committed": true});
+        let mut record = NativeIdempotencyRecord {
+            format_version: 2,
+            tenant_id: context.tenant_id,
+            bucket_id: context.bucket_id,
+            publication_root_anchor: native_idempotency_root_anchor(
+                context.tenant_id,
+                context.bucket_id,
+            ),
+            principal: context.principal,
+            idempotency_key: context.idempotency_key,
+            transaction_id: context.transaction_id,
+            request_id: context.request_id,
+            target: NativeIdempotencyTarget::new("PutObject", "docs", "a.txt"),
+            response_hash: native_response_hash(&response).unwrap(),
+            response_json: response,
+            record_hash: String::new(),
+        };
+        record.record_hash = record_hash(&record).unwrap();
+        let expected_hash = record.record_hash.clone();
+        let encoded = encode_record(
+            &record,
+            native_idempotency_common(
+                &record,
+                native_idempotency_root_key_hash(record.tenant_id, record.bucket_id),
+            ),
+        )
+        .unwrap();
+
+        let mut row = NativeIdempotencyRecordProto::decode(encoded.as_slice()).unwrap();
+        let common = row.common.as_mut().unwrap();
+        assert_eq!(
+            common.root_generation,
+            NATIVE_IDEMPOTENCY_CANDIDATE_GENERATION
+        );
+        assert_eq!(
+            common.transaction_id,
+            NATIVE_IDEMPOTENCY_CANDIDATE_TRANSACTION_ID
+        );
+        common.root_generation = 41;
+        common.transaction_id = "corestore-publication-41".to_string();
+        common.created_at_unix_nanos = 999;
+        let mut rebound = Vec::new();
+        row.encode(&mut rebound).unwrap();
+
+        let expected_root = native_idempotency_root_key_hash(record.tenant_id, record.bucket_id);
+        let decoded = decode_committed_record(&rebound).unwrap();
+        assert_eq!(decoded.record_hash, expected_hash);
+        assert_eq!(record_hash(&decoded).unwrap(), expected_hash);
+
+        let mut valid_common = native_idempotency_common(&record, expected_root.clone());
+        valid_common.root_generation = 7;
+        valid_common.transaction_id = "native-idempotency-publication-7".to_string();
+        let mut invalid_commons = Vec::new();
+        let mut invalid = valid_common.clone();
+        invalid.realm_id = "tenant/other".to_string();
+        invalid_commons.push(invalid);
+        let mut invalid = valid_common.clone();
+        invalid.root_key_hash = core_meta_root_key_hash("wrong-root");
+        invalid_commons.push(invalid);
+        let mut invalid = valid_common.clone();
+        invalid.root_generation = 0;
+        invalid_commons.push(invalid);
+        let mut invalid = valid_common;
+        invalid.visibility_state = CoreMetaVisibilityState::Pending as i32;
+        invalid_commons.push(invalid);
+        for common in invalid_commons {
+            let bytes = encode_record(&record, common).unwrap();
+            assert!(decode_committed_record(&bytes).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn native_idempotency_multiple_writes_share_a_root_without_hash_rebinding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new_at(tmp.path()).await.unwrap();
+        let first_context = context();
+        let mut second_context = context();
+        second_context.idempotency_key = "idem-2".to_string();
+        second_context.request_id = "req-2".to_string();
+        let target = NativeIdempotencyTarget::new("PutObject", "docs", "a.txt");
+
+        store_response(&storage, &first_context, &target, &json!({"version": 1}))
+            .await
+            .unwrap();
+        store_response(&storage, &second_context, &target, &json!({"version": 2}))
+            .await
+            .unwrap();
+
+        let meta = CoreMetaStore::open(storage.core_store_meta_path()).unwrap();
+        for (context, expected_generation) in [(&first_context, 1), (&second_context, 2)] {
+            let payload = meta
+                .get(
+                    CF_TRANSACTIONS,
+                    TABLE_NATIVE_IDEMPOTENCY_ROW,
+                    &record_tuple_key(context).unwrap(),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                crate::core_store::core_meta_row_common_from_payload(&payload)
+                    .unwrap()
+                    .root_generation,
+                expected_generation
+            );
+            assert_eq!(
+                decode_committed_record(&payload)
+                    .unwrap()
+                    .idempotency_key
+                    .as_str(),
+                context.idempotency_key.as_str()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn native_idempotency_keys_are_scoped_by_transaction_id() {
         let tmp = tempfile::tempdir().unwrap();
@@ -633,6 +972,40 @@ mod tests {
         store_response(&storage, &tx_context, &target, &json!({"state": "staged"}))
             .await
             .unwrap();
+
+        let core_store = CoreStore::new(storage.clone()).await.unwrap();
+        let transaction = core_store
+            .read_explicit_transaction_for_principal(
+                tx_context.transaction_id.as_deref().unwrap(),
+                &native_transaction_principal_from_context(&tx_context),
+            )
+            .await
+            .unwrap();
+        let staged_payload = transaction
+            .visible_updates
+            .iter()
+            .find_map(|update| match update {
+                CoreTransactionUpdate::CoreMetaPut {
+                    table_id, payload, ..
+                } if *table_id == TABLE_NATIVE_IDEMPOTENCY_ROW => Some(payload),
+                _ => None,
+            })
+            .unwrap();
+        let staged_common =
+            crate::core_store::core_meta_row_common_from_payload(staged_payload).unwrap();
+        assert_eq!(staged_common.root_generation, 0);
+        assert_eq!(staged_common.transaction_id, transaction.transaction_id);
+        assert_eq!(
+            decode_staged_record(
+                staged_payload,
+                &transaction.root_key_hash,
+                &transaction.transaction_id,
+            )
+            .unwrap()
+            .transaction_id
+            .as_deref(),
+            tx_context.transaction_id.as_deref()
+        );
 
         let mut other_tx_context = tx_context.clone();
         other_tx_context.transaction_id = Some(

@@ -465,6 +465,10 @@ pub struct CoreObjectManifest {
     pub region_id: String,
     pub object_hash: String,
     pub logical_size: u64,
+    pub logical_file_id: String,
+    pub logical_offset: u64,
+    pub writer_family: String,
+    pub encryption_algorithm: String,
     pub boundary_values: Vec<CoreBoundaryValue>,
     pub encoding: CoreObjectEncoding,
     pub placements: Vec<CoreObjectPlacement>,
@@ -686,6 +690,27 @@ pub struct WatchEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WatchPage {
+    pub events: Vec<WatchEvent>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadStreamPage {
+    pub records: Vec<StreamRecord>,
+    pub next_sequence: u64,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreHistoryPage<T> {
+    pub records: Vec<T>,
+    pub next_sequence: u64,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AcquireFence {
     pub fence_name: String,
     pub authenticated_principal: String,
@@ -785,6 +810,7 @@ pub struct CoreTransaction {
     pub state: CoreTransactionState,
     pub preconditions_hash: String,
     pub operations_hash: String,
+    pub writer_families: Vec<String>,
     pub visible_updates: Vec<CoreTransactionUpdate>,
     pub finalisation_error: Option<String>,
     pub committed_at: String,
@@ -816,9 +842,15 @@ pub enum CoreTransactionState {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CoreTransactionUpdate {
     StreamAppend {
+        partition_id: String,
         stream_id: String,
+        record_kind: String,
+        payload: Vec<u8>,
+        idempotency_key_hash: Option<String>,
         visible_sequence: u64,
+        previous_event_hash: String,
         prepared_record_hash: String,
+        created_at: String,
     },
     CoreMetaPut {
         cf: String,
@@ -841,8 +873,45 @@ pub struct CoreMutationBatch {
     pub transaction_id: String,
     pub scope_partition: String,
     pub committed_by_principal: String,
+    pub root_publications: Vec<CoreMutationRootPublication>,
     pub preconditions: Vec<CoreMutationPrecondition>,
     pub operations: Vec<CoreMutationOperation>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreMutationBatchAdditions {
+    pub root_publications: Vec<CoreMutationRootPublication>,
+    pub preconditions: Vec<CoreMutationPrecondition>,
+    pub operations: Vec<CoreMutationOperation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreMutationRootPublication {
+    pub root_anchor_key: String,
+    pub writer_families: Vec<String>,
+    pub transaction_coordinator: bool,
+}
+
+impl CoreMutationRootPublication {
+    pub fn new(root_anchor_key: impl Into<String>, writer_family: impl Into<String>) -> Self {
+        Self::with_writer_families(root_anchor_key, vec![writer_family.into()])
+    }
+
+    pub fn with_writer_families(
+        root_anchor_key: impl Into<String>,
+        writer_families: Vec<String>,
+    ) -> Self {
+        Self {
+            root_anchor_key: root_anchor_key.into(),
+            writer_families,
+            transaction_coordinator: false,
+        }
+    }
+
+    pub fn coordinator(mut self) -> Self {
+        self.transaction_coordinator = true;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -859,6 +928,14 @@ pub enum CoreMutationPrecondition {
         expected_payload_hash: Option<String>,
         require_absent: bool,
         require_present: bool,
+    },
+    /// Exact row-version fence which is valid only before a wall-clock deadline.
+    CoreMetaLease {
+        cf: String,
+        table_id: u16,
+        tuple_key: Vec<u8>,
+        expected_payload_hash: String,
+        expires_at_unix_nanos: u64,
     },
     StreamHead {
         stream_id: String,
@@ -952,6 +1029,7 @@ pub enum SourceKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CoreInternalPutShard {
     pub logical_file_id: String,
+    pub logical_offset: u64,
     pub block_id: String,
     pub shard_index: u16,
     pub erasure_profile_id: String,
@@ -960,6 +1038,8 @@ pub struct CoreInternalPutShard {
     pub shard_hash: String,
     pub boundary_summary_hash: String,
     pub boundary_values_b64: String,
+    pub compression_algorithm: String,
+    pub encryption_algorithm: String,
     pub writer_family: String,
     pub mutation_id: String,
 }

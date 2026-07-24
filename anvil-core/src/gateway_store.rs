@@ -1,11 +1,13 @@
 use crate::{
     core_store::{
         AppendStreamRecord, AuthzScopeRef, CF_REGISTRY, CoreLogicalFileWrite, CoreMetaBatchOp,
-        CoreMetaBatchOpKind, CoreMetaStore, CoreMetaTuplePart, CoreObjectRef, CorePipelinePolicy,
+        CoreMetaBatchOpKind, CoreMetaRootPublication, CoreMetaTuplePart, CoreMutationBatch,
+        CoreMutationOperation, CoreMutationPrecondition, CoreObjectRef, CorePipelinePolicy,
         CoreStore, CoreTraceContext, GetBlob, ReadStream, StreamAppendReceipt, StreamRecord,
-        TABLE_GATEWAY_METADATA_ROW, WriteLogicalFileRequest, core_meta_committed_row_common,
-        core_meta_root_key_hash, core_meta_tuple_key, core_object_ref_from_logical_file_write,
-        decode_deterministic_proto, encode_deterministic_proto,
+        TABLE_GATEWAY_METADATA_ROW, TABLE_GATEWAY_MOUNT_ROUTE_ROW, WriteLogicalFileRequest,
+        core_meta_committed_row_common, core_meta_payload_digest, core_meta_root_key_hash,
+        core_meta_tuple_key, core_object_ref_from_logical_file_write, decode_deterministic_proto,
+        encode_deterministic_proto,
     },
     formats::{
         hash32,
@@ -230,6 +232,13 @@ pub struct GatewayAuditAppendReceipt {
 pub struct GatewayAuditStreamRecord {
     pub audit: GatewayAuditRecord,
     pub stream: StreamRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayAuditPage {
+    pub records: Vec<GatewayAuditStreamRecord>,
+    pub next_sequence: u64,
+    pub has_more: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -531,7 +540,8 @@ pub async fn update_gateway_tag(
         &record.gateway,
         &record.registry_instance_id,
         &record.target_digest,
-    )?
+    )
+    .await?
     .ok_or_else(|| anyhow!("registry tag target blob is missing CoreMeta locator row"))?;
     let row = put_record_row(
         storage,
@@ -1326,28 +1336,6 @@ pub async fn validate_gateway_access_token(
     Ok(claims)
 }
 
-pub async fn put_gateway_mount_record(
-    storage: &Storage,
-    mut record: GatewayMountRecord,
-    expected_generation: Option<u64>,
-) -> Result<u64> {
-    record.record_hash.clear();
-    record.generation = expected_generation.unwrap_or(0).saturating_add(1);
-    validate_mount_record_shape(&record)?;
-    record.record_hash = hash_record(&record)?;
-    let ref_name = gateway_mount_ref_name(&record)?;
-    let row = put_record_row(
-        storage,
-        GATEWAY_ROW_MOUNT,
-        &ref_name,
-        &record,
-        false,
-        expected_generation,
-    )
-    .await?;
-    Ok(row.generation)
-}
-
 pub async fn read_gateway_mount_record(
     storage: &Storage,
     mount_id: &str,
@@ -1366,36 +1354,6 @@ pub async fn read_gateway_mount_record(
     }
     validate_mount_record_shape(&record)?;
     Ok(Some((record, stored_handle)))
-}
-
-pub async fn resolve_gateway_mount(
-    storage: &Storage,
-    host: &str,
-    path: &str,
-) -> Result<Option<GatewayMountResolution>> {
-    let host = normalize_gateway_host(host)?;
-    let path = normalize_gateway_path(path)?;
-    let mounts = list_gateway_mount_records(storage).await?;
-
-    if let Some(resolution) =
-        best_gateway_mount_match(&mounts, &host, &path, GatewayMountMatchKind::ExactHostAlias)
-    {
-        return Ok(Some(resolution));
-    }
-    if let Some(resolution) = best_gateway_mount_match(
-        &mounts,
-        &host,
-        &path,
-        GatewayMountMatchKind::VirtualHostRegional,
-    ) {
-        return Ok(Some(resolution));
-    }
-    Ok(best_gateway_mount_match(
-        &mounts,
-        &host,
-        &path,
-        GatewayMountMatchKind::PathStyleRegional,
-    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1418,18 +1376,10 @@ pub async fn append_gateway_audit_record(
     )?;
     let store = CoreStore::new(storage.clone()).await?;
     if let Some(idempotency_key) = idempotency_key {
-        let idempotency_key_hash = format!("sha256:{}", sha256_hex(idempotency_key.as_bytes()));
-        for stream in store
-            .read_stream(ReadStream {
-                stream_id: stream_id.clone(),
-                after_sequence: 0,
-                limit: 0,
-            })
+        if let Some(stream) = store
+            .read_stream_record_by_idempotency_key(&stream_id, idempotency_key)
             .await?
         {
-            if stream.idempotency_key_hash.as_deref() != Some(idempotency_key_hash.as_str()) {
-                continue;
-            }
             let existing: GatewayAuditRecord = decode_gateway_record(&stream.payload)?;
             validate_gateway_audit_record(&existing)?;
             if record.created_at.is_empty() {
@@ -1474,27 +1424,27 @@ pub async fn append_gateway_audit_record(
     Ok(GatewayAuditAppendReceipt { record, stream })
 }
 
-pub async fn read_gateway_audit_records(
+pub async fn read_gateway_audit_page(
     storage: &Storage,
     tenant_id: i64,
     gateway: &str,
     registry_instance_id: &str,
     after_sequence: u64,
     limit: usize,
-) -> Result<Vec<GatewayAuditStreamRecord>> {
+) -> Result<GatewayAuditPage> {
     validate_tenant(tenant_id)?;
     let gateway = normalize_gateway_identifier(gateway, "gateway")?;
     let registry_instance_id = normalize_gateway_identifier(registry_instance_id, "registry")?;
-    let records = CoreStore::new(storage.clone())
+    let page = CoreStore::new(storage.clone())
         .await?
-        .read_stream(ReadStream {
+        .read_stream_page(ReadStream {
             stream_id: gateway_audit_stream_id(tenant_id, &gateway, &registry_instance_id)?,
             after_sequence,
             limit,
         })
         .await?;
-    let mut audited = Vec::with_capacity(records.len());
-    for stream in records {
+    let mut audited = Vec::with_capacity(page.records.len());
+    for stream in page.records {
         if stream.record_kind != GATEWAY_AUDIT_SCHEMA {
             bail!("gateway audit stream contains unexpected record kind");
         }
@@ -1508,93 +1458,11 @@ pub async fn read_gateway_audit_records(
         validate_gateway_audit_record(&audit)?;
         audited.push(GatewayAuditStreamRecord { audit, stream });
     }
-    Ok(audited)
-}
-
-async fn list_gateway_mount_records(
-    storage: &Storage,
-) -> Result<Vec<(GatewayMountRecord, GatewayStoredHandle)>> {
-    let mut mounts = Vec::new();
-    for row in list_record_rows::<GatewayMountRecord>(storage, GATEWAY_ROW_MOUNT).await? {
-        validate_mount_record_shape(&row.record)?;
-        let stored_handle = row.stored_handle();
-        mounts.push((row.record, stored_handle));
-    }
-    Ok(mounts)
-}
-
-fn best_gateway_mount_match(
-    mounts: &[(GatewayMountRecord, GatewayStoredHandle)],
-    host: &str,
-    path: &str,
-    match_kind: GatewayMountMatchKind,
-) -> Option<GatewayMountResolution> {
-    mounts
-        .iter()
-        .filter_map(|(record, stored_handle)| {
-            if record.state != GatewayMountState::Active {
-                return None;
-            }
-            let matched_prefix = match match_kind {
-                GatewayMountMatchKind::ExactHostAlias => {
-                    if !record.hosts.iter().any(|candidate| candidate == host) {
-                        return None;
-                    }
-                    best_configured_path_prefix(record, path)?
-                }
-                GatewayMountMatchKind::VirtualHostRegional => {
-                    if host != virtual_host_regional_name(record) {
-                        return None;
-                    }
-                    "/".to_string()
-                }
-                GatewayMountMatchKind::PathStyleRegional => {
-                    if host != regional_gateway_host(record) {
-                        return None;
-                    }
-                    let prefix = path_style_gateway_prefix(record);
-                    if !path.starts_with(&prefix) {
-                        return None;
-                    }
-                    prefix
-                }
-            };
-            Some(GatewayMountResolution {
-                record: record.clone(),
-                row_generation: stored_handle.generation,
-                matched_host: host.to_string(),
-                matched_path_prefix: matched_prefix,
-                match_kind,
-            })
-        })
-        .max_by_key(|resolution| resolution.matched_path_prefix.len())
-}
-
-fn best_configured_path_prefix(record: &GatewayMountRecord, path: &str) -> Option<String> {
-    record
-        .path_prefixes
-        .iter()
-        .filter(|prefix| path.starts_with(prefix.as_str()))
-        .max_by_key(|prefix| prefix.len())
-        .cloned()
-}
-
-fn virtual_host_regional_name(record: &GatewayMountRecord) -> String {
-    format!(
-        "{}.{}.{}{}",
-        record.registry_instance_id, record.tenant_id, record.region, REGIONAL_GATEWAY_SUFFIX
-    )
-}
-
-fn regional_gateway_host(record: &GatewayMountRecord) -> String {
-    format!("{}{}", record.region, REGIONAL_GATEWAY_SUFFIX)
-}
-
-fn path_style_gateway_prefix(record: &GatewayMountRecord) -> String {
-    format!(
-        "/{}/_gateway/{}/{}/",
-        record.tenant_id, record.gateway, record.registry_instance_id
-    )
+    Ok(GatewayAuditPage {
+        records: audited,
+        next_sequence: page.next_sequence,
+        has_more: page.has_more,
+    })
 }
 
 async fn commit_upload_session_record(
@@ -1688,14 +1556,14 @@ mod coremeta;
 mod helpers;
 mod keys;
 mod metadata_rows;
+mod mount_routes;
 mod record_codec;
 mod registry_api;
 use helpers::*;
 use keys::*;
 use metadata_rows::*;
-pub(crate) use metadata_rows::{
-    GatewayStoredHandle, encode_gateway_metadata_row, materialize_committed_gateway_transaction,
-};
+pub(crate) use metadata_rows::{GatewayStoredHandle, materialize_committed_gateway_transaction};
+pub use mount_routes::{put_gateway_mount_record, resolve_gateway_mount};
 use record_codec::*;
 pub use registry_api::*;
 

@@ -130,8 +130,11 @@ fn transaction_boundary_hash_uses_deterministic_protobuf_not_json() {
 #[test]
 fn native_writes_accept_transaction_id_and_read_committed_source_gates_exist() {
     let object_rpc = format!(
-        "{}\n{}",
+        "{}\n{}\n{}\n{}\n{}",
         workspace_file("anvil-core/src/services/object/rpc.rs"),
+        workspace_file("anvil-core/src/services/object/native_put_rpc.rs"),
+        workspace_file("anvil-core/src/services/object/mutation_batch_rpc.rs"),
+        workspace_file("anvil-core/src/services/object/batch_helpers.rs"),
         workspace_file("anvil-core/src/services/transaction.rs")
     );
     let object_rpc_with_shared_validation = format!(
@@ -143,11 +146,11 @@ fn native_writes_accept_transaction_id_and_read_committed_source_gates_exist() {
         "native write transaction id handling",
         &object_rpc_with_shared_validation,
         &[
-            "fn native_transaction_id(context: Option<&NativeMutationContext>)",
+            "pub(super) fn native_transaction_id(",
             "fn write_state_for_transaction(transaction_id: Option<&str>)",
             "transaction_id.trim().is_empty()",
-            "ensure_transactional_mutation_batch_supported",
-            "enforce_mutation_batch_native_preconditions(self, &claims, &req).await?",
+            "ensure_mutation_batch_operations_supported",
+            "prepare_mutation_batch_native_preconditions(",
             "WriteState::Staged as i32",
             "transaction_id: transaction_id.map(ToOwned::to_owned)",
             "delete_object_version(",
@@ -163,7 +166,7 @@ fn native_writes_accept_transaction_id_and_read_committed_source_gates_exist() {
         "coordination-plane operations are explicit non-staged preconditions",
         &object_rpc,
         &[
-            "coordination-plane operation and cannot be staged inside an explicit object transaction",
+            "is a coordination-plane operation; use CoordinationService",
             "mutation_batch_operation::Op::CheckpointTaskLease",
             "mutation_batch_operation::Op::CommitTaskLease",
             "Status::failed_precondition",
@@ -201,7 +204,6 @@ fn native_writes_accept_transaction_id_and_read_committed_source_gates_exist() {
             "commit_explicit_transaction_rows_and_coremeta_updates_unlocked(&committed)",
             "let committed_transaction = self",
             "committed_transaction.committed_root_generation = Some(committed_root_generation)",
-            "commit_coremeta_batch_for_root(",
             "transaction_header_as_coremeta_op_unlocked",
             "borrow_owned_coremeta_batch_ops",
             "OwnedCoreMetaBatchOp::Delete",
@@ -211,6 +213,7 @@ fn native_writes_accept_transaction_id_and_read_committed_source_gates_exist() {
             "committed_coremeta_payload_unlocked",
             "common.transaction_id != transaction.transaction_id",
             "Some(&batch.transaction_id)",
+            "commit_coremeta_root_groups_prelocked(",
         ],
     );
     assert_contains_none(
@@ -269,11 +272,12 @@ fn corestore_model_covers_read_committed_and_single_root_release_gates() {
         "MutationBatch transaction preconditions",
         &batch_helpers,
         &[
-            "enforce_mutation_batch_native_preconditions",
+            "prepare_mutation_batch_native_preconditions",
+            "mutation_precondition_transaction",
             "mutation_batch_operation::Op::PutObject",
             "mutation_batch_operation::Op::DeleteObject",
             "mutation_batch_operation::Op::CompareAndSwapManifest",
-            "enforce_native_mutation_precondition(",
+            "prepare_native_mutation_precondition(",
         ],
     );
 
@@ -294,7 +298,13 @@ fn corestore_model_covers_read_committed_and_single_root_release_gates() {
 #[test]
 fn root_publication_requires_persisted_commit_evidence_and_fresh_owner_fence() {
     let local_roots = workspace_file("anvil-core/src/core_store/local_roots.rs");
-    let root_layout = workspace_file("anvil-core/src/core_store/local_roots_layout.rs");
+    let root_publication = format!(
+        "{}\n{}\n{}\n{}",
+        workspace_file("anvil-core/src/core_store/local_roots_layout.rs"),
+        workspace_file("anvil-core/src/core_store/local_root_publication.rs"),
+        workspace_file("anvil-core/src/core_store/local_root_publication_evidence.rs"),
+        workspace_file("anvil-core/src/core_store/local_root_failover.rs")
+    );
     let root_proto = workspace_file("anvil-core/src/core_store/root_proto.rs");
     let transaction_proto =
         workspace_file("anvil-core/src/core_store/transaction_manifest_proto.rs");
@@ -306,7 +316,6 @@ fn root_publication_requires_persisted_commit_evidence_and_fresh_owner_fence() {
         &[
             "core_meta_commit_certificate_hash",
             "certificate_persist_receipt_hashes",
-            "certificate_persist_receipt_count",
         ],
     );
     assert_contains_all(
@@ -315,33 +324,32 @@ fn root_publication_requires_persisted_commit_evidence_and_fresh_owner_fence() {
         &[
             "CoreStore non-genesis root anchor must include commit evidence",
             "validate_certificate_persist_receipts(&anchor.certificate_persist_receipt_hashes)?",
-            "validate_certificate_persist_receipts(&transaction.certificate_persist_receipt_hashes)?",
             "CoreStore certificate persist receipt hashes must be sorted and unique",
         ],
     );
     assert_contains_all(
         "CoreStore root publication release gate",
-        &root_layout,
+        &root_publication,
         &[
-            "metadata_commits: &[CoreMetaQuorumCommitOutcome]",
-            "CoreStore root publication missing CoreMeta stream metadata commit evidence",
-            "root_metadata_commit.certificate_hash.clone()",
-            "certificate_persist_receipt_hashes: root_metadata_commit",
-            "validate_transaction_manifest_record(&transaction, root_generation)?",
+            "CoreStore root anchor is missing CoreMeta commit certificate",
+            "CoreStore root anchor references missing CoreMeta evidence",
+            "core_meta_commit_certificate_hash: Some(outcome.certificate_hash.clone())",
+            "certificate_persist_receipt_hashes: outcome.certificate_persist_receipt_hashes.clone()",
+            "validate_transaction_manifest_record(&transaction_manifest, post_root_generation)?",
             "anchor.core_meta_commit_certificate_hash.as_deref()",
-            "Some(transaction.core_meta_commit_certificate_hash.as_str())",
+            "Some(certificate.certificate_hash.as_str())",
             "read_latest_root_anchor(&anchor.root_anchor_key)",
-            "CoreStore root anchor rejected stale owner fence",
+            "CoreStore root publication rejected stale owner fence",
         ],
     );
     assert_contains_none(
         "CoreStore root publication must not reuse pending-admission evidence",
-        &root_layout,
+        &root_publication,
         &["root_commit_evidence_for_records(records).await?"],
     );
     assert_contains_none(
         "CoreStore root publication stale cache path",
-        &root_layout,
+        &root_publication,
         &["read_cached_latest_root_anchor(&anchor.root_anchor_key)"],
     );
 }

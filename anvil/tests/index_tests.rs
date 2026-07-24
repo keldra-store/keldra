@@ -170,9 +170,10 @@ async fn wait_for_index_builds_for_indexes(
         attempts += 1;
         matching_tasks = cluster.states[0]
             .persistence
-            .list_tasks()
+            .list_tasks_page(None, 1_000)
             .await
             .unwrap()
+            .tasks
             .into_iter()
             .filter(|task| scoped_index_build_task(task, tenant_id, bucket_id, index_ids))
             .collect();
@@ -540,6 +541,8 @@ async fn wait_for_derived_authz_entry(
 
 #[path = "index_tests/build_repair.rs"]
 mod build_repair;
+#[path = "index_tests/list_indexes.rs"]
+mod list_indexes;
 #[path = "index_tests/query_spec.rs"]
 mod query_spec;
 #[path = "index_tests/typed_lifecycle.rs"]
@@ -634,8 +637,10 @@ async fn wait_for_index_diagnostic(
                     bucket_name: bucket_name.to_string(),
                     index_name: index_name.to_string(),
                     severity: severity.to_string(),
-                    after_cursor: 0,
-                    limit: 10,
+                    page: Some(anvil::anvil_api::PageRequest {
+                        page_size: 10,
+                        page_token: String::new(),
+                    }),
                 },
                 token,
             ))

@@ -7,6 +7,20 @@ use chrono::{DateTime, Utc};
 use prost::Message;
 use serde_json::Value as JsonValue;
 
+#[path = "local_object_metadata/projections.rs"]
+mod projections;
+use projections::*;
+pub(crate) use projections::{
+    CurrentObjectMetadataPage, ObjectMetadataPageCursor, ObjectVersionsMetadataPage,
+};
+
+#[path = "local_object_metadata/mutation.rs"]
+mod mutation;
+pub(crate) use mutation::{
+    ObjectMetadataMutationGuard, ObjectMetadataPreconditionSnapshot,
+    ObjectMetadataProjectionMutation, PreparedObjectMetadataProjection,
+};
+
 const CORE_OBJECT_METADATA_SCHEMA: &str = "anvil.core.object_metadata.v1";
 
 #[derive(Clone, PartialEq, Message)]
@@ -105,931 +119,6 @@ struct ObjectLinkTargetProto {
     created_by: String,
 }
 
-impl CoreStore {
-    pub async fn put_object_metadata(&self, bucket: &Bucket, object: &Object) -> Result<()> {
-        validate_object_scope(bucket, object)?;
-        let _guard = self.write_lock.lock().await;
-        let current_key = object_current_key(bucket, &object.key);
-        let version_key = object_version_key(bucket, &object.key, object.version_id);
-        let current_list_key = object_current_list_key(bucket, &object.key);
-        let version_list_key = object_version_list_key(bucket, &object.key, object.version_id);
-        let root_generation = object.id.max(0) as u64;
-        let current_history_key =
-            object_current_history_key(bucket, &object.key, root_generation, object.version_id);
-        let version_history_key =
-            object_version_history_key(bucket, &object.key, object.version_id, root_generation);
-        let counter_key = object_id_counter_key(bucket);
-        let payload = encode_object_metadata_row_at_generation(object, root_generation)?;
-        let counter_payload =
-            self.object_id_counter_payload_at_generation(bucket, object.id, root_generation)?;
-        let transaction_id = object.mutation_id.to_string();
-        let mut owned_ops = vec![
-            OwnedCoreMetaBatchOp::Put {
-                cf: CF_OBJECT_HEADS,
-                table_id: TABLE_OBJECT_HEAD_ROW,
-                tuple_key: current_key,
-                payload: payload.clone(),
-                common: None,
-            },
-            OwnedCoreMetaBatchOp::Put {
-                cf: CF_OBJECT_VERSIONS,
-                table_id: TABLE_OBJECT_VERSION_META_ROW,
-                tuple_key: version_key,
-                payload: payload.clone(),
-                common: None,
-            },
-            OwnedCoreMetaBatchOp::Put {
-                cf: CF_OBJECT_HEADS,
-                table_id: TABLE_OBJECT_HEAD_ROW,
-                tuple_key: current_list_key,
-                payload: payload.clone(),
-                common: None,
-            },
-            OwnedCoreMetaBatchOp::Put {
-                cf: CF_OBJECT_VERSIONS,
-                table_id: TABLE_OBJECT_VERSION_META_ROW,
-                tuple_key: version_list_key,
-                payload: payload.clone(),
-                common: None,
-            },
-            OwnedCoreMetaBatchOp::Put {
-                cf: CF_OBJECT_HEADS,
-                table_id: TABLE_OBJECT_HEAD_ROW,
-                tuple_key: current_history_key,
-                payload: payload.clone(),
-                common: None,
-            },
-            OwnedCoreMetaBatchOp::Put {
-                cf: CF_OBJECT_VERSIONS,
-                table_id: TABLE_OBJECT_VERSION_META_ROW,
-                tuple_key: version_history_key,
-                payload,
-                common: None,
-            },
-            OwnedCoreMetaBatchOp::Put {
-                cf: CF_OBJECT_VERSIONS,
-                table_id: TABLE_OBJECT_VERSION_META_ROW,
-                tuple_key: counter_key,
-                payload: counter_payload,
-                common: None,
-            },
-        ];
-        owned_ops.extend(
-            self.payload_reference_put_ops_for_object(bucket, object, &transaction_id)
-                .await?,
-        );
-        let ops = borrow_owned_coremeta_batch_ops(&owned_ops);
-        self.commit_coremeta_batch_by_embedded_roots(&transaction_id, &ops)
-            .await?;
-        drop(_guard);
-        if let Some(data_target) = object_data_target_from_shard_map(object.shard_map.as_ref())? {
-            let boundary_values = match &data_target {
-                ObjectDataTarget::LogicalFile { locator, .. } => {
-                    let manifest = self.read_logical_file_manifest(locator).await?;
-                    manifest_boundary_values(&manifest)
-                }
-                ObjectDataTarget::ObjectRef { object_ref, .. } => {
-                    self.read_object_manifest(object_ref).await?.boundary_values
-                }
-            };
-            if !boundary_values.is_empty() {
-                let bucket_key = boundary_schema_bucket_key(bucket.tenant_id, &bucket.name);
-                self.put_boundary_values_for_object(
-                    &bucket_key,
-                    data_target.target_string(),
-                    &boundary_values,
-                )
-                .await?;
-            }
-        }
-        Ok(())
-    }
-
-    pub async fn record_object_metadata_mutation_id(
-        &self,
-        bucket: &Bucket,
-        object_id: i64,
-    ) -> Result<()> {
-        let _guard = self.write_lock.lock().await;
-        let counter_key = object_id_counter_key(bucket);
-        let counter_payload = self.object_id_counter_payload_at_generation(
-            bucket,
-            object_id,
-            object_id.max(0) as u64,
-        )?;
-        self.commit_coremeta_batch_by_embedded_roots(
-            &format!(
-                "object-metadata-counter:{}:{}:{object_id}",
-                bucket.tenant_id, bucket.id
-            ),
-            &[CoreMetaBatchOp {
-                cf: CF_OBJECT_VERSIONS,
-                table_id: TABLE_OBJECT_VERSION_META_ROW,
-                tuple_key: &counter_key,
-                common: None,
-                kind: CoreMetaBatchOpKind::Put(&counter_payload),
-            }],
-        )
-        .await?;
-        Ok(())
-    }
-
-    pub async fn next_object_metadata_id(&self, bucket: &Bucket) -> Result<i64> {
-        let max_id = match self.meta.get(
-            CF_OBJECT_VERSIONS,
-            TABLE_OBJECT_VERSION_META_ROW,
-            &object_id_counter_key(bucket),
-        )? {
-            Some(bytes) => decode_object_metadata_counter(&bytes)?.max_id,
-            None => self.max_object_metadata_id_from_rows(bucket)?,
-        };
-        max_id
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("object id overflow"))
-    }
-
-    pub async fn read_current_object_metadata(
-        &self,
-        bucket: &Bucket,
-        object_key: &str,
-    ) -> Result<Option<Object>> {
-        self.read_current_object_metadata_with_generation(bucket, object_key, None)
-            .await
-    }
-
-    pub async fn read_current_object_metadata_at_generation(
-        &self,
-        bucket: &Bucket,
-        object_key: &str,
-        root_generation: u64,
-    ) -> Result<Option<Object>> {
-        self.read_current_object_metadata_with_generation(bucket, object_key, Some(root_generation))
-            .await
-    }
-
-    async fn read_current_object_metadata_with_generation(
-        &self,
-        bucket: &Bucket,
-        object_key: &str,
-        root_generation: Option<u64>,
-    ) -> Result<Option<Object>> {
-        if let Some(root_generation) = root_generation {
-            let mut candidates = Vec::new();
-            for row in self.meta.scan_prefix(
-                CF_OBJECT_HEADS,
-                TABLE_OBJECT_HEAD_ROW,
-                &object_current_history_prefix(bucket),
-            )? {
-                let decoded = decode_object_metadata_row_with_common(&row.payload)?;
-                validate_object_scope(bucket, &decoded.object)?;
-                if decoded.object.key == object_key && decoded.root_generation <= root_generation {
-                    candidates.push(decoded);
-                }
-            }
-            candidates.sort_by(|left, right| {
-                right
-                    .root_generation
-                    .cmp(&left.root_generation)
-                    .then_with(|| right.object.created_at.cmp(&left.object.created_at))
-                    .then_with(|| right.object.id.cmp(&left.object.id))
-                    .then_with(|| right.object.version_id.cmp(&left.object.version_id))
-            });
-            let Some(decoded) = candidates.into_iter().next() else {
-                return Ok(None);
-            };
-            if decoded.object.deleted_at.is_some() {
-                return Ok(None);
-            }
-            return Ok(Some(decoded.object));
-        }
-
-        let Some(bytes) = self.meta.get(
-            CF_OBJECT_HEADS,
-            TABLE_OBJECT_HEAD_ROW,
-            &object_current_key(bucket, object_key),
-        )?
-        else {
-            return Ok(None);
-        };
-        let object = decode_object_metadata_row(&bytes)?;
-        validate_object_scope(bucket, &object)?;
-        if object.key != object_key {
-            bail!("CoreStore object metadata current row key mismatch");
-        }
-        if object.deleted_at.is_some() {
-            return Ok(None);
-        }
-        Ok(Some(object))
-    }
-
-    pub async fn read_object_version_metadata(
-        &self,
-        bucket: &Bucket,
-        object_key: &str,
-        version_id: uuid::Uuid,
-    ) -> Result<Option<Object>> {
-        self.read_object_version_metadata_with_generation(bucket, object_key, version_id, None)
-            .await
-    }
-
-    pub async fn read_object_version_metadata_at_generation(
-        &self,
-        bucket: &Bucket,
-        object_key: &str,
-        version_id: uuid::Uuid,
-        root_generation: u64,
-    ) -> Result<Option<Object>> {
-        self.read_object_version_metadata_with_generation(
-            bucket,
-            object_key,
-            version_id,
-            Some(root_generation),
-        )
-        .await
-    }
-
-    async fn read_object_version_metadata_with_generation(
-        &self,
-        bucket: &Bucket,
-        object_key: &str,
-        version_id: uuid::Uuid,
-        root_generation: Option<u64>,
-    ) -> Result<Option<Object>> {
-        if let Some(root_generation) = root_generation {
-            let mut candidates = Vec::new();
-            for row in self.meta.scan_prefix(
-                CF_OBJECT_VERSIONS,
-                TABLE_OBJECT_VERSION_META_ROW,
-                &object_version_history_prefix(bucket),
-            )? {
-                let decoded = decode_object_metadata_row_with_common(&row.payload)?;
-                validate_object_scope(bucket, &decoded.object)?;
-                if decoded.object.key == object_key
-                    && decoded.object.version_id == version_id
-                    && decoded.root_generation <= root_generation
-                {
-                    candidates.push(decoded);
-                }
-            }
-            candidates.sort_by(|left, right| right.root_generation.cmp(&left.root_generation));
-            let Some(decoded) = candidates.into_iter().next() else {
-                return Ok(None);
-            };
-            if decoded.object.deleted_at.is_some() {
-                return Ok(None);
-            }
-            return Ok(Some(decoded.object));
-        }
-        let Some(bytes) = self.meta.get(
-            CF_OBJECT_VERSIONS,
-            TABLE_OBJECT_VERSION_META_ROW,
-            &object_version_key(bucket, object_key, version_id),
-        )?
-        else {
-            return Ok(None);
-        };
-        let decoded = decode_object_metadata_row_with_common(&bytes)?;
-        validate_object_scope(bucket, &decoded.object)?;
-        if decoded.object.key != object_key || decoded.object.version_id != version_id {
-            bail!("CoreStore object metadata version row key mismatch");
-        }
-        Ok(Some(decoded.object))
-    }
-
-    pub async fn read_object_version_metadata_by_id(
-        &self,
-        bucket: &Bucket,
-        version_id: uuid::Uuid,
-    ) -> Result<Option<Object>> {
-        for row in self.meta.scan_prefix(
-            CF_OBJECT_VERSIONS,
-            TABLE_OBJECT_VERSION_META_ROW,
-            &object_version_list_prefix(bucket),
-        )? {
-            let object = decode_object_metadata_row(&row.payload)?;
-            validate_object_scope(bucket, &object)?;
-            if object.version_id == version_id {
-                return Ok(Some(object));
-            }
-        }
-        Ok(None)
-    }
-
-    pub async fn list_current_object_metadata(&self, bucket: &Bucket) -> Result<Vec<Object>> {
-        self.list_current_object_metadata_with_generation(bucket, None)
-            .await
-    }
-
-    pub async fn list_current_object_metadata_at_generation(
-        &self,
-        bucket: &Bucket,
-        root_generation: u64,
-    ) -> Result<Vec<Object>> {
-        self.list_current_object_metadata_with_generation(bucket, Some(root_generation))
-            .await
-    }
-
-    async fn list_current_object_metadata_with_generation(
-        &self,
-        bucket: &Bucket,
-        root_generation: Option<u64>,
-    ) -> Result<Vec<Object>> {
-        if let Some(root_generation) = root_generation {
-            let mut best_by_key =
-                std::collections::BTreeMap::<String, DecodedObjectMetadataRow>::new();
-            for row in self.meta.scan_prefix(
-                CF_OBJECT_HEADS,
-                TABLE_OBJECT_HEAD_ROW,
-                &object_current_history_prefix(bucket),
-            )? {
-                let decoded = decode_object_metadata_row_with_common(&row.payload)?;
-                validate_object_scope(bucket, &decoded.object)?;
-                if decoded.root_generation > root_generation {
-                    continue;
-                }
-                let replace = best_by_key.get(&decoded.object.key).is_none_or(|existing| {
-                    decoded.root_generation > existing.root_generation
-                        || (decoded.root_generation == existing.root_generation
-                            && decoded.object.created_at > existing.object.created_at)
-                        || (decoded.root_generation == existing.root_generation
-                            && decoded.object.created_at == existing.object.created_at
-                            && decoded.object.id > existing.object.id)
-                });
-                if replace {
-                    best_by_key.insert(decoded.object.key.clone(), decoded);
-                }
-            }
-            let mut objects = best_by_key
-                .into_values()
-                .filter_map(|decoded| {
-                    decoded
-                        .object
-                        .deleted_at
-                        .is_none()
-                        .then_some(decoded.object)
-                })
-                .collect::<Vec<_>>();
-            objects.sort_by(|left, right| left.key.cmp(&right.key));
-            return Ok(objects);
-        }
-
-        let mut objects = Vec::new();
-        for row in self.meta.scan_prefix(
-            CF_OBJECT_HEADS,
-            TABLE_OBJECT_HEAD_ROW,
-            &object_current_list_prefix(bucket),
-        )? {
-            let object = decode_object_metadata_row(&row.payload)?;
-            validate_object_scope(bucket, &object)?;
-            if object.deleted_at.is_none() {
-                objects.push(object);
-            }
-        }
-        objects.sort_by(|left, right| left.key.cmp(&right.key));
-        Ok(objects)
-    }
-
-    pub async fn list_object_versions_metadata(
-        &self,
-        bucket: &Bucket,
-        prefix: &str,
-        key_marker: &str,
-        version_id_marker: Option<uuid::Uuid>,
-        limit: i32,
-    ) -> Result<ObjectVersionsPage> {
-        self.list_object_versions_metadata_with_generation(
-            bucket,
-            prefix,
-            key_marker,
-            version_id_marker,
-            limit,
-            None,
-        )
-        .await
-    }
-
-    pub async fn list_object_versions_metadata_at_generation(
-        &self,
-        bucket: &Bucket,
-        prefix: &str,
-        key_marker: &str,
-        version_id_marker: Option<uuid::Uuid>,
-        limit: i32,
-        root_generation: u64,
-    ) -> Result<ObjectVersionsPage> {
-        self.list_object_versions_metadata_with_generation(
-            bucket,
-            prefix,
-            key_marker,
-            version_id_marker,
-            limit,
-            Some(root_generation),
-        )
-        .await
-    }
-
-    async fn list_object_versions_metadata_with_generation(
-        &self,
-        bucket: &Bucket,
-        prefix: &str,
-        key_marker: &str,
-        version_id_marker: Option<uuid::Uuid>,
-        limit: i32,
-        root_generation: Option<u64>,
-    ) -> Result<ObjectVersionsPage> {
-        let mut versions_by_key = match root_generation {
-            Some(root_generation) => {
-                self.object_versions_by_key_at_generation(bucket, root_generation)?
-            }
-            None => self.object_versions_by_key(bucket)?,
-        };
-        let marker = match version_id_marker {
-            Some(version_id_marker) => {
-                let marker = versions_by_key.get(key_marker).and_then(|versions| {
-                    versions
-                        .iter()
-                        .find(|object| object.version_id == version_id_marker)
-                });
-                let Some(marker) = marker else {
-                    return Ok(ObjectVersionsPage {
-                        versions: Vec::new(),
-                        is_truncated: false,
-                        next_key_marker: None,
-                        next_version_id_marker: None,
-                    });
-                };
-                Some(marker.clone())
-            }
-            None => None,
-        };
-
-        for versions in versions_by_key.values_mut() {
-            sort_object_versions_descending(versions);
-        }
-
-        let mut selected = Vec::new();
-        for versions in versions_by_key.into_values() {
-            for (index, object) in versions.into_iter().enumerate() {
-                if !object.key.starts_with(prefix)
-                    || crate::validation::is_reserved_internal_key(&object.key)
-                {
-                    continue;
-                }
-                if let Some(marker) = marker.as_ref() {
-                    if object.key.as_str() < key_marker {
-                        continue;
-                    }
-                    if object.key == key_marker && !version_sorts_after_marker(&object, marker) {
-                        continue;
-                    }
-                } else if object.key.as_str() <= key_marker {
-                    continue;
-                }
-
-                selected.push(ObjectVersion {
-                    is_delete_marker: object.deleted_at.is_some(),
-                    is_latest: index == 0,
-                    object,
-                });
-            }
-        }
-
-        let limit = limit.max(1) as usize;
-        let is_truncated = selected.len() > limit;
-        if is_truncated {
-            selected.truncate(limit);
-        }
-        let (next_key_marker, next_version_id_marker) = if is_truncated {
-            selected
-                .last()
-                .map(|version| {
-                    (
-                        Some(version.object.key.clone()),
-                        Some(version.object.version_id),
-                    )
-                })
-                .unwrap_or((None, None))
-        } else {
-            (None, None)
-        };
-
-        Ok(ObjectVersionsPage {
-            versions: selected,
-            is_truncated,
-            next_key_marker,
-            next_version_id_marker,
-        })
-    }
-
-    pub async fn delete_object_version_metadata(
-        &self,
-        bucket: &Bucket,
-        object_key: &str,
-        version_id: uuid::Uuid,
-    ) -> Result<()> {
-        let _guard = self.write_lock.lock().await;
-        let current_key = object_current_key(bucket, object_key);
-        let current_list_key = object_current_list_key(bucket, object_key);
-        let version_key = object_version_key(bucket, object_key, version_id);
-        let version_list_key = object_version_list_key(bucket, object_key, version_id);
-
-        let current = self
-            .meta
-            .get(CF_OBJECT_HEADS, TABLE_OBJECT_HEAD_ROW, &current_key)?
-            .map(|bytes| decode_object_metadata_row(&bytes))
-            .transpose()?;
-        let original = self
-            .meta
-            .get(
-                CF_OBJECT_VERSIONS,
-                TABLE_OBJECT_VERSION_META_ROW,
-                &version_key,
-            )?
-            .map(|bytes| decode_object_metadata_row(&bytes))
-            .transpose()?
-            .ok_or_else(|| anyhow!("CoreStore object version metadata row missing"))?;
-        let deleted_is_current = current
-            .as_ref()
-            .is_some_and(|object| object.key == object_key && object.version_id == version_id);
-        let replacement = if deleted_is_current {
-            self.latest_object_version_for_key_after_delete(bucket, object_key, version_id)?
-        } else {
-            None
-        };
-        let root_generation = self
-            .max_object_metadata_id_from_rows(bucket)?
-            .saturating_add(1)
-            .max(1) as u64;
-        let mut tombstone = original.clone();
-        tombstone.id = i64::try_from(root_generation).unwrap_or(i64::MAX);
-        tombstone.mutation_id = uuid::Uuid::new_v4();
-        tombstone.deleted_at = Some(chrono::Utc::now());
-        tombstone.record_hash = format!("sha256:{}", sha256_hex(tombstone.mutation_id.as_bytes()));
-        let tombstone_payload = encode_object_metadata_row_at_generation_with_delete_marker(
-            &tombstone,
-            root_generation,
-            false,
-        )?;
-        let replacement_payload = replacement
-            .as_ref()
-            .map(|object| encode_object_metadata_row_at_generation(object, root_generation))
-            .transpose()?;
-        let version_history_key =
-            object_version_history_key(bucket, object_key, version_id, root_generation);
-
-        let mut owned_ops = vec![
-            OwnedCoreMetaBatchOp::Delete {
-                cf: CF_OBJECT_VERSIONS,
-                table_id: TABLE_OBJECT_VERSION_META_ROW,
-                tuple_key: version_key,
-                common: None,
-            },
-            OwnedCoreMetaBatchOp::Delete {
-                cf: CF_OBJECT_VERSIONS,
-                table_id: TABLE_OBJECT_VERSION_META_ROW,
-                tuple_key: version_list_key,
-                common: None,
-            },
-            OwnedCoreMetaBatchOp::Put {
-                cf: CF_OBJECT_VERSIONS,
-                table_id: TABLE_OBJECT_VERSION_META_ROW,
-                tuple_key: version_history_key,
-                payload: tombstone_payload.clone(),
-                common: None,
-            },
-        ];
-        if deleted_is_current {
-            if let Some(replacement_payload) = replacement_payload.as_ref() {
-                let replacement_version = replacement
-                    .as_ref()
-                    .map(|object| object.version_id)
-                    .unwrap_or(version_id);
-                let current_history_key = object_current_history_key(
-                    bucket,
-                    object_key,
-                    root_generation,
-                    replacement_version,
-                );
-                owned_ops.push(OwnedCoreMetaBatchOp::Put {
-                    cf: CF_OBJECT_HEADS,
-                    table_id: TABLE_OBJECT_HEAD_ROW,
-                    tuple_key: current_key.clone(),
-                    payload: replacement_payload.clone(),
-                    common: None,
-                });
-                owned_ops.push(OwnedCoreMetaBatchOp::Put {
-                    cf: CF_OBJECT_HEADS,
-                    table_id: TABLE_OBJECT_HEAD_ROW,
-                    tuple_key: current_list_key.clone(),
-                    payload: replacement_payload.clone(),
-                    common: None,
-                });
-                owned_ops.push(OwnedCoreMetaBatchOp::Put {
-                    cf: CF_OBJECT_HEADS,
-                    table_id: TABLE_OBJECT_HEAD_ROW,
-                    tuple_key: current_history_key.clone(),
-                    payload: replacement_payload.clone(),
-                    common: None,
-                });
-            } else {
-                let current_history_key =
-                    object_current_history_key(bucket, object_key, root_generation, version_id);
-                owned_ops.push(OwnedCoreMetaBatchOp::Delete {
-                    cf: CF_OBJECT_HEADS,
-                    table_id: TABLE_OBJECT_HEAD_ROW,
-                    tuple_key: current_key.clone(),
-                    common: None,
-                });
-                owned_ops.push(OwnedCoreMetaBatchOp::Delete {
-                    cf: CF_OBJECT_HEADS,
-                    table_id: TABLE_OBJECT_HEAD_ROW,
-                    tuple_key: current_list_key.clone(),
-                    common: None,
-                });
-                owned_ops.push(OwnedCoreMetaBatchOp::Put {
-                    cf: CF_OBJECT_HEADS,
-                    table_id: TABLE_OBJECT_HEAD_ROW,
-                    tuple_key: current_history_key.clone(),
-                    payload: tombstone_payload.clone(),
-                    common: None,
-                });
-            }
-        }
-
-        let transaction_id = format!("delete-object-version:{version_id}");
-        owned_ops.extend(
-            self.payload_reference_delete_ops_for_object(bucket, &original, &transaction_id)
-                .await?,
-        );
-        let ops = borrow_owned_coremeta_batch_ops(&owned_ops);
-        self.commit_coremeta_batch_by_embedded_roots(&transaction_id, &ops)
-            .await?;
-        Ok(())
-    }
-
-    fn object_versions_by_key(
-        &self,
-        bucket: &Bucket,
-    ) -> Result<std::collections::BTreeMap<String, Vec<Object>>> {
-        let mut versions_by_key = std::collections::BTreeMap::<String, Vec<Object>>::new();
-        for row in self.meta.scan_prefix(
-            CF_OBJECT_VERSIONS,
-            TABLE_OBJECT_VERSION_META_ROW,
-            &object_version_list_prefix(bucket),
-        )? {
-            let decoded = decode_object_metadata_row_with_common(&row.payload)?;
-            validate_object_scope(bucket, &decoded.object)?;
-            if decoded.object.deleted_at.is_some() && !decoded.delete_marker {
-                continue;
-            }
-            versions_by_key
-                .entry(decoded.object.key.clone())
-                .or_default()
-                .push(decoded.object);
-        }
-        Ok(versions_by_key)
-    }
-
-    fn object_versions_by_key_at_generation(
-        &self,
-        bucket: &Bucket,
-        root_generation: u64,
-    ) -> Result<std::collections::BTreeMap<String, Vec<Object>>> {
-        let mut latest_by_version =
-            std::collections::BTreeMap::<(String, uuid::Uuid), DecodedObjectMetadataRow>::new();
-        for row in self.meta.scan_prefix(
-            CF_OBJECT_VERSIONS,
-            TABLE_OBJECT_VERSION_META_ROW,
-            &object_version_history_prefix(bucket),
-        )? {
-            let decoded = decode_object_metadata_row_with_common(&row.payload)?;
-            validate_object_scope(bucket, &decoded.object)?;
-            if decoded.root_generation <= root_generation {
-                let key = (decoded.object.key.clone(), decoded.object.version_id);
-                let replace = latest_by_version
-                    .get(&key)
-                    .is_none_or(|existing| decoded.root_generation > existing.root_generation);
-                if replace {
-                    latest_by_version.insert(key, decoded);
-                }
-            }
-        }
-        let mut versions_by_key = std::collections::BTreeMap::<String, Vec<Object>>::new();
-        for decoded in latest_by_version.into_values() {
-            if decoded.object.deleted_at.is_some() && !decoded.delete_marker {
-                continue;
-            }
-            versions_by_key
-                .entry(decoded.object.key.clone())
-                .or_default()
-                .push(decoded.object);
-        }
-        Ok(versions_by_key)
-    }
-
-    fn latest_object_version_for_key_after_delete(
-        &self,
-        bucket: &Bucket,
-        object_key: &str,
-        deleted_version_id: uuid::Uuid,
-    ) -> Result<Option<Object>> {
-        let mut versions = self
-            .object_versions_by_key(bucket)?
-            .remove(object_key)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|object| object.version_id != deleted_version_id)
-            .collect::<Vec<_>>();
-        sort_object_versions_descending(&mut versions);
-        Ok(versions.into_iter().next())
-    }
-
-    fn object_id_counter_payload(&self, bucket: &Bucket, candidate_id: i64) -> Result<Vec<u8>> {
-        self.object_id_counter_payload_at_generation(
-            bucket,
-            candidate_id,
-            candidate_id.max(0) as u64,
-        )
-    }
-
-    fn object_id_counter_payload_at_generation(
-        &self,
-        bucket: &Bucket,
-        candidate_id: i64,
-        root_generation: u64,
-    ) -> Result<Vec<u8>> {
-        let current_max = match self.meta.get(
-            CF_OBJECT_VERSIONS,
-            TABLE_OBJECT_VERSION_META_ROW,
-            &object_id_counter_key(bucket),
-        )? {
-            Some(bytes) => decode_object_metadata_counter(&bytes)?.max_id,
-            None => self.max_object_metadata_id_from_rows(bucket)?,
-        };
-        let effective_max = candidate_id.max(current_max);
-        encode_object_metadata_counter_at_generation(
-            bucket,
-            effective_max,
-            root_generation.max(effective_max.max(0) as u64),
-        )
-    }
-
-    fn max_object_metadata_id_from_rows(&self, bucket: &Bucket) -> Result<i64> {
-        let mut max_id = 0;
-        for row in self.meta.scan_prefix(
-            CF_OBJECT_VERSIONS,
-            TABLE_OBJECT_VERSION_META_ROW,
-            &object_version_list_prefix(bucket),
-        )? {
-            let object = decode_object_metadata_row(&row.payload)?;
-            validate_object_scope(bucket, &object)?;
-            max_id = max_id.max(object.id);
-        }
-        Ok(max_id)
-    }
-}
-
-fn object_current_key(bucket: &Bucket, object_key: &str) -> Vec<u8> {
-    meta_tuple_key(&[
-        b"object-current",
-        &bucket.tenant_id.to_be_bytes(),
-        &bucket.id.to_be_bytes(),
-        object_key.as_bytes(),
-    ])
-}
-
-fn object_version_key(bucket: &Bucket, object_key: &str, version_id: uuid::Uuid) -> Vec<u8> {
-    let version_id = version_id.to_string();
-    meta_tuple_key(&[
-        b"object-version",
-        &bucket.tenant_id.to_be_bytes(),
-        &bucket.id.to_be_bytes(),
-        object_key.as_bytes(),
-        version_id.as_bytes(),
-    ])
-}
-
-fn object_current_list_prefix(bucket: &Bucket) -> Vec<u8> {
-    meta_tuple_key(&[
-        b"object-list-current",
-        &bucket.tenant_id.to_be_bytes(),
-        &bucket.id.to_be_bytes(),
-    ])
-}
-
-fn object_current_list_key(bucket: &Bucket, object_key: &str) -> Vec<u8> {
-    meta_tuple_key(&[
-        b"object-list-current",
-        &bucket.tenant_id.to_be_bytes(),
-        &bucket.id.to_be_bytes(),
-        object_key.as_bytes(),
-    ])
-}
-
-fn object_current_history_prefix(bucket: &Bucket) -> Vec<u8> {
-    meta_tuple_key(&[
-        b"object-history-current",
-        &bucket.tenant_id.to_be_bytes(),
-        &bucket.id.to_be_bytes(),
-    ])
-}
-
-fn object_current_history_key(
-    bucket: &Bucket,
-    object_key: &str,
-    root_generation: u64,
-    version_id: uuid::Uuid,
-) -> Vec<u8> {
-    let root_generation = root_generation.to_be_bytes();
-    let version_id = version_id.to_string();
-    meta_tuple_key(&[
-        b"object-history-current",
-        &bucket.tenant_id.to_be_bytes(),
-        &bucket.id.to_be_bytes(),
-        object_key.as_bytes(),
-        &root_generation,
-        version_id.as_bytes(),
-    ])
-}
-
-fn object_version_history_prefix(bucket: &Bucket) -> Vec<u8> {
-    meta_tuple_key(&[
-        b"object-history-version",
-        &bucket.tenant_id.to_be_bytes(),
-        &bucket.id.to_be_bytes(),
-    ])
-}
-
-fn object_version_history_key(
-    bucket: &Bucket,
-    object_key: &str,
-    version_id: uuid::Uuid,
-    root_generation: u64,
-) -> Vec<u8> {
-    let version_id = version_id.to_string();
-    let root_generation = root_generation.to_be_bytes();
-    meta_tuple_key(&[
-        b"object-history-version",
-        &bucket.tenant_id.to_be_bytes(),
-        &bucket.id.to_be_bytes(),
-        object_key.as_bytes(),
-        version_id.as_bytes(),
-        &root_generation,
-    ])
-}
-
-fn object_version_list_prefix(bucket: &Bucket) -> Vec<u8> {
-    meta_tuple_key(&[
-        b"object-list-version",
-        &bucket.tenant_id.to_be_bytes(),
-        &bucket.id.to_be_bytes(),
-    ])
-}
-
-fn object_version_list_key(bucket: &Bucket, object_key: &str, version_id: uuid::Uuid) -> Vec<u8> {
-    let version_id = version_id.to_string();
-    meta_tuple_key(&[
-        b"object-list-version",
-        &bucket.tenant_id.to_be_bytes(),
-        &bucket.id.to_be_bytes(),
-        object_key.as_bytes(),
-        version_id.as_bytes(),
-    ])
-}
-
-fn object_id_counter_key(bucket: &Bucket) -> Vec<u8> {
-    meta_tuple_key(&[
-        b"object-id-counter",
-        &bucket.tenant_id.to_be_bytes(),
-        &bucket.id.to_be_bytes(),
-    ])
-}
-
-fn sort_object_versions_descending(objects: &mut [Object]) {
-    objects.sort_by(|left, right| {
-        right
-            .created_at
-            .cmp(&left.created_at)
-            .then_with(|| right.id.cmp(&left.id))
-            .then_with(|| right.version_id.cmp(&left.version_id))
-    });
-}
-
-fn version_sorts_after_marker(object: &Object, marker: &Object) -> bool {
-    object.created_at < marker.created_at
-        || (object.created_at == marker.created_at
-            && (object.id < marker.id
-                || (object.id == marker.id && object.version_id < marker.version_id)))
-}
-
-fn object_metadata_common(object: &Object) -> CoreMetaRowCommonProto {
-    object_metadata_common_at_generation(
-        object,
-        object.id.max(0) as u64,
-        object.mutation_id.to_string(),
-    )
-}
-
 fn object_metadata_common_at_generation(
     object: &Object,
     root_generation: u64,
@@ -1044,25 +133,11 @@ fn object_metadata_common_at_generation(
     )
 }
 
-fn object_metadata_common_for_bucket(
-    bucket: &Bucket,
-    root_generation: u64,
-    transaction_id: impl Into<String>,
-) -> CoreMetaRowCommonProto {
-    core_meta_committed_row_common(
-        object_metadata_realm_id(bucket.tenant_id),
-        object_metadata_root_key_hash(bucket.tenant_id, bucket.id),
-        root_generation,
-        transaction_id,
-        unix_timestamp_nanos(),
-    )
-}
-
 fn validate_object_metadata_common(
     common: &CoreMetaRowCommonProto,
     tenant_id: i64,
     bucket_id: i64,
-    mutation_id: &str,
+    _mutation_id: &str,
 ) -> Result<()> {
     if common.realm_id != object_metadata_realm_id(tenant_id) {
         bail!("CoreStore object metadata row realm mismatch");
@@ -1070,8 +145,8 @@ fn validate_object_metadata_common(
     if common.root_key_hash != object_metadata_root_key_hash(tenant_id, bucket_id) {
         bail!("CoreStore object metadata row root hash mismatch");
     }
-    if !mutation_id.is_empty() && common.transaction_id != mutation_id {
-        bail!("CoreStore object metadata row transaction id mismatch");
+    if common.transaction_id.is_empty() {
+        bail!("CoreStore object metadata row transaction id is empty");
     }
     if common.visibility_state_enum() != CoreMetaVisibilityState::Committed {
         bail!("CoreStore object metadata row is not committed");
@@ -1084,7 +159,14 @@ fn object_metadata_realm_id(tenant_id: i64) -> String {
 }
 
 fn object_metadata_root_key_hash(tenant_id: i64, bucket_id: i64) -> String {
-    core_meta_root_key_hash(&format!("object-metadata/{tenant_id}/{bucket_id}"))
+    core_meta_root_key_hash(&object_metadata_root_anchor_key(tenant_id, bucket_id))
+}
+
+fn object_metadata_root_anchor_key(tenant_id: i64, bucket_id: i64) -> String {
+    let mut bytes = Vec::with_capacity(16);
+    bytes.extend_from_slice(&tenant_id.to_le_bytes());
+    bytes.extend_from_slice(&bucket_id.to_le_bytes());
+    hex::encode(crate::formats::hash32(&bytes))
 }
 
 fn validate_object_scope(bucket: &Bucket, object: &Object) -> Result<()> {
@@ -1094,18 +176,27 @@ fn validate_object_scope(bucket: &Bucket, object: &Object) -> Result<()> {
     Ok(())
 }
 
-fn encode_object_metadata_row(object: &Object) -> Result<Vec<u8>> {
-    encode_object_metadata_row_at_generation(object, object.id.max(0) as u64)
-}
-
 fn encode_object_metadata_row_at_generation(
     object: &Object,
     root_generation: u64,
 ) -> Result<Vec<u8>> {
-    encode_object_metadata_row_at_generation_with_delete_marker(
+    encode_object_metadata_row_at_generation_for_transaction(
+        object,
+        root_generation,
+        &object.mutation_id.to_string(),
+    )
+}
+
+fn encode_object_metadata_row_at_generation_for_transaction(
+    object: &Object,
+    root_generation: u64,
+    transaction_id: &str,
+) -> Result<Vec<u8>> {
+    encode_object_metadata_row_at_generation_with_delete_marker_for_transaction(
         object,
         root_generation,
         object.deleted_at.is_some(),
+        transaction_id,
     )
 }
 
@@ -1114,11 +205,25 @@ fn encode_object_metadata_row_at_generation_with_delete_marker(
     root_generation: u64,
     delete_marker: bool,
 ) -> Result<Vec<u8>> {
+    encode_object_metadata_row_at_generation_with_delete_marker_for_transaction(
+        object,
+        root_generation,
+        delete_marker,
+        &object.mutation_id.to_string(),
+    )
+}
+
+fn encode_object_metadata_row_at_generation_with_delete_marker_for_transaction(
+    object: &Object,
+    root_generation: u64,
+    delete_marker: bool,
+    transaction_id: &str,
+) -> Result<Vec<u8>> {
     let proto = ObjectMetadataRowProto {
         common: Some(object_metadata_common_at_generation(
             object,
             root_generation,
-            object.mutation_id.to_string(),
+            transaction_id,
         )),
         schema: CORE_OBJECT_METADATA_SCHEMA.to_string(),
         id: object.id,
@@ -1247,21 +352,18 @@ fn decode_object_metadata_row_with_common(bytes: &[u8]) -> Result<DecodedObjectM
     })
 }
 
-fn encode_object_metadata_counter(bucket: &Bucket, max_id: i64) -> Result<Vec<u8>> {
-    encode_object_metadata_counter_at_generation(bucket, max_id, max_id.max(0) as u64)
-}
-
 fn encode_object_metadata_counter_at_generation(
     bucket: &Bucket,
     max_id: i64,
     root_generation: u64,
+    transaction_id: &str,
 ) -> Result<Vec<u8>> {
     encode_deterministic(&ObjectMetadataCounterProto {
         common: Some(core_meta_committed_row_common(
             object_metadata_realm_id(bucket.tenant_id),
             object_metadata_root_key_hash(bucket.tenant_id, bucket.id),
             root_generation,
-            String::new(),
+            transaction_id,
             unix_timestamp_nanos(),
         )),
         schema: "anvil.core.object_metadata_counter.v1".to_string(),
@@ -1279,6 +381,22 @@ fn decode_object_metadata_counter(bytes: &[u8]) -> Result<ObjectMetadataCounterP
         .common
         .as_ref()
         .ok_or_else(|| anyhow!("CoreStore object metadata counter row missing CoreMeta common"))?;
+    Ok(proto)
+}
+
+fn decode_object_metadata_counter_for_bucket(
+    bytes: &[u8],
+    bucket: &Bucket,
+) -> Result<ObjectMetadataCounterProto> {
+    let proto = decode_object_metadata_counter(bytes)?;
+    let common = proto
+        .common
+        .as_ref()
+        .expect("counter decoder requires CoreMeta common");
+    validate_object_metadata_common(common, bucket.tenant_id, bucket.id, "")?;
+    if proto.max_id < 0 {
+        bail!("CoreStore object metadata counter max id must be non-negative");
+    }
     Ok(proto)
 }
 
@@ -1474,6 +592,10 @@ fn canonical_json(value: &JsonValue) -> JsonValue {
         }
         scalar => scalar.clone(),
     }
+}
+
+fn object_metadata_bucket_lock_id(bucket: &Bucket) -> String {
+    format!("{}:{}", bucket.tenant_id, bucket.id)
 }
 
 fn encode_deterministic<M: Message>(message: &M) -> Result<Vec<u8>> {

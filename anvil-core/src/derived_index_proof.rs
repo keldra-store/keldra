@@ -1,8 +1,10 @@
 use crate::{
     core_store::{
-        CF_INDEX_ROWS, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaRowCommonProto, CoreMetaStore,
-        CoreMetaTuplePart, CoreMetaVisibilityState, CoreStore, TABLE_DERIVED_INDEX_PROOF_ROW,
-        core_meta_root_key_hash, core_meta_tuple_key, decode_deterministic_proto,
+        CF_INDEX_ROWS, CoreMetaRowCommonProto, CoreMetaTuplePart, CoreMetaVisibilityState,
+        CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
+        CoreMutationRootPublication, CoreStore, CoreTransactionState,
+        TABLE_DERIVED_INDEX_PROOF_ROW, core_meta_payload_digest, core_meta_root_key_hash,
+        core_meta_tuple_key, core_mutation_publication_attempt_id, decode_deterministic_proto,
         encode_deterministic_proto,
     },
     formats::hash32,
@@ -14,6 +16,8 @@ use hmac::{Hmac, Mac};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+
+const MAX_DERIVED_INDEX_SEGMENT_HASHES: usize = 1024;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -48,6 +52,11 @@ pub struct DerivedIndexProofWrite {
     pub segment_hashes: Vec<String>,
     pub built_by_node: String,
     pub built_at_nanos: i64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedDerivedIndexProof {
+    sealed: DerivedIndexProof,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -151,7 +160,16 @@ pub async fn write_derived_index_proof(
     storage: &Storage,
     proof: DerivedIndexProofWrite,
     signing_key: &[u8],
+    additional_preconditions: &[CoreMutationPrecondition],
 ) -> Result<DerivedIndexProof> {
+    let prepared = prepare_derived_index_proof(proof, signing_key)?;
+    publish_prepared_derived_index_proof(storage, &prepared, additional_preconditions).await
+}
+
+pub(crate) fn prepare_derived_index_proof(
+    proof: DerivedIndexProofWrite,
+    signing_key: &[u8],
+) -> Result<PreparedDerivedIndexProof> {
     validate_write(&proof)?;
     let sealed = DerivedIndexProof {
         format_version: 1,
@@ -170,8 +188,16 @@ pub async fn write_derived_index_proof(
         proof_signature: None,
     }
     .seal(signing_key)?;
-    write_derived_index_proof_rows(storage, &sealed).await?;
-    Ok(sealed)
+    Ok(PreparedDerivedIndexProof { sealed })
+}
+
+pub(crate) async fn publish_prepared_derived_index_proof(
+    storage: &Storage,
+    prepared: &PreparedDerivedIndexProof,
+    additional_preconditions: &[CoreMutationPrecondition],
+) -> Result<DerivedIndexProof> {
+    write_derived_index_proof_rows(storage, &prepared.sealed, additional_preconditions).await?;
+    Ok(prepared.sealed.clone())
 }
 
 pub async fn read_latest_derived_index_proof(
@@ -248,6 +274,11 @@ fn validate_unsigned_proof(proof: &DerivedIndexProof) -> Result<()> {
     if proof.segment_hashes.is_empty() {
         return Err(anyhow!("derived index proof must include segment hashes"));
     }
+    if proof.segment_hashes.len() > MAX_DERIVED_INDEX_SEGMENT_HASHES {
+        return Err(anyhow!(
+            "derived index proof must contain no more than {MAX_DERIVED_INDEX_SEGMENT_HASHES} segment hashes"
+        ));
+    }
     for segment_hash in &proof.segment_hashes {
         validate_hex32(segment_hash, "segment_hash")?;
     }
@@ -304,6 +335,7 @@ fn require_safe_component(value: &str, field: &'static str) -> Result<()> {
 async fn write_derived_index_proof_rows(
     storage: &Storage,
     proof: &DerivedIndexProof,
+    additional_preconditions: &[CoreMutationPrecondition],
 ) -> Result<()> {
     let proof_hash = proof
         .proof_hash
@@ -313,29 +345,105 @@ async fn write_derived_index_proof_rows(
     let head_key = head_proof_tuple_key(&proof.index_id)?;
     let payload = encode_derived_index_proof_row(proof)?;
     let store = CoreStore::new(storage.clone()).await?;
-    let versioned_op = CoreMetaBatchOp {
-        cf: CF_INDEX_ROWS,
-        table_id: TABLE_DERIVED_INDEX_PROOF_ROW,
-        tuple_key: &versioned_key,
-        common: None,
-        kind: CoreMetaBatchOpKind::Put(&payload),
-    };
-    let head_op = CoreMetaBatchOp {
-        cf: CF_INDEX_ROWS,
-        table_id: TABLE_DERIVED_INDEX_PROOF_ROW,
-        tuple_key: &head_key,
-        common: None,
-        kind: CoreMetaBatchOpKind::Put(&payload),
-    };
-    store
-        .commit_coremeta_batch_by_embedded_roots(
-            &format!(
-                "derived-index-proof:{}:{}",
-                proof.index_id, proof.generation
-            ),
-            &[versioned_op, head_op],
-        )
+    let versioned_current =
+        store.read_coremeta_row(CF_INDEX_ROWS, TABLE_DERIVED_INDEX_PROOF_ROW, &versioned_key)?;
+    if let Some(existing) = versioned_current.as_ref()
+        && decode_derived_index_proof_row(existing)? != *proof
+    {
+        return Err(anyhow!(
+            "derived index generation already identifies a different proof"
+        ));
+    }
+    let head_current =
+        store.read_coremeta_row(CF_INDEX_ROWS, TABLE_DERIVED_INDEX_PROOF_ROW, &head_key)?;
+    if let Some(existing) = head_current.as_ref() {
+        let existing_proof = decode_derived_index_proof_row(existing)?;
+        if existing_proof.generation > proof.generation {
+            return Err(anyhow!("derived index proof head cannot move backwards"));
+        }
+        if existing_proof.generation == proof.generation {
+            if existing_proof != *proof {
+                return Err(anyhow!(
+                    "derived index proof diverges at an existing generation"
+                ));
+            }
+            return Ok(());
+        }
+    }
+
+    let row_precondition =
+        |tuple_key: Vec<u8>, current: Option<&Vec<u8>>| CoreMutationPrecondition::CoreMetaRow {
+            cf: CF_INDEX_ROWS.to_string(),
+            table_id: TABLE_DERIVED_INDEX_PROOF_ROW,
+            tuple_key,
+            expected_payload_hash: current
+                .map(|bytes| core_meta_payload_digest(TABLE_DERIVED_INDEX_PROOF_ROW, bytes)),
+            require_absent: current.is_none(),
+            require_present: current.is_some(),
+        };
+    let mut preconditions = vec![
+        row_precondition(versioned_key.clone(), versioned_current.as_ref()),
+        row_precondition(head_key.clone(), head_current.as_ref()),
+    ];
+    preconditions.extend_from_slice(additional_preconditions);
+    let partition = format!(
+        "derived-index-proof/{}/{}",
+        proof.index_id, proof.partition_id
+    );
+    let logical_transaction_id = format!(
+        "derived-index-proof:{}:{}:{}",
+        proof.index_id, proof.generation, proof_hash
+    );
+    let transaction_id =
+        core_mutation_publication_attempt_id(&logical_transaction_id, &preconditions)?;
+    let receipt = store
+        .commit_mutation_batch(CoreMutationBatch {
+            transaction_id,
+            scope_partition: partition.clone(),
+            committed_by_principal: format!("index-builder:{}", proof.built_by_node),
+            root_publications: vec![
+                CoreMutationRootPublication::with_writer_families(
+                    partition.clone(),
+                    vec![
+                        crate::formats::writer::WriterFamily::CoreControl
+                            .as_str()
+                            .to_string(),
+                        crate::formats::writer::WriterFamily::TypedMetadata
+                            .as_str()
+                            .to_string(),
+                    ],
+                )
+                .coordinator(),
+            ],
+            preconditions,
+            operations: vec![
+                CoreMutationOperation::CoreMetaPut {
+                    partition_id: partition.clone(),
+                    cf: CF_INDEX_ROWS.to_string(),
+                    table_id: TABLE_DERIVED_INDEX_PROOF_ROW,
+                    tuple_key: versioned_key,
+                    payload: payload.clone(),
+                },
+                CoreMutationOperation::CoreMetaPut {
+                    partition_id: partition,
+                    cf: CF_INDEX_ROWS.to_string(),
+                    table_id: TABLE_DERIVED_INDEX_PROOF_ROW,
+                    tuple_key: head_key,
+                    payload,
+                },
+            ],
+        })
         .await?;
+    if receipt.state != CoreTransactionState::Committed {
+        return Err(anyhow!(
+            "derived index proof publication {} did not commit: {}",
+            receipt.transaction_id,
+            receipt
+                .finalisation_error
+                .as_deref()
+                .unwrap_or("unknown finalisation failure")
+        ));
+    }
     Ok(())
 }
 
@@ -343,8 +451,10 @@ async fn read_derived_index_proof_row(
     storage: &Storage,
     tuple_key: &[u8],
 ) -> Result<Option<DerivedIndexProof>> {
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
-    let Some(bytes) = meta.get(CF_INDEX_ROWS, TABLE_DERIVED_INDEX_PROOF_ROW, tuple_key)? else {
+    let store = CoreStore::new(storage.clone()).await?;
+    let Some(bytes) =
+        store.read_coremeta_row(CF_INDEX_ROWS, TABLE_DERIVED_INDEX_PROOF_ROW, tuple_key)?
+    else {
         return Ok(None);
     };
     Ok(Some(decode_derived_index_proof_row(&bytes)?))
@@ -470,6 +580,7 @@ fn versioned_proof_tuple_key(index_id: &str, generation: u64, proof_hash: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core_store::CoreMetaStore;
     use tempfile::tempdir;
 
     const KEY: &[u8] = b"derived index proof signing key";
@@ -478,9 +589,10 @@ mod tests {
     async fn derived_index_proof_writes_version_and_head() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        let proof = write_derived_index_proof(&storage, proof(7, 42, hex::encode([8; 32])), KEY)
-            .await
-            .unwrap();
+        let proof =
+            write_derived_index_proof(&storage, proof(7, 42, hex::encode([8; 32])), KEY, &[])
+                .await
+                .unwrap();
         assert_eq!(proof.generation, 7);
         assert_eq!(proof.source_cursor, 42);
         let proof_hash = proof.proof_hash.as_deref().unwrap();
@@ -503,14 +615,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn derived_index_proof_retry_is_byte_identical() {
+        let write = proof(7, 42, hex::encode([8; 32]));
+        let first = prepare_derived_index_proof(write.clone(), KEY).unwrap();
+        let replay = prepare_derived_index_proof(write, KEY).unwrap();
+
+        assert_eq!(first.sealed, replay.sealed);
+        assert_eq!(
+            encode_derived_index_proof(&first.sealed).unwrap(),
+            encode_derived_index_proof(&replay.sealed).unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn derived_index_source_validation_requires_cursor_manifest_and_generation() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let manifest_hash = hex::encode([8; 32]);
-        let proof = write_derived_index_proof(&storage, proof(7, 42, manifest_hash.clone()), KEY)
-            .await
-            .unwrap();
+        let proof =
+            write_derived_index_proof(&storage, proof(7, 42, manifest_hash.clone()), KEY, &[])
+                .await
+                .unwrap();
         assert_eq!(
             validate_derived_index_source(&proof, 42, &manifest_hash, 7, KEY).unwrap(),
             DerivedIndexValidity::Valid
@@ -533,7 +659,7 @@ mod tests {
     async fn derived_index_proof_rejects_tamper_and_unsafe_inputs() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        write_derived_index_proof(&storage, proof(7, 42, hex::encode([8; 32])), KEY)
+        write_derived_index_proof(&storage, proof(7, 42, hex::encode([8; 32])), KEY, &[])
             .await
             .unwrap();
         let stored = read_latest_derived_index_proof(&storage, "full-text-alpha", KEY)
@@ -563,7 +689,14 @@ mod tests {
         let mut invalid = proof(7, 42, hex::encode([8; 32]));
         invalid.segment_hashes = Vec::new();
         assert!(
-            write_derived_index_proof(&storage, invalid, KEY)
+            write_derived_index_proof(&storage, invalid, KEY, &[])
+                .await
+                .is_err()
+        );
+        let mut oversized = proof(8, 43, hex::encode([8; 32]));
+        oversized.segment_hashes = vec![hex::encode([3; 32]); MAX_DERIVED_INDEX_SEGMENT_HASHES + 1];
+        assert!(
+            write_derived_index_proof(&storage, oversized, KEY, &[])
                 .await
                 .is_err()
         );

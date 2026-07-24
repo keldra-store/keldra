@@ -629,8 +629,8 @@ Index diagnostics are build-time evidence. They tell you which source record cou
 | Field or CLI flag | Behaviour |
 | --- | --- |
 | `bucket_name`, `index_name` | Selects diagnostics for one index. |
-| `after_cursor` / `--after-cursor` | Returns records after this diagnostic cursor. |
-| `limit` / `--limit` | Maximum diagnostics to return. CLI default is 100. |
+| `page.page_token` / `--page-token` | Continues from the opaque token returned by the preceding page. The token is bound to the same caller and diagnostic filter. |
+| `page.page_size` / `--page-size` | Maximum diagnostics to return. CLI default is 100. |
 | `severity` / `--severity` | Optional filter. Supported values are `info`, `warning`, and `error`. |
 
 Each diagnostic record has:
@@ -650,7 +650,7 @@ Each diagnostic record has:
 CLI example:
 
 ```bash
-anvil --profile acme index diagnostics documents by_state --severity error --limit 50
+anvil --profile acme index diagnostics documents by_state --severity error --page-size 50
 ```
 
 That command proves the caller can read index diagnostics and shows recorded failures up to the returned page. It does not rebuild the index, wait for a builder, or prove absence of future diagnostics. Use it alongside index watches and repair/diagnostic workflows described in [Index Operations](/operators/index-operations/) and [Repair and Diagnostics](/operators/repair-and-diagnostics/).

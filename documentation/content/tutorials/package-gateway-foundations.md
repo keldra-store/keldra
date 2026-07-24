@@ -196,7 +196,7 @@ Use diagnostics when rows are missing:
 ```bash
 anvil --profile acme index diagnostics documents package_catalog \
   --severity error \
-  --limit 20
+  --page-size 20
 ```
 
 This proves the caller can read index diagnostics for the bucket and that Anvil can return any matching diagnostic records. For package manifests, common problems are invalid JSON, missing required fields, a JSON Pointer that does not match the manifest shape, or an index segment that has not been built. Diagnostics are evidence, not a repair by themselves.

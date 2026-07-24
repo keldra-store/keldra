@@ -10,6 +10,12 @@ use crate::query_planner::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
+const MAX_OBJECT_LIST_RESULTS: usize = 1_001;
+const MAX_OBJECT_VERSION_RESULTS: usize = 1_000;
+const OBJECT_LIST_SOURCE_PAGE_ROWS: usize = 4_095;
+const OBJECT_LIST_CANDIDATE_MULTIPLIER: usize = 16;
+const MAX_OBJECT_LIST_CANDIDATES: usize = 16_384;
+
 impl ObjectManager {
     pub async fn get_object(
         &self,
@@ -170,11 +176,7 @@ impl ObjectManager {
             {
                 Ok(data_target) => data_target,
                 Err(error) => {
-                    let _ = tx
-                        .send(Err(Status::not_found(format!(
-                            "Object data unavailable: {error}"
-                        ))))
-                        .await;
+                    let _ = tx.send(Err(object_data_read_status(error))).await;
                     return;
                 }
             };
@@ -188,7 +190,7 @@ impl ObjectManager {
                     {
                         Ok(manifest) => manifest,
                         Err(error) => {
-                            let _ = tx.send(Err(Status::not_found(error.to_string()))).await;
+                            let _ = tx.send(Err(object_data_read_status(error))).await;
                             return;
                         }
                     };
@@ -237,7 +239,7 @@ impl ObjectManager {
             match read_result {
                 Ok(()) => {}
                 Err(error) => {
-                    let _ = tx.send(Err(Status::not_found(error.to_string()))).await;
+                    let _ = tx.send(Err(object_data_read_status(error))).await;
                 }
             }
         });
@@ -297,35 +299,6 @@ impl ObjectManager {
             if visibility.defers_write_maintenance() {
                 self.schedule_deferred_object_maintenance(bucket.clone(), object_key);
             }
-            if visibility.requires_watch_visible() {
-                self.publish_object_watch_event(tenant_id, &bucket, &delete_marker, "delete", true)
-                    .await?;
-            } else {
-                let manager = self.clone();
-                let bucket = bucket.clone();
-                let delete_marker = delete_marker.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = manager
-                        .publish_object_watch_event(
-                            tenant_id,
-                            &bucket,
-                            &delete_marker,
-                            "delete",
-                            true,
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            tenant_id,
-                            bucket_id = bucket.id,
-                            bucket_name = %bucket.name,
-                            object_key = %delete_marker.key,
-                            %error,
-                            "deferred object delete watch publication failed"
-                        );
-                    }
-                });
-            }
         }
 
         Ok(delete_marker)
@@ -384,41 +357,6 @@ impl ObjectManager {
         if transaction_id.is_none() {
             if visibility.defers_write_maintenance() {
                 self.schedule_deferred_object_maintenance(bucket.clone(), object_key);
-            }
-            if visibility.requires_watch_visible() {
-                self.publish_object_watch_event(
-                    tenant_id,
-                    &bucket,
-                    &deleted,
-                    "delete_version",
-                    deleted.deleted_at.is_some(),
-                )
-                .await?;
-            } else {
-                let manager = self.clone();
-                let bucket = bucket.clone();
-                let deleted = deleted.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = manager
-                        .publish_object_watch_event(
-                            tenant_id,
-                            &bucket,
-                            &deleted,
-                            "delete_version",
-                            deleted.deleted_at.is_some(),
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            tenant_id,
-                            bucket_id = bucket.id,
-                            bucket_name = %bucket.name,
-                            object_key = %deleted.key,
-                            %error,
-                            "deferred object version delete watch publication failed"
-                        );
-                    }
-                });
             }
         }
 
@@ -745,31 +683,97 @@ impl ObjectManager {
         delimiter: &str,
         consistency: ObjectReadConsistency,
     ) -> Result<(Vec<Object>, Vec<String>), Status> {
-        let mut objects = match consistency.root_generation() {
-            Some(root_generation) => {
-                self.core_store
-                    .list_current_object_metadata_at_generation(bucket, root_generation)
-                    .await
-            }
-            None => self.core_store.list_current_object_metadata(bucket).await,
-        }
-        .map_err(|e| Status::internal(e.to_string()))?;
-        objects.retain(|object| {
-            object.key.starts_with(prefix)
-                && object.key.as_str() > start_after
-                && !validation::is_reserved_internal_key(&object.key)
-                && object.deleted_at.is_none()
-        });
-        objects.sort_by(|left, right| left.key.cmp(&right.key));
-
         let system_revision = self
             .object_listing_authz_revision(consistency)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        let root_generation = consistency
-            .root_generation()
-            .unwrap_or_else(|| object_listing_root_generation(&objects));
+        let authz_revision = i64::try_from(system_revision)
+            .map_err(|_| Status::internal("Invalid system authz revision"))?;
+        let bucket_wide_read = self
+            .bucket_relation_allowed(claims, bucket, "get_object", Some(authz_revision))
+            .await?;
+        let result_limit = object_list_result_limit(limit, MAX_OBJECT_LIST_RESULTS);
+        let candidate_budget = if bucket_wide_read
+            && delimiter.is_empty()
+            && consistency.root_generation().is_none()
+        {
+            result_limit
+        } else {
+            object_listing_candidate_budget(result_limit)
+        };
+        let mut objects = Vec::with_capacity(result_limit);
+        let mut cursor = None;
+        let mut candidates_visited = 0_usize;
+        let mut source_generation = None;
+        loop {
+            let remaining = candidate_budget.saturating_sub(candidates_visited);
+            if remaining == 0 {
+                break;
+            }
+            let source_page_limit = if bucket_wide_read && !delimiter.is_empty() {
+                1
+            } else {
+                remaining.min(OBJECT_LIST_SOURCE_PAGE_ROWS)
+            };
+            let page = self
+                .core_store
+                .list_current_object_metadata_page(
+                    bucket,
+                    prefix,
+                    start_after,
+                    consistency.root_generation(),
+                    cursor.as_ref(),
+                    source_page_limit,
+                )
+                .await
+                .map_err(object_metadata_page_status)?;
+            if source_generation
+                .replace(page.source_generation)
+                .is_some_and(|generation| generation != page.source_generation)
+            {
+                return Err(Status::failed_precondition(
+                    "ObjectMetadataPageCursorSourceMismatch",
+                ));
+            }
+            candidates_visited = candidates_visited.saturating_add(page.candidates_visited);
+            let skipped_common_prefix = if bucket_wide_read && !delimiter.is_empty() {
+                page.objects
+                    .first()
+                    .and_then(|object| object_listing_common_prefix(&object.key, prefix, delimiter))
+            } else {
+                None
+            };
+            objects.extend(page.objects.into_iter().filter(|object| {
+                !validation::is_reserved_internal_key(&object.key) && object.deleted_at.is_none()
+            }));
+            cursor = page.next_cursor;
+            if let (Some(cursor_value), Some(common_prefix)) =
+                (cursor.as_ref(), skipped_common_prefix.as_deref())
+            {
+                cursor = Some(
+                    cursor_value
+                        .after_current_prefix(bucket, common_prefix)
+                        .map_err(object_metadata_page_status)?,
+                );
+            }
+            let page_is_full = if delimiter.is_empty() {
+                objects.len() >= result_limit
+            } else {
+                object_listing_distinct_entry_count(&objects, prefix, delimiter, result_limit)
+                    >= result_limit
+            };
+            if cursor.is_none() || (bucket_wide_read && page_is_full) {
+                break;
+            }
+        }
+
+        let root_generation =
+            source_generation.unwrap_or_else(|| consistency.root_generation().unwrap_or_default());
         let docs = object_listing_docs(bucket, objects, "object-list-current");
+        let planner_limit = u32::try_from(result_limit)
+            .map_err(|_| Status::internal("Object listing limit exceeds u32"))?;
+        let shape_limit = i32::try_from(result_limit)
+            .map_err(|_| Status::internal("Object listing limit exceeds i32"))?;
         let plan = self
             .execute_object_listing_plan(
                 claims,
@@ -781,11 +785,26 @@ impl ObjectManager {
                 prefix,
                 start_after,
                 delimiter,
-                normalized_list_limit(limit) as u32,
+                planner_limit,
             )
             .await?;
         let objects = object_listing_objects_from_plan(&plan);
-        Ok(shape_object_listing(objects, prefix, delimiter, limit))
+        let visible_entry_count = if delimiter.is_empty() {
+            objects.len()
+        } else {
+            object_listing_distinct_entry_count(&objects, prefix, delimiter, result_limit)
+        };
+        if cursor.is_some() && visible_entry_count < result_limit {
+            return Err(Status::resource_exhausted(
+                "ObjectListingCandidateBudgetExceeded",
+            ));
+        }
+        Ok(shape_object_listing(
+            objects,
+            prefix,
+            delimiter,
+            shape_limit,
+        ))
     }
 
     pub async fn list_object_versions(
@@ -852,46 +871,70 @@ impl ObjectManager {
         let reader_claims = self
             .authorized_bucket_reader_claims(claims.as_ref(), &bucket, consistency.authz_revision())
             .await?;
-        let unbounded_limit = i32::MAX;
-        let page = match consistency.root_generation() {
-            Some(root_generation) => {
-                self.core_store
-                    .list_object_versions_metadata_at_generation(
-                        &bucket,
-                        prefix,
-                        key_marker,
-                        version_id_marker,
-                        unbounded_limit,
-                        root_generation,
-                    )
-                    .await
-            }
-            None => {
-                self.core_store
-                    .list_object_versions_metadata(
-                        &bucket,
-                        prefix,
-                        key_marker,
-                        version_id_marker,
-                        unbounded_limit,
-                    )
-                    .await
-            }
-        }
-        .map_err(|e| Status::internal(e.to_string()))?;
-        let versions = page
-            .versions
-            .into_iter()
-            .filter(|version| !validation::is_reserved_internal_key(&version.object.key))
-            .collect::<Vec<_>>();
         let system_revision = self
             .object_listing_authz_revision(consistency)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        let root_generation = consistency
-            .root_generation()
-            .unwrap_or_else(|| object_version_listing_root_generation(&versions));
+        let authz_revision = i64::try_from(system_revision)
+            .map_err(|_| Status::internal("Invalid system authz revision"))?;
+        let bucket_wide_read = self
+            .bucket_relation_allowed(&reader_claims, &bucket, "get_object", Some(authz_revision))
+            .await?;
+        let result_limit = object_list_result_limit(limit, MAX_OBJECT_VERSION_RESULTS);
+        let plan_limit = result_limit.saturating_add(1);
+        let candidate_budget = if bucket_wide_read && consistency.root_generation().is_none() {
+            plan_limit
+        } else {
+            object_listing_candidate_budget(plan_limit)
+        };
+        let mut versions = Vec::with_capacity(plan_limit);
+        let mut cursor = None;
+        let mut candidates_visited = 0_usize;
+        let mut source_generation = None;
+        loop {
+            let remaining = candidate_budget.saturating_sub(candidates_visited);
+            if remaining == 0 {
+                break;
+            }
+            let page = self
+                .core_store
+                .list_object_versions_metadata_page(
+                    &bucket,
+                    prefix,
+                    key_marker,
+                    version_id_marker,
+                    consistency.root_generation(),
+                    cursor.as_ref(),
+                    remaining.min(OBJECT_LIST_SOURCE_PAGE_ROWS),
+                )
+                .await
+                .map_err(object_metadata_page_status)?;
+            if source_generation
+                .replace(page.source_generation)
+                .is_some_and(|generation| generation != page.source_generation)
+            {
+                return Err(Status::failed_precondition(
+                    "ObjectMetadataPageCursorSourceMismatch",
+                ));
+            }
+            candidates_visited = candidates_visited.saturating_add(page.candidates_visited);
+            versions.extend(
+                page.versions
+                    .into_iter()
+                    .filter(|version| !validation::is_reserved_internal_key(&version.object.key)),
+            );
+            cursor = page.next_cursor;
+            if cursor.is_none() || (bucket_wide_read && versions.len() >= plan_limit) {
+                break;
+            }
+        }
+        let root_generation =
+            source_generation.unwrap_or_else(|| consistency.root_generation().unwrap_or_default());
         let docs = object_version_listing_docs(&bucket, versions, "object-list-versions");
+        let planner_limit = u32::try_from(plan_limit)
+            .map_err(|_| Status::internal("Object version listing limit exceeds u32"))?;
+        let shape_limit = i32::try_from(result_limit)
+            .map_err(|_| Status::internal("Object version listing limit exceeds i32"))?;
         let plan = self
             .execute_object_listing_plan(
                 &reader_claims,
@@ -907,14 +950,16 @@ impl ObjectManager {
                     .map(uuid::Uuid::to_string)
                     .as_deref()
                     .unwrap_or(""),
-                normalized_list_limit(limit).saturating_add(1) as u32,
+                planner_limit,
             )
             .await?;
+        if cursor.is_some() && plan.docs.len() < plan_limit {
+            return Err(Status::resource_exhausted(
+                "ObjectListingCandidateBudgetExceeded",
+            ));
+        }
         let versions = object_listing_versions_from_plan(&plan);
-        Ok(shape_object_version_listing(
-            versions,
-            normalized_list_limit(limit),
-        ))
+        Ok(shape_object_version_listing(versions, shape_limit))
     }
 
     async fn object_listing_authz_revision(
@@ -1093,6 +1138,38 @@ impl ObjectManager {
             .map_err(|e| Status::internal(e.to_string()))
     }
 
+    pub(crate) async fn object_mutation_precondition_snapshot(
+        &self,
+        claims: &auth::Claims,
+        bucket_name: &str,
+        object_key: &str,
+        action: AnvilAction,
+        explicit_transaction: Option<&CoreTransaction>,
+    ) -> Result<ObjectMutationPreconditionSnapshot, Status> {
+        // Reuse the public mutation authorization path, then capture the exact
+        // metadata row that must remain unchanged until transaction publication.
+        self.current_object_for_mutation_precondition(claims, bucket_name, object_key, action)
+            .await?;
+        let bucket = self
+            .get_tenant_bucket(claims.tenant_id, bucket_name)
+            .await?;
+        let transaction = explicit_transaction.filter(|transaction| {
+            transaction.root_anchor_key
+                == hex::encode(crate::metadata_journal::object_metadata_partition_id(
+                    bucket.tenant_id,
+                    bucket.id,
+                ))
+        });
+        let snapshot = self
+            .core_store
+            .object_metadata_precondition_snapshot(&bucket, object_key, transaction)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        Ok(ObjectMutationPreconditionSnapshot {
+            object: snapshot.object,
+            precondition: snapshot.precondition,
+        })
+    }
+
     pub async fn copy_object(
         &self,
         claims: auth::Claims,
@@ -1121,7 +1198,7 @@ impl ObjectManager {
 
         let copied = self
             .persistence
-            .create_object_with_storage_class(
+            .create_object_with_storage_class_with_options(
                 claims.tenant_id,
                 destination_bucket.id,
                 destination_object_key,
@@ -1135,20 +1212,10 @@ impl ObjectManager {
                 transaction_id,
                 Some(transaction_principal.as_str()),
                 source_object.storage_class,
+                crate::persistence::ObjectCreateOptions::copy(),
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        if transaction_id.is_none() {
-            self.publish_object_watch_event(
-                claims.tenant_id,
-                &destination_bucket,
-                &copied,
-                "copy",
-                false,
-            )
-            .await?;
-        }
-
         Ok(copied)
     }
 
@@ -1559,7 +1626,7 @@ impl ObjectManager {
         Err(Status::permission_denied("Permission denied"))
     }
 
-    pub(crate) async fn publish_object_watch_event(
+    pub(crate) async fn verify_committed_object_watch_event(
         &self,
         tenant_id: i64,
         bucket: &Bucket,
@@ -1567,24 +1634,27 @@ impl ObjectManager {
         event_type: &str,
         is_delete_marker: bool,
     ) -> Result<(), Status> {
-        let mut event = self
-            .persistence
-            .create_object_watch_event(
-                tenant_id,
-                bucket.id,
-                &bucket.name,
-                object,
-                event_type,
-                is_delete_marker,
-            )
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let receipt = watch_log::append_object_watch_record(&self.storage, bucket, object, &event)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        event.id = i64::try_from(receipt.sequence)
+        let event = crate::persistence::ObjectWatchEvent {
+            id: 0,
+            tenant_id,
+            bucket_id: bucket.id,
+            bucket_name: bucket.name.clone(),
+            key: object.key.clone(),
+            event_type: event_type.to_string(),
+            version_id: Some(object.version_id),
+            mutation_id: object.mutation_id,
+            payload_hash: object.content_hash.clone(),
+            etag: Some(object.etag.clone()),
+            size: object.size,
+            is_delete_marker,
+            created_at: object.created_at,
+        };
+        let receipt =
+            watch_log::committed_object_watch_receipt(&self.storage, bucket, object, &event)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+        i64::try_from(receipt.sequence)
             .map_err(|_| Status::internal("object watch cursor exceeds i64"))?;
-        let _ = self.watch_tx.send(event);
         Ok(())
     }
 
@@ -1670,6 +1740,66 @@ impl ObjectManager {
         }
 
         Ok(bucket)
+    }
+}
+
+fn object_data_read_status(error: anyhow::Error) -> Status {
+    crate::services::core_store_status::availability_status(&error)
+        .unwrap_or_else(|| Status::internal(format!("Object data unavailable: {error}")))
+}
+
+fn object_list_result_limit(limit: i32, maximum: usize) -> usize {
+    usize::try_from(normalized_list_limit(limit))
+        .unwrap_or(maximum)
+        .clamp(1, maximum)
+}
+
+fn object_listing_candidate_budget(result_limit: usize) -> usize {
+    result_limit
+        .saturating_mul(OBJECT_LIST_CANDIDATE_MULTIPLIER)
+        .saturating_add(1)
+        .clamp(result_limit, MAX_OBJECT_LIST_CANDIDATES)
+}
+
+fn object_listing_distinct_entry_count(
+    objects: &[Object],
+    prefix: &str,
+    delimiter: &str,
+    stop_at: usize,
+) -> usize {
+    let mut entries = BTreeSet::new();
+    for object in objects {
+        let entry = object_listing_common_prefix(&object.key, prefix, delimiter)
+            .unwrap_or_else(|| object.key.clone());
+        entries.insert(entry);
+        if entries.len() >= stop_at {
+            break;
+        }
+    }
+    entries.len()
+}
+
+fn object_listing_common_prefix(key: &str, prefix: &str, delimiter: &str) -> Option<String> {
+    if delimiter.is_empty() {
+        return None;
+    }
+    let suffix = key.strip_prefix(prefix)?;
+    let position = suffix.find(delimiter)?;
+    Some(format!(
+        "{}{}",
+        prefix,
+        &suffix[..position + delimiter.len()]
+    ))
+}
+
+fn object_metadata_page_status(error: anyhow::Error) -> Status {
+    let message = error.to_string();
+    if message.contains("ObjectMetadataSourceChanged")
+        || message.contains("ObjectMetadataPageCursorSourceMismatch")
+    {
+        Status::failed_precondition(message)
+    } else {
+        Status::internal(message)
     }
 }
 

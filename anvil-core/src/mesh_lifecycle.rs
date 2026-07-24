@@ -1,33 +1,51 @@
 use crate::core_store::{
     CF_MESH, CoreMetaTuplePart, CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
-    CoreStore, CoreTransaction, CoreTransactionUpdate, TABLE_MESH_NODE_ROW,
-    TABLE_MESH_PARTITION_ROW, core_meta_payload_digest, core_meta_tuple_key,
+    CoreMutationRootPublication, CoreStore, CoreTransaction, CoreTransactionUpdate,
+    TABLE_MESH_NODE_ROW, TABLE_MESH_PARTITION_ROW, core_meta_payload_digest,
+    core_meta_record_tuple_key, core_meta_tuple_key,
 };
+use crate::formats::writer::WriterFamily;
 use crate::mesh_control_stream::{
     ControlMutationHeaderInput, ControlRecordDigest, ControlStreamFrame, ControlStreamSequence,
-    read_control_checkpoint, read_control_stream_log,
+    read_control_checkpoint,
 };
-use crate::mesh_directory::{self, BucketLocatorStatus};
+use crate::mesh_directory::{self, BucketLocatorDescriptor, BucketLocatorStatus};
 use crate::partition_fence::{self, PartitionWritePermit};
 use crate::routing::{self, HostAliasDescriptor, HostAliasState, RoutingConfig};
 use crate::storage::Storage;
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 mod bootstrap;
+mod cell;
 mod host_alias;
+mod node;
+mod portable_snapshot;
 mod record_proto;
+mod region;
+mod topology_activation;
+mod topology_mutation;
 pub use bootstrap::{BootstrapMeshLifecycleProjection, install_bootstrap_lifecycle_projection};
+pub use cell::*;
 pub use host_alias::{
     create_host_alias, create_host_alias_in_transaction, list_host_aliases, transition_host_alias,
     transition_host_alias_in_transaction,
+};
+pub use node::*;
+pub(crate) use portable_snapshot::validate_portable_lifecycle_topology_snapshot;
+pub use region::*;
+pub(crate) use topology_activation::is_synthetic_control_node_id;
+pub use topology_activation::{
+    CANONICAL_METADATA_QUORUM_PROFILE, CANONICAL_TOPOLOGY_ACTIVATION_SCHEMA,
+    CanonicalTopologyActivation,
 };
 
 pub const REGION_DESCRIPTOR_SCHEMA: &str = "anvil.mesh.region.v1";
 pub const CELL_DESCRIPTOR_SCHEMA: &str = "anvil.mesh.cell.v1";
 pub const NODE_DESCRIPTOR_SCHEMA: &str = "anvil.mesh.node.v1";
+pub const LIFECYCLE_TOPOLOGY_HEAD_SCHEMA: &str = "anvil.mesh.lifecycle_topology_head.v1";
 pub const ACTIVATION_CHECKPOINT_SCHEMA: &str = "anvil.mesh.activation_checkpoint.v1";
 pub const BUCKET_DRAIN_EXCEPTION_SCHEMA: &str = "anvil.mesh.bucket_drain_exception.v1";
 pub const REGION_DESCRIPTOR_STREAM_FAMILY: &str = "region_descriptor";
@@ -35,6 +53,9 @@ pub const CELL_DESCRIPTOR_STREAM_FAMILY: &str = "cell_descriptor";
 pub const NODE_DESCRIPTOR_STREAM_FAMILY: &str = "node_descriptor";
 const CONTROL_MUTATION_SCHEMA: &str = "anvil.mesh.control_mutation.v1";
 const MESH_LIFECYCLE_PROJECTION_PARTITION_ID: &str = "mesh-lifecycle-projection";
+pub(crate) const LIFECYCLE_TOPOLOGY_ROOT_ANCHOR_KEY: &str = "mesh/lifecycle/topology";
+const LIFECYCLE_PROJECTION_PAGE_SIZE: usize = 256;
+const MAX_LIFECYCLE_PROJECTION_ROWS_PER_TABLE: usize = 8_192;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MeshLifecycleCommittedResource {
@@ -164,10 +185,8 @@ pub struct NodeDescriptor {
     pub node_id: String,
     pub region: String,
     pub cell_id: String,
-    pub libp2p_peer_id: String,
-    pub receipt_signing_public_key_proto: Vec<u8>,
+    pub receipt_signing_public_key: Vec<u8>,
     pub public_api_addr: String,
-    pub public_cluster_addrs: Vec<String>,
     pub capabilities: Vec<NodeCapability>,
     pub capacity_json_hash: String,
     pub state: LifecycleState,
@@ -232,10 +251,8 @@ pub struct RegisterNodeDescriptor {
     pub node_id: String,
     pub region: String,
     pub cell_id: String,
-    pub libp2p_peer_id: String,
-    pub receipt_signing_public_key_proto: Vec<u8>,
+    pub receipt_signing_public_key: Vec<u8>,
     pub public_api_addr: String,
-    pub public_cluster_addrs: Vec<String>,
     pub capabilities: Vec<NodeCapability>,
     pub capacity_json: String,
 }
@@ -295,6 +312,14 @@ pub struct LifecycleControlWriteAuthority<'a> {
     pub signing_key: &'a [u8],
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LifecycleTopologyHead {
+    pub schema: String,
+    pub mesh_id: String,
+    pub topology_hash: String,
+    pub generation: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MeshLifecycleState {
     pub regions: BTreeMap<String, RegionDescriptor>,
@@ -304,6 +329,10 @@ pub struct MeshLifecycleState {
     pub host_aliases: BTreeMap<String, HostAliasDescriptor>,
     #[serde(default)]
     pub bucket_drain_exceptions: BTreeMap<String, BucketDrainExceptionDescriptor>,
+    #[serde(default)]
+    pub canonical_topology_activation: Option<CanonicalTopologyActivation>,
+    #[serde(default)]
+    pub topology_head: Option<LifecycleTopologyHead>,
 }
 
 pub async fn read_state(storage: &Storage) -> LifecycleResult<MeshLifecycleState> {
@@ -348,10 +377,45 @@ async fn read_state_for_transaction(
     Ok(state)
 }
 
+async fn lifecycle_transaction_timestamp(
+    storage: &Storage,
+    transaction_id: &str,
+    principal: &str,
+) -> LifecycleResult<String> {
+    let store = CoreStore::new(storage.clone()).await?;
+    let transaction = store
+        .read_explicit_transaction_for_principal(transaction_id, principal)
+        .await?;
+    let seconds =
+        i64::try_from(transaction.created_at_unix_nanos / 1_000_000_000).map_err(|_| {
+            LifecycleError::InvalidArgument(
+                "lifecycle transaction timestamp exceeds the supported range".to_string(),
+            )
+        })?;
+    let nanos = (transaction.created_at_unix_nanos % 1_000_000_000) as u32;
+    let timestamp = DateTime::<Utc>::from_timestamp(seconds, nanos).ok_or_else(|| {
+        LifecycleError::InvalidArgument(
+            "lifecycle transaction timestamp exceeds the supported range".to_string(),
+        )
+    })?;
+    Ok(timestamp.to_rfc3339_opts(SecondsFormat::Millis, true))
+}
+
 async fn write_state(storage: &Storage, state: &MeshLifecycleState) -> LifecycleResult<()> {
     let store = CoreStore::new(storage.clone()).await?;
+    let existing_state = read_lifecycle_state_projection_with_core_store(&store)?;
+    let existing_activation = existing_state.canonical_topology_activation.as_ref();
+    ensure_canonical_topology_activation_is_preserved(
+        existing_activation,
+        state.canonical_topology_activation.as_ref(),
+    )?;
+    ensure_topology_head_is_preserved(
+        existing_state.topology_head.as_ref(),
+        state.topology_head.as_ref(),
+    )?;
     let rows = encode_lifecycle_projection_rows(state)?;
     let mut desired_keys = BTreeSet::new();
+    let mut data_roots = BTreeSet::new();
     let mut preconditions = Vec::with_capacity(rows.len());
     let mut operations = Vec::with_capacity(rows.len());
     for row in rows {
@@ -359,6 +423,13 @@ async fn write_state(storage: &Storage, state: &MeshLifecycleState) -> Lifecycle
         let tuple_key = lifecycle_projection_row_key(row.kind, &row.record_key)?;
         desired_keys.insert((table_id, tuple_key.clone()));
         let current = store.read_coremeta_row(CF_MESH, table_id, &tuple_key)?;
+        if current.as_deref() == Some(row.payload.as_slice()) {
+            continue;
+        }
+        data_roots.insert(lifecycle_projection_root_anchor_key(
+            row.kind,
+            &row.record_key,
+        ));
         preconditions.push(CoreMutationPrecondition::CoreMetaRow {
             cf: CF_MESH.to_string(),
             table_id,
@@ -379,13 +450,14 @@ async fn write_state(storage: &Storage, state: &MeshLifecycleState) -> Lifecycle
     }
     let prefix = lifecycle_projection_row_prefix()?;
     for table_id in [TABLE_MESH_PARTITION_ROW, TABLE_MESH_NODE_ROW] {
-        for row in store.scan_coremeta_prefix(CF_MESH, table_id, &prefix)? {
+        for row in scan_lifecycle_projection_rows(&store, table_id, &prefix)? {
             let projection = record_proto::decode_lifecycle_projection_row(&row.payload)?;
             let (kind, record_key) = lifecycle_projection_descriptor_key(&projection)?;
             let tuple_key = lifecycle_projection_row_key(kind, &record_key)?;
             if desired_keys.contains(&(table_id, tuple_key.clone())) {
                 continue;
             }
+            data_roots.insert(lifecycle_projection_root_anchor_key(kind, &record_key));
             preconditions.push(CoreMutationPrecondition::CoreMetaRow {
                 cf: CF_MESH.to_string(),
                 table_id,
@@ -405,11 +477,14 @@ async fn write_state(storage: &Storage, state: &MeshLifecycleState) -> Lifecycle
     if operations.is_empty() {
         return Ok(());
     }
+    let root_publications =
+        lifecycle_projection_root_publications(MESH_LIFECYCLE_PROJECTION_PARTITION_ID, data_roots);
     store
         .commit_mutation_batch(CoreMutationBatch {
             transaction_id: format!("mesh-lifecycle-projection:{}", uuid::Uuid::new_v4()),
             scope_partition: MESH_LIFECYCLE_PROJECTION_PARTITION_ID.to_string(),
             committed_by_principal: "mesh-lifecycle".to_string(),
+            root_publications,
             preconditions,
             operations,
         })
@@ -428,24 +503,65 @@ fn read_lifecycle_state_projection_with_core_store(
     let mut state = MeshLifecycleState::default();
     for table_id in [TABLE_MESH_PARTITION_ROW, TABLE_MESH_NODE_ROW] {
         let prefix = lifecycle_projection_row_prefix()?;
-        for row in store.scan_coremeta_prefix(CF_MESH, table_id, &prefix)? {
+        for row in scan_lifecycle_projection_rows(store, table_id, &prefix)? {
             apply_lifecycle_projection_row(&mut state, table_id, &row.payload)?;
         }
     }
     Ok(state)
 }
 
+pub(crate) fn canonical_topology_activation_with_core_store(
+    store: &CoreStore,
+) -> LifecycleResult<Option<CanonicalTopologyActivation>> {
+    Ok(read_lifecycle_state_projection_with_core_store(store)?.canonical_topology_activation)
+}
+
+fn ensure_canonical_topology_activation_is_preserved(
+    existing: Option<&CanonicalTopologyActivation>,
+    candidate: Option<&CanonicalTopologyActivation>,
+) -> LifecycleResult<()> {
+    if let Some(existing) = existing
+        && candidate != Some(existing)
+    {
+        return Err(LifecycleError::InvalidArgument(
+            "canonical topology activation evidence cannot be replaced or removed".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_topology_head_is_preserved(
+    existing: Option<&LifecycleTopologyHead>,
+    candidate: Option<&LifecycleTopologyHead>,
+) -> LifecycleResult<()> {
+    if existing != candidate {
+        return Err(LifecycleError::InvalidArgument(
+            "generic lifecycle projection writes cannot replace, remove, or advance the topology head"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 async fn delete_lifecycle_state_projection(storage: &Storage) -> LifecycleResult<()> {
     let store = CoreStore::new(storage.clone()).await?;
+    if canonical_topology_activation_with_core_store(&store)?.is_some() {
+        return Err(LifecycleError::InvalidArgument(
+            "lifecycle test cleanup cannot remove canonical topology activation evidence"
+                .to_string(),
+        ));
+    }
     let prefix = lifecycle_projection_row_prefix()?;
+    let mut data_roots = BTreeSet::new();
     let mut preconditions = Vec::new();
     let mut operations = Vec::new();
     for table_id in [TABLE_MESH_PARTITION_ROW, TABLE_MESH_NODE_ROW] {
-        for row in store.scan_coremeta_prefix(CF_MESH, table_id, &prefix)? {
+        for row in scan_lifecycle_projection_rows(&store, table_id, &prefix)? {
             let projection = record_proto::decode_lifecycle_projection_row(&row.payload)?;
             let (kind, record_key) = lifecycle_projection_descriptor_key(&projection)?;
             let tuple_key = lifecycle_projection_row_key(kind, &record_key)?;
+            data_roots.insert(lifecycle_projection_root_anchor_key(kind, &record_key));
             preconditions.push(CoreMutationPrecondition::CoreMetaRow {
                 cf: CF_MESH.to_string(),
                 table_id,
@@ -465,16 +581,72 @@ async fn delete_lifecycle_state_projection(storage: &Storage) -> LifecycleResult
     if operations.is_empty() {
         return Ok(());
     }
+    let root_publications =
+        lifecycle_projection_root_publications(MESH_LIFECYCLE_PROJECTION_PARTITION_ID, data_roots);
     store
         .commit_mutation_batch(CoreMutationBatch {
             transaction_id: format!("mesh-lifecycle-projection-delete:{}", uuid::Uuid::new_v4()),
             scope_partition: MESH_LIFECYCLE_PROJECTION_PARTITION_ID.to_string(),
             committed_by_principal: "mesh-lifecycle-test".to_string(),
+            root_publications,
             preconditions,
             operations,
         })
         .await?;
     Ok(())
+}
+
+fn scan_lifecycle_projection_rows(
+    store: &CoreStore,
+    table_id: u16,
+    prefix: &[u8],
+) -> LifecycleResult<Vec<crate::core_store::CoreMetaRecord>> {
+    let mut rows = Vec::new();
+    let mut cursor: Option<Vec<u8>> = None;
+    loop {
+        let page = store.scan_coremeta_prefix_page(
+            CF_MESH,
+            table_id,
+            prefix,
+            cursor.as_deref(),
+            LIFECYCLE_PROJECTION_PAGE_SIZE,
+        )?;
+        if rows.len().saturating_add(page.len()) > MAX_LIFECYCLE_PROJECTION_ROWS_PER_TABLE {
+            return Err(LifecycleError::InvalidArgument(format!(
+                "mesh lifecycle projection table {table_id:#06x} exceeds the {} row safety limit",
+                MAX_LIFECYCLE_PROJECTION_ROWS_PER_TABLE
+            )));
+        }
+        if page.is_empty() {
+            break;
+        }
+        let next_cursor = core_meta_record_tuple_key(
+            &page
+                .last()
+                .ok_or_else(|| {
+                    LifecycleError::InvalidArgument(
+                        "mesh lifecycle page lost its final row".to_string(),
+                    )
+                })?
+                .key,
+        )?
+        .to_vec();
+        if cursor
+            .as_ref()
+            .is_some_and(|current| current.as_slice() >= next_cursor.as_slice())
+        {
+            return Err(LifecycleError::InvalidArgument(
+                "mesh lifecycle projection cursor did not advance".to_string(),
+            ));
+        }
+        let page_is_full = page.len() == LIFECYCLE_PROJECTION_PAGE_SIZE;
+        rows.extend(page);
+        if !page_is_full {
+            break;
+        }
+        cursor = Some(next_cursor);
+    }
+    Ok(rows)
 }
 
 fn encode_lifecycle_projection_rows(
@@ -498,6 +670,14 @@ fn encode_lifecycle_projection_rows(
             descriptor,
         )?);
     }
+    if let Some(activation) = state.canonical_topology_activation.as_ref() {
+        rows.push(record_proto::encode_topology_activation_projection_row(
+            activation,
+        )?);
+    }
+    if let Some(head) = state.topology_head.as_ref() {
+        rows.push(record_proto::encode_topology_head_projection_row(head)?);
+    }
     Ok(rows)
 }
 
@@ -507,9 +687,9 @@ fn lifecycle_projection_table_id(kind: &str) -> LifecycleResult<u16> {
         record_proto::LIFECYCLE_PROJECTION_REGION_KIND
         | record_proto::LIFECYCLE_PROJECTION_CELL_KIND
         | record_proto::LIFECYCLE_PROJECTION_HOST_ALIAS_KIND
-        | record_proto::LIFECYCLE_PROJECTION_BUCKET_DRAIN_EXCEPTION_KIND => {
-            Ok(TABLE_MESH_PARTITION_ROW)
-        }
+        | record_proto::LIFECYCLE_PROJECTION_BUCKET_DRAIN_EXCEPTION_KIND
+        | record_proto::LIFECYCLE_PROJECTION_TOPOLOGY_ACTIVATION_KIND
+        | record_proto::LIFECYCLE_PROJECTION_TOPOLOGY_HEAD_KIND => Ok(TABLE_MESH_PARTITION_ROW),
         _ => Err(LifecycleError::InvalidArgument(format!(
             "unknown mesh lifecycle projection kind {kind}"
         ))),
@@ -532,6 +712,35 @@ fn lifecycle_projection_row_key(kind: &str, record_key: &str) -> LifecycleResult
         CoreMetaTuplePart::Utf8(kind),
         CoreMetaTuplePart::Utf8(record_key),
     ])?)
+}
+
+fn lifecycle_projection_root_anchor_key(kind: &str, record_key: &str) -> String {
+    record_proto::projection_root_anchor_key(kind, record_key)
+}
+
+fn lifecycle_projection_root_publications(
+    coordinator_root: &str,
+    mut data_roots: BTreeSet<String>,
+) -> Vec<CoreMutationRootPublication> {
+    let coordinator_is_data_root = data_roots.remove(coordinator_root);
+    let coordinator = if coordinator_is_data_root {
+        CoreMutationRootPublication {
+            root_anchor_key: coordinator_root.to_string(),
+            writer_families: vec![
+                WriterFamily::CoreControl.as_str().to_string(),
+                WriterFamily::MeshControl.as_str().to_string(),
+            ],
+            transaction_coordinator: true,
+        }
+    } else {
+        CoreMutationRootPublication::new(coordinator_root, WriterFamily::CoreControl.as_str())
+            .coordinator()
+    };
+    std::iter::once(coordinator)
+        .chain(data_roots.into_iter().map(|root_anchor_key| {
+            CoreMutationRootPublication::new(root_anchor_key, WriterFamily::MeshControl.as_str())
+        }))
+        .collect()
 }
 
 async fn stage_lifecycle_projection_row_in_transaction(
@@ -654,6 +863,31 @@ fn apply_lifecycle_projection_row(
             );
             state.bucket_drain_exceptions.insert(key, descriptor);
         }
+        record_proto::LifecycleProjectionDescriptor::TopologyActivation(activation) => {
+            ensure_lifecycle_projection_table(
+                table_id,
+                record_proto::LIFECYCLE_PROJECTION_TOPOLOGY_ACTIVATION_KIND,
+            )?;
+            if let Some(existing) = state.canonical_topology_activation.as_ref()
+                && existing != &activation
+            {
+                return Err(LifecycleError::InvalidArgument(
+                    "canonical topology activation evidence is immutable".to_string(),
+                ));
+            }
+            state.canonical_topology_activation = Some(activation);
+        }
+        record_proto::LifecycleProjectionDescriptor::TopologyHead(head) => {
+            if let Some(existing) = state.topology_head.as_ref()
+                && existing.generation >= head.generation
+                && existing != &head
+            {
+                return Err(LifecycleError::InvalidArgument(
+                    "lifecycle topology head generation did not advance monotonically".to_string(),
+                ));
+            }
+            state.topology_head = Some(head);
+        }
     }
     Ok(())
 }
@@ -703,7 +937,9 @@ pub fn committed_topology_resources_from_transaction(
                 nodes.insert((descriptor.region, descriptor.cell_id, descriptor.node_id));
             }
             record_proto::LifecycleProjectionDescriptor::HostAlias(_)
-            | record_proto::LifecycleProjectionDescriptor::BucketDrainException(_) => {}
+            | record_proto::LifecycleProjectionDescriptor::BucketDrainException(_)
+            | record_proto::LifecycleProjectionDescriptor::TopologyActivation(_)
+            | record_proto::LifecycleProjectionDescriptor::TopologyHead(_) => {}
         }
     }
 
@@ -765,6 +1001,14 @@ fn lifecycle_projection_descriptor_key(
                 &descriptor.bucket_name,
             ),
         )),
+        record_proto::LifecycleProjectionDescriptor::TopologyActivation(activation) => Ok((
+            record_proto::LIFECYCLE_PROJECTION_TOPOLOGY_ACTIVATION_KIND,
+            activation.mesh_id.clone(),
+        )),
+        record_proto::LifecycleProjectionDescriptor::TopologyHead(head) => Ok((
+            record_proto::LIFECYCLE_PROJECTION_TOPOLOGY_HEAD_KIND,
+            head.mesh_id.clone(),
+        )),
     }
 }
 
@@ -778,31 +1022,55 @@ async fn overlay_lifecycle_control_streams(
 
 async fn overlay_lifecycle_control_streams_with_store(
     storage: &Storage,
-    store: &CoreStore,
+    _store: &CoreStore,
     state: &mut MeshLifecycleState,
 ) -> LifecycleResult<()> {
     for stream_family in lifecycle_control_stream_families() {
-        for partition in crate::mesh_control_stream::list_control_stream_partitions_with_store(
-            store,
-            stream_family,
-        )
-        .await
-        .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?
-        {
-            let log = read_control_stream_log(storage, stream_family, &partition).await.map_err(|err| {
-                LifecycleError::InvalidArgument(format!(
-                    "could not replay lifecycle control stream {stream_family}/{partition}: {err}"
-                ))
-            })?;
-            for record in log.records {
-                apply_lifecycle_control_frame(
-                    state,
-                    stream_family,
-                    &partition,
-                    &record.frame.header_proto,
-                    &record.frame.payload_proto,
-                )?;
+        let mut partition_cursor = None;
+        loop {
+            let partition_page = crate::mesh_control_stream::list_control_stream_partitions_page(
+                storage,
+                stream_family,
+                partition_cursor.as_deref(),
+                256,
+            )
+            .await
+            .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?;
+            for partition in partition_page.partitions {
+                let mut record_cursor = None;
+                loop {
+                    let page = crate::mesh_control_stream::list_current_control_stream_records_page(
+                        storage,
+                        stream_family,
+                        &partition,
+                        record_cursor.as_deref(),
+                        512,
+                    )
+                    .await
+                    .map_err(|err| {
+                        LifecycleError::InvalidArgument(format!(
+                            "could not read current lifecycle control records {stream_family}/{partition}: {err}"
+                        ))
+                    })?;
+                    for current in page.records {
+                        apply_lifecycle_control_frame(
+                            state,
+                            stream_family,
+                            &partition,
+                            &current.frame.header_proto,
+                            &current.frame.payload_proto,
+                        )?;
+                    }
+                    let Some(next) = page.next_stream_id else {
+                        break;
+                    };
+                    record_cursor = Some(next);
+                }
             }
+            let Some(next) = partition_page.next_stream_id else {
+                break;
+            };
+            partition_cursor = Some(next);
         }
     }
     Ok(())
@@ -892,974 +1160,6 @@ fn remove_lifecycle_projection(
         }
     }
     Ok(())
-}
-
-pub async fn create_region(
-    storage: &Storage,
-    input: CreateRegionDescriptor,
-) -> LifecycleResult<RegionDescriptor> {
-    create_region_inner(storage, input, None).await
-}
-
-pub async fn create_region_with_control(
-    storage: &Storage,
-    input: CreateRegionDescriptor,
-    authority: LifecycleControlWriteAuthority<'_>,
-) -> LifecycleResult<RegionDescriptor> {
-    create_region_inner(storage, input, Some(authority)).await
-}
-
-async fn create_region_inner(
-    storage: &Storage,
-    input: CreateRegionDescriptor,
-    authority: Option<LifecycleControlWriteAuthority<'_>>,
-) -> LifecycleResult<RegionDescriptor> {
-    require_identifier(&input.mesh_id, "mesh id")?;
-    require_identifier(&input.region, "region")?;
-    require_nonempty(&input.virtual_host_suffix, "virtual host suffix")?;
-    if let Some(default_cell) = &input.default_cell {
-        require_identifier(default_cell, "default cell")?;
-    }
-
-    let mut state = read_state(storage).await?;
-    if state.regions.contains_key(&input.region) {
-        return Err(LifecycleError::AlreadyExists {
-            resource_kind: "region",
-            resource_id: input.region,
-        });
-    }
-
-    let now = timestamp_now();
-    let descriptor = RegionDescriptor {
-        schema: REGION_DESCRIPTOR_SCHEMA.to_string(),
-        mesh_id: input.mesh_id,
-        region: input.region.clone(),
-        state: LifecycleState::Joining,
-        public_base_url: input.public_base_url,
-        virtual_host_suffix: input.virtual_host_suffix,
-        placement_weight: input.placement_weight,
-        default_cell: input.default_cell,
-        created_at: now.clone(),
-        updated_at: now,
-        generation: 1,
-    };
-    state
-        .regions
-        .insert(descriptor.region.clone(), descriptor.clone());
-    if let Some(authority) = authority {
-        append_lifecycle_control_mutation(
-            storage,
-            REGION_DESCRIPTOR_STREAM_FAMILY,
-            &lifecycle_control_partition(REGION_DESCRIPTOR_STREAM_FAMILY, &descriptor.region),
-            &descriptor.region,
-            "create",
-            None,
-            descriptor.generation,
-            &descriptor.mesh_id,
-            &descriptor,
-            authority,
-        )
-        .await?;
-    }
-    write_state(storage, &state).await?;
-    Ok(descriptor)
-}
-
-pub async fn put_region_in_transaction(
-    storage: &Storage,
-    input: CreateRegionDescriptor,
-    target: Option<LifecycleState>,
-    transaction_id: &str,
-    principal: &str,
-) -> LifecycleResult<RegionDescriptor> {
-    require_identifier(&input.mesh_id, "mesh id")?;
-    require_identifier(&input.region, "region")?;
-    require_nonempty(&input.virtual_host_suffix, "virtual host suffix")?;
-    if let Some(default_cell) = &input.default_cell {
-        require_identifier(default_cell, "default cell")?;
-    }
-
-    let mut state = read_state_for_transaction(storage, transaction_id, principal).await?;
-    let mut descriptor = if let Some(existing) = state.regions.get(&input.region).cloned() {
-        if !input.public_base_url.is_empty() && existing.public_base_url != input.public_base_url {
-            return Err(LifecycleError::InvalidArgument(format!(
-                "region {} already exists with endpoint {}",
-                existing.region, existing.public_base_url
-            )));
-        }
-        existing
-    } else {
-        require_nonempty(&input.public_base_url, "public base url")?;
-        let now = timestamp_now();
-        RegionDescriptor {
-            schema: REGION_DESCRIPTOR_SCHEMA.to_string(),
-            mesh_id: input.mesh_id,
-            region: input.region.clone(),
-            state: LifecycleState::Joining,
-            public_base_url: input.public_base_url,
-            virtual_host_suffix: input.virtual_host_suffix,
-            placement_weight: input.placement_weight,
-            default_cell: input.default_cell,
-            created_at: now.clone(),
-            updated_at: now,
-            generation: 1,
-        }
-    };
-
-    if let Some(target) = target
-        && descriptor.state != target
-    {
-        validate_region_transition(descriptor.state, target).map_err(|_| {
-            LifecycleError::LifecycleTransitionDenied {
-                resource_kind: "region",
-                resource_id: descriptor.region.clone(),
-                from: descriptor.state,
-                to: target,
-            }
-        })?;
-        ensure_region_drain_completion_is_supported(storage, &descriptor.region, target).await?;
-        descriptor.state = target;
-        descriptor.updated_at = timestamp_now();
-        descriptor.generation = descriptor.generation.saturating_add(1);
-    }
-
-    state
-        .regions
-        .insert(descriptor.region.clone(), descriptor.clone());
-    stage_lifecycle_projection_row_in_transaction(
-        storage,
-        record_proto::encode_region_projection_row(&descriptor)?,
-        transaction_id,
-        principal,
-    )
-    .await?;
-    Ok(descriptor)
-}
-
-pub async fn transition_region(
-    storage: &Storage,
-    region: &str,
-    expected_generation: u64,
-    target: LifecycleState,
-) -> LifecycleResult<RegionDescriptor> {
-    transition_region_inner(storage, region, expected_generation, target, None).await
-}
-
-pub async fn transition_region_with_control(
-    storage: &Storage,
-    region: &str,
-    expected_generation: u64,
-    target: LifecycleState,
-    authority: LifecycleControlWriteAuthority<'_>,
-) -> LifecycleResult<RegionDescriptor> {
-    transition_region_inner(
-        storage,
-        region,
-        expected_generation,
-        target,
-        Some(authority),
-    )
-    .await
-}
-
-async fn transition_region_inner(
-    storage: &Storage,
-    region: &str,
-    expected_generation: u64,
-    target: LifecycleState,
-    authority: Option<LifecycleControlWriteAuthority<'_>>,
-) -> LifecycleResult<RegionDescriptor> {
-    require_identifier(region, "region")?;
-    let mut state = read_state(storage).await?;
-    {
-        let descriptor = state
-            .regions
-            .get(region)
-            .ok_or_else(|| LifecycleError::NotFound {
-                resource_kind: "region",
-                resource_id: region.to_string(),
-            })?;
-        ensure_generation("region", region, descriptor.generation, expected_generation)?;
-        validate_region_transition(descriptor.state, target).map_err(|_| {
-            LifecycleError::LifecycleTransitionDenied {
-                resource_kind: "region",
-                resource_id: region.to_string(),
-                from: descriptor.state,
-                to: target,
-            }
-        })?;
-    }
-    ensure_region_drain_completion_is_supported(storage, region, target).await?;
-    let descriptor = state
-        .regions
-        .get_mut(region)
-        .ok_or_else(|| LifecycleError::NotFound {
-            resource_kind: "region",
-            resource_id: region.to_string(),
-        })?;
-    descriptor.state = target;
-    descriptor.updated_at = timestamp_now();
-    descriptor.generation = descriptor.generation.saturating_add(1);
-    let out = descriptor.clone();
-    if let Some(authority) = authority {
-        append_lifecycle_control_mutation(
-            storage,
-            REGION_DESCRIPTOR_STREAM_FAMILY,
-            &lifecycle_control_partition(REGION_DESCRIPTOR_STREAM_FAMILY, &out.region),
-            &out.region,
-            "upsert",
-            Some(expected_generation),
-            out.generation,
-            &out.mesh_id,
-            &out,
-            authority,
-        )
-        .await?;
-    }
-    write_state(storage, &state).await?;
-    Ok(out)
-}
-
-pub fn parse_activation_checkpoint_json(input: &str) -> LifecycleResult<ActivationCheckpoint> {
-    require_nonempty(input, "activation checkpoint")?;
-    serde_json::from_str(input).map_err(|err| {
-        LifecycleError::InvalidArgument(format!("activation checkpoint JSON is invalid: {err}"))
-    })
-}
-
-pub async fn activate_region(
-    storage: &Storage,
-    region: &str,
-    expected_generation: u64,
-    checkpoint: &ActivationCheckpoint,
-) -> LifecycleResult<RegionDescriptor> {
-    activate_region_inner(storage, region, expected_generation, checkpoint, None).await
-}
-
-pub async fn activate_region_with_control(
-    storage: &Storage,
-    region: &str,
-    expected_generation: u64,
-    checkpoint: &ActivationCheckpoint,
-    authority: LifecycleControlWriteAuthority<'_>,
-) -> LifecycleResult<RegionDescriptor> {
-    activate_region_inner(
-        storage,
-        region,
-        expected_generation,
-        checkpoint,
-        Some(authority),
-    )
-    .await
-}
-
-async fn activate_region_inner(
-    storage: &Storage,
-    region: &str,
-    expected_generation: u64,
-    checkpoint: &ActivationCheckpoint,
-    authority: Option<LifecycleControlWriteAuthority<'_>>,
-) -> LifecycleResult<RegionDescriptor> {
-    require_identifier(region, "region")?;
-
-    let mut state = read_state(storage).await?;
-    let current = state
-        .regions
-        .get(region)
-        .ok_or_else(|| LifecycleError::NotFound {
-            resource_kind: "region",
-            resource_id: region.to_string(),
-        })?;
-    ensure_generation("region", region, current.generation, expected_generation)?;
-    validate_region_transition(current.state, LifecycleState::Active).map_err(|_| {
-        LifecycleError::LifecycleTransitionDenied {
-            resource_kind: "region",
-            resource_id: region.to_string(),
-            from: current.state,
-            to: LifecycleState::Active,
-        }
-    })?;
-    validate_activation_checkpoint_header(checkpoint, &current.mesh_id, region)?;
-    validate_activation_checkpoint_streams(storage, checkpoint).await?;
-    ensure_region_activation_dependencies(&state, region)?;
-
-    let descriptor = state
-        .regions
-        .get_mut(region)
-        .ok_or_else(|| LifecycleError::NotFound {
-            resource_kind: "region",
-            resource_id: region.to_string(),
-        })?;
-    descriptor.state = LifecycleState::Active;
-    descriptor.updated_at = timestamp_now();
-    descriptor.generation = descriptor.generation.saturating_add(1);
-    let out = descriptor.clone();
-    if let Some(authority) = authority {
-        append_lifecycle_control_mutation(
-            storage,
-            REGION_DESCRIPTOR_STREAM_FAMILY,
-            &lifecycle_control_partition(REGION_DESCRIPTOR_STREAM_FAMILY, &out.region),
-            &out.region,
-            "upsert",
-            Some(expected_generation),
-            out.generation,
-            &out.mesh_id,
-            &out,
-            authority,
-        )
-        .await?;
-    }
-    write_state(storage, &state).await?;
-    Ok(out)
-}
-
-pub async fn list_regions(storage: &Storage) -> LifecycleResult<Vec<RegionDescriptor>> {
-    Ok(read_state(storage).await?.regions.into_values().collect())
-}
-
-pub async fn ensure_region_accepts_new_writes(
-    storage: &Storage,
-    region: &str,
-) -> LifecycleResult<()> {
-    require_identifier(region, "region")?;
-    let state = read_state(storage).await?;
-    ensure_region_accepts_new_writes_in_state(&state, region)
-}
-
-pub async fn ensure_new_writable_placement(
-    storage: &Storage,
-    region: &str,
-    cell_id: &str,
-    node_id: &str,
-) -> LifecycleResult<()> {
-    require_identifier(region, "region")?;
-    require_identifier(cell_id, "cell id")?;
-    require_identifier(node_id, "node id")?;
-
-    let state = read_state(storage).await?;
-    ensure_region_accepts_new_writes_in_state(&state, region)?;
-    ensure_cell_accepts_new_writes_in_state(&state, region, cell_id)?;
-    ensure_node_accepts_new_writes_in_state(&state, region, cell_id, node_id)?;
-    Ok(())
-}
-
-pub async fn register_cell(
-    storage: &Storage,
-    input: RegisterCellDescriptor,
-) -> LifecycleResult<CellDescriptor> {
-    register_cell_inner(storage, input, None).await
-}
-
-pub async fn register_cell_with_control(
-    storage: &Storage,
-    input: RegisterCellDescriptor,
-    authority: LifecycleControlWriteAuthority<'_>,
-) -> LifecycleResult<CellDescriptor> {
-    register_cell_inner(storage, input, Some(authority)).await
-}
-
-async fn register_cell_inner(
-    storage: &Storage,
-    input: RegisterCellDescriptor,
-    authority: Option<LifecycleControlWriteAuthority<'_>>,
-) -> LifecycleResult<CellDescriptor> {
-    require_identifier(&input.mesh_id, "mesh id")?;
-    require_identifier(&input.region, "region")?;
-    require_identifier(&input.cell_id, "cell id")?;
-    require_identifier(&input.failure_domain, "cell failure domain")?;
-
-    let mut state = read_state(storage).await?;
-    if !state.regions.contains_key(&input.region) {
-        return Err(LifecycleError::NotFound {
-            resource_kind: "region",
-            resource_id: input.region.clone(),
-        });
-    }
-    let key = cell_key(&input.region, &input.cell_id)?;
-    if state.cells.contains_key(&key) {
-        return Err(LifecycleError::AlreadyExists {
-            resource_kind: "cell",
-            resource_id: input.cell_id,
-        });
-    }
-
-    let now = timestamp_now();
-    let descriptor = CellDescriptor {
-        schema: CELL_DESCRIPTOR_SCHEMA.to_string(),
-        mesh_id: input.mesh_id,
-        region: input.region,
-        cell_id: input.cell_id,
-        state: LifecycleState::Joining,
-        placement_weight: input.placement_weight,
-        failure_domain: input.failure_domain,
-        created_at: now.clone(),
-        updated_at: now,
-        generation: 1,
-    };
-    state.cells.insert(key, descriptor.clone());
-    if let Some(authority) = authority {
-        let record_key = cell_record_key(&descriptor.region, &descriptor.cell_id)?;
-        append_lifecycle_control_mutation(
-            storage,
-            CELL_DESCRIPTOR_STREAM_FAMILY,
-            &lifecycle_control_partition(CELL_DESCRIPTOR_STREAM_FAMILY, &record_key),
-            &record_key,
-            "create",
-            None,
-            descriptor.generation,
-            &descriptor.mesh_id,
-            &descriptor,
-            authority,
-        )
-        .await?;
-    }
-    write_state(storage, &state).await?;
-    Ok(descriptor)
-}
-
-pub async fn put_cell_in_transaction(
-    storage: &Storage,
-    input: RegisterCellDescriptor,
-    target: Option<LifecycleState>,
-    transaction_id: &str,
-    principal: &str,
-) -> LifecycleResult<CellDescriptor> {
-    require_identifier(&input.mesh_id, "mesh id")?;
-    require_identifier(&input.region, "region")?;
-    require_identifier(&input.cell_id, "cell id")?;
-    require_identifier(&input.failure_domain, "cell failure domain")?;
-
-    let mut state = read_state_for_transaction(storage, transaction_id, principal).await?;
-    if !state.regions.contains_key(&input.region) {
-        return Err(LifecycleError::NotFound {
-            resource_kind: "region",
-            resource_id: input.region.clone(),
-        });
-    }
-    let key = cell_key(&input.region, &input.cell_id)?;
-    let mut descriptor = if let Some(existing) = state.cells.get(&key).cloned() {
-        if existing.failure_domain != input.failure_domain {
-            return Err(LifecycleError::InvalidArgument(format!(
-                "cell {}/{} already exists with failure domain {}",
-                existing.region, existing.cell_id, existing.failure_domain
-            )));
-        }
-        existing
-    } else {
-        let now = timestamp_now();
-        CellDescriptor {
-            schema: CELL_DESCRIPTOR_SCHEMA.to_string(),
-            mesh_id: input.mesh_id,
-            region: input.region,
-            cell_id: input.cell_id,
-            state: LifecycleState::Joining,
-            placement_weight: input.placement_weight,
-            failure_domain: input.failure_domain,
-            created_at: now.clone(),
-            updated_at: now,
-            generation: 1,
-        }
-    };
-
-    if let Some(target) = target
-        && descriptor.state != target
-    {
-        validate_region_transition(descriptor.state, target).map_err(|_| {
-            LifecycleError::LifecycleTransitionDenied {
-                resource_kind: "cell",
-                resource_id: descriptor.cell_id.clone(),
-                from: descriptor.state,
-                to: target,
-            }
-        })?;
-        descriptor.state = target;
-        descriptor.updated_at = timestamp_now();
-        descriptor.generation = descriptor.generation.saturating_add(1);
-    }
-
-    let key = cell_key(&descriptor.region, &descriptor.cell_id)?;
-    state.cells.insert(key, descriptor.clone());
-    stage_lifecycle_projection_row_in_transaction(
-        storage,
-        record_proto::encode_cell_projection_row(&descriptor)?,
-        transaction_id,
-        principal,
-    )
-    .await?;
-    Ok(descriptor)
-}
-
-pub async fn transition_cell(
-    storage: &Storage,
-    region: &str,
-    cell_id: &str,
-    expected_generation: u64,
-    target: LifecycleState,
-) -> LifecycleResult<CellDescriptor> {
-    transition_cell_inner(storage, region, cell_id, expected_generation, target, None).await
-}
-
-pub async fn transition_cell_with_control(
-    storage: &Storage,
-    region: &str,
-    cell_id: &str,
-    expected_generation: u64,
-    target: LifecycleState,
-    authority: LifecycleControlWriteAuthority<'_>,
-) -> LifecycleResult<CellDescriptor> {
-    transition_cell_inner(
-        storage,
-        region,
-        cell_id,
-        expected_generation,
-        target,
-        Some(authority),
-    )
-    .await
-}
-
-async fn transition_cell_inner(
-    storage: &Storage,
-    region: &str,
-    cell_id: &str,
-    expected_generation: u64,
-    target: LifecycleState,
-    authority: Option<LifecycleControlWriteAuthority<'_>>,
-) -> LifecycleResult<CellDescriptor> {
-    let key = cell_key(region, cell_id)?;
-    let mut state = read_state(storage).await?;
-    let descriptor = state
-        .cells
-        .get_mut(&key)
-        .ok_or_else(|| LifecycleError::NotFound {
-            resource_kind: "cell",
-            resource_id: cell_id.to_string(),
-        })?;
-    ensure_generation("cell", cell_id, descriptor.generation, expected_generation)?;
-    validate_region_transition(descriptor.state, target).map_err(|_| {
-        LifecycleError::LifecycleTransitionDenied {
-            resource_kind: "cell",
-            resource_id: cell_id.to_string(),
-            from: descriptor.state,
-            to: target,
-        }
-    })?;
-    descriptor.state = target;
-    descriptor.updated_at = timestamp_now();
-    descriptor.generation = descriptor.generation.saturating_add(1);
-    let out = descriptor.clone();
-    if let Some(authority) = authority {
-        let record_key = cell_record_key(&out.region, &out.cell_id)?;
-        append_lifecycle_control_mutation(
-            storage,
-            CELL_DESCRIPTOR_STREAM_FAMILY,
-            &lifecycle_control_partition(CELL_DESCRIPTOR_STREAM_FAMILY, &record_key),
-            &record_key,
-            "upsert",
-            Some(expected_generation),
-            out.generation,
-            &out.mesh_id,
-            &out,
-            authority,
-        )
-        .await?;
-    }
-    write_state(storage, &state).await?;
-    Ok(out)
-}
-
-pub async fn list_cells(
-    storage: &Storage,
-    region_filter: Option<&str>,
-) -> LifecycleResult<Vec<CellDescriptor>> {
-    if let Some(region) = region_filter.filter(|region| !region.is_empty()) {
-        require_identifier(region, "region")?;
-    }
-    let cells = read_state(storage)
-        .await?
-        .cells
-        .into_values()
-        .filter(|cell| {
-            region_filter.is_none_or(|region| region.is_empty() || cell.region == region)
-        })
-        .collect();
-    Ok(cells)
-}
-
-pub async fn register_node(
-    storage: &Storage,
-    input: RegisterNodeDescriptor,
-) -> LifecycleResult<NodeDescriptor> {
-    register_node_inner(storage, input, None).await
-}
-
-pub async fn register_node_with_control(
-    storage: &Storage,
-    input: RegisterNodeDescriptor,
-    authority: LifecycleControlWriteAuthority<'_>,
-) -> LifecycleResult<NodeDescriptor> {
-    register_node_inner(storage, input, Some(authority)).await
-}
-
-async fn register_node_inner(
-    storage: &Storage,
-    input: RegisterNodeDescriptor,
-    authority: Option<LifecycleControlWriteAuthority<'_>>,
-) -> LifecycleResult<NodeDescriptor> {
-    require_identifier(&input.mesh_id, "mesh id")?;
-    require_identifier(&input.node_id, "node id")?;
-    require_identifier(&input.region, "region")?;
-    require_identifier(&input.cell_id, "cell id")?;
-    require_nonempty(&input.libp2p_peer_id, "libp2p peer id")?;
-    if input.receipt_signing_public_key_proto.is_empty() {
-        return Err(LifecycleError::InvalidArgument(
-            "receipt signing public key protobuf must not be empty".to_string(),
-        ));
-    }
-    libp2p::identity::PublicKey::try_decode_protobuf(&input.receipt_signing_public_key_proto)
-        .map_err(|err| {
-            LifecycleError::InvalidArgument(format!(
-                "receipt signing public key protobuf is invalid: {err}"
-            ))
-        })?;
-    require_nonempty(&input.public_api_addr, "public api addr")?;
-    if input.capabilities.is_empty() {
-        return Err(LifecycleError::InvalidArgument(
-            "node capabilities must not be empty".to_string(),
-        ));
-    }
-    let capacity_json_hash = capacity_json_hash(&input.capacity_json)?;
-
-    let mut state = read_state(storage).await?;
-    if !state.regions.contains_key(&input.region) {
-        return Err(LifecycleError::NotFound {
-            resource_kind: "region",
-            resource_id: input.region,
-        });
-    }
-    let cell_key = cell_key(&input.region, &input.cell_id)?;
-    if !state.cells.contains_key(&cell_key) {
-        return Err(LifecycleError::NotFound {
-            resource_kind: "cell",
-            resource_id: input.cell_id.clone(),
-        });
-    }
-    if state.nodes.contains_key(&input.node_id) {
-        return Err(LifecycleError::AlreadyExists {
-            resource_kind: "node",
-            resource_id: input.node_id,
-        });
-    }
-
-    let now = timestamp_now();
-    let descriptor = NodeDescriptor {
-        schema: NODE_DESCRIPTOR_SCHEMA.to_string(),
-        mesh_id: input.mesh_id,
-        node_id: input.node_id.clone(),
-        region: input.region,
-        cell_id: input.cell_id,
-        libp2p_peer_id: input.libp2p_peer_id,
-        receipt_signing_public_key_proto: input.receipt_signing_public_key_proto,
-        public_api_addr: input.public_api_addr,
-        public_cluster_addrs: input.public_cluster_addrs,
-        capabilities: input.capabilities,
-        capacity_json_hash,
-        state: LifecycleState::Joining,
-        drain: None,
-        last_heartbeat_at: None,
-        created_at: now.clone(),
-        updated_at: now,
-        generation: 1,
-    };
-    state
-        .nodes
-        .insert(descriptor.node_id.clone(), descriptor.clone());
-    if let Some(authority) = authority {
-        let record_key =
-            node_record_key(&descriptor.region, &descriptor.cell_id, &descriptor.node_id)?;
-        append_lifecycle_control_mutation(
-            storage,
-            NODE_DESCRIPTOR_STREAM_FAMILY,
-            &lifecycle_control_partition(NODE_DESCRIPTOR_STREAM_FAMILY, &record_key),
-            &record_key,
-            "create",
-            None,
-            descriptor.generation,
-            &descriptor.mesh_id,
-            &descriptor,
-            authority,
-        )
-        .await?;
-    }
-    write_state(storage, &state).await?;
-    Ok(descriptor)
-}
-
-pub async fn put_node_in_transaction(
-    storage: &Storage,
-    input: RegisterNodeDescriptor,
-    target: Option<LifecycleState>,
-    transaction_id: &str,
-    principal: &str,
-) -> LifecycleResult<NodeDescriptor> {
-    require_identifier(&input.mesh_id, "mesh id")?;
-    require_identifier(&input.node_id, "node id")?;
-    require_identifier(&input.region, "region")?;
-    require_identifier(&input.cell_id, "cell id")?;
-    require_nonempty(&input.libp2p_peer_id, "libp2p peer id")?;
-    if input.receipt_signing_public_key_proto.is_empty() {
-        return Err(LifecycleError::InvalidArgument(
-            "receipt signing public key protobuf must not be empty".to_string(),
-        ));
-    }
-    libp2p::identity::PublicKey::try_decode_protobuf(&input.receipt_signing_public_key_proto)
-        .map_err(|err| {
-            LifecycleError::InvalidArgument(format!(
-                "receipt signing public key protobuf is invalid: {err}"
-            ))
-        })?;
-    require_nonempty(&input.public_api_addr, "public api addr")?;
-    if input.capabilities.is_empty() {
-        return Err(LifecycleError::InvalidArgument(
-            "node capabilities must not be empty".to_string(),
-        ));
-    }
-    let capacity_json_hash = capacity_json_hash(&input.capacity_json)?;
-
-    let mut state = read_state_for_transaction(storage, transaction_id, principal).await?;
-    if !state.regions.contains_key(&input.region) {
-        return Err(LifecycleError::NotFound {
-            resource_kind: "region",
-            resource_id: input.region,
-        });
-    }
-    let cell_key = cell_key(&input.region, &input.cell_id)?;
-    if !state.cells.contains_key(&cell_key) {
-        return Err(LifecycleError::NotFound {
-            resource_kind: "cell",
-            resource_id: input.cell_id,
-        });
-    }
-    let mut descriptor = if let Some(existing) = state.nodes.get(&input.node_id).cloned() {
-        if existing.region != input.region
-            || existing.cell_id != input.cell_id
-            || existing.libp2p_peer_id != input.libp2p_peer_id
-            || existing.receipt_signing_public_key_proto != input.receipt_signing_public_key_proto
-            || existing.public_api_addr != input.public_api_addr
-            || existing.public_cluster_addrs != input.public_cluster_addrs
-            || existing.capabilities != input.capabilities
-            || existing.capacity_json_hash != capacity_json_hash
-        {
-            return Err(LifecycleError::InvalidArgument(format!(
-                "node {} already exists with different immutable descriptor fields",
-                existing.node_id
-            )));
-        }
-        existing
-    } else {
-        let now = timestamp_now();
-        NodeDescriptor {
-            schema: NODE_DESCRIPTOR_SCHEMA.to_string(),
-            mesh_id: input.mesh_id,
-            node_id: input.node_id.clone(),
-            region: input.region,
-            cell_id: input.cell_id,
-            libp2p_peer_id: input.libp2p_peer_id,
-            receipt_signing_public_key_proto: input.receipt_signing_public_key_proto,
-            public_api_addr: input.public_api_addr,
-            public_cluster_addrs: input.public_cluster_addrs,
-            capabilities: input.capabilities,
-            capacity_json_hash,
-            state: LifecycleState::Joining,
-            drain: None,
-            last_heartbeat_at: None,
-            created_at: now.clone(),
-            updated_at: now,
-            generation: 1,
-        }
-    };
-
-    if let Some(target) = target
-        && descriptor.state != target
-    {
-        if target == LifecycleState::Active {
-            ensure_node_placement_is_active(&state, &descriptor)?;
-        }
-        validate_node_transition(descriptor.state, target).map_err(|_| {
-            LifecycleError::LifecycleTransitionDenied {
-                resource_kind: "node",
-                resource_id: descriptor.node_id.clone(),
-                from: descriptor.state,
-                to: target,
-            }
-        })?;
-        descriptor.state = target;
-        descriptor.drain = None;
-        descriptor.updated_at = timestamp_now();
-        descriptor.generation = descriptor.generation.saturating_add(1);
-    }
-
-    state
-        .nodes
-        .insert(descriptor.node_id.clone(), descriptor.clone());
-    stage_lifecycle_projection_row_in_transaction(
-        storage,
-        record_proto::encode_node_projection_row(&descriptor)?,
-        transaction_id,
-        principal,
-    )
-    .await?;
-    Ok(descriptor)
-}
-
-pub async fn transition_node(
-    storage: &Storage,
-    node_id: &str,
-    expected_generation: u64,
-    target: LifecycleState,
-    drain: Option<NodeDrainDescriptor>,
-) -> LifecycleResult<NodeDescriptor> {
-    transition_node_inner(storage, node_id, expected_generation, target, drain, None).await
-}
-
-pub async fn transition_node_with_control(
-    storage: &Storage,
-    node_id: &str,
-    expected_generation: u64,
-    target: LifecycleState,
-    drain: Option<NodeDrainDescriptor>,
-    authority: LifecycleControlWriteAuthority<'_>,
-) -> LifecycleResult<NodeDescriptor> {
-    transition_node_inner(
-        storage,
-        node_id,
-        expected_generation,
-        target,
-        drain,
-        Some(authority),
-    )
-    .await
-}
-
-async fn transition_node_inner(
-    storage: &Storage,
-    node_id: &str,
-    expected_generation: u64,
-    target: LifecycleState,
-    drain: Option<NodeDrainDescriptor>,
-    authority: Option<LifecycleControlWriteAuthority<'_>>,
-) -> LifecycleResult<NodeDescriptor> {
-    require_identifier(node_id, "node id")?;
-    let mut state = read_state(storage).await?;
-    let current = state
-        .nodes
-        .get(node_id)
-        .ok_or_else(|| LifecycleError::NotFound {
-            resource_kind: "node",
-            resource_id: node_id.to_string(),
-        })?;
-    ensure_generation("node", node_id, current.generation, expected_generation)?;
-    if target == LifecycleState::Active {
-        ensure_node_placement_is_active(&state, current)?;
-    }
-    validate_node_transition(current.state, target).map_err(|_| {
-        LifecycleError::LifecycleTransitionDenied {
-            resource_kind: "node",
-            resource_id: node_id.to_string(),
-            from: current.state,
-            to: target,
-        }
-    })?;
-
-    let descriptor = state
-        .nodes
-        .get_mut(node_id)
-        .ok_or_else(|| LifecycleError::NotFound {
-            resource_kind: "node",
-            resource_id: node_id.to_string(),
-        })?;
-    descriptor.state = target;
-    descriptor.drain = if target == LifecycleState::Draining {
-        drain
-    } else {
-        None
-    };
-    descriptor.updated_at = timestamp_now();
-    descriptor.generation = descriptor.generation.saturating_add(1);
-    let out = descriptor.clone();
-    if let Some(authority) = authority {
-        let record_key = node_record_key(&out.region, &out.cell_id, &out.node_id)?;
-        append_lifecycle_control_mutation(
-            storage,
-            NODE_DESCRIPTOR_STREAM_FAMILY,
-            &lifecycle_control_partition(NODE_DESCRIPTOR_STREAM_FAMILY, &record_key),
-            &record_key,
-            "upsert",
-            Some(expected_generation),
-            out.generation,
-            &out.mesh_id,
-            &out,
-            authority,
-        )
-        .await?;
-    }
-    write_state(storage, &state).await?;
-    Ok(out)
-}
-
-pub async fn list_nodes(
-    storage: &Storage,
-    region_filter: Option<&str>,
-    cell_filter: Option<&str>,
-) -> LifecycleResult<Vec<NodeDescriptor>> {
-    let store = CoreStore::new(storage.clone()).await?;
-    list_nodes_with_core_store(storage, &store, region_filter, cell_filter).await
-}
-
-pub async fn list_nodes_with_core_store(
-    storage: &Storage,
-    store: &CoreStore,
-    region_filter: Option<&str>,
-    cell_filter: Option<&str>,
-) -> LifecycleResult<Vec<NodeDescriptor>> {
-    if let Some(region) = region_filter.filter(|region| !region.is_empty()) {
-        require_identifier(region, "region")?;
-    }
-    if let Some(cell_id) = cell_filter.filter(|cell_id| !cell_id.is_empty()) {
-        require_identifier(cell_id, "cell id")?;
-    }
-    let nodes = read_state_with_core_store(storage, store)
-        .await?
-        .nodes
-        .into_values()
-        .filter(|node| {
-            region_filter.is_none_or(|region| region.is_empty() || node.region == region)
-        })
-        .filter(|node| cell_filter.is_none_or(|cell| cell.is_empty() || node.cell_id == cell))
-        .collect();
-    Ok(nodes)
-}
-
-pub fn list_node_projections_with_core_store(
-    store: &CoreStore,
-    region_filter: Option<&str>,
-    cell_filter: Option<&str>,
-) -> LifecycleResult<Vec<NodeDescriptor>> {
-    if let Some(region) = region_filter.filter(|region| !region.is_empty()) {
-        require_identifier(region, "region")?;
-    }
-    if let Some(cell_id) = cell_filter.filter(|cell| !cell.is_empty()) {
-        require_identifier(cell_id, "cell id")?;
-    }
-    let nodes = read_lifecycle_state_projection_with_core_store(store)?
-        .nodes
-        .into_values()
-        .filter(|node| {
-            region_filter.is_none_or(|region| region.is_empty() || node.region == region)
-        })
-        .filter(|node| cell_filter.is_none_or(|cell| cell.is_empty() || node.cell_id == cell))
-        .collect();
-    Ok(nodes)
 }
 
 pub async fn upsert_bucket_drain_exception(

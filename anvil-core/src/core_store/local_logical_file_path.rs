@@ -163,6 +163,7 @@ impl CoreStore {
                 .put_logical_file_block_with_profile(
                     &logical_request,
                     index,
+                    logical_offset,
                     pipeline_block.stored,
                     block_plain_hash,
                     pipeline_block.encryption.algorithm.clone(),

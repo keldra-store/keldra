@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#![recursion_limit = "512"]
 
 #[path = "../cli/admin.rs"]
 mod admin_cli;

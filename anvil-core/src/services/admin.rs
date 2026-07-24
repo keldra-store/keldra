@@ -131,11 +131,9 @@ impl AdminService for AppState {
         let tenant_id = resolve_tenant_id(self, &req.tenant_id).await?;
         let app = self
             .persistence
-            .list_apps_for_tenant(tenant_id)
+            .get_app_by_tenant_name(tenant_id, &req.app_name)
             .await
             .map_err(|err| Status::internal(err.to_string()))?
-            .into_iter()
-            .find(|app| app.name == req.app_name)
             .ok_or_else(|| Status::not_found("Application not found"))?;
         let client_secret = generated_client_secret();
         let encrypted_secret = encrypt_admin_client_secret(self, &client_secret)?;
@@ -429,20 +427,64 @@ impl AdminService for AppState {
         &self,
         request: Request<ListPersonalDbSigningKeysRequest>,
     ) -> Result<Response<ListPersonalDbSigningKeysResponse>, Status> {
-        let _principal = require_admin(
+        let principal = require_admin(
             &request,
             self,
             SystemAdminRelation::ManagePersonalDbSigningKeys,
         )
         .await?;
-        let keys = self
+        let req = request.into_inner();
+        let page_size = crate::services::collection_cursor::page_size(req.page.as_ref())?;
+        let revision = self
             .personaldb_signing_key_store
-            .list_public_records()
-            .map_err(|err| Status::internal(err.to_string()))?
-            .into_iter()
-            .map(personaldb_signing_key_to_proto)
-            .collect();
-        Ok(Response::new(ListPersonalDbSigningKeysResponse { keys }))
+            .current_collection_revision()
+            .map_err(|err| Status::internal(err.to_string()))?;
+        let principal_scope = format!(
+            "admin:{}/tenant:{}",
+            principal.principal_id, principal.tenant_id
+        );
+        let revision_string = revision.to_string();
+        let binding = crate::services::collection_cursor::CollectionCursorBinding {
+            service_method: "anvil.AdminService/ListPersonalDbSigningKeys",
+            filters: &[],
+            principal_scope: &principal_scope,
+            page_size,
+            revision: &revision_string,
+            sort: "key_id.asc",
+        };
+        let position = crate::services::collection_cursor::decode_page_token(
+            req.page.as_ref(),
+            &binding,
+            self.config.jwt_secret.as_bytes(),
+        )?;
+        let after_tuple_key =
+            crate::services::collection_cursor::decode_binary_position(position.as_deref())?;
+        let page = self
+            .personaldb_signing_key_store
+            .page_public_records(revision, after_tuple_key.as_deref(), page_size)
+            .map_err(|err| Status::aborted(err.to_string()))?;
+        let next_page_token = page
+            .next_tuple_key
+            .as_deref()
+            .map(crate::services::collection_cursor::encode_binary_position)
+            .transpose()?
+            .map(|position| {
+                crate::services::collection_cursor::encode_next_page_token(
+                    &position,
+                    &binding,
+                    self.config.jwt_secret.as_bytes(),
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
+        Ok(Response::new(ListPersonalDbSigningKeysResponse {
+            keys: page
+                .records
+                .into_iter()
+                .map(personaldb_signing_key_to_proto)
+                .collect(),
+            page: Some(PageResponse { next_page_token }),
+        }))
     }
 
     async fn set_personal_db_signing_key_status(
@@ -770,7 +812,7 @@ impl AdminService for AppState {
             require_admin(&request, self, SystemAdminRelation::ManageHostAliases).await?;
         let req = request.into_inner();
         let page = req.page.as_ref();
-        let limit = page_limit(page);
+        let limit = page_limit(page)?;
         let mut host_aliases = self
             .persistence
             .list_host_alias_descriptors(none_if_empty(&req.region))
@@ -820,8 +862,7 @@ impl AdminService for AppState {
 
         Ok(Response::new(ListHostAliasesResponse {
             page: Some(PageResponse {
-                next_cursor,
-                has_more,
+                next_page_token: next_cursor,
             }),
             host_aliases: host_aliases
                 .into_iter()
@@ -1077,7 +1118,7 @@ impl AdminService for AppState {
         let principal = require_admin(&request, self, SystemAdminRelation::ManageRegions).await?;
         let req = request.into_inner();
         let page = req.page.as_ref();
-        let limit = page_limit(page);
+        let limit = page_limit(page)?;
         let mut regions = self
             .persistence
             .list_region_descriptors()
@@ -1126,8 +1167,7 @@ impl AdminService for AppState {
         };
         Ok(Response::new(ListRegionsResponse {
             page: Some(PageResponse {
-                next_cursor,
-                has_more,
+                next_page_token: next_cursor,
             }),
             regions,
         }))
@@ -1287,7 +1327,7 @@ impl AdminService for AppState {
         let req = request.into_inner();
         let region_filter = none_if_empty(&req.region);
         let page = req.page.as_ref();
-        let limit = page_limit(page);
+        let limit = page_limit(page)?;
         let mut cells = self
             .persistence
             .list_cell_descriptors(region_filter)
@@ -1345,8 +1385,7 @@ impl AdminService for AppState {
         };
         Ok(Response::new(ListCellsResponse {
             page: Some(PageResponse {
-                next_cursor,
-                has_more,
+                next_page_token: next_cursor,
             }),
             cells,
         }))
@@ -1371,10 +1410,8 @@ impl AdminService for AppState {
                 node_id: req.node_id,
                 region: req.region,
                 cell_id: req.cell_id,
-                libp2p_peer_id: req.libp2p_peer_id,
-                receipt_signing_public_key_proto: req.receipt_signing_public_key_proto,
+                receipt_signing_public_key: req.receipt_signing_public_key,
                 public_api_addr: req.public_api_addr,
-                public_cluster_addrs: req.public_cluster_addrs,
                 capabilities,
                 capacity_json: req.capacity_json,
             })
@@ -1410,18 +1447,9 @@ impl AdminService for AppState {
 
         // This RPC is used by the Docker topology bootstrap before lifecycle
         // projections and control streams are initialised. Build the descriptor
-        // from local runtime state instead of reading mesh lifecycle storage,
-        // otherwise early boot can recurse through CoreStore/control-stream
-        // bootstrap while the node is still trying to join the mesh.
-        let libp2p_peer_id = self
-            .cluster
-            .read()
-            .await
-            .iter()
-            .find_map(|(peer_id, info)| {
-                (info.grpc_addr == self.config.public_api_addr).then(|| peer_id.to_base58())
-            })
-            .ok_or_else(|| Status::unavailable("local cluster identity is not ready"))?;
+        // from local configuration and signing state instead of reading mesh
+        // lifecycle storage, otherwise early boot can recurse through CoreStore/
+        // control-stream bootstrap while the node is still trying to join the mesh.
         let now = Utc::now().to_rfc3339();
         let node = mesh_lifecycle::NodeDescriptor {
             schema: mesh_lifecycle::NODE_DESCRIPTOR_SCHEMA.to_string(),
@@ -1429,12 +1457,8 @@ impl AdminService for AppState {
             node_id: self.config.node_id.clone(),
             region: self.config.region.clone(),
             cell_id: self.config.cell_id.clone(),
-            libp2p_peer_id,
-            receipt_signing_public_key_proto: self
-                .core_store
-                .local_receipt_signing_public_key_proto(),
+            receipt_signing_public_key: self.core_store.local_receipt_signing_public_key(),
             public_api_addr: self.config.public_api_addr.clone(),
-            public_cluster_addrs: self.config.public_cluster_addrs.clone(),
             capabilities: vec![
                 CoreNodeCapability::Object,
                 CoreNodeCapability::Index,
@@ -1625,7 +1649,7 @@ impl AdminService for AppState {
         let principal = require_admin(&request, self, SystemAdminRelation::ManageNodes).await?;
         let req = request.into_inner();
         let page = req.page.as_ref();
-        let limit = page_limit(page);
+        let limit = page_limit(page)?;
         let mut nodes = self
             .persistence
             .list_node_descriptors(none_if_empty(&req.region), none_if_empty(&req.cell_id))
@@ -1678,8 +1702,7 @@ impl AdminService for AppState {
         };
         Ok(Response::new(ListNodesResponse {
             page: Some(PageResponse {
-                next_cursor,
-                has_more,
+                next_page_token: next_cursor,
             }),
             nodes,
         }))
@@ -1693,7 +1716,7 @@ impl AdminService for AppState {
         let req = request.into_inner();
         let family = routing_record_family_from_proto(req.family)?;
         let page = req.page.as_ref();
-        let limit = page_limit(page);
+        let limit = page_limit(page)?;
         let mut records = self
             .persistence
             .list_mesh_routing_records(family)
@@ -1745,8 +1768,7 @@ impl AdminService for AppState {
 
         Ok(Response::new(ListRoutingRecordsResponse {
             page: Some(PageResponse {
-                next_cursor,
-                has_more,
+                next_page_token: next_cursor,
             }),
             records,
         }))
@@ -1838,135 +1860,7 @@ impl AdminService for AppState {
         &self,
         request: Request<ListDiagnosticsRequest>,
     ) -> Result<Response<DiagnosticsResponse>, Status> {
-        let principal = require_admin(&request, self, SystemAdminRelation::ViewDiagnostics).await?;
-        let req = request.into_inner();
-        let request_id = require_request_id(&req.request_id)?.to_string();
-        let page = req.page.as_ref();
-        let limit = page_limit(page);
-        let source = req.source.trim();
-
-        if !req.severity.trim().is_empty() {
-            validate_diagnostic_severity(&req.severity)?;
-        }
-
-        let mut diagnostics = Vec::new();
-
-        if source.is_empty() || source == "index" || source == "index_diagnostic_journal" {
-            if req.tenant_id.trim().is_empty() || req.bucket_name.trim().is_empty() {
-                if source == "index" || source == "index_diagnostic_journal" {
-                    return Err(Status::invalid_argument(
-                        "tenant_id and bucket_name are required for index diagnostics",
-                    ));
-                }
-            } else {
-                let tenant_id = resolve_tenant_id(self, &req.tenant_id).await?;
-                let bucket = self
-                    .persistence
-                    .get_bucket_by_name(tenant_id, &req.bucket_name)
-                    .await
-                    .map_err(|err| Status::internal(err.to_string()))?
-                    .ok_or_else(|| Status::not_found("Bucket not found"))?;
-                diagnostics.extend(
-                    self.persistence
-                        .list_index_diagnostics(
-                            tenant_id,
-                            bucket.id,
-                            &req.index_name,
-                            &req.severity,
-                            0,
-                            i32::MAX,
-                        )
-                        .await
-                        .map_err(|err| Status::internal(err.to_string()))?
-                        .into_iter()
-                        .map(index_diagnostic_to_admin_record)
-                        .collect::<Result<Vec<_>, _>>()?,
-                );
-            }
-        }
-
-        if source.is_empty() || source == "mesh" || source == "mesh_lifecycle" {
-            diagnostics.extend(mesh_lifecycle_diagnostics(self).await?);
-        }
-
-        if source.is_empty() || source == "mesh" || source == "mesh_routing_projection" {
-            diagnostics.extend(mesh_routing_projection_diagnostics(self).await?);
-        }
-
-        if !req.severity.trim().is_empty() {
-            diagnostics.retain(|diagnostic| diagnostic.severity == req.severity);
-        }
-        diagnostics
-            .sort_by(|left, right| diagnostic_position(left).cmp(&diagnostic_position(right)));
-
-        let positions = diagnostics
-            .iter()
-            .map(|diagnostic| (diagnostic_position(diagnostic), diagnostic.cursor))
-            .collect::<Vec<_>>();
-        let revision = admin_cursor::collection_revision(
-            positions
-                .iter()
-                .map(|(position, cursor)| (position.as_str(), *cursor)),
-        );
-        let filters = [
-            ("source", source),
-            ("tenant_id", req.tenant_id.trim()),
-            ("bucket_name", req.bucket_name.trim()),
-            ("index_name", req.index_name.trim()),
-            ("severity", req.severity.trim()),
-        ];
-        let binding = AdminCursorBinding {
-            scope: "admin.list_diagnostics.v1",
-            filters: &filters,
-            principal: &principal,
-            limit,
-            revision: &revision,
-            sort: "source.cursor.id.asc",
-        };
-        let cursor =
-            admin_cursor::decode_page_cursor(page, &binding, self.config.jwt_secret.as_bytes())?;
-        let mut diagnostics = diagnostics
-            .into_iter()
-            .filter(|diagnostic| {
-                cursor
-                    .as_deref()
-                    .is_none_or(|cursor| diagnostic_position(diagnostic).as_str() > cursor)
-            })
-            .take(limit + 1)
-            .collect::<Vec<_>>();
-        let has_more = diagnostics.len() > limit;
-        if has_more {
-            diagnostics.truncate(limit);
-        }
-        let next_cursor = if has_more {
-            diagnostics.last().map_or(Ok(String::new()), |diagnostic| {
-                admin_cursor::encode_next_cursor(
-                    &diagnostic_position(diagnostic),
-                    &binding,
-                    self.config.jwt_secret.as_bytes(),
-                )
-            })?
-        } else {
-            String::new()
-        };
-
-        Ok(Response::new(DiagnosticsResponse {
-            request_id,
-            page: Some(PageResponse {
-                next_cursor,
-                has_more,
-            }),
-            diagnostics,
-            data_source: if source.is_empty() {
-                "combined".to_string()
-            } else if source == "index" {
-                "index_diagnostic_journal".to_string()
-            } else if source == "mesh" {
-                "mesh".to_string()
-            } else {
-                source.to_string()
-            },
-        }))
+        read_handlers::list_diagnostics(self, request).await
     }
 
     async fn list_audit_events(

@@ -84,7 +84,7 @@ impl api::hugging_face_key_service_server::HuggingFaceKeyService for AppState {
         &self,
         request: Request<api::ListHfKeysRequest>,
     ) -> Result<Response<api::ListHfKeysResponse>, Status> {
-        let (_metadata, extensions, _req) = request.into_parts();
+        let (_metadata, extensions, req) = request.into_parts();
         let claims = auth::try_get_claims_from_extensions(&extensions)
             .ok_or_else(|| Status::unauthenticated("Missing authentication claims"))?;
         access_control::require_action(
@@ -96,26 +96,62 @@ impl api::hugging_face_key_service_server::HuggingFaceKeyService for AppState {
         )
         .await?;
 
-        let rows = self
-            .persistence
-            .hf_list_keys(claims.tenant_id)
+        let page_size = crate::services::collection_cursor::page_size(req.page.as_ref())?;
+        let principal_scope = format!("tenant:{}/subject:{}", claims.tenant_id, claims.sub);
+        let revision = crate::hf_journal::hf_collection_revision(&self.storage)
             .await
-            .map_err(|e: anyhow::Error| Status::internal(e.to_string()))?;
-
-        let keys: Vec<api::HfKey> = rows
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let binding = crate::services::collection_cursor::CollectionCursorBinding {
+            service_method: "anvil.HfKeyService/ListKeys",
+            filters: &[],
+            principal_scope: &principal_scope,
+            page_size,
+            revision: &revision,
+            sort: "name.asc",
+        };
+        let after_cursor = crate::services::collection_cursor::decode_page_token(
+            req.page.as_ref(),
+            &binding,
+            self.config.jwt_secret.as_bytes(),
+        )?
+        .map(hex::decode)
+        .transpose()
+        .map_err(|_| Status::invalid_argument("invalid Hugging Face key cursor"))?;
+        let page = self
+            .persistence
+            .hf_list_key_page(claims.tenant_id, after_cursor.as_deref(), page_size)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+        if crate::hf_journal::hf_collection_revision(&self.storage)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?
+            != revision
+        {
+            return Err(Status::aborted(
+                "Hugging Face key collection changed while reading this page",
+            ));
+        }
+        let next_page_token = page.next_cursor.map_or(Ok(String::new()), |cursor| {
+            crate::services::collection_cursor::encode_next_page_token(
+                &hex::encode(cursor),
+                &binding,
+                self.config.jwt_secret.as_bytes(),
+            )
+        })?;
+        let keys = page
+            .keys
             .into_iter()
-            .map(|(name, note, created, updated)| api::HfKey {
-                name,
-
-                note: note.unwrap_or_default(),
-
-                created_at: created.to_rfc3339(),
-
-                updated_at: updated.to_rfc3339(),
+            .map(|key| api::HfKey {
+                name: key.name,
+                note: key.note.unwrap_or_default(),
+                created_at: key.created_at.to_rfc3339(),
+                updated_at: key.updated_at.to_rfc3339(),
             })
             .collect();
-
-        Ok(Response::new(api::ListHfKeysResponse { keys }))
+        Ok(Response::new(api::ListHfKeysResponse {
+            keys,
+            page: Some(api::PageResponse { next_page_token }),
+        }))
     }
 }
 
@@ -228,33 +264,25 @@ impl api::hf_ingestion_service_server::HfIngestionService for AppState {
             .map_err(|e| Status::internal(e.to_string()))?
             .filter(|job| job.tenant_id == claims.tenant_id)
             .ok_or_else(|| Status::not_found("ingestion not found"))?;
-        let (
-            state_s,
-            queued,
-            downloading,
-            stored,
-            failed,
-            err,
-            started_at,
-            finished_at,
-            created_at,
-        ) = self
+        let status = self
             .persistence
-            .hf_status_summary(id)
+            .hf_get_ingestion_status(id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(api::GetHfIngestionStatusResponse {
-            state: state_s,
-            queued: queued as u64,
-            downloading: downloading as u64,
-            stored: stored as u64,
-            failed: failed as u64,
-            error: err.unwrap_or_default(),
-            created_at: created_at.to_rfc3339(),
-            started_at: started_at
+            state: status.state.as_str().to_string(),
+            queued: status.queued as u64,
+            downloading: status.downloading as u64,
+            stored: status.stored as u64,
+            failed: status.failed as u64,
+            error: status.error.unwrap_or_default(),
+            created_at: status.created_at.to_rfc3339(),
+            started_at: status
+                .started_at
                 .map(|d: chrono::DateTime<chrono::Utc>| d.to_rfc3339())
                 .unwrap_or_default(),
-            finished_at: finished_at
+            finished_at: status
+                .finished_at
                 .map(|d: chrono::DateTime<chrono::Utc>| d.to_rfc3339())
                 .unwrap_or_default(),
         }))

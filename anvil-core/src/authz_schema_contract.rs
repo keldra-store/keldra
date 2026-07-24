@@ -10,6 +10,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const PUBLIC_SUBJECT_KIND: &str = "app";
 pub const PUBLIC_SUBJECT_ID: &str = "_anvil/public";
+pub const MAX_AUTHZ_SCHEMA_NAMESPACES: usize = 256;
+pub const MAX_AUTHZ_SCHEMA_MEMBERS_PER_NAMESPACE: usize = 256;
+pub const MAX_AUTHZ_SCHEMA_RULES_PER_MEMBER: usize = 256;
+pub const MAX_AUTHZ_SCHEMA_SUBJECTS_PER_MEMBER: usize = 256;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
@@ -42,6 +46,11 @@ struct SchemaIndex<'a> {
 pub fn validate_schema_set(namespaces: &[AuthzNamespaceSchema]) -> Result<()> {
     if namespaces.is_empty() {
         return invalid("authorization schema must contain at least one namespace");
+    }
+    if namespaces.len() > MAX_AUTHZ_SCHEMA_NAMESPACES {
+        return invalid(format!(
+            "authorization schema must contain no more than {MAX_AUTHZ_SCHEMA_NAMESPACES} namespaces"
+        ));
     }
 
     let mut index = SchemaIndex {
@@ -86,9 +95,27 @@ pub fn validate_namespace_shape(namespace: &AuthzNamespaceSchema) -> Result<()> 
             namespace.namespace
         ));
     }
+    if namespace.relations.len() > MAX_AUTHZ_SCHEMA_MEMBERS_PER_NAMESPACE {
+        return invalid(format!(
+            "authorization namespace {} must contain no more than {MAX_AUTHZ_SCHEMA_MEMBERS_PER_NAMESPACE} members",
+            namespace.namespace
+        ));
+    }
 
     let mut members = BTreeSet::new();
     for member in &namespace.relations {
+        if member.rules.len() > MAX_AUTHZ_SCHEMA_RULES_PER_MEMBER {
+            return invalid(format!(
+                "authorization member {}#{} must contain no more than {MAX_AUTHZ_SCHEMA_RULES_PER_MEMBER} rules",
+                namespace.namespace, member.relation
+            ));
+        }
+        if member.allowed_subjects.len() > MAX_AUTHZ_SCHEMA_SUBJECTS_PER_MEMBER {
+            return invalid(format!(
+                "authorization member {}#{} must contain no more than {MAX_AUTHZ_SCHEMA_SUBJECTS_PER_MEMBER} allowed subjects",
+                namespace.namespace, member.relation
+            ));
+        }
         validate_component(&member.relation, "authorization member")?;
         if !members.insert(member.relation.as_str()) {
             return invalid(format!(
@@ -936,5 +963,26 @@ mod tests {
         )];
         let error = validate_schema_set(&incompatible).unwrap_err();
         assert!(error.to_string().contains("must be a direct relation"));
+    }
+
+    #[test]
+    fn rejects_schema_collections_above_contract_limits() {
+        let namespace = namespace(
+            "document",
+            vec![direct(
+                "viewer",
+                vec![selector(
+                    AuthzSubjectSelectorKind::AnyCanonicalId,
+                    "user",
+                    "",
+                )],
+            )],
+        );
+        assert!(
+            validate_schema_set(&vec![namespace; MAX_AUTHZ_SCHEMA_NAMESPACES + 1])
+                .unwrap_err()
+                .to_string()
+                .contains("no more than")
+        );
     }
 }

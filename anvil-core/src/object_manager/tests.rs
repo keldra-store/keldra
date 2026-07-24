@@ -4,6 +4,44 @@ use crate::{
 };
 use tempfile::{TempDir, tempdir};
 
+#[test]
+fn core_store_status_distinguishes_availability_from_internal_failure() {
+    let unavailable = core_store_status(
+        crate::core_store::CoreStoreAvailabilityError::QuorumUnavailable {
+            operation: "prepare",
+            required: 3,
+            received: 2,
+            details: "joining peer".to_string(),
+        }
+        .into(),
+    );
+    assert_eq!(unavailable.code(), tonic::Code::Unavailable);
+    assert!(
+        unavailable
+            .message()
+            .contains(AnvilErrorCode::CoreMetaQuorumUnavailable.as_str())
+    );
+
+    let shard_unavailable = core_store_status(
+        crate::core_store::CoreStoreAvailabilityError::ShardQuorumUnavailable {
+            operation: "object_write",
+            required: 6,
+            received: 4,
+            details: "two peers are unavailable".to_string(),
+        }
+        .into(),
+    );
+    assert_eq!(shard_unavailable.code(), tonic::Code::Unavailable);
+    assert!(
+        shard_unavailable
+            .message()
+            .contains(AnvilErrorCode::ObjectShardQuorumUnavailable.as_str())
+    );
+
+    let internal = core_store_status(anyhow::anyhow!("invalid commit certificate"));
+    assert_eq!(internal.code(), tonic::Code::Internal);
+}
+
 fn test_config(storage_path: &std::path::Path) -> Config {
     Config {
         jwt_secret: "test-secret".to_string(),
@@ -26,7 +64,7 @@ async fn seeded_core_store_link() -> (TempDir, ObjectManager, Bucket, Object, Ob
     let config = test_config(&storage_path);
     let storage = Storage::new_at(&config.storage_path).await.unwrap();
     let core_store = CoreStore::new(storage.clone()).await.unwrap();
-    let persistence = Persistence::new(&config, None).unwrap();
+    let persistence = Persistence::new(&config).unwrap();
     system_realm::ensure_bootstrapped(
         &config,
         &persistence,
@@ -82,7 +120,6 @@ async fn seeded_core_store_link() -> (TempDir, ObjectManager, Bucket, Object, Ob
     .await
     .unwrap();
 
-    let (watch_tx, _) = tokio::sync::broadcast::channel(8);
     let manager = ObjectManager::new(
         persistence.clone(),
         storage,
@@ -90,7 +127,6 @@ async fn seeded_core_store_link() -> (TempDir, ObjectManager, Bucket, Object, Ob
         "test-region".to_string(),
         CrossRegionRoutingPolicy::RedirectPreferred,
         hex::decode(&config.anvil_secret_encryption_key).unwrap(),
-        watch_tx,
         Observability::default(),
     );
     let target = manager
@@ -174,7 +210,7 @@ async fn seeded_object_manager(
     let config = test_config(&storage_path);
     let storage = Storage::new_at(&config.storage_path).await.unwrap();
     let core_store = CoreStore::new(storage.clone()).await.unwrap();
-    let persistence = Persistence::new(&config, None).unwrap();
+    let persistence = Persistence::new(&config).unwrap();
     system_realm::ensure_bootstrapped(
         &config,
         &persistence,
@@ -216,7 +252,6 @@ async fn seeded_object_manager(
     )
     .await
     .unwrap();
-    let (watch_tx, _) = tokio::sync::broadcast::channel(8);
     let manager = ObjectManager::new(
         persistence,
         storage,
@@ -224,7 +259,6 @@ async fn seeded_object_manager(
         "test-region".to_string(),
         CrossRegionRoutingPolicy::RedirectPreferred,
         hex::decode(&config.anvil_secret_encryption_key).unwrap(),
-        watch_tx,
         Observability::default(),
     );
     (temp, manager, bucket, claims)

@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -38,6 +39,88 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
             out.push(path);
         }
     }
+}
+
+fn root_register_shard_groups(corestore_root: &Path) -> BTreeMap<(String, String), BTreeSet<u8>> {
+    let register_root = corestore_root.join("blocks").join("register");
+    let mut files = Vec::new();
+    collect_files(corestore_root, &mut files);
+
+    let mut groups = BTreeMap::<(String, String), BTreeSet<u8>>::new();
+    for path in files
+        .into_iter()
+        .filter(|path| path.extension().is_some_and(|extension| extension == "anr"))
+    {
+        let relative = path.strip_prefix(&register_root).unwrap_or_else(|_| {
+            panic!("root-register shard escaped its private register: {path:?}")
+        });
+        let components = relative
+            .iter()
+            .map(|component| {
+                component
+                    .to_str()
+                    .unwrap_or_else(|| panic!("root-register path is not UTF-8: {path:?}"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            components.len(),
+            5,
+            "root-register shard does not use the canonical RFC 0007 layout: {path:?}"
+        );
+
+        let partition = components[0];
+        let prefix = components[1];
+        let root_hash = components[2];
+        let generation = components[3];
+        let shard_file = components[4];
+        assert!(
+            partition.len() == 20 && partition.bytes().all(|byte| byte.is_ascii_digit()),
+            "root-register partition is not a 20-digit identifier: {path:?}"
+        );
+        assert!(
+            prefix.len() == 2
+                && prefix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+            "root-register hash prefix is not canonical lowercase hex: {path:?}"
+        );
+        assert!(
+            root_hash.len() == 64
+                && root_hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                && root_hash.starts_with(prefix),
+            "root-register root hash is not canonical lowercase sha256 hex: {path:?}"
+        );
+        let generation_number = generation
+            .strip_prefix("generation-")
+            .unwrap_or_else(|| panic!("root-register generation has no prefix: {path:?}"));
+        assert!(
+            generation_number.len() == 20
+                && generation_number.bytes().all(|byte| byte.is_ascii_digit()),
+            "root-register generation is not a 20-digit identifier: {path:?}"
+        );
+        let shard_index = shard_file
+            .strip_prefix("shard-")
+            .and_then(|value| value.strip_suffix(".anr"))
+            .and_then(|value| value.parse::<u8>().ok())
+            .filter(|index| *index <= 2)
+            .unwrap_or_else(|| panic!("root-register shard index is outside r3: {path:?}"));
+        let bytes = fs::read(&path).unwrap();
+        assert!(
+            bytes.starts_with(b"ANREGRT1"),
+            "root-register shard does not contain the RFC 0007 frame: {path:?}"
+        );
+        assert!(
+            groups
+                .entry((root_hash.to_string(), generation.to_string()))
+                .or_default()
+                .insert(shard_index),
+            "root-register generation contains a duplicate shard index: {path:?}"
+        );
+    }
+
+    groups
 }
 
 fn path_has_component_sequence(path: &Path, components: &[&str]) -> bool {
@@ -143,7 +226,16 @@ async fn rfc_0007_large_compressible_payloads_do_not_inline_into_rocksdb() {
     );
 
     let meta = CoreMetaStore::open(meta_path).unwrap();
-    let rows = meta.scan_all_encoded_rows().unwrap();
+    let mut rows = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = meta.scan_encoded_rows_page(cursor.as_ref(), 256).unwrap();
+        rows.extend(page.rows);
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
     let oversized = rows
         .iter()
         .filter(|row| row.value_envelope.len() > 64 * 1024)
@@ -191,7 +283,7 @@ async fn rfc_0007_core_transaction_stream_is_root_anchor_backed() {
         .read_stream(ReadStream {
             stream_id: "core_transactions".to_string(),
             after_sequence: 0,
-            limit: 0,
+            limit: 100,
         })
         .await
         .unwrap();
@@ -201,14 +293,30 @@ async fn rfc_0007_core_transaction_stream_is_root_anchor_backed() {
             .any(|record| record.record_kind == "core_pending_mutation.finalisation"),
         "CoreStore transaction stream must replay through root-anchor-backed metadata"
     );
-    assert_eq!(
-        count_files_with_extension(
-            &tmp.path().join("corestore").join("blocks").join("register"),
-            "anr"
-        ),
-        0,
-        "RFC 0007 root anchors must not use root-anchor sidecar shard files"
+
+    let transaction_root = store
+        .read_internal_root_anchor("system/core-control/0", 1)
+        .await
+        .unwrap();
+    let shard_groups = root_register_shard_groups(&tmp.path().join("corestore"));
+    let transaction_group = (
+        transaction_root
+            .root_key_hash
+            .strip_prefix("sha256:")
+            .unwrap()
+            .to_string(),
+        format!("generation-{:020}", transaction_root.generation),
     );
+    assert!(
+        shard_groups.contains_key(&transaction_group),
+        "the committed transaction root has no private root-register generation"
+    );
+    for ((root_hash, generation), shard_indexes) in shard_groups {
+        assert!(
+            (2..=3).contains(&shard_indexes.len()),
+            "root-register generation {root_hash}/{generation} must contain a durable r3 quorum, found {shard_indexes:?}"
+        );
+    }
 }
 
 #[tokio::test]

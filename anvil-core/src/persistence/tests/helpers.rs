@@ -51,12 +51,11 @@ pub(super) async fn register_active_mesh_placement(
             node_id: "test-node".to_string(),
             region: "test-region".to_string(),
             cell_id: "default".to_string(),
-            libp2p_peer_id: "peer-test-node".to_string(),
-            receipt_signing_public_key_proto: libp2p::identity::Keypair::generate_ed25519()
-                .public()
-                .encode_protobuf(),
+            receipt_signing_public_key: crate::node_signing::NodeSigningKeypair::generate()
+                .unwrap()
+                .public_key_bytes()
+                .to_vec(),
             public_api_addr: "test-node".to_string(),
-            public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7443/quic-v1".to_string()],
             capabilities: vec![
                 crate::mesh_lifecycle::NodeCapability::Object,
                 crate::mesh_lifecycle::NodeCapability::Admin,

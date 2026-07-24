@@ -299,6 +299,14 @@ struct CoreObjectManifestProto {
     created_at: String,
     #[prost(string, tag = "11")]
     mutation_id: String,
+    #[prost(string, tag = "12")]
+    logical_file_id: String,
+    #[prost(uint64, tag = "13")]
+    logical_offset: u64,
+    #[prost(string, tag = "14")]
+    writer_family: String,
+    #[prost(string, tag = "15")]
+    encryption_algorithm: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -604,8 +612,9 @@ pub(in crate::core_store::local) fn decode_boundary_value_row(
 
 pub(in crate::core_store::local) fn encode_stream_record_index_row(
     row: &StoredStreamRecordIndexRow,
+    common: CoreMetaRowCommonProto,
 ) -> Result<Vec<u8>> {
-    encode_det(&stream_record_index_row_to_proto(row))
+    encode_det(&stream_record_index_row_to_proto(row, common))
 }
 
 pub(in crate::core_store::local) fn decode_stream_record_index_row(
@@ -618,8 +627,9 @@ pub(in crate::core_store::local) fn decode_stream_record_index_row(
 
 pub(in crate::core_store::local) fn encode_stream_idempotency_row(
     row: &StoredStreamIdempotencyRow,
+    common: CoreMetaRowCommonProto,
 ) -> Result<Vec<u8>> {
-    encode_det(&stream_idempotency_row_to_proto(row))
+    encode_det(&stream_idempotency_row_to_proto(row, common))
 }
 
 pub(in crate::core_store::local) fn decode_stream_idempotency_row(
@@ -648,8 +658,9 @@ pub(in crate::core_store::local) fn decode_stream_idempotency_row(
 
 pub(in crate::core_store::local) fn encode_stream_head_record(
     head: &CoreStoredStreamHead,
+    common: CoreMetaRowCommonProto,
 ) -> Result<Vec<u8>> {
-    encode_det(&stream_head_to_proto(head))
+    encode_det(&stream_head_to_proto(head, common))
 }
 
 pub(in crate::core_store::local) fn decode_stream_head_record(
@@ -927,15 +938,10 @@ fn boundary_source_from_proto(value: BoundarySourceProto) -> Result<CoreBoundary
 
 fn stream_record_index_row_to_proto(
     value: &StoredStreamRecordIndexRow,
+    common: CoreMetaRowCommonProto,
 ) -> StreamRecordIndexRowProto {
     StreamRecordIndexRowProto {
-        common: Some(core_meta_committed_row_common(
-            stream_realm_id(&value.stream_id),
-            stream_root_key_hash(&value.stream_id),
-            value.sequence,
-            value.transaction_id.clone().unwrap_or_default(),
-            0,
-        )),
+        common: Some(common),
         schema: value.schema.clone(),
         stream_id: value.stream_id.clone(),
         partition_id: value.partition_id.clone(),
@@ -962,15 +968,10 @@ fn stream_record_index_row_to_proto(
 
 fn stream_idempotency_row_to_proto(
     value: &StoredStreamIdempotencyRow,
+    common: CoreMetaRowCommonProto,
 ) -> StreamIdempotencyRowProto {
     StreamIdempotencyRowProto {
-        common: Some(core_meta_committed_row_common(
-            stream_realm_id(&value.stream_id),
-            stream_root_key_hash(&value.stream_id),
-            value.sequence,
-            value.transaction_id.clone().unwrap_or_default(),
-            0,
-        )),
+        common: Some(common),
         schema: value.schema.clone(),
         stream_id: value.stream_id.clone(),
         sequence: value.sequence,
@@ -1021,15 +1022,12 @@ fn stream_record_index_row_from_proto(
     })
 }
 
-fn stream_head_to_proto(value: &CoreStoredStreamHead) -> StreamHeadProto {
+fn stream_head_to_proto(
+    value: &CoreStoredStreamHead,
+    common: CoreMetaRowCommonProto,
+) -> StreamHeadProto {
     StreamHeadProto {
-        common: Some(core_meta_committed_row_common(
-            stream_realm_id(&value.stream_id),
-            stream_root_key_hash(&value.stream_id),
-            value.last_sequence,
-            String::new(),
-            0,
-        )),
+        common: Some(common),
         schema: value.schema.clone(),
         stream_id: value.stream_id.clone(),
         last_sequence: value.last_sequence,
@@ -1037,21 +1035,6 @@ fn stream_head_to_proto(value: &CoreStoredStreamHead) -> StreamHeadProto {
         record_count: value.record_count,
         updated_at: value.updated_at.clone(),
         idempotency_index_complete: value.idempotency_index_complete,
-    }
-}
-
-fn stream_realm_id(stream_id: &str) -> String {
-    stream_id
-        .split_once('/')
-        .map(|(realm, _)| format!("tenant/{realm}"))
-        .unwrap_or_else(|| "system".to_string())
-}
-
-fn stream_root_key_hash(stream_id: &str) -> String {
-    if stream_id == "core_transactions" {
-        core_meta_root_key_hash("system/core-control/0")
-    } else {
-        core_meta_root_key_hash(&format!("stream/{stream_id}"))
     }
 }
 
@@ -1165,6 +1148,10 @@ fn object_manifest_to_proto(value: &CoreObjectManifest) -> Result<CoreObjectMani
         region_id: value.region_id.clone(),
         object_hash: value.object_hash.clone(),
         logical_size: value.logical_size,
+        logical_file_id: value.logical_file_id.clone(),
+        logical_offset: value.logical_offset,
+        writer_family: value.writer_family.clone(),
+        encryption_algorithm: value.encryption_algorithm.clone(),
         boundary_values: value
             .boundary_values
             .iter()
@@ -1193,6 +1180,10 @@ fn object_manifest_from_proto(value: CoreObjectManifestProto) -> Result<CoreObje
         region_id: value.region_id,
         object_hash: value.object_hash,
         logical_size: value.logical_size,
+        logical_file_id: value.logical_file_id,
+        logical_offset: value.logical_offset,
+        writer_family: value.writer_family,
+        encryption_algorithm: value.encryption_algorithm,
         boundary_values: value
             .boundary_values
             .into_iter()
@@ -1233,12 +1224,12 @@ fn validate_object_manifest_common(
     if common.root_key_hash != object_manifest_root_key_hash(&value.object_hash) {
         return Err(anyhow!("CoreStore object manifest CoreMeta root mismatch"));
     }
-    if common.root_generation != object_manifest_root_generation(value.logical_size) {
+    if common.root_generation == 0 {
         return Err(anyhow!(
             "CoreStore object manifest CoreMeta generation mismatch"
         ));
     }
-    if common.transaction_id != value.mutation_id {
+    if common.transaction_id.is_empty() {
         return Err(anyhow!(
             "CoreStore object manifest CoreMeta transaction mismatch"
         ));
@@ -1255,10 +1246,10 @@ fn object_manifest_root_key_hash(object_hash: &str) -> String {
     core_meta_root_key_hash(&format!("object-manifest/{object_hash}"))
 }
 
-pub(in crate::core_store::local) fn object_manifest_root_generation(logical_size: u64) -> u64 {
-    // A content-addressed manifest owns one immutable root. Empty objects still
-    // need a positive CoreMeta generation so quorum preparation can advance.
-    logical_size.max(1)
+pub(in crate::core_store::local) fn object_manifest_root_generation(_logical_size: u64) -> u64 {
+    // A content-addressed manifest owns one immutable root, so its sole
+    // publication is always generation one regardless of object size.
+    1
 }
 
 fn rfc3339_unix_nanos(value: &str) -> Result<u64> {

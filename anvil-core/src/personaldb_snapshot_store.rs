@@ -165,7 +165,7 @@ pub async fn read_personaldb_snapshot_manifest_by_ref(
 ) -> Result<Option<PersonalDbSnapshotManifest>> {
     let (tenant_id, database_id) = personaldb_ref_scope(manifest_ref)?;
     let Some(row) =
-        read_personaldb_data_locator_row(storage, tenant_id, &database_id, manifest_ref)?
+        read_personaldb_data_locator_row(storage, tenant_id, &database_id, manifest_ref).await?
     else {
         return Ok(None);
     };
@@ -205,7 +205,8 @@ pub async fn read_personaldb_snapshot_object(
         tenant_id,
         database_id,
         &manifest.snapshot_object_key,
-    )?
+    )
+    .await?
     else {
         return Ok(None);
     };

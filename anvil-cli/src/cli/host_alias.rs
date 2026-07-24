@@ -122,8 +122,8 @@ pub async fn handle_host_alias_command(
             let mut request = tonic::Request::new(api::ListHostAliasesRequest {
                 region: region.clone().unwrap_or_default(),
                 page: Some(api::PageRequest {
-                    cursor: String::new(),
-                    limit: *limit,
+                    page_token: String::new(),
+                    page_size: *limit,
                 }),
             });
             attach_auth(&mut request, &token)?;

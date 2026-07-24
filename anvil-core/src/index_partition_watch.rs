@@ -1,12 +1,14 @@
 use crate::{
     core_store::{
-        AppendStreamRecord, CoreStore, ReadStream, decode_deterministic_proto,
+        CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
+        CoreMutationRootPublication, CoreStore, CoreTransactionState, ReadStream,
+        core_mutation_publication_attempt_id, decode_deterministic_proto,
         encode_deterministic_proto,
     },
     formats::{Hash32, hash32, watch::WatchRecord},
     partition_fence::{
-        OWNERSHIP_EXPIRED, OWNERSHIP_NOT_FOUND, OWNERSHIP_OWNER_MISMATCH, OWNERSHIP_STALE_FENCE,
-        OwnershipResource, OwnershipResourceKind, read_ownership_fence,
+        OWNERSHIP_OWNER_MISMATCH, OwnershipPrincipal, OwnershipResource, OwnershipResourceKind,
+        ownership_fence_precondition,
     },
     storage::Storage,
 };
@@ -16,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 const INDEX_PARTITION_FAMILY: u16 = 7;
 const INDEX_PARTITION_RECORD_KIND: u16 = 1;
+const MAX_INDEX_PARTITION_SEGMENT_HASHES: usize = 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IndexPartitionWatchPayload {
@@ -68,20 +71,58 @@ pub struct IndexPartitionWatchWriteAuthority {
     pub resource_id: String,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedIndexPartitionWatch {
+    partition_id: String,
+    stream_id: String,
+    logical_id: String,
+    payload: Vec<u8>,
+    stream_precondition: CoreMutationPrecondition,
+    ownership_precondition: CoreMutationPrecondition,
+    next_sequence: u64,
+}
+
 pub async fn append_index_partition_watch_record(
     storage: &Storage,
     tenant_id: i64,
     bucket_id: i64,
     partition_id: &str,
-    cursor: u128,
     mutation_id: [u8; 16],
     authz_revision: u64,
     payload: IndexPartitionWatchPayload,
     authority: IndexPartitionWatchWriteAuthority,
     signing_key: &[u8],
-) -> Result<()> {
+    additional_preconditions: &[CoreMutationPrecondition],
+) -> Result<u128> {
+    let prepared = prepare_index_partition_watch_record(
+        storage,
+        tenant_id,
+        bucket_id,
+        partition_id,
+        mutation_id,
+        authz_revision,
+        payload,
+        authority,
+        signing_key,
+    )
+    .await?;
+    publish_prepared_index_partition_watch(storage, prepared, additional_preconditions).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn prepare_index_partition_watch_record(
+    storage: &Storage,
+    tenant_id: i64,
+    bucket_id: i64,
+    partition_id: &str,
+    mutation_id: [u8; 16],
+    authz_revision: u64,
+    payload: IndexPartitionWatchPayload,
+    authority: IndexPartitionWatchWriteAuthority,
+    signing_key: &[u8],
+) -> Result<PreparedIndexPartitionWatch> {
     validate_payload(partition_id, &payload)?;
-    validate_write_authority(
+    let ownership_precondition = validate_write_authority(
         storage,
         tenant_id,
         bucket_id,
@@ -94,10 +135,9 @@ pub async fn append_index_partition_watch_record(
     let core_store = CoreStore::new(storage.clone()).await?;
     let stream_id =
         index_partition_watch_stream_id(tenant_id, bucket_id, &payload.index_id, partition_id);
-    ensure_cursor_is_monotonic(&core_store, &stream_id, cursor).await?;
 
     let record = WatchRecord::new(
-        cursor,
+        0,
         INDEX_PARTITION_FAMILY,
         watch_partition_id(tenant_id, bucket_id, &payload.index_id, partition_id),
         mutation_id,
@@ -107,28 +147,98 @@ pub async fn append_index_partition_watch_record(
         0,
         encode_index_partition_watch_payload(&payload),
     );
-    core_store
-        .append_stream(AppendStreamRecord {
-            stream_id,
-            partition_id: hex::encode(watch_partition_id(
-                tenant_id,
-                bucket_id,
-                &payload.index_id,
-                partition_id,
-            )),
-            record_kind: "index_partition_watch".to_string(),
-            payload: record.encode(),
-            content_type: None,
-            user_metadata_json: "{}".to_string(),
-            fence: None,
-            transaction_id: None,
-            idempotency_key: Some(format!(
-                "index-partition-watch:{tenant_id}:{bucket_id}:{}:{partition_id}:{cursor}",
-                payload.index_id
-            )),
+    let stream_precondition = core_store.stream_head_precondition(&stream_id).await?;
+    let next_sequence = next_stream_sequence(&stream_precondition)?;
+    let logical_id = format!(
+        "index-partition-watch:{tenant_id}:{bucket_id}:{}:{partition_id}:{}",
+        payload.index_id,
+        hex::encode(mutation_id)
+    );
+    Ok(PreparedIndexPartitionWatch {
+        partition_id: hex::encode(watch_partition_id(
+            tenant_id,
+            bucket_id,
+            &payload.index_id,
+            partition_id,
+        )),
+        stream_id,
+        logical_id,
+        payload: record.encode(),
+        stream_precondition,
+        ownership_precondition,
+        next_sequence,
+    })
+}
+
+pub(crate) async fn publish_prepared_index_partition_watch(
+    storage: &Storage,
+    prepared: PreparedIndexPartitionWatch,
+    additional_preconditions: &[CoreMutationPrecondition],
+) -> Result<u128> {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    if let Some(sequence) = committed_replay_sequence(&core_store, &prepared).await? {
+        return Ok(u128::from(sequence));
+    }
+    let mut preconditions = Vec::with_capacity(additional_preconditions.len() + 2);
+    preconditions.push(prepared.ownership_precondition);
+    preconditions.push(prepared.stream_precondition);
+    preconditions.extend_from_slice(additional_preconditions);
+    let transaction_id =
+        core_mutation_publication_attempt_id(&prepared.logical_id, &preconditions)?;
+    let receipt = core_store
+        .commit_mutation_batch(CoreMutationBatch {
+            transaction_id,
+            scope_partition: prepared.partition_id.clone(),
+            committed_by_principal: "index-partition-watch".to_string(),
+            root_publications: vec![
+                CoreMutationRootPublication::new(
+                    prepared.partition_id.clone(),
+                    crate::formats::writer::WriterFamily::CoreControl.as_str(),
+                )
+                .coordinator(),
+            ],
+            preconditions,
+            operations: vec![CoreMutationOperation::StreamAppend {
+                partition_id: prepared.partition_id,
+                stream_id: prepared.stream_id,
+                record_kind: "index_partition_watch".to_string(),
+                payload: prepared.payload,
+                idempotency_key: Some(prepared.logical_id),
+            }],
         })
         .await?;
-    Ok(())
+    if receipt.state != CoreTransactionState::Committed {
+        return Err(anyhow!(
+            "index partition watch publication {} did not commit: {}",
+            receipt.transaction_id,
+            receipt
+                .finalisation_error
+                .as_deref()
+                .unwrap_or("unknown finalisation failure")
+        ));
+    }
+    Ok(u128::from(prepared.next_sequence))
+}
+
+async fn committed_replay_sequence(
+    core_store: &CoreStore,
+    prepared: &PreparedIndexPartitionWatch,
+) -> Result<Option<u64>> {
+    let Some(record) = core_store
+        .read_stream_record_by_idempotency_key(&prepared.stream_id, &prepared.logical_id)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if record.record_kind != "index_partition_watch"
+        || record.payload != prepared.payload
+        || record.authenticated_principal != "index-partition-watch"
+    {
+        return Err(anyhow!(
+            "index partition watch logical id identifies different committed content"
+        ));
+    }
+    Ok(Some(record.sequence))
 }
 
 pub fn index_partition_watch_resource_id(
@@ -151,23 +261,66 @@ pub async fn list_index_partition_watch_events(
     after_cursor: u128,
     limit: usize,
 ) -> Result<Vec<IndexPartitionWatchEvent>> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let records = read_watch_or_empty(
-        &core_store,
-        &index_partition_watch_stream_id(tenant_id, bucket_id, index_id, partition_id),
+    Ok(list_index_partition_watch_event_page(
+        storage,
+        tenant_id,
+        bucket_id,
+        index_id,
+        partition_id,
+        after_cursor,
+        limit,
     )
-    .await?;
+    .await?
+    .events)
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexPartitionWatchEventPage {
+    pub events: Vec<IndexPartitionWatchEvent>,
+    pub next_cursor: u128,
+    pub has_more: bool,
+}
+
+pub async fn list_index_partition_watch_event_page(
+    storage: &Storage,
+    tenant_id: i64,
+    bucket_id: i64,
+    index_id: &str,
+    partition_id: &str,
+    after_cursor: u128,
+    limit: usize,
+) -> Result<IndexPartitionWatchEventPage> {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let after_sequence = u64::try_from(after_cursor)
+        .map_err(|_| anyhow!("index partition watch cursor exceeds u64"))?;
+    let page = core_store
+        .read_stream_page(ReadStream {
+            stream_id: index_partition_watch_stream_id(
+                tenant_id,
+                bucket_id,
+                index_id,
+                partition_id,
+            ),
+            after_sequence,
+            limit,
+        })
+        .await?;
     let expected_partition = watch_partition_id(tenant_id, bucket_id, index_id, partition_id);
-    let mut events = Vec::new();
-    for record in records {
-        if record.cursor <= after_cursor {
-            continue;
+    let mut events = Vec::with_capacity(page.records.len());
+    for source in page.records {
+        if source.record_kind != "index_partition_watch" {
+            return Err(anyhow!("index partition watch stream record kind mismatch"));
         }
+        let (mut record, used) = WatchRecord::decode(&source.payload)?;
+        if used != source.payload.len() {
+            return Err(anyhow!("index partition watch record has trailing bytes"));
+        }
+        record.cursor = u128::from(source.sequence);
         if record.partition_family != INDEX_PARTITION_FAMILY
             || record.record_kind != INDEX_PARTITION_RECORD_KIND
             || record.partition_id != expected_partition
         {
-            continue;
+            return Err(anyhow!("index partition watch record scope mismatch"));
         }
         let payload = decode_index_partition_watch_payload(&record.payload)?;
         if payload.index_id != index_id {
@@ -181,11 +334,12 @@ pub async fn list_index_partition_watch_events(
             index_generation: record.index_generation,
             payload,
         });
-        if limit > 0 && events.len() >= limit {
-            break;
-        }
     }
-    Ok(events)
+    Ok(IndexPartitionWatchEventPage {
+        events,
+        next_cursor: u128::from(page.next_sequence),
+        has_more: page.has_more,
+    })
 }
 
 async fn validate_write_authority(
@@ -196,7 +350,7 @@ async fn validate_write_authority(
     payload: &IndexPartitionWatchPayload,
     authority: &IndexPartitionWatchWriteAuthority,
     signing_key: &[u8],
-) -> Result<()> {
+) -> Result<CoreMutationPrecondition> {
     if authority.fence == 0 {
         return Err(anyhow!("index partition watch write fence must be nonzero"));
     }
@@ -211,32 +365,34 @@ async fn validate_write_authority(
         resource_kind: OwnershipResourceKind::WatchPartition,
         resource_id: authority.resource_id.clone(),
     };
-    let Some(record) = read_ownership_fence(storage, 0, &resource, signing_key).await? else {
-        return Err(anyhow!(
-            "{OWNERSHIP_NOT_FOUND}: index partition watch ownership fence is absent"
-        ));
-    };
     let now_nanos = chrono::Utc::now()
         .timestamp_nanos_opt()
         .ok_or_else(|| anyhow!("index partition watch timestamp overflow"))?;
-    if !record.is_active_unexpired(now_nanos) {
+    ownership_fence_precondition(
+        storage,
+        0,
+        &resource,
+        &OwnershipPrincipal::node(authority.owner_node_id.clone()),
+        authority.fence,
+        now_nanos,
+        signing_key,
+    )
+    .await
+}
+
+fn next_stream_sequence(precondition: &CoreMutationPrecondition) -> Result<u64> {
+    let CoreMutationPrecondition::StreamHead {
+        expected_last_sequence,
+        ..
+    } = precondition
+    else {
         return Err(anyhow!(
-            "{OWNERSHIP_EXPIRED}: index partition watch ownership fence is not active"
+            "index partition watch stream precondition has wrong kind"
         ));
-    }
-    if record.owner.principal_id != authority.owner_node_id
-        || record.owner.actor_instance_id != authority.owner_node_id
-    {
-        return Err(anyhow!(
-            "{OWNERSHIP_OWNER_MISMATCH}: index partition watch ownership fence owner mismatch"
-        ));
-    }
-    if record.fence != authority.fence {
-        return Err(anyhow!(
-            "{OWNERSHIP_STALE_FENCE}: index partition watch ownership fence token mismatch"
-        ));
-    }
-    Ok(())
+    };
+    expected_last_sequence
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("index partition watch cursor overflow"))
 }
 
 pub async fn latest_index_partition_watch_cursor(
@@ -247,54 +403,24 @@ pub async fn latest_index_partition_watch_cursor(
     partition_id: &str,
 ) -> Result<Option<u128>> {
     let core_store = CoreStore::new(storage.clone()).await?;
-    let records = read_watch_or_empty(
-        &core_store,
-        &index_partition_watch_stream_id(tenant_id, bucket_id, index_id, partition_id),
-    )
-    .await?;
-    let expected_partition = watch_partition_id(tenant_id, bucket_id, index_id, partition_id);
-    Ok(records
-        .into_iter()
-        .filter(|record| {
-            record.partition_family == INDEX_PARTITION_FAMILY
-                && record.record_kind == INDEX_PARTITION_RECORD_KIND
-                && record.partition_id == expected_partition
-        })
-        .map(|record| record.cursor)
-        .max())
-}
-
-async fn ensure_cursor_is_monotonic(
-    core_store: &CoreStore,
-    stream_id: &str,
-    cursor: u128,
-) -> Result<()> {
-    let records = read_watch_or_empty(core_store, stream_id).await?;
-    if let Some(latest) = records.iter().map(|record| record.cursor).max()
-        && cursor <= latest
-    {
-        return Err(anyhow!("index partition watch cursor must be monotonic"));
-    }
-    Ok(())
-}
-
-async fn read_watch_or_empty(core_store: &CoreStore, stream_id: &str) -> Result<Vec<WatchRecord>> {
-    let records = core_store
-        .read_stream(ReadStream {
-            stream_id: stream_id.to_string(),
-            after_sequence: 0,
-            limit: 0,
-        })
+    let sequence = core_store
+        .stream_head_sequence(&index_partition_watch_stream_id(
+            tenant_id,
+            bucket_id,
+            index_id,
+            partition_id,
+        ))
         .await?;
-    records
-        .into_iter()
-        .filter(|record| record.record_kind == "index_partition_watch")
-        .map(|record| {
-            WatchRecord::decode(&record.payload)
-                .map(|(record, _)| record)
-                .map_err(Into::into)
-        })
-        .collect()
+    Ok((sequence != 0).then_some(u128::from(sequence)))
+}
+
+pub(crate) fn index_partition_watch_stream_id_for_scope(
+    tenant_id: i64,
+    bucket_id: i64,
+    index_id: &str,
+    partition_id: &str,
+) -> String {
+    index_partition_watch_stream_id(tenant_id, bucket_id, index_id, partition_id)
 }
 
 fn validate_payload(partition_id: &str, payload: &IndexPartitionWatchPayload) -> Result<()> {
@@ -309,6 +435,11 @@ fn validate_payload(partition_id: &str, payload: &IndexPartitionWatchPayload) ->
     validate_hex32(&payload.proof_hash, "proof_hash")?;
     if payload.segment_hashes.is_empty() {
         return Err(anyhow!("index partition watch requires segment hashes"));
+    }
+    if payload.segment_hashes.len() > MAX_INDEX_PARTITION_SEGMENT_HASHES {
+        return Err(anyhow!(
+            "index partition watch must contain no more than {MAX_INDEX_PARTITION_SEGMENT_HASHES} segment hashes"
+        ));
     }
     for segment_hash in &payload.segment_hashes {
         validate_hex32(segment_hash, "segment_hash")?;
@@ -411,12 +542,12 @@ mod tests {
             3,
             9,
             &partition_id,
-            10,
             [1; 16],
             7,
             first_payload,
             first_authority,
             KEY,
+            &[],
         )
         .await
         .unwrap();
@@ -427,12 +558,12 @@ mod tests {
             3,
             9,
             &partition_id,
-            12,
             [2; 16],
             8,
             second_payload,
             second_authority,
             KEY,
+            &[],
         )
         .await
         .unwrap();
@@ -449,13 +580,13 @@ mod tests {
             9,
             "full-text-alpha",
             &partition_id,
-            10,
+            1,
             10,
         )
         .await
         .unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].cursor, 12);
+        assert_eq!(events[0].cursor, 2);
         assert_eq!(events[0].index_generation, 2);
         assert_eq!(events[0].authz_revision, 8);
         assert_eq!(events[0].payload.generation, 2);
@@ -463,12 +594,67 @@ mod tests {
             latest_index_partition_watch_cursor(&storage, 3, 9, "full-text-alpha", &partition_id)
                 .await
                 .unwrap(),
-            Some(12)
+            Some(2)
         );
     }
 
     #[tokio::test]
-    async fn index_partition_watch_rejects_non_monotonic_and_invalid_payloads() {
+    async fn index_partition_watch_exact_retry_reuses_the_committed_record() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let partition_id = hex::encode([5; 32]);
+        let event = payload(1);
+        let write_authority = authority(&storage, 3, 9, &partition_id, &event).await;
+
+        let first = append_index_partition_watch_record(
+            &storage,
+            3,
+            9,
+            &partition_id,
+            [1; 16],
+            7,
+            event.clone(),
+            write_authority.clone(),
+            KEY,
+            &[],
+        )
+        .await
+        .unwrap();
+        let replay = append_index_partition_watch_record(
+            &storage,
+            3,
+            9,
+            &partition_id,
+            [1; 16],
+            7,
+            event,
+            write_authority,
+            KEY,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(replay, first);
+        assert_eq!(
+            list_index_partition_watch_events(
+                &storage,
+                3,
+                9,
+                "full-text-alpha",
+                &partition_id,
+                0,
+                10,
+            )
+            .await
+            .unwrap()
+            .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn index_partition_watch_rejects_idempotency_conflicts_and_invalid_payloads() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let partition_id = hex::encode([5; 32]);
@@ -479,12 +665,12 @@ mod tests {
             3,
             9,
             &partition_id,
-            10,
             [1; 16],
             7,
             first_payload,
             first_authority,
             KEY,
+            &[],
         )
         .await
         .unwrap();
@@ -496,12 +682,12 @@ mod tests {
                 3,
                 9,
                 &partition_id,
-                10,
-                [2; 16],
+                [1; 16],
                 7,
                 second_payload,
                 second_authority,
                 KEY,
+                &[]
             )
             .await
             .is_err()
@@ -519,12 +705,12 @@ mod tests {
                 3,
                 9,
                 &partition_id,
-                11,
                 [3; 16],
                 7,
                 invalid,
                 invalid_authority,
                 KEY,
+                &[]
             )
             .await
             .is_err()
@@ -533,7 +719,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn index_partition_watch_limit_zero_means_unlimited() {
+    async fn index_partition_watch_requires_a_bounded_page_limit() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let partition_id = hex::encode([5; 32]);
@@ -545,17 +731,17 @@ mod tests {
                 3,
                 9,
                 &partition_id,
-                generation as u128,
                 [generation as u8; 16],
                 7,
                 next_payload,
                 next_authority,
                 KEY,
+                &[],
             )
             .await
             .unwrap();
         }
-        let events = list_index_partition_watch_events(
+        let error = list_index_partition_watch_events(
             &storage,
             3,
             9,
@@ -565,8 +751,8 @@ mod tests {
             0,
         )
         .await
-        .unwrap();
-        assert_eq!(events.len(), 3);
+        .unwrap_err();
+        assert!(error.to_string().contains("limit"));
     }
 
     #[tokio::test]
@@ -585,12 +771,12 @@ mod tests {
             3,
             9,
             &partition_id,
-            1,
             [1; 16],
             7,
             next_payload.clone(),
             stale,
             KEY,
+            &[],
         )
         .await
         .unwrap_err();
@@ -605,12 +791,12 @@ mod tests {
             3,
             9,
             &partition_id,
-            1,
             [1; 16],
             7,
             next_payload,
             wrong_resource,
             KEY,
+            &[],
         )
         .await
         .unwrap_err();
@@ -624,12 +810,12 @@ mod tests {
             3,
             9,
             &partition_id,
-            2,
             [2; 16],
             7,
             next_payload,
             stale_after_failover,
             KEY,
+            &[],
         )
         .await
         .unwrap_err();

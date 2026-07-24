@@ -1,5 +1,5 @@
 use crate::auth::JwtManager;
-use crate::cluster::ClusterState;
+use crate::core_store::CoreStore;
 use crate::crypto::EncryptionKeyring;
 use crate::object_manager::ObjectManager;
 use crate::partition_fence::{
@@ -7,16 +7,20 @@ use crate::partition_fence::{
 };
 use crate::persistence::Object;
 use crate::persistence::Persistence;
-use crate::task_lease::{LEASE_CAS_CONFLICT, LEASE_HELD, LEASE_OWNER_MISMATCH, STALE_FENCE};
-use crate::tasks::{HFIngestionItemState, HFIngestionState, TaskStatus, TaskType};
+use crate::task_execution_guard::TaskExecutionGuard;
+use crate::task_lease::{
+    self, LEASE_CAS_CONFLICT, LEASE_EXPIRED, LEASE_HELD, LEASE_OWNER_MISMATCH, STALE_FENCE,
+    TaskLease,
+};
+use crate::tasks::{
+    HFIngestionItemState, HFIngestionState, RebalanceShardTaskPayload, TaskStatus, TaskType,
+};
 use anyhow::{Result, anyhow};
 use futures_util::{Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
 use std::boxed::Box;
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
-use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -25,6 +29,8 @@ use tokio::sync::Semaphore;
 use tonic::Status;
 use tracing::{debug, error, info, warn};
 
+mod hf_index;
+
 type Task = crate::persistence::TaskRecord;
 
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -32,6 +38,8 @@ const CLAIM_CONTENTION_BASE_DELAY: Duration = Duration::from_millis(250);
 const CLAIM_CONTENTION_MAX_DELAY: Duration = Duration::from_secs(8);
 const CLAIM_TRANSIENT_MAX_DELAY: Duration = Duration::from_secs(2);
 const CLAIM_FATAL_DELAY: Duration = Duration::from_secs(5);
+const INTERRUPTED_TASK_RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
+const UNLEASED_RUNNING_TASK_GRACE: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerClaimError {
@@ -93,7 +101,12 @@ fn stable_jitter_ms(node_id: &str, attempt: u32, max_jitter_ms: u64) -> u64 {
 fn classify_worker_claim_error(error: &anyhow::Error) -> WorkerClaimError {
     if error_chain_contains(
         error,
-        &[OWNERSHIP_HELD, OWNERSHIP_OWNER_MISMATCH, LEASE_HELD],
+        &[
+            OWNERSHIP_HELD,
+            OWNERSHIP_OWNER_MISMATCH,
+            LEASE_HELD,
+            "partition owner row exists but is not committed-visible",
+        ],
     ) {
         return WorkerClaimError::OwnershipContention;
     }
@@ -120,6 +133,29 @@ fn error_chain_contains(error: &anyhow::Error, needles: &[&str]) -> bool {
         let message = cause.to_string();
         needles.iter().any(|needle| message.contains(needle))
     })
+}
+
+fn is_task_lease_fencing_error(error: &anyhow::Error) -> bool {
+    error_chain_contains(
+        error,
+        &[
+            LEASE_CAS_CONFLICT,
+            LEASE_EXPIRED,
+            LEASE_HELD,
+            LEASE_OWNER_MISMATCH,
+            STALE_FENCE,
+        ],
+    )
+}
+
+fn current_time_nanos() -> Result<i64> {
+    chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .ok_or_else(|| anyhow!("timestamp cannot be represented in nanoseconds"))
+}
+
+fn duration_nanos(duration: Duration) -> Result<i64> {
+    i64::try_from(duration.as_nanos()).map_err(|_| anyhow!("duration exceeds i64 nanoseconds"))
 }
 
 async fn wait_for_task_or_delay(task_notify: &Arc<tokio::sync::Notify>, delay: Duration) {
@@ -155,26 +191,37 @@ struct IndexBuildPayload {
 
 pub async fn run(
     persistence: Persistence,
-    cluster_state: ClusterState,
+    core_store: CoreStore,
     jwt_manager: Arc<JwtManager>,
     object_manager: ObjectManager,
     keyring: Arc<EncryptionKeyring>,
     concurrency: usize,
 ) -> Result<()> {
+    core_store.wait_for_coremeta_recovery_ready().await;
     while let Err(error) = recover_interrupted_tasks(&persistence).await {
         warn!(%error, "Failed to recover interrupted background tasks; retrying");
         tokio::time::sleep(CLAIM_FATAL_DELAY).await;
+        core_store.wait_for_coremeta_recovery_ready().await;
     }
+    let mut next_recovery = tokio::time::Instant::now() + INTERRUPTED_TASK_RECOVERY_INTERVAL;
     let task_notify = persistence.task_notify();
     let mut claim_backoff = WorkerClaimBackoff::default();
     let task_slots = Arc::new(Semaphore::new(concurrency.max(1)));
     loop {
+        core_store.wait_for_coremeta_recovery_ready().await;
+        if tokio::time::Instant::now() >= next_recovery {
+            if let Err(error) = recover_interrupted_tasks(&persistence).await {
+                warn!(%error, "Failed to recover expired background tasks");
+            }
+            next_recovery = tokio::time::Instant::now() + INTERRUPTED_TASK_RECOVERY_INTERVAL;
+        }
         if task_slots.available_permits() == 0 {
-            let permit = task_slots
-                .acquire()
-                .await
-                .map_err(|_| anyhow!("background task semaphore closed"))?;
-            drop(permit);
+            tokio::select! {
+                permit = task_slots.acquire() => {
+                    drop(permit.map_err(|_| anyhow!("background task semaphore closed"))?);
+                }
+                _ = tokio::time::sleep_until(next_recovery) => {}
+            }
             continue;
         }
 
@@ -234,7 +281,7 @@ pub async fn run(
 
         for task in tasks {
             let p = persistence.clone();
-            let cs = cluster_state.clone();
+            let core_store = core_store.clone();
             let jm = jwt_manager.clone();
             let om = object_manager.clone();
             let keyring = keyring.clone();
@@ -245,21 +292,78 @@ pub async fn run(
                 .map_err(|_| anyhow!("background task semaphore closed"))?;
             tokio::spawn(async move {
                 let _permit = permit;
-                let result = execute_task_with_lease(&p, &cs, &jm, &om, &task, &keyring).await;
+                let result =
+                    execute_task_with_lease(&p, &core_store, &jm, &om, &task, &keyring).await;
 
-                if let Err(e) = result {
-                    error!("Task {} failed: {:?}", task.id, e);
-                    if let Err(fail_err) = p.fail_task(task.id, &e.to_string()).await {
-                        error!("Failed to mark task {} as failed: {:?}", task.id, fail_err);
+                match result {
+                    Err(failure) => {
+                        error!("Task {} failed: {:?}", task.id, failure.error);
+                        if is_task_lease_fencing_error(&failure.error) {
+                            warn!(
+                                task_id = task.id,
+                                error = %failure.error,
+                                "Stale task execution stopped without mutating queue state"
+                            );
+                        } else if let Some(lease) = failure.lease {
+                            match execution_lease_precondition(&p, &core_store, &lease).await {
+                                Ok(precondition) => {
+                                    if let Err(fail_err) = p
+                                        .fail_task_with_execution_guard(
+                                            task.id,
+                                            task.attempts,
+                                            &failure.error.to_string(),
+                                            precondition,
+                                        )
+                                        .await
+                                    {
+                                        warn!(
+                                            task_id = task.id,
+                                            %fail_err,
+                                            "Task failure queue mutation was rejected"
+                                        );
+                                    }
+                                }
+                                Err(fence_error) => {
+                                    warn!(
+                                        task_id = task.id,
+                                        %fence_error,
+                                        "Task failure was not recorded because its lease is stale"
+                                    );
+                                }
+                            }
+                        } else {
+                            warn!(
+                                task_id = task.id,
+                                "Task failed before acquiring an execution lease; queue recovery will retry it"
+                            );
+                        }
                     }
-                } else {
-                    if let Err(complete_err) =
-                        p.update_task_status(task.id, TaskStatus::Completed).await
-                    {
-                        error!(
-                            "Failed to mark task {} as completed: {}",
-                            task.id, complete_err
-                        );
+                    Ok(lease) => {
+                        match execution_lease_precondition(&p, &core_store, &lease).await {
+                            Err(error) => {
+                                warn!(
+                                    task_id = task.id,
+                                    %error,
+                                    "Task completion rejected because its execution lease is stale"
+                                );
+                            }
+                            Ok(precondition) => {
+                                if let Err(complete_err) = p
+                                    .update_task_status_with_execution_guard(
+                                        task.id,
+                                        task.attempts,
+                                        TaskStatus::Completed,
+                                        precondition,
+                                    )
+                                    .await
+                                {
+                                    error!(
+                                        "Failed to mark task {} as completed: {}",
+                                        task.id, complete_err
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
             });
@@ -268,53 +372,109 @@ pub async fn run(
 }
 
 async fn recover_interrupted_tasks(persistence: &Persistence) -> Result<()> {
-    let node_id = persistence.owner_node_id();
-    let interrupted = persistence
-        .list_tasks()
-        .await?
-        .into_iter()
-        .filter(|task| task.status == TaskStatus::Running)
-        .collect::<Vec<_>>();
-    let mut recovered = 0_usize;
+    recover_interrupted_tasks_at(
+        persistence,
+        current_time_nanos()?,
+        duration_nanos(UNLEASED_RUNNING_TASK_GRACE)?,
+    )
+    .await
+}
 
-    for task in interrupted {
-        let lease = match persistence.read_task_execution_lease(task.id).await {
-            Ok(lease) => lease,
-            Err(error) => {
+async fn recover_interrupted_tasks_at(
+    persistence: &Persistence,
+    now_nanos: i64,
+    unleased_grace_nanos: i64,
+) -> Result<()> {
+    if now_nanos < 0 || unleased_grace_nanos < 0 {
+        return Err(anyhow!("task recovery timestamps must be nonnegative"));
+    }
+    let mut recovered = 0_usize;
+    let mut after_tuple_key = None;
+
+    loop {
+        let page = persistence
+            .list_tasks_page(after_tuple_key.as_deref(), 256)
+            .await?;
+        for task in page
+            .tasks
+            .into_iter()
+            .filter(|task| task.status == TaskStatus::Running)
+        {
+            let lease = match persistence.read_task_execution_lease(task.id).await {
+                Ok(lease) => lease,
+                Err(error) => {
+                    warn!(
+                        task_id = task.id,
+                        %error,
+                        "Failed to inspect an interrupted background task lease"
+                    );
+                    continue;
+                }
+            };
+            let recovery_reason = match lease.as_ref() {
+                Some(lease) if lease.expires_at_nanos <= now_nanos => {
+                    "background task execution lease expired before completion"
+                }
+                Some(_) => continue,
+                None => {
+                    let updated_at_nanos =
+                        task.updated_at.timestamp_nanos_opt().ok_or_else(|| {
+                            anyhow!("task {} update time exceeds nanosecond range", task.id)
+                        })?;
+                    if updated_at_nanos > now_nanos.saturating_sub(unleased_grace_nanos) {
+                        continue;
+                    }
+                    "background task remained unleased after being claimed"
+                }
+            };
+            let lease_precondition = match lease.as_ref() {
+                Some(lease) => {
+                    task_lease::task_lease_exact_precondition(
+                        persistence.storage(),
+                        lease,
+                        persistence.partition_owner_signing_key(),
+                    )
+                    .await
+                }
+                None => task_lease::task_lease_precondition(
+                    persistence.storage(),
+                    0,
+                    &format!("task-{}", task.id),
+                ),
+            };
+            let lease_precondition = match lease_precondition {
+                Ok(precondition) => precondition,
+                Err(error) if is_task_lease_fencing_error(&error) => continue,
+                Err(error) => return Err(error),
+            };
+            if let Err(error) = persistence
+                .fail_task_with_execution_guard(
+                    task.id,
+                    task.attempts,
+                    recovery_reason,
+                    lease_precondition,
+                )
+                .await
+            {
                 warn!(
                     task_id = task.id,
                     %error,
-                    "Failed to inspect an interrupted background task lease"
+                    "Failed to recover an interrupted background task"
                 );
                 continue;
             }
-        };
-        if lease
-            .as_ref()
-            .is_some_and(|lease| lease.owner_node_id() != node_id)
-        {
-            continue;
-        }
-        if let Err(error) = persistence
-            .fail_task(
-                task.id,
-                "background worker restarted before task completion",
-            )
-            .await
-        {
+            recovered = recovered.saturating_add(1);
             warn!(
                 task_id = task.id,
-                %error,
-                "Failed to recover an interrupted background task"
+                task_type = ?task.task_type,
+                recovery_reason,
+                "Recovered a background task without a valid execution lease"
             );
-            continue;
         }
-        recovered = recovered.saturating_add(1);
-        warn!(
-            task_id = task.id,
-            task_type = ?task.task_type,
-            "Recovered an interrupted background task"
-        );
+        let Some(next) = page.next_tuple_key else {
+            break;
+        };
+        after_tuple_key = Some(next);
     }
 
     if recovered > 0 {
@@ -323,34 +483,186 @@ async fn recover_interrupted_tasks(persistence: &Persistence) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
+struct TaskExecutionFailure {
+    lease: Option<TaskLease>,
+    error: anyhow::Error,
+}
+
 async fn execute_task_with_lease(
     persistence: &Persistence,
-    _cluster_state: &ClusterState,
+    core_store: &CoreStore,
     _jwt_manager: &Arc<JwtManager>,
     object_manager: &ObjectManager,
     task: &Task,
     keyring: &Arc<EncryptionKeyring>,
-) -> anyhow::Result<()> {
-    let lease = persistence.acquire_task_execution_lease(task).await?;
-    match task.task_type {
-        TaskType::DeleteObject => handle_delete_object(persistence, task).await?,
-        TaskType::DeleteBucket => handle_delete_bucket(persistence, task).await?,
-        TaskType::ObjectMetadataCompaction => {
-            handle_object_metadata_compaction(persistence, task).await?
+) -> std::result::Result<TaskLease, TaskExecutionFailure> {
+    let lease = persistence
+        .acquire_task_execution_lease(task)
+        .await
+        .map_err(|error| TaskExecutionFailure { lease: None, error })?;
+    if task.task_type == TaskType::RebalanceShard {
+        let mut lease = lease;
+        handle_rebalance_shard(persistence, core_store, task, &mut lease)
+            .await
+            .map_err(|error| TaskExecutionFailure {
+                lease: Some(lease.clone()),
+                error,
+            })?;
+        return check_execution_lease(persistence, core_store, &lease)
+            .await
+            .map_err(|error| TaskExecutionFailure {
+                lease: Some(lease),
+                error,
+            });
+    }
+
+    let guard = TaskExecutionGuard::new(
+        core_store.storage().clone(),
+        persistence.partition_owner_signing_key().to_vec(),
+        lease.clone(),
+    )
+    .map_err(|error| TaskExecutionFailure {
+        lease: Some(lease),
+        error,
+    })?;
+    if let Err(error) =
+        execute_task_handler_with_lease_renewal(persistence, object_manager, task, keyring, &guard)
+            .await
+    {
+        return Err(TaskExecutionFailure {
+            lease: Some(guard.snapshot().await),
+            error,
+        });
+    }
+    let source_cursor = guard.snapshot().await.source_cursor;
+    if let Err(error) = guard.checkpoint(source_cursor).await {
+        return Err(TaskExecutionFailure {
+            lease: Some(guard.snapshot().await),
+            error,
+        });
+    }
+    match guard.check().await {
+        Ok(lease) => Ok(lease),
+        Err(error) => Err(TaskExecutionFailure {
+            lease: Some(guard.snapshot().await),
+            error,
+        }),
+    }
+}
+
+async fn execute_task_handler_with_lease_renewal(
+    persistence: &Persistence,
+    object_manager: &ObjectManager,
+    task: &Task,
+    keyring: &EncryptionKeyring,
+    guard: &TaskExecutionGuard,
+) -> Result<()> {
+    let execution = async {
+        match task.task_type {
+            TaskType::DeleteObject => handle_delete_object(persistence, task, guard).await?,
+            TaskType::DeleteBucket => handle_delete_bucket(persistence, task, guard).await?,
+            TaskType::ObjectMetadataCompaction => {
+                handle_object_metadata_compaction(persistence, task, guard).await?
+            }
+            TaskType::IndexBuild => handle_index_build(persistence, task, guard).await?,
+            TaskType::AuthzMaterialization => {
+                handle_authz_materialization(persistence, task, guard).await?
+            }
+            TaskType::HFIngestion => {
+                handle_hf_ingestion(persistence, object_manager, task, keyring, guard).await?
+            }
+            TaskType::RebalanceShard => {
+                return Err(anyhow!(
+                    "RebalanceShard must use its lease-aware repair executor"
+                ));
+            }
         }
-        TaskType::IndexBuild => handle_index_build(persistence, task).await?,
-        TaskType::AuthzMaterialization => handle_authz_materialization(persistence, task).await?,
-        TaskType::HFIngestion => {
-            handle_hf_ingestion(persistence, object_manager, task, keyring).await?
-        }
-        _ => {
-            warn!("Unhandled task type: {:?}", task.task_type);
+        Ok(())
+    };
+    tokio::pin!(execution);
+
+    loop {
+        let renewal_delay = guard.renewal_delay().await?;
+        let renewal = async {
+            tokio::time::sleep(renewal_delay).await;
+            guard.renew().await
+        };
+        tokio::pin!(renewal);
+        tokio::select! {
+            biased;
+            renewed = &mut renewal => {
+                renewed?;
+            }
+            result = &mut execution => {
+                guard.check().await?;
+                return result;
+            }
         }
     }
-    persistence
-        .checkpoint_task_execution_lease(&lease, lease.source_cursor)
-        .await?;
-    Ok(())
+}
+
+async fn check_execution_lease(
+    persistence: &Persistence,
+    core_store: &CoreStore,
+    lease: &TaskLease,
+) -> Result<TaskLease> {
+    task_lease::check_task_lease(
+        core_store.storage(),
+        lease,
+        current_time_nanos()?,
+        persistence.partition_owner_signing_key(),
+    )
+    .await
+}
+
+async fn execution_lease_precondition(
+    persistence: &Persistence,
+    core_store: &CoreStore,
+    lease: &TaskLease,
+) -> Result<crate::core_store::CoreMutationPrecondition> {
+    task_lease::task_lease_fenced_precondition(
+        core_store.storage(),
+        lease,
+        current_time_nanos()?,
+        persistence.partition_owner_signing_key(),
+    )
+    .await
+}
+
+async fn renew_execution_lease(
+    persistence: &Persistence,
+    core_store: &CoreStore,
+    lease: &TaskLease,
+    ttl_nanos: i64,
+) -> Result<TaskLease> {
+    task_lease::renew_task_lease(
+        core_store.storage(),
+        lease,
+        current_time_nanos()?,
+        ttl_nanos,
+        persistence.partition_owner_signing_key(),
+    )
+    .await
+}
+
+fn task_lease_ttl_nanos(lease: &TaskLease) -> Result<i64> {
+    lease
+        .expires_at_nanos
+        .checked_sub(lease.acquired_at_nanos)
+        .filter(|ttl| *ttl > 0)
+        .ok_or_else(|| anyhow!("task lease has no positive renewal window"))
+}
+
+fn task_lease_renewal_delay(lease: &TaskLease, now_nanos: i64) -> Result<Duration> {
+    let remaining = lease.expires_at_nanos.saturating_sub(now_nanos);
+    if remaining <= 0 {
+        return Err(anyhow!("{LEASE_EXPIRED}: task lease expired"));
+    }
+    let delay_nanos = (remaining / 3).max(1);
+    Ok(Duration::from_nanos(
+        u64::try_from(delay_nanos).map_err(|_| anyhow!("task lease delay exceeds u64"))?,
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -359,13 +671,130 @@ struct AuthzMaterializationPayload {
     target_revision: u64,
 }
 
+async fn handle_rebalance_shard(
+    persistence: &Persistence,
+    core_store: &CoreStore,
+    task: &Task,
+    lease: &mut TaskLease,
+) -> anyhow::Result<()> {
+    let payload: RebalanceShardTaskPayload = serde_json::from_value(task.payload.clone())
+        .map_err(|error| anyhow!("invalid RebalanceShard task {} payload: {error}", task.id))?;
+    payload.validate()?;
+    let attempt_started_at_nanos = lease.acquired_at_nanos;
+    let ttl_nanos = task_lease_ttl_nanos(&lease)?;
+
+    *lease = check_execution_lease(persistence, core_store, lease).await?;
+    let open_finding_precondition =
+        execution_lease_precondition(persistence, core_store, lease).await?;
+    let open_finding = persistence
+        .write_rebalance_shard_finding(
+            &payload,
+            task.id,
+            lease.fence_token,
+            lease.lease_epoch,
+            attempt_started_at_nanos,
+            crate::repair_finding::RepairFindingStatus::Open,
+            open_finding_precondition,
+        )
+        .await?;
+    *lease = check_execution_lease(persistence, core_store, lease).await?;
+    let repair_finding_id = open_finding.finding_id;
+
+    let preparation = core_store.prepare_shard_repair_for_task(&payload, &repair_finding_id);
+    tokio::pin!(preparation);
+    let prepared = loop {
+        let renewal_delay = task_lease_renewal_delay(&lease, current_time_nanos()?)?;
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep(renewal_delay) => {
+                *lease = renew_execution_lease(
+                    persistence,
+                    core_store,
+                    lease,
+                    ttl_nanos,
+                ).await?;
+            }
+            result = &mut preparation => {
+                *lease = check_execution_lease(persistence, core_store, lease).await?;
+                break result?;
+            }
+        }
+    };
+    *lease = renew_execution_lease(persistence, core_store, lease, ttl_nanos).await?;
+    let lease_precondition = task_lease::task_lease_fenced_precondition(
+        core_store.storage(),
+        lease,
+        current_time_nanos()?,
+        persistence.partition_owner_signing_key(),
+    )
+    .await?;
+    let outcome = core_store
+        .publish_prepared_shard_repair(prepared, lease_precondition)
+        .await?;
+    if outcome.requires_retry() {
+        let unresolved = outcome
+            .unresolved_placements()
+            .iter()
+            .map(|placement| {
+                format!(
+                    "{}:{}:{:?}",
+                    placement.shard_index, placement.expected_node_id, placement.reason
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        return Err(anyhow!(
+            "CoreStore shard repair remains incomplete and must retry: {unresolved}"
+        ));
+    }
+    let overlays_published = outcome.overlays_published();
+    let completed_status = rebalance_shard_completion_status(overlays_published);
+    *lease = check_execution_lease(persistence, core_store, lease).await?;
+    let completed_finding_precondition =
+        execution_lease_precondition(persistence, core_store, lease).await?;
+    let completed_finding = persistence
+        .write_rebalance_shard_finding(
+            &payload,
+            task.id,
+            lease.fence_token,
+            lease.lease_epoch,
+            attempt_started_at_nanos,
+            completed_status,
+            completed_finding_precondition,
+        )
+        .await;
+    *lease = renew_execution_lease(persistence, core_store, lease, ttl_nanos).await?;
+    completed_finding?;
+
+    info!(
+        task_id = task.id,
+        object_hash = %payload.object_hash,
+        block_id = %payload.block_id,
+        lease_fence_token = lease.fence_token,
+        overlays_published,
+        "RebalanceShard task completed"
+    );
+    Ok(())
+}
+
+fn rebalance_shard_completion_status(
+    overlays_published: bool,
+) -> crate::repair_finding::RepairFindingStatus {
+    if overlays_published {
+        crate::repair_finding::RepairFindingStatus::RepairedObjectShards
+    } else {
+        crate::repair_finding::RepairFindingStatus::VerifiedHealthy
+    }
+}
+
 async fn handle_authz_materialization(
     persistence: &Persistence,
     task: &Task,
+    guard: &TaskExecutionGuard,
 ) -> anyhow::Result<()> {
     let payload: AuthzMaterializationPayload = serde_json::from_value(task.payload.clone())?;
     let outcome = persistence
-        .run_authz_materialization_task(payload.tenant_id, payload.target_revision)
+        .run_authz_materialization_task(payload.tenant_id, payload.target_revision, guard)
         .await?;
     info!(
         tenant_id = payload.tenant_id,
@@ -379,7 +808,11 @@ async fn handle_authz_materialization(
     Ok(())
 }
 
-async fn handle_index_build(persistence: &Persistence, task: &Task) -> anyhow::Result<()> {
+async fn handle_index_build(
+    persistence: &Persistence,
+    task: &Task,
+    guard: &TaskExecutionGuard,
+) -> anyhow::Result<()> {
     let payload: IndexBuildPayload = serde_json::from_value(task.payload.clone())?;
     match persistence
         .build_index_task(
@@ -388,6 +821,7 @@ async fn handle_index_build(persistence: &Persistence, task: &Task) -> anyhow::R
             payload.index_id,
             payload.index_version,
             payload.source_cursor,
+            guard,
         )
         .await?
     {
@@ -418,10 +852,11 @@ async fn handle_index_build(persistence: &Persistence, task: &Task) -> anyhow::R
 async fn handle_object_metadata_compaction(
     persistence: &Persistence,
     task: &Task,
+    guard: &TaskExecutionGuard,
 ) -> anyhow::Result<()> {
     let payload: ObjectMetadataCompactionPayload = serde_json::from_value(task.payload.clone())?;
     let Some(sealed) = persistence
-        .compact_object_metadata(payload.bucket_id)
+        .compact_object_metadata_for_task(payload.bucket_id, guard)
         .await?
     else {
         info!(
@@ -446,6 +881,7 @@ async fn handle_hf_ingestion(
     object_manager: &ObjectManager,
     task: &Task,
     keyring: &EncryptionKeyring,
+    _guard: &TaskExecutionGuard,
 ) -> anyhow::Result<()> {
     use globset::{Glob, GlobSetBuilder};
     use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
@@ -679,47 +1115,18 @@ async fn handle_hf_ingestion(
             format!("{}/anvil-index.json", target_prefix.trim_end_matches('/'))
         };
 
-        let mut file_map = HashMap::new();
-
-        // Fetch ALL items for this target (from past and current jobs) to build a complete index
-        let all_items = persistence
-            .hf_get_all_items_for_prefix(tenant_id, &target_bucket, &target_prefix)
-            .await?;
-
-        for (path, size_opt, etag_opt, finished_at_opt) in all_items {
-            let mut meta = json!({});
-            if let Some(s) = size_opt {
-                meta["size"] = json!(s);
-            }
-            if let Some(e) = etag_opt {
-                meta["etag"] = json!(e);
-            }
-            if let Some(f) = finished_at_opt {
-                meta["last_modified"] = json!(f.to_rfc3339());
-            }
-            // Insert will overwrite existing entries, so later jobs (ordered by finished_at) win.
-            file_map.insert(path, meta);
-        }
-
-        let mut total_bytes = 0;
-        for meta in file_map.values() {
-            if let Some(s) = meta.get("size").and_then(|v| v.as_i64()) {
-                total_bytes += s;
-            }
-        }
-
-        let index_json = json!({
-            "meta": {
-                "source_repo": repo_str,
-                "revision": revision,
-                "generated_at": chrono::Utc::now().to_rfc3339(),
-                "total_files": file_map.len(),
-                "total_bytes": total_bytes
-            },
-            "files": file_map,
-        });
-
-        let index_content_data = serde_json::to_vec_pretty(&index_json)?;
+        // The index output is necessarily proportional to the target contents,
+        // but paging and streaming keep memory independent of target cardinality.
+        let index_path = hf_index::write_target_index(
+            persistence,
+            tenant_id,
+            &target_bucket,
+            &target_prefix,
+            &repo_str,
+            &revision,
+            cache_dir.path(),
+        )
+        .await?;
         info!(index_key = %index_key, "Uploading anvil-index.json");
 
         // Upload index file, using retry logic adapted from above for robustness
@@ -727,13 +1134,14 @@ async fn handle_hf_ingestion(
         loop {
             attempt += 1;
             info!("Putting anvil-index.json, attempt {}", attempt);
-            let current_index_content = index_content_data.clone();
+            let index_file = tokio::fs::File::open(&index_path).await?;
             let index_stream: Pin<
                 Box<dyn Stream<Item = Result<Vec<u8>, Status>> + Send + 'static>,
-            > = Box::pin(
-                futures_util::stream::once(async move { Ok(current_index_content) })
-                    .map(|item: Result<Vec<u8>, Infallible>| item.map_err(|e| match e {})),
-            );
+            > = Box::pin(tokio_util::io::ReaderStream::new(index_file).map(|result| {
+                result
+                    .map(|bytes| bytes.to_vec())
+                    .map_err(|error| Status::internal(error.to_string()))
+            }));
 
             let res: Result<Object, Status> = object_manager
                 .put_object(
@@ -798,7 +1206,11 @@ async fn handle_hf_ingestion(
     result
 }
 
-async fn handle_delete_object(persistence: &Persistence, task: &Task) -> Result<()> {
+async fn handle_delete_object(
+    persistence: &Persistence,
+    task: &Task,
+    _guard: &TaskExecutionGuard,
+) -> Result<()> {
     let payload: DeleteObjectPayload = serde_json::from_value(task.payload.clone())?;
 
     // Finally, hard delete the object metadata.
@@ -811,7 +1223,11 @@ async fn handle_delete_object(persistence: &Persistence, task: &Task) -> Result<
     Ok(())
 }
 
-async fn handle_delete_bucket(persistence: &Persistence, task: &Task) -> Result<()> {
+async fn handle_delete_bucket(
+    persistence: &Persistence,
+    task: &Task,
+    _guard: &TaskExecutionGuard,
+) -> Result<()> {
     let payload: DeleteBucketPayload = serde_json::from_value(task.payload.clone())?;
     let deleted = persistence
         .hard_delete_bucket_if_empty(payload.bucket_id)
@@ -837,9 +1253,7 @@ mod tests {
     use super::*;
     use crate::{config::Config, storage::Storage};
     use chrono::Utc;
-    use std::collections::HashMap;
     use tempfile::tempdir;
-    use tokio::sync::{RwLock, broadcast};
 
     fn test_config(storage_path: &std::path::Path) -> Config {
         Config {
@@ -857,6 +1271,11 @@ mod tests {
     #[test]
     fn worker_claim_error_classification_treats_queue_ownership_as_contention() {
         let error = anyhow!("{OWNERSHIP_HELD}: partition task_queue is owned by active node");
+        assert_eq!(
+            classify_worker_claim_error(&error),
+            WorkerClaimError::OwnershipContention
+        );
+        let error = anyhow!("partition owner row exists but is not committed-visible");
         assert_eq!(
             classify_worker_claim_error(&error),
             WorkerClaimError::OwnershipContention
@@ -886,11 +1305,23 @@ mod tests {
         assert!(max_seen <= CLAIM_CONTENTION_MAX_DELAY + CLAIM_CONTENTION_MAX_DELAY / 2);
     }
 
+    #[test]
+    fn rebalance_completion_finding_reflects_overlay_publication() {
+        assert_eq!(
+            rebalance_shard_completion_status(true),
+            crate::repair_finding::RepairFindingStatus::RepairedObjectShards
+        );
+        assert_eq!(
+            rebalance_shard_completion_status(false),
+            crate::repair_finding::RepairFindingStatus::VerifiedHealthy
+        );
+    }
+
     #[tokio::test]
-    async fn interrupted_claim_is_requeued_when_the_worker_restarts() {
+    async fn unleased_running_task_is_recovered_only_after_the_grace_period() {
         let temp = tempdir().unwrap();
         let config = test_config(temp.path());
-        let persistence = Persistence::new(&config, None).unwrap();
+        let persistence = Persistence::new(&config).unwrap();
 
         persistence
             .enqueue_task(TaskType::DeleteObject, json!({ "object_id": 1 }), 0)
@@ -899,47 +1330,86 @@ mod tests {
         let claimed = persistence.claim_pending_tasks(1).await.unwrap();
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].status, TaskStatus::Running);
+        let claimed_at = claimed[0].updated_at.timestamp_nanos_opt().unwrap();
+        let grace = duration_nanos(UNLEASED_RUNNING_TASK_GRACE).unwrap();
 
-        recover_interrupted_tasks(&persistence).await.unwrap();
+        recover_interrupted_tasks_at(&persistence, claimed_at + grace - 1, grace)
+            .await
+            .unwrap();
+        let active = persistence
+            .list_tasks_page(None, 1_000)
+            .await
+            .unwrap()
+            .tasks;
+        assert_eq!(active[0].status, TaskStatus::Running);
 
-        let tasks = persistence.list_tasks().await.unwrap();
+        recover_interrupted_tasks_at(&persistence, claimed_at + grace, grace)
+            .await
+            .unwrap();
+
+        let tasks = persistence
+            .list_tasks_page(None, 1_000)
+            .await
+            .unwrap()
+            .tasks;
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].status, TaskStatus::Failed);
         assert_eq!(tasks[0].attempts, 1);
         assert_eq!(
             tasks[0].last_error.as_deref(),
-            Some("background worker restarted before task completion")
+            Some("background task remained unleased after being claimed")
         );
     }
 
     #[tokio::test]
-    async fn interrupted_task_owned_by_the_restarting_node_is_requeued() {
+    async fn running_task_is_recovered_only_after_its_lease_expires() {
         let temp = tempdir().unwrap();
         let config = test_config(temp.path());
-        let persistence = Persistence::new(&config, None).unwrap();
+        let persistence = Persistence::new(&config).unwrap();
 
         persistence
             .enqueue_task(TaskType::DeleteObject, json!({ "object_id": 1 }), 0)
             .await
             .unwrap();
         let claimed = persistence.claim_pending_tasks(1).await.unwrap();
-        persistence
+        let lease = persistence
             .acquire_task_execution_lease(&claimed[0])
             .await
             .unwrap();
+        let grace = duration_nanos(UNLEASED_RUNNING_TASK_GRACE).unwrap();
 
-        recover_interrupted_tasks(&persistence).await.unwrap();
+        recover_interrupted_tasks_at(&persistence, lease.expires_at_nanos - 1, grace)
+            .await
+            .unwrap();
+        let active = persistence
+            .list_tasks_page(None, 1_000)
+            .await
+            .unwrap()
+            .tasks;
+        assert_eq!(active[0].status, TaskStatus::Running);
 
-        let tasks = persistence.list_tasks().await.unwrap();
+        recover_interrupted_tasks_at(&persistence, lease.expires_at_nanos, grace)
+            .await
+            .unwrap();
+
+        let tasks = persistence
+            .list_tasks_page(None, 1_000)
+            .await
+            .unwrap()
+            .tasks;
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].status, TaskStatus::Failed);
+        assert_eq!(
+            tasks[0].last_error.as_deref(),
+            Some("background task execution lease expired before completion")
+        );
     }
 
     #[tokio::test]
     async fn object_metadata_compaction_task_seals_manifest() {
         let temp = tempdir().unwrap();
         let config = test_config(temp.path());
-        let persistence = Persistence::new(&config, None).unwrap();
+        let persistence = Persistence::new(&config).unwrap();
 
         persistence.create_region("local").await.unwrap();
         let bucket = persistence
@@ -980,23 +1450,20 @@ mod tests {
         let core_store = crate::core_store::CoreStore::new(storage.clone())
             .await
             .unwrap();
-        let cluster_state: ClusterState = Arc::new(RwLock::new(HashMap::new()));
         let jwt_manager = Arc::new(JwtManager::new(config.jwt_secret.clone()));
-        let (watch_tx, _watch_rx) = broadcast::channel(16);
         let object_manager = ObjectManager::new(
             persistence.clone(),
             storage.clone(),
-            core_store,
+            core_store.clone(),
             config.region.clone(),
             config.cross_region_routing_policy,
             hex::decode(&config.anvil_secret_encryption_key).unwrap(),
-            watch_tx,
             crate::observability::Observability::default(),
         );
         let keyring = Arc::new(config.secret_keyring().unwrap());
         execute_task_with_lease(
             &persistence,
-            &cluster_state,
+            &core_store,
             &jwt_manager,
             &object_manager,
             &task,

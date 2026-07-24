@@ -10,6 +10,10 @@ pub enum StorageClassCommands {
         request_id: Option<String>,
         #[clap(long, action = clap::ArgAction::SetTrue)]
         include_operator_only: bool,
+        #[clap(long, default_value_t = 100)]
+        page_size: u32,
+        #[clap(long, default_value = "")]
+        page_token: String,
     },
     /// Show one storage class profile
     Get {
@@ -29,6 +33,8 @@ pub(super) async fn handle_storage_class_command(
         StorageClassCommands::List {
             request_id,
             include_operator_only,
+            page_size,
+            page_token,
         } => {
             let request_id = request_id_or_cli(request_id);
             print_rpc_response(
@@ -39,6 +45,10 @@ pub(super) async fn handle_storage_class_command(
                     api::ListStorageClassesRequest {
                         request_id: request_id.clone(),
                         include_operator_only: *include_operator_only,
+                        page: Some(api::PageRequest {
+                            page_size: *page_size,
+                            page_token: page_token.clone(),
+                        }),
                     },
                     token,
                 )?),

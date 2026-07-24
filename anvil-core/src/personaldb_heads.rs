@@ -1,16 +1,16 @@
 use crate::{
     anvil_api::SignatureEnvelopeV1 as WireSignatureEnvelopeV1,
     core_store::{
-        CoreMutationBatch, CoreMutationPrecondition, CoreStore, decode_deterministic_proto,
-        encode_deterministic_proto,
+        CoreMutationBatch, CoreMutationPrecondition, CoreMutationRootPublication, CoreStore,
+        decode_deterministic_proto, encode_deterministic_proto,
     },
-    formats::hash32,
+    formats::{hash32, writer::WriterFamily},
     personaldb_control::PersonalDbGroupManifest,
     personaldb_coremeta::{
         PersonalDbDataLocatorCoreMetaRow, PersonalDbGroupCoreMetaRow,
         personaldb_data_locator_precondition, personaldb_group_coremeta_put_operation,
-        personaldb_partition_id, personaldb_payload_hash, read_personaldb_data_locator_bytes,
-        read_personaldb_data_locator_row,
+        personaldb_partition_id, personaldb_payload_hash, personaldb_root_anchor_key,
+        read_personaldb_data_locator_bytes, read_personaldb_data_locator_row,
         write_personaldb_bytes_as_data_locator_with_preconditions,
     },
     personaldb_signing::{
@@ -540,6 +540,7 @@ async fn write_head_record_with_preconditions<T: PersonalDbHeadRecordCodec>(
     )
     .await?;
     if let Some(group_row) = value.group_coremeta_row(tenant_id, &database_id, &row)? {
+        let scope_partition = personaldb_partition_id(tenant_id, &database_id);
         CoreStore::new(storage.clone())
             .await?
             .commit_mutation_batch(CoreMutationBatch {
@@ -547,8 +548,19 @@ async fn write_head_record_with_preconditions<T: PersonalDbHeadRecordCodec>(
                     "personaldb-head-group:{}:{}",
                     group_row.group_id, group_row.generation
                 ),
-                scope_partition: personaldb_partition_id(tenant_id, &database_id),
+                scope_partition: scope_partition.clone(),
                 committed_by_principal: "system:personaldb".to_string(),
+                root_publications: vec![
+                    CoreMutationRootPublication::new(
+                        scope_partition,
+                        WriterFamily::CoreControl.as_str(),
+                    )
+                    .coordinator(),
+                    CoreMutationRootPublication::new(
+                        personaldb_root_anchor_key(group_row.tenant_id, &group_row.group_id),
+                        WriterFamily::PersonalDb.as_str(),
+                    ),
+                ],
                 preconditions,
                 operations: vec![personaldb_group_coremeta_put_operation(&group_row)?],
             })
@@ -562,7 +574,8 @@ async fn read_head_record<T: PersonalDbHeadRecordCodec>(
     data_id: &str,
 ) -> Result<Option<T>> {
     let (tenant_id, database_id) = personaldb_head_scope(data_id)?;
-    let Some(row) = read_personaldb_data_locator_row(storage, tenant_id, &database_id, data_id)?
+    let Some(row) =
+        read_personaldb_data_locator_row(storage, tenant_id, &database_id, data_id).await?
     else {
         return Ok(None);
     };
@@ -674,7 +687,10 @@ impl PersonalDbHeadRecordCodec for PersonalDbGroupManifest {
         Ok(Some(PersonalDbGroupCoreMetaRow {
             tenant_id,
             group_id: database_id.to_string(),
-            generation: locator.generation,
+            generation: locator
+                .root_generation
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("personaldb group root generation overflow"))?,
             replica_set_hash: personaldb_payload_hash(self.created_by.as_bytes()),
             witness_policy_hash: personaldb_payload_hash(self.consistency_policy.as_bytes()),
             latest_commit: self.genesis_hash.clone(),
@@ -904,6 +920,7 @@ mod tests {
 
         let data_id = personaldb_head_data_id(7, "db-alpha", "committed_head").unwrap();
         let row = read_personaldb_data_locator_row(&storage, 7, "db-alpha", &data_id)
+            .await
             .unwrap()
             .expect("committed head CoreMeta locator row exists");
         assert_eq!(row.data_kind, "committed_head");
@@ -945,6 +962,7 @@ mod tests {
 
         let data_id = personaldb_head_data_id(7, "db-alpha", "snapshots_head").unwrap();
         let row = read_personaldb_data_locator_row(&storage, 7, "db-alpha", &data_id)
+            .await
             .unwrap()
             .expect("snapshots head CoreMeta locator row exists");
         assert_eq!(row.data_kind, "snapshots_head");
@@ -990,6 +1008,7 @@ mod tests {
 
         let data_id = personaldb_head_data_id(7, "db-alpha", "group_manifest").unwrap();
         let row = read_personaldb_data_locator_row(&storage, 7, "db-alpha", &data_id)
+            .await
             .unwrap()
             .expect("group manifest CoreMeta locator row exists");
         assert_eq!(row.data_kind, "group_manifest");
@@ -1065,6 +1084,7 @@ mod tests {
 
         let data_id = personaldb_head_data_id(7, "db-alpha", "committed_head").unwrap();
         let row = read_personaldb_data_locator_row(&storage, 7, "db-alpha", &data_id)
+            .await
             .unwrap()
             .expect("committed head CoreMeta locator row exists");
         let mut value = read_personaldb_data_locator_bytes(&storage, &row)

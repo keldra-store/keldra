@@ -2,9 +2,9 @@ use crate::{
     access_control, auth, bucket_journal,
     core_store::{
         AppendStreamRecord as CoreAppendStreamRecord, AuthzScopeRef, CoreBoundarySchema,
-        CoreBoundarySource, CoreBoundaryValue, CoreByteRange, CoreManifestLocator, CoreObjectRef,
-        CorePrefetchPolicy, CoreStore, GetBlob, PutBlob, SealStreamSegment,
-        WriteLogicalFilePathRequest, WriteLogicalFileRequest,
+        CoreBoundarySource, CoreBoundaryValue, CoreByteRange, CoreManifestLocator,
+        CoreMutationPrecondition, CoreObjectRef, CorePrefetchPolicy, CoreStore, CoreTransaction,
+        GetBlob, PutBlob, SealStreamSegment, WriteLogicalFilePathRequest, WriteLogicalFileRequest,
         core_object_ref_from_logical_file_write, decode_core_object_ref_target,
         decode_manifest_locator_proto, encode_core_object_ref_target,
         encode_manifest_locator_proto,
@@ -17,7 +17,7 @@ use crate::{
         RESERVED_NAMESPACE_REJECTION_COUNT,
     },
     permissions::AnvilAction,
-    persistence::{Bucket, MetadataMutationReceipt, Object, ObjectWatchEvent, Persistence},
+    persistence::{Bucket, MetadataMutationReceipt, Object, Persistence},
     routing::{self, CrossRegionRoutingPolicy},
     storage::Storage,
     validation, watch_log,
@@ -32,13 +32,15 @@ use std::pin::Pin;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use std::time::Instant;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
 use tonic::metadata::MetadataValue;
 use tracing::info;
 
+mod batch_write;
 mod write_visibility;
+pub(crate) use batch_write::ObjectBatchPut;
 pub use write_visibility::{
     AuthzMaterializationVisibility, AuthzRevisionVisibility, BoundaryExtractionVisibility,
     IndexMaintenanceVisibility, IndexPolicySnapshotVisibility, ObjectWriteOptions,
@@ -53,7 +55,6 @@ pub struct ObjectManager {
     region: String,
     cross_region_routing_policy: CrossRegionRoutingPolicy,
     signing_key: Vec<u8>,
-    watch_tx: broadcast::Sender<ObjectWatchEvent>,
     observability: Observability,
 }
 
@@ -157,6 +158,11 @@ pub struct ObjectHeadResult {
     pub followed_link: Option<object_links::FollowedObjectLink>,
 }
 
+pub(crate) struct ObjectMutationPreconditionSnapshot {
+    pub(crate) object: Option<Object>,
+    pub(crate) precondition: CoreMutationPrecondition,
+}
+
 #[derive(Debug, Clone)]
 pub struct AppendStreamRecordResult {
     pub record_sequence: u64,
@@ -196,7 +202,6 @@ impl ObjectManager {
         region: String,
         cross_region_routing_policy: CrossRegionRoutingPolicy,
         signing_key: Vec<u8>,
-        watch_tx: broadcast::Sender<ObjectWatchEvent>,
         observability: Observability,
     ) -> Self {
         Self {
@@ -206,7 +211,6 @@ impl ObjectManager {
             region,
             cross_region_routing_policy,
             signing_key,
-            watch_tx,
             observability,
         }
     }
@@ -536,7 +540,7 @@ impl ObjectManager {
                     Some(effective_storage_class_id.as_str()),
                 )
                 .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+                .map_err(core_store_status)?;
             let content_hash = object_ref.hash.clone();
             let shard_map = Some(
                 object_data_target_to_shard_map(&ObjectDataTarget::ObjectRef(object_ref))
@@ -561,7 +565,7 @@ impl ObjectManager {
                     region_id: self.region.clone(),
                 })
                 .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+                .map_err(core_store_status)?;
             let content_hash = logical_write.manifest.content_hash.clone();
             let shard_map = Some(
                 object_data_target_to_shard_map(&ObjectDataTarget::LogicalFile(
@@ -635,34 +639,6 @@ impl ObjectManager {
                     "object_manager.put_object grant_object_defaults",
                     step_start.elapsed(),
                 );
-            }
-            if options.visibility.requires_watch_visible() {
-                let step_start = std::time::Instant::now();
-                self.publish_object_watch_event(tenant_id, &bucket, &object, "put", false)
-                    .await?;
-                crate::emit_test_timing(
-                    "object_manager.put_object publish_object_watch_event",
-                    step_start.elapsed(),
-                );
-            } else {
-                let manager = self.clone();
-                let bucket = bucket.clone();
-                let object = object.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = manager
-                        .publish_object_watch_event(tenant_id, &bucket, &object, "put", false)
-                        .await
-                    {
-                        tracing::warn!(
-                            tenant_id,
-                            bucket_id = bucket.id,
-                            bucket_name = %bucket.name,
-                            object_key = %object.key,
-                            %error,
-                            "deferred object watch publication failed"
-                        );
-                    }
-                });
             }
         }
         crate::emit_test_timing("object_manager.put_object total", total_start.elapsed());
@@ -789,7 +765,7 @@ impl ObjectManager {
             bytes_u64,
             io_start.elapsed(),
         );
-        let write = write_result.map_err(|e| Status::internal(e.to_string()))?;
+        let write = write_result.map_err(core_store_status)?;
         if let Err(error) = remove_result {
             tracing::warn!(
                 path = %temp_path.display(),
@@ -1063,20 +1039,12 @@ impl ObjectManager {
             .map_err(|e| Status::internal(e.to_string()))
     }
 
-    pub async fn watch_prefix_snapshot(
+    pub async fn resolve_prefix_watch_scope(
         &self,
         claims: auth::Claims,
         bucket_name: &str,
         prefix: &str,
-        after_cursor: u64,
-    ) -> Result<
-        (
-            i64,
-            Vec<ObjectWatchEvent>,
-            broadcast::Receiver<ObjectWatchEvent>,
-        ),
-        Status,
-    > {
+    ) -> Result<i64, Status> {
         if !validation::is_valid_bucket_name(bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
         }
@@ -1091,21 +1059,7 @@ impl ObjectManager {
             .await?;
         access_control::require_bucket_permission(&self.storage, &claims, &bucket, "list_objects")
             .await?;
-        let live = self.watch_tx.subscribe();
-        let after_cursor = i64::try_from(after_cursor)
-            .map_err(|_| Status::invalid_argument("after_cursor exceeds supported range"))?;
-        let snapshot = watch_log::list_object_watch_events(
-            &self.storage,
-            claims.tenant_id,
-            bucket.id,
-            prefix,
-            after_cursor,
-            1000,
-        )
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
-
-        Ok((bucket.id, snapshot, live))
+        Ok(bucket.id)
     }
 
     pub async fn create_append_stream(
@@ -1159,7 +1113,7 @@ impl ObjectManager {
                 "grant creator stream owner",
             )
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(core_store_status)?;
         }
         Ok(CreateAppendStreamResult {
             stream_id: mutation.stream.stream_id,
@@ -1230,7 +1184,7 @@ impl ObjectManager {
                 mutation_id: stream_payload_mutation_id.clone(),
             })
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(core_store_status)?;
         let payload_hash = object_ref.hash.clone();
         self.core_store
             .append_stream_authenticated(
@@ -1260,7 +1214,7 @@ impl ObjectManager {
                 .append_stream_record_in_transaction(
                     tenant_id,
                     bucket.id,
-                    stream.id,
+                    &stream,
                     object_ref,
                     payload_size,
                     content_type.clone(),
@@ -1274,7 +1228,7 @@ impl ObjectManager {
                 .append_stream_record(
                     tenant_id,
                     bucket.id,
-                    stream.id,
+                    &stream,
                     object_ref,
                     payload_size,
                     content_type.clone(),
@@ -1337,26 +1291,13 @@ impl ObjectManager {
         }
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found("Append stream not found"))?;
-        let records = if let Some(transaction_id) = transaction_id {
-            let transaction_principal = transaction_principal.ok_or_else(|| {
-                Status::invalid_argument("transaction principal is required for append stream seal")
-            })?;
-            self.persistence
-                .list_append_stream_records_in_transaction(
-                    tenant_id,
-                    bucket.id,
-                    stream.id,
-                    transaction_id,
-                    transaction_principal,
-                )
-                .await
-        } else {
-            self.persistence
-                .list_append_stream_records(tenant_id, bucket.id, stream.id)
-                .await
-        }
-        .map_err(|e| Status::internal(e.to_string()))?;
-        if records.is_empty() {
+        let transaction = transaction_id.zip(transaction_principal);
+        let has_records = self
+            .persistence
+            .append_stream_has_records(&stream, transaction)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if !has_records {
             return Err(Status::failed_precondition(
                 "Append stream has no records to seal",
             ));
@@ -1372,7 +1313,7 @@ impl ObjectManager {
                 mutation_id: format!("append-stream-seal-{stream_id}-{}", uuid::Uuid::new_v4()),
             })
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(core_store_status)?;
         let segment_hash = core_segment.object_ref.hash.clone();
         let sealed = if let Some(transaction_id) = transaction_id {
             let transaction_principal = transaction_principal.ok_or_else(|| {
@@ -1382,7 +1323,7 @@ impl ObjectManager {
                 .seal_append_stream_in_transaction(
                     tenant_id,
                     bucket.id,
-                    stream.id,
+                    &stream,
                     &segment_hash,
                     transaction_id,
                     transaction_principal,
@@ -1390,7 +1331,7 @@ impl ObjectManager {
                 .await
         } else {
             self.persistence
-                .seal_append_stream(tenant_id, bucket.id, stream.id, &segment_hash)
+                .seal_append_stream(tenant_id, bucket.id, &stream, &segment_hash)
                 .await
         }
         .map_err(|e| Status::internal(e.to_string()))?;
@@ -1401,7 +1342,7 @@ impl ObjectManager {
         };
 
         Ok(SealAppendStreamResult {
-            record_count: records.len() as u64,
+            record_count: core_segment.record_count,
             segment_hash,
             receipt,
         })
@@ -1941,6 +1882,14 @@ fn core_append_stream_id(tenant_id: i64, bucket_id: i64, stream_id: uuid::Uuid) 
 
 fn core_append_stream_partition_id(tenant_id: i64, bucket_id: i64) -> String {
     format!("object-append-partition-{tenant_id}-{bucket_id}")
+}
+
+fn core_store_status(error: anyhow::Error) -> Status {
+    if let Some(status) = crate::services::core_store_status::availability_status(&error) {
+        status
+    } else {
+        Status::internal(error.to_string())
+    }
 }
 
 #[cfg(test)]

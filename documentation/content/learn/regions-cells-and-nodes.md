@@ -76,7 +76,9 @@ A cell descriptor records its region, cell id, placement weight, lifecycle state
 
 ## Node: one Anvil process with advertised capabilities
 
-A node is one running Anvil server process. It belongs to one region and one cell, has a node id, advertises public API and cluster addresses, and declares capabilities.
+A node is one running Anvil server process. It belongs to one region and one cell. Its committed descriptor binds the node id, dialable `public_api_addr`, Ed25519 receipt-signing public key, capabilities, lifecycle state, and generation used by routing and verification.
+
+Committed CoreMeta lifecycle topology is the membership authority. Processes do not discover one another or become eligible merely because they are reachable. Equal nodes use authenticated gRPC at the endpoint committed for each identity.
 
 Current capability names are:
 
@@ -85,6 +87,7 @@ Current capability names are:
 | `object` | The process can participate in object-serving work. Current remote object proxy selection depends on active nodes with this capability and a public API address. |
 | `index` | The process is intended to participate in index build or query responsibilities. |
 | `personaldb` | The process is intended to participate in PersonalDB witnessing, snapshot, or projection work. |
+| `metadata` | The process can participate in distributed metadata and CoreMeta responsibilities. |
 | `gateway` | The process is intended to serve gateway traffic such as S3/static surfaces. |
 | `admin` | The process is intended to participate in admin-plane responsibilities. |
 

@@ -48,7 +48,7 @@ async fn personaldb_signing_key_admin_lifecycle_is_authorised_audited_and_public
 
     let listed = client
         .list_personal_db_signing_keys(with_auth(
-            tonic::Request::new(ListPersonalDbSigningKeysRequest {}),
+            tonic::Request::new(ListPersonalDbSigningKeysRequest { page: None }),
             &token,
         ))
         .await

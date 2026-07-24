@@ -2,6 +2,7 @@ use super::*;
 use crate::core_store::{
     CF_LEASES_FENCES, CoreMetaStore, TABLE_OWNERSHIP_FENCE_ROW, TABLE_PARTITION_OWNER_ROW,
 };
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use tempfile::tempdir;
 
 const KEY: &[u8] = b"partition owner signing key";
@@ -14,6 +15,7 @@ async fn recovery_acquire_blocks_writes_until_owner_ready() {
         .await
         .unwrap();
     assert_eq!(recovering.fence_token, 1);
+    assert_eq!(recovering.generation, 1);
     assert_eq!(recovering.status, PartitionOwnerStatus::Recovering);
 
     let permit = PartitionWritePermit {
@@ -41,6 +43,7 @@ async fn recovery_acquire_blocks_writes_until_owner_ready() {
     .await
     .unwrap();
     assert_eq!(ready.status, PartitionOwnerStatus::Ready);
+    assert_eq!(ready.generation, 2);
     assert_eq!(ready.recovered_through_sequence, 77);
     validate_partition_write(&storage, &ready.write_permit().unwrap(), KEY)
         .await
@@ -150,10 +153,284 @@ async fn same_node_concurrent_partition_recovery_acquire_is_idempotent() {
         assert_eq!(owner.fence_token, first.fence_token);
         assert_eq!(owner.recovery_epoch, first.recovery_epoch);
     }
-    let listed = list_partition_owners(&storage, KEY).await.unwrap();
-    assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].owner_node_id, "node-a");
-    assert_eq!(listed[0].fence_token, first.fence_token);
+    let page = list_partition_owners_page(&storage, None, 2, KEY)
+        .await
+        .unwrap();
+    assert_eq!(page.owners.len(), 1);
+    assert!(page.next_cursor.is_none());
+    assert_eq!(page.owners[0].owner_node_id, "node-a");
+    assert_eq!(page.owners[0].fence_token, first.fence_token);
+}
+
+#[tokio::test]
+async fn unrelated_partition_owner_keys_enter_cas_concurrently() {
+    let temp = tempdir().unwrap();
+    let storage = Storage::new_at(temp.path()).await.unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let first_storage = storage.clone();
+    let first_barrier = barrier.clone();
+    let first = tokio::spawn(async move {
+        super::coremeta::with_point_cas_barrier(
+            first_barrier,
+            acquire_partition_recovery(
+                &first_storage,
+                acquire_for_partition("node-a", 11, 100),
+                KEY,
+            ),
+        )
+        .await
+    });
+    let second_storage = storage.clone();
+    let second = tokio::spawn(async move {
+        super::coremeta::with_point_cas_barrier(
+            barrier,
+            acquire_partition_recovery(
+                &second_storage,
+                acquire_for_partition("node-b", 12, 100),
+                KEY,
+            ),
+        )
+        .await
+    });
+
+    let (first, second) = tokio::time::timeout(Duration::from_secs(10), async {
+        (first.await.unwrap(), second.await.unwrap())
+    })
+    .await
+    .expect("unrelated point-key CAS operations must not wait on a module-global lock");
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_ne!(first.partition_id, second.partition_id);
+    assert_eq!(first.fence_token, 1);
+    assert_eq!(second.fence_token, 1);
+}
+
+#[tokio::test]
+async fn ownership_fence_and_partition_owner_cas_are_not_globally_serialized() {
+    let temp = tempdir().unwrap();
+    let storage = Storage::new_at(temp.path()).await.unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let fence_storage = storage.clone();
+    let fence_barrier = barrier.clone();
+    let fence = tokio::spawn(async move {
+        super::coremeta::with_point_cas_barrier(
+            fence_barrier,
+            acquire_ownership(
+                &fence_storage,
+                ownership_acquire(principal("app-a", "token-a", "node-a"), 100, 500, "fence-a"),
+                KEY,
+            ),
+        )
+        .await
+    });
+    let owner_storage = storage.clone();
+    let owner = tokio::spawn(async move {
+        super::coremeta::with_point_cas_barrier(
+            barrier,
+            acquire_partition_recovery(
+                &owner_storage,
+                acquire_for_partition("node-b", 13, 100),
+                KEY,
+            ),
+        )
+        .await
+    });
+
+    let (fence, owner) = tokio::time::timeout(Duration::from_secs(10), async {
+        (fence.await.unwrap(), owner.await.unwrap())
+    })
+    .await
+    .expect("unrelated fence tables must not share a module-global CAS lock");
+    assert_eq!(fence.unwrap().record.fence, 1);
+    assert_eq!(owner.unwrap().fence_token, 1);
+}
+
+#[tokio::test]
+async fn same_partition_owner_key_has_one_cas_winner() {
+    let temp = tempdir().unwrap();
+    let storage = Storage::new_at(temp.path()).await.unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let first_storage = storage.clone();
+    let first_barrier = barrier.clone();
+    let first = tokio::spawn(async move {
+        super::coremeta::with_point_cas_barrier(
+            first_barrier,
+            acquire_partition_recovery(
+                &first_storage,
+                acquire_for_partition("node-a", 21, 100),
+                KEY,
+            ),
+        )
+        .await
+    });
+    let second_storage = storage.clone();
+    let second = tokio::spawn(async move {
+        super::coremeta::with_point_cas_barrier(
+            barrier,
+            acquire_partition_recovery(
+                &second_storage,
+                acquire_for_partition("node-b", 21, 100),
+                KEY,
+            ),
+        )
+        .await
+    });
+
+    let outcomes = tokio::time::timeout(Duration::from_secs(10), async {
+        [first.await.unwrap(), second.await.unwrap()]
+    })
+    .await
+    .expect("same-key CAS contenders must complete after one typed conflict retry");
+    let successes = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+    let held = outcomes
+        .iter()
+        .filter(|outcome| {
+            outcome
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains(OWNERSHIP_HELD))
+        })
+        .count();
+    assert_eq!(successes, 1);
+    assert_eq!(held, 1);
+
+    let stored = read_partition_owner(&storage, "object_metadata", &hex::encode([21; 32]), KEY)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(stored.owner_node_id.as_str(), "node-a" | "node-b"));
+    assert_eq!(stored.fence_token, 1);
+    assert_eq!(stored.generation, 1);
+}
+
+#[tokio::test]
+async fn partition_owner_pages_are_bounded_and_continue_without_duplicates() {
+    let temp = tempdir().unwrap();
+    let storage = Storage::new_at(temp.path()).await.unwrap();
+    let expected = (31_u8..36)
+        .map(|seed| hex::encode([seed; 32]))
+        .collect::<BTreeSet<_>>();
+    for seed in 31_u8..36 {
+        acquire_partition_recovery(
+            &storage,
+            acquire_for_partition("node-a", seed, i64::from(seed)),
+            KEY,
+        )
+        .await
+        .unwrap();
+    }
+
+    let mut cursor = None;
+    let mut page_sizes = Vec::new();
+    let mut listed = BTreeSet::new();
+    loop {
+        let page = list_partition_owners_page(&storage, cursor.as_ref(), 2, KEY)
+            .await
+            .unwrap();
+        assert!(page.owners.len() <= 2);
+        page_sizes.push(page.owners.len());
+        for owner in page.owners {
+            assert!(listed.insert(owner.partition_id));
+        }
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(page_sizes, vec![2, 2, 1]);
+    assert_eq!(listed, expected);
+    assert!(
+        list_partition_owners_page(&storage, None, 0, KEY)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn partition_owner_node_pages_use_the_node_projection() {
+    let temp = tempdir().unwrap();
+    let storage = Storage::new_at(temp.path()).await.unwrap();
+    for seed in 1..=32 {
+        acquire_partition_recovery(
+            &storage,
+            acquire_for_partition(&format!("noise-{seed}"), seed, 100),
+            KEY,
+        )
+        .await
+        .unwrap();
+    }
+    for seed in 40..=42 {
+        acquire_partition_recovery(
+            &storage,
+            acquire_for_partition("node-target", seed, 100),
+            KEY,
+        )
+        .await
+        .unwrap();
+    }
+
+    let first = list_partition_owners_for_node_page(&storage, "node-target", None, 2, KEY)
+        .await
+        .unwrap();
+    assert_eq!(first.owners.len(), 2);
+    assert!(
+        first
+            .owners
+            .iter()
+            .all(|owner| owner.owner_node_id == "node-target")
+    );
+    let second = list_partition_owners_for_node_page(
+        &storage,
+        "node-target",
+        first.next_cursor.as_ref(),
+        2,
+        KEY,
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.owners.len(), 1);
+    assert!(second.next_cursor.is_none());
+}
+
+#[tokio::test]
+async fn point_cas_reads_are_independent_of_unrelated_owner_cardinality() {
+    let temp = tempdir().unwrap();
+    let storage = Storage::new_at(temp.path()).await.unwrap();
+    let meta = CoreMetaStore::open(storage.core_store_meta_path()).unwrap();
+    for seed in 40_u8..104 {
+        let owner = PartitionOwnerState {
+            format_version: 1,
+            partition_family: "object_metadata".to_string(),
+            partition_id: hex::encode([seed; 32]),
+            owner_node_id: format!("unrelated-{seed}"),
+            fence_token: 1,
+            recovery_epoch: 1,
+            generation: 1,
+            status: PartitionOwnerStatus::Recovering,
+            recovered_through_sequence: 0,
+            recovered_manifest_hash: hex::encode([0; 32]),
+            updated_at_nanos: i64::from(seed),
+            owner_hash: None,
+            owner_signature: None,
+        }
+        .seal(KEY)
+        .unwrap();
+        meta.put(
+            CF_LEASES_FENCES,
+            TABLE_PARTITION_OWNER_ROW,
+            &partition_owner_row_key(&owner.partition_family, &owner.partition_id).unwrap(),
+            &encode_partition_owner_record(&owner).unwrap(),
+        )
+        .unwrap();
+    }
+
+    let (outcome, point_reads) = super::coremeta::count_point_reads(acquire_partition_recovery(
+        &storage,
+        acquire_for_partition("target-node", 200, 200),
+        KEY,
+    ))
+    .await;
+    outcome.unwrap();
+    assert_eq!(point_reads, 1);
 }
 
 #[tokio::test]
@@ -360,6 +637,135 @@ async fn ownership_fences_are_coremeta_rows() {
 }
 
 #[tokio::test]
+async fn ownership_fence_pages_continue_in_bounded_coremeta_order() {
+    let temp = tempdir().unwrap();
+    let storage = Storage::new_at(temp.path()).await.unwrap();
+    let mut expected = BTreeSet::new();
+    for index in 0..5 {
+        let resource_id = format!("tenant-acme/resource-{index}");
+        expected.insert(resource_id.clone());
+        let mut request = ownership_acquire(
+            principal(
+                format!("app-{index}"),
+                format!("token-{index}"),
+                format!("node-{index}"),
+            ),
+            100 + index,
+            500,
+            format!("acquire-{index}"),
+        );
+        request.request_id = format!("ownership-page-{index}");
+        request.resource.resource_id = resource_id;
+        acquire_ownership(&storage, request, KEY).await.unwrap();
+    }
+
+    let mut cursor = None;
+    let mut listed = BTreeSet::new();
+    let mut page_sizes = Vec::new();
+    loop {
+        let page = list_ownership_fences_page(&storage, cursor.as_ref(), 2, KEY)
+            .await
+            .unwrap();
+        assert!(page.fences.len() <= 2);
+        page_sizes.push(page.fences.len());
+        for record in page.fences {
+            assert!(listed.insert(record.resource.resource_id));
+        }
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(page_sizes, vec![2, 2, 1]);
+    assert_eq!(listed, expected);
+}
+
+#[tokio::test]
+async fn ownership_fence_node_pages_use_the_node_projection() {
+    let temp = tempdir().unwrap();
+    let storage = Storage::new_at(temp.path()).await.unwrap();
+    for index in 0..24 {
+        let mut request = ownership_acquire(
+            OwnershipPrincipal::node(format!("noise-{index}")),
+            100,
+            500,
+            format!("noise-{index}"),
+        );
+        request.resource.resource_id = format!("noise-resource-{index}");
+        acquire_ownership(&storage, request, KEY).await.unwrap();
+    }
+    for index in 0..3 {
+        let mut request = ownership_acquire(
+            OwnershipPrincipal::node("node-target"),
+            100,
+            500,
+            format!("target-{index}"),
+        );
+        request.resource.resource_id = format!("target-resource-{index}");
+        acquire_ownership(&storage, request, KEY).await.unwrap();
+    }
+
+    let first =
+        list_active_ownership_fences_for_node_page(&storage, "node-target", 200, None, 2, KEY)
+            .await
+            .unwrap();
+    assert_eq!(first.fences.len(), 2);
+    let second = list_active_ownership_fences_for_node_page(
+        &storage,
+        "node-target",
+        200,
+        first.next_cursor.as_ref(),
+        2,
+        KEY,
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.fences.len(), 1);
+    assert!(second.next_cursor.is_none());
+}
+
+#[tokio::test]
+async fn same_resource_in_different_tenants_has_distinct_coremeta_roots() {
+    let temp = tempdir().unwrap();
+    let storage = Storage::new_at(temp.path()).await.unwrap();
+    let first = acquire_ownership(
+        &storage,
+        ownership_acquire(
+            principal("app-a", "token-a", "node-a"),
+            100,
+            500,
+            "tenant-one",
+        ),
+        KEY,
+    )
+    .await
+    .unwrap()
+    .record;
+    let mut second_owner = principal("app-b", "token-b", "node-b");
+    second_owner.tenant_id = 2;
+    let second = acquire_ownership(
+        &storage,
+        ownership_acquire(second_owner, 100, 500, "tenant-two"),
+        KEY,
+    )
+    .await
+    .unwrap()
+    .record;
+
+    let first_root = ownership_fence_record_to_proto(&first)
+        .unwrap()
+        .common
+        .unwrap()
+        .root_key_hash;
+    let second_root = ownership_fence_record_to_proto(&second)
+        .unwrap()
+        .common
+        .unwrap()
+        .root_key_hash;
+    assert_ne!(first_root, second_root);
+}
+
+#[tokio::test]
 async fn expired_ownership_can_be_acquired_and_increments_fence() {
     let temp = tempdir().unwrap();
     let storage = Storage::new_at(temp.path()).await.unwrap();
@@ -394,6 +800,39 @@ async fn expired_ownership_can_be_acquired_and_increments_fence() {
     assert_eq!(second.fence, first.fence + 1);
     assert_eq!(second.owner.principal_id, "app-b");
     assert_eq!(second.state, OwnershipFenceState::Active);
+}
+
+#[tokio::test]
+async fn renew_advances_coremeta_generation_without_changing_fence() {
+    let temp = tempdir().unwrap();
+    let storage = Storage::new_at(temp.path()).await.unwrap();
+    let owner = principal("app-a", "token-a", "node-a");
+    let acquired = acquire_ownership(
+        &storage,
+        ownership_acquire(owner.clone(), 100, 500, "acquire-a"),
+        KEY,
+    )
+    .await
+    .unwrap()
+    .record;
+
+    let renewed = renew_ownership(
+        &storage,
+        RenewOwnership {
+            request_id: "renew-a".to_string(),
+            resource: ownership_resource(),
+            owner,
+            current_fence: acquired.fence,
+            now_nanos: 200,
+            ttl_nanos: 500,
+        },
+        KEY,
+    )
+    .await
+    .unwrap()
+    .record;
+    assert_eq!(renewed.fence, acquired.fence);
+    assert_eq!(renewed.generation, acquired.generation + 1);
 }
 
 #[tokio::test]
@@ -707,9 +1146,17 @@ async fn release_requires_owner_and_fence_unless_force() {
 }
 
 fn acquire(owner_node_id: &str, now_nanos: i64) -> PartitionRecoveryAcquire {
+    acquire_for_partition(owner_node_id, 7, now_nanos)
+}
+
+fn acquire_for_partition(
+    owner_node_id: &str,
+    partition_seed: u8,
+    now_nanos: i64,
+) -> PartitionRecoveryAcquire {
     PartitionRecoveryAcquire {
         partition_family: "object_metadata".to_string(),
-        partition_id: hex::encode([7; 32]),
+        partition_id: hex::encode([partition_seed; 32]),
         owner_node_id: owner_node_id.to_string(),
         recovered_through_sequence: 0,
         recovered_manifest_hash: hex::encode([0; 32]),

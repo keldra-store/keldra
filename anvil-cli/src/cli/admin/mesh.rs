@@ -39,11 +39,7 @@ pub enum MeshCommands {
         #[clap(long)]
         advertise_addr: String,
         #[clap(long)]
-        libp2p_peer_id: String,
-        #[clap(long)]
-        receipt_signing_public_key_proto_b64: String,
-        #[clap(long = "cluster-addr")]
-        cluster_addrs: Vec<String>,
+        receipt_signing_public_key_b64: String,
         #[clap(long = "capability")]
         capabilities: Vec<String>,
         #[clap(long, default_value = "joining")]
@@ -141,18 +137,16 @@ pub(super) async fn handle_mesh_command(
             region_id,
             cell_id,
             advertise_addr,
-            libp2p_peer_id,
-            receipt_signing_public_key_proto_b64,
-            cluster_addrs,
+            receipt_signing_public_key_b64,
             capabilities,
             state,
             capacity_json,
         } => {
-            let receipt_signing_public_key_proto = base64::engine::general_purpose::STANDARD
-                .decode(receipt_signing_public_key_proto_b64)
+            let receipt_signing_public_key = base64::engine::general_purpose::STANDARD
+                .decode(receipt_signing_public_key_b64)
                 .or_else(|_| {
                     base64::engine::general_purpose::URL_SAFE_NO_PAD
-                        .decode(receipt_signing_public_key_proto_b64)
+                        .decode(receipt_signing_public_key_b64)
                 })?;
             print_rpc_response(
                 "mesh_node",
@@ -167,9 +161,7 @@ pub(super) async fn handle_mesh_command(
                         state: state.clone(),
                         capacity_json: capacity_json.clone(),
                         options: Some(default_write_options()),
-                        libp2p_peer_id: libp2p_peer_id.clone(),
-                        receipt_signing_public_key_proto,
-                        cluster_addrs: cluster_addrs.clone(),
+                        receipt_signing_public_key,
                         capabilities: capabilities.clone(),
                     },
                     token,
@@ -244,6 +236,7 @@ pub(super) async fn handle_mesh_command(
                 client.get_partition_map(with_auth(
                     api::GetPartitionMapRequest {
                         scope: scope.clone().unwrap_or_default(),
+                        page: None,
                     },
                     token,
                 )?),

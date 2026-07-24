@@ -247,6 +247,7 @@ pub(super) async fn proxy_s3_object_request(
         bucket_locator_generation: target.bucket_locator_generation,
         headers: proxy_headers,
         authz_context,
+        native_object_metadata: None,
     };
 
     let token = state

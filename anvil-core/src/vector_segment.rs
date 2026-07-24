@@ -1,6 +1,7 @@
 use crate::{
     core_store::{
-        CoreBoundaryValue, CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob,
+        CoreBoundaryValue, CoreMutationPrecondition, CoreObjectRef, CorePipelinePolicy, CoreStore,
+        CoreTraceContext, GetBlob,
     },
     formats::{
         FileFamily, Hash32, decode_writer_segment, encode_writer_segment_header, hash32,
@@ -20,6 +21,7 @@ use crate::{
     index_coremeta::{self, IndexSegmentCoreMetaRecord},
     storage::Storage,
     vector_hnsw::{build_hnsw_graph_for_entries, validate_hnsw_graph},
+    writer_segment_catalog::{WriterSegmentCatalogRecord, write_writer_segment_catalog_record},
     writer_segment_range::RangeAddressedWriterSegment,
 };
 use anyhow::{Context, Result, anyhow};
@@ -112,10 +114,28 @@ pub struct VectorSegmentWrite<'a> {
     pub deleted_bitset: &'a [u8],
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct StagedVectorSegment {
+    pub(crate) segment_ref: String,
+    pub(crate) segment_hash: String,
+    locator: IndexSegmentCoreMetaRecord,
+    catalog: WriterSegmentCatalogRecord,
+}
+
 pub async fn write_vector_segment(
     storage: &Storage,
     write: VectorSegmentWrite<'_>,
 ) -> Result<String> {
+    let staged = stage_vector_segment(storage, write).await?;
+    publish_vector_segment_catalog(storage, &staged, &[]).await?;
+    publish_vector_segment_locator(storage, &staged, &[]).await?;
+    Ok(staged.segment_ref)
+}
+
+pub(crate) async fn stage_vector_segment(
+    storage: &Storage,
+    write: VectorSegmentWrite<'_>,
+) -> Result<StagedVectorSegment> {
     let mut entries = write.entries.to_vec();
     validate_entries(write.dimension, write.metric, write.modality, &entries)?;
     entries.sort_by_key(|entry| entry.record.vector_id);
@@ -137,6 +157,13 @@ pub async fn write_vector_segment(
         &segment_hash,
     );
 
+    let created_at_unix_nanos = index_coremeta::deterministic_index_publication_nanos(
+        write.index_id,
+        "vector_segment",
+        write.generation,
+        u128::from(write.source_cursor),
+        &hex::encode(segment_hash),
+    );
     let header = VectorSegmentHeader {
         schema: "anvil.index.vector_segment_header.v1".to_string(),
         index_id: write.index_id.to_string(),
@@ -160,7 +187,8 @@ pub async fn write_vector_segment(
         source_cursor: write.source_cursor,
         authz_revision: write.authz_revision,
         codec: "f32_le_v1".to_string(),
-        created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+        created_at: chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(created_at_unix_nanos)
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
     };
     let (first_hash, last_hash) = record_hash_bounds(&entries);
     let header_proto = encode_vector_header_proto(&logical_file_id, &header);
@@ -193,6 +221,7 @@ pub async fn write_vector_segment(
         .write_format_build_output(WriterBuildOutput {
             logical_files: vec![built_segment.logical_file],
             core_meta_mutations: Vec::new(),
+            core_meta_root_publications: Vec::new(),
         })
         .await?;
     let object_ref = receipt
@@ -201,29 +230,63 @@ pub async fn write_vector_segment(
         .cloned()
         .ok_or_else(|| anyhow!("CoreFormatWriter returned no vector object"))?;
     let core_object_ref_target = encode_core_object_ref_target(&object_ref)?;
+    let locator = IndexSegmentCoreMetaRecord {
+        index_id: write.index_id.to_string(),
+        index_kind: "vector".to_string(),
+        writer_family: WriterFamily::Vector.as_str().to_string(),
+        segment_ref: ref_name.clone(),
+        core_object_ref_target: core_object_ref_target.clone(),
+        segment_hash: segment_file_hash.clone(),
+        segment_length,
+        generation: write.generation,
+        source_kind: "object_current".to_string(),
+        source_cursor: write.source_cursor,
+        authz_realm_id: "default".to_string(),
+        authz_scope_hash: index_coremeta::segment_authz_scope_hash("vector", "per_row_label"),
+        authz_revision: write.authz_revision,
+        row_count: entries.len() as u64,
+        field_names: Vec::new(),
+        created_at_unix_nanos: u64::try_from(created_at_unix_nanos)
+            .map_err(|_| anyhow!("vector segment timestamp is negative"))?,
+    };
+    let catalog = WriterSegmentCatalogRecord {
+        family: WriterFamily::Vector.as_str().to_string(),
+        scope: write.index_id.to_string(),
+        segment_ref: ref_name.clone(),
+        core_object_ref_target,
+        segment_hash: segment_file_hash.clone(),
+        segment_length,
+        generation: write.generation,
+        source_cursor: write.source_cursor,
+        created_at_unix_nanos: locator.created_at_unix_nanos,
+    };
+    Ok(StagedVectorSegment {
+        segment_ref: ref_name,
+        segment_hash: segment_file_hash,
+        locator,
+        catalog,
+    })
+}
+
+pub(crate) async fn publish_vector_segment_catalog(
+    storage: &Storage,
+    staged: &StagedVectorSegment,
+    additional_preconditions: &[CoreMutationPrecondition],
+) -> Result<()> {
+    write_writer_segment_catalog_record(storage, &staged.catalog, additional_preconditions).await
+}
+
+pub(crate) async fn publish_vector_segment_locator(
+    storage: &Storage,
+    staged: &StagedVectorSegment,
+    additional_preconditions: &[CoreMutationPrecondition],
+) -> Result<()> {
     index_coremeta::write_index_segment_coremeta_record(
         storage,
-        &IndexSegmentCoreMetaRecord {
-            index_id: write.index_id.to_string(),
-            index_kind: "vector".to_string(),
-            writer_family: WriterFamily::Vector.as_str().to_string(),
-            segment_ref: ref_name.clone(),
-            core_object_ref_target,
-            segment_hash: segment_file_hash,
-            segment_length,
-            generation: write.generation,
-            source_kind: "object_current".to_string(),
-            source_cursor: write.source_cursor,
-            authz_realm_id: "default".to_string(),
-            authz_scope_hash: index_coremeta::segment_authz_scope_hash("vector", "per_row_label"),
-            authz_revision: write.authz_revision,
-            row_count: entries.len() as u64,
-            field_names: Vec::new(),
-            created_at_unix_nanos: unix_nanos_from_rfc3339(&header.created_at),
-        },
+        &staged.locator,
+        additional_preconditions,
     )
-    .await?;
-    Ok(ref_name)
+    .await
 }
 
 pub async fn read_vector_segment(
@@ -238,7 +301,8 @@ pub async fn read_vector_segment_bytes(storage: &Storage, segment_ref: &str) -> 
     let store = CoreStore::new(storage.clone()).await?;
     let index_id = vector_index_id_from_segment_ref(segment_ref)?;
     let segment =
-        index_coremeta::read_index_segment_coremeta_record_by_ref(storage, &index_id, segment_ref)?
+        index_coremeta::read_index_segment_coremeta_record_by_ref(storage, &index_id, segment_ref)
+            .await?
             .ok_or_else(|| anyhow!("vector segment CoreMeta row is missing"))?;
     store
         .get_blob(GetBlob {
@@ -422,7 +486,8 @@ pub async fn latest_vector_segment_ref(
             storage,
             index_id,
             WriterFamily::Vector.as_str(),
-        )?
+        )
+        .await?
         .map(|record| record.segment_ref),
     )
 }
@@ -435,15 +500,16 @@ pub(crate) async fn vector_segment_hash_exists(
 ) -> Result<bool> {
     require_safe_component(index_id, "vector index id")?;
     validate_hex32(expected_segment_hash, "vector expected segment hash")?;
-    for record in index_coremeta::list_index_segment_coremeta_records(storage, index_id)? {
-        if record.generation != generation {
-            continue;
-        }
-        if record.segment_hash == expected_segment_hash {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Ok(
+        index_coremeta::index_segment_coremeta_record_for_family_generation(
+            storage,
+            index_id,
+            WriterFamily::Vector.as_str(),
+            generation,
+        )
+        .await?
+        .is_some_and(|record| record.segment_hash == expected_segment_hash),
+    )
 }
 
 pub fn decode_vector_segment(bytes: &[u8]) -> Result<DecodedVectorSegment> {

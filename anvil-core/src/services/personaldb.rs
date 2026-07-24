@@ -72,9 +72,8 @@ use crate::{
     personaldb_watch::{
         PersonalDbGroupWatchEvent, PersonalDbGroupWatchPayload, PersonalDbProjectionWatchEvent,
         PersonalDbProjectionWatchPayload, append_personaldb_group_watch_record,
-        append_personaldb_projection_watch_record, latest_personaldb_group_watch_cursor,
-        latest_personaldb_projection_watch_cursor, list_personaldb_group_watch_events,
-        list_personaldb_projection_watch_events,
+        append_personaldb_projection_watch_record, list_personaldb_group_watch_event_page,
+        list_personaldb_projection_watch_event_page,
     },
     services::watch_envelope::{self, WatchEnvelopeParts},
 };
@@ -464,7 +463,7 @@ impl PersonalDbService for AppState {
                 replica_id: req.replica_id,
                 have_log_index: req.have_log_index,
                 have_log_hash: req.have_log_hash,
-                max_entries: nonzero_limit(req.max_entries),
+                max_entries: nonzero_limit(req.max_entries)?,
             },
             self.personaldb_protocol_keyring.trust_store(),
         )
@@ -492,46 +491,47 @@ impl PersonalDbService for AppState {
             return Err(Status::permission_denied("Permission denied"));
         }
         let after_cursor = join_u128(req.after_cursor_low, req.after_cursor_high);
-        let snapshot = list_personaldb_group_watch_events(
-            &self.storage,
+        let stream_id = crate::personaldb_watch::personaldb_group_watch_stream_id(
             claims.tenant_id,
             &req.database_id,
-            after_cursor,
-            1000,
-        )
-        .await
-        .map_err(internal_status)?;
-        let mut live = self.personaldb_watch_tx.subscribe();
+        );
+        let mut live = self.storage.subscribe_stream(&stream_id);
+        let storage = self.storage.clone();
+        let tenant_id = claims.tenant_id;
+        let database_id = req.database_id;
         let (tx, rx) = mpsc::channel(32);
         tokio::spawn(async move {
             let mut last_cursor = after_cursor;
-            for event in snapshot {
-                last_cursor = last_cursor.max(event.cursor);
-                if tx.send(Ok(watch_response(event))).await.is_err() {
-                    return;
-                }
-            }
             loop {
-                match live.recv().await {
-                    Ok(event) => {
-                        if event.cursor <= last_cursor
-                            || event.payload.database_id != req.database_id
-                        {
-                            continue;
+                loop {
+                    let page = match list_personaldb_group_watch_event_page(
+                        &storage,
+                        tenant_id,
+                        &database_id,
+                        last_cursor,
+                        256,
+                    )
+                    .await
+                    {
+                        Ok(page) => page,
+                        Err(error) => {
+                            let _ = tx.send(Err(internal_status(error))).await;
+                            return;
                         }
-                        last_cursor = event.cursor;
+                    };
+                    let previous_cursor = last_cursor;
+                    for event in page.events {
                         if tx.send(Ok(watch_response(event))).await.is_err() {
                             return;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        let _ = tx
-                            .send(Err(Status::data_loss(
-                                "PersonalDB watch fell behind retained live event window",
-                            )))
-                            .await;
-                        return;
+                    last_cursor = page.next_cursor;
+                    if !page.has_more || last_cursor == previous_cursor {
+                        break;
                     }
+                }
+                match live.recv().await {
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
             }
@@ -563,48 +563,50 @@ impl PersonalDbService for AppState {
             return Err(Status::permission_denied("Permission denied"));
         }
         let after_cursor = join_u128(req.after_cursor_low, req.after_cursor_high);
-        let snapshot = list_personaldb_projection_watch_events(
-            &self.storage,
+        let stream_id = crate::personaldb_watch::personaldb_projection_watch_stream_id(
             claims.tenant_id,
             &req.database_id,
             &req.projection_id,
-            after_cursor,
-            1000,
-        )
-        .await
-        .map_err(internal_status)?;
-        let mut live = self.personaldb_projection_watch_tx.subscribe();
+        );
+        let mut live = self.storage.subscribe_stream(&stream_id);
+        let storage = self.storage.clone();
+        let tenant_id = claims.tenant_id;
+        let database_id = req.database_id;
+        let projection_id = req.projection_id;
         let (tx, rx) = mpsc::channel(32);
         tokio::spawn(async move {
             let mut last_cursor = after_cursor;
-            for event in snapshot {
-                last_cursor = last_cursor.max(event.cursor);
-                if tx.send(Ok(projection_watch_response(event))).await.is_err() {
-                    return;
-                }
-            }
             loop {
-                match live.recv().await {
-                    Ok(event) => {
-                        if event.cursor <= last_cursor
-                            || event.payload.database_id != req.database_id
-                            || event.payload.projection_id != req.projection_id
-                        {
-                            continue;
+                loop {
+                    let page = match list_personaldb_projection_watch_event_page(
+                        &storage,
+                        tenant_id,
+                        &database_id,
+                        &projection_id,
+                        last_cursor,
+                        256,
+                    )
+                    .await
+                    {
+                        Ok(page) => page,
+                        Err(error) => {
+                            let _ = tx.send(Err(internal_status(error))).await;
+                            return;
                         }
-                        last_cursor = event.cursor;
+                    };
+                    let previous_cursor = last_cursor;
+                    for event in page.events {
                         if tx.send(Ok(projection_watch_response(event))).await.is_err() {
                             return;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        let _ = tx
-                            .send(Err(Status::data_loss(
-                                "PersonalDB projection watch fell behind retained live event window",
-                            )))
-                            .await;
-                        return;
+                    last_cursor = page.next_cursor;
+                    if !page.has_more || last_cursor == previous_cursor {
+                        break;
                     }
+                }
+                match live.recv().await {
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
             }
@@ -641,10 +643,14 @@ impl AppState {
         let key = format!("{tenant_id}:{database_id}");
         let lock = {
             let mut locks = self.personaldb_commit_locks.lock().await;
-            locks
-                .entry(key)
-                .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
-                .clone()
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = locks.get(&key).and_then(std::sync::Weak::upgrade) {
+                lock
+            } else {
+                let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(key, std::sync::Arc::downgrade(&lock));
+                lock
+            }
         };
         lock.lock_owned().await
     }
@@ -1446,16 +1452,6 @@ impl AppState {
                 .map_err(internal_status)?;
         }
 
-        let watch_cursor = latest_personaldb_group_watch_cursor(
-            &self.storage,
-            actor.tenant_id,
-            &validated.request.database_id,
-        )
-        .await
-        .map_err(internal_status)?
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(|| Status::internal("PersonalDB watch cursor overflow"))?;
         let watch_payload = PersonalDbGroupWatchPayload {
             database_id: validated.request.database_id.clone(),
             event_type: "commit".to_string(),
@@ -1485,24 +1481,16 @@ impl AppState {
             .await
             .map_err(internal_status)?;
 
-        append_personaldb_group_watch_record(
+        let watch_cursor = append_personaldb_group_watch_record(
             &self.storage,
             actor.tenant_id,
             &validated.request.database_id,
-            watch_cursor,
             mutation_id,
             authz_revision,
             watch_payload.clone(),
         )
         .await
         .map_err(internal_status)?;
-        let _ = self.personaldb_watch_tx.send(PersonalDbGroupWatchEvent {
-            cursor: watch_cursor,
-            mutation_id,
-            authz_revision,
-            payload: watch_payload,
-        });
-
         Ok(CommittedPersonalDbChangeset {
             log_index: proposed_log_index,
             log_hash: hex::encode(record.entry_hash),
@@ -1674,17 +1662,6 @@ impl AppState {
                 },
             )
             .await?;
-        let cursor = latest_personaldb_projection_watch_cursor(
-            &self.storage,
-            tenant_id,
-            &definition.database_id,
-            &definition.projection_id,
-        )
-        .await
-        .map_err(internal_status)?
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(|| Status::internal("PersonalDB projection watch cursor overflow"))?;
         let payload = PersonalDbProjectionWatchPayload {
             database_id: definition.database_id.clone(),
             projection_id: definition.projection_id.clone(),
@@ -1698,26 +1675,17 @@ impl AppState {
             emitted_at: now_rfc3339(),
         };
         let mutation_id = *uuid::Uuid::new_v4().as_bytes();
-        append_personaldb_projection_watch_record(
+        let cursor = append_personaldb_projection_watch_record(
             &self.storage,
             tenant_id,
             &definition.database_id,
             &definition.projection_id,
-            cursor,
             mutation_id,
             authz_revision,
             payload.clone(),
         )
         .await
         .map_err(internal_status)?;
-        let _ = self
-            .personaldb_projection_watch_tx
-            .send(PersonalDbProjectionWatchEvent {
-                cursor,
-                mutation_id,
-                authz_revision,
-                payload,
-            });
         Ok(())
     }
 

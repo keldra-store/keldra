@@ -531,7 +531,7 @@ async fn tenant_can_create_and_rotate_own_app_secret() {
     let new_secret = get_token(&actor.grpc_addr, &rotated.client_id, &rotated.client_secret).await;
     assert!(!new_secret.is_empty());
 
-    let mut list = Request::new(ListApplicationsRequest {});
+    let mut list = Request::new(ListApplicationsRequest { page: None });
     add_bearer(&mut list, &token);
     let apps = auth_client
         .list_applications(list)
@@ -618,7 +618,10 @@ async fn tenant_can_delegate_narrower_policy_capability() {
     add_bearer(&mut grant, &token);
     auth_client.grant_access(grant).await.unwrap();
 
-    let mut list = Request::new(ListAccessGrantsRequest { app: grantee_app });
+    let mut list = Request::new(ListAccessGrantsRequest {
+        app: grantee_app,
+        page: None,
+    });
     add_bearer(&mut list, &token);
     let grants = auth_client
         .list_access_grants(list)
@@ -738,9 +741,11 @@ async fn tenant_diagnostics_are_tenant_scoped() {
     let mut allowed = Request::new(ListIndexDiagnosticsRequest {
         bucket_name: bucket_name.clone(),
         index_name: String::new(),
-        after_cursor: 0,
-        limit: 10,
         severity: String::new(),
+        page: Some(anvil::anvil_api::PageRequest {
+            page_size: 10,
+            page_token: String::new(),
+        }),
     });
     add_bearer(&mut allowed, &token);
     index_client.list_index_diagnostics(allowed).await.unwrap();
@@ -751,9 +756,11 @@ async fn tenant_diagnostics_are_tenant_scoped() {
     let mut denied = Request::new(ListIndexDiagnosticsRequest {
         bucket_name,
         index_name: String::new(),
-        after_cursor: 0,
-        limit: 10,
         severity: String::new(),
+        page: Some(anvil::anvil_api::PageRequest {
+            page_size: 10,
+            page_token: String::new(),
+        }),
     });
     add_bearer(&mut denied, &denied_actor.token);
     let err = index_client
@@ -833,8 +840,8 @@ async fn tenant_audit_page_token_cannot_be_reused_by_other_tenant() {
         resource_id: String::new(),
         action: String::new(),
         page: Some(PageRequest {
-            cursor: String::new(),
-            limit: 1,
+            page_token: String::new(),
+            page_size: 1,
         }),
     });
     add_bearer(&mut first_page, &token);
@@ -843,7 +850,7 @@ async fn tenant_audit_page_token_cannot_be_reused_by_other_tenant() {
         .await
         .unwrap()
         .into_inner();
-    let cursor = first_page.page.unwrap().next_cursor;
+    let cursor = first_page.page.unwrap().next_page_token;
     assert!(!cursor.is_empty());
 
     let tenant_resource = format!("tenant:{}", actor.tenant_id);
@@ -860,8 +867,8 @@ async fn tenant_audit_page_token_cannot_be_reused_by_other_tenant() {
         resource_id: String::new(),
         action: String::new(),
         page: Some(PageRequest {
-            cursor: cursor.clone(),
-            limit: 1,
+            page_token: cursor.clone(),
+            page_size: 1,
         }),
     });
     add_bearer(&mut reused, &reader.token);
@@ -882,7 +889,10 @@ async fn tenant_audit_page_token_cannot_be_reused_by_other_tenant() {
         principal_id: String::new(),
         resource_id: String::new(),
         action: String::new(),
-        page: Some(PageRequest { cursor, limit: 1 }),
+        page: Some(PageRequest {
+            page_token: cursor,
+            page_size: 1,
+        }),
     });
     add_bearer(&mut cross_tenant, &tenant_b.token);
     let err = audit_client

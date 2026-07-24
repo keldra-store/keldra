@@ -1,7 +1,46 @@
 use super::local_stream_control::control_record_proto::*;
 use super::local_tx_rows::{OwnedCoreMetaBatchOp, borrow_owned_coremeta_batch_ops};
 use super::*;
-use crate::formats::writer::{WriterFamily, canonical_logical_file_id};
+use crate::formats::writer::WriterFamily;
+
+fn stream_realm_id(stream_id: &str) -> String {
+    stream_id
+        .split_once('/')
+        .map(|(realm, _)| format!("tenant/{realm}"))
+        .unwrap_or_else(|| "system".to_string())
+}
+
+pub(super) fn direct_stream_publication_transaction_id(
+    stream_id: &str,
+    first_sequence: u64,
+    last_sequence: u64,
+) -> String {
+    format!("stream:{stream_id}:{first_sequence}:{last_sequence}")
+}
+
+pub(super) fn direct_stream_publication_transaction_parts(
+    transaction_id: &str,
+) -> Result<Option<(String, u64, u64)>> {
+    let Some(encoded) = transaction_id.strip_prefix("stream:") else {
+        return Ok(None);
+    };
+    let (stream_and_first, last_sequence) = encoded
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow!("CoreStore direct stream publication id has no last sequence"))?;
+    let (stream_id, first_sequence) = stream_and_first
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow!("CoreStore direct stream publication id has no first sequence"))?;
+    let first_sequence = first_sequence
+        .parse::<u64>()
+        .context("parse direct stream publication first sequence")?;
+    let last_sequence = last_sequence
+        .parse::<u64>()
+        .context("parse direct stream publication last sequence")?;
+    if stream_id.is_empty() || first_sequence == 0 || last_sequence < first_sequence {
+        bail!("CoreStore direct stream publication id has an invalid range");
+    }
+    Ok(Some((stream_id.to_string(), first_sequence, last_sequence)))
+}
 
 impl CoreStore {
     pub(super) async fn ensure_layout(&self) -> Result<()> {
@@ -44,8 +83,7 @@ impl CoreStore {
             bail!("CoreStore object manifest ref/hash mismatch");
         }
         let bytes = self
-            .meta
-            .get(
+            .read_coremeta_row(
                 CF_OBJECT_VERSIONS,
                 TABLE_OBJECT_VERSION_META_ROW,
                 &object_manifest_meta_key(object_ref),
@@ -56,7 +94,7 @@ impl CoreStore {
                     object_ref.manifest_ref
                 )
             })?;
-        let manifest = decode_object_manifest_record(&bytes)?;
+        let mut manifest = decode_object_manifest_record(&bytes)?;
         if manifest.schema != CORE_OBJECT_MANIFEST_SCHEMA {
             bail!("CoreStore object manifest metadata row has invalid schema");
         }
@@ -64,6 +102,7 @@ impl CoreStore {
         if is_inline_object_ref(object_ref) {
             return Ok(manifest);
         }
+        self.apply_shard_repair_overlays(&mut manifest)?;
         self.manifest_with_present_shard_placements(manifest)
     }
 
@@ -205,11 +244,7 @@ impl CoreStore {
         stream_id: &str,
         records: &[StreamRecord],
     ) -> Result<()> {
-        let metadata_commits = self.write_stream_metadata_rows(stream_id, records).await?;
-        if stream_id == CORE_TRANSACTION_STREAM_ID {
-            self.write_core_transaction_stream_records(records, &metadata_commits)
-                .await?;
-        }
+        self.write_stream_metadata_rows(stream_id, records).await?;
         Ok(())
     }
 
@@ -225,8 +260,12 @@ impl CoreStore {
             return Ok(Vec::new());
         }
         let ops = borrow_owned_coremeta_batch_ops(&prepared.owned_ops);
-        self.commit_coremeta_batch_by_embedded_roots(&prepared.transaction_id, &ops)
-            .await
+        self.commit_coremeta_root_groups(
+            &prepared.transaction_id,
+            &ops,
+            &prepared.root_publications,
+        )
+        .await
     }
 
     pub(super) async fn prepare_stream_metadata_rows(
@@ -234,6 +273,61 @@ impl CoreStore {
         stream_id: &str,
         records: &[StreamRecord],
     ) -> Result<PreparedStreamMetadataWrite> {
+        let transaction_id = records
+            .last()
+            .and_then(|record| record.transaction_id.clone())
+            .unwrap_or_else(|| {
+                let first_sequence = records.first().map_or(0, |record| record.sequence);
+                let last_sequence = records.last().map_or(0, |record| record.sequence);
+                direct_stream_publication_transaction_id(stream_id, first_sequence, last_sequence)
+            });
+        let (root_anchor_key, writer_family, coordinator) =
+            if stream_id == CORE_TRANSACTION_STREAM_ID {
+                (
+                    core_transaction_root_anchor_key().to_string(),
+                    WriterFamily::CoreControl,
+                    true,
+                )
+            } else {
+                (format!("stream/{stream_id}"), WriterFamily::Stream, false)
+            };
+        let root_generation = self
+            .read_latest_root_anchor(&root_anchor_key)
+            .await?
+            .map_or(Ok(1), |anchor| {
+                anchor
+                    .root_generation
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("CoreStore stream root generation overflow"))
+            })?;
+        self.prepare_stream_metadata_rows_for_root(
+            stream_id,
+            records,
+            &root_anchor_key,
+            root_generation,
+            &transaction_id,
+            writer_family,
+            coordinator,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn prepare_stream_metadata_rows_for_root(
+        &self,
+        stream_id: &str,
+        records: &[StreamRecord],
+        root_anchor_key: &str,
+        root_generation: u64,
+        transaction_id: &str,
+        writer_family: WriterFamily,
+        transaction_coordinator: bool,
+    ) -> Result<PreparedStreamMetadataWrite> {
+        validate_logical_id(root_anchor_key, "stream root anchor key")?;
+        validate_logical_id(transaction_id, "stream transaction id")?;
+        if root_generation == 0 {
+            bail!("CoreStore stream root generation must be nonzero");
+        }
         for record in records {
             if record.stream_id != stream_id {
                 bail!("CoreStore stream record metadata row has invalid scope");
@@ -262,6 +356,7 @@ impl CoreStore {
             return Ok(PreparedStreamMetadataWrite {
                 transaction_id: String::new(),
                 owned_ops: Vec::new(),
+                root_publications: Vec::new(),
             });
         }
 
@@ -278,15 +373,27 @@ impl CoreStore {
             previous_event_hash = record.event_hash.clone();
         }
 
+        let root_key_hash = root_key_hash(root_anchor_key);
+        let realm_id = stream_realm_id(stream_id);
+        let created_at_unix_nanos = unix_timestamp_nanos();
+        let row_common = || {
+            core_meta_committed_row_common(
+                realm_id.clone(),
+                root_key_hash.clone(),
+                root_generation,
+                transaction_id,
+                created_at_unix_nanos,
+            )
+        };
         let mut record_rows = Vec::with_capacity(new_records.len());
         for record in new_records {
             let inline_payload = record.payload.clone();
             let mut stored = StoredStreamRecordIndexRow::new(record, Some(inline_payload), None);
-            let mut payload = encode_stream_record_index_row(&stored)?;
+            let mut payload = encode_stream_record_index_row(&stored, row_common())?;
             if payload.len() > CORE_META_STREAM_RECORD_INDEX_MAX_PAYLOAD_BYTES {
                 let payload_locator = self.write_stream_record_payload(record).await?;
                 stored = StoredStreamRecordIndexRow::new(record, None, Some(payload_locator));
-                payload = encode_stream_record_index_row(&stored)?;
+                payload = encode_stream_record_index_row(&stored, row_common())?;
                 if payload.len() > CORE_META_STREAM_RECORD_INDEX_MAX_PAYLOAD_BYTES {
                     bail!(
                         "CoreStore stream record metadata row is {} bytes, exceeding {} bytes",
@@ -299,7 +406,7 @@ impl CoreStore {
                 .map(|row| {
                     Ok::<_, anyhow::Error>((
                         stream_idempotency_key(stream_id, &row.idempotency_key_hash),
-                        encode_stream_idempotency_row(&row)?,
+                        encode_stream_idempotency_row(&row, row_common())?,
                     ))
                 })
                 .transpose()?;
@@ -321,7 +428,7 @@ impl CoreStore {
             updated_at: now_rfc3339(),
         };
         let head_key = stream_head_key(stream_id);
-        let head_payload = encode_stream_head_record(&head)?;
+        let head_payload = encode_stream_head_record(&head, row_common())?;
 
         let mut owned_ops = Vec::with_capacity(record_rows.len().saturating_mul(2) + 1);
         for (record_key, idempotency_row, payload) in record_rows {
@@ -349,18 +456,12 @@ impl CoreStore {
             payload: head_payload,
             common: None,
         });
-        let transaction_id = records
-            .last()
-            .and_then(|record| record.transaction_id.clone())
-            .unwrap_or_else(|| {
-                format!(
-                    "stream:{stream_id}:{}:{}",
-                    existing_sequence, head.last_sequence
-                )
-            });
+        let mut publication = CoreMetaRootPublication::new(root_anchor_key, writer_family);
+        publication.transaction_coordinator = transaction_coordinator;
         Ok(PreparedStreamMetadataWrite {
-            transaction_id,
+            transaction_id: transaction_id.to_string(),
             owned_ops,
+            root_publications: vec![publication],
         })
     }
 
@@ -395,7 +496,7 @@ impl CoreStore {
         &self,
         stream_id: &str,
     ) -> Result<Vec<StreamRecord>> {
-        let Some(head_bytes) = self.meta.get(
+        let Some(head_bytes) = self.read_coremeta_row(
             CF_STREAM_HEADS,
             TABLE_STREAM_HEAD_ROW,
             &stream_head_key(stream_id),
@@ -407,18 +508,31 @@ impl CoreStore {
         if head.schema != "anvil.core.stream_head.v1" || head.stream_id != stream_id {
             bail!("CoreStore stream head metadata row has invalid scope");
         }
+        const PAGE_SIZE: usize = 1024;
         let mut records = Vec::new();
-        for item in self.meta.scan_range(
-            CF_STREAM_RECORDS,
-            TABLE_STREAM_RECORD_INDEX_ROW,
-            &stream_record_key(stream_id, 1),
-            &stream_record_key(stream_id, u64::MAX),
-        )? {
-            let stored = decode_stream_record_index_row(&item.payload)?;
-            if stored.stream_id != stream_id {
-                bail!("CoreStore stream record metadata row has invalid scope");
+        let mut after_sequence = 0_u64;
+        while after_sequence < head.last_sequence {
+            let through_sequence = after_sequence
+                .saturating_add(PAGE_SIZE as u64)
+                .min(head.last_sequence);
+            let page = self.scan_coremeta_range_inclusive(
+                CF_STREAM_RECORDS,
+                TABLE_STREAM_RECORD_INDEX_ROW,
+                &stream_record_key(stream_id, after_sequence.saturating_add(1)),
+                &stream_record_key(stream_id, through_sequence),
+                PAGE_SIZE,
+            )?;
+            if page.is_empty() {
+                bail!("CoreStore stream record metadata range has missing records");
             }
-            records.push(self.stream_record_from_index_row(stored).await?);
+            for item in page {
+                let stored = decode_stream_record_index_row(&item.payload)?;
+                if stored.stream_id != stream_id {
+                    bail!("CoreStore stream record metadata row has invalid scope");
+                }
+                after_sequence = stored.sequence;
+                records.push(self.stream_record_from_index_row(stored).await?);
+            }
         }
         records.sort_by_key(|record| record.sequence);
         if records.len() as u64 != head.record_count {
@@ -447,7 +561,7 @@ impl CoreStore {
         stream_id: &str,
         sequence: u64,
     ) -> Result<Option<StoredStreamRecordIndexRow>> {
-        let Some(bytes) = self.meta.get(
+        let Some(bytes) = self.read_coremeta_row(
             CF_STREAM_RECORDS,
             TABLE_STREAM_RECORD_INDEX_ROW,
             &stream_record_key(stream_id, sequence),
@@ -491,12 +605,17 @@ impl CoreStore {
             through_sequence
         };
         let mut rows = self
-            .meta
-            .scan_range(
+            .scan_coremeta_range_inclusive(
                 CF_STREAM_RECORDS,
                 TABLE_STREAM_RECORD_INDEX_ROW,
                 &stream_record_key(stream_id, first_requested),
                 &stream_record_key(stream_id, last_requested),
+                usize::try_from(
+                    last_requested
+                        .saturating_sub(first_requested)
+                        .saturating_add(1),
+                )
+                .map_err(|_| anyhow!("CoreStore stream metadata range exceeds usize"))?,
             )?
             .into_iter()
             .map(|item| decode_stream_record_index_row(&item.payload))
@@ -593,6 +712,16 @@ impl CoreStore {
             idempotency_key_hash: row.idempotency_key_hash,
             created_at: row.created_at,
         };
+        let expected_event_hash = format!("sha256:{}", sha256_hex(&event_hash_input(&record)?));
+        if record.event_hash != expected_event_hash {
+            bail!(
+                "CoreStore stream record {}:{} event hash mismatch: stored {}, reconstructed {}",
+                record.stream_id,
+                record.sequence,
+                record.event_hash,
+                expected_event_hash
+            );
+        }
         Ok(record)
     }
 
@@ -600,7 +729,7 @@ impl CoreStore {
         &self,
         stream_id: &str,
     ) -> Result<Option<CoreStoredStreamHead>> {
-        let Some(bytes) = self.meta.get(
+        let Some(bytes) = self.read_coremeta_row(
             CF_STREAM_HEADS,
             TABLE_STREAM_HEAD_ROW,
             &stream_head_key(stream_id),
@@ -624,55 +753,32 @@ impl CoreStore {
         else {
             return Ok(Vec::new());
         };
-        let Some(transaction_manifest_locator) = anchor.transaction_manifest else {
-            if anchor.root_generation == 0 {
-                return Ok(Vec::new());
-            }
-            bail!("CoreStore non-genesis root anchor is missing transaction manifest");
-        };
-        validate_manifest_locator(&transaction_manifest_locator)?;
-        if !is_inline_manifest_body_locator(&transaction_manifest_locator) {
-            bail!("CoreStore transaction root manifest must use bounded inline CoreMeta storage");
+        if anchor.root_generation == 0 {
+            return Ok(Vec::new());
         }
-        let transaction_manifest_bytes =
-            self.read_inline_manifest_body(&transaction_manifest_locator)?;
-        let transaction = decode_transaction_manifest_record(&transaction_manifest_bytes)?;
-        validate_transaction_manifest_record(&transaction, anchor.root_generation)?;
-        if anchor.core_meta_commit_certificate_hash.as_deref()
-            != Some(transaction.core_meta_commit_certificate_hash.as_str())
-            || anchor.certificate_persist_receipt_hashes
-                != transaction.certificate_persist_receipt_hashes
-        {
-            bail!("CoreStore transaction manifest commit evidence does not match root anchor");
-        }
-        for locator in &transaction.logical_manifests {
-            if !is_inline_manifest_body_locator(locator) {
-                bail!("CoreStore transaction checkpoint must use bounded inline CoreMeta storage");
-            }
-            let checkpoint_bytes = self.read_inline_manifest_body(locator)?;
-            let checkpoint = decode_transaction_stream_checkpoint_record(&checkpoint_bytes)?;
-            if checkpoint.schema != "anvil.core.transaction_stream_checkpoint.v1"
-                || checkpoint.stream_id != CORE_TRANSACTION_STREAM_ID
-            {
-                bail!("CoreStore transaction stream checkpoint has invalid scope");
-            }
-            let records = self
+        self.validate_root_anchor_coremeta_commit_evidence(&anchor)?;
+        self.read_root_transaction_manifest(&anchor)?;
+        let mut records = Vec::new();
+        let mut after_sequence = 0_u64;
+        while after_sequence < anchor.root_generation {
+            let page = self
                 .read_stream_records_from_meta_range(
                     CORE_TRANSACTION_STREAM_ID,
-                    0,
-                    checkpoint.last_sequence,
-                    0,
+                    after_sequence,
+                    anchor.root_generation,
+                    CORE_META_MAX_SCAN_PAGE_ROWS,
                 )
                 .await?;
-            let (last_sequence, last_event_hash) = stream_head_from_records(&records);
-            if last_sequence != checkpoint.last_sequence
-                || last_event_hash != checkpoint.last_event_hash
-            {
-                bail!("CoreStore transaction stream checkpoint does not match metadata rows");
+            let Some(last_sequence) = page.last().map(|record| record.sequence) else {
+                break;
+            };
+            if last_sequence <= after_sequence {
+                bail!("CoreStore transaction stream pagination did not advance");
             }
-            return Ok(records);
+            after_sequence = last_sequence;
+            records.extend(page);
         }
-        bail!("CoreStore transaction manifest is missing checkpoint logical manifests")
+        Ok(records)
     }
 
     pub(super) async fn read_core_transaction_stream_records_after_from_root(
@@ -703,255 +809,7 @@ impl CoreStore {
         if anchor.root_generation == 0 {
             return Ok((0, 0));
         }
-        let cursor = anchor
-            .mutation_last
-            .as_deref()
-            .ok_or_else(|| anyhow!("CoreStore transaction root anchor is missing mutation_last"))?;
-        let sequence = transaction_stream_sequence_from_cursor(cursor)?;
-        Ok((anchor.root_generation, sequence))
-    }
-
-    pub(super) async fn write_core_transaction_stream_records(
-        &self,
-        records: &[StreamRecord],
-        metadata_commits: &[CoreMetaQuorumCommitOutcome],
-    ) -> Result<()> {
-        let root_anchor_key = core_transaction_root_anchor_key();
-        let current = self.read_latest_root_anchor(root_anchor_key).await?;
-        let pre_root_generation = current
-            .as_ref()
-            .map(|anchor| anchor.root_generation)
-            .unwrap_or(0);
-        let post_root_generation = pre_root_generation.saturating_add(1);
-        let (last_sequence, last_event_hash) = stream_head_from_records(records);
-        let checkpoint = CoreTransactionStreamCheckpointRecord {
-            schema: "anvil.core.transaction_stream_checkpoint.v1".to_string(),
-            stream_id: CORE_TRANSACTION_STREAM_ID.to_string(),
-            record_count: records.len() as u64,
-            last_sequence,
-            last_event_hash,
-        };
-        let checkpoint_bytes = encode_transaction_stream_checkpoint_record(&checkpoint)?;
-        let checkpoint_hash = sha256_hex(&checkpoint_bytes);
-        let (checkpoint_locator, checkpoint_op) = self.prepare_inline_manifest_body(
-            WriterFamily::CoreControl.as_str(),
-            canonical_logical_file_id(
-                WriterFamily::CoreControl,
-                post_root_generation,
-                &format!("core_transaction_checkpoint:{post_root_generation:020}"),
-                checkpoint_hash.as_bytes(),
-            ),
-            post_root_generation,
-            checkpoint_bytes,
-        )?;
-        let transaction_root_key_hash = root_key_hash(core_transaction_root_anchor_key());
-        let root_metadata_commit = metadata_commits
-            .iter()
-            .find(|outcome| {
-                outcome.root_key_hash == transaction_root_key_hash
-                    && outcome.post_root_generation == post_root_generation
-            })
-            .cloned()
-            .or_else(|| None);
-        let root_metadata_commit = match root_metadata_commit {
-            Some(commit) => commit,
-            None => self
-                .recommit_existing_core_transaction_stream_metadata(records, post_root_generation)
-                .await?
-                .into_iter()
-                .find(|outcome| {
-                    outcome.root_key_hash == transaction_root_key_hash
-                        && outcome.post_root_generation == post_root_generation
-                })
-                .ok_or_else(|| {
-                    anyhow!(
-                        "CoreStore root publication missing CoreMeta stream metadata commit evidence for generation {post_root_generation}"
-                    )
-                })?,
-        };
-        let transaction = CoreTransactionManifestRecord {
-            schema: "anvil.core.transaction_manifest.v1".to_string(),
-            mutation_ids: records
-                .last()
-                .map(|record| vec![record.cursor.clone()])
-                .unwrap_or_default(),
-            idempotency_key_hashes: records
-                .last()
-                .and_then(|record| record.idempotency_key_hash.clone())
-                .into_iter()
-                .collect(),
-            pre_root_generation,
-            post_root_generation,
-            logical_manifests: vec![checkpoint_locator],
-            core_meta_commit_certificate_hash: root_metadata_commit.certificate_hash.clone(),
-            certificate_persist_receipt_hashes: root_metadata_commit
-                .certificate_persist_receipt_hashes
-                .clone(),
-        };
-        let transaction_manifest_bytes = encode_transaction_manifest_record(&transaction)?;
-        let transaction_manifest_hash = sha256_hex(&transaction_manifest_bytes);
-        let (transaction_manifest, transaction_manifest_op) = self.prepare_inline_manifest_body(
-            WriterFamily::CoreControl.as_str(),
-            canonical_logical_file_id(
-                WriterFamily::CoreControl,
-                post_root_generation,
-                &format!("core_transaction_manifest:{post_root_generation:020}"),
-                transaction_manifest_hash.as_bytes(),
-            ),
-            post_root_generation,
-            transaction_manifest_bytes,
-        )?;
-        let manifest_ops = [checkpoint_op, transaction_manifest_op];
-        let manifest_ops = borrow_owned_coremeta_batch_ops(&manifest_ops);
-        self.commit_coremeta_batch_by_embedded_roots(
-            &format!("core-transaction-manifests:{post_root_generation}"),
-            &manifest_ops,
-        )
-        .await?;
-        self.publish_core_transaction_root_anchor(
-            records,
-            transaction_manifest,
-            current.as_ref(),
-            post_root_generation,
-        )
-        .await
-    }
-
-    async fn recommit_existing_core_transaction_stream_metadata(
-        &self,
-        records: &[StreamRecord],
-        post_root_generation: u64,
-    ) -> Result<Vec<CoreMetaQuorumCommitOutcome>> {
-        if records.is_empty() {
-            return Ok(Vec::new());
-        }
-        let Some(head_bytes) = self.meta.get(
-            CF_STREAM_HEADS,
-            TABLE_STREAM_HEAD_ROW,
-            &stream_head_key(CORE_TRANSACTION_STREAM_ID),
-        )?
-        else {
-            return Ok(Vec::new());
-        };
-        let head = decode_stream_head_record(&head_bytes)?;
-        if head.stream_id != CORE_TRANSACTION_STREAM_ID {
-            bail!("CoreStore transaction stream head metadata row has invalid scope");
-        }
-        if head.last_sequence != post_root_generation {
-            bail!(
-                "CoreStore transaction stream head is at generation {}, cannot reconstruct missing root generation {}",
-                head.last_sequence,
-                post_root_generation
-            );
-        }
-
-        let mut owned_ops = Vec::with_capacity(records.len() + 1);
-        for record in records {
-            if record.stream_id != CORE_TRANSACTION_STREAM_ID {
-                bail!(
-                    "CoreStore transaction root publication received non-transaction stream record"
-                );
-            }
-            if record.sequence > post_root_generation {
-                bail!("CoreStore transaction stream record exceeds target root generation");
-            }
-            let key = stream_record_key(CORE_TRANSACTION_STREAM_ID, record.sequence);
-            let Some(record_bytes) =
-                self.meta
-                    .get(CF_STREAM_RECORDS, TABLE_STREAM_RECORD_INDEX_ROW, &key)?
-            else {
-                return Ok(Vec::new());
-            };
-            let stored = decode_stream_record_index_row(&record_bytes)?;
-            if stored.stream_id != CORE_TRANSACTION_STREAM_ID
-                || stored.sequence != record.sequence
-                || stored.event_hash != record.event_hash
-            {
-                bail!("CoreStore transaction stream record metadata row has invalid scope");
-            }
-            owned_ops.push(OwnedCoreMetaBatchOp::Put {
-                cf: CF_STREAM_RECORDS,
-                table_id: TABLE_STREAM_RECORD_INDEX_ROW,
-                tuple_key: key,
-                payload: record_bytes,
-                common: None,
-            });
-        }
-        owned_ops.push(OwnedCoreMetaBatchOp::Put {
-            cf: CF_STREAM_HEADS,
-            table_id: TABLE_STREAM_HEAD_ROW,
-            tuple_key: stream_head_key(CORE_TRANSACTION_STREAM_ID),
-            payload: head_bytes,
-            common: None,
-        });
-        let ops = borrow_owned_coremeta_batch_ops(&owned_ops);
-        self.commit_coremeta_batch_by_embedded_roots(
-            &format!("core-transaction-stream-recover:{post_root_generation}"),
-            &ops,
-        )
-        .await
-    }
-
-    pub(super) async fn publish_core_transaction_root_anchor(
-        &self,
-        records: &[StreamRecord],
-        transaction_manifest: CoreManifestLocator,
-        current: Option<&CoreRootAnchorRecord>,
-        root_generation: u64,
-    ) -> Result<()> {
-        let root_anchor_key = core_transaction_root_anchor_key();
-        let root_key_hash = root_key_hash(root_anchor_key);
-        let previous_root_hash = current
-            .map(hash_root_anchor_record)
-            .transpose()?
-            .unwrap_or_else(|| ZERO_HASH.to_string());
-        let writer_families = records
-            .iter()
-            .map(|record| {
-                if record.stream_id == CORE_TRANSACTION_STREAM_ID {
-                    WriterFamily::CoreControl.as_str().to_string()
-                } else {
-                    record.partition_id.clone()
-                }
-            })
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let final_block_count = transaction_manifest
-            .block_locators
-            .iter()
-            .map(|block| block.data_shards + block.parity_shards)
-            .sum::<u32>() as u64;
-        let transaction_manifest_bytes = self.read_inline_manifest_body(&transaction_manifest)?;
-        let transaction = decode_transaction_manifest_record(&transaction_manifest_bytes)?;
-        validate_transaction_manifest_record(&transaction, root_generation)?;
-        let anchor = CoreRootAnchorRecord {
-            schema: "anvil.core.root_anchor.v1".to_string(),
-            root_anchor_key: root_anchor_key.to_string(),
-            root_key_hash,
-            root_generation,
-            previous_root_hash,
-            transaction_manifest: Some(transaction_manifest),
-            checkpoint_manifest: None,
-            core_meta_commit_certificate_hash: Some(
-                transaction.core_meta_commit_certificate_hash.clone(),
-            ),
-            certificate_persist_receipt_hashes: transaction
-                .certificate_persist_receipt_hashes
-                .clone(),
-            publisher_node_id: CORE_PENDING_MUTATION_NODE_ID.to_string(),
-            publisher_epoch: LOCAL_PLACEMENT_EPOCH,
-            partition_owner_fence: LOCAL_PLACEMENT_EPOCH,
-            created_at_unix_nanos: unix_timestamp_nanos(),
-            root_state: "committed".to_string(),
-            mutation_first: records.first().map(|record| record.cursor.clone()),
-            mutation_last: records.last().map(|record| record.cursor.clone()),
-            writer_families,
-            manifest_count: 1,
-            final_block_count,
-            genesis_bundle: None,
-        };
-        self.write_root_anchor_generation(&anchor).await
+        Ok((anchor.root_generation, anchor.root_generation))
     }
 
     pub(super) async fn bootstrap_system_root_anchor(&self) -> Result<()> {
@@ -997,6 +855,8 @@ impl CoreStore {
         root_anchor_key: &str,
     ) -> Result<Option<CoreRootAnchorRecord>> {
         let root_key_hash = root_key_hash(root_anchor_key);
+        // Root-cache rows are the publication authority used to decide
+        // visibility, so reading them through the visibility filter recurses.
         let Some(bytes) = self.meta.get(
             CF_ROOT_CACHE,
             TABLE_ROOT_CACHE_ROW,
@@ -1032,14 +892,14 @@ impl CoreStore {
             return Ok(anchor.previous_root_hash == ZERO_HASH);
         }
 
-        let Some(previous) = self
+        let previous = self
             .read_committed_root_anchor_generation(
                 root_key_hash,
                 anchor.root_generation.saturating_sub(1),
             )
-            .await?
-        else {
-            return Ok(false);
+            .await?;
+        let Some(previous) = previous else {
+            return Ok(anchor.root_generation == 1 && anchor.previous_root_hash == ZERO_HASH);
         };
         if previous.root_anchor_key != root_anchor_key || previous.root_key_hash != root_key_hash {
             bail!("CoreStore root anchor predecessor scope mismatch");
@@ -1059,11 +919,11 @@ impl CoreStore {
 
         let mut expected_child = anchor.clone();
         for generation in (0..anchor.root_generation).rev() {
-            let Some(previous) = self
+            let previous = self
                 .read_committed_root_anchor_generation(root_key_hash, generation)
-                .await?
-            else {
-                return Ok(false);
+                .await?;
+            let Some(previous) = previous else {
+                return Ok(generation == 0 && expected_child.previous_root_hash == ZERO_HASH);
             };
             if previous.root_anchor_key != root_anchor_key {
                 bail!("CoreStore root anchor chain key mismatch");
@@ -1077,11 +937,13 @@ impl CoreStore {
         Ok(expected_child.previous_root_hash == ZERO_HASH)
     }
 
-    pub(super) async fn read_committed_root_anchor_generation(
+    pub(crate) async fn read_committed_root_anchor_generation(
         &self,
         root_key_hash: &str,
         generation: u64,
     ) -> Result<Option<CoreRootAnchorRecord>> {
+        // Historical root-cache rows are inputs to publication verification
+        // itself and therefore must bypass publication-aware application reads.
         let Some(bytes) = self.meta.get(
             CF_ROOT_CACHE,
             TABLE_ROOT_CACHE_ROW,
@@ -1112,6 +974,10 @@ impl CoreStore {
         validate_root_anchor_record(anchor)?;
         let anchor_bytes = encode_root_anchor_record(anchor)?;
         let root_anchor_hash = format!("sha256:{}", sha256_hex(&anchor_bytes));
+        self.validate_root_anchor_coremeta_commit_evidence(anchor)?;
+        let _publication_guard = self
+            .acquire_named_lock("root-publication", &anchor.root_key_hash)
+            .await?;
         match self
             .read_latest_root_anchor(&anchor.root_anchor_key)
             .await?
@@ -1140,24 +1006,41 @@ impl CoreStore {
                 if anchor.previous_root_hash != current_hash {
                     bail!("CoreStore root anchor previous hash mismatch");
                 }
-                if anchor.publisher_epoch < current.publisher_epoch
-                    || (anchor.publisher_epoch == current.publisher_epoch
-                        && anchor.partition_owner_fence < current.partition_owner_fence)
+                if current.root_generation == 0 {
+                    if anchor.publisher_epoch != LOCAL_PLACEMENT_EPOCH
+                        || anchor.partition_owner_fence != LOCAL_PLACEMENT_EPOCH
+                    {
+                        bail!(
+                            "CoreStore initial root owner terms must start at epoch and fence one"
+                        );
+                    }
+                } else if anchor.publisher_node_id == current.publisher_node_id {
+                    if anchor.publisher_epoch != current.publisher_epoch
+                        || anchor.partition_owner_fence != current.partition_owner_fence
+                    {
+                        bail!("CoreStore root anchor changed current owner terms");
+                    }
+                } else if anchor.publisher_epoch != current.publisher_epoch
+                    || anchor.partition_owner_fence
+                        != current.partition_owner_fence.saturating_add(1)
                 {
-                    bail!("CoreStore root anchor rejected stale owner fence");
+                    bail!("CoreStore root anchor owner transition is not fenced");
                 }
             }
             None => {
-                if anchor.root_generation != 0 {
-                    bail!("CoreStore root anchor first generation must be zero");
+                let valid_first_generation = (anchor.root_generation == 0
+                    && anchor.root_anchor_key == core_transaction_root_anchor_key())
+                    || (anchor.root_generation == 1
+                        && anchor.root_anchor_key != core_transaction_root_anchor_key());
+                if !valid_first_generation {
+                    bail!("CoreStore root anchor has invalid first generation");
                 }
                 if anchor.previous_root_hash != ZERO_HASH {
-                    bail!("CoreStore root anchor genesis previous hash must be zero");
+                    bail!("CoreStore first root anchor previous hash must be zero");
                 }
             }
         }
         let row = encode_root_cache_row(anchor)?;
-        self.validate_root_anchor_coremeta_commit_evidence(anchor)?;
         let generation_key =
             root_anchor_generation_key(&anchor.root_key_hash, anchor.root_generation);
         let latest_key = root_cache_key(&anchor.root_anchor_key);
@@ -1212,9 +1095,17 @@ impl CoreStore {
     pub(super) fn validate_root_anchor_coremeta_commit_evidence(
         &self,
         anchor: &CoreRootAnchorRecord,
-    ) -> Result<()> {
+    ) -> Result<Option<CoreMetaCommitCertificate>> {
+        self.validate_root_anchor_coremeta_commit_evidence_from(&self.meta, anchor)
+    }
+
+    pub(super) fn validate_root_anchor_coremeta_commit_evidence_from<R: CoreMetaReader>(
+        &self,
+        reader: &R,
+        anchor: &CoreRootAnchorRecord,
+    ) -> Result<Option<CoreMetaCommitCertificate>> {
         if anchor.root_generation == 0 {
-            return Ok(());
+            return Ok(None);
         }
         let certificate_hash = anchor
             .core_meta_commit_certificate_hash
@@ -1223,7 +1114,7 @@ impl CoreStore {
                 anyhow!("CoreStore root anchor is missing CoreMeta commit certificate")
             })?;
         let evidence = self
-            .read_coremeta_commit_evidence(certificate_hash)?
+            .read_coremeta_commit_evidence_from(reader, certificate_hash)?
             .ok_or_else(|| anyhow!("CoreStore root anchor references missing CoreMeta evidence"))?;
         let api_certificate =
             decode_deterministic_proto::<crate::anvil_api::CoreMetaCommitCertificate>(
@@ -1279,7 +1170,7 @@ impl CoreStore {
                 self.verify_internal_core_receipt_signature(node_id, signed_payload_hash, signature)
             },
         )?;
-        Ok(())
+        Ok(Some(core_certificate))
     }
 
     pub(super) async fn acquire_named_lock(&self, kind: &str, id: &str) -> Result<CoreStoreLock> {
@@ -1300,29 +1191,49 @@ impl CoreStore {
                 started_at.elapsed(),
             );
         }
+        let process_guard = process_named_lock(lock_path.clone()).lock_owned().await;
+        let open_started_at = Instant::now();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| {
+                format!("open CoreStore scoped {kind} lock {}", lock_path.display())
+            })?;
+        crate::perf::record_io_duration(
+            "core_store",
+            "lock_open",
+            &lock_path,
+            0,
+            open_started_at.elapsed(),
+        );
         for _ in 0..CORE_PROCESS_LOCK_RETRY_ATTEMPTS {
             let started_at = Instant::now();
-            let open_result = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&lock_path)
-                .await;
+            let lock_result = FileExt::try_lock_exclusive(&file);
             crate::perf::record_io_duration(
                 "core_store",
-                "lock_create_new",
+                "lock_try_exclusive",
                 &lock_path,
                 0,
                 started_at.elapsed(),
             );
-            match open_result {
-                Ok(_) => return Ok(CoreStoreLock { path: lock_path }),
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            match lock_result {
+                Ok(()) => {
+                    return Ok(CoreStoreLock {
+                        path: lock_path,
+                        file,
+                        _process_guard: process_guard,
+                    });
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                     tokio::time::sleep(CORE_PROCESS_LOCK_RETRY_DELAY).await;
                 }
                 Err(err) => {
                     return Err(err).with_context(|| {
                         format!(
-                            "create CoreStore process write lock {}",
+                            "acquire CoreStore scoped {kind} lock {}",
                             lock_path.display()
                         )
                     });
@@ -1373,12 +1284,16 @@ fn logical_file_manifest_single_block_object_ref(
     object_ref_from_logical_block_ref(block, &manifest.erasure_profile_id)
 }
 
-fn stream_coremeta_root_key_hash(stream_id: &str) -> String {
+pub(super) fn stream_coremeta_root_anchor_key(stream_id: &str) -> String {
     if stream_id == CORE_TRANSACTION_STREAM_ID {
-        root_key_hash(core_transaction_root_anchor_key())
+        core_transaction_root_anchor_key().to_string()
     } else {
-        root_key_hash(&format!("stream/{stream_id}"))
+        format!("stream/{stream_id}")
     }
+}
+
+pub(super) fn stream_coremeta_root_key_hash(stream_id: &str) -> String {
+    root_key_hash(&stream_coremeta_root_anchor_key(stream_id))
 }
 
 fn transaction_stream_sequence_from_cursor(cursor: &str) -> Result<u64> {

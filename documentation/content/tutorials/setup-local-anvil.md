@@ -76,16 +76,16 @@ docker run -d \
   -p 127.0.0.1:50051:50051 \
   -v anvil-local-data:/var/lib/anvil \
   -e STORAGE_PATH=/var/lib/anvil \
+  -e MESH_ID=local \
+  -e NODE_ID=local-node-1 \
   -e REGION=local \
+  -e CELL_ID=local-cell-1 \
   -e API_LISTEN_ADDR=0.0.0.0:50051 \
   -e PUBLIC_API_ADDR=http://127.0.0.1:50051 \
   -e ADMIN_LISTEN_ADDR=127.0.0.1:50052 \
   -e JWT_SECRET=local-jwt-secret-change-me \
   -e ANVIL_SECRET_ENCRYPTION_KEY_ID="$ANVIL_SECRET_ENCRYPTION_KEY_ID" \
   -e ANVIL_SECRET_ENCRYPTION_KEY="$ANVIL_SECRET_ENCRYPTION_KEY" \
-  -e CLUSTER_SECRET=local-cluster-secret-change-me \
-  -e INIT_CLUSTER=true \
-  -e ENABLE_MDNS=false \
   -e BOOTSTRAP_SYSTEM_ADMIN_APP_NAME=system-admin \
   -e BOOTSTRAP_SYSTEM_ADMIN_CREDENTIAL_OUTPUT_PATH=/var/lib/anvil/bootstrap/system-admin.json \
   -e ANVIL_BOOTSTRAP_CREDENTIAL_FILE=/var/lib/anvil/bootstrap/system-admin.json \
@@ -97,12 +97,14 @@ docker run -d \
 The command has a few details worth understanding before you continue:
 
 - `STORAGE_PATH=/var/lib/anvil` tells the server where its durable state lives inside the container. That directory belongs to Anvil; do not edit it by hand.
+- `NODE_ID=local-node-1` becomes the durable identity stored in node-local CoreMeta on first use of the volume. A later start must use the same value or omit it.
 - `API_LISTEN_ADDR=0.0.0.0:50051` lets Docker publish the public listener to host loopback. The host-side `-p 127.0.0.1:50051:50051` keeps it local.
+- `PUBLIC_API_ADDR=http://127.0.0.1:50051` is the reachable address stored in this node's lifecycle descriptor. In a multi-node deployment it must be a stable endpoint the other nodes can dial.
 - `ADMIN_LISTEN_ADDR=127.0.0.1:50052` keeps the admin listener inside the container. There is no `-p` line for `50052`.
 - `BOOTSTRAP_SYSTEM_ADMIN_*` values are first-start settings. They are used only when the system realm does not already exist.
 - `ANVIL_BOOTSTRAP_CREDENTIAL_FILE`, `ANVIL_PUBLIC_ENDPOINT`, and `ANVIL_ADMIN_ENDPOINT` help CLI commands run inside the container during this tutorial. They do not make the admin API public.
 
-Docker prints the volume name and container id. From that point, `/var/lib/anvil` in the container is the durable state directory for this tutorial. It contains CoreStore state, indexes, system-realm records, audit data, and encrypted secret envelopes.
+Docker prints the volume name and container id. From that point, `/var/lib/anvil` in the container is the durable state directory for this tutorial. It contains CoreStore state, indexes, system-realm records, audit data, encrypted secret envelopes, local node identity, and the node's locally generated Ed25519 receipt-signing key.
 
 If the command fails because the container name already exists, inspect the existing container before deleting it:
 

@@ -31,7 +31,12 @@ pub enum HfKeyCommands {
         note: Option<String>,
     },
     /// List keys
-    Ls,
+    Ls {
+        #[clap(long, default_value_t = 100)]
+        page_size: u32,
+        #[clap(long, default_value = "")]
+        page_token: String,
+    },
     /// Remove a key
     Rm {
         #[clap(long)]
@@ -95,15 +100,29 @@ pub async fn handle_hf_command(command: &HfCommands, ctx: &Context) -> anyhow::R
                     let resp = client.create_key(request).await?;
                     println!("created key: {}", resp.into_inner().name);
                 }
-                HfKeyCommands::Ls => {
-                    let mut request = tonic::Request::new(api::ListHfKeysRequest {});
+                HfKeyCommands::Ls {
+                    page_size,
+                    page_token,
+                } => {
+                    let mut request = tonic::Request::new(api::ListHfKeysRequest {
+                        page: Some(api::PageRequest {
+                            page_size: *page_size,
+                            page_token: page_token.clone(),
+                        }),
+                    });
                     request.metadata_mut().insert(
                         "authorization",
                         format!("Bearer {}", token).parse().unwrap(),
                     );
-                    let resp = client.list_keys(request).await?;
-                    for k in resp.into_inner().keys {
+                    let response = client.list_keys(request).await?.into_inner();
+                    for k in response.keys {
                         println!("{}\t{}", k.name, k.updated_at);
+                    }
+                    if let Some(page) = response
+                        .page
+                        .filter(|page| !page.next_page_token.is_empty())
+                    {
+                        println!("next_page_token={}", page.next_page_token);
                     }
                 }
                 HfKeyCommands::Rm { name } => {

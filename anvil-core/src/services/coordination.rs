@@ -75,12 +75,23 @@ impl CoordinationService for AppState {
         .await?;
 
         let owner = lease_owner_from_claims(&claims, "");
+        let expected = self
+            .persistence
+            .read_expected_named_task_lease(
+                &owner,
+                &req.task_id,
+                req.fence_token,
+                req.expected_root_generation,
+                req.expected_lease_epoch,
+                req.expected_expires_at_nanos,
+                &req.expected_lease_hash,
+            )
+            .await
+            .map_err(lease_error_status)?;
         let lease = self
             .persistence
             .checkpoint_named_task_lease(
-                &req.task_id,
-                &owner,
-                req.fence_token,
+                &expected,
                 join_u128(req.checkpoint_cursor_low, req.checkpoint_cursor_high),
             )
             .await
@@ -113,12 +124,23 @@ impl CoordinationService for AppState {
         .await?;
 
         let owner = lease_owner_from_claims(&claims, "");
+        let expected = self
+            .persistence
+            .read_expected_named_task_lease(
+                &owner,
+                &req.task_id,
+                req.fence_token,
+                req.expected_root_generation,
+                req.expected_lease_epoch,
+                req.expected_expires_at_nanos,
+                &req.expected_lease_hash,
+            )
+            .await
+            .map_err(lease_error_status)?;
         let lease = self
             .persistence
             .commit_named_task_lease(
-                &req.task_id,
-                &owner,
-                req.fence_token,
+                &expected,
                 join_u128(req.committed_cursor_low, req.committed_cursor_high),
             )
             .await
@@ -469,6 +491,7 @@ fn task_lease_response(lease: task_lease::TaskLease) -> TaskLease {
         owner_principal_kind: owner.principal_kind,
         owner_principal_id: owner.principal_id,
         owner_actor_instance_id: owner.actor_instance_id,
+        root_generation: lease.root_generation,
     }
 }
 

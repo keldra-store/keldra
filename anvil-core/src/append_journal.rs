@@ -1,9 +1,9 @@
 use crate::core_store::{
     CoreCompressionDescriptor, CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
-    CoreObjectEncoding, CoreObjectPlacement, CoreObjectRef, CoreStore, CoreTransaction,
-    CoreTransactionUpdate, ReadStream, StreamRecord,
+    CoreMutationRootPublication, CoreObjectEncoding, CoreObjectPlacement, CoreObjectRef, CoreStore,
+    CoreTransaction, CoreTransactionUpdate, ReadStream, StreamRecord,
 };
-use crate::formats::{Hash32, hash32};
+use crate::formats::{Hash32, hash32, writer::WriterFamily};
 use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
 use crate::persistence::{
     AppendStream, AppendStreamMutation, AppendStreamRecord, AppendStreamRecordMutation,
@@ -13,7 +13,6 @@ use crate::storage::Storage;
 use anyhow::{Result, anyhow, bail};
 use chrono::Utc;
 use prost::{Message, Oneof};
-use std::collections::BTreeMap;
 
 const APPEND_METADATA_BODY_SCHEMA: &str = "anvil.core.append_metadata.v1";
 
@@ -206,11 +205,17 @@ struct CoreObjectPlacementProto {
     receipt_signature: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Default)]
-struct AppendState {
-    streams: BTreeMap<i64, AppendStream>,
-    records: BTreeMap<(i64, i64), AppendStreamRecord>,
-}
+mod read;
+
+pub use read::{
+    AppendStreamPage, AppendStreamRecordPage, append_record_source_cursor,
+    append_stream_has_records, get_active_append_stream, get_active_append_stream_in_transaction,
+    list_append_stream_records_page, list_append_streams_page,
+};
+use read::{
+    append_record_cursor_stream_id, append_record_stream_id, append_state_stream_id,
+    get_active_append_stream_for_optional_transaction,
+};
 
 #[cfg(test)]
 async fn create_append_stream(
@@ -299,15 +304,21 @@ async fn create_append_stream_inner(
     transaction_id: Option<&str>,
     transaction_principal: Option<&str>,
 ) -> Result<AppendStreamMutation> {
-    let state = read_state_for_optional_transaction(
-        storage,
-        tenant_id,
-        bucket_id,
-        transaction_id.zip(transaction_principal),
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let explicit_transaction =
+        read_optional_explicit_transaction(&core_store, transaction_id, transaction_principal)
+            .await?;
+    let id = i64::try_from(
+        next_stream_sequence_visible_to_transaction(
+            &core_store,
+            &append_metadata_stream_id(tenant_id, bucket_id),
+            explicit_transaction.as_ref(),
+        )
+        .await?,
     )
-    .await?;
+    .map_err(|_| anyhow!("append stream id overflow"))?;
     let stream = AppendStream {
-        id: next_stream_id(&state)?,
+        id,
         tenant_id,
         bucket_id,
         bucket_name: bucket_name.to_string(),
@@ -328,56 +339,22 @@ async fn create_append_stream_inner(
         partition_precondition,
         transaction_id,
         transaction_principal,
+        transaction_principal,
     )
     .await?;
     Ok(AppendStreamMutation { stream, receipt })
 }
 
-pub async fn get_active_append_stream(
-    storage: &Storage,
-    tenant_id: i64,
-    bucket_id: i64,
-    stream_key: &str,
-    stream_id: uuid::Uuid,
-) -> Result<Option<AppendStream>> {
-    Ok(read_state(storage, tenant_id, bucket_id)
-        .await?
-        .streams
-        .into_values()
-        .find(|stream| stream.stream_key == stream_key && stream.stream_id == stream_id))
-}
-
-pub async fn get_active_append_stream_in_transaction(
-    storage: &Storage,
-    tenant_id: i64,
-    bucket_id: i64,
-    stream_key: &str,
-    stream_id: uuid::Uuid,
-    transaction_id: &str,
-    transaction_principal: &str,
-) -> Result<Option<AppendStream>> {
-    Ok(read_state_for_optional_transaction(
-        storage,
-        tenant_id,
-        bucket_id,
-        Some((transaction_id, transaction_principal)),
-    )
-    .await?
-    .streams
-    .into_values()
-    .find(|stream| stream.stream_key == stream_key && stream.stream_id == stream_id))
-}
-
 #[cfg(test)]
 async fn append_stream_record(
     storage: &Storage,
-    stream_row_id: i64,
+    stream: &AppendStream,
     payload_object_ref: CoreObjectRef,
     payload_size: i64,
 ) -> Result<AppendStreamRecordMutation> {
     append_stream_record_inner(
         storage,
-        stream_row_id,
+        stream,
         payload_object_ref,
         payload_size,
         None,
@@ -394,7 +371,7 @@ async fn append_stream_record(
 #[cfg(test)]
 pub(crate) async fn append_stream_record_with_permit(
     storage: &Storage,
-    stream_row_id: i64,
+    stream: &AppendStream,
     payload_object_ref: CoreObjectRef,
     payload_size: i64,
     content_type: Option<String>,
@@ -406,7 +383,7 @@ pub(crate) async fn append_stream_record_with_permit(
         partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
     append_stream_record_inner(
         storage,
-        stream_row_id,
+        stream,
         payload_object_ref,
         payload_size,
         content_type,
@@ -424,7 +401,7 @@ pub(crate) async fn append_stream_record_with_permit_in_partition(
     storage: &Storage,
     tenant_id: i64,
     bucket_id: i64,
-    stream_row_id: i64,
+    stream: &AppendStream,
     payload_object_ref: CoreObjectRef,
     payload_size: i64,
     content_type: Option<String>,
@@ -438,47 +415,16 @@ pub(crate) async fn append_stream_record_with_permit_in_partition(
         partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
     append_stream_record_inner(
         storage,
-        stream_row_id,
+        stream,
         payload_object_ref,
         payload_size,
         content_type,
         user_meta,
         Some(permit),
         Some(partition_precondition),
-        Some((tenant_id, bucket_id)),
+        None,
         None,
         Some(authenticated_principal),
-    )
-    .await
-}
-
-#[cfg(test)]
-pub(crate) async fn append_stream_record_with_permit_in_transaction(
-    storage: &Storage,
-    stream_row_id: i64,
-    payload_object_ref: CoreObjectRef,
-    payload_size: i64,
-    content_type: Option<String>,
-    user_meta: Option<serde_json::Value>,
-    permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
-    transaction_id: &str,
-    transaction_principal: &str,
-) -> Result<AppendStreamRecordMutation> {
-    let partition_precondition =
-        partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
-    append_stream_record_inner(
-        storage,
-        stream_row_id,
-        payload_object_ref,
-        payload_size,
-        content_type,
-        user_meta,
-        Some(permit),
-        Some(partition_precondition),
-        None,
-        Some(transaction_id),
-        Some(transaction_principal),
     )
     .await
 }
@@ -487,7 +433,7 @@ pub(crate) async fn append_stream_record_with_permit_in_partition_transaction(
     storage: &Storage,
     tenant_id: i64,
     bucket_id: i64,
-    stream_row_id: i64,
+    stream: &AppendStream,
     payload_object_ref: CoreObjectRef,
     payload_size: i64,
     content_type: Option<String>,
@@ -502,15 +448,15 @@ pub(crate) async fn append_stream_record_with_permit_in_partition_transaction(
         partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
     append_stream_record_inner(
         storage,
-        stream_row_id,
+        stream,
         payload_object_ref,
         payload_size,
         content_type,
         user_meta,
         Some(permit),
         Some(partition_precondition),
-        Some((tenant_id, bucket_id)),
         Some(transaction_id),
+        Some(transaction_principal),
         Some(transaction_principal),
     )
     .await
@@ -518,50 +464,61 @@ pub(crate) async fn append_stream_record_with_permit_in_partition_transaction(
 
 async fn append_stream_record_inner(
     storage: &Storage,
-    stream_row_id: i64,
+    stream: &AppendStream,
     payload_object_ref: CoreObjectRef,
     payload_size: i64,
     content_type: Option<String>,
     user_meta: Option<serde_json::Value>,
     permit: Option<&PartitionWritePermit>,
     partition_precondition: Option<CoreMutationPrecondition>,
-    known_partition: Option<(i64, i64)>,
     transaction_id: Option<&str>,
+    transaction_principal: Option<&str>,
     authenticated_principal: Option<&str>,
 ) -> Result<AppendStreamRecordMutation> {
-    let (tenant_id, bucket_id) = if let Some((tenant_id, bucket_id)) = known_partition {
-        (tenant_id, bucket_id)
-    } else {
-        let (tenant_id, bucket_id, _) = find_stream(storage, stream_row_id)
-            .await?
-            .ok_or_else(|| anyhow!("append stream not found"))?;
-        (tenant_id, bucket_id)
-    };
+    let tenant_id = stream.tenant_id;
+    let bucket_id = stream.bucket_id;
     if let Some(permit) = permit {
         require_append_metadata_permit(tenant_id, bucket_id, permit)?;
     }
     let fence_token = permit.map(|permit| permit.fence_token).unwrap_or(0);
-    let state = read_state_for_optional_transaction(
+    let current = get_active_append_stream_for_optional_transaction(
         storage,
         tenant_id,
         bucket_id,
-        transaction_id.zip(authenticated_principal),
+        &stream.stream_key,
+        stream.stream_id,
+        transaction_id.zip(transaction_principal),
     )
-    .await?;
-    if !state.streams.contains_key(&stream_row_id) {
-        bail!("append stream not found");
+    .await?
+    .ok_or_else(|| anyhow!("append stream not found"))?;
+    if current.id != stream.id {
+        bail!("append stream row id does not match stream identity");
     }
-    let next_seq = state
-        .records
-        .values()
-        .filter(|record| record.stream_id == stream_row_id)
-        .map(|record| record.record_sequence)
-        .max()
-        .unwrap_or(0)
-        + 1;
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let explicit_transaction =
+        read_optional_explicit_transaction(&core_store, transaction_id, transaction_principal)
+            .await?;
+    let next_seq = i64::try_from(
+        next_stream_sequence_visible_to_transaction(
+            &core_store,
+            &append_record_stream_id(&current)?,
+            explicit_transaction.as_ref(),
+        )
+        .await?,
+    )
+    .map_err(|_| anyhow!("append record sequence overflow"))?;
+    let next_record_id = i64::try_from(
+        next_stream_sequence_visible_to_transaction(
+            &core_store,
+            &append_metadata_stream_id(tenant_id, bucket_id),
+            explicit_transaction.as_ref(),
+        )
+        .await?,
+    )
+    .map_err(|_| anyhow!("append record id overflow"))?;
     let record = AppendStreamRecord {
-        id: next_record_id(&state)?,
-        stream_id: stream_row_id,
+        id: next_record_id,
+        stream_id: stream.id,
         record_sequence: next_seq,
         payload_hash: payload_object_ref.hash.clone(),
         payload_object_ref,
@@ -576,11 +533,12 @@ async fn append_stream_record_inner(
         tenant_id,
         bucket_id,
         AppendMutationKind::AppendRecord,
-        None,
+        Some(current),
         Some(record.clone()),
         fence_token,
         partition_precondition,
         transaction_id,
+        transaction_principal,
         authenticated_principal,
     )
     .await?;
@@ -588,120 +546,18 @@ async fn append_stream_record_inner(
 }
 
 #[cfg(test)]
-pub async fn list_append_stream_records(
-    storage: &Storage,
-    stream_row_id: i64,
-) -> Result<Vec<AppendStreamRecord>> {
-    let Some((tenant_id, bucket_id, _)) = find_stream(storage, stream_row_id).await? else {
-        return Ok(Vec::new());
-    };
-    let mut records = read_state(storage, tenant_id, bucket_id)
-        .await?
-        .records
-        .into_values()
-        .filter(|record| record.stream_id == stream_row_id)
-        .collect::<Vec<_>>();
-    records.sort_by_key(|record| record.record_sequence);
-    Ok(records)
-}
-
-pub async fn list_append_stream_records_for_stream(
-    storage: &Storage,
-    tenant_id: i64,
-    bucket_id: i64,
-    stream_row_id: i64,
-) -> Result<Vec<AppendStreamRecord>> {
-    let mut records = read_state(storage, tenant_id, bucket_id)
-        .await?
-        .records
-        .into_values()
-        .filter(|record| record.stream_id == stream_row_id)
-        .collect::<Vec<_>>();
-    records.sort_by_key(|record| record.record_sequence);
-    Ok(records)
-}
-
-pub async fn list_append_stream_records_in_transaction(
-    storage: &Storage,
-    tenant_id: i64,
-    bucket_id: i64,
-    stream_row_id: i64,
-    transaction_id: &str,
-    transaction_principal: &str,
-) -> Result<Vec<AppendStreamRecord>> {
-    let mut records = read_state_for_optional_transaction(
-        storage,
-        tenant_id,
-        bucket_id,
-        Some((transaction_id, transaction_principal)),
-    )
-    .await?
-    .records
-    .into_values()
-    .filter(|record| record.stream_id == stream_row_id)
-    .collect::<Vec<_>>();
-    records.sort_by_key(|record| record.record_sequence);
-    Ok(records)
-}
-
-pub async fn list_append_stream_records_for_bucket(
-    storage: &Storage,
-    tenant_id: i64,
-    bucket_id: i64,
-) -> Result<Vec<(AppendStream, AppendStreamRecord)>> {
-    let state = read_state(storage, tenant_id, bucket_id).await?;
-    let mut records = Vec::new();
-    for record in state.records.into_values() {
-        if let Some(stream) = state.streams.get(&record.stream_id) {
-            records.push((stream.clone(), record));
-        }
-    }
-    records.sort_by(|left, right| {
-        left.0
-            .stream_key
-            .cmp(&right.0.stream_key)
-            .then(left.1.record_sequence.cmp(&right.1.record_sequence))
-    });
-    Ok(records)
-}
-
-pub async fn append_record_source_cursor(
-    storage: &Storage,
-    tenant_id: i64,
-    bucket_id: i64,
-) -> Result<u128> {
-    Ok(read_state(storage, tenant_id, bucket_id)
-        .await?
-        .records
-        .values()
-        .map(|record| record.id.max(0) as u128)
-        .max()
-        .unwrap_or(0))
-}
-
-#[cfg(test)]
 async fn seal_append_stream(
     storage: &Storage,
-    stream_row_id: i64,
+    stream: &AppendStream,
     segment_hash: &str,
 ) -> Result<SealAppendStreamMutation> {
-    seal_append_stream_inner(
-        storage,
-        stream_row_id,
-        segment_hash,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    .await
+    seal_append_stream_inner(storage, stream, segment_hash, None, None, None, None).await
 }
 
 #[cfg(test)]
 pub(crate) async fn seal_append_stream_with_permit(
     storage: &Storage,
-    stream_row_id: i64,
+    stream: &AppendStream,
     segment_hash: &str,
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
@@ -710,11 +566,10 @@ pub(crate) async fn seal_append_stream_with_permit(
         partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
     seal_append_stream_inner(
         storage,
-        stream_row_id,
+        stream,
         segment_hash,
         Some(permit),
         Some(partition_precondition),
-        None,
         None,
         None,
     )
@@ -725,7 +580,7 @@ pub(crate) async fn seal_append_stream_with_permit_in_partition(
     storage: &Storage,
     tenant_id: i64,
     bucket_id: i64,
-    stream_row_id: i64,
+    stream: &AppendStream,
     segment_hash: &str,
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
@@ -735,38 +590,12 @@ pub(crate) async fn seal_append_stream_with_permit_in_partition(
         partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
     seal_append_stream_inner(
         storage,
-        stream_row_id,
-        segment_hash,
-        Some(permit),
-        Some(partition_precondition),
-        Some((tenant_id, bucket_id)),
-        None,
-        None,
-    )
-    .await
-}
-
-#[cfg(test)]
-pub(crate) async fn seal_append_stream_with_permit_in_transaction(
-    storage: &Storage,
-    stream_row_id: i64,
-    segment_hash: &str,
-    permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
-    transaction_id: &str,
-    transaction_principal: &str,
-) -> Result<SealAppendStreamMutation> {
-    let partition_precondition =
-        partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
-    seal_append_stream_inner(
-        storage,
-        stream_row_id,
+        stream,
         segment_hash,
         Some(permit),
         Some(partition_precondition),
         None,
-        Some(transaction_id),
-        Some(transaction_principal),
+        None,
     )
     .await
 }
@@ -775,7 +604,7 @@ pub(crate) async fn seal_append_stream_with_permit_in_partition_transaction(
     storage: &Storage,
     tenant_id: i64,
     bucket_id: i64,
-    stream_row_id: i64,
+    stream: &AppendStream,
     segment_hash: &str,
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
@@ -787,11 +616,10 @@ pub(crate) async fn seal_append_stream_with_permit_in_partition_transaction(
         partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
     seal_append_stream_inner(
         storage,
-        stream_row_id,
+        stream,
         segment_hash,
         Some(permit),
         Some(partition_precondition),
-        Some((tenant_id, bucket_id)),
         Some(transaction_id),
         Some(transaction_principal),
     )
@@ -800,18 +628,21 @@ pub(crate) async fn seal_append_stream_with_permit_in_partition_transaction(
 
 async fn seal_append_stream_inner(
     storage: &Storage,
-    stream_row_id: i64,
+    expected_stream: &AppendStream,
     segment_hash: &str,
     permit: Option<&PartitionWritePermit>,
     partition_precondition: Option<CoreMutationPrecondition>,
-    known_partition: Option<(i64, i64)>,
     transaction_id: Option<&str>,
     transaction_principal: Option<&str>,
 ) -> Result<SealAppendStreamMutation> {
-    let Some((tenant_id, bucket_id, mut stream)) = find_stream_for_optional_transaction(
+    let tenant_id = expected_stream.tenant_id;
+    let bucket_id = expected_stream.bucket_id;
+    let Some(mut stream) = get_active_append_stream_for_optional_transaction(
         storage,
-        stream_row_id,
-        known_partition,
+        tenant_id,
+        bucket_id,
+        &expected_stream.stream_key,
+        expected_stream.stream_id,
         transaction_id.zip(transaction_principal),
     )
     .await?
@@ -821,6 +652,9 @@ async fn seal_append_stream_inner(
             receipt: None,
         });
     };
+    if stream.id != expected_stream.id {
+        bail!("append stream row id does not match stream identity");
+    }
     if let Some(permit) = permit {
         require_append_metadata_permit(tenant_id, bucket_id, permit)?;
     }
@@ -838,111 +672,13 @@ async fn seal_append_stream_inner(
         partition_precondition,
         transaction_id,
         transaction_principal,
+        transaction_principal,
     )
     .await?;
     Ok(SealAppendStreamMutation {
         sealed: true,
         receipt: Some(receipt),
     })
-}
-
-#[cfg(test)]
-pub async fn find_append_stream_partition(
-    storage: &Storage,
-    stream_row_id: i64,
-) -> Result<Option<(i64, i64)>> {
-    Ok(find_stream(storage, stream_row_id)
-        .await?
-        .map(|(tenant_id, bucket_id, _)| (tenant_id, bucket_id)))
-}
-
-async fn find_stream(
-    storage: &Storage,
-    stream_row_id: i64,
-) -> Result<Option<(i64, i64, AppendStream)>> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    for stream_id in core_store
-        .list_stream_ids("append_metadata:tenant:")
-        .await?
-    {
-        let state = read_state_from_stream(&core_store, &stream_id).await?;
-        if let Some(stream) = state.streams.get(&stream_row_id).cloned() {
-            return Ok(Some((stream.tenant_id, stream.bucket_id, stream)));
-        }
-    }
-    Ok(None)
-}
-
-async fn read_state(storage: &Storage, tenant_id: i64, bucket_id: i64) -> Result<AppendState> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    read_state_from_stream(
-        &core_store,
-        &append_metadata_stream_id(tenant_id, bucket_id),
-    )
-    .await
-}
-
-async fn read_state_for_optional_transaction(
-    storage: &Storage,
-    tenant_id: i64,
-    bucket_id: i64,
-    transaction: Option<(&str, &str)>,
-) -> Result<AppendState> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let stream_id = append_metadata_stream_id(tenant_id, bucket_id);
-    if let Some((transaction_id, transaction_principal)) = transaction {
-        return read_state_from_records(
-            core_store
-                .read_stream_visible_to_transaction(
-                    ReadStream {
-                        stream_id,
-                        after_sequence: 0,
-                        limit: 0,
-                    },
-                    transaction_id,
-                    transaction_principal,
-                )
-                .await?,
-        );
-    }
-    read_state_from_stream(&core_store, &stream_id).await
-}
-
-async fn read_state_from_stream(core_store: &CoreStore, stream_id: &str) -> Result<AppendState> {
-    let records = core_store
-        .read_stream(ReadStream {
-            stream_id: stream_id.to_string(),
-            after_sequence: 0,
-            limit: 0,
-        })
-        .await?;
-    read_state_from_records(records)
-}
-
-fn read_state_from_records(records: Vec<StreamRecord>) -> Result<AppendState> {
-    let mut state = AppendState::default();
-    for record in records {
-        if record.record_kind != "append_metadata" {
-            continue;
-        }
-        let body = decode_append_body(&record.payload)?;
-        match body.event.as_str() {
-            "create_stream" | "seal_stream" => {
-                if let Some(stream) = body.stream {
-                    state.streams.insert(stream.id, stream);
-                }
-            }
-            "append_record" => {
-                if let Some(record) = body.record {
-                    state
-                        .records
-                        .insert((record.stream_id, record.record_sequence), record);
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(state)
 }
 
 pub async fn materialize_committed_append_streams_transaction(
@@ -956,6 +692,7 @@ pub async fn materialize_committed_append_streams_transaction(
             stream_id,
             visible_sequence,
             prepared_record_hash,
+            ..
         } = update
         else {
             continue;
@@ -986,24 +723,6 @@ pub async fn materialize_committed_append_streams_transaction(
     Ok(streams)
 }
 
-async fn find_stream_for_optional_transaction(
-    storage: &Storage,
-    stream_row_id: i64,
-    known_partition: Option<(i64, i64)>,
-    transaction: Option<(&str, &str)>,
-) -> Result<Option<(i64, i64, AppendStream)>> {
-    if let Some((tenant_id, bucket_id)) = known_partition {
-        let state =
-            read_state_for_optional_transaction(storage, tenant_id, bucket_id, transaction).await?;
-        return Ok(state
-            .streams
-            .get(&stream_row_id)
-            .cloned()
-            .map(|stream| (tenant_id, bucket_id, stream)));
-    }
-    find_stream(storage, stream_row_id).await
-}
-
 async fn append_body(
     storage: &Storage,
     tenant_id: i64,
@@ -1014,38 +733,159 @@ async fn append_body(
     fence_token: u64,
     partition_precondition: Option<CoreMutationPrecondition>,
     transaction_id: Option<&str>,
+    transaction_principal: Option<&str>,
     committed_by_principal: Option<&str>,
 ) -> Result<MetadataMutationReceipt> {
     let core_store = CoreStore::new(storage.clone()).await?;
-    let stream_id = append_metadata_stream_id(tenant_id, bucket_id);
+    let explicit_transaction = match (transaction_id, transaction_principal) {
+        (Some(transaction_id), Some(transaction_principal)) => Some(
+            core_store
+                .read_explicit_transaction_for_principal(transaction_id, transaction_principal)
+                .await?,
+        ),
+        (None, None) => None,
+        _ => {
+            return Err(anyhow!(
+                "append transaction id and principal must be provided together"
+            ));
+        }
+    };
+    let journal_stream_id = append_metadata_stream_id(tenant_id, bucket_id);
+    let stream = stream.ok_or_else(|| anyhow!("append event is missing stream identity"))?;
+    if stream.tenant_id != tenant_id || stream.bucket_id != bucket_id {
+        bail!("append event stream identity does not match journal partition");
+    }
+    let exact_stream_id = match event {
+        AppendMutationKind::CreateStream | AppendMutationKind::SealStream => {
+            append_state_stream_id(&stream)?
+        }
+        AppendMutationKind::AppendRecord => append_record_stream_id(&stream)?,
+    };
+    let journal_precondition = core_store
+        .stream_head_precondition_visible_to_transaction(
+            &journal_stream_id,
+            explicit_transaction.as_ref(),
+        )
+        .await?;
+    let exact_precondition = core_store
+        .stream_head_precondition_visible_to_transaction(
+            &exact_stream_id,
+            explicit_transaction.as_ref(),
+        )
+        .await?;
+    let record_cursor_stream_id = matches!(event, AppendMutationKind::AppendRecord)
+        .then(|| append_record_cursor_stream_id(tenant_id, bucket_id));
+    let record_cursor_precondition = if let Some(stream_id) = record_cursor_stream_id.as_deref() {
+        Some(
+            core_store
+                .stream_head_precondition_visible_to_transaction(
+                    stream_id,
+                    explicit_transaction.as_ref(),
+                )
+                .await?,
+        )
+    } else {
+        None
+    };
+    let expected_journal_sequence = expected_stream_next_sequence(&journal_precondition)?;
+    let expected_exact_sequence = expected_stream_next_sequence(&exact_precondition)?;
+    match event {
+        AppendMutationKind::CreateStream => {
+            if u64::try_from(stream.id).ok() != Some(expected_journal_sequence) {
+                bail!("append stream id does not match the journal head");
+            }
+            if expected_exact_sequence != 1 {
+                bail!("append stream identity already exists");
+            }
+        }
+        AppendMutationKind::AppendRecord => {
+            let append_record = record
+                .as_ref()
+                .ok_or_else(|| anyhow!("append record event is missing record"))?;
+            if u64::try_from(append_record.id).ok() != Some(expected_journal_sequence)
+                || u64::try_from(append_record.record_sequence).ok()
+                    != Some(expected_exact_sequence)
+                || append_record.stream_id != stream.id
+            {
+                bail!("append record ids do not match journal heads");
+            }
+        }
+        AppendMutationKind::SealStream => {
+            if record.is_some() {
+                bail!("append stream seal event must not contain a record");
+            }
+        }
+    }
     let mutation_id = uuid::Uuid::new_v4();
     let body = AppendBody {
         event: event.as_str().to_string(),
-        stream,
+        stream: Some(stream),
         record,
         emitted_at: Utc::now().to_rfc3339(),
     };
     let payload = encode_append_body(&body, fence_token, mutation_id)?;
     let payload_hash = hex::encode(hash32(&payload));
     let partition_id = hex::encode(append_metadata_partition_id(tenant_id, bucket_id));
+    let scope_partition = explicit_transaction
+        .as_ref()
+        .map(|transaction| transaction.scope_partition.clone())
+        .unwrap_or(partition_id);
+    let mut preconditions: Vec<_> = partition_precondition.into_iter().collect();
+    preconditions.push(journal_precondition);
+    preconditions.push(exact_precondition);
+    preconditions.extend(record_cursor_precondition);
+    let mut operations = vec![
+        CoreMutationOperation::StreamAppend {
+            partition_id: scope_partition.clone(),
+            stream_id: journal_stream_id.clone(),
+            record_kind: "append_metadata".to_string(),
+            payload: payload.clone(),
+            idempotency_key: Some(format!(
+                "append-metadata-journal:{tenant_id}:{bucket_id}:{mutation_id}"
+            )),
+        },
+        CoreMutationOperation::StreamAppend {
+            partition_id: scope_partition.clone(),
+            stream_id: exact_stream_id,
+            record_kind: match event {
+                AppendMutationKind::CreateStream | AppendMutationKind::SealStream => {
+                    "append_metadata.state"
+                }
+                AppendMutationKind::AppendRecord => "append_metadata.record",
+            }
+            .to_string(),
+            payload: payload.clone(),
+            idempotency_key: Some(format!(
+                "append-metadata-exact:{tenant_id}:{bucket_id}:{mutation_id}"
+            )),
+        },
+    ];
+    if let Some(stream_id) = record_cursor_stream_id {
+        operations.push(CoreMutationOperation::StreamAppend {
+            partition_id: scope_partition.clone(),
+            stream_id,
+            record_kind: "append_metadata.record_cursor".to_string(),
+            payload,
+            idempotency_key: Some(format!(
+                "append-metadata-record-cursor:{tenant_id}:{bucket_id}:{mutation_id}"
+            )),
+        });
+    }
     let batch = CoreMutationBatch {
         transaction_id: transaction_id
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| format!("append-metadata:{tenant_id}:{bucket_id}:{mutation_id}")),
-        scope_partition: partition_id.clone(),
-        committed_by_principal: committed_by_principal
+        scope_partition: scope_partition.clone(),
+        committed_by_principal: transaction_principal
+            .or(committed_by_principal)
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| append_metadata_partition_principal(tenant_id, bucket_id)),
-        preconditions: partition_precondition.into_iter().collect(),
-        operations: vec![CoreMutationOperation::StreamAppend {
-            partition_id,
-            stream_id,
-            record_kind: "append_metadata".to_string(),
-            payload,
-            idempotency_key: Some(format!(
-                "append-metadata:{tenant_id}:{bucket_id}:{mutation_id}"
-            )),
-        }],
+        root_publications: vec![
+            CoreMutationRootPublication::new(scope_partition, WriterFamily::CoreControl.as_str())
+                .coordinator(),
+        ],
+        preconditions,
+        operations,
     };
     let batch_receipt = if transaction_id.is_some() {
         core_store.stage_explicit_transaction_batch(batch).await?
@@ -1057,12 +897,14 @@ async fn append_body(
         .iter()
         .find_map(|update| match update {
             CoreTransactionUpdate::StreamAppend {
+                stream_id,
                 visible_sequence,
                 prepared_record_hash,
                 ..
-            } => Some((*visible_sequence, prepared_record_hash.clone())),
-            CoreTransactionUpdate::CoreMetaPut { .. }
-            | CoreTransactionUpdate::CoreMetaDelete { .. } => None,
+            } if stream_id == &journal_stream_id => {
+                Some((*visible_sequence, prepared_record_hash.clone()))
+            }
+            _ => None,
         })
         .ok_or_else(|| anyhow!("append metadata batch did not append stream record"))?;
     Ok(MetadataMutationReceipt {
@@ -1071,6 +913,48 @@ async fn append_body(
         record_hash: stream_update.1,
         watch_cursor: stream_update.0,
     })
+}
+
+fn expected_stream_next_sequence(precondition: &CoreMutationPrecondition) -> Result<u64> {
+    let CoreMutationPrecondition::StreamHead {
+        expected_last_sequence,
+        ..
+    } = precondition
+    else {
+        bail!("append journal expected a stream-head precondition");
+    };
+    expected_last_sequence
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("append stream sequence overflow"))
+}
+
+async fn read_optional_explicit_transaction(
+    core_store: &CoreStore,
+    transaction_id: Option<&str>,
+    transaction_principal: Option<&str>,
+) -> Result<Option<CoreTransaction>> {
+    match (transaction_id, transaction_principal) {
+        (Some(transaction_id), Some(transaction_principal)) => core_store
+            .read_explicit_transaction_for_principal(transaction_id, transaction_principal)
+            .await
+            .map(Some),
+        (None, None) => Ok(None),
+        _ => Err(anyhow!(
+            "append transaction id and principal must be provided together"
+        )),
+    }
+}
+
+async fn next_stream_sequence_visible_to_transaction(
+    core_store: &CoreStore,
+    stream_id: &str,
+    transaction: Option<&CoreTransaction>,
+) -> Result<u64> {
+    expected_stream_next_sequence(
+        &core_store
+            .stream_head_precondition_visible_to_transaction(stream_id, transaction)
+            .await?,
+    )
 }
 
 fn encode_append_body(
@@ -1347,28 +1231,6 @@ fn ensure_deterministic_proto(message: &impl Message, bytes: &[u8], label: &str)
     Ok(())
 }
 
-fn next_stream_id(state: &AppendState) -> Result<i64> {
-    state
-        .streams
-        .keys()
-        .copied()
-        .max()
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(|| anyhow!("append stream id overflow"))
-}
-
-fn next_record_id(state: &AppendState) -> Result<i64> {
-    state
-        .records
-        .values()
-        .map(|record| record.id)
-        .max()
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(|| anyhow!("append record id overflow"))
-}
-
 pub fn append_metadata_partition_id(tenant_id: i64, bucket_id: i64) -> Hash32 {
     hash32(format!("tenant/{tenant_id}/bucket/{bucket_id}/append").as_bytes())
 }
@@ -1380,17 +1242,27 @@ pub(crate) async fn read_append_frame_fences_for_test(
     bucket_id: i64,
 ) -> Result<Vec<u64>> {
     let core_store = CoreStore::new(storage.clone()).await?;
-    Ok(core_store
-        .read_stream(ReadStream {
-            stream_id: append_metadata_stream_id(tenant_id, bucket_id),
-            after_sequence: 0,
-            limit: 0,
-        })
-        .await?
-        .into_iter()
-        .filter(|record| record.record_kind == "append_metadata")
-        .map(|record| decode_append_body_fence(&record.payload))
-        .collect::<Result<Vec<_>>>()?)
+    let stream_id = append_metadata_stream_id(tenant_id, bucket_id);
+    let mut after_sequence = 0;
+    let mut fences = Vec::new();
+    loop {
+        let page = core_store
+            .read_stream_page(ReadStream {
+                stream_id: stream_id.clone(),
+                after_sequence,
+                limit: 256,
+            })
+            .await?;
+        for record in page.records {
+            if record.record_kind == "append_metadata" {
+                fences.push(decode_append_body_fence(&record.payload)?);
+            }
+        }
+        if !page.has_more {
+            return Ok(fences);
+        }
+        after_sequence = page.next_sequence;
+    }
 }
 
 fn append_metadata_stream_id(tenant_id: i64, bucket_id: i64) -> String {
@@ -1429,16 +1301,17 @@ mod tests {
             .await
             .unwrap()
             .stream;
-        append_stream_record(&storage, stream.id, payload_ref("hash-a", 10), 10)
+        append_stream_record(&storage, &stream, payload_ref("hash-a", 10), 10)
             .await
             .unwrap();
-        append_stream_record(&storage, stream.id, payload_ref("hash-b", 20), 20)
+        append_stream_record(&storage, &stream, payload_ref("hash-b", 20), 20)
             .await
             .unwrap();
         assert_eq!(
-            list_append_stream_records(&storage, stream.id)
+            list_append_stream_records_page(&storage, &stream, 0, 100)
                 .await
                 .unwrap()
+                .records
                 .len(),
             2
         );
@@ -1449,7 +1322,7 @@ mod tests {
                 .is_some()
         );
         assert!(
-            seal_append_stream(&storage, stream.id, "seg")
+            seal_append_stream(&storage, &stream, "seg")
                 .await
                 .unwrap()
                 .sealed
@@ -1460,15 +1333,110 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        append_stream_record(&storage, stream.id, payload_ref("hash-c", 30), 30)
+        append_stream_record(&storage, &stream, payload_ref("hash-c", 30), 30)
             .await
             .unwrap();
         assert_eq!(
-            list_append_stream_records(&storage, stream.id)
+            list_append_stream_records_page(&storage, &stream, 0, 100)
                 .await
                 .unwrap()
+                .records
                 .len(),
             3
+        );
+    }
+
+    #[tokio::test]
+    async fn append_journal_pages_exact_streams_and_commits_both_projections() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        let left = create_append_stream(&storage, 1, 2, "bucket", "left")
+            .await
+            .unwrap()
+            .stream;
+        let right = create_append_stream(&storage, 1, 2, "bucket", "right")
+            .await
+            .unwrap()
+            .stream;
+
+        for (label, size) in [("left-a", 10), ("left-b", 20), ("left-c", 30)] {
+            append_stream_record_inner(
+                &storage,
+                &left,
+                payload_ref(label, size),
+                i64::try_from(size).unwrap(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        append_stream_record_inner(
+            &storage,
+            &right,
+            payload_ref("right-a", 40),
+            40,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let first = list_append_stream_records_page(&storage, &left, 0, 2)
+            .await
+            .unwrap();
+        assert_eq!(first.records.len(), 2);
+        assert_eq!(first.next_sequence, 2);
+        assert!(first.has_more);
+        let second = list_append_stream_records_page(&storage, &left, first.next_sequence, 2)
+            .await
+            .unwrap();
+        assert_eq!(second.records.len(), 1);
+        assert_eq!(second.records[0].record_sequence, 3);
+        assert!(!second.has_more);
+
+        let core_store = CoreStore::new(storage.clone()).await.unwrap();
+        assert_eq!(
+            core_store
+                .stream_head_sequence(&append_state_stream_id(&left).unwrap())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            core_store
+                .stream_head_sequence(&append_record_stream_id(&left).unwrap())
+                .await
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            core_store
+                .stream_head_sequence(&append_record_cursor_stream_id(1, 2))
+                .await
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            append_record_source_cursor(&storage, 1, 2).await.unwrap(),
+            6
+        );
+        assert!(
+            list_append_stream_records_page(&storage, &left, 0, 0)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("page size")
         );
     }
 
@@ -1487,7 +1455,7 @@ mod tests {
             &storage,
             1,
             2,
-            stream.stream.id,
+            &stream.stream,
             payload_ref("hash-a", 10),
             10,
             None,
@@ -1498,14 +1466,15 @@ mod tests {
         )
         .await
         .unwrap();
-        let records = list_append_stream_records(&storage, stream.stream.id)
+        let records = list_append_stream_records_page(&storage, &stream.stream, 0, 100)
             .await
-            .unwrap();
+            .unwrap()
+            .records;
         assert_eq!(
             records[0].authenticated_principal,
             "tenant/1/principal/producer-a"
         );
-        seal_append_stream_with_permit(&storage, stream.stream.id, "segment-a", &permit, KEY)
+        seal_append_stream_with_permit(&storage, &stream.stream, "segment-a", &permit, KEY)
             .await
             .unwrap();
 
@@ -1538,7 +1507,7 @@ mod tests {
 
         let err = append_stream_record_with_permit(
             &storage,
-            stream.stream.id,
+            &stream.stream,
             payload_ref("hash-a", 10),
             10,
             None,
@@ -1579,7 +1548,7 @@ mod tests {
 
         let err = append_stream_record_inner(
             &storage,
-            stream.stream.id,
+            &stream.stream,
             payload_ref("hash-a", 10),
             10,
             None,
@@ -1594,7 +1563,8 @@ mod tests {
         .unwrap_err();
         assert!(
             err.to_string().contains("target mismatch")
-                || err.to_string().contains("generation mismatch"),
+                || err.to_string().contains("generation mismatch")
+                || err.to_string().contains("payload hash mismatch"),
             "unexpected error: {err:?}"
         );
     }

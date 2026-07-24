@@ -1,5 +1,8 @@
 use super::*;
+mod fencing;
 mod helpers;
+mod index_definition_lifecycle;
+use crate::task_execution_guard::TaskExecutionGuard;
 use helpers::*;
 use serde_json::json;
 use tempfile::tempdir;
@@ -70,7 +73,6 @@ async fn bind_persistence_test_authz_schema(persistence: &Persistence, tenant_id
                 applied_at: String::new(),
             },
         ],
-        0,
         "test",
         "bind persistence test schema",
     )
@@ -82,7 +84,6 @@ async fn bind_persistence_test_authz_schema(persistence: &Persistence, tenant_id
         crate::authz_scope::DEFAULT_AUTHZ_REALM_ID,
         schema.schema_ref,
         None,
-        0,
         "test",
         "bind persistence test schema",
     )
@@ -90,10 +91,37 @@ async fn bind_persistence_test_authz_schema(persistence: &Persistence, tenant_id
     .unwrap();
 }
 
+async fn claim_authz_materialization_guard(
+    persistence: &Persistence,
+    tenant_id: i64,
+    target_revision: u64,
+) -> TaskExecutionGuard {
+    let task = persistence
+        .claim_pending_tasks(1)
+        .await
+        .unwrap()
+        .pop()
+        .expect("pending authz materialization task");
+    assert_eq!(task.task_type, crate::tasks::TaskType::AuthzMaterialization);
+    assert_eq!(task.payload["tenant_id"], json!(tenant_id));
+    assert_eq!(task.payload["target_revision"], json!(target_revision));
+
+    let lease = persistence
+        .acquire_task_execution_lease(&task)
+        .await
+        .unwrap();
+    TaskExecutionGuard::new(
+        persistence.storage().clone(),
+        persistence.partition_owner_signing_key().to_vec(),
+        lease,
+    )
+    .unwrap()
+}
+
 #[tokio::test]
-async fn authz_tuple_write_enqueues_materialization_and_task_builds_derived_index() {
+async fn authz_tuple_write_enqueues_and_materializes_bounded_authorization_state() {
     let temp = tempdir().unwrap();
-    let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+    let persistence = Persistence::new(&test_config(temp.path())).unwrap();
     bind_persistence_test_authz_schema(&persistence, 1).await;
 
     let record = persistence
@@ -112,7 +140,11 @@ async fn authz_tuple_write_enqueues_materialization_and_task_builds_derived_inde
         .await
         .unwrap();
 
-    let tasks = persistence.list_tasks().await.unwrap();
+    let tasks = persistence
+        .list_tasks_page(None, 1_000)
+        .await
+        .unwrap()
+        .tasks;
     let materialization = tasks
         .iter()
         .find(|task| task.task_type == crate::tasks::TaskType::AuthzMaterialization)
@@ -123,46 +155,48 @@ async fn authz_tuple_write_enqueues_materialization_and_task_builds_derived_inde
         json!(record.revision)
     );
 
-    assert_eq!(
-        crate::authz_userset_index::lookup_derived_userset_index_at_revision(
-            &persistence.storage,
-            1,
-            crate::authz_userset_index::DEFAULT_DERIVED_USERSET_INDEX_ID,
-            "document",
-            "doc-a",
-            "reader",
-            "user",
-            "alice",
-            "",
-            record.revision as u64,
-        )
-        .await
-        .unwrap(),
-        None
-    );
+    let unavailable = crate::authz_segment::resolve_materialized_permission_at_revision(
+        &persistence.storage,
+        1,
+        "document",
+        "doc-a",
+        "reader",
+        "user",
+        "alice",
+        "",
+        record.revision as u64,
+    )
+    .await
+    .unwrap_err();
+    assert!(unavailable.to_string().contains("AuthzRevisionUnavailable"));
 
+    let guard = claim_authz_materialization_guard(&persistence, 1, record.revision as u64).await;
     let outcome = persistence
-        .run_authz_materialization_task(1, record.revision as u64)
+        .run_authz_materialization_task(1, record.revision as u64, &guard)
         .await
         .unwrap();
     assert_eq!(outcome.processed_revision, record.revision as u64);
-    assert_eq!(
-        crate::authz_userset_index::lookup_derived_userset_index_at_revision(
-            &persistence.storage,
-            1,
-            crate::authz_userset_index::DEFAULT_DERIVED_USERSET_INDEX_ID,
-            "document",
-            "doc-a",
-            "reader",
-            "user",
-            "alice",
-            "",
-            record.revision as u64,
-        )
-        .await
-        .unwrap(),
-        Some(true)
+    assert_eq!(outcome.source_rows_visited, 1);
+    let materialized = crate::authz_segment::resolve_materialized_permission_at_revision(
+        &persistence.storage,
+        1,
+        "document",
+        "doc-a",
+        "reader",
+        "user",
+        "alice",
+        "",
+        record.revision as u64,
+    )
+    .await
+    .unwrap();
+    assert!(materialized.allowed);
+    assert!(materialized.stats.segments_opened > 0);
+    assert!(
+        materialized.stats.segments_opened
+            <= crate::authz_segment::AUTHZ_DELTA_CHECKPOINT_INTERVAL as usize
     );
+    assert_eq!(materialized.stats.table_rows_visited, 1);
     let lag = crate::authz_derived_lag_watch::latest_authz_derived_lag_watch_event(
         &persistence.storage,
         1,
@@ -176,6 +210,71 @@ async fn authz_tuple_write_enqueues_materialization_and_task_builds_derived_inde
 }
 
 #[tokio::test]
+async fn authz_materialization_task_catches_up_a_grouped_revision_backlog() {
+    let temp = tempdir().unwrap();
+    let persistence = Persistence::new(&test_config(temp.path())).unwrap();
+    bind_persistence_test_authz_schema(&persistence, 42).await;
+
+    let first = persistence
+        .write_authz_tuple(
+            42,
+            "document",
+            "backlog-1",
+            "reader",
+            "user",
+            "alice",
+            "",
+            "add",
+            "test",
+            "seed authz materialization",
+        )
+        .await
+        .unwrap();
+
+    let mut latest = first;
+    for revision in 2..=8 {
+        latest = persistence
+            .write_authz_tuple(
+                42,
+                "document",
+                &format!("backlog-{revision}"),
+                "reader",
+                "user",
+                "alice",
+                "",
+                "add",
+                "test",
+                "extend authz materialization backlog",
+            )
+            .await
+            .unwrap();
+    }
+
+    let target_revision = latest.revision as u64;
+    let guard = claim_authz_materialization_guard(&persistence, 42, target_revision).await;
+    let outcome = persistence
+        .run_authz_materialization_task(42, target_revision, &guard)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.processed_revision, target_revision);
+    assert_eq!(outcome.source_rows_visited, 8);
+    for revision in 1..=target_revision {
+        assert!(
+            crate::authz_segment::existing_authz_tuple_segment_ref(
+                &persistence.storage,
+                42,
+                revision,
+            )
+            .await
+            .unwrap()
+            .is_some(),
+            "materialization task must publish every revision through {target_revision}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn authz_materialization_job_latency_with_retained_history_perf() {
     if std::env::var_os("ANVIL_RUN_AUTHZ_JOB_PERF").is_none() {
         return;
@@ -186,7 +285,7 @@ async fn authz_materialization_job_latency_with_retained_history_perf() {
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(100);
     let temp = tempdir().unwrap();
-    let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+    let persistence = Persistence::new(&test_config(temp.path())).unwrap();
     bind_persistence_test_authz_schema(&persistence, 42).await;
 
     let seed_started = std::time::Instant::now();
@@ -229,9 +328,10 @@ async fn authz_materialization_job_latency_with_retained_history_perf() {
 
     let immediate_check_ms =
         measure_authz_permission_checks(&persistence.storage, 42, record.revision).await;
+    let guard = claim_authz_materialization_guard(&persistence, 42, record.revision as u64).await;
     let materialize_started = std::time::Instant::now();
     let outcome = persistence
-        .run_authz_materialization_task(42, record.revision as u64)
+        .run_authz_materialization_task(42, record.revision as u64, &guard)
         .await
         .unwrap();
     let materialize_elapsed = materialize_started.elapsed();
@@ -271,7 +371,7 @@ async fn measure_authz_permission_checks(
 #[tokio::test]
 async fn empty_bucket_index_build_materialises_an_empty_typed_json_segment() {
     let temp = tempdir().unwrap();
-    let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+    let persistence = Persistence::new(&test_config(temp.path())).unwrap();
     let tenant = persistence
         .create_tenant("empty-index-tenant", "empty-index-tenant")
         .await
@@ -280,28 +380,26 @@ async fn empty_bucket_index_build_materialises_an_empty_typed_json_segment() {
         .create_bucket(tenant.id, "empty-index-bucket", "test-region")
         .await
         .unwrap();
-    let index = persistence
-        .create_index_definition(
-            tenant.id,
-            bucket.id,
-            "pending-items",
-            "typed_json",
-            json!({"prefix": "items/"}),
-            json!({}),
-            "inherit_object",
-            json!({
-                "source_kind": "object_current",
-                "fields": [
-                    {"name": "state", "extractor": "/state", "required": true}
-                ]
-            }),
-        )
+    let mutation = IndexDefinitionMutation::Create {
+        name: "pending-items".to_string(),
+        kind: "typed_json".to_string(),
+        selector: json!({"prefix": "items/"}),
+        extractor: json!({}),
+        authorization_mode: "inherit_object".to_string(),
+        build_policy: json!({
+            "source_kind": "object_current",
+            "fields": [
+                {"name": "state", "extractor": "/state", "required": true}
+            ]
+        }),
+    };
+    let IndexDefinitionMutationOutcome::Published { index, .. } = persistence
+        .apply_index_definition_mutation(&bucket, &mutation, None, None)
         .await
-        .unwrap();
-    persistence
-        .create_index_definition_event(tenant.id, bucket.id, &bucket.name, &index, "create")
-        .await
-        .unwrap();
+        .unwrap()
+    else {
+        panic!("index definition create should publish");
+    };
 
     assert!(
         persistence
@@ -311,7 +409,7 @@ async fn empty_bucket_index_build_materialises_an_empty_typed_json_segment() {
         "an empty source still needs an initial materialised generation"
     );
     let outcome = persistence
-        .build_index_task(tenant.id, bucket.id, index.id, index.version, 0)
+        .rebuild_index_direct(tenant.id, bucket.id, index.id, index.version, 0)
         .await
         .unwrap()
         .expect("typed JSON index build outcome");
@@ -355,7 +453,7 @@ async fn empty_bucket_index_build_materialises_an_empty_typed_json_segment() {
     let current_cursor = index_repair::source_cursor_from_stats(stats);
     assert!(current_cursor > 0);
     persistence
-        .build_index_task(
+        .rebuild_index_direct(
             tenant.id,
             bucket.id,
             index.id,
@@ -367,7 +465,7 @@ async fn empty_bucket_index_build_materialises_an_empty_typed_json_segment() {
         .expect("advanced typed JSON index build outcome");
 
     let stale = persistence
-        .build_index_task(tenant.id, bucket.id, index.id, index.version, 0)
+        .rebuild_index_direct(tenant.id, bucket.id, index.id, index.version, 0)
         .await
         .unwrap();
     assert!(stale.is_none(), "stale index tasks must be skipped");
@@ -376,7 +474,7 @@ async fn empty_bucket_index_build_materialises_an_empty_typed_json_segment() {
 #[tokio::test]
 async fn tenant_and_bucket_creation_materialise_mesh_directory_locators() {
     let temp = tempdir().unwrap();
-    let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+    let persistence = Persistence::new(&test_config(temp.path())).unwrap();
 
     let tenant = persistence
         .create_tenant("tenant-a", "unused")
@@ -416,50 +514,42 @@ async fn tenant_and_bucket_creation_materialise_mesh_directory_locators() {
         )
     );
 
-    let tenant_name_fence = read_ownership_fence(
+    let tenant_name_owner = read_partition_owner(
         &persistence.storage,
-        0,
-        &OwnershipResource {
-            resource_kind: OwnershipResourceKind::ControlPartition,
-            resource_id: format!(
-                "{}/{}",
-                mesh_directory::RoutingRecordFamily::TenantName.stream_family(),
-                tenant_name.partition()
-            ),
-        },
+        mesh_directory::CONTROL_PARTITION_FAMILY,
+        &mesh_directory::control_partition_id(
+            mesh_directory::RoutingRecordFamily::TenantName.stream_family(),
+            &tenant_name.partition(),
+        ),
         &persistence.partition_owner_signing_key,
     )
     .await
     .unwrap()
-    .expect("tenant-name control partition ownership fence");
-    assert_eq!(tenant_name_fence.owner, persistence.ownership_principal());
+    .expect("tenant-name control partition owner");
+    assert_eq!(tenant_name_owner.owner_node_id, persistence.owner_node_id);
 
-    let bucket_locator_fence = read_ownership_fence(
+    let bucket_locator_owner = read_partition_owner(
         &persistence.storage,
-        0,
-        &OwnershipResource {
-            resource_kind: OwnershipResourceKind::ControlPartition,
-            resource_id: format!(
-                "{}/{}",
-                mesh_directory::RoutingRecordFamily::BucketLocator.stream_family(),
-                bucket_locator.partition()
-            ),
-        },
+        mesh_directory::CONTROL_PARTITION_FAMILY,
+        &mesh_directory::control_partition_id(
+            mesh_directory::RoutingRecordFamily::BucketLocator.stream_family(),
+            &bucket_locator.partition(),
+        ),
         &persistence.partition_owner_signing_key,
     )
     .await
     .unwrap()
-    .expect("bucket-locator control partition ownership fence");
+    .expect("bucket-locator control partition owner");
     assert_eq!(
-        bucket_locator_fence.owner,
-        persistence.ownership_principal()
+        bucket_locator_owner.owner_node_id,
+        persistence.owner_node_id
     );
 }
 
 #[tokio::test]
 async fn region_drain_blocks_bucket_creation_and_completion_with_active_locator() {
     let temp = tempdir().unwrap();
-    let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+    let persistence = Persistence::new(&test_config(temp.path())).unwrap();
     let (region, _, _) = register_active_mesh_placement(&persistence).await;
     let tenant = persistence
         .create_tenant("tenant-a", "unused")
@@ -507,7 +597,7 @@ async fn region_drain_blocks_bucket_creation_and_completion_with_active_locator(
 #[tokio::test]
 async fn region_drain_applies_read_only_exceptions_to_bucket_locators() {
     let temp = tempdir().unwrap();
-    let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+    let persistence = Persistence::new(&test_config(temp.path())).unwrap();
     let (region, _, _) = register_active_mesh_placement(&persistence).await;
     let tenant = persistence
         .create_tenant("tenant-a", "unused")
@@ -608,7 +698,7 @@ async fn region_drain_applies_read_only_exceptions_to_bucket_locators() {
 #[tokio::test]
 async fn region_drain_delete_after_retention_keeps_region_from_exception_completion() {
     let temp = tempdir().unwrap();
-    let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+    let persistence = Persistence::new(&test_config(temp.path())).unwrap();
     let (region, _, _) = register_active_mesh_placement(&persistence).await;
     let tenant = persistence
         .create_tenant("tenant-a", "unused")
@@ -660,7 +750,7 @@ async fn node_drain_completion_requires_no_runtime_ownership_and_force_offline_e
     let temp = tempdir().unwrap();
     let mut config = test_config(temp.path());
     config.public_api_addr = "admin-node".to_string();
-    let persistence = Persistence::new(&config, None).unwrap();
+    let persistence = Persistence::new(&config).unwrap();
     let now_nanos = current_time_nanos()
         .unwrap()
         .saturating_add(3_600_000_000_000);
@@ -712,12 +802,11 @@ async fn node_drain_completion_requires_no_runtime_ownership_and_force_offline_e
             node_id: "worker-node".to_string(),
             region: "test-region".to_string(),
             cell_id: "default".to_string(),
-            libp2p_peer_id: "peer-worker-node".to_string(),
-            receipt_signing_public_key_proto: libp2p::identity::Keypair::generate_ed25519()
-                .public()
-                .encode_protobuf(),
+            receipt_signing_public_key: crate::node_signing::NodeSigningKeypair::generate()
+                .unwrap()
+                .public_key_bytes()
+                .to_vec(),
             public_api_addr: "worker-node".to_string(),
-            public_cluster_addrs: vec!["/ip4/127.0.0.1/udp/7444/quic-v1".to_string()],
             capabilities: vec![crate::mesh_lifecycle::NodeCapability::Object],
             capacity_json: "{}".to_string(),
         })
@@ -883,9 +972,7 @@ async fn node_drain_completion_requires_no_runtime_ownership_and_force_offline_e
     assert!(
         crate::task_lease::checkpoint_task_lease(
             &persistence.storage,
-            &task_lease.task_id,
-            &task_lease.owner,
-            task_lease.fence_token,
+            &task_lease,
             task_lease.source_cursor,
             now_nanos.saturating_add(2),
             &persistence.partition_owner_signing_key,
@@ -898,7 +985,7 @@ async fn node_drain_completion_requires_no_runtime_ownership_and_force_offline_e
 #[tokio::test]
 async fn mesh_routing_projection_diagnostics_detect_bucket_locator_mismatch() {
     let temp = tempdir().unwrap();
-    let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+    let persistence = Persistence::new(&test_config(temp.path())).unwrap();
     register_active_mesh_placement(&persistence).await;
     let tenant = persistence
         .create_tenant("tenant-a", "unused")
@@ -982,7 +1069,7 @@ fn persistence_replays_anvil_owned_state_after_fresh_instance() {
 async fn persistence_replays_anvil_owned_state_after_fresh_instance_body() {
     let temp = tempdir().unwrap();
     let first_config = test_config(temp.path());
-    let persistence = Persistence::new(&first_config, None).unwrap();
+    let persistence = Persistence::new(&first_config).unwrap();
 
     persistence.create_region("local").await.unwrap();
     let tenant = persistence
@@ -1056,7 +1143,7 @@ async fn persistence_replays_anvil_owned_state_after_fresh_instance_body() {
         .append_stream_record(
             tenant.id,
             bucket.id,
-            append_stream.id,
+            &append_stream,
             payload_ref("event-payload-hash", 42),
             42,
             None,
@@ -1080,23 +1167,21 @@ async fn persistence_replays_anvil_owned_state_after_fresh_instance_body() {
         .unwrap()
         .unwrap();
 
-    let index = persistence
-        .create_index_definition(
-            tenant.id,
-            bucket.id,
-            "body",
-            "full_text",
-            json!({"prefix": "project/"}),
-            json!({"field": "body"}),
-            "inherit",
-            json!({"mode": "watch"}),
-        )
+    let mutation = IndexDefinitionMutation::Create {
+        name: "body".to_string(),
+        kind: "full_text".to_string(),
+        selector: json!({"prefix": "project/"}),
+        extractor: json!({"field": "body"}),
+        authorization_mode: "inherit".to_string(),
+        build_policy: json!({"mode": "watch"}),
+    };
+    let IndexDefinitionMutationOutcome::Published { index, .. } = persistence
+        .apply_index_definition_mutation(&bucket, &mutation, None, None)
         .await
-        .unwrap();
-    persistence
-        .create_index_definition_event(tenant.id, bucket.id, &bucket.name, &index, "create")
-        .await
-        .unwrap();
+        .unwrap()
+    else {
+        panic!("index definition create should publish");
+    };
     persistence
         .create_index_diagnostic(
             tenant.id,
@@ -1148,7 +1233,7 @@ async fn persistence_replays_anvil_owned_state_after_fresh_instance_body() {
 
     drop(persistence);
 
-    let replayed = Persistence::new(&first_config, None).unwrap();
+    let replayed = Persistence::new(&first_config).unwrap();
 
     assert!(
         replayed
@@ -1240,9 +1325,10 @@ async fn persistence_replays_anvil_owned_state_after_fresh_instance_body() {
     );
     assert_eq!(
         replayed
-            .list_append_stream_records(tenant.id, bucket.id, append_stream.id)
+            .list_append_stream_records(&append_stream, 0, 100)
             .await
             .unwrap()
+            .records
             .len(),
         1
     );
@@ -1303,7 +1389,7 @@ async fn persistence_replays_anvil_owned_state_after_fresh_instance_body() {
             .revision,
         authz.revision
     );
-    let replayed_tasks = replayed.list_tasks().await.unwrap();
+    let replayed_tasks = replayed.list_tasks_page(None, 1_000).await.unwrap().tasks;
     assert_eq!(replayed_tasks.len(), 2);
     assert!(
         replayed_tasks
@@ -1321,14 +1407,22 @@ async fn persistence_replays_anvil_owned_state_after_fresh_instance_body() {
             .unwrap()
             .is_some()
     );
-    assert_eq!(replayed.hf_list_keys(tenant.id).await.unwrap().len(), 1);
+    assert_eq!(
+        replayed
+            .hf_list_key_page(tenant.id, None, 10)
+            .await
+            .unwrap()
+            .keys
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]
 async fn persistence_compacts_object_metadata_and_restarts_from_manifest() {
     let temp = tempdir().unwrap();
     let first_config = test_config(temp.path());
-    let persistence = Persistence::new(&first_config, None).unwrap();
+    let persistence = Persistence::new(&first_config).unwrap();
 
     persistence.create_region("local").await.unwrap();
     let bucket = persistence
@@ -1377,7 +1471,7 @@ async fn persistence_compacts_object_metadata_and_restarts_from_manifest() {
     assert_eq!(sealed.directory_record_count, 2);
 
     drop(persistence);
-    let restarted = Persistence::new(&first_config, None).unwrap();
+    let restarted = Persistence::new(&first_config).unwrap();
 
     let replayed = restarted
         .get_object(bucket.id, "docs/a.txt")
@@ -1444,9 +1538,9 @@ async fn persistence_compacts_object_metadata_and_restarts_from_manifest() {
 }
 
 #[tokio::test]
-async fn object_metadata_writes_require_rfc_ownership_fence() {
+async fn object_metadata_writes_use_one_authoritative_partition_fence() {
     let temp = tempdir().unwrap();
-    let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+    let persistence = Persistence::new(&test_config(temp.path())).unwrap();
     register_active_mesh_placement(&persistence).await;
     let tenant = persistence
         .create_tenant("tenant-a", "unused")
@@ -1466,37 +1560,11 @@ async fn object_metadata_writes_require_rfc_ownership_fence() {
             tenant.id, bucket.id
         ),
     };
-    let now_nanos = Utc::now().timestamp_nanos_opt().unwrap();
-    acquire_ownership(
-        &persistence.storage,
-        AcquireOwnership {
-            request_id: "other-node-object-owner".to_string(),
-            idempotency_key: "other-node-object-owner".to_string(),
-            resource,
-            owner: OwnershipPrincipal {
-                tenant_id: 0,
-                principal_kind: "node".to_string(),
-                principal_id: "other-node".to_string(),
-                actor_instance_id: "other-node".to_string(),
-                display_name: "other-node".to_string(),
-                region: "test-region".to_string(),
-                cell: "default".to_string(),
-            },
-            now_nanos,
-            ttl_nanos: i64::try_from(MAX_OWNERSHIP_LEASE_MS)
-                .unwrap()
-                .saturating_mul(1_000_000),
-        },
-        &persistence.partition_owner_signing_key,
-    )
-    .await
-    .unwrap();
-
-    let err = persistence
+    persistence
         .create_object(
             tenant.id,
             bucket.id,
-            "blocked.txt",
+            "single-fence.txt",
             "payload-hash",
             1,
             "etag",
@@ -1507,10 +1575,29 @@ async fn object_metadata_writes_require_rfc_ownership_fence() {
             None,
         )
         .await
-        .unwrap_err();
+        .unwrap();
+
+    let owner = read_partition_owner(
+        &persistence.storage,
+        "object_metadata",
+        &partition_id,
+        &persistence.partition_owner_signing_key,
+    )
+    .await
+    .unwrap()
+    .expect("object metadata partition owner");
+    assert_eq!(owner.owner_node_id, persistence.owner_node_id);
     assert!(
-        err.to_string().contains("OwnershipHeld"),
-        "unexpected error: {err}"
+        read_ownership_fence(
+            &persistence.storage,
+            0,
+            &resource,
+            &persistence.partition_owner_signing_key,
+        )
+        .await
+        .unwrap()
+        .is_none(),
+        "ordinary data writes must not stack a generic resource lease on the partition fence"
     );
 }
 
@@ -1522,7 +1609,7 @@ async fn persistence_schedules_deduplicated_object_metadata_compaction_tasks() {
         object_metadata_compaction_bytes_threshold: 0,
         ..test_config(temp.path())
     };
-    let persistence = Persistence::new(&config, None).unwrap();
+    let persistence = Persistence::new(&config).unwrap();
 
     persistence.create_region("local").await.unwrap();
     let bucket = persistence
@@ -1546,13 +1633,12 @@ async fn persistence_schedules_deduplicated_object_metadata_compaction_tasks() {
         .await
         .unwrap();
 
-    let tasks = persistence.list_tasks().await.unwrap();
-    assert_eq!(tasks.len(), 1);
-    assert_eq!(
-        tasks[0].task_type,
-        crate::tasks::TaskType::ObjectMetadataCompaction
-    );
-    assert_eq!(tasks[0].payload, json!({ "bucket_id": bucket.id }));
+    let tasks = persistence
+        .list_tasks_page(None, 1_000)
+        .await
+        .unwrap()
+        .tasks;
+    assert!(tasks.is_empty());
 
     persistence
         .create_object(
@@ -1570,21 +1656,17 @@ async fn persistence_schedules_deduplicated_object_metadata_compaction_tasks() {
         )
         .await
         .unwrap();
+    let tasks = persistence
+        .list_tasks_page(None, 1_000)
+        .await
+        .unwrap()
+        .tasks;
+    assert_eq!(tasks.len(), 1);
     assert_eq!(
-        persistence.list_tasks().await.unwrap().len(),
-        1,
-        "live compaction task should be deduplicated per bucket"
+        tasks[0].task_type,
+        crate::tasks::TaskType::ObjectMetadataCompaction
     );
-
-    let claimed = persistence.claim_pending_tasks(1).await.unwrap();
-    persistence
-        .compact_object_metadata(bucket.id)
-        .await
-        .unwrap();
-    persistence
-        .update_task_status(claimed[0].id, crate::tasks::TaskStatus::Completed)
-        .await
-        .unwrap();
+    assert_eq!(tasks[0].payload, json!({ "bucket_id": bucket.id }));
 
     persistence
         .create_object(
@@ -1603,16 +1685,85 @@ async fn persistence_schedules_deduplicated_object_metadata_compaction_tasks() {
         .await
         .unwrap();
     assert_eq!(
-        persistence.list_tasks().await.unwrap().len(),
+        persistence
+            .list_tasks_page(None, 1_000)
+            .await
+            .unwrap()
+            .tasks
+            .len(),
+        1,
+        "live compaction task should be deduplicated per bucket"
+    );
+
+    let claimed = persistence.claim_pending_tasks(1).await.unwrap();
+    persistence
+        .compact_object_metadata(bucket.id)
+        .await
+        .unwrap();
+    persistence
+        .update_task_status(claimed[0].id, crate::tasks::TaskStatus::Completed)
+        .await
+        .unwrap();
+
+    persistence
+        .create_object(
+            1,
+            bucket.id,
+            "objects/d.txt",
+            "hash-d",
+            14,
+            "etag-d",
+            Some("text/plain"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        persistence
+            .list_tasks_page(None, 1_000)
+            .await
+            .unwrap()
+            .tasks
+            .len(),
+        1,
+        "one post-compaction frame should remain below the threshold"
+    );
+
+    persistence
+        .create_object(
+            1,
+            bucket.id,
+            "objects/e.txt",
+            "hash-e",
+            15,
+            "etag-e",
+            Some("text/plain"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        persistence
+            .list_tasks_page(None, 1_000)
+            .await
+            .unwrap()
+            .tasks
+            .len(),
         2,
-        "new post-compaction journal frames should schedule a new task"
+        "two post-compaction journal frames should schedule a new task"
     );
 }
 
 #[tokio::test]
 async fn persistence_serializes_concurrent_task_queue_writes() {
     let temp = tempdir().unwrap();
-    let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
+    let persistence = Persistence::new(&test_config(temp.path())).unwrap();
 
     let writes = (0..12).map(|bucket_id| {
         let persistence = persistence.clone();
@@ -1631,7 +1782,11 @@ async fn persistence_serializes_concurrent_task_queue_writes() {
     for result in results {
         result.unwrap();
     }
-    let tasks = persistence.list_tasks().await.unwrap();
+    let tasks = persistence
+        .list_tasks_page(None, 1_000)
+        .await
+        .unwrap()
+        .tasks;
     assert_eq!(tasks.len(), 12);
     let ids = tasks.iter().map(|task| task.id).collect::<HashSet<_>>();
     assert_eq!(ids.len(), 12);
@@ -1648,7 +1803,7 @@ fn task_queue_retries_coremeta_target_conflicts() {
 async fn persistence_task_execution_lease_targets_object_metadata_partition() {
     let temp = tempdir().unwrap();
     let config = test_config(temp.path());
-    let persistence = Persistence::new(&config, None).unwrap();
+    let persistence = Persistence::new(&config).unwrap();
 
     persistence.create_region("local").await.unwrap();
     let bucket = persistence
@@ -1696,9 +1851,9 @@ async fn persistence_task_execution_lease_targets_object_metadata_partition() {
         lease.partition_id,
         hex::encode(metadata_journal::object_metadata_partition_id(1, bucket.id))
     );
-    assert!(
-        lease.source_cursor >= 2,
-        "object PUT should create object-version and directory frames"
+    assert_eq!(
+        lease.source_cursor, 1,
+        "one object PUT should advance the authoritative metadata stream once"
     );
 
     let read_back = persistence
@@ -1712,7 +1867,7 @@ async fn persistence_task_execution_lease_targets_object_metadata_partition() {
         public_api_addr: "other-worker-node".to_string(),
         ..config
     };
-    let competing = Persistence::new(&competing_config, None).unwrap();
+    let competing = Persistence::new(&competing_config).unwrap();
     let err = competing
         .acquire_task_execution_lease(&task)
         .await
@@ -1724,230 +1879,4 @@ async fn persistence_task_execution_lease_targets_object_metadata_partition() {
         .await
         .unwrap();
     assert_eq!(checkpointed.checkpoint_cursor, lease.source_cursor);
-}
-
-#[tokio::test]
-async fn persistence_global_journal_writes_use_current_fence_tokens() {
-    Box::pin(async {
-        let temp = tempdir().unwrap();
-        let persistence = Persistence::new(&test_config(temp.path()), None).unwrap();
-
-        persistence.create_region("local").await.unwrap();
-        bind_persistence_test_authz_schema(&persistence, 1).await;
-        let bucket = persistence
-            .create_bucket(1, "bucket-a", "local")
-            .await
-            .unwrap();
-        let object = persistence
-            .create_object(
-                1,
-                bucket.id,
-                "objects/a.txt",
-                "hash-a",
-                11,
-                "etag-a",
-                Some("text/plain"),
-                None,
-                None,
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-        persistence
-            .soft_delete_object(bucket.id, &object.key)
-            .await
-            .unwrap();
-        let upload = persistence
-            .create_multipart_upload(1, bucket.id, "objects/large.bin")
-            .await
-            .unwrap()
-            .upload;
-        persistence
-            .upsert_multipart_part(upload.id, 1, payload_ref("part-hash", 12), 12, "part-etag")
-            .await
-            .unwrap();
-        persistence
-            .complete_multipart_upload(upload.id)
-            .await
-            .unwrap();
-        let stream = persistence
-            .create_append_stream(1, bucket.id, &bucket.name, "stream-a")
-            .await
-            .unwrap()
-            .stream;
-        persistence
-            .append_stream_record(
-                1,
-                bucket.id,
-                stream.id,
-                payload_ref("payload-hash", 13),
-                13,
-                None,
-                None,
-                "tenant/1/principal/test",
-            )
-            .await
-            .unwrap();
-        persistence
-            .seal_append_stream(1, bucket.id, stream.id, "segment-hash")
-            .await
-            .unwrap();
-        persistence
-            .compare_and_swap_manifest(
-                1,
-                bucket.id,
-                &bucket.name,
-                "manifest.json",
-                0,
-                json!({"version": 1}),
-                "manifest-hash",
-            )
-            .await
-            .unwrap();
-        let index = persistence
-            .create_index_definition(
-                1,
-                bucket.id,
-                "body",
-                "full_text",
-                json!({"prefix": "objects/"}),
-                json!({"field": "body"}),
-                "inherit",
-                json!({"mode": "sync"}),
-            )
-            .await
-            .unwrap();
-        persistence
-            .create_index_definition_event(1, bucket.id, &bucket.name, &index, "create")
-            .await
-            .unwrap();
-        persistence
-            .create_index_diagnostic(
-                1,
-                bucket.id,
-                &bucket.name,
-                Some(index.id),
-                &index.name,
-                &object.key,
-                Some(object.version_id),
-                "warning",
-                "test-warning",
-                "diagnostic",
-                json!({"source": "test"}),
-            )
-            .await
-            .unwrap();
-        persistence
-            .write_authz_tuple(
-                1,
-                "object",
-                &object.key,
-                "reader",
-                "user",
-                "user-a",
-                "",
-                "add",
-                "test",
-                "test grant",
-            )
-            .await
-            .unwrap();
-        persistence
-            .enqueue_task(
-                crate::tasks::TaskType::DeleteBucket,
-                json!({"bucket_id": 7}),
-                1,
-            )
-            .await
-            .unwrap();
-        persistence
-            .create_model_artifact("artifact-a", 1, "models/a", &model_manifest())
-            .await
-            .unwrap();
-        persistence
-            .hf_create_key(1, "primary", b"secret", Some("note"))
-            .await
-            .unwrap();
-
-        let control_fences =
-            crate::control_journal::read_control_frame_fences_for_test(&persistence.storage)
-                .await
-                .unwrap();
-        assert!(control_fences.iter().all(|fence| *fence > 0));
-        let task_fences =
-            crate::task_journal::read_task_frame_fences_for_test(&persistence.storage)
-                .await
-                .unwrap();
-        assert!(task_fences.iter().all(|fence| *fence > 0));
-        let model_fences =
-            crate::model_journal::read_model_frame_fences_for_test(&persistence.storage)
-                .await
-                .unwrap();
-        assert!(model_fences.iter().all(|fence| *fence > 0));
-        let hf_fences = crate::hf_journal::read_hf_frame_fences_for_test(&persistence.storage)
-            .await
-            .expect("hf metadata journal fences");
-        assert!(hf_fences.iter().all(|fence| *fence > 0));
-        let (tenant_bucket_fences, global_bucket_fences) =
-            crate::bucket_journal::read_bucket_frame_fences_for_test(&persistence.storage, 1)
-                .await
-                .unwrap();
-        assert!(tenant_bucket_fences.iter().all(|fence| *fence > 0));
-        assert!(global_bucket_fences.iter().all(|fence| *fence > 0));
-        let object_fences = crate::metadata_journal::read_object_metadata_record_fences_for_test(
-            &persistence.storage,
-            &bucket,
-        )
-        .await
-        .expect("object metadata journal fences");
-        assert!(object_fences.iter().all(|fence| *fence > 0));
-        let multipart_fences = crate::multipart_journal::read_multipart_frame_fences_for_test(
-            &persistence.storage,
-            1,
-            bucket.id,
-        )
-        .await
-        .expect("multipart journal fences");
-        assert!(multipart_fences.iter().all(|fence| *fence > 0));
-        let append_fences = crate::append_journal::read_append_frame_fences_for_test(
-            &persistence.storage,
-            1,
-            bucket.id,
-        )
-        .await
-        .unwrap();
-        assert!(append_fences.iter().all(|fence| *fence > 0));
-        let manifest_fences = crate::manifest_journal::read_manifest_frame_fences_for_test(
-            &persistence.storage,
-            1,
-            bucket.id,
-        )
-        .await
-        .unwrap();
-        assert!(manifest_fences.iter().all(|fence| *fence > 0));
-        let index_fences = crate::index_journal::read_index_frame_fences_for_test(
-            &persistence.storage,
-            1,
-            bucket.id,
-        )
-        .await
-        .unwrap();
-        assert!(index_fences.iter().all(|fence| *fence > 0));
-        let diagnostic_fences =
-            crate::index_diagnostic_journal::read_index_diagnostic_frame_fences_for_test(
-                &persistence.storage,
-                1,
-                bucket.id,
-            )
-            .await
-            .unwrap();
-        assert!(diagnostic_fences.iter().all(|fence| *fence > 0));
-        let authz_fences =
-            crate::authz_journal::read_authz_frame_fences_for_test(&persistence.storage, 1)
-                .await
-                .expect("authz tuple journal fences");
-        assert!(authz_fences.iter().all(|fence| *fence > 0));
-    })
-    .await
 }

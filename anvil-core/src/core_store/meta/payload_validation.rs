@@ -1,4 +1,5 @@
 use super::*;
+use unicode_normalization::UnicodeNormalization;
 
 pub(super) fn validate_coremeta_common(
     common: &CoreMetaRowCommonProto,

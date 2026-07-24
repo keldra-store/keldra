@@ -223,7 +223,9 @@ async fn test_single_node_put() {
         &["test-region-1"],
     )
     .await;
-    cluster.start_and_converge(Duration::from_secs(5)).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
 
     let token = cluster.token.clone();
     let client_addr = cluster.grpc_addrs[0].clone();
@@ -292,7 +294,7 @@ async fn test_multi_region_list_and_isolation() {
     )
     .await;
     cluster_east
-        .start_and_converge(Duration::from_secs(5))
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
         .await;
 
     let mut cluster_west = isolated_test_cluster(
@@ -301,7 +303,7 @@ async fn test_multi_region_list_and_isolation() {
     )
     .await;
     cluster_west
-        .start_and_converge(Duration::from_secs(5))
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
         .await;
 
     let token = cluster_east.token.clone();

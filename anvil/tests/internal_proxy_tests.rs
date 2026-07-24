@@ -3,8 +3,9 @@
 use anvil::anvil_api::internal_proxy_service_client::InternalProxyServiceClient;
 use anvil::anvil_api::object_service_client::ObjectServiceClient;
 use anvil::anvil_api::{
-    CreateBucketRequest, GetObjectRequest, ProxyHeader, ProxyRequestChunk, ProxyRequestHeader,
-    bucket_service_client::BucketServiceClient, proxy_request_chunk, proxy_response_chunk,
+    CreateBucketRequest, GetObjectRequest, NativeMutationContext, ObjectMetadata, ProxyHeader,
+    ProxyRequestChunk, ProxyRequestHeader, bucket_service_client::BucketServiceClient,
+    proxy_request_chunk, proxy_response_chunk,
 };
 use anvil::auth::Claims;
 use anvil_test_utils::{
@@ -44,11 +45,18 @@ fn canonical_proxy_host(
 }
 
 async fn create_proxy_bucket(actor: &DockerTestStorageActor, prefix: &str) -> String {
+    create_proxy_bucket_with_id(actor, prefix).await.0
+}
+
+async fn create_proxy_bucket_with_id(
+    actor: &DockerTestStorageActor,
+    prefix: &str,
+) -> (String, i64) {
     let bucket_name = unique_test_name(prefix);
     let mut bucket_client = BucketServiceClient::connect(actor.grpc_addr.clone())
         .await
         .unwrap();
-    bucket_client
+    let bucket_id = bucket_client
         .create_bucket(with_bearer(
             tonic::Request::new(CreateBucketRequest {
                 bucket_name: bucket_name.clone(),
@@ -58,8 +66,10 @@ async fn create_proxy_bucket(actor: &DockerTestStorageActor, prefix: &str) -> St
             &actor.token,
         ))
         .await
-        .unwrap();
-    bucket_name
+        .unwrap()
+        .into_inner()
+        .bucket_id;
+    (bucket_name, bucket_id)
 }
 
 fn actor_claims(actor: &DockerTestStorageActor, jti: Option<&str>) -> Claims {
@@ -97,6 +107,7 @@ async fn internal_proxy_put_and_get_preserve_original_principal_authority() {
         bucket_locator_generation: 1,
         headers: vec![proxy_header("content-type", "text/plain")],
         authz_context: proxy_authz_context(&original_claims),
+        native_object_metadata: None,
     };
     let put_stream = iter(vec![
         ProxyRequestChunk {
@@ -138,6 +149,7 @@ async fn internal_proxy_put_and_get_preserve_original_principal_authority() {
         bucket_locator_generation: 1,
         headers: vec![],
         authz_context: proxy_authz_context(&original_claims),
+        native_object_metadata: None,
     };
     let get_stream = iter(vec![ProxyRequestChunk {
         part: Some(proxy_request_chunk::Part::Header(get_header)),
@@ -203,6 +215,115 @@ async fn internal_proxy_put_and_get_preserve_original_principal_authority() {
 }
 
 #[tokio::test]
+async fn internal_proxy_native_put_preserves_context_and_idempotent_response() {
+    let cluster = shared_docker_test_cluster().await;
+    let actor = create_docker_storage_test_actor(&cluster, "native-proxy-bucket").await;
+    let (bucket_name, bucket_id) = create_proxy_bucket_with_id(&actor, "native-proxy-bucket").await;
+    let original_claims = actor_claims(&actor, Some("native-proxy-jti"));
+    let internal_token = cluster.admin_token();
+    let request_id = unique_test_name("native-proxy-put");
+    let idempotency_key = unique_test_name("native-proxy-idempotency");
+    let metadata = ObjectMetadata {
+        bucket_name: bucket_name.clone(),
+        object_key: "native-via-proxy.txt".to_string(),
+        mutation_context: Some(NativeMutationContext {
+            tenant_id: actor.tenant_id,
+            bucket_id,
+            principal: actor.app_id.clone(),
+            request_id: request_id.clone(),
+            precondition: "none".to_string(),
+            authz_zookie_optional: String::new(),
+            idempotency_key: idempotency_key.clone(),
+            transaction_id: None,
+            saga_operation: None,
+            saga_compensation_operation: None,
+            write_visibility: None,
+        }),
+        content_type: Some("text/plain".to_string()),
+        user_metadata_json: r#"{"source":"native-proxy-test"}"#.to_string(),
+        storage_class: None,
+    };
+    let header = ProxyRequestHeader {
+        request_id,
+        idempotency_key,
+        principal_id: original_claims.sub.clone(),
+        tenant_id: original_claims.tenant_id.to_string(),
+        bucket_name: bucket_name.clone(),
+        object_key: metadata.object_key.clone(),
+        method: "NATIVE_PUT".to_string(),
+        canonical_host: canonical_proxy_host(&cluster, &actor, &bucket_name),
+        canonical_path: "/anvil.ObjectService/PutObject".to_string(),
+        bucket_locator_generation: 1,
+        headers: Vec::new(),
+        authz_context: proxy_authz_context(&original_claims),
+        native_object_metadata: Some(metadata),
+    };
+    let body = b"native context survives peer routing".to_vec();
+    let mut expected_response = None;
+    for _ in 0..2 {
+        let mut proxy_client = InternalProxyServiceClient::connect(actor.grpc_addr.clone())
+            .await
+            .unwrap();
+        let stream = iter(vec![
+            ProxyRequestChunk {
+                part: Some(proxy_request_chunk::Part::Header(header.clone())),
+            },
+            ProxyRequestChunk {
+                part: Some(proxy_request_chunk::Part::Body(body.clone())),
+            },
+        ]);
+        let mut response = proxy_client
+            .proxy_object(with_bearer(tonic::Request::new(stream), &internal_token))
+            .await
+            .unwrap()
+            .into_inner();
+        let first = response.next().await.unwrap().unwrap();
+        let proxy_response_chunk::Part::Header(response_header) = first.part.unwrap() else {
+            panic!("native proxy put must return a response header first");
+        };
+        assert_eq!(response_header.status, 200);
+        assert!(response_header.committed);
+        let native_response = response_header
+            .native_put_response
+            .expect("native proxy response");
+        assert!(!native_response.version_id.is_empty());
+        assert!(!native_response.mutation_id.is_empty());
+        assert!(!native_response.payload_hash.is_empty());
+        if let Some(expected) = expected_response.as_ref() {
+            assert_eq!(&native_response, expected);
+        } else {
+            expected_response = Some(native_response);
+        }
+        assert!(response.next().await.is_none());
+    }
+
+    let mut object_client = ObjectServiceClient::connect(actor.grpc_addr.clone())
+        .await
+        .unwrap();
+    let object_stream = object_client
+        .get_object(with_bearer(
+            tonic::Request::new(GetObjectRequest {
+                bucket_name,
+                object_key: "native-via-proxy.txt".to_string(),
+                ..Default::default()
+            }),
+            &actor.token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    tokio::pin!(object_stream);
+    let mut loaded = Vec::new();
+    while let Some(chunk) = object_stream.next().await {
+        if let Some(anvil::anvil_api::get_object_response::Data::Chunk(bytes)) = chunk.unwrap().data
+        {
+            loaded.extend_from_slice(&bytes);
+        }
+    }
+    assert_eq!(loaded, body);
+}
+
+#[tokio::test]
 async fn internal_proxy_rejects_mismatched_original_principal() {
     let cluster = shared_docker_test_cluster().await;
     let actor = create_docker_storage_test_actor(&cluster, "proxy-auth-bucket").await;
@@ -227,6 +348,7 @@ async fn internal_proxy_rejects_mismatched_original_principal() {
         bucket_locator_generation: 1,
         headers: vec![],
         authz_context: proxy_authz_context(&original_claims),
+        native_object_metadata: None,
     };
     let err = proxy_client
         .proxy_object(with_bearer(
@@ -265,6 +387,7 @@ async fn internal_proxy_rejects_magic_internal_principal_without_system_realm_au
         bucket_locator_generation: 1,
         headers: vec![],
         authz_context: proxy_authz_context(&original_claims),
+        native_object_metadata: None,
     };
     let err = proxy_client
         .proxy_object(with_bearer(

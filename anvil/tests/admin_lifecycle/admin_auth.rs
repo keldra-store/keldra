@@ -309,12 +309,19 @@ async fn admin_policy_and_secret_key_rotation_use_admin_api() {
         .await
         .expect_err("admin policy grants must reject wildcard authority");
     assert_eq!(wildcard_err.code(), tonic::Code::PermissionDenied);
+    let revision = node
+        .state
+        .persistence
+        .current_control_collection_revision()
+        .await
+        .unwrap();
     let app_record = node
         .state
         .persistence
-        .list_apps_for_tenant(tenant.tenant_id.parse().unwrap())
+        .page_apps_for_tenant(tenant.tenant_id.parse().unwrap(), &revision, None, 100)
         .await
         .unwrap()
+        .apps
         .into_iter()
         .find(|app| app.name == "policy-app")
         .unwrap();

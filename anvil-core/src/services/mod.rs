@@ -2,8 +2,11 @@ pub mod admin;
 pub(crate) mod admin_cursor;
 pub mod audit;
 pub mod auth;
+pub(crate) mod authz_status;
 pub mod bucket;
+pub mod collection_cursor;
 pub mod coordination;
+pub(crate) mod core_store_status;
 pub mod corestore_internal;
 pub mod git_source;
 pub mod huggingface;
@@ -14,6 +17,8 @@ pub mod object;
 pub mod personaldb;
 pub mod registry;
 pub mod repair;
+#[cfg(feature = "root-publication-test-control")]
+mod root_publication_test_control;
 pub mod saga;
 pub(crate) mod saga_reserved;
 pub mod stream;
@@ -171,6 +176,22 @@ pub fn create_admin_grpc_router(state: AppState, auth_interceptor: AuthIntercept
         state,
         auth_closure,
     ))
+}
+
+pub fn create_admin_axum_router(
+    state: AppState,
+    auth_interceptor: AuthInterceptorFn,
+) -> axum::Router {
+    let grpc_router = create_admin_grpc_router(state.clone(), auth_interceptor);
+    let router = create_axum_router(grpc_router);
+    #[cfg(feature = "root-publication-test-control")]
+    {
+        root_publication_test_control::extend_admin_router(router, state)
+    }
+    #[cfg(not(feature = "root-publication-test-control"))]
+    {
+        router
+    }
 }
 
 pub fn create_axum_router(grpc_router: Routes) -> axum::Router {

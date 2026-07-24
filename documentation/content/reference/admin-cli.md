@@ -276,23 +276,33 @@ Limitations: the current CLI has no dedicated cell failure-domain option. Record
 
 ## Nodes
 
-A node is one Anvil server process with capabilities. Node registration records the process identity, placement, public API address, public cluster addresses, and capability set.
+A node is one Anvil server process with capabilities. Node registration commits the process identity, placement, dialable `public_api_addr`, Ed25519 receipt-signing public key, and capability set. This lifecycle descriptor is the membership and routing authority.
+
+Read the local descriptor from the node being registered and encode its public-key byte array for the registration command:
+
+```bash
+NODE_17_SIGNING_KEY_B64="$(
+  anvil-admin --host http://10.10.0.17:50052 node describe-local \
+  | jq -r '.resource.receipt_signing_public_key | implode | @base64'
+)"
+```
+
+`node describe-local` reports the node id, configured region and cell, local signing public key, and configured endpoint without inventing a second identity. Compare those fields with the intended topology before registration.
 
 ```bash
 anvil-admin --host http://10.10.0.12:50052 node register \
   --node-id node-17 \
   --region eu-west-1 \
   --cell-id eu-west-1-a \
-  --libp2p-peer-id 12D3KooWExamplePeerId \
+  --receipt-signing-public-key-b64 "$NODE_17_SIGNING_KEY_B64" \
   --public-api-addr http://10.10.0.17:50051 \
-  --public-cluster-addr /ip4/10.10.0.17/udp/7443/quic-v1 \
-  --capability object,index,personaldb,gateway,admin \
+  --capability object,index,personaldb,metadata,gateway,admin \
   --audit-reason 'register node-17 in eu-west-1-a'
 
 anvil-admin --host http://10.10.0.12:50052 node list \
   --region eu-west-1 \
   --cell-id eu-west-1-a \
-  --limit 100
+  --page-size 100
 ```
 
 Lifecycle commands:
@@ -324,6 +334,8 @@ anvil-admin --host http://10.10.0.12:50052 node remove \
 Purpose: manage node descriptors and lifecycle state.
 
 Required relation: `manage_nodes`.
+
+Nodes contact one another through authenticated gRPC at the exact committed `public_api_addr`. Registration does not probe or discover a process, and DNS reachability alone does not grant membership. The configured internal bearer credential must identify an authorised node principal.
 
 Limitations: `node drain` records lifecycle intent; it does not stop the operating-system process, remove the node from an external load balancer, or prove background work has moved. `force-offline` is an explicit operator action for failure or emergency cases, not graceful drain completion.
 

@@ -2,8 +2,10 @@ use super::local::write_file_atomic;
 use super::*;
 use crate::formats::writer::{
     ByteSource, CoreMetaMutation, DurabilityClass, LogicalFileWrite, WriterBuildOutput,
+    WriterFamily, WriterRootPublication,
 };
 use anyhow::{Context, bail};
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 use tokio::fs;
 
@@ -15,16 +17,30 @@ pub struct CoreFormatWriteReceipt {
     pub coremeta_certificate_hashes: Vec<String>,
 }
 
+#[derive(Debug)]
+struct PreparedFormatCoreMetaCommit {
+    transaction_id: String,
+    publications: Vec<CoreMetaRootPublication>,
+}
+
 impl CoreStore {
     pub async fn write_format_build_output(
         &self,
         output: WriterBuildOutput,
     ) -> Result<CoreFormatWriteReceipt> {
-        let _guard = self.acquire_corestore_write_lock().await;
+        let prepared_coremeta_commit = self.prepare_format_coremeta_commit(
+            &output.core_meta_mutations,
+            &output.core_meta_root_publications,
+        )?;
+        let WriterBuildOutput {
+            logical_files,
+            core_meta_mutations,
+            core_meta_root_publications: _,
+        } = output;
         let mut logical_file_ids = Vec::new();
         let mut manifest_hashes = Vec::new();
         let mut written_object_refs = Vec::new();
-        for logical_file in output.logical_files {
+        for logical_file in logical_files {
             let logical_file_id = logical_file.logical_file_id.clone();
             let writer_family = logical_file.writer_family.as_str().to_string();
             let materialise_started_at = Instant::now();
@@ -90,7 +106,7 @@ impl CoreStore {
         }
 
         let coremeta_certificate_hashes = self
-            .commit_format_coremeta_mutations(output.core_meta_mutations)
+            .commit_format_coremeta_mutations(core_meta_mutations, prepared_coremeta_commit)
             .await?;
         Ok(CoreFormatWriteReceipt {
             logical_file_ids,
@@ -206,35 +222,181 @@ impl CoreStore {
     async fn commit_format_coremeta_mutations(
         &self,
         mutations: Vec<CoreMetaMutation>,
+        prepared: Option<PreparedFormatCoreMetaCommit>,
     ) -> Result<Vec<String>> {
-        if mutations.is_empty() {
+        let Some(prepared) = prepared else {
+            if !mutations.is_empty() {
+                bail!("CoreFormatWriter lost its prepared CoreMeta commit plan");
+            }
             return Ok(Vec::new());
-        }
-        let transaction_id = common_format_transaction_id(&mutations)?;
+        };
         let ops = mutations
             .iter()
             .map(CoreMetaMutation::as_batch_op)
             .collect::<Vec<_>>();
         let outcomes = self
-            .commit_coremeta_batch_by_embedded_roots(&transaction_id, &ops)
+            .commit_coremeta_root_groups(&prepared.transaction_id, &ops, &prepared.publications)
             .await?;
         Ok(outcomes
             .into_iter()
             .map(|outcome| outcome.certificate_hash)
             .collect())
     }
+
+    fn prepare_format_coremeta_commit(
+        &self,
+        mutations: &[CoreMetaMutation],
+        declarations: &[WriterRootPublication],
+    ) -> Result<Option<PreparedFormatCoreMetaCommit>> {
+        let prepared = build_format_coremeta_commit_plan(mutations, declarations)?;
+        let Some(prepared) = prepared else {
+            return Ok(None);
+        };
+        let ops = mutations
+            .iter()
+            .map(CoreMetaMutation::as_batch_op)
+            .collect::<Vec<_>>();
+        let encoded_rows = self.encode_coremeta_batch_ops(&ops)?;
+        validate_encoded_format_rows(mutations, &encoded_rows)?;
+        Ok(Some(prepared))
+    }
 }
 
-fn common_format_transaction_id(mutations: &[CoreMetaMutation]) -> Result<String> {
+fn build_format_coremeta_commit_plan(
+    mutations: &[CoreMetaMutation],
+    declarations: &[WriterRootPublication],
+) -> Result<Option<PreparedFormatCoreMetaCommit>> {
     let Some(first) = mutations.first() else {
-        bail!("CoreFormatWriter mutation list is empty");
+        if !declarations.is_empty() {
+            bail!("CoreFormatWriter output declares roots without CoreMeta mutations");
+        }
+        return Ok(None);
     };
+
+    let mut declarations_by_root = BTreeMap::new();
+    let mut roots_by_hash = BTreeMap::new();
+    let mut coordinator_count = 0_usize;
+    for declaration in declarations {
+        let root_anchor_key = declaration.root_anchor_key().to_string();
+        let root_key_hash = core_meta_root_key_hash(&root_anchor_key);
+        if let Some(existing) = roots_by_hash.insert(root_key_hash.clone(), root_anchor_key.clone())
+            && existing != root_anchor_key
+        {
+            bail!("CoreFormatWriter canonical root anchor keys collide at {root_key_hash}");
+        }
+        if declarations_by_root
+            .insert(root_anchor_key.clone(), declaration)
+            .is_some()
+        {
+            bail!("CoreFormatWriter output declares root {root_anchor_key} more than once");
+        }
+        coordinator_count += usize::from(declaration.is_transaction_coordinator());
+    }
+
+    let transaction_id = first.transaction_id.clone();
+    let mut root_generations = BTreeMap::new();
+    let mut used_roots = BTreeSet::new();
     for mutation in mutations {
-        if mutation.transaction_id != first.transaction_id {
+        mutation.validate()?;
+        if mutation.transaction_id != transaction_id {
             bail!("CoreFormatWriter output spans multiple transaction ids");
         }
+        let Some(root_anchor_key) = mutation.scope().root_anchor_key() else {
+            continue;
+        };
+        let post_root_generation = mutation
+            .scope()
+            .post_root_generation()
+            .expect("rooted mutation scopes always have a generation");
+        if !declarations_by_root.contains_key(root_anchor_key) {
+            bail!(
+                "CoreFormatWriter mutation root {root_anchor_key} has no canonical publication declaration"
+            );
+        }
+        if let Some(existing) = root_generations.insert(root_anchor_key, post_root_generation)
+            && existing != post_root_generation
+        {
+            bail!(
+                "CoreFormatWriter root {root_anchor_key} spans multiple generations in one build output"
+            );
+        }
+        used_roots.insert(root_anchor_key);
     }
-    Ok(first.transaction_id.clone())
+
+    if used_roots.len() != declarations_by_root.len() {
+        let unused = declarations_by_root
+            .keys()
+            .find(|root| !used_roots.contains(root.as_str()))
+            .expect("different root counts imply an unused declaration");
+        bail!("CoreFormatWriter output declares unused root {unused}");
+    }
+    if used_roots.is_empty() {
+        if coordinator_count != 0 {
+            bail!("CoreFormatWriter local-only output must not declare a coordinator root");
+        }
+    } else if coordinator_count != 1 {
+        bail!("CoreFormatWriter rooted output must declare exactly one coordinator root");
+    }
+
+    let mut publications = Vec::with_capacity(declarations_by_root.len());
+    for declaration in declarations_by_root.into_values() {
+        if declaration.is_transaction_coordinator()
+            && !declaration
+                .writer_families()
+                .contains(&WriterFamily::CoreControl)
+        {
+            bail!("CoreFormatWriter coordinator root must include the core_control writer family");
+        }
+        let writer_families = declaration
+            .writer_families()
+            .iter()
+            .map(|family| family.as_str().to_string())
+            .collect();
+        let mut publication = CoreMetaRootPublication::with_writer_families(
+            declaration.root_anchor_key(),
+            writer_families,
+        );
+        if declaration.is_transaction_coordinator() {
+            publication = publication.coordinator();
+        }
+        publications.push(publication);
+    }
+
+    Ok(Some(PreparedFormatCoreMetaCommit {
+        transaction_id,
+        publications,
+    }))
+}
+
+fn validate_encoded_format_rows(
+    mutations: &[CoreMetaMutation],
+    rows: &[CoreMetaEncodedOwnedRow],
+) -> Result<()> {
+    if mutations.len() != rows.len() {
+        bail!("CoreFormatWriter CoreMeta row encoding changed the mutation count");
+    }
+    for (mutation, row) in mutations.iter().zip(rows) {
+        if row.visibility_state != CoreMetaVisibilityState::Committed {
+            bail!("CoreFormatWriter may only publish committed CoreMeta rows");
+        }
+        match mutation.scope().root_anchor_key() {
+            Some(root_anchor_key) => {
+                if row.root_key_hash != core_meta_root_key_hash(root_anchor_key)
+                    || Some(row.root_generation) != mutation.scope().post_root_generation()
+                {
+                    bail!(
+                        "CoreFormatWriter encoded row does not match its canonical root declaration"
+                    );
+                }
+            }
+            None => {
+                if !row.root_key_hash.is_empty() || row.root_generation != 0 {
+                    bail!("CoreFormatWriter local mutation encoded into an undeclared rooted row");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn normalise_sha256_hash(hash: &str) -> Result<String> {
@@ -242,5 +404,114 @@ fn normalise_sha256_hash(hash: &str) -> Result<String> {
         Ok(hash.to_string())
     } else {
         Ok(format!("sha256:{hash}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::formats::writer::CoreMetaMutationScope;
+
+    fn rooted_common(
+        root_anchor_key: &str,
+        generation: u64,
+        transaction_id: &str,
+    ) -> CoreMetaRowCommonProto {
+        CoreMetaRowCommonProto {
+            realm_id: "test".to_string(),
+            root_key_hash: core_meta_root_key_hash(root_anchor_key),
+            root_generation: generation,
+            transaction_id: transaction_id.to_string(),
+            visibility_state: CoreMetaVisibilityState::Committed as i32,
+            created_at_unix_nanos: 1,
+            payload_schema_version: 1,
+        }
+    }
+
+    fn rooted_mutation(
+        root_anchor_key: &str,
+        generation: u64,
+        transaction_id: &str,
+        tuple_key: &[u8],
+    ) -> CoreMetaMutation {
+        CoreMetaMutation::put(
+            CF_INDEX_ROWS,
+            TABLE_INDEX_ROW,
+            tuple_key.to_vec(),
+            b"payload".to_vec(),
+            Some(rooted_common(root_anchor_key, generation, transaction_id)),
+            CoreMetaMutationScope::rooted(root_anchor_key, generation).expect("rooted scope"),
+            transaction_id.to_string(),
+        )
+        .expect("rooted mutation")
+    }
+
+    fn coordinator(root_anchor_key: &str) -> WriterRootPublication {
+        WriterRootPublication::new(
+            root_anchor_key,
+            vec![WriterFamily::CoreControl, WriterFamily::TypedMetadata],
+        )
+        .expect("root publication")
+        .coordinator()
+    }
+
+    #[test]
+    fn format_plan_preserves_canonical_publication_descriptor() {
+        let root_anchor_key = "bucket/acme/index/orders";
+        let mutations = vec![rooted_mutation(
+            root_anchor_key,
+            4,
+            "format-write-1",
+            b"orders/current",
+        )];
+        let declarations = vec![coordinator(root_anchor_key)];
+
+        let plan = build_format_coremeta_commit_plan(&mutations, &declarations)
+            .expect("valid plan")
+            .expect("non-empty plan");
+        assert_eq!(plan.transaction_id, "format-write-1");
+        assert_eq!(plan.publications.len(), 1);
+        assert_eq!(plan.publications[0].root_anchor_key, root_anchor_key);
+        assert_eq!(
+            plan.publications[0].writer_families,
+            vec!["core_control".to_string(), "typed_index".to_string()]
+        );
+        assert!(plan.publications[0].transaction_coordinator);
+    }
+
+    #[test]
+    fn format_plan_requires_exactly_one_coordinator() {
+        let root_anchor_key = "bucket/acme/index/orders";
+        let mutations = vec![rooted_mutation(
+            root_anchor_key,
+            1,
+            "format-write-2",
+            b"orders/current",
+        )];
+        let no_coordinator = vec![
+            WriterRootPublication::new(root_anchor_key, vec![WriterFamily::TypedMetadata])
+                .expect("root publication"),
+        ];
+        assert!(build_format_coremeta_commit_plan(&mutations, &no_coordinator).is_err());
+
+        let second_root = "bucket/acme/index/customers";
+        let mutations = vec![
+            rooted_mutation(root_anchor_key, 1, "format-write-2", b"orders/current"),
+            rooted_mutation(second_root, 1, "format-write-2", b"customers/current"),
+        ];
+        let two_coordinators = vec![coordinator(root_anchor_key), coordinator(second_root)];
+        assert!(build_format_coremeta_commit_plan(&mutations, &two_coordinators).is_err());
+    }
+
+    #[test]
+    fn format_plan_rejects_multiple_generations_for_one_root() {
+        let root_anchor_key = "bucket/acme/index/orders";
+        let mutations = vec![
+            rooted_mutation(root_anchor_key, 4, "format-write-3", b"orders/first"),
+            rooted_mutation(root_anchor_key, 5, "format-write-3", b"orders/second"),
+        ];
+        assert!(
+            build_format_coremeta_commit_plan(&mutations, &[coordinator(root_anchor_key)]).is_err()
+        );
     }
 }

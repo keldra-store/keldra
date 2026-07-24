@@ -13,9 +13,9 @@ pub enum AuditCommands {
         #[clap(long, default_value = "")]
         action: String,
         #[clap(long, default_value_t = 100)]
-        limit: u32,
+        page_size: u32,
         #[clap(long, default_value = "")]
-        cursor: String,
+        page_token: String,
     },
 }
 
@@ -27,8 +27,8 @@ pub async fn handle_audit_command(command: &AuditCommands, ctx: &Context) -> any
             principal,
             resource,
             action,
-            limit,
-            cursor,
+            page_size,
+            page_token,
         } => {
             let mut request = tonic::Request::new(api::ListAuditEventsRequest {
                 request_id: format!("audit-list-{}", uuid::Uuid::new_v4()),
@@ -36,8 +36,8 @@ pub async fn handle_audit_command(command: &AuditCommands, ctx: &Context) -> any
                 resource_id: resource.clone(),
                 action: action.clone(),
                 page: Some(api::PageRequest {
-                    cursor: cursor.clone(),
-                    limit: *limit,
+                    page_token: page_token.clone(),
+                    page_size: *page_size,
                 }),
             });
             request
@@ -54,8 +54,11 @@ pub async fn handle_audit_command(command: &AuditCommands, ctx: &Context) -> any
                     event.audit_event_id
                 );
             }
-            if let Some(page) = response.page.filter(|page| !page.next_cursor.is_empty()) {
-                println!("next_cursor={}", page.next_cursor);
+            if let Some(page) = response
+                .page
+                .filter(|page| !page.next_page_token.is_empty())
+            {
+                println!("next_page_token={}", page.next_page_token);
             }
         }
     }

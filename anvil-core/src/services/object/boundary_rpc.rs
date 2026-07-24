@@ -581,9 +581,13 @@ async fn write_boundary_migration_row(
     };
     state
         .core_store
-        .commit_coremeta_batch_by_embedded_roots(
+        .commit_coremeta_root_groups(
             &format!("boundary-migration:{boundary_bucket_key}:{migration_id}"),
             &[op],
+            &[crate::core_store::CoreMetaRootPublication::new(
+                format!("boundary/{boundary_bucket_key}"),
+                crate::formats::writer::WriterFamily::TypedMetadata,
+            )],
         )
         .await
         .map(|_| ())
@@ -596,9 +600,9 @@ async fn read_boundary_migration_row(
     migration_id: &str,
 ) -> Result<Option<BoundaryMigrationRow>, Status> {
     let tuple_key = boundary_migration_tuple_key(boundary_bucket_key, migration_id)?;
-    let Some(bytes) = crate::core_store::CoreMetaStore::open(state.storage.core_store_meta_path())
-        .map_err(|error| Status::internal(error.to_string()))?
-        .get(
+    let Some(bytes) = state
+        .core_store
+        .read_coremeta_row(
             crate::core_store::CF_BOUNDARY,
             crate::core_store::TABLE_BOUNDARY_MIGRATION_ROW,
             &tuple_key,

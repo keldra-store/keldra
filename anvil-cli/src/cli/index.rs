@@ -50,6 +50,10 @@ pub enum IndexCommands {
         bucket: String,
         #[clap(long, action = clap::ArgAction::SetTrue)]
         include_disabled: bool,
+        #[clap(long, default_value_t = 100)]
+        page_size: u32,
+        #[clap(long, default_value = "")]
+        page_token: String,
     },
     Query {
         bucket: String,
@@ -82,10 +86,10 @@ pub enum IndexCommands {
     Diagnostics {
         bucket: String,
         index: String,
-        #[clap(long, default_value_t = 0)]
-        after_cursor: u64,
         #[clap(long, default_value_t = 100)]
-        limit: u32,
+        page_size: u32,
+        #[clap(long, default_value = "")]
+        page_token: String,
         #[clap(long, default_value = "")]
         severity: String,
     },
@@ -174,14 +178,27 @@ pub async fn handle_index_command(command: &IndexCommands, ctx: &Context) -> any
         IndexCommands::List {
             bucket,
             include_disabled,
+            page_size,
+            page_token,
         } => {
             let mut request = tonic::Request::new(api::ListIndexesRequest {
                 bucket_name: bucket.clone(),
                 include_disabled: *include_disabled,
+                page: Some(api::PageRequest {
+                    page_size: *page_size,
+                    page_token: page_token.clone(),
+                }),
             });
             add_auth(&mut request, &token);
-            for index in client.list_indexes(request).await?.into_inner().indexes {
+            let response = client.list_indexes(request).await?.into_inner();
+            for index in response.indexes {
                 print_index(Some(index));
+            }
+            if let Some(page) = response
+                .page
+                .filter(|page| !page.next_page_token.is_empty())
+            {
+                println!("next_page_token={}", page.next_page_token);
             }
         }
         IndexCommands::Query {
@@ -228,28 +245,32 @@ pub async fn handle_index_command(command: &IndexCommands, ctx: &Context) -> any
         IndexCommands::Diagnostics {
             bucket,
             index,
-            after_cursor,
-            limit,
+            page_size,
+            page_token,
             severity,
         } => {
             let mut request = tonic::Request::new(api::ListIndexDiagnosticsRequest {
                 bucket_name: bucket.clone(),
                 index_name: index.clone(),
-                after_cursor: *after_cursor,
-                limit: *limit,
                 severity: severity.clone(),
+                page: Some(api::PageRequest {
+                    page_size: *page_size,
+                    page_token: page_token.clone(),
+                }),
             });
             add_auth(&mut request, &token);
-            for diagnostic in client
-                .list_index_diagnostics(request)
-                .await?
-                .into_inner()
-                .diagnostics
-            {
+            let response = client.list_index_diagnostics(request).await?.into_inner();
+            for diagnostic in response.diagnostics {
                 println!(
                     "{}\t{}\t{}\t{}",
                     diagnostic.cursor, diagnostic.severity, diagnostic.code, diagnostic.message
                 );
+            }
+            if let Some(page) = response
+                .page
+                .filter(|page| !page.next_page_token.is_empty())
+            {
+                println!("next_page_token={}", page.next_page_token);
             }
         }
     }

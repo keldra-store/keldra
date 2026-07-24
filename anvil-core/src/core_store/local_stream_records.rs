@@ -5,6 +5,40 @@ pub(super) fn event_hash_input(record: &StreamRecord) -> Result<Vec<u8>> {
     encode_stream_event_hash_input(record)
 }
 
+pub(super) fn build_stream_record_after_head(
+    input: AppendStreamRecord,
+    idempotency_key_hash: Option<String>,
+    authenticated_principal: String,
+    last_sequence: u64,
+    previous_event_hash: String,
+    created_at: String,
+) -> Result<StreamRecord> {
+    let sequence = last_sequence
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("CoreStore stream sequence overflow"))?;
+    let payload_hash = format!("sha256:{}", sha256_hex(&input.payload));
+    let mut record = StreamRecord {
+        schema: CORE_WATCH_EVENT_SCHEMA.to_string(),
+        cursor: format!("{}:{sequence:020}", input.stream_id),
+        stream_id: input.stream_id,
+        partition_id: input.partition_id,
+        sequence,
+        previous_event_hash,
+        event_hash: String::new(),
+        record_kind: input.record_kind,
+        payload_hash,
+        payload: input.payload,
+        content_type: input.content_type,
+        user_metadata_json: input.user_metadata_json,
+        authenticated_principal,
+        transaction_id: input.transaction_id,
+        idempotency_key_hash,
+        created_at,
+    };
+    record.event_hash = format!("sha256:{}", sha256_hex(&event_hash_input(&record)?));
+    Ok(record)
+}
+
 pub(super) fn validate_stream_record_index_row_metadata(
     stream_id: &str,
     row: &StoredStreamRecordIndexRow,

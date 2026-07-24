@@ -1,7 +1,7 @@
 use crate::{
     core_store::{
-        CoreBoundaryValue, CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext,
-        EncodedTypedValue, GetBlob, SourceId, TypedFieldValue,
+        CoreBoundaryValue, CoreMutationPrecondition, CoreObjectRef, CorePipelinePolicy, CoreStore,
+        CoreTraceContext, EncodedTypedValue, GetBlob, SourceId, TypedFieldValue,
     },
     formats::{
         FileFamily, Hash32, decode_writer_segment, encode_writer_segment_header, hash32,
@@ -16,6 +16,7 @@ use crate::{
     },
     index_coremeta::{self, IndexSegmentCoreMetaRecord},
     storage::Storage,
+    writer_segment_catalog::{WriterSegmentCatalogRecord, write_writer_segment_catalog_record},
     writer_segment_range::RangeAddressedWriterSegment,
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -157,10 +158,28 @@ struct StoredJsonValueProto {
     object_fields: Vec<StoredJsonFieldProto>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct StagedTypedFieldSegment {
+    pub(crate) segment_ref: String,
+    pub(crate) segment_hash: String,
+    locator: IndexSegmentCoreMetaRecord,
+    catalog: WriterSegmentCatalogRecord,
+}
+
 pub async fn write_typed_field_segment(
     storage: &Storage,
     write: TypedFieldSegmentWrite<'_>,
 ) -> Result<String> {
+    let staged = stage_typed_field_segment(storage, write).await?;
+    publish_typed_field_segment_catalog(storage, &staged, &[]).await?;
+    publish_typed_field_segment_locator(storage, &staged, &[]).await?;
+    Ok(staged.segment_ref)
+}
+
+pub(crate) async fn stage_typed_field_segment(
+    storage: &Storage,
+    write: TypedFieldSegmentWrite<'_>,
+) -> Result<StagedTypedFieldSegment> {
     validate_hex32(write.definition_hash, "typed field definition hash")?;
     let mut rows = write.rows.to_vec();
     rows.sort_by(|left, right| left.source_identity.cmp(&right.source_identity));
@@ -184,6 +203,13 @@ pub async fn write_typed_field_segment(
         &segment_hash,
     );
 
+    let created_at_unix_nanos = index_coremeta::deterministic_index_publication_nanos(
+        write.index_id,
+        "typed_field_segment",
+        write.generation,
+        u128::from(write.source_cursor),
+        &hex::encode(segment_hash),
+    );
     let header = TypedFieldSegmentHeader {
         index_id: write.index_id.to_string(),
         generation: write.generation,
@@ -194,7 +220,8 @@ pub async fn write_typed_field_segment(
         row_count: rows.len() as u64,
         field_names: write.field_names.to_vec(),
         codec: "typed-row-binary-v1".to_string(),
-        created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+        created_at: chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(created_at_unix_nanos)
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
     };
     let (first_hash, last_hash) = source_identity_hash_bounds(&rows);
     let header_proto = encode_typed_field_header_proto(&logical_file_id, &header);
@@ -230,6 +257,7 @@ pub async fn write_typed_field_segment(
         .write_format_build_output(WriterBuildOutput {
             logical_files: vec![built_segment.logical_file],
             core_meta_mutations: Vec::new(),
+            core_meta_root_publications: Vec::new(),
         })
         .await?;
     let object_ref = receipt
@@ -238,32 +266,66 @@ pub async fn write_typed_field_segment(
         .cloned()
         .ok_or_else(|| anyhow!("CoreFormatWriter returned no typed object"))?;
     let core_object_ref_target = encode_core_object_ref_target(&object_ref)?;
+    let locator = IndexSegmentCoreMetaRecord {
+        index_id: write.index_id.to_string(),
+        index_kind: index_coremeta::typed_segment_index_kind(write.source_kind).to_string(),
+        writer_family: WriterFamily::TypedMetadata.as_str().to_string(),
+        segment_ref: ref_name.clone(),
+        core_object_ref_target: core_object_ref_target.clone(),
+        segment_hash: segment_file_hash.clone(),
+        segment_length,
+        generation: write.generation,
+        source_kind: write.source_kind.to_string(),
+        source_cursor: write.source_cursor,
+        authz_realm_id: "default".to_string(),
+        authz_scope_hash: index_coremeta::segment_authz_scope_hash(
+            index_coremeta::typed_segment_index_kind(write.source_kind),
+            "per_row_label",
+        ),
+        authz_revision: write.authz_revision,
+        row_count: rows.len() as u64,
+        field_names: write.field_names.to_vec(),
+        created_at_unix_nanos: u64::try_from(created_at_unix_nanos)
+            .map_err(|_| anyhow!("typed field segment timestamp is negative"))?,
+    };
+    let catalog = WriterSegmentCatalogRecord {
+        family: WriterFamily::TypedMetadata.as_str().to_string(),
+        scope: write.index_id.to_string(),
+        segment_ref: ref_name.clone(),
+        core_object_ref_target,
+        segment_hash: segment_file_hash.clone(),
+        segment_length,
+        generation: write.generation,
+        source_cursor: write.source_cursor,
+        created_at_unix_nanos: locator.created_at_unix_nanos,
+    };
+    Ok(StagedTypedFieldSegment {
+        segment_ref: ref_name,
+        segment_hash: segment_file_hash,
+        locator,
+        catalog,
+    })
+}
+
+pub(crate) async fn publish_typed_field_segment_catalog(
+    storage: &Storage,
+    staged: &StagedTypedFieldSegment,
+    additional_preconditions: &[CoreMutationPrecondition],
+) -> Result<()> {
+    write_writer_segment_catalog_record(storage, &staged.catalog, additional_preconditions).await
+}
+
+pub(crate) async fn publish_typed_field_segment_locator(
+    storage: &Storage,
+    staged: &StagedTypedFieldSegment,
+    additional_preconditions: &[CoreMutationPrecondition],
+) -> Result<()> {
     index_coremeta::write_index_segment_coremeta_record(
         storage,
-        &IndexSegmentCoreMetaRecord {
-            index_id: write.index_id.to_string(),
-            index_kind: index_coremeta::typed_segment_index_kind(write.source_kind).to_string(),
-            writer_family: WriterFamily::TypedMetadata.as_str().to_string(),
-            segment_ref: ref_name.clone(),
-            core_object_ref_target,
-            segment_hash: segment_file_hash,
-            segment_length,
-            generation: write.generation,
-            source_kind: write.source_kind.to_string(),
-            source_cursor: write.source_cursor,
-            authz_realm_id: "default".to_string(),
-            authz_scope_hash: index_coremeta::segment_authz_scope_hash(
-                index_coremeta::typed_segment_index_kind(write.source_kind),
-                "per_row_label",
-            ),
-            authz_revision: write.authz_revision,
-            row_count: rows.len() as u64,
-            field_names: write.field_names.to_vec(),
-            created_at_unix_nanos: unix_nanos_from_rfc3339(&header.created_at),
-        },
+        &staged.locator,
+        additional_preconditions,
     )
-    .await?;
-    Ok(ref_name)
+    .await
 }
 
 pub async fn read_typed_field_segment(
@@ -281,7 +343,8 @@ pub async fn read_typed_field_segment_bytes(
     let store = CoreStore::new(storage.clone()).await?;
     let index_id = typed_field_index_id_from_segment_ref(segment_ref)?;
     let segment =
-        index_coremeta::read_index_segment_coremeta_record_by_ref(storage, &index_id, segment_ref)?
+        index_coremeta::read_index_segment_coremeta_record_by_ref(storage, &index_id, segment_ref)
+            .await?
             .ok_or_else(|| anyhow!("typed field segment CoreMeta row is missing"))?;
     store
         .get_blob(GetBlob {
@@ -434,7 +497,8 @@ pub async fn latest_typed_field_segment_ref(
     index_id: &str,
 ) -> Result<Option<String>> {
     Ok(
-        index_coremeta::latest_index_segment_coremeta_record(storage, index_id)?
+        index_coremeta::latest_index_segment_coremeta_record(storage, index_id)
+            .await?
             .map(|record| record.segment_ref),
     )
 }

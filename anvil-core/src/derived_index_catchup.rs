@@ -225,17 +225,9 @@ mod tests {
         let first = acquire_task_lease(&storage, lease_acquire("node-a", 10, 30, 10), KEY)
             .await
             .unwrap();
-        checkpoint_task_lease(
-            &storage,
-            &first.task_id,
-            &TaskLeaseOwner::node("node-a"),
-            first.fence_token,
-            42,
-            20,
-            KEY,
-        )
-        .await
-        .unwrap();
+        checkpoint_task_lease(&storage, &first, 42, 20, KEY)
+            .await
+            .unwrap();
         let handed_off = acquire_task_lease(&storage, lease_acquire("node-b", 50, 100, 10), KEY)
             .await
             .unwrap();

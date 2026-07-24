@@ -2,10 +2,18 @@ use super::*;
 use crate::formats::writer::WriterFamily;
 use prost::{Message, Oneof};
 
+#[path = "local_tx_rows/publication_guard.rs"]
+mod publication_guard;
+
+pub(super) use publication_guard::{
+    CorePublicationGuardContext, CorePublicationGuardSummary, hydrate_publication_guard_context,
+    publication_guard_summary,
+};
+
 const CORE_TRANSACTION_HEADER_ROW_SCHEMA: &str = "anvil.core.transaction_header_row.v1";
 const CORE_TRANSACTION_STAGED_UPDATE_ROW_SCHEMA: &str =
     "anvil.core.transaction_staged_update_row.v1";
-const CORE_TRANSACTION_PRECONDITION_ROW_SCHEMA: &str = "anvil.core.transaction_precondition_row.v1";
+const CORE_TRANSACTION_PRECONDITION_ROW_SCHEMA: &str = "anvil.core.transaction_precondition_row.v3";
 // Transaction rows may retain tiny CoreMeta payloads for recovery, but larger
 // staged payloads must stay in the CoreStore byte pipeline as locators.
 const CORE_TRANSACTION_STAGED_INLINE_PAYLOAD_BYTES: usize = 16 * 1024;
@@ -52,6 +60,8 @@ struct CoreTransactionHeaderRowProto {
     failure_evidence: Option<String>,
     #[prost(string, tag = "20")]
     outcome: String,
+    #[prost(string, repeated, tag = "21")]
+    writer_families: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ::prost::Enumeration)]
@@ -109,6 +119,18 @@ struct CoreTransactionStreamAppendRowProto {
     visible_sequence: u64,
     #[prost(string, tag = "3")]
     prepared_record_hash: String,
+    #[prost(string, tag = "4")]
+    partition_id: String,
+    #[prost(string, tag = "5")]
+    record_kind: String,
+    #[prost(message, optional, tag = "6")]
+    payload_ref: Option<CoreTransactionPayloadRefProto>,
+    #[prost(string, optional, tag = "7")]
+    idempotency_key_hash: Option<String>,
+    #[prost(string, tag = "8")]
+    previous_event_hash: String,
+    #[prost(string, tag = "9")]
+    created_at: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -163,11 +185,15 @@ struct CoreTransactionPreconditionRowProto {
     ordinal: u64,
     #[prost(message, optional, tag = "5")]
     precondition: Option<CoreMutationPreconditionRowProto>,
+    #[prost(uint64, tag = "6")]
+    visible_update_boundary: u64,
+    #[prost(bool, tag = "7")]
+    revalidate_at_publication: bool,
 }
 
 #[derive(Clone, PartialEq, Message)]
 struct CoreMutationPreconditionRowProto {
-    #[prost(oneof = "mutation_precondition_row_proto::Kind", tags = "2, 3, 4")]
+    #[prost(oneof = "mutation_precondition_row_proto::Kind", tags = "2, 3, 4, 5")]
     kind: Option<mutation_precondition_row_proto::Kind>,
 }
 
@@ -182,6 +208,8 @@ mod mutation_precondition_row_proto {
         StreamHead(super::CoreMutationStreamHeadPreconditionRowProto),
         #[prost(message, tag = "4")]
         CoreMetaRow(super::CoreMutationCoreMetaRowPreconditionRowProto),
+        #[prost(message, tag = "5")]
+        CoreMetaLease(super::CoreMutationCoreMetaLeasePreconditionRowProto),
     }
 }
 
@@ -220,6 +248,20 @@ struct CoreMutationCoreMetaRowPreconditionRowProto {
 }
 
 #[derive(Clone, PartialEq, Message)]
+struct CoreMutationCoreMetaLeasePreconditionRowProto {
+    #[prost(string, tag = "1")]
+    cf: String,
+    #[prost(uint32, tag = "2")]
+    table_id: u32,
+    #[prost(bytes, tag = "3")]
+    tuple_key: Vec<u8>,
+    #[prost(string, tag = "4")]
+    expected_payload_hash: String,
+    #[prost(uint64, tag = "5")]
+    expires_at_unix_nanos: u64,
+}
+
+#[derive(Clone, PartialEq, Message)]
 struct CoreMutationStreamHeadPreconditionRowProto {
     #[prost(string, tag = "1")]
     stream_id: String,
@@ -250,9 +292,15 @@ pub(super) enum CoreTransactionPayloadRef {
 
 pub(super) enum CoreTransactionUpdateRow {
     StreamAppend {
+        partition_id: String,
         stream_id: String,
+        record_kind: String,
+        payload_ref: CoreTransactionPayloadRef,
+        idempotency_key_hash: Option<String>,
         visible_sequence: u64,
+        previous_event_hash: String,
         prepared_record_hash: String,
+        created_at: String,
     },
     CoreMetaPut {
         cf: String,
@@ -275,6 +323,16 @@ pub(super) struct CoreTransactionStagedUpdateRow {
     pub update: CoreTransactionUpdateRow,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CoreTransactionPreconditionRow {
+    ordinal: u64,
+    pub(super) visible_update_boundary: u64,
+    pub(super) precondition: CoreMutationPrecondition,
+    // Recovery retains the admitted precondition as audit evidence after an
+    // exact effect is durable, but must not evaluate the before-state again.
+    pub(super) revalidate_at_publication: bool,
+}
+
 pub(super) enum OwnedCoreMetaBatchOp {
     Put {
         cf: &'static str,
@@ -292,20 +350,66 @@ pub(super) enum OwnedCoreMetaBatchOp {
 }
 
 impl CoreStore {
-    pub(super) async fn write_transaction_with_staged_rows_unlocked(
+    pub(super) fn has_pending_transaction_stream_prefix(
+        &self,
+        stream_prefix: &str,
+    ) -> Result<bool> {
+        Ok(!self
+            .meta
+            .scan_prefix_page(
+                CF_TRANSACTIONS,
+                TABLE_EXPLICIT_TRANSACTION_ROW,
+                &pending_transaction_stream_prefix(stream_prefix),
+                None,
+                1,
+            )?
+            .is_empty())
+    }
+
+    pub(super) async fn write_pending_transaction_with_staged_rows_unlocked(
         &self,
         transaction: &CoreTransaction,
         new_preconditions: &[CoreMutationPrecondition],
     ) -> Result<()> {
-        let owned_ops = self
-            .transaction_rows_as_coremeta_ops_unlocked(transaction, new_preconditions)
-            .await?;
+        if transaction.state == CoreTransactionState::Committed {
+            bail!("CoreStore committed transactions must use root publication");
+        }
+        if transaction.committed_root_generation.is_some() {
+            bail!("CoreStore unpublished transaction must not name a root generation");
+        }
+        let owned_ops = if matches!(
+            transaction.state,
+            CoreTransactionState::Open | CoreTransactionState::Prepared
+        ) {
+            self.transaction_rows_as_coremeta_ops_unlocked(transaction, new_preconditions, true)
+                .await?
+        } else {
+            let mut preconditions = self
+                .read_transaction_preconditions_unlocked(&transaction.transaction_id)
+                .await?;
+            let visible_update_boundary = u64::try_from(transaction.visible_updates.len())
+                .map_err(|_| anyhow!("CoreStore transaction has too many staged updates"))?;
+            let first_ordinal = u64::try_from(preconditions.len())
+                .map_err(|_| anyhow!("CoreStore transaction has too many staged preconditions"))?;
+            for (offset, precondition) in new_preconditions.iter().cloned().enumerate() {
+                let offset = u64::try_from(offset).map_err(|_| {
+                    anyhow!("CoreStore transaction precondition ordinal exceeds u64")
+                })?;
+                let ordinal = first_ordinal.checked_add(offset).ok_or_else(|| {
+                    anyhow!("CoreStore transaction precondition ordinal overflow")
+                })?;
+                preconditions.push(CoreTransactionPreconditionRow {
+                    ordinal,
+                    visible_update_boundary,
+                    precondition,
+                    revalidate_at_publication: true,
+                });
+            }
+            self.complete_transaction_rows_as_coremeta_ops_unlocked(transaction, &preconditions)
+                .await?
+        };
         let ops = borrow_owned_coremeta_batch_ops(&owned_ops);
-        self.commit_coremeta_batch_by_embedded_roots(
-            &format!("explicit-transaction:{}", transaction.transaction_id),
-            &ops,
-        )
-        .await?;
+        self.meta.write_local_committed_batch(&ops)?;
         Ok(())
     }
 
@@ -313,6 +417,7 @@ impl CoreStore {
         &self,
         transaction: &CoreTransaction,
         new_preconditions: &[CoreMutationPrecondition],
+        revalidate_at_publication: bool,
     ) -> Result<Vec<OwnedCoreMetaBatchOp>> {
         validate_transaction_root_scope(transaction)?;
         validate_logical_id(&transaction.transaction_id, "transaction id")?;
@@ -372,13 +477,31 @@ impl CoreStore {
             let row = self
                 .transaction_update_row_from_update(transaction, ordinal, update)
                 .await?;
+            let payload = encode_transaction_update_row(transaction, ordinal, &row)?;
             owned_ops.push(OwnedCoreMetaBatchOp::Put {
                 cf: CF_TRANSACTIONS,
                 table_id: TABLE_EXPLICIT_TRANSACTION_ROW,
                 tuple_key: transaction_update_tuple_key(&transaction.transaction_id, ordinal)?,
-                payload: encode_transaction_update_row(transaction, ordinal, &row)?,
+                payload: payload.clone(),
                 common: None,
             });
+            if matches!(
+                transaction.state,
+                CoreTransactionState::Open | CoreTransactionState::Prepared
+            ) && let CoreTransactionUpdate::StreamAppend { stream_id, .. } = update
+            {
+                owned_ops.push(OwnedCoreMetaBatchOp::Put {
+                    cf: CF_TRANSACTIONS,
+                    table_id: TABLE_EXPLICIT_TRANSACTION_ROW,
+                    tuple_key: pending_transaction_stream_key(
+                        stream_id,
+                        &transaction.transaction_id,
+                        ordinal,
+                    ),
+                    payload,
+                    common: None,
+                });
+            }
         }
 
         for (offset, precondition) in new_preconditions.iter().enumerate() {
@@ -390,11 +513,88 @@ impl CoreStore {
                     &transaction.transaction_id,
                     ordinal,
                 )?,
-                payload: encode_transaction_precondition_row(transaction, ordinal, precondition)?,
+                payload: encode_transaction_precondition_row(
+                    transaction,
+                    ordinal,
+                    existing_update_count,
+                    precondition,
+                    revalidate_at_publication,
+                )?,
                 common: None,
             });
         }
 
+        Ok(owned_ops)
+    }
+
+    pub(super) async fn complete_transaction_rows_as_coremeta_ops_unlocked(
+        &self,
+        transaction: &CoreTransaction,
+        preconditions: &[CoreTransactionPreconditionRow],
+    ) -> Result<Vec<OwnedCoreMetaBatchOp>> {
+        validate_transaction_root_scope(transaction)?;
+        validate_logical_id(&transaction.transaction_id, "transaction id")?;
+        let visible_update_count = u64::try_from(transaction.visible_updates.len())
+            .map_err(|_| anyhow!("CoreStore transaction has too many staged updates"))?;
+        let precondition_count = u64::try_from(preconditions.len())
+            .map_err(|_| anyhow!("CoreStore transaction has too many staged preconditions"))?;
+        let mut owned_ops = vec![OwnedCoreMetaBatchOp::Put {
+            cf: CF_TRANSACTIONS,
+            table_id: TABLE_EXPLICIT_TRANSACTION_ROW,
+            tuple_key: transaction_header_tuple_key(&transaction.transaction_id)?,
+            payload: encode_transaction_header_row(
+                transaction,
+                visible_update_count,
+                precondition_count,
+            )?,
+            common: None,
+        }];
+        for (ordinal, update) in transaction.visible_updates.iter().enumerate() {
+            let ordinal = u64::try_from(ordinal)
+                .map_err(|_| anyhow!("CoreStore transaction update ordinal exceeds u64"))?;
+            let row = self
+                .transaction_update_row_from_update(transaction, ordinal, update)
+                .await?;
+            owned_ops.push(OwnedCoreMetaBatchOp::Put {
+                cf: CF_TRANSACTIONS,
+                table_id: TABLE_EXPLICIT_TRANSACTION_ROW,
+                tuple_key: transaction_update_tuple_key(&transaction.transaction_id, ordinal)?,
+                payload: encode_transaction_update_row(transaction, ordinal, &row)?,
+                common: None,
+            });
+            if let CoreTransactionUpdate::StreamAppend { stream_id, .. } = update {
+                owned_ops.push(OwnedCoreMetaBatchOp::Delete {
+                    cf: CF_TRANSACTIONS,
+                    table_id: TABLE_EXPLICIT_TRANSACTION_ROW,
+                    tuple_key: pending_transaction_stream_key(
+                        stream_id,
+                        &transaction.transaction_id,
+                        ordinal,
+                    ),
+                    common: None,
+                });
+            }
+        }
+        for (ordinal, precondition) in preconditions.iter().enumerate() {
+            let ordinal = u64::try_from(ordinal)
+                .map_err(|_| anyhow!("CoreStore transaction precondition ordinal exceeds u64"))?;
+            owned_ops.push(OwnedCoreMetaBatchOp::Put {
+                cf: CF_TRANSACTIONS,
+                table_id: TABLE_EXPLICIT_TRANSACTION_ROW,
+                tuple_key: transaction_precondition_tuple_key(
+                    &transaction.transaction_id,
+                    ordinal,
+                )?,
+                payload: encode_transaction_precondition_row(
+                    transaction,
+                    ordinal,
+                    precondition.visible_update_boundary,
+                    &precondition.precondition,
+                    precondition.revalidate_at_publication,
+                )?,
+                common: None,
+            });
+        }
         Ok(owned_ops)
     }
 
@@ -432,7 +632,7 @@ impl CoreStore {
             return Ok(None);
         };
         let update_rows = self
-            .read_transaction_update_rows_unlocked(transaction_id)
+            .read_transaction_update_rows_unlocked(&header.transaction, header.visible_update_count)
             .await?;
         let mut updates_by_ordinal = BTreeMap::new();
         for row in update_rows {
@@ -465,7 +665,17 @@ impl CoreStore {
         &self,
         transaction_id: &str,
     ) -> Result<Option<CoreTransactionHeaderRow>> {
-        let Some(payload) = self.meta.get(
+        self.read_transaction_header_row_unlocked_from(&self.meta, transaction_id)
+    }
+
+    pub(super) fn read_transaction_header_row_unlocked_from<R: CoreMetaReader>(
+        &self,
+        reader: &R,
+        transaction_id: &str,
+    ) -> Result<Option<CoreTransactionHeaderRow>> {
+        // Transaction headers coordinate staged state and are themselves an
+        // input to publication visibility, so they must be read physically.
+        let Some(payload) = reader.get(
             CF_TRANSACTIONS,
             TABLE_EXPLICIT_TRANSACTION_ROW,
             &transaction_header_tuple_key(transaction_id)?,
@@ -481,17 +691,75 @@ impl CoreStore {
 
     async fn read_transaction_update_rows_unlocked(
         &self,
-        transaction_id: &str,
+        transaction: &CoreTransaction,
+        visible_update_count: u64,
     ) -> Result<Vec<CoreTransactionStagedUpdateRow>> {
-        self.meta
-            .scan_prefix(
-                CF_TRANSACTIONS,
-                TABLE_EXPLICIT_TRANSACTION_ROW,
-                &transaction_update_tuple_prefix(transaction_id)?,
-            )?
-            .into_iter()
-            .map(|record| decode_transaction_update_row(&record.payload, transaction_id))
-            .collect()
+        let capacity = usize::try_from(visible_update_count)
+            .map_err(|_| anyhow!("CoreStore transaction update count exceeds usize"))?;
+        let mut rows = Vec::with_capacity(capacity);
+        // Staged update rows are local transaction state, not published product
+        // rows; commit must inspect them before a root can become visible.
+        for ordinal in 0..visible_update_count {
+            let payload = self
+                .meta
+                .get(
+                    CF_TRANSACTIONS,
+                    TABLE_EXPLICIT_TRANSACTION_ROW,
+                    &transaction_update_tuple_key(&transaction.transaction_id, ordinal)?,
+                )?
+                .ok_or_else(|| anyhow!("CoreStore transaction staged update row is missing"))?;
+            rows.push(decode_transaction_update_row(&payload, transaction)?);
+        }
+        Ok(rows)
+    }
+
+    pub(super) async fn read_transaction_preconditions_unlocked(
+        &self,
+        transaction_id: &str,
+    ) -> Result<Vec<CoreTransactionPreconditionRow>> {
+        let Some(header) = self.read_transaction_header_row_unlocked(transaction_id)? else {
+            return Ok(Vec::new());
+        };
+        let capacity = usize::try_from(header.precondition_count)
+            .map_err(|_| anyhow!("CoreStore transaction precondition count exceeds usize"))?;
+        let mut rows = Vec::with_capacity(capacity);
+        // Preconditions are local staging inputs that commit must revalidate
+        // even though their transaction has not yet been published.
+        for ordinal in 0..header.precondition_count {
+            let payload = self
+                .meta
+                .get(
+                    CF_TRANSACTIONS,
+                    TABLE_EXPLICIT_TRANSACTION_ROW,
+                    &transaction_precondition_tuple_key(transaction_id, ordinal)?,
+                )?
+                .ok_or_else(|| anyhow!("CoreStore transaction precondition row is missing"))?;
+            rows.push(decode_transaction_precondition_row(
+                &payload,
+                &header.transaction,
+            )?);
+        }
+        rows.sort_by_key(|row| row.ordinal);
+        if rows
+            .iter()
+            .enumerate()
+            .any(|(ordinal, row)| row.ordinal != ordinal as u64)
+        {
+            bail!("CoreStore transaction precondition ordinals are not contiguous");
+        }
+        if rows
+            .iter()
+            .any(|row| row.visible_update_boundary > header.visible_update_count)
+        {
+            bail!("CoreStore transaction precondition boundary exceeds staged update count");
+        }
+        if rows
+            .windows(2)
+            .any(|rows| rows[0].visible_update_boundary > rows[1].visible_update_boundary)
+        {
+            bail!("CoreStore transaction precondition boundaries are not monotonic");
+        }
+        Ok(rows)
     }
 
     async fn transaction_update_row_from_update(
@@ -502,13 +770,27 @@ impl CoreStore {
     ) -> Result<CoreTransactionUpdateRow> {
         Ok(match update {
             CoreTransactionUpdate::StreamAppend {
+                partition_id,
                 stream_id,
+                record_kind,
+                payload,
+                idempotency_key_hash,
                 visible_sequence,
+                previous_event_hash,
                 prepared_record_hash,
+                created_at,
             } => CoreTransactionUpdateRow::StreamAppend {
+                partition_id: partition_id.clone(),
                 stream_id: stream_id.clone(),
+                record_kind: record_kind.clone(),
+                payload_ref: self
+                    .transaction_payload_ref(transaction, ordinal, payload)
+                    .await?,
+                idempotency_key_hash: idempotency_key_hash.clone(),
                 visible_sequence: *visible_sequence,
+                previous_event_hash: previous_event_hash.clone(),
                 prepared_record_hash: prepared_record_hash.clone(),
+                created_at: created_at.clone(),
             },
             CoreTransactionUpdate::CoreMetaPut {
                 cf,
@@ -600,14 +882,29 @@ impl CoreStore {
     ) -> Result<CoreTransactionUpdate> {
         Ok(match row.update {
             CoreTransactionUpdateRow::StreamAppend {
+                partition_id,
                 stream_id,
+                record_kind,
+                payload_ref,
+                idempotency_key_hash,
                 visible_sequence,
+                previous_event_hash,
                 prepared_record_hash,
-            } => CoreTransactionUpdate::StreamAppend {
-                stream_id,
-                visible_sequence,
-                prepared_record_hash,
-            },
+                created_at,
+            } => {
+                let payload = self.read_transaction_payload_ref(payload_ref).await?;
+                CoreTransactionUpdate::StreamAppend {
+                    partition_id,
+                    stream_id,
+                    record_kind,
+                    payload,
+                    idempotency_key_hash,
+                    visible_sequence,
+                    previous_event_hash,
+                    prepared_record_hash,
+                    created_at,
+                }
+            }
             CoreTransactionUpdateRow::CoreMetaPut {
                 cf,
                 table_id,
@@ -698,25 +995,16 @@ fn encode_transaction_header_row(
 ) -> Result<Vec<u8>> {
     validate_transaction_root_scope(transaction)?;
     validate_logical_id(&transaction.transaction_id, "transaction id")?;
-    let root_generation = transaction
-        .committed_root_generation
-        .unwrap_or_else(|| generation_for_transaction_state(transaction.state));
+    validate_transaction_writer_families(&transaction.writer_families)?;
     encode_message(CoreTransactionHeaderRowProto {
-        common: Some(CoreMetaRowCommonProto {
-            realm_id: transaction.committed_by_principal.clone(),
-            root_key_hash: transaction.root_key_hash.clone(),
-            root_generation,
-            transaction_id: transaction.transaction_id.clone(),
-            visibility_state: visibility_for_transaction_state(transaction.state) as i32,
-            created_at_unix_nanos: transaction.created_at_unix_nanos,
-            payload_schema_version: 1,
-        }),
+        common: Some(transaction_row_common(transaction)?),
         schema: CORE_TRANSACTION_HEADER_ROW_SCHEMA.to_string(),
         transaction_id: transaction.transaction_id.clone(),
         scope_partition: transaction.scope_partition.clone(),
         state: transaction_state_to_proto(transaction.state) as i32,
         preconditions_hash: transaction.preconditions_hash.clone(),
         operations_hash: transaction.operations_hash.clone(),
+        writer_families: transaction.writer_families.clone(),
         visible_update_count,
         precondition_count,
         finalisation_error: transaction.finalisation_error.clone(),
@@ -790,6 +1078,7 @@ fn decode_transaction_header_row(
         state: transaction_state_from_proto(proto.state)?,
         preconditions_hash: proto.preconditions_hash,
         operations_hash: proto.operations_hash,
+        writer_families: proto.writer_families,
         visible_updates: Vec::new(),
         finalisation_error: proto.finalisation_error,
         committed_at: proto.committed_at,
@@ -804,6 +1093,7 @@ fn decode_transaction_header_row(
         outcome: proto.outcome,
     };
     validate_transaction_root_scope(&transaction)?;
+    validate_transaction_writer_families(&transaction.writer_families)?;
     validate_transaction_header_common(&transaction, &common)?;
     Ok(CoreTransactionHeaderRow {
         transaction,
@@ -819,17 +1109,7 @@ fn encode_transaction_update_row(
 ) -> Result<Vec<u8>> {
     validate_logical_id(&transaction.transaction_id, "transaction id")?;
     encode_message(CoreTransactionStagedUpdateRowProto {
-        common: Some(CoreMetaRowCommonProto {
-            realm_id: transaction.committed_by_principal.clone(),
-            root_key_hash: transaction.root_key_hash.clone(),
-            root_generation: transaction
-                .committed_root_generation
-                .unwrap_or_else(|| generation_for_transaction_state(transaction.state)),
-            transaction_id: transaction.transaction_id.clone(),
-            visibility_state: visibility_for_transaction_state(transaction.state) as i32,
-            created_at_unix_nanos: transaction.created_at_unix_nanos,
-            payload_schema_version: 1,
-        }),
+        common: Some(transaction_row_common(transaction)?),
         schema: CORE_TRANSACTION_STAGED_UPDATE_ROW_SCHEMA.to_string(),
         transaction_id: transaction.transaction_id.clone(),
         ordinal,
@@ -841,40 +1121,25 @@ fn validate_transaction_header_common(
     transaction: &CoreTransaction,
     common: &CoreMetaRowCommonProto,
 ) -> Result<()> {
-    if common.root_key_hash != transaction.root_key_hash
-        || common.transaction_id != transaction.transaction_id
-    {
-        bail!("CoreStore transaction header CoreMeta common scope mismatch");
-    }
-    if common.visibility_state_enum() != visibility_for_transaction_state(transaction.state) {
-        bail!("CoreStore transaction header CoreMeta visibility mismatch");
-    }
-    if let Some(committed_root_generation) = transaction.committed_root_generation {
-        if common.root_generation != committed_root_generation {
-            bail!("CoreStore transaction header committed root generation mismatch");
-        }
-    }
-    if common.root_generation == 0 {
-        bail!("CoreStore transaction header rooted rows must use a non-zero root generation");
-    }
-    Ok(())
+    validate_transaction_row_common(transaction, common)
 }
 
 fn decode_transaction_update_row(
     bytes: &[u8],
-    expected_transaction_id: &str,
+    transaction: &CoreTransaction,
 ) -> Result<CoreTransactionStagedUpdateRow> {
     let proto = CoreTransactionStagedUpdateRowProto::decode(bytes)?;
     ensure_message_round_trips(&proto, bytes, "CoreStore transaction staged update row")?;
     if proto.schema != CORE_TRANSACTION_STAGED_UPDATE_ROW_SCHEMA {
         bail!("CoreStore transaction staged update row has invalid schema");
     }
-    if proto.transaction_id != expected_transaction_id {
+    if proto.transaction_id != transaction.transaction_id {
         bail!("CoreStore transaction staged update row scope mismatch");
     }
-    proto.common.as_ref().ok_or_else(|| {
+    let common = proto.common.as_ref().ok_or_else(|| {
         anyhow!("CoreStore transaction staged update row missing CoreMeta common")
     })?;
+    validate_transaction_row_common(transaction, common)?;
     Ok(CoreTransactionStagedUpdateRow {
         ordinal: proto.ordinal,
         update: transaction_update_from_proto(
@@ -888,25 +1153,45 @@ fn decode_transaction_update_row(
 fn encode_transaction_precondition_row(
     transaction: &CoreTransaction,
     ordinal: u64,
+    visible_update_boundary: u64,
     precondition: &CoreMutationPrecondition,
+    revalidate_at_publication: bool,
 ) -> Result<Vec<u8>> {
     validate_logical_id(&transaction.transaction_id, "transaction id")?;
     encode_message(CoreTransactionPreconditionRowProto {
-        common: Some(CoreMetaRowCommonProto {
-            realm_id: transaction.committed_by_principal.clone(),
-            root_key_hash: transaction.root_key_hash.clone(),
-            root_generation: transaction
-                .committed_root_generation
-                .unwrap_or_else(|| generation_for_transaction_state(transaction.state)),
-            transaction_id: transaction.transaction_id.clone(),
-            visibility_state: visibility_for_transaction_state(transaction.state) as i32,
-            created_at_unix_nanos: transaction.created_at_unix_nanos,
-            payload_schema_version: 1,
-        }),
+        common: Some(transaction_row_common(transaction)?),
         schema: CORE_TRANSACTION_PRECONDITION_ROW_SCHEMA.to_string(),
         transaction_id: transaction.transaction_id.clone(),
         ordinal,
         precondition: Some(mutation_precondition_to_proto(precondition)?),
+        visible_update_boundary,
+        revalidate_at_publication,
+    })
+}
+
+fn decode_transaction_precondition_row(
+    bytes: &[u8],
+    transaction: &CoreTransaction,
+) -> Result<CoreTransactionPreconditionRow> {
+    let proto = CoreTransactionPreconditionRowProto::decode(bytes)?;
+    ensure_message_round_trips(&proto, bytes, "CoreStore transaction precondition row")?;
+    if proto.schema != CORE_TRANSACTION_PRECONDITION_ROW_SCHEMA
+        || proto.transaction_id != transaction.transaction_id
+    {
+        bail!("CoreStore transaction precondition row scope mismatch");
+    }
+    let common = proto
+        .common
+        .as_ref()
+        .ok_or_else(|| anyhow!("CoreStore transaction precondition row missing CoreMeta common"))?;
+    validate_transaction_row_common(transaction, common)?;
+    Ok(CoreTransactionPreconditionRow {
+        ordinal: proto.ordinal,
+        visible_update_boundary: proto.visible_update_boundary,
+        precondition: mutation_precondition_from_proto(proto.precondition.ok_or_else(|| {
+            anyhow!("CoreStore transaction precondition row is missing precondition")
+        })?)?,
+        revalidate_at_publication: proto.revalidate_at_publication,
     })
 }
 
@@ -915,14 +1200,26 @@ fn transaction_update_to_proto(
 ) -> Result<CoreTransactionUpdateRowProto> {
     let kind = match update {
         CoreTransactionUpdateRow::StreamAppend {
+            partition_id,
             stream_id,
+            record_kind,
+            payload_ref,
+            idempotency_key_hash,
             visible_sequence,
+            previous_event_hash,
             prepared_record_hash,
+            created_at,
         } => {
             transaction_update_row_proto::Kind::StreamAppend(CoreTransactionStreamAppendRowProto {
                 stream_id: stream_id.clone(),
                 visible_sequence: *visible_sequence,
                 prepared_record_hash: prepared_record_hash.clone(),
+                partition_id: partition_id.clone(),
+                record_kind: record_kind.clone(),
+                payload_ref: Some(payload_ref_to_proto(payload_ref)?),
+                idempotency_key_hash: idempotency_key_hash.clone(),
+                previous_event_hash: previous_event_hash.clone(),
+                created_at: created_at.clone(),
             })
         }
         CoreTransactionUpdateRow::CoreMetaPut {
@@ -967,9 +1264,17 @@ fn transaction_update_from_proto(
         {
             transaction_update_row_proto::Kind::StreamAppend(value) => {
                 CoreTransactionUpdateRow::StreamAppend {
+                    partition_id: value.partition_id,
                     stream_id: value.stream_id,
+                    record_kind: value.record_kind,
+                    payload_ref: payload_ref_from_proto(value.payload_ref.ok_or_else(|| {
+                        anyhow!("CoreStore transaction staged stream append is missing payload ref")
+                    })?)?,
+                    idempotency_key_hash: value.idempotency_key_hash,
                     visible_sequence: value.visible_sequence,
+                    previous_event_hash: value.previous_event_hash,
                     prepared_record_hash: value.prepared_record_hash,
+                    created_at: value.created_at,
                 }
             }
             transaction_update_row_proto::Kind::CoreMetaPut(value) => {
@@ -1090,6 +1395,21 @@ fn mutation_precondition_to_proto(
                 require_present: *require_present,
             },
         ),
+        CoreMutationPrecondition::CoreMetaLease {
+            cf,
+            table_id,
+            tuple_key,
+            expected_payload_hash,
+            expires_at_unix_nanos,
+        } => mutation_precondition_row_proto::Kind::CoreMetaLease(
+            CoreMutationCoreMetaLeasePreconditionRowProto {
+                cf: canonical_coremeta_cf_name(cf)?.to_string(),
+                table_id: u32::from(*table_id),
+                tuple_key: tuple_key.clone(),
+                expected_payload_hash: expected_payload_hash.clone(),
+                expires_at_unix_nanos: *expires_at_unix_nanos,
+            },
+        ),
         CoreMutationPrecondition::StreamHead {
             stream_id,
             expected_last_sequence,
@@ -1103,6 +1423,54 @@ fn mutation_precondition_to_proto(
         ),
     };
     Ok(CoreMutationPreconditionRowProto { kind: Some(kind) })
+}
+
+fn mutation_precondition_from_proto(
+    precondition: CoreMutationPreconditionRowProto,
+) -> Result<CoreMutationPrecondition> {
+    Ok(
+        match precondition
+            .kind
+            .ok_or_else(|| anyhow!("CoreStore transaction precondition kind is missing"))?
+        {
+            mutation_precondition_row_proto::Kind::Fence(value) => {
+                CoreMutationPrecondition::Fence {
+                    fence_name: value.fence_name,
+                    fence_token: value.fence_token,
+                }
+            }
+            mutation_precondition_row_proto::Kind::StreamHead(value) => {
+                CoreMutationPrecondition::StreamHead {
+                    stream_id: value.stream_id,
+                    expected_last_sequence: value.expected_last_sequence,
+                    expected_last_event_hash: value.expected_last_event_hash,
+                }
+            }
+            mutation_precondition_row_proto::Kind::CoreMetaRow(value) => {
+                CoreMutationPrecondition::CoreMetaRow {
+                    cf: canonical_coremeta_cf_name(&value.cf)?.to_string(),
+                    table_id: u16::try_from(value.table_id).map_err(|_| {
+                        anyhow!("CoreStore transaction precondition table exceeds u16")
+                    })?,
+                    tuple_key: value.tuple_key,
+                    expected_payload_hash: value.expected_payload_hash,
+                    require_absent: value.require_absent,
+                    require_present: value.require_present,
+                }
+            }
+            mutation_precondition_row_proto::Kind::CoreMetaLease(value) => {
+                CoreMutationPrecondition::CoreMetaLease {
+                    cf: canonical_coremeta_cf_name(&value.cf)?.to_string(),
+                    table_id: u16::try_from(value.table_id).map_err(|_| {
+                        anyhow!("CoreStore transaction lease precondition table exceeds u16")
+                    })?,
+                    tuple_key: value.tuple_key,
+                    expected_payload_hash: value.expected_payload_hash,
+                    expires_at_unix_nanos: value.expires_at_unix_nanos,
+                }
+            }
+        },
+    )
 }
 
 fn fence_precondition_to_proto(value: &CoreFencePrecondition) -> CoreFencePreconditionRowProto {
@@ -1119,15 +1487,6 @@ fn transaction_header_tuple_key(transaction_id: &str) -> Result<Vec<u8>> {
         CoreMetaTuplePart::Utf8("transaction"),
         CoreMetaTuplePart::Utf8(transaction_id),
         CoreMetaTuplePart::Utf8("header"),
-    ])
-}
-
-fn transaction_update_tuple_prefix(transaction_id: &str) -> Result<Vec<u8>> {
-    validate_logical_id(transaction_id, "transaction id")?;
-    core_meta_tuple_key(&[
-        CoreMetaTuplePart::Utf8("transaction"),
-        CoreMetaTuplePart::Utf8(transaction_id),
-        CoreMetaTuplePart::Utf8("update"),
     ])
 }
 
@@ -1198,16 +1557,83 @@ fn visibility_for_transaction_state(state: CoreTransactionState) -> CoreMetaVisi
     }
 }
 
-fn generation_for_transaction_state(state: CoreTransactionState) -> u64 {
-    match state {
-        CoreTransactionState::Open | CoreTransactionState::Prepared => 1,
-        CoreTransactionState::Committed => 2,
-        CoreTransactionState::FinalisationFailed
-        | CoreTransactionState::Aborted
-        | CoreTransactionState::RolledBack
-        | CoreTransactionState::Expired
-        | CoreTransactionState::Failed => 3,
+fn transaction_row_common(transaction: &CoreTransaction) -> Result<CoreMetaRowCommonProto> {
+    let (root_key_hash, root_generation) = if transaction.state == CoreTransactionState::Committed {
+        (
+            transaction.root_key_hash.clone(),
+            transaction.committed_root_generation.ok_or_else(|| {
+                anyhow!("CoreStore committed transaction is missing its root generation")
+            })?,
+        )
+    } else {
+        if transaction.committed_root_generation.is_some() {
+            bail!("CoreStore unpublished transaction must not name a root generation");
+        }
+        (String::new(), 0)
+    };
+    Ok(CoreMetaRowCommonProto {
+        realm_id: transaction.committed_by_principal.clone(),
+        root_key_hash,
+        root_generation,
+        transaction_id: transaction.transaction_id.clone(),
+        visibility_state: visibility_for_transaction_state(transaction.state) as i32,
+        created_at_unix_nanos: transaction.created_at_unix_nanos,
+        payload_schema_version: 1,
+    })
+}
+
+fn validate_transaction_row_common(
+    transaction: &CoreTransaction,
+    common: &CoreMetaRowCommonProto,
+) -> Result<()> {
+    if common.realm_id != transaction.committed_by_principal
+        || common.transaction_id != transaction.transaction_id
+        || common.visibility_state_enum() != visibility_for_transaction_state(transaction.state)
+    {
+        bail!("CoreStore transaction row CoreMeta common metadata mismatch");
     }
+    if transaction.state == CoreTransactionState::Committed {
+        let committed_root_generation = transaction.committed_root_generation.ok_or_else(|| {
+            anyhow!("CoreStore committed transaction is missing its root generation")
+        })?;
+        if common.root_key_hash != transaction.root_key_hash
+            || common.root_generation != committed_root_generation
+            || committed_root_generation == 0
+        {
+            bail!("CoreStore committed transaction row root scope mismatch");
+        }
+    } else if !common.root_key_hash.is_empty()
+        || common.root_generation != 0
+        || transaction.committed_root_generation.is_some()
+    {
+        bail!("CoreStore unpublished transaction row must not claim a visible root generation");
+    }
+    Ok(())
+}
+
+fn validate_transaction_writer_families(writer_families: &[String]) -> Result<()> {
+    if writer_families.is_empty() {
+        bail!("CoreStore transaction must declare at least one writer family");
+    }
+    let mut canonical = writer_families.to_vec();
+    canonical.sort();
+    canonical.dedup();
+    if canonical != writer_families {
+        bail!("CoreStore transaction writer families must be sorted and unique");
+    }
+    if writer_families
+        .iter()
+        .any(|family| WriterFamily::from_name(family).is_none())
+    {
+        bail!("CoreStore transaction names an unknown writer family");
+    }
+    if !writer_families
+        .iter()
+        .any(|family| family == WriterFamily::CoreControl.as_str())
+    {
+        bail!("CoreStore transaction writer families must include core_control");
+    }
+    Ok(())
 }
 
 fn transaction_updates_have_prefix(

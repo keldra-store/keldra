@@ -12,8 +12,8 @@ use crate::formats::{
     },
 };
 use crate::personaldb_coremeta::{
-    list_personaldb_data_locator_rows, read_personaldb_data_locator_bytes,
-    read_personaldb_data_locator_row,
+    PERSONALDB_DATA_LOCATOR_PAGE_MAX, list_personaldb_data_locator_rows,
+    read_personaldb_data_locator_bytes, read_personaldb_data_locator_row,
     write_personaldb_logical_file_as_data_locator_with_preconditions,
 };
 use crate::storage::Storage;
@@ -179,7 +179,8 @@ pub async fn read_personaldb_log_segment(
     segment_ref: &str,
 ) -> Result<DecodedPersonalDbLogSegment> {
     let (tenant_id, database_id) = personaldb_log_segment_ref_scope(segment_ref)?;
-    let row = read_personaldb_data_locator_row(storage, tenant_id, &database_id, segment_ref)?
+    let row = read_personaldb_data_locator_row(storage, tenant_id, &database_id, segment_ref)
+        .await?
         .ok_or_else(|| anyhow!("personaldb log segment CoreMeta row is missing"))?;
     if row.data_kind != "log_segment" {
         return Err(anyhow!(
@@ -196,11 +197,28 @@ pub async fn list_personaldb_log_segment_refs(
     database_id: &str,
 ) -> Result<Vec<String>> {
     let prefix = personaldb_log_segment_ref_prefix(tenant_id, database_id)?;
-    let mut refs = list_personaldb_data_locator_rows(storage, tenant_id, database_id)?
-        .into_iter()
-        .filter(|row| row.data_kind == "log_segment" && row.data_id.starts_with(&prefix))
-        .map(|row| row.data_id)
-        .collect::<Vec<_>>();
+    let mut refs = Vec::new();
+    let mut after_tuple_key = None;
+    loop {
+        let page = list_personaldb_data_locator_rows(
+            storage,
+            tenant_id,
+            database_id,
+            after_tuple_key.as_deref(),
+            PERSONALDB_DATA_LOCATOR_PAGE_MAX,
+        )
+        .await?;
+        refs.extend(
+            page.rows
+                .into_iter()
+                .filter(|row| row.data_kind == "log_segment" && row.data_id.starts_with(&prefix))
+                .map(|row| row.data_id),
+        );
+        let Some(next_tuple_key) = page.next_tuple_key else {
+            break;
+        };
+        after_tuple_key = Some(next_tuple_key);
+    }
     refs.sort();
     Ok(refs)
 }
@@ -582,6 +600,7 @@ mod tests {
         .await
         .unwrap();
         let row = read_personaldb_data_locator_row(&storage, 9, "db-alpha", &segment_ref)
+            .await
             .unwrap()
             .expect("segment CoreMeta row exists");
         let mut bytes = read_personaldb_data_locator_bytes(&storage, &row)

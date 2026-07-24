@@ -1,14 +1,18 @@
 use crate::{
     core_store::{
         CF_MATERIALISATION, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaStore, CoreMetaTuplePart,
+        CoreMetaVisibilityState, CoreMutationBatch, CoreMutationOperation,
+        CoreMutationPrecondition, CoreMutationRootPublication, CoreStore, CoreTransactionState,
         TABLE_MATERIALISATION_CURSOR_ROW, TABLE_WATCH_CHECKPOINT_ROW,
-        commit_coremeta_batch_for_storage, core_meta_committed_row_common, core_meta_root_key_hash,
-        core_meta_tuple_key, decode_deterministic_proto, encode_deterministic_proto,
+        commit_coremeta_batch_for_storage, core_meta_committed_row_common,
+        core_meta_payload_digest, core_meta_root_key_hash, core_meta_tuple_key,
+        core_mutation_publication_attempt_id, decode_deterministic_proto,
+        encode_deterministic_proto,
     },
     formats::hash32,
     partition_fence::{
-        OWNERSHIP_EXPIRED, OWNERSHIP_NOT_FOUND, OWNERSHIP_OWNER_MISMATCH, OWNERSHIP_STALE_FENCE,
-        OwnershipResource, OwnershipResourceKind, read_ownership_fence,
+        OWNERSHIP_OWNER_MISMATCH, OwnershipPrincipal, OwnershipResource, OwnershipResourceKind,
+        ownership_fence_precondition,
     },
     storage::Storage,
 };
@@ -20,6 +24,11 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
+
+const WATCH_CHECKPOINT_ROW_SCHEMA: &str = "anvil.coremeta.watch_checkpoint.v1";
+const WATCH_CHECKPOINT_LAG_ROW_SCHEMA: &str = "anvil.coremeta.watch_checkpoint_lag.v1";
+// CoreStore replaces this value and the empty transaction id before publication.
+const CORE_META_PUBLICATION_GENERATION_PLACEHOLDER: u64 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WatchCheckpoint {
@@ -101,6 +110,13 @@ pub struct WatchCheckpointWriteAuthority {
     pub owner_node_id: String,
     pub fence: u64,
     pub resource_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedWatchCheckpoint {
+    checkpoint: WatchCheckpoint,
+    current_payload: Option<Vec<u8>>,
+    ownership_precondition: CoreMutationPrecondition,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,16 +215,37 @@ pub async fn checkpoint_watch_consumer(
     update: WatchCheckpointUpdate,
     authority: WatchCheckpointWriteAuthority,
     signing_key: &[u8],
+    additional_preconditions: &[CoreMutationPrecondition],
 ) -> Result<WatchCheckpoint> {
+    let prepared = prepare_watch_checkpoint(storage, update, authority, signing_key).await?;
+    let checkpoint =
+        publish_prepared_watch_checkpoint(storage, &prepared, additional_preconditions).await?;
+    write_watch_checkpoint_lag_record(storage, &checkpoint).await?;
+    Ok(checkpoint)
+}
+
+pub(crate) async fn prepare_watch_checkpoint(
+    storage: &Storage,
+    update: WatchCheckpointUpdate,
+    authority: WatchCheckpointWriteAuthority,
+    signing_key: &[u8],
+) -> Result<PreparedWatchCheckpoint> {
     validate_update(&update)?;
-    validate_write_authority(storage, &update, &authority, signing_key).await?;
-    let existing = read_watch_checkpoint(
-        storage,
-        &update.watch_stream_id,
-        &update.consumer_id,
-        signing_key,
-    )
-    .await?;
+    let ownership_precondition =
+        validate_write_authority(storage, &update, &authority, signing_key).await?;
+    let store = CoreStore::new(storage.clone()).await?;
+    let current_payload = store.read_coremeta_row(
+        CF_MATERIALISATION,
+        TABLE_WATCH_CHECKPOINT_ROW,
+        &watch_checkpoint_tuple_key(&update.watch_stream_id, &update.consumer_id)?,
+    )?;
+    let existing = current_payload
+        .as_ref()
+        .map(|bytes| decode_watch_checkpoint_row(bytes))
+        .transpose()?;
+    if let Some(existing) = existing.as_ref() {
+        existing.verify(signing_key)?;
+    }
     if let Some(existing) = existing.as_ref() {
         if existing.cursor > update.cursor {
             return Err(anyhow!("watch checkpoint cursor cannot move backwards"));
@@ -252,9 +289,36 @@ pub async fn checkpoint_watch_consumer(
         checkpoint_signature: None,
     }
     .seal(signing_key)?;
-    write_watch_checkpoint(storage, &checkpoint).await?;
-    write_watch_checkpoint_lag_record(storage, &checkpoint).await?;
-    Ok(checkpoint)
+    Ok(PreparedWatchCheckpoint {
+        checkpoint,
+        current_payload,
+        ownership_precondition,
+    })
+}
+
+pub(crate) async fn publish_prepared_watch_checkpoint(
+    storage: &Storage,
+    prepared: &PreparedWatchCheckpoint,
+    additional_preconditions: &[CoreMutationPrecondition],
+) -> Result<WatchCheckpoint> {
+    let mut preconditions = Vec::with_capacity(additional_preconditions.len() + 1);
+    preconditions.push(prepared.ownership_precondition.clone());
+    preconditions.extend_from_slice(additional_preconditions);
+    write_watch_checkpoint(
+        storage,
+        &prepared.checkpoint,
+        prepared.current_payload.as_ref(),
+        &preconditions,
+    )
+    .await?;
+    Ok(prepared.checkpoint.clone())
+}
+
+pub(crate) async fn record_watch_checkpoint_lag(
+    storage: &Storage,
+    checkpoint: &WatchCheckpoint,
+) -> Result<()> {
+    write_watch_checkpoint_lag_record(storage, checkpoint).await
 }
 
 pub fn watch_checkpoint_resource_id(
@@ -273,8 +337,8 @@ pub async fn read_watch_checkpoint(
 ) -> Result<Option<WatchCheckpoint>> {
     require_safe_component(watch_stream_id, "watch_stream_id")?;
     require_safe_component(consumer_id, "consumer_id")?;
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
-    let Some(bytes) = meta.get(
+    let store = CoreStore::new(storage.clone()).await?;
+    let Some(bytes) = store.read_coremeta_row(
         CF_MATERIALISATION,
         TABLE_WATCH_CHECKPOINT_ROW,
         &watch_checkpoint_tuple_key(watch_stream_id, consumer_id)?,
@@ -297,6 +361,8 @@ pub fn read_watch_checkpoint_lag_record(
 ) -> Result<Option<WatchCheckpointLagRecord>> {
     require_safe_component(watch_stream_id, "watch_stream_id")?;
     require_safe_component(consumer_id, "consumer_id")?;
+    // Lag rows are node-local materialisation telemetry, not rooted product
+    // state, and must remain readable while a watcher recovers its checkpoint.
     let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
     meta.get(
         CF_MATERIALISATION,
@@ -312,7 +378,7 @@ async fn validate_write_authority(
     update: &WatchCheckpointUpdate,
     authority: &WatchCheckpointWriteAuthority,
     signing_key: &[u8],
-) -> Result<()> {
+) -> Result<CoreMutationPrecondition> {
     if authority.fence == 0 {
         return Err(anyhow!("watch checkpoint write fence must be nonzero"));
     }
@@ -335,32 +401,19 @@ async fn validate_write_authority(
         resource_kind: OwnershipResourceKind::WatchPartition,
         resource_id: authority.resource_id.clone(),
     };
-    let Some(record) = read_ownership_fence(storage, 0, &resource, signing_key).await? else {
-        return Err(anyhow!(
-            "{OWNERSHIP_NOT_FOUND}: watch checkpoint ownership fence is absent"
-        ));
-    };
     let now_nanos = chrono::Utc::now()
         .timestamp_nanos_opt()
         .ok_or_else(|| anyhow!("watch checkpoint timestamp overflow"))?;
-    if !record.is_active_unexpired(now_nanos) {
-        return Err(anyhow!(
-            "{OWNERSHIP_EXPIRED}: watch checkpoint ownership fence is not active"
-        ));
-    }
-    if record.owner.principal_id != authority.owner_node_id
-        || record.owner.actor_instance_id != authority.owner_node_id
-    {
-        return Err(anyhow!(
-            "{OWNERSHIP_OWNER_MISMATCH}: watch checkpoint ownership fence owner mismatch"
-        ));
-    }
-    if record.fence != authority.fence {
-        return Err(anyhow!(
-            "{OWNERSHIP_STALE_FENCE}: watch checkpoint ownership fence token mismatch"
-        ));
-    }
-    Ok(())
+    ownership_fence_precondition(
+        storage,
+        0,
+        &resource,
+        &OwnershipPrincipal::node(authority.owner_node_id.clone()),
+        authority.fence,
+        now_nanos,
+        signing_key,
+    )
+    .await
 }
 
 async fn write_watch_checkpoint_lag_record(
@@ -394,36 +447,79 @@ async fn write_watch_checkpoint_lag_record(
     };
     commit_coremeta_batch_for_storage(
         storage,
-        &format!(
-            "watch-checkpoint-lag:{}:{}:{}",
-            record.watch_stream_id, record.consumer_id, record.checkpoint_generation
-        ),
+        &format!("watch-checkpoint-lag:{}", record.checkpoint_hash),
         &[op],
+        &[],
     )
     .await?;
     Ok(())
 }
 
-async fn write_watch_checkpoint(storage: &Storage, checkpoint: &WatchCheckpoint) -> Result<()> {
+async fn write_watch_checkpoint(
+    storage: &Storage,
+    checkpoint: &WatchCheckpoint,
+    current_payload: Option<&Vec<u8>>,
+    additional_preconditions: &[CoreMutationPrecondition],
+) -> Result<()> {
+    let logical_id = watch_checkpoint_logical_id(checkpoint)?;
     let payload = encode_watch_checkpoint_row(checkpoint)?;
     let tuple_key =
         watch_checkpoint_tuple_key(&checkpoint.watch_stream_id, &checkpoint.consumer_id)?;
-    let op = CoreMetaBatchOp {
-        cf: CF_MATERIALISATION,
+    if let Some(current) = current_payload
+        && decode_watch_checkpoint_row(current)? == *checkpoint
+    {
+        return Ok(());
+    }
+    let mut preconditions = vec![CoreMutationPrecondition::CoreMetaRow {
+        cf: CF_MATERIALISATION.to_string(),
         table_id: TABLE_WATCH_CHECKPOINT_ROW,
-        tuple_key: &tuple_key,
-        common: None,
-        kind: CoreMetaBatchOpKind::Put(&payload),
-    };
-    commit_coremeta_batch_for_storage(
-        storage,
-        &format!(
-            "watch-checkpoint:{}:{}:{}",
-            checkpoint.watch_stream_id, checkpoint.consumer_id, checkpoint.generation
-        ),
-        &[op],
-    )
-    .await?;
+        tuple_key: tuple_key.clone(),
+        expected_payload_hash: current_payload
+            .map(|bytes| core_meta_payload_digest(TABLE_WATCH_CHECKPOINT_ROW, bytes)),
+        require_absent: current_payload.is_none(),
+        require_present: current_payload.is_some(),
+    }];
+    preconditions.extend_from_slice(additional_preconditions);
+    let transaction_id = core_mutation_publication_attempt_id(&logical_id, &preconditions)?;
+    let root_anchor =
+        watch_checkpoint_root_anchor_key(&checkpoint.watch_stream_id, &checkpoint.consumer_id);
+    let store = CoreStore::new(storage.clone()).await?;
+    let receipt = store
+        .commit_mutation_batch(CoreMutationBatch {
+            transaction_id,
+            scope_partition: checkpoint.partition_id.clone(),
+            committed_by_principal: format!("watch-consumer:{}", checkpoint.updated_by_node),
+            root_publications: vec![
+                CoreMutationRootPublication::new(
+                    checkpoint.partition_id.clone(),
+                    crate::formats::writer::WriterFamily::CoreControl.as_str(),
+                )
+                .coordinator(),
+                CoreMutationRootPublication::new(
+                    root_anchor,
+                    crate::formats::writer::WriterFamily::CoreControl.as_str(),
+                ),
+            ],
+            preconditions,
+            operations: vec![CoreMutationOperation::CoreMetaPut {
+                partition_id: checkpoint.partition_id.clone(),
+                cf: CF_MATERIALISATION.to_string(),
+                table_id: TABLE_WATCH_CHECKPOINT_ROW,
+                tuple_key,
+                payload,
+            }],
+        })
+        .await?;
+    if receipt.state != CoreTransactionState::Committed {
+        return Err(anyhow!(
+            "watch checkpoint publication {} did not commit: {}",
+            receipt.transaction_id,
+            receipt
+                .finalisation_error
+                .as_deref()
+                .unwrap_or("unknown finalisation failure")
+        ));
+    }
     Ok(())
 }
 
@@ -539,22 +635,9 @@ fn encode_watch_checkpoint_row(checkpoint: &WatchCheckpoint) -> Result<Vec<u8>> 
     if checkpoint.checkpoint_signature.is_none() {
         return Err(anyhow!("watch checkpoint row requires sealed checkpoint"));
     }
-    let checkpoint_hash = checkpoint
-        .checkpoint_hash
-        .clone()
-        .ok_or_else(|| anyhow!("sealed watch checkpoint is missing checkpoint hash"))?;
     Ok(encode_deterministic_proto(&WatchCheckpointRowProto {
-        common: Some(core_meta_committed_row_common(
-            "system",
-            core_meta_root_key_hash(&format!(
-                "watch-checkpoint/{}/{}",
-                checkpoint.watch_stream_id, checkpoint.consumer_id
-            )),
-            checkpoint.generation,
-            checkpoint_hash,
-            checkpoint.updated_at_nanos.max(0) as u64,
-        )),
-        schema: "anvil.coremeta.watch_checkpoint.v1".to_string(),
+        common: Some(watch_checkpoint_publication_candidate_common(checkpoint)),
+        schema: WATCH_CHECKPOINT_ROW_SCHEMA.to_string(),
         checkpoint_bytes: encode_watch_checkpoint(checkpoint),
     }))
 }
@@ -563,16 +646,13 @@ fn encode_watch_checkpoint_lag_record(record: &WatchCheckpointLagRecord) -> Resu
     validate_lag_record(record)?;
     Ok(encode_deterministic_proto(&WatchCheckpointLagRecordProto {
         common: Some(core_meta_committed_row_common(
-            "system",
-            core_meta_root_key_hash(&format!(
-                "watch-checkpoint/{}/{}",
-                record.watch_stream_id, record.consumer_id
-            )),
-            record.checkpoint_generation,
-            record.checkpoint_hash.clone(),
+            "",
+            "",
+            0,
+            "",
             record.updated_at_nanos.max(0) as u64,
         )),
-        schema: "anvil.coremeta.watch_checkpoint_lag.v1".to_string(),
+        schema: WATCH_CHECKPOINT_LAG_ROW_SCHEMA.to_string(),
         watch_stream_id: record.watch_stream_id.clone(),
         partition_family: record.partition_family.clone(),
         partition_id: record.partition_id.clone(),
@@ -618,13 +698,17 @@ fn decode_watch_checkpoint(bytes: &[u8]) -> Result<WatchCheckpoint> {
 
 fn decode_watch_checkpoint_row(bytes: &[u8]) -> Result<WatchCheckpoint> {
     let row = decode_deterministic_proto::<WatchCheckpointRowProto>(bytes, "watch checkpoint row")?;
-    if row.schema != "anvil.coremeta.watch_checkpoint.v1" {
+    if row.schema != WATCH_CHECKPOINT_ROW_SCHEMA {
         return Err(anyhow!("watch checkpoint row has invalid schema"));
     }
-    row.common
+    let common = row
+        .common
         .as_ref()
         .ok_or_else(|| anyhow!("watch checkpoint row missing CoreMeta common"))?;
-    decode_watch_checkpoint(&row.checkpoint_bytes)
+    let checkpoint = decode_watch_checkpoint(&row.checkpoint_bytes)?;
+    validate_unsigned_checkpoint(&checkpoint)?;
+    validate_watch_checkpoint_publication_common(&checkpoint, common)?;
+    Ok(checkpoint)
 }
 
 fn decode_watch_checkpoint_lag_record(bytes: &[u8]) -> Result<WatchCheckpointLagRecord> {
@@ -632,12 +716,12 @@ fn decode_watch_checkpoint_lag_record(bytes: &[u8]) -> Result<WatchCheckpointLag
         bytes,
         "watch checkpoint lag record",
     )?;
-    if proto.schema != "anvil.coremeta.watch_checkpoint_lag.v1" {
+    if proto.schema != WATCH_CHECKPOINT_LAG_ROW_SCHEMA {
         return Err(anyhow!("watch checkpoint lag record has invalid schema"));
     }
-    proto
+    let common = proto
         .common
-        .as_ref()
+        .clone()
         .ok_or_else(|| anyhow!("watch checkpoint lag row missing CoreMeta common"))?;
     let record = WatchCheckpointLagRecord {
         watch_stream_id: proto.watch_stream_id,
@@ -658,7 +742,77 @@ fn decode_watch_checkpoint_lag_record(bytes: &[u8]) -> Result<WatchCheckpointLag
         updated_at_nanos: proto.updated_at_nanos,
     };
     validate_lag_record(&record)?;
+    validate_watch_checkpoint_lag_common(&common)?;
     Ok(record)
+}
+
+fn watch_checkpoint_publication_candidate_common(
+    checkpoint: &WatchCheckpoint,
+) -> crate::core_store::CoreMetaRowCommonProto {
+    core_meta_committed_row_common(
+        "system",
+        watch_checkpoint_root_key_hash(&checkpoint.watch_stream_id, &checkpoint.consumer_id),
+        CORE_META_PUBLICATION_GENERATION_PLACEHOLDER,
+        "",
+        checkpoint.updated_at_nanos.max(0) as u64,
+    )
+}
+
+fn validate_watch_checkpoint_publication_common(
+    checkpoint: &WatchCheckpoint,
+    common: &crate::core_store::CoreMetaRowCommonProto,
+) -> Result<()> {
+    let expected_shape = watch_checkpoint_publication_candidate_common(checkpoint);
+    if common.realm_id != expected_shape.realm_id
+        || common.root_key_hash != expected_shape.root_key_hash
+        || common.root_generation == 0
+        || common.transaction_id.is_empty()
+        || common.visibility_state_enum() != CoreMetaVisibilityState::Committed
+        || common.payload_schema_version != expected_shape.payload_schema_version
+    {
+        return Err(anyhow!(
+            "watch checkpoint row has invalid rooted CoreMeta publication metadata"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_watch_checkpoint_lag_common(
+    common: &crate::core_store::CoreMetaRowCommonProto,
+) -> Result<()> {
+    let expected_shape = core_meta_committed_row_common("", "", 0, "", 0);
+    if !common.realm_id.is_empty()
+        || !common.root_key_hash.is_empty()
+        || common.root_generation != 0
+        || !common.transaction_id.is_empty()
+        || common.visibility_state_enum() != CoreMetaVisibilityState::Committed
+        || common.payload_schema_version != expected_shape.payload_schema_version
+    {
+        return Err(anyhow!(
+            "watch checkpoint lag row has invalid local CoreMeta metadata"
+        ));
+    }
+    Ok(())
+}
+
+fn watch_checkpoint_logical_id(checkpoint: &WatchCheckpoint) -> Result<String> {
+    let checkpoint_hash = checkpoint
+        .checkpoint_hash
+        .as_deref()
+        .ok_or_else(|| anyhow!("sealed watch checkpoint is missing checkpoint hash"))?;
+    validate_hex32(checkpoint_hash, "checkpoint_hash")?;
+    Ok(format!("watch-checkpoint:{checkpoint_hash}"))
+}
+
+fn watch_checkpoint_root_anchor_key(watch_stream_id: &str, consumer_id: &str) -> String {
+    format!("watch-checkpoint/{watch_stream_id}/{consumer_id}")
+}
+
+fn watch_checkpoint_root_key_hash(watch_stream_id: &str, consumer_id: &str) -> String {
+    core_meta_root_key_hash(&watch_checkpoint_root_anchor_key(
+        watch_stream_id,
+        consumer_id,
+    ))
 }
 
 fn watch_checkpoint_tuple_key(watch_stream_id: &str, consumer_id: &str) -> Result<Vec<u8>> {
@@ -672,10 +826,10 @@ fn watch_checkpoint_tuple_key(watch_stream_id: &str, consumer_id: &str) -> Resul
 }
 
 fn watch_checkpoint_lag_tuple_key(watch_stream_id: &str, consumer_id: &str) -> Result<Vec<u8>> {
-    tuple_key(&[
-        TuplePart::Str("watch_checkpoint_lag"),
-        TuplePart::Str(watch_stream_id),
-        TuplePart::Str(consumer_id),
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("watch_checkpoint_lag"),
+        CoreMetaTuplePart::Utf8(watch_stream_id),
+        CoreMetaTuplePart::Utf8(consumer_id),
     ])
 }
 
@@ -696,32 +850,6 @@ fn validate_lag_record(record: &WatchCheckpointLagRecord) -> Result<()> {
     Ok(())
 }
 
-enum TuplePart<'a> {
-    Str(&'a str),
-}
-
-fn tuple_key(parts: &[TuplePart<'_>]) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&(parts.len() as u16).to_le_bytes());
-    for part in parts {
-        match part {
-            TuplePart::Str(value) => {
-                if value.as_bytes().contains(&0) {
-                    return Err(anyhow!("CoreMeta tuple string part contains NUL"));
-                }
-                if value.len() > u16::MAX as usize {
-                    return Err(anyhow!("CoreMeta tuple string part exceeds u16 length"));
-                }
-                out.push(0x01);
-                out.push(0);
-                out.extend_from_slice(&(value.len() as u16).to_le_bytes());
-                out.extend_from_slice(value.as_bytes());
-            }
-        }
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -734,26 +862,29 @@ mod tests {
     const KEY: &[u8] = b"watch checkpoint signing key";
 
     #[tokio::test]
-    async fn watch_checkpoint_writes_reads_and_advances_cursor() {
+    async fn watch_checkpoint_separates_logical_generation_and_keeps_lag_node_local() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        let first_update = update(40, 1);
+        let first_update = update(40, 41);
         let first_authority = authority(&storage, &first_update).await;
-        let first = checkpoint_watch_consumer(&storage, first_update, first_authority, KEY)
+        let first = checkpoint_watch_consumer(&storage, first_update, first_authority, KEY, &[])
             .await
             .unwrap();
         assert_eq!(first.cursor, 40);
-        assert_eq!(first.generation, 1);
+        assert_eq!(first.generation, 41);
         assert!(first.checkpoint_hash.as_deref().unwrap().len() == 64);
         assert!(watch_checkpoint_tuple_key("object-prefix", "full-text-builder").is_ok());
+        let first_common = persisted_checkpoint_row(&storage).common.unwrap();
+        assert_eq!(first_common.root_generation, 1);
+        assert_ne!(first_common.root_generation, first.generation);
 
-        let second_update = update(75, 2);
+        let second_update = update(75, 99);
         let second_authority = authority(&storage, &second_update).await;
-        let second = checkpoint_watch_consumer(&storage, second_update, second_authority, KEY)
+        let second = checkpoint_watch_consumer(&storage, second_update, second_authority, KEY, &[])
             .await
             .unwrap();
         assert_eq!(second.cursor, 75);
-        assert_eq!(second.generation, 2);
+        assert_eq!(second.generation, 99);
         assert_eq!(
             read_watch_checkpoint(&storage, "object-prefix", "full-text-builder", KEY)
                 .await
@@ -761,12 +892,39 @@ mod tests {
                 .unwrap(),
             second
         );
+        let second_common = persisted_checkpoint_row(&storage).common.unwrap();
+        assert_eq!(second_common.root_generation, 2);
+        assert_ne!(second_common.root_generation, second.generation);
+        assert!(second_common.transaction_id.starts_with(&format!(
+            "{}:attempt:sha256:",
+            watch_checkpoint_logical_id(&second).unwrap()
+        )));
         let lag = read_watch_checkpoint_lag_record(&storage, "object-prefix", "full-text-builder")
             .unwrap()
             .unwrap();
         assert_eq!(lag.applied_cursor, 75);
         assert_eq!(lag.source_cursor_high, 80);
         assert_eq!(lag.lag_record_count_hint, 5);
+        let lag_common = persisted_lag_row(&storage).common.unwrap();
+        assert!(lag_common.realm_id.is_empty());
+        assert!(lag_common.root_key_hash.is_empty());
+        assert_eq!(lag_common.root_generation, 0);
+        assert!(lag_common.transaction_id.is_empty());
+        assert_eq!(
+            lag_common.visibility_state_enum(),
+            CoreMetaVisibilityState::Committed
+        );
+
+        let next_generation = CoreStore::new(storage.clone())
+            .await
+            .unwrap()
+            .next_root_generation_for_anchor(&watch_checkpoint_root_anchor_key(
+                "object-prefix",
+                "full-text-builder",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(next_generation, 3);
     }
 
     #[tokio::test]
@@ -775,15 +933,21 @@ mod tests {
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let first = update(40, 3);
         let first_authority = authority(&storage, &first).await;
-        checkpoint_watch_consumer(&storage, first, first_authority, KEY)
+        checkpoint_watch_consumer(&storage, first, first_authority, KEY, &[])
             .await
             .unwrap();
         let backwards_cursor = update(39, 4);
         let backwards_cursor_authority = authority(&storage, &backwards_cursor).await;
         assert!(
-            checkpoint_watch_consumer(&storage, backwards_cursor, backwards_cursor_authority, KEY)
-                .await
-                .is_err()
+            checkpoint_watch_consumer(
+                &storage,
+                backwards_cursor,
+                backwards_cursor_authority,
+                KEY,
+                &[]
+            )
+            .await
+            .is_err()
         );
         let backwards_generation = update(41, 2);
         let backwards_generation_authority = authority(&storage, &backwards_generation).await;
@@ -792,7 +956,8 @@ mod tests {
                 &storage,
                 backwards_generation,
                 backwards_generation_authority,
-                KEY
+                KEY,
+                &[]
             )
             .await
             .is_err()
@@ -805,7 +970,8 @@ mod tests {
                 &storage,
                 changed_partition,
                 changed_partition_authority,
-                KEY
+                KEY,
+                &[]
             )
             .await
             .is_err()
@@ -818,7 +984,7 @@ mod tests {
         let storage = Storage::new_at(temp.path()).await.unwrap();
         let first = update(40, 1);
         let first_authority = authority(&storage, &first).await;
-        checkpoint_watch_consumer(&storage, first, first_authority, KEY)
+        checkpoint_watch_consumer(&storage, first, first_authority, KEY, &[])
             .await
             .unwrap();
         let meta = CoreMetaStore::open(storage.core_store_meta_path()).unwrap();
@@ -864,7 +1030,7 @@ mod tests {
             ),
         };
         assert!(
-            checkpoint_watch_consumer(&storage, invalid, invalid_authority, KEY)
+            checkpoint_watch_consumer(&storage, invalid, invalid_authority, KEY, &[])
                 .await
                 .is_err()
         );
@@ -881,7 +1047,7 @@ mod tests {
             fence: valid.fence.saturating_add(1),
             ..valid.clone()
         };
-        let err = checkpoint_watch_consumer(&storage, first_update.clone(), stale, KEY)
+        let err = checkpoint_watch_consumer(&storage, first_update.clone(), stale, KEY, &[])
             .await
             .unwrap_err();
         assert!(err.to_string().contains("StaleFence"));
@@ -890,7 +1056,7 @@ mod tests {
             owner_node_id: "node-b".to_string(),
             ..valid
         };
-        let err = checkpoint_watch_consumer(&storage, first_update, wrong_owner, KEY)
+        let err = checkpoint_watch_consumer(&storage, first_update, wrong_owner, KEY, &[])
             .await
             .unwrap_err();
         assert!(err.to_string().contains("OwnershipOwnerMismatch"));
@@ -898,10 +1064,73 @@ mod tests {
         let next_update = update(41, 2);
         let stale_after_failover = authority(&storage, &next_update).await;
         replace_watch_checkpoint_owner(&storage, &stale_after_failover).await;
-        let err = checkpoint_watch_consumer(&storage, next_update, stale_after_failover, KEY)
+        let err = checkpoint_watch_consumer(&storage, next_update, stale_after_failover, KEY, &[])
             .await
             .unwrap_err();
         assert!(err.to_string().contains("OwnershipOwnerMismatch"));
+    }
+
+    #[test]
+    fn checkpoint_decoder_validates_domain_and_physical_common_independently() {
+        let checkpoint = sealed_checkpoint(12, 73);
+        let mut row = decode_deterministic_proto::<WatchCheckpointRowProto>(
+            &encode_watch_checkpoint_row(&checkpoint).unwrap(),
+            "watch checkpoint test row",
+        )
+        .unwrap();
+        {
+            let common = row.common.as_mut().unwrap();
+            common.root_generation = 5;
+            common.transaction_id = "physical-watch-checkpoint-transaction".to_string();
+        }
+
+        let decoded = decode_watch_checkpoint_row(&encode_deterministic_proto(&row)).unwrap();
+        assert_eq!(decoded.generation, 73);
+        assert_eq!(row.common.as_ref().unwrap().root_generation, 5);
+        assert_ne!(
+            decoded.generation,
+            row.common.as_ref().unwrap().root_generation
+        );
+
+        let mut wrong_scope = row.clone();
+        wrong_scope.common.as_mut().unwrap().root_key_hash =
+            watch_checkpoint_root_key_hash("different-stream", "full-text-builder");
+        assert!(decode_watch_checkpoint_row(&encode_deterministic_proto(&wrong_scope)).is_err());
+
+        let mut pending = row;
+        pending.common.as_mut().unwrap().visibility_state = CoreMetaVisibilityState::Pending as i32;
+        assert!(decode_watch_checkpoint_row(&encode_deterministic_proto(&pending)).is_err());
+
+        let lag = WatchCheckpointLagRecord {
+            watch_stream_id: checkpoint.watch_stream_id.clone(),
+            partition_family: checkpoint.partition_family.clone(),
+            partition_id: checkpoint.partition_id.clone(),
+            consumer_id: checkpoint.consumer_id.clone(),
+            applied_cursor: checkpoint.cursor,
+            source_cursor_high: checkpoint.source_cursor_high,
+            lag_record_count_hint: checkpoint.lag_record_count_hint,
+            checkpoint_generation: checkpoint.generation,
+            checkpoint_hash: checkpoint.checkpoint_hash.clone().unwrap(),
+            updated_at_nanos: checkpoint.updated_at_nanos,
+        };
+        let lag_bytes = encode_watch_checkpoint_lag_record(&lag).unwrap();
+        assert_eq!(decode_watch_checkpoint_lag_record(&lag_bytes).unwrap(), lag);
+
+        let mut rooted_lag = decode_deterministic_proto::<WatchCheckpointLagRecordProto>(
+            &lag_bytes,
+            "watch checkpoint rooted lag test row",
+        )
+        .unwrap();
+        rooted_lag.common = Some(core_meta_committed_row_common(
+            "system",
+            watch_checkpoint_root_key_hash("object-prefix", "full-text-builder"),
+            6,
+            "physical-rooted-lag-transaction",
+            1,
+        ));
+        assert!(
+            decode_watch_checkpoint_lag_record(&encode_deterministic_proto(&rooted_lag)).is_err()
+        );
     }
 
     fn update(cursor: u128, generation: u64) -> WatchCheckpointUpdate {
@@ -918,6 +1147,53 @@ mod tests {
             updated_by_node: "node-a".to_string(),
             updated_at_nanos: 1000 + i64::try_from(cursor).unwrap(),
         }
+    }
+
+    fn sealed_checkpoint(cursor: u128, generation: u64) -> WatchCheckpoint {
+        let update = update(cursor, generation);
+        WatchCheckpoint {
+            format_version: 1,
+            watch_stream_id: update.watch_stream_id,
+            partition_family: update.partition_family,
+            partition_id: update.partition_id,
+            consumer_id: update.consumer_id,
+            cursor: update.cursor,
+            source_cursor_high: update.source_cursor_high,
+            lag_record_count_hint: update.lag_record_count_hint,
+            source_manifest_hash: update.source_manifest_hash,
+            generation: update.generation,
+            updated_by_node: update.updated_by_node,
+            updated_at_nanos: update.updated_at_nanos,
+            checkpoint_hash: None,
+            checkpoint_signature: None,
+        }
+        .seal(KEY)
+        .unwrap()
+    }
+
+    fn persisted_checkpoint_row(storage: &Storage) -> WatchCheckpointRowProto {
+        let tuple_key = watch_checkpoint_tuple_key("object-prefix", "full-text-builder").unwrap();
+        let payload = CoreMetaStore::open(storage.core_store_meta_path())
+            .unwrap()
+            .get(CF_MATERIALISATION, TABLE_WATCH_CHECKPOINT_ROW, &tuple_key)
+            .unwrap()
+            .unwrap();
+        decode_deterministic_proto(&payload, "persisted watch checkpoint test row").unwrap()
+    }
+
+    fn persisted_lag_row(storage: &Storage) -> WatchCheckpointLagRecordProto {
+        let tuple_key =
+            watch_checkpoint_lag_tuple_key("object-prefix", "full-text-builder").unwrap();
+        let payload = CoreMetaStore::open(storage.core_store_meta_path())
+            .unwrap()
+            .get(
+                CF_MATERIALISATION,
+                TABLE_MATERIALISATION_CURSOR_ROW,
+                &tuple_key,
+            )
+            .unwrap()
+            .unwrap();
+        decode_deterministic_proto(&payload, "persisted watch checkpoint lag test row").unwrap()
     }
 
     async fn authority(

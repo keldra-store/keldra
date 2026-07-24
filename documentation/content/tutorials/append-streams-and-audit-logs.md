@@ -178,7 +178,7 @@ Inspect index diagnostics when expected rows are missing:
 
 ```bash
 anvil --profile acme index diagnostics documents audit_events \
-  --limit 20
+  --page-size 20
 ```
 
 This command proves the caller has `index:read` on `documents` and that Anvil can read diagnostics for the index. It does not prove there are no stream records. No output only means no diagnostics were returned in that page.
@@ -188,7 +188,7 @@ This command proves the caller has `index:read` on `documents` and that Anvil ca
 List tenant audit events recorded by Anvil services:
 
 ```bash
-anvil --profile acme audit list --limit 20
+anvil --profile acme audit list --page-size 20
 ```
 
 You can narrow by principal, resource, or action:
@@ -197,12 +197,17 @@ You can narrow by principal, resource, or action:
 anvil --profile acme audit list \
   --principal docs-writer \
   --resource documents/audits/customer-acme \
-  --limit 20
+  --page-size 20
 ```
 
 A successful audit list proves the token is authenticated for the tenant and the audit service can read the tenant audit stream. It does not prove your application append stream has records, and it does not list private admin-plane audit events. It also does not currently prove a separate audit-read public policy scope, because the tenant audit list implementation authenticates the caller but does not enforce a distinct public policy action.
 
-The CLI prints `created_at`, `principal_id`, `action`, `resource_id`, and `audit_event_id`. If there are more results, it prints `next_cursor=<token>`. Pass that cursor back with `--cursor` to continue the same audit query. The cursor is bound to the tenant, caller, filters, limit, and collection revision, so changing the filter invalidates the cursor.
+The CLI prints `created_at`, `principal_id`, `action`, `resource_id`, and
+`audit_event_id`. If there are more results, it prints
+`next_page_token=<token>`. Pass that opaque token back with `--page-token` to
+continue the same audit query. The token is bound to the tenant, caller,
+filters, page size, and collection revision, so changing the request invalidates
+the token.
 
 ## Operational checks and common failures
 

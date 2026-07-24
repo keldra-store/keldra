@@ -1,13 +1,12 @@
 use crate::core_store::{
-    CF_OBJECT_HEADS, CoreCompressionDescriptor, CoreMetaBatchOp, CoreMetaBatchOpKind,
-    CoreMetaRecord, CoreMetaStore, CoreMetaTuplePart, CoreMutationBatch, CoreMutationOperation,
-    CoreMutationPrecondition, CoreObjectEncoding, CoreObjectPlacement, CoreObjectRef, CoreStore,
+    CF_OBJECT_HEADS, CoreCompressionDescriptor, CoreMetaRecord, CoreMetaTuplePart,
+    CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
+    CoreMutationRootPublication, CoreObjectEncoding, CoreObjectPlacement, CoreObjectRef, CoreStore,
     CoreTransaction, CoreTransactionUpdate, TABLE_MULTIPART_PART_CURRENT_ROW,
-    TABLE_MULTIPART_UPLOAD_CURRENT_ROW, canonical_coremeta_cf_name,
-    commit_coremeta_batch_for_storage, core_meta_committed_row_common, core_meta_payload_digest,
+    TABLE_MULTIPART_UPLOAD_CURRENT_ROW, canonical_coremeta_cf_name, core_meta_committed_row_common,
     core_meta_record_tuple_key, core_meta_root_key_hash, core_meta_tuple_key,
 };
-use crate::formats::{Hash32, hash32};
+use crate::formats::{Hash32, hash32, writer::WriterFamily};
 use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
 use crate::persistence::{
     MetadataMutationReceipt, MultipartAbortMutation, MultipartCompletionMutation,
@@ -21,18 +20,32 @@ use prost::Message;
 use std::collections::BTreeMap;
 
 mod codec;
+mod current_rows;
+#[cfg(test)]
+use crate::core_store::{
+    CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaRootPublication, CoreMetaStore,
+    core_meta_row_common_from_payload,
+};
 pub use codec::multipart_metadata_partition_id;
 use codec::{
-    current_part_payload, current_unix_nanos, current_upload_payload, decode_part_current_record,
-    decode_part_current_row, decode_upload_current_record, decode_upload_current_row,
-    encode_multipart_event, encode_part_current_row, encode_upload_current_row,
-    multipart_all_upload_rows_prefix, multipart_current_root_key,
-    multipart_metadata_partition_principal, multipart_metadata_stream_id, multipart_part_row_key,
-    multipart_part_rows_prefix, multipart_realm_id, multipart_upload_row_key,
-    multipart_upload_rows_prefix, next_part_id, next_upload_id,
+    current_part_payload, current_upload_payload, decode_committed_part_current_row,
+    decode_committed_upload_current_row, decode_part_current_record, decode_part_current_row,
+    decode_upload_current_row, encode_multipart_event, encode_part_current_row,
+    encode_upload_current_row, multipart_current_root_key, multipart_metadata_partition_principal,
+    multipart_metadata_stream_id, multipart_part_row_key, multipart_upload_row_key,
 };
 #[cfg(test)]
 use codec::{decode_multipart_event, decode_multipart_event_fence};
+use current_rows::*;
+#[cfg(test)]
+use current_rows::{
+    MultipartActiveCountCurrentRow, MultipartCurrentRowUpdate, encode_active_count_current_row,
+    stage_active_count_update,
+};
+use current_rows::{
+    active_count_value, multipart_active_count_key, multipart_current_row_operations,
+    multipart_current_row_update, multipart_current_row_update_with_transaction,
+};
 
 const MULTIPART_UPLOAD_SCHEMA: &str = "anvil.multipart.upload.v1";
 const MULTIPART_PART_SCHEMA: &str = "anvil.multipart.part.v1";
@@ -40,7 +53,12 @@ const MULTIPART_EVENT_SCHEMA: &str = "anvil.multipart.event.v1";
 const MULTIPART_UPLOAD_CURRENT_ROW_SCHEMA: &str = "anvil.multipart.upload_current_row.v1";
 const MULTIPART_PART_CURRENT_ROW_SCHEMA: &str = "anvil.multipart.part_current_row.v1";
 const MULTIPART_CURRENT_ROW_KEY_PREFIX: &str = "multipart_current";
+const MULTIPART_CURRENT_ROW_CANDIDATE_GENERATION: u64 = 1;
+const MULTIPART_CURRENT_ROW_CANDIDATE_TRANSACTION_ID: &str = "multipart-current-candidate";
 const MULTIPART_MAX_CURRENT_PROTO_BYTES: usize = 16 * 1024;
+const MULTIPART_PAGE_MAX: usize = 1000;
+const MULTIPART_PART_NUMBER_MAX: i32 = 10_000;
+const MULTIPART_PART_COUNT_MAX: usize = MULTIPART_PART_NUMBER_MAX as usize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MultipartMutationKind {
@@ -137,6 +155,8 @@ struct MultipartUploadCurrentRowProto {
     schema: String,
     #[prost(message, optional, tag = "3")]
     upload: Option<MultipartUploadProto>,
+    #[prost(uint64, tag = "4")]
+    logical_revision: u64,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -151,14 +171,14 @@ struct MultipartPartCurrentRowProto {
     bucket_id: i64,
     #[prost(message, optional, tag = "5")]
     part: Option<MultipartPartProto>,
+    #[prost(uint64, tag = "6")]
+    logical_revision: u64,
 }
 
 #[derive(Debug, Clone)]
 struct MultipartUploadCurrentRow {
     upload: MultipartUpload,
-    generation: u64,
-    transaction_id: String,
-    created_at_unix_nanos: u64,
+    logical_revision: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -166,9 +186,7 @@ struct MultipartPartCurrentRow {
     tenant_id: i64,
     bucket_id: i64,
     part: MultipartUploadPart,
-    generation: u64,
-    transaction_id: String,
-    created_at_unix_nanos: u64,
+    logical_revision: u64,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -259,16 +277,6 @@ struct CoreObjectPlacementProto {
     receipt_signature: Vec<u8>,
 }
 
-#[cfg(test)]
-async fn create_multipart_upload(
-    storage: &Storage,
-    tenant_id: i64,
-    bucket_id: i64,
-    key: &str,
-) -> Result<MultipartUploadMutation> {
-    create_multipart_upload_inner(storage, tenant_id, bucket_id, key, 0, None, None).await
-}
-
 pub(crate) async fn create_multipart_upload_with_permit(
     storage: &Storage,
     tenant_id: i64,
@@ -326,15 +334,13 @@ async fn create_multipart_upload_inner(
     partition_precondition: Option<CoreMutationPrecondition>,
     transaction: Option<(&str, &str)>,
 ) -> Result<MultipartUploadMutation> {
-    let state =
-        read_state_for_optional_transaction(storage, tenant_id, bucket_id, transaction).await?;
-    let id = next_upload_id(&state)?;
+    let upload_id = uuid::Uuid::new_v4();
     let upload = MultipartUpload {
-        id,
+        id: multipart_upload_row_id(upload_id),
         tenant_id,
         bucket_id,
         key: key.to_string(),
-        upload_id: uuid::Uuid::new_v4(),
+        upload_id,
         created_at: Utc::now(),
         completed_at: None,
         aborted_at: None,
@@ -361,16 +367,10 @@ pub async fn get_active_multipart_upload(
     key: &str,
     upload_id: uuid::Uuid,
 ) -> Result<Option<MultipartUpload>> {
-    Ok(read_state(storage, tenant_id, bucket_id)
-        .await?
-        .uploads
-        .into_values()
-        .find(|u| {
-            u.key == key
-                && u.upload_id == upload_id
-                && u.completed_at.is_none()
-                && u.aborted_at.is_none()
-        }))
+    get_active_multipart_upload_for_optional_transaction(
+        storage, tenant_id, bucket_id, key, upload_id, None,
+    )
+    .await
 }
 
 pub async fn get_active_multipart_upload_in_transaction(
@@ -382,21 +382,15 @@ pub async fn get_active_multipart_upload_in_transaction(
     transaction_id: &str,
     transaction_principal: &str,
 ) -> Result<Option<MultipartUpload>> {
-    Ok(read_state_for_optional_transaction(
+    get_active_multipart_upload_for_optional_transaction(
         storage,
         tenant_id,
         bucket_id,
+        key,
+        upload_id,
         Some((transaction_id, transaction_principal)),
     )
-    .await?
-    .uploads
-    .into_values()
-    .find(|u| {
-        u.key == key
-            && u.upload_id == upload_id
-            && u.completed_at.is_none()
-            && u.aborted_at.is_none()
-    }))
+    .await
 }
 
 async fn get_active_multipart_upload_for_optional_transaction(
@@ -407,51 +401,60 @@ async fn get_active_multipart_upload_for_optional_transaction(
     upload_id: uuid::Uuid,
     transaction: Option<(&str, &str)>,
 ) -> Result<Option<MultipartUpload>> {
-    Ok(
-        read_state_for_optional_transaction(storage, tenant_id, bucket_id, transaction)
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let tuple_key = multipart_active_upload_key(bucket_id, key, upload_id)?;
+    let transaction_scoped = transaction.is_some();
+    let payload = if let Some(transaction) = transaction {
+        let transaction = read_transaction_for_optional_scope(&core_store, Some(transaction))
             .await?
-            .uploads
-            .into_values()
-            .find(|u| {
-                u.key == key
-                    && u.upload_id == upload_id
-                    && u.completed_at.is_none()
-                    && u.aborted_at.is_none()
-            }),
-    )
+            .ok_or_else(|| anyhow!("multipart transaction scope is missing"))?;
+        coremeta_payload_visible_to_transaction(
+            &core_store,
+            &transaction,
+            CF_OBJECT_HEADS,
+            TABLE_MULTIPART_UPLOAD_CURRENT_ROW,
+            &tuple_key,
+        )?
+    } else {
+        core_store.read_coremeta_row(
+            CF_OBJECT_HEADS,
+            TABLE_MULTIPART_UPLOAD_CURRENT_ROW,
+            &tuple_key,
+        )?
+    };
+    let Some(payload) = payload else {
+        return Ok(None);
+    };
+    let upload = if transaction_scoped {
+        decode_upload_current_row(&payload)?
+    } else {
+        decode_committed_upload_current_row(&payload)?
+    }
+    .upload;
+    if upload.tenant_id != tenant_id
+        || upload.bucket_id != bucket_id
+        || upload.key != key
+        || upload.upload_id != upload_id
+    {
+        return Err(anyhow!("multipart active upload head scope mismatch"));
+    }
+    if upload.completed_at.is_some() || upload.aborted_at.is_some() {
+        return Ok(None);
+    }
+    Ok(Some(upload))
 }
 
 pub async fn has_active_multipart_upload(storage: &Storage, bucket_id: i64) -> Result<bool> {
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
-    Ok(
-        list_uploads_by_prefix(&meta, &multipart_all_upload_rows_prefix()?)?
-            .into_iter()
-            .any(|u| {
-                u.bucket_id == bucket_id && u.completed_at.is_none() && u.aborted_at.is_none()
-            }),
-    )
-}
-
-#[cfg(test)]
-async fn upsert_multipart_part(
-    storage: &Storage,
-    upload_row_id: i64,
-    part_number: i32,
-    object_ref: CoreObjectRef,
-    size: i64,
-    etag: &str,
-) -> Result<MultipartUploadPartMutation> {
-    upsert_multipart_part_inner(
-        storage,
-        upload_row_id,
-        part_number,
-        object_ref,
-        size,
-        etag,
-        None,
-        None,
-    )
-    .await
+    let store = CoreStore::new(storage.clone()).await?;
+    let Some(payload) = store.read_coremeta_row(
+        CF_OBJECT_HEADS,
+        TABLE_MULTIPART_UPLOAD_CURRENT_ROW,
+        &multipart_active_count_key(bucket_id)?,
+    )?
+    else {
+        return Ok(false);
+    };
+    Ok(active_count_value(&payload, bucket_id)? > 0)
 }
 
 pub(crate) async fn upsert_multipart_part_with_permit(
@@ -512,10 +515,18 @@ async fn upsert_multipart_part_inner(
     permit: Option<(&PartitionWritePermit, &[u8])>,
     transaction: Option<(&str, &str)>,
 ) -> Result<MultipartUploadPartMutation> {
-    let (tenant_id, bucket_id, _) =
+    if !(1..=MULTIPART_PART_NUMBER_MAX).contains(&part_number) {
+        return Err(anyhow!(
+            "multipart part number must be between 1 and {MULTIPART_PART_NUMBER_MAX}"
+        ));
+    }
+    let (tenant_id, bucket_id, upload) =
         find_upload_for_optional_transaction(storage, upload_row_id, transaction)
             .await?
             .ok_or_else(|| anyhow!("multipart upload not found"))?;
+    if upload.completed_at.is_some() || upload.aborted_at.is_some() {
+        return Err(anyhow!("multipart upload is no longer active"));
+    }
     let (fence_token, partition_precondition) = if let Some((permit, signing_key)) = permit {
         require_multipart_metadata_permit(tenant_id, bucket_id, permit)?;
         (
@@ -525,14 +536,20 @@ async fn upsert_multipart_part_inner(
     } else {
         (0, None)
     };
-    let state =
-        read_state_for_optional_transaction(storage, tenant_id, bucket_id, transaction).await?;
+    let current = read_current_part_for_optional_transaction(
+        storage,
+        tenant_id,
+        bucket_id,
+        upload_row_id,
+        part_number,
+        transaction,
+    )
+    .await?;
     let part = MultipartUploadPart {
-        id: state
-            .parts
-            .get(&(upload_row_id, part_number))
+        id: current
+            .as_ref()
             .map(|part| part.id)
-            .unwrap_or(next_part_id(&state)?),
+            .unwrap_or_else(|| multipart_part_row_id(upload_row_id, part_number)),
         upload_id: upload_row_id,
         part_number,
         content_hash: object_ref.hash.clone(),
@@ -560,17 +577,7 @@ pub async fn list_multipart_parts(
     storage: &Storage,
     upload_row_id: i64,
 ) -> Result<Vec<MultipartUploadPart>> {
-    let Some((tenant_id, bucket_id, _)) = find_upload(storage, upload_row_id).await? else {
-        return Ok(Vec::new());
-    };
-    let mut parts = read_state(storage, tenant_id, bucket_id)
-        .await?
-        .parts
-        .into_values()
-        .filter(|part| part.upload_id == upload_row_id)
-        .collect::<Vec<_>>();
-    parts.sort_by_key(|part| part.part_number);
-    Ok(parts)
+    list_multipart_parts_for_optional_transaction(storage, upload_row_id, None).await
 }
 
 pub async fn list_multipart_parts_in_transaction(
@@ -579,20 +586,12 @@ pub async fn list_multipart_parts_in_transaction(
     transaction_id: &str,
     transaction_principal: &str,
 ) -> Result<Vec<MultipartUploadPart>> {
-    let transaction = Some((transaction_id, transaction_principal));
-    let Some((tenant_id, bucket_id, _)) =
-        find_upload_for_optional_transaction(storage, upload_row_id, transaction).await?
-    else {
-        return Ok(Vec::new());
-    };
-    let mut parts = read_state_for_optional_transaction(storage, tenant_id, bucket_id, transaction)
-        .await?
-        .parts
-        .into_values()
-        .filter(|part| part.upload_id == upload_row_id)
-        .collect::<Vec<_>>();
-    parts.sort_by_key(|part| part.part_number);
-    Ok(parts)
+    list_multipart_parts_for_optional_transaction(
+        storage,
+        upload_row_id,
+        Some((transaction_id, transaction_principal)),
+    )
+    .await
 }
 
 pub async fn list_multipart_parts_page(
@@ -601,30 +600,28 @@ pub async fn list_multipart_parts_page(
     part_number_marker: i32,
     limit: i32,
 ) -> Result<MultipartPartsPage> {
-    let mut parts = list_multipart_parts(storage, upload_row_id)
-        .await?
-        .into_iter()
-        .filter(|part| part.part_number > part_number_marker)
-        .collect::<Vec<_>>();
-    let limit = if limit == 0 {
-        1000
-    } else {
-        limit.max(1) as usize
-    };
-    let is_truncated = parts.len() > limit;
-    if is_truncated {
-        parts.truncate(limit);
+    if !(0..=MULTIPART_PART_NUMBER_MAX).contains(&part_number_marker) {
+        return Err(anyhow!(
+            "multipart part number marker must be between 0 and {MULTIPART_PART_NUMBER_MAX}"
+        ));
     }
-    let next_part_number_marker = if is_truncated {
-        parts.last().map(|part| part.part_number)
-    } else {
-        None
+    let page_size = multipart_page_size(limit)?;
+    let Some((tenant_id, bucket_id, _)) = find_upload(storage, upload_row_id).await? else {
+        return Ok(MultipartPartsPage {
+            parts: Vec::new(),
+            is_truncated: false,
+            next_part_number_marker: None,
+        });
     };
-    Ok(MultipartPartsPage {
-        parts,
-        is_truncated,
-        next_part_number_marker,
-    })
+    let store = CoreStore::new(storage.clone()).await?;
+    page_multipart_parts_from_store(
+        &store,
+        tenant_id,
+        bucket_id,
+        upload_row_id,
+        part_number_marker,
+        page_size,
+    )
 }
 
 pub async fn list_active_multipart_uploads(
@@ -635,55 +632,43 @@ pub async fn list_active_multipart_uploads(
     upload_id_marker: Option<uuid::Uuid>,
     limit: i32,
 ) -> Result<MultipartUploadsPage> {
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
-    let mut uploads = list_uploads_by_prefix(&meta, &multipart_all_upload_rows_prefix()?)?
-        .into_iter()
-        .filter(|upload| {
-            upload.bucket_id == bucket_id
-                && upload.key.starts_with(prefix)
-                && upload.completed_at.is_none()
-                && upload.aborted_at.is_none()
-        })
-        .collect::<Vec<_>>();
-    uploads.sort_by(|left, right| {
-        left.key
-            .cmp(&right.key)
-            .then_with(|| left.created_at.cmp(&right.created_at))
-    });
-    if !key_marker.is_empty() {
-        let mut past_marker = upload_id_marker.is_none();
-        uploads.retain(|upload| {
-            if upload.key.as_str() < key_marker {
-                return false;
-            }
-            if upload.key.as_str() > key_marker {
-                return true;
-            }
-            if let Some(marker) = upload_id_marker {
-                if past_marker {
-                    return true;
-                }
-                if upload.upload_id == marker {
-                    past_marker = true;
-                }
-                return false;
-            }
-            true
-        });
-    }
-    let limit = if limit == 0 {
-        1000
-    } else {
-        limit.max(1) as usize
-    };
-    let is_truncated = uploads.len() > limit;
-    if is_truncated {
-        uploads.truncate(limit);
+    let page_size = multipart_page_size(limit)?;
+    let store = CoreStore::new(storage.clone()).await?;
+    let tuple_prefix = multipart_active_upload_bucket_prefix(bucket_id)?;
+    let after_tuple_key =
+        multipart_active_upload_scan_after(bucket_id, prefix, key_marker, upload_id_marker)?;
+    let records = store.scan_coremeta_prefix_page(
+        CF_OBJECT_HEADS,
+        TABLE_MULTIPART_UPLOAD_CURRENT_ROW,
+        &tuple_prefix,
+        after_tuple_key.as_deref(),
+        page_size + 1,
+    )?;
+    let mut uploads = Vec::with_capacity(page_size);
+    let mut is_truncated = false;
+    let mut last_source_upload = None;
+    let mut source_count = 0;
+    for record in records {
+        let upload = decode_active_upload_record(&record)?;
+        if upload.bucket_id != bucket_id {
+            return Err(anyhow!("multipart active upload bucket scope mismatch"));
+        }
+        if !upload.key.starts_with(prefix) {
+            break;
+        }
+        if source_count == page_size {
+            is_truncated = true;
+            break;
+        }
+        source_count += 1;
+        last_source_upload = Some((upload.key.clone(), upload.upload_id));
+        if upload.completed_at.is_none() && upload.aborted_at.is_none() {
+            uploads.push(upload);
+        }
     }
     let (next_key_marker, next_upload_id_marker) = if is_truncated {
-        uploads
-            .last()
-            .map(|upload| (Some(upload.key.clone()), Some(upload.upload_id)))
+        last_source_upload
+            .map(|(key, upload_id)| (Some(key), Some(upload_id)))
             .unwrap_or((None, None))
     } else {
         (None, None)
@@ -694,14 +679,6 @@ pub async fn list_active_multipart_uploads(
         next_key_marker,
         next_upload_id_marker,
     })
-}
-
-#[cfg(test)]
-async fn complete_multipart_upload(
-    storage: &Storage,
-    upload_row_id: i64,
-) -> Result<MultipartCompletionMutation> {
-    complete_multipart_upload_inner(storage, upload_row_id, None, None).await
 }
 
 pub(crate) async fn complete_multipart_upload_with_permit(
@@ -750,6 +727,12 @@ async fn complete_multipart_upload_inner(
             receipt: None,
         });
     };
+    if upload.completed_at.is_some() || upload.aborted_at.is_some() {
+        return Ok(MultipartCompletionMutation {
+            completed: false,
+            receipt: None,
+        });
+    }
     let (fence_token, partition_precondition) = if let Some((permit, signing_key)) = permit {
         require_multipart_metadata_permit(tenant_id, bucket_id, permit)?;
         (
@@ -902,13 +885,8 @@ async fn find_upload(
     storage: &Storage,
     upload_row_id: i64,
 ) -> Result<Option<(i64, i64, MultipartUpload)>> {
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
-    for upload in list_uploads_by_prefix(&meta, &multipart_all_upload_rows_prefix()?)? {
-        if upload.id == upload_row_id {
-            return Ok(Some((upload.tenant_id, upload.bucket_id, upload)));
-        }
-    }
-    Ok(None)
+    let store = CoreStore::new(storage.clone()).await?;
+    read_upload_id_head(&store, upload_row_id)
 }
 
 async fn find_upload_for_optional_transaction(
@@ -919,74 +897,25 @@ async fn find_upload_for_optional_transaction(
     if transaction.is_none() {
         return find_upload(storage, upload_row_id).await;
     }
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
     let core_store = CoreStore::new(storage.clone()).await?;
     let transaction = read_transaction_for_optional_scope(&core_store, transaction).await?;
-    for upload in list_uploads_by_prefix(&meta, &multipart_all_upload_rows_prefix()?)? {
-        if upload.id == upload_row_id {
-            let state = read_state_with_transaction(
-                &meta,
-                upload.tenant_id,
-                upload.bucket_id,
-                transaction.as_ref(),
-            )?;
-            if let Some(upload) = state.uploads.get(&upload_row_id).cloned() {
-                return Ok(Some((upload.tenant_id, upload.bucket_id, upload)));
-            }
-        }
-    }
-    if let Some(transaction) = transaction.as_ref() {
-        for update in &transaction.visible_updates {
-            let CoreTransactionUpdate::CoreMetaPut {
-                cf,
-                table_id,
-                tuple_key,
-                payload,
-                ..
-            } = update
-            else {
-                continue;
-            };
-            if canonical_coremeta_cf_name(cf)? != CF_OBJECT_HEADS
-                || *table_id != TABLE_MULTIPART_UPLOAD_CURRENT_ROW
-            {
-                continue;
-            }
-            let row = decode_upload_current_row(payload)?;
-            if row.upload.id == upload_row_id
-                && tuple_key
-                    == &multipart_upload_row_key(
-                        row.upload.tenant_id,
-                        row.upload.bucket_id,
-                        row.upload.id,
-                    )?
-            {
-                return Ok(Some((
-                    row.upload.tenant_id,
-                    row.upload.bucket_id,
-                    row.upload,
-                )));
-            }
-        }
-    }
-    Ok(None)
-}
-
-async fn read_state(storage: &Storage, tenant_id: i64, bucket_id: i64) -> Result<MultipartState> {
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
-    read_state_from_current_rows(&meta, tenant_id, bucket_id)
-}
-
-async fn read_state_for_optional_transaction(
-    storage: &Storage,
-    tenant_id: i64,
-    bucket_id: i64,
-    transaction: Option<(&str, &str)>,
-) -> Result<MultipartState> {
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let transaction = read_transaction_for_optional_scope(&core_store, transaction).await?;
-    read_state_with_transaction(&meta, tenant_id, bucket_id, transaction.as_ref())
+    let tuple_key = multipart_upload_id_head_key(upload_row_id)?;
+    let payload = if let Some(transaction) = transaction.as_ref() {
+        coremeta_payload_visible_to_transaction(
+            &core_store,
+            transaction,
+            CF_OBJECT_HEADS,
+            TABLE_MULTIPART_UPLOAD_CURRENT_ROW,
+            &tuple_key,
+        )?
+    } else {
+        core_store.read_coremeta_row(
+            CF_OBJECT_HEADS,
+            TABLE_MULTIPART_UPLOAD_CURRENT_ROW,
+            &tuple_key,
+        )?
+    };
+    decode_upload_id_head(payload.as_deref(), upload_row_id, false)
 }
 
 async fn read_transaction_for_optional_scope<'a>(
@@ -1003,16 +932,235 @@ async fn read_transaction_for_optional_scope<'a>(
     ))
 }
 
-fn read_state_with_transaction(
-    meta: &CoreMetaStore,
+async fn read_current_part_for_optional_transaction(
+    storage: &Storage,
     tenant_id: i64,
     bucket_id: i64,
-    transaction: Option<&CoreTransaction>,
-) -> Result<MultipartState> {
-    let mut state = read_state_from_current_rows(meta, tenant_id, bucket_id)?;
-    let Some(transaction) = transaction else {
-        return Ok(state);
+    upload_row_id: i64,
+    part_number: i32,
+    transaction: Option<(&str, &str)>,
+) -> Result<Option<MultipartUploadPart>> {
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let tuple_key = multipart_part_row_key(tenant_id, bucket_id, upload_row_id, part_number)?;
+    let transaction_scoped = transaction.is_some();
+    let payload = if let Some(transaction) = transaction {
+        let transaction = read_transaction_for_optional_scope(&core_store, Some(transaction))
+            .await?
+            .ok_or_else(|| anyhow!("multipart transaction scope is missing"))?;
+        coremeta_payload_visible_to_transaction(
+            &core_store,
+            &transaction,
+            CF_OBJECT_HEADS,
+            TABLE_MULTIPART_PART_CURRENT_ROW,
+            &tuple_key,
+        )?
+    } else {
+        core_store.read_coremeta_row(
+            CF_OBJECT_HEADS,
+            TABLE_MULTIPART_PART_CURRENT_ROW,
+            &tuple_key,
+        )?
     };
+    let Some(payload) = payload else {
+        return Ok(None);
+    };
+    let row = if transaction_scoped {
+        decode_part_current_row(&payload)?
+    } else {
+        decode_committed_part_current_row(&payload)?
+    };
+    if row.tenant_id != tenant_id
+        || row.bucket_id != bucket_id
+        || row.part.upload_id != upload_row_id
+        || row.part.part_number != part_number
+    {
+        return Err(anyhow!("multipart part current row scope mismatch"));
+    }
+    Ok(Some(row.part))
+}
+
+async fn list_multipart_parts_for_optional_transaction(
+    storage: &Storage,
+    upload_row_id: i64,
+    transaction: Option<(&str, &str)>,
+) -> Result<Vec<MultipartUploadPart>> {
+    let Some((tenant_id, bucket_id, _)) =
+        find_upload_for_optional_transaction(storage, upload_row_id, transaction).await?
+    else {
+        return Ok(Vec::new());
+    };
+    let core_store = CoreStore::new(storage.clone()).await?;
+    let mut parts =
+        read_all_multipart_parts_bounded(&core_store, tenant_id, bucket_id, upload_row_id)?;
+    if let Some(transaction) = transaction {
+        let transaction = read_transaction_for_optional_scope(&core_store, Some(transaction))
+            .await?
+            .ok_or_else(|| anyhow!("multipart transaction scope is missing"))?;
+        apply_transaction_parts(
+            &transaction,
+            tenant_id,
+            bucket_id,
+            upload_row_id,
+            &mut parts,
+        )?;
+    }
+    if parts.len() > MULTIPART_PART_COUNT_MAX {
+        return Err(anyhow!(
+            "multipart upload exceeds the bounded part count of {MULTIPART_PART_COUNT_MAX}"
+        ));
+    }
+    Ok(parts.into_values().collect())
+}
+
+fn read_all_multipart_parts_bounded(
+    store: &CoreStore,
+    tenant_id: i64,
+    bucket_id: i64,
+    upload_row_id: i64,
+) -> Result<BTreeMap<i32, MultipartUploadPart>> {
+    let prefix = multipart_upload_part_rows_prefix(tenant_id, bucket_id, upload_row_id)?;
+    let mut after_tuple_key = None;
+    let mut parts = BTreeMap::new();
+    loop {
+        let remaining = MULTIPART_PART_COUNT_MAX
+            .saturating_add(1)
+            .saturating_sub(parts.len());
+        let scan_limit = remaining.min(MULTIPART_PAGE_MAX);
+        let records = store.scan_coremeta_prefix_page(
+            CF_OBJECT_HEADS,
+            TABLE_MULTIPART_PART_CURRENT_ROW,
+            &prefix,
+            after_tuple_key.as_deref(),
+            scan_limit,
+        )?;
+        if records.is_empty() {
+            return Ok(parts);
+        }
+        for record in &records {
+            if parts.len() == MULTIPART_PART_COUNT_MAX {
+                return Err(anyhow!(
+                    "multipart upload exceeds the bounded part count of {MULTIPART_PART_COUNT_MAX}"
+                ));
+            }
+            let row = decode_part_current_record(record)?;
+            if row.tenant_id != tenant_id
+                || row.bucket_id != bucket_id
+                || row.part.upload_id != upload_row_id
+            {
+                return Err(anyhow!("multipart part page scope mismatch"));
+            }
+            after_tuple_key = Some(core_meta_record_tuple_key(&record.key)?.to_vec());
+            if parts.insert(row.part.part_number, row.part).is_some() {
+                return Err(anyhow!(
+                    "multipart part table contains a duplicate part number"
+                ));
+            }
+        }
+        if records.len() < scan_limit {
+            return Ok(parts);
+        }
+    }
+}
+
+fn read_upload_id_head(
+    store: &CoreStore,
+    upload_row_id: i64,
+) -> Result<Option<(i64, i64, MultipartUpload)>> {
+    let payload = store.read_coremeta_row(
+        CF_OBJECT_HEADS,
+        TABLE_MULTIPART_UPLOAD_CURRENT_ROW,
+        &multipart_upload_id_head_key(upload_row_id)?,
+    )?;
+    decode_upload_id_head(payload.as_deref(), upload_row_id, true)
+}
+
+fn decode_upload_id_head(
+    payload: Option<&[u8]>,
+    upload_row_id: i64,
+    committed: bool,
+) -> Result<Option<(i64, i64, MultipartUpload)>> {
+    let Some(payload) = payload else {
+        return Ok(None);
+    };
+    let upload = if committed {
+        decode_committed_upload_current_row(payload)?
+    } else {
+        decode_upload_current_row(payload)?
+    }
+    .upload;
+    if upload.id != upload_row_id {
+        return Err(anyhow!("multipart upload id head scope mismatch"));
+    }
+    Ok(Some((upload.tenant_id, upload.bucket_id, upload)))
+}
+
+fn page_multipart_parts_from_store(
+    store: &CoreStore,
+    tenant_id: i64,
+    bucket_id: i64,
+    upload_row_id: i64,
+    part_number_marker: i32,
+    page_size: usize,
+) -> Result<MultipartPartsPage> {
+    if !(1..=MULTIPART_PAGE_MAX).contains(&page_size) {
+        return Err(anyhow!(
+            "multipart page size must be between 1 and {MULTIPART_PAGE_MAX}"
+        ));
+    }
+    let prefix = multipart_upload_part_rows_prefix(tenant_id, bucket_id, upload_row_id)?;
+    let after_tuple_key = if part_number_marker == 0 {
+        None
+    } else {
+        Some(multipart_part_row_key(
+            tenant_id,
+            bucket_id,
+            upload_row_id,
+            part_number_marker,
+        )?)
+    };
+    let mut records = store.scan_coremeta_prefix_page(
+        CF_OBJECT_HEADS,
+        TABLE_MULTIPART_PART_CURRENT_ROW,
+        &prefix,
+        after_tuple_key.as_deref(),
+        page_size + 1,
+    )?;
+    let is_truncated = records.len() > page_size;
+    if is_truncated {
+        records.truncate(page_size);
+    }
+    let mut parts = Vec::with_capacity(records.len());
+    for record in records {
+        let row = decode_part_current_record(&record)?;
+        if row.tenant_id != tenant_id
+            || row.bucket_id != bucket_id
+            || row.part.upload_id != upload_row_id
+            || row.part.part_number <= part_number_marker
+        {
+            return Err(anyhow!("multipart part page scope mismatch"));
+        }
+        parts.push(row.part);
+    }
+    let next_part_number_marker = if is_truncated {
+        parts.last().map(|part| part.part_number)
+    } else {
+        None
+    };
+    Ok(MultipartPartsPage {
+        parts,
+        is_truncated,
+        next_part_number_marker,
+    })
+}
+
+fn apply_transaction_parts(
+    transaction: &CoreTransaction,
+    tenant_id: i64,
+    bucket_id: i64,
+    upload_row_id: i64,
+    parts: &mut BTreeMap<i32, MultipartUploadPart>,
+) -> Result<()> {
+    let prefix = multipart_upload_part_rows_prefix(tenant_id, bucket_id, upload_row_id)?;
     for update in &transaction.visible_updates {
         match update {
             CoreTransactionUpdate::CoreMetaPut {
@@ -1022,38 +1170,31 @@ fn read_state_with_transaction(
                 payload,
                 ..
             } => {
-                if canonical_coremeta_cf_name(cf)? != CF_OBJECT_HEADS {
+                if canonical_coremeta_cf_name(cf)? != CF_OBJECT_HEADS
+                    || *table_id != TABLE_MULTIPART_PART_CURRENT_ROW
+                    || !tuple_key.starts_with(&prefix)
+                {
                     continue;
                 }
-                match *table_id {
-                    TABLE_MULTIPART_UPLOAD_CURRENT_ROW => {
-                        let row = decode_upload_current_row(payload)?;
-                        if row.upload.tenant_id == tenant_id
-                            && row.upload.bucket_id == bucket_id
-                            && tuple_key
-                                == &multipart_upload_row_key(tenant_id, bucket_id, row.upload.id)?
-                        {
-                            state.uploads.insert(row.upload.id, row.upload);
-                        }
-                    }
-                    TABLE_MULTIPART_PART_CURRENT_ROW => {
-                        let row = decode_part_current_row(payload)?;
-                        if row.tenant_id == tenant_id
-                            && row.bucket_id == bucket_id
-                            && tuple_key
-                                == &multipart_part_row_key(
-                                    tenant_id,
-                                    bucket_id,
-                                    row.part.upload_id,
-                                    row.part.part_number,
-                                )?
-                        {
-                            state
-                                .parts
-                                .insert((row.part.upload_id, row.part.part_number), row.part);
-                        }
-                    }
-                    _ => {}
+                let row = decode_part_current_row(payload)?;
+                if row.tenant_id != tenant_id
+                    || row.bucket_id != bucket_id
+                    || row.part.upload_id != upload_row_id
+                    || tuple_key
+                        != &multipart_part_row_key(
+                            tenant_id,
+                            bucket_id,
+                            upload_row_id,
+                            row.part.part_number,
+                        )?
+                {
+                    return Err(anyhow!("multipart transaction part row scope mismatch"));
+                }
+                parts.insert(row.part.part_number, row.part);
+                if parts.len() > MULTIPART_PART_COUNT_MAX {
+                    return Err(anyhow!(
+                        "multipart upload exceeds the bounded part count of {MULTIPART_PART_COUNT_MAX}"
+                    ));
                 }
             }
             CoreTransactionUpdate::CoreMetaDelete {
@@ -1062,75 +1203,155 @@ fn read_state_with_transaction(
                 tuple_key,
                 ..
             } => {
-                if canonical_coremeta_cf_name(cf)? != CF_OBJECT_HEADS {
+                if canonical_coremeta_cf_name(cf)? != CF_OBJECT_HEADS
+                    || *table_id != TABLE_MULTIPART_PART_CURRENT_ROW
+                    || !tuple_key.starts_with(&prefix)
+                {
                     continue;
                 }
-                match *table_id {
-                    TABLE_MULTIPART_UPLOAD_CURRENT_ROW => {
-                        for upload in state.uploads.values().cloned().collect::<Vec<_>>() {
-                            if tuple_key
-                                == &multipart_upload_row_key(tenant_id, bucket_id, upload.id)?
-                            {
-                                state.uploads.remove(&upload.id);
-                            }
-                        }
+                let mut deleted_part_number = None;
+                for part_number in parts.keys().copied() {
+                    if tuple_key
+                        == &multipart_part_row_key(
+                            tenant_id,
+                            bucket_id,
+                            upload_row_id,
+                            part_number,
+                        )?
+                    {
+                        deleted_part_number = Some(part_number);
+                        break;
                     }
-                    TABLE_MULTIPART_PART_CURRENT_ROW => {
-                        for part in state.parts.values().cloned().collect::<Vec<_>>() {
-                            if tuple_key
-                                == &multipart_part_row_key(
-                                    tenant_id,
-                                    bucket_id,
-                                    part.upload_id,
-                                    part.part_number,
-                                )?
-                            {
-                                state.parts.remove(&(part.upload_id, part.part_number));
-                            }
-                        }
-                    }
-                    _ => {}
+                }
+                if let Some(part_number) = deleted_part_number {
+                    parts.remove(&part_number);
                 }
             }
-            _ => {}
+            CoreTransactionUpdate::StreamAppend { .. } => {}
         }
     }
-    Ok(state)
+    Ok(())
 }
 
-fn read_state_from_current_rows(
-    meta: &CoreMetaStore,
+fn decode_active_upload_record(record: &CoreMetaRecord) -> Result<MultipartUpload> {
+    let upload = decode_committed_upload_current_row(&record.payload)?.upload;
+    if core_meta_record_tuple_key(&record.key)?
+        != multipart_active_upload_key(upload.bucket_id, &upload.key, upload.upload_id)?
+    {
+        return Err(anyhow!("multipart active upload physical row key mismatch"));
+    }
+    Ok(upload)
+}
+
+fn multipart_page_size(limit: i32) -> Result<usize> {
+    if limit == 0 {
+        return Ok(MULTIPART_PAGE_MAX);
+    }
+    let page_size =
+        usize::try_from(limit).map_err(|_| anyhow!("multipart page size must be positive"))?;
+    if !(1..=MULTIPART_PAGE_MAX).contains(&page_size) {
+        return Err(anyhow!(
+            "multipart page size must be between 1 and {MULTIPART_PAGE_MAX}"
+        ));
+    }
+    Ok(page_size)
+}
+
+fn multipart_upload_id_head_key(upload_row_id: i64) -> Result<Vec<u8>> {
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8(MULTIPART_CURRENT_ROW_KEY_PREFIX),
+        CoreMetaTuplePart::Utf8("upload_id_head"),
+        CoreMetaTuplePart::I64(upload_row_id),
+    ])
+}
+
+fn multipart_active_upload_bucket_prefix(bucket_id: i64) -> Result<Vec<u8>> {
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8(MULTIPART_CURRENT_ROW_KEY_PREFIX),
+        CoreMetaTuplePart::Utf8("active_upload"),
+        CoreMetaTuplePart::I64(bucket_id),
+    ])
+}
+
+fn multipart_active_upload_object_prefix(bucket_id: i64, key: &str) -> Result<Vec<u8>> {
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8(MULTIPART_CURRENT_ROW_KEY_PREFIX),
+        CoreMetaTuplePart::Utf8("active_upload"),
+        CoreMetaTuplePart::I64(bucket_id),
+        CoreMetaTuplePart::Raw(key.as_bytes()),
+    ])
+}
+
+fn multipart_active_upload_key(
+    bucket_id: i64,
+    key: &str,
+    upload_id: uuid::Uuid,
+) -> Result<Vec<u8>> {
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8(MULTIPART_CURRENT_ROW_KEY_PREFIX),
+        CoreMetaTuplePart::Utf8("active_upload"),
+        CoreMetaTuplePart::I64(bucket_id),
+        CoreMetaTuplePart::Raw(key.as_bytes()),
+        CoreMetaTuplePart::Raw(upload_id.as_bytes()),
+    ])
+}
+
+fn multipart_active_upload_scan_after(
+    bucket_id: i64,
+    prefix: &str,
+    key_marker: &str,
+    upload_id_marker: Option<uuid::Uuid>,
+) -> Result<Option<Vec<u8>>> {
+    if key_marker.is_empty() && upload_id_marker.is_some() {
+        return Err(anyhow!(
+            "multipart upload id marker requires a nonempty key marker"
+        ));
+    }
+    let marker_is_start = !key_marker.is_empty() && key_marker.as_bytes() >= prefix.as_bytes();
+    let start_key = if marker_is_start { key_marker } else { prefix };
+    if start_key.is_empty() {
+        return Ok(None);
+    }
+    if marker_is_start {
+        if let Some(upload_id) = upload_id_marker {
+            return Ok(Some(multipart_active_upload_key(
+                bucket_id, start_key, upload_id,
+            )?));
+        }
+    }
+    Ok(Some(multipart_active_upload_object_prefix(
+        bucket_id, start_key,
+    )?))
+}
+
+fn multipart_upload_part_rows_prefix(
     tenant_id: i64,
     bucket_id: i64,
-) -> Result<MultipartState> {
-    let mut state = MultipartState::default();
-    for upload in
-        list_uploads_by_prefix(meta, &multipart_upload_rows_prefix(tenant_id, bucket_id)?)?
-    {
-        state.uploads.insert(upload.id, upload);
-    }
-    for part in list_parts_by_prefix(meta, &multipart_part_rows_prefix(tenant_id, bucket_id)?)? {
-        state.parts.insert((part.upload_id, part.part_number), part);
-    }
-    Ok(state)
+    upload_row_id: i64,
+) -> Result<Vec<u8>> {
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8(MULTIPART_CURRENT_ROW_KEY_PREFIX),
+        CoreMetaTuplePart::Utf8("part"),
+        CoreMetaTuplePart::I64(tenant_id),
+        CoreMetaTuplePart::I64(bucket_id),
+        CoreMetaTuplePart::I64(upload_row_id),
+    ])
 }
 
-fn list_uploads_by_prefix(meta: &CoreMetaStore, prefix: &[u8]) -> Result<Vec<MultipartUpload>> {
-    let mut uploads = Vec::new();
-    for record in meta.scan_prefix(CF_OBJECT_HEADS, TABLE_MULTIPART_UPLOAD_CURRENT_ROW, prefix)? {
-        let row = decode_upload_current_record(&record)?;
-        uploads.push(row.upload);
-    }
-    Ok(uploads)
+fn multipart_upload_row_id(upload_id: uuid::Uuid) -> i64 {
+    multipart_positive_row_id(format!("multipart-upload:{upload_id}").as_bytes())
 }
 
-fn list_parts_by_prefix(meta: &CoreMetaStore, prefix: &[u8]) -> Result<Vec<MultipartUploadPart>> {
-    let mut parts = Vec::new();
-    for record in meta.scan_prefix(CF_OBJECT_HEADS, TABLE_MULTIPART_PART_CURRENT_ROW, prefix)? {
-        let row = decode_part_current_record(&record)?;
-        parts.push(row.part);
-    }
-    Ok(parts)
+fn multipart_part_row_id(upload_row_id: i64, part_number: i32) -> i64 {
+    multipart_positive_row_id(format!("multipart-part:{upload_row_id}:{part_number}").as_bytes())
+}
+
+fn multipart_positive_row_id(seed: &[u8]) -> i64 {
+    let digest = hash32(seed);
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    let value = u64::from_be_bytes(bytes) & (i64::MAX as u64);
+    i64::try_from(value.max(1)).expect("positive multipart row id must fit i64")
 }
 
 async fn append_body(
@@ -1145,7 +1366,6 @@ async fn append_body(
     transaction: Option<(&str, &str)>,
 ) -> Result<MetadataMutationReceipt> {
     let core_store = CoreStore::new(storage.clone()).await?;
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
     let stream_id = multipart_metadata_stream_id(tenant_id, bucket_id);
     let mutation_id = uuid::Uuid::new_v4();
     let internal_transaction_id = format!("multipart-metadata:{mutation_id}");
@@ -1161,33 +1381,37 @@ async fn append_body(
     )?;
     let payload_hash = hex::encode(hash32(&body));
     let partition_id = hex::encode(multipart_metadata_partition_id(tenant_id, bucket_id));
+    let data_root = multipart_current_root_key(tenant_id, bucket_id);
     let transaction_state = read_transaction_for_optional_scope(&core_store, transaction).await?;
+    let scope_partition = transaction_state
+        .as_ref()
+        .map(|transaction| transaction.scope_partition.clone())
+        .unwrap_or(partition_id);
+    let root_publications = multipart_root_publications(data_root, scope_partition.clone());
     let current_update = if let Some(transaction_state) = transaction_state.as_ref() {
         multipart_current_row_update_with_transaction(
-            &meta,
+            &core_store,
             transaction_state,
             tenant_id,
             bucket_id,
             event,
             upload.as_ref(),
             part.as_ref(),
-            &transaction_record_id,
         )?
     } else {
         multipart_current_row_update(
-            &meta,
+            &core_store,
             tenant_id,
             bucket_id,
             event,
             upload.as_ref(),
             part.as_ref(),
-            &transaction_record_id,
         )?
     };
     let mut preconditions = partition_precondition.into_iter().collect::<Vec<_>>();
     preconditions.extend(current_update.preconditions.clone());
     let mut operations = vec![CoreMutationOperation::StreamAppend {
-        partition_id: partition_id.clone(),
+        partition_id: scope_partition.clone(),
         stream_id: stream_id.clone(),
         record_kind: "multipart_metadata".to_string(),
         payload: body.clone(),
@@ -1195,15 +1419,16 @@ async fn append_body(
     }];
     operations.extend(multipart_current_row_operations(
         &current_update,
-        &partition_id,
+        &scope_partition,
     )?);
     let committed_by_principal = transaction
         .map(|(_, principal)| principal.to_string())
         .unwrap_or_else(|| multipart_metadata_partition_principal(tenant_id, bucket_id));
     let batch = CoreMutationBatch {
         transaction_id: transaction_record_id,
-        scope_partition: partition_id.clone(),
+        scope_partition,
         committed_by_principal,
+        root_publications,
         preconditions,
         operations,
     };
@@ -1233,325 +1458,26 @@ async fn append_body(
     })
 }
 
-#[cfg(test)]
-async fn read_events_from_store(
-    core_store: &CoreStore,
-    stream_id: &str,
-) -> Result<Vec<MultipartEventProto>> {
-    let records = core_store
-        .read_stream(crate::core_store::ReadStream {
-            stream_id: stream_id.to_string(),
-            after_sequence: 0,
-            limit: 0,
-        })
-        .await?;
-    let mut events = Vec::new();
-    for record in records {
-        if record.record_kind != "multipart_metadata" {
-            continue;
-        }
-        events.push(decode_multipart_event(&record.payload)?);
+fn multipart_root_publications(
+    data_root: String,
+    coordinator_root: String,
+) -> Vec<CoreMutationRootPublication> {
+    if data_root == coordinator_root {
+        return vec![CoreMutationRootPublication {
+            root_anchor_key: data_root,
+            writer_families: vec![
+                WriterFamily::CoreControl.as_str().to_string(),
+                WriterFamily::ObjectBlob.as_str().to_string(),
+            ],
+            transaction_coordinator: true,
+        }];
     }
-    Ok(events)
-}
 
-#[derive(Debug, Clone, Default)]
-struct MultipartCurrentRowUpdate {
-    preconditions: Vec<CoreMutationPrecondition>,
-    upload_row: Option<MultipartUploadCurrentRow>,
-    part_row: Option<MultipartPartCurrentRow>,
-}
-
-fn multipart_current_row_update(
-    meta: &CoreMetaStore,
-    tenant_id: i64,
-    bucket_id: i64,
-    event: MultipartMutationKind,
-    upload: Option<&MultipartUpload>,
-    part: Option<&MultipartUploadPart>,
-    transaction_id: &str,
-) -> Result<MultipartCurrentRowUpdate> {
-    let mut update = MultipartCurrentRowUpdate::default();
-    match event {
-        MultipartMutationKind::CreateUpload
-        | MultipartMutationKind::CompleteUpload
-        | MultipartMutationKind::AbortUpload => {
-            let upload = upload.ok_or_else(|| anyhow!("multipart upload event missing upload"))?;
-            let (payload, current) = current_upload_payload(meta, tenant_id, bucket_id, upload.id)?;
-            let generation = current
-                .as_ref()
-                .map(|row| row.generation.saturating_add(1))
-                .unwrap_or(1);
-            update.preconditions.push(coremeta_row_precondition(
-                TABLE_MULTIPART_UPLOAD_CURRENT_ROW,
-                multipart_upload_row_key(tenant_id, bucket_id, upload.id)?,
-                payload.as_ref(),
-                event == MultipartMutationKind::CreateUpload,
-                event != MultipartMutationKind::CreateUpload,
-            ));
-            update.upload_row = Some(MultipartUploadCurrentRow {
-                upload: upload.clone(),
-                generation,
-                transaction_id: transaction_id.to_string(),
-                created_at_unix_nanos: current_unix_nanos()?,
-            });
-        }
-        MultipartMutationKind::UpsertPart => {
-            let part = part.ok_or_else(|| anyhow!("multipart part event missing part"))?;
-            let upload_payload = meta.get(
-                CF_OBJECT_HEADS,
-                TABLE_MULTIPART_UPLOAD_CURRENT_ROW,
-                &multipart_upload_row_key(tenant_id, bucket_id, part.upload_id)?,
-            )?;
-            update.preconditions.push(coremeta_row_precondition(
-                TABLE_MULTIPART_UPLOAD_CURRENT_ROW,
-                multipart_upload_row_key(tenant_id, bucket_id, part.upload_id)?,
-                upload_payload.as_ref(),
-                false,
-                true,
-            ));
-            let (payload, current) =
-                current_part_payload(meta, tenant_id, bucket_id, part.upload_id, part.part_number)?;
-            let generation = current
-                .as_ref()
-                .map(|row| row.generation.saturating_add(1))
-                .unwrap_or(1);
-            update.preconditions.push(coremeta_row_precondition(
-                TABLE_MULTIPART_PART_CURRENT_ROW,
-                multipart_part_row_key(tenant_id, bucket_id, part.upload_id, part.part_number)?,
-                payload.as_ref(),
-                payload.is_none(),
-                payload.is_some(),
-            ));
-            update.part_row = Some(MultipartPartCurrentRow {
-                tenant_id,
-                bucket_id,
-                part: part.clone(),
-                generation,
-                transaction_id: transaction_id.to_string(),
-                created_at_unix_nanos: current_unix_nanos()?,
-            });
-        }
-    }
-    Ok(update)
-}
-
-fn multipart_current_row_update_with_transaction(
-    meta: &CoreMetaStore,
-    transaction: &CoreTransaction,
-    tenant_id: i64,
-    bucket_id: i64,
-    event: MultipartMutationKind,
-    upload: Option<&MultipartUpload>,
-    part: Option<&MultipartUploadPart>,
-    transaction_id: &str,
-) -> Result<MultipartCurrentRowUpdate> {
-    let mut update = MultipartCurrentRowUpdate::default();
-    match event {
-        MultipartMutationKind::CreateUpload
-        | MultipartMutationKind::CompleteUpload
-        | MultipartMutationKind::AbortUpload => {
-            let upload = upload.ok_or_else(|| anyhow!("multipart upload event missing upload"))?;
-            let key = multipart_upload_row_key(tenant_id, bucket_id, upload.id)?;
-            let payload = coremeta_payload_visible_to_transaction(
-                meta,
-                transaction,
-                CF_OBJECT_HEADS,
-                TABLE_MULTIPART_UPLOAD_CURRENT_ROW,
-                &key,
-            )?;
-            let current = payload
-                .as_deref()
-                .map(decode_upload_current_row)
-                .transpose()?;
-            let generation = current
-                .as_ref()
-                .map(|row| row.generation.saturating_add(1))
-                .unwrap_or(1);
-            update.preconditions.push(coremeta_row_precondition(
-                TABLE_MULTIPART_UPLOAD_CURRENT_ROW,
-                key,
-                payload.as_ref(),
-                event == MultipartMutationKind::CreateUpload,
-                event != MultipartMutationKind::CreateUpload,
-            ));
-            update.upload_row = Some(MultipartUploadCurrentRow {
-                upload: upload.clone(),
-                generation,
-                transaction_id: transaction_id.to_string(),
-                created_at_unix_nanos: current_unix_nanos()?,
-            });
-        }
-        MultipartMutationKind::UpsertPart => {
-            let part = part.ok_or_else(|| anyhow!("multipart part event missing part"))?;
-            let upload_key = multipart_upload_row_key(tenant_id, bucket_id, part.upload_id)?;
-            let upload_payload = coremeta_payload_visible_to_transaction(
-                meta,
-                transaction,
-                CF_OBJECT_HEADS,
-                TABLE_MULTIPART_UPLOAD_CURRENT_ROW,
-                &upload_key,
-            )?;
-            update.preconditions.push(coremeta_row_precondition(
-                TABLE_MULTIPART_UPLOAD_CURRENT_ROW,
-                upload_key,
-                upload_payload.as_ref(),
-                false,
-                true,
-            ));
-
-            let part_key =
-                multipart_part_row_key(tenant_id, bucket_id, part.upload_id, part.part_number)?;
-            let payload = coremeta_payload_visible_to_transaction(
-                meta,
-                transaction,
-                CF_OBJECT_HEADS,
-                TABLE_MULTIPART_PART_CURRENT_ROW,
-                &part_key,
-            )?;
-            let current = payload
-                .as_deref()
-                .map(decode_part_current_row)
-                .transpose()?;
-            let generation = current
-                .as_ref()
-                .map(|row| row.generation.saturating_add(1))
-                .unwrap_or(1);
-            update.preconditions.push(coremeta_row_precondition(
-                TABLE_MULTIPART_PART_CURRENT_ROW,
-                part_key,
-                payload.as_ref(),
-                payload.is_none(),
-                payload.is_some(),
-            ));
-            update.part_row = Some(MultipartPartCurrentRow {
-                tenant_id,
-                bucket_id,
-                part: part.clone(),
-                generation,
-                transaction_id: transaction_id.to_string(),
-                created_at_unix_nanos: current_unix_nanos()?,
-            });
-        }
-    }
-    Ok(update)
-}
-
-fn coremeta_payload_visible_to_transaction(
-    meta: &CoreMetaStore,
-    transaction: &CoreTransaction,
-    cf: &str,
-    table_id: u16,
-    tuple_key: &[u8],
-) -> Result<Option<Vec<u8>>> {
-    let cf = canonical_coremeta_cf_name(cf)?;
-    let mut current = meta.get_named(cf, table_id, tuple_key)?;
-    for update in &transaction.visible_updates {
-        match update {
-            CoreTransactionUpdate::CoreMetaPut {
-                cf: update_cf,
-                table_id: update_table_id,
-                tuple_key: update_key,
-                payload,
-                ..
-            } => {
-                if canonical_coremeta_cf_name(update_cf)? == cf
-                    && *update_table_id == table_id
-                    && update_key == tuple_key
-                {
-                    current = Some(payload.clone());
-                }
-            }
-            CoreTransactionUpdate::CoreMetaDelete {
-                cf: update_cf,
-                table_id: update_table_id,
-                tuple_key: update_key,
-                ..
-            } => {
-                if canonical_coremeta_cf_name(update_cf)? == cf
-                    && *update_table_id == table_id
-                    && update_key == tuple_key
-                {
-                    current = None;
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(current)
-}
-
-fn multipart_current_row_operations(
-    update: &MultipartCurrentRowUpdate,
-    partition_id: &str,
-) -> Result<Vec<CoreMutationOperation>> {
-    let mut operations = Vec::new();
-    if let Some(row) = update.upload_row.as_ref() {
-        operations.push(CoreMutationOperation::CoreMetaPut {
-            partition_id: partition_id.to_string(),
-            cf: CF_OBJECT_HEADS.to_string(),
-            table_id: TABLE_MULTIPART_UPLOAD_CURRENT_ROW,
-            tuple_key: multipart_upload_row_key(
-                row.upload.tenant_id,
-                row.upload.bucket_id,
-                row.upload.id,
-            )?,
-            payload: encode_upload_current_row(row)?,
-        });
-    }
-    if let Some(row) = update.part_row.as_ref() {
-        operations.push(CoreMutationOperation::CoreMetaPut {
-            partition_id: partition_id.to_string(),
-            cf: CF_OBJECT_HEADS.to_string(),
-            table_id: TABLE_MULTIPART_PART_CURRENT_ROW,
-            tuple_key: multipart_part_row_key(
-                row.tenant_id,
-                row.bucket_id,
-                row.part.upload_id,
-                row.part.part_number,
-            )?,
-            payload: encode_part_current_row(row)?,
-        });
-    }
-    Ok(operations)
-}
-
-fn coremeta_row_precondition(
-    table_id: u16,
-    tuple_key: Vec<u8>,
-    current_payload: Option<&Vec<u8>>,
-    require_absent: bool,
-    require_present: bool,
-) -> CoreMutationPrecondition {
-    CoreMutationPrecondition::CoreMetaRow {
-        cf: CF_OBJECT_HEADS.to_string(),
-        table_id,
-        tuple_key,
-        expected_payload_hash: current_payload
-            .map(|payload| core_meta_payload_digest(table_id, payload)),
-        require_absent,
-        require_present,
-    }
-}
-
-#[cfg(test)]
-pub(crate) async fn read_multipart_frame_fences_for_test(
-    storage: &Storage,
-    tenant_id: i64,
-    bucket_id: i64,
-) -> Result<Vec<u64>> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    Ok(core_store
-        .read_stream(crate::core_store::ReadStream {
-            stream_id: multipart_metadata_stream_id(tenant_id, bucket_id),
-            after_sequence: 0,
-            limit: 0,
-        })
-        .await?
-        .into_iter()
-        .filter(|record| record.record_kind == "multipart_metadata")
-        .map(|record| decode_multipart_event_fence(&record.payload))
-        .collect::<Result<Vec<_>>>()?)
+    vec![
+        CoreMutationRootPublication::new(coordinator_root, WriterFamily::CoreControl.as_str())
+            .coordinator(),
+        CoreMutationRootPublication::new(data_root, WriterFamily::ObjectBlob.as_str()),
+    ]
 }
 
 fn require_multipart_metadata_permit(
@@ -1570,3 +1496,5 @@ fn require_multipart_metadata_permit(
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::read_multipart_frame_fences as read_multipart_frame_fences_for_test;

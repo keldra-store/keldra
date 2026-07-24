@@ -23,7 +23,9 @@ A **region** is a placement and routing boundary. In production it often maps to
 
 A **cell** is a smaller boundary inside one region. It is typically a rack, rack-like failure domain, zone slice, storage pool, Kubernetes node pool, or capacity unit. The cell gives operators a way to avoid treating a whole region as one flat bag of nodes. Placement and draining can then reason about correlated failure or maintenance work.
 
-A **node** is one Anvil server process. Anvil does not model separate worker-node binaries for object work, index work, PersonalDB work, gateway work, and admin work. One process may advertise capabilities such as `object`, `index`, `personaldb`, `gateway`, and `admin`, and background work is virtual work inside those processes. A node descriptor records its node id, region, cell, libp2p peer id, public API address, public cluster addresses, capabilities, lifecycle state, optional drain descriptor, heartbeat timestamp when recorded, and generation.
+A **node** is one Anvil server process. Anvil does not model separate worker-node binaries for object work, index work, PersonalDB work, gateway work, and admin work. One process may advertise capabilities such as `object`, `index`, `personaldb`, `metadata`, `gateway`, and `admin`, and background work is virtual work inside those processes. A node descriptor records its node id, region, cell, Ed25519 receipt-signing public key, dialable `public_api_addr`, capabilities, lifecycle state, optional drain descriptor, heartbeat timestamp when recorded, and generation.
+
+Committed CoreMeta lifecycle topology is the sole membership and routing authority. There is no independent discovery or announcement path. Equal nodes contact the exact endpoint committed for each identity using authenticated gRPC, and verify signed evidence against the public key in that descriptor.
 
 Capabilities are operational intent. If a process should not be selected for remote object proxying, it should not advertise object capability. If a process lacks capacity for index or PersonalDB maintenance, it should not claim that capability just because the binary includes the code.
 
@@ -35,7 +37,7 @@ A **tenant locator** is routing state for a storage tenant. A **bucket locator**
 
 A **partition** is a bounded slice of durable work or control history. Mesh routing records are written through control streams and materialised into routing projections. Background owners use partition fences so stale workers cannot publish after handoff. Partitions are not a promise that every data feature has production-complete distributed placement; they are the vocabulary Anvil uses to make ownership, checkpoints, and repair evidence precise.
 
-Placement checks are lifecycle-aware. When topology descriptors exist, new writable placement requires the region, cell, and node to be eligible for writes. A region left in `joining`, `read_only`, `draining`, `offline`, or `removed` should not receive new writable placement. Compatibility paths may let very small local setups work before topology is registered, but once operators create topology records, those records become part of the serving contract.
+Placement checks are lifecycle-aware. New writable placement requires the committed region, cell, and node descriptors to be eligible for writes. A region left in `joining`, `read_only`, `draining`, `offline`, or `removed` must not receive new writable placement. Even a single-node deployment has lifecycle topology; process presence and local configuration do not supersede the committed records.
 
 ## Routing records are derived state
 

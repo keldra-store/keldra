@@ -74,6 +74,50 @@ fn corestore_perf_baseline_release() {
 }
 
 #[test]
+fn coremeta_ordered_access_has_enforced_quick_and_release_profiles() {
+    let manifest_raw = repo_file("ops/perf/coremeta-release-gate.json");
+    let manifest: serde_json::Value = serde_json::from_str(&manifest_raw).unwrap();
+    assert_eq!(
+        manifest.get("schema").and_then(serde_json::Value::as_str),
+        Some("anvil.perf.coremeta_gate_manifest.v1")
+    );
+    for (profile, small_rows, large_rows) in [
+        ("quick", 4_096_u64, 65_536_u64),
+        ("release", 65_536_u64, 1_048_576_u64),
+    ] {
+        let profile = &manifest["profiles"][profile];
+        assert_eq!(profile["small_rows"].as_u64(), Some(small_rows));
+        assert_eq!(profile["large_rows"].as_u64(), Some(large_rows));
+        assert!(profile["page_samples"].as_u64().unwrap() >= 100);
+        assert!(profile["thresholds"]["deep_page_work_growth_ratio"].is_number());
+        assert!(profile["thresholds"]["page_work_per_item"].is_number());
+    }
+
+    let runner = repo_file("anvil-core/benches/coremeta_release_gate/runner.rs");
+    for expected in [
+        "PerfStatsLevel::EnableCount",
+        "point_get_small",
+        "point_get_large",
+        "prefix_page_early_large",
+        "prefix_page_deep_small",
+        "prefix_page_deep_large",
+        "bounded_list_scaled_page_large",
+        "transactional_head_read_and_batch",
+        "deep_page_work_is_table_size_independent",
+        "bounded_list_work_scales_with_page_size",
+    ] {
+        assert!(runner.contains(expected), "missing {expected}");
+    }
+
+    let release_gates = repo_file("scripts/release-gates.sh");
+    assert!(release_gates.contains("perf-quick"));
+    assert!(release_gates.contains("perf-release"));
+    let report_checker = repo_file("scripts/check-coremeta-perf-report.py");
+    assert!(report_checker.contains("REQUIRED_COMPLEXITY_GATES"));
+    assert!(report_checker.contains("benchmark reported a failed gate"));
+}
+
+#[test]
 fn stable_trace_event_schema_and_operation_names_are_code_contract() {
     let perf = repo_file("anvil-core/src/perf.rs");
     for expected in [

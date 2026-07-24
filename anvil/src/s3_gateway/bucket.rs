@@ -51,9 +51,84 @@ pub(super) async fn list_buckets(State(state): State<AppState>, req: Request) ->
     let claims = checked_route
         .claims
         .expect("authenticated delete bucket path supplied claims");
+    let query = s3_query_map(req.uri());
+    if query.contains_key("prefix") || query.contains_key("bucket-region") {
+        return s3_error(
+            "NotImplemented",
+            "ListBuckets prefix and bucket-region filters are not implemented",
+            axum::http::StatusCode::NOT_IMPLEMENTED,
+        );
+    }
+    let max_buckets = match query.get("max-buckets") {
+        Some(value) => match value.parse::<u32>() {
+            Ok(value) if (1..=1000).contains(&value) => value,
+            _ => {
+                return s3_error(
+                    "InvalidArgument",
+                    "max-buckets must be between 1 and 1000",
+                    axum::http::StatusCode::BAD_REQUEST,
+                );
+            }
+        },
+        None => 1000,
+    };
+    let continuation_token = query.get("continuation-token").cloned().unwrap_or_default();
 
-    match state.bucket_manager.list_buckets(&claims).await {
-        Ok(buckets) => {
+    let result = async {
+        state.bucket_manager.authorize_bucket_list(&claims).await?;
+        let page_request = anvil_core::anvil_api::PageRequest {
+            page_size: max_buckets,
+            page_token: continuation_token.clone(),
+        };
+        let revision =
+            bucket_journal::current_bucket_collection_revision(&state.storage, claims.tenant_id)
+                .await
+                .map_err(|error| tonic::Status::internal(error.to_string()))?;
+        let principal_scope = format!("tenant:{}/subject:{}", claims.tenant_id, claims.sub);
+        let binding = anvil_core::services::collection_cursor::CollectionCursorBinding {
+            service_method: "anvil.S3/ListBuckets",
+            filters: &[],
+            principal_scope: &principal_scope,
+            page_size: max_buckets as usize,
+            revision: &revision,
+            sort: "bucket_name.asc",
+        };
+        let position = anvil_core::services::collection_cursor::decode_page_token(
+            Some(&page_request),
+            &binding,
+            state.config.jwt_secret.as_bytes(),
+        )?;
+        let after_tuple_key =
+            anvil_core::services::collection_cursor::decode_binary_position(position.as_deref())?;
+        let page = bucket_journal::page_current_buckets(
+            &state.storage,
+            claims.tenant_id,
+            &revision,
+            after_tuple_key.as_deref(),
+            max_buckets as usize,
+        )
+        .await
+        .map_err(|error| tonic::Status::aborted(error.to_string()))?;
+        let next_page_token = page
+            .next_tuple_key
+            .as_deref()
+            .map(anvil_core::services::collection_cursor::encode_binary_position)
+            .transpose()?
+            .map(|position| {
+                anvil_core::services::collection_cursor::encode_next_page_token(
+                    &position,
+                    &binding,
+                    state.config.jwt_secret.as_bytes(),
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
+        Ok::<_, tonic::Status>((page.buckets, next_page_token))
+    }
+    .await;
+
+    match result {
+        Ok((buckets, next_page_token)) => {
             let mut xml = String::from(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n",
             );
@@ -76,6 +151,12 @@ pub(super) async fn list_buckets(State(state): State<AppState>, req: Request) ->
                 xml.push_str("    </Bucket>\n");
             }
             xml.push_str("  </Buckets>\n");
+            if !next_page_token.is_empty() {
+                xml.push_str(&format!(
+                    "  <ContinuationToken>{}</ContinuationToken>\n",
+                    xml_escape(&next_page_token)
+                ));
+            }
             xml.push_str("</ListAllMyBucketsResult>\n");
 
             Response::builder()
@@ -84,11 +165,23 @@ pub(super) async fn list_buckets(State(state): State<AppState>, req: Request) ->
                 .body(Body::from(xml))
                 .unwrap()
         }
-        Err(status) => s3_error(
-            "InternalError",
-            status.message(),
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-        ),
+        Err(status) => match status.code() {
+            tonic::Code::InvalidArgument | tonic::Code::Aborted => s3_error(
+                "InvalidArgument",
+                status.message(),
+                axum::http::StatusCode::BAD_REQUEST,
+            ),
+            tonic::Code::PermissionDenied | tonic::Code::Unauthenticated => s3_error(
+                "AccessDenied",
+                status.message(),
+                axum::http::StatusCode::FORBIDDEN,
+            ),
+            _ => s3_error(
+                "InternalError",
+                status.message(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        },
     }
 }
 
@@ -1339,12 +1432,26 @@ mod list_bucket_pagination_tests {
 }
 
 pub(super) async fn readiness_check(State(state): State<AppState>) -> Response {
-    // Cluster readiness: at least 1 peer known (self included).
-    let peers = state.cluster.read().await.len();
-    if peers >= 1 {
+    let coremeta = state.core_store.coremeta_recovery_snapshot();
+    if coremeta.ready {
         (axum::http::StatusCode::OK, "READY").into_response()
     } else {
-        let body = serde_json::json!({"status":"not_ready","peers":peers});
+        let body = serde_json::json!({
+            "status": "not_ready",
+            "coremeta": {
+                "ready": coremeta.ready,
+                "distributed_required": coremeta.distributed_required,
+                "in_progress": coremeta.in_progress,
+                "reachable_peers": coremeta.reachable_peers,
+                "known_roots": coremeta.known_roots,
+                "lagging_roots": coremeta.lagging_roots,
+                "root_directory_complete": coremeta.root_directory_complete,
+                "canonical_settlement_complete": coremeta.canonical_settlement_complete,
+                "physical_register_quorum_complete": coremeta.physical_register_quorum_complete,
+                "completed_rounds": coremeta.completed_rounds,
+                "last_error": coremeta.last_error,
+            }
+        });
         (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             axum::response::Json(body),

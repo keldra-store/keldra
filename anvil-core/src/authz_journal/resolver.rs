@@ -30,6 +30,14 @@ pub(crate) struct SchemaRuleIndex {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct MaterializedSchemaRelation {
+    pub(crate) namespace: String,
+    pub(crate) relation: String,
+    pub(crate) direct_relation: bool,
+    pub(crate) rules: Vec<AuthzRelationRule>,
+}
+
+#[derive(Debug, Clone)]
 struct SchemaMember {
     direct_relation: bool,
     rules: Vec<AuthzRelationRule>,
@@ -42,6 +50,31 @@ struct UsersetRuleKey {
 }
 
 impl SchemaRuleIndex {
+    pub(crate) fn from_materialized_relations(
+        bound_namespaces: impl IntoIterator<Item = String>,
+        relations: impl IntoIterator<Item = MaterializedSchemaRelation>,
+    ) -> Self {
+        let members_by_userset = relations
+            .into_iter()
+            .map(|relation| {
+                (
+                    UsersetRuleKey {
+                        namespace: relation.namespace,
+                        relation: relation.relation,
+                    },
+                    SchemaMember {
+                        direct_relation: relation.direct_relation,
+                        rules: relation.rules,
+                    },
+                )
+            })
+            .collect();
+        Self {
+            members_by_userset,
+            schema_bound_namespaces: bound_namespaces.into_iter().collect(),
+        }
+    }
+
     pub(crate) async fn load<'a, I>(
         storage: &Storage,
         tenant_id: i64,

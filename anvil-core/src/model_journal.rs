@@ -1,15 +1,27 @@
 use crate::anvil_api::{ModelManifest, TensorIndexRow};
 use crate::core_store::{
-    CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition, CoreStore, ReadStream,
+    CF_OBSERVABILITY, CoreMetaTuplePart, CoreMutationBatch, CoreMutationOperation,
+    CoreMutationPrecondition, CoreMutationRootPublication, CoreStore,
+    TABLE_OBSERVABILITY_CURSOR_ROW, core_meta_committed_row_common, core_meta_record_tuple_key,
+    core_meta_root_key_hash, core_meta_tuple_key,
 };
-use crate::formats::{Hash32, hash32};
+use crate::formats::{Hash32, hash32, writer::WriterFamily};
 use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
 use crate::storage::Storage;
 use anyhow::{Result, anyhow};
 use prost::{Message, Oneof};
-use std::collections::BTreeMap;
 
 const MODEL_METADATA_BODY_SCHEMA: &str = "anvil.core.model_metadata.v1";
+const MODEL_ARTIFACT_PROJECTION_SCHEMA: &str = "anvil.model.artifact_projection.v1";
+const MODEL_TENSOR_PROJECTION_SCHEMA: &str = "anvil.model.tensor_projection.v1";
+const MODEL_TENSOR_SCAN_PAGE_MAX: usize = 4096;
+const MODEL_TENSOR_PAGE_MAX: usize = MODEL_TENSOR_SCAN_PAGE_MAX - 1;
+
+#[derive(Debug, Clone)]
+pub struct ModelTensorPage {
+    pub tensors: Vec<TensorIndexRow>,
+    pub next_cursor: Option<Vec<u8>>,
+}
 
 #[derive(Debug, Clone)]
 enum ModelEventBody {
@@ -69,10 +81,32 @@ struct ModelTensorsReplaceProto {
     tensors: Vec<TensorIndexRow>,
 }
 
-#[derive(Debug, Clone, Default)]
-struct ModelState {
-    artifacts: BTreeMap<String, ModelManifest>,
-    tensors: BTreeMap<String, Vec<TensorIndexRow>>,
+#[derive(Clone, PartialEq, Message)]
+struct ModelArtifactProjectionProto {
+    #[prost(message, optional, tag = "1")]
+    common: Option<crate::core_store::CoreMetaRowCommonProto>,
+    #[prost(string, tag = "2")]
+    schema: String,
+    #[prost(string, tag = "3")]
+    artifact_id: String,
+    #[prost(int64, tag = "4")]
+    bucket_id: i64,
+    #[prost(string, tag = "5")]
+    key: String,
+    #[prost(message, optional, tag = "6")]
+    manifest: Option<ModelManifest>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct ModelTensorProjectionProto {
+    #[prost(message, optional, tag = "1")]
+    common: Option<crate::core_store::CoreMetaRowCommonProto>,
+    #[prost(string, tag = "2")]
+    schema: String,
+    #[prost(string, tag = "3")]
+    artifact_id: String,
+    #[prost(message, optional, tag = "4")]
+    tensor: Option<TensorIndexRow>,
 }
 
 #[cfg(test)]
@@ -182,23 +216,51 @@ async fn create_model_tensors_inner(
     .await
 }
 
-pub async fn list_tensors(
+pub async fn list_tensor_page(
     storage: &Storage,
     artifact_id: &str,
-    limit: i64,
-    offset: i64,
-) -> Result<Vec<TensorIndexRow>> {
-    let mut tensors = read_model_state(storage)
+    after_cursor: Option<&[u8]>,
+    limit: usize,
+) -> Result<ModelTensorPage> {
+    if !(1..=MODEL_TENSOR_PAGE_MAX).contains(&limit) {
+        return Err(anyhow!(
+            "model tensor page size must be between 1 and {MODEL_TENSOR_PAGE_MAX}"
+        ));
+    }
+    let mut rows = CoreStore::new(storage.clone())
         .await?
-        .tensors
-        .remove(artifact_id)
-        .unwrap_or_default();
-    tensors.sort_by(|a, b| a.tensor_name.cmp(&b.tensor_name));
-    Ok(tensors
+        .scan_coremeta_prefix_page(
+            CF_OBSERVABILITY,
+            TABLE_OBSERVABILITY_CURSOR_ROW,
+            &model_tensor_prefix(artifact_id)?,
+            after_cursor,
+            limit + 1,
+        )?;
+    let has_more = rows.len() > limit;
+    if has_more {
+        rows.truncate(limit);
+    }
+    let next_cursor = if has_more {
+        Some(
+            core_meta_record_tuple_key(
+                &rows
+                    .last()
+                    .ok_or_else(|| anyhow!("model tensor continuation has no row"))?
+                    .key,
+            )?
+            .to_vec(),
+        )
+    } else {
+        None
+    };
+    let tensors = rows
         .into_iter()
-        .skip(offset.max(0) as usize)
-        .take(limit.max(0) as usize)
-        .collect())
+        .map(|row| decode_model_tensor_projection(&row.payload, artifact_id))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ModelTensorPage {
+        tensors,
+        next_cursor,
+    })
 }
 
 pub async fn get_tensor_metadata(
@@ -206,46 +268,33 @@ pub async fn get_tensor_metadata(
     artifact_id: &str,
     tensor_name: &str,
 ) -> Result<Option<TensorIndexRow>> {
-    Ok(read_model_state(storage)
-        .await?
-        .tensors
-        .get(artifact_id)
-        .and_then(|rows| rows.iter().find(|row| row.tensor_name == tensor_name))
-        .cloned())
+    let Some(payload) = CoreStore::new(storage.clone()).await?.read_coremeta_row(
+        CF_OBSERVABILITY,
+        TABLE_OBSERVABILITY_CURSOR_ROW,
+        &model_tensor_key(artifact_id, tensor_name)?,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(decode_model_tensor_projection(&payload, artifact_id)?))
 }
 
 pub async fn get_model_artifact(
     storage: &Storage,
     artifact_id: &str,
 ) -> Result<Option<ModelManifest>> {
-    Ok(read_model_state(storage)
-        .await?
-        .artifacts
-        .get(artifact_id)
-        .cloned())
-}
-
-async fn read_model_state(storage: &Storage) -> Result<ModelState> {
-    let events = read_model_events(storage).await?;
-    let mut state = ModelState::default();
-    for event in events {
-        match event {
-            ModelEventBody::ArtifactUpsert {
-                artifact_id,
-                manifest,
-                ..
-            } => {
-                state.artifacts.insert(artifact_id, manifest);
-            }
-            ModelEventBody::TensorsReplace {
-                artifact_id,
-                tensors,
-            } => {
-                state.tensors.insert(artifact_id, tensors);
-            }
-        }
-    }
-    Ok(state)
+    let Some(payload) = CoreStore::new(storage.clone()).await?.read_coremeta_row(
+        CF_OBSERVABILITY,
+        TABLE_OBSERVABILITY_CURSOR_ROW,
+        &model_artifact_key(artifact_id)?,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(decode_model_artifact_projection(
+        &payload,
+        artifact_id,
+    )?))
 }
 
 async fn append_model_event(
@@ -258,42 +307,236 @@ async fn append_model_event(
     let mutation_id = uuid::Uuid::new_v4();
     let payload = encode_model_event_body(&event, fence_token, mutation_id)?;
     let partition_id = hex::encode(model_partition_id());
+    let stream_id = model_metadata_stream_id();
+    let stream_precondition = core_store.stream_head_precondition(&stream_id).await?;
+    let root_generation = next_stream_generation(&stream_precondition)?;
+    let transaction_id = format!("model-metadata:{mutation_id}");
+    let projection_operations = model_projection_operations(
+        &core_store,
+        &event,
+        &stream_id,
+        root_generation,
+        &transaction_id,
+        &partition_id,
+    )?;
+    let mut root_publications = vec![
+        CoreMutationRootPublication::new(partition_id.clone(), WriterFamily::CoreControl.as_str())
+            .coordinator(),
+    ];
+    if !projection_operations.is_empty() {
+        root_publications.push(CoreMutationRootPublication::new(
+            model_projection_root_anchor_key(&stream_id),
+            WriterFamily::Vector.as_str(),
+        ));
+    }
+    let mut operations = vec![CoreMutationOperation::StreamAppend {
+        partition_id: partition_id.clone(),
+        stream_id: stream_id.clone(),
+        record_kind: "model_metadata".to_string(),
+        payload,
+        idempotency_key: Some(transaction_id.clone()),
+    }];
+    operations.extend(projection_operations);
+    let mut preconditions: Vec<_> = partition_precondition.into_iter().collect();
+    preconditions.push(stream_precondition);
     core_store
         .commit_mutation_batch(CoreMutationBatch {
-            transaction_id: format!("model-metadata:{mutation_id}"),
+            transaction_id,
             scope_partition: partition_id.clone(),
             committed_by_principal: model_partition_principal(),
-            preconditions: partition_precondition.into_iter().collect(),
-            operations: vec![CoreMutationOperation::StreamAppend {
-                partition_id,
-                stream_id: model_metadata_stream_id(),
-                record_kind: "model_metadata".to_string(),
-                payload,
-                idempotency_key: Some(format!("model-metadata:{mutation_id}")),
-            }],
+            root_publications,
+            preconditions,
+            operations,
         })
         .await?;
     Ok(())
 }
 
-async fn read_model_events(storage: &Storage) -> Result<Vec<ModelEventBody>> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let records = core_store
-        .read_stream(ReadStream {
-            stream_id: model_metadata_stream_id(),
-            after_sequence: 0,
-            limit: 0,
-        })
-        .await?;
-    records
-        .into_iter()
-        .filter(|record| record.record_kind == "model_metadata")
-        .map(|record| decode_model_event_body(&record.payload))
-        .collect()
-}
-
 pub fn model_partition_id() -> Hash32 {
     hash32(b"model_metadata/global")
+}
+
+fn next_stream_generation(precondition: &CoreMutationPrecondition) -> Result<u64> {
+    let CoreMutationPrecondition::StreamHead {
+        expected_last_sequence,
+        ..
+    } = precondition
+    else {
+        return Err(anyhow!("model stream precondition has wrong kind"));
+    };
+    expected_last_sequence
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("model stream sequence overflow"))
+}
+
+fn model_projection_operations(
+    core_store: &CoreStore,
+    event: &ModelEventBody,
+    stream_id: &str,
+    root_generation: u64,
+    transaction_id: &str,
+    partition_id: &str,
+) -> Result<Vec<CoreMutationOperation>> {
+    let root_key_hash = core_meta_root_key_hash(&model_projection_root_anchor_key(stream_id));
+    match event {
+        ModelEventBody::ArtifactUpsert {
+            artifact_id,
+            bucket_id,
+            key,
+            manifest,
+        } => Ok(vec![CoreMutationOperation::CoreMetaPut {
+            partition_id: partition_id.to_string(),
+            cf: CF_OBSERVABILITY.to_string(),
+            table_id: TABLE_OBSERVABILITY_CURSOR_ROW,
+            tuple_key: model_artifact_key(artifact_id)?,
+            payload: encode_deterministic_proto(&ModelArtifactProjectionProto {
+                common: Some(core_meta_committed_row_common(
+                    "system",
+                    root_key_hash,
+                    root_generation,
+                    transaction_id,
+                    root_generation,
+                )),
+                schema: MODEL_ARTIFACT_PROJECTION_SCHEMA.to_string(),
+                artifact_id: artifact_id.clone(),
+                bucket_id: *bucket_id,
+                key: key.clone(),
+                manifest: Some(manifest.clone()),
+            })?,
+        }]),
+        ModelEventBody::TensorsReplace {
+            artifact_id,
+            tensors,
+        } => {
+            let mut names = std::collections::BTreeSet::new();
+            let mut replacement_keys = std::collections::BTreeSet::new();
+            for tensor in tensors {
+                if !names.insert(tensor.tensor_name.as_str()) {
+                    return Err(anyhow!(
+                        "model tensor replacement contains duplicate tensor name {}",
+                        tensor.tensor_name
+                    ));
+                }
+                replacement_keys.insert(model_tensor_key(artifact_id, &tensor.tensor_name)?);
+            }
+            let prefix = model_tensor_prefix(artifact_id)?;
+            let mut after = None;
+            let mut operations = Vec::new();
+            loop {
+                let rows = core_store.scan_coremeta_prefix_page(
+                    CF_OBSERVABILITY,
+                    TABLE_OBSERVABILITY_CURSOR_ROW,
+                    &prefix,
+                    after.as_deref(),
+                    MODEL_TENSOR_SCAN_PAGE_MAX,
+                )?;
+                if rows.is_empty() {
+                    break;
+                }
+                let row_count = rows.len();
+                after = Some(
+                    core_meta_record_tuple_key(
+                        &rows
+                            .last()
+                            .ok_or_else(|| anyhow!("model tensor page has no last row"))?
+                            .key,
+                    )?
+                    .to_vec(),
+                );
+                for row in rows {
+                    let tuple_key = core_meta_record_tuple_key(&row.key)?.to_vec();
+                    if replacement_keys.contains(&tuple_key) {
+                        continue;
+                    }
+                    operations.push(CoreMutationOperation::CoreMetaDelete {
+                        partition_id: partition_id.to_string(),
+                        cf: CF_OBSERVABILITY.to_string(),
+                        table_id: TABLE_OBSERVABILITY_CURSOR_ROW,
+                        tuple_key,
+                    });
+                }
+                if row_count < MODEL_TENSOR_SCAN_PAGE_MAX {
+                    break;
+                }
+            }
+            for tensor in tensors {
+                operations.push(CoreMutationOperation::CoreMetaPut {
+                    partition_id: partition_id.to_string(),
+                    cf: CF_OBSERVABILITY.to_string(),
+                    table_id: TABLE_OBSERVABILITY_CURSOR_ROW,
+                    tuple_key: model_tensor_key(artifact_id, &tensor.tensor_name)?,
+                    payload: encode_deterministic_proto(&ModelTensorProjectionProto {
+                        common: Some(core_meta_committed_row_common(
+                            "system",
+                            root_key_hash.clone(),
+                            root_generation,
+                            transaction_id,
+                            root_generation,
+                        )),
+                        schema: MODEL_TENSOR_PROJECTION_SCHEMA.to_string(),
+                        artifact_id: artifact_id.clone(),
+                        tensor: Some(tensor.clone()),
+                    })?,
+                });
+            }
+            Ok(operations)
+        }
+    }
+}
+
+fn model_projection_root_anchor_key(stream_id: &str) -> String {
+    format!("stream/{stream_id}")
+}
+
+fn model_artifact_key(artifact_id: &str) -> Result<Vec<u8>> {
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("model"),
+        CoreMetaTuplePart::Utf8("artifact"),
+        CoreMetaTuplePart::Utf8(artifact_id),
+    ])
+}
+
+fn model_tensor_prefix(artifact_id: &str) -> Result<Vec<u8>> {
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("model"),
+        CoreMetaTuplePart::Utf8("tensor"),
+        CoreMetaTuplePart::Utf8(artifact_id),
+    ])
+}
+
+fn model_tensor_key(artifact_id: &str, tensor_name: &str) -> Result<Vec<u8>> {
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("model"),
+        CoreMetaTuplePart::Utf8("tensor"),
+        CoreMetaTuplePart::Utf8(artifact_id),
+        CoreMetaTuplePart::Utf8(tensor_name),
+    ])
+}
+
+fn decode_model_artifact_projection(bytes: &[u8], artifact_id: &str) -> Result<ModelManifest> {
+    let row = ModelArtifactProjectionProto::decode(bytes)?;
+    ensure_deterministic_proto(&row, bytes, "model artifact projection")?;
+    if row.common.is_none()
+        || row.schema != MODEL_ARTIFACT_PROJECTION_SCHEMA
+        || row.artifact_id != artifact_id
+    {
+        return Err(anyhow!("model artifact projection scope mismatch"));
+    }
+    row.manifest
+        .ok_or_else(|| anyhow!("model artifact projection is missing manifest"))
+}
+
+fn decode_model_tensor_projection(bytes: &[u8], artifact_id: &str) -> Result<TensorIndexRow> {
+    let row = ModelTensorProjectionProto::decode(bytes)?;
+    ensure_deterministic_proto(&row, bytes, "model tensor projection")?;
+    if row.common.is_none()
+        || row.schema != MODEL_TENSOR_PROJECTION_SCHEMA
+        || row.artifact_id != artifact_id
+    {
+        return Err(anyhow!("model tensor projection scope mismatch"));
+    }
+    row.tensor
+        .ok_or_else(|| anyhow!("model tensor projection is missing tensor"))
 }
 
 fn encode_model_event_body(
@@ -405,17 +648,27 @@ fn model_partition_principal() -> String {
 #[cfg(test)]
 pub(crate) async fn read_model_frame_fences_for_test(storage: &Storage) -> Result<Vec<u64>> {
     let core_store = CoreStore::new(storage.clone()).await?;
-    Ok(core_store
-        .read_stream(ReadStream {
-            stream_id: model_metadata_stream_id(),
-            after_sequence: 0,
-            limit: 0,
-        })
-        .await?
-        .into_iter()
-        .filter(|record| record.record_kind == "model_metadata")
-        .map(|record| decode_model_event_body_fence(&record.payload))
-        .collect::<Result<Vec<_>>>()?)
+    let mut after_sequence = 0;
+    let mut fences = Vec::new();
+    loop {
+        let page = core_store
+            .read_stream_page(crate::core_store::ReadStream {
+                stream_id: model_metadata_stream_id(),
+                after_sequence,
+                limit: 256,
+            })
+            .await?;
+        for record in page.records {
+            if record.record_kind == "model_metadata" {
+                fences.push(decode_model_event_body_fence(&record.payload)?);
+            }
+        }
+        if !page.has_more || page.next_sequence == after_sequence {
+            break;
+        }
+        after_sequence = page.next_sequence;
+    }
+    Ok(fences)
 }
 
 async fn model_write_precondition(
@@ -498,9 +751,10 @@ mod tests {
                 .is_some()
         );
         assert_eq!(
-            list_tensors(&storage, "artifact-a", 10, 0)
+            list_tensor_page(&storage, "artifact-a", None, 10)
                 .await
                 .unwrap()
+                .tensors
                 .into_iter()
                 .map(|row| row.tensor_name)
                 .collect::<Vec<_>>(),
@@ -594,7 +848,9 @@ mod tests {
         .unwrap_err();
         let message = err.to_string();
         assert!(
-            message.contains("generation mismatch") || message.contains("target mismatch"),
+            message.contains("generation mismatch")
+                || message.contains("target mismatch")
+                || message.contains("precondition failed"),
             "unexpected stale precondition error: {message}"
         );
 
@@ -612,24 +868,114 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_journal_reader_fails_closed_on_tampered_frame() {
+    async fn current_model_projection_does_not_replay_unrelated_history() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
 
         create_model_artifact(&storage, "artifact-a", 1, "models/a", &manifest(""))
             .await
             .unwrap();
-
-        CoreStore::new(storage.clone())
+        for index in 0..64 {
+            let artifact_id = format!("unrelated-{index:03}");
+            create_model_artifact(
+                &storage,
+                &artifact_id,
+                1,
+                &format!("models/{artifact_id}"),
+                &manifest(""),
+            )
             .await
-            .unwrap()
-            .corrupt_stream_record_payload_for_test(&model_metadata_stream_id(), 1)
             .unwrap();
+        }
 
-        let err = get_model_artifact(&storage, "artifact-a")
+        assert!(
+            get_model_artifact(&storage, "artifact-a")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn tensor_cursor_pages_are_bounded_and_scoped_to_the_requested_artifact() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+
+        for index in 0..64 {
+            create_model_tensors(
+                &storage,
+                &format!("unrelated-{index:03}"),
+                &[tensor(&format!("noise-{index:03}"))],
+            )
             .await
-            .expect_err("tampered model journal must not replay partial state");
-        assert!(!err.to_string().is_empty());
+            .unwrap();
+        }
+        create_model_tensors(
+            &storage,
+            "artifact-a",
+            &[tensor("c"), tensor("a"), tensor("b")],
+        )
+        .await
+        .unwrap();
+
+        let first = list_tensor_page(&storage, "artifact-a", None, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            first
+                .tensors
+                .iter()
+                .map(|row| row.tensor_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        assert!(first.next_cursor.is_some());
+
+        let second = list_tensor_page(&storage, "artifact-a", first.next_cursor.as_deref(), 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            second
+                .tensors
+                .iter()
+                .map(|row| row.tensor_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c"]
+        );
+        assert!(second.next_cursor.is_none());
+
+        let error = list_tensor_page(&storage, "unrelated-000", first.next_cursor.as_deref(), 2)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("outside the requested prefix"));
+
+        create_model_tensors(&storage, "artifact-a", &[tensor("b"), tensor("d")])
+            .await
+            .unwrap();
+        assert_eq!(
+            list_tensor_page(&storage, "artifact-a", None, 10)
+                .await
+                .unwrap()
+                .tensors
+                .into_iter()
+                .map(|row| row.tensor_name)
+                .collect::<Vec<_>>(),
+            vec!["b".to_string(), "d".to_string()]
+        );
+        assert!(
+            get_tensor_metadata(&storage, "artifact-a", "a")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        assert!(
+            list_tensor_page(&storage, "artifact-a", None, 0)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("page size")
+        );
     }
 
     async fn ready_owner(

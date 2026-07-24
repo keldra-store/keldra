@@ -41,7 +41,8 @@ impl RangeAddressedWriterSegment {
             storage,
             &index_id,
             segment_ref,
-        )?
+        )
+        .await?
         .ok_or_else(|| anyhow!("writer segment CoreMeta row {segment_ref} is missing"))?;
         let object_ref = decode_core_object_ref_target(&segment.core_object_ref_target)?;
         Self::open_object_ref(store, object_ref, family).await

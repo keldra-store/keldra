@@ -89,9 +89,19 @@ If activation fails because the region is missing, register or inspect the regio
 
 ## Register and activate the local node
 
-The node descriptor represents the running `anvil-local` server process. Its public API address is the address clients use from the host. Its cluster address is the private node-to-node address other Anvil nodes would dial in a real mesh. This single-node tutorial does not publish the cluster port to the host, but the descriptor still shows where that value belongs.
+The node descriptor represents the running `anvil-local` server process. Its `public_api_addr` is both the client endpoint in this tutorial and the authenticated gRPC endpoint other nodes would dial in a distributed deployment. The descriptor must also contain the Ed25519 receipt-signing public key generated and stored locally by this exact node.
 
-Capabilities should reflect the process you are actually running. The local all-in-one node advertises object storage, indexing, PersonalDB work, gateway serving, and admin capability. Production deployments may split capabilities across processes, but Anvil nodes are still peers in one system model; avoid inventing a special worker-node hierarchy in docs or runbooks unless the implementation provides one.
+Capabilities should reflect the process you are actually running. The local all-in-one node advertises object storage, indexing, PersonalDB work, metadata, gateway serving, and admin capability. Production deployments may vary capabilities, but Anvil nodes remain equal participants rather than a separate worker hierarchy.
+
+Read the local descriptor first and convert its byte-array public key to base64 for the registration command:
+
+```bash
+export LOCAL_NODE_SIGNING_KEY_B64="$(
+  docker exec -e ANVIL_AUTH_TOKEN="$ANVIL_AUTH_TOKEN" anvil-local \
+    anvil-admin node describe-local \
+  | jq -r '.resource.receipt_signing_public_key | implode | @base64'
+)"
+```
 
 ```bash
 docker exec -e ANVIL_AUTH_TOKEN="$ANVIL_AUTH_TOKEN" anvil-local \
@@ -99,10 +109,9 @@ docker exec -e ANVIL_AUTH_TOKEN="$ANVIL_AUTH_TOKEN" anvil-local \
     --node-id local-node-1 \
     --region local \
     --cell-id local-cell-1 \
-    --libp2p-peer-id local-dev-peer \
+    --receipt-signing-public-key-b64 "$LOCAL_NODE_SIGNING_KEY_B64" \
     --public-api-addr http://127.0.0.1:50051 \
-    --public-cluster-addr /ip4/127.0.0.1/udp/7443/quic-v1 \
-    --capability object,index,personaldb,gateway,admin \
+    --capability object,index,personaldb,metadata,gateway,admin \
     --audit-reason 'register local tutorial node'
 ```
 
@@ -116,7 +125,7 @@ docker exec -e ANVIL_AUTH_TOKEN="$ANVIL_AUTH_TOKEN" anvil-local \
     --audit-reason 'activate local tutorial node'
 ```
 
-Success proves Anvil recorded the node descriptor, accepted the advertised capability list, and moved the node lifecycle to active using a generation check. It does not prove region activation, bucket placement, S3 routing, host aliases, or cluster gossip are production-ready.
+Success proves Anvil recorded the node descriptor with the local signing public key and endpoint, accepted the capability list, and moved the lifecycle to active using a generation check. It does not prove region activation, bucket placement, S3 routing, host aliases, or distributed recovery.
 
 If a capability is wrong, fix the descriptor through the supported lifecycle/update path rather than hoping other services infer reality from traffic. A node that cannot serve gateway traffic should not advertise `gateway`; a node that should not receive admin responsibilities should not advertise `admin`. Accurate capabilities are what make later drain and repair operations explainable.
 

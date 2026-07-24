@@ -1,5 +1,13 @@
 use super::*;
 
+mod idempotency;
+mod portable_bootstrap;
+mod root_directory;
+mod stream_publication_recovery;
+
+const TEST_PENDING_MUTATION_NODE_ID: &str = "local-corestore-node";
+const TEST_PENDING_MUTATION_EPOCH: u64 = 1;
+
 fn test_pending_mutation_record(
     mutation_id: &str,
     created_at_unix_nanos: u64,
@@ -7,14 +15,14 @@ fn test_pending_mutation_record(
 ) -> CorePendingMutationRecord {
     CorePendingMutationRecord {
         schema: CORE_PENDING_MUTATION_RECORD_SCHEMA.to_string(),
-        node_id: CORE_PENDING_MUTATION_NODE_ID.to_string(),
-        mutation_epoch: CORE_PENDING_MUTATION_EPOCH,
+        node_id: TEST_PENDING_MUTATION_NODE_ID.to_string(),
+        mutation_epoch: TEST_PENDING_MUTATION_EPOCH,
         sequence,
         mutation_id: mutation_id.to_string(),
         idempotency_key_hash: None,
         anvil_storage_tenant_id: "local".to_string(),
         authz_scope: test_pending_authz_scope(),
-        operation_family: "test.operation".to_string(),
+        operation_family: "mutation.batch".to_string(),
         writer_family: "core_control".to_string(),
         target: test_mutation_target(),
         precondition_fingerprints: Vec::new(),
@@ -53,6 +61,7 @@ fn test_object_put_target(logical_name: &str) -> CorePendingMutationTarget {
         compression: none_compression_descriptor(payload),
         writer_generation: 0,
         block_ordinal: 0,
+        logical_offset: 0,
     }
 }
 
@@ -72,10 +81,12 @@ fn test_stream_append_target(
 fn count_root_cache_generations(store: &CoreStore, root_key_hash_value: &str) -> usize {
     store
         .meta
-        .scan_prefix(
+        .scan_prefix_page(
             CF_ROOT_CACHE,
             TABLE_ROOT_CACHE_ROW,
             &root_anchor_generation_prefix(root_key_hash_value),
+            None,
+            CORE_META_MAX_SCAN_PAGE_ROWS,
         )
         .unwrap()
         .len()
@@ -340,7 +351,7 @@ fn test_object_ref_for_payload(
             written_at_unix_nanos,
             receipt_signature: store.sign_core_receipt(&signed_payload_hash).unwrap(),
             signed_payload_hash,
-            signature_algorithm: "ed25519-libp2p".to_string(),
+            signature_algorithm: "ed25519".to_string(),
         });
     }
     CoreObjectRef {
@@ -369,30 +380,50 @@ async fn write_test_pending_mutation_records(
     store: &CoreStore,
     records: Vec<CorePendingMutationRecord>,
 ) {
-    let mut max_sequence = 0;
+    let mut max_sequences = BTreeMap::<String, u64>::new();
     for record in records {
-        max_sequence = max_sequence.max(record.sequence);
+        let shard_hash = record.target.admission_shard().hash;
+        let pending_row = encode_stored_pending_mutation_row(&record, b"").unwrap();
+        let pending_hash_input = encode_pending_mutation_hash_input(&record, b"").unwrap();
+        let payload_set_hash = format!("sha256:{}", sha256_hex(&pending_row));
+        let evidence = store
+            .local_admission_evidence_bytes(&record, &pending_hash_input, payload_set_hash)
+            .unwrap();
+        max_sequences
+            .entry(shard_hash.clone())
+            .and_modify(|sequence| *sequence = (*sequence).max(record.sequence))
+            .or_insert(record.sequence);
         store
             .meta
             .put(
                 CF_TRANSACTIONS,
                 TABLE_PENDING_MUTATION_ROW,
-                &admission_record_key(record.sequence),
-                &encode_stored_pending_mutation_row(&record, b"").unwrap(),
+                &admission_record_key(&shard_hash, record.sequence),
+                &pending_row,
+            )
+            .unwrap();
+        store
+            .meta
+            .put(
+                CF_TRANSACTIONS,
+                TABLE_LOCAL_ADMISSION_EVIDENCE_ROW,
+                &admission_evidence_key(&shard_hash, record.sequence),
+                &evidence,
             )
             .unwrap();
     }
-    if max_sequence > 0 {
+    for (shard_hash, max_sequence) in max_sequences {
         store
             .meta
             .put(
                 CF_MATERIALISATION,
                 TABLE_MATERIALISATION_CURSOR_ROW,
-                &admission_sequence_key(),
-                &encode_materialisation_cursor_row(max_sequence).unwrap(),
+                &admission_sequence_key(&shard_hash),
+                &encode_admission_sequence_cursor_row(&shard_hash, max_sequence).unwrap(),
             )
             .unwrap();
     }
+    store.install_admission_point_state_for_tests().unwrap();
 }
 
 async fn read_test_pending_mutation_records(
@@ -433,9 +464,21 @@ fn sample_boundary_schema(bucket: &str, generation: u64) -> CoreBoundarySchema {
     }
 }
 
+mod admission_accounting;
 mod cancellation;
 mod control_record_encoding;
+mod coremeta_history;
 mod erasure_roots;
+mod explicit_precondition_boundaries;
+mod explicit_stream_transactions;
+mod final_linearization_guards;
 mod logical;
+mod object_metadata;
 mod pending;
+mod pending_terminal_recovery;
+mod precondition_errors;
 mod record_formats;
+mod root_publication_recovery;
+mod stream_paging;
+mod task_publication_successor;
+mod visibility;

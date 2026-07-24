@@ -151,13 +151,17 @@ impl CoreStore {
         }
         let present = shards.iter().filter(|shard| shard.is_some()).count();
         if present < data_shards {
-            bail!(
-                "CoreStore blob {} has only {} shards present; {} data shards required; unavailable or invalid shards: {}",
-                input.object_ref.hash,
-                present,
-                data_shards,
-                shard_failures.join("; ")
-            );
+            return Err(CoreStoreAvailabilityError::ShardQuorumUnavailable {
+                operation: "object_read",
+                required: data_shards,
+                received: present,
+                details: format!(
+                    "object {} unavailable or invalid shards: {}",
+                    input.object_ref.hash,
+                    shard_failures.join("; ")
+                ),
+            }
+            .into());
         }
         let profile = local_erasure_profile_for_counts(
             &manifest.encoding.profile_id,
@@ -470,10 +474,20 @@ impl CoreStore {
         if object_hash != manifest_hash {
             bail!("CoreStore inline object manifest ref/hash mismatch");
         }
+        let tuple_key = inline_payload_meta_key(object_ref);
+        // CoreMetaStore owns the specialised inline-payload decoder. The raw
+        // value is not returned until the publication-aware row read succeeds.
         let bytes = self
             .meta
-            .get_inline_payload(&inline_payload_meta_key(object_ref))?
+            .get_inline_payload(&tuple_key)?
             .ok_or_else(|| anyhow!("CoreStore inline payload row is missing"))?;
+        let visible_payload = self
+            .read_coremeta_row(CF_INLINE_PAYLOADS, TABLE_INLINE_PAYLOAD_ROW, &tuple_key)?
+            .ok_or_else(|| anyhow!("CoreStore inline payload row is not published"))?;
+        let visible_common = core_meta_row_common_from_payload(&visible_payload)?;
+        if encode_core_meta_inline_payload_row(&bytes, visible_common)? != visible_payload {
+            bail!("CoreStore inline payload row changed during publication-aware read");
+        }
         if bytes.len() as u64 != object_ref.logical_size {
             bail!("CoreStore inline payload length mismatch");
         }
@@ -748,42 +762,60 @@ impl CoreStore {
         if !is_inline_manifest_body_locator(locator) {
             bail!("CoreStore manifest locator is not an inline manifest body locator");
         }
-        let bytes = self
-            .meta
-            .get(
-                CF_TRANSACTIONS,
-                TABLE_INLINE_MANIFEST_BODY_ROW,
-                &inline_manifest_body_key(&locator.manifest_hash)?,
-            )?
-            .ok_or_else(|| {
-                anyhow!(
-                    "CoreStore inline manifest body row is missing for {}",
-                    locator.manifest_hash
-                )
-            })?;
-        let row = decode_inline_manifest_body_row(&bytes)?;
-        if row.schema != CORE_INLINE_MANIFEST_BODY_SCHEMA
-            || row.logical_file_id != locator.manifest_ref.logical_file_id
-            || row.writer_family != locator.manifest_ref.writer_family
-            || row.writer_generation != locator.manifest_ref.writer_generation
-            || row.manifest_hash != locator.manifest_hash
-            || row.manifest_encoding != locator.manifest_encoding
-            || row.manifest_length != locator.manifest_length
+        let key = inline_manifest_body_key(&locator.manifest_hash)?;
+        let body = if let Some(bytes) =
+            self.meta
+                .get(CF_TRANSACTIONS, TABLE_INLINE_MANIFEST_BODY_ROW, &key)?
         {
-            bail!("CoreStore inline manifest body row identity mismatch");
-        }
-        if row.body.len() as u64 != locator.manifest_length {
+            let row = decode_inline_manifest_body_row(&bytes)?;
+            if row.schema != CORE_INLINE_MANIFEST_BODY_SCHEMA
+                || row.logical_file_id != locator.manifest_ref.logical_file_id
+                || row.writer_family != locator.manifest_ref.writer_family
+                || row.writer_generation != locator.manifest_ref.writer_generation
+                || row.manifest_hash != locator.manifest_hash
+                || row.manifest_encoding != locator.manifest_encoding
+                || row.manifest_length != locator.manifest_length
+            {
+                bail!("CoreStore inline manifest body row identity mismatch");
+            }
+            row.body
+        } else {
+            let key = super::local_root_publication::transaction_manifest_body_key(
+                &locator.manifest_hash,
+            )?;
+            let bytes = self
+                .meta
+                .get(CF_TRANSACTIONS, TABLE_TRANSACTION_MANIFEST_BODY_ROW, &key)?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "CoreStore inline manifest body row is missing for {}",
+                        locator.manifest_hash
+                    )
+                })?;
+            super::local_root_publication::validate_transaction_manifest_body_row(&bytes)?;
+            let (common, body) =
+                super::local_root_publication::decode_transaction_manifest_body_row(&bytes)?;
+            if !self.root_generation_is_published(
+                &common.root_key_hash,
+                common.root_generation,
+                &common.transaction_id,
+            )? {
+                bail!("CoreStore inline transaction manifest body is not published");
+            }
+            body
+        };
+        if body.len() as u64 != locator.manifest_length {
             bail!("CoreStore inline manifest body row length mismatch");
         }
-        if row.body.len() > CORE_META_INLINE_MANIFEST_BODY_MAX_BYTES {
+        if body.len() > CORE_META_INLINE_MANIFEST_BODY_MAX_BYTES {
             bail!("CoreStore inline manifest body row exceeds bounded CoreMeta size");
         }
-        let actual_hash = format!("sha256:{}", sha256_hex(&row.body));
+        let actual_hash = format!("sha256:{}", sha256_hex(&body));
         if actual_hash != locator.manifest_hash || actual_hash != locator.manifest_ref.manifest_hash
         {
             bail!("CoreStore inline manifest body row hash mismatch");
         }
-        Ok(row.body)
+        Ok(body)
     }
 
     pub(super) async fn read_logical_range_from_blocks(

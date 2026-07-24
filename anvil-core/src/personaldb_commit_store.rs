@@ -1,6 +1,6 @@
 use crate::{
     anvil_api::SignatureEnvelopeV1 as WireSignatureEnvelopeV1,
-    core_store::{decode_deterministic_proto, encode_deterministic_proto},
+    core_store::{CoreStore, decode_deterministic_proto, encode_deterministic_proto},
     formats::{Hash32, hash32},
     personaldb_control::PersonalDbCommitCertificate,
     personaldb_coremeta::{
@@ -109,6 +109,12 @@ pub async fn write_personaldb_changeset_payload(
         data_id: by_index_ref.clone(),
         data_kind: "changeset".to_string(),
         generation: log_index,
+        root_generation: CoreStore::new(storage.clone())
+            .await?
+            .next_root_generation_for_anchor(
+                &crate::personaldb_coremeta::personaldb_root_anchor_key(tenant_id, database_id),
+            )
+            .await?,
         sqlite_changeset_hash: payload_hash_hex,
         payload_locator: by_hash_row.payload_locator.clone(),
         projection_keys: by_hash_row.projection_keys.clone(),
@@ -162,7 +168,8 @@ pub async fn read_personaldb_changeset_payload_ref(
     expected_payload_hash: Hash32,
 ) -> Result<Option<Vec<u8>>> {
     let (tenant_id, database_id) = personaldb_ref_scope(ref_name)?;
-    let Some(row) = read_personaldb_data_locator_row(storage, tenant_id, &database_id, ref_name)?
+    let Some(row) =
+        read_personaldb_data_locator_row(storage, tenant_id, &database_id, ref_name).await?
     else {
         return Ok(None);
     };
@@ -235,7 +242,8 @@ pub async fn read_personaldb_commit_certificate_ref(
     trust_store: &PublicKeyTrustStore,
 ) -> Result<Option<PersonalDbCommitCertificate>> {
     let (tenant_id, database_id) = personaldb_ref_scope(ref_name)?;
-    let Some(row) = read_personaldb_data_locator_row(storage, tenant_id, &database_id, ref_name)?
+    let Some(row) =
+        read_personaldb_data_locator_row(storage, tenant_id, &database_id, ref_name).await?
     else {
         return Ok(None);
     };
@@ -585,6 +593,7 @@ mod tests {
         .unwrap();
 
         let row = read_personaldb_data_locator_row(&storage, 9, "db-alpha", &ref_name)
+            .await
             .unwrap()
             .expect("certificate locator exists");
         let mut value = read_personaldb_data_locator_bytes(&storage, &row)

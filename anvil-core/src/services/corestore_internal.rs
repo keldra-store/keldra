@@ -1,18 +1,24 @@
 use crate::anvil_api::anti_entropy_internal_server::AntiEntropyInternal;
 use crate::anvil_api::block_store_internal_server::BlockStoreInternal;
 use crate::anvil_api::core_meta_replication_internal_server::CoreMetaReplicationInternal;
-use crate::anvil_api::cross_region_proxy_internal_server::CrossRegionProxyInternal;
 use crate::anvil_api::root_register_internal_server::RootRegisterInternal;
 use crate::anvil_api::*;
 use crate::core_store::{self, CoreInternalGetShard, CoreInternalPutShard, CoreMetaEncodedRow};
+use crate::mesh_lifecycle::NodeCapability;
 use crate::{AppState, auth, diagnostic_store, system_realm, task_lease};
 use futures_util::StreamExt;
+use prost::Message;
 use std::collections::{BTreeMap, BTreeSet};
 use std::pin::Pin;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
+
+mod cross_region_proxy;
+mod pending_finalisation;
+mod request_validation;
+use self::request_validation::*;
 
 #[tonic::async_trait]
 impl BlockStoreInternal for AppState {
@@ -25,6 +31,7 @@ impl BlockStoreInternal for AppState {
     ) -> Result<Response<ShardReceipt>, Status> {
         ensure_internal_node_request(self, &request).await?;
         let req = request.into_inner();
+        validate_put_shard_request(&req)?;
         let writer_family = if req.writer_family.trim().is_empty() {
             return Err(Status::invalid_argument("writer_family is required"));
         } else {
@@ -39,6 +46,7 @@ impl BlockStoreInternal for AppState {
             .core_store
             .put_internal_shard(CoreInternalPutShard {
                 logical_file_id: req.logical_file_id,
+                logical_offset: req.logical_offset,
                 block_id: req.block_id,
                 shard_index: u16::try_from(req.shard_index)
                     .map_err(|_| Status::invalid_argument("shard_index exceeds u16"))?,
@@ -48,6 +56,8 @@ impl BlockStoreInternal for AppState {
                 shard_hash: req.shard_hash,
                 boundary_summary_hash: req.boundary_summary_hash,
                 boundary_values_b64: req.boundary_values_b64,
+                compression_algorithm: req.compression_algorithm,
+                encryption_algorithm: req.encryption_algorithm,
                 writer_family,
                 mutation_id,
             })
@@ -62,14 +72,14 @@ impl BlockStoreInternal for AppState {
     ) -> Result<Response<Self::GetShardStream>, Status> {
         ensure_internal_node_request(self, &request).await?;
         let req = request.into_inner();
-        let range = if req.range_end_exclusive > 0 || req.range_start > 0 {
-            Some(core_store::CoreByteRange {
-                start: req.range_start,
-                end_exclusive: req.range_end_exclusive,
-            })
-        } else {
-            None
-        };
+        validate_shard_read_scope(
+            &req.block_id,
+            req.shard_index,
+            &req.erasure_profile_id,
+            &req.shard_hash,
+            &req.boundary_summary_hash,
+        )?;
+        let range = bounded_shard_range(req.range_start, req.range_end_exclusive)?;
         let bytes = self
             .core_store
             .read_internal_shard_range(CoreInternalGetShard {
@@ -109,6 +119,13 @@ impl BlockStoreInternal for AppState {
     ) -> Result<Response<ShardReceipt>, Status> {
         ensure_internal_node_request(self, &request).await?;
         let req = request.into_inner();
+        validate_shard_read_scope(
+            &req.block_id,
+            req.shard_index,
+            &req.erasure_profile_id,
+            &req.shard_hash,
+            &req.boundary_summary_hash,
+        )?;
         let receipt = self
             .core_store
             .get_internal_shard_receipt(CoreInternalGetShard {
@@ -136,34 +153,33 @@ impl BlockStoreInternal for AppState {
     ) -> Result<Response<ShardReceipt>, Status> {
         ensure_internal_node_request(self, &request).await?;
         let req = request.into_inner();
-        let writer_family = if req.writer_family.trim().is_empty() {
-            return Err(Status::invalid_argument("writer_family is required"));
-        } else {
-            req.writer_family
-        };
-        let mutation_id = if req.mutation_id.trim().is_empty() {
-            request_id_from_header(req.header.as_ref())
-        } else {
-            req.mutation_id
-        };
+        validate_repair_shard_request(&req)?;
+        let mutation_id = repair_mutation_id(&req)?;
+        let repair_operation_id = req.repair_finding_id.clone();
         let receipt = self
             .core_store
-            .put_internal_shard(CoreInternalPutShard {
-                logical_file_id: req.logical_file_id,
-                block_id: req.block_id,
-                shard_index: u16::try_from(req.shard_index)
-                    .map_err(|_| Status::invalid_argument("shard_index exceeds u16"))?,
-                erasure_profile_id: req.erasure_profile_id,
-                placement_epoch: req.placement_epoch,
-                shard_bytes: req.shard_bytes,
-                shard_hash: req.shard_hash,
-                boundary_summary_hash: req.boundary_summary_hash,
-                boundary_values_b64: req.boundary_values_b64,
-                writer_family,
-                mutation_id,
-            })
+            .repair_internal_shard(
+                CoreInternalPutShard {
+                    logical_file_id: req.logical_file_id,
+                    logical_offset: req.logical_offset,
+                    block_id: req.block_id,
+                    shard_index: u16::try_from(req.shard_index)
+                        .map_err(|_| Status::invalid_argument("shard_index exceeds u16"))?,
+                    erasure_profile_id: req.erasure_profile_id,
+                    placement_epoch: req.placement_epoch,
+                    shard_bytes: req.shard_bytes,
+                    shard_hash: req.shard_hash,
+                    boundary_summary_hash: req.boundary_summary_hash,
+                    boundary_values_b64: req.boundary_values_b64,
+                    compression_algorithm: req.compression_algorithm,
+                    encryption_algorithm: req.encryption_algorithm,
+                    writer_family: req.writer_family,
+                    mutation_id,
+                },
+                &repair_operation_id,
+            )
             .await
-            .map_err(internal_status)?;
+            .map_err(repair_shard_status)?;
         Ok(Response::new(shard_receipt_from_core(receipt)))
     }
 }
@@ -186,12 +202,19 @@ impl CoreMetaReplicationInternal for AppState {
         );
         let validation_started_at = Instant::now();
         let req = request.into_inner();
+        validate_coremeta_batch_group_bounds(&req)?;
         if req.batches.is_empty() {
             return Err(Status::invalid_argument(
                 "CoreMeta batch group must not be empty",
             ));
         }
+        if req.publication_intent.is_empty() {
+            return Err(Status::invalid_argument(
+                "CoreMeta batch group must include a durable publication intent",
+            ));
+        }
         let mut marker_rows = Vec::with_capacity(req.batches.len());
+        let mut rows_by_root = BTreeMap::new();
         let mut roots = BTreeSet::new();
         for batch in &req.batches {
             if !roots.insert(batch.root_key_hash.as_str()) {
@@ -205,6 +228,17 @@ impl CoreMetaReplicationInternal for AppState {
                 ));
             }
             let rows = request_rows_checked(&batch.mutations)?;
+            let delete_common = core_store::core_meta_committed_row_common(
+                "system/coremeta-publication-intent",
+                &batch.root_key_hash,
+                batch.post_root_generation,
+                &batch.transaction_id,
+                1,
+            );
+            let owned_rows = self
+                .core_store
+                .validate_and_own_coremeta_encoded_rows(&rows, Some(&delete_common))
+                .map_err(internal_status)?;
             let row_hashes = batch
                 .mutations
                 .iter()
@@ -236,7 +270,11 @@ impl CoreMetaReplicationInternal for AppState {
                     )
                     .map_err(internal_status)?,
             );
+            rows_by_root.insert(batch.root_key_hash.clone(), owned_rows);
         }
+        self.core_store
+            .stage_replica_root_publication_intent(&req.publication_intent, &rows_by_root)
+            .map_err(internal_status)?;
         crate::emit_test_timing(
             "coremeta.internal.replicate_pending_batches validate",
             validation_started_at.elapsed(),
@@ -288,6 +326,7 @@ impl CoreMetaReplicationInternal for AppState {
         );
         let validation_started_at = Instant::now();
         let req = request.into_inner();
+        validate_coremeta_commit_group_bounds(&req)?;
         if req.commits.is_empty() {
             return Err(Status::invalid_argument(
                 "CoreMeta commit group must not be empty",
@@ -295,9 +334,9 @@ impl CoreMetaReplicationInternal for AppState {
         }
         let mut receipts = Vec::with_capacity(req.commits.len());
         let mut evidence_rows = Vec::with_capacity(req.commits.len());
+        let mut committed_rows_by_root = BTreeMap::new();
         let mut roots = BTreeSet::new();
         for commit in &req.commits {
-            let _rows = request_rows_checked(&commit.committed_rows)?;
             let cert = commit
                 .commit_certificate
                 .as_ref()
@@ -307,6 +346,19 @@ impl CoreMetaReplicationInternal for AppState {
                     "CoreMeta commit group contains a duplicate root",
                 ));
             }
+            let rows = request_rows_checked(&commit.committed_rows)?;
+            let delete_common = core_store::core_meta_committed_row_common(
+                "system/coremeta-publication-intent",
+                &cert.root_key_hash,
+                cert.post_root_generation,
+                &cert.transaction_id,
+                1,
+            );
+            let owned_rows = self
+                .core_store
+                .validate_and_own_coremeta_encoded_rows(&rows, Some(&delete_common))
+                .map_err(internal_status)?;
+            committed_rows_by_root.insert(cert.root_key_hash.clone(), owned_rows);
             let row_hashes = commit
                 .committed_rows
                 .iter()
@@ -350,9 +402,13 @@ impl CoreMetaReplicationInternal for AppState {
                 &commit.committed_batch_hash,
                 1,
             )?;
+            let created_at_unix_nanos = self
+                .core_store
+                .root_publication_intent_created_at(&cert.transaction_id)
+                .map_err(internal_status)?;
             evidence_rows.push(
                 self.core_store
-                    .coremeta_commit_evidence_encoded_row(
+                    .coremeta_commit_evidence_encoded_row_at(
                         &cert.root_key_hash,
                         cert.post_root_generation,
                         &cert.transaction_id,
@@ -366,29 +422,41 @@ impl CoreMetaReplicationInternal for AppState {
                             .map_err(internal_status)?,
                         ],
                         vec![core_store::encode_deterministic_proto(&receipt)],
+                        created_at_unix_nanos,
                     )
                     .map_err(internal_status)?,
             );
             receipts.push(receipt);
         }
+        let transaction_id = req
+            .commits
+            .first()
+            .and_then(|commit| commit.commit_certificate.as_ref())
+            .map(|certificate| certificate.transaction_id.as_str())
+            .ok_or_else(|| Status::invalid_argument("commit_certificate is required"))?;
+        if req.commits.iter().any(|commit| {
+            commit
+                .commit_certificate
+                .as_ref()
+                .map_or(true, |certificate| {
+                    certificate.transaction_id != transaction_id
+                })
+        }) {
+            return Err(Status::invalid_argument(
+                "CoreMeta commit group spans multiple publication intents",
+            ));
+        }
         crate::emit_test_timing(
             "coremeta.internal.persist_commit_certificates validate_and_sign",
             validation_started_at.elapsed(),
         );
-
-        let mut rows = Vec::new();
-        for commit in &req.commits {
-            rows.extend(request_rows_checked(&commit.committed_rows)?);
-        }
-        rows.extend(evidence_rows.iter().map(|row| CoreMetaEncodedRow {
-            cf: row.cf.as_str(),
-            core_meta_key: &row.core_meta_key,
-            value_envelope: &row.value_envelope,
-            delete_marker: row.delete_marker,
-        }));
         let write_started_at = Instant::now();
         self.core_store
-            .write_coremeta_encoded_rows(&rows)
+            .persist_replica_publication_certificate_evidence(
+                transaction_id,
+                &committed_rows_by_root,
+                &evidence_rows,
+            )
             .map_err(internal_status)?;
         crate::emit_test_timing(
             "coremeta.internal.persist_commit_certificates rocksdb_write",
@@ -425,11 +493,27 @@ impl CoreMetaReplicationInternal for AppState {
                         return;
                     }
                 };
+                if let Err(status) = ensure_message_size(
+                    &frame,
+                    MAX_INTERNAL_RPC_REQUEST_BYTES,
+                    "CoreMeta stream frame",
+                ) {
+                    let _ = tx.send(Err(status)).await;
+                    return;
+                }
                 let request_id = frame.request_id.clone();
                 if request_id.trim().is_empty() {
                     let _ = tx
                         .send(Err(Status::invalid_argument(
                             "CoreMeta stream request_id is required",
+                        )))
+                        .await;
+                    return;
+                }
+                if request_id.len() > MAX_INTERNAL_HEADER_FIELD_BYTES {
+                    let _ = tx
+                        .send(Err(Status::invalid_argument(
+                            "CoreMeta stream request_id exceeds bounded size",
                         )))
                         .await;
                     return;
@@ -504,43 +588,6 @@ impl CoreMetaReplicationInternal for AppState {
         Ok(Response::new(receipt))
     }
 
-    async fn read_rows(
-        &self,
-        request: Request<CoreMetaReadRowsRequest>,
-    ) -> Result<Response<CoreMetaReadRowsResponse>, Status> {
-        ensure_internal_node_request(self, &request).await?;
-        let req = request.into_inner();
-        let rows = self
-            .core_store
-            .read_coremeta_encoded_rows(&req.column_family, &req.core_meta_keys)
-            .map_err(internal_status)?;
-        let rows = rows
-            .into_iter()
-            .map(|row| {
-                let row_hash = core_store::core_meta_encoded_row_hash(
-                    &row.cf,
-                    &row.core_meta_key,
-                    &row.value_envelope,
-                );
-                CoreMetaRowMutation {
-                    column_family: row.cf,
-                    row_hash,
-                    core_meta_key: row.core_meta_key,
-                    value_envelope: row.value_envelope,
-                    delete_marker: row.delete_marker,
-                }
-            })
-            .collect::<Vec<_>>();
-        Ok(Response::new(CoreMetaReadRowsResponse {
-            rows,
-            root_generation: req.root_generation,
-            inventory_hash: format!(
-                "sha256:{}",
-                core_store::sha256_hex(req.root_key_hash.as_bytes())
-            ),
-        }))
-    }
-
     type CatchUpPartitionStream =
         Pin<Box<dyn futures_core::Stream<Item = Result<CoreMetaBatchFrame, Status>> + Send>>;
 
@@ -550,13 +597,18 @@ impl CoreMetaReplicationInternal for AppState {
     ) -> Result<Response<Self::CatchUpPartitionStream>, Status> {
         ensure_internal_node_request(self, &request).await?;
         let req = request.into_inner();
-        let limit = usize::try_from(req.limit.max(1))
-            .map_err(|_| Status::invalid_argument("limit exceeds usize"))?;
-        let rows = self
+        let max_rows =
+            bounded_coremeta_history_page(req.max_rows, req.max_bytes, "CoreMeta catch-up")?;
+        let frames = self
             .core_store
-            .catch_up_coremeta_rows(&req.root_key_hash, req.after_generation, limit)
+            .catch_up_coremeta_generation_history(
+                &req.root_key_hash,
+                req.after.as_ref(),
+                req.through_generation,
+                max_rows,
+                req.max_bytes,
+            )
             .map_err(internal_status)?;
-        let frames = coremeta_rows_to_frames(&req.root_key_hash, rows);
         let (tx, rx) = mpsc::channel(frames.len().max(1));
         tokio::spawn(async move {
             for frame in frames {
@@ -574,28 +626,30 @@ impl CoreMetaReplicationInternal for AppState {
     ) -> Result<Response<CoreMetaInventory>, Status> {
         ensure_internal_node_request(self, &request).await?;
         let req = request.into_inner();
-        let rows = self
+        let max_entries =
+            bounded_coremeta_history_page(req.max_entries, req.max_bytes, "CoreMeta inventory")?;
+        let inventory = self
             .core_store
-            .coremeta_inventory_rows(
+            .coremeta_generation_inventory(
                 &req.root_key_hash,
-                req.from_generation,
-                req.to_generation,
-                100_000,
+                req.after.as_ref(),
+                req.through_generation,
+                max_entries,
+                req.max_bytes,
             )
             .map_err(internal_status)?;
-        let generation_hashes = inventory_generation_hashes(rows);
-        let inventory_hash = hash_string_list("anvil.coremeta.inventory.v1", &generation_hashes);
-        Ok(Response::new(CoreMetaInventory {
-            root_key_hash: req.root_key_hash.clone(),
-            from_generation: req.from_generation,
-            to_generation: req.to_generation,
-            inventory_hash,
-            generation_hashes,
-        }))
+        Ok(Response::new(inventory))
+    }
+
+    async fn publish_pending_mutation_finalisation(
+        &self,
+        request: Request<PublishPendingMutationFinalisationRequest>,
+    ) -> Result<Response<PublishPendingMutationFinalisationResponse>, Status> {
+        pending_finalisation::handle(self, request).await
     }
 }
 
-trait InternalHeaderCarrier {
+trait InternalHeaderCarrier: Message {
     fn internal_header(&self) -> Option<&InternalRequestHeader>;
     fn internal_operation(&self) -> &'static str;
 }
@@ -624,14 +678,15 @@ impl_internal_header_carrier!(
     CoreMetaBatchGroupRequest => "coremeta.replicate_pending_batches",
     CoreMetaPersistCommitGroupRequest => "coremeta.persist_commit_certificates",
     CoreMetaAbortRequest => "coremeta.abort_pending_batch",
-    CoreMetaReadRowsRequest => "coremeta.read_rows",
     CoreMetaCatchUpRequest => "coremeta.catch_up_partition",
     CoreMetaInventoryRequest => "coremeta.exchange_inventory",
+    PublishPendingMutationFinalisationRequest => "coremeta.publish_pending_mutation_finalisation",
     ReadRootRequest => "root.read",
     PrepareRootRequest => "root.prepare",
     CompareAndSwapRootRequest => "root.compare_and_swap",
     VoteFailoverRequest => "root.vote_failover",
     ExchangeRootInventoryRequest => "root.exchange_inventory",
+    ExchangeRootDirectoryRequest => "root.exchange_directory",
     ExchangeInventoryRequest => "anti_entropy.exchange_inventory",
     PublishRepairFindingRequest => "anti_entropy.publish_repair_finding",
     ClaimRepairRequest => "anti_entropy.claim_repair",
@@ -645,32 +700,20 @@ async fn ensure_internal_node_request<T: InternalHeaderCarrier>(
     request: &Request<T>,
 ) -> Result<(), Status> {
     let total_started_at = Instant::now();
-    let claims = request
-        .extensions()
-        .get::<auth::Claims>()
-        .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
-    let relation_started_at = Instant::now();
-    let allowed = system_realm::check_admin_relation(
-        &state.storage,
-        &state.config.mesh_id,
-        claims,
-        system_realm::SystemAdminRelation::ManageNodes,
-    )
-    .await
-    .map_err(internal_status)?;
-    crate::emit_test_timing(
-        "coremeta.internal.authorise zanzibar_check",
-        relation_started_at.elapsed(),
-    );
-    if !allowed {
-        return Err(Status::permission_denied(
-            "system realm manage_nodes relation required",
-        ));
-    }
+    ensure_message_size(
+        request.get_ref(),
+        MAX_INTERNAL_RPC_REQUEST_BYTES,
+        "internal RPC request",
+    )?;
     let header = request
         .get_ref()
         .internal_header()
         .ok_or_else(|| Status::unauthenticated("internal request header required"))?;
+    validate_internal_header_bounds(header)?;
+    let claims = request
+        .extensions()
+        .get::<auth::Claims>()
+        .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
     if header.source_node_id.trim().is_empty() || header.request_id.trim().is_empty() {
         return Err(Status::unauthenticated(
             "internal request source node and request id are required",
@@ -686,6 +729,7 @@ async fn ensure_internal_node_request<T: InternalHeaderCarrier>(
             "internal request source node must match authenticated principal",
         ));
     }
+
     let signed_payload_hash = internal_request_payload_hash(
         request.get_ref().internal_operation(),
         &header.request_id,
@@ -699,12 +743,43 @@ async fn ensure_internal_node_request<T: InternalHeaderCarrier>(
             &signed_payload_hash,
             &header.signature,
         )
-        .map_err(internal_status)?;
+        .map_err(core_store_internal_status)?;
+
+    let relation_started_at = Instant::now();
+    let allowed = system_realm::check_internal_node_access(
+        &state.storage,
+        &state.core_store,
+        &state.config.mesh_id,
+        claims,
+        &header.source_node_id,
+        required_internal_node_capability(request.get_ref().internal_operation()),
+    )
+    .await
+    .map_err(internal_status)?;
+    crate::emit_test_timing(
+        "coremeta.internal.authorise node_membership",
+        relation_started_at.elapsed(),
+    );
+    if !allowed {
+        return Err(Status::permission_denied(
+            "active system-realm node grant and operation capability required",
+        ));
+    }
     crate::emit_test_timing(
         "coremeta.internal.authorise total",
         total_started_at.elapsed(),
     );
     Ok(())
+}
+
+fn required_internal_node_capability(operation: &str) -> NodeCapability {
+    if operation.starts_with("block.") || operation.starts_with("anti_entropy.") {
+        NodeCapability::Object
+    } else if operation.starts_with("proxy.") {
+        NodeCapability::Gateway
+    } else {
+        NodeCapability::Metadata
+    }
 }
 
 fn internal_request_payload_hash(
@@ -732,6 +807,9 @@ fn validate_root_prepare_receipts(
     root_key_hash: &str,
     expected_generation: u64,
     new_root_anchor_record: &[u8],
+    register_cohort_node_ids: &[String],
+    register_cohort_hash: &str,
+    placement_epoch: u64,
     receipts: &[RootPrepareReceipt],
 ) -> Result<(), Status> {
     if receipts.len() < core_store::CORE_META_DEFAULT_QUORUM {
@@ -741,12 +819,36 @@ fn validate_root_prepare_receipts(
     }
     let new_root_hash = format!("sha256:{}", core_store::sha256_hex(new_root_anchor_record));
     let post_generation = expected_generation.saturating_add(1);
+    if register_cohort_node_ids.len() != 3
+        || placement_epoch == 0
+        || register_cohort_hash
+            != core_store::root_register_cohort_hash(
+                root_key_hash,
+                post_generation,
+                register_cohort_node_ids,
+            )
+    {
+        return Err(Status::failed_precondition(
+            "root-register cohort scope mismatch",
+        ));
+    }
     let mut replicas = BTreeSet::new();
+    let mut shard_indices = BTreeSet::new();
     for receipt in receipts {
+        let shard_index = usize::try_from(receipt.shard_index)
+            .map_err(|_| Status::failed_precondition("root prepare shard index overflow"))?;
         if receipt.root_key_hash != root_key_hash
             || receipt.expected_generation != expected_generation
             || receipt.post_generation != post_generation
             || receipt.new_root_hash != new_root_hash
+            || receipt.register_cohort_hash != register_cohort_hash
+            || receipt.placement_epoch != placement_epoch
+            || receipt.fsync_sequence == 0
+            || register_cohort_node_ids
+                .get(shard_index)
+                .map(String::as_str)
+                != Some(receipt.replica_node_id.as_str())
+            || receipt.signed_payload_hash != core_store::root_prepare_receipt_payload_hash(receipt)
         {
             return Err(Status::failed_precondition(
                 "root prepare receipt scope mismatch",
@@ -756,15 +858,71 @@ fn validate_root_prepare_receipts(
             .core_store
             .verify_internal_core_receipt_signature(
                 &receipt.replica_node_id,
-                &receipt.new_root_hash,
+                &receipt.signed_payload_hash,
                 &receipt.signature,
             )
             .map_err(internal_status)?;
         replicas.insert(receipt.replica_node_id.as_str());
+        shard_indices.insert(receipt.shard_index);
     }
-    if replicas.len() < core_store::CORE_META_DEFAULT_QUORUM {
+    if replicas.len() < core_store::CORE_META_DEFAULT_QUORUM
+        || shard_indices.len() < core_store::CORE_META_DEFAULT_QUORUM
+    {
         return Err(Status::failed_precondition(
             "root prepare quorum not reached",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_coordinator_publication_evidence(
+    certificate: &CoreMetaCommitCertificate,
+    request: &CompareAndSwapRootRequest,
+) -> Result<(), Status> {
+    let mut matches = request
+        .participant_commit_evidence
+        .iter()
+        .filter(|participant| participant.root_anchor_record == request.new_root_anchor_record);
+    let participant = matches.next().ok_or_else(|| {
+        Status::failed_precondition("coordinator publication evidence is missing")
+    })?;
+    if matches.next().is_some() {
+        return Err(Status::failed_precondition(
+            "coordinator publication evidence is duplicated",
+        ));
+    }
+    let participant_certificate = participant.commit_certificate.as_ref().ok_or_else(|| {
+        Status::failed_precondition("coordinator publication certificate is missing")
+    })?;
+    if core_store::encode_deterministic_proto(participant_certificate)
+        != core_store::encode_deterministic_proto(certificate)
+    {
+        return Err(Status::failed_precondition(
+            "coordinator publication certificate mismatch",
+        ));
+    }
+    let mut request_receipts = request
+        .certificate_persist_receipts
+        .iter()
+        .map(core_store::encode_deterministic_proto)
+        .collect::<Vec<_>>();
+    request_receipts.sort();
+    request_receipts.dedup();
+    let mut participant_receipts = participant
+        .certificate_persist_receipts
+        .iter()
+        .map(core_store::encode_deterministic_proto)
+        .collect::<Vec<_>>();
+    participant_receipts.sort();
+    participant_receipts.dedup();
+    if request_receipts != participant_receipts
+        || request
+            .certificate_persist_receipts
+            .iter()
+            .any(|receipt| receipt.committed_batch_hash != participant.committed_batch_hash)
+    {
+        return Err(Status::failed_precondition(
+            "coordinator publication persist evidence mismatch",
         ));
     }
     Ok(())
@@ -795,66 +953,6 @@ fn request_rows_checked(
         .collect()
 }
 
-fn coremeta_rows_to_frames(
-    root_key_hash: &str,
-    rows: Vec<core_store::CoreMetaEncodedOwnedRow>,
-) -> Vec<CoreMetaBatchFrame> {
-    let mut by_generation: BTreeMap<u64, Vec<CoreMetaRowMutation>> = BTreeMap::new();
-    for row in rows {
-        let row_hash = core_store::core_meta_encoded_row_hash_with_delete(
-            &row.cf,
-            &row.core_meta_key,
-            &row.value_envelope,
-            row.delete_marker,
-        );
-        by_generation
-            .entry(row.root_generation)
-            .or_default()
-            .push(CoreMetaRowMutation {
-                column_family: row.cf,
-                core_meta_key: row.core_meta_key,
-                row_hash,
-                value_envelope: row.value_envelope,
-                delete_marker: row.delete_marker,
-            });
-    }
-    by_generation
-        .into_iter()
-        .map(|(generation, rows)| CoreMetaBatchFrame {
-            root_key_hash: root_key_hash.to_string(),
-            root_generation: generation,
-            committed_rows: rows,
-            commit_certificate: None,
-            certificate_persist_receipts: Vec::new(),
-        })
-        .collect()
-}
-
-fn inventory_generation_hashes(rows: Vec<core_store::CoreMetaInventoryRow>) -> Vec<String> {
-    let mut by_generation: BTreeMap<u64, Vec<String>> = BTreeMap::new();
-    for row in rows {
-        by_generation
-            .entry(row.root_generation)
-            .or_default()
-            .push(format!(
-                "{}:{}:{}",
-                row.cf,
-                hex::encode(row.core_meta_key),
-                row.row_hash
-            ));
-    }
-    by_generation
-        .into_iter()
-        .map(|(generation, mut rows)| {
-            rows.sort();
-            format!(
-                "{generation}:{}",
-                hash_string_list("anvil.coremeta.inventory.generation.v1", &rows)
-            )
-        })
-        .collect()
-}
-
 fn hash_string_list(domain: &str, values: &[String]) -> String {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(domain.as_bytes());
@@ -863,6 +961,42 @@ fn hash_string_list(domain: &str, values: &[String]) -> String {
         bytes.extend_from_slice(value.as_bytes());
     }
     format!("sha256:{}", core_store::sha256_hex(&bytes))
+}
+
+fn complete_coremeta_history_inventory_hash(
+    store: &core_store::CoreStore,
+    root_key_hash: &str,
+) -> Result<String, Status> {
+    let mut after = None;
+    let mut through_generation = 0;
+    let mut generation_hashes = Vec::new();
+    loop {
+        let inventory = store
+            .coremeta_generation_inventory(
+                root_key_hash,
+                after.as_ref(),
+                through_generation,
+                MAX_COREMETA_HISTORY_PAGE_ROWS,
+                MAX_COREMETA_HISTORY_PAGE_BYTES,
+            )
+            .map_err(internal_status)?;
+        if through_generation == 0 {
+            through_generation = inventory.final_generation;
+        }
+        generation_hashes.extend(
+            inventory.descriptors.iter().map(|descriptor| {
+                format!("{}:{}", descriptor.generation, descriptor.generation_hash)
+            }),
+        );
+        if inventory.inventory_complete {
+            break;
+        }
+        after = inventory.next_cursor;
+    }
+    Ok(hash_string_list(
+        "anvil.antientropy.coremeta.inventory.v1",
+        &generation_hashes,
+    ))
 }
 
 fn local_prepare_receipt(
@@ -991,13 +1125,6 @@ fn api_persist_receipt_to_core(
     Ok(core)
 }
 
-fn request_id_from_header(header: Option<&InternalRequestHeader>) -> String {
-    header
-        .map(|header| header.request_id.clone())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
-}
-
 fn shard_receipt_from_core(receipt: core_store::CoreInternalShardReceipt) -> ShardReceipt {
     ShardReceipt {
         node_id: receipt.node_id,
@@ -1012,10 +1139,6 @@ fn shard_receipt_from_core(receipt: core_store::CoreInternalShardReceipt) -> Sha
     }
 }
 
-fn internal_status(error: impl std::fmt::Display) -> Status {
-    Status::internal(format!("{error:#}"))
-}
-
 #[tonic::async_trait]
 impl RootRegisterInternal for AppState {
     async fn read_root(
@@ -1024,6 +1147,59 @@ impl RootRegisterInternal for AppState {
     ) -> Result<Response<RootAnchorRead>, Status> {
         ensure_internal_node_request(self, &request).await?;
         let req = request.into_inner();
+        if let Some(generation) = req.exact_generation {
+            if generation < req.min_generation {
+                return Err(Status::invalid_argument(
+                    "exact root generation is below the requested minimum",
+                ));
+            }
+            if req.committed_cache {
+                let anchor = self
+                    .core_store
+                    .read_committed_root_anchor_generation(&req.root_key_hash, generation)
+                    .await
+                    .map_err(internal_status)?
+                    .ok_or_else(|| {
+                        Status::not_found("committed root-cache generation not found")
+                    })?;
+                let root_anchor_record =
+                    core_store::encode_root_anchor_record(&anchor).map_err(internal_status)?;
+                return Ok(Response::new(RootAnchorRead {
+                    root_key_hash: anchor.root_key_hash,
+                    generation: anchor.root_generation,
+                    root_anchor_hash: format!(
+                        "sha256:{}",
+                        core_store::sha256_hex(&root_anchor_record)
+                    ),
+                    root_anchor_record,
+                    shard_index: 0,
+                    register_cohort_node_ids: Vec::new(),
+                    register_cohort_hash: String::new(),
+                    placement_epoch: 0,
+                }));
+            }
+            let shard = self
+                .core_store
+                .read_exact_root_register_shard(&req.root_key_hash, generation)
+                .await
+                .map_err(internal_status)?
+                .ok_or_else(|| Status::not_found("physical root-register shard not found"))?;
+            return Ok(Response::new(RootAnchorRead {
+                root_key_hash: shard.root_key_hash,
+                generation: shard.root_generation,
+                root_anchor_record: shard.root_anchor_record,
+                root_anchor_hash: shard.root_anchor_hash,
+                shard_index: u32::from(shard.shard_index),
+                register_cohort_node_ids: shard.register_cohort_nodes,
+                register_cohort_hash: shard.register_cohort_hash,
+                placement_epoch: shard.placement_epoch,
+            }));
+        }
+        if req.committed_cache {
+            return Err(Status::invalid_argument(
+                "committed-cache root reads require an exact generation",
+            ));
+        }
         let read = self
             .core_store
             .read_internal_root_anchor_by_hash(&req.root_key_hash, req.min_generation)
@@ -1034,6 +1210,10 @@ impl RootRegisterInternal for AppState {
             generation: read.generation,
             root_anchor_record: read.root_anchor_record,
             root_anchor_hash: read.root_anchor_hash,
+            shard_index: 0,
+            register_cohort_node_ids: Vec::new(),
+            register_cohort_hash: String::new(),
+            placement_epoch: 0,
         }))
     }
 
@@ -1042,6 +1222,12 @@ impl RootRegisterInternal for AppState {
         request: Request<PrepareRootRequest>,
     ) -> Result<Response<RootPrepareReceipt>, Status> {
         ensure_internal_node_request(self, &request).await?;
+        let source_node_id = request
+            .get_ref()
+            .header
+            .as_ref()
+            .map(|header| header.source_node_id.clone())
+            .ok_or_else(|| Status::unauthenticated("internal request header required"))?;
         let req = request.into_inner();
         let post_generation = req.expected_generation.saturating_add(1);
         let new_root_hash = format!(
@@ -1056,6 +1242,28 @@ impl RootRegisterInternal for AppState {
         if new_anchor.root_generation != post_generation {
             return Err(Status::failed_precondition("root post generation mismatch"));
         }
+        if req.partition_owner_fence != new_anchor.partition_owner_fence {
+            return Err(Status::failed_precondition(
+                "root partition owner fence mismatch",
+            ));
+        }
+        if source_node_id != new_anchor.publisher_node_id {
+            return Err(Status::failed_precondition(
+                "root publication source is not the declared owner",
+            ));
+        }
+        if !self
+            .core_store
+            .incoming_root_publication_is_ready(&req.root_key_hash, req.expected_generation)
+            .map_err(internal_status)?
+        {
+            return Err(Status::unavailable(
+                "root-register replica catch-up has been queued",
+            ));
+        }
+        self.core_store
+            .validate_root_owner_publication(&source_node_id, &new_anchor)
+            .map_err(internal_status)?;
         match self
             .core_store
             .read_internal_root_anchor_by_hash(&req.root_key_hash, 0)
@@ -1091,18 +1299,24 @@ impl RootRegisterInternal for AppState {
                 }
             }
         }
-        let signature = self
+        let shard_index = u16::try_from(req.shard_index)
+            .map_err(|_| Status::invalid_argument("root-register shard index overflow"))?;
+        let receipt = self
             .core_store
-            .sign_internal_core_receipt(&new_root_hash)
+            .persist_root_register_prepare(
+                &self.config.node_id,
+                &new_anchor,
+                &req.new_root_anchor_record,
+                req.expected_generation,
+                &req.register_cohort_node_ids,
+                &req.register_cohort_hash,
+                shard_index,
+                req.placement_epoch,
+            )
+            .await
             .map_err(internal_status)?;
-        Ok(Response::new(RootPrepareReceipt {
-            replica_node_id: self.config.node_id.clone(),
-            root_key_hash: req.root_key_hash,
-            expected_generation: req.expected_generation,
-            post_generation,
-            new_root_hash,
-            signature,
-        }))
+        debug_assert_eq!(receipt.new_root_hash, new_root_hash);
+        Ok(Response::new(receipt))
     }
 
     async fn compare_and_swap_root(
@@ -1110,7 +1324,43 @@ impl RootRegisterInternal for AppState {
         request: Request<CompareAndSwapRootRequest>,
     ) -> Result<Response<RootAnchorWrite>, Status> {
         ensure_internal_node_request(self, &request).await?;
+        let source_node_id = request
+            .get_ref()
+            .header
+            .as_ref()
+            .map(|header| header.source_node_id.clone())
+            .ok_or_else(|| Status::unauthenticated("internal request header required"))?;
         let req = request.into_inner();
+        let new_anchor = core_store::decode_root_anchor_record(&req.new_root_anchor_record)
+            .map_err(internal_status)?;
+        if req.partition_owner_fence != new_anchor.partition_owner_fence {
+            return Err(Status::failed_precondition(
+                "root partition owner fence mismatch",
+            ));
+        }
+        if source_node_id != new_anchor.publisher_node_id {
+            return Err(Status::failed_precondition(
+                "root publication source is not the declared owner",
+            ));
+        }
+        if !self
+            .core_store
+            .incoming_root_publication_is_ready(&req.root_key_hash, req.expected_generation)
+            .map_err(internal_status)?
+        {
+            // Unlike prepare, a CAS request carries evidence for the post
+            // generation. Once Q2 commits elsewhere, supervised recovery can
+            // therefore advance through the generation this replica rejected,
+            // rather than remaining permanently one publication behind.
+            self.core_store
+                .request_coremeta_root_repair(&req.root_key_hash, new_anchor.root_generation);
+            return Err(Status::unavailable(
+                "root-register replica catch-up has been queued",
+            ));
+        }
+        self.core_store
+            .validate_root_owner_publication(&source_node_id, &new_anchor)
+            .map_err(internal_status)?;
         let certificate = req
             .core_meta_commit_certificate
             .as_ref()
@@ -1158,32 +1408,65 @@ impl RootRegisterInternal for AppState {
             .iter()
             .map(core_store::encode_deterministic_proto)
             .collect::<Vec<_>>();
-        self.core_store
-            .persist_coremeta_commit_evidence(
-                &certificate.root_key_hash,
-                certificate.post_root_generation,
-                &certificate.transaction_id,
-                &certificate.certificate_hash,
-                &committed_batch_hash,
-                core_store::encode_deterministic_proto(certificate),
-                persist_receipt_hashes,
-                persist_receipt_bytes,
-            )
-            .map_err(internal_status)?;
+        let evidence_created_at = self
+            .core_store
+            .root_publication_intent_created_at(&certificate.transaction_id)
+            .unwrap_or_else(|_| u64::try_from(now_unix_nanos()).unwrap_or(u64::MAX));
         validate_root_prepare_receipts(
             self,
             &req.root_key_hash,
             req.expected_generation,
             &req.new_root_anchor_record,
+            &req.register_cohort_node_ids,
+            &req.register_cohort_hash,
+            req.placement_epoch,
             &req.prepare_receipts,
         )?;
+        self.core_store
+            .ensure_local_committed_root_register_shard(
+                &new_anchor,
+                &req.new_root_anchor_record,
+                req.expected_generation,
+                &req.register_cohort_node_ids,
+                &req.register_cohort_hash,
+                req.placement_epoch,
+            )
+            .await
+            .map_err(internal_status)?;
+        let participant_anchor_records = if req.participant_commit_evidence.is_empty() {
+            self.core_store
+                .persist_coremeta_commit_evidence_at(
+                    &certificate.root_key_hash,
+                    certificate.post_root_generation,
+                    &certificate.transaction_id,
+                    &certificate.certificate_hash,
+                    &committed_batch_hash,
+                    core_store::encode_deterministic_proto(certificate),
+                    persist_receipt_hashes,
+                    persist_receipt_bytes,
+                    evidence_created_at,
+                )
+                .map_err(internal_status)?;
+            Vec::new()
+        } else {
+            validate_coordinator_publication_evidence(certificate, &req)?;
+            self.core_store
+                .install_root_publication_commit_evidence(
+                    &source_node_id,
+                    &certificate.transaction_id,
+                    &req.participant_commit_evidence,
+                )
+                .await
+                .map_err(internal_status)?
+        };
         let read = self
             .core_store
-            .compare_and_swap_internal_root_anchor(
+            .compare_and_swap_internal_root_anchor_from_register_quorum(
                 &req.root_key_hash,
                 req.expected_generation,
                 &req.expected_root_hash,
                 &req.new_root_anchor_record,
+                &participant_anchor_records,
             )
             .await
             .map_err(internal_status)?;
@@ -1201,28 +1484,17 @@ impl RootRegisterInternal for AppState {
     ) -> Result<Response<FailoverVoteReceipt>, Status> {
         ensure_internal_node_request(self, &request).await?;
         let req = request.into_inner();
-        let new_owner_fence = req.observed_owner_fence.saturating_add(1);
-        let signed = format!(
-            "sha256:{}",
-            core_store::sha256_hex(
-                format!(
-                    "{}:{}:{}",
-                    req.root_key_hash, req.candidate_owner_node_id, new_owner_fence
-                )
-                .as_bytes()
-            )
-        );
-        let signature = self
+        let receipt = self
             .core_store
-            .sign_internal_core_receipt(&signed)
-            .map_err(internal_status)?;
-        Ok(Response::new(FailoverVoteReceipt {
-            replica_node_id: self.config.node_id.clone(),
-            root_key_hash: req.root_key_hash,
-            candidate_owner_node_id: req.candidate_owner_node_id,
-            new_owner_fence,
-            signature,
-        }))
+            .vote_root_owner_failover(&req)
+            .await
+            .map_err(internal_status)?
+            .ok_or_else(|| {
+                Status::failed_precondition(
+                    "root owner failure evidence has not reached the voting threshold",
+                )
+            })?;
+        Ok(Response::new(receipt))
     }
 
     async fn exchange_root_inventory(
@@ -1251,6 +1523,20 @@ impl RootRegisterInternal for AppState {
             inventory_hash: hash_string_list("anvil.root.inventory.v1", &inventory_parts),
         }))
     }
+
+    async fn exchange_root_directory(
+        &self,
+        request: Request<ExchangeRootDirectoryRequest>,
+    ) -> Result<Response<RootDirectoryPage>, Status> {
+        ensure_internal_node_request(self, &request).await?;
+        let req = request.into_inner();
+        let max_entries = bounded_root_directory_page(req.max_entries, req.max_bytes)?;
+        let page = self
+            .core_store
+            .coremeta_root_directory_page(&req.after_root_key_hash, max_entries, req.max_bytes)
+            .map_err(internal_status)?;
+        Ok(Response::new(page))
+    }
 }
 
 #[tonic::async_trait]
@@ -1261,16 +1547,20 @@ impl AntiEntropyInternal for AppState {
     ) -> Result<Response<InventoryDiff>, Status> {
         ensure_internal_node_request(self, &request).await?;
         let req = request.into_inner();
+        if req.namespace == "shard" {
+            let state = self
+                .core_store
+                .shard_inventory_state(&req.partition)
+                .await
+                .map_err(internal_status)?;
+            return Ok(Response::new(core_store::shard_inventory_response(
+                &req.partition,
+                state,
+            )));
+        }
         let local_hash = match req.namespace.as_str() {
             "coremeta" => {
-                let rows = self
-                    .core_store
-                    .coremeta_inventory_rows(&req.partition, 0, u64::MAX, 100_000)
-                    .map_err(internal_status)?;
-                hash_string_list(
-                    "anvil.antientropy.coremeta.inventory.v1",
-                    &inventory_generation_hashes(rows),
-                )
+                complete_coremeta_history_inventory_hash(&self.core_store, &req.partition)?
             }
             "root" => {
                 let read = self
@@ -1286,10 +1576,6 @@ impl AntiEntropyInternal for AppState {
                     )],
                 )
             }
-            "shard" => format!(
-                "sha256:{}",
-                core_store::sha256_hex(req.partition.as_bytes())
-            ),
             other => {
                 return Err(Status::invalid_argument(format!(
                     "unsupported anti-entropy namespace {other}"
@@ -1315,6 +1601,11 @@ impl AntiEntropyInternal for AppState {
     ) -> Result<Response<WriteResponse>, Status> {
         ensure_internal_node_request(self, &request).await?;
         let req = request.into_inner();
+        ensure_len_at_most(
+            req.finding_json.len(),
+            MAX_REPAIR_FINDING_JSON_BYTES,
+            "finding_json",
+        )?;
         let details: serde_json::Value =
             serde_json::from_str(&req.finding_json).map_err(|error| {
                 Status::invalid_argument(format!("finding_json must be valid JSON: {error}"))
@@ -1371,16 +1662,9 @@ impl AntiEntropyInternal for AppState {
     ) -> Result<Response<RepairClaim>, Status> {
         ensure_internal_node_request(self, &request).await?;
         let req = request.into_inner();
-        if req.finding_id.trim().is_empty() {
-            return Err(Status::invalid_argument("finding_id is required"));
-        }
-        let owner = task_lease::TaskLeaseOwner {
-            tenant_id: 0,
-            principal_kind: "anvil-node".to_string(),
-            principal_id: self.config.node_id.clone(),
-            actor_instance_id: request_id_from_header(req.header.as_ref()),
-            display_name: self.config.node_id.clone(),
-        };
+        validate_repair_finding_id(&req.finding_id)?;
+        let owner = repair_claim_owner(req.header.as_ref())?;
+        let claimant_node_id = owner.principal_id.clone();
         let lease = self
             .persistence
             .acquire_named_task_lease(task_lease::TaskLeaseAcquire {
@@ -1397,236 +1681,20 @@ impl AntiEntropyInternal for AppState {
             .map_err(internal_status)?;
         Ok(Response::new(RepairClaim {
             finding_id: req.finding_id,
-            claimant_node_id: self.config.node_id.clone(),
+            claimant_node_id,
             fence_token: lease.fence_token,
         }))
     }
 }
 
-#[tonic::async_trait]
-impl CrossRegionProxyInternal for AppState {
-    type ProxyObjectReadStream =
-        Pin<Box<dyn futures_core::Stream<Item = Result<ObjectChunk, Status>> + Send>>;
-    type ProxyShardRangeStream =
-        Pin<Box<dyn futures_core::Stream<Item = Result<ShardChunk, Status>> + Send>>;
-
-    async fn proxy_native(
-        &self,
-        request: Request<ProxyNativeRequest>,
-    ) -> Result<Response<ProxyNativeResponse>, Status> {
-        ensure_internal_node_request(self, &request).await?;
-        let req = request.into_inner();
-        ensure_local_proxy_target(&self.config.region, &req.target_region_id)?;
-        match req.method.as_str() {
-            "anvil.internal.ping" => Ok(Response::new(ProxyNativeResponse {
-                status_code: 200,
-                response_body: format!(
-                    "{{\"region\":\"{}\",\"node_id\":\"{}\"}}",
-                    self.config.region, self.config.node_id
-                )
-                .into_bytes(),
-                error_code: String::new(),
-            })),
-            "anvil.internal.root.read_by_hash" => {
-                let body = core_store::decode_deterministic_proto::<ReadRootRequest>(
-                    &req.request_body,
-                    "proxied ReadRootRequest",
-                )
-                .map_err(internal_status)?;
-                let read = self
-                    .core_store
-                    .read_internal_root_anchor_by_hash(&body.root_key_hash, body.min_generation)
-                    .await
-                    .map_err(internal_status)?;
-                Ok(Response::new(ProxyNativeResponse {
-                    status_code: 200,
-                    response_body: core_store::encode_deterministic_proto(&RootAnchorRead {
-                        root_key_hash: read.root_key_hash,
-                        generation: read.generation,
-                        root_anchor_record: read.root_anchor_record,
-                        root_anchor_hash: read.root_anchor_hash,
-                    }),
-                    error_code: String::new(),
-                }))
-            }
-            "anvil.internal.coremeta.inventory" => {
-                let body = core_store::decode_deterministic_proto::<CoreMetaInventoryRequest>(
-                    &req.request_body,
-                    "proxied CoreMetaInventoryRequest",
-                )
-                .map_err(internal_status)?;
-                let rows = self
-                    .core_store
-                    .coremeta_inventory_rows(
-                        &body.root_key_hash,
-                        body.from_generation,
-                        body.to_generation,
-                        100_000,
-                    )
-                    .map_err(internal_status)?;
-                let generation_hashes = inventory_generation_hashes(rows);
-                let inventory_hash =
-                    hash_string_list("anvil.coremeta.inventory.v1", &generation_hashes);
-                Ok(Response::new(ProxyNativeResponse {
-                    status_code: 200,
-                    response_body: core_store::encode_deterministic_proto(&CoreMetaInventory {
-                        root_key_hash: body.root_key_hash,
-                        from_generation: body.from_generation,
-                        to_generation: body.to_generation,
-                        inventory_hash,
-                        generation_hashes,
-                    }),
-                    error_code: String::new(),
-                }))
-            }
-            other => Err(Status::invalid_argument(format!(
-                "native proxy method is not admitted by this Anvil build: {other}"
-            ))),
-        }
-    }
-
-    async fn proxy_object_read(
-        &self,
-        request: Request<ProxyObjectReadRequest>,
-    ) -> Result<Response<Self::ProxyObjectReadStream>, Status> {
-        ensure_internal_node_request(self, &request).await?;
-        let req = request.into_inner();
-        ensure_local_proxy_target(&self.config.region, &req.target_region_id)?;
-        let range = if req.range_start > 0 || req.range_end_exclusive > 0 {
-            Some(core_store::CoreByteRange {
-                start: req.range_start,
-                end_exclusive: req.range_end_exclusive,
-            })
-        } else {
-            None
-        };
-        let version_id = if req.version_id.trim().is_empty() {
-            None
-        } else {
-            Some(
-                uuid::Uuid::parse_str(&req.version_id)
-                    .map_err(|_| Status::invalid_argument("version_id must be a UUID"))?,
-            )
-        };
-        let original_claims =
-            crate::services::internal_proxy::decode_proxy_authz_context_bytes(&req.authz_context)?;
-        if original_claims.tenant_id != req.tenant_id {
-            return Err(Status::permission_denied(
-                "proxy tenant does not match authz context",
-            ));
-        }
-        if !req.principal_id.is_empty() && original_claims.sub != req.principal_id {
-            return Err(Status::permission_denied(
-                "proxy principal does not match authz context",
-            ));
-        }
-        let result = self
-            .object_manager
-            .get_object_with_link_mode_for_tenant(
-                Some(original_claims),
-                Some(req.tenant_id),
-                req.bucket_name.clone(),
-                req.object_key.clone(),
-                version_id,
-                range,
-                crate::object_manager::ObjectLinkReadMode::Follow,
-                crate::object_manager::ObjectReadConsistency::Latest,
-            )
-            .await?;
-        let mut stream = result.stream;
-        let start_offset = result.range_start;
-        let (tx, rx) = mpsc::channel(4);
-        tokio::spawn(async move {
-            let mut offset = start_offset;
-            while let Some(chunk) = stream.next().await {
-                match chunk {
-                    Ok(data) => {
-                        let len = data.len() as u64;
-                        if tx
-                            .send(Ok(ObjectChunk {
-                                offset,
-                                data,
-                                eof: false,
-                            }))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                        offset = offset.saturating_add(len);
-                    }
-                    Err(status) => {
-                        let _ = tx.send(Err(status)).await;
-                        return;
-                    }
-                }
-            }
-            let _ = tx
-                .send(Ok(ObjectChunk {
-                    offset,
-                    data: Vec::new(),
-                    eof: true,
-                }))
-                .await;
-        });
-        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
-    }
-
-    async fn proxy_shard_range(
-        &self,
-        request: Request<ProxyShardRangeRequest>,
-    ) -> Result<Response<Self::ProxyShardRangeStream>, Status> {
-        ensure_internal_node_request(self, &request).await?;
-        let req = request.into_inner();
-        ensure_local_proxy_target(&self.config.region, &req.target_region_id)?;
-        let bytes = self
-            .core_store
-            .read_internal_shard_range(CoreInternalGetShard {
-                block_id: req.block_id.clone(),
-                shard_index: u16::try_from(req.shard_index)
-                    .map_err(|_| Status::invalid_argument("shard_index exceeds u16"))?,
-                erasure_profile_id: req.erasure_profile_id,
-                placement_epoch: req.placement_epoch,
-                shard_hash: req.shard_hash,
-                boundary_summary_hash: if req.boundary_summary_hash.is_empty() {
-                    None
-                } else {
-                    Some(req.boundary_summary_hash)
-                },
-                range: if req.range_start > 0 || req.range_end_exclusive > 0 {
-                    Some(core_store::CoreByteRange {
-                        start: req.range_start,
-                        end_exclusive: req.range_end_exclusive,
-                    })
-                } else {
-                    None
-                },
-            })
-            .await
-            .map_err(internal_status)?;
-        let (tx, rx) = mpsc::channel(2);
-        tokio::spawn(async move {
-            let _ = tx
-                .send(Ok(ShardChunk {
-                    block_id: req.block_id,
-                    shard_index: req.shard_index,
-                    offset: req.range_start,
-                    data: bytes,
-                    eof: true,
-                }))
-                .await;
-        });
-        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
-    }
-}
-
-fn ensure_local_proxy_target(local_region: &str, target_region: &str) -> Result<(), Status> {
-    if !target_region.is_empty() && target_region != local_region {
-        return Err(Status::unavailable(format!(
-            "target region {target_region} is not served by this node"
-        )));
-    }
-    Ok(())
+fn repair_claim_owner(
+    header: Option<&InternalRequestHeader>,
+) -> Result<task_lease::TaskLeaseOwner, Status> {
+    let claimant_node_id = header
+        .map(|header| header.source_node_id.clone())
+        .filter(|node_id| !node_id.trim().is_empty())
+        .ok_or_else(|| Status::invalid_argument("source_node_id is required"))?;
+    Ok(task_lease::TaskLeaseOwner::node(claimant_node_id))
 }
 
 fn now_unix_nanos() -> i64 {

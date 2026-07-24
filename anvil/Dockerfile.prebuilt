@@ -1,10 +1,14 @@
 ARG ANVIL_RUNTIME_BASE=debian:bookworm-slim
 FROM ${ANVIL_RUNTIME_BASE}
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+ARG ANVIL_INCLUDE_TEST_TOOLS=0
+
+RUN set -eux; \
+    packages="ca-certificates curl"; \
+    if [ "${ANVIL_INCLUDE_TEST_TOOLS}" = "1" ]; then packages="${packages} iproute2"; fi; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ${packages}; \
+    rm -rf /var/lib/apt/lists/*
 
 RUN useradd --uid 10001 --create-home --home-dir /var/lib/anvil --shell /usr/sbin/nologin anvil
 
@@ -21,7 +25,6 @@ WORKDIR /var/lib/anvil
 
 EXPOSE 50051
 EXPOSE 50052
-EXPOSE 7443
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=5 CMD curl -fsS http://127.0.0.1:50051/ready || exit 1
 

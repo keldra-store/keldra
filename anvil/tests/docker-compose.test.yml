@@ -1,9 +1,21 @@
 # This Docker Compose file is exclusively for the end-to-end test.
 # It uses environment variables to dynamically set the image and optional host
-# API ports. Cluster UDP ports are intentionally not published to the host;
-# nodes communicate over the compose network.
+# API ports. Each public API is published through a proxy on a node-private
+# driver network so tests retain a control channel while partitioning authenticated gRPC traffic.
 
 networks:
+  driver1net:
+    driver: bridge
+  driver2net:
+    driver: bridge
+  driver3net:
+    driver: bridge
+  driver4net:
+    driver: bridge
+  driver5net:
+    driver: bridge
+  driver6net:
+    driver: bridge
   anvilnet:
     driver: bridge
 
@@ -11,11 +23,15 @@ services:
   anvil1:
     image: ${ANVIL_IMAGE}
     pull_policy: never
+    cap_add:
+      - NET_ADMIN
     environment:
       - RUST_LOG=${ANVIL_TEST_LOG:-warn}
       - ANVIL_TEST_TIMINGS=${ANVIL_TEST_TIMINGS:-}
       - ANVIL_PERF_TRACE=${ANVIL_PERF_TRACE:-}
       - ANVIL_PERF_GREPTIME_URL=${ANVIL_PERF_GREPTIME_URL:-}
+      - ANVIL_TEST_ROOT_PUBLICATION_CONTROL_DIR=/var/lib/anvil/test-control/root-publication
+      - ANVIL_TEST_ROOT_PUBLICATION_CONTROL_TOKEN=distributed-root-publication-test
       - REGION=${ANVIL_DOCKER_TEST_REGION:-test-region-1}
       - CELL_ID=test-cell-1
       - NODE_ID=anvil-test-node-1
@@ -24,7 +40,6 @@ services:
       - JWT_SECRET=${ANVIL_DOCKER_TEST_JWT_SECRET:-docker-test-secret}
       - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       - ANVIL_SECRET_ENCRYPTION_KEY_ID=docker-test-primary
-      - CLUSTER_SECRET=docker-cluster-secret
       - API_LISTEN_ADDR=0.0.0.0:50051
       - ADMIN_LISTEN_ADDR=0.0.0.0:50052
       - ALLOW_PUBLIC_ADMIN_LISTENER=true
@@ -33,18 +48,19 @@ services:
       - BOOTSTRAP_NODE_IDS=anvil-test-node-1,anvil-test-node-2,anvil-test-node-3,anvil-test-node-4,anvil-test-node-5,anvil-test-node-6
       - ANVIL_PUBLIC_ENDPOINT=http://127.0.0.1:50051
       - ANVIL_ADMIN_ENDPOINT=http://127.0.0.1:50052
-      - CLUSTER_LISTEN_ADDR=/ip4/0.0.0.0/udp/7443/quic-v1
-      - PUBLIC_CLUSTER_ADDRS=/dns4/anvil1/udp/7443/quic-v1
-      - PUBLIC_API_ADDR=http://anvil1:50051
-      - ENABLE_MDNS=false
+      - PUBLIC_API_ADDR=http://anvil1-internal:50051
       - STORAGE_PATH=/var/lib/anvil
-    command: ["anvil-server", "--init-cluster"]
     ports:
       - "${ANVIL_TEST_API1_PORT:-55051}:50051"
       - "${ANVIL_TEST_ADMIN1_PORT:-56051}:50052"
     volumes:
       - anvil1_data:/var/lib/anvil
-    networks: [anvilnet]
+    networks:
+      driver1net:
+        gw_priority: 1
+        priority: 1000
+      anvilnet:
+        aliases: [anvil1-internal]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:50051/ready"]
       interval: 5s
@@ -54,6 +70,8 @@ services:
   anvil2:
     image: ${ANVIL_IMAGE}
     pull_policy: never
+    cap_add:
+      - NET_ADMIN
     depends_on:
       anvil1:
         condition: service_started
@@ -70,7 +88,6 @@ services:
       - JWT_SECRET=${ANVIL_DOCKER_TEST_JWT_SECRET:-docker-test-secret}
       - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       - ANVIL_SECRET_ENCRYPTION_KEY_ID=docker-test-primary
-      - CLUSTER_SECRET=docker-cluster-secret
       - API_LISTEN_ADDR=0.0.0.0:50051
       - ADMIN_LISTEN_ADDR=0.0.0.0:50052
       - ALLOW_PUBLIC_ADMIN_LISTENER=true
@@ -79,22 +96,25 @@ services:
       - BOOTSTRAP_NODE_IDS=anvil-test-node-1,anvil-test-node-2,anvil-test-node-3,anvil-test-node-4,anvil-test-node-5,anvil-test-node-6
       - ANVIL_PUBLIC_ENDPOINT=http://127.0.0.1:50051
       - ANVIL_ADMIN_ENDPOINT=http://127.0.0.1:50052
-      - CLUSTER_LISTEN_ADDR=/ip4/0.0.0.0/udp/7444/quic-v1
-      - PUBLIC_CLUSTER_ADDRS=/dns4/anvil2/udp/7444/quic-v1
-      - PUBLIC_API_ADDR=http://anvil2:50051
-      - ENABLE_MDNS=false
-      - BOOTSTRAP_ADDRS=/dns4/anvil1/udp/7443/quic-v1
+      - PUBLIC_API_ADDR=http://anvil2-internal:50051
       - STORAGE_PATH=/var/lib/anvil
     ports:
       - "${ANVIL_TEST_API2_PORT:-55052}:50051"
       - "${ANVIL_TEST_ADMIN2_PORT:-56052}:50052"
     volumes:
       - anvil2_data:/var/lib/anvil
-    networks: [anvilnet]
+    networks:
+      driver2net:
+        gw_priority: 1
+        priority: 1000
+      anvilnet:
+        aliases: [anvil2-internal]
 
   anvil3:
     image: ${ANVIL_IMAGE}
     pull_policy: never
+    cap_add:
+      - NET_ADMIN
     depends_on:
       anvil1:
         condition: service_started
@@ -111,7 +131,6 @@ services:
       - JWT_SECRET=${ANVIL_DOCKER_TEST_JWT_SECRET:-docker-test-secret}
       - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       - ANVIL_SECRET_ENCRYPTION_KEY_ID=docker-test-primary
-      - CLUSTER_SECRET=docker-cluster-secret
       - API_LISTEN_ADDR=0.0.0.0:50051
       - ADMIN_LISTEN_ADDR=0.0.0.0:50052
       - ALLOW_PUBLIC_ADMIN_LISTENER=true
@@ -120,22 +139,25 @@ services:
       - BOOTSTRAP_NODE_IDS=anvil-test-node-1,anvil-test-node-2,anvil-test-node-3,anvil-test-node-4,anvil-test-node-5,anvil-test-node-6
       - ANVIL_PUBLIC_ENDPOINT=http://127.0.0.1:50051
       - ANVIL_ADMIN_ENDPOINT=http://127.0.0.1:50052
-      - CLUSTER_LISTEN_ADDR=/ip4/0.0.0.0/udp/7445/quic-v1
-      - PUBLIC_CLUSTER_ADDRS=/dns4/anvil3/udp/7445/quic-v1
-      - PUBLIC_API_ADDR=http://anvil3:50051
-      - ENABLE_MDNS=false
-      - BOOTSTRAP_ADDRS=/dns4/anvil1/udp/7443/quic-v1
+      - PUBLIC_API_ADDR=http://anvil3-internal:50051
       - STORAGE_PATH=/var/lib/anvil
     ports:
       - "${ANVIL_TEST_API3_PORT:-55053}:50051"
       - "${ANVIL_TEST_ADMIN3_PORT:-56053}:50052"
     volumes:
       - anvil3_data:/var/lib/anvil
-    networks: [anvilnet]
+    networks:
+      driver3net:
+        gw_priority: 1
+        priority: 1000
+      anvilnet:
+        aliases: [anvil3-internal]
 
   anvil4:
     image: ${ANVIL_IMAGE}
     pull_policy: never
+    cap_add:
+      - NET_ADMIN
     depends_on:
       anvil1:
         condition: service_started
@@ -152,7 +174,6 @@ services:
       - JWT_SECRET=${ANVIL_DOCKER_TEST_JWT_SECRET:-docker-test-secret}
       - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       - ANVIL_SECRET_ENCRYPTION_KEY_ID=docker-test-primary
-      - CLUSTER_SECRET=docker-cluster-secret
       - API_LISTEN_ADDR=0.0.0.0:50051
       - ADMIN_LISTEN_ADDR=0.0.0.0:50052
       - ALLOW_PUBLIC_ADMIN_LISTENER=true
@@ -161,22 +182,25 @@ services:
       - BOOTSTRAP_NODE_IDS=anvil-test-node-1,anvil-test-node-2,anvil-test-node-3,anvil-test-node-4,anvil-test-node-5,anvil-test-node-6
       - ANVIL_PUBLIC_ENDPOINT=http://127.0.0.1:50051
       - ANVIL_ADMIN_ENDPOINT=http://127.0.0.1:50052
-      - CLUSTER_LISTEN_ADDR=/ip4/0.0.0.0/udp/7446/quic-v1
-      - PUBLIC_CLUSTER_ADDRS=/dns4/anvil4/udp/7446/quic-v1
-      - PUBLIC_API_ADDR=http://anvil4:50051
-      - ENABLE_MDNS=false
-      - BOOTSTRAP_ADDRS=/dns4/anvil1/udp/7443/quic-v1
+      - PUBLIC_API_ADDR=http://anvil4-internal:50051
       - STORAGE_PATH=/var/lib/anvil
     ports:
       - "${ANVIL_TEST_API4_PORT:-55054}:50051"
       - "${ANVIL_TEST_ADMIN4_PORT:-56054}:50052"
     volumes:
       - anvil4_data:/var/lib/anvil
-    networks: [anvilnet]
+    networks:
+      driver4net:
+        gw_priority: 1
+        priority: 1000
+      anvilnet:
+        aliases: [anvil4-internal]
 
   anvil5:
     image: ${ANVIL_IMAGE}
     pull_policy: never
+    cap_add:
+      - NET_ADMIN
     depends_on:
       anvil1:
         condition: service_started
@@ -193,7 +217,6 @@ services:
       - JWT_SECRET=${ANVIL_DOCKER_TEST_JWT_SECRET:-docker-test-secret}
       - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       - ANVIL_SECRET_ENCRYPTION_KEY_ID=docker-test-primary
-      - CLUSTER_SECRET=docker-cluster-secret
       - API_LISTEN_ADDR=0.0.0.0:50051
       - ADMIN_LISTEN_ADDR=0.0.0.0:50052
       - ALLOW_PUBLIC_ADMIN_LISTENER=true
@@ -202,22 +225,25 @@ services:
       - BOOTSTRAP_NODE_IDS=anvil-test-node-1,anvil-test-node-2,anvil-test-node-3,anvil-test-node-4,anvil-test-node-5,anvil-test-node-6
       - ANVIL_PUBLIC_ENDPOINT=http://127.0.0.1:50051
       - ANVIL_ADMIN_ENDPOINT=http://127.0.0.1:50052
-      - CLUSTER_LISTEN_ADDR=/ip4/0.0.0.0/udp/7447/quic-v1
-      - PUBLIC_CLUSTER_ADDRS=/dns4/anvil5/udp/7447/quic-v1
-      - PUBLIC_API_ADDR=http://anvil5:50051
-      - ENABLE_MDNS=false
-      - BOOTSTRAP_ADDRS=/dns4/anvil1/udp/7443/quic-v1
+      - PUBLIC_API_ADDR=http://anvil5-internal:50051
       - STORAGE_PATH=/var/lib/anvil
     ports:
       - "${ANVIL_TEST_API5_PORT:-55055}:50051"
       - "${ANVIL_TEST_ADMIN5_PORT:-56055}:50052"
     volumes:
       - anvil5_data:/var/lib/anvil
-    networks: [anvilnet]
+    networks:
+      driver5net:
+        gw_priority: 1
+        priority: 1000
+      anvilnet:
+        aliases: [anvil5-internal]
 
   anvil6:
     image: ${ANVIL_IMAGE}
     pull_policy: never
+    cap_add:
+      - NET_ADMIN
     depends_on:
       anvil1:
         condition: service_started
@@ -234,7 +260,6 @@ services:
       - JWT_SECRET=${ANVIL_DOCKER_TEST_JWT_SECRET:-docker-test-secret}
       - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       - ANVIL_SECRET_ENCRYPTION_KEY_ID=docker-test-primary
-      - CLUSTER_SECRET=docker-cluster-secret
       - API_LISTEN_ADDR=0.0.0.0:50051
       - ADMIN_LISTEN_ADDR=0.0.0.0:50052
       - ALLOW_PUBLIC_ADMIN_LISTENER=true
@@ -243,18 +268,19 @@ services:
       - BOOTSTRAP_NODE_IDS=anvil-test-node-1,anvil-test-node-2,anvil-test-node-3,anvil-test-node-4,anvil-test-node-5,anvil-test-node-6
       - ANVIL_PUBLIC_ENDPOINT=http://127.0.0.1:50051
       - ANVIL_ADMIN_ENDPOINT=http://127.0.0.1:50052
-      - CLUSTER_LISTEN_ADDR=/ip4/0.0.0.0/udp/7448/quic-v1
-      - PUBLIC_CLUSTER_ADDRS=/dns4/anvil6/udp/7448/quic-v1
-      - PUBLIC_API_ADDR=http://anvil6:50051
-      - ENABLE_MDNS=false
-      - BOOTSTRAP_ADDRS=/dns4/anvil1/udp/7443/quic-v1
+      - PUBLIC_API_ADDR=http://anvil6-internal:50051
       - STORAGE_PATH=/var/lib/anvil
     ports:
       - "${ANVIL_TEST_API6_PORT:-55056}:50051"
       - "${ANVIL_TEST_ADMIN6_PORT:-56056}:50052"
     volumes:
       - anvil6_data:/var/lib/anvil
-    networks: [anvilnet]
+    networks:
+      driver6net:
+        gw_priority: 1
+        priority: 1000
+      anvilnet:
+        aliases: [anvil6-internal]
 
 volumes:
   anvil1_data:

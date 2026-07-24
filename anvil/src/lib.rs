@@ -16,6 +16,7 @@ pub use anvil_core::*;
 pub mod s3_gateway;
 
 pub mod s3_auth;
+mod startup_readiness;
 
 pub async fn run(
     listener: tokio::net::TcpListener,
@@ -25,49 +26,83 @@ pub async fn run(
     config.validate_admin_listener_bind()?;
     let personaldb_protocol_keyring =
         anvil_core::personaldb_signing::PersonalDbProtocolKeyring::disabled();
-    let (tx, rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(config, Some(tx), personaldb_protocol_keyring).await?;
-    let swarm = anvil_core::cluster::create_swarm(state.config.clone()).await?;
+    let state = AppState::new(config, personaldb_protocol_keyring).await?;
 
     // Then start the node
-    start_node_with_admin_listener(listener, Some(admin_listener), state, swarm, rx).await
+    start_node_with_admin_listener(listener, Some(admin_listener), state).await
 }
 
-pub async fn start_node(
-    listener: tokio::net::TcpListener,
-    state: AppState,
-    swarm: libp2p::Swarm<anvil_core::cluster::ClusterBehaviour>,
-    outbound_events_rx: tokio::sync::mpsc::Receiver<anvil_core::cluster::MetadataEvent>,
-) -> Result<()> {
-    start_node_with_admin_listener(listener, None, state, swarm, outbound_events_rx).await
+pub async fn start_node(listener: tokio::net::TcpListener, state: AppState) -> Result<()> {
+    start_node_with_admin_listener(listener, None, state).await
 }
 
 pub async fn start_node_with_admin_listener(
     listener: tokio::net::TcpListener,
     admin_listener: Option<tokio::net::TcpListener>,
     state: AppState,
-    mut swarm: libp2p::Swarm<anvil_core::cluster::ClusterBehaviour>,
-    outbound_events_rx: tokio::sync::mpsc::Receiver<anvil_core::cluster::MetadataEvent>,
 ) -> Result<()> {
-    for addr in &state.config.bootstrap_addrs {
-        let multiaddr: libp2p::Multiaddr = addr.parse()?;
-        swarm.dial(multiaddr)?;
+    // Distributed nodes must fail closed before any background mutation can
+    // race the canonical topology/bootstrap import.
+    let distributed_recovery_required = state.config.requires_distributed_coremeta_recovery();
+    let startup_recovery_deferred = state.core_store.startup_recovery_deferred();
+    let public_readiness = startup_readiness::PublicReadiness::new(
+        state.core_store.clone(),
+        !startup_recovery_deferred,
+    );
+    let _coremeta_recovery_task = state
+        .core_store
+        .start_coremeta_distributed_recovery(distributed_recovery_required);
+    if startup_recovery_deferred {
+        let startup_state = state.clone();
+        let startup_readiness = public_readiness.clone();
+        tokio::spawn(async move {
+            loop {
+                startup_state
+                    .core_store
+                    .wait_for_coremeta_recovery_ready()
+                    .await;
+                match startup_state.ensure_system_realm_bootstrapped().await {
+                    Ok(()) => {
+                        startup_readiness.mark_system_realm_ready();
+                        break;
+                    }
+                    Err(error) => {
+                        error!(%error, "deferred system realm bootstrap failed");
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    }
+                }
+            }
+        });
     }
 
     if state.config.run_background_worker {
         let worker_state = state.clone();
+        let worker_readiness = public_readiness.clone();
         tokio::spawn(async move {
-            if let Err(e) = anvil_core::worker::run(
+            // Recovery and system-realm bootstrap establish the canonical
+            // metadata view. Background maintenance must not race either one.
+            worker_readiness.wait_until_ready().await;
+            // Queue scanning must share the worker capability and cancellation scope.
+            let shard_recovery_store = worker_state.core_store.clone();
+            let shard_recovery = async move {
+                shard_recovery_store.run_distributed_shard_recovery().await;
+                std::future::pending::<()>().await;
+            };
+            let worker = anvil_core::worker::run(
                 worker_state.persistence.clone(),
-                worker_state.cluster.clone(),
+                worker_state.core_store.clone(),
                 worker_state.jwt_manager.clone(),
                 worker_state.object_manager.clone(),
                 worker_state.secret_keyring.clone(),
                 worker_state.config.background_worker_concurrency,
-            )
-            .await
-            {
-                error!("Worker process failed: {}", e);
+            );
+            tokio::select! {
+                result = worker => {
+                    if let Err(error) = result {
+                        error!("Worker process failed: {}", error);
+                    }
+                }
+                _ = shard_recovery => unreachable!("shard recovery supervisor completed"),
             }
         });
     }
@@ -93,16 +128,17 @@ pub async fn start_node_with_admin_listener(
             middleware::admin_auth_interceptor(req, &admin_auth_state)
         });
     let admin_axum = admin_listener.as_ref().map(|_| {
-        anvil_core::services::create_axum_router(anvil_core::services::create_admin_grpc_router(
+        anvil_core::services::create_admin_axum_router(
             state.clone(),
             admin_auth_interceptor.clone(),
-        ))
+        )
     });
     let s3_app = s3_gateway::app(state.clone());
 
     let app = tower::service_fn(move |req: axum::extract::Request| {
         let grpc_router = grpc_axum.clone();
         let s3_router = s3_app.clone();
+        let public_readiness = public_readiness.clone();
 
         async move {
             let started_at = Instant::now();
@@ -120,6 +156,16 @@ pub async fn start_node_with_admin_listener(
             } else {
                 "s3"
             };
+            if !public_readiness.public_api_ready()
+                && !startup_readiness::may_bypass_public_readiness(
+                    &path,
+                    public_readiness.coremeta_ready(),
+                )
+            {
+                return Ok(startup_readiness::unavailable_response(
+                    content_type.starts_with("application/grpc"),
+                ));
+            }
             let mux_request_id = uuid::Uuid::new_v4().simple().to_string();
             let context = vec![
                 ("mux_request_id".to_string(), mux_request_id.clone()),
@@ -168,15 +214,6 @@ pub async fn start_node_with_admin_listener(
         info!("Anvil admin gRPC listener available on {}", admin_addr);
     }
 
-    // Spawn the gossip service to run in the background.
-    let gossip_task = tokio::spawn(anvil_core::cluster::run_gossip(
-        swarm,
-        state.cluster.clone(),
-        state.config.public_api_addr.clone(),
-        state.config.cluster_secret.clone(),
-        state.persistence.cache().clone(),
-        outbound_events_rx,
-    ));
     let server_task = tokio::spawn(async move {
         let listener = listener.tap_io(|stream| {
             if let Err(error) = stream.set_nodelay(true) {
@@ -202,17 +239,13 @@ pub async fn start_node_with_admin_listener(
             })
         });
 
-    // Run both tasks concurrently.
+    // Run the public and optional admin gRPC servers concurrently.
     if let Some(admin_server_task) = admin_server_task {
-        let (server_result, admin_result, gossip_result) =
-            tokio::join!(server_task, admin_server_task, gossip_task);
+        let (server_result, admin_result) = tokio::join!(server_task, admin_server_task);
         server_result??;
         admin_result??;
-        gossip_result??;
     } else {
-        let (server_result, gossip_result) = tokio::join!(server_task, gossip_task);
-        server_result??;
-        gossip_result??;
+        server_task.await??;
     }
 
     Ok(())

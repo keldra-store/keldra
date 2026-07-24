@@ -12,17 +12,11 @@ services:
       - REGION=DOCKER_TEST
       - JWT_SECRET=docker-test-secret
       - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-      - CLUSTER_SECRET=docker-cluster-secret
       - API_LISTEN_ADDR=0.0.0.0:50051
-      - CLUSTER_LISTEN_ADDR=/ip4/0.0.0.0/udp/7443/quic-v1
-      - PUBLIC_CLUSTER_ADDRS=/dns4/anvil1/udp/7443/quic-v1
       - PUBLIC_API_ADDR=http://anvil1:50051
-      - ENABLE_MDNS=false
       - STORAGE_PATH=/var/lib/anvil
-    command: ["anvil", "--init-cluster"]
     ports:
       - "50051:50051"
-      - "7443:7443/udp"
     volumes:
       - anvil1_data:/var/lib/anvil
     networks: [anvilnet]
@@ -42,17 +36,11 @@ services:
       - REGION=DOCKER_TEST
       - JWT_SECRET=docker-test-secret
       - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-      - CLUSTER_SECRET=docker-cluster-secret
       - API_LISTEN_ADDR=0.0.0.0:50051
-      - CLUSTER_LISTEN_ADDR=/ip4/0.0.0.0/udp/7444/quic-v1
-      - PUBLIC_CLUSTER_ADDRS=/dns4/anvil2/udp/7444/quic-v1
       - PUBLIC_API_ADDR=http://anvil2:50051
-      - ENABLE_MDNS=false
-      - BOOTSTRAP_ADDRS=/dns4/anvil1/udp/7443/quic-v1
       - STORAGE_PATH=/var/lib/anvil
     ports:
       - "50052:50051"
-      - "7444:7443/udp"
     volumes:
       - anvil2_data:/var/lib/anvil
     networks: [anvilnet]
@@ -67,17 +55,11 @@ services:
       - REGION=DOCKER_TEST
       - JWT_SECRET=docker-test-secret
       - ANVIL_SECRET_ENCRYPTION_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-      - CLUSTER_SECRET=docker-cluster-secret
       - API_LISTEN_ADDR=0.0.0.0:50051
-      - CLUSTER_LISTEN_ADDR=/ip4/0.0.0.0/udp/7445/quic-v1
-      - PUBLIC_CLUSTER_ADDRS=/dns4/anvil3/udp/7445/quic-v1
       - PUBLIC_API_ADDR=http://anvil3:50051
-      - ENABLE_MDNS=false
-      - BOOTSTRAP_ADDRS=/dns4/anvil1/udp/7443/quic-v1
       - STORAGE_PATH=/var/lib/anvil
     ports:
       - "50053:50051"
-      - "7445:7443/udp"
     volumes:
       - anvil3_data:/var/lib/anvil
     networks: [anvilnet]

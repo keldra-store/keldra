@@ -1,91 +1,8 @@
 use super::*;
+use crate::index_coremeta;
 
 impl Persistence {
-    #[allow(clippy::too_many_arguments)]
-    pub async fn create_index_definition(
-        &self,
-        tenant_id: i64,
-        bucket_id: i64,
-        name: &str,
-        kind: &str,
-        selector: JsonValue,
-        extractor: JsonValue,
-        authorization_mode: &str,
-        build_policy: JsonValue,
-    ) -> Result<IndexDefinition> {
-        let now = Utc::now();
-        Ok(IndexDefinition {
-            id: index_journal::next_index_definition_id(&self.storage, tenant_id, bucket_id)
-                .await?,
-            tenant_id,
-            bucket_id,
-            name: name.to_string(),
-            kind: kind.to_string(),
-            selector,
-            extractor,
-            authorization_mode: authorization_mode.to_string(),
-            build_policy,
-            enabled: true,
-            version: 1,
-            created_at: now,
-            updated_at: now,
-        })
-    }
-
-    pub async fn update_index_definition(
-        &self,
-        tenant_id: i64,
-        bucket_id: i64,
-        name: &str,
-        selector: JsonValue,
-        extractor: JsonValue,
-        authorization_mode: &str,
-        build_policy: JsonValue,
-    ) -> Result<Option<IndexDefinition>> {
-        let Some(mut index) =
-            index_journal::read_current_index_definition(&self.storage, tenant_id, bucket_id, name)
-                .await?
-        else {
-            return Ok(None);
-        };
-        index.selector = selector;
-        index.extractor = extractor;
-        index.authorization_mode = authorization_mode.to_string();
-        index.build_policy = build_policy;
-        index.version += 1;
-        index.updated_at = Utc::now();
-        Ok(Some(index))
-    }
-
     pub async fn get_index_definition(
-        &self,
-        tenant_id: i64,
-        bucket_id: i64,
-        name: &str,
-    ) -> Result<Option<IndexDefinition>> {
-        index_journal::read_current_index_definition(&self.storage, tenant_id, bucket_id, name)
-            .await
-    }
-
-    pub async fn disable_index_definition(
-        &self,
-        tenant_id: i64,
-        bucket_id: i64,
-        name: &str,
-    ) -> Result<Option<IndexDefinition>> {
-        let Some(mut index) =
-            index_journal::read_current_index_definition(&self.storage, tenant_id, bucket_id, name)
-                .await?
-        else {
-            return Ok(None);
-        };
-        index.enabled = false;
-        index.version += 1;
-        index.updated_at = Utc::now();
-        Ok(Some(index))
-    }
-
-    pub async fn drop_index_definition(
         &self,
         tenant_id: i64,
         bucket_id: i64,
@@ -110,28 +27,8 @@ impl Persistence {
         .await
     }
 
-    pub async fn create_index_definition_event(
-        &self,
-        tenant_id: i64,
-        bucket_id: i64,
-        bucket_name: &str,
-        index: &IndexDefinition,
-        event_type: &str,
-    ) -> Result<IndexDefinitionEvent> {
-        self.create_index_definition_event_with_transaction(
-            tenant_id,
-            bucket_id,
-            bucket_name,
-            index,
-            event_type,
-            None,
-            None,
-        )
-        .await
-    }
-
     #[allow(clippy::too_many_arguments)]
-    pub async fn create_index_definition_event_with_transaction(
+    pub(super) async fn create_index_definition_event_with_transaction(
         &self,
         tenant_id: i64,
         bucket_id: i64,
@@ -142,20 +39,8 @@ impl Persistence {
         transaction_principal: Option<&str>,
     ) -> Result<IndexDefinitionEvent> {
         let event = IndexDefinitionEvent {
-            id: index_journal::read_index_definition_events(
-                &self.storage,
-                tenant_id,
-                bucket_id,
-                0,
-                0,
-            )
-            .await?
-            .into_iter()
-            .map(|event| event.id)
-            .max()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("index definition cursor overflow"))?,
+            id: index_journal::next_index_definition_cursor(&self.storage, tenant_id, bucket_id)
+                .await?,
             tenant_id,
             bucket_id,
             bucket_name: bucket_name.to_string(),
@@ -373,13 +258,55 @@ impl Persistence {
         Ok(scheduled)
     }
 
-    pub async fn build_index_task(
+    pub(crate) async fn build_index_task(
         &self,
         tenant_id: i64,
         bucket_id: i64,
         index_id: i64,
         index_version: i64,
         source_cursor: u128,
+        task_guard: &crate::task_execution_guard::TaskExecutionGuard,
+    ) -> Result<Option<index_builder::IndexBuildOutcome>> {
+        self.build_index_with_authority(
+            tenant_id,
+            bucket_id,
+            index_id,
+            index_version,
+            source_cursor,
+            index_builder::IndexBuildAuthority::Task(task_guard),
+        )
+        .await
+    }
+
+    pub async fn rebuild_index_direct(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        index_id: i64,
+        index_version: i64,
+        source_cursor: u128,
+    ) -> Result<Option<index_builder::IndexBuildOutcome>> {
+        self.build_index_with_authority(
+            tenant_id,
+            bucket_id,
+            index_id,
+            index_version,
+            source_cursor,
+            index_builder::IndexBuildAuthority::DirectRepair(
+                index_builder::DirectRepairIndexBuildAuthority::new(),
+            ),
+        )
+        .await
+    }
+
+    async fn build_index_with_authority(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        index_id: i64,
+        index_version: i64,
+        source_cursor: u128,
+        authority: index_builder::IndexBuildAuthority<'_>,
     ) -> Result<Option<index_builder::IndexBuildOutcome>> {
         let Some(bucket) =
             bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
@@ -418,8 +345,6 @@ impl Persistence {
             // monotonicity when it tried to publish its stale cursor.
             return Ok(None);
         }
-        self.ensure_index_build_ownership_fence(tenant_id, bucket_id, &index_storage_id)
-            .await?;
         let outcome = match index.kind.as_str() {
             "path" | "metadata_filter" => {
                 index_builder::build_metadata_backed_index(
@@ -429,6 +354,7 @@ impl Persistence {
                     &self.partition_owner_signing_key,
                     source_cursor,
                     &self.owner_node_id,
+                    authority,
                 )
                 .await?
             }
@@ -440,6 +366,7 @@ impl Persistence {
                     &self.partition_owner_signing_key,
                     source_cursor,
                     &self.owner_node_id,
+                    authority,
                 )
                 .await?
             }
@@ -452,6 +379,7 @@ impl Persistence {
                     source_cursor,
                     &self.owner_node_id,
                     &self.embedding_providers,
+                    authority,
                 )
                 .await?
             }
@@ -464,6 +392,7 @@ impl Persistence {
                     source_cursor,
                     &self.owner_node_id,
                     &self.embedding_providers,
+                    authority,
                 )
                 .await?
             }
@@ -475,26 +404,45 @@ impl Persistence {
                     &self.partition_owner_signing_key,
                     source_cursor,
                     &self.owner_node_id,
+                    authority,
                 )
                 .await?
             }
             _ => return Ok(None),
         };
-        for diagnostic in &outcome.diagnostics {
-            self.create_index_diagnostic(
-                tenant_id,
-                bucket_id,
-                &bucket.name,
-                Some(index.id),
-                &index.name,
-                &diagnostic.object_key,
-                diagnostic.version_id,
-                &diagnostic.severity,
-                &diagnostic.code,
-                &diagnostic.message,
-                diagnostic.details.clone(),
-            )
-            .await?;
+        for (ordinal, diagnostic) in outcome.diagnostics.iter().enumerate() {
+            match authority {
+                index_builder::IndexBuildAuthority::Task(task_guard) => {
+                    self.create_index_diagnostic_for_task(
+                        tenant_id,
+                        bucket_id,
+                        &bucket.name,
+                        Some(index.id),
+                        &index.name,
+                        diagnostic,
+                        &outcome,
+                        ordinal,
+                        task_guard,
+                    )
+                    .await?;
+                }
+                index_builder::IndexBuildAuthority::DirectRepair(_) => {
+                    self.create_index_diagnostic(
+                        tenant_id,
+                        bucket_id,
+                        &bucket.name,
+                        Some(index.id),
+                        &index.name,
+                        &diagnostic.object_key,
+                        diagnostic.version_id,
+                        &diagnostic.severity,
+                        &diagnostic.code,
+                        &diagnostic.message,
+                        diagnostic.details.clone(),
+                    )
+                    .await?;
+                }
+            }
         }
         Ok(Some(outcome))
     }
@@ -562,7 +510,13 @@ impl Persistence {
                 .await?;
             if rebuild {
                 build = self
-                    .build_index_task(tenant_id, bucket.id, index.id, index.version, source_cursor)
+                    .rebuild_index_direct(
+                        tenant_id,
+                        bucket.id,
+                        index.id,
+                        index.version,
+                        source_cursor,
+                    )
                     .await?;
                 status = index_repair::IndexRepairStatus::Rebuilt(reason.clone());
             }
@@ -626,23 +580,32 @@ impl Persistence {
         .await
     }
 
-    pub async fn list_repair_findings(
+    pub async fn repair_finding_scope_revision(
         &self,
         scope_kind: &str,
         scope_id: &str,
+    ) -> Result<u64> {
+        repair_finding::repair_finding_scope_revision(&self.storage, scope_kind, scope_id).await
+    }
+
+    pub async fn page_repair_findings(
+        &self,
+        scope_kind: &str,
+        scope_id: &str,
+        after_revision: u64,
+        through_revision: u64,
         limit: usize,
     ) -> Result<Vec<repair_finding::RepairFinding>> {
-        let mut findings = repair_finding::list_repair_findings(
+        repair_finding::page_repair_findings(
             &self.storage,
             scope_kind,
             scope_id,
+            after_revision,
+            through_revision,
+            limit,
             &self.partition_owner_signing_key,
         )
-        .await?;
-        if limit > 0 && findings.len() > limit {
-            findings.truncate(limit);
-        }
-        Ok(findings)
+        .await
     }
 
     pub async fn repair_authz_derived_userset_index(
@@ -721,6 +684,86 @@ impl Persistence {
             &self.partition_owner_signing_key,
         )
         .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_index_diagnostic_for_task(
+        &self,
+        tenant_id: i64,
+        bucket_id: i64,
+        bucket_name: &str,
+        index_id: Option<i64>,
+        index_name: &str,
+        diagnostic: &index_builder::IndexBuildDiagnostic,
+        outcome: &index_builder::IndexBuildOutcome,
+        ordinal: usize,
+        task_guard: &crate::task_execution_guard::TaskExecutionGuard,
+    ) -> Result<IndexDiagnostic> {
+        let identity = serde_json::to_vec(&serde_json::json!({
+            "schema": "anvil.index.task_diagnostic_identity.v1",
+            "index_storage_id": outcome.index_storage_id,
+            "index_kind": outcome.index_kind,
+            "generation": outcome.generation,
+            "source_cursor": outcome.source_cursor.to_string(),
+            "ordinal": ordinal,
+            "object_key": diagnostic.object_key,
+            "version_id": diagnostic.version_id.map(|value| value.to_string()),
+            "severity": diagnostic.severity,
+            "code": diagnostic.code,
+            "message": diagnostic.message,
+            "details": diagnostic.details,
+        }))?;
+        let digest = blake3::hash(&identity).to_hex().to_string();
+        let created_at_nanos = index_coremeta::deterministic_index_publication_nanos(
+            &outcome.index_storage_id,
+            "diagnostic",
+            outcome.generation,
+            outcome.source_cursor,
+            &digest,
+        );
+        let mutation_id = index_coremeta::deterministic_index_mutation_id(
+            &outcome.index_storage_id,
+            "diagnostic",
+            outcome.generation,
+            outcome.source_cursor,
+            &digest,
+        );
+        let permit = self
+            .index_diagnostic_write_permit(tenant_id, bucket_id)
+            .await?;
+        let prepared = index_diagnostic_journal::prepare_index_diagnostic_for_task(
+            &self.storage,
+            IndexDiagnostic {
+                id: 0,
+                tenant_id,
+                bucket_id,
+                bucket_name: bucket_name.to_string(),
+                index_id,
+                index_name: index_name.to_string(),
+                object_key: diagnostic.object_key.clone(),
+                version_id: diagnostic.version_id,
+                severity: diagnostic.severity.clone(),
+                code: diagnostic.code.clone(),
+                message: diagnostic.message.clone(),
+                details: diagnostic.details.clone(),
+                created_at: chrono::DateTime::<Utc>::from_timestamp_nanos(created_at_nanos),
+            },
+            &permit,
+            &self.partition_owner_signing_key,
+            mutation_id,
+        )
+        .await?;
+        let publication_permit = task_guard.publication_permit().await?;
+        publication_permit
+            .publish_with(|task_precondition| async move {
+                index_diagnostic_journal::publish_prepared_index_diagnostic(
+                    &self.storage,
+                    prepared,
+                    &[task_precondition],
+                )
+                .await
+            })
+            .await
     }
 
     pub async fn list_index_diagnostics(

@@ -284,9 +284,11 @@ async fn test_list_index_diagnostics_filters_by_index_and_severity() {
             ListIndexDiagnosticsRequest {
                 bucket_name: bucket_name.clone(),
                 index_name: "body-text".to_string(),
-                after_cursor: 0,
-                limit: 100,
                 severity: "warning".to_string(),
+                page: Some(anvil::anvil_api::PageRequest {
+                    page_size: 100,
+                    page_token: String::new(),
+                }),
             },
             &token,
         ))
@@ -303,21 +305,49 @@ async fn test_list_index_diagnostics_filters_by_index_and_severity() {
         "object_body_utf8"
     );
 
-    let all = index_client
+    let first = index_client
         .list_index_diagnostics(authorized(
             ListIndexDiagnosticsRequest {
-                bucket_name,
+                bucket_name: bucket_name.clone(),
                 index_name: String::new(),
-                after_cursor: warnings[0].cursor,
-                limit: 100,
                 severity: String::new(),
+                page: Some(anvil::anvil_api::PageRequest {
+                    page_size: 1,
+                    page_token: String::new(),
+                }),
             },
             &token,
         ))
         .await
         .unwrap()
-        .into_inner()
-        .diagnostics;
-    assert_eq!(all.len(), 1);
-    assert_eq!(all[0].severity, "error");
+        .into_inner();
+    assert_eq!(first.diagnostics.len(), 1);
+    let next_page_token = first.page.unwrap().next_page_token;
+    assert!(!next_page_token.is_empty());
+
+    let second = index_client
+        .list_index_diagnostics(authorized(
+            ListIndexDiagnosticsRequest {
+                bucket_name,
+                index_name: String::new(),
+                severity: String::new(),
+                page: Some(anvil::anvil_api::PageRequest {
+                    page_size: 1,
+                    page_token: next_page_token,
+                }),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(second.diagnostics.len(), 1);
+    assert!(second.page.unwrap().next_page_token.is_empty());
+
+    let mut severities = [
+        first.diagnostics[0].severity.as_str(),
+        second.diagnostics[0].severity.as_str(),
+    ];
+    severities.sort_unstable();
+    assert_eq!(severities, ["error", "warning"]);
 }

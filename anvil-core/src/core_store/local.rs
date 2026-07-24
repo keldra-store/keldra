@@ -23,22 +23,27 @@ use super::meta::{
     CF_BOUNDARY, CF_INLINE_PAYLOADS, CF_LEASES_FENCES, CF_MATERIALISATION, CF_MESH,
     CF_OBJECT_HEADS, CF_OBJECT_VERSIONS, CF_REFCOUNTS, CF_ROOT_CACHE, CF_STREAM_HEADS,
     CF_STREAM_RECORDS, CF_TRANSACTIONS, CORE_META_INLINE_MANIFEST_BODY_MAX_BYTES,
-    CORE_META_MAX_INLINE_PAYLOAD_BYTES, CORE_META_STREAM_RECORD_INDEX_MAX_PAYLOAD_BYTES,
-    CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaEncodedOwnedRow, CoreMetaEncodedRow,
-    CoreMetaInventoryRow, CoreMetaLocatorProto, CoreMetaRecord, CoreMetaRowCommonProto,
-    CoreMetaStore, CoreMetaTuplePart, CoreMetaVisibilityState,
-    TABLE_ADMISSION_COMMIT_CERTIFICATE_ROW, TABLE_BOUNDARY_SCHEMA_ROW, TABLE_BOUNDARY_VALUE_ROW,
-    TABLE_CORE_FENCE_ROW, TABLE_EXPLICIT_TRANSACTION_ROW, TABLE_INLINE_MANIFEST_BODY_ROW,
-    TABLE_INLINE_PAYLOAD_ROW, TABLE_LANDED_BYTE_REF_ROW, TABLE_MATERIALISATION_CURSOR_ROW,
-    TABLE_NODE_SIGNING_KEYPAIR_ROW, TABLE_OBJECT_HEAD_ROW, TABLE_OBJECT_VERSION_META_ROW,
-    TABLE_PENDING_MUTATION_ROW, TABLE_QUORUM_PROFILE_CURRENT_ROW, TABLE_REFCOUNT_ROW,
-    TABLE_ROOT_CACHE_ROW, TABLE_ROOT_CATALOG_CURRENT_ROW, TABLE_STREAM_HEAD_ROW,
+    CORE_META_MAX_INLINE_PAYLOAD_BYTES, CORE_META_MAX_SCAN_PAGE_ROWS,
+    CORE_META_STREAM_RECORD_INDEX_MAX_PAYLOAD_BYTES, CoreMetaBatchOp, CoreMetaBatchOpKind,
+    CoreMetaEncodedOwnedRow, CoreMetaEncodedRow, CoreMetaLocatorProto, CoreMetaReadSnapshot,
+    CoreMetaReader, CoreMetaRecord, CoreMetaRowCommonProto, CoreMetaStore, CoreMetaTuplePart,
+    CoreMetaVisibilityState, TABLE_BOUNDARY_SCHEMA_CURRENT_ROW, TABLE_BOUNDARY_SCHEMA_ROW,
+    TABLE_BOUNDARY_VALUE_ROW, TABLE_CORE_FENCE_ROW, TABLE_EXPLICIT_TRANSACTION_ROW,
+    TABLE_INLINE_MANIFEST_BODY_ROW, TABLE_INLINE_PAYLOAD_ROW, TABLE_LANDED_BYTE_REF_ROW,
+    TABLE_LOCAL_ADMISSION_EVIDENCE_ROW, TABLE_LOCAL_NODE_IDENTITY_ROW,
+    TABLE_MATERIALISATION_CURSOR_ROW, TABLE_NODE_SIGNING_KEYPAIR_ROW, TABLE_OBJECT_HEAD_ROW,
+    TABLE_OBJECT_SHARD_REPAIR_ROW, TABLE_OBJECT_VERSION_META_ROW, TABLE_PENDING_MUTATION_ROW,
+    TABLE_QUORUM_PROFILE_CURRENT_ROW, TABLE_REFCOUNT_ROW, TABLE_ROOT_CACHE_ROW,
+    TABLE_ROOT_CATALOG_CURRENT_ROW, TABLE_ROOT_FAILOVER_CERTIFICATE_ROW,
+    TABLE_ROOT_FAILOVER_VOTE_ROW, TABLE_ROOT_PUBLICATION_INTENT_ROW, TABLE_STREAM_HEAD_ROW,
     TABLE_STREAM_IDEMPOTENCY_ROW, TABLE_STREAM_RECORD_INDEX_ROW,
     TABLE_TRANSACTION_COMMIT_EVIDENCE_ROW, TABLE_TRANSACTION_LOCATOR_ROW,
-    canonical_coremeta_cf_name, core_meta_committed_row_common,
+    TABLE_TRANSACTION_MANIFEST_BODY_ROW, canonical_coremeta_cf_name,
+    core_meta_bootstrap_row_common, core_meta_committed_row_common,
     core_meta_locator_from_manifest_locator, core_meta_locator_to_manifest_locator,
-    core_meta_payload_digest, core_meta_pending_row_common, core_meta_root_key_hash,
-    core_meta_row_common_from_payload, core_meta_tuple_key, encode_core_meta_inline_payload_row,
+    core_meta_payload_digest, core_meta_pending_row_common, core_meta_record_table_id,
+    core_meta_record_tuple_key, core_meta_root_key_hash, core_meta_row_common_from_payload,
+    core_meta_tuple_key, encode_core_meta_inline_payload_row, replace_core_meta_row_common,
     validate_coremeta_operation_key, validate_coremeta_operation_payload,
 };
 use super::pending_mutation::*;
@@ -57,6 +62,7 @@ use super::transaction_manifest_proto::{
 use super::types::*;
 use crate::error_codes::AnvilErrorCode;
 use crate::formats::writer::{WriterFamily, canonical_logical_file_id};
+use crate::node_signing::NodeSigningKeypair;
 use crate::storage::Storage;
 use aes_gcm_siv::aead::{Aead, AeadCore, OsRng, Payload};
 use aes_gcm_siv::{Aes256GcmSiv, Nonce};
@@ -64,8 +70,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::Utc;
+use fs2::FileExt;
 use hmac::{Hmac, Mac};
-use libp2p::identity;
 #[cfg(test)]
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -74,12 +80,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::io::Cursor;
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock, Mutex as StdMutex, Weak};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify, OwnedMutexGuard};
 use tonic::transport::{Channel, Endpoint};
 
 const CORE_PROCESS_LOCK_RETRY_ATTEMPTS: usize = 12_000;
@@ -112,12 +118,85 @@ pub enum CoreStoreCommitError {
         actual_sequence: u64,
         actual_event_hash: String,
     },
+    #[error("CoreMeta row {cf}/{table_id:#06x}/{tuple_key_hex} precondition failed: {reason}")]
+    CoreMetaRowPreconditionFailed {
+        cf: String,
+        table_id: u16,
+        tuple_key_hex: String,
+        reason: String,
+    },
+    #[error(
+        "CoreMeta root {root_key_hash} changed before durable staging: expected generation {expected_generation} hash {expected_hash}, got generation {actual_generation} hash {actual_hash}"
+    )]
+    RootChangedBeforeDurableStaging {
+        root_key_hash: String,
+        expected_generation: u64,
+        expected_hash: String,
+        actual_generation: u64,
+        actual_hash: String,
+    },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CoreStoreAvailabilityError {
+    #[error("CoreStore mesh topology is not ready to verify node {node_id}")]
+    MeshTopologyUnavailable { node_id: String },
+    #[error(
+        "CoreMeta quorum unavailable during {operation}: required {required}, received {received}: {details}"
+    )]
+    QuorumUnavailable {
+        operation: &'static str,
+        required: usize,
+        received: usize,
+        details: String,
+    },
+    #[error("CoreStore peer unavailable during {operation} at {endpoint}: {details}")]
+    PeerUnavailable {
+        operation: String,
+        endpoint: String,
+        details: String,
+    },
+    #[error(
+        "CoreStore shard quorum unavailable during {operation}: required {required}, received {received}: {details}"
+    )]
+    ShardQuorumUnavailable {
+        operation: &'static str,
+        required: usize,
+        received: usize,
+        details: String,
+    },
+}
+
+pub fn is_core_store_unavailable(error: &anyhow::Error) -> bool {
+    core_store_availability_error(error).is_some()
+}
+
+pub fn core_store_availability_error(error: &anyhow::Error) -> Option<&CoreStoreAvailabilityError> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<CoreStoreAvailabilityError>())
 }
 
 pub fn is_stream_head_mismatch(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.downcast_ref::<CoreStoreCommitError>().is_some())
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<CoreStoreCommitError>(),
+            Some(CoreStoreCommitError::StreamHeadMismatch { .. })
+        )
+    })
+}
+
+pub fn is_retryable_mutation_conflict(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<CoreStoreCommitError>(),
+            Some(
+                CoreStoreCommitError::StreamHeadMismatch { .. }
+                    | CoreStoreCommitError::CoreMetaRowPreconditionFailed { .. }
+                    | CoreStoreCommitError::RootChangedBeforeDurableStaging { .. }
+            )
+        )
+    })
 }
 
 const ZERO_HASH: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
@@ -146,10 +225,10 @@ const LOCAL_INLINE_PAYLOAD_BLOCK_PREFIX: &str = "inline-payload";
 
 type HmacSha256 = Hmac<Sha256>;
 
-static CORE_STORE_PROCESS_WRITE_LOCKS: LazyLock<StdMutex<BTreeMap<PathBuf, Weak<Mutex<()>>>>> =
+static CORE_STORE_STARTUP_RECOVERY_LOCKS: LazyLock<StdMutex<BTreeMap<PathBuf, Weak<Mutex<()>>>>> =
     LazyLock::new(|| StdMutex::new(BTreeMap::new()));
-static CORE_STORE_PROCESS_LOCKS_INITIALIZED: LazyLock<StdMutex<BTreeSet<PathBuf>>> =
-    LazyLock::new(|| StdMutex::new(BTreeSet::new()));
+static CORE_STORE_NAMED_LOCKS: LazyLock<StdMutex<BTreeMap<PathBuf, Weak<Mutex<()>>>>> =
+    LazyLock::new(|| StdMutex::new(BTreeMap::new()));
 static CORE_STORE_INSTANCE_REGISTRY: LazyLock<StdMutex<BTreeMap<PathBuf, CoreStore>>> =
     LazyLock::new(|| StdMutex::new(BTreeMap::new()));
 
@@ -175,6 +254,24 @@ struct LocalShardPlacement {
     cell_weight: u32,
     public_api_addr: String,
     is_local: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CoreMetaPeerTarget {
+    pub(crate) node_id: String,
+    pub(crate) public_api_addr: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CoreMetaPeerRoute {
+    pub(crate) local_replica: bool,
+    pub(crate) remote_targets: Vec<CoreMetaPeerTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CoreMetaWriteRoute {
+    Local,
+    Remote(CoreMetaPeerTarget),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -265,21 +362,28 @@ impl CoreAdmissionCapacityLimits {
 pub struct CoreStore {
     storage: Storage,
     meta: CoreMetaStore,
-    write_lock: Arc<Mutex<()>>,
+    startup_recovery_lock: Arc<Mutex<()>>,
     internal_channels: Arc<Mutex<BTreeMap<String, Channel>>>,
     coremeta_streams: Arc<Mutex<BTreeMap<String, local_coremeta_stream::CoreMetaPeerStream>>>,
+    coremeta_recovery: Arc<local_coremeta_recovery::CoreMetaRecoveryState>,
+    repair_task_scheduler: Arc<OnceLock<local_repair_task_scheduler::RepairTaskScheduler>>,
+    root_owner_failure_tracker: Arc<Mutex<local_root_failover::RootOwnerFailureTracker>>,
     pipeline_keyring: Option<Arc<CorePipelineKeyring>>,
     storage_classes: CoreStorageClassCatalog,
-    node_signing_keypair: Arc<identity::Keypair>,
+    node_signing_keypair: Arc<NodeSigningKeypair>,
+    admission_mutation_epoch: u64,
     node_identity: CoreStoreNodeIdentity,
+    startup_recovery_deferred: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreStoreStartupRecovery {
+    Immediate,
+    Distributed,
 }
 
 impl CoreStore {
-    pub(crate) async fn acquire_corestore_write_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.write_lock.lock().await
-    }
-
-    pub(super) async fn internal_grpc_channel(
+    pub(crate) async fn internal_grpc_channel(
         &self,
         public_api_addr: &str,
         operation_label: &str,
@@ -372,10 +476,15 @@ impl CoreStore {
             }
         }
 
-        bail!(
-            "{operation_label} request to {endpoint} failed after {CORE_INTERNAL_REQUEST_ATTEMPTS} attempts: {}",
-            failures.join("; ")
-        )
+        Err(CoreStoreAvailabilityError::PeerUnavailable {
+            operation: operation_label.to_string(),
+            endpoint,
+            details: format!(
+                "failed after {CORE_INTERNAL_REQUEST_ATTEMPTS} attempts: {}",
+                failures.join("; ")
+            ),
+        }
+        .into())
     }
 }
 
@@ -416,7 +525,7 @@ impl Default for CoreStoreNodeIdentity {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CorePipelineKeyring {
     active_key_id: String,
     keys: BTreeMap<String, [u8; CORE_PIPELINE_KEY_LEN]>,
@@ -487,10 +596,10 @@ impl CorePipelineKeyring {
     }
 }
 
-fn process_write_lock(storage_root: PathBuf) -> Arc<Mutex<()>> {
-    let mut locks = CORE_STORE_PROCESS_WRITE_LOCKS
+fn startup_recovery_lock(storage_root: PathBuf) -> Arc<Mutex<()>> {
+    let mut locks = CORE_STORE_STARTUP_RECOVERY_LOCKS
         .lock()
-        .expect("CoreStore process write-lock registry poisoned");
+        .expect("CoreStore startup-recovery lock registry poisoned");
     if let Some(existing) = locks.get(&storage_root).and_then(Weak::upgrade) {
         return existing;
     }
@@ -499,28 +608,16 @@ fn process_write_lock(storage_root: PathBuf) -> Arc<Mutex<()>> {
     lock
 }
 
-fn clear_stale_process_locks_once(storage: &Storage) -> Result<()> {
-    let storage_root = storage.core_store_root_path();
-    let mut initialized = CORE_STORE_PROCESS_LOCKS_INITIALIZED
+fn process_named_lock(lock_path: PathBuf) -> Arc<Mutex<()>> {
+    let mut locks = CORE_STORE_NAMED_LOCKS
         .lock()
-        .expect("CoreStore process lock registry poisoned");
-    if initialized.contains(&storage_root) {
-        return Ok(());
+        .expect("CoreStore named-lock registry poisoned");
+    if let Some(existing) = locks.get(&lock_path).and_then(Weak::upgrade) {
+        return existing;
     }
-
-    // Process lock files are expendable Class C state. A crashed process cannot
-    // remove them through Drop, so discard them before recovery starts.
-    let lock_root = storage.core_store_staging_path().join("locks");
-    match std::fs::remove_dir_all(&lock_root) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("remove stale CoreStore locks {}", lock_root.display()));
-        }
-    }
-    initialized.insert(storage_root);
-    Ok(())
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(lock_path, Arc::downgrade(&lock));
+    lock
 }
 
 #[derive(Debug, Clone)]
@@ -611,7 +708,7 @@ pub(crate) struct CoreRootAnchorRecord {
     pub(crate) writer_families: Vec<String>,
     pub(crate) manifest_count: u64,
     pub(crate) final_block_count: u64,
-    pub(crate) genesis_bundle: Option<CoreGenesisBundle>,
+    pub(super) genesis_bundle: Option<CoreGenesisBundle>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -637,13 +734,14 @@ pub(super) struct CoreGenesisPartition {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct CoreTransactionManifestRecord {
     pub(super) schema: String,
+    pub(super) root_key_hash: String,
+    pub(super) coordinator_root_key_hash: Option<String>,
+    pub(super) coordinator_root_generation: Option<u64>,
     pub(super) mutation_ids: Vec<String>,
     pub(super) idempotency_key_hashes: Vec<String>,
     pub(super) pre_root_generation: u64,
     pub(super) post_root_generation: u64,
     pub(super) logical_manifests: Vec<CoreManifestLocator>,
-    pub(super) core_meta_commit_certificate_hash: String,
-    pub(super) certificate_persist_receipt_hashes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -666,6 +764,7 @@ struct StreamAppendOutcome {
 struct PreparedStreamMetadataWrite {
     transaction_id: String,
     owned_ops: Vec<local_tx_rows::OwnedCoreMetaBatchOp>,
+    root_publications: Vec<CoreMetaRootPublication>,
 }
 
 struct PreparedStreamAppend {
@@ -676,15 +775,17 @@ struct PreparedStreamAppend {
 
 struct CoreStoreLock {
     path: PathBuf,
+    file: std::fs::File,
+    _process_guard: OwnedMutexGuard<()>,
 }
 
 impl Drop for CoreStoreLock {
     fn drop(&mut self) {
         let started_at = Instant::now();
-        let _ = std::fs::remove_file(&self.path);
+        let _ = FileExt::unlock(&self.file);
         crate::perf::record_io_duration(
             "core_store",
-            "lock_remove_on_drop",
+            "lock_advisory_unlock",
             &self.path,
             0,
             started_at.elapsed(),
@@ -795,8 +896,12 @@ mod local_block_distribution;
 mod local_boundaries;
 #[path = "local_codec.rs"]
 mod local_codec;
+#[path = "local_coremeta_history.rs"]
+pub(in crate::core_store) mod local_coremeta_history;
 #[path = "local_coremeta_quorum.rs"]
 mod local_coremeta_quorum;
+#[path = "local_coremeta_recovery.rs"]
+mod local_coremeta_recovery;
 #[path = "local_coremeta_stream.rs"]
 mod local_coremeta_stream;
 #[path = "local_erasure.rs"]
@@ -819,20 +924,64 @@ mod local_key_helpers;
 mod local_logical_file_path;
 #[path = "local_logical_files.rs"]
 mod local_logical_files;
+#[path = "local_mutation_preparation.rs"]
+mod local_mutation_preparation;
 #[path = "local_object_metadata.rs"]
 mod local_object_metadata;
+pub(crate) use local_object_metadata::{
+    CurrentObjectMetadataPage, ObjectMetadataMutationGuard, ObjectMetadataPageCursor,
+    ObjectMetadataPreconditionSnapshot, ObjectMetadataProjectionMutation,
+    ObjectVersionsMetadataPage, PreparedObjectMetadataProjection,
+};
+#[path = "local_pending_finalisation.rs"]
+mod local_pending_finalisation;
 #[path = "local_refcounts.rs"]
 mod local_refcounts;
+#[path = "local_repair_task_scheduler.rs"]
+mod local_repair_task_scheduler;
 pub(crate) use self::local_codec::{decode_core_object_ref_target, encode_core_object_ref_target};
 pub(crate) use self::local_coremeta_quorum::commit_coremeta_batch_for_storage;
 pub(crate) use self::local_io::{record_corestore_trace_event, write_file_atomic};
 pub(crate) use self::local_roots::decode_root_anchor_record;
+
+/// Derives the physical publication identity from a stable logical mutation
+/// identity and the exact guards protecting this attempt.
+///
+/// Logical/content idempotency must continue to use `logical_id`; a renewed
+/// lease produces a new publication attempt without changing that identity.
+pub(crate) fn core_mutation_publication_attempt_id(
+    logical_id: &str,
+    preconditions: &[CoreMutationPrecondition],
+) -> Result<String> {
+    let preconditions_hash = core_mutation_preconditions_hash(preconditions)?;
+    Ok(format!("{logical_id}:attempt:{preconditions_hash}"))
+}
+
+#[path = "local_root_binding.rs"]
+mod local_root_binding;
+#[path = "local_root_failover.rs"]
+mod local_root_failover;
+#[path = "local_root_publication.rs"]
+mod local_root_publication;
+#[path = "local_root_publication_evidence.rs"]
+mod local_root_publication_evidence;
+#[path = "local_root_publication_recovery.rs"]
+mod local_root_publication_recovery;
+#[cfg(any(test, feature = "root-publication-test-control"))]
+#[path = "local_root_publication_test_control.rs"]
+mod local_root_publication_test_control;
+#[path = "local_root_register.rs"]
+mod local_root_register;
 #[path = "local_roots.rs"]
 mod local_roots;
 #[path = "local_roots_layout.rs"]
 mod local_roots_layout;
+#[path = "local_shard_recovery.rs"]
+mod local_shard_recovery;
 #[path = "local_stream_control.rs"]
 mod local_stream_control;
+#[path = "local_stream_publication_recovery.rs"]
+mod local_stream_publication_recovery;
 #[path = "local_stream_records.rs"]
 mod local_stream_records;
 #[path = "local_transaction_finalise.rs"]
@@ -849,12 +998,29 @@ mod local_tx_rows;
 use self::local_block_distribution::*;
 use self::local_boundaries::*;
 use self::local_codec::*;
+use self::local_coremeta_history::*;
 use self::local_coremeta_quorum::*;
+pub use self::local_coremeta_recovery::CoreMetaRecoverySnapshot;
 use self::local_erasure::*;
 use self::local_io::*;
 use self::local_key_helpers::*;
 use self::local_logical_files::*;
+pub(crate) use self::local_root_publication::CoreMetaRootPublication;
+use self::local_root_publication::PreparedRootPublication;
+pub(in crate::core_store) use self::local_root_publication::validate_transaction_manifest_body_row;
+pub(in crate::core_store) use self::local_root_publication_recovery::validate_root_publication_intent_row;
+use self::local_root_publication_recovery::{
+    RootPublicationIntent, RootPublicationIntentRoot, build_root_publication_intent,
+    publication_intent_local_rows_match, publication_intent_retry_matches,
+    root_publication_plan_hash,
+};
+use self::local_root_register::*;
+pub(crate) use self::local_root_register::{
+    root_prepare_receipt_payload_hash, root_register_cohort_hash,
+};
+pub(crate) use self::local_roots::encode_root_anchor_record;
 use self::local_roots::*;
+pub(crate) use self::local_shard_recovery::{ShardInventoryState, shard_inventory_response};
 use self::local_stream_records::*;
 use self::local_tx_helpers::*;
 use self::local_tx_rows::*;

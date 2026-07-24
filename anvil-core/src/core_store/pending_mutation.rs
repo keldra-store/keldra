@@ -1,8 +1,11 @@
+use super::local::{decode_core_object_ref_target, encode_core_object_ref_target};
 use super::transaction_manifest_proto::{
     decode_manifest_locator_proto, encode_manifest_locator_proto,
 };
-use super::types::{CoreBoundaryValue, CoreCompressionDescriptor, CoreManifestLocator};
-use super::{CoreMetaRowCommonProto, core_meta_committed_row_common};
+use super::types::{
+    CoreBoundaryValue, CoreCompressionDescriptor, CoreManifestLocator, CoreObjectRef,
+};
+use super::{CoreMetaRowCommonProto, CoreMetaVisibilityState, core_meta_committed_row_common};
 use anyhow::{Context, Result, anyhow, bail};
 use prost::{Message, Oneof};
 use serde::{Deserialize, Serialize};
@@ -12,23 +15,25 @@ pub(super) const CORE_PENDING_MUTATION_HASH_INPUT_MAGIC: &[u8; 8] = b"ANPMH1\0\0
 pub(super) const CORE_PENDING_MUTATION_RECORD_SCHEMA: &str =
     "anvil.core.pending_mutation_record.v1";
 pub(super) const CORE_PENDING_MUTATION_ROW_SCHEMA: &str = "anvil.core.pending_mutation_row.v1";
+pub(super) const CORE_LANDED_BYTE_REF_SCHEMA: &str = "anvil.core.landed_byte_ref.v1";
 pub(super) const CORE_PENDING_MUTATION_FINALISATION_SCHEMA: &str =
     "anvil.core.pending_mutation_finalisation.v1";
 pub(super) const CORE_PENDING_MUTATION_FINALISATION_INDEX_SCHEMA: &str =
     "anvil.core.pending_mutation_finalisation_index.v1";
 pub(super) const CORE_MATERIALISATION_CURSOR_SCHEMA: &str = "anvil.core.materialisation_cursor.v1";
 pub(super) const CORE_LOCAL_ADMISSION_RECEIPT_SCHEMA: &str = "anvil.admission.local_receipt.v1";
-pub(super) const CORE_ADMISSION_COMMIT_CERTIFICATE_SCHEMA: &str =
-    "anvil.admission.commit_certificate.v1";
+pub(super) const CORE_LOCAL_ADMISSION_EVIDENCE_SCHEMA: &str = "anvil.admission.local_evidence.v1";
 pub(super) const CORE_PENDING_MUTATION_FINALISATION_RECORD_KIND: &str =
     "core_pending_mutation.finalisation";
-pub(super) const CORE_META_ADMISSION_PROFILE: &str = "metadata-r3-q2";
-pub(super) const CORE_META_ADMISSION_PROFILE_EPOCH: u64 = 1;
+pub(super) const CORE_LOCAL_ADMISSION_PROFILE: &str = "rocksdb-wal-fsync";
+pub(super) const CORE_LOCAL_ADMISSION_PROFILE_EPOCH: u64 = 1;
 pub(super) const CORE_PENDING_MUTATION_MAX_INLINE_PAYLOAD_BYTES: usize = 16 * 1024;
-pub(super) const CORE_PENDING_MUTATION_NODE_ID: &str = "local-node";
-pub(super) const CORE_PENDING_MUTATION_EPOCH: u64 = 1;
 
-pub(super) const CORE_TRANSACTION_ROOT_ANCHOR_KEY: &str = "system/core-control/0";
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CoreAdmissionShard {
+    pub(super) key: String,
+    pub(super) hash: String,
+}
 
 fn crc32c(bytes: &[u8]) -> u32 {
     let mut crc = !0u32;
@@ -45,7 +50,7 @@ fn crc32c(bytes: &[u8]) -> u32 {
     !crc
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct CorePendingLandedByte {
     pub(super) sha256: String,
     pub(super) length: u64,
@@ -56,6 +61,8 @@ pub(super) struct CorePendingLandedByte {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct CoreStoredLandedByteRef {
     pub(super) schema: String,
+    pub(super) admission_shard_hash: String,
+    pub(super) admission_sequence: u64,
     pub(super) landed: CorePendingLandedByte,
     pub(super) mutation_id: String,
     pub(super) boundary_values: Vec<CoreBoundaryValue>,
@@ -68,7 +75,7 @@ pub(super) struct CorePendingAuthzScope {
     pub(super) revision: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) enum CorePendingMutationTarget {
     ObjectPut {
         logical_name: String,
@@ -81,6 +88,7 @@ pub(super) enum CorePendingMutationTarget {
         compression: CoreCompressionDescriptor,
         writer_generation: u64,
         block_ordinal: u64,
+        logical_offset: u64,
     },
     StreamAppend {
         stream_id: String,
@@ -95,14 +103,51 @@ pub(super) enum CorePendingMutationTarget {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl CorePendingMutationTarget {
+    pub(super) fn admission_shard(&self) -> CoreAdmissionShard {
+        let (kind, parts) = match self {
+            Self::ObjectPut {
+                logical_name,
+                region_id,
+                ..
+            } => ("object", vec![region_id.as_str(), logical_name.as_str()]),
+            Self::StreamAppend {
+                stream_id,
+                partition_id,
+                ..
+            } => ("stream", vec![partition_id.as_str(), stream_id.as_str()]),
+            Self::MutationBatch {
+                scope_partition, ..
+            } => ("mutation-batch", vec![scope_partition.as_str()]),
+        };
+        let mut identity_input = Vec::new();
+        for part in parts {
+            identity_input.extend_from_slice(&(part.len() as u64).to_be_bytes());
+            identity_input.extend_from_slice(part.as_bytes());
+        }
+        let identity = domain_hash_bytes("anvil.admission.shard-identity.v1", &identity_input);
+        let key = format!("{kind}/{identity}");
+        let hash = domain_hash_bytes("anvil.admission.shard.v1", key.as_bytes());
+        CoreAdmissionShard { key, hash }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) enum CorePendingMutationFinalisationResult {
     StreamStateLocator(CoreManifestLocator),
+    ObjectRef(CoreObjectRef),
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum CoreAdmissionOutcome {
+    Pending(CorePendingMutationRecord),
+    Finalised(CorePendingMutationFinalisationRecord),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct CorePendingMutationFinalisationIndexRow {
     pub(super) schema: String,
+    pub(super) admission_shard_hash: String,
     pub(super) node_id: String,
     pub(super) mutation_epoch: u64,
     pub(super) mutation_sequence: u64,
@@ -130,7 +175,7 @@ pub(super) struct CorePendingMutationRecord {
     pub(super) created_at_unix_nanos: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct CorePendingMutationFinalisationRecord {
     pub(super) schema: String,
     pub(super) node_id: String,
@@ -150,15 +195,14 @@ pub(super) struct CorePendingMutationFinalisationRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct CoreAdmissionAttemptId {
     pub(super) mutation_id: String,
-    pub(super) root_anchor_key: String,
-    pub(super) root_key_hash: String,
+    pub(super) admission_shard_key: String,
+    pub(super) admission_shard_hash: String,
     pub(super) source_node_id: String,
     pub(super) source_mutation_epoch: u64,
     pub(super) source_mutation_sequence: u64,
     pub(super) request_hash: String,
     pub(super) admission_profile: String,
     pub(super) admission_profile_epoch: u64,
-    pub(super) metadata_replica_node_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -175,19 +219,19 @@ pub(super) struct CoreLocalAdmissionReceipt {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(super) struct CoreAdmissionCommitCertificate {
+pub(super) struct CoreLocalAdmissionEvidence {
     pub(super) schema: String,
     pub(super) attempt_id: CoreAdmissionAttemptId,
     pub(super) local_receipt: CoreLocalAdmissionReceipt,
-    pub(super) core_meta_commit_certificate_hash: String,
-    pub(super) certificate_persist_receipt_hashes: Vec<String>,
-    pub(super) committed_at_unix_nanos: u64,
+    pub(super) admitted_payload_set_hash: String,
+    pub(super) admitted_at_unix_nanos: u64,
     pub(super) signed_payload_hash: String,
     pub(super) source_signature: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(super) struct CorePendingMutationKey {
+    pub(super) admission_shard_hash: String,
     pub(super) node_id: String,
     pub(super) mutation_epoch: u64,
     pub(super) mutation_sequence: u64,
@@ -202,6 +246,7 @@ pub(super) struct CorePendingMutationReplayOutcome {
 impl From<&CorePendingMutationRecord> for CorePendingMutationKey {
     fn from(record: &CorePendingMutationRecord) -> Self {
         Self {
+            admission_shard_hash: record.target.admission_shard().hash,
             node_id: record.node_id.clone(),
             mutation_epoch: record.mutation_epoch,
             mutation_sequence: record.sequence,
@@ -285,6 +330,8 @@ struct CoreObjectPutTargetProto {
     writer_generation: u64,
     #[prost(uint64, tag = "10")]
     block_ordinal: u64,
+    #[prost(uint64, tag = "11")]
+    logical_offset: u64,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -349,7 +396,7 @@ mod core_pending_mutation_target_proto {
 struct CorePendingMutationFinalisationResultProto {
     #[prost(
         oneof = "core_pending_mutation_finalisation_result_proto::Kind",
-        tags = "1"
+        tags = "1, 2"
     )]
     kind: Option<core_pending_mutation_finalisation_result_proto::Kind>,
 }
@@ -361,6 +408,8 @@ mod core_pending_mutation_finalisation_result_proto {
     pub(super) enum Kind {
         #[prost(bytes, tag = "1")]
         StreamStateLocator(Vec<u8>),
+        #[prost(string, tag = "2")]
+        ObjectRef(String),
     }
 }
 
@@ -424,6 +473,10 @@ struct CoreStoredLandedByteRefProto {
     boundary_values: Vec<CoreBoundaryValueProto>,
     #[prost(uint64, tag = "6")]
     created_at_unix_nanos: u64,
+    #[prost(string, tag = "7")]
+    admission_shard_hash: String,
+    #[prost(uint64, tag = "8")]
+    admission_sequence: u64,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -444,6 +497,8 @@ struct CorePendingMutationFinalisationIndexRowProto {
     state: String,
     #[prost(string, tag = "8")]
     result_hash: String,
+    #[prost(string, tag = "9")]
+    admission_shard_hash: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -493,9 +548,9 @@ struct CoreAdmissionAttemptIdProto {
     #[prost(string, tag = "1")]
     mutation_id: String,
     #[prost(string, tag = "2")]
-    root_anchor_key: String,
+    admission_shard_key: String,
     #[prost(string, tag = "3")]
-    root_key_hash: String,
+    admission_shard_hash: String,
     #[prost(string, tag = "4")]
     source_node_id: String,
     #[prost(uint64, tag = "5")]
@@ -508,8 +563,6 @@ struct CoreAdmissionAttemptIdProto {
     admission_profile: String,
     #[prost(uint64, tag = "9")]
     admission_profile_epoch: u64,
-    #[prost(string, repeated, tag = "10")]
-    metadata_replica_node_ids: Vec<String>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -535,7 +588,7 @@ struct CoreLocalAdmissionReceiptProto {
 }
 
 #[derive(Clone, PartialEq, Message)]
-struct CoreAdmissionCommitCertificateProto {
+struct CoreLocalAdmissionEvidenceProto {
     #[prost(message, optional, tag = "1")]
     common: Option<CoreMetaRowCommonProto>,
     #[prost(string, tag = "2")]
@@ -545,25 +598,44 @@ struct CoreAdmissionCommitCertificateProto {
     #[prost(message, optional, tag = "4")]
     local_receipt: Option<CoreLocalAdmissionReceiptProto>,
     #[prost(uint64, tag = "5")]
-    committed_at_unix_nanos: u64,
+    admitted_at_unix_nanos: u64,
     #[prost(string, tag = "6")]
     signed_payload_hash: String,
     #[prost(bytes, tag = "7")]
     source_signature: Vec<u8>,
     #[prost(string, tag = "8")]
-    core_meta_commit_certificate_hash: String,
-    #[prost(string, repeated, tag = "9")]
-    certificate_persist_receipt_hashes: Vec<String>,
+    admitted_payload_set_hash: String,
 }
 
 fn pending_mutation_common(record: &CorePendingMutationRecord) -> CoreMetaRowCommonProto {
+    let shard = record.target.admission_shard();
     core_meta_committed_row_common(
-        format!("tenant/{}", record.anvil_storage_tenant_id),
-        root_key_hash(CORE_TRANSACTION_ROOT_ANCHOR_KEY),
+        "system/local-admission",
+        shard.hash,
         record.sequence,
         record.mutation_id.clone(),
         record.created_at_unix_nanos,
     )
+}
+
+fn validate_local_admission_common(
+    common: &CoreMetaRowCommonProto,
+    admission_shard_hash: &str,
+    generation: u64,
+    transaction_id: &str,
+    created_at_unix_nanos: u64,
+    label: &str,
+) -> Result<()> {
+    if common.realm_id != "system/local-admission"
+        || common.root_key_hash != admission_shard_hash
+        || common.root_generation != generation
+        || common.transaction_id != transaction_id
+        || common.created_at_unix_nanos != created_at_unix_nanos
+        || common.visibility_state_enum() != CoreMetaVisibilityState::Committed
+    {
+        bail!("{label} has invalid shard-local CoreMeta common metadata");
+    }
+    Ok(())
 }
 
 pub(super) fn encode_stored_pending_mutation_row(
@@ -596,24 +668,44 @@ pub(super) fn decode_stored_pending_mutation_row(
     if proto.inline_payload.len() > CORE_PENDING_MUTATION_MAX_INLINE_PAYLOAD_BYTES {
         bail!("CoreStore pending mutation row payload exceeds inline cap");
     }
-    proto
+    let common = proto
         .common
         .as_ref()
-        .ok_or_else(|| anyhow!("CoreStore pending mutation row missing CoreMeta common"))?;
+        .ok_or_else(|| anyhow!("CoreStore pending mutation row missing CoreMeta common"))?
+        .clone();
     let record = record_from_proto(
         proto
             .record
             .ok_or_else(|| anyhow!("CoreStore pending mutation row is missing record"))?,
     )?;
+    if record.schema != CORE_PENDING_MUTATION_RECORD_SCHEMA || record.sequence == 0 {
+        bail!("CoreStore pending mutation record has invalid schema or sequence");
+    }
+    let shard = record.target.admission_shard();
+    validate_local_admission_common(
+        &common,
+        &shard.hash,
+        record.sequence,
+        &record.mutation_id,
+        record.created_at_unix_nanos,
+        "CoreStore pending mutation row",
+    )?;
     Ok((record, proto.inline_payload))
 }
 
 pub(super) fn encode_landed_byte_ref_row(row: &CoreStoredLandedByteRef) -> Result<Vec<u8>> {
+    if row.schema != CORE_LANDED_BYTE_REF_SCHEMA || row.admission_sequence == 0 {
+        bail!("CoreStore landed byte ref row has invalid schema or sequence");
+    }
+    validate_hash(
+        &row.admission_shard_hash,
+        "landed byte ref admission shard hash",
+    )?;
     let proto = CoreStoredLandedByteRefProto {
         common: Some(core_meta_committed_row_common(
-            "system",
-            root_key_hash(CORE_TRANSACTION_ROOT_ANCHOR_KEY),
-            row.created_at_unix_nanos,
+            "system/local-admission",
+            &row.admission_shard_hash,
+            row.admission_sequence,
             row.mutation_id.clone(),
             row.created_at_unix_nanos,
         )),
@@ -622,6 +714,8 @@ pub(super) fn encode_landed_byte_ref_row(row: &CoreStoredLandedByteRef) -> Resul
         mutation_id: row.mutation_id.clone(),
         boundary_values: row.boundary_values.iter().map(boundary_to_proto).collect(),
         created_at_unix_nanos: row.created_at_unix_nanos,
+        admission_shard_hash: row.admission_shard_hash.clone(),
+        admission_sequence: row.admission_sequence,
     };
     encode_deterministic(proto)
 }
@@ -629,12 +723,15 @@ pub(super) fn encode_landed_byte_ref_row(row: &CoreStoredLandedByteRef) -> Resul
 pub(super) fn decode_landed_byte_ref_row(bytes: &[u8]) -> Result<CoreStoredLandedByteRef> {
     let proto = CoreStoredLandedByteRefProto::decode(bytes)?;
     ensure_round_trips(&proto, bytes, "CoreStore landed byte ref")?;
-    proto
+    let common = proto
         .common
         .as_ref()
-        .ok_or_else(|| anyhow!("CoreStore landed byte ref row missing CoreMeta common"))?;
-    Ok(CoreStoredLandedByteRef {
+        .ok_or_else(|| anyhow!("CoreStore landed byte ref row missing CoreMeta common"))?
+        .clone();
+    let row = CoreStoredLandedByteRef {
         schema: proto.schema,
+        admission_shard_hash: proto.admission_shard_hash,
+        admission_sequence: proto.admission_sequence,
         landed: landed_from_proto(
             proto
                 .landed
@@ -647,7 +744,32 @@ pub(super) fn decode_landed_byte_ref_row(bytes: &[u8]) -> Result<CoreStoredLande
             .map(boundary_from_proto)
             .collect(),
         created_at_unix_nanos: proto.created_at_unix_nanos,
-    })
+    };
+    if row.schema != CORE_LANDED_BYTE_REF_SCHEMA || row.admission_sequence == 0 {
+        bail!("CoreStore landed byte ref row has invalid schema or sequence");
+    }
+    let (algorithm, remainder) = row
+        .landed
+        .landing_id
+        .split_once(':')
+        .ok_or_else(|| anyhow!("CoreStore landed byte ref row has invalid landing id"))?;
+    let (digest, _) = remainder
+        .split_once(':')
+        .ok_or_else(|| anyhow!("CoreStore landed byte ref row has invalid landing id"))?;
+    let shard_hash = format!("{algorithm}:{digest}");
+    validate_hash(&shard_hash, "landed byte ref admission shard hash")?;
+    if row.admission_shard_hash != shard_hash {
+        bail!("CoreStore landed byte ref row shard/landing identity mismatch");
+    }
+    validate_local_admission_common(
+        &common,
+        &row.admission_shard_hash,
+        row.admission_sequence,
+        &row.mutation_id,
+        row.created_at_unix_nanos,
+        "CoreStore landed byte ref row",
+    )?;
+    Ok(row)
 }
 
 pub(super) fn encode_pending_mutation_finalisation_index_row(
@@ -655,13 +777,14 @@ pub(super) fn encode_pending_mutation_finalisation_index_row(
 ) -> Result<Vec<u8>> {
     let proto = CorePendingMutationFinalisationIndexRowProto {
         common: Some(core_meta_committed_row_common(
-            "system",
-            root_key_hash(CORE_TRANSACTION_ROOT_ANCHOR_KEY),
+            "system/local-admission",
+            row.admission_shard_hash.clone(),
             row.mutation_sequence,
             row.mutation_id.clone(),
             0,
         )),
         schema: row.schema.clone(),
+        admission_shard_hash: row.admission_shard_hash.clone(),
         node_id: row.node_id.clone(),
         mutation_epoch: row.mutation_epoch,
         mutation_sequence: row.mutation_sequence,
@@ -681,27 +804,45 @@ pub(super) fn decode_pending_mutation_finalisation_index_row(
         bytes,
         "CoreStore pending mutation finalisation index row",
     )?;
-    proto.common.as_ref().ok_or_else(|| {
-        anyhow!("CoreStore pending mutation finalisation index missing CoreMeta common")
-    })?;
-    Ok(CorePendingMutationFinalisationIndexRow {
+    let common = proto
+        .common
+        .as_ref()
+        .ok_or_else(|| {
+            anyhow!("CoreStore pending mutation finalisation index missing CoreMeta common")
+        })?
+        .clone();
+    let row = CorePendingMutationFinalisationIndexRow {
         schema: proto.schema,
+        admission_shard_hash: proto.admission_shard_hash,
         node_id: proto.node_id,
         mutation_epoch: proto.mutation_epoch,
         mutation_sequence: proto.mutation_sequence,
         mutation_id: proto.mutation_id,
         state: proto.state,
         result_hash: proto.result_hash,
-    })
+    };
+    if row.schema != CORE_PENDING_MUTATION_FINALISATION_INDEX_SCHEMA {
+        bail!("CoreStore pending mutation finalisation index has invalid schema");
+    }
+    validate_local_admission_common(
+        &common,
+        &row.admission_shard_hash,
+        row.mutation_sequence,
+        &row.mutation_id,
+        0,
+        "CoreStore pending mutation finalisation index",
+    )?;
+    Ok(row)
 }
 
 pub(super) fn encode_pending_mutation_finalisation_record(
     record: &CorePendingMutationFinalisationRecord,
 ) -> Result<Vec<u8>> {
+    let shard = record.target.admission_shard();
     let proto = CorePendingMutationFinalisationRecordProto {
         common: Some(core_meta_committed_row_common(
-            "system",
-            root_key_hash(CORE_TRANSACTION_ROOT_ANCHOR_KEY),
+            "system/local-admission",
+            shard.hash,
             record.mutation_sequence,
             record.mutation_id.clone(),
             record.finalised_at_unix_nanos,
@@ -739,10 +880,14 @@ pub(super) fn decode_pending_mutation_finalisation_record(
     if proto.schema != CORE_PENDING_MUTATION_FINALISATION_SCHEMA {
         bail!("CoreStore pending mutation finalisation record has invalid schema");
     }
-    proto.common.as_ref().ok_or_else(|| {
-        anyhow!("CoreStore pending mutation finalisation record missing CoreMeta common")
-    })?;
-    Ok(CorePendingMutationFinalisationRecord {
+    let common = proto
+        .common
+        .as_ref()
+        .ok_or_else(|| {
+            anyhow!("CoreStore pending mutation finalisation record missing CoreMeta common")
+        })?
+        .clone();
+    let record = CorePendingMutationFinalisationRecord {
         schema: proto.schema,
         node_id: proto.node_id,
         mutation_epoch: proto.mutation_epoch,
@@ -766,14 +911,27 @@ pub(super) fn decode_pending_mutation_finalisation_record(
         state: proto.state,
         result: proto.result.map(result_from_proto).transpose()?,
         finalised_at_unix_nanos: proto.finalised_at_unix_nanos,
-    })
+    };
+    let shard = record.target.admission_shard();
+    validate_local_admission_common(
+        &common,
+        &shard.hash,
+        record.mutation_sequence,
+        &record.mutation_id,
+        record.finalised_at_unix_nanos,
+        "CoreStore pending mutation finalisation record",
+    )?;
+    Ok(record)
 }
 
-pub(super) fn encode_materialisation_cursor_row(sequence: u64) -> Result<Vec<u8>> {
+pub(super) fn encode_admission_sequence_cursor_row(
+    admission_shard_hash: &str,
+    sequence: u64,
+) -> Result<Vec<u8>> {
     encode_deterministic(CoreMaterialisationCursorRowProto {
         common: Some(core_meta_committed_row_common(
-            "system",
-            root_key_hash(CORE_TRANSACTION_ROOT_ANCHOR_KEY),
+            "system/local-admission",
+            admission_shard_hash,
             sequence,
             format!("materialisation-cursor:{sequence}"),
             0,
@@ -783,7 +941,10 @@ pub(super) fn encode_materialisation_cursor_row(sequence: u64) -> Result<Vec<u8>
     })
 }
 
-pub(super) fn decode_materialisation_cursor_row(bytes: &[u8]) -> Result<u64> {
+pub(super) fn decode_admission_sequence_cursor_row(
+    bytes: &[u8],
+    admission_shard_hash: &str,
+) -> Result<u64> {
     let proto = CoreMaterialisationCursorRowProto::decode(bytes)?;
     ensure_round_trips(&proto, bytes, "CoreStore materialisation cursor row")?;
     if proto.schema != CORE_MATERIALISATION_CURSOR_SCHEMA {
@@ -792,16 +953,38 @@ pub(super) fn decode_materialisation_cursor_row(bytes: &[u8]) -> Result<u64> {
     let common = proto
         .common
         .ok_or_else(|| anyhow!("CoreStore materialisation cursor row missing CoreMeta common"))?;
-    if common.realm_id != "system" {
+    if common.realm_id != "system/local-admission" {
         bail!("CoreStore materialisation cursor row realm mismatch");
     }
-    if common.root_key_hash != root_key_hash(CORE_TRANSACTION_ROOT_ANCHOR_KEY) {
+    if common.root_key_hash != admission_shard_hash {
         bail!("CoreStore materialisation cursor row root mismatch");
     }
     if common.root_generation != proto.sequence {
         bail!("CoreStore materialisation cursor row generation mismatch");
     }
+    if common.transaction_id != format!("materialisation-cursor:{}", proto.sequence)
+        || common.created_at_unix_nanos != 0
+        || common.visibility_state_enum() != CoreMetaVisibilityState::Committed
+    {
+        bail!("CoreStore materialisation cursor row common metadata mismatch");
+    }
     Ok(proto.sequence)
+}
+
+#[cfg(test)]
+pub(super) fn encode_materialisation_cursor_row(sequence: u64) -> Result<Vec<u8>> {
+    const TRANSACTION_ROOT: &str = "system/core-control/0";
+    encode_deterministic(CoreMaterialisationCursorRowProto {
+        common: Some(core_meta_committed_row_common(
+            "system",
+            root_key_hash(TRANSACTION_ROOT),
+            sequence,
+            format!("materialisation-cursor:{sequence}"),
+            0,
+        )),
+        schema: CORE_MATERIALISATION_CURSOR_SCHEMA.to_string(),
+        sequence,
+    })
 }
 
 pub(super) fn encode_pending_mutation_hash_input(
@@ -845,65 +1028,69 @@ pub(super) fn finalisation_result_hash(
     ))
 }
 
-pub(super) fn encode_admission_commit_certificate(
-    certificate: &CoreAdmissionCommitCertificate,
+pub(super) fn encode_local_admission_evidence(
+    evidence: &CoreLocalAdmissionEvidence,
 ) -> Result<Vec<u8>> {
-    let proto = CoreAdmissionCommitCertificateProto {
+    let proto = CoreLocalAdmissionEvidenceProto {
         common: Some(core_meta_committed_row_common(
-            "system",
-            certificate.attempt_id.root_key_hash.clone(),
-            certificate.attempt_id.source_mutation_sequence,
-            certificate.attempt_id.mutation_id.clone(),
-            certificate.committed_at_unix_nanos,
+            "system/local-admission",
+            evidence.attempt_id.admission_shard_hash.clone(),
+            evidence.attempt_id.source_mutation_sequence,
+            evidence.attempt_id.mutation_id.clone(),
+            evidence.admitted_at_unix_nanos,
         )),
-        schema: certificate.schema.clone(),
-        attempt_id: Some(admission_attempt_id_to_proto(&certificate.attempt_id)),
-        local_receipt: Some(local_admission_receipt_to_proto(&certificate.local_receipt)),
-        committed_at_unix_nanos: certificate.committed_at_unix_nanos,
-        signed_payload_hash: certificate.signed_payload_hash.clone(),
-        source_signature: certificate.source_signature.clone(),
-        core_meta_commit_certificate_hash: certificate.core_meta_commit_certificate_hash.clone(),
-        certificate_persist_receipt_hashes: certificate.certificate_persist_receipt_hashes.clone(),
+        schema: evidence.schema.clone(),
+        attempt_id: Some(admission_attempt_id_to_proto(&evidence.attempt_id)),
+        local_receipt: Some(local_admission_receipt_to_proto(&evidence.local_receipt)),
+        admitted_at_unix_nanos: evidence.admitted_at_unix_nanos,
+        signed_payload_hash: evidence.signed_payload_hash.clone(),
+        source_signature: evidence.source_signature.clone(),
+        admitted_payload_set_hash: evidence.admitted_payload_set_hash.clone(),
     };
     encode_deterministic(proto)
 }
 
-pub(super) fn decode_admission_commit_certificate(
-    bytes: &[u8],
-) -> Result<CoreAdmissionCommitCertificate> {
-    let proto = CoreAdmissionCommitCertificateProto::decode(bytes)?;
-    ensure_round_trips(&proto, bytes, "CoreStore admission commit certificate")?;
-    proto
+pub(super) fn decode_local_admission_evidence(bytes: &[u8]) -> Result<CoreLocalAdmissionEvidence> {
+    let proto = CoreLocalAdmissionEvidenceProto::decode(bytes)?;
+    ensure_round_trips(&proto, bytes, "CoreStore local admission evidence")?;
+    let common = proto
         .common
         .as_ref()
-        .ok_or_else(|| anyhow!("CoreStore admission commit certificate missing CoreMeta common"))?;
-    Ok(CoreAdmissionCommitCertificate {
-        schema: proto.schema,
-        attempt_id: admission_attempt_id_from_proto(proto.attempt_id.ok_or_else(|| {
-            anyhow!("CoreStore admission commit certificate is missing attempt_id")
-        })?),
-        local_receipt: local_admission_receipt_from_proto(proto.local_receipt.ok_or_else(
-            || anyhow!("CoreStore admission commit certificate is missing local_receipt"),
-        )?)?,
-        core_meta_commit_certificate_hash: proto.core_meta_commit_certificate_hash,
-        certificate_persist_receipt_hashes: proto.certificate_persist_receipt_hashes,
-        committed_at_unix_nanos: proto.committed_at_unix_nanos,
-        signed_payload_hash: proto.signed_payload_hash,
-        source_signature: proto.source_signature,
-    })
+        .ok_or_else(|| anyhow!("CoreStore local admission evidence missing CoreMeta common"))?
+        .clone();
+    let evidence =
+        CoreLocalAdmissionEvidence {
+            schema: proto.schema,
+            attempt_id: admission_attempt_id_from_proto(proto.attempt_id.ok_or_else(|| {
+                anyhow!("CoreStore local admission evidence is missing attempt_id")
+            })?),
+            local_receipt: local_admission_receipt_from_proto(proto.local_receipt.ok_or_else(
+                || anyhow!("CoreStore local admission evidence is missing local_receipt"),
+            )?)?,
+            admitted_payload_set_hash: proto.admitted_payload_set_hash,
+            admitted_at_unix_nanos: proto.admitted_at_unix_nanos,
+            signed_payload_hash: proto.signed_payload_hash,
+            source_signature: proto.source_signature,
+        };
+    validate_local_admission_common(
+        &common,
+        &evidence.attempt_id.admission_shard_hash,
+        evidence.attempt_id.source_mutation_sequence,
+        &evidence.attempt_id.mutation_id,
+        evidence.admitted_at_unix_nanos,
+        "CoreStore local admission evidence",
+    )?;
+    Ok(evidence)
 }
 
-pub(super) fn build_local_pending_mutation_commit_certificate(
+pub(super) fn build_local_admission_evidence(
     record: &CorePendingMutationRecord,
     pending_mutation_hash_input: &[u8],
-    committed_at_unix_nanos: u64,
+    admitted_payload_set_hash: String,
+    admitted_at_unix_nanos: u64,
     local_fsync_sequence: u64,
-    metadata_replica_node_ids: Vec<String>,
-    core_meta_commit_certificate_hash: String,
-    certificate_persist_receipt_hashes: Vec<String>,
-) -> Result<CoreAdmissionCommitCertificate> {
-    let attempt_id =
-        admission_attempt_id_with_metadata_replicas(record, metadata_replica_node_ids)?;
+) -> Result<CoreLocalAdmissionEvidence> {
+    let attempt_id = admission_attempt_id(record)?;
     let landed_byte_hashes = record
         .landed_bytes
         .iter()
@@ -929,99 +1116,105 @@ pub(super) fn build_local_pending_mutation_commit_certificate(
         source_signature: Vec::new(),
     };
     local_receipt.signed_payload_hash = local_admission_receipt_payload_hash(&local_receipt)?;
-    let mut certificate = CoreAdmissionCommitCertificate {
-        schema: CORE_ADMISSION_COMMIT_CERTIFICATE_SCHEMA.to_string(),
+    let mut evidence = CoreLocalAdmissionEvidence {
+        schema: CORE_LOCAL_ADMISSION_EVIDENCE_SCHEMA.to_string(),
         attempt_id,
         local_receipt,
-        core_meta_commit_certificate_hash,
-        certificate_persist_receipt_hashes,
-        committed_at_unix_nanos,
+        admitted_payload_set_hash,
+        admitted_at_unix_nanos,
         signed_payload_hash: String::new(),
         source_signature: Vec::new(),
     };
-    certificate.signed_payload_hash = admission_commit_certificate_payload_hash(&certificate)?;
-    Ok(certificate)
+    evidence.signed_payload_hash = local_admission_evidence_payload_hash(&evidence)?;
+    Ok(evidence)
 }
 
-pub(super) fn validate_local_pending_mutation_commit_certificate(
-    certificate: &CoreAdmissionCommitCertificate,
+pub(super) fn validate_local_admission_evidence(
+    evidence: &CoreLocalAdmissionEvidence,
 ) -> Result<()> {
-    if certificate.schema != CORE_ADMISSION_COMMIT_CERTIFICATE_SCHEMA {
-        bail!("CoreStore admission commit certificate has invalid schema");
+    if evidence.schema != CORE_LOCAL_ADMISSION_EVIDENCE_SCHEMA {
+        bail!("CoreStore local admission evidence has invalid schema");
     }
-    if certificate.local_receipt.schema != CORE_LOCAL_ADMISSION_RECEIPT_SCHEMA {
+    if evidence.local_receipt.schema != CORE_LOCAL_ADMISSION_RECEIPT_SCHEMA {
         bail!("CoreStore local admission receipt has invalid schema");
     }
-    if certificate.attempt_id != certificate.local_receipt.attempt_id {
-        bail!("CoreStore admission commit certificate attempt mismatch");
+    if evidence.attempt_id != evidence.local_receipt.attempt_id {
+        bail!("CoreStore local admission evidence attempt mismatch");
     }
     validate_hash(
-        &certificate.attempt_id.root_key_hash,
-        "admission attempt root key hash",
+        &evidence.attempt_id.admission_shard_hash,
+        "admission attempt shard hash",
     )?;
+    if evidence.attempt_id.admission_shard_hash
+        != domain_hash_bytes(
+            "anvil.admission.shard.v1",
+            evidence.attempt_id.admission_shard_key.as_bytes(),
+        )
+    {
+        bail!("CoreStore local admission attempt shard identity mismatch");
+    }
     validate_hash(
-        &certificate.attempt_id.request_hash,
+        &evidence.attempt_id.request_hash,
         "admission attempt request hash",
     )?;
     validate_logical_id(
-        &certificate.attempt_id.source_node_id,
+        &evidence.attempt_id.source_node_id,
         "admission source node id",
     )?;
-    if certificate.attempt_id.admission_profile.is_empty()
-        || certificate.attempt_id.admission_profile_epoch == 0
+    if evidence.attempt_id.admission_shard_key.is_empty()
+        || evidence.attempt_id.admission_profile != CORE_LOCAL_ADMISSION_PROFILE
+        || evidence.attempt_id.admission_profile_epoch != CORE_LOCAL_ADMISSION_PROFILE_EPOCH
+        || evidence.attempt_id.source_mutation_sequence == 0
     {
-        bail!("CoreStore admission attempt profile must be present");
+        bail!("CoreStore local admission attempt shard and profile must be present");
     }
-    if certificate.local_receipt.local_metadata_fsync_sequence == 0 {
+    if evidence.local_receipt.local_metadata_fsync_sequence == 0 {
         bail!("CoreStore local admission receipt metadata fsync sequence must be nonzero");
     }
-    if !certificate.local_receipt.landed_byte_hashes.is_empty()
-        && certificate.local_receipt.local_landed_fsync_sequence == 0
+    if evidence.local_receipt.local_metadata_fsync_sequence
+        != evidence.attempt_id.source_mutation_sequence
+        || evidence.local_receipt.local_landed_fsync_sequence
+            != evidence.attempt_id.source_mutation_sequence
+    {
+        bail!("CoreStore local admission receipt fsync sequence mismatch");
+    }
+    if !evidence.local_receipt.landed_byte_hashes.is_empty()
+        && evidence.local_receipt.local_landed_fsync_sequence == 0
     {
         bail!("CoreStore local admission receipt landed fsync sequence must be nonzero");
     }
-    if certificate.local_receipt.landed_byte_hashes.len()
-        != certificate.local_receipt.descriptor_hashes.len()
+    if evidence.local_receipt.landed_byte_hashes.len()
+        != evidence.local_receipt.descriptor_hashes.len()
     {
         bail!("CoreStore local admission receipt descriptor count mismatch");
     }
     validate_hash(
-        &certificate.local_receipt.pending_mutation_hash,
+        &evidence.local_receipt.pending_mutation_hash,
         "admission pending mutation hash input hash",
     )?;
-    for hash in &certificate.local_receipt.landed_byte_hashes {
+    for hash in &evidence.local_receipt.landed_byte_hashes {
         validate_hash(hash, "admission landed byte hash")?;
     }
-    for hash in &certificate.local_receipt.descriptor_hashes {
+    for hash in &evidence.local_receipt.descriptor_hashes {
         validate_hash(hash, "admission landed descriptor hash")?;
     }
     validate_hash(
-        &certificate.core_meta_commit_certificate_hash,
-        "admission CoreMeta commit certificate hash",
+        &evidence.admitted_payload_set_hash,
+        "admission payload set hash",
     )?;
-    let mut seen_certificate_persist_receipt_hashes = std::collections::BTreeSet::new();
-    for receipt_hash in &certificate.certificate_persist_receipt_hashes {
-        validate_hash(
-            receipt_hash,
-            "admission CoreMeta certificate persist receipt hash",
-        )?;
-        if !seen_certificate_persist_receipt_hashes.insert(receipt_hash.clone()) {
-            bail!("CoreStore admission CoreMeta certificate persist receipt hash is duplicated");
-        }
-    }
-    let expected_local = local_admission_receipt_payload_hash(&certificate.local_receipt)?;
-    if certificate.local_receipt.signed_payload_hash != expected_local {
+    let expected_local = local_admission_receipt_payload_hash(&evidence.local_receipt)?;
+    if evidence.local_receipt.signed_payload_hash != expected_local {
         bail!("CoreStore local admission receipt payload hash mismatch");
     }
-    if certificate.local_receipt.source_signature.is_empty() {
+    if evidence.local_receipt.source_signature.is_empty() {
         bail!("CoreStore local admission receipt signature must not be empty");
     }
-    let expected_certificate = admission_commit_certificate_payload_hash(certificate)?;
-    if certificate.signed_payload_hash != expected_certificate {
-        bail!("CoreStore admission commit certificate payload hash mismatch");
+    let expected_evidence = local_admission_evidence_payload_hash(evidence)?;
+    if evidence.signed_payload_hash != expected_evidence {
+        bail!("CoreStore local admission evidence payload hash mismatch");
     }
-    if certificate.source_signature.is_empty() {
-        bail!("CoreStore admission commit certificate signature must not be empty");
+    if evidence.source_signature.is_empty() {
+        bail!("CoreStore local admission evidence signature must not be empty");
     }
     Ok(())
 }
@@ -1029,32 +1222,25 @@ pub(super) fn validate_local_pending_mutation_commit_certificate(
 pub(super) fn admission_attempt_id(
     record: &CorePendingMutationRecord,
 ) -> Result<CoreAdmissionAttemptId> {
-    admission_attempt_id_with_metadata_replicas(record, Vec::new())
-}
-
-pub(super) fn admission_attempt_id_with_metadata_replicas(
-    record: &CorePendingMutationRecord,
-    metadata_replica_node_ids: Vec<String>,
-) -> Result<CoreAdmissionAttemptId> {
+    let shard = record.target.admission_shard();
     Ok(CoreAdmissionAttemptId {
         mutation_id: record.mutation_id.clone(),
-        root_anchor_key: CORE_TRANSACTION_ROOT_ANCHOR_KEY.to_string(),
-        root_key_hash: root_key_hash(CORE_TRANSACTION_ROOT_ANCHOR_KEY),
+        admission_shard_key: shard.key,
+        admission_shard_hash: shard.hash,
         source_node_id: record.node_id.clone(),
         source_mutation_epoch: record.mutation_epoch,
         source_mutation_sequence: record.sequence,
         request_hash: admission_request_hash(record)?,
-        admission_profile: CORE_META_ADMISSION_PROFILE.to_string(),
-        admission_profile_epoch: CORE_META_ADMISSION_PROFILE_EPOCH,
-        metadata_replica_node_ids,
+        admission_profile: CORE_LOCAL_ADMISSION_PROFILE.to_string(),
+        admission_profile_epoch: CORE_LOCAL_ADMISSION_PROFILE_EPOCH,
     })
 }
 
-fn admission_request_hash(record: &CorePendingMutationRecord) -> Result<String> {
+pub(super) fn admission_request_hash(record: &CorePendingMutationRecord) -> Result<String> {
     let descriptor_hashes = record
         .landed_bytes
         .iter()
-        .map(landed_byte_descriptor_hash)
+        .map(landed_byte_content_descriptor_hash)
         .collect::<Result<Vec<_>>>()?;
     let request = CoreAdmissionRequestHashProto {
         operation_family: record.operation_family.clone(),
@@ -1102,6 +1288,16 @@ fn landed_byte_descriptor_hash(landed: &CorePendingLandedByte) -> Result<String>
     ]))
 }
 
+fn landed_byte_content_descriptor_hash(landed: &CorePendingLandedByte) -> Result<String> {
+    validate_hash(&landed.sha256, "landed byte content descriptor hash")?;
+    Ok(descriptor_hash(&[
+        "anvil.landed_byte.content_descriptor.v1",
+        &landed.sha256,
+        &landed.length.to_string(),
+        "application/octet-stream",
+    ]))
+}
+
 fn local_admission_receipt_payload_hash(receipt: &CoreLocalAdmissionReceipt) -> Result<String> {
     let mut proto = local_admission_receipt_to_proto(receipt);
     proto.signed_payload_hash.clear();
@@ -1110,31 +1306,28 @@ fn local_admission_receipt_payload_hash(receipt: &CoreLocalAdmissionReceipt) -> 
     Ok(domain_hash_bytes("anvil.admission.receipt.v1", &bytes))
 }
 
-fn admission_commit_certificate_payload_hash(
-    certificate: &CoreAdmissionCommitCertificate,
-) -> Result<String> {
-    let mut local_receipt = local_admission_receipt_to_proto(&certificate.local_receipt);
+fn local_admission_evidence_payload_hash(evidence: &CoreLocalAdmissionEvidence) -> Result<String> {
+    let mut local_receipt = local_admission_receipt_to_proto(&evidence.local_receipt);
     local_receipt.source_signature.clear();
-    let proto = CoreAdmissionCommitCertificateProto {
+    let proto = CoreLocalAdmissionEvidenceProto {
         common: Some(core_meta_committed_row_common(
-            "system",
-            certificate.attempt_id.root_key_hash.clone(),
-            certificate.attempt_id.source_mutation_sequence,
-            certificate.attempt_id.mutation_id.clone(),
-            certificate.committed_at_unix_nanos,
+            "system/local-admission",
+            evidence.attempt_id.admission_shard_hash.clone(),
+            evidence.attempt_id.source_mutation_sequence,
+            evidence.attempt_id.mutation_id.clone(),
+            evidence.admitted_at_unix_nanos,
         )),
-        schema: certificate.schema.clone(),
-        attempt_id: Some(admission_attempt_id_to_proto(&certificate.attempt_id)),
+        schema: evidence.schema.clone(),
+        attempt_id: Some(admission_attempt_id_to_proto(&evidence.attempt_id)),
         local_receipt: Some(local_receipt),
-        committed_at_unix_nanos: certificate.committed_at_unix_nanos,
+        admitted_at_unix_nanos: evidence.admitted_at_unix_nanos,
         signed_payload_hash: String::new(),
         source_signature: Vec::new(),
-        core_meta_commit_certificate_hash: certificate.core_meta_commit_certificate_hash.clone(),
-        certificate_persist_receipt_hashes: certificate.certificate_persist_receipt_hashes.clone(),
+        admitted_payload_set_hash: evidence.admitted_payload_set_hash.clone(),
     };
     let bytes = encode_deterministic(proto)?;
     Ok(domain_hash_bytes(
-        "anvil.admission.commit_certificate.v1",
+        "anvil.admission.local_evidence.v1",
         &bytes,
     ))
 }
@@ -1249,6 +1442,7 @@ fn target_to_proto(value: &CorePendingMutationTarget) -> Result<CorePendingMutat
             compression,
             writer_generation,
             block_ordinal,
+            logical_offset,
         } => Kind::ObjectPut(CoreObjectPutTargetProto {
             logical_name: logical_name.clone(),
             region_id: region_id.clone(),
@@ -1260,6 +1454,7 @@ fn target_to_proto(value: &CorePendingMutationTarget) -> Result<CorePendingMutat
             compression: Some(compression_to_proto(compression)),
             writer_generation: *writer_generation,
             block_ordinal: *block_ordinal,
+            logical_offset: *logical_offset,
         }),
         CorePendingMutationTarget::StreamAppend {
             stream_id,
@@ -1304,6 +1499,7 @@ fn target_from_proto(value: CorePendingMutationTargetProto) -> Result<CorePendin
             })?),
             writer_generation: value.writer_generation,
             block_ordinal: value.block_ordinal,
+            logical_offset: value.logical_offset,
         },
         Kind::StreamAppend(value) => CorePendingMutationTarget::StreamAppend {
             stream_id: value.stream_id,
@@ -1328,6 +1524,12 @@ fn result_to_proto(
                 .with_context(|| "encode CoreStore stream state locator")?;
             core_pending_mutation_finalisation_result_proto::Kind::StreamStateLocator(locator_bytes)
         }
+        CorePendingMutationFinalisationResult::ObjectRef(object_ref) => {
+            core_pending_mutation_finalisation_result_proto::Kind::ObjectRef(
+                encode_core_object_ref_target(object_ref)
+                    .with_context(|| "encode CoreStore finalised object ref")?,
+            )
+        }
     };
     Ok(CorePendingMutationFinalisationResultProto { kind: Some(kind) })
 }
@@ -1345,6 +1547,12 @@ fn result_from_proto(
             decode_manifest_locator_proto(&locator_bytes)
                 .with_context(|| "decode CoreStore stream state locator")?,
         ),
+        core_pending_mutation_finalisation_result_proto::Kind::ObjectRef(object_ref) => {
+            CorePendingMutationFinalisationResult::ObjectRef(
+                decode_core_object_ref_target(&object_ref)
+                    .with_context(|| "decode CoreStore finalised object ref")?,
+            )
+        }
     })
 }
 
@@ -1403,30 +1611,28 @@ fn landed_from_proto(value: CorePendingLandedByteProto) -> CorePendingLandedByte
 fn admission_attempt_id_to_proto(value: &CoreAdmissionAttemptId) -> CoreAdmissionAttemptIdProto {
     CoreAdmissionAttemptIdProto {
         mutation_id: value.mutation_id.clone(),
-        root_anchor_key: value.root_anchor_key.clone(),
-        root_key_hash: value.root_key_hash.clone(),
+        admission_shard_key: value.admission_shard_key.clone(),
+        admission_shard_hash: value.admission_shard_hash.clone(),
         source_node_id: value.source_node_id.clone(),
         source_mutation_epoch: value.source_mutation_epoch,
         source_mutation_sequence: value.source_mutation_sequence,
         request_hash: value.request_hash.clone(),
         admission_profile: value.admission_profile.clone(),
         admission_profile_epoch: value.admission_profile_epoch,
-        metadata_replica_node_ids: value.metadata_replica_node_ids.clone(),
     }
 }
 
 fn admission_attempt_id_from_proto(value: CoreAdmissionAttemptIdProto) -> CoreAdmissionAttemptId {
     CoreAdmissionAttemptId {
         mutation_id: value.mutation_id,
-        root_anchor_key: value.root_anchor_key,
-        root_key_hash: value.root_key_hash,
+        admission_shard_key: value.admission_shard_key,
+        admission_shard_hash: value.admission_shard_hash,
         source_node_id: value.source_node_id,
         source_mutation_epoch: value.source_mutation_epoch,
         source_mutation_sequence: value.source_mutation_sequence,
         request_hash: value.request_hash,
         admission_profile: value.admission_profile,
         admission_profile_epoch: value.admission_profile_epoch,
-        metadata_replica_node_ids: value.metadata_replica_node_ids,
     }
 }
 
@@ -1487,10 +1693,6 @@ fn write_u32_le(out: &mut Vec<u8>, value: usize) -> Result<()> {
     Ok(())
 }
 
-fn root_key_hash(root_anchor_key: &str) -> String {
-    descriptor_hash(&["anvil.root.key.v1", root_anchor_key])
-}
-
 fn descriptor_hash(parts: &[&str]) -> String {
     let mut hasher = Sha256::new();
     for part in parts {
@@ -1498,6 +1700,11 @@ fn descriptor_hash(parts: &[&str]) -> String {
         hasher.update(part.as_bytes());
     }
     format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+#[cfg(test)]
+fn root_key_hash(root_anchor_key: &str) -> String {
+    descriptor_hash(&["anvil.root.key.v1", root_anchor_key])
 }
 
 fn domain_hash_bytes(domain: &str, bytes: &[u8]) -> String {

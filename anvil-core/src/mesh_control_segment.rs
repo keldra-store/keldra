@@ -133,6 +133,7 @@ pub async fn write_mesh_control_segment(
         .write_format_build_output(WriterBuildOutput {
             logical_files: vec![built_segment.logical_file],
             core_meta_mutations: Vec::new(),
+            core_meta_root_publications: Vec::new(),
         })
         .await
         .with_context(|| format!("write mesh-control logical file output for {ref_name}"))?;
@@ -159,6 +160,7 @@ pub async fn write_mesh_control_segment(
             source_cursor: write.source_cursor,
             created_at_unix_nanos: unix_nanos_from_rfc3339(&header.created_at),
         },
+        &[],
     )
     .await
     .with_context(|| format!("write mesh-control segment catalog row for {ref_name}"))?;
@@ -179,8 +181,10 @@ pub async fn read_mesh_control_segment(
             &parsed.partition,
             &parsed.event_kind,
         )?,
+        parsed.generation,
         segment_ref,
-    )?
+    )
+    .await?
     .ok_or_else(|| anyhow!("mesh control segment catalog row is missing"))?;
     let store = CoreStore::new(storage.clone()).await?;
     let bytes = store
@@ -274,6 +278,7 @@ struct ParsedMeshControlSegmentRef {
     stream_family: String,
     partition: String,
     event_kind: String,
+    generation: u64,
 }
 
 fn parse_mesh_control_segment_ref(segment_ref: &str) -> Result<ParsedMeshControlSegmentRef> {
@@ -293,7 +298,7 @@ fn parse_mesh_control_segment_ref(segment_ref: &str) -> Result<ParsedMeshControl
     validate_segment_component(parts[4], "mesh control stream family")?;
     validate_segment_component(parts[6], "mesh control partition")?;
     validate_segment_component(parts[8], "mesh control event kind")?;
-    parts[10]
+    let generation = parts[10]
         .parse::<u64>()
         .map_err(|_| anyhow!("mesh control segment ref generation is invalid"))?;
     if parts[12].is_empty() {
@@ -304,6 +309,7 @@ fn parse_mesh_control_segment_ref(segment_ref: &str) -> Result<ParsedMeshControl
         stream_family: parts[4].to_string(),
         partition: parts[6].to_string(),
         event_kind: parts[8].to_string(),
+        generation,
     })
 }
 

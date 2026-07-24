@@ -14,6 +14,8 @@ pub enum AnvilErrorCode {
     IndexUnavailable,
     IndexDoesNotSupportQuery,
     AuthzRevisionUnavailable,
+    CoreMetaQuorumUnavailable,
+    ObjectShardQuorumUnavailable,
     WatchCursorExpired,
     PersonalDbGroupNotFound,
     PersonalDbStaleBase,
@@ -44,7 +46,7 @@ pub enum AnvilErrorCode {
 }
 
 impl AnvilErrorCode {
-    pub const ALL: [Self; 41] = [
+    pub const ALL: [Self; 43] = [
         Self::Unauthorized,
         Self::UnauthorizedReservedNamespace,
         Self::ForbiddenByPolicy,
@@ -59,6 +61,8 @@ impl AnvilErrorCode {
         Self::IndexUnavailable,
         Self::IndexDoesNotSupportQuery,
         Self::AuthzRevisionUnavailable,
+        Self::CoreMetaQuorumUnavailable,
+        Self::ObjectShardQuorumUnavailable,
         Self::WatchCursorExpired,
         Self::PersonalDbGroupNotFound,
         Self::PersonalDbStaleBase,
@@ -104,6 +108,8 @@ impl AnvilErrorCode {
             Self::IndexUnavailable => "IndexUnavailable",
             Self::IndexDoesNotSupportQuery => "IndexDoesNotSupportQuery",
             Self::AuthzRevisionUnavailable => "AuthzRevisionUnavailable",
+            Self::CoreMetaQuorumUnavailable => "CoreMetaQuorumUnavailable",
+            Self::ObjectShardQuorumUnavailable => "ObjectShardQuorumUnavailable",
             Self::WatchCursorExpired => "WatchCursorExpired",
             Self::PersonalDbGroupNotFound => "PersonalDbGroupNotFound",
             Self::PersonalDbStaleBase => "PersonalDbStaleBase",
@@ -184,6 +190,8 @@ mod tests {
                 "IndexUnavailable",
                 "IndexDoesNotSupportQuery",
                 "AuthzRevisionUnavailable",
+                "CoreMetaQuorumUnavailable",
+                "ObjectShardQuorumUnavailable",
                 "WatchCursorExpired",
                 "PersonalDbGroupNotFound",
                 "PersonalDbStaleBase",

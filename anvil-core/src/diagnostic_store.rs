@@ -1,9 +1,11 @@
+#[cfg(test)]
+use crate::core_store::CoreMetaStore;
 use crate::{
     core_store::{
-        CF_OBSERVABILITY, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaStore, CoreMetaTuplePart,
+        CF_OBSERVABILITY, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaTuplePart, CoreStore,
         TABLE_DIAGNOSTIC_ROW, commit_coremeta_batch_for_storage, core_meta_committed_row_common,
-        core_meta_root_key_hash, core_meta_tuple_key, decode_deterministic_proto,
-        encode_deterministic_proto,
+        core_meta_record_tuple_key, core_meta_root_key_hash, core_meta_tuple_key,
+        decode_deterministic_proto, encode_deterministic_proto,
     },
     formats::hash32,
     storage::Storage,
@@ -17,6 +19,7 @@ use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 const DIAGNOSTIC_REF_PREFIX: &str = "diagnostic:";
+pub const DIAGNOSTIC_OBJECT_PAGE_MAX: usize = 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DiagnosticSeverity {
@@ -64,6 +67,12 @@ pub struct DiagnosticWrite {
     pub created_at_nanos: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct DiagnosticObjectPage {
+    pub diagnostics: Vec<DiagnosticObject>,
+    pub next_tuple_key: Option<Vec<u8>>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
 enum DiagnosticSeverityProto {
     Unspecified = 0,
@@ -102,34 +111,40 @@ struct DiagnosticJsonValueProto {
 }
 
 #[derive(Clone, PartialEq, Message)]
-struct DiagnosticObjectProto {
+struct DiagnosticObjectRowProto {
     #[prost(message, optional, tag = "1")]
     common: Option<crate::core_store::CoreMetaRowCommonProto>,
-    #[prost(uint32, tag = "2")]
+    #[prost(message, optional, tag = "2")]
+    body: Option<DiagnosticObjectBodyProto>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct DiagnosticObjectBodyProto {
+    #[prost(uint32, tag = "1")]
     format_version: u32,
-    #[prost(string, tag = "3")]
+    #[prost(string, tag = "2")]
     diagnostic_id: String,
-    #[prost(string, tag = "4")]
+    #[prost(string, tag = "3")]
     scope_kind: String,
-    #[prost(string, tag = "5")]
+    #[prost(string, tag = "4")]
     scope_id: String,
-    #[prost(string, tag = "6")]
+    #[prost(string, tag = "5")]
     source: String,
-    #[prost(enumeration = "DiagnosticSeverityProto", tag = "7")]
+    #[prost(enumeration = "DiagnosticSeverityProto", tag = "6")]
     severity: i32,
-    #[prost(string, tag = "8")]
+    #[prost(string, tag = "7")]
     code: String,
-    #[prost(string, tag = "9")]
+    #[prost(string, tag = "8")]
     message: String,
-    #[prost(message, optional, tag = "10")]
+    #[prost(message, optional, tag = "9")]
     object_ref: Option<DiagnosticObjectRefProto>,
-    #[prost(message, optional, tag = "11")]
+    #[prost(message, optional, tag = "10")]
     details: Option<DiagnosticJsonValueProto>,
-    #[prost(int64, tag = "12")]
+    #[prost(int64, tag = "11")]
     created_at_nanos: i64,
-    #[prost(string, optional, tag = "13")]
+    #[prost(string, optional, tag = "12")]
     diagnostic_hash: Option<String>,
-    #[prost(string, optional, tag = "14")]
+    #[prost(string, optional, tag = "13")]
     diagnostic_signature: Option<String>,
 }
 
@@ -191,7 +206,7 @@ pub fn hash_diagnostic_object(diagnostic: &DiagnosticObject) -> Result<String> {
     let mut unsigned = diagnostic.clone();
     unsigned.diagnostic_hash = None;
     unsigned.diagnostic_signature = None;
-    Ok(hex::encode(hash32(&encode_diagnostic_object(&unsigned)?)))
+    Ok(hex::encode(hash32(&encode_diagnostic_body(&unsigned)?)))
 }
 
 pub async fn write_diagnostic_object(
@@ -254,14 +269,42 @@ pub async fn list_diagnostic_objects(
     source: &str,
     min_severity: Option<DiagnosticSeverity>,
     signing_key: &[u8],
-) -> Result<Vec<DiagnosticObject>> {
-    let mut diagnostics = Vec::new();
-    let meta = CoreMetaStore::open(storage.core_store_meta_path())?;
-    for record in meta.scan_prefix(
+    after_tuple_key: Option<&[u8]>,
+    page_size: usize,
+) -> Result<DiagnosticObjectPage> {
+    if !(1..=DIAGNOSTIC_OBJECT_PAGE_MAX).contains(&page_size) {
+        return Err(anyhow!(
+            "diagnostic object page size must be between 1 and {DIAGNOSTIC_OBJECT_PAGE_MAX}"
+        ));
+    }
+    let prefix = diagnostic_tuple_prefix(scope_kind, scope_id, source)?;
+    let store = CoreStore::new(storage.clone()).await?;
+    let mut records = store.scan_coremeta_prefix_page(
         CF_OBSERVABILITY,
         TABLE_DIAGNOSTIC_ROW,
-        &diagnostic_tuple_prefix(scope_kind, scope_id, source)?,
-    )? {
+        &prefix,
+        after_tuple_key,
+        page_size + 1,
+    )?;
+    let has_more = records.len() > page_size;
+    if has_more {
+        records.truncate(page_size);
+    }
+    let next_tuple_key = if has_more {
+        Some(
+            core_meta_record_tuple_key(
+                &records
+                    .last()
+                    .ok_or_else(|| anyhow!("diagnostic page continuation has no row"))?
+                    .key,
+            )?
+            .to_vec(),
+        )
+    } else {
+        None
+    };
+    let mut diagnostics = Vec::with_capacity(records.len());
+    for record in records {
         let diagnostic = decode_diagnostic_object(&record.payload)?;
         diagnostic.verify(signing_key)?;
         if diagnostic.scope_kind != scope_kind
@@ -269,6 +312,11 @@ pub async fn list_diagnostic_objects(
             || diagnostic.source != source
         {
             return Err(anyhow!("diagnostic object path scope mismatch"));
+        }
+        if core_meta_record_tuple_key(&record.key)?
+            != diagnostic_tuple_key(scope_kind, scope_id, source, &diagnostic.diagnostic_id)?
+        {
+            return Err(anyhow!("diagnostic object physical row key mismatch"));
         }
         if min_severity
             .map(|minimum| severity_rank(diagnostic.severity) < severity_rank(minimum))
@@ -278,12 +326,10 @@ pub async fn list_diagnostic_objects(
         }
         diagnostics.push(diagnostic);
     }
-    diagnostics.sort_by(|left, right| {
-        left.created_at_nanos
-            .cmp(&right.created_at_nanos)
-            .then(left.diagnostic_id.cmp(&right.diagnostic_id))
-    });
-    Ok(diagnostics)
+    Ok(DiagnosticObjectPage {
+        diagnostics,
+        next_tuple_key,
+    })
 }
 
 async fn write_diagnostic_ref(storage: &Storage, diagnostic: &DiagnosticObject) -> Result<()> {
@@ -308,6 +354,10 @@ async fn write_diagnostic_ref(storage: &Storage, diagnostic: &DiagnosticObject) 
             diagnostic.scope_kind, diagnostic.scope_id, diagnostic.diagnostic_id
         ),
         &[op],
+        &[crate::core_store::CoreMetaRootPublication::new(
+            diagnostic_root_anchor_key(diagnostic),
+            crate::formats::writer::WriterFamily::CoreControl,
+        )],
     )
     .await?;
     Ok(())
@@ -319,7 +369,7 @@ async fn read_diagnostic_ref(
 ) -> Result<Option<DiagnosticObject>> {
     let (scope_kind, scope_id, source, diagnostic_id) = parse_diagnostic_ref_name(ref_name)?;
     let tuple_key = diagnostic_tuple_key(&scope_kind, &scope_id, &source, &diagnostic_id)?;
-    let Some(bytes) = CoreMetaStore::open(storage.core_store_meta_path())?.get(
+    let Some(bytes) = CoreStore::new(storage.clone()).await?.read_coremeta_row(
         CF_OBSERVABILITY,
         TABLE_DIAGNOSTIC_ROW,
         &tuple_key,
@@ -331,30 +381,38 @@ async fn read_diagnostic_ref(
 }
 
 fn encode_diagnostic_object(diagnostic: &DiagnosticObject) -> Result<Vec<u8>> {
-    Ok(encode_deterministic_proto(&diagnostic_to_proto(
-        diagnostic,
-    )?))
+    encode_diagnostic_object_with_common(diagnostic, diagnostic_common(diagnostic))
+}
+
+fn encode_diagnostic_object_with_common(
+    diagnostic: &DiagnosticObject,
+    common: crate::core_store::CoreMetaRowCommonProto,
+) -> Result<Vec<u8>> {
+    Ok(encode_deterministic_proto(&DiagnosticObjectRowProto {
+        common: Some(common),
+        body: Some(diagnostic_to_proto(diagnostic)),
+    }))
 }
 
 fn decode_diagnostic_object(bytes: &[u8]) -> Result<DiagnosticObject> {
-    diagnostic_from_proto(decode_deterministic_proto::<DiagnosticObjectProto>(
-        bytes,
-        "diagnostic object",
-    )?)
+    let row = decode_deterministic_proto::<DiagnosticObjectRowProto>(bytes, "diagnostic object")?;
+    let common = row
+        .common
+        .ok_or_else(|| anyhow!("diagnostic object missing CoreMeta common"))?;
+    let diagnostic = diagnostic_from_proto(
+        row.body
+            .ok_or_else(|| anyhow!("diagnostic object missing domain body"))?,
+    )?;
+    validate_diagnostic_common(&diagnostic, &common)?;
+    Ok(diagnostic)
 }
 
-fn diagnostic_to_proto(diagnostic: &DiagnosticObject) -> Result<DiagnosticObjectProto> {
-    Ok(DiagnosticObjectProto {
-        common: Some(core_meta_committed_row_common(
-            "system",
-            core_meta_root_key_hash(&format!(
-                "diagnostic/{}/{}/{}",
-                diagnostic.scope_kind, diagnostic.scope_id, diagnostic.source
-            )),
-            diagnostic.created_at_nanos.max(0) as u64,
-            diagnostic.diagnostic_id.clone(),
-            diagnostic.created_at_nanos.max(0) as u64,
-        )),
+fn encode_diagnostic_body(diagnostic: &DiagnosticObject) -> Result<Vec<u8>> {
+    Ok(encode_deterministic_proto(&diagnostic_to_proto(diagnostic)))
+}
+
+fn diagnostic_to_proto(diagnostic: &DiagnosticObject) -> DiagnosticObjectBodyProto {
+    DiagnosticObjectBodyProto {
         format_version: u32::from(diagnostic.format_version),
         diagnostic_id: diagnostic.diagnostic_id.clone(),
         scope_kind: diagnostic.scope_kind.clone(),
@@ -368,14 +426,27 @@ fn diagnostic_to_proto(diagnostic: &DiagnosticObject) -> Result<DiagnosticObject
         created_at_nanos: diagnostic.created_at_nanos,
         diagnostic_hash: diagnostic.diagnostic_hash.clone(),
         diagnostic_signature: diagnostic.diagnostic_signature.clone(),
-    })
+    }
 }
 
-fn diagnostic_from_proto(proto: DiagnosticObjectProto) -> Result<DiagnosticObject> {
-    proto
-        .common
-        .as_ref()
-        .ok_or_else(|| anyhow!("diagnostic object missing CoreMeta common"))?;
+fn diagnostic_common(diagnostic: &DiagnosticObject) -> crate::core_store::CoreMetaRowCommonProto {
+    core_meta_committed_row_common(
+        "system",
+        core_meta_root_key_hash(&diagnostic_root_anchor_key(diagnostic)),
+        1,
+        diagnostic.diagnostic_id.clone(),
+        diagnostic.created_at_nanos.max(0) as u64,
+    )
+}
+
+fn diagnostic_root_anchor_key(diagnostic: &DiagnosticObject) -> String {
+    format!(
+        "diagnostic/{}/{}/{}",
+        diagnostic.scope_kind, diagnostic.scope_id, diagnostic.source
+    )
+}
+
+fn diagnostic_from_proto(proto: DiagnosticObjectBodyProto) -> Result<DiagnosticObject> {
     Ok(DiagnosticObject {
         format_version: u16::try_from(proto.format_version)
             .map_err(|_| anyhow!("diagnostic object version exceeds u16"))?,
@@ -396,6 +467,27 @@ fn diagnostic_from_proto(proto: DiagnosticObjectProto) -> Result<DiagnosticObjec
         diagnostic_hash: proto.diagnostic_hash,
         diagnostic_signature: proto.diagnostic_signature,
     })
+}
+
+fn validate_diagnostic_common(
+    diagnostic: &DiagnosticObject,
+    common: &crate::core_store::CoreMetaRowCommonProto,
+) -> Result<()> {
+    if common.realm_id != "system" {
+        return Err(anyhow!("diagnostic object CoreMeta realm mismatch"));
+    }
+    if common.root_key_hash != core_meta_root_key_hash(&diagnostic_root_anchor_key(diagnostic)) {
+        return Err(anyhow!("diagnostic object CoreMeta root mismatch"));
+    }
+    if common.root_generation == 0 {
+        return Err(anyhow!(
+            "diagnostic object CoreMeta root generation must be nonzero"
+        ));
+    }
+    if common.visibility_state_enum() != crate::core_store::CoreMetaVisibilityState::Committed {
+        return Err(anyhow!("diagnostic object CoreMeta row is not committed"));
+    }
+    Ok(())
 }
 
 fn diagnostic_ref_to_proto(object_ref: &DiagnosticObjectRef) -> DiagnosticObjectRefProto {
@@ -735,6 +827,31 @@ mod tests {
         )
         .await
         .unwrap();
+        let meta = CoreMetaStore::open(storage.core_store_meta_path()).unwrap();
+        for (expected, expected_generation) in [(&first, 1), (&second, 2)] {
+            let payload = meta
+                .get(
+                    CF_OBSERVABILITY,
+                    TABLE_DIAGNOSTIC_ROW,
+                    &diagnostic_tuple_key(
+                        "bucket",
+                        "tenant-1-bucket-2",
+                        "full-text",
+                        &expected.diagnostic_id,
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+                .unwrap();
+            let common = crate::core_store::core_meta_row_common_from_payload(&payload).unwrap();
+            assert_eq!(common.root_generation, expected_generation);
+            assert_ne!(common.root_generation, expected.created_at_nanos as u64);
+            assert_ne!(common.transaction_id, expected.diagnostic_id);
+            let decoded = decode_diagnostic_object(&payload).unwrap();
+            decoded.verify(KEY).unwrap();
+            assert_eq!(decoded.diagnostic_hash, expected.diagnostic_hash);
+            assert_eq!(decoded.diagnostic_signature, expected.diagnostic_signature);
+        }
         assert_eq!(
             diagnostic_ref_name("bucket", "tenant-1-bucket-2", "full-text", "diag-001").unwrap(),
             "diagnostic:scope:bucket:id:tenant-1-bucket-2:source:full-text:diagnostic:diag-001"
@@ -754,32 +871,205 @@ mod tests {
             .unwrap(),
             first
         );
-        assert_eq!(
+        let all = list_diagnostic_objects(
+            &storage,
+            "bucket",
+            "tenant-1-bucket-2",
+            "full-text",
+            None,
+            KEY,
+            None,
+            1000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(all.diagnostics, vec![first.clone(), second.clone()]);
+        assert!(all.next_tuple_key.is_none());
+
+        let errors = list_diagnostic_objects(
+            &storage,
+            "bucket",
+            "tenant-1-bucket-2",
+            "full-text",
+            Some(DiagnosticSeverity::Warning),
+            KEY,
+            None,
+            1000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(errors.diagnostics, vec![second]);
+        assert!(errors.next_tuple_key.is_none());
+    }
+
+    #[test]
+    fn diagnostic_hash_and_signature_survive_physical_common_rebinding() {
+        let sealed = sealed_diagnostic("diag-001", 10, DiagnosticSeverity::Warning);
+        let encoded = encode_diagnostic_object(&sealed).unwrap();
+        let mut row = decode_deterministic_proto::<DiagnosticObjectRowProto>(
+            &encoded,
+            "diagnostic object test row",
+        )
+        .unwrap();
+        let common = row.common.as_mut().unwrap();
+        common.root_generation = 73;
+        common.transaction_id = "corestore-publication-73".to_string();
+        common.created_at_unix_nanos = 999;
+        let rebound = encode_deterministic_proto(&row);
+
+        let decoded = decode_diagnostic_object(&rebound).unwrap();
+        decoded.verify(KEY).unwrap();
+        assert_eq!(decoded, sealed);
+
+        let valid_common = diagnostic_common(&sealed);
+        let mut invalid_commons = Vec::new();
+        let mut invalid = valid_common.clone();
+        invalid.realm_id = "tenant/not-system".to_string();
+        invalid_commons.push(invalid);
+        let mut invalid = valid_common.clone();
+        invalid.root_key_hash = core_meta_root_key_hash("wrong-diagnostic-root");
+        invalid_commons.push(invalid);
+        let mut invalid = valid_common.clone();
+        invalid.root_generation = 0;
+        invalid_commons.push(invalid);
+        let mut invalid = valid_common;
+        invalid.visibility_state = crate::core_store::CoreMetaVisibilityState::Pending as i32;
+        invalid_commons.push(invalid);
+        for common in invalid_commons {
+            let bytes = encode_diagnostic_object_with_common(&sealed, common).unwrap();
+            assert!(decode_diagnostic_object(&bytes).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostic_pages_seek_by_source_and_bound_materialization() -> Result<()> {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new_at(temp.path()).await.unwrap();
+        for (id, created_at) in [("diag-001", 10), ("diag-002", 20), ("diag-003", 30)] {
+            write_diagnostic_object(
+                &storage,
+                diagnostic(id, created_at, DiagnosticSeverity::Info),
+                KEY,
+            )
+            .await
+            .unwrap();
+        }
+
+        // This malformed row is in the same table but a different source prefix.
+        let malformed = DiagnosticObjectRowProto {
+            common: Some(core_meta_committed_row_common(
+                "system",
+                core_meta_root_key_hash("diagnostic/bucket/tenant-1-bucket-2/other-source"),
+                1,
+                "malformed-diagnostic",
+                1,
+            )),
+            body: Some(DiagnosticObjectBodyProto {
+                format_version: 1,
+                diagnostic_id: "broken".to_string(),
+                scope_kind: "bucket".to_string(),
+                scope_id: "tenant-1-bucket-2".to_string(),
+                source: "other-source".to_string(),
+                severity: DiagnosticSeverityProto::Info as i32,
+                code: "Broken".to_string(),
+                message: "broken".to_string(),
+                object_ref: None,
+                details: None,
+                created_at_nanos: 1,
+                diagnostic_hash: None,
+                diagnostic_signature: None,
+            }),
+        };
+        CoreMetaStore::open(storage.core_store_meta_path())?.put(
+            CF_OBSERVABILITY,
+            TABLE_DIAGNOSTIC_ROW,
+            &diagnostic_tuple_key("bucket", "tenant-1-bucket-2", "other-source", "broken")?,
+            &encode_deterministic_proto(&malformed),
+        )?;
+
+        let hidden = diagnostic("diag-000", 5, DiagnosticSeverity::Info);
+        let hidden = DiagnosticObject {
+            format_version: 1,
+            diagnostic_id: hidden.diagnostic_id,
+            scope_kind: hidden.scope_kind,
+            scope_id: hidden.scope_id,
+            source: hidden.source,
+            severity: hidden.severity,
+            code: hidden.code,
+            message: hidden.message,
+            object_ref: hidden.object_ref,
+            details: hidden.details,
+            created_at_nanos: hidden.created_at_nanos,
+            diagnostic_hash: None,
+            diagnostic_signature: None,
+        }
+        .seal(KEY)?;
+        let mut hidden_common = diagnostic_common(&hidden);
+        hidden_common.root_generation = 4;
+        hidden_common.transaction_id = "corestore-hidden-publication".to_string();
+        CoreMetaStore::open(storage.core_store_meta_path())?.put(
+            CF_OBSERVABILITY,
+            TABLE_DIAGNOSTIC_ROW,
+            &diagnostic_tuple_key("bucket", "tenant-1-bucket-2", "full-text", "diag-000")?,
+            &encode_diagnostic_object_with_common(&hidden, hidden_common)?,
+        )?;
+
+        let filtered = list_diagnostic_objects(
+            &storage,
+            "bucket",
+            "tenant-1-bucket-2",
+            "full-text",
+            Some(DiagnosticSeverity::Error),
+            KEY,
+            None,
+            1,
+        )
+        .await?;
+        assert!(filtered.diagnostics.is_empty());
+        assert!(filtered.next_tuple_key.is_some());
+
+        let first = list_diagnostic_objects(
+            &storage,
+            "bucket",
+            "tenant-1-bucket-2",
+            "full-text",
+            None,
+            KEY,
+            None,
+            1,
+        )
+        .await?;
+        assert_eq!(first.diagnostics.len(), 1);
+        assert_eq!(first.diagnostics[0].diagnostic_id, "diag-001");
+        let second = list_diagnostic_objects(
+            &storage,
+            "bucket",
+            "tenant-1-bucket-2",
+            "full-text",
+            None,
+            KEY,
+            first.next_tuple_key.as_deref(),
+            1,
+        )
+        .await?;
+        assert_eq!(second.diagnostics.len(), 1);
+        assert_eq!(second.diagnostics[0].diagnostic_id, "diag-002");
+        assert!(second.next_tuple_key.is_some());
+        assert!(
             list_diagnostic_objects(
                 &storage,
                 "bucket",
                 "tenant-1-bucket-2",
                 "full-text",
                 None,
-                KEY
-            )
-            .await
-            .unwrap(),
-            vec![first.clone(), second.clone()]
-        );
-        assert_eq!(
-            list_diagnostic_objects(
-                &storage,
-                "bucket",
-                "tenant-1-bucket-2",
-                "full-text",
-                Some(DiagnosticSeverity::Warning),
                 KEY,
+                None,
+                0,
             )
             .await
-            .unwrap(),
-            vec![second]
+            .is_err()
         );
+        Ok(())
     }
 
     #[tokio::test]
@@ -872,5 +1162,30 @@ mod tests {
             details: serde_json::json!({"source_cursor": 50, "processed_cursor": 40}),
             created_at_nanos,
         }
+    }
+
+    fn sealed_diagnostic(
+        id: &str,
+        created_at_nanos: i64,
+        severity: DiagnosticSeverity,
+    ) -> DiagnosticObject {
+        let write = diagnostic(id, created_at_nanos, severity);
+        DiagnosticObject {
+            format_version: 1,
+            diagnostic_id: write.diagnostic_id,
+            scope_kind: write.scope_kind,
+            scope_id: write.scope_id,
+            source: write.source,
+            severity: write.severity,
+            code: write.code,
+            message: write.message,
+            object_ref: write.object_ref,
+            details: write.details,
+            created_at_nanos: write.created_at_nanos,
+            diagnostic_hash: None,
+            diagnostic_signature: None,
+        }
+        .seal(KEY)
+        .unwrap()
     }
 }

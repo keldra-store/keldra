@@ -126,6 +126,35 @@ pub(super) fn reconstruct_data_shards(
     Ok(())
 }
 
+pub(super) fn reconstruct_all_shards(
+    shards: &mut [Option<Vec<u8>>],
+    profile: LocalErasureProfile,
+) -> Result<()> {
+    reconstruct_data_shards(shards, profile)?;
+    let shard_len = shards
+        .iter()
+        .find_map(|shard| shard.as_ref().map(Vec::len))
+        .ok_or_else(|| anyhow!("CoreStore erasure reconstruction has no shards"))?;
+    for parity_row in 0..profile.parity_shards {
+        let parity_index = profile.data_shards + parity_row;
+        if shards[parity_index].is_some() {
+            continue;
+        }
+        let mut reconstructed = vec![0u8; shard_len];
+        for data_index in 0..profile.data_shards {
+            let data = shards[data_index]
+                .as_ref()
+                .ok_or_else(|| anyhow!("CoreStore erasure reconstruction left missing data"))?;
+            let coefficient = gf_pow((data_index + 1) as u8, parity_row as u32);
+            for byte_index in 0..shard_len {
+                reconstructed[byte_index] ^= gf_mul(coefficient, data[byte_index]);
+            }
+        }
+        shards[parity_index] = Some(reconstructed);
+    }
+    Ok(())
+}
+
 pub(super) fn erasure_coding_row(shard_index: usize, data_shards: usize) -> Vec<u8> {
     if shard_index < data_shards {
         let mut row = vec![0u8; data_shards];
@@ -237,4 +266,37 @@ pub(super) fn required_data_shard_indices_for_range(
         }
     }
     Ok(indices)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconstructs_missing_data_and_parity_shards() {
+        let source = b"distributed erasure recovery must restore every placement";
+        let encoded = encode_erasure_shards(source, LOCAL_EC_4_2_PROFILE).unwrap();
+        let mut degraded = encoded.iter().cloned().map(Some).collect::<Vec<_>>();
+        degraded[1] = None;
+        degraded[5] = None;
+
+        reconstruct_all_shards(&mut degraded, LOCAL_EC_4_2_PROFILE).unwrap();
+
+        assert_eq!(
+            degraded.into_iter().map(Option::unwrap).collect::<Vec<_>>(),
+            encoded
+        );
+    }
+
+    #[test]
+    fn refuses_repair_below_read_quorum() {
+        let encoded = encode_erasure_shards(b"too few shards", LOCAL_EC_4_2_PROFILE).unwrap();
+        let mut degraded = encoded.into_iter().map(Some).collect::<Vec<_>>();
+        degraded[0] = None;
+        degraded[1] = None;
+        degraded[2] = None;
+
+        let error = reconstruct_all_shards(&mut degraded, LOCAL_EC_4_2_PROFILE).unwrap_err();
+        assert!(error.to_string().contains("fewer than 4 readable shards"));
+    }
 }
