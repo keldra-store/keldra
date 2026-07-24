@@ -1253,7 +1253,7 @@ async fn publish_index_build_proof_and_checkpoint(
     let checkpoint_authority = acquire_watch_checkpoint_authority(
         storage,
         &checkpoint_update,
-        &payload_actor,
+        builder_node_id,
         signing_key,
     )
     .await?;
