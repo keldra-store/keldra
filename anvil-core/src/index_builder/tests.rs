@@ -1,6 +1,47 @@
 use super::*;
 use chrono::Utc;
 
+#[tokio::test]
+async fn checkpoint_ownership_is_stable_across_task_payload_actors() {
+    let temp = tempfile::tempdir().unwrap();
+    let storage = Storage::new_at(temp.path()).await.unwrap();
+    let signing_key = b"index-builder-test-signing-key";
+    let update = |updated_by_node: &str| WatchCheckpointUpdate {
+        watch_stream_id: "object_metadata".to_string(),
+        partition_family: "object_metadata".to_string(),
+        partition_id: "partition-a".to_string(),
+        consumer_id: "index-a".to_string(),
+        cursor: 1,
+        source_cursor_high: 1,
+        lag_record_count_hint: 0,
+        source_manifest_hash: "manifest-a".to_string(),
+        generation: 1,
+        updated_by_node: updated_by_node.to_string(),
+        updated_at_nanos: 1,
+    };
+
+    let first = acquire_watch_checkpoint_authority(
+        &storage,
+        &update("index-build-task:first"),
+        "node-a",
+        signing_key,
+    )
+    .await
+    .unwrap();
+    let second = acquire_watch_checkpoint_authority(
+        &storage,
+        &update("index-build-task:second"),
+        "node-a",
+        signing_key,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(first.owner_node_id, "node-a");
+    assert_eq!(second.owner_node_id, "node-a");
+    assert_eq!(first.fence, second.fence);
+}
+
 #[test]
 fn selector_matches_prefix_and_content_type() {
     let object = object("docs/a.txt", Some("text/plain"));
