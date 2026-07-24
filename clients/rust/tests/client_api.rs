@@ -116,6 +116,17 @@ fn generated_proto_exports_core_service_types() {
 }
 
 #[test]
+fn generated_proto_exports_read_consistency_modes() {
+    let consistency = proto::ReadConsistency {
+        mode: Some(proto::read_consistency::Mode::Latest(true)),
+    };
+    assert!(matches!(
+        consistency.mode,
+        Some(proto::read_consistency::Mode::Latest(true))
+    ));
+}
+
+#[test]
 fn transaction_helpers_construct_proto_requests() {
     let scope = proto::TransactionScope {
         root_anchor_key: "tenant/root".to_string(),
