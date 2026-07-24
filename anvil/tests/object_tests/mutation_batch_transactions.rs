@@ -81,8 +81,14 @@ impl SingleNodeMutationBatchFixture {
         tag: &str,
         ttl_ms: u64,
     ) -> BeginTransactionResponse {
-        self.begin_transaction_as(client, tag, ttl_ms, &self.actor.token)
-            .await
+        self.begin_transaction_with_preconditions_as(
+            client,
+            tag,
+            ttl_ms,
+            Vec::new(),
+            &self.actor.token,
+        )
+        .await
     }
 
     async fn begin_transaction_as(
@@ -90,6 +96,18 @@ impl SingleNodeMutationBatchFixture {
         client: &mut TransactionServiceClient<tonic::transport::Channel>,
         tag: &str,
         ttl_ms: u64,
+        token: &str,
+    ) -> BeginTransactionResponse {
+        self.begin_transaction_with_preconditions_as(client, tag, ttl_ms, Vec::new(), token)
+            .await
+    }
+
+    async fn begin_transaction_with_preconditions_as(
+        &self,
+        client: &mut TransactionServiceClient<tonic::transport::Channel>,
+        tag: &str,
+        ttl_ms: u64,
+        preconditions: Vec<WritePrecondition>,
         token: &str,
     ) -> BeginTransactionResponse {
         let root_anchor_key = hex::encode(anvil::metadata_journal::object_metadata_partition_id(
@@ -106,7 +124,7 @@ impl SingleNodeMutationBatchFixture {
                         ),
                         root_anchor_key,
                     }),
-                    preconditions: Vec::new(),
+                    preconditions,
                     boundary_values: Vec::new(),
                     ttl_ms,
                     purpose: tag.to_string(),
@@ -243,6 +261,82 @@ fn at_root_generation(generation: u64) -> Option<ReadConsistency> {
             generation,
         )),
     })
+}
+
+#[tokio::test]
+async fn strict_visibility_stages_and_commits_an_absent_object_put() {
+    let fixture = SingleNodeMutationBatchFixture::new("tx-batch-strict-absent-put").await;
+    let mut transaction_client = fixture.transaction_client().await;
+    let mut object_client = fixture.object_client().await;
+    let object_key = "strict/absent.json";
+    let precondition = WritePrecondition {
+        object_versions: vec![ObjectVersionPrecondition {
+            bucket_name: fixture.bucket_name.clone(),
+            object_key: object_key.to_string(),
+            expected_version_id: None,
+            must_not_exist: true,
+        }],
+        lease_fence: None,
+    };
+    let transaction = fixture
+        .begin_transaction_with_preconditions_as(
+            &mut transaction_client,
+            "strict absent object put",
+            EXPLICIT_TRANSACTION_TTL_MS,
+            vec![precondition.clone()],
+            &fixture.actor.token,
+        )
+        .await;
+    let mut context = fixture.mutation_context("strict-absent-put", &transaction.transaction_id);
+    context.write_visibility = Some(WriteVisibilityOptions {
+        indexes: 1,
+        watches: 1,
+        authz_materialization: 0,
+        boundary_extraction: 1,
+        index_policy_snapshot: 1,
+        authz_revision: 1,
+    });
+
+    let staged = object_client
+        .mutation_batch(authorized(
+            MutationBatchRequest {
+                bucket_name: fixture.bucket_name.clone(),
+                mutation_context: Some(context),
+                precondition: Some(precondition),
+                operations: vec![small_put(object_key, br#"{"strict":true}"#.to_vec())],
+            },
+            &fixture.actor.token,
+        ))
+        .await
+        .expect("stage strict absent-object put")
+        .into_inner();
+    assert_eq!(staged.write_state, WriteState::Staged as i32);
+
+    transaction_client
+        .commit_transaction(authorized(
+            CommitTransactionRequest {
+                transaction_id: transaction.transaction_id,
+                consistency: ConsistencyMode::Committed as i32,
+                wait_for_finalization: false,
+                final_preconditions: Vec::new(),
+            },
+            &fixture.actor.token,
+        ))
+        .await
+        .expect("commit strict absent-object put");
+
+    object_client
+        .head_object(authorized(
+            HeadObjectRequest {
+                bucket_name: fixture.bucket_name,
+                object_key: object_key.to_string(),
+                version_id: None,
+                consistency: None,
+            },
+            &fixture.actor.token,
+        ))
+        .await
+        .expect("strict absent-object put is visible after commit");
 }
 
 fn unix_time_nanos() -> u64 {
