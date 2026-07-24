@@ -123,7 +123,12 @@ jobs:
           version: 0.14.1
 
       - name: Install cargo-zigbuild
-        run: cargo install cargo-zigbuild --version 0.20.1 --locked
+        run: |
+          if cargo zigbuild --version 2>/dev/null | grep -q 'cargo-zigbuild 0.20.1'; then
+            echo "cargo-zigbuild 0.20.1 is already installed"
+          else
+            cargo install cargo-zigbuild --version 0.20.1 --locked --force
+          fi
 
       - name: Install system build dependencies
         run: |
