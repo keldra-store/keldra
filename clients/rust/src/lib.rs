@@ -10,6 +10,7 @@ mod generated {
 }
 
 pub mod proto {
+    pub use super::generated::read_consistency;
     pub use super::generated::{
         AbortMultipartRequest, AbortMultipartResponse, AbortSagaDraftRequest,
         AcquireTaskLeaseRequest, AnvilError, AppendStreamRecordInfo, AppendStreamRecordRequest,
