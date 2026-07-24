@@ -428,7 +428,9 @@ jobs:
       CARGO_BUILD_JOBS: "8"
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
-      ANVIL_DOCKER_TEST_THREADS: "2"
+      # The runner has 16 cores. Shared-cluster tests can fan out while the
+      # test-utils semaphore continues to cap isolated clusters at two.
+      ANVIL_DOCKER_TEST_THREADS: "8"
       ANVIL_IMAGE: anvil:test-integration-amd64-${{ github.run_id }}-${{ github.run_attempt }}
       ANVIL_DOCKER_TEST_PROJECT: anvil-release-${{ matrix.group }}-${{ github.run_id }}-${{ github.run_attempt }}
       ANVIL_GATE_STEP_TIMEOUT_SECONDS: "5400"
