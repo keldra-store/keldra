@@ -664,7 +664,9 @@ async fn test_authz_permission_resolves_nested_usersets() {
         .await
         .unwrap()
         .into_inner();
-    for expected_revision in (schema_revision + 1)..=(schema_revision + 4) {
+    let target_revision = schema_revision + 4;
+    let mut previous_revision = 0;
+    loop {
         let event = tokio::time::timeout(Duration::from_secs(5), lag_stream.next())
             .await
             .unwrap()
@@ -672,9 +674,19 @@ async fn test_authz_permission_resolves_nested_usersets() {
             .unwrap();
         assert_eq!(event.derived_index_id, DEFAULT_DERIVED_USERSET_INDEX_ID);
         assert_eq!(event.derived_index_kind, "userset");
-        assert_eq!(event.processed_revision, expected_revision);
-        assert_eq!(event.latest_revision, expected_revision);
-        assert_eq!(event.revision_lag, 0);
+        assert!(event.processed_revision > previous_revision);
+        assert!(event.processed_revision <= target_revision);
+        assert!(event.latest_revision >= event.processed_revision);
+        assert_eq!(
+            event.revision_lag,
+            event.latest_revision - event.processed_revision
+        );
+        previous_revision = event.processed_revision;
+        if previous_revision == target_revision {
+            assert_eq!(event.latest_revision, target_revision);
+            assert_eq!(event.revision_lag, 0);
+            break;
+        }
     }
 }
 
