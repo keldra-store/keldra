@@ -2,36 +2,41 @@ use super::*;
 use chrono::Utc;
 
 #[tokio::test]
-async fn checkpoint_ownership_is_stable_across_task_payload_actors() {
+async fn checkpoint_ownership_matches_the_stable_writer_node() {
     let temp = tempfile::tempdir().unwrap();
     let storage = Storage::new_at(temp.path()).await.unwrap();
     let signing_key = b"index-builder-test-signing-key";
-    let update = |updated_by_node: &str| WatchCheckpointUpdate {
+    let update = || WatchCheckpointUpdate {
         watch_stream_id: "object_metadata".to_string(),
         partition_family: "object_metadata".to_string(),
-        partition_id: "partition-a".to_string(),
+        partition_id: "22".repeat(32),
         consumer_id: "index-a".to_string(),
         cursor: 1,
         source_cursor_high: 1,
         lag_record_count_hint: 0,
-        source_manifest_hash: "manifest-a".to_string(),
+        source_manifest_hash: "11".repeat(32),
         generation: 1,
-        updated_by_node: updated_by_node.to_string(),
+        updated_by_node: "node-a".to_string(),
         updated_at_nanos: 1,
     };
 
-    let first = acquire_watch_checkpoint_authority(
+    let first_update = update();
+    let first = acquire_watch_checkpoint_authority(&storage, &first_update, "node-a", signing_key)
+        .await
+        .unwrap();
+    watch_checkpoint::prepare_watch_checkpoint(&storage, first_update, first.clone(), signing_key)
+        .await
+        .unwrap();
+
+    let second_update = update();
+    let second =
+        acquire_watch_checkpoint_authority(&storage, &second_update, "node-a", signing_key)
+            .await
+            .unwrap();
+    watch_checkpoint::prepare_watch_checkpoint(
         &storage,
-        &update("index-build-task:first"),
-        "node-a",
-        signing_key,
-    )
-    .await
-    .unwrap();
-    let second = acquire_watch_checkpoint_authority(
-        &storage,
-        &update("index-build-task:second"),
-        "node-a",
+        second_update,
+        second.clone(),
         signing_key,
     )
     .await

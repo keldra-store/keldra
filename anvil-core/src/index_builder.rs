@@ -1247,7 +1247,7 @@ async fn publish_index_build_proof_and_checkpoint(
         lag_record_count_hint: 0,
         source_manifest_hash: source_manifest_hash.to_string(),
         generation,
-        updated_by_node: payload_actor.clone(),
+        updated_by_node: builder_node_id.to_string(),
         updated_at_nanos: built_at_nanos,
     };
     let checkpoint_authority = acquire_watch_checkpoint_authority(
