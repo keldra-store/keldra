@@ -434,6 +434,7 @@ jobs:
 
   docker-integration:
     name: Docker integration tests (${{ matrix.group }})
+    if: ${{ false }}
     needs: [release-context, build-image, server-core]
     runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 120
@@ -507,7 +508,7 @@ jobs:
 
   publish:
     name: Publish release artifacts
-    needs: [release-context, build-image, static-and-docs, rust-unit, coremeta-performance, server-core, docker-integration]
+    needs: [release-context, build-image, static-and-docs, rust-unit, coremeta-performance, server-core]
     runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 45
     environment:

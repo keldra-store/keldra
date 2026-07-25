@@ -301,25 +301,12 @@ fn production_authorisation_has_no_scope_or_policy_bypass() {
         "\"*|*\"",
     ];
     let mut violations = Vec::new();
-    for (path, mut source) in production_rust_sources(&[
+    for (path, source) in production_rust_sources(&[
         "anvil-core/src",
         "anvil/src",
         "anvil-cli/src",
         "clients/rust/src",
     ]) {
-        if path == std::path::Path::new("anvil-core/src/core_store/local_coremeta_recovery.rs") {
-            const PUBLICATION_SCOPE_CHECK: &str = "bundle.scopes.contains(scope)";
-            assert_eq!(
-                source.matches("scopes.contains(").count(),
-                1,
-                "CoreMeta recovery scope checks changed; review them before excluding any from the authorization scan"
-            );
-            assert!(
-                source.contains(PUBLICATION_SCOPE_CHECK),
-                "expected CoreMeta root-publication scope membership check is missing"
-            );
-            source = source.replacen(PUBLICATION_SCOPE_CHECK, "", 1);
-        }
         for term in forbidden {
             if source.contains(term) {
                 violations.push(format!("{} contains {term}", path.display()));
