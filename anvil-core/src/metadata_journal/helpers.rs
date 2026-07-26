@@ -1,5 +1,6 @@
 use super::*;
-use crate::core_store::{CoreObjectRef, GetBlob};
+use crate::core_store::{CoreObjectRef, GetBlob, core_meta_root_key_hash};
+use anyhow::bail;
 use base64::Engine;
 
 pub(super) fn version_sorts_after_marker(

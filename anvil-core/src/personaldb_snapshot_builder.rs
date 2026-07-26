@@ -137,24 +137,35 @@ pub async fn maybe_build_personaldb_snapshot(
 
     let result = build_snapshot(
         storage,
+        mvcc,
         request,
         protocol_keyring,
         previous_snapshot.as_ref(),
         &committed_head,
         &new_records,
+        snapshot_version,
     )
     .await?;
-    publish_snapshots_head(storage, request, protocol_keyring, &result.manifest).await?;
+    publish_snapshots_head(
+        mvcc,
+        request,
+        protocol_keyring,
+        previous_snapshot.as_ref(),
+        &result.manifest,
+    )
+    .await?;
     Ok(Some(result))
 }
 
 async fn build_snapshot(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     request: PersonalDbSnapshotBuildRequest<'_>,
     protocol_keyring: &PersonalDbProtocolKeyring,
     previous_snapshot: Option<&PersonalDbSnapshotsHead>,
     committed_head: &PersonalDbCommittedHead,
     new_records: &[PersonalDbLogRecord],
+    snapshot_version: u64,
 ) -> Result<PersonalDbSnapshotBuildResult> {
     // Class C scratch: the SQLite file is a build workspace, not the snapshot's durable state.
     let temp = NamedTempFile::new_in(storage.temp_dir_path())?;
@@ -293,9 +304,10 @@ async fn restore_snapshot_database_scratch(
 }
 
 async fn publish_snapshots_head(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     request: PersonalDbSnapshotBuildRequest<'_>,
     protocol_keyring: &PersonalDbProtocolKeyring,
+    previous_snapshot: Option<&PersonalDbSnapshotsHead>,
     manifest: &PersonalDbSnapshotManifest,
 ) -> Result<()> {
     let manifest_ref = personaldb_snapshot_manifest_ref_name(
@@ -323,12 +335,13 @@ async fn publish_snapshots_head(
         mvcc,
         request.tenant_id,
         request.database_id,
-        previous_snapshot.as_ref(),
+        previous_snapshot,
         &head,
         protocol_keyring.trust_store(),
         request.created_by_node,
     )
     .await
+    .map(|_| ())
 }
 
 async fn read_canonical_records(

@@ -289,7 +289,7 @@ impl PersonalDbSigningKeyStore {
                 Ok(crate::core_store::CoreMetaRecord {
                     key: key
                         .application_key
-                        .strip_prefix(&namespace)
+                        .strip_prefix(namespace.as_slice())
                         .ok_or_else(|| anyhow!("signing key MVCC namespace mismatch"))?
                         .to_vec(),
                     payload: row.value,

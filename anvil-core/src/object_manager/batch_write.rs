@@ -206,10 +206,11 @@ impl ObjectManager {
             .iter()
             .map(|input| input.object_key.as_str())
             .collect::<BTreeSet<_>>();
+        let mvcc = self.installed_mvcc()?;
         try_join_all(unique_keys.into_iter().map(|object_key| {
             access_control::require_object_permission(
                 &self.storage,
-                self.installed_mvcc()?,
+                mvcc,
                 claims,
                 &bucket,
                 object_key,

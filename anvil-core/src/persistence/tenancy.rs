@@ -190,7 +190,10 @@ impl Persistence {
             step_start.elapsed(),
         );
         let step_start = std::time::Instant::now();
-        if bucket_journal::read_current_bucket_mvcc(self.mvcc()?, tenant_id, name)
+        let mvcc = self
+            .mvcc()
+            .map_err(|e| tonic::Status::internal(e.to_string()))?;
+        if bucket_journal::read_current_bucket_mvcc(mvcc, tenant_id, name)
             .map_err(|e| tonic::Status::internal(e.to_string()))?
             .is_some()
         {
@@ -204,7 +207,7 @@ impl Persistence {
         );
         let tenant_permit = async {
             let step_start = std::time::Instant::now();
-            let permit = self.bucket_tenant_write_permit(tenant_id);
+            let permit = self.bucket_tenant_write_permit(tenant_id).await;
             crate::emit_test_timing(
                 "persistence.create_bucket tenant_write_permit",
                 step_start.elapsed(),
@@ -244,7 +247,7 @@ impl Persistence {
             uuid::Uuid::new_v4()
         );
         let plan = bucket_journal::build_bucket_mvcc_mutation_plan(
-            self.mvcc()?,
+            mvcc,
             &bucket,
             BucketJournalMutation::Create,
         )
@@ -255,7 +258,7 @@ impl Persistence {
         .map_err(|e| tonic::Status::internal(e.to_string()))?;
         let (allocated_id, _) = plan
             .autocommit(
-                self.mvcc()?,
+                mvcc,
                 "bucket-metadata",
                 &idempotency_key,
                 crate::mvcc_transaction::DurabilityLevel::Quorum,
@@ -305,7 +308,7 @@ impl Persistence {
             bucket_journal::read_current_bucket_mvcc(self.mvcc()?, tenant_id, bucket_name)?
                 .ok_or_else(|| anyhow!("bucket not found"))?;
         out.is_public_read = is_public;
-        let tenant_permit = self.bucket_tenant_write_permit(out.tenant_id)?;
+        let tenant_permit = self.bucket_tenant_write_permit(out.tenant_id).await?;
         let global_permit = self.bucket_global_write_permit().await?;
         let _validated_permits = (&tenant_permit, &global_permit);
         bucket_journal::build_bucket_mvcc_mutation_plan(
@@ -331,14 +334,14 @@ impl Persistence {
     pub async fn soft_delete_bucket(&self, tenant_id: i64, name: &str) -> Result<Option<Bucket>> {
         let deleted = bucket_journal::read_current_bucket_mvcc(self.mvcc()?, tenant_id, name)?;
         if let Some(bucket) = &deleted {
-            let tenant_permit = self.bucket_tenant_write_permit(bucket.tenant_id)?;
+            let tenant_permit = self.bucket_tenant_write_permit(bucket.tenant_id).await?;
             let global_permit = self.bucket_global_write_permit().await?;
             let _validated_permits = (&tenant_permit, &global_permit);
             bucket_journal::build_bucket_mvcc_mutation_plan(
                 self.mvcc()?,
                 bucket,
                 BucketJournalMutation::Delete,
-            )
+            )?
             .autocommit(
                 self.mvcc()?,
                 "bucket-metadata",
@@ -363,7 +366,7 @@ impl Persistence {
         if has_objects {
             return Ok(true);
         }
-        multipart_journal::has_active_multipart_upload(self.mvcc()?, bucket_id)
+        multipart_journal::has_active_multipart_upload(self.mvcc()?, bucket_id).await
     }
 
     pub async fn hard_delete_bucket_if_empty(&self, bucket_id: i64) -> Result<bool> {

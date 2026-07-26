@@ -222,7 +222,8 @@ pub(super) async fn put_record_row<T: GatewayRecordCodec>(
     )?;
     let current_bytes = mvcc.read_latest_value(&logical_key)?;
     let current = current_bytes
-        .map(|bytes| decode_gateway_metadata_row::<T>(row_kind, row_key, &bytes))
+        .as_ref()
+        .map(|bytes| decode_gateway_metadata_row::<T>(row_kind, row_key, bytes))
         .transpose()?;
     if require_absent && current.is_some() {
         bail!("gateway metadata row {row_kind}/{row_key} already exists");

@@ -704,31 +704,38 @@ impl ObjectManager {
                             }
                         }
                         if !missing.is_empty() {
-                            let repair = crate::mvcc_shard_repair::ShardRepairJob {
-                                schema: crate::mvcc_shard_repair::ShardRepairJob::SCHEMA
-                                    .to_string(),
-                                cluster_id: binding.cluster_id.clone(),
-                                transaction_id: transaction_id.to_string(),
-                                kind: crate::mvcc_shard_repair::ShardMaintenanceKind::Repair,
-                                target_logical_identity: format!(
-                                    "cluster/{}/object/{}",
-                                    binding.cluster_id, manifest.object_hash
-                                ),
-                                source_manifest: manifest.clone(),
-                                source_manifest_hash: hex::encode(blake3::hash(
-                                    &manifest
-                                        .canonical_bytes()
-                                        .map_err(|error| Status::internal(error.to_string()))?,
-                                )),
-                                missing,
-                                retiring: Vec::new(),
-                                originating_snapshot_version: binding.snapshot_version,
-                                requested_at_unix_ms: Self::current_unix_ms_for_object()?,
-                            };
+                            let repair =
+                                crate::mvcc_shard_repair::ShardRepairJob {
+                                    schema: crate::mvcc_shard_repair::ShardRepairJob::SCHEMA
+                                        .to_string(),
+                                    cluster_id: binding.cluster_id.clone(),
+                                    transaction_id: transaction_id.to_string(),
+                                    kind: crate::mvcc_shard_repair::ShardMaintenanceKind::Repair,
+                                    target_logical_identity: format!(
+                                        "cluster/{}/object/{}",
+                                        binding.cluster_id, manifest.object_hash
+                                    ),
+                                    source_manifest: manifest.clone(),
+                                    source_manifest_hash: hex::encode(
+                                        blake3::hash(&manifest.canonical_bytes().map_err(
+                                            |error| Status::internal(error.to_string()),
+                                        )?)
+                                        .as_bytes(),
+                                    ),
+                                    missing,
+                                    retiring: Vec::new(),
+                                    originating_snapshot_version: mvcc
+                                        .open_transactions
+                                        .handle(transaction_id)
+                                        .map_err(|error| {
+                                            Status::failed_precondition(error.to_string())
+                                        })?
+                                        .snapshot_version,
+                                    requested_at_unix_ms: Self::current_unix_ms_for_object()?,
+                                };
                             mvcc.open_transactions
                                 .add_job(
                                     transaction_id,
-                                    &binding.cluster_id,
                                     repair
                                         .canonical_bytes()
                                         .map_err(|error| Status::internal(error.to_string()))?,

@@ -21,7 +21,7 @@ use crate::persistence::{Bucket, Object, ObjectVersion, ObjectVersionsPage};
 use crate::storage::Storage;
 use crate::task_execution_guard::TaskExecutionGuard;
 use crate::writer_segment_catalog::WriterSegmentCatalogRecord;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use hmac::{Hmac, Mac};
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -2080,15 +2080,16 @@ use self::mvcc_event::*;
 mod object_mutation;
 pub(crate) use self::object_mutation::{
     append_object_mutation_with_permit, append_object_mutation_with_permit_in_transaction,
+    append_object_mutation_with_permit_in_transaction_and_audit,
     append_object_put_mutations_with_permit_in_transaction,
     commit_object_put_mutations_with_permit,
 };
 
 mod object_projection;
 pub(crate) use self::object_projection::{
-    ObjectProjectionSnapshot, ObjectVersionSnapshot, object_current_logical_key,
-    object_id_counter_logical_key, object_version_logical_key, plan_object_delete_version,
-    plan_object_upsert,
+    ObjectProjectionSnapshot, ObjectVersionSnapshot, load_object_projection_snapshot,
+    object_current_logical_key, object_id_counter_logical_key, object_version_logical_key,
+    plan_object_delete_version, plan_object_upsert,
 };
 
 mod version_sort;

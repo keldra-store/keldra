@@ -818,13 +818,13 @@ impl ObjectManager {
             page_objects.retain(|object| {
                 object.key.starts_with(prefix) && object.key.as_str() > start_after
             });
-            let candidates_visited = page_objects.len().min(source_page_limit);
+            let page_candidates_visited = page_objects.len().min(source_page_limit);
             page_objects.truncate(source_page_limit);
             let page = crate::core_store::CurrentObjectMetadataPage {
                 objects: page_objects,
                 next_cursor: None,
                 source_generation: snapshot,
-                candidates_visited,
+                candidates_visited: page_candidates_visited,
             };
             if source_generation
                 .replace(page.source_generation)
@@ -1026,13 +1026,13 @@ impl ObjectManager {
             };
             page_versions.drain(..start);
             let source_limit = remaining;
-            let candidates_visited = page_versions.len().min(source_limit);
+            let page_candidates_visited = page_versions.len().min(source_limit);
             page_versions.truncate(source_limit);
             let page = crate::core_store::ObjectVersionsMetadataPage {
                 versions: page_versions,
                 next_cursor: None,
                 source_generation: snapshot,
-                candidates_visited,
+                candidates_visited: page_candidates_visited,
             };
             if source_generation
                 .replace(page.source_generation)

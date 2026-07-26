@@ -5,9 +5,7 @@ use crate::{
         read_personaldb_changeset_payload_ref, read_personaldb_commit_certificate,
         read_personaldb_commit_certificate_ref,
     },
-    personaldb_heads::{
-        PersonalDbCommittedHead, read_personaldb_committed_head, read_personaldb_group_manifest,
-    },
+    personaldb_heads::{PersonalDbCommittedHead, read_personaldb_group_manifest},
     personaldb_segment::{list_personaldb_log_segment_refs, read_personaldb_log_segment},
     repair_finding::{
         RepairActionKind, RepairFinding, RepairFindingSeverity, RepairFindingStatus,

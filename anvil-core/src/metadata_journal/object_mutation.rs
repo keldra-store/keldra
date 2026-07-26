@@ -21,7 +21,6 @@ pub(crate) async fn append_object_mutation_with_permit(
         partition_owner_signing_key,
         None,
         None,
-        None,
     )
     .await
 }

@@ -12,6 +12,7 @@ use crate::core_store::{
 };
 use crate::mvcc_product::{ProductMutation, coremeta_logical_key};
 use crate::mvcc_transaction::{LogicalKey, PredicateKind, WriteOperation};
+use anyhow::bail;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ObjectVersionSnapshot {
@@ -125,7 +126,7 @@ fn read_observed(
     key: &LogicalKey,
     snapshot: u64,
     transaction: Option<(&str, &str)>,
-    _predicates: &mut Vec<(LogicalKey, PredicateKind)>,
+    predicates: &mut Vec<(LogicalKey, PredicateKind)>,
 ) -> Result<Option<Vec<u8>>> {
     let base = mvcc.runtime.read_at(key, snapshot)?.map(|row| row.value);
     predicates.push((

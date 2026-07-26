@@ -304,7 +304,6 @@ pub async fn get_package_version(
     let Some((tag, stored_handle)) = read_gateway_tag(
         storage,
         mvcc,
-        mvcc,
         tenant_id,
         registry_kind,
         namespace,

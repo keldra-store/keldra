@@ -601,7 +601,8 @@ impl Persistence {
         if bucket.region == target_region {
             return Ok(bucket);
         }
-        crate::mesh_lifecycle::ensure_region_accepts_new_writes(&self.storage, target_region)?;
+        crate::mesh_lifecycle::ensure_region_accepts_new_writes(&self.storage, target_region)
+            .await?;
 
         let target_cell = self
             .choose_bucket_home_cell(target_region)
@@ -630,7 +631,7 @@ impl Persistence {
             self.mvcc()?,
             &bucket,
             BucketJournalMutation::Update,
-        )
+        )?
         .autocommit(
             self.mvcc()?,
             "bucket-metadata",
