@@ -199,7 +199,7 @@ impl AdminService for AppState {
             }),
         )?;
         let audit_event_id = audit_event.audit_event_id.clone();
-        crate::access_control::write_delegated_action_tuple(
+        crate::access_control::write_delegated_action_tuple_with_admin_audit(
             &self.storage,
             &self.persistence,
             tenant_id,
@@ -252,7 +252,7 @@ impl AdminService for AppState {
             }),
         )?;
         let audit_event_id = audit_event.audit_event_id.clone();
-        crate::access_control::write_delegated_action_tuple(
+        crate::access_control::write_delegated_action_tuple_with_admin_audit(
             &self.storage,
             &self.persistence,
             tenant_id,

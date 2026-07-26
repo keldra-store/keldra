@@ -376,6 +376,7 @@ async fn write_repair_finding_inner(
         .map(|payload| decode_repair_finding_head(payload, &finding.scope_kind, &finding.scope_id))
         .transpose()?;
     let scope_revision = current_head
+        .as_ref()
         .map(|head| head.revision)
         .unwrap_or_default()
         .checked_add(1)

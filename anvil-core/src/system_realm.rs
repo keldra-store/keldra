@@ -267,8 +267,7 @@ pub(crate) async fn check_internal_node_access(
         SYSTEM_ADMIN_SUBJECT_KIND_APP,
         node_id,
         "",
-    )
-    .await?
+    )?
     .is_some();
     if !granted {
         return Ok(false);

@@ -1033,6 +1033,63 @@ pub async fn write_delegated_action_tuple(
     reason: &str,
     audit_event: &crate::tenant_audit::TenantAuditEvent,
 ) -> Result<(), Status> {
+    write_delegated_action_tuple_with_audit(
+        storage,
+        persistence,
+        tenant_id,
+        grantee_principal_id,
+        action,
+        resource,
+        operation,
+        written_by,
+        reason,
+        None,
+        Some(audit_event),
+    )
+    .await
+}
+
+pub async fn write_delegated_action_tuple_with_admin_audit(
+    storage: &Storage,
+    persistence: &Persistence,
+    tenant_id: i64,
+    grantee_principal_id: &str,
+    action: AnvilAction,
+    resource: &str,
+    operation: &str,
+    written_by: &str,
+    reason: &str,
+    audit_event: &crate::admin_audit::AdminAuditEvent,
+) -> Result<(), Status> {
+    write_delegated_action_tuple_with_audit(
+        storage,
+        persistence,
+        tenant_id,
+        grantee_principal_id,
+        action,
+        resource,
+        operation,
+        written_by,
+        reason,
+        Some(audit_event),
+        None,
+    )
+    .await
+}
+
+async fn write_delegated_action_tuple_with_audit(
+    storage: &Storage,
+    persistence: &Persistence,
+    tenant_id: i64,
+    grantee_principal_id: &str,
+    action: AnvilAction,
+    resource: &str,
+    operation: &str,
+    written_by: &str,
+    reason: &str,
+    admin_audit_event: Option<&crate::admin_audit::AdminAuditEvent>,
+    tenant_audit_event: Option<&crate::tenant_audit::TenantAuditEvent>,
+) -> Result<(), Status> {
     let relation =
         delegated_relation_for_action(storage, persistence, tenant_id, action.clone(), resource)
             .await?;
@@ -1051,8 +1108,8 @@ pub async fn write_delegated_action_tuple(
                 reason: reason.to_string(),
             }],
             written_by,
-            None,
-            Some(audit_event),
+            admin_audit_event,
+            tenant_audit_event,
         )
         .await
         .map_err(authz_tuple_write_status)?;
@@ -1328,13 +1385,12 @@ pub async fn require_index_permission(
 }
 
 pub async fn principal_has_any_system_realm_relation(
-    storage: &Storage,
+    _storage: &Storage,
     mvcc: &MvccSubsystem,
     principal_id: &str,
 ) -> Result<bool> {
     let revision = authz_journal::latest_authz_revision(mvcc, SYSTEM_STORAGE_TENANT_ID)?;
     let page = authz_journal::page_current_authz_tuples(
-        storage,
         mvcc,
         SYSTEM_STORAGE_TENANT_ID,
         &authz_journal::AuthzTupleFilter {

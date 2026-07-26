@@ -532,7 +532,7 @@ pub(crate) async fn fail_task_with_permit(
     _partition_owner_signing_key: &[u8],
 ) -> Result<()> {
     require_task_queue_permit(mvcc, permit)?;
-    fail_task_inner(mvcc, task_id, error, permit.fence_token, None).await
+    fail_task_inner(mvcc, task_id, error, permit.fence_token, None, None).await
 }
 
 pub(crate) async fn fail_task_with_execution_guard(

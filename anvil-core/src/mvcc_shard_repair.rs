@@ -119,7 +119,7 @@ pub fn plan_rebalance_job(
         kind: ShardMaintenanceKind::Rebalance,
         target_logical_identity,
         source_manifest: manifest.clone(),
-        source_manifest_hash: hex::encode(blake3::hash(&manifest.canonical_bytes()?)),
+        source_manifest_hash: hex::encode(blake3::hash(&manifest.canonical_bytes()?).as_bytes()),
         missing,
         retiring,
         originating_snapshot_version,
@@ -141,32 +141,33 @@ pub fn stage_rebalance_if_drift(
     now_unix_ms: u64,
 ) -> Result<bool> {
     let binding = mvcc.open_transactions.binding(transaction_id, principal)?;
+    let snapshot_version = mvcc
+        .open_transactions
+        .handle(transaction_id)?
+        .snapshot_version;
     if binding.cluster_id != source_manifest.cluster_id {
         bail!("rebalance source manifest belongs to another cluster");
     }
     let resolved = resolve_manifest_at_snapshot(
         mvcc.runtime.local_store(),
         source_manifest,
-        binding.snapshot_version,
+        snapshot_version,
     )?;
     let Some(mut job) = plan_rebalance_job(
         &resolved,
         transaction_id,
         candidates,
         policy,
-        binding.snapshot_version,
+        snapshot_version,
         now_unix_ms,
     )?
     else {
         return Ok(false);
     };
-    job.source_manifest_hash = hex::encode(blake3::hash(&source_manifest.canonical_bytes()?));
-    mvcc.open_transactions.add_job(
-        transaction_id,
-        &binding.cluster_id,
-        job.canonical_bytes()?,
-        now_unix_ms,
-    )?;
+    job.source_manifest_hash =
+        hex::encode(blake3::hash(&source_manifest.canonical_bytes()?).as_bytes());
+    mvcc.open_transactions
+        .add_job(transaction_id, job.canonical_bytes()?, now_unix_ms)?;
     Ok(true)
 }
 
@@ -187,7 +188,9 @@ impl ShardRepairJob {
     }
 
     pub fn job_id(&self) -> Result<String> {
-        Ok(hex::encode(blake3::hash(&self.canonical_bytes()?)))
+        Ok(hex::encode(
+            blake3::hash(&self.canonical_bytes()?).as_bytes(),
+        ))
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -484,10 +487,10 @@ impl ShardRebalanceReconciler {
                 checkpoint.snapshot_version,
                 now,
             )? {
-                job.source_manifest_hash = hex::encode(blake3::hash(&manifest.canonical_bytes()?));
+                job.source_manifest_hash =
+                    hex::encode(blake3::hash(&manifest.canonical_bytes()?).as_bytes());
                 self.mvcc.open_transactions.add_job(
                     &handle.transaction_id,
-                    self.mvcc.cluster_id(),
                     job.canonical_bytes()?,
                     now,
                 )?;
@@ -565,7 +568,7 @@ pub fn resolve_manifest_at_snapshot(
         return Ok(source.clone());
     };
     let overlay: ShardPlacementOverlay = serde_json::from_slice(&row.value)?;
-    let source_hash = hex::encode(blake3::hash(&source.canonical_bytes()?));
+    let source_hash = hex::encode(blake3::hash(&source.canonical_bytes()?).as_bytes());
     if overlay.cluster_id != source.cluster_id
         || overlay.target_logical_identity != String::from_utf8_lossy(&key.application_key)
         || overlay.source_manifest_hash != source_hash
@@ -1031,7 +1034,8 @@ mod tests {
                 failure_domain: "zone-a".into(),
             }],
         };
-        let source_manifest_hash = hex::encode(blake3::hash(&source.canonical_bytes().unwrap()));
+        let source_manifest_hash =
+            hex::encode(blake3::hash(&source.canonical_bytes().unwrap()).as_bytes());
         ShardRepairJob {
             schema: ShardRepairJob::SCHEMA.into(),
             cluster_id: "cluster".into(),
