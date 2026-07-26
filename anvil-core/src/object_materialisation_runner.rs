@@ -244,6 +244,10 @@ impl ObjectMaterialisationExecutor for MvccObjectMaterialisationExecutor {
             job.job_id()? == job_id,
             "materialisation job identity mismatch"
         );
+        anyhow::ensure!(
+            !job.requested_operations.maintain_indexes,
+            "MVCC snapshot-aware index materialisation is not available"
+        );
         let payload = if job.requested_operations.extract_boundaries {
             self.payload(job).await?
         } else {
