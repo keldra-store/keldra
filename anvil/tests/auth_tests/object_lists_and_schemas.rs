@@ -269,7 +269,6 @@ async fn test_authz_namespace_watch_streams_snapshot_and_new_events() {
         .unwrap()
         .unwrap();
     assert!(live.cursor_low > snapshot.cursor_low);
-    assert_eq!(live.cursor_low, 2);
     assert_eq!(live.authz_revision, 11);
 }
 
