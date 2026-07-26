@@ -6,6 +6,7 @@
 mod certification;
 mod consensus;
 mod control;
+mod gc;
 // Concrete OpenRaft types stay private until the network-backed Consensus
 // runtime is constructed inside this crate.
 #[allow(dead_code)]
@@ -16,6 +17,7 @@ mod types;
 pub use certification::{CertificationError, CertificationState};
 pub use consensus::{Consensus, ConsensusError};
 pub use control::ClusterControlState;
+pub use gc::{GarbageCollectionPins, GarbageCollectionSafetyError};
 pub use openraft_adapter::{
     ConsensusNode, ConsensusRpc, ConsensusRpcClient, ConsensusRpcError, ConsensusRpcFactory,
     ConsensusRpcKind, OpenRaftConsensus,
