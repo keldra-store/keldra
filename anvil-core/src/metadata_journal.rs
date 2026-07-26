@@ -22,10 +22,7 @@ use crate::partition_fence::{PartitionWritePermit, partition_write_precondition}
 use crate::persistence::{Bucket, Object, ObjectVersion, ObjectVersionsPage};
 use crate::storage::Storage;
 use crate::task_execution_guard::TaskExecutionGuard;
-use crate::writer_segment_catalog::{
-    WriterSegmentCatalogRecord, read_writer_segment_catalog_record,
-    write_writer_segment_catalog_record,
-};
+use crate::writer_segment_catalog::WriterSegmentCatalogRecord;
 use anyhow::{Context, Result, anyhow};
 use hmac::{Hmac, Mac};
 use prost::Message;
@@ -1005,13 +1002,11 @@ async fn publish_staged_compaction(
     staged: &StagedObjectMetadataCompaction,
     additional_preconditions: &[CoreMutationPrecondition],
 ) -> Result<()> {
-    for segment in &staged.segments {
-        publish_segment_catalog(storage, segment, additional_preconditions).await?;
-    }
     publish_partition_manifest(
         mvcc,
         bucket,
         &staged.partition_manifest,
+        &staged.segments,
         additional_preconditions,
     )
     .await
@@ -1025,22 +1020,18 @@ async fn publish_staged_compaction_for_task(
     partition_precondition: &CoreMutationPrecondition,
     task_guard: &TaskExecutionGuard,
 ) -> Result<()> {
-    for segment in &staged.segments {
-        let permit = task_guard.publication_permit().await?;
-        permit
-            .publish_with(|task_precondition| async move {
-                let preconditions = [partition_precondition.clone(), task_precondition];
-                publish_segment_catalog(storage, segment, &preconditions).await
-            })
-            .await?;
-    }
-
     let permit = task_guard.publication_permit().await?;
     permit
         .publish_with(|task_precondition| async move {
             let preconditions = [partition_precondition.clone(), task_precondition];
-            publish_partition_manifest(mvcc, bucket, &staged.partition_manifest, &preconditions)
-                .await
+            publish_partition_manifest(
+                mvcc,
+                bucket,
+                &staged.partition_manifest,
+                &staged.segments,
+                &preconditions,
+            )
+            .await
         })
         .await
 }
@@ -1122,7 +1113,7 @@ pub async fn recover_object_metadata_partition(
     let mut directory_latest = std::collections::BTreeMap::<Vec<u8>, SegmentRecord>::new();
     for segment in &manifest.segments {
         let family = file_family_from_manifest_name(&segment.family)?;
-        let bytes = read_manifest_segment(storage, segment).await?;
+        let bytes = read_manifest_segment(storage, mvcc, bucket, segment).await?;
         let (mut records, footer) = decode_segment_file_with_footer(&bytes, family)?;
         if hex::encode(footer.file_hash) != segment.file_hash {
             return Err(anyhow!("partition segment file hash mismatch"));
@@ -1210,7 +1201,7 @@ async fn recover_object_directory_partition(
         if family != FileFamily::DirectorySegment {
             continue;
         }
-        let bytes = read_manifest_segment(storage, segment).await?;
+        let bytes = read_manifest_segment(storage, mvcc, bucket, segment).await?;
         let (records, footer) =
             decode_segment_file_with_footer(&bytes, FileFamily::DirectorySegment)?;
         if hex::encode(footer.file_hash) != segment.file_hash {
@@ -1888,7 +1879,7 @@ async fn read_object_version_bodies_from_metadata_only(
             if family != FileFamily::MetadataSegment {
                 continue;
             }
-            let bytes = read_manifest_segment(storage, segment).await?;
+            let bytes = read_manifest_segment(storage, mvcc, bucket, segment).await?;
             let (records, footer) =
                 decode_segment_file_with_footer(&bytes, FileFamily::MetadataSegment)?;
             if hex::encode(footer.file_hash) != segment.file_hash {

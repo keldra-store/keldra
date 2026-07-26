@@ -101,15 +101,6 @@ pub(super) async fn stage_segment_file(
     })
 }
 
-pub(super) async fn publish_segment_catalog(
-    storage: &Storage,
-    segment: &WrittenSegment,
-    additional_preconditions: &[CoreMutationPrecondition],
-) -> Result<()> {
-    write_writer_segment_catalog_record(storage, &segment.catalog_record, additional_preconditions)
-        .await
-}
-
 pub(super) fn encode_object_segment_body_table(
     family: FileFamily,
     records: &[SegmentRecord],
@@ -277,6 +268,7 @@ pub(super) async fn publish_partition_manifest(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     staged: &StagedPartitionManifest,
+    segments: &[WrittenSegment],
     additional_preconditions: &[CoreMutationPrecondition],
 ) -> Result<()> {
     let key = metadata_product_key(
@@ -299,6 +291,18 @@ pub(super) async fn publish_partition_manifest(
         metadata_product_key(MetadataProductRowKind::CompactionState, bucket, None)?,
         staged.manifest_payload.clone(),
     )?;
+    for segment in segments {
+        let tuple_key = metadata_writer_catalog_tuple_key(&segment.catalog_record)?;
+        plan.observe_and_put(
+            mvcc,
+            metadata_product_key(
+                MetadataProductRowKind::WriterCatalogReference,
+                bucket,
+                Some(&tuple_key),
+            )?,
+            serde_json::to_vec(&segment.catalog_record)?,
+        )?;
+    }
     let principal = object_metadata_partition_principal(bucket);
     plan.autocommit(
         mvcc,
@@ -379,21 +383,16 @@ pub(super) fn partition_manifest_exists(
 
 pub(super) async fn read_manifest_segment(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    bucket: &Bucket,
     segment: &ManifestSegmentRef,
 ) -> Result<Vec<u8>> {
     let ref_name = segment
         .path
         .strip_prefix(MANIFEST_SEGMENT_REF_PREFIX)
         .ok_or_else(|| anyhow!("partition segment manifest entry is not a CoreMeta segment ref"))?;
-    let record = read_writer_segment_catalog_record(
-        storage,
-        OBJECT_METADATA_SEGMENT_CATALOG_FAMILY,
-        &object_metadata_segment_scope(ref_name)?,
-        object_metadata_segment_generation(ref_name)?,
-        ref_name,
-    )
-    .await?
-    .ok_or_else(|| anyhow!("partition segment catalog row is missing"))?;
+    let record = read_metadata_writer_catalog_record(mvcc, bucket, ref_name)?
+        .ok_or_else(|| anyhow!("partition segment catalog row is missing"))?;
     let store = CoreStore::new(storage.clone()).await?;
     store
         .get_blob(GetBlob {
@@ -403,25 +402,69 @@ pub(super) async fn read_manifest_segment(
 }
 
 #[cfg(test)]
-pub(super) async fn read_core_ref_uri_payload(storage: &Storage, ref_uri: &str) -> Result<Vec<u8>> {
+pub(super) async fn read_core_ref_uri_payload(
+    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    bucket: &Bucket,
+    ref_uri: &str,
+) -> Result<Vec<u8>> {
     let ref_name = ref_uri
         .strip_prefix(MANIFEST_SEGMENT_REF_PREFIX)
         .unwrap_or(ref_uri);
-    let record = read_writer_segment_catalog_record(
-        storage,
-        OBJECT_METADATA_SEGMENT_CATALOG_FAMILY,
-        &object_metadata_segment_scope(ref_name)?,
-        object_metadata_segment_generation(ref_name)?,
-        ref_name,
-    )
-    .await?
-    .ok_or_else(|| anyhow!("CoreStore writer segment catalog row is missing"))?;
+    let record = read_metadata_writer_catalog_record(mvcc, bucket, ref_name)?
+        .ok_or_else(|| anyhow!("CoreStore writer segment catalog row is missing"))?;
     let store = CoreStore::new(storage.clone()).await?;
     store
         .get_blob(GetBlob {
             object_ref: decode_core_object_ref_target(&record.core_object_ref_target)?,
         })
         .await
+}
+
+fn metadata_writer_catalog_tuple_key(record: &WriterSegmentCatalogRecord) -> Result<Vec<u8>> {
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8(&record.family),
+        CoreMetaTuplePart::Hash(&core_meta_root_key_hash(&format!(
+            "writer-scope/{}/{}",
+            record.family, record.scope
+        ))),
+        CoreMetaTuplePart::U64(record.generation),
+    ])
+}
+
+fn read_metadata_writer_catalog_record(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    bucket: &Bucket,
+    ref_name: &str,
+) -> Result<Option<WriterSegmentCatalogRecord>> {
+    let record = WriterSegmentCatalogRecord {
+        family: OBJECT_METADATA_SEGMENT_CATALOG_FAMILY.to_string(),
+        scope: object_metadata_segment_scope(ref_name)?,
+        segment_ref: ref_name.to_string(),
+        core_object_ref_target: String::new(),
+        segment_hash: String::new(),
+        segment_length: 0,
+        generation: object_metadata_segment_generation(ref_name)?,
+        source_cursor: 0,
+        created_at_unix_nanos: 0,
+    };
+    let key = metadata_product_key(
+        MetadataProductRowKind::WriterCatalogReference,
+        bucket,
+        Some(&metadata_writer_catalog_tuple_key(&record)?),
+    )?;
+    let Some(payload) = read_metadata_product_latest(mvcc, &key)? else {
+        return Ok(None);
+    };
+    let decoded: WriterSegmentCatalogRecord = serde_json::from_slice(&payload)?;
+    if decoded.family != record.family
+        || decoded.scope != record.scope
+        || decoded.segment_ref != ref_name
+        || decoded.generation != record.generation
+    {
+        bail!("object metadata writer catalog reference scope mismatch");
+    }
+    Ok(Some(decoded))
 }
 
 pub fn verify_partition_manifest(

@@ -26,7 +26,7 @@ pub const WRITER_SEGMENT_PAGE_MAX: usize = 1000;
 static WRITER_LOCKS: LazyLock<std::sync::Mutex<BTreeMap<String, Weak<tokio::sync::Mutex<()>>>>> =
     LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WriterSegmentCatalogRecord {
     pub family: String,
     pub scope: String,
