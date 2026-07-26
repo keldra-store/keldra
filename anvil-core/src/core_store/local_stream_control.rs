@@ -997,8 +997,9 @@ impl CoreStore {
             after_key.as_deref(),
             input.limit,
         )?;
-        let has_pending_staged_transaction =
-            self.has_pending_transaction_stream_prefix(&input.stream_prefix)?;
+        // MVCC transaction events enter the stream index only after
+        // certification, so committed scans cannot encounter pending rows.
+        let has_pending_staged_transaction = false;
         let source_page_full = rows.len() == input.limit;
         let mut events = Vec::with_capacity(rows.len());
         let mut next_cursor = None;

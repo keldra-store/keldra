@@ -3,7 +3,8 @@ use super::transaction_manifest_proto::{
     decode_manifest_locator_proto, encode_manifest_locator_proto,
 };
 use super::types::{
-    CoreBoundaryValue, CoreCompressionDescriptor, CoreManifestLocator, CoreObjectRef,
+    CoreBoundaryValue, CoreCompressionDescriptor, CoreManifestLocator, CoreMutationBatchReceipt,
+    CoreObjectRef,
 };
 use super::{CoreMetaRowCommonProto, CoreMetaVisibilityState, core_meta_committed_row_common};
 use anyhow::{Context, Result, anyhow, bail};
