@@ -588,24 +588,6 @@ async fn update_gateway_tag_in_transaction(
     })
 }
 
-async fn registry_blob_locator_exists(
-    storage: &Storage,
-    tenant_id: i64,
-    registry_kind: &str,
-    namespace: &str,
-    digest: &str,
-) -> Result<bool> {
-    Ok(coremeta::read_registry_blob_locator_row(
-        storage,
-        tenant_id,
-        registry_kind,
-        namespace,
-        digest,
-    )
-    .await?
-    .is_some())
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn registry_blob_exists_for_transaction(
     storage: &Storage,
@@ -618,29 +600,27 @@ async fn registry_blob_exists_for_transaction(
     principal: &str,
     transaction_id: Option<&str>,
 ) -> Result<bool> {
-    if registry_blob_locator_exists(storage, tenant_id, registry_kind, namespace, digest).await? {
-        return Ok(true);
-    }
-    let Some(transaction_id) = transaction_id else {
-        return Ok(false);
-    };
     let registry_kind = normalize_gateway_identifier(registry_kind, "registry kind")?;
     let namespace = normalize_gateway_identifier(namespace, "namespace")?;
     let repository = normalize_gateway_identifier(repository, "repository")?;
     let principal = normalize_gateway_identifier(principal, "principal")?;
     let ref_name =
         gateway_blob_ref_name(tenant_id, &registry_kind, &namespace, &repository, digest)?;
-    let transaction_principal = format!("tenant/{tenant_id}/principal/{principal}");
-    let Some(row) = read_record_row_in_transaction::<GatewayBlobRecord>(
-        storage,
-        mvcc,
-        GATEWAY_ROW_BLOB,
-        &ref_name,
-        transaction_id,
-        &transaction_principal,
-    )
-    .await?
-    else {
+    let row = if let Some(transaction_id) = transaction_id {
+        let transaction_principal = format!("tenant/{tenant_id}/principal/{principal}");
+        read_record_row_in_transaction::<GatewayBlobRecord>(
+            storage,
+            mvcc,
+            GATEWAY_ROW_BLOB,
+            &ref_name,
+            transaction_id,
+            &transaction_principal,
+        )
+        .await?
+    } else {
+        read_record_row::<GatewayBlobRecord>(mvcc, GATEWAY_ROW_BLOB, &ref_name).await?
+    };
+    let Some(row) = row else {
         return Ok(false);
     };
     validate_blob_record(

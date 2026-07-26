@@ -1,12 +1,11 @@
 use crate::{
     core_store::{
-        AppendStreamRecord, AuthzScopeRef, CF_REGISTRY, CoreLogicalFileWrite, CoreMetaBatchOp,
-        CoreMetaBatchOpKind, CoreMetaRootPublication, CoreMetaTuplePart, CoreObjectRef,
-        CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob, ReadStream, StreamAppendReceipt,
-        StreamRecord, TABLE_GATEWAY_METADATA_ROW, TABLE_GATEWAY_MOUNT_ROUTE_ROW,
-        WriteLogicalFileRequest, core_meta_committed_row_common, core_meta_root_key_hash,
-        core_meta_tuple_key, core_object_ref_from_logical_file_write, decode_deterministic_proto,
-        encode_deterministic_proto,
+        AppendStreamRecord, AuthzScopeRef, CF_REGISTRY, CoreLogicalFileWrite, CoreMetaTuplePart,
+        CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob, ReadStream,
+        StreamAppendReceipt, StreamRecord, TABLE_GATEWAY_METADATA_ROW,
+        TABLE_GATEWAY_MOUNT_ROUTE_ROW, WriteLogicalFileRequest, core_meta_committed_row_common,
+        core_meta_root_key_hash, core_meta_tuple_key, core_object_ref_from_logical_file_write,
+        decode_deterministic_proto, encode_deterministic_proto,
     },
     formats::{
         hash32,
@@ -450,7 +449,6 @@ pub async fn put_gateway_blob(
         record_hash: String::new(),
     };
     record.record_hash = hash_record(&record)?;
-    coremeta::write_registry_blob_locator_row(storage, &record, &payload_write.locator).await?;
     put_record_row(mvcc, GATEWAY_ROW_BLOB, &ref_name, &record, true, None).await?;
     Ok(record)
 }
@@ -534,15 +532,19 @@ pub async fn update_gateway_tag(
     };
     record.record_hash = hash_record(&record)?;
     let ref_name = gateway_tag_ref_name(&record)?;
-    let blob = coremeta::read_registry_blob_locator_row(
-        storage,
+    let blob_ref_name = gateway_blob_ref_name(
         tenant_id,
         &record.gateway,
         &record.registry_instance_id,
+        &record.repository,
         &record.target_digest,
-    )
-    .await?
-    .ok_or_else(|| anyhow!("registry tag target blob is missing CoreMeta locator row"))?;
+    )?;
+    if read_record_row::<GatewayBlobRecord>(mvcc, GATEWAY_ROW_BLOB, &blob_ref_name)
+        .await?
+        .is_none()
+    {
+        bail!("registry tag target blob is missing");
+    }
     let row = put_record_row(
         mvcc,
         GATEWAY_ROW_TAG,
@@ -552,7 +554,6 @@ pub async fn update_gateway_tag(
         expected_generation,
     )
     .await?;
-    coremeta::write_registry_version_row_for_tag(storage, &record, &blob, row.generation).await?;
     Ok(GatewayTagUpdateReceipt {
         record,
         generation: row.generation,
@@ -1127,8 +1128,6 @@ pub async fn finalise_gateway_upload_session(
         record_hash: String::new(),
     };
     blob_record.record_hash = hash_record(&blob_record)?;
-    coremeta::write_registry_blob_locator_row(storage, &blob_record, &payload_write.locator)
-        .await?;
     commit_upload_session_record(
         mvcc,
         session,
@@ -1482,21 +1481,68 @@ async fn commit_upload_session_record(
     session.record_hash.clear();
     session.record_hash = hash_record(&session)?;
     let session_handle_name = gateway_upload_ref_name(&session)?;
-    if let Some((blob_key, blob_record)) = blob_record {
-        put_record_row(mvcc, GATEWAY_ROW_BLOB, &blob_key, &blob_record, true, None).await?;
-    }
-    let row = put_record_row(
-        mvcc,
+    let session_logical_key = crate::mvcc_product::coremeta_logical_key(
+        CF_REGISTRY,
+        TABLE_GATEWAY_METADATA_ROW,
+        &gateway_metadata_tuple_key(GATEWAY_ROW_UPLOAD_SESSION, &session_handle_name)?,
+    )?;
+    let current_session_payload = mvcc
+        .read_latest_value(&session_logical_key)?
+        .ok_or_else(|| anyhow!("gateway upload session row is missing"))?;
+    let current_session = decode_gateway_metadata_row::<GatewayUploadSessionRecord>(
         GATEWAY_ROW_UPLOAD_SESSION,
         &session_handle_name,
-        &session,
-        false,
-        Some(session_handle.generation),
+        &current_session_payload,
+    )?;
+    if current_session.generation != session_handle.generation {
+        bail!("gateway upload session generation mismatch");
+    }
+    let next_generation = session_handle.generation.saturating_add(1);
+    let mut mutations = vec![crate::mvcc_product::ProductMutation::put(
+        session_logical_key.clone(),
+        encode_gateway_metadata_row(
+            GATEWAY_ROW_UPLOAD_SESSION,
+            &session_handle_name,
+            next_generation,
+            &session,
+        )?,
+    )];
+    let mut predicates = vec![(
+        session_logical_key,
+        crate::mvcc_transaction::PredicateKind::ValueHash(
+            *blake3::hash(&current_session_payload).as_bytes(),
+        ),
+    )];
+    if let Some((blob_key, blob_record)) = blob_record {
+        let blob_logical_key = crate::mvcc_product::coremeta_logical_key(
+            CF_REGISTRY,
+            TABLE_GATEWAY_METADATA_ROW,
+            &gateway_metadata_tuple_key(GATEWAY_ROW_BLOB, &blob_key)?,
+        )?;
+        mutations.push(crate::mvcc_product::ProductMutation::put(
+            blob_logical_key.clone(),
+            encode_gateway_metadata_row(GATEWAY_ROW_BLOB, &blob_key, 1, &blob_record)?,
+        ));
+        predicates.push((
+            blob_logical_key,
+            crate::mvcc_transaction::PredicateKind::Absent,
+        ));
+    }
+    mvcc.autocommit_product_mutations_with_predicates(
+        "gateway-upload",
+        &format!(
+            "gateway-upload-commit:{}:{}",
+            session.upload_id, session.record_hash
+        ),
+        mutations,
+        predicates,
+        crate::mvcc_transaction::DurabilityLevel::Local,
+        u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default(),
     )
     .await?;
     Ok(GatewayUploadSessionReceipt {
         record: session,
-        generation: row.generation,
+        generation: next_generation,
     })
 }
 
@@ -1548,7 +1594,6 @@ async fn write_gateway_logical_file_with_locator(
         .await
 }
 
-mod coremeta;
 mod helpers;
 mod keys;
 mod metadata_rows;
