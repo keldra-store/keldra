@@ -1024,7 +1024,38 @@ A transaction touching few keys has:
 There is no separate protocol based on which product areas or partitions those
 keys occupy.
 
-### 14.8 Large Transactions
+### 14.8 Deterministic Lease and Ownership Fencing
+
+Lease expiry is an admission condition for a successor claim; it is not itself
+an authority revocation. Authority changes only when a successful cluster-local
+MVCC transaction installs a new holder and advances the lease or ownership
+epoch.
+
+A protected publisher must observe the exact authoritative lease or ownership
+row and include a value-hash predicate for that row in the same transaction
+bundle as every protected product mutation. The predicate covers holder
+identity, incarnation, fence token, and epoch. A successor claim observes the
+prior row and atomically installs a strictly greater epoch. Publication and
+reassignment therefore conflict under ordinary MVCC certification:
+
+- if publication certifies first, the successor retries from the published
+  state;
+- if reassignment certifies first, the stale publisher's exact-row predicate
+  aborts;
+- an expired row remains authoritative until reassignment commits;
+- renewal is an epoch-advancing row replacement and conflicts with publication
+  based on the previous version.
+
+Wall-clock time is used only before proposing a successor claim to decide
+whether reclaim is permitted. No timestamp or clock comparison enters the Raft
+command or deterministic state machine. Local observation of expiry is never
+permission to publish, delete, or ignore the current authority row.
+
+Proof, checkpoint, catalog-head, and other lease-protected publications must
+stage their authority predicate and protected rows in one transaction. A
+check-then-autocommit sequence is invalid.
+
+### 14.9 Large Transactions
 
 Large conflict sets increase certification-entry size and state-machine work.
 The implementation must define limits for:

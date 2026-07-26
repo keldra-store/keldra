@@ -517,8 +517,14 @@ async fn execute_task_with_lease(
             });
     }
 
-    let guard = TaskExecutionGuard::new(
+    let guard = TaskExecutionGuard::new_mvcc(
         core_store.storage().clone(),
+        persistence
+            .mvcc_arc()
+            .map_err(|error| TaskExecutionFailure {
+                lease: Some(lease.clone()),
+                error,
+            })?,
         persistence.partition_owner_signing_key().to_vec(),
         lease.clone(),
     )
@@ -607,13 +613,13 @@ async fn check_execution_lease(
     core_store: &CoreStore,
     lease: &TaskLease,
 ) -> Result<TaskLease> {
-    task_lease::check_task_lease(
-        core_store.storage(),
+    let _ = core_store;
+    task_lease::check_task_lease_mvcc(
+        persistence.mvcc()?,
         lease,
         current_time_nanos()?,
         persistence.partition_owner_signing_key(),
     )
-    .await
 }
 
 async fn execution_lease_precondition(
@@ -636,8 +642,9 @@ async fn renew_execution_lease(
     lease: &TaskLease,
     ttl_nanos: i64,
 ) -> Result<TaskLease> {
-    task_lease::renew_task_lease(
-        core_store.storage(),
+    let _ = core_store;
+    task_lease::renew_task_lease_mvcc(
+        persistence.mvcc()?,
         lease,
         current_time_nanos()?,
         ttl_nanos,

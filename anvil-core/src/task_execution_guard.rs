@@ -18,6 +18,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 pub(crate) struct TaskExecutionGuard {
     lease: Arc<Mutex<TaskLease>>,
     storage: Storage,
+    mvcc: Option<Arc<crate::mvcc_bootstrap::MvccSubsystem>>,
     signing_key: Arc<[u8]>,
     ttl_nanos: i64,
 }
@@ -33,6 +34,24 @@ pub(crate) struct TaskPublicationPermit {
 
 impl TaskExecutionGuard {
     pub(crate) fn new(storage: Storage, signing_key: Vec<u8>, lease: TaskLease) -> Result<Self> {
+        Self::new_inner(storage, None, signing_key, lease)
+    }
+
+    pub(crate) fn new_mvcc(
+        storage: Storage,
+        mvcc: Arc<crate::mvcc_bootstrap::MvccSubsystem>,
+        signing_key: Vec<u8>,
+        lease: TaskLease,
+    ) -> Result<Self> {
+        Self::new_inner(storage, Some(mvcc), signing_key, lease)
+    }
+
+    fn new_inner(
+        storage: Storage,
+        mvcc: Option<Arc<crate::mvcc_bootstrap::MvccSubsystem>>,
+        signing_key: Vec<u8>,
+        lease: TaskLease,
+    ) -> Result<Self> {
         let ttl_nanos = lease
             .expires_at_nanos
             .checked_sub(lease.acquired_at_nanos)
@@ -43,6 +62,7 @@ impl TaskExecutionGuard {
         Ok(Self {
             lease: Arc::new(Mutex::new(lease)),
             storage,
+            mvcc,
             signing_key: Arc::from(signing_key),
             ttl_nanos,
         })
@@ -56,13 +76,12 @@ impl TaskExecutionGuard {
     /// Confirms that the guarded version is still current and unexpired.
     pub(crate) async fn check(&self) -> Result<TaskLease> {
         let mut lease = self.lease.lock().await;
-        let checked = task_lease::check_task_lease(
-            &self.storage,
-            &lease,
-            current_time_nanos()?,
-            &self.signing_key,
-        )
-        .await?;
+        let now = current_time_nanos()?;
+        let checked = if let Some(mvcc) = self.mvcc.as_deref() {
+            task_lease::check_task_lease_mvcc(mvcc, &lease, now, &self.signing_key)?
+        } else {
+            task_lease::check_task_lease(&self.storage, &lease, now, &self.signing_key).await?
+        };
         *lease = checked.clone();
         Ok(checked)
     }
@@ -70,14 +89,20 @@ impl TaskExecutionGuard {
     /// Renews the current version while excluding publication and checkpointing.
     pub(crate) async fn renew(&self) -> Result<TaskLease> {
         let mut lease = self.lease.lock().await;
-        let renewed = task_lease::renew_task_lease(
-            &self.storage,
-            &lease,
-            current_time_nanos()?,
-            self.ttl_nanos,
-            &self.signing_key,
-        )
-        .await?;
+        let now = current_time_nanos()?;
+        let renewed = if let Some(mvcc) = self.mvcc.as_deref() {
+            task_lease::renew_task_lease_mvcc(mvcc, &lease, now, self.ttl_nanos, &self.signing_key)
+                .await?
+        } else {
+            task_lease::renew_task_lease(
+                &self.storage,
+                &lease,
+                now,
+                self.ttl_nanos,
+                &self.signing_key,
+            )
+            .await?
+        };
         *lease = renewed.clone();
         Ok(renewed)
     }
@@ -85,14 +110,26 @@ impl TaskExecutionGuard {
     /// Persists progress against the exact current lease version.
     pub(crate) async fn checkpoint(&self, checkpoint_cursor: u128) -> Result<TaskLease> {
         let mut lease = self.lease.lock().await;
-        let checkpointed = task_lease::checkpoint_task_lease(
-            &self.storage,
-            &lease,
-            checkpoint_cursor,
-            current_time_nanos()?,
-            &self.signing_key,
-        )
-        .await?;
+        let now = current_time_nanos()?;
+        let checkpointed = if let Some(mvcc) = self.mvcc.as_deref() {
+            task_lease::checkpoint_task_lease_mvcc(
+                mvcc,
+                &lease,
+                checkpoint_cursor,
+                now,
+                &self.signing_key,
+            )
+            .await?
+        } else {
+            task_lease::checkpoint_task_lease(
+                &self.storage,
+                &lease,
+                checkpoint_cursor,
+                now,
+                &self.signing_key,
+            )
+            .await?
+        };
         *lease = checkpointed.clone();
         Ok(checkpointed)
     }
