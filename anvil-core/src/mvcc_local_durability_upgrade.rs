@@ -246,6 +246,20 @@ pub trait LocalUpgradeManifestPublisher: Send + Sync {
 
 const LOCAL_UPGRADE_MANIFEST_TABLE_ID: u16 = 0x7f15;
 
+pub fn resolve_promoted_manifest(
+    store: &crate::mvcc_store::LocalMvccStore,
+    object_hash: &str,
+) -> Result<Option<PhysicalObjectShardManifest>> {
+    let key = crate::mvcc_transaction::LogicalKey {
+        table_id: LOCAL_UPGRADE_MANIFEST_TABLE_ID,
+        application_key: format!("object/{object_hash}").into_bytes(),
+    };
+    store
+        .read_latest(&key)?
+        .map(|row| serde_json::from_slice(&row.value).map_err(Into::into))
+        .transpose()
+}
+
 #[async_trait]
 impl LocalUpgradeManifestPublisher for Arc<crate::mvcc_bootstrap::MvccSubsystem> {
     async fn publish(

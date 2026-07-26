@@ -208,6 +208,23 @@ impl ObjectManager {
                     }
                 }
             }
+            if let ObjectDataTarget::MvccLocal(manifest) = &data_target
+                && let Some(mvcc) = app_state.mvcc.get()
+            {
+                match crate::mvcc_local_durability_upgrade::resolve_promoted_manifest(
+                    mvcc.runtime.local_store(),
+                    &manifest.object_hash,
+                ) {
+                    Ok(Some(promoted)) => {
+                        data_target = ObjectDataTarget::MvccShards(promoted);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let _ = tx.send(Err(Status::data_loss(error.to_string()))).await;
+                        return;
+                    }
+                }
+            }
 
             let read_result = match data_target {
                 ObjectDataTarget::LogicalFile(locator) => {
