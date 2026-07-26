@@ -13,23 +13,26 @@ use rocksdb::{
     ColumnFamily, ColumnFamilyDescriptor, DB, Direction, IteratorMode, Options, WriteBatch,
     WriteOptions,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::mvcc_transaction::{CommitVersion, LogicalKey, TransactionBundle, WriteOperation};
 use crate::object_materialisation::ObjectMaterialisationState;
 use crate::object_materialisation::{ObjectMaterialisationJob, ObjectMaterialisationRecord};
 
-pub const MVCC_COLUMN_FAMILIES: [&str; 5] = [
+pub const MVCC_COLUMN_FAMILIES: [&str; 6] = [
     "mvcc_versions",
     "mvcc_heads",
     "mvcc_applied",
     "mvcc_meta",
     "cf_materialisation",
+    "cf_outbox",
 ];
 const CF_VERSIONS: &str = MVCC_COLUMN_FAMILIES[0];
 const CF_HEADS: &str = MVCC_COLUMN_FAMILIES[1];
 const CF_APPLIED: &str = MVCC_COLUMN_FAMILIES[2];
 const CF_META: &str = MVCC_COLUMN_FAMILIES[3];
 const CF_MATERIALISATION: &str = MVCC_COLUMN_FAMILIES[4];
+const CF_OUTBOX: &str = MVCC_COLUMN_FAMILIES[5];
 const APPLIED_VERSION_KEY: &[u8] = b"applied_version";
 const GC_WATERMARK_KEY: &[u8] = b"gc_watermark";
 const DECISION_WATERMARK_KEY: &[u8] = b"decision_watermark";
@@ -48,12 +51,34 @@ pub enum ApplyOutcome {
     Replayed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutboxState {
+    Pending,
+    Running,
+    Delivered,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutboxRecord {
+    pub event_id: String,
+    pub transaction_id: String,
+    pub commit_version: CommitVersion,
+    pub ordinal: u32,
+    pub payload: Vec<u8>,
+    pub state: OutboxState,
+    pub attempts: u32,
+    pub lease_owner: Option<String>,
+    pub lease_expires_unix_ms: Option<u64>,
+}
+
 #[derive(Clone)]
 pub struct MvccStore {
     db: Arc<DB>,
     cluster_id: String,
     scope: Vec<u8>,
     materialisation_transition: Arc<Mutex<()>>,
+    outbox_transition: Arc<Mutex<()>>,
 }
 
 pub type LocalMvccStore = MvccStore;
@@ -88,6 +113,7 @@ impl MvccStore {
             cluster_id: cluster_id.to_string(),
             scope,
             materialisation_transition: Arc::new(Mutex::new(())),
+            outbox_transition: Arc::new(Mutex::new(())),
         })
     }
 
@@ -146,6 +172,7 @@ impl MvccStore {
         let heads_cf = self.cf(CF_HEADS)?;
         let meta_cf = self.cf(CF_META)?;
         let materialisation_cf = self.cf(CF_MATERIALISATION)?;
+        let outbox_cf = self.cf(CF_OUTBOX)?;
         let mut batch = WriteBatch::default();
         for write in &bundle.writes {
             let key = write.key();
@@ -172,6 +199,25 @@ impl MvccStore {
             }
             batch.put_cf(materialisation_cf, key, record);
         }
+        for (ordinal, payload) in bundle.outbox_events.iter().enumerate() {
+            let ordinal = u32::try_from(ordinal).context("too many outbox events in bundle")?;
+            let record = OutboxRecord {
+                event_id: outbox_event_id(&bundle.transaction_id, ordinal, payload),
+                transaction_id: bundle.transaction_id.clone(),
+                commit_version,
+                ordinal,
+                payload: payload.clone(),
+                state: OutboxState::Pending,
+                attempts: 0,
+                lease_owner: None,
+                lease_expires_unix_ms: None,
+            };
+            batch.put_cf(
+                outbox_cf,
+                self.key(&outbox_event_key(commit_version, ordinal)),
+                serde_json::to_vec(&record)?,
+            );
+        }
         batch.put_cf(applied_cf, applied_key, identity.as_bytes());
         batch.put_cf(
             meta_cf,
@@ -187,6 +233,114 @@ impl MvccStore {
         }
         self.db.write_opt(batch, &durable_write_options())?;
         Ok(ApplyOutcome::Applied)
+    }
+
+    pub fn outbox_records_after(
+        &self,
+        commit_version: CommitVersion,
+        limit: usize,
+    ) -> Result<Vec<OutboxRecord>> {
+        if limit == 0 {
+            bail!("outbox page limit must be non-zero");
+        }
+        let cf = self.cf(CF_OUTBOX)?;
+        let seek = self.key(&outbox_event_key(commit_version.saturating_add(1), 0));
+        let prefix = self.key(b"event/");
+        let mut records = Vec::new();
+        for row in self
+            .db
+            .iterator_cf(cf, IteratorMode::From(&seek, Direction::Forward))
+        {
+            let (key, value) = row?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            records.push(serde_json::from_slice(&value)?);
+            if records.len() == limit {
+                break;
+            }
+        }
+        Ok(records)
+    }
+
+    pub fn claim_outbox(
+        &self,
+        worker_id: &str,
+        now_unix_ms: u64,
+        lease_ms: u64,
+    ) -> Result<Option<OutboxRecord>> {
+        if worker_id.trim().is_empty() || lease_ms == 0 {
+            bail!("outbox worker and lease must be non-empty");
+        }
+        let _transition = self.outbox_transition.lock().unwrap();
+        let cf = self.cf(CF_OUTBOX)?;
+        let prefix = self.key(b"event/");
+        for row in self
+            .db
+            .iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward))
+        {
+            let (key, value) = row?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let mut record: OutboxRecord = serde_json::from_slice(&value)?;
+            let claimable = record.state == OutboxState::Pending
+                || (record.state == OutboxState::Running
+                    && record
+                        .lease_expires_unix_ms
+                        .is_some_and(|deadline| deadline <= now_unix_ms));
+            if !claimable {
+                continue;
+            }
+            record.state = OutboxState::Running;
+            record.attempts = record.attempts.saturating_add(1);
+            record.lease_owner = Some(worker_id.to_string());
+            record.lease_expires_unix_ms = Some(
+                now_unix_ms
+                    .checked_add(lease_ms)
+                    .context("outbox lease expiry overflow")?,
+            );
+            self.db.put_cf_opt(
+                cf,
+                key,
+                serde_json::to_vec(&record)?,
+                &durable_write_options(),
+            )?;
+            return Ok(Some(record));
+        }
+        Ok(None)
+    }
+
+    pub fn complete_outbox(&self, record: &OutboxRecord, worker_id: &str) -> Result<()> {
+        let _transition = self.outbox_transition.lock().unwrap();
+        let cf = self.cf(CF_OUTBOX)?;
+        let key = self.key(&outbox_event_key(record.commit_version, record.ordinal));
+        let bytes = self
+            .db
+            .get_cf(cf, &key)?
+            .context("outbox event not found")?;
+        let mut current: OutboxRecord = serde_json::from_slice(&bytes)?;
+        if current.event_id != record.event_id {
+            bail!("outbox event identity mismatch");
+        }
+        if current.state == OutboxState::Delivered {
+            return Ok(());
+        }
+        if current.state != OutboxState::Running
+            || current.lease_owner.as_deref() != Some(worker_id)
+        {
+            bail!("outbox event is not leased by this worker");
+        }
+        current.state = OutboxState::Delivered;
+        current.lease_owner = None;
+        current.lease_expires_unix_ms = None;
+        self.db.put_cf_opt(
+            cf,
+            key,
+            serde_json::to_vec(&current)?,
+            &durable_write_options(),
+        )?;
+        Ok(())
     }
 
     pub fn read_at(
@@ -535,6 +689,25 @@ fn decode_logical_key(encoded: &[u8]) -> Result<LogicalKey> {
     })
 }
 
+fn outbox_event_key(commit_version: CommitVersion, ordinal: u32) -> Vec<u8> {
+    let mut key = Vec::with_capacity(6 + 8 + 4);
+    key.extend_from_slice(b"event/");
+    key.extend_from_slice(&commit_version.to_be_bytes());
+    key.extend_from_slice(&ordinal.to_be_bytes());
+    key
+}
+
+fn outbox_event_id(transaction_id: &str, ordinal: u32, payload: &[u8]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"anvil.mvcc.outbox-event.v1");
+    hasher.update(&(transaction_id.len() as u64).to_be_bytes());
+    hasher.update(transaction_id.as_bytes());
+    hasher.update(&ordinal.to_be_bytes());
+    hasher.update(&(payload.len() as u64).to_be_bytes());
+    hasher.update(payload);
+    hasher.finalize().to_hex().to_string()
+}
+
 fn encode_versioned_key(key: &LogicalKey, version: CommitVersion) -> Result<Vec<u8>> {
     let mut encoded = encode_logical_key(key)?;
     encoded.extend_from_slice(&(!version).to_be_bytes());
@@ -640,6 +813,51 @@ mod tests {
         assert_eq!(store.read_at(&row, 2).unwrap().unwrap().value, b"old");
         assert_eq!(store.read_at(&row, 4).unwrap().unwrap().value, b"old");
         assert_eq!(store.read_latest(&row).unwrap().unwrap().value, b"new");
+    }
+
+    #[test]
+    fn outbox_events_install_atomically_and_claim_durably() {
+        let temp = tempdir().unwrap();
+        let row = key(7, b"account");
+        let store = MvccStore::open(temp.path()).unwrap();
+        store
+            .apply_certified_bundle(
+                3,
+                &bundle("with-outbox", |builder| {
+                    builder.put(row.clone(), b"visible".to_vec());
+                    builder.add_outbox_event(b"notify-account".to_vec());
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(store.read_latest(&row).unwrap().unwrap().value, b"visible");
+        let records = store.outbox_records_after(0, 10).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].commit_version, 3);
+        assert_eq!(records[0].payload, b"notify-account");
+        assert_eq!(records[0].state, OutboxState::Pending);
+
+        let first = store.claim_outbox("worker-a", 10, 5).unwrap().unwrap();
+        assert_eq!(first.state, OutboxState::Running);
+        assert_eq!(first.attempts, 1);
+        assert!(store.claim_outbox("worker-b", 14, 5).unwrap().is_none());
+        let reclaimed = store.claim_outbox("worker-b", 15, 5).unwrap().unwrap();
+        assert_eq!(reclaimed.event_id, first.event_id);
+        assert_eq!(reclaimed.attempts, 2);
+        store.complete_outbox(&reclaimed, "worker-b").unwrap();
+        store.complete_outbox(&reclaimed, "worker-b").unwrap();
+        assert!(store.claim_outbox("worker-a", 100, 5).unwrap().is_none());
+        assert_eq!(
+            store.outbox_records_after(0, 10).unwrap()[0].state,
+            OutboxState::Delivered
+        );
+
+        drop(store);
+        let reopened = MvccStore::open(temp.path()).unwrap();
+        let persisted = reopened.outbox_records_after(0, 10).unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].state, OutboxState::Delivered);
+        assert_eq!(persisted[0].event_id, first.event_id);
     }
 
     #[test]

@@ -83,7 +83,7 @@ Status values:
 |---|---|---|
 | No migration machinery, dual reads/writes or shadow transaction protocol | Contradicted | Reachable product code still contains CoreStore explicit-transaction machinery and some MVCC-first/physical-row fallback reads. These must be deleted rather than retained as migration behavior. |
 | No discarded internal protocol on the active write path | Contradicted | The cutover removed transaction overlays from topology, manifest, append, mesh routing, boundary, index and several materializers, but remaining `CoreStore` explicit transaction APIs and legacy receipt/publication paths are still reachable in parts of object/metadata handling. |
-| Materialisation and outbox work are ordinary durable MVCC state | Partial | Materialisation jobs are applied atomically with a bundle. `cf_outbox` is not inferred terminology: Section 11 explicitly lists it under “Required MVCC concepts.” It is absent, and bundle `outbox_events` are not materialised by `LocalMvccStore::apply_certified_bundle_at_decision`, so durable outbox consumption is genuinely missing. |
+| Materialisation and outbox work are ordinary durable MVCC state | Implemented | Materialisation jobs and Section 11's required `cf_outbox` events are installed in the same durable RocksDB batch as product rows and the applied watermark. Outbox records carry commit version and deterministic identity; durable lease, reclaim and idempotent completion semantics are covered by focused tests. |
 
 ## Highest-priority next work
 
