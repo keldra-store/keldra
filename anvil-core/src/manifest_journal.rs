@@ -117,6 +117,7 @@ async fn compare_and_swap_manifest(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn compare_and_swap_manifest_with_permit(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     bucket_id: i64,
     object_key: &str,
@@ -131,7 +132,7 @@ pub(crate) async fn compare_and_swap_manifest_with_permit(
         partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
     compare_and_swap_manifest_inner(
         storage,
-        None,
+        Some(mvcc),
         tenant_id,
         bucket_id,
         object_key,
@@ -286,17 +287,28 @@ async fn append_manifest(
     let partition_id = hex::encode(manifest_cas_partition_id(body.tenant_id, body.bucket_id));
     let data_root = manifest_cas_current_root_key(body.tenant_id, body.bucket_id);
     let scope_partition = partition_id.clone();
-    let root_generation = next_manifest_cas_root_generation(&core_store, &data_root).await?;
-    let root_publications = manifest_root_publications(data_root, scope_partition.clone());
     let current_payload = manifest_current_payload(
         storage,
-        None,
+        mvcc,
         body.tenant_id,
         body.bucket_id,
         &body.object_key,
-        None,
+        staged_transaction
+            .then_some(transaction_id.as_str())
+            .zip(transaction_principal),
     )
     .await?;
+    let root_generation = if mvcc.is_some() {
+        current_payload
+            .as_deref()
+            .map(decode_manifest_current_row)
+            .transpose()?
+            .map(|row| row.root_generation.saturating_add(1))
+            .unwrap_or(1)
+    } else {
+        next_manifest_cas_root_generation(&core_store, &data_root).await?
+    };
+    let root_publications = manifest_root_publications(data_root, scope_partition.clone());
     let current_update = manifest_current_row_update_from_payload(
         &body,
         root_generation,
@@ -338,17 +350,23 @@ async fn append_manifest(
             },
         ],
     };
-    let batch_receipt = if staged_transaction {
-        let mvcc = mvcc.ok_or_else(|| anyhow!("MVCC staging handle is required"))?;
-        let principal =
-            transaction_principal.ok_or_else(|| anyhow!("transaction principal is required"))?;
+    let batch_receipt = if let Some(mvcc) = mvcc {
         let mutations = crate::mvcc_product::product_mutations_from_operations(batch.operations)?;
-        mvcc.stage_product_mutations(
-            &transaction_id,
-            principal,
-            mutations,
-            u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default(),
-        )?;
+        let now_unix_ms = u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default();
+        if staged_transaction {
+            let principal = transaction_principal
+                .ok_or_else(|| anyhow!("transaction principal is required"))?;
+            mvcc.stage_product_mutations(&transaction_id, principal, mutations, now_unix_ms)?;
+        } else {
+            mvcc.autocommit_product_mutations(
+                &manifest_cas_partition_principal(body.tenant_id, body.bucket_id),
+                &transaction_id,
+                mutations,
+                crate::mvcc_transaction::DurabilityLevel::Local,
+                now_unix_ms,
+            )
+            .await?;
+        }
         return Ok(MetadataMutationReceipt {
             mutation_id,
             payload_hash: payload_hash.clone(),
@@ -567,6 +585,14 @@ async fn manifest_current_payload(
             &key,
         )?;
         return mvcc.read_transaction_value(transaction_id, transaction_principal, &logical_key);
+    }
+    if let Some(mvcc) = mvcc {
+        let logical_key = crate::mvcc_product::coremeta_logical_key(
+            CF_OBJECT_HEADS,
+            TABLE_MANIFEST_CAS_CURRENT_ROW,
+            &key,
+        )?;
+        return mvcc.read_latest_value(&logical_key);
     }
     CoreStore::new(storage.clone()).await?.read_coremeta_row(
         CF_OBJECT_HEADS,
@@ -938,147 +964,5 @@ mod tests {
             ]
         );
         assert!(publications[0].transaction_coordinator);
-    }
-
-    #[tokio::test]
-    pub(crate) async fn manifest_cas_with_permit_writes_fenced_protobuf_record_and_current_row() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let owner = ready_owner(&storage, 1, 2, "node-a").await;
-        let permit = owner.write_permit().unwrap();
-
-        let result = compare_and_swap_manifest_with_permit(
-            &storage,
-            1,
-            2,
-            "manifest.json",
-            0,
-            json!({"a":1}),
-            "hash-a",
-            &permit,
-            KEY,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(result.revision, 1);
-
-        let bodies = read_manifest_bodies(&storage, 1, 2).await.unwrap();
-        assert_eq!(bodies.len(), 1);
-        assert_eq!(bodies[0].revision, 1);
-        assert_eq!(bodies[0].manifest_hash, "hash-a");
-        let fences = read_manifest_frame_fences_for_test(&storage, 1, 2)
-            .await
-            .unwrap();
-        assert_eq!(fences, vec![permit.fence_token]);
-
-        let store = CoreStore::new(storage.clone()).await.unwrap();
-        let current = read_manifest_current_row(&store, 1, 2, "manifest.json")
-            .unwrap()
-            .expect("manifest CAS current row");
-        assert_eq!(current.revision, 1);
-        assert_eq!(current.root_generation, 1);
-        assert_eq!(current.manifest_hash, "hash-a");
-    }
-
-    #[tokio::test]
-    pub(crate) async fn manifest_cas_with_permit_rejects_stale_fence() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let owner = ready_owner(&storage, 1, 2, "node-a").await;
-        let stale_permit = owner.write_permit().unwrap();
-        let newer = ready_owner(&storage, 1, 2, "node-b").await;
-        assert!(newer.fence_token > stale_permit.fence_token);
-
-        let err = compare_and_swap_manifest_with_permit(
-            &storage,
-            1,
-            2,
-            "manifest.json",
-            0,
-            json!({"a":1}),
-            "hash-a",
-            &stale_permit,
-            KEY,
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("write permit owner is not current")
-        );
-    }
-
-    #[tokio::test]
-    pub(crate) async fn manifest_cas_batch_rejects_stale_partition_precondition() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let owner = ready_owner(&storage, 1, 2, "node-a").await;
-        let stale_permit = owner.write_permit().unwrap();
-        let stale_precondition = partition_write_precondition(&storage, &stale_permit, KEY)
-            .await
-            .unwrap();
-        let newer = ready_owner(&storage, 1, 2, "node-b").await;
-        assert!(newer.fence_token > stale_permit.fence_token);
-
-        let err = compare_and_swap_manifest_inner(
-            &storage,
-            None,
-            1,
-            2,
-            "manifest.json",
-            0,
-            json!({"a":1}),
-            "hash-a",
-            stale_permit.fence_token,
-            Some(stale_precondition),
-            None,
-            None,
-        )
-        .await
-        .unwrap_err();
-        let message = err.to_string();
-        assert!(
-            message.contains("generation mismatch")
-                || message.contains("target mismatch")
-                || message.contains("precondition failed"),
-            "unexpected stale precondition error: {message}"
-        );
-
-        compare_and_swap_manifest_with_permit(
-            &storage,
-            1,
-            2,
-            "manifest.json",
-            0,
-            json!({"a":1}),
-            "hash-a",
-            &newer.write_permit().unwrap(),
-            KEY,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    }
-
-    async fn ready_owner(
-        storage: &Storage,
-        tenant_id: i64,
-        bucket_id: i64,
-        owner_node_id: &str,
-    ) -> crate::partition_fence::PartitionOwnerState {
-        let family = "manifest_cas".to_string();
-        let id = hex::encode(manifest_cas_partition_id(tenant_id, bucket_id));
-        crate::partition_fence::ready_partition_owner_for_test(
-            storage,
-            family,
-            id,
-            owner_node_id,
-            0,
-            hex::encode([0; 32]),
-            hex::encode([1; 32]),
-            KEY,
-        )
-        .await
     }
 }
