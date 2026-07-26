@@ -86,6 +86,13 @@ impl Persistence {
             .ok_or_else(|| anyhow!("MVCC subsystem is not installed"))
     }
 
+    pub(crate) fn mvcc_arc(&self) -> Result<Arc<crate::mvcc_bootstrap::MvccSubsystem>> {
+        self.mvcc
+            .get()
+            .cloned()
+            .ok_or_else(|| anyhow!("MVCC subsystem is not installed"))
+    }
+
     pub fn task_notify(&self) -> Arc<Notify> {
         self.task_notify.clone()
     }
@@ -594,8 +601,7 @@ impl Persistence {
         if bucket.region == target_region {
             return Ok(bucket);
         }
-        crate::mesh_lifecycle::ensure_region_accepts_new_writes(&self.storage, target_region)
-            .await?;
+        crate::mesh_lifecycle::ensure_region_accepts_new_writes(&self.storage, target_region)?;
 
         let target_cell = self
             .choose_bucket_home_cell(target_region)

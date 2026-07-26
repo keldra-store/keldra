@@ -107,8 +107,7 @@ impl Persistence {
         if inputs.is_empty() {
             return Err(anyhow!("object batch must not be empty"));
         }
-        let bucket = bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id)
-            .await?
+        let bucket = bucket_journal::read_current_bucket_by_id_mvcc(self.mvcc()?, bucket_id)?
             .ok_or_else(|| anyhow!("bucket not found"))?;
         if bucket.tenant_id != tenant_id {
             return Err(anyhow!("bucket does not belong to tenant"));
@@ -330,8 +329,7 @@ impl Persistence {
     ) -> Result<Object> {
         let total_start = std::time::Instant::now();
         let step_start = std::time::Instant::now();
-        let bucket = bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id)
-            .await?
+        let bucket = bucket_journal::read_current_bucket_by_id_mvcc(self.mvcc()?, bucket_id)?
             .ok_or_else(|| anyhow!("bucket not found"))?;
         if bucket.tenant_id != tenant_id {
             return Err(anyhow!("bucket does not belong to tenant"));
@@ -503,9 +501,9 @@ impl Persistence {
             return Err(object_links::ObjectLinkError::InvalidTargetKey);
         }
 
-        let bucket = bucket_journal::read_current_bucket_by_id(&self.storage, request.bucket_id)
-            .await?
-            .ok_or(object_links::ObjectLinkError::BucketNotFound)?;
+        let bucket =
+            bucket_journal::read_current_bucket_by_id_mvcc(self.mvcc()?, request.bucket_id)?
+                .ok_or(object_links::ObjectLinkError::BucketNotFound)?;
         if bucket.tenant_id != request.tenant_id {
             return Err(object_links::ObjectLinkError::BucketTenantMismatch);
         }
@@ -698,8 +696,7 @@ impl Persistence {
     }
 
     pub async fn get_object(&self, bucket_id: i64, key: &str) -> Result<Option<Object>> {
-        let Some(bucket) =
-            bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
+        let Some(bucket) = bucket_journal::read_current_bucket_by_id_mvcc(self.mvcc()?, bucket_id)?
         else {
             return Ok(None);
         };
@@ -714,8 +711,7 @@ impl Persistence {
         Option<object_links::ObjectLinkDescriptor>,
         object_links::ObjectLinkError,
     > {
-        let Some(bucket) =
-            bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
+        let Some(bucket) = bucket_journal::read_current_bucket_by_id_mvcc(self.mvcc()?, bucket_id)?
         else {
             return Ok(None);
         };
@@ -735,8 +731,7 @@ impl Persistence {
         prefix: Option<&str>,
     ) -> std::result::Result<Vec<object_links::ObjectLinkDescriptor>, object_links::ObjectLinkError>
     {
-        let Some(bucket) =
-            bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
+        let Some(bucket) = bucket_journal::read_current_bucket_by_id_mvcc(self.mvcc()?, bucket_id)?
         else {
             return Err(object_links::ObjectLinkError::BucketNotFound);
         };
@@ -774,9 +769,9 @@ impl Persistence {
             return Err(object_links::ObjectLinkError::InvalidLinkKey);
         }
 
-        let bucket = bucket_journal::read_current_bucket_by_id(&self.storage, request.bucket_id)
-            .await?
-            .ok_or(object_links::ObjectLinkError::BucketNotFound)?;
+        let bucket =
+            bucket_journal::read_current_bucket_by_id_mvcc(self.mvcc()?, request.bucket_id)?
+                .ok_or(object_links::ObjectLinkError::BucketNotFound)?;
         if bucket.tenant_id != request.tenant_id {
             return Err(object_links::ObjectLinkError::BucketTenantMismatch);
         }
@@ -916,8 +911,7 @@ impl Persistence {
         bucket_id: i64,
         link_key: &str,
     ) -> std::result::Result<Object, object_links::ObjectLinkError> {
-        let Some(bucket) =
-            bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
+        let Some(bucket) = bucket_journal::read_current_bucket_by_id_mvcc(self.mvcc()?, bucket_id)?
         else {
             return Err(object_links::ObjectLinkError::BucketNotFound);
         };
@@ -962,8 +956,7 @@ impl Persistence {
         key: &str,
         version_id: uuid::Uuid,
     ) -> Result<Option<Object>> {
-        let Some(bucket) =
-            bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
+        let Some(bucket) = bucket_journal::read_current_bucket_by_id_mvcc(self.mvcc()?, bucket_id)?
         else {
             return Ok(None);
         };
@@ -975,8 +968,7 @@ impl Persistence {
         bucket_id: i64,
         version_id: uuid::Uuid,
     ) -> Result<Option<Object>> {
-        let Some(bucket) =
-            bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
+        let Some(bucket) = bucket_journal::read_current_bucket_by_id_mvcc(self.mvcc()?, bucket_id)?
         else {
             return Ok(None);
         };
@@ -995,8 +987,7 @@ impl Persistence {
         limit: i32,
         delimiter: &str,
     ) -> Result<(Vec<Object>, Vec<String>)> {
-        let Some(bucket) =
-            bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
+        let Some(bucket) = bucket_journal::read_current_bucket_by_id_mvcc(self.mvcc()?, bucket_id)?
         else {
             return Ok((Vec::new(), Vec::new()));
         };
@@ -1041,8 +1032,7 @@ impl Persistence {
         transaction_principal: Option<&str>,
         options: ObjectCreateOptions,
     ) -> Result<Option<Object>> {
-        let Some(bucket) =
-            bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
+        let Some(bucket) = bucket_journal::read_current_bucket_by_id_mvcc(self.mvcc()?, bucket_id)?
         else {
             return Ok(None);
         };
@@ -1139,8 +1129,7 @@ impl Persistence {
         transaction_principal: Option<&str>,
         options: ObjectCreateOptions,
     ) -> Result<Option<Object>> {
-        let Some(bucket) =
-            bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
+        let Some(bucket) = bucket_journal::read_current_bucket_by_id_mvcc(self.mvcc()?, bucket_id)?
         else {
             return Ok(None);
         };
@@ -1199,8 +1188,7 @@ impl Persistence {
         version_id_marker: Option<uuid::Uuid>,
         limit: i32,
     ) -> Result<ObjectVersionsPage> {
-        let Some(bucket) =
-            bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
+        let Some(bucket) = bucket_journal::read_current_bucket_by_id_mvcc(self.mvcc()?, bucket_id)?
         else {
             return Ok(ObjectVersionsPage {
                 versions: Vec::new(),
@@ -1264,8 +1252,7 @@ impl Persistence {
     }
 
     async fn pending_object_metadata_compaction(&self, bucket_id: i64) -> Result<Option<Bucket>> {
-        let Some(bucket) =
-            bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
+        let Some(bucket) = bucket_journal::read_current_bucket_by_id_mvcc(self.mvcc()?, bucket_id)?
         else {
             return Ok(None);
         };

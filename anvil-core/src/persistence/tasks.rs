@@ -370,8 +370,8 @@ impl Persistence {
         let target = self.task_lease_target(task).await?;
         let now_nanos = current_time_nanos()?;
         let ttl_nanos = self.task_lease_ttl_nanos()?;
-        task_lease::acquire_task_lease(
-            &self.storage,
+        task_lease::acquire_task_lease_mvcc(
+            self.mvcc()?,
             task_lease::TaskLeaseAcquire {
                 task_id: task_lease_id(task.id)?,
                 task_kind: task.task_type.as_str().to_string(),
@@ -395,8 +395,8 @@ impl Persistence {
         lease: &task_lease::TaskLease,
         checkpoint_cursor: u128,
     ) -> Result<task_lease::TaskLease> {
-        task_lease::checkpoint_task_lease(
-            &self.storage,
+        task_lease::checkpoint_task_lease_mvcc(
+            self.mvcc()?,
             lease,
             checkpoint_cursor,
             current_time_nanos()?,
@@ -409,8 +409,12 @@ impl Persistence {
         &self,
         request: task_lease::TaskLeaseAcquire,
     ) -> Result<task_lease::TaskLease> {
-        task_lease::acquire_task_lease(&self.storage, request, &self.partition_owner_signing_key)
-            .await
+        task_lease::acquire_task_lease_mvcc(
+            self.mvcc()?,
+            request,
+            &self.partition_owner_signing_key,
+        )
+        .await
     }
 
     pub async fn checkpoint_named_task_lease(
@@ -418,8 +422,8 @@ impl Persistence {
         expected: &task_lease::TaskLease,
         checkpoint_cursor: u128,
     ) -> Result<task_lease::TaskLease> {
-        task_lease::checkpoint_task_lease(
-            &self.storage,
+        task_lease::checkpoint_task_lease_mvcc(
+            self.mvcc()?,
             expected,
             checkpoint_cursor,
             current_time_nanos()?,
@@ -535,9 +539,9 @@ impl Persistence {
         match task.task_type {
             crate::tasks::TaskType::ObjectMetadataCompaction => {
                 let bucket_id = task_payload_i64(task, "bucket_id")?;
-                let bucket = bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id)
-                    .await?
-                    .ok_or_else(|| anyhow!("object metadata compaction bucket not found"))?;
+                let bucket =
+                    bucket_journal::read_current_bucket_by_id_mvcc(self.mvcc()?, bucket_id)?
+                        .ok_or_else(|| anyhow!("object metadata compaction bucket not found"))?;
                 let stats = metadata_journal::active_object_journal_stats(
                     &self.storage,
                     &bucket,

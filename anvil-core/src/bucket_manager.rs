@@ -81,11 +81,12 @@ impl BucketManager {
         )
         .await?;
 
-        let existing_bucket =
-            bucket_journal::read_current_bucket(&self.storage, claims.tenant_id, bucket_name)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?
-                .ok_or_else(|| Status::not_found("Bucket not found"))?;
+        let existing_bucket = self
+            .persistence
+            .get_bucket_by_name(claims.tenant_id, bucket_name)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Bucket not found"))?;
         if self
             .persistence
             .bucket_has_retained_objects_or_uploads(existing_bucket.id)
@@ -143,11 +144,12 @@ impl BucketManager {
         )
         .await?;
 
-        let bucket =
-            bucket_journal::read_current_bucket(&self.storage, claims.tenant_id, bucket_name)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?
-                .ok_or_else(|| Status::not_found("Bucket not found"))?;
+        let bucket = self
+            .persistence
+            .get_bucket_by_name(claims.tenant_id, bucket_name)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Bucket not found"))?;
 
         Ok(serde_json::json!({
             "is_public_read": bucket.is_public_read,

@@ -511,8 +511,7 @@ async fn require_mesh_bucket_manage(
     tenant_id: i64,
     bucket_name: &str,
 ) -> Result<(), Status> {
-    let bucket = bucket_journal::read_current_bucket(&state.storage, tenant_id, bucket_name)
-        .await
+    let bucket = bucket_journal::read_current_bucket_mvcc(&state.mvcc, tenant_id, bucket_name)
         .map_err(|err| Status::internal(err.to_string()))?
         .ok_or_else(|| Status::not_found("bucket not found"))?;
     access_control::require_system_realm_permission(
@@ -522,7 +521,6 @@ async fn require_mesh_bucket_manage(
         &access_control::bucket_object_id(&bucket),
         "manage_bucket",
     )
-    .await
 }
 
 fn admin_claims<T>(request: &Request<T>) -> Result<auth::Claims, Status> {

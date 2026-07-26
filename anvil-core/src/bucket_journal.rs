@@ -142,20 +142,6 @@ pub(crate) async fn stage_bucket_mutation_in_transaction(
     Ok(())
 }
 
-pub async fn read_current_bucket_by_id(
-    storage: &Storage,
-    bucket_id: i64,
-) -> Result<Option<Bucket>> {
-    let current = read_current_bucket_by_id_row(storage, bucket_id).await?;
-    let Some(current) = current else {
-        return Ok(None);
-    };
-    if current.bucket.id != bucket_id {
-        return Err(anyhow!("CoreStore bucket current id row scope mismatch"));
-    }
-    Ok(current.into_active_bucket())
-}
-
 pub fn next_bucket_id_mvcc(mvcc: &crate::mvcc_bootstrap::MvccSubsystem) -> Result<i64> {
     let key = bucket_mvcc_key(
         TABLE_BUCKET_ID_ALLOCATOR_ROW,
@@ -818,39 +804,6 @@ fn bucket_current_coremeta_operations_with_root(
         }],
     };
     Ok(operations)
-}
-
-async fn read_current_bucket_for_tenant_row(
-    storage: &Storage,
-    tenant_id: i64,
-    bucket_name: &str,
-) -> Result<Option<BucketCurrentRow>> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let tuple_key = tenant_bucket_name_current_tuple_key(tenant_id, bucket_name)?;
-    let Some(payload) =
-        core_store.read_coremeta_row(CF_MESH, TABLE_BUCKET_CURRENT_BY_NAME_ROW, &tuple_key)?
-    else {
-        return Ok(None);
-    };
-    decode_bucket_current_row(&payload)
-        .with_context(|| format!("decode bucket current CoreMeta row {tenant_id}/{bucket_name}"))
-        .map(Some)
-}
-
-async fn read_current_bucket_by_id_row(
-    storage: &Storage,
-    bucket_id: i64,
-) -> Result<Option<BucketCurrentRow>> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let tuple_key = global_bucket_id_current_tuple_key(bucket_id)?;
-    let Some(payload) =
-        core_store.read_coremeta_row(CF_MESH, TABLE_BUCKET_CURRENT_BY_ID_ROW, &tuple_key)?
-    else {
-        return Ok(None);
-    };
-    decode_bucket_current_row(&payload)
-        .with_context(|| format!("decode bucket current CoreMeta row id/{bucket_id}"))
-        .map(Some)
 }
 
 fn encode_bucket_current_row_with_root(

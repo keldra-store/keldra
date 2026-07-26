@@ -316,8 +316,7 @@ impl Persistence {
         source_cursor: u128,
         authority: index_builder::IndexBuildAuthority<'_>,
     ) -> Result<Option<index_builder::IndexBuildOutcome>> {
-        let Some(bucket) =
-            bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
+        let Some(bucket) = bucket_journal::read_current_bucket_by_id_mvcc(self.mvcc()?, bucket_id)?
         else {
             return Ok(None);
         };

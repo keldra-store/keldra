@@ -65,8 +65,7 @@ async fn public_action_resource_for_system_tuple(
         }
         crate::system_realm::SYSTEM_BUCKET_NAMESPACE => {
             let bucket_id = grant.object_id.parse::<i64>().ok()?;
-            let bucket = bucket_journal::read_current_bucket_by_id(&state.storage, bucket_id)
-                .await
+            let bucket = bucket_journal::read_current_bucket_by_id_mvcc(&state.mvcc, bucket_id)
                 .ok()
                 .flatten()?;
             let action = match grant.relation.as_str() {
@@ -84,11 +83,10 @@ async fn public_action_resource_for_system_tuple(
         }
         crate::system_realm::SYSTEM_OBJECT_NAMESPACE => {
             let (bucket_id, key) = grant.object_id.split_once('/')?;
-            let bucket = bucket_journal::read_current_bucket_by_id(
-                &state.storage,
+            let bucket = bucket_journal::read_current_bucket_by_id_mvcc(
+                &state.mvcc,
                 bucket_id.parse::<i64>().ok()?,
             )
-            .await
             .ok()
             .flatten()?;
             let action = match grant.relation.as_str() {
@@ -102,11 +100,10 @@ async fn public_action_resource_for_system_tuple(
         }
         crate::system_realm::SYSTEM_INDEX_NAMESPACE => {
             let (bucket_id, index) = grant.object_id.split_once('/')?;
-            let bucket = bucket_journal::read_current_bucket_by_id(
-                &state.storage,
+            let bucket = bucket_journal::read_current_bucket_by_id_mvcc(
+                &state.mvcc,
                 bucket_id.parse::<i64>().ok()?,
             )
-            .await
             .ok()
             .flatten()?;
             let action = match grant.relation.as_str() {
@@ -119,11 +116,10 @@ async fn public_action_resource_for_system_tuple(
         }
         crate::system_realm::SYSTEM_STREAM_NAMESPACE => {
             let (bucket_id, stream_key) = grant.object_id.split_once('/')?;
-            let bucket = bucket_journal::read_current_bucket_by_id(
-                &state.storage,
+            let bucket = bucket_journal::read_current_bucket_by_id_mvcc(
+                &state.mvcc,
                 bucket_id.parse::<i64>().ok()?,
             )
-            .await
             .ok()
             .flatten()?;
             let action = match grant.relation.as_str() {

@@ -9,8 +9,7 @@ impl AppState {
         if !validation::is_valid_bucket_name(bucket_name) {
             return Err(Status::invalid_argument("Invalid bucket name"));
         }
-        bucket_journal::read_current_bucket(&self.storage, tenant_id, bucket_name)
-            .await
+        bucket_journal::read_current_bucket_mvcc(&self.mvcc, tenant_id, bucket_name)
             .map_err(|error| Status::internal(error.to_string()))?
             .ok_or_else(|| Status::not_found("Bucket not found"))
     }

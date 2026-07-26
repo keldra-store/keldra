@@ -1508,10 +1508,13 @@ impl ObjectManager {
                 "Bucket reads require authenticated tenant claims or an explicit tenant route",
             )
         })?;
-        let bucket = bucket_journal::read_current_bucket(&self.storage, tenant_id, bucket_name)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("Bucket not found for this tenant"))?;
+        let bucket = bucket_journal::read_current_bucket_mvcc(
+            self.installed_mvcc()?,
+            tenant_id,
+            bucket_name,
+        )
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found("Bucket not found for this tenant"))?;
 
         if bucket.region != self.region {
             return Err(self.remote_bucket_status(&bucket.region));
@@ -1872,10 +1875,13 @@ impl ObjectManager {
             return Err(self.remote_bucket_status(locator.home_region.as_str()));
         }
 
-        let bucket = bucket_journal::read_current_bucket(&self.storage, tenant_id, bucket_name)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("Bucket not found"))?;
+        let bucket = bucket_journal::read_current_bucket_mvcc(
+            self.installed_mvcc()?,
+            tenant_id,
+            bucket_name,
+        )
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found("Bucket not found"))?;
 
         if bucket.region != self.region {
             return Err(self.remote_bucket_status(&bucket.region));

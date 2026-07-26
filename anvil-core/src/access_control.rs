@@ -67,19 +67,24 @@ fn authz_runtime_relation_for_action(action: AnvilAction, resource: &str) -> Opt
 }
 
 async fn read_claims_bucket(
-    storage: &Storage,
+    persistence: &Persistence,
     claims: &auth::Claims,
     bucket_name: &str,
 ) -> Result<Bucket, Status> {
-    bucket_journal::read_current_bucket(storage, claims.tenant_id, bucket_name)
-        .await
-        .map_err(|error| Status::internal(error.to_string()))?
-        .ok_or_else(|| Status::not_found("Bucket not found"))
+    bucket_journal::read_current_bucket_mvcc(
+        persistence
+            .mvcc()
+            .map_err(|error| Status::internal(error.to_string()))?,
+        claims.tenant_id,
+        bucket_name,
+    )
+    .map_err(|error| Status::internal(error.to_string()))?
+    .ok_or_else(|| Status::not_found("Bucket not found"))
 }
 
 pub async fn action_allows(
     storage: &Storage,
-    _persistence: &Persistence,
+    persistence: &Persistence,
     claims: &auth::Claims,
     action: AnvilAction,
     resource: &str,
@@ -119,7 +124,7 @@ pub async fn action_allows(
             .await
         }
         AnvilAction::BucketRead | AnvilAction::BucketWrite | AnvilAction::BucketDelete => {
-            let bucket = read_claims_bucket(storage, claims, resource).await?;
+            let bucket = read_claims_bucket(persistence, claims, resource).await?;
             let relation = match action {
                 AnvilAction::BucketRead => "list_objects",
                 AnvilAction::BucketWrite | AnvilAction::BucketDelete => "manage_bucket",
@@ -138,7 +143,7 @@ pub async fn action_allows(
 
         AnvilAction::ObjectList => {
             let (bucket_name, _) = split_bucket_key(resource);
-            let bucket = read_claims_bucket(storage, claims, bucket_name).await?;
+            let bucket = read_claims_bucket(persistence, claims, bucket_name).await?;
             system_realm_relationship_allows(
                 storage,
                 claims,
@@ -151,7 +156,7 @@ pub async fn action_allows(
         }
         AnvilAction::ObjectRead | AnvilAction::ObjectWrite | AnvilAction::ObjectDelete => {
             let (bucket_name, key) = split_bucket_key(resource);
-            let bucket = read_claims_bucket(storage, claims, bucket_name).await?;
+            let bucket = read_claims_bucket(persistence, claims, bucket_name).await?;
             let relation = match action {
                 AnvilAction::ObjectRead => "get",
                 AnvilAction::ObjectWrite => "put",
@@ -207,7 +212,7 @@ pub async fn action_allows(
 
         AnvilAction::StreamCreate => {
             let (bucket_name, _) = split_bucket_key(resource);
-            let bucket = read_claims_bucket(storage, claims, bucket_name).await?;
+            let bucket = read_claims_bucket(persistence, claims, bucket_name).await?;
             system_realm_relationship_allows(
                 storage,
                 claims,
@@ -223,7 +228,7 @@ pub async fn action_allows(
             let stream_key = stream_key.ok_or_else(|| {
                 Status::invalid_argument("stream action resource must be bucket/stream")
             })?;
-            let bucket = read_claims_bucket(storage, claims, bucket_name).await?;
+            let bucket = read_claims_bucket(persistence, claims, bucket_name).await?;
             let relation = match action {
                 AnvilAction::StreamAppend => "append",
                 AnvilAction::StreamRead => "read",
@@ -247,7 +252,7 @@ pub async fn action_allows(
         | AnvilAction::IndexRead
         | AnvilAction::IndexWatch => {
             let (bucket_name, index_name) = split_bucket_key(resource);
-            let bucket = read_claims_bucket(storage, claims, bucket_name).await?;
+            let bucket = read_claims_bucket(persistence, claims, bucket_name).await?;
             let relation = match action {
                 AnvilAction::IndexCreate | AnvilAction::IndexUpdate | AnvilAction::IndexDelete => {
                     "define"
@@ -640,18 +645,24 @@ fn normalize_delegation_resource(tenant_id: i64, resource: &str) -> Result<Strin
 }
 
 async fn read_bucket_for_tenant(
-    storage: &Storage,
+    persistence: &Persistence,
     tenant_id: i64,
     bucket_name: &str,
 ) -> Result<Bucket, Status> {
-    bucket_journal::read_current_bucket(storage, tenant_id, bucket_name)
-        .await
-        .map_err(|error| Status::internal(error.to_string()))?
-        .ok_or_else(|| Status::not_found("Bucket not found"))
+    bucket_journal::read_current_bucket_mvcc(
+        persistence
+            .mvcc()
+            .map_err(|error| Status::internal(error.to_string()))?,
+        tenant_id,
+        bucket_name,
+    )
+    .map_err(|error| Status::internal(error.to_string()))?
+    .ok_or_else(|| Status::not_found("Bucket not found"))
 }
 
 pub async fn delegated_relation_for_action(
     storage: &Storage,
+    persistence: &Persistence,
     tenant_id: i64,
     action: AnvilAction,
     resource: &str,
@@ -684,7 +695,7 @@ pub async fn delegated_relation_for_action(
             relation: "list_buckets".to_string(),
         }),
         AnvilAction::BucketRead | AnvilAction::BucketWrite | AnvilAction::BucketDelete => {
-            let bucket = read_bucket_for_tenant(storage, tenant_id, &resource).await?;
+            let bucket = read_bucket_for_tenant(persistence, tenant_id, &resource).await?;
             Ok(DelegatedSystemRelation {
                 namespace: system_realm_namespace(SYSTEM_BUCKET_NAMESPACE),
                 object_id: bucket_object_id(&bucket),
@@ -699,7 +710,7 @@ pub async fn delegated_relation_for_action(
 
         AnvilAction::ObjectList => {
             let (bucket_name, _) = split_bucket_key(&resource);
-            let bucket = read_bucket_for_tenant(storage, tenant_id, bucket_name).await?;
+            let bucket = read_bucket_for_tenant(persistence, tenant_id, bucket_name).await?;
             Ok(DelegatedSystemRelation {
                 namespace: system_realm_namespace(SYSTEM_BUCKET_NAMESPACE),
                 object_id: bucket_object_id(&bucket),
@@ -708,7 +719,7 @@ pub async fn delegated_relation_for_action(
         }
         AnvilAction::ObjectRead | AnvilAction::ObjectWrite | AnvilAction::ObjectDelete => {
             let (bucket_name, key) = split_bucket_key(&resource);
-            let bucket = read_bucket_for_tenant(storage, tenant_id, bucket_name).await?;
+            let bucket = read_bucket_for_tenant(persistence, tenant_id, bucket_name).await?;
             if let Some(key) = key {
                 Ok(DelegatedSystemRelation {
                     namespace: system_realm_namespace(SYSTEM_OBJECT_NAMESPACE),
@@ -742,7 +753,7 @@ pub async fn delegated_relation_for_action(
         | AnvilAction::IndexRead
         | AnvilAction::IndexWatch => {
             let (bucket_name, index_name) = split_bucket_key(&resource);
-            let bucket = read_bucket_for_tenant(storage, tenant_id, bucket_name).await?;
+            let bucket = read_bucket_for_tenant(persistence, tenant_id, bucket_name).await?;
             if let Some(index_name) = index_name {
                 Ok(DelegatedSystemRelation {
                     namespace: system_realm_namespace(SYSTEM_INDEX_NAMESPACE),
@@ -774,7 +785,7 @@ pub async fn delegated_relation_for_action(
 
         AnvilAction::StreamCreate => {
             let (bucket_name, _) = split_bucket_key(&resource);
-            let bucket = read_bucket_for_tenant(storage, tenant_id, bucket_name).await?;
+            let bucket = read_bucket_for_tenant(persistence, tenant_id, bucket_name).await?;
             Ok(DelegatedSystemRelation {
                 namespace: system_realm_namespace(SYSTEM_BUCKET_NAMESPACE),
                 object_id: bucket_object_id(&bucket),
@@ -786,7 +797,7 @@ pub async fn delegated_relation_for_action(
             let stream_key = stream_key.ok_or_else(|| {
                 Status::invalid_argument("stream delegation resource must be bucket/stream")
             })?;
-            let bucket = read_bucket_for_tenant(storage, tenant_id, bucket_name).await?;
+            let bucket = read_bucket_for_tenant(persistence, tenant_id, bucket_name).await?;
             Ok(DelegatedSystemRelation {
                 namespace: system_realm_namespace(SYSTEM_STREAM_NAMESPACE),
                 object_id: stream_object_id(&bucket, stream_key),
@@ -934,7 +945,8 @@ pub async fn write_delegated_action_tuple(
     reason: &str,
 ) -> Result<(), Status> {
     let relation =
-        delegated_relation_for_action(storage, tenant_id, action.clone(), resource).await?;
+        delegated_relation_for_action(storage, persistence, tenant_id, action.clone(), resource)
+            .await?;
     let assignment_relation = delegated_assignment_relation(&action, &relation);
     let record = persistence
         .write_authz_tuple(
@@ -981,8 +993,14 @@ pub async fn write_delegated_action_tuple_batch(
 
     let mut mutations = Vec::with_capacity(policies.len());
     for (action, resource) in policies {
-        let relation =
-            delegated_relation_for_action(storage, tenant_id, action.clone(), resource).await?;
+        let relation = delegated_relation_for_action(
+            storage,
+            persistence,
+            tenant_id,
+            action.clone(),
+            resource,
+        )
+        .await?;
         let assignment_relation = delegated_assignment_relation(action, &relation);
         mutations.push(AuthzTupleBatchMutation {
             namespace: relation.namespace,

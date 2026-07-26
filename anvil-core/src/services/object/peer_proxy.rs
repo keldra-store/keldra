@@ -15,12 +15,11 @@ pub(super) async fn native_put_route_target(
     claims: &auth::Claims,
     metadata: &ObjectMetadata,
 ) -> Result<Option<CoreMetaPeerTarget>, Status> {
-    let Some(bucket) = bucket_journal::read_current_bucket(
-        &state.storage,
+    let Some(bucket) = bucket_journal::read_current_bucket_mvcc(
+        &state.mvcc,
         claims.tenant_id,
         &metadata.bucket_name,
     )
-    .await
     .map_err(|error| Status::internal(error.to_string()))?
     else {
         return Ok(None);

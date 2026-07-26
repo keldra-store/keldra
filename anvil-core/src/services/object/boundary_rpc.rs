@@ -13,8 +13,7 @@ pub(super) async fn put_boundary_schema_rpc(
     let req = request.into_inner();
     require_bucket_scope(state, &claims, &req.bucket_name, AnvilAction::BucketWrite).await?;
     let bucket =
-        bucket_journal::read_current_bucket(&state.storage, claims.tenant_id, &req.bucket_name)
-            .await
+        bucket_journal::read_current_bucket_mvcc(&state.mvcc, claims.tenant_id, &req.bucket_name)
             .map_err(|error| Status::internal(error.to_string()))?
             .ok_or_else(|| Status::not_found("Bucket not found"))?;
 
@@ -38,7 +37,6 @@ pub(super) async fn put_boundary_schema_rpc(
     } else {
         core_store
             .read_boundary_schema(&boundary_bucket_key)
-            .await
             .map_err(|error| Status::internal(error.to_string()))?
     };
     let generation = match (current.as_ref(), req.expected_generation) {
@@ -207,8 +205,7 @@ pub(super) async fn get_boundary_schema_rpc(
     let _consistency = object_read_consistency(req.consistency.as_ref())?;
     require_bucket_scope(state, &claims, &req.bucket_name, AnvilAction::BucketRead).await?;
     let bucket =
-        bucket_journal::read_current_bucket(&state.storage, claims.tenant_id, &req.bucket_name)
-            .await
+        bucket_journal::read_current_bucket_mvcc(&state.mvcc, claims.tenant_id, &req.bucket_name)
             .map_err(|error| Status::internal(error.to_string()))?
             .ok_or_else(|| Status::not_found("Bucket not found"))?;
     let boundary_bucket_key =
@@ -217,7 +214,6 @@ pub(super) async fn get_boundary_schema_rpc(
         state
             .core_store
             .read_boundary_schema_generation(&boundary_bucket_key, generation)
-            .await
     } else {
         state
             .core_store
@@ -480,8 +476,7 @@ pub(super) async fn start_boundary_migration_rpc(
     let req = request.into_inner();
     require_bucket_scope(state, &claims, &req.bucket_name, AnvilAction::BucketWrite).await?;
     let bucket =
-        bucket_journal::read_current_bucket(&state.storage, claims.tenant_id, &req.bucket_name)
-            .await
+        bucket_journal::read_current_bucket_mvcc(&state.mvcc, claims.tenant_id, &req.bucket_name)
             .map_err(|error| Status::internal(error.to_string()))?
             .ok_or_else(|| Status::not_found("Bucket not found"))?;
     let boundary_bucket_key =
@@ -489,7 +484,6 @@ pub(super) async fn start_boundary_migration_rpc(
     let current = state
         .core_store
         .read_boundary_schema(&boundary_bucket_key)
-        .await
         .map_err(|error| Status::internal(error.to_string()))?
         .ok_or_else(|| Status::failed_precondition("Boundary schema not found"))?;
     if req.from_generation == 0
@@ -616,14 +610,12 @@ pub(super) async fn get_boundary_migration_rpc(
     let req = request.into_inner();
     require_bucket_scope(state, &claims, &req.bucket_name, AnvilAction::BucketRead).await?;
     let bucket =
-        bucket_journal::read_current_bucket(&state.storage, claims.tenant_id, &req.bucket_name)
-            .await
+        bucket_journal::read_current_bucket_mvcc(&state.mvcc, claims.tenant_id, &req.bucket_name)
             .map_err(|error| Status::internal(error.to_string()))?
             .ok_or_else(|| Status::not_found("Bucket not found"))?;
     let boundary_bucket_key =
         crate::core_store::boundary_schema_bucket_key(claims.tenant_id, &bucket.name);
-    let row = read_boundary_migration_row(state, &boundary_bucket_key, &req.migration_id)
-        .await?
+    let row = read_boundary_migration_row(state, &boundary_bucket_key, &req.migration_id)?
         .ok_or_else(|| Status::not_found("Boundary migration not found"))?;
     Ok(Response::new(boundary_migration_status(row)))
 }

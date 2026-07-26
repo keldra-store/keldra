@@ -339,8 +339,7 @@ impl AppState {
             &bucket,
             BucketJournalMutation::Create,
             transaction_id,
-        )
-        .await?;
+        )?;
         Ok(bucket)
     }
 
@@ -356,17 +355,17 @@ impl AppState {
             claims,
             AnvilAction::BucketDelete,
             &req.bucket_name,
+        )?;
+        let bucket = bucket_journal::read_current_bucket_mvcc(
+            &self.mvcc,
+            claims.tenant_id,
+            &req.bucket_name,
         )
-        .await?;
-        let bucket =
-            bucket_journal::read_current_bucket(&self.storage, claims.tenant_id, &req.bucket_name)
-                .await
-                .map_err(|err| Status::internal(err.to_string()))?
-                .ok_or_else(|| Status::not_found("Bucket not found"))?;
+        .map_err(|err| Status::internal(err.to_string()))?
+        .ok_or_else(|| Status::not_found("Bucket not found"))?;
         if self
             .persistence
             .bucket_has_retained_objects_or_uploads(bucket.id)
-            .await
             .map_err(|err| Status::internal(err.to_string()))?
         {
             return Err(Status::failed_precondition("Bucket not empty"));
@@ -396,19 +395,20 @@ impl AppState {
             &req.bucket_name,
         )
         .await?;
-        let mut bucket =
-            bucket_journal::read_current_bucket(&self.storage, claims.tenant_id, &req.bucket_name)
-                .await
-                .map_err(|err| Status::internal(err.to_string()))?
-                .ok_or_else(|| Status::not_found("Bucket not found"))?;
+        let mut bucket = bucket_journal::read_current_bucket_mvcc(
+            &self.mvcc,
+            claims.tenant_id,
+            &req.bucket_name,
+        )
+        .map_err(|err| Status::internal(err.to_string()))?
+        .ok_or_else(|| Status::not_found("Bucket not found"))?;
         bucket.is_public_read = is_public_read;
         self.stage_bucket_metadata_transaction(
             claims,
             &bucket,
             BucketJournalMutation::Update,
             transaction_id,
-        )
-        .await?;
+        )?;
         Ok(bucket)
     }
 

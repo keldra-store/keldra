@@ -163,7 +163,7 @@ impl Persistence {
         );
         let tenant_permit = async {
             let step_start = std::time::Instant::now();
-            let permit = self.bucket_tenant_write_permit(tenant_id).await;
+            let permit = self.bucket_tenant_write_permit(tenant_id);
             crate::emit_test_timing(
                 "persistence.create_bucket tenant_write_permit",
                 step_start.elapsed(),
@@ -249,7 +249,7 @@ impl Persistence {
             bucket_journal::read_current_bucket_mvcc(self.mvcc()?, tenant_id, bucket_name)?
                 .ok_or_else(|| anyhow!("bucket not found"))?;
         out.is_public_read = is_public;
-        let tenant_permit = self.bucket_tenant_write_permit(out.tenant_id).await?;
+        let tenant_permit = self.bucket_tenant_write_permit(out.tenant_id)?;
         let global_permit = self.bucket_global_write_permit().await?;
         let _validated_permits = (&tenant_permit, &global_permit);
         bucket_journal::build_bucket_mvcc_mutation_plan(
@@ -271,7 +271,7 @@ impl Persistence {
     pub async fn soft_delete_bucket(&self, tenant_id: i64, name: &str) -> Result<Option<Bucket>> {
         let deleted = bucket_journal::read_current_bucket_mvcc(self.mvcc()?, tenant_id, name)?;
         if let Some(bucket) = &deleted {
-            let tenant_permit = self.bucket_tenant_write_permit(bucket.tenant_id).await?;
+            let tenant_permit = self.bucket_tenant_write_permit(bucket.tenant_id)?;
             let global_permit = self.bucket_global_write_permit().await?;
             let _validated_permits = (&tenant_permit, &global_permit);
             bucket_journal::build_bucket_mvcc_mutation_plan(
@@ -303,7 +303,7 @@ impl Persistence {
         if has_objects {
             return Ok(true);
         }
-        multipart_journal::has_active_multipart_upload(&self.storage, bucket_id).await
+        multipart_journal::has_active_multipart_upload(&self.storage, bucket_id)
     }
 
     pub async fn hard_delete_bucket_if_empty(&self, bucket_id: i64) -> Result<bool> {

@@ -158,17 +158,16 @@ pub(super) async fn validate_native_mutation_context(
     require_native_context_field("request_id", &context.request_id)?;
     require_native_context_field("precondition", &context.precondition)?;
     require_native_context_field("idempotency_key", &context.idempotency_key)?;
-    let bucket = bucket_journal::read_current_bucket(&state.storage, claims.tenant_id, bucket_name)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found("BucketNotFound"))?;
+    let bucket =
+        bucket_journal::read_current_bucket_mvcc(&state.mvcc, claims.tenant_id, bucket_name)
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("BucketNotFound"))?;
     if context.bucket_id > 0 && bucket.id != context.bucket_id {
         return Err(Status::permission_denied("Native mutation bucket mismatch"));
     }
 
     if let Some(required_revision) = parse_authz_zookie(&context.authz_zookie_optional)? {
         let latest = authz_journal::latest_authz_revision(&state.storage, claims.tenant_id)
-            .await
             .map_err(|e| Status::internal(e.to_string()))?;
         if latest < required_revision {
             return Err(Status::failed_precondition("AuthzRevisionUnavailable"));
