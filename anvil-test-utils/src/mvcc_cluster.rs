@@ -69,6 +69,8 @@ impl RealMvccCluster {
                 jwt_secret: "e2e-secret".into(),
                 anvil_secret_encryption_key:
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                bootstrap_system_admin_subject_kind: "app".into(),
+                bootstrap_system_admin_subject_id: "e2e-admin".into(),
                 node_id: format!("{cluster_id}-node-{}", index + 1),
                 region: "e2e-region".into(),
                 storage_path: directory
