@@ -136,6 +136,7 @@ impl CorePendingMutationTarget {
 pub(super) enum CorePendingMutationFinalisationResult {
     StreamStateLocator(CoreManifestLocator),
     ObjectRef(CoreObjectRef),
+    MutationBatchReceipt(CoreMutationBatchReceipt),
 }
 
 #[derive(Debug, Clone)]
@@ -396,7 +397,7 @@ mod core_pending_mutation_target_proto {
 struct CorePendingMutationFinalisationResultProto {
     #[prost(
         oneof = "core_pending_mutation_finalisation_result_proto::Kind",
-        tags = "1, 2"
+        tags = "1, 2, 3"
     )]
     kind: Option<core_pending_mutation_finalisation_result_proto::Kind>,
 }
@@ -410,6 +411,8 @@ mod core_pending_mutation_finalisation_result_proto {
         StreamStateLocator(Vec<u8>),
         #[prost(string, tag = "2")]
         ObjectRef(String),
+        #[prost(bytes, tag = "3")]
+        MutationBatchReceipt(Vec<u8>),
     }
 }
 
@@ -1530,6 +1533,12 @@ fn result_to_proto(
                     .with_context(|| "encode CoreStore finalised object ref")?,
             )
         }
+        CorePendingMutationFinalisationResult::MutationBatchReceipt(receipt) => {
+            core_pending_mutation_finalisation_result_proto::Kind::MutationBatchReceipt(
+                serde_json::to_vec(receipt)
+                    .context("encode CoreStore mutation batch finalisation receipt")?,
+            )
+        }
     };
     Ok(CorePendingMutationFinalisationResultProto { kind: Some(kind) })
 }
@@ -1551,6 +1560,12 @@ fn result_from_proto(
             CorePendingMutationFinalisationResult::ObjectRef(
                 decode_core_object_ref_target(&object_ref)
                     .with_context(|| "decode CoreStore finalised object ref")?,
+            )
+        }
+        core_pending_mutation_finalisation_result_proto::Kind::MutationBatchReceipt(receipt) => {
+            CorePendingMutationFinalisationResult::MutationBatchReceipt(
+                serde_json::from_slice(&receipt)
+                    .context("decode CoreStore mutation batch finalisation receipt")?,
             )
         }
     })

@@ -15,7 +15,6 @@ struct StreamBatchState {
 
 pub(super) struct PreparedMutationBatch {
     pub owned_ops: Vec<OwnedCoreMetaBatchOp>,
-    pub legacy_updates: Vec<CoreTransactionUpdate>,
     pub stream_appends: Vec<CoreCommittedStreamAppend>,
 }
 
@@ -188,7 +187,6 @@ pub(super) async fn prepare_mutation_batch_operations(
         .collect::<Result<Vec<_>>>()?;
     Ok(PreparedMutationBatch {
         owned_ops,
-        legacy_updates: updates,
         stream_appends,
     })
 }

@@ -325,10 +325,6 @@ impl CoreStore {
         }
         Self::complete_implicit_stream_root_publications(&mut batch)?;
         validate_batch_partitions(&batch)?;
-        let requested_preconditions_hash = core_mutation_preconditions_hash(&batch.preconditions)?;
-        let requested_operations_hash =
-            core_mutation_logical_operations_hash(&batch.operations, &batch.root_publications)?;
-
         let step_start = std::time::Instant::now();
         let operation_guards = self.acquire_batch_locks(&batch).await?;
         crate::emit_test_timing(
@@ -337,51 +333,6 @@ impl CoreStore {
         );
         self.validate_mutation_root_publications_unlocked(&batch, false)?;
         let step_start = std::time::Instant::now();
-        if let Some(transaction) = self
-            .read_transaction_unlocked(&batch.transaction_id)
-            .await?
-        {
-            if matches!(
-                transaction.state,
-                CoreTransactionState::Committed | CoreTransactionState::FinalisationFailed
-            ) {
-                let implicit_record = CoreImplicitMutationRecord::from_legacy(&transaction)
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "CoreStore transaction {} already exists with non-implicit state {}",
-                            batch.transaction_id,
-                            core_transaction_state_name(transaction.state)
-                        )
-                    })?;
-                validate_implicit_mutation_replay(
-                    &implicit_record,
-                    &batch,
-                    &requested_preconditions_hash,
-                    &requested_operations_hash,
-                )?;
-                if implicit_record.outcome == CoreMutationBatchOutcome::FinalisationFailed {
-                    return Ok(implicit_record.receipt());
-                }
-                let generation = implicit_record.committed_root_generation.ok_or_else(|| {
-                    anyhow!("CoreStore terminal mutation transaction has no coordinator generation")
-                })?;
-                if self.root_generation_is_published(
-                    &implicit_record.root_key_hash,
-                    generation,
-                    &implicit_record.transaction_id,
-                )? {
-                    return Ok(implicit_record.receipt());
-                }
-                bail!(
-                    "CoreStore admitted mutation coordinator publication is incomplete; durable repair is required"
-                );
-            }
-            bail!(
-                "CoreStore transaction {} already exists with non-implicit state {}",
-                batch.transaction_id,
-                core_transaction_state_name(transaction.state)
-            );
-        }
         self.bind_mutation_batch_root_generations_unlocked(&mut batch)
             .await?;
         crate::emit_test_timing(
@@ -414,8 +365,8 @@ impl CoreStore {
                         CorePendingMutationPayload::Landed(&batch_payload)
                     };
                 let step_start = std::time::Instant::now();
-                let admission = store
-                    .admit_core_mutation(
+                let admission = match store
+                    .admit_core_mutation_outcome(
                         "mutation.batch",
                         WriterFamily::CoreControl.as_str(),
                         CorePendingMutationTarget::MutationBatch {
@@ -428,7 +379,13 @@ impl CoreStore {
                         pending_mutation_payload,
                         Vec::new(),
                     )
-                    .await?;
+                    .await?
+                {
+                    CoreAdmissionOutcome::Pending(admission) => admission,
+                    CoreAdmissionOutcome::Finalised(finalisation) => {
+                        return mutation_batch_receipt_from_finalisation(finalisation);
+                    }
+                };
                 crate::emit_test_timing(
                     format!(
                         "core_store.commit_mutation_batch admission tx={finalisation_timing_name}"
@@ -459,17 +416,6 @@ impl CoreStore {
                                 "recover admitted CoreStore mutation after finalisation error: {first_error:#}"
                             )
                         })?;
-                        store
-                            .mark_pending_mutation_finalised_unlocked(
-                                &admission,
-                                match receipt.outcome {
-                                    CoreMutationBatchOutcome::Committed => "committed",
-                                    CoreMutationBatchOutcome::FinalisationFailed => {
-                                        "finalisation_failed"
-                                    }
-                                },
-                            )
-                            .await?;
                         if retryable_conflict {
                             Err(first_error)
                         } else {
@@ -506,20 +452,20 @@ impl CoreStore {
         admission: &CorePendingMutationRecord,
         timing_name: &str,
         initial_error: Option<String>,
-        revalidate_preconditions: bool,
+        _revalidate_preconditions: bool,
     ) -> Result<CoreMutationBatchReceipt> {
         let step_start = std::time::Instant::now();
         let mut prepared_coremeta_ops = Vec::new();
         let mut stream_appends = Vec::new();
-        let (visible_updates, finalisation_error) = match initial_error {
-            Some(error) => (Vec::new(), Some(error)),
+        let finalisation_error = match initial_error {
+            Some(error) => Some(error),
             None => match self.prepare_mutation_batch_operations_unlocked(batch).await {
                 Ok(prepared) => {
                     prepared_coremeta_ops = prepared.owned_ops;
                     stream_appends = prepared.stream_appends;
-                    (prepared.legacy_updates, None)
+                    None
                 }
-                Err(error) => (Vec::new(), Some(format!("{error:#}"))),
+                Err(error) => Some(format!("{error:#}")),
             },
         };
         crate::emit_test_timing(
@@ -527,68 +473,28 @@ impl CoreStore {
             step_start.elapsed(),
         );
 
-        let transaction_state = if finalisation_error.is_some() {
-            CoreTransactionState::FinalisationFailed
+        let outcome = if finalisation_error.is_some() {
+            CoreMutationBatchOutcome::FinalisationFailed
         } else {
-            CoreTransactionState::Committed
+            CoreMutationBatchOutcome::Committed
         };
-        let transaction_visible_updates = if finalisation_error.is_some() {
-            Vec::new()
-        } else {
-            visible_updates.clone()
-        };
-        let writer_families = batch
-            .root_publications
-            .iter()
-            .find(|publication| publication.transaction_coordinator)
-            .ok_or_else(|| anyhow!("CoreStore mutation batch has no coordinator publication"))?
-            .writer_families
-            .clone();
-        let mut implicit_record = CoreImplicitMutationRecord {
+        let receipt = CoreMutationBatchReceipt {
             transaction_id: batch.transaction_id.clone(),
             scope_partition: batch.scope_partition.clone(),
-            outcome: if transaction_state == CoreTransactionState::Committed {
-                CoreMutationBatchOutcome::Committed
-            } else {
-                CoreMutationBatchOutcome::FinalisationFailed
-            },
-            preconditions_hash: core_mutation_preconditions_hash(&batch.preconditions)?,
-            operations_hash: core_mutation_logical_operations_hash(
-                &batch.operations,
-                &batch.root_publications,
-            )?,
-            writer_families,
+            outcome,
             stream_appends: stream_appends.clone(),
-            legacy_updates: transaction_visible_updates,
             finalisation_error: finalisation_error.clone(),
-            committed_at: now_rfc3339(),
-            committed_by_principal: batch.committed_by_principal.clone(),
-            created_at_unix_nanos: current_unix_nanos_u64()?,
-            root_anchor_key: batch.scope_partition.clone(),
-            root_key_hash: root_key_hash(&batch.scope_partition),
-            committed_root_generation: None,
         };
-        if transaction_state == CoreTransactionState::Committed {
-            let transaction = implicit_record.as_legacy_transaction();
-            implicit_record.committed_root_generation = Some(
-                self.infer_implicit_transaction_coordinator_generation_unlocked(&transaction)
-                    .await?,
-            );
-        }
-        let transaction = implicit_record.as_legacy_transaction();
         let step_start = std::time::Instant::now();
-        let transaction_ops = self
-            .transaction_rows_as_coremeta_ops_unlocked(
-                &transaction,
-                &batch.preconditions,
-                revalidate_preconditions && finalisation_error.is_none(),
-            )
-            .await?;
-        prepared_coremeta_ops.extend(transaction_ops);
         self.mark_pending_mutation_finalised_with_result_and_ops_unlocked(
             admission,
-            core_transaction_state_name(transaction_state),
-            None,
+            match outcome {
+                CoreMutationBatchOutcome::Committed => "committed",
+                CoreMutationBatchOutcome::FinalisationFailed => "finalisation_failed",
+            },
+            Some(CorePendingMutationFinalisationResult::MutationBatchReceipt(
+                receipt.clone(),
+            )),
             prepared_coremeta_ops,
         )
         .await?;
@@ -597,13 +503,7 @@ impl CoreStore {
             step_start.elapsed(),
         );
 
-        Ok(CoreMutationBatchReceipt {
-            transaction_id: batch.transaction_id.clone(),
-            scope_partition: batch.scope_partition.clone(),
-            outcome: implicit_record.outcome,
-            stream_appends,
-            finalisation_error,
-        })
+        Ok(receipt)
     }
 
     pub(super) async fn recover_admitted_mutation_batch(
@@ -643,55 +543,6 @@ impl CoreStore {
         validate_batch_partitions(&batch)?;
         self.validate_admitted_mutation_root_publications(&batch, false)?;
         validate_admitted_batch_root_bindings(&batch)?;
-        let requested_preconditions_hash = core_mutation_preconditions_hash(&batch.preconditions)?;
-        let requested_operations_hash =
-            core_mutation_logical_operations_hash(&batch.operations, &batch.root_publications)?;
-
-        if let Some(transaction) = self
-            .read_transaction_unlocked(&batch.transaction_id)
-            .await?
-        {
-            if matches!(
-                transaction.state,
-                CoreTransactionState::Committed | CoreTransactionState::FinalisationFailed
-            ) {
-                let implicit_record = CoreImplicitMutationRecord::from_legacy(&transaction)
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "CoreStore transaction {} already exists with non-implicit state {}",
-                            batch.transaction_id,
-                            core_transaction_state_name(transaction.state)
-                        )
-                    })?;
-                validate_implicit_mutation_replay(
-                    &implicit_record,
-                    &batch,
-                    &requested_preconditions_hash,
-                    &requested_operations_hash,
-                )?;
-                if implicit_record.outcome == CoreMutationBatchOutcome::FinalisationFailed {
-                    return Ok(implicit_record.receipt());
-                }
-                let generation = implicit_record.committed_root_generation.ok_or_else(|| {
-                    anyhow!(
-                        "CoreStore terminal recovered transaction has no coordinator generation"
-                    )
-                })?;
-                if self.root_generation_is_published(
-                    &implicit_record.root_key_hash,
-                    generation,
-                    &implicit_record.transaction_id,
-                )? {
-                    return Ok(implicit_record.receipt());
-                }
-                bail!("CoreStore recovered transaction coordinator publication is incomplete");
-            }
-            bail!(
-                "CoreStore transaction {} already exists with non-implicit state {}",
-                batch.transaction_id,
-                core_transaction_state_name(transaction.state)
-            );
-        }
         let has_published_effect = self
             .mutation_batch_has_published_effect_unlocked(&batch)
             .await?;
@@ -1712,128 +1563,16 @@ impl CoreStore {
     }
 }
 
-struct CoreImplicitMutationRecord {
-    transaction_id: String,
-    scope_partition: String,
-    outcome: CoreMutationBatchOutcome,
-    preconditions_hash: String,
-    operations_hash: String,
-    writer_families: Vec<String>,
-    stream_appends: Vec<CoreCommittedStreamAppend>,
-    legacy_updates: Vec<CoreTransactionUpdate>,
-    finalisation_error: Option<String>,
-    committed_at: String,
-    committed_by_principal: String,
-    created_at_unix_nanos: u64,
-    root_anchor_key: String,
-    root_key_hash: String,
-    committed_root_generation: Option<u64>,
-}
-
-impl CoreImplicitMutationRecord {
-    fn from_legacy(transaction: &CoreTransaction) -> Option<Self> {
-        if transaction.purpose != "implicit_mutation_batch"
-            || !matches!(
-                transaction.state,
-                CoreTransactionState::Committed | CoreTransactionState::FinalisationFailed
-            )
-        {
-            return None;
-        }
-        Some(Self {
-            transaction_id: transaction.transaction_id.clone(),
-            scope_partition: transaction.scope_partition.clone(),
-            outcome: if transaction.state == CoreTransactionState::Committed {
-                CoreMutationBatchOutcome::Committed
-            } else {
-                CoreMutationBatchOutcome::FinalisationFailed
-            },
-            preconditions_hash: transaction.preconditions_hash.clone(),
-            operations_hash: transaction.operations_hash.clone(),
-            writer_families: transaction.writer_families.clone(),
-            stream_appends: transaction
-                .visible_updates
-                .iter()
-                .filter_map(committed_stream_append)
-                .collect(),
-            legacy_updates: transaction.visible_updates.clone(),
-            finalisation_error: transaction.finalisation_error.clone(),
-            committed_at: transaction.committed_at.clone(),
-            committed_by_principal: transaction.committed_by_principal.clone(),
-            created_at_unix_nanos: transaction.created_at_unix_nanos,
-            root_anchor_key: transaction.root_anchor_key.clone(),
-            root_key_hash: transaction.root_key_hash.clone(),
-            committed_root_generation: transaction.committed_root_generation,
-        })
+fn mutation_batch_receipt_from_finalisation(
+    finalisation: CorePendingMutationFinalisationRecord,
+) -> Result<CoreMutationBatchReceipt> {
+    match finalisation.result {
+        Some(CorePendingMutationFinalisationResult::MutationBatchReceipt(receipt)) => Ok(receipt),
+        _ => bail!(
+            "CoreStore finalised mutation batch {} has no compact receipt",
+            finalisation.mutation_id
+        ),
     }
-
-    fn as_legacy_transaction(&self) -> CoreTransaction {
-        let state = match self.outcome {
-            CoreMutationBatchOutcome::Committed => CoreTransactionState::Committed,
-            CoreMutationBatchOutcome::FinalisationFailed => {
-                CoreTransactionState::FinalisationFailed
-            }
-        };
-        CoreTransaction {
-            schema: CORE_TRANSACTION_SCHEMA.to_string(),
-            transaction_id: self.transaction_id.clone(),
-            scope_partition: self.scope_partition.clone(),
-            state,
-            preconditions_hash: self.preconditions_hash.clone(),
-            operations_hash: self.operations_hash.clone(),
-            writer_families: self.writer_families.clone(),
-            visible_updates: self.legacy_updates.clone(),
-            finalisation_error: self.finalisation_error.clone(),
-            committed_at: self.committed_at.clone(),
-            committed_by_principal: self.committed_by_principal.clone(),
-            created_at_unix_nanos: self.created_at_unix_nanos,
-            expires_at_unix_nanos: 0,
-            root_anchor_key: self.root_anchor_key.clone(),
-            root_key_hash: self.root_key_hash.clone(),
-            committed_root_generation: self.committed_root_generation,
-            purpose: "implicit_mutation_batch".to_string(),
-            failure_evidence: self.finalisation_error.clone(),
-            outcome: core_transaction_state_name(state).to_string(),
-        }
-    }
-
-    fn receipt(&self) -> CoreMutationBatchReceipt {
-        CoreMutationBatchReceipt {
-            transaction_id: self.transaction_id.clone(),
-            scope_partition: self.scope_partition.clone(),
-            outcome: self.outcome,
-            stream_appends: self.stream_appends.clone(),
-            finalisation_error: self.finalisation_error.clone(),
-        }
-    }
-}
-
-fn validate_implicit_mutation_replay(
-    transaction: &CoreImplicitMutationRecord,
-    batch: &CoreMutationBatch,
-    requested_preconditions_hash: &str,
-    requested_operations_hash: &str,
-) -> Result<()> {
-    let coordinator = batch
-        .root_publications
-        .iter()
-        .find(|publication| publication.transaction_coordinator)
-        .ok_or_else(|| anyhow!("CoreStore mutation batch has no coordinator publication"))?;
-    let expected_root_key_hash = root_key_hash(&batch.scope_partition);
-    let exact_replay = transaction.scope_partition == batch.scope_partition
-        && transaction.committed_by_principal == batch.committed_by_principal
-        && transaction.preconditions_hash == requested_preconditions_hash
-        && transaction.operations_hash == requested_operations_hash
-        && transaction.writer_families == coordinator.writer_families
-        && transaction.root_anchor_key == batch.scope_partition
-        && transaction.root_key_hash == expected_root_key_hash;
-    if !exact_replay {
-        bail!(
-            "CoreStore transaction {} idempotency conflict",
-            batch.transaction_id
-        );
-    }
-    Ok(())
 }
 
 fn merge_implicit_coordinator_generation(current: &mut Option<u64>, candidate: u64) -> Result<()> {
