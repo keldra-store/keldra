@@ -356,8 +356,9 @@ impl Persistence {
         let permit = self
             .append_metadata_write_permit(tenant_id, bucket_id)
             .await?;
-        append_journal::create_append_stream_with_permit(
+        append_journal::create_append_stream_with_permit_mvcc(
             &self.storage,
+            self.mvcc()?,
             tenant_id,
             bucket_id,
             bucket_name,
@@ -402,8 +403,9 @@ impl Persistence {
         stream_key: &str,
         stream_id: uuid::Uuid,
     ) -> Result<Option<AppendStream>> {
-        append_journal::get_active_append_stream(
+        append_journal::get_active_append_stream_mvcc(
             &self.storage,
+            self.mvcc()?,
             tenant_id,
             bucket_id,
             stream_key,

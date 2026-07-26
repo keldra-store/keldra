@@ -207,10 +207,12 @@ struct CoreObjectPlacementProto {
 
 mod read;
 
+#[cfg(test)]
+pub use read::get_active_append_stream;
 pub use read::{
     AppendStreamPage, AppendStreamRecordPage, append_record_source_cursor,
-    append_stream_has_records, get_active_append_stream, get_active_append_stream_in_transaction,
-    list_append_stream_records_page, list_append_streams_page,
+    append_stream_has_records, get_active_append_stream_in_transaction,
+    get_active_append_stream_mvcc, list_append_stream_records_page, list_append_streams_page,
 };
 use read::{
     append_record_cursor_stream_id, append_record_stream_id, append_state_stream_id,
@@ -239,6 +241,64 @@ async fn create_append_stream(
     .await
 }
 
+pub(crate) async fn create_append_stream_with_permit_mvcc(
+    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    bucket_id: i64,
+    bucket_name: &str,
+    stream_key: &str,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<AppendStreamMutation> {
+    require_append_metadata_permit(tenant_id, bucket_id, permit)?;
+    let partition_precondition =
+        partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
+    let journal_head_key = crate::mvcc_product::stream_logical_key(
+        crate::core_store::TABLE_STREAM_HEAD_ROW,
+        &append_metadata_stream_id(tenant_id, bucket_id),
+        None,
+    )?;
+    let id = mvcc
+        .read_latest_value(&journal_head_key)?
+        .map(|payload| decode_append_body(&payload))
+        .transpose()?
+        .and_then(|body| body.stream.map(|stream| stream.id))
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("append stream id overflow"))?;
+    let stream = AppendStream {
+        id,
+        tenant_id,
+        bucket_id,
+        bucket_name: bucket_name.to_string(),
+        stream_key: stream_key.to_string(),
+        stream_id: uuid::Uuid::new_v4(),
+        created_at: Utc::now(),
+        sealed_at: None,
+        segment_hash: None,
+    };
+    let (receipt, mutations) = append_body_mvcc_mutations(
+        tenant_id,
+        bucket_id,
+        AppendMutationKind::CreateStream,
+        stream.clone(),
+        None,
+        permit.fence_token,
+    )?;
+    let _ = partition_precondition;
+    mvcc.autocommit_product_mutations(
+        &append_metadata_partition_principal(tenant_id, bucket_id),
+        &format!("append-create:{}", receipt.mutation_id),
+        mutations,
+        crate::mvcc_transaction::DurabilityLevel::Local,
+        u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default(),
+    )
+    .await?;
+    Ok(AppendStreamMutation { stream, receipt })
+}
+
+#[cfg(test)]
 pub(crate) async fn create_append_stream_with_permit(
     storage: &Storage,
     tenant_id: i64,
@@ -734,6 +794,28 @@ fn stage_append_body_mvcc(
     transaction_id: &str,
     transaction_principal: &str,
 ) -> Result<MetadataMutationReceipt> {
+    let (receipt, mutations) =
+        append_body_mvcc_mutations(tenant_id, bucket_id, event, stream, record, fence_token)?;
+    mvcc.stage_product_mutations(
+        transaction_id,
+        transaction_principal,
+        mutations,
+        u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default(),
+    )?;
+    Ok(receipt)
+}
+
+fn append_body_mvcc_mutations(
+    tenant_id: i64,
+    bucket_id: i64,
+    event: AppendMutationKind,
+    stream: AppendStream,
+    record: Option<AppendStreamRecord>,
+    fence_token: u64,
+) -> Result<(
+    MetadataMutationReceipt,
+    Vec<crate::mvcc_product::ProductMutation>,
+)> {
     let mutation_id = uuid::Uuid::new_v4();
     let body = AppendBody {
         event: event.as_str().to_string(),
@@ -751,6 +833,14 @@ fn stage_append_body_mvcc(
         AppendMutationKind::AppendRecord => append_record_stream_id(&stream)?,
     };
     let mut mutations = vec![
+        crate::mvcc_product::ProductMutation::put(
+            crate::mvcc_product::stream_logical_key(
+                crate::core_store::TABLE_STREAM_HEAD_ROW,
+                &journal_stream_id,
+                None,
+            )?,
+            payload.clone(),
+        ),
         crate::mvcc_product::ProductMutation::put(
             crate::mvcc_product::stream_logical_key(
                 crate::core_store::TABLE_STREAM_RECORD_INDEX_ROW,
@@ -778,18 +868,15 @@ fn stage_append_body_mvcc(
             payload,
         ));
     }
-    mvcc.stage_product_mutations(
-        transaction_id,
-        transaction_principal,
+    Ok((
+        MetadataMutationReceipt {
+            mutation_id,
+            payload_hash: payload_hash.clone(),
+            record_hash: payload_hash,
+            watch_cursor: 0,
+        },
         mutations,
-        u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default(),
-    )?;
-    Ok(MetadataMutationReceipt {
-        mutation_id,
-        payload_hash: payload_hash.clone(),
-        record_hash: payload_hash,
-        watch_cursor: 0,
-    })
+    ))
 }
 
 fn stable_append_ordinal(mutation_id: uuid::Uuid) -> u64 {

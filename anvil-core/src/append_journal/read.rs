@@ -15,6 +15,27 @@ pub struct AppendStreamPage {
     pub next_stream_id: Option<String>,
 }
 
+pub async fn get_active_append_stream_mvcc(
+    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    bucket_id: i64,
+    stream_key: &str,
+    stream_id: uuid::Uuid,
+) -> Result<Option<AppendStream>> {
+    get_active_append_stream_for_optional_transaction(
+        storage,
+        Some(mvcc),
+        tenant_id,
+        bucket_id,
+        stream_key,
+        stream_id,
+        None,
+    )
+    .await
+}
+
+#[cfg(test)]
 pub async fn get_active_append_stream(
     storage: &Storage,
     tenant_id: i64,
@@ -70,6 +91,26 @@ pub(super) async fn get_active_append_stream_for_optional_transaction(
         )?;
         return mvcc
             .read_transaction_value(transaction_id, principal, &key)?
+            .map(|payload| {
+                decode_active_stream_state(
+                    &state_stream_id,
+                    tenant_id,
+                    bucket_id,
+                    stream_key,
+                    stream_id,
+                    &payload,
+                )
+            })
+            .transpose();
+    }
+    if let Some(mvcc) = mvcc {
+        let key = crate::mvcc_product::stream_logical_key(
+            crate::core_store::TABLE_STREAM_HEAD_ROW,
+            &state_stream_id,
+            None,
+        )?;
+        return mvcc
+            .read_latest_value(&key)?
             .map(|payload| {
                 decode_active_stream_state(
                     &state_stream_id,
