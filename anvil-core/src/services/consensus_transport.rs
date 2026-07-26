@@ -345,23 +345,39 @@ impl TonicConsensusRpcClient {
             })
             .await
             .map_err(|_| ConsensusRpcError::Unreachable("consensus stream closed".into()))?;
-        let response = session
-            .input
-            .message()
-            .await
-            .map_err(|error| ConsensusRpcError::Unreachable(error.to_string()))?
-            .ok_or_else(|| ConsensusRpcError::Unreachable("consensus stream ended".into()))?;
-        let Some(consensus_stream_response::Message::Reply(reply)) = response.message else {
-            return Err(ConsensusRpcError::Protocol(
-                "unexpected consensus stream response".into(),
-            ));
+        let reply = loop {
+            let response = session
+                .input
+                .message()
+                .await
+                .map_err(|error| ConsensusRpcError::Unreachable(error.to_string()))?
+                .ok_or_else(|| ConsensusRpcError::Unreachable("consensus stream ended".into()))?;
+            let Some(consensus_stream_response::Message::Reply(reply)) = response.message else {
+                return Err(ConsensusRpcError::Protocol(
+                    "unexpected consensus stream response".into(),
+                ));
+            };
+            if reply.request_id < request_id {
+                // OpenRaft can cancel this future at its own shorter RPC
+                // deadline. The server still completes that already-sent
+                // request, so its authenticated reply remains queued on the
+                // persistent stream. Discard it on the next call instead of
+                // poisoning the session's correlation sequence.
+                tracing::debug!(
+                    expected_request_id = request_id,
+                    stale_request_id = reply.request_id,
+                    "discarding late consensus reply after caller cancellation"
+                );
+                continue;
+            }
+            if reply.request_id > request_id {
+                return Err(ConsensusRpcError::Protocol(format!(
+                    "consensus response ID advanced past request: expected {request_id}, received {}",
+                    reply.request_id
+                )));
+            }
+            break reply;
         };
-        if reply.request_id != request_id {
-            return Err(ConsensusRpcError::Protocol(format!(
-                "consensus response ID mismatch: expected {request_id}, received {}",
-                reply.request_id
-            )));
-        }
         if !reply.error.is_empty() {
             return Err(ConsensusRpcError::Protocol(reply.error));
         }
