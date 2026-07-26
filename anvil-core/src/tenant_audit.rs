@@ -76,6 +76,8 @@ pub struct TenantAuditEventPage {
     pub revision: String,
 }
 
+/// Direct idempotent ingestion for external mesh/topology control events.
+/// Cluster product consequences must use `tenant_audit_mvcc_plan` atomically.
 pub async fn append_tenant_audit_event(storage: &Storage, event: &TenantAuditEvent) -> Result<()> {
     let core_store = CoreStore::new(storage.clone()).await?;
     let stream_id = tenant_audit_stream_id(event.tenant_id);

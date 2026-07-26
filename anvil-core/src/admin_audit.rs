@@ -78,6 +78,9 @@ pub struct AdminAuditEventPage {
     pub revision: String,
 }
 
+/// Direct idempotent ingestion for external mesh, region, topology, and
+/// security-control audit events. Cluster product consequences must use
+/// `admin_audit_mvcc_plan` in their originating transaction.
 pub async fn append_audit_event(storage: &Storage, event: &AdminAuditEvent) -> Result<()> {
     let core_store = CoreStore::new(storage.clone()).await?;
     let stream_id = audit_stream_id(&event.audit_event_id);

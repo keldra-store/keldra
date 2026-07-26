@@ -1031,28 +1031,39 @@ pub async fn write_delegated_action_tuple(
     operation: &str,
     written_by: &str,
     reason: &str,
+    audit_event: &crate::tenant_audit::TenantAuditEvent,
 ) -> Result<(), Status> {
     let relation =
         delegated_relation_for_action(storage, persistence, tenant_id, action.clone(), resource)
             .await?;
     let assignment_relation = delegated_assignment_relation(&action, &relation);
-    let record = persistence
-        .write_authz_tuple(
+    let records = persistence
+        .write_authz_tuple_batch_with_admin_audit(
             SYSTEM_STORAGE_TENANT_ID,
-            &relation.namespace,
-            &relation.object_id,
-            &assignment_relation,
-            APP_SUBJECT_KIND,
-            grantee_principal_id,
-            "",
-            operation,
+            vec![AuthzTupleBatchMutation {
+                namespace: relation.namespace,
+                object_id: relation.object_id,
+                relation: assignment_relation,
+                subject_kind: APP_SUBJECT_KIND.to_string(),
+                subject_id: grantee_principal_id.to_string(),
+                caveat_hash: String::new(),
+                operation: operation.to_string(),
+                reason: reason.to_string(),
+            }],
             written_by,
-            reason,
+            None,
+            Some(audit_event),
         )
         .await
         .map_err(authz_tuple_write_status)?;
     persistence
-        .materialize_authz_through_revision(SYSTEM_STORAGE_TENANT_ID, record.revision)
+        .materialize_authz_through_revision(
+            SYSTEM_STORAGE_TENANT_ID,
+            records
+                .first()
+                .ok_or_else(|| Status::internal("missing authz record"))?
+                .revision,
+        )
         .await
         .map_err(authz_tuple_write_status)?;
     Ok(())
@@ -1109,6 +1120,7 @@ pub async fn write_delegated_action_tuple_batch(
             mutations,
             written_by,
             Some(audit_event),
+            None,
         )
         .await
         .map_err(authz_tuple_write_status)?;

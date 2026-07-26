@@ -511,6 +511,22 @@ impl Persistence {
         )
     }
 
+    pub async fn list_append_stream_records_at_snapshot(
+        &self,
+        stream: &AppendStream,
+        snapshot: u64,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Result<append_journal::AppendStreamRecordPage> {
+        append_journal::list_append_stream_records_page_at_mvcc_snapshot(
+            self.mvcc()?,
+            stream,
+            snapshot,
+            after_sequence,
+            limit,
+        )
+    }
+
     pub async fn append_stream_has_records(
         &self,
         mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
@@ -518,6 +534,19 @@ impl Persistence {
         transaction: Option<(&str, &str)>,
     ) -> Result<bool> {
         append_journal::append_stream_has_records(mvcc.unwrap_or(self.mvcc()?), stream, transaction)
+    }
+
+    pub async fn append_stream_segment_hash(
+        &self,
+        mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
+        stream: &AppendStream,
+        transaction: Option<(&str, &str)>,
+    ) -> Result<(String, u64)> {
+        append_journal::append_stream_segment_hash(
+            mvcc.unwrap_or(self.mvcc()?),
+            stream,
+            transaction,
+        )
     }
 
     pub async fn list_append_streams_page(
@@ -706,7 +735,7 @@ impl Persistence {
         mutations: Vec<AuthzTupleBatchMutation>,
         written_by: &str,
     ) -> Result<Vec<AuthzTupleRecord>> {
-        self.write_authz_tuple_batch_with_admin_audit(tenant_id, mutations, written_by, None)
+        self.write_authz_tuple_batch_with_admin_audit(tenant_id, mutations, written_by, None, None)
             .await
     }
 
@@ -716,6 +745,7 @@ impl Persistence {
         mutations: Vec<AuthzTupleBatchMutation>,
         written_by: &str,
         audit_event: Option<&crate::admin_audit::AdminAuditEvent>,
+        tenant_audit_event: Option<&crate::tenant_audit::TenantAuditEvent>,
     ) -> Result<Vec<AuthzTupleRecord>> {
         let permit = self.authz_write_permit(tenant_id).await?;
         let writes = mutations
@@ -740,6 +770,7 @@ impl Persistence {
             &permit,
             &self.partition_owner_signing_key,
             audit_event,
+            tenant_audit_event,
         )
         .await?;
         if let Some(revision) = records.iter().map(|record| record.revision).max() {

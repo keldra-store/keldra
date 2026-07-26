@@ -176,10 +176,17 @@ pub(crate) async fn write_authz_tuple_with_permit(
 ) -> Result<AuthzTupleRecord> {
     require_authz_permit(input.tenant_id, permit)?;
     validate_optional_caveat_hash(input.caveat_hash)?;
-    let records =
-        write_authz_tuple_batch_mvcc(storage, mvcc, vec![input], None, permit.fence_token, None)
-            .await?
-            .records;
+    let records = write_authz_tuple_batch_mvcc(
+        storage,
+        mvcc,
+        vec![input],
+        None,
+        permit.fence_token,
+        None,
+        None,
+    )
+    .await?
+    .records;
     records
         .into_iter()
         .next()
@@ -193,6 +200,7 @@ pub(crate) async fn write_authz_tuple_batch_with_permit(
     permit: &PartitionWritePermit,
     _partition_owner_signing_key: &[u8],
     audit_event: Option<&crate::admin_audit::AdminAuditEvent>,
+    tenant_audit_event: Option<&crate::tenant_audit::TenantAuditEvent>,
 ) -> Result<Vec<AuthzTupleRecord>> {
     let Some(first) = inputs.first() else {
         return Err(anyhow!("authz tuple batch must not be empty"));
@@ -205,11 +213,17 @@ pub(crate) async fn write_authz_tuple_batch_with_permit(
         }
         validate_optional_caveat_hash(input.caveat_hash)?;
     }
-    Ok(
-        write_authz_tuple_batch_mvcc(storage, mvcc, inputs, None, permit.fence_token, audit_event)
-            .await?
-            .records,
+    Ok(write_authz_tuple_batch_mvcc(
+        storage,
+        mvcc,
+        inputs,
+        None,
+        permit.fence_token,
+        audit_event,
+        tenant_audit_event,
     )
+    .await?
+    .records)
 }
 
 pub(crate) async fn replay_authz_tuple_batch(
@@ -249,6 +263,7 @@ pub(crate) async fn write_authz_tuple_batch_conditionally_with_permit(
         Some(options),
         permit.fence_token,
         None,
+        None,
     )
     .await
 }
@@ -264,6 +279,7 @@ async fn write_authz_tuple_batch_mvcc(
     options: Option<&crate::persistence::AuthzTupleBatchWriteOptions>,
     fence_token: u64,
     audit_event: Option<&crate::admin_audit::AdminAuditEvent>,
+    tenant_audit_event: Option<&crate::tenant_audit::TenantAuditEvent>,
 ) -> Result<crate::persistence::AuthzTupleBatchWriteOutcome> {
     let first = inputs
         .first()
@@ -402,6 +418,23 @@ async fn write_authz_tuple_batch_mvcc(
     mvcc.stage_product_mutations(transaction_id, &principal, mutations, now_unix_ms)?;
     if let Some(audit_event) = audit_event {
         let audit_plan = crate::admin_audit::admin_audit_mvcc_plan(
+            audit_event,
+            u64::try_from(revision).context("authorization revision must be nonnegative")?,
+            transaction_id,
+        )?;
+        mvcc.stage_product_mutations(
+            transaction_id,
+            &principal,
+            audit_plan.mutations,
+            now_unix_ms,
+        )?;
+        for event in audit_plan.outbox_events {
+            mvcc.open_transactions
+                .add_stream_event(transaction_id, event, now_unix_ms)?;
+        }
+    }
+    if let Some(audit_event) = tenant_audit_event {
+        let audit_plan = crate::tenant_audit::tenant_audit_mvcc_plan(
             audit_event,
             u64::try_from(revision).context("authorization revision must be nonnegative")?,
             transaction_id,

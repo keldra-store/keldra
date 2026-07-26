@@ -454,6 +454,13 @@ impl AuthService for AppState {
         .await?;
 
         let app = app_in_claims_tenant(self, claims.tenant_id, &req.grantee_app_id).await?;
+        let audit_event = crate::services::audit::build_tenant_audit_event(
+            claims,
+            "policy-grant",
+            &req.resource,
+            "policy.grant",
+            serde_json::json!({ "grantee_app_id": app.id, "action": req.action }),
+        )?;
         access_control::write_delegated_action_tuple(
             &self.storage,
             &self.persistence,
@@ -464,15 +471,7 @@ impl AuthService for AppState {
             "add",
             &claims.sub,
             "tenant access grant",
-        )
-        .await?;
-        crate::services::audit::record_tenant_audit_event(
-            self,
-            claims,
-            "policy-grant",
-            &req.resource,
-            "policy.grant",
-            serde_json::json!({ "grantee_app_id": app.id, "action": req.action }),
+            &audit_event,
         )
         .await?;
 
@@ -505,6 +504,13 @@ impl AuthService for AppState {
             .action
             .parse::<AnvilAction>()
             .map_err(|_| Status::invalid_argument("Invalid delegated action"))?;
+        let audit_event = crate::services::audit::build_tenant_audit_event(
+            claims,
+            "policy-revoke",
+            &req.resource,
+            "policy.revoke",
+            serde_json::json!({ "grantee_app_id": app.id, "action": req.action }),
+        )?;
         access_control::write_delegated_action_tuple(
             &self.storage,
             &self.persistence,
@@ -515,15 +521,7 @@ impl AuthService for AppState {
             "remove",
             &claims.sub,
             "tenant access revoke",
-        )
-        .await?;
-        crate::services::audit::record_tenant_audit_event(
-            self,
-            claims,
-            "policy-revoke",
-            &req.resource,
-            "policy.revoke",
-            serde_json::json!({ "grantee_app_id": app.id, "action": req.action }),
+            &audit_event,
         )
         .await?;
 
