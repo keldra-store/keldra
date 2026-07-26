@@ -501,19 +501,18 @@ impl ObjectManager {
             u64::try_from(total_bytes).map_err(|_| Status::internal("Negative payload size"))?;
         let boundary_values = if prepared_ingest.is_some() {
             if options.visibility.requires_payload_boundary_extraction() {
-                return Err(Status::failed_precondition(
-                    "streaming MVCC ingest requires boundary hints; synchronous payload extraction is unavailable",
-                ));
+                Vec::new()
+            } else {
+                self.object_write_boundary_values_from_hints(
+                    tenant_id,
+                    &bucket.name,
+                    object_key,
+                    options.content_type.as_deref(),
+                    options.user_metadata.as_ref(),
+                    total_bytes_u64,
+                )
+                .await?
             }
-            self.object_write_boundary_values_from_hints(
-                tenant_id,
-                &bucket.name,
-                object_key,
-                options.content_type.as_deref(),
-                options.user_metadata.as_ref(),
-                total_bytes_u64,
-            )
-            .await?
         } else if options.visibility.requires_payload_boundary_extraction() {
             self.object_write_boundary_values_from_file(
                 tenant_id,
@@ -638,6 +637,16 @@ impl ObjectManager {
         );
 
         let step_start = std::time::Instant::now();
+        let materialisation_content_type = options.content_type.clone();
+        let materialisation_user_metadata = options
+            .user_metadata
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let materialisation_representation = if transaction_id.is_some() {
+            shard_map.clone()
+        } else {
+            None
+        };
         let object = self
             .persistence
             .create_object_with_storage_class_with_options(
@@ -658,6 +667,118 @@ impl ObjectManager {
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        if let (Some(transaction_id), Some(principal), Some(representation), Some(mvcc)) = (
+            transaction_id.as_deref(),
+            options.transaction_principal.as_deref(),
+            materialisation_representation,
+            self.mvcc.get(),
+        ) {
+            let boundary_schema = self
+                .core_store
+                .read_boundary_schema(&crate::core_store::boundary_schema_bucket_key(
+                    tenant_id,
+                    &bucket.name,
+                ))
+                .await
+                .map_err(|error| Status::internal(error.to_string()))?;
+            let boundary_schema_value = boundary_schema
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|error| Status::internal(error.to_string()))?;
+            let boundary_schema_hash = boundary_schema_value.as_ref().map(|schema| {
+                use sha2::Digest as _;
+                format!(
+                    "sha256:{}",
+                    hex::encode(sha2::Sha256::digest(
+                        serde_json::to_vec(schema).expect("schema serializes")
+                    ))
+                )
+            });
+            let target = format!(
+                "tenant/{tenant_id}/bucket/{}/object/{object_key}/version/{}",
+                bucket.id, object.version_id
+            );
+            let now = Self::current_unix_ms_for_object()?;
+            let job = crate::object_materialisation::ObjectMaterialisationJob {
+                schema: crate::object_materialisation::ObjectMaterialisationJob::SCHEMA.into(),
+                cluster_id: mvcc.cluster_id().to_string(),
+                transaction_id: transaction_id.to_string(),
+                tenant_id,
+                bucket_id: bucket.id,
+                bucket_name: bucket.name.clone(),
+                object_key: object_key.to_string(),
+                object_version_id: object.version_id.to_string(),
+                target_logical_identity: target,
+                representation,
+                payload_length: total_bytes_u64,
+                content_type: materialisation_content_type,
+                user_metadata: materialisation_user_metadata,
+                index_policy_snapshot: serde_json::json!({
+                    "snapshot": object.index_policy_snapshot.clone(),
+                }),
+                authz_revision: object.authz_revision,
+                boundary_schema_generation: boundary_schema
+                    .as_ref()
+                    .map(|schema| schema.generation)
+                    .unwrap_or(0),
+                boundary_schema: boundary_schema_value,
+                boundary_schema_hash,
+                requested_operations:
+                    crate::object_materialisation::ObjectMaterialisationOperations {
+                        extract_boundaries: options
+                            .visibility
+                            .requires_payload_boundary_extraction(),
+                        maintain_indexes: matches!(
+                            options.visibility.indexes,
+                            IndexMaintenanceVisibility::Enqueued
+                                | IndexMaintenanceVisibility::CaughtUp
+                        ),
+                    },
+                requested_at_unix_ms: now,
+            };
+            if job.requested_operations.extract_boundaries
+                || job.requested_operations.maintain_indexes
+            {
+                let job_id = job
+                    .job_id()
+                    .map_err(|error| Status::internal(error.to_string()))?;
+                let pending = crate::object_materialisation::ObjectMaterialisationResult {
+                    schema: crate::object_materialisation::ObjectMaterialisationResult::SCHEMA
+                        .into(),
+                    cluster_id: job.cluster_id.clone(),
+                    target_logical_identity: job.target_logical_identity.clone(),
+                    job_id,
+                    state: crate::object_materialisation::ObjectMaterialisationState::Pending,
+                    boundary_schema_hash: job.boundary_schema_hash.clone(),
+                    derived_boundaries: serde_json::json!([]),
+                    index_marker: serde_json::json!({"pending": true}),
+                    updated_at_unix_ms: now,
+                };
+                mvcc.stage_product_mutations(
+                    transaction_id,
+                    principal,
+                    vec![crate::mvcc_product::ProductMutation::put(
+                        pending
+                            .status_key()
+                            .map_err(|error| Status::internal(error.to_string()))?,
+                        pending
+                            .canonical_bytes()
+                            .map_err(|error| Status::internal(error.to_string()))?,
+                    )],
+                    now,
+                )
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                mvcc.open_transactions
+                    .add_job(
+                        transaction_id,
+                        job.canonical_bytes()
+                            .map_err(|error| Status::internal(error.to_string()))?,
+                        now,
+                    )
+                    .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            }
+        }
         crate::emit_test_timing(
             "object_manager.put_object persistence_create_object",
             step_start.elapsed(),
@@ -685,6 +806,13 @@ impl ObjectManager {
         crate::emit_test_timing("object_manager.put_object total", total_start.elapsed());
 
         Ok(object)
+    }
+
+    fn current_unix_ms_for_object() -> Result<u64, Status> {
+        let elapsed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| Status::internal("system clock precedes Unix epoch"))?;
+        u64::try_from(elapsed.as_millis()).map_err(|_| Status::internal("system time exceeds u64"))
     }
 
     pub async fn initiate_multipart_upload(
