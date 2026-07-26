@@ -37,6 +37,7 @@ pub(super) async fn put_boundary_schema_rpc(
     } else {
         core_store
             .read_boundary_schema(&boundary_bucket_key)
+            .await
             .map_err(|error| Status::internal(error.to_string()))?
     };
     let generation = match (current.as_ref(), req.expected_generation) {
@@ -214,6 +215,7 @@ pub(super) async fn get_boundary_schema_rpc(
         state
             .core_store
             .read_boundary_schema_generation(&boundary_bucket_key, generation)
+            .await
     } else {
         state
             .core_store
@@ -484,6 +486,7 @@ pub(super) async fn start_boundary_migration_rpc(
     let current = state
         .core_store
         .read_boundary_schema(&boundary_bucket_key)
+        .await
         .map_err(|error| Status::internal(error.to_string()))?
         .ok_or_else(|| Status::failed_precondition("Boundary schema not found"))?;
     if req.from_generation == 0
@@ -614,7 +617,8 @@ pub(super) async fn get_boundary_migration_rpc(
             .ok_or_else(|| Status::not_found("Bucket not found"))?;
     let boundary_bucket_key =
         crate::core_store::boundary_schema_bucket_key(claims.tenant_id, &bucket.name);
-    let row = read_boundary_migration_row(state, &boundary_bucket_key, &req.migration_id)?
+    let row = read_boundary_migration_row(state, &boundary_bucket_key, &req.migration_id)
+        .await?
         .ok_or_else(|| Status::not_found("Boundary migration not found"))?;
     Ok(Response::new(boundary_migration_status(row)))
 }

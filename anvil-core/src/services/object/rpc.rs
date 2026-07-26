@@ -1,6 +1,16 @@
 use super::*;
 use crate::object_manager;
 
+fn request_id<T>(request: &Request<T>) -> String {
+    request
+        .metadata()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+}
+
 pub(super) fn native_transaction_id(
     context: Option<&NativeMutationContext>,
 ) -> Result<Option<&str>, Status> {

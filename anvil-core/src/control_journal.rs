@@ -396,7 +396,11 @@ pub fn read_app_by_id_mvcc(
     if app.id != app_id {
         bail!("control app-id row does not match its key");
     }
-    Ok(Some(app_record(&app)))
+    Ok(Some(App {
+        id: app.id,
+        name: app.name,
+        client_id: app.client_id,
+    }))
 }
 
 pub fn read_app_by_tenant_name_mvcc(
@@ -411,7 +415,11 @@ pub fn read_app_by_tenant_name_mvcc(
     if app.tenant_id != tenant_id || app.name != name {
         bail!("control tenant-app row does not match its key");
     }
-    Ok(Some(app_record(&app)))
+    Ok(Some(App {
+        id: app.id,
+        name: app.name,
+        client_id: app.client_id,
+    }))
 }
 
 pub fn read_app_details_by_client_id_mvcc(

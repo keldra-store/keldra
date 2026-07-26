@@ -124,7 +124,7 @@ pub(crate) async fn execute_native_put(
                     &state.mvcc,
                     transaction_id,
                     &transaction_principal,
-                    &manifest,
+                    &ingest.manifest,
                     current_unix_ms()?,
                 )
                 .map_err(|error| Status::failed_precondition(error.to_string()))?;
