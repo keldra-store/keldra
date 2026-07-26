@@ -932,7 +932,10 @@ mod local_object_metadata;
 pub(crate) use local_object_metadata::{
     CurrentObjectMetadataPage, ObjectMetadataMutationGuard, ObjectMetadataPageCursor,
     ObjectMetadataPreconditionSnapshot, ObjectMetadataProjectionMutation,
-    ObjectVersionsMetadataPage, PreparedObjectMetadataProjection,
+    ObjectVersionsMetadataPage, PreparedObjectMetadataProjection, decode_object_metadata_max_id,
+    decode_object_metadata_row, object_current_key, object_current_page_key_for_object,
+    object_id_counter_key, object_version_id_key, object_version_key,
+    object_version_page_key_for_object, object_version_page_prefix,
 };
 #[path = "local_pending_finalisation.rs"]
 mod local_pending_finalisation;

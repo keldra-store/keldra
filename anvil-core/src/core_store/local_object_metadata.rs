@@ -277,7 +277,7 @@ struct DecodedObjectMetadataRow {
     delete_marker: bool,
 }
 
-fn decode_object_metadata_row(bytes: &[u8]) -> Result<Object> {
+pub(crate) fn decode_object_metadata_row(bytes: &[u8]) -> Result<Object> {
     Ok(decode_object_metadata_row_with_common(bytes)?.object)
 }
 
@@ -398,6 +398,10 @@ fn decode_object_metadata_counter_for_bucket(
         bail!("CoreStore object metadata counter max id must be non-negative");
     }
     Ok(proto)
+}
+
+pub(crate) fn decode_object_metadata_max_id(bytes: &[u8], bucket: &Bucket) -> Result<i64> {
+    Ok(decode_object_metadata_counter_for_bucket(bytes, bucket)?.max_id)
 }
 
 fn link_to_proto(link: &object_links::ObjectLinkTarget) -> ObjectLinkTargetProto {

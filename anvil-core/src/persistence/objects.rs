@@ -136,7 +136,7 @@ impl Persistence {
                     )
                     .await?
             }
-            (None, None) => core_store.next_object_metadata_id(&bucket).await?,
+            (None, None) => metadata_journal::next_object_id_mvcc(self.mvcc()?, &bucket)?,
             _ => {
                 return Err(anyhow!(
                     "transaction ID and principal must be supplied together"
@@ -207,6 +207,7 @@ impl Persistence {
             .await?;
         metadata_journal::commit_object_put_mutations_with_permit(
             &self.storage,
+            self.mvcc()?,
             &prepared.bucket,
             &prepared.objects,
             &permit,

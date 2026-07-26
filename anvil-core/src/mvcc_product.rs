@@ -81,6 +81,18 @@ pub fn coremeta_logical_key(cf: &str, table_id: u16, tuple_key: &[u8]) -> Result
     })
 }
 
+pub fn coremeta_application_prefix(cf: &str, tuple_prefix: &[u8]) -> Result<Vec<u8>> {
+    if cf.is_empty() {
+        bail!("CoreMeta column-family namespace must not be empty");
+    }
+    let mut application_prefix =
+        Vec::with_capacity(CORE_META_KEY_SCHEMA.len() + 2 + cf.len() + tuple_prefix.len());
+    application_prefix.extend_from_slice(CORE_META_KEY_SCHEMA);
+    push_len_prefixed(&mut application_prefix, cf.as_bytes())?;
+    application_prefix.extend_from_slice(tuple_prefix);
+    Ok(application_prefix)
+}
+
 /// Encode a stream position. Stream records and heads use their existing table
 /// IDs; the application key remains ordered by stream ID and sequence.
 pub fn stream_logical_key(

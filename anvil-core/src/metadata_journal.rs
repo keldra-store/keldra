@@ -1254,6 +1254,80 @@ pub async fn next_object_id(
         .await
 }
 
+pub fn next_object_id_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    bucket: &Bucket,
+) -> Result<i64> {
+    let tuple_key = crate::core_store::object_id_counter_key(bucket);
+    let logical_key = crate::mvcc_product::coremeta_logical_key(
+        crate::core_store::CF_OBJECT_VERSIONS,
+        crate::core_store::TABLE_OBJECT_VERSION_META_ROW,
+        &tuple_key,
+    )?;
+    let max_id = mvcc
+        .read_latest_value(&logical_key)?
+        .as_deref()
+        .map(|payload| crate::core_store::decode_object_metadata_max_id(payload, bucket))
+        .transpose()?
+        .unwrap_or_default();
+    max_id
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("object id overflow"))
+}
+
+pub fn read_current_object_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    bucket: &Bucket,
+    object_key: &str,
+) -> Result<Option<Object>> {
+    let tuple_key = crate::core_store::object_current_key(bucket, object_key);
+    let logical_key = crate::mvcc_product::coremeta_logical_key(
+        crate::core_store::CF_OBJECT_HEADS,
+        crate::core_store::TABLE_OBJECT_HEAD_ROW,
+        &tuple_key,
+    )?;
+    mvcc.read_latest_value(&logical_key)?
+        .as_deref()
+        .map(crate::core_store::decode_object_metadata_row)
+        .transpose()
+        .map(|object| object.filter(|object| object.deleted_at.is_none()))
+}
+
+pub fn read_object_version_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    bucket: &Bucket,
+    object_key: &str,
+    version_id: uuid::Uuid,
+) -> Result<Option<Object>> {
+    let tuple_key = crate::core_store::object_version_key(bucket, object_key, version_id);
+    let logical_key = crate::mvcc_product::coremeta_logical_key(
+        crate::core_store::CF_OBJECT_VERSIONS,
+        crate::core_store::TABLE_OBJECT_VERSION_META_ROW,
+        &tuple_key,
+    )?;
+    mvcc.read_latest_value(&logical_key)?
+        .as_deref()
+        .map(crate::core_store::decode_object_metadata_row)
+        .transpose()
+}
+
+pub fn read_object_version_by_id_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    bucket: &Bucket,
+    version_id: uuid::Uuid,
+) -> Result<Option<Object>> {
+    let tuple_key = crate::core_store::object_version_id_key(bucket, version_id);
+    let logical_key = crate::mvcc_product::coremeta_logical_key(
+        crate::core_store::CF_OBJECT_VERSIONS,
+        crate::core_store::TABLE_OBJECT_VERSION_META_ROW,
+        &tuple_key,
+    )?;
+    mvcc.read_latest_value(&logical_key)?
+        .as_deref()
+        .map(crate::core_store::decode_object_metadata_row)
+        .transpose()
+}
+
 pub async fn read_current_object(
     storage: &Storage,
     bucket: &Bucket,

@@ -97,6 +97,7 @@ pub(crate) async fn append_object_put_mutations_with_permit_in_transaction(
 
 pub(crate) async fn commit_object_put_mutations_with_permit(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     objects: &[Object],
     permit: &PartitionWritePermit,
@@ -106,7 +107,7 @@ pub(crate) async fn commit_object_put_mutations_with_permit(
 ) -> Result<()> {
     append_object_put_mutations_with_permit_inner(
         storage,
-        None,
+        Some(mvcc),
         bucket,
         objects,
         permit,
@@ -228,35 +229,95 @@ async fn append_object_put_mutations_with_permit_inner(
     let batch = CoreMutationBatch {
         transaction_id: transaction_id.to_string(),
         scope_partition,
-        committed_by_principal,
+        committed_by_principal: committed_by_principal.clone(),
         root_publications,
         preconditions,
         operations,
     };
+    let mvcc = mvcc.ok_or_else(|| anyhow!("MVCC staging handle is required"))?;
+    let predicates =
+        object_put_predicates(mvcc, bucket, objects, transaction_id, transaction_principal)?;
+    let mutations = crate::mvcc_product::product_mutations_from_operations(batch.operations)?;
     if let Some(transaction_principal) = transaction_principal {
-        let mvcc = mvcc.ok_or_else(|| anyhow!("MVCC staging handle is required"))?;
-        let mutations = crate::mvcc_product::product_mutations_from_operations(batch.operations)?;
         mvcc.stage_product_mutations(
             transaction_id,
             transaction_principal,
             mutations,
             u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
         )?;
+        let now_unix_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default();
+        for (key, kind) in predicates {
+            mvcc.stage_predicate(
+                transaction_id,
+                transaction_principal,
+                key,
+                kind,
+                now_unix_ms,
+            )?;
+        }
         return Ok(());
     }
-    let receipt = { core_store.commit_mutation_batch(batch).await? };
-    if !receipt.is_committed() {
-        bail!(
-            "object metadata mutation batch did not commit: {}",
-            receipt
-                .finalisation_error
-                .as_deref()
-                .unwrap_or("unknown finalisation error")
-        );
-    }
-    require_stream_update(&receipt, &metadata_stream_id)?;
-    require_stream_update(&receipt, &watch_stream_id)?;
+    mvcc.autocommit_product_mutations_with_predicates(
+        &committed_by_principal,
+        transaction_id,
+        mutations,
+        predicates,
+        crate::mvcc_transaction::DurabilityLevel::Local,
+        u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+    )
+    .await?;
     Ok(())
+}
+
+fn object_put_predicates(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    bucket: &Bucket,
+    objects: &[Object],
+    transaction_id: &str,
+    transaction_principal: Option<&str>,
+) -> Result<
+    Vec<(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )>,
+> {
+    use crate::mvcc_transaction::PredicateKind;
+
+    let mut keys = Vec::with_capacity(objects.len() * 3 + 1);
+    for object in objects {
+        keys.push(crate::mvcc_product::coremeta_logical_key(
+            crate::core_store::CF_OBJECT_HEADS,
+            crate::core_store::TABLE_OBJECT_HEAD_ROW,
+            &crate::core_store::object_current_key(bucket, &object.key),
+        )?);
+        keys.push(crate::mvcc_product::coremeta_logical_key(
+            crate::core_store::CF_OBJECT_VERSIONS,
+            crate::core_store::TABLE_OBJECT_VERSION_META_ROW,
+            &crate::core_store::object_version_key(bucket, &object.key, object.version_id),
+        )?);
+        keys.push(crate::mvcc_product::coremeta_logical_key(
+            crate::core_store::CF_OBJECT_VERSIONS,
+            crate::core_store::TABLE_OBJECT_VERSION_META_ROW,
+            &crate::core_store::object_version_id_key(bucket, object.version_id),
+        )?);
+    }
+    keys.push(crate::mvcc_product::coremeta_logical_key(
+        crate::core_store::CF_OBJECT_VERSIONS,
+        crate::core_store::TABLE_OBJECT_VERSION_META_ROW,
+        &crate::core_store::object_id_counter_key(bucket),
+    )?);
+    keys.into_iter()
+        .map(|key| {
+            let visible = match transaction_principal {
+                Some(principal) => mvcc.read_transaction_value(transaction_id, principal, &key)?,
+                None => mvcc.read_latest_value(&key)?,
+            };
+            let kind = visible
+                .map(|payload| PredicateKind::ValueHash(*blake3::hash(&payload).as_bytes()))
+                .unwrap_or(PredicateKind::Absent);
+            Ok((key, kind))
+        })
+        .collect()
 }
 
 fn coalesce_coremeta_operations_last_write_wins(

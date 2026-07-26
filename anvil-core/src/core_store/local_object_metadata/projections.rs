@@ -915,7 +915,7 @@ fn validate_version_page_row_key(
     Ok(())
 }
 
-pub(super) fn object_current_key(bucket: &Bucket, object_key: &str) -> Vec<u8> {
+pub(crate) fn object_current_key(bucket: &Bucket, object_key: &str) -> Vec<u8> {
     meta_tuple_key(&[
         b"object-current",
         &bucket.tenant_id.to_be_bytes(),
@@ -924,7 +924,7 @@ pub(super) fn object_current_key(bucket: &Bucket, object_key: &str) -> Vec<u8> {
     ])
 }
 
-pub(super) fn object_version_key(
+pub(crate) fn object_version_key(
     bucket: &Bucket,
     object_key: &str,
     version_id: uuid::Uuid,
@@ -939,7 +939,7 @@ pub(super) fn object_version_key(
     ])
 }
 
-pub(super) fn object_version_id_key(bucket: &Bucket, version_id: uuid::Uuid) -> Vec<u8> {
+pub(crate) fn object_version_id_key(bucket: &Bucket, version_id: uuid::Uuid) -> Vec<u8> {
     let version_id = version_id.to_string();
     meta_tuple_key(&[
         OBJECT_VERSION_ID_FAMILY,
@@ -1025,7 +1025,7 @@ pub(super) fn object_version_history_key(
     ])
 }
 
-pub(super) fn object_id_counter_key(bucket: &Bucket) -> Vec<u8> {
+pub(crate) fn object_id_counter_key(bucket: &Bucket) -> Vec<u8> {
     meta_tuple_key(&[
         b"object-id-counter",
         &bucket.tenant_id.to_be_bytes(),
@@ -1033,7 +1033,7 @@ pub(super) fn object_id_counter_key(bucket: &Bucket) -> Vec<u8> {
     ])
 }
 
-pub(super) fn object_current_page_key_for_object(bucket: &Bucket, object: &Object) -> Vec<u8> {
+pub(crate) fn object_current_page_key_for_object(bucket: &Bucket, object: &Object) -> Vec<u8> {
     object_current_page_key(OBJECT_CURRENT_PAGE_FAMILY, bucket, &object.key)
 }
 
@@ -1041,7 +1041,7 @@ pub(super) fn object_key_catalog_key(bucket: &Bucket, object: &Object) -> Vec<u8
     object_current_page_key(OBJECT_KEY_CATALOG_FAMILY, bucket, &object.key)
 }
 
-pub(super) fn object_version_page_key_for_object(
+pub(crate) fn object_version_page_key_for_object(
     bucket: &Bucket,
     object: &Object,
     root_generation: u64,
@@ -1095,7 +1095,7 @@ fn object_ordered_full_key_prefix(family: &[u8], bucket: &Bucket, object_key: &s
     key
 }
 
-pub(super) fn object_version_page_prefix(bucket: &Bucket, object_key: &str) -> Vec<u8> {
+pub(crate) fn object_version_page_prefix(bucket: &Bucket, object_key: &str) -> Vec<u8> {
     object_ordered_full_key_prefix(OBJECT_VERSION_PAGE_FAMILY, bucket, object_key)
 }
 
