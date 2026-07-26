@@ -178,6 +178,52 @@ pub async fn write_personaldb_bytes_as_data_locator_mvcc(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub async fn write_personaldb_logical_file_as_data_locator_mvcc(
+    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    group_id: &str,
+    data_id: &str,
+    data_kind: &str,
+    request: WriteLogicalFileRequest,
+    sqlite_changeset_hash: String,
+    projection_keys: Vec<String>,
+    transaction_id: String,
+    principal: &str,
+) -> Result<PersonalDbDataLocatorCoreMetaRow> {
+    validate_personaldb_scope(tenant_id, group_id)?;
+    require_coremeta_ref_id(data_id, "data_id")?;
+    require_safe_component(data_kind, "data_kind")?;
+    if request.generation == 0 {
+        bail!("PersonalDB data locator generation must be nonzero");
+    }
+    let generation = request.generation;
+    let logical = CoreStore::new(storage.clone())
+        .await?
+        .write_logical_file_with_locator(request)
+        .await?;
+    let row = PersonalDbDataLocatorCoreMetaRow {
+        tenant_id,
+        group_id: group_id.to_string(),
+        data_id: data_id.to_string(),
+        data_kind: data_kind.to_string(),
+        generation,
+        root_generation: mvcc
+            .runtime
+            .applied_version()?
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("PersonalDB locator generation overflow"))?,
+        sqlite_changeset_hash,
+        payload_locator: logical.locator,
+        projection_keys,
+        transaction_id,
+        created_at_unix_nanos: current_unix_nanos()?,
+    };
+    write_personaldb_data_locator_row_mvcc(mvcc, &row, principal).await?;
+    Ok(row)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn write_personaldb_bytes_as_data_locator_with_preconditions(
     storage: &Storage,
     tenant_id: i64,
