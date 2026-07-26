@@ -7,13 +7,10 @@ use crate::{
     authz_scope::encode_realm_namespace,
     config::Config,
     core_store::{
-        AcquireFence, CF_MESH, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaTuplePart, CoreStore,
-        TABLE_SYSTEM_BOOTSTRAP_MARKER_ROW, commit_coremeta_batch_for_storage,
-        core_meta_committed_row_common, core_meta_root_key_hash, core_meta_tuple_key,
-        encode_deterministic_proto,
+        CF_MESH, CoreMetaTuplePart, CoreStore, TABLE_SYSTEM_BOOTSTRAP_MARKER_ROW,
+        core_meta_tuple_key, encode_deterministic_proto,
     },
     crypto::EncryptionKeyring,
-    formats::unix_nanos_from_rfc3339,
     mesh_lifecycle::{LifecycleState, NodeCapability},
     persistence::{App, AuthzTupleBatchMutation, Persistence},
     storage::Storage,
@@ -149,8 +146,6 @@ struct BootstrapMarkerProto {
 
 #[derive(Clone, PartialEq, Message)]
 struct BootstrapMarkerRowProto {
-    #[prost(message, optional, tag = "1")]
-    common: Option<crate::core_store::CoreMetaRowCommonProto>,
     #[prost(string, tag = "2")]
     schema: String,
     #[prost(bytes, tag = "3")]
@@ -174,14 +169,7 @@ fn encode_bootstrap_marker(marker: &BootstrapMarker) -> Vec<u8> {
 
 fn encode_bootstrap_marker_row(marker: &BootstrapMarker) -> Result<Vec<u8>> {
     Ok(encode_deterministic_proto(&BootstrapMarkerRowProto {
-        common: Some(core_meta_committed_row_common(
-            SYSTEM_REALM_ID,
-            core_meta_root_key_hash(&format!("system-realm-bootstrap/{}", marker.mesh_id)),
-            1,
-            format!("system-realm-bootstrap:{}", marker.mesh_id),
-            unix_nanos_from_rfc3339(&marker.completed_at),
-        )),
-        schema: "anvil.coremeta.system_bootstrap_marker.v1".to_string(),
+        schema: "anvil.mvcc.system_bootstrap_marker.v2".to_string(),
         marker_bytes: encode_bootstrap_marker(marker),
     }))
 }
@@ -193,7 +181,8 @@ pub async fn ensure_bootstrapped(
     secret_keyring: &EncryptionKeyring,
 ) -> Result<()> {
     let mesh_id = normalized_mesh_id(&config.mesh_id);
-    if bootstrap_marker_exists(storage, &mesh_id).await? {
+    let mvcc = persistence.mvcc()?;
+    if bootstrap_marker_exists(mvcc, &mesh_id)? {
         reject_stale_bootstrap_config(config)?;
         install_system_schema(storage, persistence)
             .await
@@ -201,12 +190,11 @@ pub async fn ensure_bootstrapped(
         return Ok(());
     }
 
-    let fence_owner = format!("system-realm-bootstrap-{}", uuid::Uuid::new_v4().simple());
-    let Some(_fence) = acquire_bootstrap_fence(storage, &mesh_id, &fence_owner).await? else {
-        reject_stale_bootstrap_config(config)?;
-        return Ok(());
-    };
-    if bootstrap_marker_exists(storage, &mesh_id).await? {
+    let assignment = mvcc
+        .reconcile_work_assignment("system-realm-bootstrap", &mesh_id)
+        .await?
+        .ok_or_else(|| anyhow!("this node does not own the system realm bootstrap assignment"))?;
+    if bootstrap_marker_exists(mvcc, &mesh_id)? {
         reject_stale_bootstrap_config(config)?;
         return Ok(());
     }
@@ -226,7 +214,7 @@ pub async fn ensure_bootstrapped(
     )
     .await
     .context("write system relation tuples")?;
-    write_bootstrap_marker(storage, &mesh_id)
+    write_bootstrap_marker(mvcc, &mesh_id, &assignment)
         .await
         .context("write system bootstrap marker")
 }
@@ -359,46 +347,33 @@ fn all_admin_relations() -> &'static [SystemAdminRelation] {
     ]
 }
 
-async fn bootstrap_marker_exists(storage: &Storage, mesh_id: &str) -> Result<bool> {
-    Ok(CoreStore::new(storage.clone())
-        .await?
-        .read_coremeta_row(
-            CF_MESH,
-            TABLE_SYSTEM_BOOTSTRAP_MARKER_ROW,
-            &bootstrap_marker_tuple_key(mesh_id)?,
-        )?
-        .is_some())
-}
-
-async fn acquire_bootstrap_fence(
-    storage: &Storage,
+fn bootstrap_marker_exists(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     mesh_id: &str,
-    owner: &str,
-) -> Result<Option<crate::core_store::FencedPermit>> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let fence_name = format!("system-realm-bootstrap-{mesh_id}");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
-    loop {
-        match store
-            .acquire_fence(AcquireFence {
-                fence_name: fence_name.clone(),
-                authenticated_principal: owner.to_string(),
-                ttl_ms: 60_000,
-            })
-            .await
-        {
-            Ok(permit) => return Ok(Some(permit)),
-            Err(err) => {
-                if bootstrap_marker_exists(storage, mesh_id).await? {
-                    return Ok(None);
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(err).context("acquire system realm bootstrap fence");
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-        }
+) -> Result<bool> {
+    let snapshot = mvcc.runtime.applied_version()?;
+    let Some(row) = mvcc
+        .runtime
+        .read_at(&bootstrap_marker_logical_key(mesh_id)?, snapshot)?
+    else {
+        return Ok(false);
+    };
+    let marker_row = BootstrapMarkerRowProto::decode(row.value.as_slice())?;
+    if encode_deterministic_proto(&marker_row) != row.value
+        || marker_row.schema != "anvil.mvcc.system_bootstrap_marker.v2"
+    {
+        return Err(anyhow!("system realm bootstrap marker row is invalid"));
     }
+    let marker = BootstrapMarkerProto::decode(marker_row.marker_bytes.as_slice())?;
+    if encode_deterministic_proto(&marker) != marker_row.marker_bytes
+        || marker.schema != "anvil.system_realm.bootstrap_marker.v1"
+        || marker.mesh_id != mesh_id
+        || marker.authz_realm_id != SYSTEM_REALM_ID
+        || chrono::DateTime::parse_from_rfc3339(&marker.completed_at).is_err()
+    {
+        return Err(anyhow!("system realm bootstrap marker payload is invalid"));
+    }
+    Ok(true)
 }
 
 fn reject_stale_bootstrap_config(config: &Config) -> Result<()> {
@@ -1309,7 +1284,11 @@ async fn write_system_relation_tuples(
     Ok(())
 }
 
-async fn write_bootstrap_marker(storage: &Storage, mesh_id: &str) -> Result<()> {
+async fn write_bootstrap_marker(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    mesh_id: &str,
+    assignment: &crate::mvcc_worker_authority::AssignmentGuard,
+) -> Result<()> {
     let marker = BootstrapMarker {
         schema: "anvil.system_realm.bootstrap_marker.v1",
         mesh_id: mesh_id.to_string(),
@@ -1317,25 +1296,68 @@ async fn write_bootstrap_marker(storage: &Storage, mesh_id: &str) -> Result<()> 
         completed_at: chrono::Utc::now().to_rfc3339(),
     };
     let payload = encode_bootstrap_marker_row(&marker)?;
-    let tuple_key = bootstrap_marker_tuple_key(mesh_id)?;
-    let op = CoreMetaBatchOp {
-        cf: CF_MESH,
-        table_id: TABLE_SYSTEM_BOOTSTRAP_MARKER_ROW,
-        tuple_key: &tuple_key,
-        common: None,
-        kind: CoreMetaBatchOpKind::Put(&payload),
-    };
-    commit_coremeta_batch_for_storage(
-        storage,
-        &format!("system-realm-bootstrap:{}", uuid::Uuid::new_v4().simple()),
-        &[op],
-        &[crate::core_store::CoreMetaRootPublication::new(
-            format!("system-realm-bootstrap/{mesh_id}"),
-            crate::formats::writer::WriterFamily::MeshControl,
+    let principal = format!("system-realm-bootstrap:{mesh_id}");
+    let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default();
+    let handle = mvcc
+        .open_transactions
+        .begin(
+            mvcc.runtime.as_ref(),
+            mvcc.cluster_id(),
+            &principal,
+            &format!("system-realm-bootstrap:{mesh_id}"),
+            std::time::Duration::from_secs(30),
+            crate::mvcc_transaction::DurabilityLevel::Quorum,
+            crate::mvcc_transaction::ReadConsistency::Linearized,
+            now,
+        )
+        .await?;
+    let logical_key = bootstrap_marker_logical_key(mesh_id)?;
+    let observed = mvcc.read_transaction_value(&handle.transaction_id, &principal, &logical_key)?;
+    if observed.is_some() {
+        return Ok(());
+    }
+    mvcc.stage_product_mutations(
+        &handle.transaction_id,
+        &principal,
+        vec![crate::mvcc_product::ProductMutation::put(
+            logical_key.clone(),
+            payload,
         )],
-    )
-    .await?;
-    Ok(())
+        now,
+    )?;
+    mvcc.stage_predicate(
+        &handle.transaction_id,
+        &principal,
+        logical_key,
+        crate::mvcc_transaction::PredicateKind::Absent,
+        now,
+    )?;
+    mvcc.stage_assignment_guard(&handle.transaction_id, &principal, assignment, now)?;
+    let outcome = mvcc
+        .open_transactions
+        .commit(
+            mvcc.runtime.as_ref(),
+            &handle.transaction_id,
+            &principal,
+            u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+        )
+        .await?;
+    match outcome.certification {
+        crate::mvcc_transaction::CertificationResult::Committed { .. } => Ok(()),
+        crate::mvcc_transaction::CertificationResult::Aborted { reason }
+            if bootstrap_marker_exists(mvcc, mesh_id)? =>
+        {
+            tracing::debug!(
+                ?reason,
+                mesh_id,
+                "system realm bootstrap raced with completion"
+            );
+            Ok(())
+        }
+        crate::mvcc_transaction::CertificationResult::Aborted { reason } => {
+            Err(anyhow!("system realm bootstrap marker aborted: {reason:?}"))
+        }
+    }
 }
 
 fn bootstrap_marker_tuple_key(mesh_id: &str) -> Result<Vec<u8>> {
@@ -1345,495 +1367,10 @@ fn bootstrap_marker_tuple_key(mesh_id: &str) -> Result<Vec<u8>> {
     ])
 }
 
-#[cfg(any())]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    fn test_config(storage_path: &std::path::Path) -> Config {
-        Config {
-            jwt_secret: "test-secret".to_string(),
-            anvil_secret_encryption_key:
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            public_api_addr: "test-node".to_string(),
-            api_listen_addr: "127.0.0.1:0".to_string(),
-            admin_listen_addr: "127.0.0.1:0".to_string(),
-            mesh_id: "mesh-test".to_string(),
-            region: "test-region".to_string(),
-            storage_path: storage_path.to_string_lossy().to_string(),
-            bootstrap_system_admin_subject_kind: "app".to_string(),
-            bootstrap_system_admin_subject_id: "admin-principal".to_string(),
-            ..Config::default()
-        }
-    }
-
-    async fn install_active_internal_node(storage: &Storage, mesh_id: &str, node_id: &str) {
-        let region = crate::mesh_lifecycle::create_region(
-            storage,
-            crate::mesh_lifecycle::CreateRegionDescriptor {
-                mesh_id: mesh_id.to_string(),
-                region: "test-region".to_string(),
-                public_base_url: "https://test-region.anvil.invalid".to_string(),
-                virtual_host_suffix: "test-region.anvil.invalid".to_string(),
-                placement_weight: 100,
-                default_cell: Some("test-cell".to_string()),
-            },
-        )
-        .await
-        .unwrap();
-        let cell = crate::mesh_lifecycle::register_cell(
-            storage,
-            crate::mesh_lifecycle::RegisterCellDescriptor {
-                mesh_id: mesh_id.to_string(),
-                region: region.region.clone(),
-                cell_id: "test-cell".to_string(),
-                placement_weight: 100,
-                failure_domain: "test-rack".to_string(),
-            },
-        )
-        .await
-        .unwrap();
-        crate::mesh_lifecycle::transition_cell(
-            storage,
-            &region.region,
-            &cell.cell_id,
-            cell.generation,
-            LifecycleState::Active,
-        )
-        .await
-        .unwrap();
-        crate::mesh_lifecycle::transition_region(
-            storage,
-            &region.region,
-            region.generation,
-            LifecycleState::Active,
-        )
-        .await
-        .unwrap();
-        let node = crate::mesh_lifecycle::register_node(
-            storage,
-            crate::mesh_lifecycle::RegisterNodeDescriptor {
-                mesh_id: mesh_id.to_string(),
-                node_id: node_id.to_string(),
-                region: region.region,
-                cell_id: cell.cell_id,
-                receipt_signing_public_key: crate::node_signing::NodeSigningKeypair::generate()
-                    .unwrap()
-                    .public_key_bytes()
-                    .to_vec(),
-                public_api_addr: "http://127.0.0.1:50051".to_string(),
-                capabilities: vec![NodeCapability::Metadata, NodeCapability::Object],
-                capacity_json: "{}".to_string(),
-            },
-        )
-        .await
-        .unwrap();
-        crate::mesh_lifecycle::transition_node(
-            storage,
-            node_id,
-            node.generation,
-            LifecycleState::Active,
-            None,
-        )
-        .await
-        .unwrap();
-    }
-
-    #[test]
-    fn bootstrap_marker_encoding_is_canonical_protobuf_not_json() {
-        let marker = BootstrapMarker {
-            schema: "anvil.system_realm.bootstrap_marker.v1",
-            mesh_id: "mesh-a".to_string(),
-            authz_realm_id: SYSTEM_REALM_ID.to_string(),
-            completed_at: "2026-07-09T00:00:00Z".to_string(),
-        };
-        let bytes = encode_bootstrap_marker(&marker);
-        assert!(serde_json::from_slice::<serde_json::Value>(&bytes).is_err());
-        let decoded = crate::core_store::decode_deterministic_proto::<BootstrapMarkerProto>(
-            &bytes,
-            "system realm bootstrap marker",
-        )
-        .unwrap();
-        assert_eq!(decoded.mesh_id, marker.mesh_id);
-        assert_eq!(decoded.authz_realm_id, marker.authz_realm_id);
-    }
-
-    #[tokio::test]
-    async fn system_realm_bootstrap_creates_builtin_schema_and_owner_tuple() {
-        let temp = tempdir().unwrap();
-        let config = test_config(temp.path());
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let persistence = Persistence::new(&config).unwrap();
-        let keyring = config.secret_keyring().unwrap();
-
-        ensure_bootstrapped(&config, &persistence, &storage, &keyring)
-            .await
-            .unwrap();
-
-        let allowed = check_admin_relation(
-            &storage,
-            &config.mesh_id,
-            &auth::Claims {
-                sub: "admin-principal".to_string(),
-                exp: usize::MAX,
-                tenant_id: 0,
-                jti: None,
-            },
-            SystemAdminRelation::ManageNodes,
-        )
-        .await
-        .unwrap();
-        assert!(allowed);
-
-        let denied = check_admin_relation(
-            &storage,
-            &config.mesh_id,
-            &auth::Claims {
-                sub: "ordinary-app".to_string(),
-                exp: usize::MAX,
-                tenant_id: 0,
-                jti: None,
-            },
-            SystemAdminRelation::ManageNodes,
-        )
-        .await
-        .unwrap();
-        assert!(!denied);
-    }
-
-    #[tokio::test]
-    async fn internal_node_access_requires_direct_grant_active_membership_and_capability() {
-        let temp = tempdir().unwrap();
-        let mut config = test_config(temp.path());
-        config.bootstrap_node_ids = vec!["node-a".to_string()];
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let persistence = Persistence::new(&config).unwrap();
-        let keyring = config.secret_keyring().unwrap();
-
-        install_active_internal_node(&storage, &config.mesh_id, "node-a").await;
-        ensure_bootstrapped(&config, &persistence, &storage, &keyring)
-            .await
-            .unwrap();
-        let core_store = CoreStore::new(storage.clone()).await.unwrap();
-        let claims = auth::Claims {
-            sub: "node-a".to_string(),
-            exp: usize::MAX,
-            tenant_id: SYSTEM_STORAGE_TENANT_ID,
-            jti: None,
-        };
-
-        assert!(
-            check_internal_node_access(
-                &storage,
-                &core_store,
-                &config.mesh_id,
-                &claims,
-                "node-a",
-                NodeCapability::Metadata,
-            )
-            .await
-            .unwrap()
-        );
-        assert!(
-            !check_internal_node_access(
-                &storage,
-                &core_store,
-                &config.mesh_id,
-                &claims,
-                "node-a",
-                NodeCapability::Gateway,
-            )
-            .await
-            .unwrap()
-        );
-        assert!(
-            !check_internal_node_access(
-                &storage,
-                &core_store,
-                "another-mesh",
-                &claims,
-                "node-a",
-                NodeCapability::Metadata,
-            )
-            .await
-            .unwrap()
-        );
-        let forged_claims = auth::Claims {
-            sub: "node-b".to_string(),
-            ..claims
-        };
-        assert!(
-            !check_internal_node_access(
-                &storage,
-                &core_store,
-                &config.mesh_id,
-                &forged_claims,
-                "node-a",
-                NodeCapability::Metadata,
-            )
-            .await
-            .unwrap()
-        );
-    }
-
-    #[tokio::test]
-    async fn system_realm_bootstrap_existing_realm_does_not_grant_again() {
-        let temp = tempdir().unwrap();
-        let config = test_config(temp.path());
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let persistence = Persistence::new(&config).unwrap();
-        let keyring = config.secret_keyring().unwrap();
-
-        ensure_bootstrapped(&config, &persistence, &storage, &keyring)
-            .await
-            .unwrap();
-
-        ensure_bootstrapped(&config, &persistence, &storage, &keyring)
-            .await
-            .unwrap();
-
-        let denied = check_admin_relation(
-            &storage,
-            &config.mesh_id,
-            &auth::Claims {
-                sub: "new-bootstrap-subject".to_string(),
-                exp: usize::MAX,
-                tenant_id: 0,
-                jti: None,
-            },
-            SystemAdminRelation::ManageNodes,
-        )
-        .await
-        .unwrap();
-        assert!(!denied);
-    }
-
-    #[tokio::test]
-    async fn system_realm_bootstrap_missing_config_fails_closed() {
-        let temp = tempdir().unwrap();
-        let mut config = test_config(temp.path());
-        config.bootstrap_system_admin_subject_kind.clear();
-        config.bootstrap_system_admin_subject_id.clear();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let persistence = Persistence::new(&config).unwrap();
-        let keyring = config.secret_keyring().unwrap();
-
-        let err = ensure_bootstrapped(&config, &persistence, &storage, &keyring)
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("system realm is missing"));
-    }
-
-    #[tokio::test]
-    async fn generated_bootstrap_admin_credential_uses_reserved_system_tenant() {
-        let temp = tempdir().unwrap();
-        let storage_path = temp.path().join("storage");
-        let credential_path = temp.path().join("system-admin.json");
-        let mut config = test_config(&storage_path);
-        config.storage_path = storage_path.to_string_lossy().to_string();
-        config.bootstrap_system_admin_subject_kind.clear();
-        config.bootstrap_system_admin_subject_id.clear();
-        config.bootstrap_system_admin_app_name = "system-admin".to_string();
-        config.bootstrap_system_admin_credential_output_path =
-            credential_path.to_string_lossy().to_string();
-
-        let storage = Storage::new_at(&storage_path).await.unwrap();
-        let persistence = Persistence::new(&config).unwrap();
-        let keyring = config.secret_keyring().unwrap();
-
-        ensure_bootstrapped(&config, &persistence, &storage, &keyring)
-            .await
-            .unwrap();
-
-        let credential: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&credential_path).unwrap()).unwrap();
-        assert_eq!(
-            credential["tenant_id"].as_i64().unwrap(),
-            SYSTEM_STORAGE_TENANT_ID
-        );
-        assert!(
-            persistence
-                .get_tenant_by_name("system")
-                .await
-                .unwrap()
-                .is_none()
-        );
-
-        let client_id = credential["client_id"].as_str().unwrap();
-        let app_details = persistence
-            .get_app_by_client_id(client_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(app_details.tenant_id, SYSTEM_STORAGE_TENANT_ID);
-
-        let token = auth::JwtManager::new(config.jwt_secret.clone())
-            .mint_token(app_details.id.to_string(), app_details.tenant_id)
-            .unwrap();
-        let claims = auth::JwtManager::new(config.jwt_secret.clone())
-            .verify_token(&token)
-            .unwrap();
-        assert_eq!(claims.tenant_id, SYSTEM_STORAGE_TENANT_ID);
-
-        let allowed = check_admin_relation(
-            &storage,
-            &config.mesh_id,
-            &claims,
-            SystemAdminRelation::ManageTenants,
-        )
-        .await
-        .unwrap();
-        assert!(allowed);
-    }
-
-    #[test]
-    fn bootstrap_credential_output_path_must_not_live_under_storage_path() {
-        let temp = tempdir().unwrap();
-        let storage_path = temp.path().join("storage");
-        std::fs::create_dir_all(&storage_path).unwrap();
-        let mut config = test_config(&storage_path);
-
-        let storage_sidecar = storage_path.join("bootstrap-admin.json");
-        let err = reject_bootstrap_credential_output_path(&config, &storage_sidecar).unwrap_err();
-        assert!(
-            err.to_string().contains("must be outside storage_path"),
-            "unexpected error: {err:#}"
-        );
-
-        config.bootstrap_system_admin_credential_output_path = temp
-            .path()
-            .join("bootstrap-admin.json")
-            .to_string_lossy()
-            .to_string();
-        reject_bootstrap_credential_output_path(
-            &config,
-            Path::new(&config.bootstrap_system_admin_credential_output_path),
-        )
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn system_realm_bootstrap_runs_before_listeners_start() {
-        let temp = tempdir().unwrap();
-        let storage_path = temp.path().join("storage");
-        let mut config = test_config(&storage_path);
-        config.storage_path = storage_path.to_string_lossy().to_string();
-        config.bootstrap_system_admin_subject_kind.clear();
-        config.bootstrap_system_admin_subject_id.clear();
-
-        let err = crate::AppState::new(config, crate::test_support::personaldb_protocol_keyring())
-            .await
-            .unwrap_err();
-        assert!(
-            format!("{err:#}").contains("system realm is missing"),
-            "unexpected error: {err:#}"
-        );
-    }
-
-    #[tokio::test]
-    async fn system_realm_bootstrap_two_node_race_has_one_winner() {
-        let temp = tempdir().unwrap();
-        let config = test_config(temp.path());
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let persistence = Persistence::new(&config).unwrap();
-        let keyring = config.secret_keyring().unwrap();
-
-        let (left, right) = tokio::join!(
-            ensure_bootstrapped(&config, &persistence, &storage, &keyring),
-            ensure_bootstrapped(&config, &persistence, &storage, &keyring),
-        );
-
-        left.unwrap();
-        right.unwrap();
-        let marker = bootstrap_marker_exists(&storage, &config.mesh_id)
-            .await
-            .unwrap();
-        assert!(marker);
-        let allowed = check_admin_relation(
-            &storage,
-            &config.mesh_id,
-            &auth::Claims {
-                sub: "admin-principal".to_string(),
-                exp: usize::MAX,
-                tenant_id: 0,
-                jti: None,
-            },
-            SystemAdminRelation::ManageRegions,
-        )
-        .await
-        .unwrap();
-        assert!(allowed);
-    }
-
-    #[tokio::test]
-    async fn system_realm_bootstrap_partial_crash_recovers_idempotently() {
-        let temp = tempdir().unwrap();
-        let config = test_config(temp.path());
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let persistence = Persistence::new(&config).unwrap();
-        let keyring = config.secret_keyring().unwrap();
-
-        install_system_schema(&storage, &persistence).await.unwrap();
-        assert!(
-            !bootstrap_marker_exists(&storage, &config.mesh_id)
-                .await
-                .unwrap()
-        );
-
-        ensure_bootstrapped(&config, &persistence, &storage, &keyring)
-            .await
-            .unwrap();
-        assert!(
-            bootstrap_marker_exists(&storage, &config.mesh_id)
-                .await
-                .unwrap()
-        );
-        for relation in [
-            SystemAdminRelation::ManageSecretEncryptionKeys,
-            SystemAdminRelation::ManagePersonalDbSigningKeys,
-        ] {
-            let allowed = check_admin_relation(
-                &storage,
-                &config.mesh_id,
-                &auth::Claims {
-                    sub: "admin-principal".to_string(),
-                    exp: usize::MAX,
-                    tenant_id: 0,
-                    jti: None,
-                },
-                relation,
-            )
-            .await
-            .unwrap();
-            assert!(allowed, "bootstrap admin is missing {}", relation.as_str());
-        }
-    }
-
-    #[tokio::test]
-    async fn bootstrap_credential_is_not_accepted_by_public_or_admin_api() {
-        let temp = tempdir().unwrap();
-        let config = test_config(temp.path());
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let persistence = Persistence::new(&config).unwrap();
-        let keyring = config.secret_keyring().unwrap();
-
-        ensure_bootstrapped(&config, &persistence, &storage, &keyring)
-            .await
-            .unwrap();
-        let forged_claims = auth::Claims {
-            sub: "forged-bootstrap-token".to_string(),
-            exp: usize::MAX,
-            tenant_id: 0,
-            jti: None,
-        };
-        let denied = check_admin_relation(
-            &storage,
-            &config.mesh_id,
-            &forged_claims,
-            SystemAdminRelation::ManageTenants,
-        )
-        .await
-        .unwrap();
-        assert!(!denied);
-    }
+fn bootstrap_marker_logical_key(mesh_id: &str) -> Result<crate::mvcc_transaction::LogicalKey> {
+    crate::mvcc_product::coremeta_logical_key(
+        CF_MESH,
+        TABLE_SYSTEM_BOOTSTRAP_MARKER_ROW,
+        &bootstrap_marker_tuple_key(mesh_id)?,
+    )
 }

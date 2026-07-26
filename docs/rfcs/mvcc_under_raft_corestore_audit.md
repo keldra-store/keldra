@@ -47,8 +47,8 @@ bundle materialisation, or physical transport used by MVCC.
   legacy physical metadata stream/head and mutation paths remain.
 - Gateway mutable metadata is now MVCC-only. Remaining `CoreStore` calls are
   immutable blob/upload-part I/O and external security-audit ingestion.
-- `system_realm.rs`: mutable system-realm bootstrap/current rows remain
-  physically authoritative.
+- System-realm bootstrap completion is now canonical MVCC state. Mesh lifecycle
+  projections used to authorize internal nodes remain external control input.
 - `bucket_journal.rs`: legacy physical test/helper paths remain. Production
   bucket current state already uses MVCC; the production watch event/head path
   was moved to MVCC in the commit accompanying this audit.
@@ -82,3 +82,21 @@ The remaining production `CoreStore` calls in the gateway group are limited to
 immutable registry blob/upload-part bytes and the explicitly external gateway
 security-audit stream. No physical mutable-row fallback or gateway test module
 remains.
+
+## System-realm follow-up evidence
+
+The cluster-local system-realm bootstrap marker is now an MVCC-v2 product row.
+Bootstrap admission obtains a compact-Raft work assignment, performs a
+linearized second existence check, and certifies the marker at quorum with an
+exact `Absent` predicate and assignment guard. Reads use one applied MVCC
+snapshot. The physical bootstrap fence, CoreMeta marker publication, legacy row
+common metadata, and disabled physical test suite were removed.
+
+The following dependencies deliberately remain outside this marker row:
+
+- mesh/region/cell/node lifecycle projections are external mesh-control input;
+- the node capability check reads those external projections;
+- the operator bootstrap credential export is an immutable operator-owned file
+  outside Anvil storage;
+- authz schema and tuple state are canonical MVCC data owned by their existing
+  authz transactions.
