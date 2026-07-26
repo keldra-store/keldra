@@ -471,22 +471,10 @@ fn decode_canonical_json_bytes(bytes: &[u8], label: &str) -> Result<JsonValue> {
 }
 
 enum ObjectDataTarget {
-    LogicalFile {
-        locator: CoreManifestLocator,
-        target: String,
-        bytes: Vec<u8>,
-    },
-    ObjectRef {
-        object_ref: CoreObjectRef,
-        target: String,
-        bytes: Vec<u8>,
-    },
-    MvccLocal {
-        bytes: Vec<u8>,
-    },
-    MvccShards {
-        bytes: Vec<u8>,
-    },
+    LogicalFile { bytes: Vec<u8> },
+    ObjectRef { bytes: Vec<u8> },
+    MvccLocal { bytes: Vec<u8> },
+    MvccShards { bytes: Vec<u8> },
 }
 
 impl ObjectDataTarget {
@@ -506,14 +494,6 @@ impl ObjectDataTarget {
             Self::MvccLocal { bytes } | Self::MvccShards { bytes } => bytes,
         }
     }
-
-    fn target_string(&self) -> &str {
-        match self {
-            Self::LogicalFile { target, .. } => target,
-            Self::ObjectRef { target, .. } => target,
-            Self::MvccLocal { .. } | Self::MvccShards { .. } => "",
-        }
-    }
 }
 
 fn optional_object_data_target_bytes(
@@ -525,12 +505,6 @@ fn optional_object_data_target_bytes(
                 .map(|target| (target.kind().to_string(), target.bytes().to_vec()))
         })
         .transpose()
-}
-
-fn object_data_target_from_shard_map(
-    value: Option<&JsonValue>,
-) -> Result<Option<ObjectDataTarget>> {
-    value.map(object_data_target_from_json).transpose()
 }
 
 fn object_data_target_from_json(value: &JsonValue) -> Result<ObjectDataTarget> {
@@ -561,18 +535,12 @@ fn object_data_target_from_json(value: &JsonValue) -> Result<ObjectDataTarget> {
             let bytes = URL_SAFE_NO_PAD
                 .decode(target)
                 .context("CoreStore object metadata logical-file target is not base64url")?;
-            let locator = decode_manifest_locator_proto(&bytes)?;
-            Ok(ObjectDataTarget::LogicalFile {
-                locator,
-                target: target.to_string(),
-                bytes,
-            })
+            decode_manifest_locator_proto(&bytes)?;
+            Ok(ObjectDataTarget::LogicalFile { bytes })
         }
         "object_ref" => {
-            let object_ref = decode_core_object_ref_target(target)?;
+            decode_core_object_ref_target(target)?;
             Ok(ObjectDataTarget::ObjectRef {
-                object_ref,
-                target: target.to_string(),
                 bytes: target.as_bytes().to_vec(),
             })
         }
