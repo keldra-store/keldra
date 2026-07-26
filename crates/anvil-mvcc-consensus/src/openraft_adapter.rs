@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Debug,
-    io::Cursor,
+    io::{self, Cursor},
     ops::{Bound, RangeBounds},
     sync::Arc,
 };
@@ -226,6 +226,32 @@ pub(crate) struct OpenRaftLogStore {
     store: RocksRaftStore,
 }
 
+impl OpenRaftLogStore {
+    /// Append and report completion through the same boundary used by
+    /// OpenRaft's `LogFlushed`. The completion is invoked only after the
+    /// synchronous RocksDB write has returned, and receives the durable write
+    /// error when persistence fails.
+    fn append_durable_with_completion<F>(
+        &self,
+        encoded: &[(u64, Vec<u8>)],
+        completion: F,
+    ) -> Result<(), RaftStorageError>
+    where
+        F: FnOnce(Result<(), io::Error>),
+    {
+        match self.store.append_logs(encoded) {
+            Ok(()) => {
+                completion(Ok(()));
+                Ok(())
+            }
+            Err(error) => {
+                completion(Err(io::Error::other(error.to_string())));
+                Err(error)
+            }
+        }
+    }
+}
+
 /// Concrete OpenRaft V2 state machine backed by the existing RocksDB.
 #[derive(Clone)]
 pub(crate) struct OpenRaftStateMachine {
@@ -354,11 +380,13 @@ impl OpenRaftConsensus {
         &self,
         cluster_id_hash: [u8; 32],
         node: NodeIncarnation,
+        raft_node_id: NodeId,
         failure_domain: String,
     ) -> Result<ControlApplyResult, ConsensusError> {
         self.apply_control(ConsensusCommand::InstallNode {
             cluster_id_hash,
             node,
+            raft_node_id,
             failure_domain,
         })
         .await
@@ -729,17 +757,10 @@ impl RaftLogStorage<AnvilRaftConfig> for OpenRaftLogStore {
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        match self.store.append_logs(&encoded) {
-            Ok(()) => {
-                callback.log_io_completed(Ok(()));
-                Ok(())
-            }
-            Err(error) => {
-                let message = error.to_string();
-                callback.log_io_completed(Err(std::io::Error::other(message.clone())));
-                Err(storage_error(ErrorSubject::Logs, ErrorVerb::Write, message))
-            }
-        }
+        self.append_durable_with_completion(&encoded, |result| {
+            callback.log_io_completed(result);
+        })
+        .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Write, error))
     }
 
     async fn truncate(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
@@ -1008,13 +1029,19 @@ impl RaftStateMachine<AnvilRaftConfig> for OpenRaftStateMachine {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
     use openraft::{CommittedLeaderId, RaftTypeConfig, storage::RaftLogStorage};
     use tempfile::TempDir;
 
     use super::*;
-    use crate::{BundleHash, DurabilityLevel, NodeId, NodeIncarnation, TransactionId};
+    use crate::{
+        BundleHash, DurabilityLevel, NodeId, NodeIncarnation, TransactionId,
+        storage::fail_sync_write_at,
+    };
 
     struct NoRemoteFactory;
 
@@ -1062,6 +1089,78 @@ mod tests {
         );
     }
 
+    #[test]
+    fn log_flushed_completion_follows_durable_success_and_reports_failed_write() {
+        let directory = TempDir::new().unwrap();
+        let store = RocksRaftStore::open(directory.path(), 7).unwrap();
+        let log_store = OpenRaftLogStore {
+            store: store.clone(),
+        };
+
+        let successful_completion = Arc::new(Mutex::new(None));
+        let observed = successful_completion.clone();
+        let callback_store = store.clone();
+        log_store
+            .append_durable_with_completion(&[(0, vec![1, 2, 3])], move |result| {
+                assert_eq!(callback_store.get_log(0).unwrap(), Some(vec![1, 2, 3]));
+                assert_eq!(callback_store.last_log_index().unwrap(), Some(0));
+                *observed.lock().unwrap() = Some(result);
+            })
+            .unwrap();
+        assert!(
+            successful_completion
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .is_ok()
+        );
+
+        fail_sync_write_at(1);
+        let failed_completion = Arc::new(Mutex::new(None));
+        let observed = failed_completion.clone();
+        let error = log_store
+            .append_durable_with_completion(&[(1, vec![4, 5, 6])], move |result| {
+                *observed.lock().unwrap() = Some(result);
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("injected"));
+        assert!(failed_completion.lock().unwrap().take().unwrap().is_err());
+        assert_eq!(store.get_log(1).unwrap(), None);
+        assert_eq!(store.last_log_index().unwrap(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn failed_state_machine_write_preserves_state_and_last_applied_atomically() {
+        let directory = TempDir::new().unwrap();
+        let store = RocksRaftStore::open(directory.path(), 0).unwrap();
+        let (_, mut machine) = stores(store.clone(), [3; 32]).unwrap();
+
+        fail_sync_write_at(1);
+        let owner = NodeIncarnation {
+            node_id: NodeId(9),
+            incarnation: 2,
+        };
+        let error = machine
+            .apply([Entry {
+                log_id: LogId::new(CommittedLeaderId::new(1, 1), 1),
+                payload: EntryPayload::Normal(ConsensusCommand::InstallNode {
+                    cluster_id_hash: [3; 32],
+                    node: owner,
+                    raft_node_id: NodeId(8),
+                    failure_domain: "zone-a".into(),
+                }),
+            }])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("injected"));
+
+        let persisted: MachineState = store.read_state_value(KEY_OPENRAFT_STATE).unwrap().unwrap();
+        assert_eq!(persisted.last_applied_log_id, None);
+        assert_eq!(persisted.control.node_incarnation(owner.node_id), None);
+        assert!(persisted.decisions.is_empty());
+    }
+
     #[tokio::test]
     async fn snapshot_from_another_cluster_is_rejected() {
         let source_directory = TempDir::new().unwrap();
@@ -1099,6 +1198,7 @@ mod tests {
             ConsensusCommand::InstallNode {
                 cluster_id_hash: [4; 32],
                 node: owner,
+                raft_node_id: NodeId(8),
                 failure_domain: "zone-a".into(),
             },
             ConsensusCommand::AssignPartition {
@@ -1208,6 +1308,7 @@ mod tests {
                             node_id: NodeId(1),
                             incarnation: 1,
                         },
+                        raft_node_id: NodeId(1),
                         failure_domain: "zone-a".into(),
                     }),
                 },

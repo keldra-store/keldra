@@ -1,19 +1,24 @@
-#[cfg(test)]
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     path::Path,
     sync::{Arc, Mutex},
 };
 
 #[cfg(test)]
-static FAIL_SYNC_WRITE_AT: AtomicU64 = AtomicU64::new(0);
-#[cfg(test)]
-static SYNC_WRITE_ORDINAL: AtomicU64 = AtomicU64::new(0);
+use std::{
+    cell::Cell,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 #[cfg(test)]
 pub(crate) fn fail_sync_write_at(ordinal: u64) {
-    SYNC_WRITE_ORDINAL.store(0, Ordering::SeqCst);
-    FAIL_SYNC_WRITE_AT.store(ordinal, Ordering::SeqCst);
+    SYNC_WRITE_FAILURE.with(|failure| failure.set(Some((ordinal, 0))));
+}
+
+#[cfg(test)]
+thread_local! {
+    // Failure injection is thread-local so concurrently executing storage tests
+    // cannot consume each other's write ordinal.
+    static SYNC_WRITE_FAILURE: Cell<Option<(u64, u64)>> = const { Cell::new(None) };
 }
 
 use bincode::{
@@ -78,6 +83,10 @@ pub struct RocksRaftStore {
     db: Arc<DB>,
     group_id: u64,
     writer: Arc<Mutex<()>>,
+    #[cfg(test)]
+    active_sync_writes: Arc<AtomicU64>,
+    #[cfg(test)]
+    max_active_sync_writes: Arc<AtomicU64>,
 }
 
 impl RocksRaftStore {
@@ -108,6 +117,10 @@ impl RocksRaftStore {
             db,
             group_id,
             writer: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            active_sync_writes: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            max_active_sync_writes: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -380,8 +393,23 @@ impl RocksRaftStore {
     fn sync_write(&self, batch: WriteBatch) -> Result<(), RaftStorageError> {
         #[cfg(test)]
         {
-            let ordinal = SYNC_WRITE_ORDINAL.fetch_add(1, Ordering::SeqCst) + 1;
-            if FAIL_SYNC_WRITE_AT.load(Ordering::SeqCst) == ordinal {
+            let active = self.active_sync_writes.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active_sync_writes
+                .fetch_max(active, Ordering::SeqCst);
+            let _active_guard = ActiveSyncWriteGuard(&self.active_sync_writes);
+            let fail = SYNC_WRITE_FAILURE.with(|failure| {
+                let Some((target, completed)) = failure.get() else {
+                    return false;
+                };
+                let ordinal = completed + 1;
+                failure.set(if ordinal == target {
+                    None
+                } else {
+                    Some((target, ordinal))
+                });
+                ordinal == target
+            });
+            if fail {
                 return Err(RaftStorageError::Codec(
                     "injected Raft durable write failure".into(),
                 ));
@@ -391,6 +419,11 @@ impl RocksRaftStore {
         options.set_sync(true);
         self.db.write_opt(batch, &options)?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn max_concurrent_sync_writes(&self) -> u64 {
+        self.max_active_sync_writes.load(Ordering::SeqCst)
     }
 
     fn cf(&self, name: &'static str) -> Result<&ColumnFamily, RaftStorageError> {
@@ -422,6 +455,16 @@ impl RocksRaftStore {
     }
 }
 
+#[cfg(test)]
+struct ActiveSyncWriteGuard<'a>(&'a AtomicU64);
+
+#[cfg(test)]
+impl Drop for ActiveSyncWriteGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, RaftStorageError> {
     encode_to_vec(value, config::standard())
         .map_err(|error| RaftStorageError::Codec(error.to_string()))
@@ -443,6 +486,11 @@ fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, RaftStorageError> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::{Arc, Barrier},
+        thread,
+    };
+
     use tempfile::TempDir;
 
     use super::*;
@@ -518,6 +566,41 @@ mod tests {
             store.read_vote::<(String, u64)>().unwrap(),
             Some(("leader".into(), 12))
         );
+    }
+
+    #[test]
+    fn concurrent_vote_and_log_writes_share_one_serialization_boundary() {
+        let dir = TempDir::new().unwrap();
+        let store = store(dir.path());
+        let barrier = Arc::new(Barrier::new(3));
+
+        let vote_store = store.clone();
+        let vote_barrier = barrier.clone();
+        assert!(Arc::ptr_eq(&store.writer, &vote_store.writer));
+        let vote = thread::spawn(move || {
+            vote_barrier.wait();
+            vote_store.save_vote(&("leader", 14_u64))
+        });
+
+        let log_store = store.clone();
+        let log_barrier = barrier.clone();
+        assert!(Arc::ptr_eq(&store.writer, &log_store.writer));
+        let log = thread::spawn(move || {
+            log_barrier.wait();
+            log_store.append_logs(&[(0, vec![7])])
+        });
+
+        barrier.wait();
+        vote.join().unwrap().unwrap();
+        log.join().unwrap().unwrap();
+
+        assert_eq!(store.max_concurrent_sync_writes(), 1);
+        assert_eq!(
+            store.read_vote::<(String, u64)>().unwrap(),
+            Some(("leader".into(), 14))
+        );
+        assert_eq!(store.get_log(0).unwrap(), Some(vec![7]));
+        assert_eq!(store.last_log_index().unwrap(), Some(0));
     }
 
     #[test]
