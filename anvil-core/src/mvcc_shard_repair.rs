@@ -142,6 +142,43 @@ impl ShardPlacementOverlay {
     pub const TABLE_ID: u16 = 0x7f12;
 }
 
+pub fn placement_overlay_key(
+    manifest: &PhysicalObjectShardManifest,
+) -> crate::mvcc_transaction::LogicalKey {
+    crate::mvcc_transaction::LogicalKey {
+        table_id: ShardPlacementOverlay::TABLE_ID,
+        application_key: format!(
+            "cluster/{}/object/{}",
+            manifest.cluster_id, manifest.object_hash
+        )
+        .into_bytes(),
+    }
+}
+
+/// Resolves a placement overlay using only versions visible at `snapshot`.
+/// Callers performing historical or transactional reads must pass their
+/// captured read snapshot rather than consulting the latest overlay.
+pub fn resolve_manifest_at_snapshot(
+    store: &crate::mvcc_store::LocalMvccStore,
+    source: &PhysicalObjectShardManifest,
+    snapshot: CommitVersion,
+) -> Result<PhysicalObjectShardManifest> {
+    let key = placement_overlay_key(source);
+    let Some(row) = store.read_at(&key, snapshot)? else {
+        return Ok(source.clone());
+    };
+    let overlay: ShardPlacementOverlay = serde_json::from_slice(&row.value)?;
+    let source_hash = hex::encode(blake3::hash(&source.canonical_bytes()?));
+    if overlay.cluster_id != source.cluster_id
+        || overlay.target_logical_identity != String::from_utf8_lossy(&key.application_key)
+        || overlay.source_manifest_hash != source_hash
+    {
+        bail!("shard placement overlay does not match its source manifest");
+    }
+    overlay.replacement_manifest.validate()?;
+    Ok(overlay.replacement_manifest)
+}
+
 pub struct ShardRepairRunner {
     mvcc: Arc<crate::mvcc_bootstrap::MvccSubsystem>,
     worker_id: String,

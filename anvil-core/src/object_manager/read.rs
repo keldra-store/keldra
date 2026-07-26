@@ -182,46 +182,24 @@ impl ObjectManager {
                 }
             };
             if apply_latest_overlay && let ObjectDataTarget::MvccShards(manifest) = &data_target {
-                let overlay_identity = format!(
-                    "cluster/{}/object/{}",
-                    manifest.cluster_id, manifest.object_hash
-                );
-                let overlay_key = crate::mvcc_transaction::LogicalKey {
-                    table_id: crate::mvcc_shard_repair::ShardPlacementOverlay::TABLE_ID,
-                    application_key: overlay_identity.into_bytes(),
-                };
-                if let Some(mvcc) = app_state.mvcc.get()
-                    && let Ok(Some(row)) = mvcc.runtime.local_store().read_latest(&overlay_key)
-                {
-                    match serde_json::from_slice::<crate::mvcc_shard_repair::ShardPlacementOverlay>(
-                        &row.value,
-                    ) {
-                        Ok(overlay)
-                            if overlay.cluster_id == manifest.cluster_id
-                                && overlay.target_logical_identity
-                                    == String::from_utf8_lossy(&overlay_key.application_key)
-                                && overlay.source_manifest_hash
-                                    == hex::encode(blake3::hash(
-                                        &manifest.canonical_bytes().unwrap_or_default(),
-                                    )) =>
-                        {
-                            data_target =
-                                ObjectDataTarget::MvccShards(overlay.replacement_manifest);
-                        }
-                        Ok(_) => {
-                            let _ = tx
-                                .send(Err(Status::data_loss(
-                                    "shard placement overlay identity mismatch",
-                                )))
-                                .await;
+                if let Some(mvcc) = app_state.mvcc.get() {
+                    let snapshot = match mvcc.runtime.local_store().readable_version() {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            let _ = tx.send(Err(Status::unavailable(error.to_string()))).await;
                             return;
                         }
+                    };
+                    match crate::mvcc_shard_repair::resolve_manifest_at_snapshot(
+                        mvcc.runtime.local_store(),
+                        manifest,
+                        snapshot,
+                    ) {
+                        Ok(resolved) => {
+                            data_target = ObjectDataTarget::MvccShards(resolved);
+                        }
                         Err(error) => {
-                            let _ = tx
-                                .send(Err(Status::data_loss(format!(
-                                    "invalid shard placement overlay: {error}"
-                                ))))
-                                .await;
+                            let _ = tx.send(Err(Status::data_loss(error.to_string()))).await;
                             return;
                         }
                     }
