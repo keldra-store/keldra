@@ -84,6 +84,7 @@ pub mod model_journal;
 pub mod multipart_journal;
 pub mod mvcc_apply_worker;
 pub mod mvcc_bootstrap;
+pub mod mvcc_control_plane;
 pub mod mvcc_consensus_adapter;
 #[cfg(test)]
 pub mod mvcc_fault_injection;

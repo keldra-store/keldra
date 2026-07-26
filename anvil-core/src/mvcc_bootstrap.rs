@@ -704,7 +704,7 @@ fn validate_secure_peer_transport(config: &Config, peers: &[MvccPeerConfig]) -> 
     Ok(())
 }
 
-fn cluster_id_hash(cluster_id: &str) -> [u8; 32] {
+pub(crate) fn cluster_id_hash(cluster_id: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
     let domain = b"anvil.mvcc.cluster-id.v1";
     hasher.update((domain.len() as u64).to_be_bytes());
@@ -714,7 +714,7 @@ fn cluster_id_hash(cluster_id: &str) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-fn consensus_control_node_id(node_id: &str) -> NodeId {
+pub(crate) fn consensus_control_node_id(node_id: &str) -> NodeId {
     let mut hasher = Sha256::new();
     let domain = b"anvil.node-id.v1";
     hasher.update((domain.len() as u64).to_be_bytes());
