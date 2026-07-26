@@ -17,11 +17,12 @@ use anvil_core::{
         ReadConsistency, TransactionBundle, TransactionBundleBuilder, TransactionCertifier,
         TransactionCoordinator,
     },
-    replication::{
-        AckStatus, AuthenticatedPeer, ConnectionSession, ReplicationAck, ReplicationFrame,
-        TransferKind, TransferReceiver,
+    replication::{AckStatus, AuthenticatedPeer, ReplicationAck},
+    replication_client::{
+        ReplicationPeer, ReplicationStreamOptions, TonicReplicationStreamManager,
+        object_shard_transfer_id,
     },
-    replication_client::object_shard_transfer_id,
+    services::replication::{ReplicationConnectionAuthorizer, ReplicationServiceImpl},
     shard_placement::{
         DistributedIngest, ShardPlacementPlan, ShardPlacementPolicy, ShardTarget, ShardTargetStream,
     },
@@ -34,6 +35,8 @@ use anvil_mvcc_consensus::{
 use anyhow::Result;
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
+use tokio_stream::wrappers::TcpListenerStream;
+use tonic::{Status, metadata::MetadataMap};
 use uuid::Uuid;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Phase {
@@ -357,9 +360,11 @@ async fn run_shape(shape: Shape, timings: &mut PhaseTimings) {
     });
     match shape.name {
         "replication_reconnect_resume" => {
-            timings.measure(Phase::ReplicationReconnect, || {
-                run_reconnect_resume(shape.payload_bytes).expect("benchmark replication reconnect");
-            });
+            let started = Instant::now();
+            run_reconnect_resume(shape.payload_bytes)
+                .await
+                .expect("benchmark replication reconnect");
+            *timings.0.entry(Phase::ReplicationReconnect).or_default() += started.elapsed();
         }
         "retained_history_read" => {
             timings.measure(Phase::MvccRead, || {
@@ -637,71 +642,96 @@ async fn run_erasure(payload_bytes: usize) -> Result<(Duration, Duration)> {
     Ok((total.saturating_sub(streaming), streaming))
 }
 
-fn run_reconnect_resume(payload_bytes: usize) -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    let mut receiver = TransferReceiver::open(directory.path())?;
-    let peer = AuthenticatedPeer::new("benchmark-peer", 1)?;
-    let transfer_id = Uuid::new_v4();
-    let bytes = vec![11_u8; payload_bytes];
-    let split = bytes.len() / 2;
-    let final_hash = *blake3::hash(&bytes).as_bytes();
-    let mut first_session = ConnectionSession::establish("benchmark-cluster", peer.clone())?;
-    let first = benchmark_frame(
-        &first_session,
-        transfer_id,
-        1,
-        0,
-        &bytes[..split],
-        bytes.len() as u64,
-        final_hash,
-        false,
-    );
-    receiver.receive(&mut first_session, &first)?;
-    drop(receiver);
+#[derive(Clone)]
+struct BenchmarkReplicationAuthorizer;
 
-    let mut receiver = TransferReceiver::open(directory.path())?;
-    let watermark = receiver
-        .watermark(transfer_id)?
-        .expect("partial transfer has persisted watermark");
-    let mut resumed = ConnectionSession::establish("benchmark-cluster", peer)?;
-    let final_frame = benchmark_frame(
-        &resumed,
-        transfer_id,
-        1,
-        watermark.persisted_through,
-        &bytes[usize::try_from(watermark.persisted_through)?..],
-        bytes.len() as u64,
-        final_hash,
-        true,
+#[async_trait]
+impl ReplicationConnectionAuthorizer for BenchmarkReplicationAuthorizer {
+    async fn authorize(
+        &self,
+        _metadata: &MetadataMap,
+        open: &anvil_core::anvil_api::ReplicationSessionOpen,
+    ) -> Result<AuthenticatedPeer, Status> {
+        AuthenticatedPeer::new_bound(
+            open.node_id.clone(),
+            open.node_incarnation,
+            "benchmark-client",
+        )
+        .map_err(|error| Status::permission_denied(error.to_string()))
+    }
+}
+
+async fn start_replication_server(
+    receiver_directory: &std::path::Path,
+) -> Result<(
+    String,
+    tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let service = ReplicationServiceImpl::open(BenchmarkReplicationAuthorizer, receiver_directory)?;
+    let task = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(
+                anvil_core::anvil_api::replication_service_server::ReplicationServiceServer::new(
+                    service,
+                ),
+            )
+            .serve_with_incoming(TcpListenerStream::new(listener)),
     );
-    let ack = receiver.receive(&mut resumed, &final_frame)?;
-    assert_eq!(ack.status, AckStatus::Complete);
+    Ok((format!("http://{address}"), task))
+}
+
+async fn run_reconnect_resume(payload_bytes: usize) -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let bytes = vec![11_u8; payload_bytes];
+    let identity = bundle_identity(&bytes);
+    let target = bundle_target("benchmark-peer", "zone-2");
+    let (first_endpoint, first_server) = start_replication_server(directory.path()).await?;
+    let manager = TonicReplicationStreamManager::new(
+        "benchmark-cluster",
+        NodeIncarnation {
+            node_id: "benchmark-client".into(),
+            incarnation: 1,
+        },
+        "benchmark-token",
+        [ReplicationPeer {
+            cluster_id: "benchmark-cluster".into(),
+            node: target.node.clone(),
+            endpoint: first_endpoint,
+        }],
+        ReplicationStreamOptions {
+            allow_insecure_transport_for_tests: true,
+            frame_bytes: 64 * 1024,
+            ..ReplicationStreamOptions::default()
+        },
+    )?;
+    let first_ack = manager.send_bundle(&target, &identity, &bytes).await?;
+    assert_eq!(first_ack.status, AckStatus::Complete);
+    first_server.abort();
+
+    // A replacement service reopens the same durable receiver directory. The
+    // real client discards its old channel, authenticates a new gRPC stream,
+    // queries the transfer watermark, and resumes the immutable transfer.
+    let (second_endpoint, second_server) = start_replication_server(directory.path()).await?;
+    manager
+        .replace_peer_endpoint("benchmark-cluster", &target.node, second_endpoint)
+        .await?;
+    let resumed_ack = manager.send_bundle(&target, &identity, &bytes).await?;
+    assert_eq!(resumed_ack.status, AckStatus::Complete);
+    assert_eq!(resumed_ack.persisted_through, bytes.len() as u64);
+    second_server.abort();
     Ok(())
 }
 
-fn benchmark_frame(
-    session: &ConnectionSession,
-    transfer_id: Uuid,
-    sequence: u64,
-    offset: u64,
-    payload: &[u8],
-    total_length: u64,
-    final_hash: [u8; 32],
-    finish: bool,
-) -> ReplicationFrame {
-    ReplicationFrame {
-        session_id: session.id(),
-        cluster_id: "benchmark-cluster".into(),
-        sequence,
-        partition: "benchmark/reconnect".into(),
-        transfer_id,
-        kind: TransferKind::ObjectShard,
-        offset,
-        payload: payload.to_vec(),
-        payload_checksum: ReplicationFrame::checksum(payload),
-        total_length,
-        final_hash,
-        finish,
+fn bundle_identity(bytes: &[u8]) -> BundleIdentity {
+    let mut hash = Sha256::new();
+    hash.update(b"anvil.mvcc.transaction-bundle.v1");
+    hash.update((bytes.len() as u64).to_be_bytes());
+    hash.update(bytes);
+    BundleIdentity {
+        hash: format!("sha256:{}", hex::encode(hash.finalize())),
+        length: bytes.len() as u64,
     }
 }
 
