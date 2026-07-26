@@ -3,6 +3,7 @@
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use reed_solomon_erasure::galois_8::ReedSolomon;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use uuid::Uuid;
 
@@ -69,7 +70,7 @@ impl StreamingErasureEncoder {
     ) -> Result<EncodedObject> {
         let stripe_capacity = self.profile.data_shards * self.profile.shard_bytes;
         let mut stripe = vec![0; stripe_capacity];
-        let mut object_hash = blake3::Hasher::new();
+        let mut object_hash = Sha256::new();
         let mut object_length = 0_u64;
         let mut stripe_ordinal = 0_u64;
         loop {
@@ -117,7 +118,7 @@ impl StreamingErasureEncoder {
             }
         }
         Ok(EncodedObject {
-            content_hash: *object_hash.finalize().as_bytes(),
+            content_hash: object_hash.finalize().into(),
             object_length,
             stripe_count: stripe_ordinal,
         })
@@ -162,7 +163,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.object_length, 11);
-        assert_eq!(result.content_hash, *blake3::hash(input).as_bytes());
+        let expected_hash: [u8; 32] = Sha256::digest(input).into();
+        assert_eq!(result.content_hash, expected_hash);
         assert_eq!(result.stripe_count, 2);
         assert_eq!(sink.0.len(), 6);
         assert_eq!(sink.0[0].4, b"abcd");

@@ -119,6 +119,7 @@ pub mod replication;
 pub mod routing;
 pub mod search_query;
 pub mod services;
+pub mod shard_placement;
 pub mod shard_store;
 pub mod sharding;
 pub mod storage;
