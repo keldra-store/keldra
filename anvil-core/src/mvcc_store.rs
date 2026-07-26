@@ -940,6 +940,21 @@ impl MvccStore {
         })
     }
 
+    pub fn rebind_local_durability_upgrade_lease(
+        &self,
+        job_id: &str,
+        current_owner: &str,
+        assignment_owner: &str,
+    ) -> Result<()> {
+        if assignment_owner.trim().is_empty() {
+            bail!("assignment-fenced lease owner is required");
+        }
+        self.transition_local_durability_upgrade(job_id, current_owner, |record| {
+            record.lease_owner = Some(assignment_owner.to_string());
+            Ok(())
+        })
+    }
+
     pub fn complete_local_durability_upgrade(&self, job_id: &str, worker_id: &str) -> Result<()> {
         self.transition_local_durability_upgrade(job_id, worker_id, |record| {
             record.state = LocalDurabilityUpgradeState::Complete;

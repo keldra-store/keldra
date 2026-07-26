@@ -545,15 +545,29 @@ where
         else {
             return Ok(false);
         };
+        let assignment = match self.placement.assignment(&record.job).await {
+            Ok(assignment) => assignment,
+            Err(error) => {
+                store.retry_local_durability_upgrade(
+                    &job_id,
+                    worker_id,
+                    retry_after_unix_ms,
+                    &error.to_string(),
+                )?;
+                return Err(error);
+            }
+        };
+        let lease_owner = assignment.lease_owner(worker_id);
+        store.rebind_local_durability_upgrade_lease(&job_id, worker_id, &lease_owner)?;
         match self.execute(&record.job).await {
             Ok(()) => {
-                store.complete_local_durability_upgrade(&job_id, worker_id)?;
+                store.complete_local_durability_upgrade(&job_id, &lease_owner)?;
                 Ok(true)
             }
             Err(error) => {
                 store.retry_local_durability_upgrade(
                     &job_id,
-                    worker_id,
+                    &lease_owner,
                     retry_after_unix_ms,
                     &error.to_string(),
                 )?;
