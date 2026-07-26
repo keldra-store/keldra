@@ -21,9 +21,9 @@ pub mod repair;
 pub mod replication;
 #[cfg(feature = "root-publication-test-control")]
 mod root_publication_test_control;
-pub(crate) mod transaction_context;
 pub mod stream;
 pub mod transaction;
+pub(crate) mod transaction_context;
 pub(crate) mod watch_envelope;
 
 use crate::anvil_api::{

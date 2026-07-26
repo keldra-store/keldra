@@ -56,7 +56,9 @@ fn validate_transaction_id(transaction_id: &str) -> Result<&str, Status> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::anvil_api::{NativeMutationContext, PublicMutationContext, WriteOptions, write_options};
+    use crate::anvil_api::{
+        NativeMutationContext, PublicMutationContext, WriteOptions, write_options,
+    };
 
     #[test]
     fn write_options_extracts_transaction_id() {
@@ -69,7 +71,10 @@ mod tests {
             execution: Some(write_options::Execution::TransactionId("tx-1".to_string())),
         };
 
-        assert_eq!(write_options_transaction_id(Some(&options)).unwrap(), Some("tx-1"));
+        assert_eq!(
+            write_options_transaction_id(Some(&options)).unwrap(),
+            Some("tx-1")
+        );
     }
 
     #[test]
