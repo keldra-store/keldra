@@ -908,12 +908,11 @@ impl AppState {
 
         let latest_cursor = if definition.source_kind == "append_record" {
             u64::try_from(
-                crate::append_journal::append_record_source_cursor(
-                    &self.storage,
+                crate::append_journal::append_record_source_cursor_mvcc(
+                    &self.mvcc,
                     claims.tenant_id,
                     bucket.id,
                 )
-                .await
                 .map_err(|e| Status::internal(e.to_string()))?,
             )
             .unwrap_or(u64::MAX)

@@ -138,19 +138,21 @@ impl Persistence {
         } else {
             "object_current"
         };
-        let source_cursor = if index.kind == "typed_json"
-            && typed_json_source_kind == "append_record"
-        {
-            append_journal::append_record_source_cursor(&self.storage, bucket.tenant_id, bucket.id)
+        let source_cursor =
+            if index.kind == "typed_json" && typed_json_source_kind == "append_record" {
+                append_journal::append_record_source_cursor_mvcc(
+                    self.mvcc()?,
+                    bucket.tenant_id,
+                    bucket.id,
+                )?
+            } else {
+                metadata_journal::object_metadata_source_cursor(
+                    &self.storage,
+                    bucket,
+                    &self.partition_owner_signing_key,
+                )
                 .await?
-        } else {
-            metadata_journal::object_metadata_source_cursor(
-                &self.storage,
-                bucket,
-                &self.partition_owner_signing_key,
-            )
-            .await?
-        };
+            };
         let index_storage_id =
             index_journal::index_storage_id(bucket.tenant_id, bucket.id, index.id);
         let checkpoint = watch_checkpoint::read_watch_checkpoint(

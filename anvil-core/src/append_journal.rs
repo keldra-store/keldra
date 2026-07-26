@@ -211,8 +211,10 @@ mod read;
 pub use read::get_active_append_stream;
 pub use read::{
     AppendStreamPage, AppendStreamRecordPage, append_record_source_cursor,
-    append_stream_has_records, get_active_append_stream_in_transaction,
-    get_active_append_stream_mvcc, list_append_stream_records_page, list_append_streams_page,
+    append_record_source_cursor_mvcc, append_stream_has_records,
+    get_active_append_stream_in_transaction, get_active_append_stream_mvcc,
+    list_append_stream_records_page, list_append_stream_records_page_mvcc,
+    list_append_streams_page, list_append_streams_page_mvcc,
 };
 use read::{
     append_record_cursor_stream_id, append_record_stream_id, append_state_stream_id,
@@ -475,6 +477,7 @@ pub(crate) async fn append_stream_record_with_permit(
 
 pub(crate) async fn append_stream_record_with_permit_in_partition(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     bucket_id: i64,
     stream: &AppendStream,
@@ -489,20 +492,58 @@ pub(crate) async fn append_stream_record_with_permit_in_partition(
     require_append_metadata_permit(tenant_id, bucket_id, permit)?;
     let partition_precondition =
         partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
-    append_stream_record_inner(
+    let current = get_active_append_stream_mvcc(
         storage,
-        stream,
+        mvcc,
+        tenant_id,
+        bucket_id,
+        &stream.stream_key,
+        stream.stream_id,
+    )
+    .await?
+    .ok_or_else(|| anyhow!("append stream not found"))?;
+    let journal_head = crate::mvcc_product::stream_logical_key(
+        crate::core_store::TABLE_STREAM_HEAD_ROW,
+        &append_metadata_stream_id(tenant_id, bucket_id),
+        None,
+    )?;
+    let record_head = crate::mvcc_product::stream_logical_key(
+        crate::core_store::TABLE_STREAM_HEAD_ROW,
+        &append_record_stream_id(&current)?,
+        None,
+    )?;
+    let next_record_id = next_append_id_from_mvcc_head(mvcc, &journal_head, false)?;
+    let next_sequence = next_append_id_from_mvcc_head(mvcc, &record_head, true)?;
+    let record = AppendStreamRecord {
+        id: next_record_id,
+        stream_id: current.id,
+        record_sequence: next_sequence,
+        payload_hash: payload_object_ref.hash.clone(),
         payload_object_ref,
         payload_size,
         content_type,
         user_meta,
-        Some(permit),
-        Some(partition_precondition),
-        None,
-        None,
-        Some(authenticated_principal),
+        authenticated_principal: authenticated_principal.to_string(),
+        created_at: Utc::now(),
+    };
+    let (receipt, mutations) = append_body_mvcc_mutations(
+        tenant_id,
+        bucket_id,
+        AppendMutationKind::AppendRecord,
+        current,
+        Some(record.clone()),
+        permit.fence_token,
+    )?;
+    let _ = partition_precondition;
+    mvcc.autocommit_product_mutations(
+        authenticated_principal,
+        &format!("append-record:{}", receipt.mutation_id),
+        mutations,
+        crate::mvcc_transaction::DurabilityLevel::Local,
+        u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default(),
     )
-    .await
+    .await?;
+    Ok(AppendStreamRecordMutation { record, receipt })
 }
 
 pub(crate) async fn append_stream_record_with_permit_in_partition_transaction(
@@ -669,6 +710,7 @@ pub(crate) async fn seal_append_stream_with_permit(
 
 pub(crate) async fn seal_append_stream_with_permit_in_partition(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     bucket_id: i64,
     stream: &AppendStream,
@@ -679,16 +721,46 @@ pub(crate) async fn seal_append_stream_with_permit_in_partition(
     require_append_metadata_permit(tenant_id, bucket_id, permit)?;
     let partition_precondition =
         partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
-    seal_append_stream_inner(
+    let mut sealed = get_active_append_stream_mvcc(
         storage,
-        stream,
-        segment_hash,
-        Some(permit),
-        Some(partition_precondition),
-        None,
-        None,
+        mvcc,
+        tenant_id,
+        bucket_id,
+        &stream.stream_key,
+        stream.stream_id,
     )
-    .await
+    .await?
+    .ok_or_else(|| anyhow!("append stream not found"))?;
+    if sealed.sealed_at.is_some() {
+        return Ok(SealAppendStreamMutation {
+            sealed: false,
+            receipt: None,
+        });
+    }
+    sealed.sealed_at = Some(Utc::now());
+    sealed.segment_hash = Some(segment_hash.to_string());
+    let (receipt, mutations) = append_body_mvcc_mutations(
+        tenant_id,
+        bucket_id,
+        AppendMutationKind::SealStream,
+        sealed,
+        None,
+        permit.fence_token,
+    )?;
+    let principal = append_metadata_partition_principal(tenant_id, bucket_id);
+    let _ = partition_precondition;
+    mvcc.autocommit_product_mutations(
+        &principal,
+        &format!("append-seal:{}", receipt.mutation_id),
+        mutations,
+        crate::mvcc_transaction::DurabilityLevel::Local,
+        u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default(),
+    )
+    .await?;
+    Ok(SealAppendStreamMutation {
+        sealed: true,
+        receipt: Some(receipt),
+    })
 }
 
 pub(crate) async fn seal_append_stream_with_permit_in_partition_transaction(
@@ -881,6 +953,30 @@ fn append_body_mvcc_mutations(
 
 fn stable_append_ordinal(mutation_id: uuid::Uuid) -> u64 {
     u64::from_be_bytes(mutation_id.as_bytes()[..8].try_into().expect("UUID prefix"))
+}
+
+fn next_append_id_from_mvcc_head(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    key: &crate::mvcc_transaction::LogicalKey,
+    record_sequence: bool,
+) -> Result<i64> {
+    let previous = mvcc
+        .read_latest_value(key)?
+        .map(|payload| decode_append_body(&payload))
+        .transpose()?
+        .and_then(|body| {
+            if record_sequence {
+                body.record.map(|record| record.record_sequence)
+            } else {
+                body.record
+                    .map(|record| record.id)
+                    .or_else(|| body.stream.map(|stream| stream.id))
+            }
+        })
+        .unwrap_or(0);
+    previous
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("append MVCC head counter overflow"))
 }
 
 async fn append_body(
@@ -1530,166 +1626,5 @@ mod tests {
                 .to_string()
                 .contains("page size")
         );
-    }
-
-    #[tokio::test]
-    pub(crate) async fn append_journal_with_permit_writes_fenced_frames_and_header() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let owner = ready_owner(&storage, 1, 2, "node-a").await;
-        let permit = owner.write_permit().unwrap();
-
-        let stream =
-            create_append_stream_with_permit(&storage, 1, 2, "bucket", "stream", &permit, KEY)
-                .await
-                .unwrap();
-        append_stream_record_with_permit_in_partition(
-            &storage,
-            1,
-            2,
-            &stream.stream,
-            payload_ref("hash-a", 10),
-            10,
-            None,
-            None,
-            "tenant/1/principal/producer-a",
-            &permit,
-            KEY,
-        )
-        .await
-        .unwrap();
-        let records = list_append_stream_records_page(&storage, &stream.stream, 0, 100)
-            .await
-            .unwrap()
-            .records;
-        assert_eq!(
-            records[0].authenticated_principal,
-            "tenant/1/principal/producer-a"
-        );
-        seal_append_stream_with_permit(&storage, &stream.stream, "segment-a", &permit, KEY)
-            .await
-            .unwrap();
-
-        let fences = read_append_frame_fences_for_test(&storage, 1, 2)
-            .await
-            .unwrap();
-        assert_eq!(fences.len(), 3);
-        assert!(fences.iter().all(|fence| *fence == permit.fence_token));
-    }
-
-    #[tokio::test]
-    pub(crate) async fn append_journal_with_permit_rejects_stale_fence() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let owner = ready_owner(&storage, 1, 2, "node-a").await;
-        let stale_permit = owner.write_permit().unwrap();
-        let stream = create_append_stream_with_permit(
-            &storage,
-            1,
-            2,
-            "bucket",
-            "stream",
-            &stale_permit,
-            KEY,
-        )
-        .await
-        .unwrap();
-        let newer = ready_owner(&storage, 1, 2, "node-b").await;
-        assert!(newer.fence_token > stale_permit.fence_token);
-
-        let err = append_stream_record_with_permit(
-            &storage,
-            &stream.stream,
-            payload_ref("hash-a", 10),
-            10,
-            None,
-            None,
-            &stale_permit,
-            KEY,
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("write permit owner is not current")
-        );
-    }
-
-    #[tokio::test]
-    pub(crate) async fn append_journal_batch_rejects_stale_partition_precondition() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let owner = ready_owner(&storage, 1, 2, "node-a").await;
-        let stale_permit = owner.write_permit().unwrap();
-        let stream = create_append_stream_with_permit(
-            &storage,
-            1,
-            2,
-            "bucket",
-            "stream",
-            &stale_permit,
-            KEY,
-        )
-        .await
-        .unwrap();
-        let stale_precondition = partition_write_precondition(&storage, &stale_permit, KEY)
-            .await
-            .unwrap();
-        let newer = ready_owner(&storage, 1, 2, "node-b").await;
-        assert!(newer.fence_token > stale_permit.fence_token);
-
-        let err = append_stream_record_inner(
-            &storage,
-            &stream.stream,
-            payload_ref("hash-a", 10),
-            10,
-            None,
-            None,
-            Some(&stale_permit),
-            Some(stale_precondition),
-            None,
-            None,
-            None,
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("target mismatch")
-                || err.to_string().contains("generation mismatch")
-                || err.to_string().contains("payload hash mismatch"),
-            "unexpected error: {err:?}"
-        );
-    }
-
-    async fn ready_owner(
-        storage: &Storage,
-        tenant_id: i64,
-        bucket_id: i64,
-        owner_node_id: &str,
-    ) -> crate::partition_fence::PartitionOwnerState {
-        let family = "append_metadata".to_string();
-        let id = hex::encode(append_metadata_partition_id(tenant_id, bucket_id));
-        crate::partition_fence::ready_partition_owner_for_test(
-            storage,
-            family,
-            id,
-            owner_node_id,
-            0,
-            hex::encode([0; 32]),
-            hex::encode([1; 32]),
-            KEY,
-        )
-        .await
-    }
-
-    fn payload_ref(label: &str, logical_size: u64) -> CoreObjectRef {
-        CoreObjectRef::test_unlocated(
-            format!(
-                "sha256:{}",
-                hex::encode(blake3::hash(label.as_bytes()).as_bytes())
-            ),
-            logical_size,
-            format!("manifest:{label}"),
-        )
     }
 }

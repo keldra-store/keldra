@@ -1325,7 +1325,7 @@ async fn persistence_replays_anvil_owned_state_after_fresh_instance_body() {
     );
     assert_eq!(
         replayed
-            .list_append_stream_records(&append_stream, 0, 100)
+            .list_append_stream_records(&append_stream, None, 100)
             .await
             .unwrap()
             .records

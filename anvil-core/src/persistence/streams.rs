@@ -453,6 +453,7 @@ impl Persistence {
             .await?;
         append_journal::append_stream_record_with_permit_in_partition(
             &self.storage,
+            self.mvcc()?,
             tenant_id,
             bucket_id,
             stream,
@@ -503,16 +504,15 @@ impl Persistence {
     pub async fn list_append_stream_records(
         &self,
         stream: &AppendStream,
-        after_sequence: u64,
+        after_cursor: Option<&str>,
         limit: usize,
     ) -> Result<append_journal::AppendStreamRecordPage> {
-        append_journal::list_append_stream_records_page(
-            &self.storage,
+        append_journal::list_append_stream_records_page_mvcc(
+            self.mvcc()?,
             stream,
-            after_sequence,
+            after_cursor,
             limit,
         )
-        .await
     }
 
     pub async fn append_stream_has_records(
@@ -528,17 +528,16 @@ impl Persistence {
         &self,
         tenant_id: i64,
         bucket_id: i64,
-        after_stream_id: Option<&str>,
+        after_cursor: Option<&str>,
         limit: usize,
     ) -> Result<append_journal::AppendStreamPage> {
-        append_journal::list_append_streams_page(
-            &self.storage,
+        append_journal::list_append_streams_page_mvcc(
+            self.mvcc()?,
             tenant_id,
             bucket_id,
-            after_stream_id,
+            after_cursor,
             limit,
         )
-        .await
     }
 
     pub async fn seal_append_stream(
@@ -553,6 +552,7 @@ impl Persistence {
             .await?;
         append_journal::seal_append_stream_with_permit_in_partition(
             &self.storage,
+            self.mvcc()?,
             tenant_id,
             bucket_id,
             stream,

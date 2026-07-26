@@ -14,10 +14,14 @@ use crate::{
     mvcc_open_transactions::StagedLogicalMutation,
     mvcc_transaction::{CertificationResult, DurabilityLevel, LogicalKey, ReadConsistency},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 const CORE_META_KEY_SCHEMA: &[u8] = b"anvil.mvcc.coremeta-key.v1";
 const STREAM_KEY_SCHEMA: &[u8] = b"anvil.mvcc.stream-key.v1";
+
+pub fn stream_table_prefix() -> &'static [u8] {
+    STREAM_KEY_SCHEMA
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProductMutation {
@@ -32,6 +36,20 @@ struct StreamRecordValue<'a> {
     record_kind: &'a str,
     idempotency_key: &'a str,
     payload: &'a [u8],
+}
+
+pub fn decode_stream_record_value(bytes: &[u8]) -> Result<(String, Vec<u8>)> {
+    #[derive(Deserialize)]
+    struct OwnedStreamRecordValue {
+        schema: String,
+        record_kind: String,
+        payload: Vec<u8>,
+    }
+    let value: OwnedStreamRecordValue = serde_json::from_slice(bytes)?;
+    if value.schema != "anvil.mvcc.stream-record.v1" {
+        bail!("MVCC stream record has an unsupported schema");
+    }
+    Ok((value.record_kind, value.payload))
 }
 
 impl ProductMutation {
