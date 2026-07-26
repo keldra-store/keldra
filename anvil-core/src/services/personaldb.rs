@@ -459,6 +459,7 @@ impl PersonalDbService for AppState {
         }
         let response = personaldb_catch_up(
             &self.storage,
+            &self.mvcc,
             CoreCatchUpRequest {
                 tenant_id: claims.tenant_id,
                 database_id: req.database_id,
@@ -1452,6 +1453,7 @@ impl AppState {
         let mutation_id = *uuid::Uuid::new_v4().as_bytes();
         maybe_build_personaldb_snapshot(
             &self.storage,
+            &self.mvcc,
             PersonalDbSnapshotBuildRequest {
                 tenant_id: actor.tenant_id,
                 database_id: &validated.request.database_id,

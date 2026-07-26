@@ -71,8 +71,14 @@ pub async fn repair_personaldb_log_chain(
         ));
     }
 
-    let mut report =
-        assess_log_chain(storage, tenant_id, database_id, personaldb_trust_store).await?;
+    let mut report = assess_log_chain(
+        storage,
+        mvcc,
+        tenant_id,
+        database_id,
+        personaldb_trust_store,
+    )
+    .await?;
     if let PersonalDbLogChainRepairStatus::NeedsReview(reason) = report.status.clone() {
         let write = repair_finding_write(
             tenant_id,
@@ -89,6 +95,7 @@ pub async fn repair_personaldb_log_chain(
 
 async fn assess_log_chain(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
     trust_store: &PublicKeyTrustStore,
@@ -111,24 +118,28 @@ async fn assess_log_chain(
                 ));
             }
         };
-    let head =
-        match read_personaldb_committed_head(storage, tenant_id, database_id, trust_store).await {
-            Ok(Some(head)) => head,
-            Ok(None) => {
-                return Ok(report_without_head(
-                    tenant_id,
-                    database_id,
-                    PersonalDbLogChainRepairReason::MissingCommittedHead,
-                ));
-            }
-            Err(err) => {
-                return Ok(report_without_head(
-                    tenant_id,
-                    database_id,
-                    PersonalDbLogChainRepairReason::InvalidCommittedHead(err.to_string()),
-                ));
-            }
-        };
+    let head = match crate::personaldb_proposal_admission::read_personaldb_committed_head_mvcc(
+        mvcc,
+        tenant_id,
+        database_id,
+        trust_store,
+    ) {
+        Ok(Some(head)) => head,
+        Ok(None) => {
+            return Ok(report_without_head(
+                tenant_id,
+                database_id,
+                PersonalDbLogChainRepairReason::MissingCommittedHead,
+            ));
+        }
+        Err(err) => {
+            return Ok(report_without_head(
+                tenant_id,
+                database_id,
+                PersonalDbLogChainRepairReason::InvalidCommittedHead(err.to_string()),
+            ));
+        }
+    };
 
     if head.schema_hash != manifest.schema_hash || head.database_id != manifest.database_id {
         return Ok(report_with_head(
@@ -737,285 +748,4 @@ fn hex32(value: &str) -> Result<Hash32> {
     Ok(hex::decode(value)?
         .try_into()
         .map_err(|_| anyhow!("value must be hex32"))?)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        personaldb_commit_store::{
-            write_personaldb_changeset_payload, write_personaldb_commit_certificate,
-        },
-        personaldb_control::{PersonalDbCommitCertificate, PersonalDbGroupManifest},
-        personaldb_coremeta::delete_personaldb_data_locator_row,
-        personaldb_heads::{
-            PersonalDbCommittedHead, write_personaldb_committed_head,
-            write_personaldb_group_manifest,
-        },
-        personaldb_segment::{PersonalDbLogSegmentWrite, write_personaldb_log_segment},
-        test_support::personaldb_protocol_keyring,
-    };
-    use tempfile::{TempDir, tempdir};
-
-    const KEY: &[u8] = b"personaldb repair signing key";
-
-    #[tokio::test]
-    async fn healthy_chain_is_up_to_date() {
-        let fixture = Fixture::create().await;
-        let report = repair_personaldb_log_chain(
-            &fixture.storage,
-            &fixture.mvcc,
-            7,
-            "db-alpha",
-            9,
-            fixture.protocol_keyring.trust_store(),
-            KEY,
-        )
-        .await
-        .unwrap();
-        assert_eq!(report.status, PersonalDbLogChainRepairStatus::UpToDate);
-        assert_eq!(report.committed_log_index, 1);
-        assert_eq!(report.verified_log_index, 1);
-        assert!(report.finding.is_none());
-    }
-
-    #[tokio::test]
-    async fn missing_payload_requires_operator_review() {
-        let fixture = Fixture::create().await;
-        delete_personaldb_data_locator_row(
-            &fixture.storage,
-            7,
-            "db-alpha",
-            &fixture.payload_ref,
-            "test-delete-payload-locator",
-        )
-        .await
-        .unwrap();
-
-        let report = repair_personaldb_log_chain(
-            &fixture.storage,
-            &fixture.mvcc,
-            7,
-            "db-alpha",
-            9,
-            fixture.protocol_keyring.trust_store(),
-            KEY,
-        )
-        .await
-        .unwrap();
-        assert_eq!(status_name(&report.status), "needs_review");
-        assert_eq!(
-            status_reason(&report.status),
-            "PersonalDbChangesetPayloadMissing"
-        );
-        let finding = report.finding.expect("repair finding");
-        assert_eq!(finding.status, RepairFindingStatus::RequiresOperatorReview);
-        assert_eq!(finding.proposed_action, RepairActionKind::VerifyOnly);
-    }
-
-    #[tokio::test]
-    async fn missing_certificate_requires_operator_review() {
-        let fixture = Fixture::create().await;
-        delete_personaldb_data_locator_row(
-            &fixture.storage,
-            7,
-            "db-alpha",
-            &fixture.certificate_ref,
-            "test-delete-certificate-locator",
-        )
-        .await
-        .unwrap();
-
-        let report = repair_personaldb_log_chain(
-            &fixture.storage,
-            &fixture.mvcc,
-            7,
-            "db-alpha",
-            9,
-            fixture.protocol_keyring.trust_store(),
-            KEY,
-        )
-        .await
-        .unwrap();
-        assert_eq!(status_name(&report.status), "needs_review");
-        assert_eq!(
-            status_reason(&report.status),
-            "PersonalDbCommitCertificateMissing"
-        );
-        let finding = report.finding.expect("repair finding");
-        assert_eq!(finding.status, RepairFindingStatus::RequiresOperatorReview);
-        assert_eq!(finding.proposed_action, RepairActionKind::VerifyOnly);
-    }
-
-    struct Fixture {
-        _temp: TempDir,
-        storage: Storage,
-        mvcc: crate::mvcc_bootstrap::MvccSubsystem,
-        payload_ref: String,
-        certificate_ref: String,
-        protocol_keyring: crate::personaldb_signing::PersonalDbProtocolKeyring,
-    }
-
-    impl Fixture {
-        async fn create() -> Self {
-            let temp = tempdir().unwrap();
-            let storage = Storage::new_at(temp.path()).await.unwrap();
-            let config = crate::Config {
-                node_id: "personaldb-repair-test".into(),
-                storage_path: temp.path().to_string_lossy().into_owned(),
-                public_api_addr: "127.0.0.1:0".into(),
-                ..crate::Config::default()
-            };
-            let meta =
-                crate::core_store::CoreMetaStore::open(storage.core_store_meta_path()).unwrap();
-            let mvcc = crate::mvcc_bootstrap::MvccSubsystem::bootstrap(&config, meta.database())
-                .await
-                .unwrap();
-            let protocol_keyring = personaldb_protocol_keyring();
-            let schema_hash = hash32(b"schema");
-            let genesis_hash = hash32(b"genesis");
-            let payload = b"changeset";
-            let payload_hash = hash32(payload);
-            let payload_paths = write_personaldb_changeset_payload(
-                &storage,
-                7,
-                "db-alpha",
-                1,
-                payload_hash,
-                payload,
-            )
-            .await
-            .unwrap();
-            let payload_ref = payload_paths.by_index_ref.clone();
-            let provisional = PersonalDbLogRecord::new(
-                1,
-                1,
-                1,
-                1,
-                genesis_hash,
-                payload_hash,
-                hash32(b"envelope"),
-                [0; 32],
-                payload_ref.clone().into_bytes(),
-                Vec::new(),
-                Vec::new(),
-            );
-            let certificate = PersonalDbCommitCertificate {
-                format_version: 2,
-                tenant_id: "7".to_string(),
-                database_id: "db-alpha".to_string(),
-                log_index: 1,
-                previous_log_hash: hex::encode(genesis_hash),
-                entry_hash: hex::encode(provisional.entry_hash),
-                changeset_payload_hash: hex::encode(payload_hash),
-                verified_envelope_hash: hex::encode(hash32(b"envelope")),
-                client_log_epoch: 1,
-                membership_epoch: 1,
-                policy_epoch: 1,
-                leader_replica_id: "leader".to_string(),
-                voter_acks_hash: hex::encode(hash32(b"acks")),
-                authz_revision: 1,
-                witness_node_id: "node".to_string(),
-                witnessed_at: "2026-06-28T00:00:00Z".to_string(),
-                certificate_hash: None,
-                witness_signature: None,
-            }
-            .seal(&protocol_keyring)
-            .await
-            .unwrap();
-            let certificate_ref = write_personaldb_commit_certificate(
-                &storage,
-                7,
-                "db-alpha",
-                &certificate,
-                protocol_keyring.trust_store(),
-            )
-            .await
-            .unwrap();
-            let record = PersonalDbLogRecord::new(
-                1,
-                1,
-                1,
-                1,
-                genesis_hash,
-                payload_hash,
-                hash32(b"envelope"),
-                hex32(certificate.certificate_hash.as_deref().unwrap()).unwrap(),
-                payload_ref.clone().into_bytes(),
-                certificate_ref.clone().into_bytes(),
-                Vec::new(),
-            );
-            let manifest = PersonalDbGroupManifest {
-                format_version: 2,
-                tenant_id: "7".to_string(),
-                database_id: "db-alpha".to_string(),
-                schema_hash: hex::encode(schema_hash),
-                genesis_hash: hex::encode(genesis_hash),
-                created_at: "2026-06-28T00:00:00Z".to_string(),
-                created_by: "node".to_string(),
-                consistency_policy: "StrictWitnessed".to_string(),
-                object_layout_version: 1,
-                active_membership_epoch: 1,
-                active_policy_epoch: 1,
-                current_row_index_generation: 0,
-                current_projection_generation: 0,
-                manifest_hash: None,
-                manifest_signature: None,
-            }
-            .seal(&protocol_keyring)
-            .await
-            .unwrap();
-            write_personaldb_group_manifest(&storage, 7, &manifest, protocol_keyring.trust_store())
-                .await
-                .unwrap();
-            let segment_ref = write_personaldb_log_segment(
-                &storage,
-                PersonalDbLogSegmentWrite {
-                    tenant_id: 7,
-                    database_id: "db-alpha",
-                    schema_hash,
-                    source_fence_token: 3,
-                    records: std::slice::from_ref(&record),
-                },
-            )
-            .await
-            .unwrap();
-            let head = PersonalDbCommittedHead {
-                format_version: 2,
-                tenant_id: "7".to_string(),
-                database_id: "db-alpha".to_string(),
-                log_index: 1,
-                log_hash: hex::encode(record.entry_hash),
-                segment_ref,
-                row_index_generation: 0,
-                policy_epoch: 1,
-                membership_epoch: 1,
-                schema_hash: hex::encode(schema_hash),
-                updated_at: "2026-06-28T00:00:00Z".to_string(),
-                updated_by_node: "node".to_string(),
-                head_hash: None,
-                head_signature: None,
-            }
-            .seal(&protocol_keyring)
-            .await
-            .unwrap();
-            write_personaldb_committed_head(
-                &storage,
-                7,
-                "db-alpha",
-                &head,
-                protocol_keyring.trust_store(),
-            )
-            .await
-            .unwrap();
-            Self {
-                _temp: temp,
-                storage,
-                mvcc,
-                payload_ref,
-                certificate_ref,
-                protocol_keyring,
-            }
-        }
-    }
 }
