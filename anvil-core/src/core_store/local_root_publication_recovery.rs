@@ -269,7 +269,6 @@ pub(super) fn root_publication_plan_hash(
     let mut bytes = Vec::new();
     append_hash_part(&mut bytes, b"anvil.core.root_publication_plan.v1");
     append_hash_part(&mut bytes, transaction_id.as_bytes());
-    let mut guard_owned_rows = local_rows.to_vec();
     let mut sorted_local_rows = local_rows.to_vec();
     sort_encoded_rows(&mut sorted_local_rows);
     for row in &sorted_local_rows {
@@ -294,14 +293,11 @@ pub(super) fn root_publication_plan_hash(
             append_hash_part(&mut bytes, hash.as_bytes());
         }
         sort_encoded_rows(&mut rows);
-        guard_owned_rows.extend(rows.iter().cloned());
         for row in &rows {
             append_hash_part(&mut bytes, encoded_row_hash(row).as_bytes());
         }
     }
-    let guard_rows = guard_owned_rows.iter().collect::<Vec<_>>();
-    let guard = super::local_tx_rows::publication_guard_summary(transaction_id, &guard_rows)?;
-    append_publication_guard_plan_hash(&mut bytes, guard.as_ref());
+    append_publication_guard_plan_hash(&mut bytes, None);
     Ok(format!("sha256:{}", sha256_hex(&bytes)))
 }
 
@@ -346,12 +342,6 @@ pub(super) fn build_root_publication_intent(
         validate_intent_root(transaction_id, created_at_unix_nanos, root)?;
         sort_encoded_rows(&mut root.rows);
     }
-    let guard_rows = roots
-        .iter()
-        .flat_map(|root| root.rows.iter())
-        .chain(local_rows.iter())
-        .collect::<Vec<_>>();
-    let guard = super::local_tx_rows::publication_guard_summary(transaction_id, &guard_rows)?;
     let intent = RootPublicationIntent {
         transaction_id: transaction_id.to_string(),
         plan_hash,
@@ -359,7 +349,7 @@ pub(super) fn build_root_publication_intent(
         created_at_unix_nanos,
         roots,
         local_rows,
-        guard,
+        guard: None,
         state: RootPublicationIntentState::Pending,
         terminal_reason: None,
     };
