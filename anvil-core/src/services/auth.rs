@@ -1323,7 +1323,7 @@ impl AuthService for AppState {
             .max(1);
         for namespace in req.namespaces {
             let record = authz_schema::write_authz_namespace_schema(
-                &self.storage,
+                &self.mvcc,
                 claims.tenant_id,
                 namespace,
                 authz_revision,
@@ -1410,7 +1410,7 @@ impl AuthService for AppState {
         .await?;
         let records = if req.namespace.is_empty() {
             let page = authz_schema::page_authz_namespace_schemas(
-                &self.storage,
+                &self.mvcc,
                 claims.tenant_id,
                 None,
                 authz_schema::AUTHZ_NAMESPACE_SCHEMA_PAGE_MAX,
@@ -1425,14 +1425,10 @@ impl AuthService for AppState {
             }
             page.records
         } else {
-            authz_schema::read_authz_namespace_schema(
-                &self.storage,
-                claims.tenant_id,
-                &req.namespace,
-            )
-            .await
-            .map(|record| record.into_iter().collect())
-            .map_err(|error| Status::internal(error.to_string()))?
+            authz_schema::read_authz_namespace_schema(&self.mvcc, claims.tenant_id, &req.namespace)
+                .await
+                .map(|record| record.into_iter().collect())
+                .map_err(|error| Status::internal(error.to_string()))?
         };
         let schema_version = records
             .iter()

@@ -1,16 +1,13 @@
 use crate::core_store::{
-    CF_AUTHZ, CoreMetaTuplePart, CoreMutationOperation, CoreMutationPrecondition, CoreStore,
-    TABLE_AUTHZ_HEAD_ROW, core_meta_committed_row_common, core_meta_payload_digest,
-    core_meta_root_key_hash, core_meta_tuple_key, decode_deterministic_proto,
-    encode_deterministic_proto, sha256_hex,
+    CF_AUTHZ, CoreMetaTuplePart, TABLE_AUTHZ_HEAD_ROW, core_meta_tuple_key,
+    decode_deterministic_proto, encode_deterministic_proto, sha256_hex,
 };
-use crate::storage::Storage;
 use anyhow::{Context, Result, bail};
 use prost::Message;
 use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock, Weak};
 
-const AUTHZ_HEAD_SCHEMA: &str = "anvil.authz.head.v1";
+const AUTHZ_HEAD_SCHEMA: &str = "anvil.authz.head.v2";
 const AUTHZ_HEAD_ROW_KIND: &str = "authz-head";
 const ZERO_SHA256: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -28,12 +25,6 @@ pub(crate) struct AuthzHead {
     pub(crate) tuple_fence_token: u64,
     pub(crate) active_schema_bindings_hash: String,
     pub(crate) updated_at_unix_nanos: u64,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct AuthzHeadSnapshot {
-    pub(crate) head: AuthzHead,
-    expected_payload_hash: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -61,8 +52,6 @@ pub(crate) enum AuthzHeadMutation<'a> {
 
 #[derive(Clone, PartialEq, Message)]
 struct AuthzHeadRowProto {
-    #[prost(message, optional, tag = "1")]
-    common: Option<crate::core_store::CoreMetaRowCommonProto>,
     #[prost(string, tag = "2")]
     schema: String,
     #[prost(int64, tag = "3")]
@@ -97,23 +86,6 @@ pub(crate) fn tenant_write_lock(tenant_id: i64) -> Result<Arc<tokio::sync::Mutex
     let lock = Arc::new(tokio::sync::Mutex::new(()));
     locks.insert(tenant_id, Arc::downgrade(&lock));
     Ok(lock)
-}
-
-pub(crate) async fn read(storage: &Storage, tenant_id: i64) -> Result<AuthzHeadSnapshot> {
-    validate_tenant_id(tenant_id)?;
-    let tuple_key = tuple_key(tenant_id)?;
-    let store = CoreStore::new(storage.clone()).await?;
-    let payload = store.read_coremeta_row(CF_AUTHZ, TABLE_AUTHZ_HEAD_ROW, &tuple_key)?;
-    match payload {
-        Some(payload) => Ok(AuthzHeadSnapshot {
-            head: decode(&payload, tenant_id)?,
-            expected_payload_hash: Some(core_meta_payload_digest(TABLE_AUTHZ_HEAD_ROW, &payload)),
-        }),
-        None => Ok(AuthzHeadSnapshot {
-            head: initial(tenant_id),
-            expected_payload_hash: None,
-        }),
-    }
 }
 
 pub(crate) fn read_mvcc(
@@ -183,14 +155,6 @@ pub(crate) fn latest_mvcc_predicate(
         },
     );
     Ok((key, predicate))
-}
-
-pub(crate) fn advance(
-    snapshot: &AuthzHeadSnapshot,
-    transaction_id: &str,
-    mutation: AuthzHeadMutation<'_>,
-) -> Result<AuthzHead> {
-    advance_from(&snapshot.head, transaction_id, mutation)
 }
 
 pub(crate) fn advance_mvcc(
@@ -264,41 +228,8 @@ pub(crate) fn mvcc_mutation(
     ))
 }
 
-pub(crate) fn precondition(snapshot: &AuthzHeadSnapshot) -> Result<CoreMutationPrecondition> {
-    Ok(CoreMutationPrecondition::CoreMetaRow {
-        cf: CF_AUTHZ.to_string(),
-        table_id: TABLE_AUTHZ_HEAD_ROW,
-        tuple_key: tuple_key(snapshot.head.tenant_id)?,
-        expected_payload_hash: snapshot.expected_payload_hash.clone(),
-        require_absent: snapshot.expected_payload_hash.is_none(),
-        require_present: snapshot.expected_payload_hash.is_some(),
-    })
-}
-
-pub(crate) fn put_operation(
-    partition_id: &str,
-    transaction_id: &str,
-    head: &AuthzHead,
-) -> Result<CoreMutationOperation> {
-    Ok(CoreMutationOperation::CoreMetaPut {
-        partition_id: partition_id.to_string(),
-        cf: CF_AUTHZ.to_string(),
-        table_id: TABLE_AUTHZ_HEAD_ROW,
-        tuple_key: tuple_key(head.tenant_id)?,
-        payload: encode(head, transaction_id)?,
-    })
-}
-
-pub(crate) fn transaction_partition(tenant_id: i64) -> String {
-    hex::encode(crate::authz_journal::authz_partition_id(tenant_id))
-}
-
 pub(crate) fn transaction_principal(tenant_id: i64) -> String {
     format!("partition-owner:authz_tuple:{tenant_id}")
-}
-
-pub(crate) fn root_anchor_key(tenant_id: i64) -> String {
-    format!("authz/{tenant_id}")
 }
 
 fn initial(tenant_id: i64) -> AuthzHead {
@@ -317,14 +248,10 @@ fn initial(tenant_id: i64) -> AuthzHead {
 
 fn encode(head: &AuthzHead, transaction_id: &str) -> Result<Vec<u8>> {
     validate(head)?;
+    if transaction_id.is_empty() {
+        bail!("authorization head transaction id must not be empty");
+    }
     Ok(encode_deterministic_proto(&AuthzHeadRowProto {
-        common: Some(core_meta_committed_row_common(
-            format!("tenant/{}/authz", head.tenant_id),
-            core_meta_root_key_hash(&root_anchor_key(head.tenant_id)),
-            head.committed_revision,
-            transaction_id,
-            head.updated_at_unix_nanos,
-        )),
         schema: AUTHZ_HEAD_SCHEMA.to_string(),
         tenant_id: head.tenant_id,
         committed_revision: head.committed_revision,
@@ -343,10 +270,6 @@ fn decode(payload: &[u8], expected_tenant_id: i64) -> Result<AuthzHead> {
     if proto.schema != AUTHZ_HEAD_SCHEMA {
         bail!("authorization head schema mismatch");
     }
-    let common = proto
-        .common
-        .as_ref()
-        .context("authorization head is missing CoreMeta common")?;
     let head = AuthzHead {
         tenant_id: proto.tenant_id,
         committed_revision: proto.committed_revision,
@@ -359,15 +282,8 @@ fn decode(payload: &[u8], expected_tenant_id: i64) -> Result<AuthzHead> {
         updated_at_unix_nanos: proto.updated_at_unix_nanos,
     };
     validate(&head)?;
-    if head.tenant_id != expected_tenant_id
-        || common.realm_id != format!("tenant/{expected_tenant_id}/authz")
-        || common.root_key_hash != core_meta_root_key_hash(&root_anchor_key(expected_tenant_id))
-        || common.root_generation == 0
-        || common.transaction_id.is_empty()
-        || common.visibility_state_enum() != crate::core_store::CoreMetaVisibilityState::Committed
-        || common.created_at_unix_nanos != head.updated_at_unix_nanos
-    {
-        bail!("authorization head scope metadata mismatch");
+    if head.tenant_id != expected_tenant_id {
+        bail!("authorization head tenant scope mismatch");
     }
     Ok(head)
 }
@@ -455,12 +371,8 @@ mod tests {
 
     #[test]
     fn authz_head_round_trip_preserves_point_state() {
-        let snapshot = AuthzHeadSnapshot {
-            head: initial(42),
-            expected_payload_hash: None,
-        };
-        let head = advance(
-            &snapshot,
+        let head = advance_from(
+            &initial(42),
             "tx-1",
             AuthzHeadMutation::TupleBatch {
                 journal_payload: b"tuple batch",
@@ -478,10 +390,7 @@ mod tests {
 
     #[test]
     fn binding_updates_form_a_deterministic_state_commitment() {
-        let snapshot = AuthzHeadSnapshot {
-            head: initial(7),
-            expected_payload_hash: None,
-        };
+        let head = initial(7);
         let mutation = AuthzHeadMutation::SchemaBinding {
             realm_id: "default",
             schema_id: "main",
@@ -489,36 +398,12 @@ mod tests {
             schema_digest: "blake3:0123456789abcdef",
             binding_generation: 2,
         };
-        let left = advance(&snapshot, "tx", mutation).unwrap();
-        let right = advance(&snapshot, "tx", mutation).unwrap();
+        let left = advance_from(&head, "tx", mutation).unwrap();
+        let right = advance_from(&head, "tx", mutation).unwrap();
         assert_eq!(
             left.active_schema_bindings_hash,
             right.active_schema_bindings_hash
         );
         assert_ne!(left.active_schema_bindings_hash, ZERO_SHA256);
-    }
-
-    #[test]
-    fn authz_head_accepts_independent_physical_root_generation() {
-        let snapshot = AuthzHeadSnapshot {
-            head: initial(42),
-            expected_payload_hash: None,
-        };
-        let head = advance(
-            &snapshot,
-            "tx-physical-generation",
-            AuthzHeadMutation::TupleBatch {
-                journal_payload: b"tuple batch",
-                fence_token: 17,
-            },
-        )
-        .unwrap();
-        let payload = encode(&head, "tx-physical-generation").unwrap();
-        let mut common = crate::core_store::core_meta_row_common_from_payload(&payload).unwrap();
-        common.root_generation = 91;
-        let rebound = crate::core_store::replace_core_meta_row_common(&payload, &common).unwrap();
-
-        assert_eq!(decode(&rebound, 42).unwrap(), head);
-        assert_ne!(common.root_generation, head.committed_revision);
     }
 }

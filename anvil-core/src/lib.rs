@@ -28,7 +28,6 @@ pub(crate) fn emit_test_timing(label: impl AsRef<str>, elapsed: Duration) {
 pub mod access_control;
 pub mod anvil_personaldb_sqlite_changeset;
 pub mod auth;
-pub(crate) mod authz_coremeta_payload;
 pub mod authz_derived_lag_watch;
 mod authz_head;
 pub mod authz_journal;

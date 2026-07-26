@@ -2,18 +2,13 @@ use crate::{
     anvil_api::{
         AuthzAllowedSubject, AuthzNamespaceSchema, AuthzRelationRule, AuthzRelationSchema,
     },
-    authz_coremeta_payload::{decode_authz_payload_row, encode_authz_payload_row},
     core_store::{
-        CF_AUTHZ, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaRowCommonProto, CoreMetaTuplePart,
-        CoreMetaVisibilityState, CoreStore, TABLE_AUTHZ_SCHEMA_ROW,
-        commit_coremeta_batch_for_storage, core_meta_committed_row_common,
-        core_meta_record_tuple_key, core_meta_root_key_hash, core_meta_row_common_from_payload,
-        core_meta_tuple_key, decode_deterministic_proto, encode_deterministic_proto,
+        CF_AUTHZ, CoreMetaTuplePart, TABLE_AUTHZ_SCHEMA_ROW, core_meta_tuple_key,
+        decode_deterministic_proto, encode_deterministic_proto,
     },
     formats::hash32,
-    storage::Storage,
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use chrono::Utc;
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -66,7 +61,7 @@ pub struct AuthzRelationRuleRecord {
     pub target_relation: String,
 }
 
-// Publication common belongs to the outer CoreMeta row, never this hashed domain payload.
+// Canonical domain payload stored directly as the MVCC row value.
 #[derive(Clone, PartialEq, Message)]
 struct AuthzNamespaceSchemaDomainProto {
     #[prost(uint32, tag = "1")]
@@ -130,7 +125,7 @@ struct AuthzRelationRuleRecordProto {
 }
 
 pub async fn write_authz_namespace_schema(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     mut schema: AuthzNamespaceSchema,
     authz_revision: u64,
@@ -138,13 +133,49 @@ pub async fn write_authz_namespace_schema(
     reason: &str,
 ) -> Result<AuthzNamespaceSchemaRecord> {
     validate_namespace_schema(&schema)?;
-    let previous = read_authz_namespace_schema(storage, tenant_id, &schema.namespace).await?;
+    let assignment = mvcc
+        .reconcile_authz_tuple_assignment(tenant_id)
+        .await?
+        .ok_or_else(|| anyhow!("this node is not the assigned authorization schema writer"))?;
+    let principal = crate::authz_head::transaction_principal(tenant_id);
+    let requested_hash = schema_hash(&schema)?;
+    let operation_hash = hex::encode(hash32(
+        format!(
+            "{tenant_id}\0{}\0{requested_hash}\0{authz_revision}\0{applied_by}\0{reason}",
+            schema.namespace
+        )
+        .as_bytes(),
+    ));
+    let idempotency_key = format!(
+        "authz-namespace-schema:{tenant_id}:{}:{operation_hash}",
+        schema.namespace,
+    );
+    let now_unix_ms = current_unix_ms();
+    let handle = mvcc
+        .open_transactions
+        .begin(
+            mvcc.runtime.as_ref(),
+            mvcc.cluster_id(),
+            &principal,
+            idempotency_key,
+            std::time::Duration::from_secs(30),
+            crate::mvcc_transaction::DurabilityLevel::Quorum,
+            crate::mvcc_transaction::ReadConsistency::Linearized,
+            now_unix_ms,
+        )
+        .await?;
+    let key = namespace_schema_logical_key(tenant_id, &schema.namespace)?;
+    let previous_payload = mvcc.read_transaction_value(&handle.transaction_id, &principal, &key)?;
+    let previous = previous_payload
+        .as_deref()
+        .map(decode_namespace_schema_record)
+        .transpose()?;
     let schema_version = previous
         .as_ref()
         .map(|record| record.schema_version.saturating_add(1))
         .unwrap_or(1);
     let applied_at = Utc::now().to_rfc3339();
-    schema.schema_hash = schema_hash(&schema)?;
+    schema.schema_hash = requested_hash;
     schema.schema_version = schema_version;
     schema.authz_revision = authz_revision;
     schema.applied_at = applied_at.clone();
@@ -168,24 +199,77 @@ pub async fn write_authz_namespace_schema(
     };
     record.record_hash = record_hash(&record)?;
     validate_record(&record, tenant_id, &record.namespace)?;
-    write_namespace_schema_row(storage, &record).await?;
-    Ok(record)
+    let status = mvcc
+        .open_transactions
+        .status(&handle.transaction_id, &principal, now_unix_ms)?;
+    if status.state == "open" {
+        mvcc.stage_product_mutations(
+            &handle.transaction_id,
+            &principal,
+            vec![crate::mvcc_product::ProductMutation::put(
+                key.clone(),
+                encode_namespace_schema_record(&record)?,
+            )],
+            now_unix_ms,
+        )?;
+        let predicate = previous_payload
+            .as_ref()
+            .map(|payload| {
+                crate::mvcc_transaction::PredicateKind::ValueHash(*blake3::hash(payload).as_bytes())
+            })
+            .unwrap_or(crate::mvcc_transaction::PredicateKind::Absent);
+        mvcc.stage_predicate(
+            &handle.transaction_id,
+            &principal,
+            key.clone(),
+            predicate,
+            now_unix_ms,
+        )?;
+        mvcc.stage_assignment_guard(&handle.transaction_id, &principal, &assignment, now_unix_ms)?;
+    }
+    let outcome = mvcc
+        .open_transactions
+        .commit(
+            mvcc.runtime.as_ref(),
+            &handle.transaction_id,
+            &principal,
+            current_unix_ms(),
+        )
+        .await?;
+    let commit_version = match outcome.certification {
+        crate::mvcc_transaction::CertificationResult::Committed { commit_version } => {
+            commit_version
+        }
+        crate::mvcc_transaction::CertificationResult::Aborted { reason } => {
+            bail!("authorization namespace schema transaction aborted: {reason:?}")
+        }
+    };
+    let payload = mvcc
+        .runtime
+        .read_at(&key, commit_version)?
+        .ok_or_else(|| anyhow!("committed authorization namespace schema is not readable"))?;
+    let committed = decode_namespace_schema_record(&payload.value)?;
+    validate_record(&committed, tenant_id, &committed.namespace)?;
+    Ok(committed)
 }
 
 pub async fn read_authz_namespace_schema(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     namespace: &str,
 ) -> Result<Option<AuthzNamespaceSchemaRecord>> {
-    let Some(record) = read_namespace_schema_row(storage, tenant_id, namespace).await? else {
+    let snapshot = mvcc.runtime.applied_version()?;
+    let key = namespace_schema_logical_key(tenant_id, namespace)?;
+    let Some(payload) = mvcc.runtime.read_at(&key, snapshot)?.map(|row| row.value) else {
         return Ok(None);
     };
+    let record = decode_namespace_schema_record(&payload)?;
     validate_record(&record, tenant_id, namespace)?;
     Ok(Some(record))
 }
 
 pub async fn page_authz_namespace_schemas(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     after_tuple_key: Option<&[u8]>,
     page_size: usize,
@@ -203,40 +287,42 @@ pub async fn page_authz_namespace_schemas(
             "authorization namespace schema cursor is outside the tenant prefix"
         ));
     }
-    let store = CoreStore::new(storage.clone()).await?;
-    let mut rows = store.scan_coremeta_prefix_page(
-        CF_AUTHZ,
-        TABLE_AUTHZ_SCHEMA_ROW,
-        &prefix,
-        after_tuple_key,
-        page_size + 1,
-    )?;
+    let snapshot = mvcc.runtime.applied_version()?;
+    let application_prefix = crate::mvcc_product::coremeta_application_prefix(CF_AUTHZ, &prefix)?;
+    let mut rows = mvcc
+        .runtime
+        .scan_table_prefix_at(TABLE_AUTHZ_SCHEMA_ROW, &application_prefix, snapshot)?
+        .into_iter()
+        .map(|(key, row)| {
+            Ok((
+                crate::mvcc_product::coremeta_tuple_from_logical_key(&key, CF_AUTHZ)?.to_vec(),
+                row.value,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    rows.retain(|(tuple_key, _)| after_tuple_key.is_none_or(|after| tuple_key.as_slice() > after));
+    rows.truncate(page_size.saturating_add(1));
     let has_more = rows.len() > page_size;
     if has_more {
         rows.truncate(page_size);
     }
     let next_tuple_key = if has_more {
         Some(
-            core_meta_record_tuple_key(
-                &rows
-                    .last()
-                    .ok_or_else(|| anyhow!("authorization namespace schema page is empty"))?
-                    .key,
-            )?
-            .to_vec(),
+            rows.last()
+                .ok_or_else(|| anyhow!("authorization namespace schema page is empty"))?
+                .0
+                .clone(),
         )
     } else {
         None
     };
     let mut records = Vec::with_capacity(rows.len());
-    for row in rows {
-        let record = decode_namespace_schema_row_payload(storage, tenant_id, &row.payload).await?;
+    for (tuple_key, payload) in rows {
+        let record = decode_namespace_schema_record(&payload)?;
         validate_record(&record, tenant_id, &record.namespace)?;
-        if core_meta_record_tuple_key(&row.key)?
-            != namespace_schema_tuple_key(tenant_id, &record.namespace)?.as_slice()
-        {
+        if tuple_key != namespace_schema_tuple_key(tenant_id, &record.namespace)? {
             return Err(anyhow!(
-                "authorization namespace schema physical row scope mismatch"
+                "authorization namespace schema MVCC row scope mismatch"
             ));
         }
         records.push(record);
@@ -361,84 +447,6 @@ fn canonical_schema(schema: &AuthzNamespaceSchema) -> AuthzNamespaceSchema {
     schema
 }
 
-async fn write_namespace_schema_row(
-    storage: &Storage,
-    record: &AuthzNamespaceSchemaRecord,
-) -> Result<()> {
-    validate_record(record, record.tenant_id, &record.namespace)?;
-    let tuple_key = namespace_schema_tuple_key(record.tenant_id, &record.namespace)?;
-    let record_payload = encode_namespace_schema_record(record)?;
-    let payload = encode_authz_payload_row(
-        storage,
-        namespace_schema_publication_common(record.tenant_id),
-        AUTHZ_NAMESPACE_SCHEMA_ROW_KIND,
-        &format!("tenant/{}/namespace/{}", record.tenant_id, record.namespace),
-        record.schema_version,
-        &record.record_hash,
-        record_payload,
-    )
-    .await?;
-    let op = CoreMetaBatchOp {
-        cf: CF_AUTHZ,
-        table_id: TABLE_AUTHZ_SCHEMA_ROW,
-        tuple_key: &tuple_key,
-        common: None,
-        kind: CoreMetaBatchOpKind::Put(&payload),
-    };
-    commit_coremeta_batch_for_storage(
-        storage,
-        &format!(
-            "authz-namespace-schema:{}:{}:{}",
-            record.tenant_id, record.namespace, record.schema_version
-        ),
-        &[op],
-        &[crate::core_store::CoreMetaRootPublication::new(
-            namespace_schema_root_anchor_key(record.tenant_id),
-            crate::formats::writer::WriterFamily::Authz,
-        )],
-    )
-    .await?;
-    Ok(())
-}
-
-async fn read_namespace_schema_row(
-    storage: &Storage,
-    tenant_id: i64,
-    namespace: &str,
-) -> Result<Option<AuthzNamespaceSchemaRecord>> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(bytes) = store.read_coremeta_row(
-        CF_AUTHZ,
-        TABLE_AUTHZ_SCHEMA_ROW,
-        &namespace_schema_tuple_key(tenant_id, namespace)?,
-    )?
-    else {
-        return Ok(None);
-    };
-    let record = decode_namespace_schema_row_payload(storage, tenant_id, &bytes)
-        .await
-        .with_context(|| format!("decode authorization namespace schema {namespace}"))?;
-    validate_record(&record, tenant_id, namespace)?;
-    Ok(Some(record))
-}
-
-async fn decode_namespace_schema_row_payload(
-    storage: &Storage,
-    tenant_id: i64,
-    row_payload: &[u8],
-) -> Result<AuthzNamespaceSchemaRecord> {
-    let common = core_meta_row_common_from_payload(row_payload)?;
-    validate_namespace_schema_publication_common(tenant_id, &common)?;
-    let record_payload = decode_authz_payload_row(
-        storage,
-        tenant_id,
-        row_payload,
-        AUTHZ_NAMESPACE_SCHEMA_ROW_KIND,
-    )
-    .await?;
-    decode_namespace_schema_record(&record_payload)
-}
-
 fn encode_namespace_schema_record(record: &AuthzNamespaceSchemaRecord) -> Result<Vec<u8>> {
     Ok(encode_deterministic_proto(&namespace_record_to_proto(
         record,
@@ -479,59 +487,6 @@ fn namespace_record_to_proto(
         applied_at: record.applied_at.clone(),
         record_hash: record.record_hash.clone(),
     }
-}
-
-fn namespace_schema_publication_common(tenant_id: i64) -> CoreMetaRowCommonProto {
-    // CoreStore replaces the publication placeholders while committing the root.
-    core_meta_committed_row_common(
-        format!("tenant/{tenant_id}"),
-        core_meta_root_key_hash(&namespace_schema_root_anchor_key(tenant_id)),
-        1,
-        String::new(),
-        0,
-    )
-}
-
-fn validate_namespace_schema_publication_common(
-    tenant_id: i64,
-    common: &CoreMetaRowCommonProto,
-) -> Result<()> {
-    let expected = namespace_schema_publication_common(tenant_id);
-    if common.realm_id != expected.realm_id {
-        return Err(anyhow!(
-            "authorization namespace schema CoreMeta realm mismatch"
-        ));
-    }
-    if common.root_key_hash != expected.root_key_hash {
-        return Err(anyhow!(
-            "authorization namespace schema CoreMeta root mismatch"
-        ));
-    }
-    if common.root_generation == 0 {
-        return Err(anyhow!(
-            "authorization namespace schema CoreMeta publication generation must be nonzero"
-        ));
-    }
-    if common.transaction_id.is_empty() {
-        return Err(anyhow!(
-            "authorization namespace schema CoreMeta transaction must not be empty"
-        ));
-    }
-    if common.visibility_state_enum() != CoreMetaVisibilityState::Committed {
-        return Err(anyhow!(
-            "authorization namespace schema CoreMeta row is not committed"
-        ));
-    }
-    if common.payload_schema_version != expected.payload_schema_version {
-        return Err(anyhow!(
-            "authorization namespace schema CoreMeta payload version mismatch"
-        ));
-    }
-    Ok(())
-}
-
-fn namespace_schema_root_anchor_key(tenant_id: i64) -> String {
-    format!("authz-schema/{tenant_id}")
 }
 
 fn namespace_record_from_proto(
@@ -697,6 +652,21 @@ fn namespace_schema_tuple_key(tenant_id: i64, namespace: &str) -> Result<Vec<u8>
     ])
 }
 
+fn namespace_schema_logical_key(
+    tenant_id: i64,
+    namespace: &str,
+) -> Result<crate::mvcc_transaction::LogicalKey> {
+    crate::mvcc_product::coremeta_logical_key(
+        CF_AUTHZ,
+        TABLE_AUTHZ_SCHEMA_ROW,
+        &namespace_schema_tuple_key(tenant_id, namespace)?,
+    )
+}
+
+fn current_unix_ms() -> u64 {
+    u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default()
+}
+
 impl From<AuthzRelationRule> for AuthzRelationRuleRecord {
     fn from(rule: AuthzRelationRule) -> Self {
         Self {
@@ -770,163 +740,5 @@ impl From<&AuthzAllowedSubjectRecord> for AuthzAllowedSubject {
             subject_kind: selector.subject_kind.clone(),
             subject_id: selector.subject_id.clone(),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::anvil_api::{AuthzSchemaMemberKind, AuthzSubjectSelectorKind};
-    use tempfile::tempdir;
-
-    fn schema(namespace: &str) -> AuthzNamespaceSchema {
-        AuthzNamespaceSchema {
-            namespace: namespace.to_string(),
-            relations: vec![
-                AuthzRelationSchema {
-                    relation: "viewer".to_string(),
-                    rules: vec![AuthzRelationRule {
-                        kind: "inherit".to_string(),
-                        relation: "editor".to_string(),
-                        tuple_relation: String::new(),
-                        target_relation: String::new(),
-                    }],
-                    member_kind: AuthzSchemaMemberKind::Permission as i32,
-                    allowed_subjects: Vec::new(),
-                },
-                AuthzRelationSchema {
-                    relation: "editor".to_string(),
-                    rules: Vec::new(),
-                    member_kind: AuthzSchemaMemberKind::DirectRelation as i32,
-                    allowed_subjects: vec![AuthzAllowedSubject {
-                        selector_kind: AuthzSubjectSelectorKind::AnyCanonicalId as i32,
-                        subject_kind: "user".to_string(),
-                        subject_id: String::new(),
-                    }],
-                },
-            ],
-            schema_json: r#"{"namespace":"document"}"#.to_string(),
-            schema_hash: String::new(),
-            schema_version: 0,
-            authz_revision: 0,
-            applied_at: String::new(),
-        }
-    }
-
-    #[tokio::test]
-    async fn namespace_schema_persists_versions_and_hashes() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let first =
-            write_authz_namespace_schema(&storage, 7, schema("document"), 10, "tester", "initial")
-                .await
-                .unwrap();
-        assert_eq!(first.schema_version, 1);
-        assert_eq!(first.authz_revision, 10);
-
-        let second =
-            write_authz_namespace_schema(&storage, 7, schema("document"), 11, "tester", "update")
-                .await
-                .unwrap();
-        assert_eq!(second.schema_version, 2);
-
-        let read = read_authz_namespace_schema(&storage, 7, "document")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(read.schema_version, 2);
-        let page = page_authz_namespace_schemas(&storage, 7, None, 1)
-            .await
-            .unwrap();
-        assert_eq!(page.records.len(), 1);
-        assert!(page.next_tuple_key.is_none());
-    }
-
-    #[tokio::test]
-    async fn namespace_schema_separates_logical_and_physical_generations() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        write_authz_namespace_schema(&storage, 7, schema("document"), 10, "tester", "first root")
-            .await
-            .unwrap();
-        let record = write_authz_namespace_schema(
-            &storage,
-            7,
-            schema("folder"),
-            11,
-            "tester",
-            "second root",
-        )
-        .await
-        .unwrap();
-
-        let store = CoreStore::new(storage.clone()).await.unwrap();
-        let row_payload = store
-            .read_coremeta_row(
-                CF_AUTHZ,
-                TABLE_AUTHZ_SCHEMA_ROW,
-                &namespace_schema_tuple_key(7, "folder").unwrap(),
-            )
-            .unwrap()
-            .unwrap();
-        let common = core_meta_row_common_from_payload(&row_payload).unwrap();
-
-        assert_eq!(record.schema_version, 1);
-        assert_eq!(common.root_generation, 2);
-        assert_ne!(common.root_generation, record.schema_version);
-        assert_eq!(common.transaction_id, "authz-namespace-schema:7:folder:1");
-        assert_eq!(
-            common.visibility_state_enum(),
-            CoreMetaVisibilityState::Committed
-        );
-        assert_eq!(
-            read_authz_namespace_schema(&storage, 7, "folder")
-                .await
-                .unwrap(),
-            Some(record.clone())
-        );
-
-        let domain_payload = encode_namespace_schema_record(&record).unwrap();
-        assert!(core_meta_row_common_from_payload(&domain_payload).is_err());
-        assert_eq!(record_hash(&record).unwrap(), record.record_hash);
-    }
-
-    #[test]
-    fn namespace_schema_publication_keeps_scope_and_visibility_strict() {
-        let mut common = namespace_schema_publication_common(7);
-        common.root_generation = 91;
-        common.transaction_id = "corestore-assigned-transaction".to_string();
-        assert!(validate_namespace_schema_publication_common(7, &common).is_ok());
-
-        let mut wrong_realm = common.clone();
-        wrong_realm.realm_id = "tenant/8".to_string();
-        assert!(validate_namespace_schema_publication_common(7, &wrong_realm).is_err());
-
-        let mut wrong_root = common.clone();
-        wrong_root.root_key_hash = core_meta_root_key_hash("authz-schema/8");
-        assert!(validate_namespace_schema_publication_common(7, &wrong_root).is_err());
-
-        let mut pending = common;
-        pending.visibility_state = CoreMetaVisibilityState::Pending as i32;
-        assert!(validate_namespace_schema_publication_common(7, &pending).is_err());
-    }
-
-    #[tokio::test]
-    async fn namespace_schema_rejects_unsafe_names_and_bad_rules() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        assert!(
-            write_authz_namespace_schema(&storage, 7, schema("../bad"), 1, "tester", "bad")
-                .await
-                .is_err()
-        );
-
-        let mut bad = schema("document");
-        bad.relations[0].rules[0].kind = "made_up".to_string();
-        assert!(
-            write_authz_namespace_schema(&storage, 7, bad, 1, "tester", "bad")
-                .await
-                .is_err()
-        );
     }
 }

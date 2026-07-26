@@ -185,11 +185,6 @@ async fn persistence_global_journal_writes_use_current_fence_tokens() {
         .await
         .unwrap();
         assert!(index_fences.iter().all(|fence| *fence > 0));
-        let authz_fences =
-            crate::authz_journal::read_authz_frame_fences_for_test(&persistence.storage, 1)
-                .await
-                .expect("authz tuple journal fences");
-        assert!(authz_fences.iter().all(|fence| *fence > 0));
     })
     .await
 }

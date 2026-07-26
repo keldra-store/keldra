@@ -1,15 +1,10 @@
 use crate::anvil_api::AuthzNamespaceSchema;
-use crate::authz_coremeta_payload::{decode_authz_payload_row, encode_authz_payload_row};
-use crate::authz_head::{self, AuthzHeadMutation, AuthzHeadSnapshot};
+use crate::authz_head::{self, AuthzHeadMutation};
 use crate::core_store::{
-    CF_AUTHZ, CoreMetaRecord, CoreMetaTuplePart, CoreMutationBatch, CoreMutationOperation,
-    CoreMutationPrecondition, CoreMutationRootPublication, CoreStore, TABLE_AUTHZ_SCHEMA_ROW,
-    core_meta_committed_row_common, core_meta_payload_digest, core_meta_record_tuple_key,
-    core_meta_root_key_hash, core_meta_tuple_key, decode_deterministic_proto,
-    encode_deterministic_proto,
+    CF_AUTHZ, CoreMetaTuplePart, TABLE_AUTHZ_SCHEMA_ROW, core_meta_tuple_key,
+    decode_deterministic_proto, encode_deterministic_proto,
 };
-use crate::formats::{hash32, writer::WriterFamily};
-use crate::persistence::AuthzSchemaBindingPrecondition;
+use crate::formats::hash32;
 use crate::storage::Storage;
 use anyhow::{Result, anyhow, bail};
 use prost::Message;
@@ -59,12 +54,6 @@ pub struct StoredAuthzSchemaRevisionPage {
 pub struct StoredAuthzSchemaBindingPage {
     pub records: Vec<StoredAuthzSchemaBinding>,
     pub next_tuple_key: Option<Vec<u8>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct BoundAuthzSchemaSnapshot {
-    pub schema: Option<StoredAuthzSchemaRevision>,
-    pub binding_precondition: AuthzSchemaBindingPrecondition,
 }
 
 #[derive(Debug, Clone)]
@@ -474,47 +463,6 @@ pub async fn read_schema_binding(
     .await
 }
 
-pub async fn read_bound_schema_snapshot(
-    storage: &Storage,
-    tenant_id: i64,
-    realm_id: &str,
-) -> Result<BoundAuthzSchemaSnapshot> {
-    validate_realm_id(realm_id)?;
-    let tuple_key = schema_binding_tuple_key(tenant_id, realm_id)?;
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(payload) = store.read_coremeta_row(CF_AUTHZ, TABLE_AUTHZ_SCHEMA_ROW, &tuple_key)?
-    else {
-        return Ok(BoundAuthzSchemaSnapshot {
-            schema: None,
-            binding_precondition: AuthzSchemaBindingPrecondition {
-                tuple_key,
-                expected_payload_hash: None,
-            },
-        });
-    };
-    let binding =
-        decode_schema_record_row::<StoredAuthzSchemaBinding>(storage, tenant_id, &payload).await?;
-    let schema = read_schema_revision(
-        storage,
-        tenant_id,
-        &binding.schema_ref.schema_id,
-        Some(binding.schema_ref.schema_revision),
-    )
-    .await?
-    .ok_or_else(|| anyhow!("bound authorization schema revision not found"))?;
-    validate_stored_schema_revision(&schema)?;
-    if schema.schema_ref != binding.schema_ref {
-        return Err(anyhow!("bound authorization schema reference mismatch"));
-    }
-    Ok(BoundAuthzSchemaSnapshot {
-        schema: Some(schema),
-        binding_precondition: AuthzSchemaBindingPrecondition {
-            tuple_key,
-            expected_payload_hash: Some(core_meta_payload_digest(TABLE_AUTHZ_SCHEMA_ROW, &payload)),
-        },
-    })
-}
-
 pub async fn read_bound_schema_snapshot_mvcc(
     storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
@@ -721,248 +669,6 @@ fn scan_schema_rows_page(
     Ok((rows, next_tuple_key))
 }
 
-async fn write_schema_record(
-    storage: &Storage,
-    tenant_id: i64,
-    record: &StoredAuthzSchemaRevision,
-    head_snapshot: &AuthzHeadSnapshot,
-    expected_latest_payload_hash: Option<String>,
-) -> Result<()> {
-    let revision_key = schema_revision_tuple_key(
-        tenant_id,
-        &record.schema_ref.schema_id,
-        record.schema_ref.schema_revision,
-    )?;
-    let latest_key = schema_latest_tuple_key(tenant_id, &record.schema_ref.schema_id)?;
-    let digest_key = schema_digest_tuple_key(
-        tenant_id,
-        &record.schema_ref.schema_id,
-        &record.schema_ref.schema_digest,
-    )?;
-    let transaction_id = schema_revision_transaction_id(tenant_id, record);
-    let partition_id = authz_head::transaction_partition(tenant_id);
-    let head = authz_head::advance(
-        head_snapshot,
-        &transaction_id,
-        AuthzHeadMutation::SchemaRevision,
-    )?;
-    if head.committed_revision != record.authz_revision {
-        return Err(anyhow!(
-            "authorization schema revision does not advance the authorization head"
-        ));
-    }
-    let operations = vec![
-        proto_put_operation(
-            storage,
-            tenant_id,
-            &partition_id,
-            revision_key.clone(),
-            record,
-            &transaction_id,
-        )
-        .await?,
-        proto_put_operation(
-            storage,
-            tenant_id,
-            &partition_id,
-            latest_key,
-            record,
-            &transaction_id,
-        )
-        .await?,
-        proto_put_operation(
-            storage,
-            tenant_id,
-            &partition_id,
-            digest_key.clone(),
-            record,
-            &transaction_id,
-        )
-        .await?,
-        authz_head::put_operation(&partition_id, &transaction_id, &head)?,
-    ];
-    CoreStore::new(storage.clone())
-        .await?
-        .commit_mutation_batch(CoreMutationBatch {
-            transaction_id,
-            scope_partition: partition_id.clone(),
-            committed_by_principal: authz_head::transaction_principal(tenant_id),
-            root_publications: authz_schema_root_publications(&partition_id, tenant_id),
-            preconditions: vec![
-                CoreMutationPrecondition::CoreMetaRow {
-                    cf: CF_AUTHZ.to_string(),
-                    table_id: TABLE_AUTHZ_SCHEMA_ROW,
-                    tuple_key: revision_key,
-                    expected_payload_hash: None,
-                    require_absent: true,
-                    require_present: false,
-                },
-                CoreMutationPrecondition::CoreMetaRow {
-                    cf: CF_AUTHZ.to_string(),
-                    table_id: TABLE_AUTHZ_SCHEMA_ROW,
-                    tuple_key: schema_latest_tuple_key(tenant_id, &record.schema_ref.schema_id)?,
-                    expected_payload_hash: expected_latest_payload_hash.clone(),
-                    require_absent: expected_latest_payload_hash.is_none(),
-                    require_present: expected_latest_payload_hash.is_some(),
-                },
-                CoreMutationPrecondition::CoreMetaRow {
-                    cf: CF_AUTHZ.to_string(),
-                    table_id: TABLE_AUTHZ_SCHEMA_ROW,
-                    tuple_key: digest_key,
-                    expected_payload_hash: None,
-                    require_absent: true,
-                    require_present: false,
-                },
-                authz_head::precondition(head_snapshot)?,
-            ],
-            operations,
-        })
-        .await?;
-    Ok(())
-}
-
-async fn write_binding_record(
-    storage: &Storage,
-    tenant_id: i64,
-    binding: &StoredAuthzSchemaBinding,
-    head_snapshot: &AuthzHeadSnapshot,
-    expected_payload_hash: Option<String>,
-) -> Result<()> {
-    let tuple_key = schema_binding_tuple_key(tenant_id, &binding.realm_id)?;
-    let transaction_id = schema_binding_transaction_id(tenant_id, binding);
-    let partition_id = authz_head::transaction_partition(tenant_id);
-    let head = authz_head::advance(
-        head_snapshot,
-        &transaction_id,
-        AuthzHeadMutation::SchemaBinding {
-            realm_id: &binding.realm_id,
-            schema_id: &binding.schema_ref.schema_id,
-            schema_revision: binding.schema_ref.schema_revision,
-            schema_digest: &binding.schema_ref.schema_digest,
-            binding_generation: binding.binding_generation,
-        },
-    )?;
-    if head.committed_revision != binding.authz_revision {
-        return Err(anyhow!(
-            "authorization schema binding does not advance the authorization head"
-        ));
-    }
-    let operation = proto_put_operation(
-        storage,
-        tenant_id,
-        &partition_id,
-        tuple_key,
-        binding,
-        &transaction_id,
-    )
-    .await?;
-    let head_operation = authz_head::put_operation(&partition_id, &transaction_id, &head)?;
-    CoreStore::new(storage.clone())
-        .await?
-        .commit_mutation_batch(CoreMutationBatch {
-            transaction_id,
-            scope_partition: partition_id.clone(),
-            committed_by_principal: authz_head::transaction_principal(tenant_id),
-            root_publications: authz_schema_root_publications(&partition_id, tenant_id),
-            preconditions: vec![
-                CoreMutationPrecondition::CoreMetaRow {
-                    cf: CF_AUTHZ.to_string(),
-                    table_id: TABLE_AUTHZ_SCHEMA_ROW,
-                    tuple_key: schema_binding_tuple_key(tenant_id, &binding.realm_id)?,
-                    expected_payload_hash: expected_payload_hash.clone(),
-                    require_absent: expected_payload_hash.is_none(),
-                    require_present: expected_payload_hash.is_some(),
-                },
-                authz_head::precondition(head_snapshot)?,
-            ],
-            operations: vec![operation, head_operation],
-        })
-        .await?;
-    Ok(())
-}
-
-fn authz_schema_root_publications(
-    coordinator_root: &str,
-    tenant_id: i64,
-) -> Vec<CoreMutationRootPublication> {
-    vec![
-        CoreMutationRootPublication::new(coordinator_root, WriterFamily::CoreControl.as_str())
-            .coordinator(),
-        CoreMutationRootPublication::new(
-            authz_head::root_anchor_key(tenant_id),
-            WriterFamily::Authz.as_str(),
-        ),
-    ]
-}
-
-fn schema_revision_transaction_id(tenant_id: i64, record: &StoredAuthzSchemaRevision) -> String {
-    format!(
-        "authz-schema:{tenant_id}:{}:{}",
-        record.schema_ref.schema_revision, record.schema_ref.schema_digest
-    )
-}
-
-fn schema_binding_transaction_id(tenant_id: i64, binding: &StoredAuthzSchemaBinding) -> String {
-    let identity = format!(
-        "{tenant_id}\0{}\0{}\0{}\0{}\0{}",
-        binding.realm_id,
-        binding.schema_ref.schema_id,
-        binding.schema_ref.schema_revision,
-        binding.schema_ref.schema_digest,
-        binding.binding_generation
-    );
-    format!(
-        "authz-schema-binding:{}",
-        hex::encode(hash32(identity.as_bytes()))
-    )
-}
-
-async fn read_latest_schema_revision(
-    storage: &Storage,
-    tenant_id: i64,
-    schema_id: &str,
-) -> Result<Option<StoredAuthzSchemaRevision>> {
-    read_proto_row(
-        storage,
-        tenant_id,
-        schema_latest_tuple_key(tenant_id, schema_id)?,
-    )
-    .await
-}
-
-async fn find_schema_by_digest(
-    storage: &Storage,
-    tenant_id: i64,
-    schema_id: &str,
-    digest: &str,
-) -> Result<Option<StoredAuthzSchemaRevision>> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(payload) = store.read_coremeta_row(
-        CF_AUTHZ,
-        TABLE_AUTHZ_SCHEMA_ROW,
-        &schema_digest_tuple_key(tenant_id, schema_id, digest)?,
-    )?
-    else {
-        return Ok(None);
-    };
-    let record =
-        decode_schema_record_row::<StoredAuthzSchemaRevision>(storage, tenant_id, &payload).await?;
-    if record.schema_ref.schema_id != schema_id || record.schema_ref.schema_digest != digest {
-        return Err(anyhow!("authorization schema digest lookup row mismatch"));
-    }
-    Ok(Some(record))
-}
-
-async fn read_proto_row<T: AuthzSchemaRecordCodec>(
-    storage: &Storage,
-    tenant_id: i64,
-    tuple_key: Vec<u8>,
-) -> Result<Option<T>> {
-    Ok(read_proto_row_snapshot::<T>(storage, tenant_id, tuple_key)
-        .await?
-        .map(|(record, _)| record))
-}
-
 fn schema_logical_key(tuple_key: &[u8]) -> Result<crate::mvcc_transaction::LogicalKey> {
     crate::mvcc_product::coremeta_logical_key(CF_AUTHZ, TABLE_AUTHZ_SCHEMA_ROW, tuple_key)
 }
@@ -1055,79 +761,12 @@ fn current_unix_ms() -> u64 {
     u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default()
 }
 
-async fn read_proto_row_snapshot<T: AuthzSchemaRecordCodec>(
-    storage: &Storage,
-    tenant_id: i64,
-    tuple_key: Vec<u8>,
-) -> Result<Option<(T, String)>> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(bytes) = store.read_coremeta_row(CF_AUTHZ, TABLE_AUTHZ_SCHEMA_ROW, &tuple_key)? else {
-        return Ok(None);
-    };
-    let payload_hash = core_meta_payload_digest(TABLE_AUTHZ_SCHEMA_ROW, &bytes);
-    Ok(Some((
-        decode_schema_record_row::<T>(storage, tenant_id, &bytes).await?,
-        payload_hash,
-    )))
-}
-
-async fn proto_put_operation<T: AuthzSchemaRecordCodec>(
-    storage: &Storage,
-    tenant_id: i64,
-    partition_id: &str,
-    tuple_key: Vec<u8>,
-    value: &T,
-    transaction_id: &str,
-) -> Result<CoreMutationOperation> {
-    let record_payload = value.encode_record(tenant_id, transaction_id)?;
-    let payload = encode_authz_payload_row(
-        storage,
-        T::row_common(value, tenant_id, transaction_id)?,
-        T::payload_kind(),
-        &hex::encode(&tuple_key),
-        T::payload_generation(value),
-        transaction_id,
-        record_payload,
-    )
-    .await?;
-    Ok(CoreMutationOperation::CoreMetaPut {
-        partition_id: partition_id.to_string(),
-        cf: CF_AUTHZ.to_string(),
-        table_id: TABLE_AUTHZ_SCHEMA_ROW,
-        tuple_key,
-        payload,
-    })
-}
-
 trait AuthzSchemaRecordCodec: Sized {
-    fn payload_kind() -> &'static str;
-    fn payload_generation(&self) -> u64;
-    fn row_common(
-        &self,
-        tenant_id: i64,
-        transaction_id: &str,
-    ) -> Result<crate::core_store::CoreMetaRowCommonProto>;
     fn encode_record(&self, tenant_id: i64, transaction_id: &str) -> Result<Vec<u8>>;
     fn decode_record(bytes: &[u8], tenant_id: i64) -> Result<Self>;
 }
 
 impl AuthzSchemaRecordCodec for StoredAuthzSchemaRevision {
-    fn payload_kind() -> &'static str {
-        AUTHZ_SCHEMA_REVISION_ROW_KIND
-    }
-
-    fn payload_generation(&self) -> u64 {
-        self.schema_ref.schema_revision
-    }
-
-    fn row_common(
-        &self,
-        tenant_id: i64,
-        transaction_id: &str,
-    ) -> Result<crate::core_store::CoreMetaRowCommonProto> {
-        schema_revision_common(self, tenant_id, transaction_id)
-    }
-
     fn encode_record(&self, tenant_id: i64, transaction_id: &str) -> Result<Vec<u8>> {
         Ok(encode_deterministic_proto(&schema_revision_to_proto(
             self,
@@ -1148,22 +787,6 @@ impl AuthzSchemaRecordCodec for StoredAuthzSchemaRevision {
 }
 
 impl AuthzSchemaRecordCodec for StoredAuthzSchemaBinding {
-    fn payload_kind() -> &'static str {
-        AUTHZ_SCHEMA_BINDING_ROW_KIND
-    }
-
-    fn payload_generation(&self) -> u64 {
-        self.binding_generation
-    }
-
-    fn row_common(
-        &self,
-        tenant_id: i64,
-        transaction_id: &str,
-    ) -> Result<crate::core_store::CoreMetaRowCommonProto> {
-        schema_binding_common(self, tenant_id, transaction_id)
-    }
-
     fn encode_record(&self, tenant_id: i64, transaction_id: &str) -> Result<Vec<u8>> {
         Ok(encode_deterministic_proto(&schema_binding_to_proto(
             self,

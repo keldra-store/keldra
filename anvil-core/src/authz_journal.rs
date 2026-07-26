@@ -5,7 +5,6 @@ use crate::authz_schema_contract::{
 };
 use crate::authz_scope::{DEFAULT_AUTHZ_REALM_ID, split_realm_namespace};
 use crate::authz_segment;
-use crate::core_store::{CoreStore, ReadStream};
 use crate::formats::{Hash32, hash32};
 use crate::partition_fence::PartitionWritePermit;
 use crate::persistence::AuthzTupleRecord;
@@ -639,7 +638,7 @@ pub async fn check_authz_tuple_at_revision(
     .record)
 }
 
-/// Resolve an exact current tuple through an already-open CoreStore. Internal
+/// Resolve an exact current tuple through the local MVCC projection. Internal
 /// node authentication uses this point lookup because its grant is a direct
 /// system-realm edge; invoking the general Zanzibar graph resolver for every
 /// replication frame would add no authorization semantics and can recursively
@@ -1284,28 +1283,6 @@ fn decode_authz_tuple_batch_journal_body(bytes: &[u8]) -> Result<Vec<AuthzTupleR
         .collect()
 }
 
-fn decode_authz_tuple_journal_body_fence(bytes: &[u8]) -> Result<u64> {
-    let body = AuthzTupleJournalBodyProto::decode(bytes)?;
-    ensure_deterministic_proto(&body, bytes, "authz tuple journal body")?;
-    if body.schema != AUTHZ_TUPLE_JOURNAL_BODY_SCHEMA {
-        return Err(anyhow!("authz tuple journal body schema mismatch"));
-    }
-    let _mutation_id = uuid::Uuid::parse_str(&body.mutation_id)
-        .context("authz tuple journal body mutation_id is not a UUID")?;
-    Ok(body.fence_token)
-}
-
-fn decode_authz_tuple_batch_journal_body_fence(bytes: &[u8]) -> Result<u64> {
-    let body = AuthzTupleBatchJournalBodyProto::decode(bytes)?;
-    ensure_deterministic_proto(&body, bytes, "authz tuple batch journal body")?;
-    if body.schema != AUTHZ_TUPLE_BATCH_JOURNAL_BODY_SCHEMA {
-        return Err(anyhow!("authz tuple batch journal body schema mismatch"));
-    }
-    let _mutation_id = uuid::Uuid::parse_str(&body.mutation_id)
-        .context("authz tuple batch journal body mutation_id is not a UUID")?;
-    Ok(body.fence_token)
-}
-
 fn authz_record_to_proto(record: &AuthzTupleRecord) -> Result<AuthzTupleRecordProto> {
     let written_at_unix_nanos = record
         .written_at
@@ -1401,49 +1378,6 @@ pub(crate) fn latest_authz_journal_fence_token(
         authz_head::read_at_mvcc(mvcc, tenant_id, mvcc.runtime.applied_version()?)?
             .tuple_fence_token,
     )
-}
-
-#[cfg(test)]
-pub(crate) async fn read_authz_frame_fences_for_test(
-    storage: &Storage,
-    tenant_id: i64,
-) -> Result<Vec<u64>> {
-    read_authz_journal_payload_fences(storage, tenant_id).await
-}
-
-#[cfg(test)]
-async fn read_authz_journal_payload_fences(storage: &Storage, tenant_id: i64) -> Result<Vec<u64>> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let mut fences = Vec::new();
-    let mut after_sequence = 0;
-    loop {
-        let page = core_store
-            .read_stream_page(ReadStream {
-                stream_id: authz_tuple_stream_id(tenant_id),
-                after_sequence,
-                limit: 1_000,
-            })
-            .await?;
-        fences.extend(page.records.into_iter().filter_map(
-            |record| match record.record_kind.as_str() {
-                AUTHZ_TUPLE_RECORD_KIND => {
-                    Some(decode_authz_tuple_journal_body_fence(&record.payload))
-                }
-                AUTHZ_TUPLE_BATCH_RECORD_KIND => {
-                    Some(decode_authz_tuple_batch_journal_body_fence(&record.payload))
-                }
-                _ => None,
-            },
-        ));
-        if !page.has_more {
-            break;
-        }
-        if page.next_sequence <= after_sequence {
-            bail!("authorization fence page did not advance its continuation");
-        }
-        after_sequence = page.next_sequence;
-    }
-    fences.into_iter().collect()
 }
 
 fn require_authz_permit(tenant_id: i64, permit: &PartitionWritePermit) -> Result<()> {
