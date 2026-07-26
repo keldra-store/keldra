@@ -414,6 +414,7 @@ impl ObjectEvidenceRegistry {
     }
 }
 
+#[derive(Clone)]
 pub struct StreamingBundleReplicator<T> {
     transport: T,
     targets: Vec<BundleTarget>,

@@ -13,10 +13,11 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
+    bundle_replication::{AppendOnlyPreparedBundleStore, StreamingBundleReplicator},
     local_object_store::{LocalObjectManifest, LocalObjectStore},
     mvcc_transaction::{
-        BundleDurabilityEvidence, BundleIdentity, DurabilityLevel, NodeIncarnation,
-        ObjectDurabilityEvidence,
+        BundleDurabilityEvidence, BundleIdentity, BundleReplicator, DurabilityLevel,
+        NodeIncarnation, ObjectDurabilityEvidence, PreparedBundleStore,
     },
     object_shard_manifest::PhysicalObjectShardManifest,
     shard_placement::{
@@ -24,6 +25,39 @@ use crate::{
     },
     streaming_erasure::ErasureProfile,
 };
+
+pub struct PreparedBundleUpgradePublisher<T> {
+    pub store: AppendOnlyPreparedBundleStore,
+    pub replicator: StreamingBundleReplicator<T>,
+}
+
+#[async_trait]
+impl<T> LocalUpgradeBundlePublisher for PreparedBundleUpgradePublisher<T>
+where
+    T: crate::bundle_replication::BundleTargetStream,
+{
+    async fn establish_holders(
+        &self,
+        job: &LocalDurabilityUpgradeJob,
+    ) -> Result<Vec<BundleDurabilityEvidence>> {
+        let identity = job
+            .bundle
+            .as_ref()
+            .context("committed bundle identity is missing")?;
+        let bytes = self
+            .store
+            .read(identity)?
+            .context("committed prepared bundle is unavailable locally")?;
+        let local = self.store.persist(identity, &bytes).await?;
+        let mut evidence = self
+            .replicator
+            .replicate(identity, &bytes, &[], job.target)
+            .await?
+            .bundle_holders;
+        evidence.push(local);
+        Ok(evidence)
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LocalDurabilityUpgradeObject {
@@ -167,6 +201,37 @@ pub trait LocalUpgradePlacementProvider: Send + Sync {
     ) -> Result<LocalUpgradePlacement>;
 }
 
+#[async_trait]
+impl LocalUpgradePlacementProvider for Arc<crate::mvcc_bootstrap::MvccSubsystem> {
+    async fn placement(
+        &self,
+        _job: &LocalDurabilityUpgradeJob,
+        _object: &LocalDurabilityUpgradeObject,
+    ) -> Result<LocalUpgradePlacement> {
+        let (candidates, tolerated_failure_domains, topology_epoch) =
+            self.live_shard_placement()?;
+        if candidates.len() < 2 {
+            bail!("distributed durability upgrade requires at least two shard targets");
+        }
+        let parity_shards = tolerated_failure_domains.max(1).min(candidates.len() - 1);
+        let profile = ErasureProfile {
+            data_shards: candidates.len() - parity_shards,
+            parity_shards,
+            shard_bytes: 256 * 1024,
+        };
+        let policy = ShardPlacementPolicy {
+            tolerated_failure_domains,
+        };
+        let generation = topology_epoch.max(1);
+        Ok(LocalUpgradePlacement {
+            plan: policy.plan(_object.object_identity, generation, profile, &candidates)?,
+            policy,
+            profile,
+            encoding_generation: generation,
+        })
+    }
+}
+
 /// Publishes immutable physical-representation overlays durably and
 /// idempotently. Implementations must fence their worker assignment.
 #[async_trait]
@@ -177,6 +242,82 @@ pub trait LocalUpgradeManifestPublisher: Send + Sync {
         manifests: &[PhysicalObjectShardManifest],
         evidence: &[ObjectDurabilityEvidence],
     ) -> Result<()>;
+}
+
+const LOCAL_UPGRADE_MANIFEST_TABLE_ID: u16 = 0x7f15;
+
+#[async_trait]
+impl LocalUpgradeManifestPublisher for Arc<crate::mvcc_bootstrap::MvccSubsystem> {
+    async fn publish(
+        &self,
+        job: &LocalDurabilityUpgradeJob,
+        manifests: &[PhysicalObjectShardManifest],
+        _evidence: &[ObjectDurabilityEvidence],
+    ) -> Result<()> {
+        let principal = format!("local-durability-upgrade/{}", self.local_node.node_id);
+        let now = unix_time_ms()?;
+        let handle = self
+            .open_transactions
+            .begin(
+                self.runtime.as_ref(),
+                job.cluster_id.clone(),
+                &principal,
+                format!("local-upgrade/{}", job.job_id()?),
+                std::time::Duration::from_secs(30),
+                DurabilityLevel::Quorum,
+                crate::mvcc_transaction::ReadConsistency::Linearized,
+                now,
+            )
+            .await?;
+        for manifest in manifests {
+            manifest.validate()?;
+            let key = crate::mvcc_transaction::LogicalKey {
+                table_id: LOCAL_UPGRADE_MANIFEST_TABLE_ID,
+                application_key: format!("object/{}", manifest.object_hash).into_bytes(),
+            };
+            let observed = self
+                .runtime
+                .local_store()
+                .read_at(&key, handle.snapshot_version)?;
+            self.open_transactions.observe_point(
+                &handle.transaction_id,
+                &job.cluster_id,
+                key.clone(),
+                observed.as_ref().map(|row| row.commit_version),
+                now,
+            )?;
+            self.open_transactions.put(
+                &handle.transaction_id,
+                &job.cluster_id,
+                key,
+                manifest.canonical_bytes()?,
+                now,
+            )?;
+            crate::mvcc_shard_repair::stage_manifest_catalog_entry(
+                self,
+                &handle.transaction_id,
+                &principal,
+                manifest,
+                now,
+            )?;
+        }
+        let outcome = self
+            .open_transactions
+            .commit(
+                self.runtime.as_ref(),
+                &handle.transaction_id,
+                &principal,
+                unix_time_ms()?,
+            )
+            .await?;
+        if !matches!(
+            outcome.certification,
+            crate::mvcc_transaction::CertificationResult::Committed { .. }
+        ) {
+            bail!("local durability representation publication conflicted");
+        }
+        Ok(())
+    }
 }
 
 /// Re-reads the immutable prepared bundle, verifies its identity, streams it
@@ -368,6 +509,34 @@ where
             }
         }
     }
+
+    pub async fn run(
+        self,
+        store: crate::mvcc_store::LocalMvccStore,
+        worker_id: String,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
+        loop {
+            if *shutdown.borrow() {
+                return;
+            }
+            let now = unix_time_ms().unwrap_or(1);
+            if let Err(error) = self
+                .run_once(&store, &worker_id, now, 30_000, now.saturating_add(1_000))
+                .await
+            {
+                tracing::warn!(%error, "local durability upgrade attempt will retry");
+            }
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return;
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+            }
+        }
+    }
 }
 
 fn validate_bundle_holders(
@@ -420,4 +589,12 @@ fn domain_hash(domain: &[u8], fields: &[&[u8]]) -> [u8; 32] {
         hasher.update(field);
     }
     hasher.finalize().into()
+}
+
+fn unix_time_ms() -> Result<u64> {
+    Ok(u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis(),
+    )?)
 }

@@ -283,6 +283,8 @@ pub struct MvccSubsystem {
     pub replication_client: TonicReplicationStreamManager,
     pub object_evidence: ObjectEvidenceRegistry,
     pub local_objects: LocalObjectStore,
+    prepared_bundles: AppendOnlyPreparedBundleStore,
+    bundle_replicator: StreamingBundleReplicator<TonicReplicationStreamManager>,
     pub materialisation_storage: crate::storage::Storage,
     pub materialisation_signing_key: Arc<[u8]>,
     pub materialisation_embedding_providers: crate::embedding_provider::EmbeddingProviderRegistry,
@@ -296,6 +298,7 @@ pub struct MvccSubsystem {
     object_materialisation_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     shard_repair_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     shard_rebalance_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    durability_upgrade_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     outbox_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     assignment_reconciler_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -527,7 +530,7 @@ impl MvccSubsystem {
             crate::embedding_provider::EmbeddingProviderRegistry::from_config(config)?;
         let runtime = Arc::new(MvccNodeRuntime::new_with_ownership_resolver(
             prepared.clone(),
-            replicator,
+            replicator.clone(),
             consensus.as_ref().clone(),
             DurabilityPolicy {
                 bundle_quorum_holders: config.mvcc_bundle_quorum_holders,
@@ -594,6 +597,8 @@ impl MvccSubsystem {
             replication_client,
             object_evidence,
             local_objects,
+            prepared_bundles: prepared,
+            bundle_replicator: replicator,
             materialisation_storage,
             materialisation_signing_key,
             materialisation_embedding_providers,
@@ -607,6 +612,7 @@ impl MvccSubsystem {
             object_materialisation_task: Mutex::new(None),
             shard_repair_task: Mutex::new(None),
             shard_rebalance_task: Mutex::new(None),
+            durability_upgrade_task: Mutex::new(None),
             outbox_task: Mutex::new(None),
             assignment_reconciler_task: Mutex::new(None),
         })
@@ -685,6 +691,33 @@ impl MvccSubsystem {
             bail!("shard rebalance reconciler is already started");
         }
         *rebalance_slot = Some(rebalance_task);
+        drop(rebalance_slot);
+        let upgrade = crate::mvcc_local_durability_upgrade::LocalDurabilityUpgradeRunner::new(
+            self.local_objects.clone(),
+            self.replication_client.clone(),
+            self.clone(),
+            self.clone(),
+            crate::mvcc_local_durability_upgrade::PreparedBundleUpgradePublisher {
+                store: self.prepared_bundles.clone(),
+                replicator: self.bundle_replicator.clone(),
+            },
+            self.consensus.as_ref().clone(),
+        );
+        let upgrade_task = tokio::spawn(upgrade.run(
+            self.runtime.local_store().clone(),
+            format!("local-durability-upgrade/{}", self.local_node.node_id),
+            self.apply_shutdown.subscribe(),
+        ));
+        let mut upgrade_slot = self
+            .durability_upgrade_task
+            .lock()
+            .map_err(|_| anyhow::anyhow!("durability upgrade task lock poisoned"))?;
+        if upgrade_slot.is_some() {
+            upgrade_task.abort();
+            bail!("local durability upgrade runner is already started");
+        }
+        *upgrade_slot = Some(upgrade_task);
+        drop(upgrade_slot);
         let outbox = crate::mvcc_outbox::MvccOutboxRunner::new(
             self.runtime.local_store().clone(),
             self.consensus.clone(),
@@ -734,6 +767,14 @@ impl MvccSubsystem {
             .ok()
             .and_then(|mut task| task.take());
         if let Some(task) = rebalance_task {
+            let _ = task.await;
+        }
+        let upgrade_task = self
+            .durability_upgrade_task
+            .lock()
+            .ok()
+            .and_then(|mut task| task.take());
+        if let Some(task) = upgrade_task {
             let _ = task.await;
         }
         let outbox_task = self
