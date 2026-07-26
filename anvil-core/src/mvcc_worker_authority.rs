@@ -2,7 +2,10 @@
 
 use anyhow::{Result, bail};
 
-use crate::{mvcc_bootstrap::MvccSubsystem, mvcc_transaction::NodeIncarnation};
+use crate::{
+    mvcc_bootstrap::MvccSubsystem,
+    mvcc_transaction::{AssignmentPredicate, NodeIncarnation},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssignmentGuard {
@@ -90,6 +93,26 @@ impl MvccSubsystem {
             bail!("background work assignment changed while execution was in flight");
         }
         Ok(())
+    }
+
+    pub fn stage_assignment_guard(
+        &self,
+        transaction_id: &str,
+        principal: &str,
+        guard: &AssignmentGuard,
+        now_unix_ms: u64,
+    ) -> Result<()> {
+        self.open_transactions.require_assignment(
+            transaction_id,
+            principal,
+            AssignmentPredicate {
+                partition_id: guard.partition_id,
+                assignment_epoch: guard.assignment_epoch,
+                topology_epoch: guard.topology_epoch,
+                owner: guard.owner.clone(),
+            },
+            now_unix_ms,
+        )
     }
 }
 

@@ -76,6 +76,14 @@ pub struct WrittenPoint {
     pub value_hash: Option<[u8; 32]>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct AssignmentPredicate {
+    pub partition_id: u64,
+    pub assignment_epoch: u64,
+    pub topology_epoch: u64,
+    pub owner: NodeIncarnation,
+}
+
 /// Compact application entry placed in Raft.
 ///
 /// It intentionally contains no transaction bundle body or product row value.
@@ -88,6 +96,8 @@ pub struct CertifyTransaction {
     pub range_observations: Vec<RangeObservation>,
     #[serde(default)]
     pub predicates: Vec<ExplicitPredicate>,
+    #[serde(default)]
+    pub assignment_predicates: Vec<AssignmentPredicate>,
     pub written_point_keys: Vec<LogicalKeyHash>,
     #[serde(default)]
     pub written_points: Vec<WrittenPoint>,

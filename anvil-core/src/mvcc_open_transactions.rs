@@ -137,6 +137,8 @@ struct DraftMutations {
     points: Vec<PointObservation>,
     ranges: Vec<RangeObservation>,
     predicates: Vec<crate::mvcc_transaction::ExplicitPredicate>,
+    #[serde(default)]
+    assignment_predicates: Vec<crate::mvcc_transaction::AssignmentPredicate>,
     writes: Vec<WriteOperation>,
     manifests: Vec<ObjectShardManifestReference>,
     events: Vec<Vec<u8>>,
@@ -339,6 +341,21 @@ impl OpenTransactionRegistry {
                     kind,
                     observed_version,
                 });
+            Ok(())
+        })
+    }
+
+    pub fn require_assignment(
+        &self,
+        transaction_id: &str,
+        principal: &str,
+        predicate: crate::mvcc_transaction::AssignmentPredicate,
+        now_unix_ms: u64,
+    ) -> Result<()> {
+        self.mutate_for_principal(transaction_id, principal, now_unix_ms, |draft| {
+            if !draft.mutations.assignment_predicates.contains(&predicate) {
+                draft.mutations.assignment_predicates.push(predicate);
+            }
             Ok(())
         })
     }
@@ -783,6 +800,9 @@ fn build_bundle(draft: &Draft) -> Result<TransactionBundle> {
             predicate.kind.clone(),
             predicate.observed_version,
         );
+    }
+    for predicate in &draft.mutations.assignment_predicates {
+        builder.require_assignment(predicate.clone());
     }
     for write in &draft.mutations.writes {
         match write {

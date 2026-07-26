@@ -278,6 +278,7 @@ mod tests {
             point_observations: vec![],
             range_observations: vec![],
             predicates: vec![],
+            assignment_predicates: vec![],
             written_point_keys: vec![],
             written_points: vec![],
             advanced_range_stamps: vec![],

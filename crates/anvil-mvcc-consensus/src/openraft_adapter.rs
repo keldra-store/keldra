@@ -865,12 +865,26 @@ impl RaftStateMachine<AnvilRaftConfig> for OpenRaftStateMachine {
                                 == Some(holder.incarnation)
                         })
                         .count();
+                    let assignments_current =
+                        command.assignment_predicates.iter().all(|predicate| {
+                            state.control.topology_epoch() == predicate.topology_epoch
+                                && state.control.partition(predicate.partition_id).is_some_and(
+                                    |current| {
+                                        current.epoch == predicate.assignment_epoch
+                                            && current.owner == predicate.owner
+                                    },
+                                )
+                        });
                     if policy.generation == 0
                         || required_holders == 0
                         || current_holders < required_holders
                     {
                         RaftApplyResult::Rejected(
                             "durability evidence violates applied Raft control state".into(),
+                        )
+                    } else if !assignments_current {
+                        RaftApplyResult::Rejected(
+                            "assignment predicate violates applied Raft control state".into(),
                         )
                     } else {
                         let result = state
@@ -1172,6 +1186,7 @@ mod tests {
             point_observations: vec![],
             range_observations: vec![],
             predicates: vec![],
+            assignment_predicates: vec![],
             written_point_keys: vec![],
             written_points: vec![],
             advanced_range_stamps: vec![],
@@ -1310,6 +1325,7 @@ mod tests {
             point_observations: vec![],
             range_observations: vec![],
             predicates: vec![],
+            assignment_predicates: vec![],
             written_point_keys: vec![],
             written_points: vec![],
             advanced_range_stamps: vec![],

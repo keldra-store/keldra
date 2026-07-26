@@ -169,6 +169,16 @@ pub(crate) fn to_consensus_command(
         point_observations,
         range_observations,
         predicates,
+        assignment_predicates: request
+            .assignment_predicates
+            .iter()
+            .map(|predicate| consensus::AssignmentPredicate {
+                partition_id: predicate.partition_id,
+                assignment_epoch: predicate.assignment_epoch,
+                topology_epoch: predicate.topology_epoch,
+                owner: node_incarnation(&predicate.owner),
+            })
+            .collect(),
         written_point_keys,
         written_points,
         advanced_range_stamps,
@@ -412,6 +422,7 @@ mod tests {
                 observed_range_stamp: Some(5),
             }],
             predicates: Vec::new(),
+            assignment_predicates: Vec::new(),
             advanced_range_stamps: vec![product::RangeStampKey {
                 scheme_version: product::HierarchicalRangeStampScheme::SCHEME_VERSION,
                 table_id: 8,
@@ -491,6 +502,7 @@ mod tests {
             point_observations: bundle.point_observations,
             range_observations: bundle.range_observations,
             predicates: bundle.predicates,
+            assignment_predicates: bundle.assignment_predicates,
             advanced_range_stamps: bundle.advanced_range_stamps,
             written_keys,
             written_points,

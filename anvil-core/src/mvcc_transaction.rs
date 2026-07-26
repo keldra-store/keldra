@@ -183,12 +183,22 @@ pub struct TransactionBundle {
     pub range_observations: Vec<RangeObservation>,
     #[serde(default)]
     pub predicates: Vec<ExplicitPredicate>,
+    #[serde(default)]
+    pub assignment_predicates: Vec<AssignmentPredicate>,
     pub advanced_range_stamps: Vec<RangeStampKey>,
     pub writes: Vec<WriteOperation>,
     pub shard_manifests: Vec<ObjectShardManifestReference>,
     pub outbox_events: Vec<Vec<u8>>,
     pub materialisation_jobs: Vec<Vec<u8>>,
     pub ownership_claims: Vec<ClusterOwnershipClaim>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct AssignmentPredicate {
+    pub partition_id: u64,
+    pub assignment_epoch: u64,
+    pub topology_epoch: u64,
+    pub owner: NodeIncarnation,
 }
 
 impl TransactionBundle {
@@ -235,6 +245,21 @@ impl TransactionBundle {
             |predicate| &predicate.key,
             "explicit predicate key",
         )?;
+        self.assignment_predicates.sort();
+        ensure_unique_by(
+            self.assignment_predicates.iter(),
+            |predicate| predicate.partition_id,
+            "assignment predicate partition",
+        )?;
+        if self.assignment_predicates.iter().any(|predicate| {
+            predicate.partition_id == 0
+                || predicate.assignment_epoch == 0
+                || predicate.topology_epoch == 0
+                || predicate.owner.node_id.trim().is_empty()
+                || predicate.owner.incarnation == 0
+        }) {
+            bail!("assignment predicates require non-zero exact authority");
+        }
         ensure_unique_by(
             self.range_observations.iter(),
             |entry| {
@@ -419,6 +444,7 @@ impl TransactionBundleBuilder {
                 point_observations: Vec::new(),
                 range_observations: Vec::new(),
                 predicates: Vec::new(),
+                assignment_predicates: Vec::new(),
                 advanced_range_stamps: Vec::new(),
                 writes: Vec::new(),
                 shard_manifests: Vec::new(),
@@ -538,6 +564,13 @@ impl TransactionBundleBuilder {
             self.claim(resource);
         }
         self.bundle.outbox_events.push(event);
+        self
+    }
+
+    pub fn require_assignment(&mut self, predicate: AssignmentPredicate) -> &mut Self {
+        if !self.bundle.assignment_predicates.contains(&predicate) {
+            self.bundle.assignment_predicates.push(predicate);
+        }
         self
     }
 
@@ -829,6 +862,7 @@ pub struct CertificationRequest {
     pub point_observations: Vec<PointObservation>,
     pub range_observations: Vec<RangeObservation>,
     pub predicates: Vec<ExplicitPredicate>,
+    pub assignment_predicates: Vec<AssignmentPredicate>,
     pub advanced_range_stamps: Vec<RangeStampKey>,
     pub written_keys: Vec<LogicalKey>,
     pub written_points: Vec<(LogicalKey, Option<[u8; 32]>)>,
@@ -1029,6 +1063,7 @@ where
                 point_observations: bundle.point_observations,
                 range_observations: bundle.range_observations,
                 predicates: bundle.predicates,
+                assignment_predicates: bundle.assignment_predicates,
                 advanced_range_stamps: bundle.advanced_range_stamps,
                 written_keys,
                 written_points,

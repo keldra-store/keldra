@@ -500,6 +500,7 @@ mod tests {
             }],
             range_observations: Vec::new(),
             predicates: Vec::new(),
+            assignment_predicates: Vec::new(),
             written_point_keys: vec![key],
             written_points: vec![anvil_mvcc_consensus::WrittenPoint {
                 key,

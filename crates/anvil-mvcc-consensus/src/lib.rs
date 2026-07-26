@@ -26,9 +26,9 @@ pub use storage::{
     CONSENSUS_COLUMN_FAMILIES, PersistedConsensusState, RaftStorageError, RocksRaftStore,
 };
 pub use types::{
-    AppliedDecision, BundleHash, CertificationAbort, CertificationResult, CertifyTransaction,
-    CommitVersion, CommittedBundleDecision, ConsensusCommand, ConsensusDurabilityPolicy,
-    ControlApplyResult, DurabilityLevel, ExplicitPredicate, LogicalKeyHash, NodeId,
-    NodeIncarnation, PartitionAssignment, PointObservation, PredicateKind, RangeConflictKey,
-    RangeObservation, TransactionId, WrittenPoint,
+    AppliedDecision, AssignmentPredicate, BundleHash, CertificationAbort, CertificationResult,
+    CertifyTransaction, CommitVersion, CommittedBundleDecision, ConsensusCommand,
+    ConsensusDurabilityPolicy, ControlApplyResult, DurabilityLevel, ExplicitPredicate,
+    LogicalKeyHash, NodeId, NodeIncarnation, PartitionAssignment, PointObservation, PredicateKind,
+    RangeConflictKey, RangeObservation, TransactionId, WrittenPoint,
 };
