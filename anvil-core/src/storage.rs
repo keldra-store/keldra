@@ -95,6 +95,10 @@ impl Storage {
         self.storage_path.join(CORESTORE_DIR)
     }
 
+    pub(crate) fn mesh_control_checkpoint_path(&self) -> PathBuf {
+        self.storage_path.join("mesh-control").join("checkpoints")
+    }
+
     pub fn core_store_meta_path(&self) -> PathBuf {
         self.core_store_root_path().join("meta").join("rocksdb")
     }

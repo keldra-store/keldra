@@ -483,6 +483,7 @@ pub(super) fn validate_activation_checkpoint_header(
 
 pub(super) async fn validate_activation_checkpoint_streams(
     storage: &Storage,
+    checkpoint_store: &crate::mesh_control_stream::MeshCheckpointStore,
     checkpoint: &ActivationCheckpoint,
 ) -> LifecycleResult<()> {
     let supplied_streams = checkpoint
@@ -504,19 +505,19 @@ pub(super) async fn validate_activation_checkpoint_streams(
     }
 
     for required in &checkpoint.required_streams {
-        let Some(region_checkpoint) = read_control_checkpoint(
-            storage,
-            &checkpoint.region,
-            &required.stream_family,
-            &required.partition,
-        )
-        .await
-        .map_err(|err| {
-            LifecycleError::InvalidArgument(format!(
-                "activation checkpoint could not read regional checkpoint {}/{} for {}: {err}",
-                required.stream_family, required.partition, checkpoint.region
-            ))
-        })?
+        let Some(region_checkpoint) = checkpoint_store
+            .read(
+                &checkpoint.region,
+                &required.stream_family,
+                &required.partition,
+            )
+            .await
+            .map_err(|err| {
+                LifecycleError::InvalidArgument(format!(
+                    "activation checkpoint could not read regional checkpoint {}/{} for {}: {err}",
+                    required.stream_family, required.partition, checkpoint.region
+                ))
+            })?
         else {
             return Err(activation_checkpoint_not_reached(
                 required,

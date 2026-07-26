@@ -235,7 +235,8 @@ async fn activate_region_inner(
         }
     })?;
     validate_activation_checkpoint_header(checkpoint, &current.mesh_id, region)?;
-    validate_activation_checkpoint_streams(storage, checkpoint).await?;
+    let checkpoint_store = crate::mesh_control_stream::MeshCheckpointStore::new(storage);
+    validate_activation_checkpoint_streams(storage, &checkpoint_store, checkpoint).await?;
     ensure_region_activation_dependencies(&state, region)?;
 
     let descriptor = state

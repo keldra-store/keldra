@@ -367,6 +367,115 @@ pub struct ControlCheckpointRecord {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct MeshCheckpointStore {
+    root: std::path::PathBuf,
+}
+
+impl MeshCheckpointStore {
+    pub fn new(storage: &Storage) -> Self {
+        Self {
+            root: storage.mesh_control_checkpoint_path(),
+        }
+    }
+
+    fn checkpoint_dir(
+        &self,
+        region: &str,
+        stream_family: &str,
+        partition: &str,
+    ) -> std::path::PathBuf {
+        self.root
+            .join(hex::encode(region.as_bytes()))
+            .join(hex::encode(stream_family.as_bytes()))
+            .join(hex::encode(partition.as_bytes()))
+    }
+
+    pub async fn read(
+        &self,
+        region: &str,
+        stream_family: &str,
+        partition: &str,
+    ) -> AnyhowResult<Option<ControlCheckpointRecord>> {
+        let directory = self.checkpoint_dir(region, stream_family, partition);
+        let mut entries = match tokio::fs::read_dir(&directory).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let mut latest: Option<ControlCheckpointRecord> = None;
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let bytes = tokio::fs::read(entry.path()).await?;
+            let checkpoint: ControlCheckpointRecord = serde_json::from_slice(&bytes)?;
+            validate_control_checkpoint(&checkpoint)?;
+            ensure_control_checkpoint_scope(&checkpoint, region, stream_family, partition)?;
+            match latest.as_ref() {
+                Some(current) if checkpoint.last_sequence < current.last_sequence => {}
+                Some(current) if checkpoint.last_sequence == current.last_sequence => {
+                    if checkpoint.last_digest != current.last_digest {
+                        return Err(anyhow!(
+                            "ControlStreamDivergence: checkpoint sequence {} has multiple digests",
+                            checkpoint.last_sequence.get()
+                        ));
+                    }
+                }
+                _ => latest = Some(checkpoint),
+            }
+        }
+        Ok(latest)
+    }
+
+    pub async fn append(&self, checkpoint: &ControlCheckpointRecord) -> AnyhowResult<()> {
+        validate_control_checkpoint(checkpoint)?;
+        if let Some(current) = self
+            .read(
+                &checkpoint.region,
+                &checkpoint.stream_family,
+                &checkpoint.partition,
+            )
+            .await?
+        {
+            if checkpoint.last_sequence < current.last_sequence {
+                return Err(anyhow!("control checkpoint cannot move backwards"));
+            }
+            if checkpoint.last_sequence == current.last_sequence {
+                if checkpoint.last_digest != current.last_digest {
+                    return Err(anyhow!(
+                        "ControlStreamDivergence: checkpoint digest changed"
+                    ));
+                }
+                return Ok(());
+            }
+        }
+        let directory = self.checkpoint_dir(
+            &checkpoint.region,
+            &checkpoint.stream_family,
+            &checkpoint.partition,
+        );
+        tokio::fs::create_dir_all(&directory).await?;
+        let final_path = directory.join(format!(
+            "{:020}-{}.json",
+            checkpoint.last_sequence.get(),
+            hex::encode(checkpoint.last_digest.as_str().as_bytes())
+        ));
+        let temp_path = directory.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
+        tokio::fs::write(&temp_path, serde_json::to_vec(checkpoint)?).await?;
+        match tokio::fs::hard_link(&temp_path, &final_path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                return Err(error.into());
+            }
+        }
+        tokio::fs::remove_file(temp_path).await?;
+        Ok(())
+    }
+}
+
 impl ControlCheckpointRecord {
     pub fn new(
         mesh_id: impl Into<String>,
@@ -756,97 +865,7 @@ pub async fn write_control_checkpoint(
     storage: &Storage,
     checkpoint: &ControlCheckpointRecord,
 ) -> AnyhowResult<()> {
-    validate_control_checkpoint(checkpoint)?;
-    let row_key = control_checkpoint_row_key(
-        &checkpoint.region,
-        &checkpoint.stream_family,
-        &checkpoint.partition,
-    )?;
-    let store = CoreStore::new(storage.clone()).await?;
-    let current_payload = store.read_coremeta_row(CF_MESH, TABLE_MESH_PARTITION_ROW, &row_key)?;
-    if let Some(existing) = current_payload
-        .as_deref()
-        .map(decode_control_checkpoint_proto)
-        .transpose()?
-    {
-        ensure_control_checkpoint_scope(
-            &existing,
-            &checkpoint.region,
-            &checkpoint.stream_family,
-            &checkpoint.partition,
-        )?;
-        if checkpoint.last_sequence < existing.last_sequence {
-            return Err(anyhow!(
-                "control checkpoint cannot move backwards for {}/{}/{}: existing sequence {}, new sequence {}",
-                checkpoint.region,
-                checkpoint.stream_family,
-                checkpoint.partition,
-                existing.last_sequence.get(),
-                checkpoint.last_sequence.get()
-            ));
-        }
-        if checkpoint.last_sequence == existing.last_sequence {
-            if checkpoint.last_digest.as_str() != existing.last_digest.as_str() {
-                return Err(anyhow!(
-                    "ControlStreamDivergence: control checkpoint {}/{}/{} sequence {} has digest {}, existing digest {}",
-                    checkpoint.region,
-                    checkpoint.stream_family,
-                    checkpoint.partition,
-                    checkpoint.last_sequence.get(),
-                    checkpoint.last_digest,
-                    existing.last_digest
-                ));
-            }
-            return Ok(());
-        }
-    }
-    let payload = encode_control_checkpoint_proto(checkpoint)?;
-    let partition_id = control_checkpoint_partition_id(
-        &checkpoint.region,
-        &checkpoint.stream_family,
-        &checkpoint.partition,
-    )?;
-    let root_publications = control_checkpoint_root_publications(
-        partition_id.clone(),
-        control_checkpoint_root_anchor_key(
-            &checkpoint.region,
-            &checkpoint.stream_family,
-            &checkpoint.partition,
-        ),
-    );
-    store
-        .commit_mutation_batch(CoreMutationBatch {
-            transaction_id: format!(
-                "mesh-control-checkpoint:{}:{}:{}:{}:{}",
-                checkpoint.mesh_id,
-                checkpoint.region,
-                checkpoint.stream_family,
-                checkpoint.partition,
-                checkpoint.last_sequence.get()
-            ),
-            scope_partition: partition_id.clone(),
-            committed_by_principal: "mesh-control-checkpoint".to_string(),
-            root_publications,
-            preconditions: vec![CoreMutationPrecondition::CoreMetaRow {
-                cf: CF_MESH.to_string(),
-                table_id: TABLE_MESH_PARTITION_ROW,
-                tuple_key: row_key.clone(),
-                expected_payload_hash: current_payload
-                    .as_ref()
-                    .map(|payload| core_meta_payload_digest(TABLE_MESH_PARTITION_ROW, payload)),
-                require_absent: current_payload.is_none(),
-                require_present: current_payload.is_some(),
-            }],
-            operations: vec![CoreMutationOperation::CoreMetaPut {
-                partition_id,
-                cf: CF_MESH.to_string(),
-                table_id: TABLE_MESH_PARTITION_ROW,
-                tuple_key: row_key,
-                payload,
-            }],
-        })
-        .await?;
-    Ok(())
+    MeshCheckpointStore::new(storage).append(checkpoint).await
 }
 
 pub async fn read_control_checkpoint(
@@ -855,15 +874,9 @@ pub async fn read_control_checkpoint(
     stream_family: &str,
     partition: &str,
 ) -> AnyhowResult<Option<ControlCheckpointRecord>> {
-    let row_key = control_checkpoint_row_key(region, stream_family, partition)?;
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(payload) = store.read_coremeta_row(CF_MESH, TABLE_MESH_PARTITION_ROW, &row_key)?
-    else {
-        return Ok(None);
-    };
-    let checkpoint = decode_control_checkpoint_proto(&payload)?;
-    ensure_control_checkpoint_scope(&checkpoint, region, stream_family, partition)?;
-    Ok(Some(checkpoint))
+    MeshCheckpointStore::new(storage)
+        .read(region, stream_family, partition)
+        .await
 }
 
 fn ensure_control_checkpoint_scope(
