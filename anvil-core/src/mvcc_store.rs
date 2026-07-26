@@ -605,6 +605,42 @@ mod tests {
     }
 
     #[test]
+    fn table_prefix_scan_is_filtered_and_snapshot_consistent() {
+        let temp = tempdir().unwrap();
+        let store = MvccStore::open(temp.path()).unwrap();
+        store
+            .apply_certified_bundle(
+                1,
+                &bundle("initial", |builder| {
+                    builder.put(key(7, b"part/a"), b"a1".to_vec());
+                    builder.put(key(7, b"part/b"), b"b1".to_vec());
+                    builder.put(key(7, b"other/c"), b"c1".to_vec());
+                    builder.put(key(8, b"part/d"), b"d1".to_vec());
+                }),
+            )
+            .unwrap();
+        store
+            .apply_certified_bundle(
+                2,
+                &bundle("update", |builder| {
+                    builder.put(key(7, b"part/a"), b"a2".to_vec());
+                    builder.delete(key(7, b"part/b"));
+                }),
+            )
+            .unwrap();
+
+        let at_one = store.scan_table_prefix_at(7, b"part/", 1).unwrap();
+        assert_eq!(at_one.len(), 2);
+        assert_eq!(at_one[0].1.value, b"a1");
+        assert_eq!(at_one[1].1.value, b"b1");
+
+        let at_two = store.scan_table_prefix_at(7, b"part/", 2).unwrap();
+        assert_eq!(at_two.len(), 1);
+        assert_eq!(at_two[0].0.application_key, b"part/a");
+        assert_eq!(at_two[0].1.value, b"a2");
+    }
+
+    #[test]
     fn materialisation_leases_retry_and_recover_after_expiry() {
         let temp = tempdir().unwrap();
         let store = MvccStore::open(temp.path()).unwrap();
@@ -614,9 +650,23 @@ mod tests {
             transaction_id: "jobs".into(),
             tenant_id: 1,
             bucket_id: 2,
+            bucket_name: "bucket".into(),
             object_key: "object".into(),
             object_version_id: "version".into(),
+            target_logical_identity: "tenant/1/bucket/2/object/object/version/version".into(),
             representation: serde_json::json!({"schema": "local"}),
+            payload_length: 3,
+            content_type: Some("application/json".into()),
+            user_metadata: serde_json::json!({}),
+            index_policy_snapshot: serde_json::json!({}),
+            authz_revision: 1,
+            boundary_schema: None,
+            boundary_schema_generation: 0,
+            boundary_schema_hash: None,
+            requested_operations: crate::object_materialisation::ObjectMaterialisationOperations {
+                extract_boundaries: true,
+                maintain_indexes: true,
+            },
             requested_at_unix_ms: 1,
         };
         let id = job.job_id().unwrap();
