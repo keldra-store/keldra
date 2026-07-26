@@ -13,7 +13,7 @@ use openraft::{
     AnyError, BasicNode, Entry, EntryPayload, ErrorSubject, ErrorVerb, LogId, LogState,
     OptionalSend, RaftLogReader, RaftSnapshotBuilder, Snapshot, SnapshotMeta, StorageError,
     StorageIOError, StoredMembership, Vote,
-    error::{InstallSnapshotError, NetworkError, RPCError, RaftError},
+    error::{InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError},
     network::{RPCOption, RaftNetwork, RaftNetworkFactory},
     raft::{
         AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
@@ -91,6 +91,8 @@ struct NetworkFactoryAdapter {
 
 struct NetworkAdapter {
     client: Box<dyn ConsensusRpcClient>,
+    target: u64,
+    node: BasicNode,
 }
 
 impl RaftNetworkFactory<AnvilRaftConfig> for NetworkFactoryAdapter {
@@ -102,6 +104,8 @@ impl RaftNetworkFactory<AnvilRaftConfig> for NetworkFactoryAdapter {
         };
         NetworkAdapter {
             client: self.inner.client(NodeId(target), &descriptor),
+            target,
+            node: node.clone(),
         }
     }
 }
@@ -115,7 +119,7 @@ impl NetworkAdapter {
     where
         Req: Serialize,
         Resp: for<'de> Deserialize<'de>,
-        AppError: std::error::Error,
+        AppError: std::error::Error + Serialize + for<'de> Deserialize<'de>,
     {
         let payload = bincode::serde::encode_to_vec(request, bincode::config::standard())
             .map_err(|error| RPCError::Network(NetworkError::new(&error)))?;
@@ -133,9 +137,17 @@ impl NetworkAdapter {
                 }
                 ConsensusRpcError::Protocol(_) => RPCError::Network(NetworkError::new(&error)),
             })?;
-        bincode::serde::decode_from_slice(&response, bincode::config::standard())
-            .map(|(value, _)| value)
-            .map_err(|error| RPCError::Network(NetworkError::new(&error)))
+        let remote: Result<Resp, RaftError<u64, AppError>> =
+            bincode::serde::decode_from_slice(&response, bincode::config::standard())
+                .map(|(value, _)| value)
+                .map_err(|error| RPCError::Network(NetworkError::new(&error)))?;
+        remote.map_err(|error| {
+            RPCError::RemoteError(RemoteError::new_with_node(
+                self.target,
+                self.node.clone(),
+                error,
+            ))
+        })
     }
 }
 
@@ -215,6 +227,30 @@ pub struct OpenRaftConsensus {
 }
 
 impl OpenRaftConsensus {
+    /// Handle one opaque RPC received by the injected transport.
+    pub async fn handle_rpc(&self, rpc: ConsensusRpc) -> Result<Vec<u8>, ConsensusRpcError> {
+        if rpc.schema_version != 1 {
+            return Err(ConsensusRpcError::Protocol(format!(
+                "unsupported consensus RPC schema {}",
+                rpc.schema_version
+            )));
+        }
+        match rpc.kind {
+            ConsensusRpcKind::AppendEntries => {
+                let request: AppendEntriesRequest<AnvilRaftConfig> = decode_rpc(&rpc.payload)?;
+                encode_rpc(&self.raft.append_entries(request).await)
+            }
+            ConsensusRpcKind::Vote => {
+                let request: VoteRequest<u64> = decode_rpc(&rpc.payload)?;
+                encode_rpc(&self.raft.vote(request).await)
+            }
+            ConsensusRpcKind::InstallSnapshot => {
+                let request: InstallSnapshotRequest<AnvilRaftConfig> = decode_rpc(&rpc.payload)?;
+                encode_rpc(&self.raft.install_snapshot(request).await)
+            }
+        }
+    }
+
     pub async fn from_db(
         node_id: NodeId,
         db: Arc<rocksdb::DB>,
@@ -298,6 +334,22 @@ impl OpenRaftConsensus {
             .await
             .map_err(|error| ConsensusError::Unavailable(error.to_string()))
     }
+}
+
+fn decode_rpc<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, ConsensusRpcError> {
+    let (value, consumed) = bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+        .map_err(|error| ConsensusRpcError::Protocol(error.to_string()))?;
+    if consumed != bytes.len() {
+        return Err(ConsensusRpcError::Protocol(
+            "trailing bytes in consensus RPC".into(),
+        ));
+    }
+    Ok(value)
+}
+
+fn encode_rpc<T: Serialize>(value: &T) -> Result<Vec<u8>, ConsensusRpcError> {
+    bincode::serde::encode_to_vec(value, bincode::config::standard())
+        .map_err(|error| ConsensusRpcError::Protocol(error.to_string()))
 }
 
 fn map_raft_error<E>(error: openraft::error::RaftError<u64, E>) -> ConsensusError
