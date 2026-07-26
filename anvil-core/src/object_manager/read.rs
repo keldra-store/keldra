@@ -1235,41 +1235,34 @@ impl ObjectManager {
     ) -> Result<Object, Status> {
         self.validate_write_request(&claims, destination_bucket_name, destination_object_key)
             .await?;
-        let source_object = self
-            .head_object(
+        let (source_object, source_stream, _) = self
+            .get_object(
                 Some(claims.clone()),
-                source_bucket_name,
-                source_object_key,
+                source_bucket_name.to_string(),
+                source_object_key.to_string(),
                 source_version_id,
+                None,
             )
-            .await?;
-        let destination_bucket = self
-            .get_tenant_bucket(claims.tenant_id, destination_bucket_name)
             .await?;
         let transaction_principal =
             crate::object_manager::transaction_principal_from_claims(&claims);
 
-        let copied = self
-            .persistence
-            .create_object_with_storage_class_with_options(
-                claims.tenant_id,
-                destination_bucket.id,
-                destination_object_key,
-                &source_object.content_hash,
-                source_object.size,
-                &source_object.etag,
-                source_object.content_type.as_deref(),
-                source_object.user_meta,
-                source_object.shard_map,
-                None,
-                transaction_id,
-                Some(transaction_principal.as_str()),
-                source_object.storage_class,
-                crate::persistence::ObjectCreateOptions::copy(),
-            )
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        Ok(copied)
+        self.put_object(
+            &claims,
+            destination_bucket_name,
+            destination_object_key,
+            source_stream,
+            ObjectWriteOptions {
+                content_type: source_object.content_type,
+                user_metadata: source_object.user_meta,
+                transaction_id: transaction_id.map(ToOwned::to_owned),
+                transaction_principal: transaction_id.map(|_| transaction_principal),
+                storage_class_id: source_object.storage_class,
+                visibility: ObjectWriteVisibility::strict(),
+                prepared_ingest: None,
+            },
+        )
+        .await
     }
 
     pub async fn compose_object(
@@ -1332,6 +1325,8 @@ impl ObjectManager {
             composed_stream,
             ObjectWriteOptions {
                 transaction_id: transaction_id.map(ToOwned::to_owned),
+                transaction_principal: transaction_id
+                    .map(|_| crate::object_manager::transaction_principal_from_claims(&claims)),
                 visibility: ObjectWriteVisibility::strict(),
                 ..Default::default()
             },
