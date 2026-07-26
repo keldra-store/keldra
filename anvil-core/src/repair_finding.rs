@@ -356,7 +356,9 @@ async fn write_repair_finding_inner(
         &finding.scope_id,
         &finding.finding_id,
         signing_key,
-    )? {
+    )
+    .await?
+    {
         if finding_matches_write(&existing, &finding) {
             return Ok(existing);
         }

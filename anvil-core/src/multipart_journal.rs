@@ -623,7 +623,7 @@ pub async fn list_active_multipart_uploads(
     if let Some(after) = after_tuple_key {
         records.retain(|(key, _)| {
             key.application_key
-                .strip_prefix(&namespace)
+                .strip_prefix(namespace.as_slice())
                 .is_some_and(|tuple| tuple > after.as_slice())
         });
     }

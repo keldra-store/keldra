@@ -523,6 +523,7 @@ async fn require_mesh_bucket_manage(
         &access_control::bucket_object_id(&bucket),
         "manage_bucket",
     )
+    .await
 }
 
 fn admin_claims<T>(request: &Request<T>) -> Result<auth::Claims, Status> {

@@ -2,7 +2,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use anvil_mvcc_consensus::{NodeIncarnation, OpenRaftConsensus};
+use anvil_mvcc_consensus::{Consensus, NodeIncarnation, OpenRaftConsensus};
 use anyhow::{Context, Result, bail};
 use tokio::sync::watch;
 

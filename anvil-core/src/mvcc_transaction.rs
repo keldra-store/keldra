@@ -6,7 +6,7 @@
 
 use std::{collections::BTreeSet, sync::Arc};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1145,12 +1145,20 @@ where
                         );
                     }
                 }
-                DurabilityLevel::Quorum => {
-                    self.validate_shard_placement(cluster_id, object, &evidence.objects, false)?
-                }
-                DurabilityLevel::Erasure => {
-                    self.validate_shard_placement(cluster_id, object, &evidence.objects, true)?
-                }
+                DurabilityLevel::Quorum => self.validate_shard_placement(
+                    cluster_id,
+                    object,
+                    &evidence.objects,
+                    false,
+                    policy,
+                )?,
+                DurabilityLevel::Erasure => self.validate_shard_placement(
+                    cluster_id,
+                    object,
+                    &evidence.objects,
+                    true,
+                    policy,
+                )?,
             }
         }
         Ok(())
@@ -1162,6 +1170,7 @@ where
         manifest: &ObjectShardManifestReference,
         evidence: &[ObjectDurabilityEvidence],
         require_complete_plan: bool,
+        policy: DurabilityPolicy,
     ) -> Result<()> {
         let object_hash = manifest.object_hash.as_str();
         let mut placements = Vec::new();

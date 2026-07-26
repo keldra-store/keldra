@@ -100,7 +100,7 @@ pub(crate) async fn record_tenant_audit_event(
 }
 
 pub(crate) fn build_tenant_audit_event(
-    claims: &Claims,
+    claims: &auth::Claims,
     request_id: &str,
     resource_id: impl Into<String>,
     action: impl Into<String>,

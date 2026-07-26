@@ -1472,7 +1472,9 @@ impl AuthService for AppState {
                         last_revision,
                         &namespace,
                         256,
-                    ) {
+                    )
+                    .await
+                    {
                         Ok(page) => page,
                         Err(error) => {
                             let _ = tx.send(Err(Status::internal(error.to_string()))).await;

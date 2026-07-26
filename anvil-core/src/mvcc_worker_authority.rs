@@ -1,5 +1,6 @@
 //! Compact-Raft authority fences for replicated background work.
 
+use anvil_mvcc_consensus::Consensus;
 use anyhow::{Result, bail};
 
 use crate::{

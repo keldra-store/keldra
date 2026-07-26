@@ -551,28 +551,6 @@ pub(super) fn multipart_current_root_key(tenant_id: i64, bucket_id: i64) -> Stri
     format!("tenant/{tenant_id}/bucket/{bucket_id}/multipart/current")
 }
 
-pub(super) fn next_upload_id(state: &MultipartState) -> Result<i64> {
-    state
-        .uploads
-        .keys()
-        .copied()
-        .max()
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(|| anyhow!("multipart upload id overflow"))
-}
-
-pub(super) fn next_part_id(state: &MultipartState) -> Result<i64> {
-    state
-        .parts
-        .values()
-        .map(|part| part.id)
-        .max()
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(|| anyhow!("multipart part id overflow"))
-}
-
 pub fn multipart_metadata_partition_id(tenant_id: i64, bucket_id: i64) -> Hash32 {
     hash32(format!("tenant/{tenant_id}/bucket/{bucket_id}/multipart").as_bytes())
 }

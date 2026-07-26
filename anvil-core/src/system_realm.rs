@@ -245,7 +245,7 @@ pub async fn check_admin_relation(
 
 pub(crate) async fn check_internal_node_access(
     core_store: &CoreStore,
-    runtime: &crate::mvcc_node_runtime::MvccNodeRuntime,
+    runtime: &crate::mvcc_bootstrap::ProductMvccRuntime,
     mesh_id: &str,
     claims: &auth::Claims,
     node_id: &str,

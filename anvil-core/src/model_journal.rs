@@ -442,9 +442,6 @@ fn model_projection_mutations(
                 replacement_keys.insert(model_tensor_key(artifact_id, &tensor.tensor_name)?);
             }
             let tuple_prefix = model_tensor_prefix(artifact_id)?;
-            if after_cursor.is_some_and(|cursor| !cursor.starts_with(&tuple_prefix)) {
-                bail!("model tensor cursor is outside the requested prefix");
-            }
             let prefix = coremeta_application_prefix(CF_OBSERVABILITY, &tuple_prefix)?;
             let rows = mvcc.runtime.scan_table_prefix_at(
                 TABLE_OBSERVABILITY_CURSOR_ROW,

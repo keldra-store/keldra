@@ -237,6 +237,11 @@ fn decode_task_lease_record(bytes: &[u8]) -> Result<TaskLease> {
     task_lease_from_proto(proto)
 }
 
+fn encode_task_lease_record(lease: &TaskLease) -> Result<Vec<u8>> {
+    validate_unsigned_lease(lease)?;
+    Ok(task_lease_to_proto(lease).encode_to_vec())
+}
+
 fn task_lease_to_proto(lease: &TaskLease) -> TaskLeaseRecordProto {
     TaskLeaseRecordProto {
         format_version: u32::from(lease.format_version),

@@ -334,7 +334,8 @@ impl AppState {
             &bucket,
             BucketJournalMutation::Create,
             transaction_id,
-        )?;
+        )
+        .await?;
         Ok(bucket)
     }
 
@@ -350,7 +351,8 @@ impl AppState {
             claims,
             AnvilAction::BucketDelete,
             &req.bucket_name,
-        )?;
+        )
+        .await?;
         let bucket = bucket_journal::read_current_bucket_mvcc(
             &self.mvcc,
             claims.tenant_id,
@@ -361,6 +363,7 @@ impl AppState {
         if self
             .persistence
             .bucket_has_retained_objects_or_uploads(bucket.id)
+            .await
             .map_err(|err| Status::internal(err.to_string()))?
         {
             return Err(Status::failed_precondition("Bucket not empty"));
@@ -403,7 +406,8 @@ impl AppState {
             &bucket,
             BucketJournalMutation::Update,
             transaction_id,
-        )?;
+        )
+        .await?;
         Ok(bucket)
     }
 

@@ -454,7 +454,7 @@ pub(crate) async fn update_task_status_with_permit(
     _partition_owner_signing_key: &[u8],
 ) -> Result<()> {
     require_task_queue_permit(mvcc, permit)?;
-    update_task_status_inner(mvcc, task_id, status, permit.fence_token, None).await
+    update_task_status_inner(mvcc, task_id, status, permit.fence_token, None, None).await
 }
 
 pub(crate) async fn update_task_status_with_execution_guard(
