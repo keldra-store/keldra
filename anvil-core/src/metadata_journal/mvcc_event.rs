@@ -40,11 +40,22 @@ pub(super) fn plan_metadata_events(
 ) -> Result<MetadataEventPlan> {
     let stream_id = object_metadata_stream_id(bucket.tenant_id, bucket.id);
     let head_key = stream_logical_key(TABLE_STREAM_HEAD_ROW, &stream_id, None)?;
-    let current_payload = if let Some((transaction_id, principal)) = transaction {
-        mvcc.read_transaction_value(transaction_id, principal, &head_key)?
-    } else {
-        mvcc.read_latest_value(&head_key)?
-    };
+    let (current_payload, predicate_payload) =
+        if let Some((transaction_id, principal)) = transaction {
+            let snapshot = mvcc
+                .open_transactions
+                .handle(transaction_id)?
+                .snapshot_version;
+            (
+                mvcc.read_transaction_value(transaction_id, principal, &head_key)?,
+                mvcc.runtime
+                    .read_at(&head_key, snapshot)?
+                    .map(|row| row.value),
+            )
+        } else {
+            let current = mvcc.read_latest_value(&head_key)?;
+            (current.clone(), current)
+        };
     let mut head = current_payload
         .as_deref()
         .map(decode_head)
@@ -56,7 +67,7 @@ pub(super) fn plan_metadata_events(
         });
     let head_predicate = (
         head_key.clone(),
-        current_payload
+        predicate_payload
             .as_ref()
             .map(|payload| PredicateKind::ValueHash(*blake3::hash(payload).as_bytes()))
             .unwrap_or(PredicateKind::Absent),
