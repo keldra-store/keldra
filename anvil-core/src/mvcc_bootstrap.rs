@@ -243,12 +243,14 @@ pub struct MvccSubsystem {
     pub consensus_service: ConsensusTransportService<NodeConnectionAuthorizer>,
     pub replication_service: ReplicationServiceImpl<NodeConnectionAuthorizer>,
     pub peers: Arc<[MvccPeerConfig]>,
+    pub local_node: NodeIncarnation,
     pub apply_worker_state: Arc<tokio::sync::Mutex<ApplyWorkerState>>,
     apply_shutdown: tokio::sync::watch::Sender<bool>,
     apply_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     object_materialisation_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     shard_repair_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     shard_rebalance_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    outbox_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl fmt::Debug for MvccSubsystem {
@@ -445,7 +447,7 @@ impl MvccSubsystem {
         let local_objects = LocalObjectStore::open(
             &paths.local_objects,
             config.mvcc_cluster_id.clone(),
-            local_incarnation,
+            local_incarnation.clone(),
             local.failure_domain.clone(),
         )?;
         let object_evidence = ObjectEvidenceRegistry::default();
@@ -522,16 +524,22 @@ impl MvccSubsystem {
             consensus_service,
             replication_service,
             peers: peers.into(),
+            local_node: local_incarnation,
             apply_worker_state,
             apply_shutdown,
             apply_task: Mutex::new(Some(apply_task)),
             object_materialisation_task: Mutex::new(None),
             shard_repair_task: Mutex::new(None),
             shard_rebalance_task: Mutex::new(None),
+            outbox_task: Mutex::new(None),
         })
     }
 
-    pub fn start_object_materialisation(self: &Arc<Self>) -> Result<()> {
+    pub fn start_background_work(
+        self: &Arc<Self>,
+        core_store: crate::core_store::CoreStore,
+        observability: crate::observability::Observability,
+    ) -> Result<()> {
         let executor = Arc::new(
             crate::object_materialisation_runner::MvccObjectMaterialisationExecutor::new(
                 self.clone(),
@@ -582,6 +590,24 @@ impl MvccSubsystem {
             bail!("shard rebalance reconciler is already started");
         }
         *rebalance_slot = Some(rebalance_task);
+        let outbox = crate::mvcc_outbox::MvccOutboxRunner::new(
+            self.runtime.local_store().clone(),
+            self.consensus.clone(),
+            consensus_control_node_id(&self.local_node.node_id),
+            self.local_node.clone(),
+            core_store,
+            observability,
+        )?;
+        let outbox_task = tokio::spawn(outbox.run(self.apply_shutdown.subscribe()));
+        let mut outbox_slot = self
+            .outbox_task
+            .lock()
+            .map_err(|_| anyhow::anyhow!("outbox task lock poisoned"))?;
+        if outbox_slot.is_some() {
+            outbox_task.abort();
+            bail!("outbox runner is already started");
+        }
+        *outbox_slot = Some(outbox_task);
         Ok(())
     }
 
@@ -613,6 +639,14 @@ impl MvccSubsystem {
             .ok()
             .and_then(|mut task| task.take());
         if let Some(task) = rebalance_task {
+            let _ = task.await;
+        }
+        let outbox_task = self
+            .outbox_task
+            .lock()
+            .ok()
+            .and_then(|mut task| task.take());
+        if let Some(task) = outbox_task {
             let _ = task.await;
         }
         let _ = self.consensus.shutdown().await;

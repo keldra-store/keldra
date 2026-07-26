@@ -84,8 +84,8 @@ pub mod model_journal;
 pub mod multipart_journal;
 pub mod mvcc_apply_worker;
 pub mod mvcc_bootstrap;
-pub mod mvcc_control_plane;
 pub mod mvcc_consensus_adapter;
+pub mod mvcc_control_plane;
 #[cfg(test)]
 mod mvcc_cross_feature_tests;
 #[cfg(test)]
@@ -93,6 +93,7 @@ pub mod mvcc_fault_injection;
 pub mod mvcc_gc;
 pub mod mvcc_node_runtime;
 pub mod mvcc_open_transactions;
+pub mod mvcc_outbox;
 pub mod mvcc_product;
 pub mod mvcc_shard_repair;
 pub mod mvcc_store;
@@ -296,8 +297,8 @@ impl AppState {
         object_manager
             .install_mvcc(mvcc.clone())
             .context("install MVCC object runtime")?;
-        mvcc.start_object_materialisation()
-            .context("start object materialisation runner")?;
+        mvcc.start_background_work(core_store.clone(), observability.clone())
+            .context("start MVCC background workers")?;
 
         Ok(Self {
             persistence,

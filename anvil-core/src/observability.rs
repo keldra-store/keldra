@@ -19,6 +19,9 @@ pub const WATCH_STREAM_LAG: &str = "watch_stream_lag";
 pub const PARTITION_RECOVERY_DURATION: &str = "partition_recovery_duration";
 pub const COMPACTION_BACKLOG: &str = "compaction_backlog";
 pub const REPAIR_FINDINGS: &str = "repair_findings";
+pub const MVCC_OUTBOX_BACKLOG: &str = "mvcc_outbox_backlog";
+pub const MVCC_OUTBOX_OLDEST_AGE_MS: &str = "mvcc_outbox_oldest_age_ms";
+pub const MVCC_OUTBOX_FAILURES: &str = "mvcc_outbox_failures";
 
 pub const REQUIRED_METRICS: &[&str] = &[
     OBJECT_WRITE_LATENCY,
@@ -38,6 +41,9 @@ pub const REQUIRED_METRICS: &[&str] = &[
     PARTITION_RECOVERY_DURATION,
     COMPACTION_BACKLOG,
     REPAIR_FINDINGS,
+    MVCC_OUTBOX_BACKLOG,
+    MVCC_OUTBOX_OLDEST_AGE_MS,
+    MVCC_OUTBOX_FAILURES,
 ];
 
 #[derive(Clone, Debug, Default)]

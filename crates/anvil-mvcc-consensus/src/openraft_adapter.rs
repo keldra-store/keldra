@@ -272,6 +272,7 @@ pub struct OpenRaftConsensus {
 pub struct AppliedControlSnapshot {
     pub topology_epoch: u64,
     pub nodes: Vec<(NodeId, u64, String)>,
+    pub partitions: Vec<(u64, crate::PartitionAssignment)>,
     pub durability_policy: crate::ConsensusDurabilityPolicy,
 }
 
@@ -288,6 +289,11 @@ impl OpenRaftConsensus {
                 .control
                 .nodes()
                 .map(|(id, incarnation, domain)| (id, incarnation, domain.to_string()))
+                .collect(),
+            partitions: state
+                .control
+                .partitions()
+                .map(|(id, assignment)| (id, assignment.clone()))
                 .collect(),
             durability_policy: state.control.durability_policy(),
         })

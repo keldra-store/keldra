@@ -70,6 +70,12 @@ pub struct OutboxRecord {
     pub payload: Vec<u8>,
     pub state: OutboxState,
     pub attempts: u32,
+    #[serde(default)]
+    pub created_unix_ms: u64,
+    #[serde(default)]
+    pub next_attempt_unix_ms: u64,
+    #[serde(default)]
+    pub last_error: Option<String>,
     pub lease_owner: Option<String>,
     pub lease_expires_unix_ms: Option<u64>,
 }
@@ -250,6 +256,9 @@ impl MvccStore {
                 payload: payload.clone(),
                 state: OutboxState::Pending,
                 attempts: 0,
+                created_unix_ms: current_unix_ms(),
+                next_attempt_unix_ms: 0,
+                last_error: None,
                 lease_owner: None,
                 lease_expires_unix_ms: None,
             };
@@ -315,6 +324,19 @@ impl MvccStore {
         if worker_id.trim().is_empty() || lease_ms == 0 {
             bail!("outbox worker and lease must be non-empty");
         }
+        self.claim_outbox_where(worker_id, now_unix_ms, lease_ms, |_| true)
+    }
+
+    pub fn claim_outbox_where(
+        &self,
+        worker_id: &str,
+        now_unix_ms: u64,
+        lease_ms: u64,
+        eligible: impl Fn(&OutboxRecord) -> bool,
+    ) -> Result<Option<OutboxRecord>> {
+        if worker_id.trim().is_empty() || lease_ms == 0 {
+            bail!("outbox worker and lease must be non-empty");
+        }
         let _transition = self.outbox_transition.lock().unwrap();
         let cf = self.cf(CF_OUTBOX)?;
         let prefix = self.key(b"event/");
@@ -327,12 +349,16 @@ impl MvccStore {
                 break;
             }
             let mut record: OutboxRecord = serde_json::from_slice(&value)?;
-            let claimable = record.state == OutboxState::Pending
+            let claimable = (record.state == OutboxState::Pending
+                && record.next_attempt_unix_ms <= now_unix_ms)
                 || (record.state == OutboxState::Running
                     && record
                         .lease_expires_unix_ms
                         .is_some_and(|deadline| deadline <= now_unix_ms));
             if !claimable {
+                continue;
+            }
+            if !eligible(&record) {
                 continue;
             }
             record.state = OutboxState::Running;
@@ -354,7 +380,67 @@ impl MvccStore {
         Ok(None)
     }
 
+    pub fn retry_outbox(
+        &self,
+        record: &OutboxRecord,
+        worker_id: &str,
+        next_attempt_unix_ms: u64,
+        error: &str,
+    ) -> Result<()> {
+        let _transition = self.outbox_transition.lock().unwrap();
+        let cf = self.cf(CF_OUTBOX)?;
+        let key = self.key(&outbox_event_key(record.commit_version, record.ordinal));
+        let bytes = self
+            .db
+            .get_cf(cf, &key)?
+            .context("outbox event not found")?;
+        let mut current: OutboxRecord = serde_json::from_slice(&bytes)?;
+        if current.event_id != record.event_id
+            || current.state != OutboxState::Running
+            || current.lease_owner.as_deref() != Some(worker_id)
+        {
+            bail!("outbox event is not leased by this worker");
+        }
+        current.state = OutboxState::Pending;
+        current.next_attempt_unix_ms = next_attempt_unix_ms;
+        current.last_error = Some(error.to_string());
+        current.lease_owner = None;
+        current.lease_expires_unix_ms = None;
+        self.db.put_cf_opt(
+            cf,
+            key,
+            serde_json::to_vec(&current)?,
+            &durable_write_options(),
+        )?;
+        Ok(())
+    }
+
+    pub fn outbox_backlog(&self, now_unix_ms: u64) -> Result<(u64, u64, u64)> {
+        let records = self.outbox_records_after(0, usize::MAX)?;
+        let mut count = 0u64;
+        let mut oldest_age_ms = 0u64;
+        let mut failures = 0u64;
+        for record in records {
+            if record.state == OutboxState::Delivered {
+                continue;
+            }
+            count = count.saturating_add(1);
+            oldest_age_ms = oldest_age_ms.max(now_unix_ms.saturating_sub(record.created_unix_ms));
+            failures = failures.saturating_add(u64::from(record.last_error.is_some()));
+        }
+        Ok((count, oldest_age_ms, failures))
+    }
+
     pub fn complete_outbox(&self, record: &OutboxRecord, worker_id: &str) -> Result<()> {
+        self.complete_outbox_at(record, worker_id, 0)
+    }
+
+    pub fn complete_outbox_at(
+        &self,
+        record: &OutboxRecord,
+        worker_id: &str,
+        now_unix_ms: u64,
+    ) -> Result<()> {
         let _transition = self.outbox_transition.lock().unwrap();
         let cf = self.cf(CF_OUTBOX)?;
         let key = self.key(&outbox_event_key(record.commit_version, record.ordinal));
@@ -374,7 +460,15 @@ impl MvccStore {
         {
             bail!("outbox event is not leased by this worker");
         }
+        if now_unix_ms != 0
+            && current
+                .lease_expires_unix_ms
+                .is_none_or(|expires| expires <= now_unix_ms)
+        {
+            bail!("outbox lease expired before durable downstream ACK");
+        }
         current.state = OutboxState::Delivered;
+        current.last_error = None;
         current.lease_owner = None;
         current.lease_expires_unix_ms = None;
         self.db.put_cf_opt(
@@ -980,6 +1074,16 @@ impl MvccStore {
         key.strip_prefix(self.scope.as_slice())
             .ok_or_else(|| anyhow!("MVCC key belongs to another cluster"))
     }
+}
+
+fn current_unix_ms() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 fn encode_logical_key(key: &LogicalKey) -> Result<Vec<u8>> {

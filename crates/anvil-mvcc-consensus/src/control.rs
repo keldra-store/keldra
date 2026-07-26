@@ -60,6 +60,12 @@ impl ClusterControlState {
         self.partitions.get(&partition_id)
     }
 
+    pub fn partitions(&self) -> impl Iterator<Item = (u64, &PartitionAssignment)> {
+        self.partitions
+            .iter()
+            .map(|(partition_id, assignment)| (*partition_id, assignment))
+    }
+
     pub fn durability_policy(&self) -> ConsensusDurabilityPolicy {
         self.durability_policy
     }
