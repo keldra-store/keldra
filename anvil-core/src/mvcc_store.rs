@@ -803,8 +803,8 @@ impl MvccStore {
         if safe_watermark < current {
             bail!("GC watermark cannot move backwards");
         }
-        if safe_watermark > self.applied_version()? {
-            bail!("GC watermark cannot exceed the applied version");
+        if safe_watermark > self.readable_version()? {
+            bail!("GC watermark cannot exceed the readable version");
         }
         if let Some(oldest_pin) = self.unfinished_work_pins()?.all().into_iter().next()
             && oldest_pin < safe_watermark

@@ -159,6 +159,11 @@ impl MvccApplyWorker {
             watermark = decision.position;
             applied += 1;
         }
+        if self.local.gc_watermark()? < gc.0 {
+            self.local
+                .garbage_collect(gc.0)
+                .context("apply consensus-approved MVCC GC watermark locally")?;
+        }
         Ok(applied)
     }
 
@@ -524,6 +529,37 @@ mod tests {
             .await
             .unwrap_err();
         assert!(is_unrecoverable(&error));
+    }
+
+    #[tokio::test]
+    async fn applies_consensus_gc_watermark_only_after_local_catch_up() {
+        let prepared_directory = tempdir().unwrap();
+        let local_directory = tempdir().unwrap();
+        let prepared = AppendOnlyPreparedBundleStore::open(
+            prepared_directory.path(),
+            "cluster",
+            NodeIncarnation {
+                node_id: "node-a".into(),
+                incarnation: 1,
+            },
+            "zone-a",
+        )
+        .unwrap();
+        let local = LocalMvccStore::open(local_directory.path()).unwrap();
+        local.advance_decision_watermark(1).unwrap();
+        let source = Arc::new(Source {
+            decisions: StdMutex::new(Vec::new()),
+            gc: CommitVersion(1),
+        });
+
+        assert_eq!(
+            worker(source, prepared, local.clone())
+                .apply_available()
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(local.gc_watermark().unwrap(), 1);
     }
 
     #[tokio::test]
