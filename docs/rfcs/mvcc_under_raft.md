@@ -10,7 +10,8 @@ repair, and garbage collection
 
 ## 1. Decision
 
-Anvil will use a global MVCC commit sequencer backed by OpenRaft. Raft is used
+Anvil will use one cluster-local MVCC commit sequencer backed by OpenRaft for
+each cluster. Raft is used
 only to agree on compact cluster-control decisions and compact transaction
 certification decisions. Each certification command contains the transaction
 identity and snapshot version, deterministic hashes of the point and range
@@ -32,16 +33,19 @@ layer only after the acknowledged bytes are durably stored. Transport-level
 success is not a durability acknowledgement.
 
 Every transaction is certified with one Raft command, regardless of how many
-logical keys, tables, buckets, tenants, or product features it changes.
-Certification either commits the complete transaction at one global commit
-version or commits none of it. There is no distributed participant protocol and
-no separate per-feature commit.
+logical keys, tables, buckets, tenants, physical partitions, or product features
+it changes within its cluster. Certification either commits the complete
+transaction at one cluster-local commit version or commits none of it. A
+transaction may not span clusters, regions, or the mesh. There is no distributed
+participant protocol and no separate per-feature commit.
 
-The initial implementation uses one cluster-wide OpenRaft group for transaction
+The initial implementation uses one OpenRaft group per cluster for transaction
 certification and cluster control. Transaction bundles are replicated outside
-Raft before certification. This deliberately chooses a simple global ordering
-point over sharded consensus. Consensus sharding may be considered later only
-if measurements demonstrate that the global sequencer is a material bottleneck.
+Raft before certification. This deliberately chooses one simple ordering point
+inside each cluster over sharded consensus inside a cluster. Consensus sharding
+may be considered later only if measurements demonstrate that a cluster
+sequencer is a material bottleneck. Separate clusters never share a transaction
+Raft group.
 
 OpenRaft `0.9` will be used behind an Anvil-owned adapter. OpenRaft durable state
 will be stored in dedicated column families in the same local RocksDB database
@@ -92,8 +96,8 @@ decision path   compact OpenRaft certification commands and conflict-key version
 
 - Provide serializable atomic transactions across arbitrary logical keys and
   product features.
-- Give every committed transaction one global, monotonically increasing commit
-  version.
+- Give every committed transaction one cluster-local, monotonically increasing
+  commit version.
 - Use MVCC versions for visibility, snapshots, conflict detection, recovery,
   retained history, and garbage collection.
 - Keep object bytes and ordinary CoreMeta rows outside the Raft log.
@@ -113,6 +117,7 @@ decision path   compact OpenRaft certification commands and conflict-key version
   loss, retries, and partially completed background work.
 - Define the minimum state permitted in Raft.
 - Avoid artificial transaction boundaries based on storage organization.
+- Reject transactions whose keys resolve to more than one cluster.
 
 ## 4. Non-Goals
 
@@ -164,38 +169,58 @@ of its prior durable state. Durable acknowledgements name an incarnation so an
 acknowledgement from an obsolete process cannot be mistaken for one from its
 replacement.
 
-### 6.4 Cluster
+### 6.4 Mesh
+
+A **mesh** is the complete Anvil system presented to users and operators. It
+contains one or more regions. The mesh provides common discovery, routing,
+authorization, and asynchronous data movement, but it is not a transaction or
+consensus domain.
+
+### 6.5 Region
+
+A **region** is a locality containing one or more clusters. A region is not a
+transaction or consensus domain.
+
+### 6.6 Cluster
 
 A **cluster** is the set of nodes governed by one Anvil cluster identity and one
-initial consensus group.
+initial consensus group. The cluster is the transaction, MVCC-version, conflict,
+durability-policy, and consensus boundary.
 
-### 6.5 Consensus Group
+Every logical key has one owning cluster. Every transaction is permanently
+bound to one `cluster_id`, and every key it observes or mutates must resolve to
+that cluster. Crossing a physical partition inside the cluster is allowed;
+crossing a cluster boundary is not.
+
+### 6.7 Consensus Group
 
 A **consensus group** is an OpenRaft group containing voters and optionally
-learners. The initial architecture has one consensus group for the cluster.
+learners. The initial architecture has one independent consensus group per
+cluster. Its durable keys, RPC envelopes, snapshots, and membership are
+namespaced and authenticated by `cluster_id`.
 
-### 6.6 Voter
+### 6.8 Voter
 
 A **voter** is a node that participates in OpenRaft elections and quorum
 decisions.
 
-### 6.7 Learner
+### 6.9 Learner
 
 A **learner** receives consensus state without voting. It may be promoted
 through OpenRaft membership change after catching up.
 
-### 6.8 Leader
+### 6.10 Leader
 
 The **leader** is the current OpenRaft leader. Only the leader may successfully
 sequence new certification decisions. Leadership is a consensus role, not a
 claim that all transaction data must pass through that node.
 
-### 6.9 Realm
+### 6.11 Realm
 
 A **realm** is a durable administrative and authorization namespace. Realms
 separate tenants, system state, or other independently governed scopes.
 
-### 6.10 Logical Key
+### 6.12 Logical Key
 
 A **logical key** identifies one logical value before MVCC versioning:
 
@@ -209,7 +234,7 @@ tuple, task, stream position, index definition, or idempotency result.
 Logical-key encoding must preserve the ordering required for point, prefix, and
 range access.
 
-### 6.11 Key Range
+### 6.13 Key Range
 
 A **key range** is a half-open ordered interval:
 
@@ -219,19 +244,19 @@ A **key range** is a half-open ordered interval:
 
 Prefix reads are represented as their corresponding ordered interval.
 
-### 6.12 Table
+### 6.14 Table
 
 A **table** is a typed collection of logical keys and values within CoreMeta. A
 table is a schema and key-space concept, not an independent database,
 replication protocol, or transaction boundary.
 
-### 6.13 Partition
+### 6.15 Partition
 
 A **partition** is a routing and physical-placement unit used to distribute
 transaction bundles and data. It does not constrain transaction atomicity. One
 transaction may affect any number of partitions.
 
-### 6.14 Transaction
+### 6.16 Transaction
 
 A **transaction** is an atomic set of reads, predicates, metadata mutations,
 byte references, events, and durable jobs.
@@ -245,7 +270,7 @@ Committed(commit_version)
 Aborted(reason)
 ```
 
-### 6.15 Transaction ID
+### 6.17 Transaction ID
 
 A **transaction ID** is a globally unique, stable identifier for a transaction
 attempt. Retries of the same logical attempt reuse the same transaction ID.
@@ -253,7 +278,7 @@ attempt. Retries of the same logical attempt reuse the same transaction ID.
 The certification state retains transaction outcomes for an idempotency window
 so a retry returns the original result.
 
-### 6.16 Transaction Coordinator
+### 6.18 Transaction Coordinator
 
 The **transaction coordinator** is the node handling a transaction attempt. It
 builds and replicates the transaction bundle and submits the certification
@@ -262,7 +287,7 @@ command.
 The coordinator is not a durable authority. Its failure cannot change a
 certification result.
 
-### 6.17 Transaction Bundle
+### 6.19 Transaction Bundle
 
 A **transaction bundle** is the immutable, canonically encoded data body of a
 transaction. It is transferred and persisted outside Raft.
@@ -283,14 +308,14 @@ It contains:
 The bundle is identified by a content hash. A committed certification decision
 refers to its hash and length, not its body.
 
-### 6.18 Prepared Bundle
+### 6.20 Prepared Bundle
 
 A **prepared bundle** is a transaction bundle durably stored on a node but not
 yet assigned a committed certification result.
 
 Prepared bundles are invisible to ordinary reads.
 
-### 6.19 Ingest Pipeline
+### 6.21 Ingest Pipeline
 
 The **ingest pipeline** incrementally hashes, optionally compresses and encrypts,
 forms stripes, erasure-codes each stripe, and sends the resulting shards to
@@ -299,7 +324,7 @@ their target nodes while the client is still uploading.
 The pipeline must not require a complete object file before shard transfer can
 begin.
 
-### 6.20 Stripe
+### 6.22 Stripe
 
 A **stripe** is a bounded consecutive portion of an object's encoded byte
 stream. It is divided into `k` data shards and `m` parity shards.
@@ -307,18 +332,18 @@ stream. It is divided into `k` data shards and `m` parity shards.
 Only one bounded stripe, plus configured pipeline buffers, needs to be resident
 in memory at a time.
 
-### 6.21 Shard
+### 6.23 Shard
 
 A **shard** is one immutable data or parity fragment of one stripe. It is
 identified by the object identity, encoding generation, stripe ordinal, shard
 ordinal, length, and content hash.
 
-### 6.22 Shard Target
+### 6.24 Shard Target
 
 A **shard target** is the node incarnation and failure domain selected to store
 one shard.
 
-### 6.23 Shard Manifest
+### 6.25 Shard Manifest
 
 A **shard manifest** describes the encoding profile, object length and hash,
 stripe layout, shard identities, target nodes, and durable shard evidence for
@@ -326,13 +351,13 @@ one object representation.
 
 The manifest is part of the transaction bundle. Shard bytes are not.
 
-### 6.24 Local Representation
+### 6.26 Local Representation
 
 A **local representation** is the single-node durable form permitted by
 `local` durability. It may be a sequential local data segment or locally stored
 data fragments. It is not copied in full to remote nodes.
 
-### 6.25 Materialised Object
+### 6.27 Materialised Object
 
 A **materialised object** is a verified physical representation described by a
 shard manifest or, for `local`, a local representation.
@@ -340,7 +365,7 @@ shard manifest or, for `local`, a local representation.
 Producing or repairing a physical representation does not change the logical
 object's commit version.
 
-### 6.26 MVCC
+### 6.28 MVCC
 
 **Multi-Version Concurrency Control (MVCC)** stores multiple committed versions
 of a logical key and makes visibility a function of a read snapshot.
@@ -351,51 +376,53 @@ A versioned row is conceptually identified by:
 (logical_key, commit_version)
 ```
 
-### 6.27 Snapshot Version
+### 6.29 Snapshot Version
 
-A **snapshot version** is the greatest global commit version visible to a
-transaction's ordinary reads.
+A **snapshot version** is the greatest commit version in the transaction's
+cluster that is visible to its ordinary reads. Snapshot versions from different
+clusters are unrelated and must never be compared.
 
 Every read in a transaction uses the same snapshot version unless a public API
 explicitly requests weaker behavior.
 
-### 6.28 Commit Version
+### 6.30 Commit Version
 
-A **commit version** is the globally ordered version assigned to a committed
-transaction. The initial implementation derives it from the committed Raft log
-position.
+A **commit version** is the cluster-locally ordered version assigned to a
+committed transaction. The initial implementation derives it from the committed
+position in that cluster's Raft log.
 
-Commit versions are unique and monotonically increasing. They need not be
-contiguous because aborted certifications, membership entries, and control
-decisions may consume log positions.
+Within a cluster, commit versions are unique and monotonically increasing. They
+need not be contiguous because aborted certifications, membership entries, and
+control decisions may consume log positions. A complete version identity is
+`(cluster_id, commit_version)`.
 
-### 6.29 Row Version
+### 6.31 Row Version
 
 A **row version** is one committed value or tombstone for one logical key at one
 commit version.
 
-### 6.30 Head
+### 6.32 Head
 
 A **head** is a local performance index from a logical key to its newest locally
 applied committed row version. It is updated atomically with the row version.
 
 A head is not a separate publication or consensus object.
 
-### 6.31 Tombstone
+### 6.33 Tombstone
 
 A **tombstone** is a row version indicating that its logical key is deleted as
 of the tombstone's commit version.
 
-### 6.32 Read Set
+### 6.34 Read Set
 
 A transaction's **read set** contains the point observations, range
 observations, and explicit predicates whose state influenced the transaction.
 
-### 6.33 Write Set
+### 6.35 Write Set
 
 A transaction's **write set** contains its logical-key puts and deletes.
 
-### 6.34 Point Observation
+### 6.36 Point Observation
 
 A **point observation** records the version observed for one logical key:
 
@@ -403,7 +430,7 @@ A **point observation** records the version observed for one logical key:
 PointObservation = (logical_key_hash, observed_version_or_absent)
 ```
 
-### 6.35 Range Observation
+### 6.37 Range Observation
 
 A **range observation** records the version of an ordered interval used by a
 transaction:
@@ -415,7 +442,7 @@ RangeObservation =
 
 Range observations prevent phantoms without listing every row returned.
 
-### 6.36 Range Stamp
+### 6.38 Range Stamp
 
 A **range stamp** is a monotonically increasing conflict marker for a bounded
 portion of ordered key space. A write advances every range stamp required by
@@ -424,7 +451,7 @@ the configured range-indexing scheme.
 The range-stamp scheme must guarantee that any insertion, deletion, or update
 that could change a prior range result invalidates that range observation.
 
-### 6.37 Conflict Key
+### 6.39 Conflict Key
 
 A **conflict key** is the compact identifier used by certification to serialize
 conflicting operations. Point conflict keys represent logical keys; range
@@ -432,7 +459,7 @@ conflict keys represent range stamps or explicit predicates.
 
 Conflict keys are transaction-certification metadata, not product data.
 
-### 6.38 Certification
+### 6.40 Certification
 
 **Certification** is deterministic validation that decides whether a
 transaction may commit after the transactions ordered before it.
@@ -440,24 +467,24 @@ transaction may commit after the transactions ordered before it.
 Certification is performed by the OpenRaft state machine using compact conflict
 state. It does not read arbitrary local product data.
 
-### 6.39 Certification Command
+### 6.41 Certification Command
 
 A **certification command** is the compact application entry proposed to
 OpenRaft. It identifies the prepared bundle, requested durability, read
 observations, and write conflict keys.
 
-### 6.40 Certification Result
+### 6.42 Certification Result
 
 A **certification result** is the committed or aborted outcome produced when a
 certification command is applied.
 
-### 6.41 Durable Holder
+### 6.43 Durable Holder
 
 A **durable holder** is a node incarnation that has acknowledged complete,
 hash-verified, fsynced storage of a transaction bundle, local representation,
 or shard required by the requested durability level.
 
-### 6.42 Durability Level
+### 6.44 Durability Level
 
 A **durability level** determines which physical writes must finish before
 certification may be proposed:
@@ -470,7 +497,7 @@ erasure
 
 Durability level is distinct from read consistency and transaction isolation.
 
-### 6.43 Read Consistency
+### 6.45 Read Consistency
 
 **Read consistency** controls how a reader selects or verifies its visible
 snapshot. Examples include a local snapshot read and a leader-confirmed
@@ -478,12 +505,12 @@ linearized read.
 
 Read consistency does not determine how many physical copies a write has.
 
-### 6.44 Transaction Isolation
+### 6.46 Transaction Isolation
 
 **Transaction isolation** defines which concurrent histories are permitted.
 This RFC requires serializable outcomes through optimistic MVCC certification.
 
-### 6.45 Application Acknowledgement
+### 6.47 Application Acknowledgement
 
 An **application acknowledgement** is a replication response emitted after the
 receiver has performed the operation represented by the acknowledgement.
@@ -491,31 +518,31 @@ receiver has performed the operation represented by the acknowledgement.
 A `Persisted` or `Complete` acknowledgement is not inferred from TCP delivery,
 HTTP/2 flow control, or successful gRPC message transmission.
 
-### 6.46 Connection Session
+### 6.48 Connection Session
 
 A **connection session** is one authenticated node-to-node connection lifetime.
 It has a unique session ID and is bound to the authenticated peer's node
 incarnation.
 
-### 6.47 Materialisation Job
+### 6.49 Materialisation Job
 
 A **materialisation job** is an ordinary durable MVCC row committed atomically
 with the logical state requiring background transformation.
 
 Materialisation jobs are not Raft entries.
 
-### 6.48 Outbox Event
+### 6.50 Outbox Event
 
 An **outbox event** is a durable event row committed atomically with the state
 change it describes. Watch delivery, index maintenance, replication catch-up,
 and other derived work consume outbox events.
 
-### 6.49 Applied Watermark
+### 6.51 Applied Watermark
 
 A node's **applied watermark** is the greatest consecutive commit version for
 which the node has applied every required transaction bundle locally.
 
-### 6.50 Garbage Collection Watermark
+### 6.52 Garbage Collection Watermark
 
 A **garbage collection watermark** is a commit version below which obsolete
 MVCC versions may be removed, subject to active snapshots, retention policy,
@@ -607,6 +634,11 @@ Only the following application state may be proposed through OpenRaft:
 OpenRaft also stores its own vote, term, log, committed index, applied index,
 membership, and snapshot metadata.
 
+Every item above is scoped to exactly one `cluster_id`. A cluster's Raft group
+must not contain another cluster's membership, conflict state, transaction
+outcomes, assignments, durability policy, or GC watermark. Mesh and region
+topology are routed and streamed outside transaction consensus.
+
 ### 9.2 State Forbidden in Raft
 
 The following must not appear in Raft application entries or snapshots:
@@ -634,6 +666,7 @@ The following must not appear in Raft application entries or snapshots:
 The deterministic certification state is:
 
 ```text
+cluster_id
 last_applied_log_id
 stored_membership
 point_latest_write_version: logical_key_hash -> commit_version
@@ -642,6 +675,11 @@ recent_transaction_results: transaction_id -> certification_result
 cluster_configuration
 gc_safety_watermark
 ```
+
+`cluster_id` is installed when the group is created and is immutable. All
+logical maps above are implicitly namespaced by it. If one process hosts storage
+for more than one cluster, its RocksDB keys and snapshots must carry an explicit
+group/cluster prefix.
 
 Conflict state may use a bounded hierarchical range structure to prevent the
 consensus snapshot from growing once per historical transaction.
@@ -704,6 +742,10 @@ cf_raft_log
 cf_raft_meta
 cf_consensus_state
 ```
+
+Column families may be shared by several locally hosted cluster groups only
+when every key is prefixed by an unambiguous cluster/group identifier. Opening a
+group over state bound to another cluster must fail closed.
 
 Required MVCC concepts:
 
@@ -824,11 +866,12 @@ Prepared bundles, provisional shards, and provisional local representations
 have no MVCC visibility until their certification decision commits and local
 application reaches that version.
 
-### 12.5 Global Snapshot
+### 12.5 Cluster Snapshot
 
-The global commit version provides one snapshot coordinate across all logical
-keys, tables, partitions, and product features. A transaction opened at
-snapshot `S` reads all state as of `S`.
+The cluster commit version provides one snapshot coordinate across all logical
+keys, tables, partitions, and product features owned by that cluster. A
+transaction opened at snapshot `S` reads the cluster's state as of `S`. It
+provides no ordering or visibility guarantee for another cluster.
 
 ## 13. Transaction Bundle
 
@@ -836,6 +879,7 @@ snapshot `S` reads all state as of `S`.
 
 ```text
 schema
+cluster_id
 transaction_id
 snapshot_version
 authenticated_principal
@@ -867,6 +911,11 @@ be rejected before durable acknowledgement.
 Canonical encoding protects against corruption and implementation disagreement;
 it is not a trust signature.
 
+Before a bundle is prepared, every point observation, range observation, write,
+object manifest, event, and job with an owning key must resolve to the bundle's
+`cluster_id`. A mixed-cluster bundle is invalid. The cluster binding is part of
+the canonical bytes and bundle identity.
+
 ### 13.4 Immutability
 
 Once any node acknowledges a bundle as persisted, its bytes and hash must not
@@ -879,6 +928,7 @@ conflict.
 
 ```rust
 struct CertifyTransaction {
+    cluster_id: ClusterId,
     transaction_id: TransactionId,
     snapshot_version: CommitVersion,
     point_observations: Vec<PointObservation>,
@@ -895,6 +945,9 @@ struct CertifyTransaction {
 Every repeated field must be canonically sorted and unique.
 
 The command contains conflict metadata, not row values.
+The state machine rejects a command whose `cluster_id` does not equal the
+consensus group's durable cluster identity. Conflict keys and transaction IDs
+are domain-separated by `cluster_id`.
 
 ### 14.2 Deterministic Certification
 
@@ -989,11 +1042,14 @@ raised without changing transaction semantics.
 
 ### 15.1 Begin
 
-1. Route the transaction to a coordinator.
-2. Obtain a snapshot version.
-3. Create or recover the transaction ID.
-4. Read ordinary state at that snapshot.
-5. Record point/range observations and explicit predicates.
+1. Resolve the owning `cluster_id` and route the transaction to a coordinator
+   in that cluster.
+2. Bind the transaction ID permanently to that cluster.
+3. Obtain a snapshot version from that cluster's certifier.
+4. Create or recover the transaction ID.
+5. Read ordinary state at that cluster snapshot.
+6. Record point/range observations and explicit predicates.
+7. Reject any later operation whose logical key resolves to another cluster.
 
 ### 15.2 Build
 
@@ -1065,9 +1121,9 @@ Before certification:
 - the bundle is fsynced on the coordinator;
 - each object has one fsynced local representation on the coordinator.
 
-The certification decision still goes through Raft for global transaction
-order. If the sole durable holder is lost before a durability upgrade, committed
-data may be unrecoverable.
+The certification decision still goes through the owning cluster's Raft group
+for cluster-local transaction order. If the sole durable holder is lost before
+a durability upgrade, committed data may be unrecoverable.
 
 The API and metrics must label this durability accurately.
 
@@ -1749,8 +1805,9 @@ MVCC read with retained history
 MVCC garbage collection
 ```
 
-The global sequencer must be measured before sharded consensus is designed. The
-benchmark must include proposal batching and RocksDB WAL group commit.
+The per-cluster sequencer must be measured before consensus sharding within a
+cluster is designed. The benchmark must include proposal batching and RocksDB
+WAL group commit.
 
 ## 30. Implementation Approach
 
@@ -1826,8 +1883,10 @@ This is a clean implementation, not an in-place protocol transition.
 This RFC is implemented only when:
 
 - transactions atomically modify arbitrary logical keys, tables, partitions,
-  and product features;
-- one global commit version orders committed transactions;
+  and product features within one cluster;
+- transactions spanning clusters, regions, or the mesh are rejected;
+- one cluster-local commit version orders each cluster's committed
+  transactions, and versions from different clusters are never compared;
 - OpenRaft contains only state permitted by Section 9;
 - OpenRaft state is stored in the existing RocksDB database;
 - object bytes and bundle bodies never enter the Raft log;
