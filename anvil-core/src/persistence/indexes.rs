@@ -23,7 +23,6 @@ impl Persistence {
             bucket_id,
             include_disabled,
         )
-        .await
     }
 
     #[allow(clippy::too_many_arguments)]

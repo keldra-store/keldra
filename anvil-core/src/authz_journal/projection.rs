@@ -279,7 +279,8 @@ pub(super) fn page_current_records(
         ),
     };
     let candidate_budget = candidate_budget(page_size);
-    let mut matches = Vec::with_capacity(page_size.saturating_add(1));
+    let mut matches: Vec<(Vec<u8>, AuthzTupleRecord)> =
+        Vec::with_capacity(page_size.saturating_add(1));
     let mut candidates_visited = 0;
     let mut continuation = None;
     for (tuple_key, payload) in scan_projection(mvcc, table_id, &prefix, snapshot)? {

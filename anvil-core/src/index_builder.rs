@@ -111,6 +111,43 @@ struct TextExtraction {
 }
 
 #[derive(Debug, Clone)]
+struct ExtractedVector {
+    chunk_id: u32,
+    source_start: u64,
+    source_len: u32,
+    values: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+struct VectorExtractionDiagnostic {
+    code: String,
+    message: String,
+    details: JsonValue,
+}
+
+#[derive(Debug, Clone)]
+struct VectorExtraction {
+    vectors: Vec<ExtractedVector>,
+    diagnostics: Vec<VectorExtractionDiagnostic>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JsonVectorRecord {
+    #[serde(default)]
+    vector: Option<Vec<f32>>,
+    #[serde(default)]
+    values: Option<Vec<f32>>,
+    #[serde(default)]
+    embedding: Option<Vec<f32>>,
+    #[serde(default)]
+    chunk_id: Option<u32>,
+    #[serde(default)]
+    source_start: Option<u64>,
+    #[serde(default)]
+    source_len: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
 struct OwnedVectorDocument {
     vector_id: u64,
     source_id_binary: Vec<u8>,
@@ -652,6 +689,7 @@ async fn build_typed_json_index_from_source(
                     bucket,
                     index,
                     &definition,
+                    mvcc.ok_or_else(|| anyhow!("object_current index source requires MVCC"))?,
                     core_store
                         .as_ref()
                         .expect("object payload source has a physical byte store"),

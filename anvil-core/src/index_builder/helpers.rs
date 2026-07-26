@@ -1,5 +1,34 @@
 use super::*;
 
+pub(super) async fn extract_vectors(
+    extractor: &JsonValue,
+    payload: &[u8],
+    definition: &VectorIndexDefinition,
+    embedding_providers: &EmbeddingProviderRegistry,
+) -> VectorExtraction {
+    match extractor
+        .get("kind")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("object_body_utf8")
+    {
+        "object_body_utf8" | "text" => {
+            extract_provider_embedding(extractor, payload, definition, embedding_providers).await
+        }
+        "json_vector" | "json" | "json_pointer" => {
+            extract_json_vectors(extractor, payload, definition)
+        }
+        "f32_le" | "raw_f32_le" => extract_f32_le_vectors(payload, definition),
+        kind => VectorExtraction {
+            vectors: Vec::new(),
+            diagnostics: vec![VectorExtractionDiagnostic {
+                code: "VectorExtractorUnsupported".to_string(),
+                message: format!("unsupported vector extractor kind {kind}"),
+                details: serde_json::json!({ "kind": kind }),
+            }],
+        },
+    }
+}
+
 pub(super) async fn extract_provider_embedding(
     extractor: &JsonValue,
     payload: &[u8],
@@ -452,6 +481,7 @@ pub(super) async fn build_typed_json_append_rows(
     bucket: &Bucket,
     index: &IndexDefinition,
     definition: &TypedJsonBuildDefinition,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     core_store: &CoreStore,
     source_cursor: u128,
 ) -> Result<(
