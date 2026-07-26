@@ -42,6 +42,7 @@ pub struct IndexRepairReport {
 }
 
 pub async fn assess_derived_index(
+    storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     index: &IndexDefinition,
     index_storage_id: &str,
@@ -86,7 +87,8 @@ pub async fn assess_derived_index(
         }
     }
 
-    let missing = missing_proof_segments(storage, &index.kind, index_storage_id, &proof).await?;
+    let missing =
+        missing_proof_segments(storage, mvcc, &index.kind, index_storage_id, &proof).await?;
     if missing.is_empty() {
         Ok(IndexRepairStatus::UpToDate)
     } else {
@@ -204,6 +206,7 @@ fn missing_segments(reason: &IndexRepairReason) -> Vec<String> {
 
 async fn missing_proof_segments(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     index_kind: &str,
     index_storage_id: &str,
     proof: &DerivedIndexProof,
@@ -213,7 +216,7 @@ async fn missing_proof_segments(
         let exists = match index_kind {
             "full_text" => {
                 full_text_segment::full_text_segment_hash_exists(
-                    storage,
+                    mvcc,
                     index_storage_id,
                     proof.generation,
                     segment_hash,
@@ -222,7 +225,7 @@ async fn missing_proof_segments(
             }
             "vector" => {
                 vector_segment::vector_segment_hash_exists(
-                    storage,
+                    mvcc,
                     index_storage_id,
                     proof.generation,
                     segment_hash,
@@ -231,14 +234,14 @@ async fn missing_proof_segments(
             }
             "hybrid" => {
                 let full_text_exists = full_text_segment::full_text_segment_hash_exists(
-                    storage,
+                    mvcc,
                     index_storage_id,
                     proof.generation,
                     segment_hash,
                 )
                 .await?;
                 let vector_exists = vector_segment::vector_segment_hash_exists(
-                    storage,
+                    mvcc,
                     index_storage_id,
                     proof.generation,
                     segment_hash,
@@ -255,7 +258,7 @@ async fn missing_proof_segments(
 
     if missing.is_empty()
         && let Err(error) =
-            validate_latest_segment_readable(storage, index_kind, index_storage_id).await
+            validate_latest_segment_readable(storage, mvcc, index_kind, index_storage_id).await
     {
         let error_hash = crate::formats::hash32(error.to_string().as_bytes());
         missing.push(format!("unreadable-{}", hex::encode(&error_hash[..8])));
@@ -265,25 +268,26 @@ async fn missing_proof_segments(
 
 async fn validate_latest_segment_readable(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     index_kind: &str,
     index_storage_id: &str,
 ) -> Result<()> {
     match index_kind {
         "full_text" => {
-            full_text_segment::read_latest_full_text_segment(storage, index_storage_id)
+            full_text_segment::read_latest_full_text_segment(storage, mvcc, index_storage_id)
                 .await?
                 .ok_or_else(|| anyhow!("full text derived index segment is absent"))?;
         }
         "vector" => {
-            vector_segment::read_latest_vector_segment(storage, index_storage_id)
+            vector_segment::read_latest_vector_segment(storage, mvcc, index_storage_id)
                 .await?
                 .ok_or_else(|| anyhow!("vector derived index segment is absent"))?;
         }
         "hybrid" => {
-            full_text_segment::read_latest_full_text_segment(storage, index_storage_id)
+            full_text_segment::read_latest_full_text_segment(storage, mvcc, index_storage_id)
                 .await?
                 .ok_or_else(|| anyhow!("hybrid full text derived index segment is absent"))?;
-            vector_segment::read_latest_vector_segment(storage, index_storage_id)
+            vector_segment::read_latest_vector_segment(storage, mvcc, index_storage_id)
                 .await?
                 .ok_or_else(|| anyhow!("hybrid vector derived index segment is absent"))?;
         }

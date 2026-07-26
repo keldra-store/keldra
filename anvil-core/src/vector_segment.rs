@@ -1,7 +1,6 @@
 use crate::{
     core_store::{
-        CoreBoundaryValue, CoreMutationPrecondition, CoreObjectRef, CorePipelinePolicy, CoreStore,
-        CoreTraceContext, GetBlob,
+        CoreBoundaryValue, CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob,
     },
     formats::{
         FileFamily, Hash32, decode_writer_segment, encode_writer_segment_header, hash32,
@@ -129,7 +128,7 @@ pub async fn write_vector_segment(
 ) -> Result<String> {
     let staged = stage_vector_segment(storage, write).await?;
     publish_vector_segment_catalog(mvcc, &staged, &[]).await?;
-    publish_vector_segment_locator(storage, &staged, &[]).await?;
+    publish_vector_segment_locator(mvcc, &staged, &[]).await?;
     Ok(staged.segment_ref)
 }
 
@@ -281,12 +280,15 @@ pub(crate) async fn publish_vector_segment_catalog(
 }
 
 pub(crate) async fn publish_vector_segment_locator(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     staged: &StagedVectorSegment,
-    additional_preconditions: &[CoreMutationPrecondition],
+    additional_preconditions: &[(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )],
 ) -> Result<()> {
     index_coremeta::write_index_segment_coremeta_record(
-        storage,
+        mvcc,
         &staged.locator,
         additional_preconditions,
     )
@@ -295,17 +297,22 @@ pub(crate) async fn publish_vector_segment_locator(
 
 pub async fn read_vector_segment(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     segment_ref: &str,
 ) -> Result<DecodedVectorSegment> {
-    let bytes = read_vector_segment_bytes(storage, segment_ref).await?;
+    let bytes = read_vector_segment_bytes(storage, mvcc, segment_ref).await?;
     decode_vector_segment(&bytes)
 }
 
-pub async fn read_vector_segment_bytes(storage: &Storage, segment_ref: &str) -> Result<Vec<u8>> {
+pub async fn read_vector_segment_bytes(
+    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    segment_ref: &str,
+) -> Result<Vec<u8>> {
     let store = CoreStore::new(storage.clone()).await?;
     let index_id = vector_index_id_from_segment_ref(segment_ref)?;
     let segment =
-        index_coremeta::read_index_segment_coremeta_record_by_ref(storage, &index_id, segment_ref)
+        index_coremeta::read_index_segment_coremeta_record_by_ref(mvcc, &index_id, segment_ref)
             .await?
             .ok_or_else(|| anyhow!("vector segment CoreMeta row is missing"))?;
     store
@@ -317,10 +324,12 @@ pub async fn read_vector_segment_bytes(storage: &Storage, segment_ref: &str) -> 
 
 pub async fn read_vector_segment_header(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     segment_ref: &str,
 ) -> Result<VectorSegmentHeader> {
     let segment =
-        RangeAddressedWriterSegment::open(storage, segment_ref, FileFamily::VectorSegment).await?;
+        RangeAddressedWriterSegment::open(storage, mvcc, segment_ref, FileFamily::VectorSegment)
+            .await?;
     let header = decode_vector_header_proto(&segment.header)?;
     validate_vector_segment_header(&header)?;
     Ok(header)
@@ -328,27 +337,32 @@ pub async fn read_vector_segment_header(
 
 pub async fn read_latest_vector_segment(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     index_id: &str,
 ) -> Result<Option<DecodedVectorSegment>> {
-    let Some(segment_ref) = latest_vector_segment_ref(storage, index_id).await? else {
+    let Some(segment_ref) = latest_vector_segment_ref(mvcc, index_id).await? else {
         return Ok(None);
     };
-    Ok(Some(read_vector_segment(storage, &segment_ref).await?))
+    Ok(Some(
+        read_vector_segment(storage, mvcc, &segment_ref).await?,
+    ))
 }
 
 pub async fn query_latest_vector_segment_ranges(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     index_id: &str,
     query: &[f32],
     metric: VectorMetric,
     authorized_labels: Option<&BTreeSet<Hash32>>,
     limit: usize,
 ) -> Result<Option<(VectorSegmentHeader, Vec<VectorSearchResult>)>> {
-    let Some(segment_ref) = latest_vector_segment_ref(storage, index_id).await? else {
+    let Some(segment_ref) = latest_vector_segment_ref(mvcc, index_id).await? else {
         return Ok(None);
     };
     query_vector_segment_ranges(
         storage,
+        mvcc,
         &segment_ref,
         query,
         metric,
@@ -361,6 +375,7 @@ pub async fn query_latest_vector_segment_ranges(
 
 pub async fn query_vector_segment_ranges(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     segment_ref: &str,
     query: &[f32],
     metric: VectorMetric,
@@ -368,7 +383,8 @@ pub async fn query_vector_segment_ranges(
     limit: usize,
 ) -> Result<(VectorSegmentHeader, Vec<VectorSearchResult>)> {
     let segment =
-        RangeAddressedWriterSegment::open(storage, segment_ref, FileFamily::VectorSegment).await?;
+        RangeAddressedWriterSegment::open(storage, mvcc, segment_ref, FileFamily::VectorSegment)
+            .await?;
     let header = decode_vector_header_proto(&segment.header)?;
     validate_vector_segment_header(&header)?;
     if query.len() != usize::from(header.dimension) {
@@ -481,13 +497,13 @@ async fn fill_vector_search_results_from_entry_table(
 }
 
 pub async fn latest_vector_segment_ref(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     index_id: &str,
 ) -> Result<Option<String>> {
     require_safe_component(index_id, "vector index id")?;
     Ok(
         index_coremeta::latest_index_segment_coremeta_record_for_family(
-            storage,
+            mvcc,
             index_id,
             WriterFamily::Vector.as_str(),
         )
@@ -497,7 +513,7 @@ pub async fn latest_vector_segment_ref(
 }
 
 pub(crate) async fn vector_segment_hash_exists(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     index_id: &str,
     generation: u64,
     expected_segment_hash: &str,
@@ -506,7 +522,7 @@ pub(crate) async fn vector_segment_hash_exists(
     validate_hex32(expected_segment_hash, "vector expected segment hash")?;
     Ok(
         index_coremeta::index_segment_coremeta_record_for_family_generation(
-            storage,
+            mvcc,
             index_id,
             WriterFamily::Vector.as_str(),
             generation,

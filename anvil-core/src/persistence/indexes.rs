@@ -499,6 +499,7 @@ impl Persistence {
         };
 
         let mut status = index_repair::assess_derived_index(
+            &self.storage,
             self.mvcc()?,
             &index,
             &index_storage_id,

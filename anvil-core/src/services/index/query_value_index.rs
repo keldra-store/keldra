@@ -8,6 +8,7 @@ pub(super) struct TypedValueCandidateEntry {
 
 pub(super) async fn typed_json_candidate_entries_from_value_index(
     storage: &crate::storage::Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     segment_ref: &str,
     predicates: &[TypedPredicate],
     row_count: u64,
@@ -25,6 +26,7 @@ pub(super) async fn typed_json_candidate_entries_from_value_index(
         }
         let entries = typed_field_segment::read_typed_field_value_index_entries(
             storage,
+            mvcc,
             segment_ref,
             lookups,
         )
@@ -59,6 +61,7 @@ pub(super) async fn typed_json_candidate_entries_from_value_index(
 
 pub(super) async fn boundary_candidate_entries_from_value_index(
     storage: &crate::storage::Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     segment_ref: &str,
     predicates: &[BoundaryPredicate],
     row_count: u64,
@@ -81,6 +84,7 @@ pub(super) async fn boundary_candidate_entries_from_value_index(
         }
         let entries = typed_field_segment::read_typed_field_value_index_entries(
             storage,
+            mvcc,
             segment_ref,
             lookups,
         )
@@ -128,6 +132,7 @@ pub(super) fn intersect_typed_candidate_entries(
 
 pub(super) async fn metadata_candidate_entries_from_value_index(
     storage: &crate::storage::Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     segment_ref: &str,
     path_prefix: &str,
     filters: &QueryFilters,
@@ -146,6 +151,7 @@ pub(super) async fn metadata_candidate_entries_from_value_index(
         };
         let entries = typed_field_segment::read_typed_field_value_index_entries(
             storage,
+            mvcc,
             segment_ref,
             [typed_field_segment::TypedFieldValueIndexLookup {
                 field_name: "object_key".to_string(),
@@ -166,6 +172,7 @@ pub(super) async fn metadata_candidate_entries_from_value_index(
         .map_err(|e| Status::invalid_argument(format!("Invalid metadata filter value: {e}")))?;
         let entries = typed_field_segment::read_typed_field_value_index_entries(
             storage,
+            mvcc,
             segment_ref,
             [typed_field_segment::TypedFieldValueIndexLookup {
                 field_name: filter.field.clone(),

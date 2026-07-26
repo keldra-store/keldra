@@ -1,7 +1,7 @@
 use crate::{
     core_store::{
-        CoreBoundaryValue, CoreMutationPrecondition, CoreObjectRef, CorePipelinePolicy, CoreStore,
-        CoreTraceContext, EncodedTypedValue, GetBlob, SourceId, TypedFieldValue,
+        CoreBoundaryValue, CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext,
+        EncodedTypedValue, GetBlob, SourceId, TypedFieldValue,
     },
     formats::{
         FileFamily, Hash32, decode_writer_segment, encode_writer_segment_header, hash32,
@@ -173,7 +173,7 @@ pub async fn write_typed_field_segment(
 ) -> Result<String> {
     let staged = stage_typed_field_segment(storage, write).await?;
     publish_typed_field_segment_catalog(mvcc, &staged, &[]).await?;
-    publish_typed_field_segment_locator(storage, &staged, &[]).await?;
+    publish_typed_field_segment_locator(mvcc, &staged, &[]).await?;
     Ok(staged.segment_ref)
 }
 
@@ -320,12 +320,15 @@ pub(crate) async fn publish_typed_field_segment_catalog(
 }
 
 pub(crate) async fn publish_typed_field_segment_locator(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     staged: &StagedTypedFieldSegment,
-    additional_preconditions: &[CoreMutationPrecondition],
+    additional_preconditions: &[(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )],
 ) -> Result<()> {
     index_coremeta::write_index_segment_coremeta_record(
-        storage,
+        mvcc,
         &staged.locator,
         additional_preconditions,
     )
@@ -334,20 +337,22 @@ pub(crate) async fn publish_typed_field_segment_locator(
 
 pub async fn read_typed_field_segment(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     segment_ref: &str,
 ) -> Result<DecodedTypedFieldSegment> {
-    let bytes = read_typed_field_segment_bytes(storage, segment_ref).await?;
+    let bytes = read_typed_field_segment_bytes(storage, mvcc, segment_ref).await?;
     decode_typed_field_segment(&bytes)
 }
 
 pub async fn read_typed_field_segment_bytes(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     segment_ref: &str,
 ) -> Result<Vec<u8>> {
     let store = CoreStore::new(storage.clone()).await?;
     let index_id = typed_field_index_id_from_segment_ref(segment_ref)?;
     let segment =
-        index_coremeta::read_index_segment_coremeta_record_by_ref(storage, &index_id, segment_ref)
+        index_coremeta::read_index_segment_coremeta_record_by_ref(mvcc, &index_id, segment_ref)
             .await?
             .ok_or_else(|| anyhow!("typed field segment CoreMeta row is missing"))?;
     store
@@ -359,32 +364,45 @@ pub async fn read_typed_field_segment_bytes(
 
 pub async fn read_latest_typed_field_segment(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     index_id: &str,
 ) -> Result<Option<DecodedTypedFieldSegment>> {
-    let Some(segment_ref) = latest_typed_field_segment_ref(storage, index_id).await? else {
+    let Some(segment_ref) = latest_typed_field_segment_ref(mvcc, index_id).await? else {
         return Ok(None);
     };
-    Ok(Some(read_typed_field_segment(storage, &segment_ref).await?))
+    Ok(Some(
+        read_typed_field_segment(storage, mvcc, &segment_ref).await?,
+    ))
 }
 
 pub async fn read_typed_field_segment_header(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     segment_ref: &str,
 ) -> Result<TypedFieldSegmentHeader> {
-    let segment =
-        RangeAddressedWriterSegment::open(storage, segment_ref, FileFamily::TypedFieldSegment)
-            .await?;
+    let segment = RangeAddressedWriterSegment::open(
+        storage,
+        mvcc,
+        segment_ref,
+        FileFamily::TypedFieldSegment,
+    )
+    .await?;
     decode_typed_field_header_proto(&segment.header).map_err(anyhow::Error::from)
 }
 
 pub async fn read_typed_field_segment_rows_by_ordinals(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     segment_ref: &str,
     ordinals: impl IntoIterator<Item = usize>,
 ) -> Result<DecodedTypedFieldSegment> {
-    let segment =
-        RangeAddressedWriterSegment::open(storage, segment_ref, FileFamily::TypedFieldSegment)
-            .await?;
+    let segment = RangeAddressedWriterSegment::open(
+        storage,
+        mvcc,
+        segment_ref,
+        FileFamily::TypedFieldSegment,
+    )
+    .await?;
     let header = decode_typed_field_header_proto(&segment.header)?;
     let rows = read_typed_field_rows_by_ordinals_from_segment(&segment, &header, ordinals).await?;
     let value_index = build_value_index_entries_from_rows(&rows)?;
@@ -397,24 +415,34 @@ pub async fn read_typed_field_segment_rows_by_ordinals(
 
 pub async fn read_typed_field_rows_by_ordinals(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     segment_ref: &str,
     ordinals: impl IntoIterator<Item = usize>,
 ) -> Result<Vec<TypedFieldSegmentRow>> {
-    let segment =
-        RangeAddressedWriterSegment::open(storage, segment_ref, FileFamily::TypedFieldSegment)
-            .await?;
+    let segment = RangeAddressedWriterSegment::open(
+        storage,
+        mvcc,
+        segment_ref,
+        FileFamily::TypedFieldSegment,
+    )
+    .await?;
     let header = decode_typed_field_header_proto(&segment.header)?;
     read_typed_field_rows_by_ordinals_from_segment(&segment, &header, ordinals).await
 }
 
 pub async fn read_typed_field_value_index_entries(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     segment_ref: &str,
     lookups: impl IntoIterator<Item = TypedFieldValueIndexLookup>,
 ) -> Result<Vec<TypedFieldValueIndexEntry>> {
-    let segment =
-        RangeAddressedWriterSegment::open(storage, segment_ref, FileFamily::TypedFieldSegment)
-            .await?;
+    let segment = RangeAddressedWriterSegment::open(
+        storage,
+        mvcc,
+        segment_ref,
+        FileFamily::TypedFieldSegment,
+    )
+    .await?;
     let directory = segment.read_body_table_directory().await?;
     let value_index_table =
         RangeAddressedWriterSegment::table_entry(&directory, TABLE_TYPED_FIELD_VALUE_INDEX)?;
@@ -497,11 +525,11 @@ async fn read_typed_field_rows_by_ordinals_from_segment(
 }
 
 pub async fn latest_typed_field_segment_ref(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     index_id: &str,
 ) -> Result<Option<String>> {
     Ok(
-        index_coremeta::latest_index_segment_coremeta_record(storage, index_id)
+        index_coremeta::latest_index_segment_coremeta_record(mvcc, index_id)
             .await?
             .map(|record| record.segment_ref),
     )

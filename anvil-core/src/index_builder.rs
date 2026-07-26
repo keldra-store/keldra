@@ -220,9 +220,12 @@ fn encode_deterministic_proto(message: &impl Message) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-async fn latest_index_segment_generation(storage: &Storage, index_storage_id: &str) -> Result<u64> {
+async fn latest_index_segment_generation(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    index_storage_id: &str,
+) -> Result<u64> {
     Ok(
-        index_coremeta::latest_index_segment_coremeta_record(storage, index_storage_id)
+        index_coremeta::latest_index_segment_coremeta_record(mvcc, index_storage_id)
             .await?
             .map(|record| record.generation)
             .unwrap_or(0),
@@ -301,7 +304,8 @@ async fn build_full_text_index_from_source(
         .map_err(|error| anyhow!("invalid full text index definition: {error}"))?;
     let index_storage_id =
         index_journal::index_storage_id(index.tenant_id, index.bucket_id, index.id);
-    let latest_generation = latest_index_segment_generation(storage, &index_storage_id).await?;
+    let latest_generation =
+        latest_index_segment_generation(authority.mvcc()?, &index_storage_id).await?;
     let latest_checkpoint_generation = latest_index_checkpoint_generation(
         authority.mvcc()?,
         &index_storage_id,
@@ -450,13 +454,13 @@ async fn build_full_text_index_from_source(
         .await?;
     let staged_for_locator = &staged_segment;
     authority
-        .publish_with(
+        .publish_mvcc_with(
             storage,
             &ownership,
             partition_owner_signing_key,
             |preconditions| async move {
                 full_text_segment::publish_full_text_segment_locator(
-                    storage,
+                    authority.mvcc()?,
                     staged_for_locator,
                     &preconditions,
                 )
@@ -605,7 +609,8 @@ async fn build_typed_json_index_from_source(
     let definition = parse_typed_json_build_definition(index)?;
     let index_storage_id =
         index_journal::index_storage_id(index.tenant_id, index.bucket_id, index.id);
-    let latest_generation = latest_index_segment_generation(storage, &index_storage_id).await?;
+    let latest_generation =
+        latest_index_segment_generation(authority.mvcc()?, &index_storage_id).await?;
     let latest_checkpoint_generation = latest_index_checkpoint_generation(
         authority.mvcc()?,
         &index_storage_id,
@@ -725,13 +730,13 @@ async fn build_typed_json_index_from_source(
         .await?;
     let staged_for_locator = &staged_segment;
     authority
-        .publish_with(
+        .publish_mvcc_with(
             storage,
             &ownership,
             partition_owner_signing_key,
             |preconditions| async move {
                 typed_field_segment::publish_typed_field_segment_locator(
-                    storage,
+                    authority.mvcc()?,
                     staged_for_locator,
                     &preconditions,
                 )
@@ -852,7 +857,8 @@ pub(crate) async fn build_metadata_backed_index(
     }
     let index_storage_id =
         index_journal::index_storage_id(index.tenant_id, index.bucket_id, index.id);
-    let latest_generation = latest_index_segment_generation(storage, &index_storage_id).await?;
+    let latest_generation =
+        latest_index_segment_generation(authority.mvcc()?, &index_storage_id).await?;
     let latest_checkpoint_generation = latest_index_checkpoint_generation(
         authority.mvcc()?,
         &index_storage_id,
@@ -935,13 +941,13 @@ pub(crate) async fn build_metadata_backed_index(
         .await?;
     let staged_for_locator = &staged_segment;
     authority
-        .publish_with(
+        .publish_mvcc_with(
             storage,
             &ownership,
             partition_owner_signing_key,
             |preconditions| async move {
                 typed_field_segment::publish_typed_field_segment_locator(
-                    storage,
+                    authority.mvcc()?,
                     staged_for_locator,
                     &preconditions,
                 )
@@ -1172,7 +1178,8 @@ async fn build_vector_index_with_policy(
         .map_err(|error| anyhow!("invalid vector index definition: {error}"))?;
     let index_storage_id =
         index_journal::index_storage_id(index.tenant_id, index.bucket_id, index.id);
-    let latest_generation = latest_index_segment_generation(storage, &index_storage_id).await?;
+    let latest_generation =
+        latest_index_segment_generation(authority.mvcc()?, &index_storage_id).await?;
     let latest_checkpoint_generation = latest_index_checkpoint_generation(
         authority.mvcc()?,
         &index_storage_id,
@@ -1351,13 +1358,13 @@ async fn build_vector_index_with_policy(
         .await?;
     let staged_for_locator = &staged_segment;
     authority
-        .publish_with(
+        .publish_mvcc_with(
             storage,
             &ownership,
             partition_owner_signing_key,
             |preconditions| async move {
                 vector_segment::publish_vector_segment_locator(
-                    storage,
+                    authority.mvcc()?,
                     staged_for_locator,
                     &preconditions,
                 )

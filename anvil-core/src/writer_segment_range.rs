@@ -34,16 +34,18 @@ pub struct RangeAddressedWriterSegment {
 }
 
 impl RangeAddressedWriterSegment {
-    pub async fn open(storage: &Storage, segment_ref: &str, family: FileFamily) -> Result<Self> {
+    pub async fn open(
+        storage: &Storage,
+        mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+        segment_ref: &str,
+        family: FileFamily,
+    ) -> Result<Self> {
         let store = CoreStore::new(storage.clone()).await?;
         let index_id = index_id_from_segment_ref(segment_ref)?;
-        let segment = index_coremeta::read_index_segment_coremeta_record_by_ref(
-            storage,
-            &index_id,
-            segment_ref,
-        )
-        .await?
-        .ok_or_else(|| anyhow!("writer segment CoreMeta row {segment_ref} is missing"))?;
+        let segment =
+            index_coremeta::read_index_segment_coremeta_record_by_ref(mvcc, &index_id, segment_ref)
+                .await?
+                .ok_or_else(|| anyhow!("writer segment CoreMeta row {segment_ref} is missing"))?;
         let object_ref = decode_core_object_ref_target(&segment.core_object_ref_target)?;
         Self::open_object_ref(store, object_ref, family).await
     }

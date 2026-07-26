@@ -339,7 +339,7 @@ impl AppState {
         let page_token = IndexPageToken::decode(req.page_token.as_str(), &signing_key)?;
         let segment_ref = if let Some(token) = page_token.as_ref() {
             index_coremeta::index_segment_coremeta_record_for_family_generation(
-                &self.storage,
+                &self.mvcc,
                 &index_storage_id,
                 WriterFamily::FullText.as_str(),
                 token.index_generation,
@@ -349,13 +349,14 @@ impl AppState {
             .map(|record| record.segment_ref)
             .ok_or_else(|| Status::invalid_argument("PageTokenScopeMismatch"))?
         } else {
-            full_text_segment::latest_full_text_segment_ref(&self.storage, &index_storage_id)
+            full_text_segment::latest_full_text_segment_ref(&self.mvcc, &index_storage_id)
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?
                 .ok_or_else(|| Status::failed_precondition("IndexUnavailable"))?
         };
         let segment = full_text_segment::read_full_text_segment_terms(
             &self.storage,
+            &self.mvcc,
             &segment_ref,
             &query_terms,
         )
@@ -625,7 +626,7 @@ impl AppState {
         let segment_ref = if let Some(token) = page_token.as_ref() {
             Some(
                 index_coremeta::index_segment_coremeta_record_for_family_generation(
-                    &self.storage,
+                    &self.mvcc,
                     &index_storage_id,
                     WriterFamily::TypedMetadata.as_str(),
                     token.index_generation,
@@ -636,7 +637,7 @@ impl AppState {
                 .ok_or_else(|| Status::invalid_argument("PageTokenScopeMismatch"))?,
             )
         } else {
-            typed_field_segment::latest_typed_field_segment_ref(&self.storage, &index_storage_id)
+            typed_field_segment::latest_typed_field_segment_ref(&self.mvcc, &index_storage_id)
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?
         };
@@ -662,10 +663,13 @@ impl AppState {
             }
             return Err(Status::failed_precondition("IndexUnavailable"));
         };
-        let segment_header =
-            typed_field_segment::read_typed_field_segment_header(&self.storage, &segment_ref)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+        let segment_header = typed_field_segment::read_typed_field_segment_header(
+            &self.storage,
+            &self.mvcc,
+            &segment_ref,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
         if segment_header.source_kind != "object_metadata" {
             return Err(Status::failed_precondition(
                 "MetadataBackedIndexSourceKindMismatch",
@@ -716,6 +720,7 @@ impl AppState {
 
         let candidate_entries = metadata_candidate_entries_from_value_index(
             &self.storage,
+            &self.mvcc,
             &segment_ref,
             &req.path_prefix,
             &filters,
@@ -753,6 +758,7 @@ impl AppState {
             .collect::<Vec<_>>();
         let selected_rows = typed_field_segment::read_typed_field_rows_by_ordinals(
             &self.storage,
+            &self.mvcc,
             &segment_ref,
             selected_ordinals,
         )
@@ -942,14 +948,17 @@ impl AppState {
         let index_storage_id =
             index_journal::index_storage_id(bucket.tenant_id, bucket.id, index.id);
         let segment_ref =
-            typed_field_segment::latest_typed_field_segment_ref(&self.storage, &index_storage_id)
+            typed_field_segment::latest_typed_field_segment_ref(&self.mvcc, &index_storage_id)
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?
                 .ok_or_else(|| Status::failed_precondition("TypedJsonIndexNotMaterialised"))?;
-        let segment_header =
-            typed_field_segment::read_typed_field_segment_header(&self.storage, &segment_ref)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+        let segment_header = typed_field_segment::read_typed_field_segment_header(
+            &self.storage,
+            &self.mvcc,
+            &segment_ref,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
         if segment_header.source_kind != definition.source_kind {
             return Err(Status::failed_precondition(
                 "TypedJsonIndexSourceKindMismatch",
@@ -1003,6 +1012,7 @@ impl AppState {
         let mut candidate_entries = if predicates.is_empty() {
             boundary_candidate_entries_from_value_index(
                 &self.storage,
+                &self.mvcc,
                 &segment_ref,
                 &boundary_predicates,
                 segment_header.row_count,
@@ -1011,6 +1021,7 @@ impl AppState {
         } else {
             typed_json_candidate_entries_from_value_index(
                 &self.storage,
+                &self.mvcc,
                 &segment_ref,
                 &predicates,
                 segment_header.row_count,
@@ -1020,6 +1031,7 @@ impl AppState {
         if !predicates.is_empty() && !boundary_predicates.is_empty() {
             let boundary_entries = boundary_candidate_entries_from_value_index(
                 &self.storage,
+                &self.mvcc,
                 &segment_ref,
                 &boundary_predicates,
                 segment_header.row_count,
@@ -1060,6 +1072,7 @@ impl AppState {
             .collect::<Vec<_>>();
         let selected_rows = typed_field_segment::read_typed_field_rows_by_ordinals(
             &self.storage,
+            &self.mvcc,
             &segment_ref,
             selected_ordinals,
         )
@@ -1293,7 +1306,7 @@ impl AppState {
         if has_vector {
             let Some(latest_record) =
                 index_coremeta::latest_index_segment_coremeta_record_for_family(
-                    &self.storage,
+                    &self.mvcc,
                     &index_storage_id,
                     WriterFamily::Vector.as_str(),
                 )
@@ -1304,6 +1317,7 @@ impl AppState {
             };
             let vector_header = vector_segment::read_vector_segment_header(
                 &self.storage,
+                &self.mvcc,
                 &latest_record.segment_ref,
             )
             .await
@@ -1325,6 +1339,7 @@ impl AppState {
             )?;
             let (_, search_hits) = vector_segment::query_vector_segment_ranges(
                 &self.storage,
+                &self.mvcc,
                 &latest_record.segment_ref,
                 &req.query_vector,
                 metric,
@@ -1608,7 +1623,7 @@ impl AppState {
         let page_token = IndexPageToken::decode(req.page_token.as_str(), &signing_key)?;
         let segment_record = if let Some(token) = page_token.as_ref() {
             index_coremeta::index_segment_coremeta_record_for_family_generation(
-                &self.storage,
+                &self.mvcc,
                 &index_storage_id,
                 WriterFamily::Vector.as_str(),
                 token.index_generation,
@@ -1618,7 +1633,7 @@ impl AppState {
             .ok_or_else(|| Status::invalid_argument("PageTokenScopeMismatch"))?
         } else {
             index_coremeta::latest_index_segment_coremeta_record_for_family(
-                &self.storage,
+                &self.mvcc,
                 &index_storage_id,
                 WriterFamily::Vector.as_str(),
             )
@@ -1626,10 +1641,13 @@ impl AppState {
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::failed_precondition("IndexUnavailable"))?
         };
-        let vector_header =
-            vector_segment::read_vector_segment_header(&self.storage, &segment_record.segment_ref)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+        let vector_header = vector_segment::read_vector_segment_header(
+            &self.storage,
+            &self.mvcc,
+            &segment_record.segment_ref,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
         if req.query_vector.len() != usize::from(vector_header.dimension) {
             return Err(Status::invalid_argument("query_vector dimension mismatch"));
         }
@@ -1690,6 +1708,7 @@ impl AppState {
         }
         let (_, search_hits) = vector_segment::query_vector_segment_ranges(
             &self.storage,
+            &self.mvcc,
             &segment_record.segment_ref,
             &req.query_vector,
             metric,

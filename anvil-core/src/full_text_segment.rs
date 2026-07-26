@@ -1,7 +1,6 @@
 use crate::{
     core_store::{
-        CoreBoundaryValue, CoreMutationPrecondition, CoreObjectRef, CorePipelinePolicy, CoreStore,
-        CoreTraceContext, GetBlob,
+        CoreBoundaryValue, CoreObjectRef, CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob,
     },
     formats::{
         FileFamily, Hash32, decode_writer_segment, encode_writer_segment_header,
@@ -216,7 +215,7 @@ pub async fn write_full_text_segment(
 ) -> Result<String> {
     let staged = stage_full_text_segment(storage, write).await?;
     publish_full_text_segment_catalog(mvcc, &staged, &[]).await?;
-    publish_full_text_segment_locator(storage, &staged, &[]).await?;
+    publish_full_text_segment_locator(mvcc, &staged, &[]).await?;
     Ok(staged.segment_ref)
 }
 
@@ -368,12 +367,15 @@ pub(crate) async fn publish_full_text_segment_catalog(
 }
 
 pub(crate) async fn publish_full_text_segment_locator(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     staged: &StagedFullTextSegment,
-    additional_preconditions: &[CoreMutationPrecondition],
+    additional_preconditions: &[(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )],
 ) -> Result<()> {
     index_coremeta::write_index_segment_coremeta_record(
-        storage,
+        mvcc,
         &staged.locator,
         additional_preconditions,
     )
@@ -382,17 +384,22 @@ pub(crate) async fn publish_full_text_segment_locator(
 
 pub async fn read_full_text_segment(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     segment_ref: &str,
 ) -> Result<DecodedFullTextSegment> {
-    let bytes = read_full_text_segment_bytes(storage, segment_ref).await?;
+    let bytes = read_full_text_segment_bytes(storage, mvcc, segment_ref).await?;
     decode_full_text_segment(&bytes)
 }
 
-pub async fn read_full_text_segment_bytes(storage: &Storage, segment_ref: &str) -> Result<Vec<u8>> {
+pub async fn read_full_text_segment_bytes(
+    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    segment_ref: &str,
+) -> Result<Vec<u8>> {
     let store = CoreStore::new(storage.clone()).await?;
     let index_id = full_text_index_id_from_segment_ref(segment_ref)?;
     let segment =
-        index_coremeta::read_index_segment_coremeta_record_by_ref(storage, &index_id, segment_ref)
+        index_coremeta::read_index_segment_coremeta_record_by_ref(mvcc, &index_id, segment_ref)
             .await?
             .ok_or_else(|| anyhow!("full text segment CoreMeta row is missing"))?;
     store
@@ -404,34 +411,39 @@ pub async fn read_full_text_segment_bytes(storage: &Storage, segment_ref: &str) 
 
 pub async fn read_latest_full_text_segment(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     index_id: &str,
 ) -> Result<Option<DecodedFullTextSegment>> {
-    let Some(segment_ref) = latest_full_text_segment_ref(storage, index_id).await? else {
+    let Some(segment_ref) = latest_full_text_segment_ref(mvcc, index_id).await? else {
         return Ok(None);
     };
-    Ok(Some(read_full_text_segment(storage, &segment_ref).await?))
+    Ok(Some(
+        read_full_text_segment(storage, mvcc, &segment_ref).await?,
+    ))
 }
 
 pub async fn read_latest_full_text_segment_terms(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     index_id: &str,
     query_terms: &[Vec<u8>],
 ) -> Result<Option<DecodedFullTextSegment>> {
-    let Some(segment_ref) = latest_full_text_segment_ref(storage, index_id).await? else {
+    let Some(segment_ref) = latest_full_text_segment_ref(mvcc, index_id).await? else {
         return Ok(None);
     };
-    read_full_text_segment_terms(storage, &segment_ref, query_terms)
+    read_full_text_segment_terms(storage, mvcc, &segment_ref, query_terms)
         .await
         .map(Some)
 }
 
 pub async fn read_full_text_segment_terms(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     segment_ref: &str,
     query_terms: &[Vec<u8>],
 ) -> Result<DecodedFullTextSegment> {
     let segment =
-        RangeAddressedWriterSegment::open(storage, segment_ref, FileFamily::FullTextSegment)
+        RangeAddressedWriterSegment::open(storage, mvcc, segment_ref, FileFamily::FullTextSegment)
             .await?;
     let header = decode_full_text_header_proto(&segment.header)?;
     let directory = segment.read_body_table_directory().await?;
@@ -501,13 +513,13 @@ pub async fn read_full_text_segment_terms(
 }
 
 pub async fn latest_full_text_segment_ref(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     index_id: &str,
 ) -> Result<Option<String>> {
     require_safe_component(index_id, "full text index id")?;
     Ok(
         index_coremeta::latest_index_segment_coremeta_record_for_family(
-            storage,
+            mvcc,
             index_id,
             WriterFamily::FullText.as_str(),
         )
@@ -517,7 +529,7 @@ pub async fn latest_full_text_segment_ref(
 }
 
 pub(crate) async fn full_text_segment_hash_exists(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     index_id: &str,
     generation: u64,
     expected_segment_hash: &str,
@@ -526,7 +538,7 @@ pub(crate) async fn full_text_segment_hash_exists(
     validate_hex32(expected_segment_hash, "full text expected segment hash")?;
     Ok(
         index_coremeta::index_segment_coremeta_record_for_family_generation(
-            storage,
+            mvcc,
             index_id,
             WriterFamily::FullText.as_str(),
             generation,
