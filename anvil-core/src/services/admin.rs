@@ -390,6 +390,14 @@ impl AdminService for AppState {
             status,
         };
         let trust_record = PublicKeyTrustRecord::new(public_key, policy);
+        let audit_event = build_admin_audit_event(
+            &principal,
+            context,
+            "admin.personaldb_signing_key.import",
+            &format!("personaldb_signing_key:{}", trust_record.key_id),
+            json!({ "resource_kind": "personaldb_signing_key", "key_id": trust_record.key_id.as_str(), "status": trust_record.status.as_str() }),
+        )?;
+        let audit_event_id = audit_event.audit_event_id.clone();
         let import_result = self
             .personaldb_signing_key_store
             .import_key(PersonalDbSigningKeyImport {
@@ -400,25 +408,10 @@ impl AdminService for AppState {
                     &context.request_id,
                 )
                 .with_reason(&context.audit_reason),
+                admin_audit_event: Some(&audit_event),
             })
             .await;
         let record = import_result.map_err(|err| Status::failed_precondition(err.to_string()))?;
-        let audit_event_id = record_admin_audit_event(
-            self,
-            &principal,
-            context,
-            "admin.personaldb_signing_key.import",
-            &format!("personaldb_signing_key:{}", record.trust_record.key_id),
-            json!({
-                "resource_kind": "personaldb_signing_key",
-                "key_id": record.trust_record.key_id.as_str(),
-                "key_generation": record.trust_record.key_generation.get(),
-                "purpose": record.trust_record.purpose.as_str(),
-                "status": record.trust_record.status.as_str(),
-                "record_revision": record.record_revision,
-            }),
-        )
-        .await?;
         Ok(Response::new(PersonalDbSigningKeyResponse {
             request_id: context.request_id.clone(),
             key: Some(personaldb_signing_key_to_proto(record)),
@@ -517,6 +510,14 @@ impl AdminService for AppState {
                 context.expected_generation, current.record_revision
             )));
         }
+        let audit_event = build_admin_audit_event(
+            &principal,
+            context,
+            "admin.personaldb_signing_key.status_set",
+            &format!("personaldb_signing_key:{}", current.trust_record.key_id),
+            json!({ "resource_kind": "personaldb_signing_key", "key_id": current.trust_record.key_id.as_str(), "status": status.as_str(), "valid_until_log_index": req.valid_until_log_index }),
+        )?;
+        let audit_event_id = audit_event.audit_event_id.clone();
         let record = self
             .personaldb_signing_key_store
             .set_status(PersonalDbSigningKeyStatusUpdate {
@@ -529,26 +530,10 @@ impl AdminService for AppState {
                     &context.request_id,
                 )
                 .with_reason(&context.audit_reason),
+                admin_audit_event: Some(audit_event),
             })
             .await
             .map_err(|err| Status::failed_precondition(err.to_string()))?;
-        let audit_event_id = record_admin_audit_event(
-            self,
-            &principal,
-            context,
-            "admin.personaldb_signing_key.status_set",
-            &format!("personaldb_signing_key:{}", record.trust_record.key_id),
-            json!({
-                "resource_kind": "personaldb_signing_key",
-                "key_id": record.trust_record.key_id.as_str(),
-                "key_generation": record.trust_record.key_generation.get(),
-                "purpose": record.trust_record.purpose.as_str(),
-                "status": record.trust_record.status.as_str(),
-                "valid_until_log_index": record.trust_record.valid_until_log_index,
-                "record_revision": record.record_revision,
-            }),
-        )
-        .await?;
         Ok(Response::new(PersonalDbSigningKeyResponse {
             request_id: context.request_id.clone(),
             key: Some(personaldb_signing_key_to_proto(record)),

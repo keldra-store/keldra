@@ -96,6 +96,7 @@ pub struct PersonalDbSigningKeyImport<'a> {
     pub trust_record: PublicKeyTrustRecord,
     pub private_key_pkcs8_der: &'a [u8],
     pub audit: PersonalDbSigningKeyAuditMetadata,
+    pub admin_audit_event: Option<&'a crate::admin_audit::AdminAuditEvent>,
 }
 
 impl fmt::Debug for PersonalDbSigningKeyImport<'_> {
@@ -117,6 +118,7 @@ pub struct PersonalDbSigningKeyStatusUpdate {
     /// Exclusive upper boundary for the key's authority.
     pub valid_until_log_index: Option<LogIndex>,
     pub audit: PersonalDbSigningKeyAuditMetadata,
+    pub admin_audit_event: Option<crate::admin_audit::AdminAuditEvent>,
 }
 
 #[derive(Clone)]
@@ -203,7 +205,8 @@ impl PersonalDbSigningKeyStore {
             },
             encrypted_private_key_pkcs8_der,
         };
-        self.write_stored_row(&row).await?;
+        self.write_stored_row(&row, import.admin_audit_event)
+            .await?;
         Ok(row.public)
     }
 
@@ -442,7 +445,8 @@ impl PersonalDbSigningKeyStore {
         );
         row.public.updated_audit = update.audit;
 
-        self.write_stored_row(&row).await?;
+        self.write_stored_row(&row, update.admin_audit_event.as_ref())
+            .await?;
         Ok(row.public)
     }
 
@@ -530,7 +534,11 @@ impl PersonalDbSigningKeyStore {
             .transpose()
     }
 
-    async fn write_stored_row(&self, row: &StoredSigningKey) -> Result<()> {
+    async fn write_stored_row(
+        &self,
+        row: &StoredSigningKey,
+        audit_event: Option<&crate::admin_audit::AdminAuditEvent>,
+    ) -> Result<()> {
         validate_stored_row(row)?;
         let key_id = &row.public.trust_record.key_id;
         let mutation_id = signing_key_mutation_id(key_id, row.public.record_revision);
@@ -552,18 +560,30 @@ impl PersonalDbSigningKeyStore {
             }
             None => crate::mvcc_transaction::PredicateKind::Absent,
         };
+        let mut mutations = vec![
+            crate::mvcc_product::ProductMutation::put(key.clone(), payload),
+            crate::mvcc_product::ProductMutation::put(head.clone(), head_payload),
+        ];
+        let mut outbox = Vec::new();
+        if let Some(event) = audit_event {
+            let plan = crate::admin_audit::admin_audit_mvcc_plan(
+                event,
+                collection_revision,
+                &mutation_id,
+            )?;
+            mutations.extend(plan.mutations);
+            outbox.extend(plan.outbox_events);
+        }
         self.mvcc
-            .autocommit_product_mutations_with_predicates(
+            .autocommit_product_mutations_with_predicates_and_outbox(
                 "personaldb-signing-key-store",
                 &mutation_id,
-                vec![
-                    crate::mvcc_product::ProductMutation::put(key.clone(), payload),
-                    crate::mvcc_product::ProductMutation::put(head.clone(), head_payload),
-                ],
+                mutations,
                 vec![
                     (key, predicate(key_current.as_ref())),
                     (head, predicate(head_current.as_ref())),
                 ],
+                outbox,
                 crate::mvcc_transaction::DurabilityLevel::Quorum,
                 u64::try_from(chrono::Utc::now().timestamp_millis())
                     .map_err(|_| anyhow!("signing key timestamp predates Unix epoch"))?,
