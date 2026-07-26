@@ -503,11 +503,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         {
             let store = store(dir.path());
-            let mut state = CertificationState::default();
+            let mut state = CertificationState::new([1; 32]).unwrap();
             state
                 .apply(
                     CommitVersion(8),
                     &CertifyTransaction {
+                        cluster_id_hash: [1; 32],
                         transaction_id: TransactionId([1; 16]),
                         snapshot_version: CommitVersion(0),
                         point_observations: vec![],
@@ -535,11 +536,12 @@ mod tests {
     fn consensus_snapshot_installs_into_empty_store() {
         let source_dir = TempDir::new().unwrap();
         let source = store(source_dir.path());
-        let mut state = CertificationState::default();
+        let mut state = CertificationState::new([1; 32]).unwrap();
         state
             .apply(
                 CommitVersion(11),
                 &CertifyTransaction {
+                    cluster_id_hash: [1; 32],
                     transaction_id: TransactionId([4; 16]),
                     snapshot_version: CommitVersion(0),
                     point_observations: vec![],

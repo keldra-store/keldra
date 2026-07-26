@@ -22,9 +22,20 @@ const CF_IDEMPOTENCY: &str = "transaction_idempotency";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransactionHandle {
+    pub cluster_id: String,
     pub transaction_id: String,
     pub snapshot_version: CommitVersion,
     pub expires_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransactionRegistryStatus {
+    pub cluster_id: String,
+    pub transaction_id: String,
+    pub snapshot_version: CommitVersion,
+    pub expires_at_unix_ms: u64,
+    pub state: &'static str,
+    pub result: Option<CertificationResult>,
 }
 
 #[async_trait]
@@ -72,6 +83,7 @@ where
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Draft {
+    cluster_id: String,
     transaction_id: String,
     idempotency_key: String,
     principal: String,
@@ -91,6 +103,7 @@ enum DraftState {
         bundle: TransactionBundle,
         result: CertificationResult,
     },
+    RolledBack,
     Expired,
 }
 
@@ -133,31 +146,37 @@ impl OpenTransactionRegistry {
     pub async fn begin(
         &self,
         runtime: &impl TransactionRuntime,
+        cluster_id: impl Into<String>,
         principal: impl Into<String>,
         idempotency_key: impl Into<String>,
         ttl: Duration,
         consistency: ReadConsistency,
         now_unix_ms: u64,
     ) -> Result<TransactionHandle> {
+        let cluster_id = cluster_id.into();
         let principal = principal.into();
         let idempotency_key = idempotency_key.into();
-        if principal.trim().is_empty() || idempotency_key.trim().is_empty() {
-            bail!("principal and idempotency key must be non-empty");
+        if cluster_id.trim().is_empty()
+            || principal.trim().is_empty()
+            || idempotency_key.trim().is_empty()
+        {
+            bail!("cluster ID, principal and idempotency key must be non-empty");
         }
         let ttl_ms = u64::try_from(ttl.as_millis()).context("transaction TTL exceeds u64")?;
         if ttl_ms == 0 {
             bail!("transaction TTL must be non-zero");
         }
 
-        if let Some(existing) = self.find_by_idempotency(&idempotency_key)? {
+        if let Some(existing) = self.find_by_idempotency(&cluster_id, &idempotency_key)? {
             return self.retry_handle(existing, &principal);
         }
         let snapshot_version = runtime.transaction_snapshot(consistency).await?;
         let expires_at_unix_ms = now_unix_ms
             .checked_add(ttl_ms)
             .context("transaction expiry overflow")?;
-        let transaction_id = transaction_id(&principal, &idempotency_key);
+        let transaction_id = transaction_id(&cluster_id, &principal, &idempotency_key);
         let draft = Draft {
+            cluster_id,
             transaction_id: transaction_id.clone(),
             idempotency_key: idempotency_key.clone(),
             principal,
@@ -168,7 +187,7 @@ impl OpenTransactionRegistry {
         };
 
         let _guard = self.transition.lock().unwrap();
-        if let Some(existing) = self.find_by_idempotency(&idempotency_key)? {
+        if let Some(existing) = self.find_by_idempotency(&draft.cluster_id, &idempotency_key)? {
             return self.retry_handle(existing, &draft.principal);
         }
         let mut batch = WriteBatch::default();
@@ -179,7 +198,7 @@ impl OpenTransactionRegistry {
         );
         batch.put_cf(
             self.cf(CF_IDEMPOTENCY)?,
-            idempotency_key.as_bytes(),
+            idempotency_index_key(&draft.cluster_id, &idempotency_key),
             transaction_id.as_bytes(),
         );
         self.db.write_opt(batch, &durable_write_options())?;
@@ -189,11 +208,13 @@ impl OpenTransactionRegistry {
     pub fn observe_point(
         &self,
         transaction_id: &str,
+        owning_cluster_id: &str,
         key: LogicalKey,
         observed_version: Option<CommitVersion>,
         now_unix_ms: u64,
     ) -> Result<()> {
         self.mutate(transaction_id, now_unix_ms, |draft| {
+            ensure_owning_cluster(draft, owning_cluster_id)?;
             draft.mutations.points.push(PointObservation {
                 key,
                 observed_version,
@@ -205,6 +226,7 @@ impl OpenTransactionRegistry {
     pub fn observe_range(
         &self,
         transaction_id: &str,
+        owning_cluster_id: &str,
         table_id: u16,
         start_application_key: Option<Vec<u8>>,
         end_application_key: Option<Vec<u8>>,
@@ -212,7 +234,9 @@ impl OpenTransactionRegistry {
         now_unix_ms: u64,
     ) -> Result<()> {
         self.mutate(transaction_id, now_unix_ms, |draft| {
+            ensure_owning_cluster(draft, owning_cluster_id)?;
             let mut builder = TransactionBundleBuilder::new(
+                &draft.cluster_id,
                 &draft.transaction_id,
                 draft.snapshot_version,
                 &draft.principal,
@@ -233,11 +257,13 @@ impl OpenTransactionRegistry {
     pub fn put(
         &self,
         transaction_id: &str,
+        owning_cluster_id: &str,
         key: LogicalKey,
         value: Vec<u8>,
         now_unix_ms: u64,
     ) -> Result<()> {
         self.mutate(transaction_id, now_unix_ms, |draft| {
+            ensure_owning_cluster(draft, owning_cluster_id)?;
             draft
                 .mutations
                 .writes
@@ -246,8 +272,15 @@ impl OpenTransactionRegistry {
         })
     }
 
-    pub fn delete(&self, transaction_id: &str, key: LogicalKey, now_unix_ms: u64) -> Result<()> {
+    pub fn delete(
+        &self,
+        transaction_id: &str,
+        owning_cluster_id: &str,
+        key: LogicalKey,
+        now_unix_ms: u64,
+    ) -> Result<()> {
         self.mutate(transaction_id, now_unix_ms, |draft| {
+            ensure_owning_cluster(draft, owning_cluster_id)?;
             draft.mutations.writes.push(WriteOperation::Delete { key });
             Ok(())
         })
@@ -256,10 +289,12 @@ impl OpenTransactionRegistry {
     pub fn add_manifest(
         &self,
         transaction_id: &str,
+        owning_cluster_id: &str,
         manifest: ObjectShardManifestReference,
         now_unix_ms: u64,
     ) -> Result<()> {
         self.mutate(transaction_id, now_unix_ms, |draft| {
+            ensure_owning_cluster(draft, owning_cluster_id)?;
             draft.mutations.manifests.push(manifest);
             Ok(())
         })
@@ -283,12 +318,13 @@ impl OpenTransactionRegistry {
         &self,
         runtime: &impl TransactionRuntime,
         transaction_id: &str,
+        principal: &str,
         durability: DurabilityLevel,
         now_unix_ms: u64,
     ) -> Result<CommitOutcome> {
         let (bundle, resolved) = {
             let _guard = self.transition.lock().unwrap();
-            let mut draft = self.load(transaction_id)?;
+            let mut draft = self.load_for_principal(transaction_id, principal)?;
             match &draft.state {
                 DraftState::Open => {
                     if now_unix_ms >= draft.expires_at_unix_ms {
@@ -305,6 +341,7 @@ impl OpenTransactionRegistry {
                 }
                 DraftState::Committing { bundle } => (bundle.clone(), None),
                 DraftState::Resolved { bundle, result } => (bundle.clone(), Some(result.clone())),
+                DraftState::RolledBack => bail!("transaction was rolled back"),
                 DraftState::Expired => bail!("transaction has expired"),
             }
         };
@@ -318,7 +355,7 @@ impl OpenTransactionRegistry {
             }
         };
         let _guard = self.transition.lock().unwrap();
-        let mut draft = self.load(transaction_id)?;
+        let mut draft = self.load_for_principal(transaction_id, principal)?;
         draft.state = DraftState::Resolved {
             bundle,
             result: outcome.certification.clone(),
@@ -329,6 +366,69 @@ impl OpenTransactionRegistry {
 
     pub fn handle(&self, transaction_id: &str) -> Result<TransactionHandle> {
         Ok(handle(&self.load(transaction_id)?))
+    }
+
+    pub fn status(
+        &self,
+        transaction_id: &str,
+        principal: &str,
+        now_unix_ms: u64,
+    ) -> Result<TransactionRegistryStatus> {
+        let _guard = self.transition.lock().unwrap();
+        let mut draft = self.load_for_principal(transaction_id, principal)?;
+        if matches!(draft.state, DraftState::Open) && now_unix_ms >= draft.expires_at_unix_ms {
+            draft.state = DraftState::Expired;
+            self.save(&draft)?;
+        }
+        let (state, result) = match &draft.state {
+            DraftState::Open => ("open", None),
+            DraftState::Committing { .. } => ("committing", None),
+            DraftState::Resolved { result, .. } => match result {
+                CertificationResult::Committed { .. } => ("committed", Some(result.clone())),
+                CertificationResult::Aborted { .. } => ("aborted", Some(result.clone())),
+            },
+            DraftState::RolledBack => ("rolled_back", None),
+            DraftState::Expired => ("expired", None),
+        };
+        Ok(TransactionRegistryStatus {
+            cluster_id: draft.cluster_id,
+            transaction_id: draft.transaction_id,
+            snapshot_version: draft.snapshot_version,
+            expires_at_unix_ms: draft.expires_at_unix_ms,
+            state,
+            result,
+        })
+    }
+
+    pub fn rollback(
+        &self,
+        transaction_id: &str,
+        principal: &str,
+        now_unix_ms: u64,
+    ) -> Result<TransactionRegistryStatus> {
+        let _guard = self.transition.lock().unwrap();
+        let mut draft = self.load_for_principal(transaction_id, principal)?;
+        match draft.state {
+            DraftState::Open if now_unix_ms < draft.expires_at_unix_ms => {
+                draft.state = DraftState::RolledBack;
+                self.save(&draft)?;
+            }
+            DraftState::Open => {
+                draft.state = DraftState::Expired;
+                self.save(&draft)?;
+                bail!("transaction has expired");
+            }
+            DraftState::RolledBack => {}
+            _ => bail!("transaction can no longer be rolled back"),
+        }
+        Ok(TransactionRegistryStatus {
+            cluster_id: draft.cluster_id,
+            transaction_id: draft.transaction_id,
+            snapshot_version: draft.snapshot_version,
+            expires_at_unix_ms: draft.expires_at_unix_ms,
+            state: "rolled_back",
+            result: None,
+        })
     }
 
     fn mutate(
@@ -358,8 +458,12 @@ impl OpenTransactionRegistry {
         Ok(handle(&draft))
     }
 
-    fn find_by_idempotency(&self, key: &str) -> Result<Option<Draft>> {
-        let Some(transaction_id) = self.db.get_cf(self.cf(CF_IDEMPOTENCY)?, key.as_bytes())? else {
+    fn find_by_idempotency(&self, cluster_id: &str, key: &str) -> Result<Option<Draft>> {
+        let Some(transaction_id) = self.db.get_cf(
+            self.cf(CF_IDEMPOTENCY)?,
+            idempotency_index_key(cluster_id, key),
+        )?
+        else {
             return Ok(None);
         };
         let transaction_id =
@@ -373,6 +477,14 @@ impl OpenTransactionRegistry {
             .get_cf(self.cf(CF_TRANSACTIONS)?, transaction_id.as_bytes())?
             .with_context(|| format!("unknown transaction {transaction_id}"))?;
         serde_json::from_slice(&bytes).context("decode persisted transaction draft")
+    }
+
+    fn load_for_principal(&self, transaction_id: &str, principal: &str) -> Result<Draft> {
+        let draft = self.load(transaction_id)?;
+        if draft.principal != principal {
+            bail!("transaction belongs to another principal");
+        }
+        Ok(draft)
     }
 
     fn save(&self, draft: &Draft) -> Result<()> {
@@ -394,6 +506,7 @@ impl OpenTransactionRegistry {
 
 fn build_bundle(draft: &Draft) -> Result<TransactionBundle> {
     let mut builder = TransactionBundleBuilder::new(
+        &draft.cluster_id,
         &draft.transaction_id,
         draft.snapshot_version,
         &draft.principal,
@@ -432,9 +545,18 @@ fn build_bundle(draft: &Draft) -> Result<TransactionBundle> {
     builder.build()
 }
 
-fn transaction_id(principal: &str, idempotency_key: &str) -> String {
+fn ensure_owning_cluster(draft: &Draft, owning_cluster_id: &str) -> Result<()> {
+    if owning_cluster_id != draft.cluster_id {
+        bail!("staged resource belongs to another cluster");
+    }
+    Ok(())
+}
+
+fn transaction_id(cluster_id: &str, principal: &str, idempotency_key: &str) -> String {
     let mut hash = Sha256::new();
     hash.update(b"anvil.mvcc.open-transaction.v1");
+    hash.update((cluster_id.len() as u64).to_be_bytes());
+    hash.update(cluster_id.as_bytes());
     hash.update((principal.len() as u64).to_be_bytes());
     hash.update(principal.as_bytes());
     hash.update((idempotency_key.len() as u64).to_be_bytes());
@@ -442,8 +564,18 @@ fn transaction_id(principal: &str, idempotency_key: &str) -> String {
     format!("tx-{:x}", hash.finalize())
 }
 
+fn idempotency_index_key(cluster_id: &str, idempotency_key: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(cluster_id.len() + idempotency_key.len() + 8);
+    key.extend_from_slice(&(cluster_id.len() as u32).to_be_bytes());
+    key.extend_from_slice(cluster_id.as_bytes());
+    key.extend_from_slice(&(idempotency_key.len() as u32).to_be_bytes());
+    key.extend_from_slice(idempotency_key.as_bytes());
+    key
+}
+
 fn handle(draft: &Draft) -> TransactionHandle {
     TransactionHandle {
+        cluster_id: draft.cluster_id.clone(),
         transaction_id: draft.transaction_id.clone(),
         snapshot_version: draft.snapshot_version,
         expires_at_unix_ms: draft.expires_at_unix_ms,
@@ -520,6 +652,7 @@ mod tests {
         let handle = registry
             .begin(
                 &runtime,
+                "cluster",
                 "alice",
                 "request-1",
                 Duration::from_secs(30),
@@ -531,6 +664,7 @@ mod tests {
         registry
             .put(
                 &handle.transaction_id,
+                "cluster",
                 LogicalKey {
                     table_id: 1,
                     application_key: b"a".to_vec(),
@@ -542,6 +676,7 @@ mod tests {
         registry
             .put(
                 &handle.transaction_id,
+                "cluster",
                 LogicalKey {
                     table_id: 8,
                     application_key: b"b".to_vec(),
@@ -560,6 +695,7 @@ mod tests {
             .commit(
                 &runtime,
                 &handle.transaction_id,
+                "alice",
                 DurabilityLevel::Local,
                 1_005,
             )
@@ -581,6 +717,7 @@ mod tests {
         let handle = registry
             .begin(
                 &runtime,
+                "cluster",
                 "alice",
                 "expires",
                 Duration::from_millis(5),
@@ -593,6 +730,7 @@ mod tests {
             registry
                 .put(
                     &handle.transaction_id,
+                    "cluster",
                     LogicalKey {
                         table_id: 1,
                         application_key: b"k".to_vec(),
@@ -607,6 +745,7 @@ mod tests {
                 .commit(
                     &runtime,
                     &handle.transaction_id,
+                    "alice",
                     DurabilityLevel::Local,
                     105,
                 )
@@ -623,6 +762,7 @@ mod tests {
         let first = registry
             .begin(
                 &runtime,
+                "cluster",
                 "alice",
                 "same",
                 Duration::from_secs(1),
@@ -634,6 +774,7 @@ mod tests {
         let retry = registry
             .begin(
                 &runtime,
+                "cluster",
                 "alice",
                 "same",
                 Duration::from_secs(99),
@@ -647,6 +788,7 @@ mod tests {
             registry
                 .begin(
                     &runtime,
+                    "cluster",
                     "mallory",
                     "same",
                     Duration::from_secs(1),
@@ -659,6 +801,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn staging_rejects_resources_owned_by_another_cluster() {
+        let temp = tempdir().unwrap();
+        let registry = OpenTransactionRegistry::open(temp.path()).unwrap();
+        let runtime = runtime();
+        let handle = registry
+            .begin(
+                &runtime,
+                "cluster",
+                "alice",
+                "cluster-bound",
+                Duration::from_secs(1),
+                ReadConsistency::LocalSnapshot,
+                10,
+            )
+            .await
+            .unwrap();
+        let error = registry
+            .put(
+                &handle.transaction_id,
+                "foreign",
+                LogicalKey {
+                    table_id: 1,
+                    application_key: b"k".to_vec(),
+                },
+                b"value".to_vec(),
+                11,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("another cluster"));
+    }
+
+    #[tokio::test]
     async fn restart_resumes_open_and_resolves_frozen_transactions() {
         let temp = tempdir().unwrap();
         let runtime = runtime();
@@ -667,6 +841,7 @@ mod tests {
             let handle = registry
                 .begin(
                     &runtime,
+                    "cluster",
                     "alice",
                     "restart",
                     Duration::from_secs(60),
@@ -678,6 +853,7 @@ mod tests {
             registry
                 .put(
                     &handle.transaction_id,
+                    "cluster",
                     LogicalKey {
                         table_id: 2,
                         application_key: b"k".to_vec(),
@@ -694,7 +870,13 @@ mod tests {
             9
         );
         let first = reopened
-            .commit(&runtime, &transaction_id, DurabilityLevel::Local, 2)
+            .commit(
+                &runtime,
+                &transaction_id,
+                "alice",
+                DurabilityLevel::Local,
+                2,
+            )
             .await
             .unwrap();
         assert_eq!(first.local_apply, Some(ApplyOutcome::Applied));
@@ -702,7 +884,13 @@ mod tests {
 
         let reopened = OpenTransactionRegistry::open(temp.path()).unwrap();
         let retry = reopened
-            .commit(&runtime, &transaction_id, DurabilityLevel::Local, 3)
+            .commit(
+                &runtime,
+                &transaction_id,
+                "alice",
+                DurabilityLevel::Local,
+                3,
+            )
             .await
             .unwrap();
         assert_eq!(retry.local_apply, Some(ApplyOutcome::Replayed));

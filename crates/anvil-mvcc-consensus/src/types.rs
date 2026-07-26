@@ -60,6 +60,7 @@ pub struct RangeObservation {
 /// It intentionally contains no transaction bundle body or product row value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CertifyTransaction {
+    pub cluster_id_hash: [u8; 32],
     pub transaction_id: TransactionId,
     pub snapshot_version: CommitVersion,
     pub point_observations: Vec<PointObservation>,

@@ -61,7 +61,7 @@ pub(crate) fn to_consensus_command(
         .point_observations
         .iter()
         .map(|observation| consensus::PointObservation {
-            key: logical_key_hash(&observation.key),
+            key: logical_key_hash(&request.cluster_id, &observation.key),
             observed_version: observation.observed_version.map(consensus::CommitVersion),
         })
         .collect::<Vec<_>>();
@@ -72,7 +72,7 @@ pub(crate) fn to_consensus_command(
         .range_observations
         .iter()
         .map(|observation| consensus::RangeObservation {
-            range: range_conflict_hash(&observation.conflict_key),
+            range: range_conflict_hash(&request.cluster_id, &observation.conflict_key),
             observed_stamp: observation
                 .observed_range_stamp
                 .map(consensus::CommitVersion),
@@ -84,7 +84,7 @@ pub(crate) fn to_consensus_command(
     let mut written_point_keys = request
         .written_keys
         .iter()
-        .map(logical_key_hash)
+        .map(|key| logical_key_hash(&request.cluster_id, key))
         .collect::<Vec<_>>();
     written_point_keys.sort();
     written_point_keys.dedup();
@@ -92,13 +92,14 @@ pub(crate) fn to_consensus_command(
     let mut advanced_range_stamps = request
         .advanced_range_stamps
         .iter()
-        .map(range_conflict_hash)
+        .map(|key| range_conflict_hash(&request.cluster_id, key))
         .collect::<Vec<_>>();
     advanced_range_stamps.sort();
     advanced_range_stamps.dedup();
 
     Ok(consensus::CertifyTransaction {
-        transaction_id: transaction_id(&request.transaction_id),
+        cluster_id_hash: cluster_id_hash(&request.cluster_id),
+        transaction_id: transaction_id(&request.cluster_id, &request.transaction_id),
         snapshot_version: consensus::CommitVersion(request.snapshot_version),
         point_observations,
         range_observations,
@@ -120,13 +121,18 @@ fn valid_durable_holders(
 ) -> Vec<consensus::NodeIncarnation> {
     let mut holders = BTreeSet::new();
     for evidence in &request.bundle_holders {
-        if evidence.complete && evidence.hash_verified && evidence.fsynced {
+        if evidence.cluster_id == request.cluster_id
+            && evidence.complete
+            && evidence.hash_verified
+            && evidence.fsynced
+        {
             holders.insert(node_incarnation(&evidence.node));
         }
     }
     for evidence in &request.object_durability {
         match evidence {
             product::ObjectDurabilityEvidence::LocalRepresentation {
+                cluster_id,
                 node,
                 complete: true,
                 hash_verified: true,
@@ -134,12 +140,13 @@ fn valid_durable_holders(
                 ..
             }
             | product::ObjectDurabilityEvidence::ShardPlacement {
+                cluster_id,
                 node,
                 complete: true,
                 hash_verified: true,
                 fsynced: true,
                 ..
-            } => {
+            } if cluster_id == &request.cluster_id => {
                 holders.insert(node_incarnation(node));
             }
             _ => {}
@@ -174,24 +181,39 @@ fn from_consensus_result(result: consensus::CertificationResult) -> product::Cer
     }
 }
 
-fn transaction_id(value: &str) -> consensus::TransactionId {
-    let digest = domain_hash(b"anvil.mvcc.transaction-id.v1", &[value.as_bytes()]);
+fn cluster_id_hash(value: &str) -> [u8; 32] {
+    domain_hash(b"anvil.mvcc.cluster-id.v1", &[value.as_bytes()])
+}
+
+fn transaction_id(cluster_id: &str, value: &str) -> consensus::TransactionId {
+    let digest = domain_hash(
+        b"anvil.mvcc.transaction-id.v1",
+        &[cluster_id.as_bytes(), value.as_bytes()],
+    );
     let mut id = [0_u8; 16];
     id.copy_from_slice(&digest[..16]);
     consensus::TransactionId(id)
 }
 
-fn logical_key_hash(key: &product::LogicalKey) -> consensus::LogicalKeyHash {
+fn logical_key_hash(cluster_id: &str, key: &product::LogicalKey) -> consensus::LogicalKeyHash {
     consensus::LogicalKeyHash(domain_hash(
         b"anvil.mvcc.logical-key.v1",
-        &[&key.table_id.to_be_bytes(), &key.application_key],
+        &[
+            cluster_id.as_bytes(),
+            &key.table_id.to_be_bytes(),
+            &key.application_key,
+        ],
     ))
 }
 
-fn range_conflict_hash(key: &product::RangeStampKey) -> consensus::RangeConflictKey {
+fn range_conflict_hash(
+    cluster_id: &str,
+    key: &product::RangeStampKey,
+) -> consensus::RangeConflictKey {
     consensus::RangeConflictKey(domain_hash(
         b"anvil.mvcc.range-conflict.v1",
         &[
+            cluster_id.as_bytes(),
             &key.scheme_version.to_be_bytes(),
             &key.table_id.to_be_bytes(),
             &key.key_prefix,
@@ -260,6 +282,7 @@ mod tests {
 
     fn request() -> product::CertificationRequest {
         product::CertificationRequest {
+            cluster_id: "cluster".to_string(),
             transaction_id: "tx-a".to_string(),
             snapshot_version: 7,
             bundle: product::BundleIdentity {
@@ -326,6 +349,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn durable_holders_never_promote_evidence_from_another_cluster() {
+        let mut request = request();
+        request
+            .bundle_holders
+            .push(product::BundleDurabilityEvidence {
+                cluster_id: "foreign".into(),
+                node: node("foreign-bundle"),
+                failure_domain: "zone-foreign".into(),
+                complete: true,
+                hash_verified: true,
+                fsynced: true,
+            });
+        request
+            .object_durability
+            .push(product::ObjectDurabilityEvidence::LocalRepresentation {
+                cluster_id: "foreign".into(),
+                object_hash: format!("sha256:{}", "b".repeat(64)),
+                node: node("foreign-object"),
+                failure_domain: "zone-foreign".into(),
+                complete: true,
+                hash_verified: true,
+                fsynced: true,
+            });
+
+        let holders = valid_durable_holders(&request);
+        assert!(!holders.contains(&node_incarnation(&node("foreign-bundle"))));
+        assert!(!holders.contains(&node_incarnation(&node("foreign-object"))));
+    }
+
     fn request_for_bundle(bundle: product::TransactionBundle) -> product::CertificationRequest {
         let identity = bundle.identity().unwrap();
         let written_keys = bundle
@@ -334,6 +387,7 @@ mod tests {
             .map(|write| write.key().clone())
             .collect();
         product::CertificationRequest {
+            cluster_id: bundle.cluster_id,
             transaction_id: bundle.transaction_id,
             snapshot_version: bundle.snapshot_version,
             bundle: identity,
@@ -427,8 +481,13 @@ mod tests {
         let scheme = product::HierarchicalRangeStampScheme::new();
         let writers = [
             {
-                let mut builder =
-                    product::TransactionBundleBuilder::new("insert", 0, "principal", scheme);
+                let mut builder = product::TransactionBundleBuilder::new(
+                    "cluster",
+                    "insert",
+                    0,
+                    "principal",
+                    scheme,
+                );
                 builder.put(
                     product::LogicalKey {
                         table_id: 7,
@@ -439,8 +498,13 @@ mod tests {
                 builder.build().unwrap()
             },
             {
-                let mut builder =
-                    product::TransactionBundleBuilder::new("delete", 0, "principal", scheme);
+                let mut builder = product::TransactionBundleBuilder::new(
+                    "cluster",
+                    "delete",
+                    0,
+                    "principal",
+                    scheme,
+                );
                 builder.delete(product::LogicalKey {
                     table_id: 7,
                     application_key: b"orders/n".to_vec(),
@@ -448,8 +512,13 @@ mod tests {
                 builder.build().unwrap()
             },
             {
-                let mut builder =
-                    product::TransactionBundleBuilder::new("rename", 0, "principal", scheme);
+                let mut builder = product::TransactionBundleBuilder::new(
+                    "cluster",
+                    "rename",
+                    0,
+                    "principal",
+                    scheme,
+                );
                 builder.rename(
                     product::LogicalKey {
                         table_id: 3,
@@ -467,6 +536,7 @@ mod tests {
 
         for (index, writer) in writers.into_iter().enumerate() {
             let mut scan = product::TransactionBundleBuilder::new(
+                "cluster",
                 format!("scan-{index}"),
                 0,
                 "principal",
@@ -477,7 +547,7 @@ mod tests {
 
             let writer = to_consensus_command(&request_for_bundle(writer)).unwrap();
             let scanner = to_consensus_command(&request_for_bundle(scan.build().unwrap())).unwrap();
-            let mut state = consensus::CertificationState::default();
+            let mut state = consensus::CertificationState::new(writer.cluster_id_hash).unwrap();
             assert!(matches!(
                 state.apply(consensus::CommitVersion(1), &writer).unwrap(),
                 consensus::CertificationResult::Committed { .. }
@@ -495,8 +565,13 @@ mod tests {
     #[test]
     fn one_cross_table_transaction_advances_each_table_hierarchy() {
         let scheme = product::HierarchicalRangeStampScheme::new();
-        let mut builder =
-            product::TransactionBundleBuilder::new("cross-table", 0, "principal", scheme);
+        let mut builder = product::TransactionBundleBuilder::new(
+            "cluster",
+            "cross-table",
+            0,
+            "principal",
+            scheme,
+        );
         builder
             .put(
                 product::LogicalKey {

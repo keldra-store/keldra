@@ -2425,30 +2425,36 @@ message BoundaryMigrationStatus {
 
 message BeginTransactionRequest {
     string idempotency_key = 1;
-    TransactionScope scope = 2;
-    repeated WritePrecondition preconditions = 4;
-    repeated BoundaryValue boundary_values = 5;
+    reserved 2, 4, 5, 7;
+    reserved "scope", "preconditions", "boundary_values", "purpose";
     uint64 ttl_ms = 6;
-    string purpose = 7;
+    MvccReadConsistency read_consistency = 8;
+    string cluster_id = 9;
 }
 
 message BeginTransactionResponse {
     string request_id = 1;
     string transaction_id = 2;
-    uint64 expires_at_unix_nanos = 3;
+    reserved 3;
+    reserved "expires_at_unix_nanos";
     string state = 4;
+    uint64 snapshot_version = 5;
+    string cluster_id = 6;
+    uint64 expires_at_unix_ms = 7;
 }
 
 message CommitTransactionRequest {
     string transaction_id = 1;
-    ConsistencyMode consistency = 2;
-    bool wait_for_finalization = 3;
-    repeated WritePrecondition final_preconditions = 4;
+    reserved 2, 3, 4;
+    reserved "consistency", "wait_for_finalization", "final_preconditions";
+    MvccDurability durability = 5;
+    string cluster_id = 6;
 }
 
 message RollbackTransactionRequest {
     string transaction_id = 1;
     string reason = 2;
+    string cluster_id = 3;
 }
 
 message RollbackTransactionResponse {
@@ -2459,14 +2465,32 @@ message RollbackTransactionResponse {
 
 message GetTransactionRequest {
     string transaction_id = 1;
+    string cluster_id = 2;
 }
 
 message TransactionStatus {
     string transaction_id = 1;
     string state = 2;
-    string root_key_hash = 3;
-    optional uint64 committed_root_generation = 4;
+    reserved 3, 4;
+    reserved "root_key_hash", "committed_root_generation";
     AnvilError error = 5;
+    uint64 snapshot_version = 6;
+    uint64 expires_at_unix_ms = 7;
+    optional uint64 commit_version = 8;
+    string cluster_id = 9;
+}
+
+enum MvccReadConsistency {
+    MVCC_READ_CONSISTENCY_UNSPECIFIED = 0;
+    MVCC_READ_CONSISTENCY_LOCAL_SNAPSHOT = 1;
+    MVCC_READ_CONSISTENCY_LINEARIZED = 2;
+}
+
+enum MvccDurability {
+    MVCC_DURABILITY_UNSPECIFIED = 0;
+    MVCC_DURABILITY_LOCAL = 1;
+    MVCC_DURABILITY_QUORUM = 2;
+    MVCC_DURABILITY_ERASURE = 3;
 }
 
 
@@ -4507,6 +4531,7 @@ service ConsensusTransport {
 message ConsensusSessionOpen {
   uint64 node_id = 1;
   uint64 node_incarnation = 2;
+  string cluster_id = 3;
 }
 
 message ConsensusRpcFrame {

@@ -1,16 +1,6 @@
-use std::collections::{BTreeMap, BTreeSet};
-
 use crate::anvil_api::transaction_service_server::TransactionService;
 use crate::anvil_api::*;
-use crate::core_store::{
-    CoreBeginTransaction, CoreTransaction, CoreTransactionState, is_retryable_mutation_conflict,
-};
-use crate::{
-    AppState, auth, index_journal, manifest_journal, mesh_lifecycle, metadata_journal, middleware,
-    services::object::enforce_write_precondition,
-};
-use prost::Message;
-use sha2::{Digest, Sha256};
+use crate::{AppState, auth, middleware};
 use tonic::{Request, Response, Status};
 
 #[tonic::async_trait]
@@ -20,37 +10,32 @@ impl TransactionService for AppState {
         request: Request<BeginTransactionRequest>,
     ) -> Result<Response<BeginTransactionResponse>, Status> {
         let request_id = request_id(&request);
-        let claims = transaction_claims(&request)?;
-        let principal = transaction_principal_from_claims(&claims);
+        let principal = transaction_principal(&request)?;
         let req = request.into_inner();
-        let scope = req
-            .scope
-            .ok_or_else(|| Status::invalid_argument("transaction scope is required"))?;
-        enforce_transaction_preconditions(self, &claims, &req.preconditions).await?;
-
-        let transaction = self
-            .core_store
-            .begin_explicit_transaction(CoreBeginTransaction {
-                idempotency_key: req.idempotency_key,
-                root_anchor_key: scope.root_anchor_key.clone(),
-                root_key_hash: scope.root_key_hash,
-                scope_partition: scope.root_anchor_key,
-                ttl_ms: req.ttl_ms,
-                purpose: req.purpose,
+        validate_local_cluster(self, &req.cluster_id)?;
+        let consistency = read_consistency(req.read_consistency)?;
+        let handle = self
+            .mvcc
+            .open_transactions
+            .begin(
+                self.mvcc.runtime.as_ref(),
+                req.cluster_id,
                 principal,
-                preconditions_hash: transaction_preconditions_hash(
-                    &req.preconditions,
-                    &req.boundary_values,
-                )?,
-            })
+                req.idempotency_key,
+                std::time::Duration::from_millis(req.ttl_ms),
+                consistency,
+                now_unix_ms()?,
+            )
             .await
-            .map_err(core_store_status)?;
+            .map_err(mvcc_status)?;
 
         Ok(Response::new(BeginTransactionResponse {
             request_id,
-            transaction_id: transaction.transaction_id,
-            expires_at_unix_nanos: transaction.expires_at_unix_nanos,
-            state: transaction_state_name(transaction.state).to_string(),
+            transaction_id: handle.transaction_id,
+            expires_at_unix_ms: handle.expires_at_unix_ms,
+            state: "open".to_string(),
+            snapshot_version: handle.snapshot_version,
+            cluster_id: handle.cluster_id,
         }))
     }
 
@@ -59,236 +44,47 @@ impl TransactionService for AppState {
         request: Request<CommitTransactionRequest>,
     ) -> Result<Response<WriteResponse>, Status> {
         let request_id = request_id(&request);
-        let claims = transaction_claims(&request)?;
-        let principal = transaction_principal_from_claims(&claims);
+        let principal = transaction_principal(&request)?;
         let req = request.into_inner();
-        if req.consistency != 0
-            && req.consistency != ConsistencyMode::Committed as i32
-            && req.consistency != ConsistencyMode::Finalised as i32
-        {
-            return Err(Status::invalid_argument(
-                "explicit transactions support committed or finalised consistency",
-            ));
-        }
-        let wait_for_finalization =
-            req.wait_for_finalization || req.consistency == ConsistencyMode::Finalised as i32;
-        enforce_transaction_preconditions(self, &claims, &req.final_preconditions).await?;
-
-        let transaction = self
-            .core_store
-            .commit_explicit_transaction(&req.transaction_id, &principal)
-            .await
-            .map_err(core_store_status)?;
-        let bucket_events =
-            crate::bucket_journal::materialize_committed_bucket_metadata_transaction(
-                &self.storage,
-                &transaction,
+        validate_local_cluster(self, &req.cluster_id)?;
+        let outcome = self
+            .mvcc
+            .open_transactions
+            .commit(
+                self.mvcc.runtime.as_ref(),
+                &req.transaction_id,
+                &principal,
+                durability(req.durability)?,
+                now_unix_ms()?,
             )
             .await
-            .map_err(core_store_status)?;
-        for event in bucket_events {
-            if let Some(bucket) =
-                crate::bucket_journal::read_current_bucket_by_id(&self.storage, event.bucket_id)
-                    .await
-                    .map_err(core_store_status)?
-            {
-                crate::access_control::grant_bucket_defaults(
-                    &self.persistence,
-                    &bucket,
-                    &claims.sub,
-                    &claims.sub,
-                    "explicit transaction bucket materialisation",
-                )
-                .await
-                .map_err(core_store_status)?;
-                crate::access_control::write_bucket_public_read_tuple(
-                    &self.persistence,
-                    &bucket,
-                    bucket.is_public_read,
-                    &claims.sub,
-                    "explicit transaction bucket public-read materialisation",
-                )
-                .await
-                .map_err(core_store_status)?;
+            .map_err(mvcc_status)?;
+        let _commit_version = match outcome.certification {
+            crate::mvcc_transaction::CertificationResult::Committed { commit_version } => {
+                commit_version
             }
-        }
-        let object_projections =
-            metadata_journal::materialize_committed_object_metadata_transaction(
-                &self.storage,
-                &transaction,
-            )
-            .await
-            .map_err(core_store_status)?;
-        crate::access_control::grant_object_defaults_batch(
-            &self.persistence,
-            object_projections
-                .iter()
-                .map(|projection| (&projection.bucket, projection.object.key.as_str())),
-            "explicit transaction object materialisation",
-        )
-        .await
-        .map_err(core_store_status)?;
-        let mut changed_object_keys_by_bucket = BTreeMap::new();
-        for projection in object_projections {
-            self.object_manager
-                .verify_committed_object_watch_event(
-                    projection.object.tenant_id,
-                    &projection.bucket,
-                    &projection.object,
-                    projection.event_type,
-                    projection.is_delete_marker,
-                )
-                .await?;
-            let (_, object_keys) = changed_object_keys_by_bucket
-                .entry(projection.bucket.id)
-                .or_insert_with(|| (projection.bucket.clone(), BTreeSet::new()));
-            object_keys.insert(projection.object.key);
-        }
-        for (_, (bucket, object_keys)) in changed_object_keys_by_bucket {
-            self.persistence
-                .enqueue_index_builds_for_object_keys(
-                    &bucket,
-                    object_keys.iter().map(String::as_str),
-                )
-                .await
-                .map_err(core_store_status)?;
-        }
-        manifest_journal::materialize_committed_manifest_cas_transaction(
-            &self.storage,
-            &transaction,
-        )
-        .await
-        .map_err(core_store_status)?;
-        let append_streams =
-            crate::append_journal::materialize_committed_append_streams_transaction(
-                &self.storage,
-                &transaction,
-            )
-            .await
-            .map_err(core_store_status)?;
-        for stream in append_streams {
-            let Some(bucket) =
-                crate::bucket_journal::read_current_bucket_by_id(&self.storage, stream.bucket_id)
-                    .await
-                    .map_err(core_store_status)?
-            else {
-                continue;
-            };
-            crate::access_control::grant_stream_defaults(
-                &self.persistence,
-                &bucket,
-                &stream.stream_key,
-                &claims.sub,
-                &claims.sub,
-                "explicit transaction append stream materialisation",
-            )
-            .await
-            .map_err(core_store_status)?;
-        }
-        let index_events = index_journal::materialize_committed_index_definition_transaction(
-            &self.storage,
-            &transaction,
-        )
-        .await
-        .map_err(core_store_status)?;
-        for event in index_events {
-            let Some(bucket) =
-                crate::bucket_journal::read_current_bucket_by_id(&self.storage, event.bucket_id)
-                    .await
-                    .map_err(core_store_status)?
-            else {
-                continue;
-            };
-            let index = crate::index_journal::index_definition_from_event_for_projection(&event)
-                .map_err(core_store_status)?;
-            crate::access_control::grant_index_defaults(
-                &self.persistence,
-                &bucket,
-                &index.name,
-                &claims.sub,
-                &claims.sub,
-                "explicit transaction index materialisation",
-            )
-            .await
-            .map_err(core_store_status)?;
-            self.persistence
-                .enqueue_index_build_for_index(&bucket, &index)
-                .await
-                .map_err(core_store_status)?;
-        }
-        crate::gateway_store::materialize_committed_gateway_transaction(
-            &self.storage,
-            &transaction,
-        )
-        .await
-        .map_err(core_store_status)?;
-        for resource in mesh_lifecycle::committed_topology_resources_from_transaction(&transaction)
-            .map_err(|err| Status::internal(err.to_string()))?
-        {
-            match resource {
-                mesh_lifecycle::MeshLifecycleCommittedResource::Region { region } => {
-                    crate::access_control::grant_region_defaults(
-                        &self.persistence,
-                        &region,
-                        &claims.sub,
-                        "explicit transaction mesh region materialisation",
-                    )
-                    .await
-                    .map_err(core_store_status)?;
-                }
-                mesh_lifecycle::MeshLifecycleCommittedResource::Cell { region, cell_id } => {
-                    crate::access_control::grant_cell_defaults(
-                        &self.persistence,
-                        &region,
-                        &cell_id,
-                        &claims.sub,
-                        "explicit transaction mesh cell materialisation",
-                    )
-                    .await
-                    .map_err(core_store_status)?;
-                }
-                mesh_lifecycle::MeshLifecycleCommittedResource::Node {
-                    region,
-                    cell_id,
-                    node_id,
-                } => {
-                    crate::access_control::grant_node_defaults(
-                        &self.persistence,
-                        &region,
-                        &cell_id,
-                        &node_id,
-                        &claims.sub,
-                        "explicit transaction mesh node materialisation",
-                    )
-                    .await
-                    .map_err(core_store_status)?;
-                }
+            crate::mvcc_transaction::CertificationResult::Aborted { reason } => {
+                tracing::warn!(?reason, transaction_id = %req.transaction_id, "MVCC transaction conflicted");
+                return Err(Status::aborted(certification_abort_name(&reason)));
             }
-        }
-        let root_generation = if wait_for_finalization {
-            Some(
-                self.core_store
-                    .verify_explicit_transaction_finalised(&req.transaction_id, &principal)
-                    .await
-                    .map_err(core_store_status)?,
-            )
-        } else {
-            transaction.committed_root_generation
         };
 
         Ok(Response::new(WriteResponse {
             request_id,
-            mutation_id: transaction.transaction_id.clone(),
-            state: if wait_for_finalization {
-                WriteState::Finalised as i32
-            } else {
-                WriteState::Committed as i32
-            },
-            root_generation,
+            mutation_id: req.transaction_id,
+            state: WriteState::Committed as i32,
+            root_generation: None,
             transaction_manifest_ref: None,
-            idempotency_outcome: "accepted".to_string(),
+            idempotency_outcome: if matches!(
+                outcome.local_apply,
+                Some(crate::mvcc_store::ApplyOutcome::Replayed)
+            ) {
+                "replayed".to_string()
+            } else {
+                "accepted".to_string()
+            },
             retry_after_hint: None,
-            finalisation_error: transaction_error(&transaction),
+            finalisation_error: None,
             saga: None,
         }))
     }
@@ -300,16 +96,16 @@ impl TransactionService for AppState {
         let request_id = request_id(&request);
         let principal = transaction_principal(&request)?;
         let req = request.into_inner();
-        let transaction = self
-            .core_store
-            .rollback_explicit_transaction(&req.transaction_id, &principal, &req.reason)
-            .await
-            .map_err(core_store_status)?;
-
+        validate_local_cluster(self, &req.cluster_id)?;
+        let status = self
+            .mvcc
+            .open_transactions
+            .rollback(&req.transaction_id, &principal, now_unix_ms()?)
+            .map_err(mvcc_status)?;
         Ok(Response::new(RollbackTransactionResponse {
             request_id,
-            transaction_id: transaction.transaction_id,
-            state: transaction_state_name(transaction.state).to_string(),
+            transaction_id: status.transaction_id,
+            state: status.state.to_string(),
         }))
     }
 
@@ -319,13 +115,56 @@ impl TransactionService for AppState {
     ) -> Result<Response<TransactionStatus>, Status> {
         let principal = transaction_principal(&request)?;
         let req = request.into_inner();
-        let transaction = self
-            .core_store
-            .read_explicit_transaction_for_principal(&req.transaction_id, &principal)
-            .await
-            .map_err(core_store_status)?;
+        validate_local_cluster(self, &req.cluster_id)?;
+        let status = self
+            .mvcc
+            .open_transactions
+            .status(&req.transaction_id, &principal, now_unix_ms()?)
+            .map_err(mvcc_status)?;
+        Ok(Response::new(transaction_status(status)))
+    }
+}
 
-        Ok(Response::new(transaction_status(&transaction)))
+#[cfg(test)]
+mod mvcc_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn lifecycle_defaults_are_safe_and_explicit_values_map_exactly() {
+        assert_eq!(
+            read_consistency(MvccReadConsistency::Unspecified as i32).unwrap(),
+            crate::mvcc_transaction::ReadConsistency::Linearized
+        );
+        assert_eq!(
+            read_consistency(MvccReadConsistency::LocalSnapshot as i32).unwrap(),
+            crate::mvcc_transaction::ReadConsistency::LocalSnapshot
+        );
+        assert_eq!(
+            durability(MvccDurability::Unspecified as i32).unwrap(),
+            crate::mvcc_transaction::DurabilityLevel::Quorum
+        );
+        assert_eq!(
+            durability(MvccDurability::Erasure as i32).unwrap(),
+            crate::mvcc_transaction::DurabilityLevel::Erasure
+        );
+    }
+
+    #[test]
+    fn certification_conflicts_have_stable_public_codes() {
+        assert_eq!(
+            certification_abort_name(
+                &crate::mvcc_transaction::CertificationAbort::PointConflict { key_hash: [0; 32] },
+            ),
+            "TransactionPointConflict"
+        );
+        assert_eq!(
+            certification_abort_name(
+                &crate::mvcc_transaction::CertificationAbort::RangeConflict {
+                    range_hash: [0; 32],
+                },
+            ),
+            "TransactionRangeConflict"
+        );
     }
 }
 
@@ -347,41 +186,6 @@ fn transaction_principal_from_claims(claims: &auth::Claims) -> String {
     format!("tenant/{}/principal/{}", claims.tenant_id, claims.sub)
 }
 
-async fn enforce_transaction_preconditions(
-    state: &AppState,
-    claims: &auth::Claims,
-    preconditions: &[WritePrecondition],
-) -> Result<(), Status> {
-    for precondition in preconditions {
-        enforce_write_precondition(state, claims, Some(precondition)).await?;
-    }
-    Ok(())
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct TransactionPreconditionsHashProto {
-    #[prost(message, repeated, tag = "1")]
-    preconditions: Vec<WritePrecondition>,
-    #[prost(message, repeated, tag = "2")]
-    boundary_values: Vec<BoundaryValue>,
-}
-
-fn transaction_preconditions_hash(
-    preconditions: &[WritePrecondition],
-    boundary_values: &[BoundaryValue],
-) -> Result<String, Status> {
-    let input = TransactionPreconditionsHashProto {
-        preconditions: preconditions.to_vec(),
-        boundary_values: boundary_values.to_vec(),
-    };
-    let bytes = crate::core_store::encode_deterministic_proto(&input);
-    let mut hasher = Sha256::new();
-    hasher.update(b"anvil.transaction.preconditions.v1");
-    hasher.update(&(bytes.len() as u64).to_le_bytes());
-    hasher.update(&bytes);
-    Ok(format!("sha256:{:x}", hasher.finalize()))
-}
-
 fn request_id<T>(request: &Request<T>) -> String {
     request
         .extensions()
@@ -390,83 +194,117 @@ fn request_id<T>(request: &Request<T>) -> String {
         .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string())
 }
 
-fn transaction_status(transaction: &CoreTransaction) -> TransactionStatus {
+fn transaction_status(
+    transaction: crate::mvcc_open_transactions::TransactionRegistryStatus,
+) -> TransactionStatus {
+    let commit_version = match &transaction.result {
+        Some(crate::mvcc_transaction::CertificationResult::Committed { commit_version }) => {
+            Some(*commit_version)
+        }
+        _ => None,
+    };
+    let error = match &transaction.result {
+        Some(crate::mvcc_transaction::CertificationResult::Aborted { reason }) => {
+            Some(AnvilError {
+                code: certification_abort_name(reason).to_string(),
+                message: format!("{reason:?}"),
+            })
+        }
+        _ => None,
+    };
     TransactionStatus {
-        transaction_id: transaction.transaction_id.clone(),
-        state: transaction_state_name(transaction.state).to_string(),
-        root_key_hash: transaction.root_key_hash.clone(),
-        committed_root_generation: transaction.committed_root_generation,
-        error: transaction_error(transaction),
+        transaction_id: transaction.transaction_id,
+        state: transaction.state.to_string(),
+        error,
+        snapshot_version: transaction.snapshot_version,
+        expires_at_unix_ms: transaction.expires_at_unix_ms,
+        commit_version,
+        cluster_id: transaction.cluster_id,
     }
 }
 
-fn transaction_error(transaction: &CoreTransaction) -> Option<AnvilError> {
-    transaction
-        .finalisation_error
-        .as_ref()
-        .or(transaction.failure_evidence.as_ref())
-        .map(|message| AnvilError {
-            code: transaction_state_name(transaction.state).to_string(),
-            message: message.clone(),
-        })
-}
-
-fn transaction_state_name(state: CoreTransactionState) -> &'static str {
-    match state {
-        CoreTransactionState::Open => "open",
-        CoreTransactionState::Prepared => "committing",
-        CoreTransactionState::Committed => "committed",
-        CoreTransactionState::FinalisationFailed | CoreTransactionState::Aborted => "failed",
-        CoreTransactionState::RolledBack => "rolled_back",
-        CoreTransactionState::Expired => "expired",
-        CoreTransactionState::Failed => "failed",
-    }
-}
-
-fn core_store_status(error: anyhow::Error) -> Status {
-    if let Some(status) = crate::services::core_store_status::availability_status(&error) {
-        return status;
-    }
-    if is_retryable_mutation_conflict(&error) {
-        tracing::warn!(error = %error, "explicit transaction conflicted");
-        return Status::aborted("TransactionConflict");
-    }
-    let message = error.to_string();
-    if message.contains("TransactionConflict") {
-        tracing::warn!(error = %message, "explicit transaction conflicted");
-    }
-    if message.contains("TransactionNotFound") {
-        Status::not_found("TransactionNotFound")
-    } else if message.contains("TransactionPrincipalMismatch") {
-        Status::permission_denied("TransactionPrincipalMismatch")
-    } else if message.contains("TransactionScopeMismatch") {
-        Status::failed_precondition("TransactionScopeMismatch")
-    } else if message.contains("TransactionExpired") {
-        Status::failed_precondition("TransactionExpired")
-    } else if message.contains("TransactionRolledBack") {
-        Status::failed_precondition("TransactionRolledBack")
-    } else if message.contains("TransactionAlreadyCommitted") {
-        Status::failed_precondition("TransactionAlreadyCommitted")
-    } else if message.contains("TransactionConflict") {
-        Status::aborted("TransactionConflict")
-    } else if message.contains("TransactionNotOpen") {
-        Status::failed_precondition("TransactionNotOpen")
-    } else if message.contains("TransactionNotCommittable") {
-        Status::failed_precondition("TransactionNotCommittable")
-    } else if message.contains("idempotency conflict") {
-        Status::already_exists("TransactionConflict")
-    } else if message.contains("must not be empty")
-        || message.contains("must be a sha256 hash")
-        || message.contains("root key hash mismatch")
-        || message.contains("contains an invalid component")
+fn read_consistency(value: i32) -> Result<crate::mvcc_transaction::ReadConsistency, Status> {
+    match MvccReadConsistency::try_from(value)
+        .map_err(|_| Status::invalid_argument("invalid MVCC read consistency"))?
     {
+        MvccReadConsistency::Unspecified | MvccReadConsistency::Linearized => {
+            Ok(crate::mvcc_transaction::ReadConsistency::Linearized)
+        }
+        MvccReadConsistency::LocalSnapshot => {
+            Ok(crate::mvcc_transaction::ReadConsistency::LocalSnapshot)
+        }
+    }
+}
+
+fn durability(value: i32) -> Result<crate::mvcc_transaction::DurabilityLevel, Status> {
+    match MvccDurability::try_from(value)
+        .map_err(|_| Status::invalid_argument("invalid MVCC durability"))?
+    {
+        MvccDurability::Unspecified | MvccDurability::Quorum => {
+            Ok(crate::mvcc_transaction::DurabilityLevel::Quorum)
+        }
+        MvccDurability::Local => Ok(crate::mvcc_transaction::DurabilityLevel::Local),
+        MvccDurability::Erasure => Ok(crate::mvcc_transaction::DurabilityLevel::Erasure),
+    }
+}
+
+fn mvcc_status(error: anyhow::Error) -> Status {
+    let message = error.to_string();
+    if message.contains("unknown transaction") {
+        Status::not_found("TransactionNotFound")
+    } else if message.contains("another principal") {
+        Status::permission_denied("TransactionPrincipalMismatch")
+    } else if message.contains("expired")
+        || message.contains("rolled back")
+        || message.contains("no longer open")
+        || message.contains("can no longer")
+    {
+        Status::failed_precondition(message)
+    } else if message.contains("must be") || message.contains("invalid") {
         Status::invalid_argument(message)
     } else {
         Status::internal(message)
     }
 }
 
-#[cfg(test)]
+fn certification_abort_name(reason: &crate::mvcc_transaction::CertificationAbort) -> &'static str {
+    match reason {
+        crate::mvcc_transaction::CertificationAbort::InvalidCommand(_) => {
+            "TransactionInvalidCommand"
+        }
+        crate::mvcc_transaction::CertificationAbort::PointConflict { .. } => {
+            "TransactionPointConflict"
+        }
+        crate::mvcc_transaction::CertificationAbort::RangeConflict { .. } => {
+            "TransactionRangeConflict"
+        }
+    }
+}
+
+fn validate_local_cluster(state: &AppState, cluster_id: &str) -> Result<(), Status> {
+    let local = &state.config.mvcc_cluster_id;
+    if cluster_id.trim().is_empty() {
+        return Err(Status::invalid_argument("cluster_id is required"));
+    }
+    if cluster_id != local {
+        return Err(Status::failed_precondition(
+            "transaction belongs to another cluster",
+        ));
+    }
+    Ok(())
+}
+
+fn now_unix_ms() -> Result<u64, Status> {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| Status::internal("system clock is before Unix epoch"))?
+        .as_millis();
+    u64::try_from(millis).map_err(|_| Status::internal("system clock exceeds u64 milliseconds"))
+}
+
+// Pre-MVCC transaction service tests are retained temporarily as source
+// history, but target the removed CoreStore lifecycle and are not compiled.
+#[cfg(any())]
 mod tests {
     use super::*;
     use crate::anvil_api::object_service_server::ObjectService;

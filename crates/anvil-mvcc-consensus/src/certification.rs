@@ -11,6 +11,7 @@ use crate::{
 /// Complete deterministic state replicated by the certification state machine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct CertificationState {
+    cluster_id_hash: [u8; 32],
     last_applied: CommitVersion,
     point_latest_write: BTreeMap<LogicalKeyHash, CommitVersion>,
     range_latest_write: BTreeMap<RangeConflictKey, CommitVersion>,
@@ -19,6 +20,8 @@ pub struct CertificationState {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum CertificationError {
+    #[error("cluster identity must be configured")]
+    InvalidClusterIdentity,
     #[error("commit positions must increase: last {last:?}, proposed {proposed:?}")]
     NonMonotonicPosition {
         last: CommitVersion,
@@ -29,6 +32,20 @@ pub enum CertificationError {
 }
 
 impl CertificationState {
+    pub fn new(cluster_id_hash: [u8; 32]) -> Result<Self, CertificationError> {
+        if cluster_id_hash == [0; 32] {
+            return Err(CertificationError::InvalidClusterIdentity);
+        }
+        Ok(Self {
+            cluster_id_hash,
+            ..Self::default()
+        })
+    }
+
+    pub fn cluster_id_hash(&self) -> [u8; 32] {
+        self.cluster_id_hash
+    }
+
     pub fn last_applied(&self) -> CommitVersion {
         self.last_applied
     }
@@ -62,6 +79,20 @@ impl CertificationState {
                 last: self.last_applied,
                 proposed: position,
             });
+        }
+
+        if self.cluster_id_hash == [0; 32] || self.cluster_id_hash != command.cluster_id_hash {
+            let result = aborted(
+                position,
+                command,
+                CertificationAbort::InvalidCommand(
+                    "command belongs to an unconfigured or different cluster".to_string(),
+                ),
+            );
+            self.last_applied = position;
+            self.recent_results
+                .insert(command.transaction_id, result.clone());
+            return Ok(result);
         }
 
         if let Some(result) = self.recent_results.get(&command.transaction_id) {
@@ -135,6 +166,11 @@ fn aborted(
 }
 
 fn validate_canonical(command: &CertifyTransaction) -> Result<(), CertificationAbort> {
+    if command.cluster_id_hash == [0; 32] {
+        return Err(CertificationAbort::InvalidCommand(
+            "cluster identity is required".to_string(),
+        ));
+    }
     check_sorted_unique(&command.point_observations, "point observations")?;
     check_sorted_unique(&command.range_observations, "range observations")?;
     check_sorted_unique(&command.written_point_keys, "written point keys")?;
@@ -175,6 +211,7 @@ mod tests {
 
     fn command(id: u8) -> CertifyTransaction {
         CertifyTransaction {
+            cluster_id_hash: [1; 32],
             transaction_id: TransactionId([id; 16]),
             snapshot_version: CommitVersion(0),
             point_observations: vec![],
@@ -195,7 +232,7 @@ mod tests {
     fn conflicting_point_transaction_aborts_atomically() {
         let key = LogicalKeyHash(hash(1));
         let untouched = LogicalKeyHash(hash(2));
-        let mut state = CertificationState::default();
+        let mut state = CertificationState::new([1; 32]).unwrap();
 
         let mut first = command(1);
         first.written_point_keys = vec![key];
@@ -222,7 +259,7 @@ mod tests {
 
     #[test]
     fn unrelated_transactions_commit() {
-        let mut state = CertificationState::default();
+        let mut state = CertificationState::new([1; 32]).unwrap();
         for id in 1..=2 {
             let mut tx = command(id);
             tx.written_point_keys = vec![LogicalKeyHash(hash(id))];
@@ -236,7 +273,7 @@ mod tests {
     #[test]
     fn range_phantom_aborts() {
         let range = RangeConflictKey(hash(7));
-        let mut state = CertificationState::default();
+        let mut state = CertificationState::new([1; 32]).unwrap();
         let mut insertion = command(1);
         insertion.advanced_range_stamps = vec![range];
         state.apply(CommitVersion(1), &insertion).unwrap();
@@ -257,7 +294,7 @@ mod tests {
 
     #[test]
     fn retries_are_stable_and_do_not_consume_a_new_version() {
-        let mut state = CertificationState::default();
+        let mut state = CertificationState::new([1; 32]).unwrap();
         let tx = command(1);
         let first = state.apply(CommitVersion(4), &tx).unwrap();
         let retry = state.apply(CommitVersion(99), &tx).unwrap();
@@ -267,7 +304,7 @@ mod tests {
 
     #[test]
     fn transaction_id_cannot_name_different_bundle() {
-        let mut state = CertificationState::default();
+        let mut state = CertificationState::new([1; 32]).unwrap();
         let first = command(1);
         state.apply(CommitVersion(1), &first).unwrap();
         let mut changed = first;
@@ -281,7 +318,7 @@ mod tests {
 
     #[test]
     fn noncanonical_command_is_a_stable_abort() {
-        let mut state = CertificationState::default();
+        let mut state = CertificationState::new([1; 32]).unwrap();
         let mut tx = command(1);
         let duplicate = LogicalKeyHash(hash(1));
         tx.written_point_keys = vec![duplicate, duplicate];

@@ -883,6 +883,7 @@ cluster_id
 transaction_id
 snapshot_version
 authenticated_principal
+durability
 realms
 created_at
 body_length
@@ -1045,11 +1046,17 @@ raised without changing transaction semantics.
 1. Resolve the owning `cluster_id` and route the transaction to a coordinator
    in that cluster.
 2. Bind the transaction ID permanently to that cluster.
-3. Obtain a snapshot version from that cluster's certifier.
-4. Create or recover the transaction ID.
-5. Read ordinary state at that cluster snapshot.
-6. Record point/range observations and explicit predicates.
-7. Reject any later operation whose logical key resolves to another cluster.
+3. Bind the requested durability level permanently to the transaction before
+   accepting object bytes.
+4. Obtain a snapshot version from that cluster's certifier.
+5. Create or recover the transaction ID.
+6. Read ordinary state at that cluster snapshot.
+7. Record point/range observations and explicit predicates.
+8. Reject any later operation whose logical key resolves to another cluster.
+
+Durability cannot first be selected at commit time: `local` and distributed
+erasure ingest use different foreground byte paths. A retry or commit request
+that attempts to change the transaction's bound durability is rejected.
 
 ### 15.2 Build
 

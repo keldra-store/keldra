@@ -245,8 +245,13 @@ mod tests {
     }
 
     fn bundle(id: &str, key: LogicalKey, value: &[u8]) -> TransactionBundle {
-        let mut builder =
-            TransactionBundleBuilder::new(id, 0, "principal", HierarchicalRangeStampScheme::new());
+        let mut builder = TransactionBundleBuilder::new(
+            "cluster",
+            id,
+            0,
+            "principal",
+            HierarchicalRangeStampScheme::new(),
+        );
         builder.put(key, value.to_vec());
         builder.build().unwrap()
     }

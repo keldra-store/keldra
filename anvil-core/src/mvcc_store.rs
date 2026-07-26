@@ -282,6 +282,7 @@ mod tests {
         writes: impl FnOnce(&mut TransactionBundleBuilder),
     ) -> TransactionBundle {
         let mut builder = TransactionBundleBuilder::new(
+            "cluster",
             transaction_id,
             0,
             "principal",
