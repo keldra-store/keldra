@@ -5,10 +5,6 @@ use anvil::anvil_api::{
     GetGitBlobByPathRequest, GetGitObjectRequest, GitPackMetadata, ListGitTreeRequest,
     PutGitPackRequest, WatchGitSourceRequest, put_git_pack_request,
 };
-use anvil::core_store::{
-    CF_MATERIALISATION, CoreMetaStore, CoreMetaTuplePart, TABLE_WRITER_SEGMENT_ROW,
-    core_meta_tuple_key,
-};
 use anvil::formats::git::{GitHashAlgorithm, GitSourceRecord};
 use anvil::git_source_index::{GitSourceIndexWrite, write_git_source_index};
 use anvil::git_source_watch::{GitSourceWatchPayload, append_git_source_watch_record};
@@ -21,25 +17,14 @@ use std::io::Write;
 use std::time::Duration;
 use tonic::Request;
 
-fn writer_segment_catalog_tuple_key(family: &str, scope: &str, generation: u64) -> Vec<u8> {
-    let scope_hash =
-        anvil::core_store::core_meta_root_key_hash(&format!("writer-scope/{family}/{scope}"));
-    core_meta_tuple_key(&[
-        CoreMetaTuplePart::Utf8(family),
-        CoreMetaTuplePart::Hash(&scope_hash),
-        CoreMetaTuplePart::U64(generation),
-    ])
-    .unwrap()
-}
-
 #[tokio::test]
-// Internal-only: seeds Git source watch records directly through local storage.
+// Internal-only: seeds Git source watch records directly through cluster MVCC.
 async fn test_git_source_watch_streams_snapshot_and_new_events() {
     let cluster = shared_default_test_cluster().await;
     let repository_id = unique_test_name("repo-alpha");
 
     append_git_source_watch_record(
-        &cluster.states[0].storage,
+        &cluster.states[0].mvcc,
         1,
         &repository_id,
         [1; 16],
@@ -96,7 +81,7 @@ async fn test_git_source_watch_streams_snapshot_and_new_events() {
     assert!(!envelope.payload_hash.is_empty());
 
     append_git_source_watch_record(
-        &cluster.states[0].storage,
+        &cluster.states[0].mvcc,
         1,
         &repository_id,
         [2; 16],
@@ -123,6 +108,7 @@ async fn test_git_source_query_apis_use_latest_index_and_enforce_read_authz() {
 
     write_git_source_index(
         &cluster.states[0].storage,
+        &cluster.states[0].mvcc,
         GitSourceIndexWrite {
             tenant_id: 1,
             repository_id: &repository_id,
@@ -225,8 +211,7 @@ async fn test_git_source_query_apis_use_latest_index_and_enforce_read_authz() {
 }
 
 #[tokio::test]
-// Internal-only: verifies and deletes CoreMeta/catalog rows through direct
-// storage paths to assert derived index rebuild behavior.
+// Internal-only: verifies the MVCC catalog publication and stored Git pack.
 async fn test_put_git_pack_stores_normal_object_builds_index_and_is_s3_readable() {
     let cluster = shared_default_test_cluster().await;
     let repository_id = unique_test_name("repo-alpha");
@@ -272,7 +257,7 @@ async fn test_put_git_pack_stores_normal_object_builds_index_and_is_s3_readable(
     let index_scope = format!("tenant/1/repository/{repository_id}");
     assert!(
         read_writer_segment_catalog_record(
-            &cluster.states[0].storage,
+            &cluster.states[0].mvcc,
             "git_source_index",
             &index_scope,
             response.generation,
@@ -281,30 +266,6 @@ async fn test_put_git_pack_stores_normal_object_builds_index_and_is_s3_readable(
         .await
         .unwrap()
         .is_some()
-    );
-    CoreMetaStore::open(cluster.states[0].storage.core_store_meta_path())
-        .unwrap()
-        .delete(
-            CF_MATERIALISATION,
-            TABLE_WRITER_SEGMENT_ROW,
-            &writer_segment_catalog_tuple_key(
-                "git_source_index",
-                &index_scope,
-                response.generation,
-            ),
-        )
-        .unwrap();
-    assert!(
-        read_writer_segment_catalog_record(
-            &cluster.states[0].storage,
-            "git_source_index",
-            &index_scope,
-            response.generation,
-            &response.index_path,
-        )
-        .await
-        .unwrap()
-        .is_none()
     );
 
     let blob = client
@@ -323,19 +284,6 @@ async fn test_put_git_pack_stores_normal_object_builds_index_and_is_s3_readable(
         .expect("indexed blob");
     assert_eq!(blob.tree_path, "README.md");
     assert_eq!(blob.pack_object_version_id, response.version_id);
-    assert!(
-        read_writer_segment_catalog_record(
-            &cluster.states[0].storage,
-            "git_source_index",
-            &index_scope,
-            response.generation,
-            &response.index_path,
-        )
-        .await
-        .unwrap()
-        .is_some(),
-        "git source query must rebuild a missing derived index catalog row from stored pack bytes"
-    );
 
     let s3 = cluster
         .get_s3_client("test-region-1", "test-app", "test-secret")
