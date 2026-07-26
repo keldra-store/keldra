@@ -588,9 +588,9 @@ impl Persistence {
         bucket_name: &str,
         target_region: &str,
     ) -> Result<Bucket> {
-        let mut bucket = bucket_journal::read_current_bucket(&self.storage, tenant_id, bucket_name)
-            .await?
-            .ok_or_else(|| anyhow!("bucket not found"))?;
+        let mut bucket =
+            bucket_journal::read_current_bucket_mvcc(self.mvcc()?, tenant_id, bucket_name)?
+                .ok_or_else(|| anyhow!("bucket not found"))?;
         if bucket.region == target_region {
             return Ok(bucket);
         }
@@ -619,13 +619,18 @@ impl Persistence {
         bucket.region = target_region.to_string();
         let tenant_permit = self.bucket_tenant_write_permit(bucket.tenant_id).await?;
         let global_permit = self.bucket_global_write_permit().await?;
-        bucket_journal::append_bucket_mutation_with_permits(
-            &self.storage,
+        let _validated_permits = (&tenant_permit, &global_permit);
+        bucket_journal::build_bucket_mvcc_mutation_plan(
+            self.mvcc()?,
             &bucket,
             BucketJournalMutation::Update,
-            &tenant_permit,
-            &global_permit,
-            &self.partition_owner_signing_key,
+        )
+        .autocommit(
+            self.mvcc()?,
+            "bucket-metadata",
+            &format!("bucket-move:{}:{}", bucket.id, uuid::Uuid::new_v4()),
+            crate::mvcc_transaction::DurabilityLevel::Local,
+            u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
         )
         .await?;
         Ok(bucket)

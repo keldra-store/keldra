@@ -126,114 +126,6 @@ struct BucketEventHeadRowProto {
     event_payload: Vec<u8>,
 }
 
-#[cfg(test)]
-async fn append_bucket_mutation(
-    storage: &Storage,
-    bucket: &Bucket,
-    mutation: BucketJournalMutation,
-) -> Result<()> {
-    append_bucket_mutation_to_stream(
-        storage,
-        bucket,
-        mutation,
-        BucketJournalScope::Tenant(bucket.tenant_id),
-        0,
-        None,
-    )
-    .await?;
-    append_bucket_mutation_to_stream(
-        storage,
-        bucket,
-        mutation,
-        BucketJournalScope::Global,
-        0,
-        None,
-    )
-    .await
-}
-
-pub(crate) async fn append_bucket_mutation_with_permits(
-    storage: &Storage,
-    bucket: &Bucket,
-    mutation: BucketJournalMutation,
-    tenant_permit: &PartitionWritePermit,
-    global_permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
-) -> Result<()> {
-    let total_start = std::time::Instant::now();
-    let tenant_scope = BucketJournalScope::Tenant(bucket.tenant_id);
-    let global_scope = BucketJournalScope::Global;
-    require_bucket_scope_permit(tenant_scope, tenant_permit)?;
-    require_bucket_scope_permit(global_scope, global_permit)?;
-    let tenant_precondition = async {
-        let step_start = std::time::Instant::now();
-        let precondition =
-            partition_write_precondition(storage, tenant_permit, partition_owner_signing_key).await;
-        crate::emit_test_timing(
-            "bucket_journal.append_bucket_mutation tenant_precondition",
-            step_start.elapsed(),
-        );
-        precondition
-    };
-    let global_precondition = async {
-        let step_start = std::time::Instant::now();
-        let precondition =
-            partition_write_precondition(storage, global_permit, partition_owner_signing_key).await;
-        crate::emit_test_timing(
-            "bucket_journal.append_bucket_mutation global_precondition",
-            step_start.elapsed(),
-        );
-        precondition
-    };
-    let (tenant_precondition, global_precondition) =
-        tokio::join!(tenant_precondition, global_precondition);
-    let tenant_precondition = tenant_precondition?;
-    let global_precondition = global_precondition?;
-
-    let tenant_append = async {
-        let step_start = std::time::Instant::now();
-        let result = append_bucket_mutation_to_stream(
-            storage,
-            bucket,
-            mutation,
-            tenant_scope,
-            tenant_permit.fence_token,
-            Some(tenant_precondition),
-        )
-        .await;
-        crate::emit_test_timing(
-            "bucket_journal.append_bucket_mutation tenant_append",
-            step_start.elapsed(),
-        );
-        result
-    };
-    let global_append = async {
-        let step_start = std::time::Instant::now();
-        let result = append_bucket_mutation_to_stream(
-            storage,
-            bucket,
-            mutation,
-            global_scope,
-            global_permit.fence_token,
-            Some(global_precondition),
-        )
-        .await;
-        crate::emit_test_timing(
-            "bucket_journal.append_bucket_mutation global_append",
-            step_start.elapsed(),
-        );
-        result
-    };
-    let (tenant_result, global_result) = tokio::join!(tenant_append, global_append);
-    tenant_result?;
-    global_result?;
-    crate::emit_test_timing(
-        "bucket_journal.append_bucket_mutation total",
-        total_start.elapsed(),
-    );
-    Ok(())
-}
-
 pub(crate) async fn stage_bucket_mutation_in_transaction(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
@@ -264,185 +156,18 @@ pub async fn read_current_bucket_by_id(
     Ok(current.into_active_bucket())
 }
 
-pub async fn next_bucket_id(storage: &Storage) -> Result<i64> {
-    read_bucket_id_allocator(storage)
-        .await?
-        .max_allocated_id
+pub fn next_bucket_id_mvcc(mvcc: &crate::mvcc_bootstrap::MvccSubsystem) -> Result<i64> {
+    let key = bucket_mvcc_key(
+        TABLE_BUCKET_ID_ALLOCATOR_ROW,
+        &bucket_id_allocator_tuple_key()?,
+    )?;
+    mvcc.read_latest_value(&key)?
+        .as_deref()
+        .map(decode_bucket_id_allocator_payload)
+        .transpose()?
+        .unwrap_or_default()
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("bucket id overflow"))
-}
-
-pub(crate) async fn reserve_next_bucket_id_with_permit(
-    storage: &Storage,
-    permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
-) -> Result<i64> {
-    let scope = BucketJournalScope::Global;
-    require_bucket_scope_permit(scope, permit)?;
-
-    for attempt in 0..BUCKET_ID_ALLOCATION_ATTEMPTS {
-        let partition_precondition =
-            partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
-        let snapshot = read_bucket_id_allocator(storage).await?;
-        let next_id = snapshot
-            .max_allocated_id
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("bucket id overflow"))?;
-        let mutation_id = uuid::Uuid::new_v4().to_string();
-        let partition_id = hex::encode(scope.partition_id());
-        let result = CoreStore::new(storage.clone())
-            .await?
-            .commit_mutation_batch(CoreMutationBatch {
-                transaction_id: format!("bucket-id-allocation:{mutation_id}"),
-                scope_partition: partition_id.clone(),
-                committed_by_principal: scope.partition_principal(),
-                root_publications: bucket_root_publications(&partition_id, scope.root_anchor_key()),
-                preconditions: vec![
-                    partition_precondition,
-                    bucket_id_allocator_precondition(&snapshot)?,
-                ],
-                operations: vec![bucket_id_allocator_put(
-                    next_id,
-                    &partition_id,
-                    &mutation_id,
-                    current_unix_nanos(),
-                )?],
-            })
-            .await;
-        match result {
-            Ok(_) => return Ok(next_id),
-            Err(error)
-                if attempt + 1 < BUCKET_ID_ALLOCATION_ATTEMPTS
-                    && is_bucket_id_allocator_conflict(&error) =>
-            {
-                crate::perf::record_counter(
-                    "bucket_id_allocator_conflicts_total",
-                    &[("outcome", "retry")],
-                    1,
-                );
-                tokio::task::yield_now().await;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-
-    unreachable!("bounded bucket id allocation loop returns on its final attempt")
-}
-
-async fn append_bucket_mutation_to_stream(
-    storage: &Storage,
-    bucket: &Bucket,
-    mutation: BucketJournalMutation,
-    scope: BucketJournalScope,
-    fence_token: u64,
-    partition_precondition: Option<CoreMutationPrecondition>,
-) -> Result<()> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let mutation_id = uuid::Uuid::new_v4();
-    let row_generation = current_unix_nanos();
-    let body = BucketJournalBody {
-        event: mutation.event_name().to_string(),
-        tenant_id: bucket.tenant_id,
-        bucket_id: bucket.id,
-        bucket_name: bucket.name.clone(),
-        region: bucket.region.clone(),
-        is_public_read: bucket.is_public_read,
-        mutation_id: mutation_id.to_string(),
-        fence_token,
-        created_at: bucket.created_at.to_rfc3339(),
-        emitted_at: Some(chrono::Utc::now().to_rfc3339()),
-    };
-    let payload = encode_bucket_journal_body(&body)?;
-
-    let partition_id = hex::encode(scope.partition_id());
-    let stream_id = scope.stream_id();
-    let stream_precondition = core_store.stream_head_precondition(&stream_id).await?;
-    let expected_stream_sequence = match &stream_precondition {
-        CoreMutationPrecondition::StreamHead {
-            expected_last_sequence,
-            ..
-        } => expected_last_sequence
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("bucket metadata stream sequence overflow"))?,
-        _ => unreachable!("stream head helper returned a non-stream precondition"),
-    };
-    let mut operations = vec![CoreMutationOperation::StreamAppend {
-        partition_id: partition_id.clone(),
-        stream_id: stream_id.clone(),
-        record_kind: BUCKET_METADATA_RECORD_KIND.to_string(),
-        payload: payload.clone(),
-        idempotency_key: Some(format!("bucket-metadata:{}:{}", stream_id, mutation_id)),
-    }];
-    operations.extend(bucket_current_coremeta_operations(
-        scope,
-        bucket,
-        mutation,
-        &partition_id,
-        &mutation_id.to_string(),
-        row_generation,
-    )?);
-    if scope == BucketJournalScope::Tenant(bucket.tenant_id) {
-        operations.push(bucket_event_head_put(
-            bucket,
-            &payload,
-            expected_stream_sequence,
-            &partition_id,
-            &mutation_id.to_string(),
-            row_generation,
-        )?);
-    }
-
-    let mut preconditions = partition_precondition.into_iter().collect::<Vec<_>>();
-    preconditions.push(stream_precondition);
-    if scope == BucketJournalScope::Global && mutation == BucketJournalMutation::Create {
-        let allocator = read_bucket_id_allocator(storage).await?;
-        if bucket.id > allocator.max_allocated_id {
-            preconditions.push(bucket_id_allocator_precondition(&allocator)?);
-            operations.push(bucket_id_allocator_put(
-                bucket.id,
-                &partition_id,
-                &mutation_id.to_string(),
-                row_generation,
-            )?);
-        }
-    }
-
-    let receipt = core_store
-        .commit_mutation_batch(CoreMutationBatch {
-            transaction_id: format!("bucket-metadata:{stream_id}:{mutation_id}"),
-            scope_partition: partition_id.clone(),
-            committed_by_principal: scope.partition_principal(),
-            root_publications: bucket_root_publications(&partition_id, scope.root_anchor_key()),
-            preconditions,
-            operations,
-        })
-        .await?;
-    if !receipt.is_committed() {
-        return Err(anyhow!(
-            "bucket metadata mutation {} did not commit: {}",
-            receipt.transaction_id,
-            receipt
-                .finalisation_error
-                .as_deref()
-                .unwrap_or("unknown finalisation failure")
-        ));
-    }
-    Ok(())
-}
-
-pub async fn read_current_bucket(
-    storage: &Storage,
-    tenant_id: i64,
-    bucket_name: &str,
-) -> Result<Option<Bucket>> {
-    if let Some(current) =
-        read_current_bucket_for_tenant_row(storage, tenant_id, bucket_name).await?
-    {
-        ensure_bucket_tenant_name_matches(&current.bucket, tenant_id, bucket_name)?;
-        return Ok(current.into_active_bucket());
-    }
-
-    Ok(None)
 }
 
 fn bucket_event_head_put(
@@ -774,6 +499,37 @@ pub(crate) fn read_bucket_collection_revision_mvcc(
     Ok(value.revision)
 }
 
+pub(crate) fn current_bucket_collection_revision_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+) -> Result<String> {
+    Ok(read_bucket_collection_revision_mvcc(mvcc, tenant_id)?.to_string())
+}
+
+pub(crate) fn page_current_buckets_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    expected_revision: &str,
+    after_application_key: Option<&[u8]>,
+    page_size: usize,
+) -> Result<CurrentBucketPage> {
+    if current_bucket_collection_revision_mvcc(mvcc, tenant_id)? != expected_revision {
+        bail!("bucket collection revision changed");
+    }
+    let snapshot = mvcc.runtime.applied_version()?;
+    let page = page_current_buckets_at_mvcc_snapshot(
+        mvcc,
+        tenant_id,
+        snapshot,
+        after_application_key,
+        page_size,
+    )?;
+    if current_bucket_collection_revision_mvcc(mvcc, tenant_id)? != expected_revision {
+        bail!("bucket collection revision changed");
+    }
+    Ok(page)
+}
+
 pub(crate) fn build_bucket_mvcc_mutation_plan(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
@@ -959,57 +715,6 @@ impl BucketCurrentRow {
     }
 }
 
-async fn read_bucket_id_allocator(storage: &Storage) -> Result<BucketIdAllocatorSnapshot> {
-    let tuple_key = bucket_id_allocator_tuple_key()?;
-    let payload = CoreStore::new(storage.clone()).await?.read_coremeta_row(
-        CF_MESH,
-        TABLE_BUCKET_ID_ALLOCATOR_ROW,
-        &tuple_key,
-    )?;
-    let Some(payload) = payload else {
-        return Ok(BucketIdAllocatorSnapshot {
-            max_allocated_id: 0,
-            expected_payload_hash: None,
-        });
-    };
-    let row = BucketIdAllocatorRowProto::decode(payload.as_slice())?;
-    ensure_deterministic_proto(&row, &payload, "bucket id allocator row")?;
-    if row.schema != BUCKET_ID_ALLOCATOR_ROW_SCHEMA {
-        return Err(anyhow!("bucket id allocator row schema mismatch"));
-    }
-    let common = row
-        .common
-        .as_ref()
-        .ok_or_else(|| anyhow!("bucket id allocator row is missing CoreMeta common"))?;
-    let scope = BucketJournalScope::Global;
-    if common.realm_id != scope.realm_id() || common.root_key_hash != scope.root_key_hash() {
-        return Err(anyhow!("bucket id allocator row scope mismatch"));
-    }
-    if row.max_allocated_id < 0 {
-        return Err(anyhow!("bucket id allocator row is negative"));
-    }
-    Ok(BucketIdAllocatorSnapshot {
-        max_allocated_id: row.max_allocated_id,
-        expected_payload_hash: Some(core_meta_payload_digest(
-            TABLE_BUCKET_ID_ALLOCATOR_ROW,
-            &payload,
-        )),
-    })
-}
-
-fn bucket_id_allocator_precondition(
-    snapshot: &BucketIdAllocatorSnapshot,
-) -> Result<CoreMutationPrecondition> {
-    Ok(CoreMutationPrecondition::CoreMetaRow {
-        cf: CF_MESH.to_string(),
-        table_id: TABLE_BUCKET_ID_ALLOCATOR_ROW,
-        tuple_key: bucket_id_allocator_tuple_key()?,
-        expected_payload_hash: snapshot.expected_payload_hash.clone(),
-        require_absent: snapshot.expected_payload_hash.is_none(),
-        require_present: snapshot.expected_payload_hash.is_some(),
-    })
-}
-
 fn bucket_id_allocator_put(
     max_allocated_id: i64,
     partition_id: &str,
@@ -1042,15 +747,6 @@ fn bucket_id_allocator_put(
 
 fn bucket_id_allocator_tuple_key() -> Result<Vec<u8>> {
     core_meta_tuple_key(&[CoreMetaTuplePart::Utf8("bucket-id-allocator")])
-}
-
-fn is_bucket_id_allocator_conflict(error: &anyhow::Error) -> bool {
-    if crate::core_store::is_retryable_mutation_conflict(error) {
-        return true;
-    }
-    let message = format!("{error:#}");
-    message.contains(&format!("{TABLE_BUCKET_ID_ALLOCATOR_ROW:#06x}"))
-        && (message.contains("target mismatch") || message.contains("must be absent"))
 }
 
 fn bucket_current_coremeta_operations(
@@ -1124,36 +820,6 @@ fn bucket_current_coremeta_operations_with_root(
     Ok(operations)
 }
 
-async fn bucket_current_coremeta_precondition(
-    core_store: &CoreStore,
-    scope: BucketJournalScope,
-    bucket: &Bucket,
-    mutation: BucketJournalMutation,
-    transaction_id: &str,
-    transaction_principal: &str,
-) -> Result<CoreMutationPrecondition> {
-    let (table_id, tuple_key) = scope.bucket_current_tuple_key(bucket)?;
-    let current = core_store
-        .read_coremeta_row_visible_to_transaction(
-            CF_MESH,
-            table_id,
-            &tuple_key,
-            transaction_id,
-            transaction_principal,
-        )
-        .await?;
-    Ok(CoreMutationPrecondition::CoreMetaRow {
-        cf: CF_MESH.to_string(),
-        table_id,
-        tuple_key,
-        expected_payload_hash: current
-            .as_ref()
-            .map(|payload| core_meta_payload_digest(table_id, payload)),
-        require_absent: mutation == BucketJournalMutation::Create,
-        require_present: mutation != BucketJournalMutation::Create,
-    })
-}
-
 async fn read_current_bucket_for_tenant_row(
     storage: &Storage,
     tenant_id: i64,
@@ -1185,72 +851,6 @@ async fn read_current_bucket_by_id_row(
     decode_bucket_current_row(&payload)
         .with_context(|| format!("decode bucket current CoreMeta row id/{bucket_id}"))
         .map(Some)
-}
-
-pub async fn current_bucket_collection_revision(
-    storage: &Storage,
-    tenant_id: i64,
-) -> Result<String> {
-    let scope = BucketJournalScope::Tenant(tenant_id);
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let (sequence, event_hash) = core_store.raw_stream_head(&scope.stream_id()).await?;
-    Ok(format!("{sequence}:{event_hash}"))
-}
-
-pub async fn page_current_buckets(
-    storage: &Storage,
-    tenant_id: i64,
-    expected_revision: &str,
-    after_tuple_key: Option<&[u8]>,
-    page_size: usize,
-) -> Result<CurrentBucketPage> {
-    if !(1..=1000).contains(&page_size) {
-        return Err(anyhow!("bucket page size must be between 1 and 1000"));
-    }
-    if current_bucket_collection_revision(storage, tenant_id).await? != expected_revision {
-        return Err(anyhow!("bucket collection revision changed"));
-    }
-
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let prefix = tenant_bucket_name_current_tuple_prefix(tenant_id)?;
-    let mut rows = core_store.scan_coremeta_prefix_page(
-        CF_MESH,
-        TABLE_BUCKET_CURRENT_BY_NAME_ROW,
-        &prefix,
-        after_tuple_key,
-        page_size + 1,
-    )?;
-    let has_more = rows.len() > page_size;
-    if has_more {
-        rows.truncate(page_size);
-    }
-    let next_tuple_key = if has_more {
-        let last = rows
-            .last()
-            .ok_or_else(|| anyhow!("bucket page continuation has no last row"))?;
-        Some(core_meta_record_tuple_key(&last.key)?.to_vec())
-    } else {
-        None
-    };
-    let mut buckets = Vec::with_capacity(rows.len());
-    for row in rows {
-        let current = decode_bucket_current_row(&row.payload)
-            .with_context(|| "decode bucket list CoreMeta row")?;
-        ensure_bucket_scope_matches(BucketJournalScope::Tenant(tenant_id), &current.bucket)?;
-        if current.deleted {
-            return Err(anyhow!(
-                "tenant bucket current table contains a deleted row"
-            ));
-        }
-        buckets.push(current.bucket);
-    }
-    if current_bucket_collection_revision(storage, tenant_id).await? != expected_revision {
-        return Err(anyhow!("bucket collection changed during page read"));
-    }
-    Ok(CurrentBucketPage {
-        buckets,
-        next_tuple_key,
-    })
 }
 
 fn encode_bucket_current_row_with_root(
@@ -1634,6 +1234,3 @@ fn ensure_deterministic_proto(message: &impl Message, bytes: &[u8], label: &str)
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests;

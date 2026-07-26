@@ -93,8 +93,7 @@ impl BucketService for AppState {
         self.bucket_manager.authorize_bucket_list(&claims).await?;
         let page_size = crate::services::collection_cursor::page_size(req.page.as_ref())?;
         let revision =
-            bucket_journal::current_bucket_collection_revision(&self.storage, claims.tenant_id)
-                .await
+            bucket_journal::current_bucket_collection_revision_mvcc(&self.mvcc, claims.tenant_id)
                 .map_err(|error| Status::internal(error.to_string()))?;
         let principal_scope = format!("tenant:{}/subject:{}", claims.tenant_id, claims.sub);
         let binding = crate::services::collection_cursor::CollectionCursorBinding {
@@ -112,14 +111,13 @@ impl BucketService for AppState {
         )?;
         let after_tuple_key =
             crate::services::collection_cursor::decode_binary_position(position.as_deref())?;
-        let bucket_page = bucket_journal::page_current_buckets(
-            &self.storage,
+        let bucket_page = bucket_journal::page_current_buckets_mvcc(
+            &self.mvcc,
             claims.tenant_id,
             &revision,
             after_tuple_key.as_deref(),
             page_size,
         )
-        .await
         .map_err(|error| Status::aborted(error.to_string()))?;
         let next_page_token = bucket_page
             .next_tuple_key
@@ -319,8 +317,7 @@ impl AppState {
         )
         .await
         .map_err(|err| Status::failed_precondition(err.to_string()))?;
-        if bucket_journal::read_current_bucket(&self.storage, claims.tenant_id, &req.bucket_name)
-            .await
+        if bucket_journal::read_current_bucket_mvcc(&self.mvcc, claims.tenant_id, &req.bucket_name)
             .map_err(|err| Status::internal(err.to_string()))?
             .is_some()
         {
@@ -329,8 +326,7 @@ impl AppState {
             ));
         }
         let bucket = crate::persistence::Bucket {
-            id: bucket_journal::next_bucket_id(&self.storage)
-                .await
+            id: bucket_journal::next_bucket_id_mvcc(&self.mvcc)
                 .map_err(|err| Status::internal(err.to_string()))?,
             tenant_id: claims.tenant_id,
             name: req.bucket_name.clone(),
