@@ -23,6 +23,7 @@ impl TransactionService for AppState {
                 principal,
                 req.idempotency_key,
                 std::time::Duration::from_millis(req.ttl_ms),
+                durability(req.durability)?,
                 consistency,
                 now_unix_ms()?,
             )
@@ -36,6 +37,7 @@ impl TransactionService for AppState {
             state: "open".to_string(),
             snapshot_version: handle.snapshot_version,
             cluster_id: handle.cluster_id,
+            durability: durability_to_proto(handle.durability) as i32,
         }))
     }
 
@@ -54,7 +56,6 @@ impl TransactionService for AppState {
                 self.mvcc.runtime.as_ref(),
                 &req.transaction_id,
                 &principal,
-                durability(req.durability)?,
                 now_unix_ms()?,
             )
             .await
@@ -220,6 +221,7 @@ fn transaction_status(
         expires_at_unix_ms: transaction.expires_at_unix_ms,
         commit_version,
         cluster_id: transaction.cluster_id,
+        durability: durability_to_proto(transaction.durability) as i32,
     }
 }
 
@@ -245,6 +247,14 @@ fn durability(value: i32) -> Result<crate::mvcc_transaction::DurabilityLevel, St
         }
         MvccDurability::Local => Ok(crate::mvcc_transaction::DurabilityLevel::Local),
         MvccDurability::Erasure => Ok(crate::mvcc_transaction::DurabilityLevel::Erasure),
+    }
+}
+
+fn durability_to_proto(value: crate::mvcc_transaction::DurabilityLevel) -> MvccDurability {
+    match value {
+        crate::mvcc_transaction::DurabilityLevel::Local => MvccDurability::Local,
+        crate::mvcc_transaction::DurabilityLevel::Quorum => MvccDurability::Quorum,
+        crate::mvcc_transaction::DurabilityLevel::Erasure => MvccDurability::Erasure,
     }
 }
 

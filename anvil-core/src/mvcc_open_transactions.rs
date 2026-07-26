@@ -26,6 +26,7 @@ pub struct TransactionHandle {
     pub transaction_id: String,
     pub snapshot_version: CommitVersion,
     pub expires_at_unix_ms: u64,
+    pub durability: DurabilityLevel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +37,13 @@ pub struct TransactionRegistryStatus {
     pub expires_at_unix_ms: u64,
     pub state: &'static str,
     pub result: Option<CertificationResult>,
+    pub durability: DurabilityLevel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransactionBinding {
+    pub cluster_id: String,
+    pub durability: DurabilityLevel,
 }
 
 #[async_trait]
@@ -89,6 +97,7 @@ struct Draft {
     principal: String,
     snapshot_version: CommitVersion,
     expires_at_unix_ms: u64,
+    durability: DurabilityLevel,
     state: DraftState,
     mutations: DraftMutations,
 }
@@ -150,6 +159,7 @@ impl OpenTransactionRegistry {
         principal: impl Into<String>,
         idempotency_key: impl Into<String>,
         ttl: Duration,
+        durability: DurabilityLevel,
         consistency: ReadConsistency,
         now_unix_ms: u64,
     ) -> Result<TransactionHandle> {
@@ -182,6 +192,7 @@ impl OpenTransactionRegistry {
             principal,
             snapshot_version,
             expires_at_unix_ms,
+            durability,
             state: DraftState::Open,
             mutations: DraftMutations::default(),
         };
@@ -319,10 +330,9 @@ impl OpenTransactionRegistry {
         runtime: &impl TransactionRuntime,
         transaction_id: &str,
         principal: &str,
-        durability: DurabilityLevel,
         now_unix_ms: u64,
     ) -> Result<CommitOutcome> {
-        let (bundle, resolved) = {
+        let (bundle, resolved, durability) = {
             let _guard = self.transition.lock().unwrap();
             let mut draft = self.load_for_principal(transaction_id, principal)?;
             match &draft.state {
@@ -337,10 +347,12 @@ impl OpenTransactionRegistry {
                         bundle: bundle.clone(),
                     };
                     self.save(&draft)?;
-                    (bundle, None)
+                    (bundle, None, draft.durability)
                 }
-                DraftState::Committing { bundle } => (bundle.clone(), None),
-                DraftState::Resolved { bundle, result } => (bundle.clone(), Some(result.clone())),
+                DraftState::Committing { bundle } => (bundle.clone(), None, draft.durability),
+                DraftState::Resolved { bundle, result } => {
+                    (bundle.clone(), Some(result.clone()), draft.durability)
+                }
                 DraftState::RolledBack => bail!("transaction was rolled back"),
                 DraftState::Expired => bail!("transaction has expired"),
             }
@@ -366,6 +378,20 @@ impl OpenTransactionRegistry {
 
     pub fn handle(&self, transaction_id: &str) -> Result<TransactionHandle> {
         Ok(handle(&self.load(transaction_id)?))
+    }
+
+    pub fn binding(&self, transaction_id: &str, principal: &str) -> Result<TransactionBinding> {
+        let draft = self.load_for_principal(transaction_id, principal)?;
+        if !matches!(
+            draft.state,
+            DraftState::Open | DraftState::Committing { .. }
+        ) {
+            bail!("transaction can no longer accept staged data");
+        }
+        Ok(TransactionBinding {
+            cluster_id: draft.cluster_id,
+            durability: draft.durability,
+        })
     }
 
     pub fn status(
@@ -397,6 +423,7 @@ impl OpenTransactionRegistry {
             expires_at_unix_ms: draft.expires_at_unix_ms,
             state,
             result,
+            durability: draft.durability,
         })
     }
 
@@ -428,6 +455,7 @@ impl OpenTransactionRegistry {
             expires_at_unix_ms: draft.expires_at_unix_ms,
             state: "rolled_back",
             result: None,
+            durability: draft.durability,
         })
     }
 
@@ -579,6 +607,7 @@ fn handle(draft: &Draft) -> TransactionHandle {
         transaction_id: draft.transaction_id.clone(),
         snapshot_version: draft.snapshot_version,
         expires_at_unix_ms: draft.expires_at_unix_ms,
+        durability: draft.durability,
     }
 }
 
@@ -656,6 +685,7 @@ mod tests {
                 "alice",
                 "request-1",
                 Duration::from_secs(30),
+                DurabilityLevel::Local,
                 ReadConsistency::Linearized,
                 1_000,
             )
@@ -692,13 +722,7 @@ mod tests {
             .add_job(&handle.transaction_id, b"job".to_vec(), 1_004)
             .unwrap();
         registry
-            .commit(
-                &runtime,
-                &handle.transaction_id,
-                "alice",
-                DurabilityLevel::Local,
-                1_005,
-            )
+            .commit(&runtime, &handle.transaction_id, "alice", 1_005)
             .await
             .unwrap();
 
@@ -721,6 +745,7 @@ mod tests {
                 "alice",
                 "expires",
                 Duration::from_millis(5),
+                DurabilityLevel::Local,
                 ReadConsistency::LocalSnapshot,
                 100,
             )
@@ -742,13 +767,7 @@ mod tests {
         );
         assert!(
             registry
-                .commit(
-                    &runtime,
-                    &handle.transaction_id,
-                    "alice",
-                    DurabilityLevel::Local,
-                    105,
-                )
+                .commit(&runtime, &handle.transaction_id, "alice", 105,)
                 .await
                 .is_err()
         );
@@ -766,6 +785,7 @@ mod tests {
                 "alice",
                 "same",
                 Duration::from_secs(1),
+                DurabilityLevel::Local,
                 ReadConsistency::LocalSnapshot,
                 10,
             )
@@ -778,6 +798,7 @@ mod tests {
                 "alice",
                 "same",
                 Duration::from_secs(99),
+                DurabilityLevel::Local,
                 ReadConsistency::Linearized,
                 500,
             )
@@ -792,6 +813,7 @@ mod tests {
                     "mallory",
                     "same",
                     Duration::from_secs(1),
+                    DurabilityLevel::Local,
                     ReadConsistency::LocalSnapshot,
                     10,
                 )
@@ -812,6 +834,7 @@ mod tests {
                 "alice",
                 "cluster-bound",
                 Duration::from_secs(1),
+                DurabilityLevel::Local,
                 ReadConsistency::LocalSnapshot,
                 10,
             )
@@ -845,6 +868,7 @@ mod tests {
                     "alice",
                     "restart",
                     Duration::from_secs(60),
+                    DurabilityLevel::Local,
                     ReadConsistency::LocalSnapshot,
                     0,
                 )
@@ -870,13 +894,7 @@ mod tests {
             9
         );
         let first = reopened
-            .commit(
-                &runtime,
-                &transaction_id,
-                "alice",
-                DurabilityLevel::Local,
-                2,
-            )
+            .commit(&runtime, &transaction_id, "alice", 2)
             .await
             .unwrap();
         assert_eq!(first.local_apply, Some(ApplyOutcome::Applied));
@@ -884,13 +902,7 @@ mod tests {
 
         let reopened = OpenTransactionRegistry::open(temp.path()).unwrap();
         let retry = reopened
-            .commit(
-                &runtime,
-                &transaction_id,
-                "alice",
-                DurabilityLevel::Local,
-                3,
-            )
+            .commit(&runtime, &transaction_id, "alice", 3)
             .await
             .unwrap();
         assert_eq!(retry.local_apply, Some(ApplyOutcome::Replayed));

@@ -2430,6 +2430,7 @@ message BeginTransactionRequest {
     uint64 ttl_ms = 6;
     MvccReadConsistency read_consistency = 8;
     string cluster_id = 9;
+    MvccDurability durability = 10;
 }
 
 message BeginTransactionResponse {
@@ -2441,13 +2442,15 @@ message BeginTransactionResponse {
     uint64 snapshot_version = 5;
     string cluster_id = 6;
     uint64 expires_at_unix_ms = 7;
+    MvccDurability durability = 8;
 }
 
 message CommitTransactionRequest {
     string transaction_id = 1;
     reserved 2, 3, 4;
     reserved "consistency", "wait_for_finalization", "final_preconditions";
-    MvccDurability durability = 5;
+    reserved 5;
+    reserved "durability";
     string cluster_id = 6;
 }
 
@@ -2478,6 +2481,7 @@ message TransactionStatus {
     uint64 expires_at_unix_ms = 7;
     optional uint64 commit_version = 8;
     string cluster_id = 9;
+    MvccDurability durability = 10;
 }
 
 enum MvccReadConsistency {
@@ -4504,12 +4508,29 @@ message ReplicationHeartbeat {
   uint64 last_acknowledged_sequence = 3;
 }
 
+message ReplicationReadRequest {
+  string transfer_id = 1;
+  uint64 offset = 2;
+  uint64 max_bytes = 3;
+}
+
+message ReplicationReadChunk {
+  string transfer_id = 1;
+  uint64 offset = 2;
+  bytes payload = 3;
+  bytes payload_checksum = 4;
+  uint64 total_length = 5;
+  bytes completed_hash = 6;
+  bool finish = 7;
+}
+
 message ReplicationStreamRequest {
   oneof message {
     ReplicationSessionOpen open = 1;
     ReplicationDataFrame frame = 2;
     ReplicationTransferWatermark watermark = 3;
     ReplicationHeartbeat heartbeat = 4;
+    ReplicationReadRequest read = 5;
   }
 }
 
@@ -4519,6 +4540,7 @@ message ReplicationStreamResponse {
     ReplicationApplicationAck ack = 2;
     ReplicationTransferWatermark watermark = 3;
     ReplicationHeartbeat heartbeat = 4;
+    ReplicationReadChunk read = 5;
   }
 }
 
