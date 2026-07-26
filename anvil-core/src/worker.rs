@@ -13,7 +13,8 @@ use crate::task_lease::{
     TaskLease,
 };
 use crate::tasks::{
-    HFIngestionItemState, HFIngestionState, RebalanceShardTaskPayload, TaskStatus, TaskType,
+    HFIngestionItemState, HFIngestionState, RebalanceShardTaskPayload, RepairRunBackend,
+    RepairRunTaskPayload, TaskStatus, TaskType,
 };
 use anyhow::{Result, anyhow};
 use futures_util::{Stream, StreamExt};
@@ -574,6 +575,7 @@ async fn execute_task_handler_with_lease_renewal(
                     "RebalanceShard must use its lease-aware repair executor"
                 ));
             }
+            TaskType::RepairRun => handle_repair_run(persistence, task, keyring, guard).await?,
         }
         Ok(())
     };
@@ -597,6 +599,86 @@ async fn execute_task_handler_with_lease_renewal(
             }
         }
     }
+}
+
+async fn handle_repair_run(
+    persistence: &Persistence,
+    task: &Task,
+    keyring: &EncryptionKeyring,
+    guard: &TaskExecutionGuard,
+) -> Result<()> {
+    let payload: RepairRunTaskPayload = serde_json::from_value(task.payload.clone())
+        .map_err(|error| anyhow!("invalid RepairRun task {} payload: {error}", task.id))?;
+    payload.validate()?;
+    guard.check().await?;
+    match payload.backend {
+        RepairRunBackend::Index => {
+            persistence
+                .repair_index_from_base_journal(
+                    payload.tenant_id,
+                    payload
+                        .bucket_name
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("RepairRun index bucket is missing"))?,
+                    payload
+                        .index_name
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("RepairRun index name is missing"))?,
+                    payload.rebuild,
+                )
+                .await?;
+        }
+        RepairRunBackend::DirectoryIndex => {
+            persistence
+                .repair_directory_index(
+                    payload.tenant_id,
+                    payload
+                        .bucket_name
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("RepairRun directory bucket is missing"))?,
+                    payload.rebuild,
+                )
+                .await?;
+        }
+        RepairRunBackend::AuthzDerivedIndex => {
+            persistence
+                .repair_authz_derived_userset_index(
+                    payload.tenant_id,
+                    payload
+                        .derived_index_id
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("RepairRun derived index id is missing"))?,
+                    payload.rebuild,
+                )
+                .await?;
+        }
+        RepairRunBackend::PersonalDbLogChain => {
+            let signing_store = crate::personaldb_signing_store::PersonalDbSigningKeyStore::new(
+                persistence.storage().clone(),
+                persistence.mvcc_arc()?,
+                Arc::new(keyring.clone()),
+            );
+            let trust_store = signing_store.load_trust_store()?;
+            persistence
+                .repair_personaldb_log_chain(
+                    payload.tenant_id,
+                    payload
+                        .database_id
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("RepairRun database id is missing"))?,
+                    &trust_store,
+                )
+                .await?;
+        }
+    }
+    guard.check().await?;
+    info!(
+        task_id = task.id,
+        backend = ?payload.backend,
+        audit_event_id = %payload.audit_event_id,
+        "RepairRun task completed"
+    );
+    Ok(())
 }
 
 async fn check_execution_lease(

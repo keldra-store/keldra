@@ -1808,10 +1808,9 @@ impl AdminService for AppState {
         let audit_event_id = audit_event_id(&principal, context);
 
         let response = match req.repair_kind {
-            1 => run_index_repair(self, &request_id, &audit_event_id, &req).await?,
-            2 => run_directory_index_repair(self, &request_id, &audit_event_id, &req).await?,
-            3 => run_authz_derived_index_repair(self, &request_id, &audit_event_id, &req).await?,
-            4 => run_personaldb_log_chain_repair(self, &request_id, &audit_event_id, &req).await?,
+            1..=4 => {
+                enqueue_product_repair(self, &principal, context, &audit_event_id, &req).await?
+            }
             5 => run_mesh_routing_projection_repair(self, &request_id, &audit_event_id).await?,
             _ => {
                 return Err(Status::invalid_argument(
@@ -1819,21 +1818,23 @@ impl AdminService for AppState {
                 ));
             }
         };
-        record_admin_audit_event(
-            self,
-            &principal,
-            context,
-            "admin.repair.run",
-            &response.repair_task_id,
-            json!({
-                "repair_kind": req.repair_kind,
-                "scope_kind": &response.scope_kind,
-                "scope_id": &response.scope_id,
-                "status": &response.status,
-                "repair_task_details_json": &response.details_json,
-            }),
-        )
-        .await?;
+        if req.repair_kind == 5 {
+            record_admin_audit_event(
+                self,
+                &principal,
+                context,
+                "admin.repair.run",
+                &response.repair_task_id,
+                json!({
+                    "repair_kind": req.repair_kind,
+                    "scope_kind": &response.scope_kind,
+                    "scope_id": &response.scope_id,
+                    "status": &response.status,
+                    "repair_task_details_json": &response.details_json,
+                }),
+            )
+            .await?;
+        }
 
         Ok(Response::new(response))
     }

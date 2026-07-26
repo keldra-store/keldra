@@ -145,6 +145,144 @@ pub(super) async fn run_index_repair(
     })
 }
 
+pub(super) async fn enqueue_product_repair(
+    state: &AppState,
+    principal: &AdminPrincipal,
+    context: &AdminRequestContext,
+    audit_event_id: &str,
+    req: &RunRepairRequest,
+) -> Result<RepairTaskResponse, Status> {
+    use crate::tasks::{RepairRunBackend, RepairRunTaskPayload};
+
+    let tenant_id = resolve_tenant_id(state, &req.tenant_id).await?;
+    let (backend, bucket_name, index_name, derived_index_id, database_id, scope_kind, scope_id) =
+        match req.repair_kind {
+            1 => {
+                require_nonempty_admin_field(&req.bucket_name, "bucket_name")?;
+                require_nonempty_admin_field(&req.index_name, "index_name")?;
+                let bucket = state
+                    .persistence
+                    .get_bucket_by_name(tenant_id, &req.bucket_name)
+                    .await
+                    .map_err(|error| Status::internal(error.to_string()))?
+                    .ok_or_else(|| Status::not_found("Bucket not found"))?;
+                (
+                    RepairRunBackend::Index,
+                    Some(req.bucket_name.clone()),
+                    Some(req.index_name.clone()),
+                    None,
+                    None,
+                    "index",
+                    format!(
+                        "tenant-{tenant_id}-bucket-{}-index-{}",
+                        bucket.id, req.index_name
+                    ),
+                )
+            }
+            2 => {
+                require_nonempty_admin_field(&req.bucket_name, "bucket_name")?;
+                let bucket = state
+                    .persistence
+                    .get_bucket_by_name(tenant_id, &req.bucket_name)
+                    .await
+                    .map_err(|error| Status::internal(error.to_string()))?
+                    .ok_or_else(|| Status::not_found("Bucket not found"))?;
+                (
+                    RepairRunBackend::DirectoryIndex,
+                    Some(req.bucket_name.clone()),
+                    None,
+                    None,
+                    None,
+                    "bucket",
+                    format!("tenant-{tenant_id}-bucket-{}", bucket.id),
+                )
+            }
+            3 => {
+                require_nonempty_admin_field(&req.derived_index_id, "derived_index_id")?;
+                (
+                    RepairRunBackend::AuthzDerivedIndex,
+                    None,
+                    None,
+                    Some(req.derived_index_id.clone()),
+                    None,
+                    "authz_derived_index",
+                    format!("tenant-{tenant_id}-authz-{}", req.derived_index_id),
+                )
+            }
+            4 => {
+                require_nonempty_admin_field(&req.database_id, "database_id")?;
+                (
+                    RepairRunBackend::PersonalDbLogChain,
+                    None,
+                    None,
+                    None,
+                    Some(req.database_id.clone()),
+                    "personaldb",
+                    format!("tenant-{tenant_id}-database-{}", req.database_id),
+                )
+            }
+            _ => {
+                return Err(Status::invalid_argument(
+                    "product repair kind must be between 1 and 4",
+                ));
+            }
+        };
+    let payload = RepairRunTaskPayload {
+        backend,
+        tenant_id,
+        bucket_name,
+        index_name,
+        derived_index_id,
+        database_id,
+        rebuild: req.rebuild,
+        audit_event_id: audit_event_id.to_string(),
+        request_id: context.request_id.clone(),
+    };
+    payload
+        .validate()
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    let event = build_admin_audit_event(
+        principal,
+        context,
+        "admin.repair.run",
+        audit_event_id,
+        json!({
+            "repair_kind": req.repair_kind,
+            "scope_kind": scope_kind,
+            "scope_id": &scope_id,
+            "status": "pending",
+            "repair_backend": backend,
+        }),
+    )?;
+    let task = state
+        .persistence
+        .enqueue_repair_run(&payload, 0, &event)
+        .await
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    let repair_task_id = format!("repair-run-{}", task.id);
+    let status = match task.status {
+        crate::tasks::TaskStatus::Pending => "pending",
+        crate::tasks::TaskStatus::Running => "running",
+        crate::tasks::TaskStatus::Completed => "completed",
+        crate::tasks::TaskStatus::Failed => "failed",
+    };
+    Ok(RepairTaskResponse {
+        request_id: context.request_id.clone(),
+        repair_task_id,
+        status: status.to_string(),
+        scope_kind: scope_kind.to_string(),
+        scope_id,
+        findings: Vec::new(),
+        audit_event_id: audit_event_id.to_string(),
+        details_json: json!({
+            "repair_kind": req.repair_kind,
+            "repair_backend": backend,
+            "rebuild": req.rebuild,
+        })
+        .to_string(),
+    })
+}
+
 pub(super) async fn run_directory_index_repair(
     state: &AppState,
     request_id: &str,

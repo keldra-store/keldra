@@ -209,6 +209,8 @@ pub(super) struct TaskMutation<'a> {
     initial: BTreeMap<Vec<u8>, RowSnapshot>,
     desired: BTreeMap<Vec<u8>, Option<TaskQueueRow>>,
     audit: Vec<TaskAuditEvent>,
+    external_mutations: Vec<ProductMutation>,
+    outbox_events: Vec<crate::mvcc_outbox::StreamOutboxEvent>,
 }
 
 impl<'a> TaskMutation<'a> {
@@ -221,6 +223,8 @@ impl<'a> TaskMutation<'a> {
             initial: BTreeMap::new(),
             desired: BTreeMap::new(),
             audit: Vec::new(),
+            external_mutations: Vec::new(),
+            outbox_events: Vec::new(),
         })
     }
 
@@ -264,8 +268,21 @@ impl<'a> TaskMutation<'a> {
         self.additional_predicates.push(predicate);
     }
 
+    pub fn transaction_id(&self) -> &str {
+        &self.transaction_id
+    }
+
+    pub fn add_product_plan(&mut self, plan: crate::mvcc_product::ProductMutationPlan) {
+        self.external_mutations.extend(plan.mutations);
+        self.outbox_events.extend(plan.outbox_events);
+    }
+
     pub async fn commit(mut self) -> Result<()> {
-        if self.desired.is_empty() && self.audit.is_empty() {
+        if self.desired.is_empty()
+            && self.audit.is_empty()
+            && self.external_mutations.is_empty()
+            && self.outbox_events.is_empty()
+        {
             return Ok(());
         }
         let desired_keys = self.desired.keys().cloned().collect::<Vec<_>>();
@@ -273,7 +290,7 @@ impl<'a> TaskMutation<'a> {
             self.ensure_snapshot(&key)?;
         }
         let created_at_unix_nanos = current_unix_nanos()?;
-        let mut mutations = Vec::new();
+        let mut mutations = std::mem::take(&mut self.external_mutations);
         let mut predicates = std::mem::take(&mut self.additional_predicates);
         for (key, desired) in &self.desired {
             let snapshot = self
@@ -300,7 +317,14 @@ impl<'a> TaskMutation<'a> {
         if mutations.is_empty() {
             return Ok(());
         }
-        commit_task_mutation(self.store.mvcc, &self.transaction_id, mutations, predicates).await
+        commit_task_mutation(
+            self.store.mvcc,
+            &self.transaction_id,
+            mutations,
+            predicates,
+            self.outbox_events,
+        )
+        .await
     }
 
     fn plan_audit_events(
@@ -379,6 +403,7 @@ async fn commit_task_mutation(
     idempotency_key: &str,
     mutations: Vec<ProductMutation>,
     predicates: Vec<(LogicalKey, PredicateKind)>,
+    outbox_events: Vec<crate::mvcc_outbox::StreamOutboxEvent>,
 ) -> Result<()> {
     let principal = task_queue_partition_principal();
     let assignment = mvcc
@@ -406,6 +431,10 @@ async fn commit_task_mutation(
         mvcc.stage_product_mutations(&handle.transaction_id, &principal, mutations, now)?;
         for (key, kind) in predicates {
             mvcc.stage_predicate(&handle.transaction_id, &principal, key, kind, now)?;
+        }
+        for event in outbox_events {
+            mvcc.open_transactions
+                .add_stream_event(&handle.transaction_id, event, now)?;
         }
         mvcc.stage_assignment_guard(&handle.transaction_id, &principal, &assignment, now)?;
     }

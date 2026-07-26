@@ -75,6 +75,40 @@ impl Persistence {
         .await
     }
 
+    pub async fn enqueue_repair_run(
+        &self,
+        payload: &crate::tasks::RepairRunTaskPayload,
+        priority: i32,
+        audit_event: &crate::admin_audit::AdminAuditEvent,
+    ) -> Result<TaskRecord> {
+        payload.validate()?;
+        let permit = self.task_queue_write_permit().await?;
+        let task = task_journal::enqueue_repair_run_with_permit(
+            self.mvcc()?,
+            payload,
+            priority,
+            &permit,
+            audit_event,
+        )
+        .await?;
+        self.notify_task_enqueued();
+        Ok(task)
+    }
+
+    pub fn repair_run_status(&self, repair_task_id: &str) -> Result<Option<TaskRecord>> {
+        let task_id = repair_task_id
+            .strip_prefix("repair-run-")
+            .ok_or_else(|| anyhow!("repair task id must use repair-run-<id>"))?
+            .parse::<i64>()
+            .context("repair task id has an invalid numeric id")?;
+        let task = task_journal::get_task(self.mvcc()?, task_id)?;
+        match task {
+            Some(task) if task.task_type == crate::tasks::TaskType::RepairRun => Ok(Some(task)),
+            Some(_) => Err(anyhow!("repair task id names a different task type")),
+            None => Ok(None),
+        }
+    }
+
     pub(crate) async fn owns_rebalance_shard_scheduler(&self) -> Result<bool> {
         match self.task_queue_write_permit().await {
             Ok(permit) => Ok(permit.owner_node_id == self.owner_node_id),

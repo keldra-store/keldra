@@ -6,6 +6,7 @@ pub enum TaskType {
     ObjectMetadataCompaction,
     IndexBuild,
     RebalanceShard,
+    RepairRun,
     HFIngestion,
     AuthzMaterialization,
 }
@@ -18,10 +19,99 @@ impl TaskType {
             Self::ObjectMetadataCompaction => "OBJECT_METADATA_COMPACTION",
             Self::IndexBuild => "INDEX_BUILD",
             Self::RebalanceShard => "REBALANCE_SHARD",
+            Self::RepairRun => "REPAIR_RUN",
             Self::HFIngestion => "HF_INGESTION",
             Self::AuthzMaterialization => "AUTHZ_MATERIALIZATION",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairRunBackend {
+    Index,
+    DirectoryIndex,
+    AuthzDerivedIndex,
+    PersonalDbLogChain,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepairRunTaskPayload {
+    pub backend: RepairRunBackend,
+    pub tenant_id: i64,
+    pub bucket_name: Option<String>,
+    pub index_name: Option<String>,
+    pub derived_index_id: Option<String>,
+    pub database_id: Option<String>,
+    pub rebuild: bool,
+    pub audit_event_id: String,
+    pub request_id: String,
+}
+
+impl RepairRunTaskPayload {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.tenant_id <= 0 {
+            return Err(anyhow::anyhow!("RepairRun tenant_id must be positive"));
+        }
+        require_repair_identity(&self.audit_event_id, "audit_event_id")?;
+        require_repair_identity(&self.request_id, "request_id")?;
+        let present = |value: &Option<String>| {
+            value.as_deref().is_some_and(|value| {
+                !value.trim().is_empty() && !value.chars().any(char::is_control)
+            })
+        };
+        let valid = match self.backend {
+            RepairRunBackend::Index => {
+                present(&self.bucket_name)
+                    && present(&self.index_name)
+                    && self.derived_index_id.is_none()
+                    && self.database_id.is_none()
+            }
+            RepairRunBackend::DirectoryIndex => {
+                present(&self.bucket_name)
+                    && self.index_name.is_none()
+                    && self.derived_index_id.is_none()
+                    && self.database_id.is_none()
+            }
+            RepairRunBackend::AuthzDerivedIndex => {
+                self.bucket_name.is_none()
+                    && self.index_name.is_none()
+                    && present(&self.derived_index_id)
+                    && self.database_id.is_none()
+            }
+            RepairRunBackend::PersonalDbLogChain => {
+                self.bucket_name.is_none()
+                    && self.index_name.is_none()
+                    && self.derived_index_id.is_none()
+                    && present(&self.database_id)
+            }
+        };
+        if !valid {
+            return Err(anyhow::anyhow!(
+                "RepairRun payload fields do not match its backend"
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn scope_kind(&self) -> &'static str {
+        match self.backend {
+            RepairRunBackend::Index => "index",
+            RepairRunBackend::DirectoryIndex => "bucket",
+            RepairRunBackend::AuthzDerivedIndex => "authz_derived_index",
+            RepairRunBackend::PersonalDbLogChain => "personaldb",
+        }
+    }
+}
+
+fn require_repair_identity(value: &str, field: &'static str) -> anyhow::Result<()> {
+    if value.trim().is_empty() || value.chars().any(char::is_control) {
+        return Err(anyhow::anyhow!(
+            "RepairRun {field} must be a nonempty stable identity"
+        ));
+    }
+    Ok(())
 }
 
 /// Durable canonical manifest identity; workers re-probe effective placements at execution time.
@@ -364,5 +454,32 @@ mod tests {
         assert_eq!(outcome.unresolved_placements(), &[unresolved]);
         assert!(RebalanceShardTaskOutcome::repaired(vec![repaired]).is_ok());
         assert!(RebalanceShardTaskOutcome::retryable(Vec::new(), Vec::new()).is_err());
+    }
+
+    #[test]
+    fn repair_run_payload_accepts_exact_backend_fields_only() {
+        let payload = RepairRunTaskPayload {
+            backend: RepairRunBackend::Index,
+            tenant_id: 7,
+            bucket_name: Some("documents".to_string()),
+            index_name: Some("search".to_string()),
+            derived_index_id: None,
+            database_id: None,
+            rebuild: true,
+            audit_event_id: "audit:admin:req-1".to_string(),
+            request_id: "req-1".to_string(),
+        };
+        payload.validate().unwrap();
+        assert_eq!(payload.scope_kind(), "index");
+
+        let mut invalid = payload.clone();
+        invalid.database_id = Some("db-1".to_string());
+        assert!(invalid.validate().is_err());
+
+        let encoded = serde_json::to_value(&payload).unwrap();
+        assert_eq!(
+            serde_json::from_value::<RepairRunTaskPayload>(encoded).unwrap(),
+            payload
+        );
     }
 }

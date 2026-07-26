@@ -82,6 +82,7 @@ pub struct AdminAuditEventPage {
 /// security-control audit events. Cluster product consequences must use
 /// `admin_audit_mvcc_plan` in their originating transaction.
 pub async fn append_audit_event(storage: &Storage, event: &AdminAuditEvent) -> Result<()> {
+    require_direct_audit_action(event)?;
     let core_store = CoreStore::new(storage.clone()).await?;
     let stream_id = audit_stream_id(&event.audit_event_id);
     let stream_precondition = core_store.stream_head_precondition(&stream_id).await?;
@@ -122,6 +123,49 @@ pub async fn append_audit_event(storage: &Storage, event: &AdminAuditEvent) -> R
             operations,
         })
         .await?;
+    Ok(())
+}
+
+/// Contract for the deliberately small set of control-plane consequences that
+/// are outside a cluster MVCC transaction. Product mutations must compose
+/// `admin_audit_mvcc_plan` into the transaction that changes their state.
+pub fn require_direct_audit_action(event: &AdminAuditEvent) -> Result<()> {
+    let allowed = matches!(
+        event.action.as_str(),
+        "admin.app.policy.grant"
+            | "admin.app.policy.revoke"
+            | "admin.cell.activate"
+            | "admin.cell.drain"
+            | "admin.cell.register"
+            | "admin.cell.remove"
+            | "admin.host_alias.activate"
+            | "admin.host_alias.create"
+            | "admin.host_alias.delete"
+            | "admin.host_alias.suspend"
+            | "admin.node.activate"
+            | "admin.node.drain"
+            | "admin.node.force_offline"
+            | "admin.node.register"
+            | "admin.node.remove"
+            | "admin.region.activate"
+            | "admin.region.bucket_disposition"
+            | "admin.region.create"
+            | "admin.region.drain"
+            | "admin.region.read_only.set"
+            | "admin.region.remove"
+            | "admin.routing_record.repair"
+            | "admin.secret_encryption_key.rotate"
+    ) || (event.action == "admin.repair.run"
+        && serde_json::from_str::<serde_json::Value>(&event.details_json)
+            .ok()
+            .and_then(|details| details.get("repair_kind").and_then(|kind| kind.as_i64()))
+            == Some(5));
+    if !allowed {
+        return Err(anyhow!(
+            "admin action {} must publish audit in its originating cluster MVCC transaction",
+            event.action
+        ));
+    }
     Ok(())
 }
 
@@ -437,16 +481,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn direct_audit_contract_keeps_product_repairs_inside_mvcc() {
+        let mut repair = event("audit-1", "admin-1", "repair-1", "admin.repair.run");
+        repair.details_json = serde_json::json!({ "repair_kind": 1 }).to_string();
+        assert!(require_direct_audit_action(&repair).is_err());
+
+        repair.details_json = serde_json::json!({ "repair_kind": 5 }).to_string();
+        assert!(require_direct_audit_action(&repair).is_ok());
+
+        let product = event("audit-2", "admin-1", "tenant-1", "admin.tenant.create");
+        assert!(require_direct_audit_action(&product).is_err());
+    }
+
     #[tokio::test]
     async fn audit_events_are_durable_and_filterable() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        append_audit_event(&storage, &event("audit-a", "admin-a", "bucket-a", "create"))
-            .await
-            .unwrap();
-        append_audit_event(&storage, &event("audit-b", "admin-b", "bucket-b", "delete"))
-            .await
-            .unwrap();
+        append_audit_event(
+            &storage,
+            &event("audit-a", "admin-a", "bucket-a", "admin.node.activate"),
+        )
+        .await
+        .unwrap();
+        append_audit_event(
+            &storage,
+            &event("audit-b", "admin-b", "bucket-b", "admin.node.drain"),
+        )
+        .await
+        .unwrap();
 
         let raw = CoreStore::new(storage.clone())
             .await
@@ -471,7 +534,7 @@ mod tests {
             AuditEventFilter {
                 principal_id: Some("admin-a"),
                 resource_id: Some("bucket-a"),
-                action: Some("create"),
+                action: Some("admin.node.activate"),
             },
             None,
             10,
@@ -493,7 +556,7 @@ mod tests {
                     &format!("noise-{index:03}"),
                     "unrelated",
                     "other-bucket",
-                    "read",
+                    "admin.node.drain",
                 ),
             )
             .await
@@ -506,7 +569,7 @@ mod tests {
                     &format!("target-{index:03}"),
                     "admin-a",
                     "bucket-a",
-                    "create",
+                    "admin.node.activate",
                 ),
             )
             .await
@@ -516,7 +579,7 @@ mod tests {
         let filter = AuditEventFilter {
             principal_id: Some("admin-a"),
             resource_id: Some("bucket-a"),
-            action: Some("create"),
+            action: Some("admin.node.activate"),
         };
         let first = list_audit_event_page_after(&storage, filter.clone(), None, 2)
             .await

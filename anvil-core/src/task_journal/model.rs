@@ -294,6 +294,7 @@ enum TaskTypeProto {
     RebalanceShard = 5,
     HfIngestion = 6,
     AuthzMaterialization = 7,
+    RepairRun = 8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
@@ -793,6 +794,7 @@ fn task_order_from_proto(proto: TaskOrderProto) -> Result<TaskOrder> {
 }
 
 fn task_record_to_proto(task: &TaskRecord) -> Result<TaskRecordProto> {
+    validate_task_payload(task.task_type, &task.payload)?;
     Ok(TaskRecordProto {
         id: task.id,
         task_type: task_type_to_proto(task.task_type) as i32,
@@ -808,7 +810,7 @@ fn task_record_to_proto(task: &TaskRecord) -> Result<TaskRecordProto> {
 }
 
 fn task_record_from_proto(proto: TaskRecordProto) -> Result<TaskRecord> {
-    Ok(TaskRecord {
+    let task = TaskRecord {
         id: require_task_id(proto.id)?,
         task_type: task_type_from_proto(proto.task_type)?,
         payload: json_value_from_proto(
@@ -823,7 +825,18 @@ fn task_record_from_proto(proto: TaskRecordProto) -> Result<TaskRecord> {
         scheduled_at: parse_time(&proto.scheduled_at, "scheduled_at")?,
         created_at: parse_time(&proto.created_at, "created_at")?,
         updated_at: parse_time(&proto.updated_at, "updated_at")?,
-    })
+    };
+    validate_task_payload(task.task_type, &task.payload)?;
+    Ok(task)
+}
+
+fn validate_task_payload(task_type: TaskType, payload: &JsonValue) -> Result<()> {
+    if task_type == TaskType::RepairRun {
+        serde_json::from_value::<crate::tasks::RepairRunTaskPayload>(payload.clone())
+            .context("decode RepairRun task payload")?
+            .validate()?;
+    }
+    Ok(())
 }
 
 fn task_type_to_proto(value: TaskType) -> TaskTypeProto {
@@ -835,6 +848,7 @@ fn task_type_to_proto(value: TaskType) -> TaskTypeProto {
         TaskType::RebalanceShard => TaskTypeProto::RebalanceShard,
         TaskType::HFIngestion => TaskTypeProto::HfIngestion,
         TaskType::AuthzMaterialization => TaskTypeProto::AuthzMaterialization,
+        TaskType::RepairRun => TaskTypeProto::RepairRun,
     }
 }
 
@@ -851,6 +865,7 @@ fn task_type_from_proto(value: i32) -> Result<TaskType> {
             TaskTypeProto::RebalanceShard => TaskType::RebalanceShard,
             TaskTypeProto::HfIngestion => TaskType::HFIngestion,
             TaskTypeProto::AuthzMaterialization => TaskType::AuthzMaterialization,
+            TaskTypeProto::RepairRun => TaskType::RepairRun,
         },
     )
 }

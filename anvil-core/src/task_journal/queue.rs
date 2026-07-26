@@ -15,7 +15,7 @@ use crate::{
     task_lease::STALE_FENCE,
     tasks::{TaskStatus, TaskType},
 };
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
 
@@ -52,6 +52,83 @@ pub(crate) async fn enqueue_task_if_absent_with_permit(
 ) -> Result<bool> {
     require_task_queue_permit(mvcc, permit)?;
     enqueue_generic(mvcc, task_type, payload, priority, true, permit.fence_token).await
+}
+
+pub(crate) async fn enqueue_repair_run_with_permit(
+    mvcc: &MvccSubsystem,
+    payload: &crate::tasks::RepairRunTaskPayload,
+    priority: i32,
+    permit: &PartitionWritePermit,
+    audit_event: &crate::admin_audit::AdminAuditEvent,
+) -> Result<TaskRecord> {
+    require_task_queue_permit(mvcc, permit)?;
+    payload.validate()?;
+    if audit_event.audit_event_id != payload.audit_event_id
+        || audit_event.request_id != payload.request_id
+        || audit_event.action != "admin.repair.run"
+    {
+        bail!("RepairRun audit identity does not match its task payload");
+    }
+    let payload_json = serde_json::to_value(payload).context("serialize RepairRun task payload")?;
+    let dedupe_hash = task_identity_hash(
+        TaskType::RepairRun,
+        &serde_json::json!({ "audit_event_id": payload.audit_event_id }),
+    )?;
+    for attempt in 0..max_queue_cas_attempts() {
+        let mut mutation = TaskMutation::new(mvcc, permit.fence_token)?;
+        if let Some(existing) = live_dedupe_task(&mut mutation, &dedupe_hash)? {
+            if existing.task.payload != payload_json {
+                bail!("RepairRun idempotency identity was reused with a different payload");
+            }
+            return Ok(existing.task);
+        }
+        let task_id = reserve_task_id(&mut mutation)?;
+        let now = Utc::now();
+        let entry = TaskEntry {
+            task: TaskRecord {
+                id: task_id,
+                task_type: TaskType::RepairRun,
+                payload: payload_json.clone(),
+                priority,
+                status: TaskStatus::Pending,
+                attempts: 0,
+                last_error: None,
+                scheduled_at: now,
+                created_at: now,
+                updated_at: now,
+            },
+            dedupe_hash: Some(dedupe_hash.clone()),
+            group: None,
+        };
+        mutation.put(current_key(task_id)?, TaskQueueRow::Task(entry.clone()))?;
+        add_pending_projection(&mut mutation, &entry)?;
+        mutation.put(
+            dedupe_key(&dedupe_hash)?,
+            TaskQueueRow::Dedupe(LiveDedupeHead {
+                dedupe_hash: dedupe_hash.clone(),
+                task_id,
+            }),
+        )?;
+        mutation.audit(TaskAuditEvent::Enqueued {
+            task: entry.task.clone(),
+        });
+        let transaction_id = mutation.transaction_id().to_string();
+        mutation.add_product_plan(crate::admin_audit::admin_audit_mvcc_plan(
+            audit_event,
+            crate::admin_audit::audit_event_revision_generation(audit_event).max(1),
+            &transaction_id,
+        )?);
+        match mutation.commit().await {
+            Ok(()) => return Ok(entry.task),
+            Err(error)
+                if attempt + 1 < max_queue_cas_attempts() && is_queue_cas_conflict(&error) =>
+            {
+                tokio::task::yield_now().await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("bounded RepairRun enqueue loop returns on its final attempt")
 }
 
 pub(crate) async fn enqueue_index_build_task_with_permit(
@@ -340,6 +417,12 @@ pub(crate) async fn list_tasks_page(
     page_size: usize,
 ) -> Result<crate::persistence::TaskPage> {
     QueueStore::open(mvcc)?.list_tasks_page(after_tuple_key, page_size)
+}
+
+pub(crate) fn get_task(mvcc: &MvccSubsystem, task_id: i64) -> Result<Option<TaskRecord>> {
+    Ok(QueueStore::open(mvcc)?
+        .read_task(task_id)?
+        .map(|entry| entry.task))
 }
 
 pub(crate) async fn has_due_tasks(mvcc: &MvccSubsystem) -> Result<bool> {
@@ -783,6 +866,12 @@ fn retire_superseded_task(mutation: &mut TaskMutation, mut entry: TaskEntry) -> 
 }
 
 fn release_dedupe(mutation: &mut TaskMutation, entry: &TaskEntry) -> Result<()> {
+    // Admin RepairRun is request-idempotent for its full lifetime. Retaining
+    // this head makes a replay return the original terminal task and stable ID
+    // rather than executing the repair again.
+    if entry.task.task_type == TaskType::RepairRun {
+        return Ok(());
+    }
     let Some(hash) = entry.dedupe_hash.as_ref() else {
         return Ok(());
     };
