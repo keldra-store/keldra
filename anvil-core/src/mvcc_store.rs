@@ -954,6 +954,19 @@ impl MvccStore {
         })
     }
 
+    pub fn shard_repair_record(&self, job_id: &str) -> Result<Option<ShardRepairRecord>> {
+        if job_id.trim().is_empty() {
+            bail!("shard repair job ID is required");
+        }
+        self.db
+            .get_cf(
+                self.cf(CF_MATERIALISATION)?,
+                self.key(format!("shard-repair/{job_id}").as_bytes()),
+            )?
+            .map(|bytes| serde_json::from_slice(&bytes).map_err(Into::into))
+            .transpose()
+    }
+
     pub fn has_incomplete_object_materialisations(&self) -> Result<bool> {
         let cf = self.cf(CF_MATERIALISATION)?;
         let prefix = self.key(b"object-job/");

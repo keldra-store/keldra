@@ -583,6 +583,8 @@ pub struct ShardRepairRunner {
     mvcc: Arc<crate::mvcc_bootstrap::MvccSubsystem>,
     worker_id: String,
     lease_ms: u64,
+    #[cfg(test)]
+    prepared_replacement: Option<PhysicalObjectShardManifest>,
 }
 
 impl ShardRepairRunner {
@@ -598,7 +600,15 @@ impl ShardRepairRunner {
             mvcc,
             worker_id,
             lease_ms: 30_000,
+            #[cfg(test)]
+            prepared_replacement: None,
         })
+    }
+
+    #[cfg(test)]
+    fn with_prepared_replacement(mut self, replacement: PhysicalObjectShardManifest) -> Self {
+        self.prepared_replacement = Some(replacement);
+        self
     }
 
     pub async fn run(self, mut shutdown: watch::Receiver<bool>) {
@@ -730,6 +740,12 @@ impl ShardRepairRunner {
                 return Ok(());
             }
         }
+        #[cfg(test)]
+        if let Some(replacement) = &self.prepared_replacement {
+            return self
+                .apply_replacement(job, replacement.clone(), guard)
+                .await;
+        }
         let payload = Arc::new(std::sync::Mutex::new(Vec::new()));
         job.source_manifest
             .read_range_chunks(
@@ -806,15 +822,49 @@ impl ShardRepairRunner {
                 placement.node_incarnation,
             )
         });
+        self.apply_replacement(job, replacement, guard).await
+    }
+
+    async fn apply_replacement(
+        &self,
+        job: &ShardRepairJob,
+        replacement: PhysicalObjectShardManifest,
+        guard: &crate::mvcc_worker_authority::AssignmentGuard,
+    ) -> Result<()> {
         replacement.validate()?;
+        for missing in &job.missing {
+            if !replacement.placements.iter().any(|placement| {
+                placement.stripe_ordinal == missing.stripe_ordinal
+                    && placement.shard_ordinal == missing.shard_ordinal
+                    && placement.node_id == missing.target.node.node_id
+                    && placement.node_incarnation == missing.target.node.incarnation
+                    && placement.failure_domain == missing.target.failure_domain
+            }) {
+                bail!("replacement manifest does not contain every acknowledged repair target");
+            }
+        }
+        for retiring in &job.retiring {
+            if replacement.placements.iter().any(|placement| {
+                placement.stripe_ordinal == retiring.stripe_ordinal
+                    && placement.shard_ordinal == retiring.shard_ordinal
+                    && placement.node_id == retiring.node_id
+                    && placement.node_incarnation == retiring.node_incarnation
+                    && placement.failure_domain == retiring.failure_domain
+            }) {
+                bail!("retiring placement remains live in the replacement manifest");
+            }
+        }
         self.mvcc.validate_assignment(guard)?;
-        self.publish_overlay(job, replacement).await
+        #[cfg(test)]
+        crate::mvcc_fault_injection::hit(crate::mvcc_fault_injection::FaultPoint::RepairApply)?;
+        self.publish_overlay(job, replacement, guard).await
     }
 
     async fn publish_overlay(
         &self,
         job: &ShardRepairJob,
         mut replacement_manifest: PhysicalObjectShardManifest,
+        guard: &crate::mvcc_worker_authority::AssignmentGuard,
     ) -> Result<()> {
         let principal = format!("shard-repair/{}", self.worker_id);
         let handle = self
@@ -831,6 +881,12 @@ impl ShardRepairRunner {
                 now_unix_ms(),
             )
             .await?;
+        self.mvcc.stage_assignment_guard(
+            &handle.transaction_id,
+            &principal,
+            guard,
+            now_unix_ms(),
+        )?;
         let source_manifest_hash = job.source_manifest_hash.clone();
         let overlay_key = crate::mvcc_transaction::LogicalKey {
             table_id: ShardPlacementOverlay::TABLE_ID,
@@ -1004,12 +1060,33 @@ fn now_unix_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        path::Path,
+        sync::{Arc, Mutex},
+    };
+
     use super::*;
     use crate::{
-        mvcc_transaction::NodeIncarnation,
+        Config,
+        mvcc_bootstrap::MvccSubsystem,
+        mvcc_fault_injection::{self, DeterministicFaults, FaultPoint},
+        mvcc_transaction::{
+            HierarchicalRangeStampScheme, NodeIncarnation, TransactionBundleBuilder,
+        },
         object_shard_manifest::{OBJECT_SHARD_MANIFEST_SCHEMA, PhysicalShardPlacement},
     };
+    use tempfile::TempDir;
     use uuid::Uuid;
+
+    static REPAIR_EXECUTION_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct ClearFaults;
+
+    impl Drop for ClearFaults {
+        fn drop(&mut self) {
+            mvcc_fault_injection::clear();
+        }
+    }
 
     fn job() -> ShardRepairJob {
         let source = PhysicalObjectShardManifest {
@@ -1060,6 +1137,310 @@ mod tests {
             originating_snapshot_version: 4,
             requested_at_unix_ms: 10,
         }
+    }
+
+    fn test_config(path: &Path) -> Config {
+        Config {
+            node_id: "node-a".into(),
+            public_api_addr: "127.0.0.1:50051".into(),
+            storage_path: path.to_string_lossy().into_owned(),
+            mvcc_cluster_id: "cluster".into(),
+            allow_test_only_insecure_mvcc_transport: true,
+            anvil_secret_encryption_key:
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            ..Config::default()
+        }
+    }
+
+    async fn test_subsystem() -> (TempDir, Arc<MvccSubsystem>) {
+        let directory = tempfile::tempdir().unwrap();
+        let coremeta =
+            crate::core_store::CoreMetaStore::open(directory.path().join("coremeta")).unwrap();
+        let subsystem =
+            MvccSubsystem::bootstrap(&test_config(directory.path()), coremeta.database())
+                .await
+                .unwrap();
+        (directory, Arc::new(subsystem))
+    }
+
+    fn replacement_for(job: &ShardRepairJob) -> PhysicalObjectShardManifest {
+        let mut replacement = job.source_manifest.clone();
+        for missing in &job.missing {
+            replacement.placements.retain(|placement| {
+                (placement.stripe_ordinal, placement.shard_ordinal)
+                    != (missing.stripe_ordinal, missing.shard_ordinal)
+            });
+            replacement.placements.push(PhysicalShardPlacement {
+                stripe_ordinal: missing.stripe_ordinal,
+                shard_ordinal: missing.shard_ordinal,
+                payload_length: replacement.shard_bytes,
+                payload_hash: [9; 32],
+                transfer_id: Uuid::from_u128(
+                    100 + u128::from(missing.stripe_ordinal) * 10
+                        + u128::from(missing.shard_ordinal),
+                ),
+                node_id: missing.target.node.node_id.clone(),
+                node_incarnation: missing.target.node.incarnation,
+                failure_domain: missing.target.failure_domain.clone(),
+            });
+        }
+        replacement.placements.sort_by_key(|placement| {
+            (
+                placement.stripe_ordinal,
+                placement.shard_ordinal,
+                placement.node_id.clone(),
+            )
+        });
+        replacement.validate().unwrap();
+        replacement
+    }
+
+    fn rebalance_job() -> ShardRepairJob {
+        let mut job = job();
+        let retiring = job.source_manifest.placements[0].clone();
+        job.kind = ShardMaintenanceKind::Rebalance;
+        job.missing = vec![MissingShardTarget {
+            stripe_ordinal: retiring.stripe_ordinal,
+            shard_ordinal: retiring.shard_ordinal,
+            target: ShardTarget {
+                cluster_id: "cluster".into(),
+                node: NodeIncarnation {
+                    node_id: "node-b".into(),
+                    incarnation: 2,
+                },
+                failure_domain: "zone-b".into(),
+            },
+        }];
+        job.retiring = vec![retiring];
+        job
+    }
+
+    fn seed_job(subsystem: &MvccSubsystem, job: &ShardRepairJob) -> String {
+        let mut builder = TransactionBundleBuilder::new(
+            &job.cluster_id,
+            &job.transaction_id,
+            subsystem.runtime.local_store().applied_version().unwrap(),
+            "repair-test",
+            HierarchicalRangeStampScheme::new(),
+        );
+        builder.add_materialisation_job(job.canonical_bytes().unwrap());
+        let bundle = builder.build().unwrap();
+        let version = subsystem
+            .runtime
+            .local_store()
+            .applied_version()
+            .unwrap()
+            .saturating_add(1);
+        subsystem
+            .runtime
+            .local_store()
+            .apply_certified_bundle(version, &bundle)
+            .unwrap();
+        job.job_id().unwrap()
+    }
+
+    async fn assign_job(subsystem: &MvccSubsystem, job: &ShardRepairJob) {
+        assert!(
+            subsystem
+                .reconcile_work_assignment("shard-repair", &job.target_logical_identity)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    async fn wait_for_overlay(
+        subsystem: &MvccSubsystem,
+        job: &ShardRepairJob,
+    ) -> ShardPlacementOverlay {
+        let key = placement_overlay_key(&job.source_manifest);
+        for _ in 0..200 {
+            if let Some(row) = subsystem.runtime.local_store().read_latest(&key).unwrap() {
+                return serde_json::from_slice(&row.value).unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("repair overlay was not applied");
+    }
+
+    #[tokio::test]
+    async fn runner_successfully_commits_overlay_and_completes_durable_record() {
+        let _serial = REPAIR_EXECUTION_TEST_LOCK.lock().unwrap();
+        let (_directory, subsystem) = test_subsystem().await;
+        let job = job();
+        let job_id = seed_job(&subsystem, &job);
+        assign_job(&subsystem, &job).await;
+        let runner = ShardRepairRunner::new(subsystem.clone(), "worker-a")
+            .unwrap()
+            .with_prepared_replacement(replacement_for(&job));
+
+        assert!(runner.run_once(10).await.unwrap());
+        assert_eq!(
+            subsystem
+                .runtime
+                .local_store()
+                .shard_repair_record(&job_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            ShardRepairState::Complete
+        );
+        let overlay = wait_for_overlay(&subsystem, &job).await;
+        assert_eq!(overlay.replacement_manifest, replacement_for(&job));
+        subsystem.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn duplicate_runner_execution_has_one_effect() {
+        let _serial = REPAIR_EXECUTION_TEST_LOCK.lock().unwrap();
+        let (_directory, subsystem) = test_subsystem().await;
+        let job = job();
+        let job_id = seed_job(&subsystem, &job);
+        assign_job(&subsystem, &job).await;
+        let runner = ShardRepairRunner::new(subsystem.clone(), "worker-a")
+            .unwrap()
+            .with_prepared_replacement(replacement_for(&job));
+
+        assert!(runner.run_once(10).await.unwrap());
+        assert!(!runner.run_once(11).await.unwrap());
+        let record = subsystem
+            .runtime
+            .local_store()
+            .shard_repair_record(&job_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state, ShardRepairState::Complete);
+        assert_eq!(record.attempts, 1);
+        subsystem.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn simultaneous_workers_respect_single_lease_owner() {
+        let _serial = REPAIR_EXECUTION_TEST_LOCK.lock().unwrap();
+        let (_directory, subsystem) = test_subsystem().await;
+        let job = job();
+        let job_id = seed_job(&subsystem, &job);
+        assign_job(&subsystem, &job).await;
+        let first = ShardRepairRunner::new(subsystem.clone(), "worker-a")
+            .unwrap()
+            .with_prepared_replacement(replacement_for(&job));
+        let second = ShardRepairRunner::new(subsystem.clone(), "worker-b")
+            .unwrap()
+            .with_prepared_replacement(replacement_for(&job));
+
+        let (first, second) = tokio::join!(first.run_once(10), second.run_once(10));
+        assert_eq!(
+            usize::from(first.unwrap()) + usize::from(second.unwrap()),
+            1
+        );
+        let record = subsystem
+            .runtime
+            .local_store()
+            .shard_repair_record(&job_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state, ShardRepairState::Complete);
+        assert_eq!(record.attempts, 1);
+        subsystem.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn repair_apply_fault_retries_without_publishing_partial_state() {
+        let _serial = REPAIR_EXECUTION_TEST_LOCK.lock().unwrap();
+        let _clear = ClearFaults;
+        let (_directory, subsystem) = test_subsystem().await;
+        let job = job();
+        let job_id = seed_job(&subsystem, &job);
+        assign_job(&subsystem, &job).await;
+        let runner = ShardRepairRunner::new(subsystem.clone(), "worker-a")
+            .unwrap()
+            .with_prepared_replacement(replacement_for(&job));
+        mvcc_fault_injection::install(
+            DeterministicFaults::default().fail_at(FaultPoint::RepairApply, 1),
+        );
+
+        assert!(runner.run_once(10).await.unwrap());
+        let failed = subsystem
+            .runtime
+            .local_store()
+            .shard_repair_record(&job_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.state, ShardRepairState::Pending);
+        assert_eq!(failed.attempts, 1);
+        assert!(failed.last_error.unwrap().contains("RepairApply"));
+        assert!(
+            subsystem
+                .runtime
+                .local_store()
+                .read_latest(&placement_overlay_key(&job.source_manifest))
+                .unwrap()
+                .is_none()
+        );
+
+        mvcc_fault_injection::clear();
+        assert!(runner.run_once(failed.next_attempt_unix_ms).await.unwrap());
+        let complete = subsystem
+            .runtime
+            .local_store()
+            .shard_repair_record(&job_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(complete.state, ShardRepairState::Complete);
+        assert_eq!(complete.attempts, 2);
+        wait_for_overlay(&subsystem, &job).await;
+        subsystem.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn retiring_placement_is_not_exposed_before_safe_overlay_commit() {
+        let _serial = REPAIR_EXECUTION_TEST_LOCK.lock().unwrap();
+        let _clear = ClearFaults;
+        let (_directory, subsystem) = test_subsystem().await;
+        let job = rebalance_job();
+        let source = job.source_manifest.clone();
+        seed_job(&subsystem, &job);
+        assign_job(&subsystem, &job).await;
+        let runner = ShardRepairRunner::new(subsystem.clone(), "worker-a")
+            .unwrap()
+            .with_prepared_replacement(replacement_for(&job));
+        mvcc_fault_injection::install(
+            DeterministicFaults::default().fail_at(FaultPoint::RepairApply, 1),
+        );
+
+        assert!(runner.run_once(10).await.unwrap());
+        assert_eq!(
+            resolve_manifest_at_snapshot(
+                subsystem.runtime.local_store(),
+                &source,
+                subsystem.runtime.local_store().applied_version().unwrap(),
+            )
+            .unwrap(),
+            source
+        );
+
+        mvcc_fault_injection::clear();
+        let record = subsystem
+            .runtime
+            .local_store()
+            .shard_repair_record(&job.job_id().unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(runner.run_once(record.next_attempt_unix_ms).await.unwrap());
+        let overlay = wait_for_overlay(&subsystem, &job).await;
+        assert_eq!(overlay.retired_after_commit, job.retiring);
+        assert!(
+            overlay
+                .replacement_manifest
+                .placements
+                .iter()
+                .any(|placement| {
+                    placement.node_id == "node-b"
+                        && placement.node_incarnation == 2
+                        && placement.failure_domain == "zone-b"
+                })
+        );
+        subsystem.shutdown().await;
     }
 
     #[test]
