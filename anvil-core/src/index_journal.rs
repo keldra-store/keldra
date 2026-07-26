@@ -408,52 +408,6 @@ pub struct IndexDefinitionEventPage {
 }
 
 #[cfg(any())]
-pub async fn read_index_definition_event_page(
-    storage: &Storage,
-    tenant_id: i64,
-    bucket_id: i64,
-    after_cursor: i64,
-    limit: usize,
-) -> Result<IndexDefinitionEventPage> {
-    if after_cursor < 0 {
-        return Err(anyhow!(
-            "index definition watch cursor must be non-negative"
-        ));
-    }
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let page = core_store
-        .read_stream_page(ReadStream {
-            stream_id: index_definition_stream_id(tenant_id, bucket_id),
-            after_sequence: u64::try_from(after_cursor)?,
-            limit,
-        })
-        .await?;
-    let next_cursor = i64::try_from(page.next_sequence)
-        .map_err(|_| anyhow!("index definition watch cursor exceeds i64"))?;
-    let mut events = Vec::with_capacity(page.records.len());
-    for record in page.records {
-        if record.record_kind != INDEX_DEFINITION_RECORD_KIND {
-            return Err(anyhow!("index definition stream record kind mismatch"));
-        }
-        let event = index_event_body_from_proto(decode_index_event_body(&record.payload)?)?;
-        if event.tenant_id != tenant_id
-            || event.bucket_id != bucket_id
-            || event.id != i64::try_from(record.sequence)?
-        {
-            return Err(anyhow!(
-                "index definition stream record scope or cursor mismatch"
-            ));
-        }
-        events.push(event);
-    }
-    Ok(IndexDefinitionEventPage {
-        events,
-        next_cursor,
-        has_more: page.has_more,
-    })
-}
-
-#[cfg(any())]
 pub async fn read_current_index_definition_events(
     storage: &Storage,
     tenant_id: i64,
@@ -676,32 +630,6 @@ pub async fn next_index_definition_id(
         .ok_or_else(|| anyhow::anyhow!("index definition id overflow"))
 }
 
-#[cfg(any())]
-pub async fn next_index_definition_cursor(
-    storage: &Storage,
-    tenant_id: i64,
-    bucket_id: i64,
-) -> Result<i64> {
-    let projected_cursor = read_index_current_state(storage, tenant_id, bucket_id)
-        .await?
-        .map(|state| state.latest_cursor)
-        .unwrap_or_default();
-    let stream_cursor = CoreStore::new(storage.clone())
-        .await?
-        .stream_head_sequence(&index_definition_stream_id(tenant_id, bucket_id))
-        .await?;
-    if u64::try_from(projected_cursor)? != stream_cursor {
-        return Err(anyhow!(
-            "index definition projection cursor {} differs from durable stream head {}",
-            projected_cursor,
-            stream_cursor
-        ));
-    }
-    projected_cursor
-        .checked_add(1)
-        .ok_or_else(|| anyhow!("index definition cursor overflow"))
-}
-
 pub fn index_storage_id(tenant_id: i64, bucket_id: i64, index_id: i64) -> String {
     format!("tenant-{tenant_id}-bucket-{bucket_id}-index-{index_id}")
 }
@@ -731,30 +659,6 @@ fn require_index_definition_permit(
         ));
     }
     Ok(())
-}
-
-#[cfg(any())]
-async fn read_index_current_row(
-    storage: &Storage,
-    tenant_id: i64,
-    bucket_id: i64,
-    index_name: &str,
-) -> Result<Option<IndexCurrentRef>> {
-    let Some(row) =
-        current_definitions::read_current(storage, tenant_id, bucket_id, index_name).await?
-    else {
-        return Ok(None);
-    };
-    index_current_from_coremeta_row(row).map(Some)
-}
-
-#[cfg(any())]
-async fn read_index_current_state(
-    storage: &Storage,
-    tenant_id: i64,
-    bucket_id: i64,
-) -> Result<Option<IndexCurrentState>> {
-    current_definitions::read_state(storage, tenant_id, bucket_id).await
 }
 
 fn encode_index_event_body(event: &IndexDefinitionEvent, fence_token: u64) -> Result<Vec<u8>> {
