@@ -9,6 +9,11 @@ Status values:
 - **Missing**: no production implementation was found.
 - **Contradicted**: reachable production code retains behavior the RFC forbids.
 
+Validation note: this audit is based on static inspection of current HEAD.
+Focused tests and benchmark harnesses added during this implementation run are
+identified as **present but unrun** because Cargo execution was explicitly
+disabled; that is distinct from missing production implementation.
+
 ## Consensus and local storage
 
 | RFC requirement | Status | Evidence or gap |
@@ -37,9 +42,9 @@ Status values:
 | All writes in a bundle must become visible at one commit version | Implemented | `LocalMvccStore::apply_certified_bundle_at_decision` writes all versions, heads, jobs and watermarks in one RocksDB `WriteBatch`. |
 | Tombstones must retain and hide older versions by snapshot | Implemented | `WriteOperation::Delete` stores a tombstone; snapshot/tombstone tests cover visibility before and after deletion. |
 | Read-only transactions must not create an application log entry | Implemented | `OpenTransactionRegistry::commit` now resolves a read-only bundle at its snapshot without invoking the runtime; focused retry/no-proposal test added in `972391d`. |
-| Transactions may cross arbitrary tables, partitions, tenants and features inside one cluster | Partial | Bundle and registry types are scope-free and cross-table tests exist. Several product paths have moved to logical MVCC mutations, but not every reachable write path has been converted. |
+| Transactions may cross arbitrary tables, partitions, tenants and features inside one cluster | Implemented | Bundles, durable drafts and certification are scope-free; canonical product autocommit now groups mutations across tables/features, and focused cross-table/cross-feature tests are present but unrun in this audit. |
 | Transactions must reject resources owned by another cluster before preparation | Implemented | Routing remains authoritative rather than deriving ownership from key hashes. Canonical bundles carry an exact `ClusterOwnershipClaim` set for every observed/written logical key, range, manifest, outbox event and materialisation job. Canonicalization rejects missing/forged coverage, and the coordinator invokes an injectable `ClusterOwnershipResolver` for every claim before bundle persistence or replication. Open transaction staging also retains its routing-issued owning-cluster check. |
-| Explicit uniqueness/CAS predicates must certify deterministically | Partial | Point observations cover create/update conflicts, but the bundle and consensus command have no distinct `explicit_predicates` representation described by the RFC. |
+| Explicit uniqueness/CAS predicates must certify deterministically | Implemented | `ExplicitPredicate` is canonical bundle state, is hashed into compact consensus `PredicateObservation` entries, and certification evaluates absent/version/value-hash predicates deterministically. Focused source tests are present but unrun. |
 | Define limits for observations, writes, command bytes, bundle bytes and raw payload bytes | Implemented | `TransactionResourceLimits` provides validated configurable limits with conservative defaults. The coordinator rejects point/range/write counts, canonical bundle bytes and aggregate raw payload bytes before prepared persistence; the adapter independently rejects an oversized encoded certification command before Raft. Focused tests cover every dimension. |
 
 ## Durability, replication and recovery
@@ -47,11 +52,11 @@ Status values:
 | RFC requirement | Status | Evidence or gap |
 |---|---|---|
 | Persistent authenticated bidirectional gRPC streams | Implemented | `replication_client.rs`, `replication_service.rs` and the bootstrap services maintain reusable sessions and multiplex transfers. |
-| Authenticate/authorize on connect or reconnect, not every frame | Partial | `NodeConnectionAuthorizer` validates the opening identity/cluster/incarnation and frames are session-bound. Deployment-enforced TLS and a concrete Zanzibar graph check are not demonstrated by focused tests. |
+| Authenticate/authorize on connect or reconnect, not every frame | Implemented | `NodeConnectionAuthorizer` validates token-derived node identity, cluster and incarnation once when a session opens/reopens; subsequent frames are bound to the authorised session. `c02a187` removes per-frame authorisation. Focused tests are present but unrun. |
 | Persisted/Complete ACK only after durable storage/hash verification | Implemented | `replication.rs` syncs partial data before `Persisted`, verifies final length/hash before `Complete`, and rejects session/sequence/hash mismatches. |
 | Reconnect must resume from persisted offset and deduplicate | Implemented | Client/server watermark exchange resumes incomplete transfers; tests cover reconnect, persisted offsets and duplicate completion. |
-| Silent half-open connection must be detected from ACK progress | Partial | Transfer calls have deadlines and progress validation, but no clear continuous heartbeat/outstanding-window implementation matching Section 17.4 was found. |
-| `local`, `quorum`, and `erasure` must have distinct honest thresholds | Partial | `DurabilityPolicy` validates bundle-holder and shard evidence with distinct levels. `DistributedIngest` requires every `k+m` Complete ACK for `erasure` and a failure-domain-safe reconstructable set for `quorum`; unit tests and the combined distributed E2E exercise these primitives. Complete public-API coverage for all three levels remains incomplete. |
+| Silent half-open connection must be detected from ACK progress | Implemented | Persistent streams track outstanding progress, emit heartbeats and fail stalled ACK windows; reconnect/resume follows the durable transfer watermark (`ccf2118`). Deterministic half-open hooks/tests are present but unrun. |
+| `local`, `quorum`, and `erasure` must have distinct honest thresholds | Implemented | `DurabilityPolicy` validates distinct bundle/shard thresholds. Public object write paths select local inline storage or bounded `DistributedIngest`; quorum requires a failure-domain-safe reconstructable set and erasure requires every `k+m` Complete ACK. Source tests/E2E are present but unrun. |
 | Missing committed bundles must be fetched and verified before watermark advance | Implemented | `MvccApplyWorker` stops at gaps, fetches from peers, verifies canonical bytes/hash/length/cluster, applies, then advances. Restart/gap/foreign-cluster tests cover this. |
 | Durable acknowledgements must name node incarnation | Implemented | `NodeIncarnation` is present in durability evidence and authenticated replication peer state; stale-incarnation validation is tested. |
 
@@ -59,35 +64,35 @@ Status values:
 
 | RFC requirement | Status | Evidence or gap |
 |---|---|---|
-| Distributed ingest must erasure-code bounded stripes while upload is arriving | Partial | `StreamingErasureEncoder` is a production `AsyncRead` pipeline that retains one bounded stripe, emits data/parity shards before EOF, and propagates sink backpressure; its test proves the first complete stripe is emitted before the padded tail. `DistributedIngest` integrates it with placement, durability evidence and transport. The remaining gap is wiring this production pipeline directly into every applicable public streaming upload path rather than invoking it only through lower-level integration. |
+| Distributed ingest must erasure-code bounded stripes while upload is arriving | Implemented | `StreamingErasureEncoder` retains one bounded stripe and emits before EOF with sink backpressure. Both `ObjectManager` and the native public put RPC invoke `DistributedIngest::encode` directly for distributed durability. Focused source tests are present but unrun. |
 | Quorum/erasure shards must stream directly to final targets | Implemented | `ShardPlacementPolicy` deterministically selects distinct node incarnations/failure domains. `DistributedIngest` sends each encoded shard to the ordinal's final target through the `ShardTargetStream` trait; `TonicReplicationStreamManager` implements that trait with `ObjectShard` transfers and waits for matching Complete ACKs. The combined distributed E2E in `lib.rs` uses the real replication manager and final targets. |
-| Distributed writes must not create complete remote replicas before encoding | Partial | The implemented distributed-ingest primitive streams stripe shards directly and requires no complete remote object. The remaining qualification is repository-wide public upload-path wiring and deletion of legacy/raw paths, not absence of the erasure primitive. |
+| Distributed writes must not create complete remote replicas before encoding | Implemented | Public distributed writes stream encoded stripes directly to final shard targets and construct the committed physical manifest from Complete ACK evidence; no complete remote-object staging precedes encoding. |
 | Committed object metadata must carry a canonical shard manifest and support verified reconstruction | Implemented | `PhysicalObjectShardManifest::from_ingest` binds placements, incarnation, failure domain, transfer identity and BLAKE3 shard hashes; its reference is added to the transaction bundle. Range reconstruction verifies the same BLAKE3 identity, fetches only shard transfers and Reed-Solomon reconstructs missing data. A focused hash/reconstruction test and the combined E2E cover missing-shard reconstruction. |
-| Missing optional shards must create durable repair jobs | Missing | Object materialisation jobs exist, but the RFC repair/rebalance job lifecycle and placement-update transaction are not implemented end to end. |
-| Workers must claim jobs with MVCC CAS and be duplicate-safe | Partial | Materialisation lease/claim/retry state exists and is tested. It is a special materialisation CF transition rather than the full repair worker and MVCC placement flow specified by Section 19. |
+| Missing optional shards must create durable repair jobs | Implemented | Object ingest derives `ShardRepairJob` for missing optional placements and commits it with the originating bundle. `ShardRepairRunner` reconstructs, places replacements, and publishes a versioned placement overlay transaction (`a7bf14e`). Tests are present but unrun. |
+| Workers must claim jobs with MVCC CAS and be duplicate-safe | Implemented | Durable materialisation/repair records use lease-owner transitions, expiry recovery and identity-stable overlay publication. Duplicate repair execution resolves the current overlay and has exactly-once effect. Focused tests and deterministic duplicate-repair hooks are present but unrun. |
 
 ## Garbage collection, observability and validation
 
 | RFC requirement | Status | Evidence or gap |
 |---|---|---|
-| GC watermark must protect active snapshots, lagging replicas, history, backup and jobs | Partial | `GarbageCollectionPins` computes the minimum safe candidate across durable open-session snapshots, reported replica apply positions, history retention, backup/audit pins and unfinished outbox/materialisation/repair work. Only `AdvanceGcWatermark` advances cluster safety state; followers collect after catch-up. Local MVCC GC retains the newest value or tombstone anchor at/below the watermark and all newer history, and reclaims delivered/completed queue rows plus old applied identities. Consensus retry/decision history, prepared-bundle logs and shard segments have conservative collectors. Automatic construction of prepared-bundle and shard reachability/retirement plans from committed manifests and retention timestamps remains incomplete. |
-| Required transaction/replication/MVCC/consensus/shard metrics | Missing | The exact metric set in Section 26 is not present. Existing performance guards do not satisfy the required counters, gauges and histograms. |
-| Required stable trace operations | Partial | Some consensus/transaction/replication tracing exists, but the complete stable operation list is not implemented. |
+| GC watermark must protect active snapshots, lagging replicas, history, backup and jobs | Implemented | Consensus candidates take the minimum of durable snapshots, replica apply positions, retention, backup/audit and unfinished-work pins. Followers collect only after applying `AdvanceGcWatermark`. MVCC preserves the value/tombstone visibility anchor; prepared bundles and shards use durable timestamps, reachability, Complete replacement ACKs, overlay-application evidence and grace windows. Tests are present but unrun. |
+| Required transaction/replication/MVCC/consensus/shard metrics | Implemented | `perf.rs` defines the Section 26 transaction, replication, MVCC, consensus, ingest and repair measurements. Current GC work adds the previously absent MVCC GC watermark/bytes and shard GC measurements. Instrumentation is statically wired; runtime emission was not executed in this audit. |
+| Required stable trace operations | Partial | Transaction, ingest encode/stripe, shard stream/fsync, replication, consensus, apply, repair and MVCC/shard GC operations are wired. Explicit `request.receive` and `response.send` operations remain to be standardised across public transports. |
 | Required model/storage/transaction/replication tests | Partial | Strong unit and restart/recovery coverage exists for certification, storage, MVCC and replication. Several enumerated failure, repair, GC and cross-feature cases are absent. |
-| Required fault-injection tests | Missing | The complete disk-full, process-kill-at-boundary, reordered-frame and minority-loss matrix is not present. |
-| Required benchmark suite and separated phase timings | Missing | The Section 29 benchmark and metrics suite is not present. |
+| Required fault-injection tests | Partial | Deterministic ordinal failpoints are wired at prepared/shard/MVCC/Raft writes, proposal/apply and Complete-ACK boundaries; frame drop/duplicate/reorder/half-open and the full named RFC scenario matrix are defined in `mvcc_fault_injection.rs`. Hooks/tests are present but unrun; several topology scenarios remain declarative rather than full multi-node executions. |
+| Required benchmark suite and separated phase timings | Partial | `benches/mvcc_rfc.rs` defines every Section 29 transaction shape, proposal batching/WAL group commit, and separate phase columns. The concrete workloads are still skeletal and the harness is unrun. |
 
 ## Contradictions and discarded internals
 
 | RFC requirement | Status | Evidence or gap |
 |---|---|---|
-| No migration machinery, dual reads/writes or shadow transaction protocol | Contradicted | Reachable product code still contains CoreStore explicit-transaction machinery and some MVCC-first/physical-row fallback reads. These must be deleted rather than retained as migration behavior. |
-| No discarded internal protocol on the active write path | Contradicted | The cutover removed transaction overlays from topology, manifest, append, mesh routing, boundary, index and several materializers, but remaining `CoreStore` explicit transaction APIs and legacy receipt/publication paths are still reachable in parts of object/metadata handling. |
+| No migration machinery, dual reads/writes or shadow transaction protocol | Implemented | The legacy CoreStore explicit transaction engine was deleted in `744ac07`; metadata fallback reads were removed in `accae34`. Current product writes use MVCC transactions/autocommit without shadow receipts or dual visibility. |
+| No discarded internal protocol on the active write path | Implemented | Manifest, append, index and product autocommit paths now stage canonical MVCC mutations. Remaining CoreStore root/publication code supports separate CoreMeta durability internals rather than a reachable shadow application transaction protocol. |
 | Materialisation and outbox work are ordinary durable MVCC state | Implemented | Materialisation jobs and Section 11's required `cf_outbox` events are installed in the same durable RocksDB batch as product rows and the applied watermark. Outbox records carry commit version and deterministic identity; durable lease, reclaim and idempotent completion semantics are covered by focused tests. |
 
 ## Highest-priority next work
 
-1. Finish deleting every reachable CoreStore explicit-transaction and receipt/publication path; remove MVCC/physical fallback reads rather than treating them as migration support.
-2. Wire the existing bounded-stripe `DistributedIngest` and final-target shard streams into every applicable public streaming upload path; remove legacy/raw alternatives and add public-API durability tests.
-3. Complete automatic prepared-bundle and shard reachability/retirement plans, including retention timestamps, committed-manifest traversal, replacement-placement application acknowledgements and rollback grace windows.
-4. Add the required observability, fault matrix and benchmark suite.
+1. Convert the declarative minority-loss, leader-change, lagging-follower-GC and restart boundaries into executable multi-node fault scenarios using the existing deterministic hooks.
+2. Replace the skeletal Section 29 harness bodies with real local and multi-node workloads, including proposal batching and RocksDB WAL group commit.
+3. Finish the stable trace-operation list at request/response, stripe and shard-fsync boundaries and validate metric emission/labels in focused tests.
+4. Audit any remaining product-specific direct mutation helpers and require canonical product autocommit or an explicit non-product CoreMeta classification.
