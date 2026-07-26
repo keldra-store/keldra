@@ -12,11 +12,15 @@ use anvil_core::{
     mvcc_consensus_adapter::ConsensusTransactionCertifier,
     mvcc_store::LocalMvccStore,
     mvcc_transaction::{
-        BundleIdentity, CertificationResult, DurabilityLevel, DurabilityPolicy,
-        HierarchicalRangeStampScheme, LogicalKey, NodeIncarnation, TransactionBundleBuilder,
+        BundleIdentity, CertificationRequest, CertificationResult, CommitVersion, DurabilityLevel,
+        DurabilityPolicy, HierarchicalRangeStampScheme, LogicalKey, NodeIncarnation,
+        ReadConsistency, TransactionBundle, TransactionBundleBuilder, TransactionCertifier,
         TransactionCoordinator,
     },
-    replication::{AckStatus, ReplicationAck},
+    replication::{
+        AckStatus, AuthenticatedPeer, ConnectionSession, ReplicationAck, ReplicationFrame,
+        TransferKind, TransferReceiver,
+    },
     replication_client::object_shard_transfer_id,
     shard_placement::{
         DistributedIngest, ShardPlacementPlan, ShardPlacementPolicy, ShardTarget, ShardTargetStream,
@@ -38,8 +42,12 @@ enum Phase {
     ShardStreaming,
     RemotePersistenceWait,
     RaftCertification,
+    GroupCommit,
     LocalMvccApply,
     MvccRead,
+    DeferredRepair,
+    ReplicationReconnect,
+    MvccGc,
     EndToEnd,
 }
 
@@ -116,6 +124,62 @@ const SHAPES: &[Shape] = &[
         payload_bytes: 4 * 1024,
         concurrency: 1,
     },
+    Shape {
+        name: "unrelated_concurrency",
+        logical_keys: 1,
+        tables: 1,
+        payload_bytes: 128,
+        concurrency: 16,
+    },
+    Shape {
+        name: "same_key_conflict",
+        logical_keys: 1,
+        tables: 1,
+        payload_bytes: 128,
+        concurrency: 16,
+    },
+    Shape {
+        name: "overlapping_range_conflict",
+        logical_keys: 1,
+        tables: 1,
+        payload_bytes: 128,
+        concurrency: 16,
+    },
+    Shape {
+        name: "group_commit",
+        logical_keys: 1,
+        tables: 1,
+        payload_bytes: 128,
+        concurrency: 64,
+    },
+    Shape {
+        name: "replication_reconnect_resume",
+        logical_keys: 1,
+        tables: 1,
+        payload_bytes: 1024 * 1024,
+        concurrency: 1,
+    },
+    Shape {
+        name: "retained_history_read",
+        logical_keys: 1,
+        tables: 1,
+        payload_bytes: 128,
+        concurrency: 1,
+    },
+    Shape {
+        name: "mvcc_garbage_collection",
+        logical_keys: 1,
+        tables: 1,
+        payload_bytes: 128,
+        concurrency: 1,
+    },
+    Shape {
+        name: "deferred_repair",
+        logical_keys: 1,
+        tables: 1,
+        payload_bytes: 4 * 1024 * 1024,
+        concurrency: 1,
+    },
 ];
 
 #[derive(Default)]
@@ -148,8 +212,12 @@ fn main() {
             Phase::ShardStreaming,
             Phase::RemotePersistenceWait,
             Phase::RaftCertification,
+            Phase::GroupCommit,
             Phase::LocalMvccApply,
             Phase::MvccRead,
+            Phase::DeferredRepair,
+            Phase::ReplicationReconnect,
+            Phase::MvccGc,
             Phase::EndToEnd,
         ] {
             println!(
@@ -181,29 +249,12 @@ async fn run_shape(shape: Shape, timings: &mut PhaseTimings) {
         shape.payload_bytes
     };
     let payload_per_key = logical_payload_bytes / shape.logical_keys.max(1);
-    let mut builder = TransactionBundleBuilder::new(
-        "benchmark-cluster",
-        format!("{}-tx", shape.name),
-        0,
-        "benchmark-principal",
-        HierarchicalRangeStampScheme::new(),
-    );
-    timings.measure(Phase::BundleBuild, || {
-        for ordinal in 0..shape.logical_keys {
-            builder.put(
-                LogicalKey {
-                    table_id: u16::try_from(ordinal % shape.tables.max(1) + 1).unwrap(),
-                    application_key: format!("partition-{}/key-{ordinal}", ordinal % 8)
-                        .into_bytes(),
-                },
-                vec![u8::try_from(ordinal % 251).unwrap(); payload_per_key],
-            );
-        }
-    });
-    let bundle = timings.measure(Phase::BundleBuild, || {
-        let bundle = builder.build().expect("build benchmark transaction");
-        bundle.canonical_bytes().expect("encode benchmark bundle");
-        bundle
+    let bundles = timings.measure(Phase::BundleBuild, || {
+        (0..shape.concurrency)
+            .map(|worker| {
+                build_bundle(shape, worker, payload_per_key).expect("build benchmark transaction")
+            })
+            .collect::<Vec<_>>()
     });
     let durability = match shape.name {
         "local_durability" => DurabilityLevel::Local,
@@ -245,37 +296,53 @@ async fn run_shape(shape: Shape, timings: &mut PhaseTimings) {
     .expect("build multi-target bundle replicator");
     let raft_directory = tempfile::tempdir().expect("create OpenRaft directory");
     let consensus = openraft_consensus(raft_directory.path()).await;
+    let certification_time = Arc::new(Mutex::new(Duration::ZERO));
     let coordinator = TransactionCoordinator::new(
         prepared,
         replicator,
-        ConsensusTransactionCertifier::new(consensus.clone()),
+        TimedCertifier {
+            inner: ConsensusTransactionCertifier::new(consensus.clone()),
+            elapsed: certification_time.clone(),
+        },
         DurabilityPolicy {
             bundle_quorum_holders: 2,
             tolerated_failure_domains: 1,
         },
     )
     .expect("build benchmark coordinator");
-    let certification_started = Instant::now();
+    let group_started = Instant::now();
     let results = futures::future::join_all(
-        (0..shape.concurrency).map(|_| coordinator.commit(bundle.clone(), durability)),
+        bundles
+            .iter()
+            .cloned()
+            .map(|bundle| coordinator.commit(bundle, durability)),
     )
     .await;
-    *timings.0.entry(Phase::RaftCertification).or_default() += certification_started.elapsed();
+    if shape.name == "group_commit" {
+        timings
+            .0
+            .insert(Phase::GroupCommit, group_started.elapsed());
+    }
+    timings.0.insert(
+        Phase::RaftCertification,
+        *certification_time.lock().unwrap(),
+    );
     timings.0.insert(
         Phase::RemotePersistenceWait,
         *replication_time.lock().unwrap(),
     );
-    let commit_version = match results
+    let (commit_version, bundle) = results
         .into_iter()
-        .next()
-        .expect("benchmark has non-zero concurrency")
-        .expect("coordinate benchmark transaction")
-    {
-        CertificationResult::Committed { commit_version } => commit_version,
-        CertificationResult::Aborted { reason } => {
-            panic!("benchmark transaction aborted: {reason:?}")
-        }
-    };
+        .enumerate()
+        .find_map(
+            |(index, result)| match result.expect("coordinate benchmark transaction") {
+                CertificationResult::Committed { commit_version } => {
+                    Some((commit_version, bundles[index].clone()))
+                }
+                CertificationResult::Aborted { .. } => None,
+            },
+        )
+        .expect("at least one benchmark transaction must commit");
     timings.measure(Phase::LocalMvccApply, || {
         store
             .apply_certified_bundle(commit_version, &bundle)
@@ -288,11 +355,100 @@ async fn run_shape(shape: Shape, timings: &mut PhaseTimings) {
                 .expect("read benchmark MVCC row");
         }
     });
+    match shape.name {
+        "replication_reconnect_resume" => {
+            timings.measure(Phase::ReplicationReconnect, || {
+                run_reconnect_resume(shape.payload_bytes).expect("benchmark replication reconnect");
+            });
+        }
+        "retained_history_read" => {
+            timings.measure(Phase::MvccRead, || {
+                run_retained_history_read().expect("benchmark retained history");
+            });
+        }
+        "mvcc_garbage_collection" => {
+            timings.measure(Phase::MvccGc, || {
+                run_mvcc_gc().expect("benchmark MVCC garbage collection");
+            });
+        }
+        "deferred_repair" => {
+            let (encoding, streaming) = run_erasure(shape.payload_bytes)
+                .await
+                .expect("benchmark deferred repair reconstruction");
+            *timings.0.entry(Phase::DeferredRepair).or_default() += encoding + streaming;
+        }
+        _ => {}
+    }
     consensus
         .shutdown()
         .await
         .expect("shutdown benchmark OpenRaft");
     timings.0.insert(Phase::EndToEnd, end_to_end.elapsed());
+}
+
+fn build_bundle(shape: Shape, worker: usize, payload_per_key: usize) -> Result<TransactionBundle> {
+    let mut builder = TransactionBundleBuilder::new(
+        "benchmark-cluster",
+        format!("{}-tx-{worker}", shape.name),
+        0,
+        "benchmark-principal",
+        HierarchicalRangeStampScheme::new(),
+    );
+    if shape.name == "overlapping_range_conflict" {
+        builder.observe_range(
+            1,
+            b"partition-0/a".to_vec(),
+            b"partition-0/z".to_vec(),
+            None,
+        )?;
+    }
+    for ordinal in 0..shape.logical_keys {
+        let key_ordinal = if matches!(
+            shape.name,
+            "same_key_conflict" | "overlapping_range_conflict"
+        ) {
+            ordinal
+        } else {
+            worker * shape.logical_keys + ordinal
+        };
+        let key = LogicalKey {
+            table_id: u16::try_from(ordinal % shape.tables.max(1) + 1)?,
+            application_key: format!("partition-{}/key-{key_ordinal}", ordinal % 8).into_bytes(),
+        };
+        if shape.name == "same_key_conflict" {
+            builder.observe_point(key.clone(), None);
+        }
+        builder.put(
+            key,
+            vec![u8::try_from((worker + ordinal) % 251)?; payload_per_key],
+        );
+    }
+    let bundle = builder.build()?;
+    bundle.canonical_bytes()?;
+    Ok(bundle)
+}
+
+struct TimedCertifier<C> {
+    inner: C,
+    elapsed: Arc<Mutex<Duration>>,
+}
+
+#[async_trait]
+impl<C: TransactionCertifier> TransactionCertifier for TimedCertifier<C> {
+    async fn observed_commit_version(&self, consistency: ReadConsistency) -> Result<CommitVersion> {
+        self.inner.observed_commit_version(consistency).await
+    }
+
+    async fn certify(&self, request: CertificationRequest) -> Result<CertificationResult> {
+        let started = Instant::now();
+        let result = self.inner.certify(request).await;
+        *self.elapsed.lock().unwrap() += started.elapsed();
+        result
+    }
+
+    fn durability_policy(&self) -> Option<DurabilityPolicy> {
+        self.inner.durability_policy()
+    }
 }
 
 struct DurableBundleTargets {
@@ -479,4 +635,117 @@ async fn run_erasure(payload_bytes: usize) -> Result<(Duration, Duration)> {
     let total = started.elapsed();
     let streaming = *streaming.lock().unwrap();
     Ok((total.saturating_sub(streaming), streaming))
+}
+
+fn run_reconnect_resume(payload_bytes: usize) -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let mut receiver = TransferReceiver::open(directory.path())?;
+    let peer = AuthenticatedPeer::new("benchmark-peer", 1)?;
+    let transfer_id = Uuid::new_v4();
+    let bytes = vec![11_u8; payload_bytes];
+    let split = bytes.len() / 2;
+    let final_hash = *blake3::hash(&bytes).as_bytes();
+    let mut first_session = ConnectionSession::establish("benchmark-cluster", peer.clone())?;
+    let first = benchmark_frame(
+        &first_session,
+        transfer_id,
+        1,
+        0,
+        &bytes[..split],
+        bytes.len() as u64,
+        final_hash,
+        false,
+    );
+    receiver.receive(&mut first_session, &first)?;
+    drop(receiver);
+
+    let mut receiver = TransferReceiver::open(directory.path())?;
+    let watermark = receiver
+        .watermark(transfer_id)?
+        .expect("partial transfer has persisted watermark");
+    let mut resumed = ConnectionSession::establish("benchmark-cluster", peer)?;
+    let final_frame = benchmark_frame(
+        &resumed,
+        transfer_id,
+        1,
+        watermark.persisted_through,
+        &bytes[usize::try_from(watermark.persisted_through)?..],
+        bytes.len() as u64,
+        final_hash,
+        true,
+    );
+    let ack = receiver.receive(&mut resumed, &final_frame)?;
+    assert_eq!(ack.status, AckStatus::Complete);
+    Ok(())
+}
+
+fn benchmark_frame(
+    session: &ConnectionSession,
+    transfer_id: Uuid,
+    sequence: u64,
+    offset: u64,
+    payload: &[u8],
+    total_length: u64,
+    final_hash: [u8; 32],
+    finish: bool,
+) -> ReplicationFrame {
+    ReplicationFrame {
+        session_id: session.id(),
+        cluster_id: "benchmark-cluster".into(),
+        sequence,
+        partition: "benchmark/reconnect".into(),
+        transfer_id,
+        kind: TransferKind::ObjectShard,
+        offset,
+        payload: payload.to_vec(),
+        payload_checksum: ReplicationFrame::checksum(payload),
+        total_length,
+        final_hash,
+        finish,
+    }
+}
+
+fn run_retained_history_read() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let store = LocalMvccStore::open(directory.path())?;
+    let key = LogicalKey {
+        table_id: 1,
+        application_key: b"partition-0/history-key".to_vec(),
+    };
+    for version in 1..=256_u64 {
+        let mut builder = TransactionBundleBuilder::new(
+            "benchmark-cluster",
+            format!("history-{version}"),
+            version.saturating_sub(1),
+            "benchmark-principal",
+            HierarchicalRangeStampScheme::new(),
+        );
+        builder.put(key.clone(), vec![version as u8; 128]);
+        store.apply_certified_bundle(version, &builder.build()?)?;
+    }
+    let _ = store.read_at(&key, 128)?;
+    Ok(())
+}
+
+fn run_mvcc_gc() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let store = LocalMvccStore::open(directory.path())?;
+    let key = LogicalKey {
+        table_id: 1,
+        application_key: b"partition-0/gc-key".to_vec(),
+    };
+    for version in 1..=256_u64 {
+        let mut builder = TransactionBundleBuilder::new(
+            "benchmark-cluster",
+            format!("gc-{version}"),
+            version.saturating_sub(1),
+            "benchmark-principal",
+            HierarchicalRangeStampScheme::new(),
+        );
+        builder.put(key.clone(), version.to_be_bytes().to_vec());
+        store.apply_certified_bundle(version, &builder.build()?)?;
+    }
+    let deleted = store.garbage_collect(192)?;
+    assert!(deleted > 0);
+    Ok(())
 }
