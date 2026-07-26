@@ -300,6 +300,236 @@ impl ShardPlacementOverlay {
     pub const TABLE_ID: u16 = 0x7f12;
 }
 
+pub const SHARD_MANIFEST_CATALOG_TABLE_ID: u16 = 0x7f13;
+const SHARD_REBALANCE_CHECKPOINT_TABLE_ID: u16 = 0x7f14;
+const REBALANCE_PAGE_SIZE: usize = 64;
+
+pub fn manifest_catalog_key(
+    manifest: &PhysicalObjectShardManifest,
+) -> crate::mvcc_transaction::LogicalKey {
+    crate::mvcc_transaction::LogicalKey {
+        table_id: SHARD_MANIFEST_CATALOG_TABLE_ID,
+        application_key: format!("manifest/{}", manifest.object_hash).into_bytes(),
+    }
+}
+
+pub fn stage_manifest_catalog_entry(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    manifest: &PhysicalObjectShardManifest,
+    now_unix_ms: u64,
+) -> Result<()> {
+    let binding = mvcc.open_transactions.binding(transaction_id, principal)?;
+    if binding.cluster_id != manifest.cluster_id {
+        bail!("manifest catalog entry belongs to another cluster");
+    }
+    mvcc.open_transactions.put(
+        transaction_id,
+        &binding.cluster_id,
+        manifest_catalog_key(manifest),
+        manifest.canonical_bytes()?,
+        now_unix_ms,
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RebalanceCheckpoint {
+    schema: String,
+    topology_epoch: [u8; 32],
+    snapshot_version: CommitVersion,
+    after_application_key: Option<Vec<u8>>,
+}
+
+impl RebalanceCheckpoint {
+    const SCHEMA: &'static str = "anvil.mvcc.shard-rebalance-checkpoint.v1";
+}
+
+pub struct ShardRebalanceReconciler {
+    mvcc: Arc<crate::mvcc_bootstrap::MvccSubsystem>,
+    worker_id: String,
+}
+
+impl ShardRebalanceReconciler {
+    pub fn new(
+        mvcc: Arc<crate::mvcc_bootstrap::MvccSubsystem>,
+        worker_id: impl Into<String>,
+    ) -> Result<Self> {
+        let worker_id = worker_id.into();
+        if worker_id.trim().is_empty() {
+            bail!("shard rebalance reconciler worker ID is required");
+        }
+        Ok(Self { mvcc, worker_id })
+    }
+
+    pub async fn run(self, mut shutdown: watch::Receiver<bool>) {
+        loop {
+            if *shutdown.borrow() {
+                return;
+            }
+            if let Err(error) = self.run_once(now_unix_ms()).await {
+                tracing::warn!(%error, worker_id = %self.worker_id, "shard rebalance reconciliation failed");
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn run_once(&self, now: u64) -> Result<bool> {
+        if !self.mvcc.consensus.is_leader() {
+            return Ok(false);
+        }
+        let epoch = topology_epoch(
+            &self.mvcc.shard_candidates,
+            self.mvcc.tolerated_failure_domains,
+        )?;
+        let checkpoint_key = crate::mvcc_transaction::LogicalKey {
+            table_id: SHARD_REBALANCE_CHECKPOINT_TABLE_ID,
+            application_key: b"reconciler/checkpoint".to_vec(),
+        };
+        let latest = self
+            .mvcc
+            .runtime
+            .local_store()
+            .read_latest(&checkpoint_key)?;
+        let checkpoint = latest
+            .as_ref()
+            .map(|row| serde_json::from_slice::<RebalanceCheckpoint>(&row.value))
+            .transpose()?
+            .filter(|checkpoint| {
+                checkpoint.schema == RebalanceCheckpoint::SCHEMA
+                    && checkpoint.topology_epoch == epoch
+            });
+        let mut checkpoint = match checkpoint {
+            Some(checkpoint) => checkpoint,
+            None => RebalanceCheckpoint {
+                schema: RebalanceCheckpoint::SCHEMA.to_string(),
+                topology_epoch: epoch,
+                snapshot_version: self
+                    .mvcc
+                    .runtime
+                    .snapshot(crate::mvcc_transaction::ReadConsistency::Linearized)
+                    .await?,
+                after_application_key: None,
+            },
+        };
+        if checkpoint.snapshot_version < self.mvcc.runtime.local_store().gc_watermark()? {
+            checkpoint.snapshot_version = self
+                .mvcc
+                .runtime
+                .snapshot(crate::mvcc_transaction::ReadConsistency::Linearized)
+                .await?;
+            checkpoint.after_application_key = None;
+        }
+        let rows = self.mvcc.runtime.scan_table_prefix_at(
+            SHARD_MANIFEST_CATALOG_TABLE_ID,
+            b"manifest/",
+            checkpoint.snapshot_version,
+        )?;
+        let page = rows
+            .into_iter()
+            .filter(|(key, _)| {
+                checkpoint
+                    .after_application_key
+                    .as_ref()
+                    .is_none_or(|after| key.application_key > *after)
+            })
+            .take(REBALANCE_PAGE_SIZE)
+            .collect::<Vec<_>>();
+        let principal = format!("shard-rebalance/{}", self.worker_id);
+        let cursor_hash = blake3::hash(
+            checkpoint
+                .after_application_key
+                .as_deref()
+                .unwrap_or_default(),
+        );
+        let handle = self
+            .mvcc
+            .open_transactions
+            .begin(
+                self.mvcc.runtime.as_ref(),
+                self.mvcc.cluster_id().to_string(),
+                &principal,
+                format!(
+                    "rebalance/{}/{}/{}",
+                    hex::encode(epoch),
+                    checkpoint.snapshot_version,
+                    hex::encode(cursor_hash.as_bytes())
+                ),
+                Duration::from_secs(30),
+                crate::mvcc_transaction::DurabilityLevel::Quorum,
+                crate::mvcc_transaction::ReadConsistency::Linearized,
+                now,
+            )
+            .await?;
+        for (key, row) in &page {
+            let manifest: PhysicalObjectShardManifest = serde_json::from_slice(&row.value)?;
+            let resolved = resolve_manifest_at_snapshot(
+                self.mvcc.runtime.local_store(),
+                &manifest,
+                checkpoint.snapshot_version,
+            )?;
+            if let Some(mut job) = plan_rebalance_job(
+                &resolved,
+                &handle.transaction_id,
+                &self.mvcc.shard_candidates,
+                ShardPlacementPolicy {
+                    tolerated_failure_domains: self.mvcc.tolerated_failure_domains,
+                },
+                checkpoint.snapshot_version,
+                now,
+            )? {
+                job.source_manifest_hash = hex::encode(blake3::hash(&manifest.canonical_bytes()?));
+                self.mvcc.open_transactions.add_job(
+                    &handle.transaction_id,
+                    self.mvcc.cluster_id(),
+                    job.canonical_bytes()?,
+                    now,
+                )?;
+            }
+            checkpoint.after_application_key = Some(key.application_key.clone());
+        }
+        if page.len() < REBALANCE_PAGE_SIZE {
+            checkpoint.snapshot_version = self
+                .mvcc
+                .runtime
+                .snapshot(crate::mvcc_transaction::ReadConsistency::Linearized)
+                .await?;
+            checkpoint.after_application_key = None;
+        }
+        self.mvcc.open_transactions.put(
+            &handle.transaction_id,
+            self.mvcc.cluster_id(),
+            checkpoint_key,
+            serde_json::to_vec(&checkpoint)?,
+            now,
+        )?;
+        let outcome = self
+            .mvcc
+            .open_transactions
+            .commit(
+                self.mvcc.runtime.as_ref(),
+                &handle.transaction_id,
+                &principal,
+                now,
+            )
+            .await?;
+        if !matches!(
+            outcome.certification,
+            crate::mvcc_transaction::CertificationResult::Committed { .. }
+        ) {
+            bail!("rebalance page and checkpoint transaction was not committed");
+        }
+        Ok(!page.is_empty())
+    }
+}
+
 pub fn placement_overlay_key(
     manifest: &PhysicalObjectShardManifest,
 ) -> crate::mvcc_transaction::LogicalKey {
@@ -716,6 +946,22 @@ fn maintenance_label(kind: ShardMaintenanceKind) -> &'static str {
     }
 }
 
+fn topology_epoch(
+    candidates: &[ShardTarget],
+    tolerated_failure_domains: usize,
+) -> Result<[u8; 32]> {
+    let mut candidates = candidates.to_vec();
+    candidates.sort_by(|left, right| {
+        (&left.cluster_id, &left.node, &left.failure_domain).cmp(&(
+            &right.cluster_id,
+            &right.node,
+            &right.failure_domain,
+        ))
+    });
+    let bytes = serde_json::to_vec(&(candidates, tolerated_failure_domains))?;
+    Ok(*blake3::hash(&bytes).as_bytes())
+}
+
 fn now_unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -836,6 +1082,31 @@ mod tests {
         assert_eq!(
             ShardRepairJob::decode(&planned.canonical_bytes().unwrap()).unwrap(),
             planned
+        );
+    }
+
+    #[test]
+    fn topology_epoch_is_order_independent_and_policy_sensitive() {
+        let candidates = ["a", "b"]
+            .into_iter()
+            .map(|suffix| ShardTarget {
+                cluster_id: "cluster".into(),
+                node: NodeIncarnation {
+                    node_id: format!("node-{suffix}"),
+                    incarnation: 1,
+                },
+                failure_domain: format!("zone-{suffix}"),
+            })
+            .collect::<Vec<_>>();
+        let mut reversed = candidates.clone();
+        reversed.reverse();
+        assert_eq!(
+            topology_epoch(&candidates, 1).unwrap(),
+            topology_epoch(&reversed, 1).unwrap()
+        );
+        assert_ne!(
+            topology_epoch(&candidates, 0).unwrap(),
+            topology_epoch(&candidates, 1).unwrap()
         );
     }
 }

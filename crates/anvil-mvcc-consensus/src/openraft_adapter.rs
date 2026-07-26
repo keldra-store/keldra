@@ -269,6 +269,12 @@ pub struct OpenRaftConsensus {
 }
 
 impl OpenRaftConsensus {
+    pub fn is_leader(&self) -> bool {
+        let metrics = self.raft.metrics();
+        let metrics = metrics.borrow();
+        metrics.current_leader == Some(metrics.id)
+    }
+
     pub fn applied_decisions_after(
         &self,
         position: CommitVersion,

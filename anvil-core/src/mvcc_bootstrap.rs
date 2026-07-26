@@ -227,6 +227,7 @@ pub struct MvccSubsystem {
     apply_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     object_materialisation_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     shard_repair_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    shard_rebalance_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl fmt::Debug for MvccSubsystem {
@@ -451,6 +452,7 @@ impl MvccSubsystem {
             apply_task: Mutex::new(Some(apply_task)),
             object_materialisation_task: Mutex::new(None),
             shard_repair_task: Mutex::new(None),
+            shard_rebalance_task: Mutex::new(None),
         })
     }
 
@@ -491,6 +493,20 @@ impl MvccSubsystem {
             bail!("shard repair runner is already started");
         }
         *repair_slot = Some(repair_task);
+        let reconciler = crate::mvcc_shard_repair::ShardRebalanceReconciler::new(
+            self.clone(),
+            format!("shard-rebalance/{}", self.peers[0].node_id),
+        )?;
+        let rebalance_task = tokio::spawn(reconciler.run(self.apply_shutdown.subscribe()));
+        let mut rebalance_slot = self
+            .shard_rebalance_task
+            .lock()
+            .map_err(|_| anyhow::anyhow!("shard rebalance task lock poisoned"))?;
+        if rebalance_slot.is_some() {
+            rebalance_task.abort();
+            bail!("shard rebalance reconciler is already started");
+        }
+        *rebalance_slot = Some(rebalance_task);
         Ok(())
     }
 
@@ -506,6 +522,22 @@ impl MvccSubsystem {
             .ok()
             .and_then(|mut task| task.take());
         if let Some(task) = object_task {
+            let _ = task.await;
+        }
+        let repair_task = self
+            .shard_repair_task
+            .lock()
+            .ok()
+            .and_then(|mut task| task.take());
+        if let Some(task) = repair_task {
+            let _ = task.await;
+        }
+        let rebalance_task = self
+            .shard_rebalance_task
+            .lock()
+            .ok()
+            .and_then(|mut task| task.take());
+        if let Some(task) = rebalance_task {
             let _ = task.await;
         }
         let _ = self.consensus.shutdown().await;

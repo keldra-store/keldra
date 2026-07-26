@@ -732,6 +732,14 @@ impl ObjectManager {
                             Self::current_unix_ms_for_object()?,
                         )
                         .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                    crate::mvcc_shard_repair::stage_manifest_catalog_entry(
+                        mvcc,
+                        transaction_id,
+                        transaction_principal,
+                        &manifest,
+                        Self::current_unix_ms_for_object()?,
+                    )
+                    .map_err(|error| Status::failed_precondition(error.to_string()))?;
                     let content_hash = manifest.object_hash.clone();
                     let shard_map = Some(
                         object_data_target_to_shard_map(&ObjectDataTarget::MvccShards(manifest))

@@ -120,6 +120,14 @@ pub(crate) async fn execute_native_put(
                         current_unix_ms()?,
                     )
                     .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                crate::mvcc_shard_repair::stage_manifest_catalog_entry(
+                    &state.mvcc,
+                    transaction_id,
+                    &transaction_principal,
+                    &manifest,
+                    current_unix_ms()?,
+                )
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
                 data_stream = Box::pin(futures_util::stream::empty());
                 Some(crate::object_manager::PreparedObjectIngest {
                     object_hash: ingest.manifest.object_hash.clone(),
