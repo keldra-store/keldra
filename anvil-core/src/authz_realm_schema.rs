@@ -189,10 +189,17 @@ pub async fn put_schema_revision(
     {
         return Ok(existing);
     }
-    let assignment = mvcc
-        .reconcile_authz_tuple_assignment(tenant_id)
-        .await?
-        .ok_or_else(|| anyhow!("this node is not the assigned authorization schema writer"))?;
+    let assignment = if tenant_id == crate::system_realm::SYSTEM_STORAGE_TENANT_ID {
+        None
+    } else {
+        Some(
+            mvcc.reconcile_authz_tuple_assignment(tenant_id)
+                .await?
+                .ok_or_else(|| {
+                    anyhow!("this node is not the assigned authorization schema writer")
+                })?,
+        )
+    };
     let principal = authz_head::transaction_principal(tenant_id);
     let idempotency_key = format!("authz-schema:{tenant_id}:{schema_id}:{schema_digest}");
     let now_unix_ms = current_unix_ms();
@@ -277,7 +284,9 @@ pub async fn put_schema_revision(
         head_snapshot.predicate,
         now_unix_ms,
     )?;
-    mvcc.stage_assignment_guard(transaction_id, &principal, &assignment, now_unix_ms)?;
+    if let Some(assignment) = &assignment {
+        mvcc.stage_assignment_guard(transaction_id, &principal, assignment, now_unix_ms)?;
+    }
     commit_schema_transaction(mvcc, transaction_id, &principal).await?;
     Ok(record)
 }
@@ -351,10 +360,17 @@ pub async fn bind_schema(
         (Some(expected), Some(actual)) if expected == actual => {}
         _ => bail!("schema binding generation conflict"),
     }
-    let assignment = mvcc
-        .reconcile_authz_tuple_assignment(tenant_id)
-        .await?
-        .ok_or_else(|| anyhow!("this node is not the assigned authorization schema writer"))?;
+    let assignment = if tenant_id == crate::system_realm::SYSTEM_STORAGE_TENANT_ID {
+        None
+    } else {
+        Some(
+            mvcc.reconcile_authz_tuple_assignment(tenant_id)
+                .await?
+                .ok_or_else(|| {
+                    anyhow!("this node is not the assigned authorization schema writer")
+                })?,
+        )
+    };
     let principal = authz_head::transaction_principal(tenant_id);
     let idempotency_key = format!(
         "authz-schema-binding:{tenant_id}:{realm_id}:{}:{}",
@@ -442,7 +458,9 @@ pub async fn bind_schema(
         head_snapshot.predicate,
         now_unix_ms,
     )?;
-    mvcc.stage_assignment_guard(transaction_id, &principal, &assignment, now_unix_ms)?;
+    if let Some(assignment) = &assignment {
+        mvcc.stage_assignment_guard(transaction_id, &principal, assignment, now_unix_ms)?;
+    }
     commit_schema_transaction(mvcc, transaction_id, &principal).await?;
     Ok(binding)
 }

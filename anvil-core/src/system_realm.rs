@@ -190,10 +190,6 @@ pub async fn ensure_bootstrapped(
         return Ok(());
     }
 
-    let assignment = mvcc
-        .reconcile_work_assignment("system-realm-bootstrap", &mesh_id)
-        .await?
-        .ok_or_else(|| anyhow!("this node does not own the system realm bootstrap assignment"))?;
     if bootstrap_marker_exists(mvcc, &mesh_id)? {
         reject_stale_bootstrap_config(config)?;
         return Ok(());
@@ -214,7 +210,7 @@ pub async fn ensure_bootstrapped(
     )
     .await
     .context("write system relation tuples")?;
-    write_bootstrap_marker(mvcc, &mesh_id, &assignment)
+    write_bootstrap_marker(mvcc, &mesh_id)
         .await
         .context("write system bootstrap marker")
 }
@@ -1290,7 +1286,6 @@ async fn write_system_relation_tuples(
 async fn write_bootstrap_marker(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     mesh_id: &str,
-    assignment: &crate::mvcc_worker_authority::AssignmentGuard,
 ) -> Result<()> {
     let marker = BootstrapMarker {
         schema: "anvil.system_realm.bootstrap_marker.v1",
@@ -1335,7 +1330,6 @@ async fn write_bootstrap_marker(
         crate::mvcc_transaction::PredicateKind::Absent,
         now,
     )?;
-    mvcc.stage_assignment_guard(&handle.transaction_id, &principal, assignment, now)?;
     let outcome = mvcc
         .open_transactions
         .commit(

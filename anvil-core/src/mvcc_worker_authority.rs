@@ -46,8 +46,8 @@ pub fn work_partition_id(kind: &str, logical_identity: &str) -> Result<u64> {
 }
 
 pub fn authz_tuple_partition_id(tenant_id: i64) -> Result<u64> {
-    if tenant_id <= 0 {
-        bail!("authorization tuple tenant ID must be positive");
+    if tenant_id < 0 {
+        bail!("authorization tuple tenant ID must not be negative");
     }
     work_partition_id("authz-tuple", &tenant_id.to_string())
 }
@@ -211,6 +211,7 @@ mod tests {
             authz_tuple_partition_id(42).unwrap(),
             work_partition_id("authz-tuple", "42").unwrap()
         );
-        assert!(authz_tuple_partition_id(0).is_err());
+        assert!(authz_tuple_partition_id(0).is_ok());
+        assert!(authz_tuple_partition_id(-1).is_err());
     }
 }

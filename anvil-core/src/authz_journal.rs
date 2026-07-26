@@ -292,10 +292,17 @@ async fn write_authz_tuple_batch_mvcc(
         return Ok(replay);
     }
 
-    let assignment = mvcc
-        .reconcile_authz_tuple_assignment(tenant_id)
-        .await?
-        .ok_or_else(|| anyhow!("this node is not the assigned authorization tuple writer"))?;
+    let assignment = if tenant_id == crate::system_realm::SYSTEM_STORAGE_TENANT_ID {
+        None
+    } else {
+        Some(
+            mvcc.reconcile_authz_tuple_assignment(tenant_id)
+                .await?
+                .ok_or_else(|| {
+                    anyhow!("this node is not the assigned authorization tuple writer")
+                })?,
+        )
+    };
     let principal = authz_head::transaction_principal(tenant_id);
     let idempotency_key = options
         .and_then(|options| options.operation_id.as_deref())
@@ -474,7 +481,9 @@ async fn write_authz_tuple_batch_mvcc(
             now_unix_ms,
         )?;
     }
-    mvcc.stage_assignment_guard(transaction_id, &principal, &assignment, now_unix_ms)?;
+    if let Some(assignment) = &assignment {
+        mvcc.stage_assignment_guard(transaction_id, &principal, assignment, now_unix_ms)?;
+    }
 
     let outcome = mvcc
         .open_transactions
