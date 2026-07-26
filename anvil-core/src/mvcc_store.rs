@@ -38,6 +38,8 @@ pub struct MvccStore {
     db: DB,
 }
 
+pub type LocalMvccStore = MvccStore;
+
 impl MvccStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let mut options = Options::default();
