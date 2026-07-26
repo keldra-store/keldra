@@ -119,53 +119,39 @@ fn generated_proto_exports_read_consistency_modes() {
 
 #[test]
 fn transaction_helpers_construct_proto_requests() {
-    let scope = proto::TransactionScope {
-        root_anchor_key: "tenant/root".to_string(),
-        root_key_hash: "hash-123".to_string(),
-    };
-    let precondition = proto::WritePrecondition {
-        object_versions: vec![proto::ObjectVersionPrecondition {
-            bucket_name: "documents".to_string(),
-            object_key: "invoice.json".to_string(),
-            expected_version_id: Some("v1".to_string()),
-            must_not_exist: false,
-        }],
-        lease_fence: None,
-    };
-    let boundary = proto::BoundaryValue {
-        name: "tenant".to_string(),
-        value: "acme".to_string(),
-    };
-
-    let begin = proto::BeginTransactionRequest::from(
-        BeginTransaction::new("begin-idem", scope.clone(), 30_000, "client-test")
-            .with_preconditions([precondition.clone()])
-            .with_boundary_values([boundary.clone()]),
-    );
+    let begin = proto::BeginTransactionRequest::from(BeginTransaction::new(
+        "begin-idem",
+        "cluster-a",
+        30_000,
+        proto::MvccReadConsistency::Linearized,
+        proto::MvccDurability::Quorum,
+    ));
     assert_eq!(begin.idempotency_key, "begin-idem");
-    assert_eq!(begin.scope, Some(scope));
-    assert_eq!(begin.preconditions, vec![precondition.clone()]);
-    assert_eq!(begin.boundary_values, vec![boundary]);
     assert_eq!(begin.ttl_ms, 30_000);
-    assert_eq!(begin.purpose, "client-test");
-
-    let commit = proto::CommitTransactionRequest::from(
-        CommitTransaction::new("tx-123", proto::ConsistencyMode::Finalised)
-            .wait_for_finalization(true)
-            .with_final_preconditions([precondition]),
+    assert_eq!(
+        begin.read_consistency,
+        proto::MvccReadConsistency::Linearized as i32
     );
-    assert_eq!(commit.transaction_id, "tx-123");
-    assert_eq!(commit.consistency, proto::ConsistencyMode::Finalised as i32);
-    assert!(commit.wait_for_finalization);
-    assert_eq!(commit.final_preconditions.len(), 1);
+    assert_eq!(begin.cluster_id, "cluster-a");
+    assert_eq!(begin.durability, proto::MvccDurability::Quorum as i32);
 
-    let rollback =
-        proto::RollbackTransactionRequest::from(RollbackTransaction::new("tx-123", "aborted"));
+    let commit =
+        proto::CommitTransactionRequest::from(CommitTransaction::new("tx-123", "cluster-a"));
+    assert_eq!(commit.transaction_id, "tx-123");
+    assert_eq!(commit.cluster_id, "cluster-a");
+
+    let rollback = proto::RollbackTransactionRequest::from(RollbackTransaction::new(
+        "tx-123",
+        "cluster-a",
+        "aborted",
+    ));
     assert_eq!(rollback.transaction_id, "tx-123");
+    assert_eq!(rollback.cluster_id, "cluster-a");
     assert_eq!(rollback.reason, "aborted");
 
-    let get = proto::GetTransactionRequest::from(GetTransaction::new("tx-123"));
+    let get = proto::GetTransactionRequest::from(GetTransaction::new("tx-123", "cluster-a"));
     assert_eq!(get.transaction_id, "tx-123");
+    assert_eq!(get.cluster_id, "cluster-a");
 }
 
 #[test]

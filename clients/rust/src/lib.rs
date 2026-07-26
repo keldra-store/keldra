@@ -13,68 +13,67 @@ pub mod proto {
     pub use super::generated::read_consistency;
     pub use super::generated::{
         AbortMultipartRequest, AbortMultipartResponse, AcquireTaskLeaseRequest, AnvilError,
-        AppendStreamRecordInfo, AppendStreamRecordRequest,
-        AppendStreamRecordResponse, ApplicationDescriptor, ApplyAuthzSchemaRequest,
-        ApplyAuthzSchemaResponse, AuditEventsResponse,
-        AuthzAllowedSubject, AuthzMaterializationMode, AuthzNamespaceSchema, AuthzRelationRule,
-        AuthzRelationSchema, AuthzRevisionMode, AuthzSchemaMemberKind, AuthzSchemaRef, AuthzScope,
-        AuthzSubject, AuthzSubjectSelectorKind, AuthzTuple, AuthzTupleMutation,
-        BeginTransactionRequest, BeginTransactionResponse, BindAuthzSchemaRequest,
-        BindAuthzSchemaResponse,
-        BoundaryDimension, BoundaryExtractionMode, BoundaryMigrationMode, BoundaryMigrationStatus,
-        BoundarySchemaRecord, BoundarySchemaResponse, BoundarySource, BoundaryValue, Bucket,
-        ByteRange, CancelHfIngestionRequest, CancelHfIngestionResponse, CheckPermissionRequest,
-        CheckPermissionResponse, CheckPermissionsRequest,
-        CheckPermissionsResponse, CheckpointTaskLeaseRequest, CommitTaskLeaseRequest,
-        CommitTaskLeaseResponse, CommitTransactionRequest, CompareAndSwapManifestRequest,
-        CompareAndSwapManifestResponse, CompleteMultipartPart, CompleteMultipartRequest,
-        CompleteMultipartResponse, ComposeObjectRequest, ComposeObjectResponse,
-        ComposeObjectSource, ConsistencyMode, CopyObjectRequest, CopyObjectResponse,
-        CreateAppendStreamRequest, CreateAppendStreamResponse, CreateApplicationCredentialRequest,
-        CreateBucketRequest, CreateBucketResponse, CreateHfKeyRequest, CreateHfKeyResponse,
-        CreateHostAliasRequest, CreateIndexRequest, CreateObjectLinkRequest,
-        CreatePersonalDbGroupRequest, CreatePersonalDbProjectionRequest, DType,
-        DeleteApplicationCredentialRequest, DeleteApplicationCredentialResponse,
-        DeleteBucketRequest, DeleteBucketResponse, DeleteHfKeyRequest, DeleteHfKeyResponse,
-        DeleteHostAliasRequest, DeleteObjectLinkRequest, DeleteObjectRequest, DeleteObjectResponse,
-        DisableIndexRequest, DropIndexRequest, DropIndexResponse, ForceReleaseTaskLeaseRequest,
-        ForceReleaseTaskLeaseResponse, GetAccessTokenRequest, GetAccessTokenResponse,
-        GetAuthzSchemaBindingRequest, GetAuthzSchemaBindingResponse, GetAuthzSchemaRequest,
-        GetAuthzSchemaResponse, GetBoundaryMigrationRequest, GetBoundarySchemaRequest,
-        GetBucketPolicyRequest, GetBucketPolicyResponse, GetGitBlobByPathRequest,
-        GetGitBlobByPathResponse, GetGitObjectRequest, GetGitObjectResponse,
-        GetHfIngestionStatusRequest, GetHfIngestionStatusResponse, GetObjectRequest,
-        GetObjectResponse, GetPackageVersionRequest, GetPartitionMapRequest,
-        GetPersonalDbGroupRequest, GetPersonalDbProjectionRequest, GetStorageClassRequest,
-        GetTensorChunk, GetTensorRequest, GetTensorsRequest,
-        GetTransactionRequest, GitBlobLocation, GitPackMetadata, GitTreeEntryRecord,
-        GrantAccessRequest, GrantAccessResponse, HeadObjectRequest, HeadObjectResponse, HfKey,
-        IndexBuildRecord, IndexDefinitionRecord, IndexDefinitionResponse, IndexDiagnosticRecord,
-        IndexKind, IndexMaintenanceMode, IndexPolicySnapshotMode, IndexQueryHit,
-        InitiateMultipartRequest, InitiateMultipartResponse, LeaseFencePrecondition,
-        ListAccessGrantsRequest, ListAccessGrantsResponse, ListApplicationsRequest,
-        ListApplicationsResponse, ListAuditEventsRequest, ListAuthzObjectsRequest,
-        ListAuthzObjectsResponse, ListAuthzSubjectsRequest, ListAuthzSubjectsResponse,
-        ListBucketsRequest, ListBucketsResponse, ListGitTreeRequest, ListGitTreeResponse,
-        ListHfKeysRequest, ListHfKeysResponse, ListIndexDiagnosticsRequest,
-        ListIndexDiagnosticsResponse, ListIndexesRequest, ListIndexesResponse,
-        ListObjectLinksRequest, ListObjectLinksResponse, ListObjectVersionsRequest,
-        ListObjectVersionsResponse, ListObjectsRequest, ListObjectsResponse,
-        ListPackageVersionsRequest, ListPackageVersionsResponse, ListRepairFindingsRequest,
-        ListRepairFindingsResponse, ListStorageClassesRequest, ListStorageClassesResponse,
-        ListTensorsRequest, ListTensorsResponse, ModelManifest, MoveBucketRequest,
-        MutationBatchAppendStreamRecord, MutationBatchCheckpointTaskLease,
+        AppendStreamRecordInfo, AppendStreamRecordRequest, AppendStreamRecordResponse,
+        ApplicationDescriptor, ApplyAuthzSchemaRequest, ApplyAuthzSchemaResponse,
+        AuditEventsResponse, AuthzAllowedSubject, AuthzMaterializationMode, AuthzNamespaceSchema,
+        AuthzRelationRule, AuthzRelationSchema, AuthzRevisionMode, AuthzSchemaMemberKind,
+        AuthzSchemaRef, AuthzScope, AuthzSubject, AuthzSubjectSelectorKind, AuthzTuple,
+        AuthzTupleMutation, BeginTransactionRequest, BeginTransactionResponse,
+        BindAuthzSchemaRequest, BindAuthzSchemaResponse, BoundaryDimension, BoundaryExtractionMode,
+        BoundaryMigrationMode, BoundaryMigrationStatus, BoundarySchemaRecord,
+        BoundarySchemaResponse, BoundarySource, BoundaryValue, Bucket, ByteRange,
+        CancelHfIngestionRequest, CancelHfIngestionResponse, CheckPermissionRequest,
+        CheckPermissionResponse, CheckPermissionsRequest, CheckPermissionsResponse,
+        CheckpointTaskLeaseRequest, CommitTaskLeaseRequest, CommitTaskLeaseResponse,
+        CommitTransactionRequest, CompareAndSwapManifestRequest, CompareAndSwapManifestResponse,
+        CompleteMultipartPart, CompleteMultipartRequest, CompleteMultipartResponse,
+        ComposeObjectRequest, ComposeObjectResponse, ComposeObjectSource, ConsistencyMode,
+        CopyObjectRequest, CopyObjectResponse, CreateAppendStreamRequest,
+        CreateAppendStreamResponse, CreateApplicationCredentialRequest, CreateBucketRequest,
+        CreateBucketResponse, CreateHfKeyRequest, CreateHfKeyResponse, CreateHostAliasRequest,
+        CreateIndexRequest, CreateObjectLinkRequest, CreatePersonalDbGroupRequest,
+        CreatePersonalDbProjectionRequest, DType, DeleteApplicationCredentialRequest,
+        DeleteApplicationCredentialResponse, DeleteBucketRequest, DeleteBucketResponse,
+        DeleteHfKeyRequest, DeleteHfKeyResponse, DeleteHostAliasRequest, DeleteObjectLinkRequest,
+        DeleteObjectRequest, DeleteObjectResponse, DisableIndexRequest, DropIndexRequest,
+        DropIndexResponse, ForceReleaseTaskLeaseRequest, ForceReleaseTaskLeaseResponse,
+        GetAccessTokenRequest, GetAccessTokenResponse, GetAuthzSchemaBindingRequest,
+        GetAuthzSchemaBindingResponse, GetAuthzSchemaRequest, GetAuthzSchemaResponse,
+        GetBoundaryMigrationRequest, GetBoundarySchemaRequest, GetBucketPolicyRequest,
+        GetBucketPolicyResponse, GetGitBlobByPathRequest, GetGitBlobByPathResponse,
+        GetGitObjectRequest, GetGitObjectResponse, GetHfIngestionStatusRequest,
+        GetHfIngestionStatusResponse, GetObjectRequest, GetObjectResponse,
+        GetPackageVersionRequest, GetPartitionMapRequest, GetPersonalDbGroupRequest,
+        GetPersonalDbProjectionRequest, GetStorageClassRequest, GetTensorChunk, GetTensorRequest,
+        GetTensorsRequest, GetTransactionRequest, GitBlobLocation, GitPackMetadata,
+        GitTreeEntryRecord, GrantAccessRequest, GrantAccessResponse, HeadObjectRequest,
+        HeadObjectResponse, HfKey, IndexBuildRecord, IndexDefinitionRecord,
+        IndexDefinitionResponse, IndexDiagnosticRecord, IndexKind, IndexMaintenanceMode,
+        IndexPolicySnapshotMode, IndexQueryHit, InitiateMultipartRequest,
+        InitiateMultipartResponse, LeaseFencePrecondition, ListAccessGrantsRequest,
+        ListAccessGrantsResponse, ListApplicationsRequest, ListApplicationsResponse,
+        ListAuditEventsRequest, ListAuthzObjectsRequest, ListAuthzObjectsResponse,
+        ListAuthzSubjectsRequest, ListAuthzSubjectsResponse, ListBucketsRequest,
+        ListBucketsResponse, ListGitTreeRequest, ListGitTreeResponse, ListHfKeysRequest,
+        ListHfKeysResponse, ListIndexDiagnosticsRequest, ListIndexDiagnosticsResponse,
+        ListIndexesRequest, ListIndexesResponse, ListObjectLinksRequest, ListObjectLinksResponse,
+        ListObjectVersionsRequest, ListObjectVersionsResponse, ListObjectsRequest,
+        ListObjectsResponse, ListPackageVersionsRequest, ListPackageVersionsResponse,
+        ListRepairFindingsRequest, ListRepairFindingsResponse, ListStorageClassesRequest,
+        ListStorageClassesResponse, ListTensorsRequest, ListTensorsResponse, ModelManifest,
+        MoveBucketRequest, MutationBatchAppendStreamRecord, MutationBatchCheckpointTaskLease,
         MutationBatchCommitTaskLease, MutationBatchCompareAndSwapManifest,
         MutationBatchDeleteObject, MutationBatchOperation, MutationBatchOperationReceipt,
         MutationBatchPatchJsonObject, MutationBatchPutObject, MutationBatchRequest,
-        MutationBatchResponse, MutationResponse, NativeMutationContext, ObjectInfo,
-        ObjectLinkResponse, ObjectMetadata, ObjectRef, ObjectSummary, ObjectVersionPrecondition,
-        ObjectVersionSummary, PackageVersion, PageRequest, PageResponse, PartitionMap,
-        PatchJsonObjectRequest, PatchJsonObjectResponse, PersonalDbCatchUpEntry,
-        PersonalDbCatchUpRequest, PersonalDbCatchUpResponse, PersonalDbCommitCertificateRecord,
-        PersonalDbCommittedHeadRecord, PersonalDbGroupManifestRecord, PersonalDbGroupResponse,
-        PersonalDbLogRecord, PersonalDbProjectionResponse, PersonalDbSnapshotsHeadRecord,
-        PersonalDbVoterAck, PublicMutationContext, PutAuthzSchemaRequest, PutAuthzSchemaResponse,
+        MutationBatchResponse, MutationResponse, MvccDurability, MvccReadConsistency,
+        NativeMutationContext, ObjectInfo, ObjectLinkResponse, ObjectMetadata, ObjectRef,
+        ObjectSummary, ObjectVersionPrecondition, ObjectVersionSummary, PackageVersion,
+        PageRequest, PageResponse, PartitionMap, PatchJsonObjectRequest, PatchJsonObjectResponse,
+        PersonalDbCatchUpEntry, PersonalDbCatchUpRequest, PersonalDbCatchUpResponse,
+        PersonalDbCommitCertificateRecord, PersonalDbCommittedHeadRecord,
+        PersonalDbGroupManifestRecord, PersonalDbGroupResponse, PersonalDbLogRecord,
+        PersonalDbProjectionResponse, PersonalDbSnapshotsHeadRecord, PersonalDbVoterAck,
+        PublicMutationContext, PutAuthzSchemaRequest, PutAuthzSchemaResponse,
         PutBoundarySchemaRequest, PutBucketPolicyRequest, PutBucketPolicyResponse, PutCellRequest,
         PutGitPackRequest, PutGitPackResponse, PutModelManifestRequest, PutModelManifestResponse,
         PutNodeRequest, PutObjectRequest, PutObjectResponse, PutPackageBlobRequest,
@@ -91,24 +90,24 @@ pub mod proto {
         SealAppendStreamSegmentResponse, SetPublicAccessRequest, SetPublicAccessResponse,
         StartBoundaryMigrationRequest, StartHfIngestionRequest, StartHfIngestionResponse,
         StorageClassDescriptor, StorageClassResponse, SubmitPersonalDbChangesetRequest,
-        SubmitPersonalDbChangesetResponse,
-        TailAppendStreamRequest, TailAppendStreamResponse, TaskLease, TaskLeaseResponse,
-        TenantScope, TensorIndexRow, TransactionScope, TransactionStatus, UpdateIndexRequest,
-        UpdateObjectLinkRequest, UploadPartMetadata, UploadPartRequest, UploadPartResponse,
-        VerifyHostAliasRequest, WatchAuthzDerivedLagRequest, WatchAuthzDerivedLagResponse,
-        WatchAuthzNamespaceRequest, WatchAuthzNamespaceResponse, WatchAuthzTupleLogRequest,
-        WatchAuthzTupleLogResponse, WatchBucketMetadataRequest, WatchBucketMetadataResponse,
-        WatchEventEnvelope, WatchGitSourceRequest, WatchGitSourceResponse,
-        WatchIndexDefinitionRequest, WatchIndexDefinitionResponse, WatchIndexPartitionRequest,
-        WatchIndexPartitionResponse, WatchPersonalDbGroupRequest, WatchPersonalDbGroupResponse,
-        WatchPersonalDbProjectionRequest, WatchPersonalDbProjectionResponse, WatchPrefixRequest,
-        WatchPrefixResponse, WatchVisibilityMode, WriteAuthzTupleRequest,
-        WriteAuthzTupleResponse, WriteAuthzTuplesRequest, WriteAuthzTuplesResponse, WriteOptions,
-        WritePrecondition, WriteResponse, WriteState, WriteVisibilityOptions, admin_service_client,
-        audit_service_client, auth_service_client,
-        bucket_service_client, coordination_service_client, get_object_response,
-        git_source_service_client, hf_ingestion_service_client, hugging_face_key_service_client,
-        index_service_client, mesh_control_service_client, model_manifest, model_service_client,
+        SubmitPersonalDbChangesetResponse, TailAppendStreamRequest, TailAppendStreamResponse,
+        TaskLease, TaskLeaseResponse, TenantScope, TensorIndexRow, TransactionScope,
+        TransactionStatus, UpdateIndexRequest, UpdateObjectLinkRequest, UploadPartMetadata,
+        UploadPartRequest, UploadPartResponse, VerifyHostAliasRequest, WatchAuthzDerivedLagRequest,
+        WatchAuthzDerivedLagResponse, WatchAuthzNamespaceRequest, WatchAuthzNamespaceResponse,
+        WatchAuthzTupleLogRequest, WatchAuthzTupleLogResponse, WatchBucketMetadataRequest,
+        WatchBucketMetadataResponse, WatchEventEnvelope, WatchGitSourceRequest,
+        WatchGitSourceResponse, WatchIndexDefinitionRequest, WatchIndexDefinitionResponse,
+        WatchIndexPartitionRequest, WatchIndexPartitionResponse, WatchPersonalDbGroupRequest,
+        WatchPersonalDbGroupResponse, WatchPersonalDbProjectionRequest,
+        WatchPersonalDbProjectionResponse, WatchPrefixRequest, WatchPrefixResponse,
+        WatchVisibilityMode, WriteAuthzTupleRequest, WriteAuthzTupleResponse,
+        WriteAuthzTuplesRequest, WriteAuthzTuplesResponse, WriteOptions, WritePrecondition,
+        WriteResponse, WriteState, WriteVisibilityOptions, admin_service_client,
+        audit_service_client, auth_service_client, bucket_service_client,
+        coordination_service_client, get_object_response, git_source_service_client,
+        hf_ingestion_service_client, hugging_face_key_service_client, index_service_client,
+        mesh_control_service_client, model_manifest, model_service_client,
         mutation_batch_operation, object_service_client, personal_db_service_client,
         put_git_pack_request, put_object_request, registry_service_client, repair_service_client,
         stream_service_client, transaction_service_client, upload_part_request, write_options,
@@ -181,36 +180,20 @@ pub struct BeginTransaction {
 impl BeginTransaction {
     pub fn new(
         idempotency_key: impl Into<String>,
-        scope: proto::TransactionScope,
+        cluster_id: impl Into<String>,
         ttl_ms: u64,
-        purpose: impl Into<String>,
+        read_consistency: proto::MvccReadConsistency,
+        durability: proto::MvccDurability,
     ) -> Self {
         Self {
             request: proto::BeginTransactionRequest {
                 idempotency_key: idempotency_key.into(),
-                scope: Some(scope),
-                preconditions: Vec::new(),
-                boundary_values: Vec::new(),
                 ttl_ms,
-                purpose: purpose.into(),
+                read_consistency: read_consistency as i32,
+                cluster_id: cluster_id.into(),
+                durability: durability as i32,
             },
         }
-    }
-
-    pub fn with_preconditions(
-        mut self,
-        preconditions: impl IntoIterator<Item = proto::WritePrecondition>,
-    ) -> Self {
-        self.request.preconditions = preconditions.into_iter().collect();
-        self
-    }
-
-    pub fn with_boundary_values(
-        mut self,
-        boundary_values: impl IntoIterator<Item = proto::BoundaryValue>,
-    ) -> Self {
-        self.request.boundary_values = boundary_values.into_iter().collect();
-        self
     }
 
     pub fn into_proto(self) -> proto::BeginTransactionRequest {
@@ -236,28 +219,13 @@ pub struct CommitTransaction {
 }
 
 impl CommitTransaction {
-    pub fn new(transaction_id: impl Into<String>, consistency: proto::ConsistencyMode) -> Self {
+    pub fn new(transaction_id: impl Into<String>, cluster_id: impl Into<String>) -> Self {
         Self {
             request: proto::CommitTransactionRequest {
                 transaction_id: transaction_id.into(),
-                consistency: consistency as i32,
-                wait_for_finalization: false,
-                final_preconditions: Vec::new(),
+                cluster_id: cluster_id.into(),
             },
         }
-    }
-
-    pub fn wait_for_finalization(mut self, wait_for_finalization: bool) -> Self {
-        self.request.wait_for_finalization = wait_for_finalization;
-        self
-    }
-
-    pub fn with_final_preconditions(
-        mut self,
-        final_preconditions: impl IntoIterator<Item = proto::WritePrecondition>,
-    ) -> Self {
-        self.request.final_preconditions = final_preconditions.into_iter().collect();
-        self
     }
 
     pub fn into_proto(self) -> proto::CommitTransactionRequest {
@@ -283,11 +251,16 @@ pub struct RollbackTransaction {
 }
 
 impl RollbackTransaction {
-    pub fn new(transaction_id: impl Into<String>, reason: impl Into<String>) -> Self {
+    pub fn new(
+        transaction_id: impl Into<String>,
+        cluster_id: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
         Self {
             request: proto::RollbackTransactionRequest {
                 transaction_id: transaction_id.into(),
                 reason: reason.into(),
+                cluster_id: cluster_id.into(),
             },
         }
     }
@@ -315,10 +288,11 @@ pub struct GetTransaction {
 }
 
 impl GetTransaction {
-    pub fn new(transaction_id: impl Into<String>) -> Self {
+    pub fn new(transaction_id: impl Into<String>, cluster_id: impl Into<String>) -> Self {
         Self {
             request: proto::GetTransactionRequest {
                 transaction_id: transaction_id.into(),
+                cluster_id: cluster_id.into(),
             },
         }
     }
