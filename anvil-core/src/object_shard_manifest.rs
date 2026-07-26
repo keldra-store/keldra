@@ -200,7 +200,7 @@ impl PhysicalObjectShardManifest {
                 let Ok(bytes) = result else {
                     continue;
                 };
-                if <[u8; 32]>::from(Sha256::digest(&bytes)) != placement.payload_hash {
+                if !shard_payload_matches(&bytes, placement.payload_hash) {
                     continue;
                 }
                 shards[usize::from(placement.shard_ordinal)] = Some(bytes);
@@ -239,6 +239,10 @@ impl PhysicalObjectShardManifest {
         }
         Ok(())
     }
+}
+
+fn shard_payload_matches(payload: &[u8], expected_hash: [u8; 32]) -> bool {
+    *blake3::hash(payload).as_bytes() == expected_hash
 }
 
 #[cfg(test)]
@@ -300,5 +304,27 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn reconstruction_accepts_encoder_blake3_shard_hashes() {
+        let codec = reed_solomon_erasure::galois_8::ReedSolomon::new(2, 1).unwrap();
+        let mut encoded = vec![b"abcd".to_vec(), b"efgh".to_vec(), vec![0; 4]];
+        codec.encode(&mut encoded).unwrap();
+        let hashes = encoded
+            .iter()
+            .map(|payload| *blake3::hash(payload).as_bytes())
+            .collect::<Vec<_>>();
+
+        let mut available = encoded
+            .iter()
+            .zip(hashes)
+            .map(|(payload, hash)| shard_payload_matches(payload, hash).then(|| payload.clone()))
+            .collect::<Vec<_>>();
+        available[0] = None;
+        codec.reconstruct(&mut available).unwrap();
+
+        assert_eq!(available[0].as_deref(), Some(b"abcd".as_slice()));
+        assert_eq!(available[1].as_deref(), Some(b"efgh".as_slice()));
     }
 }
