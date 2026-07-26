@@ -27,14 +27,6 @@ pub struct PutBlob {
     pub mutation_id: String,
 }
 
-#[cfg(test)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct CorePayloadReferenceSummary {
-    pub payload_identity: String,
-    pub storage_kind: String,
-    pub reference_count: usize,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GetBlob {
     pub object_ref: CoreObjectRef,

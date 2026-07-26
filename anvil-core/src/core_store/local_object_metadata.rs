@@ -9,7 +9,6 @@ use serde_json::Value as JsonValue;
 
 #[path = "local_object_metadata/projections.rs"]
 mod projections;
-use projections::*;
 pub(crate) use projections::{
     CurrentObjectMetadataPage, ObjectMetadataPageCursor, ObjectVersionsMetadataPage,
     object_current_history_key, object_current_key, object_current_page_bucket_prefix,
