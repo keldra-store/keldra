@@ -24,7 +24,7 @@ async fn personaldb_group_watch_streams_reserved_internal_events_through_native_
         emitted_at: "2026-06-28T00:00:00Z".to_string(),
     };
     append_personaldb_group_watch_record(
-        &cluster.states[0].storage,
+        cluster.states[0].mvcc.get().expect("MVCC subsystem"),
         1,
         &database_id,
         *uuid::Uuid::new_v4().as_bytes(),

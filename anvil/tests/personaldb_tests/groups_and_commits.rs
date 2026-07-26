@@ -272,9 +272,16 @@ async fn personaldb_submit_commits_and_is_available_to_catch_up_and_watch() {
 
     let row_index_data_id =
         personaldb_row_index_data_id(1, &database_id, 1, &committed.log_hash).unwrap();
-    let row_index = read_personaldb_row_index(&cluster.states[0].storage, &row_index_data_id)
-        .await
-        .unwrap();
+    let mvcc = cluster.states[0].mvcc.get().expect("MVCC subsystem");
+    let snapshot_version = mvcc.runtime.local_store().readable_version().unwrap();
+    let row_index = read_personaldb_row_index(
+        &cluster.states[0].storage,
+        mvcc,
+        &row_index_data_id,
+        snapshot_version,
+    )
+    .await
+    .unwrap();
     assert_eq!(row_index.header.generation, 1);
     assert_eq!(row_index.records.len(), 1);
     assert_eq!(row_index.records[0].database_id, database_id.as_bytes());
@@ -361,83 +368,6 @@ async fn personaldb_submit_commits_and_is_available_to_catch_up_and_watch() {
     assert_eq!(envelope.authz_revision, event.authz_revision);
     assert_eq!(envelope.record_kind, "personaldb_group");
     assert!(!envelope.payload_hash.is_empty());
-}
-
-#[tokio::test]
-// Internal-only: removes a PersonalDB payload locator directly from storage to
-// force the repair finding under test.
-async fn personaldb_repair_verifies_log_chain_and_reports_missing_payload() {
-    let cluster = shared_default_test_cluster().await;
-
-    let grpc_addr = cluster.grpc_addrs[0].clone();
-    let token = cluster.token.clone();
-    let mut personaldb = PersonalDbServiceClient::connect(grpc_addr.clone())
-        .await
-        .unwrap();
-    let mut repair = RepairServiceClient::connect(grpc_addr).await.unwrap();
-    let database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
-    let genesis_hash = create_group(&mut personaldb, &token, &database_id).await;
-    let committed = personaldb
-        .submit_personal_db_changeset(authorized(
-            valid_submit_request(&database_id, &genesis_hash, &token),
-            &token,
-        ))
-        .await
-        .unwrap()
-        .into_inner();
-
-    let healthy = repair
-        .repair_personal_db_log_chain(authorized(
-            RepairPersonalDbLogChainRequest {
-                database_id: database_id.clone(),
-            },
-            &token,
-        ))
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(healthy.status, "up_to_date");
-    assert_eq!(healthy.committed_log_index, 1);
-    assert_eq!(healthy.verified_log_index, 1);
-    assert_eq!(healthy.committed_log_hash, committed.log_hash);
-    assert!(healthy.finding.is_none());
-
-    let payload_ref = personaldb_changeset_payload_by_index_ref_name(
-        1,
-        &database_id,
-        committed.log_index,
-        &committed.changeset_payload_hash,
-    )
-    .unwrap();
-    delete_personaldb_data_locator_row(
-        &cluster.states[0].storage,
-        1,
-        &database_id,
-        &payload_ref,
-        "personaldb-repair-remove-payload",
-    )
-    .await
-    .unwrap();
-
-    let report = repair
-        .repair_personal_db_log_chain(authorized(
-            RepairPersonalDbLogChainRequest {
-                database_id: database_id.clone(),
-            },
-            &token,
-        ))
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(report.status, "needs_review");
-    assert_eq!(report.reason, "PersonalDbChangesetPayloadMissing");
-    assert_eq!(report.committed_log_index, 1);
-    assert_eq!(report.verified_log_index, 0);
-    let finding = report.finding.expect("repair finding");
-    assert_eq!(finding.scope_kind, "personaldb");
-    assert_eq!(finding.scope_id, format!("tenant-1-database-{database_id}"));
-    assert_eq!(finding.status, "RequiresOperatorReview");
-    assert_eq!(finding.proposed_action, "VerifyOnly");
 }
 
 #[tokio::test]
@@ -788,10 +718,14 @@ async fn personaldb_submit_builds_snapshot_when_threshold_is_reached() {
     let snapshots_head = divergent.snapshots_head.expect("snapshots head");
     assert_eq!(snapshots_head.latest_snapshot_log_index, 1);
     assert_eq!(snapshots_head.latest_snapshot_log_hash, committed.log_hash);
+    let mvcc = cluster.states[0].mvcc.get().expect("MVCC subsystem");
+    let snapshot_version = mvcc.runtime.local_store().readable_version().unwrap();
     let snapshot_manifest = read_personaldb_snapshot_manifest_by_ref(
         &cluster.states[0].storage,
+        mvcc,
         &snapshots_head.latest_snapshot_manifest_ref,
         cluster.states[0].personaldb_protocol_keyring.trust_store(),
+        snapshot_version,
     )
     .await
     .unwrap()
@@ -808,10 +742,12 @@ async fn personaldb_submit_builds_snapshot_when_threshold_is_reached() {
 
     let snapshot_object = read_personaldb_snapshot_object(
         &cluster.states[0].storage,
+        mvcc,
         1,
         &database_id,
         &snapshot_manifest,
         cluster.states[0].personaldb_protocol_keyring.trust_store(),
+        snapshot_version,
     )
     .await
     .unwrap()

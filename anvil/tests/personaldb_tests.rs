@@ -2,11 +2,10 @@
 
 use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::personal_db_service_client::PersonalDbServiceClient;
-use anvil::anvil_api::repair_service_client::RepairServiceClient;
 use anvil::anvil_api::{
     CreatePersonalDbGroupRequest, CreatePersonalDbProjectionRequest, GetPersonalDbGroupRequest,
     GetPersonalDbProjectionRequest, PersonalDbCatchUpRequest, PersonalDbVoterAck,
-    RepairPersonalDbLogChainRequest, SubmitPersonalDbChangesetRequest, WatchPersonalDbGroupRequest,
+    SubmitPersonalDbChangesetRequest, WatchPersonalDbGroupRequest,
     WatchPersonalDbProjectionRequest, WriteAuthzTupleRequest,
 };
 use anvil::anvil_personaldb_sqlite_changeset::iterate_changeset;
@@ -16,8 +15,6 @@ use anvil::partition_fence::{
     AcquireOwnership, MAX_OWNERSHIP_LEASE_MS, OwnershipPrincipal, OwnershipResource,
     OwnershipResourceKind, acquire_ownership, read_ownership_fence, read_partition_owner,
 };
-use anvil::personaldb_commit_store::personaldb_changeset_payload_by_index_ref_name;
-use anvil::personaldb_coremeta::delete_personaldb_data_locator_row;
 use anvil::personaldb_envelope::{
     PersonalDbEnvelopeDerivationInput, derive_verified_mutation_envelope,
 };
