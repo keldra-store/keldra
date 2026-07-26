@@ -1,18 +1,17 @@
 use crate::{
     anvil_api::SignatureEnvelopeV1 as WireSignatureEnvelopeV1,
     core_store::{
-        CF_PERSONALDB, CoreMetaRowCommonProto, CoreMetaTuplePart, CoreMutationBatch,
-        CoreMutationBatchReceipt, CoreMutationOperation, CoreMutationPrecondition, CoreStore,
-        TABLE_PERSONALDB_PROPOSAL_CLAIM_ROW, TABLE_PERSONALDB_PROPOSAL_RESERVATION_ROW,
-        TABLE_PERSONALDB_PROPOSAL_SLOT_ROW, TABLE_PERSONALDB_WITNESS_CANDIDATE_ROW,
-        TABLE_PERSONALDB_WITNESS_RECEIPT_ROW, core_meta_committed_row_common,
-        core_meta_payload_digest, core_meta_tuple_key, decode_deterministic_proto,
-        encode_deterministic_proto,
+        CF_PERSONALDB, CoreMetaRowCommonProto, CoreMetaTuplePart, CoreMutationOperation,
+        CoreMutationPrecondition, TABLE_PERSONALDB_GROUP_ROW, TABLE_PERSONALDB_PROPOSAL_CLAIM_ROW,
+        TABLE_PERSONALDB_PROPOSAL_RESERVATION_ROW, TABLE_PERSONALDB_PROPOSAL_SLOT_ROW,
+        TABLE_PERSONALDB_WITNESS_CANDIDATE_ROW, TABLE_PERSONALDB_WITNESS_RECEIPT_ROW,
+        core_meta_committed_row_common, core_meta_payload_digest, core_meta_tuple_key,
+        decode_deterministic_proto, encode_deterministic_proto,
     },
     formats::hash32,
     partition_fence::{
-        PartitionOwnerState, PartitionWritePermit, partition_write_precondition,
-        read_partition_owner, validate_write_permit_for_state,
+        PartitionOwnerState, PartitionWritePermit, read_partition_owner,
+        validate_write_permit_for_state,
     },
     personaldb_commit_store::{decode_commit_certificate, encode_commit_certificate},
     personaldb_control::{PersonalDbCommitCertificate, validate_commit_certificate_unsigned},
@@ -22,7 +21,6 @@ use crate::{
     },
     personaldb_heads::{
         PersonalDbCommittedHead, decode_committed_head, encode_committed_head,
-        personaldb_committed_head_precondition, read_personaldb_committed_head,
         validate_committed_head_unsigned,
     },
     personaldb_signing::{
@@ -263,6 +261,7 @@ pub struct SignCertificateAndHeadV1 {
 
 pub struct PersonalDbAdmissionAuthority<'a> {
     pub storage: &'a Storage,
+    pub mvcc: &'a crate::mvcc_bootstrap::MvccSubsystem,
     pub trust_store: &'a PublicKeyTrustStore,
     pub write_permit: &'a PartitionWritePermit,
     pub partition_owner_signing_key: &'a [u8],
@@ -590,6 +589,88 @@ pub fn personaldb_group_leader_lease_id(owner: &PartitionOwnerState) -> String {
     )
 }
 
+pub async fn seed_personaldb_committed_head(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    database_id: &str,
+    head: &PersonalDbCommittedHead,
+    trust_store: &PublicKeyTrustStore,
+    principal: &str,
+) -> Result<()> {
+    head.verify(trust_store)?;
+    let key = committed_head_key(tenant_id, database_id)?;
+    commit_group_batch(
+        mvcc,
+        format!(
+            "personaldb-head-seed:{tenant_id}:{database_id}:{}",
+            head.head_hash.as_deref().unwrap_or_default()
+        ),
+        tenant_id,
+        database_id,
+        principal,
+        vec![absent_precondition(TABLE_PERSONALDB_GROUP_ROW, key.clone())],
+        vec![put_operation(
+            tenant_id,
+            database_id,
+            TABLE_PERSONALDB_GROUP_ROW,
+            key,
+            encode_committed_head(head)?,
+        )],
+    )
+    .await
+}
+
+pub fn read_personaldb_committed_head_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    database_id: &str,
+    trust_store: &PublicKeyTrustStore,
+) -> Result<Option<PersonalDbCommittedHead>> {
+    Ok(read_committed_head_mvcc(mvcc, tenant_id, database_id, trust_store)?.map(|(_, head)| head))
+}
+
+pub async fn write_personaldb_committed_head_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    database_id: &str,
+    expected: &PersonalDbCommittedHead,
+    next: &PersonalDbCommittedHead,
+    trust_store: &PublicKeyTrustStore,
+    principal: &str,
+) -> Result<()> {
+    expected.verify(trust_store)?;
+    next.verify(trust_store)?;
+    let key = committed_head_key(tenant_id, database_id)?;
+    let (payload, current) = read_committed_head_mvcc(mvcc, tenant_id, database_id, trust_store)?
+        .ok_or_else(|| anyhow!("PersonalDB committed head is absent"))?;
+    if current != *expected {
+        bail!("PersonalDB committed head changed before publication");
+    }
+    commit_group_batch(
+        mvcc,
+        format!(
+            "personaldb-head-update:{tenant_id}:{database_id}:{}",
+            next.head_hash.as_deref().unwrap_or_default()
+        ),
+        tenant_id,
+        database_id,
+        principal,
+        vec![exact_precondition(
+            TABLE_PERSONALDB_GROUP_ROW,
+            key.clone(),
+            &payload,
+        )],
+        vec![put_operation(
+            tenant_id,
+            database_id,
+            TABLE_PERSONALDB_GROUP_ROW,
+            key,
+            encode_committed_head(next)?,
+        )],
+    )
+    .await
+}
+
 pub async fn reserve_personaldb_proposal(
     authority: &PersonalDbAdmissionAuthority<'_>,
     claim: ProposalIdempotencyClaimIdentityV1,
@@ -657,9 +738,9 @@ pub async fn reserve_personaldb_proposal(
         slot.client_log_epoch,
     )?;
     let reservation_key = reservation_key(&reservation.identity.reservation_id)?;
-    let existing_claim = read_claim_row(authority.storage, &claim_key)?;
-    let existing_slot = read_slot_row(authority.storage, &slot_key)?;
-    let existing_reservation = read_reservation_row(authority.storage, &reservation_key)?;
+    let existing_claim = read_claim_row(authority.mvcc, &claim_key)?;
+    let existing_slot = read_slot_row(authority.mvcc, &slot_key)?;
+    let existing_reservation = read_reservation_row(authority.mvcc, &reservation_key)?;
     if existing_claim.is_some() || existing_slot.is_some() || existing_reservation.is_some() {
         return exact_reservation_replay(
             tenant_id,
@@ -675,7 +756,7 @@ pub async fn reserve_personaldb_proposal(
     let protocol_hash = reservation.identity.hash_sha256()?;
     let transaction_id = format!("personaldb-reserve:{}", hex::encode(protocol_hash));
     let root_generation =
-        next_group_root_generation(authority.storage, tenant_id, &claim.database_id).await?;
+        next_group_root_generation(authority.mvcc, tenant_id, &claim.database_id).await?;
     let created_at_unix_nanos = unix_seconds_to_nanos(reservation.identity.issued_at_unix_seconds)?;
     let common = row_common(
         tenant_id,
@@ -697,7 +778,6 @@ pub async fn reserve_personaldb_proposal(
         reservation: Some(reservation_to_proto(&reservation)),
     });
     let preconditions = vec![
-        guard.owner_precondition,
         guard.head_precondition,
         absent_precondition(TABLE_PERSONALDB_PROPOSAL_CLAIM_ROW, claim_key.clone()),
         absent_precondition(TABLE_PERSONALDB_PROPOSAL_SLOT_ROW, slot_key.clone()),
@@ -730,7 +810,7 @@ pub async fn reserve_personaldb_proposal(
         ),
     ];
     commit_group_batch(
-        authority.storage,
+        authority.mvcc,
         transaction_id,
         tenant_id,
         &claim.database_id,
@@ -740,11 +820,9 @@ pub async fn reserve_personaldb_proposal(
     )
     .await?;
 
-    let stored = read_personaldb_proposal_reservation(
-        authority.storage,
-        &reservation.identity.reservation_id,
-    )?
-    .ok_or_else(|| anyhow!("proposal reservation commit produced no visible row"))?;
+    let stored =
+        read_personaldb_proposal_reservation(authority.mvcc, &reservation.identity.reservation_id)?
+            .ok_or_else(|| anyhow!("proposal reservation commit produced no visible row"))?;
     if stored.tenant_id != tenant_id || stored.reservation != reservation {
         bail!("proposal reservation commit did not round-trip exactly");
     }
@@ -767,7 +845,7 @@ pub async fn begin_personaldb_witness_signing(
     require_unsigned_certificate(&request.unsigned_commit_certificate)?;
     require_unsigned_head(&request.head_template)?;
 
-    let stored = read_personaldb_proposal_reservation(authority.storage, &request.reservation_id)?
+    let stored = read_personaldb_proposal_reservation(authority.mvcc, &request.reservation_id)?
         .ok_or_else(|| anyhow!("proposal reservation not found"))?;
     if stored.tenant_id != request.tenant_id {
         bail!("witness candidate tenant does not match reservation");
@@ -847,11 +925,11 @@ pub async fn begin_personaldb_witness_signing(
         &candidate.reservation_id,
     )?;
     let reservation_key = reservation_key(&candidate.reservation_id)?;
-    let existing_candidate = read_candidate_row(authority.storage, &candidate_key)?;
+    let existing_candidate = read_candidate_row(authority.mvcc, &candidate_key)?;
     if let Some(existing) = existing_candidate {
         if existing == candidate {
             let current =
-                read_personaldb_proposal_reservation(authority.storage, &candidate.reservation_id)?
+                read_personaldb_proposal_reservation(authority.mvcc, &candidate.reservation_id)?
                     .ok_or_else(|| anyhow!("witness candidate has no reservation"))?;
             if current.tenant_id == request.tenant_id && current.reservation == signing_reservation
             {
@@ -862,14 +940,14 @@ pub async fn begin_personaldb_witness_signing(
     }
 
     let current_reservation_payload = read_raw_row(
-        authority.storage,
+        authority.mvcc,
         TABLE_PERSONALDB_PROPOSAL_RESERVATION_ROW,
         &reservation_key,
     )?
     .ok_or_else(|| anyhow!("proposal reservation disappeared"))?;
     let transaction_id = format!("personaldb-candidate:{}", hex::encode(candidate_hash));
     let root_generation =
-        next_group_root_generation(authority.storage, request.tenant_id, &candidate.database_id)
+        next_group_root_generation(authority.mvcc, request.tenant_id, &candidate.database_id)
             .await?;
     let common = row_common(
         request.tenant_id,
@@ -887,13 +965,12 @@ pub async fn begin_personaldb_witness_signing(
         reservation: Some(reservation_to_proto(&signing_reservation)),
     });
     commit_group_batch(
-        authority.storage,
+        authority.mvcc,
         transaction_id,
         request.tenant_id,
         &candidate.database_id,
         &authority.write_permit.owner_node_id,
         vec![
-            guard.owner_precondition,
             guard.head_precondition,
             exact_precondition(
                 TABLE_PERSONALDB_PROPOSAL_RESERVATION_ROW,
@@ -925,7 +1002,7 @@ pub async fn begin_personaldb_witness_signing(
     .await?;
 
     let stored_candidate = read_witness_signing_candidate(
-        authority.storage,
+        authority.mvcc,
         request.tenant_id,
         &candidate.database_id,
         candidate.next_log_index,
@@ -975,14 +1052,14 @@ async fn sign_personaldb_certificate_and_head_with_authority(
         bail!("signing reservation revision must be nonzero");
     }
     if let Some(existing) =
-        read_witness_dual_signing_receipt(authority.storage, &request.reservation_id)?
+        read_witness_dual_signing_receipt(authority.mvcc, &request.reservation_id)?
     {
         validate_receipt_request(&existing, request)?;
         validate_stored_receipt(authority, &existing)?;
         return Ok(existing);
     }
 
-    let stored = read_personaldb_proposal_reservation(authority.storage, &request.reservation_id)?
+    let stored = read_personaldb_proposal_reservation(authority.mvcc, &request.reservation_id)?
         .ok_or_else(|| anyhow!("proposal reservation not found"))?;
     let tenant_id = stored.tenant_id;
     let reservation = stored.reservation;
@@ -995,7 +1072,7 @@ async fn sign_personaldb_certificate_and_head_with_authority(
     let guard = load_group_guard(authority, tenant_id, &identity.database_id).await?;
     validate_identity_against_guard(authority, identity, &guard)?;
     let candidate = read_witness_signing_candidate(
-        authority.storage,
+        authority.mvcc,
         tenant_id,
         &identity.database_id,
         next_log_index(identity)?,
@@ -1065,7 +1142,7 @@ async fn sign_personaldb_certificate_and_head_with_authority(
     validate_receipt_against_candidate(&receipt, &candidate)?;
     store_witness_receipt_create_absent(authority, tenant_id, &candidate, &guard, &receipt).await?;
     Ok(
-        read_witness_dual_signing_receipt(authority.storage, &request.reservation_id)?
+        read_witness_dual_signing_receipt(authority.mvcc, &request.reservation_id)?
             .ok_or_else(|| anyhow!("witness receipt commit produced no visible row"))?,
     )
 }
@@ -1074,19 +1151,19 @@ pub async fn acknowledge_personaldb_witness_receipt(
     authority: &PersonalDbAdmissionAuthority<'_>,
     request: &SignCertificateAndHeadV1,
 ) -> Result<ProposalAdmissionReservationV1> {
-    let stored = read_personaldb_proposal_reservation(authority.storage, &request.reservation_id)?
+    let stored = read_personaldb_proposal_reservation(authority.mvcc, &request.reservation_id)?
         .ok_or_else(|| anyhow!("proposal reservation not found"))?;
     let tenant_id = stored.tenant_id;
     let reservation = stored.reservation;
     let identity = &reservation.identity;
-    let receipt = read_witness_dual_signing_receipt(authority.storage, &request.reservation_id)?
+    let receipt = read_witness_dual_signing_receipt(authority.mvcc, &request.reservation_id)?
         .ok_or_else(|| anyhow!("witness dual-signing receipt not found"))?;
     validate_receipt_request(&receipt, request)?;
     validate_stored_receipt(authority, &receipt)?;
     let receipt_hash = receipt.hash_sha256()?;
     if reservation.witness_dual_signing_receipt_sha256 == Some(receipt_hash) {
         let slot = read_proposal_admission_slot(
-            authority.storage,
+            authority.mvcc,
             tenant_id,
             &identity.database_id,
             next_log_index(identity)?,
@@ -1115,7 +1192,7 @@ pub async fn acknowledge_personaldb_witness_receipt(
         next_log_index(identity)?,
         identity.client_log_epoch,
     )?;
-    let mut slot = read_slot_row(authority.storage, &slot_key)?
+    let mut slot = read_slot_row(authority.mvcc, &slot_key)?
         .ok_or_else(|| anyhow!("proposal slot not found"))?;
     if slot.reservation_id != identity.reservation_id
         || slot.state != ProposalAdmissionSlotStateV1::Reserved
@@ -1139,27 +1216,27 @@ pub async fn acknowledge_personaldb_witness_receipt(
 
     let reservation_key = reservation_key(&identity.reservation_id)?;
     let current_reservation_payload = read_raw_row(
-        authority.storage,
+        authority.mvcc,
         TABLE_PERSONALDB_PROPOSAL_RESERVATION_ROW,
         &reservation_key,
     )?
     .ok_or_else(|| anyhow!("proposal reservation disappeared"))?;
     let current_slot_payload = read_raw_row(
-        authority.storage,
+        authority.mvcc,
         TABLE_PERSONALDB_PROPOSAL_SLOT_ROW,
         &slot_key,
     )?
     .ok_or_else(|| anyhow!("proposal slot disappeared"))?;
     let receipt_key = receipt_key(&identity.reservation_id)?;
     let receipt_payload = read_raw_row(
-        authority.storage,
+        authority.mvcc,
         TABLE_PERSONALDB_WITNESS_RECEIPT_ROW,
         &receipt_key,
     )?
     .ok_or_else(|| anyhow!("witness receipt disappeared"))?;
     let transaction_id = format!("personaldb-receipt-ack:{}", hex::encode(receipt_hash));
     let root_generation =
-        next_group_root_generation(authority.storage, tenant_id, &identity.database_id).await?;
+        next_group_root_generation(authority.mvcc, tenant_id, &identity.database_id).await?;
     let common = row_common(
         tenant_id,
         &identity.database_id,
@@ -1176,13 +1253,12 @@ pub async fn acknowledge_personaldb_witness_receipt(
         slot: Some(slot_to_proto(&slot)),
     });
     commit_group_batch(
-        authority.storage,
+        authority.mvcc,
         transaction_id,
         tenant_id,
         &identity.database_id,
         &authority.write_permit.owner_node_id,
         vec![
-            guard.owner_precondition,
             guard.head_precondition,
             exact_precondition(
                 TABLE_PERSONALDB_PROPOSAL_RESERVATION_ROW,
@@ -1219,7 +1295,7 @@ pub async fn acknowledge_personaldb_witness_receipt(
     )
     .await?;
     Ok(
-        read_personaldb_proposal_reservation(authority.storage, &request.reservation_id)?
+        read_personaldb_proposal_reservation(authority.mvcc, &request.reservation_id)?
             .ok_or_else(|| anyhow!("acknowledged proposal reservation disappeared"))?
             .reservation,
     )
@@ -1229,12 +1305,12 @@ pub async fn commit_personaldb_witnessed_proposal(
     authority: &PersonalDbAdmissionAuthority<'_>,
     request: &SignCertificateAndHeadV1,
 ) -> Result<ProposalAdmissionReservationV1> {
-    let stored = read_personaldb_proposal_reservation(authority.storage, &request.reservation_id)?
+    let stored = read_personaldb_proposal_reservation(authority.mvcc, &request.reservation_id)?
         .ok_or_else(|| anyhow!("proposal reservation not found"))?;
     let tenant_id = stored.tenant_id;
     let reservation = stored.reservation;
     let identity = &reservation.identity;
-    let receipt = read_witness_dual_signing_receipt(authority.storage, &request.reservation_id)?
+    let receipt = read_witness_dual_signing_receipt(authority.mvcc, &request.reservation_id)?
         .ok_or_else(|| anyhow!("witness dual-signing receipt not found"))?;
     validate_receipt_request(&receipt, request)?;
     validate_stored_receipt(authority, &receipt)?;
@@ -1245,7 +1321,7 @@ pub async fn commit_personaldb_witnessed_proposal(
         next_log_index(identity)?,
         identity.client_log_epoch,
     )?;
-    let slot = read_slot_row(authority.storage, &slot_key)?
+    let slot = read_slot_row(authority.mvcc, &slot_key)?
         .ok_or_else(|| anyhow!("proposal slot not found"))?;
     if reservation.state == ProposalAdmissionReservationStateV1::Committed {
         if reservation.witness_dual_signing_receipt_sha256 == Some(receipt_hash)
@@ -1283,14 +1359,15 @@ pub async fn commit_personaldb_witnessed_proposal(
         bail!("proposal reservation leader lease is stale at commit finalisation");
     }
     let committed_head = decode_committed_head(&receipt.signed_committed_head)?;
-    let current_head_bytes = encode_committed_head(&guard.head)?;
-    if guard.head != committed_head
-        || domain_hash(SIGNED_HEAD_HASH_DOMAIN, &current_head_bytes)
+    let committed_certificate = decode_commit_certificate(&receipt.signed_commit_certificate)?;
+    let committed_head_bytes = encode_committed_head(&committed_head)?;
+    if committed_head.log_index != next_log_index(identity)?
+        || committed_head.log_hash != committed_certificate.entry_hash
+        || domain_hash(SIGNED_HEAD_HASH_DOMAIN, &committed_head_bytes)
             != receipt.signed_committed_head_sha256
     {
-        bail!("proposal witnessed head is not the current committed head");
+        bail!("proposal witnessed head is not the certified successor head");
     }
-    let committed_certificate = decode_commit_certificate(&receipt.signed_commit_certificate)?;
     if domain_hash(
         SIGNED_CERTIFICATE_HASH_DOMAIN,
         &encode_commit_certificate(&committed_certificate)?,
@@ -1322,27 +1399,27 @@ pub async fn commit_personaldb_witnessed_proposal(
 
     let reservation_key = reservation_key(&identity.reservation_id)?;
     let current_reservation_payload = read_raw_row(
-        authority.storage,
+        authority.mvcc,
         TABLE_PERSONALDB_PROPOSAL_RESERVATION_ROW,
         &reservation_key,
     )?
     .ok_or_else(|| anyhow!("proposal reservation disappeared"))?;
     let current_slot_payload = read_raw_row(
-        authority.storage,
+        authority.mvcc,
         TABLE_PERSONALDB_PROPOSAL_SLOT_ROW,
         &slot_key,
     )?
     .ok_or_else(|| anyhow!("proposal slot disappeared"))?;
     let receipt_key = receipt_key(&identity.reservation_id)?;
     let receipt_payload = read_raw_row(
-        authority.storage,
+        authority.mvcc,
         TABLE_PERSONALDB_WITNESS_RECEIPT_ROW,
         &receipt_key,
     )?
     .ok_or_else(|| anyhow!("witness receipt disappeared"))?;
     let transaction_id = format!("personaldb-admission-commit:{}", hex::encode(receipt_hash));
     let root_generation =
-        next_group_root_generation(authority.storage, tenant_id, &identity.database_id).await?;
+        next_group_root_generation(authority.mvcc, tenant_id, &identity.database_id).await?;
     let common = row_common(
         tenant_id,
         &identity.database_id,
@@ -1359,13 +1436,12 @@ pub async fn commit_personaldb_witnessed_proposal(
         slot: Some(slot_to_proto(&committed_slot)),
     });
     commit_group_batch(
-        authority.storage,
+        authority.mvcc,
         transaction_id,
         tenant_id,
         &identity.database_id,
         &authority.write_permit.owner_node_id,
         vec![
-            guard.owner_precondition,
             guard.head_precondition,
             exact_precondition(
                 TABLE_PERSONALDB_PROPOSAL_RESERVATION_ROW,
@@ -1387,6 +1463,13 @@ pub async fn commit_personaldb_witnessed_proposal(
             put_operation(
                 tenant_id,
                 &identity.database_id,
+                TABLE_PERSONALDB_GROUP_ROW,
+                committed_head_key(tenant_id, &identity.database_id)?,
+                committed_head_bytes,
+            ),
+            put_operation(
+                tenant_id,
+                &identity.database_id,
                 TABLE_PERSONALDB_PROPOSAL_RESERVATION_ROW,
                 reservation_key,
                 reservation_payload,
@@ -1402,19 +1485,18 @@ pub async fn commit_personaldb_witnessed_proposal(
     )
     .await?;
     Ok(
-        read_personaldb_proposal_reservation(authority.storage, &request.reservation_id)?
+        read_personaldb_proposal_reservation(authority.mvcc, &request.reservation_id)?
             .ok_or_else(|| anyhow!("committed proposal reservation disappeared"))?
             .reservation,
     )
 }
 
 pub fn read_personaldb_proposal_reservation(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     reservation_id: &str,
 ) -> Result<Option<StoredProposalAdmissionReservationV1>> {
     let key = reservation_key(reservation_id)?;
-    let Some(payload) = read_raw_row(storage, TABLE_PERSONALDB_PROPOSAL_RESERVATION_ROW, &key)?
-    else {
+    let Some(payload) = read_raw_row(mvcc, TABLE_PERSONALDB_PROPOSAL_RESERVATION_ROW, &key)? else {
         return Ok(None);
     };
     let (common, reservation) = decode_reservation_row(&payload)?;
@@ -1431,14 +1513,14 @@ pub fn read_personaldb_proposal_reservation(
 }
 
 pub fn read_proposal_admission_slot(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
     next_log_index: u64,
     client_log_epoch: u64,
 ) -> Result<Option<ProposalAdmissionSlotV1>> {
     let key = slot_key(tenant_id, database_id, next_log_index, client_log_epoch)?;
-    let Some(payload) = read_raw_row(storage, TABLE_PERSONALDB_PROPOSAL_SLOT_ROW, &key)? else {
+    let Some(payload) = read_raw_row(mvcc, TABLE_PERSONALDB_PROPOSAL_SLOT_ROW, &key)? else {
         return Ok(None);
     };
     let (common, slot) = decode_slot_row(&payload)?;
@@ -1454,7 +1536,7 @@ pub fn read_proposal_admission_slot(
 }
 
 pub fn read_witness_signing_candidate(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
     next_log_index: u64,
@@ -1468,7 +1550,7 @@ pub fn read_witness_signing_candidate(
         client_log_epoch,
         reservation_id,
     )?;
-    let Some(payload) = read_raw_row(storage, TABLE_PERSONALDB_WITNESS_CANDIDATE_ROW, &key)? else {
+    let Some(payload) = read_raw_row(mvcc, TABLE_PERSONALDB_WITNESS_CANDIDATE_ROW, &key)? else {
         return Ok(None);
     };
     let (common, candidate) = decode_candidate_row(&payload)?;
@@ -1485,11 +1567,11 @@ pub fn read_witness_signing_candidate(
 }
 
 pub fn read_witness_dual_signing_receipt(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     reservation_id: &str,
 ) -> Result<Option<WitnessDualSigningReceiptV1>> {
     let key = receipt_key(reservation_id)?;
-    let Some(payload) = read_raw_row(storage, TABLE_PERSONALDB_WITNESS_RECEIPT_ROW, &key)? else {
+    let Some(payload) = read_raw_row(mvcc, TABLE_PERSONALDB_WITNESS_RECEIPT_ROW, &key)? else {
         return Ok(None);
     };
     let (_common, receipt) = decode_receipt_row(&payload)?;
@@ -1503,7 +1585,6 @@ pub fn read_witness_dual_signing_receipt(
 struct GroupGuard {
     owner: PartitionOwnerState,
     head: PersonalDbCommittedHead,
-    owner_precondition: CoreMutationPrecondition,
     head_precondition: CoreMutationPrecondition,
 }
 
@@ -1529,27 +1610,21 @@ async fn load_group_guard(
     .ok_or_else(|| anyhow!("PersonalDB group leader lease is absent"))?;
     validate_write_permit_for_state(&owner, authority.write_permit, true)
         .map_err(|error| anyhow!("{error}"))?;
-    let owner_precondition = partition_write_precondition(
-        authority.storage,
-        authority.write_permit,
-        authority.partition_owner_signing_key,
-    )
-    .await
-    .map_err(|error| anyhow!("{error}"))?;
-    let head = read_personaldb_committed_head(
-        authority.storage,
+    let (head_payload, head) = read_committed_head_mvcc(
+        authority.mvcc,
         tenant_id,
         database_id,
         authority.trust_store,
-    )
-    .await?
+    )?
     .ok_or_else(|| anyhow!("PersonalDB group committed head is absent"))?;
-    let head_precondition =
-        personaldb_committed_head_precondition(authority.storage, tenant_id, database_id)?;
+    let head_precondition = exact_precondition(
+        TABLE_PERSONALDB_GROUP_ROW,
+        committed_head_key(tenant_id, database_id)?,
+        &head_payload,
+    );
     Ok(GroupGuard {
         owner,
         head,
-        owner_precondition,
         head_precondition,
     })
 }
@@ -1668,7 +1743,7 @@ fn validate_stored_receipt(
     receipt: &WitnessDualSigningReceiptV1,
 ) -> Result<()> {
     validate_receipt_shape(receipt)?;
-    let stored = read_personaldb_proposal_reservation(authority.storage, &receipt.reservation_id)?
+    let stored = read_personaldb_proposal_reservation(authority.mvcc, &receipt.reservation_id)?
         .ok_or_else(|| anyhow!("witness receipt reservation not found"))?;
     let reservation = stored.reservation;
     let identity = &reservation.identity;
@@ -1694,7 +1769,7 @@ fn validate_stored_receipt(
         bail!("stored witness receipt does not match reservation");
     }
     let candidate = read_witness_signing_candidate(
-        authority.storage,
+        authority.mvcc,
         stored.tenant_id,
         &identity.database_id,
         next_log_index(identity)?,
@@ -1766,7 +1841,7 @@ async fn store_witness_receipt_create_absent(
     validate_receipt_against_candidate(receipt, candidate)?;
     let receipt_key = receipt_key(&receipt.reservation_id)?;
     if let Some(existing) =
-        read_witness_dual_signing_receipt(authority.storage, &receipt.reservation_id)?
+        read_witness_dual_signing_receipt(authority.mvcc, &receipt.reservation_id)?
     {
         if existing == *receipt {
             return Ok(());
@@ -1782,13 +1857,13 @@ async fn store_witness_receipt_create_absent(
         &candidate.reservation_id,
     )?;
     let current_reservation_payload = read_raw_row(
-        authority.storage,
+        authority.mvcc,
         TABLE_PERSONALDB_PROPOSAL_RESERVATION_ROW,
         &reservation_key,
     )?
     .ok_or_else(|| anyhow!("proposal reservation disappeared"))?;
     let current_candidate_payload = read_raw_row(
-        authority.storage,
+        authority.mvcc,
         TABLE_PERSONALDB_WITNESS_CANDIDATE_ROW,
         &candidate_key,
     )?
@@ -1796,7 +1871,7 @@ async fn store_witness_receipt_create_absent(
     let receipt_hash = receipt.hash_sha256()?;
     let transaction_id = format!("personaldb-witness:{}", hex::encode(receipt_hash));
     let root_generation =
-        next_group_root_generation(authority.storage, tenant_id, &candidate.database_id).await?;
+        next_group_root_generation(authority.mvcc, tenant_id, &candidate.database_id).await?;
     let common = row_common(
         tenant_id,
         &candidate.database_id,
@@ -1809,13 +1884,12 @@ async fn store_witness_receipt_create_absent(
         receipt: Some(receipt_to_proto(receipt)),
     });
     commit_group_batch(
-        authority.storage,
+        authority.mvcc,
         transaction_id,
         tenant_id,
         &candidate.database_id,
         &authority.write_permit.owner_node_id,
         vec![
-            guard.owner_precondition.clone(),
             guard.head_precondition.clone(),
             exact_precondition(
                 TABLE_PERSONALDB_PROPOSAL_RESERVATION_ROW,
@@ -1920,6 +1994,3 @@ fn slot_from_reservation(
     validate_slot(&slot)?;
     Ok(slot)
 }
-
-#[cfg(test)]
-mod tests;

@@ -30,9 +30,7 @@ use crate::{
     },
     personaldb_heads::{
         PersonalDbCommittedHead, PersonalDbSnapshotsHead, decode_committed_head,
-        read_personaldb_committed_head, read_personaldb_group_manifest,
-        write_personaldb_committed_head, write_personaldb_committed_head_with_preconditions,
-        write_personaldb_group_manifest,
+        read_personaldb_group_manifest, write_personaldb_group_manifest,
     },
     personaldb_projection::{
         ProjectionDefinition, WriteBackPolicy, list_projection_definitions_for_database,
@@ -51,8 +49,10 @@ use crate::{
         ProposalAdmissionReservationIdentityV1, ProposalIdempotencyClaimIdentityV1,
         SignCertificateAndHeadV1, acknowledge_personaldb_witness_receipt,
         begin_personaldb_witness_signing, commit_personaldb_witnessed_proposal,
-        derive_reservation_id, personaldb_group_leader_lease_id, reserve_personaldb_proposal,
-        sign_personaldb_certificate_and_head_with_keyring,
+        derive_reservation_id, personaldb_group_leader_lease_id,
+        read_personaldb_committed_head_mvcc, reserve_personaldb_proposal,
+        seed_personaldb_committed_head, sign_personaldb_certificate_and_head_with_keyring,
+        write_personaldb_committed_head_mvcc,
     },
     personaldb_row_index::{PersonalDbRowIndexWrite, write_personaldb_row_index},
     personaldb_schema::{
@@ -214,12 +214,13 @@ impl PersonalDbService for AppState {
         .seal(protocol_keyring)
         .await
         .map_err(internal_status)?;
-        write_personaldb_committed_head(
-            &self.storage,
+        seed_personaldb_committed_head(
+            &self.mvcc,
             claims.tenant_id,
             &committed_head.database_id,
             &committed_head,
             protocol_keyring.trust_store(),
+            &claims.sub,
         )
         .await
         .map_err(internal_status)?;
@@ -268,13 +269,12 @@ impl PersonalDbService for AppState {
         .await
         .map_err(internal_status)?
         .ok_or_else(|| Status::not_found("PersonalDB group not found"))?;
-        let committed_head = read_personaldb_committed_head(
-            &self.storage,
+        let committed_head = read_personaldb_committed_head_mvcc(
+            &self.mvcc,
             claims.tenant_id,
             &req.database_id,
             self.personaldb_protocol_keyring.trust_store(),
         )
-        .await
         .map_err(internal_status)?;
 
         Ok(Response::new(PersonalDbGroupResponse {
@@ -792,13 +792,12 @@ impl AppState {
         .await
         .map_err(internal_status)?
         .ok_or_else(|| Status::not_found("PersonalDB projection group not found"))?;
-        let projection_head = read_personaldb_committed_head(
-            &self.storage,
+        let projection_head = read_personaldb_committed_head_mvcc(
+            &self.mvcc,
             actor.tenant_id,
             &definition.database_id,
             self.personaldb_protocol_keyring.trust_store(),
         )
-        .await
         .map_err(internal_status)?
         .ok_or_else(|| Status::failed_precondition("PersonalDB projection head missing"))?;
         if projection_head.log_index != request.base_log_index
@@ -827,13 +826,12 @@ impl AppState {
         .await
         .map_err(internal_status)?
         .ok_or_else(|| Status::not_found("PersonalDB source group not found"))?;
-        let source_head = read_personaldb_committed_head(
-            &self.storage,
+        let source_head = read_personaldb_committed_head_mvcc(
+            &self.mvcc,
             actor.tenant_id,
             &source_database_id,
             self.personaldb_protocol_keyring.trust_store(),
         )
-        .await
         .map_err(internal_status)?
         .ok_or_else(|| Status::failed_precondition("PersonalDB source head missing"))?;
         let source_schema_sql = read_personaldb_schema_sql(
@@ -942,13 +940,12 @@ impl AppState {
         .await
         .map_err(internal_status)?
         .ok_or_else(|| Status::not_found("PersonalDB group not found"))?;
-        let previous_head = read_personaldb_committed_head(
-            &self.storage,
+        let previous_head = read_personaldb_committed_head_mvcc(
+            &self.mvcc,
             actor.tenant_id,
             &validated.request.database_id,
             protocol_keyring.trust_store(),
         )
-        .await
         .map_err(internal_status)?
         .ok_or_else(|| Status::failed_precondition("PersonalDB committed head missing"))?;
 
@@ -975,13 +972,12 @@ impl AppState {
                 &previous_head.log_hash,
             )
             .await?;
-        let current_head_after_fence = read_personaldb_committed_head(
-            &self.storage,
+        let current_head_after_fence = read_personaldb_committed_head_mvcc(
+            &self.mvcc,
             actor.tenant_id,
             &validated.request.database_id,
             protocol_keyring.trust_store(),
         )
-        .await
         .map_err(internal_status)?
         .ok_or_else(|| Status::failed_precondition("PersonalDB committed head missing"))?;
         if current_head_after_fence.log_index != previous_head.log_index
@@ -1128,6 +1124,7 @@ impl AppState {
             };
             let authority = PersonalDbAdmissionAuthority {
                 storage: &self.storage,
+                mvcc: &self.mvcc,
                 trust_store: protocol_keyring.trust_store(),
                 write_permit: &write_permit,
                 partition_owner_signing_key: self.persistence.partition_owner_signing_key(),
@@ -1258,6 +1255,7 @@ impl AppState {
                 };
                 let authority = PersonalDbAdmissionAuthority {
                     storage: &self.storage,
+                    mvcc: &self.mvcc,
                     trust_store: protocol_keyring.trust_store(),
                     write_permit: &write_permit,
                     partition_owner_signing_key: self.persistence.partition_owner_signing_key(),
@@ -1415,39 +1413,10 @@ impl AppState {
             .await
             .map_err(internal_status)?;
         }
-        let write_precondition = self
-            .personaldb_group_write_precondition(&write_permit)
-            .await?;
-        let current_head_before_publish = read_personaldb_committed_head(
-            &self.storage,
-            actor.tenant_id,
-            &validated.request.database_id,
-            protocol_keyring.trust_store(),
-        )
-        .await
-        .map_err(internal_status)?
-        .ok_or_else(|| Status::failed_precondition("PersonalDB committed head missing"))?;
-        if current_head_before_publish.log_index != previous_head.log_index
-            || current_head_before_publish.log_hash != previous_head.log_hash
-            || current_head_before_publish.head_hash != previous_head.head_hash
-        {
-            return Err(Status::failed_precondition(
-                "PersonalDB committed head changed before publish",
-            ));
-        }
-        write_personaldb_committed_head_with_preconditions(
-            &self.storage,
-            actor.tenant_id,
-            &validated.request.database_id,
-            &committed_head,
-            protocol_keyring.trust_store(),
-            vec![write_precondition],
-        )
-        .await
-        .map_err(internal_status)?;
         if let Some(signing_request) = admission_terminal_request.as_ref() {
             let authority = PersonalDbAdmissionAuthority {
                 storage: &self.storage,
+                mvcc: &self.mvcc,
                 trust_store: protocol_keyring.trust_store(),
                 write_permit: &write_permit,
                 partition_owner_signing_key: self.persistence.partition_owner_signing_key(),
@@ -1456,6 +1425,18 @@ impl AppState {
             commit_personaldb_witnessed_proposal(&authority, signing_request)
                 .await
                 .map_err(internal_status)?;
+        } else {
+            write_personaldb_committed_head_mvcc(
+                &self.mvcc,
+                actor.tenant_id,
+                &validated.request.database_id,
+                &previous_head,
+                &committed_head,
+                protocol_keyring.trust_store(),
+                &write_permit.owner_node_id,
+            )
+            .await
+            .map_err(internal_status)?;
         }
 
         let watch_payload = PersonalDbGroupWatchPayload {
@@ -1582,13 +1563,12 @@ impl AppState {
         .await
         .map_err(internal_status)?
         .ok_or_else(|| Status::not_found("PersonalDB projection group not found"))?;
-        let target_head = read_personaldb_committed_head(
-            &self.storage,
+        let target_head = read_personaldb_committed_head_mvcc(
+            &self.mvcc,
             tenant_id,
             &definition.database_id,
             self.personaldb_protocol_keyring.trust_store(),
         )
-        .await
         .map_err(internal_status)?
         .ok_or_else(|| Status::failed_precondition("PersonalDB projection head missing"))?;
         let target_schema_sql = read_personaldb_schema_sql(

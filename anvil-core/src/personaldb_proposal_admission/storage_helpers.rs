@@ -1,33 +1,20 @@
 use super::codec::*;
 use super::*;
-use crate::{
-    core_store::{CoreMetaStore, CoreMutationRootPublication},
-    formats::writer::WriterFamily,
-};
+use crate::mvcc_transaction::{DurabilityLevel, PredicateKind, ReadConsistency};
 
 pub(super) async fn next_group_root_generation(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
 ) -> Result<u64> {
-    let anchor_key = personaldb_root_anchor_key(tenant_id, database_id);
-    let anchor = CoreStore::new(storage.clone())
-        .await?
-        .read_internal_root_anchor(&anchor_key, 1)
-        .await
-        .context("read PersonalDB group root anchor")?;
-    let expected_root_key_hash = personaldb_root_key_hash(tenant_id, database_id);
-    if anchor.root_key_hash != expected_root_key_hash {
-        bail!("PersonalDB group root anchor scope mismatch");
-    }
-    anchor
-        .generation
+    mvcc.runtime
+        .applied_version()?
         .checked_add(1)
         .ok_or_else(|| anyhow!("PersonalDB group root generation overflow"))
 }
 
 pub(super) async fn commit_group_batch(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     transaction_id: String,
     tenant_id: i64,
     database_id: &str,
@@ -35,43 +22,103 @@ pub(super) async fn commit_group_batch(
     preconditions: Vec<CoreMutationPrecondition>,
     operations: Vec<CoreMutationOperation>,
 ) -> Result<()> {
-    let scope_partition = personaldb_partition_id(tenant_id, database_id);
-    let receipt = CoreStore::new(storage.clone())
+    let assignment = mvcc
+        .reconcile_work_assignment(
+            PERSONALDB_GROUP_PARTITION_FAMILY,
+            &personaldb_partition_id(tenant_id, database_id),
+        )
         .await?
-        .commit_mutation_batch(CoreMutationBatch {
-            transaction_id,
-            scope_partition: scope_partition.clone(),
-            committed_by_principal: principal.to_string(),
-            root_publications: vec![
-                CoreMutationRootPublication::new(
-                    scope_partition,
-                    WriterFamily::CoreControl.as_str(),
-                )
-                .coordinator(),
-                CoreMutationRootPublication::new(
-                    personaldb_root_anchor_key(tenant_id, database_id),
-                    WriterFamily::PersonalDb.as_str(),
-                ),
-            ],
-            preconditions,
-            operations,
-        })
+        .ok_or_else(|| anyhow!("local node does not own the PersonalDB group assignment"))?;
+    let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default();
+    let handle = mvcc
+        .open_transactions
+        .begin(
+            mvcc.runtime.as_ref(),
+            mvcc.cluster_id(),
+            principal,
+            &transaction_id,
+            std::time::Duration::from_secs(30),
+            DurabilityLevel::Quorum,
+            ReadConsistency::Linearized,
+            now,
+        )
         .await?;
-    ensure_committed_receipt(&receipt)
-}
-
-pub(super) fn ensure_committed_receipt(receipt: &CoreMutationBatchReceipt) -> Result<()> {
-    if !receipt.is_committed() {
-        bail!(
-            "PersonalDB admission CoreStore transaction {} did not commit: {}",
-            receipt.transaction_id,
-            receipt
-                .finalisation_error
-                .as_deref()
-                .unwrap_or("unknown finalisation failure")
-        );
+    let mut product_mutations = Vec::with_capacity(operations.len());
+    for operation in operations {
+        match operation {
+            CoreMutationOperation::CoreMetaPut {
+                cf,
+                table_id,
+                tuple_key,
+                payload,
+                ..
+            } => {
+                product_mutations.push(crate::mvcc_product::ProductMutation::put(
+                    crate::mvcc_product::coremeta_logical_key(&cf, table_id, &tuple_key)?,
+                    payload,
+                ));
+            }
+            CoreMutationOperation::CoreMetaDelete {
+                cf,
+                table_id,
+                tuple_key,
+                ..
+            } => {
+                product_mutations.push(crate::mvcc_product::ProductMutation::delete(
+                    crate::mvcc_product::coremeta_logical_key(&cf, table_id, &tuple_key)?,
+                ));
+            }
+            CoreMutationOperation::StreamAppend { .. } => {
+                bail!("PersonalDB admission MVCC transaction received a physical stream append")
+            }
+        }
     }
-    Ok(())
+    mvcc.stage_product_mutations(&handle.transaction_id, principal, product_mutations, now)?;
+    for precondition in preconditions {
+        let CoreMutationPrecondition::CoreMetaRow {
+            cf,
+            table_id,
+            tuple_key,
+            expected_payload_hash,
+            require_absent,
+            require_present,
+        } = precondition
+        else {
+            bail!("PersonalDB admission requires MVCC-compatible row predicates");
+        };
+        let key = crate::mvcc_product::coremeta_logical_key(&cf, table_id, &tuple_key)?;
+        let current = mvcc.read_latest_value(&key)?;
+        let kind = if require_absent {
+            PredicateKind::Absent
+        } else if require_present {
+            let current = current.ok_or_else(|| anyhow!("PersonalDB predicate row is missing"))?;
+            if expected_payload_hash.as_deref()
+                != Some(core_meta_payload_digest(table_id, &current).as_str())
+            {
+                bail!("PersonalDB exact predicate payload changed");
+            }
+            PredicateKind::ValueHash(*blake3::hash(&current).as_bytes())
+        } else {
+            PredicateKind::Exists
+        };
+        mvcc.stage_predicate(&handle.transaction_id, principal, key, kind, now)?;
+    }
+    mvcc.stage_assignment_guard(&handle.transaction_id, principal, &assignment, now)?;
+    let outcome = mvcc
+        .open_transactions
+        .commit(
+            mvcc.runtime.as_ref(),
+            &handle.transaction_id,
+            principal,
+            now,
+        )
+        .await?;
+    match outcome.certification {
+        crate::mvcc_transaction::CertificationResult::Committed { .. } => Ok(()),
+        crate::mvcc_transaction::CertificationResult::Aborted { reason } => {
+            bail!("PersonalDB admission MVCC transaction aborted: {reason:?}")
+        }
+    }
 }
 
 pub(super) fn put_operation(
@@ -88,6 +135,32 @@ pub(super) fn put_operation(
         tuple_key,
         payload,
     }
+}
+
+pub(super) fn committed_head_key(tenant_id: i64, database_id: &str) -> Result<Vec<u8>> {
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8(&personaldb_realm_id(tenant_id)),
+        CoreMetaTuplePart::Utf8("committed-head-current"),
+        CoreMetaTuplePart::Utf8(database_id),
+    ])
+}
+
+pub(super) fn read_committed_head_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    database_id: &str,
+    trust_store: &PublicKeyTrustStore,
+) -> Result<Option<(Vec<u8>, PersonalDbCommittedHead)>> {
+    let key = committed_head_key(tenant_id, database_id)?;
+    let Some(payload) = read_raw_row(mvcc, TABLE_PERSONALDB_GROUP_ROW, &key)? else {
+        return Ok(None);
+    };
+    let head = decode_committed_head(&payload)?;
+    head.verify(trust_store)?;
+    if head.tenant_id != tenant_id.to_string() || head.database_id != database_id {
+        bail!("PersonalDB committed head MVCC scope mismatch");
+    }
+    Ok(Some((payload, head)))
 }
 
 pub(super) fn absent_precondition(table_id: u16, tuple_key: Vec<u8>) -> CoreMutationPrecondition {
@@ -117,20 +190,24 @@ pub(super) fn exact_precondition(
 }
 
 pub(super) fn read_raw_row(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     table_id: u16,
     key: &[u8],
 ) -> Result<Option<Vec<u8>>> {
     // Proposal claims, slots, reservations, and witness candidates are local
     // admission state read to construct exact mutation preconditions.
-    CoreMetaStore::open(storage.core_store_meta_path())?.get(CF_PERSONALDB, table_id, key)
+    mvcc.read_latest_value(&crate::mvcc_product::coremeta_logical_key(
+        CF_PERSONALDB,
+        table_id,
+        key,
+    )?)
 }
 
 pub(super) fn read_claim_row(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     key: &[u8],
 ) -> Result<Option<ProposalIdempotencyClaimIdentityV1>> {
-    let Some(payload) = read_raw_row(storage, TABLE_PERSONALDB_PROPOSAL_CLAIM_ROW, key)? else {
+    let Some(payload) = read_raw_row(mvcc, TABLE_PERSONALDB_PROPOSAL_CLAIM_ROW, key)? else {
         return Ok(None);
     };
     let row =
@@ -148,10 +225,10 @@ pub(super) fn read_claim_row(
 }
 
 pub(super) fn read_slot_row(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     key: &[u8],
 ) -> Result<Option<ProposalAdmissionSlotV1>> {
-    let Some(payload) = read_raw_row(storage, TABLE_PERSONALDB_PROPOSAL_SLOT_ROW, key)? else {
+    let Some(payload) = read_raw_row(mvcc, TABLE_PERSONALDB_PROPOSAL_SLOT_ROW, key)? else {
         return Ok(None);
     };
     let (_common, slot) = decode_slot_row(&payload)?;
@@ -160,11 +237,10 @@ pub(super) fn read_slot_row(
 }
 
 pub(super) fn read_reservation_row(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     key: &[u8],
 ) -> Result<Option<(i64, ProposalAdmissionReservationV1)>> {
-    let Some(payload) = read_raw_row(storage, TABLE_PERSONALDB_PROPOSAL_RESERVATION_ROW, key)?
-    else {
+    let Some(payload) = read_raw_row(mvcc, TABLE_PERSONALDB_PROPOSAL_RESERVATION_ROW, key)? else {
         return Ok(None);
     };
     let (common, reservation) = decode_reservation_row(&payload)?;
@@ -175,10 +251,10 @@ pub(super) fn read_reservation_row(
 }
 
 pub(super) fn read_candidate_row(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     key: &[u8],
 ) -> Result<Option<WitnessSigningCandidateV1>> {
-    let Some(payload) = read_raw_row(storage, TABLE_PERSONALDB_WITNESS_CANDIDATE_ROW, key)? else {
+    let Some(payload) = read_raw_row(mvcc, TABLE_PERSONALDB_WITNESS_CANDIDATE_ROW, key)? else {
         return Ok(None);
     };
     let (_common, candidate) = decode_candidate_row(&payload)?;
