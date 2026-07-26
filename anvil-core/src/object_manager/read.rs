@@ -804,23 +804,33 @@ impl ObjectManager {
             if remaining == 0 {
                 break;
             }
-            let source_page_limit = if bucket_wide_read && !delimiter.is_empty() {
-                1
-            } else {
-                remaining.min(OBJECT_LIST_SOURCE_PAGE_ROWS)
+            let source_page_limit = remaining;
+            let snapshot = match consistency.root_generation() {
+                Some(snapshot) => snapshot,
+                None => self
+                    .installed_mvcc()?
+                    .runtime
+                    .applied_version()
+                    .map_err(object_metadata_page_status)?,
             };
-            let page = self
-                .core_store
-                .list_current_object_metadata_page(
+            let mut page_objects =
+                crate::metadata_journal::read_current_directory_objects_at_mvcc_snapshot(
+                    self.installed_mvcc()?,
                     bucket,
-                    prefix,
-                    start_after,
-                    consistency.root_generation(),
-                    cursor.as_ref(),
-                    source_page_limit,
+                    snapshot,
                 )
-                .await
                 .map_err(object_metadata_page_status)?;
+            page_objects.retain(|object| {
+                object.key.starts_with(prefix) && object.key.as_str() > start_after
+            });
+            let candidates_visited = page_objects.len().min(source_page_limit);
+            page_objects.truncate(source_page_limit);
+            let page = crate::core_store::CurrentObjectMetadataPage {
+                objects: page_objects,
+                next_cursor: None,
+                source_generation: snapshot,
+                candidates_visited,
+            };
             if source_generation
                 .replace(page.source_generation)
                 .is_some_and(|generation| generation != page.source_generation)
@@ -990,19 +1000,45 @@ impl ObjectManager {
             if remaining == 0 {
                 break;
             }
-            let page = self
-                .core_store
-                .list_object_versions_metadata_page(
-                    &bucket,
-                    prefix,
-                    key_marker,
-                    version_id_marker,
-                    consistency.root_generation(),
-                    cursor.as_ref(),
-                    remaining.min(OBJECT_LIST_SOURCE_PAGE_ROWS),
-                )
-                .await
-                .map_err(object_metadata_page_status)?;
+            let snapshot = match consistency.root_generation() {
+                Some(snapshot) => snapshot,
+                None => self
+                    .installed_mvcc()?
+                    .runtime
+                    .applied_version()
+                    .map_err(object_metadata_page_status)?,
+            };
+            let mut page_versions = crate::metadata_journal::read_object_versions_at_mvcc_snapshot(
+                self.installed_mvcc()?,
+                &bucket,
+                snapshot,
+            )
+            .map_err(object_metadata_page_status)?;
+            page_versions.retain(|version| version.object.key.starts_with(prefix));
+            let start = match version_id_marker {
+                Some(marker) => page_versions
+                    .iter()
+                    .position(|version| {
+                        version.object.key == key_marker && version.object.version_id == marker
+                    })
+                    .map(|position| position + 1)
+                    .unwrap_or_else(|| {
+                        page_versions
+                            .partition_point(|version| version.object.key.as_str() <= key_marker)
+                    }),
+                None => page_versions
+                    .partition_point(|version| version.object.key.as_str() <= key_marker),
+            };
+            page_versions.drain(..start);
+            let source_limit = remaining;
+            let candidates_visited = page_versions.len().min(source_limit);
+            page_versions.truncate(source_limit);
+            let page = crate::core_store::ObjectVersionsMetadataPage {
+                versions: page_versions,
+                next_cursor: None,
+                source_generation: snapshot,
+                candidates_visited,
+            };
             if source_generation
                 .replace(page.source_generation)
                 .is_some_and(|generation| generation != page.source_generation)

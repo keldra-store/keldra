@@ -1454,6 +1454,14 @@ pub fn read_object_versions_mvcc(
     bucket: &Bucket,
 ) -> Result<Vec<ObjectVersion>> {
     let snapshot = mvcc.runtime.applied_version()?;
+    read_object_versions_at_mvcc_snapshot(mvcc, bucket, snapshot)
+}
+
+pub fn read_object_versions_at_mvcc_snapshot(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    bucket: &Bucket,
+    snapshot: u64,
+) -> Result<Vec<ObjectVersion>> {
     let tuple_prefix = crate::core_store::object_version_page_bucket_prefix(bucket);
     let application_prefix = crate::mvcc_product::coremeta_application_prefix(
         crate::core_store::CF_OBJECT_VERSIONS,
