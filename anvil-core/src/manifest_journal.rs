@@ -1,8 +1,8 @@
 use crate::core_store::{
     CF_OBJECT_HEADS, CoreMetaTuplePart, CoreMutationBatch, CoreMutationOperation,
-    CoreMutationPrecondition, CoreMutationRootPublication, CoreStore, CoreTransaction,
-    CoreTransactionUpdate, TABLE_MANIFEST_CAS_CURRENT_ROW, core_meta_committed_row_common,
-    core_meta_payload_digest, core_meta_root_key_hash, core_meta_tuple_key,
+    CoreMutationPrecondition, CoreMutationRootPublication, CoreStore, CoreTransactionUpdate,
+    TABLE_MANIFEST_CAS_CURRENT_ROW, core_meta_committed_row_common, core_meta_payload_digest,
+    core_meta_root_key_hash, core_meta_tuple_key,
 };
 use crate::formats::{Hash32, hash32, writer::WriterFamily};
 use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
@@ -198,6 +198,7 @@ async fn compare_and_swap_manifest_inner(
 ) -> Result<Option<ManifestCasResult>> {
     let current = current_revision(
         storage,
+        mvcc,
         tenant_id,
         bucket_id,
         object_key,
@@ -237,19 +238,15 @@ async fn compare_and_swap_manifest_inner(
 
 async fn current_revision(
     storage: &Storage,
+    mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
     tenant_id: i64,
     bucket_id: i64,
     object_key: &str,
     transaction: Option<(&str, &str)>,
 ) -> Result<i64> {
-    let payload = manifest_current_payload_for_optional_transaction(
-        storage,
-        tenant_id,
-        bucket_id,
-        object_key,
-        transaction,
-    )
-    .await?;
+    let payload =
+        manifest_current_payload(storage, mvcc, tenant_id, bucket_id, object_key, transaction)
+            .await?;
     Ok(payload
         .map(|payload| decode_manifest_current_row(&payload))
         .transpose()?
@@ -291,8 +288,9 @@ async fn append_manifest(
     let scope_partition = partition_id.clone();
     let root_generation = next_manifest_cas_root_generation(&core_store, &data_root).await?;
     let root_publications = manifest_root_publications(data_root, scope_partition.clone());
-    let current_payload = manifest_current_payload_for_optional_transaction(
+    let current_payload = manifest_current_payload(
         storage,
+        None,
         body.tenant_id,
         body.bucket_id,
         &body.object_key,
@@ -413,81 +411,12 @@ async fn read_manifest_bodies(
     Ok(bodies)
 }
 
-pub async fn materialize_committed_manifest_cas_transaction(
-    storage: &Storage,
-    transaction: &CoreTransaction,
-) -> Result<usize> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let mut materialized = 0usize;
-    for update in &transaction.visible_updates {
-        let CoreTransactionUpdate::StreamAppend {
-            stream_id,
-            visible_sequence,
-            prepared_record_hash,
-            ..
-        } = update
-        else {
-            continue;
-        };
-        let Some((tenant_id, bucket_id)) = parse_manifest_cas_stream_id(stream_id) else {
-            continue;
-        };
-        let records = core_store
-            .read_stream(crate::core_store::ReadStream {
-                stream_id: stream_id.clone(),
-                after_sequence: visible_sequence.saturating_sub(1),
-                limit: 1,
-            })
-            .await?;
-        let Some(record) = records.into_iter().find(|record| {
-            record.sequence == *visible_sequence && &record.event_hash == prepared_record_hash
-        }) else {
-            return Err(anyhow!(
-                "manifest CAS transaction {} committed stream record {stream_id}:{visible_sequence} is not readable",
-                transaction.transaction_id
-            ));
-        };
-        if record.record_kind != "manifest_cas" {
-            continue;
-        }
-        let body = decode_manifest_body(&record.payload)?;
-        if body.tenant_id != tenant_id || body.bucket_id != bucket_id {
-            return Err(anyhow!(
-                "manifest CAS transaction {} stream scope does not match payload",
-                transaction.transaction_id
-            ));
-        }
-        let current =
-            read_manifest_current_row(&core_store, tenant_id, bucket_id, &body.object_key)?
-                .ok_or_else(|| {
-                    anyhow!(
-                        "manifest CAS transaction {} committed without its current projection",
-                        transaction.transaction_id
-                    )
-                })?;
-        if current.revision != body.revision || current.manifest_hash != body.manifest_hash {
-            return Err(anyhow!(
-                "manifest CAS transaction {} current projection does not match committed stream record",
-                transaction.transaction_id
-            ));
-        }
-        materialized += 1;
-    }
-    Ok(materialized)
-}
-
 pub fn manifest_cas_partition_id(tenant_id: i64, bucket_id: i64) -> Hash32 {
     hash32(format!("tenant/{tenant_id}/bucket/{bucket_id}/manifest_cas").as_bytes())
 }
 
 fn manifest_cas_stream_id(tenant_id: i64, bucket_id: i64) -> String {
     format!("manifest_cas:tenant:{tenant_id}:bucket:{bucket_id}")
-}
-
-fn parse_manifest_cas_stream_id(stream_id: &str) -> Option<(i64, i64)> {
-    let rest = stream_id.strip_prefix("manifest_cas:tenant:")?;
-    let (tenant, bucket_part) = rest.split_once(":bucket:")?;
-    Some((tenant.parse().ok()?, bucket_part.parse().ok()?))
 }
 
 fn manifest_cas_partition_principal(tenant_id: i64, bucket_id: i64) -> String {
@@ -629,52 +558,29 @@ fn manifest_current_row_update_from_payload(
     })
 }
 
-async fn manifest_current_payload_for_optional_transaction(
+async fn manifest_current_payload(
     storage: &Storage,
+    mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
     tenant_id: i64,
     bucket_id: i64,
     object_key: &str,
     transaction: Option<(&str, &str)>,
 ) -> Result<Option<Vec<u8>>> {
     let key = manifest_current_row_key(tenant_id, bucket_id, object_key)?;
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let mut current =
-        core_store.read_coremeta_row(CF_OBJECT_HEADS, TABLE_MANIFEST_CAS_CURRENT_ROW, &key)?;
-    let Some((transaction_id, transaction_principal)) = transaction else {
-        return Ok(current);
-    };
-    let transaction = core_store
-        .read_explicit_transaction_for_principal(transaction_id, transaction_principal)
-        .await?;
-    for update in transaction.visible_updates {
-        match update {
-            CoreTransactionUpdate::CoreMetaPut {
-                cf,
-                table_id,
-                tuple_key,
-                payload,
-                ..
-            } if cf == CF_OBJECT_HEADS
-                && table_id == TABLE_MANIFEST_CAS_CURRENT_ROW
-                && tuple_key == key =>
-            {
-                current = Some(payload)
-            }
-            CoreTransactionUpdate::CoreMetaDelete {
-                cf,
-                table_id,
-                tuple_key,
-                ..
-            } if cf == CF_OBJECT_HEADS
-                && table_id == TABLE_MANIFEST_CAS_CURRENT_ROW
-                && tuple_key == key =>
-            {
-                current = None
-            }
-            _ => {}
-        }
+    if let Some((transaction_id, transaction_principal)) = transaction {
+        let mvcc = mvcc.ok_or_else(|| anyhow!("MVCC transaction handle is required"))?;
+        let logical_key = crate::mvcc_product::coremeta_logical_key(
+            CF_OBJECT_HEADS,
+            TABLE_MANIFEST_CAS_CURRENT_ROW,
+            &key,
+        )?;
+        return mvcc.read_transaction_value(transaction_id, transaction_principal, &logical_key);
     }
-    Ok(current)
+    CoreStore::new(storage.clone()).await?.read_coremeta_row(
+        CF_OBJECT_HEADS,
+        TABLE_MANIFEST_CAS_CURRENT_ROW,
+        &key,
+    )
 }
 
 fn read_manifest_current_payload(
