@@ -180,7 +180,7 @@ impl ThreeNodeFixture {
         node: usize,
         id: &str,
         key: LogicalKey,
-    ) -> anyhow::Result<crate::mvcc_open_transactions::CommitOutcome> {
+    ) -> anyhow::Result<crate::mvcc_node_runtime::CommitOutcome> {
         let transaction_id = self.stage_write(node, id, key).await;
         self.states[node]
             .mvcc

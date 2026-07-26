@@ -318,7 +318,7 @@ pub(super) async fn execute_mutation_batch(
                 })
             })
             .collect::<Result<Vec<_>, Status>>()?;
-        let transaction_id = effective_transaction_id
+        let batch_transaction_id = effective_transaction_id
             .expect("put-only batches always have an explicit or implicit transaction");
         let objects = state
             .object_manager
@@ -326,7 +326,7 @@ pub(super) async fn execute_mutation_batch(
                 &claims,
                 &req.bucket_name,
                 inputs,
-                transaction_id,
+                batch_transaction_id,
                 transaction_principal
                     .as_deref()
                     .expect("effective transaction has a principal"),
@@ -354,7 +354,7 @@ pub(super) async fn execute_mutation_batch(
                 .open_transactions
                 .commit(
                     state.mvcc.runtime.as_ref(),
-                    transaction_id,
+                    batch_transaction_id,
                     transaction_principal
                         .as_deref()
                         .expect("effective transaction has a principal"),
