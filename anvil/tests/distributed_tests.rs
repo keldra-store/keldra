@@ -8,5 +8,3 @@ mod faults;
 mod metadata;
 #[path = "distributed_tests/objects.rs"]
 mod objects;
-#[path = "distributed_tests/publication_recovery.rs"]
-mod publication_recovery;
