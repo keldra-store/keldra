@@ -678,6 +678,8 @@ mod tests {
             content_type: Some("application/json".into()),
             user_metadata: serde_json::json!({}),
             index_policy_snapshot: serde_json::json!({}),
+            originating_snapshot_version: 0,
+            frozen_index_definitions: Vec::new(),
             authz_revision: 1,
             boundary_schema: None,
             boundary_schema_generation: 0,

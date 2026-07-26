@@ -25,12 +25,26 @@ pub struct ObjectMaterialisationJob {
     pub content_type: Option<String>,
     pub user_metadata: Value,
     pub index_policy_snapshot: Value,
+    pub originating_snapshot_version: u64,
+    pub frozen_index_definitions: Vec<FrozenIndexDefinition>,
     pub authz_revision: i64,
     pub boundary_schema: Option<Value>,
     pub boundary_schema_generation: u64,
     pub boundary_schema_hash: Option<String>,
     pub requested_operations: ObjectMaterialisationOperations,
     pub requested_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenIndexDefinition {
+    pub id: i64,
+    pub version: i64,
+    pub name: String,
+    pub kind: String,
+    pub selector: Value,
+    pub extractor: Value,
+    pub authorization_mode: String,
+    pub build_policy: Value,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +90,13 @@ impl ObjectMaterialisationJob {
                 && !self.requested_operations.maintain_indexes)
         {
             bail!("invalid object materialisation job");
+        }
+        let mut definitions = self.frozen_index_definitions.clone();
+        definitions.sort_by_key(|definition| (definition.id, definition.version));
+        if definitions != self.frozen_index_definitions
+            || definitions.windows(2).any(|pair| pair[0].id == pair[1].id)
+        {
+            bail!("frozen index definitions must be sorted and unique");
         }
         Ok(())
     }
@@ -222,6 +243,8 @@ mod tests {
             content_type: Some("application/json".into()),
             user_metadata: serde_json::json!({}),
             index_policy_snapshot: serde_json::json!({}),
+            originating_snapshot_version: 1,
+            frozen_index_definitions: Vec::new(),
             authz_revision: 1,
             boundary_schema: None,
             boundary_schema_generation: 0,

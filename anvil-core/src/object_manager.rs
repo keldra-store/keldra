@@ -700,6 +700,31 @@ impl ObjectManager {
                 bucket.id, object.version_id
             );
             let now = Self::current_unix_ms_for_object()?;
+            let binding = mvcc
+                .open_transactions
+                .handle(transaction_id)
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            let mut frozen_index_definitions = self
+                .persistence
+                .list_index_definitions(tenant_id, bucket.id, false)
+                .await
+                .map_err(|error| Status::internal(error.to_string()))?
+                .into_iter()
+                .filter(|definition| definition.enabled)
+                .map(
+                    |definition| crate::object_materialisation::FrozenIndexDefinition {
+                        id: definition.id,
+                        version: definition.version,
+                        name: definition.name,
+                        kind: definition.kind,
+                        selector: definition.selector,
+                        extractor: definition.extractor,
+                        authorization_mode: definition.authorization_mode,
+                        build_policy: definition.build_policy,
+                    },
+                )
+                .collect::<Vec<_>>();
+            frozen_index_definitions.sort_by_key(|definition| (definition.id, definition.version));
             let job = crate::object_materialisation::ObjectMaterialisationJob {
                 schema: crate::object_materialisation::ObjectMaterialisationJob::SCHEMA.into(),
                 cluster_id: mvcc.cluster_id().to_string(),
@@ -717,6 +742,8 @@ impl ObjectManager {
                 index_policy_snapshot: serde_json::json!({
                     "snapshot": object.index_policy_snapshot.clone(),
                 }),
+                originating_snapshot_version: binding.snapshot_version,
+                frozen_index_definitions,
                 authz_revision: object.authz_revision,
                 boundary_schema_generation: boundary_schema
                     .as_ref()
