@@ -92,6 +92,16 @@ where
         self.local.read_latest(key)
     }
 
+    pub fn scan_table_prefix_at(
+        &self,
+        table_id: u16,
+        application_prefix: &[u8],
+        snapshot: u64,
+    ) -> Result<Vec<(LogicalKey, VisibleRow)>> {
+        self.local
+            .scan_table_prefix_at(table_id, application_prefix, snapshot)
+    }
+
     pub fn applied_version(&self) -> Result<u64> {
         self.local.applied_version()
     }

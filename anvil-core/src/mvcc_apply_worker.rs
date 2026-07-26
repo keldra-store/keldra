@@ -231,13 +231,35 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     use anvil_mvcc_consensus::{AppliedDecision, CommittedBundleDecision};
+    use async_trait::async_trait;
     use tempfile::tempdir;
+    use tokio::net::TcpListener;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::{Status, metadata::MetadataMap, transport::Server};
 
     use super::*;
     use crate::{
+        anvil_api::{ReplicationSessionOpen, replication_service_server::ReplicationServiceServer},
+        bundle_replication::{BundleTarget, BundleTargetStream},
         mvcc_transaction::{HierarchicalRangeStampScheme, LogicalKey, TransactionBundleBuilder},
-        replication_client::ReplicationStreamOptions,
+        replication::AuthenticatedPeer,
+        replication_client::{ReplicationPeer, ReplicationStreamOptions},
+        services::replication::{ReplicationConnectionAuthorizer, ReplicationServiceImpl},
     };
+
+    struct TestAuthorizer;
+
+    #[async_trait]
+    impl ReplicationConnectionAuthorizer for TestAuthorizer {
+        async fn authorize(
+            &self,
+            _metadata: &MetadataMap,
+            open: &ReplicationSessionOpen,
+        ) -> std::result::Result<AuthenticatedPeer, Status> {
+            AuthenticatedPeer::new(open.node_id.clone(), open.node_incarnation)
+                .map_err(|error| Status::permission_denied(error.to_string()))
+        }
+    }
 
     struct Source {
         decisions: StdMutex<Vec<AppliedDecision>>,
@@ -360,6 +382,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn follower_fetches_bundle_over_persistent_stream_and_applies_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let inbox = tempdir().unwrap();
+        let service = ReplicationServiceImpl::open(TestAuthorizer, inbox.path()).unwrap();
+        let server = tokio::spawn(
+            Server::builder()
+                .add_service(ReplicationServiceServer::new(service))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let remote = NodeIncarnation {
+            node_id: "node-b".into(),
+            incarnation: 1,
+        };
+        let peer = ReplicationPeer {
+            cluster_id: "cluster".into(),
+            node: remote.clone(),
+            endpoint: format!("http://{address}"),
+        };
+        let options = ReplicationStreamOptions::default();
+        let uploader = TonicReplicationStreamManager::new(
+            "cluster",
+            NodeIncarnation {
+                node_id: "node-a".into(),
+                incarnation: 1,
+            },
+            "token",
+            [peer.clone()],
+            options.clone(),
+        )
+        .unwrap();
+        let bundle = bundle();
+        let bytes = bundle.canonical_bytes().unwrap();
+        let identity = bundle.identity().unwrap();
+        uploader
+            .send_bundle(
+                &BundleTarget {
+                    cluster_id: "cluster".into(),
+                    node: remote.clone(),
+                    failure_domain: "zone-b".into(),
+                },
+                &identity,
+                &bytes,
+            )
+            .await
+            .unwrap();
+
+        let prepared_directory = tempdir().unwrap();
+        let local_directory = tempdir().unwrap();
+        let prepared = AppendOnlyPreparedBundleStore::open(
+            prepared_directory.path(),
+            "cluster",
+            NodeIncarnation {
+                node_id: "node-c".into(),
+                incarnation: 1,
+            },
+            "zone-c",
+        )
+        .unwrap();
+        let local = LocalMvccStore::open(local_directory.path()).unwrap();
+        let source = Arc::new(Source {
+            decisions: StdMutex::new(vec![committed(&bundle, 1)]),
+            gc: CommitVersion(0),
+        });
+        let downloader = TonicReplicationStreamManager::new(
+            "cluster",
+            NodeIncarnation {
+                node_id: "node-c".into(),
+                incarnation: 1,
+            },
+            "token",
+            [peer],
+            options,
+        )
+        .unwrap();
+        let worker = MvccApplyWorker::new(
+            source,
+            "cluster",
+            prepared.clone(),
+            downloader,
+            [remote],
+            local.clone(),
+        );
+
+        assert_eq!(worker.apply_available().await.unwrap(), 1);
+        assert_eq!(local.applied_version().unwrap(), 1);
+        assert_eq!(local.decision_watermark().unwrap(), 1);
+        assert_eq!(
+            local
+                .read_at(
+                    &LogicalKey {
+                        table_id: 1,
+                        application_key: b"key".to_vec(),
+                    },
+                    1,
+                )
+                .unwrap()
+                .unwrap()
+                .value,
+            b"value"
+        );
+        assert_eq!(prepared.read(&identity).unwrap(), Some(bytes));
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn detects_a_decision_gap_and_gc_loss_as_unrecoverable() {
         let prepared_directory = tempdir().unwrap();
         let local_directory = tempdir().unwrap();
@@ -392,6 +520,37 @@ mod tests {
             gc: CommitVersion(1),
         });
         let error = worker(collected, prepared, local)
+            .apply_available()
+            .await
+            .unwrap_err();
+        assert!(is_unrecoverable(&error));
+    }
+
+    #[tokio::test]
+    async fn rejects_a_foreign_cluster_decision_before_fetching() {
+        let prepared_directory = tempdir().unwrap();
+        let local_directory = tempdir().unwrap();
+        let prepared = AppendOnlyPreparedBundleStore::open(
+            prepared_directory.path(),
+            "cluster",
+            NodeIncarnation {
+                node_id: "node-a".into(),
+                incarnation: 1,
+            },
+            "zone-a",
+        )
+        .unwrap();
+        let local = LocalMvccStore::open(local_directory.path()).unwrap();
+        let bundle = bundle();
+        let mut decision = committed(&bundle, 1);
+        decision.committed_bundle.as_mut().unwrap().cluster_id_hash =
+            cluster_id_hash("another-cluster");
+        let source = Arc::new(Source {
+            decisions: StdMutex::new(vec![decision]),
+            gc: CommitVersion(0),
+        });
+
+        let error = worker(source, prepared, local)
             .apply_available()
             .await
             .unwrap_err();

@@ -679,6 +679,10 @@ mod tests {
         let _ = (&mut servers[2]).await;
         third.shutdown().await.unwrap();
         drop(third);
+        first
+            .change_membership([NodeId(1), NodeId(2)].into_iter().collect(), false)
+            .await
+            .unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         addresses[2] = listener.local_addr().unwrap();
         let restarted = node(
@@ -705,6 +709,13 @@ mod tests {
             restarted.observed_commit_version() >= latest
         })
         .await;
+        first
+            .change_membership(
+                [NodeId(1), NodeId(2), NodeId(3)].into_iter().collect(),
+                false,
+            )
+            .await
+            .unwrap();
 
         for server in servers {
             server.abort();
