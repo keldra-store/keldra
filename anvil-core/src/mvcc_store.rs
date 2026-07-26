@@ -3,7 +3,10 @@
 //! Certification orders transactions; this store atomically installs one
 //! certified bundle and advances the node's locally applied version.
 
-use std::{path::Path, sync::Arc};
+use std::{
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use rocksdb::{
@@ -12,6 +15,7 @@ use rocksdb::{
 };
 
 use crate::mvcc_transaction::{CommitVersion, LogicalKey, TransactionBundle, WriteOperation};
+use crate::object_materialisation::ObjectMaterialisationState;
 use crate::object_materialisation::{ObjectMaterialisationJob, ObjectMaterialisationRecord};
 
 pub const MVCC_COLUMN_FAMILIES: [&str; 5] = [
@@ -49,6 +53,7 @@ pub struct MvccStore {
     db: Arc<DB>,
     cluster_id: String,
     scope: Vec<u8>,
+    materialisation_transition: Arc<Mutex<()>>,
 }
 
 pub type LocalMvccStore = MvccStore;
@@ -82,6 +87,7 @@ impl MvccStore {
             db,
             cluster_id: cluster_id.to_string(),
             scope,
+            materialisation_transition: Arc::new(Mutex::new(())),
         })
     }
 
@@ -227,6 +233,42 @@ impl MvccStore {
         self.read_at(key, version)
     }
 
+    pub fn scan_table_prefix_at(
+        &self,
+        table_id: u16,
+        application_prefix: &[u8],
+        snapshot_version: CommitVersion,
+    ) -> Result<Vec<(LogicalKey, VisibleRow)>> {
+        let gc_watermark = self.gc_watermark()?;
+        if snapshot_version < gc_watermark {
+            bail!("snapshot {snapshot_version} is below local GC watermark {gc_watermark}");
+        }
+        let applied_version = self.applied_version()?;
+        if snapshot_version > applied_version {
+            bail!("snapshot {snapshot_version} is above local applied version {applied_version}");
+        }
+
+        let heads_cf = self.cf(CF_HEADS)?;
+        let mut visible = Vec::new();
+        for row in self.db.iterator_cf(
+            heads_cf,
+            IteratorMode::From(&self.scope, Direction::Forward),
+        ) {
+            let (encoded_key, _) = row?;
+            if !encoded_key.starts_with(&self.scope) {
+                break;
+            }
+            let key = decode_logical_key(self.unscoped(&encoded_key)?)?;
+            if key.table_id != table_id || !key.application_key.starts_with(application_prefix) {
+                continue;
+            }
+            if let Some(row) = self.read_at(&key, snapshot_version)? {
+                visible.push((key, row));
+            }
+        }
+        Ok(visible)
+    }
+
     pub fn applied_version(&self) -> Result<CommitVersion> {
         self.read_meta_version(APPLIED_VERSION_KEY)
     }
@@ -248,6 +290,110 @@ impl MvccStore {
             self.cf(CF_META)?,
             self.key(DECISION_WATERMARK_KEY),
             position.to_be_bytes(),
+            &durable_write_options(),
+        )?;
+        Ok(())
+    }
+
+    pub fn claim_object_materialisation(
+        &self,
+        worker_id: &str,
+        now_unix_ms: u64,
+        lease_ms: u64,
+    ) -> Result<Option<(String, ObjectMaterialisationRecord)>> {
+        if worker_id.trim().is_empty() || lease_ms == 0 {
+            bail!("materialisation worker and lease must be non-empty");
+        }
+        let _transition = self.materialisation_transition.lock().unwrap();
+        let cf = self.cf(CF_MATERIALISATION)?;
+        let prefix = self.key(b"object-job/");
+        for row in self
+            .db
+            .iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward))
+        {
+            let (key, value) = row?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let mut record: ObjectMaterialisationRecord = serde_json::from_slice(&value)?;
+            if !record.claimable(now_unix_ms) {
+                continue;
+            }
+            record.state = ObjectMaterialisationState::Running;
+            record.attempts = record.attempts.saturating_add(1);
+            record.lease_owner = Some(worker_id.to_string());
+            record.lease_expires_unix_ms = Some(
+                now_unix_ms
+                    .checked_add(lease_ms)
+                    .context("materialisation lease expiry overflow")?,
+            );
+            record.last_error = None;
+            self.db.put_cf_opt(
+                cf,
+                &key,
+                serde_json::to_vec(&record)?,
+                &durable_write_options(),
+            )?;
+            let id = String::from_utf8(self.unscoped(&key)?.to_vec())?
+                .strip_prefix("object-job/")
+                .context("invalid materialisation job key")?
+                .to_string();
+            return Ok(Some((id, record)));
+        }
+        Ok(None)
+    }
+
+    pub fn retry_object_materialisation(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        next_attempt_unix_ms: u64,
+        error: &str,
+    ) -> Result<()> {
+        self.transition_object_materialisation(job_id, worker_id, |record| {
+            record.state = ObjectMaterialisationState::Pending;
+            record.next_attempt_unix_ms = next_attempt_unix_ms;
+            record.lease_owner = None;
+            record.lease_expires_unix_ms = None;
+            record.last_error = Some(error.to_string());
+            Ok(())
+        })
+    }
+
+    pub fn complete_object_materialisation(&self, job_id: &str, worker_id: &str) -> Result<()> {
+        self.transition_object_materialisation(job_id, worker_id, |record| {
+            record.state = ObjectMaterialisationState::Complete;
+            record.lease_owner = None;
+            record.lease_expires_unix_ms = None;
+            record.last_error = None;
+            Ok(())
+        })
+    }
+
+    fn transition_object_materialisation(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        update: impl FnOnce(&mut ObjectMaterialisationRecord) -> Result<()>,
+    ) -> Result<()> {
+        let _transition = self.materialisation_transition.lock().unwrap();
+        let cf = self.cf(CF_MATERIALISATION)?;
+        let key = self.key(format!("object-job/{job_id}").as_bytes());
+        let bytes = self
+            .db
+            .get_cf(cf, &key)?
+            .context("materialisation job not found")?;
+        let mut record: ObjectMaterialisationRecord = serde_json::from_slice(&bytes)?;
+        if record.state != ObjectMaterialisationState::Running
+            || record.lease_owner.as_deref() != Some(worker_id)
+        {
+            bail!("materialisation job is not leased by this worker");
+        }
+        update(&mut record)?;
+        self.db.put_cf_opt(
+            cf,
+            key,
+            serde_json::to_vec(&record)?,
             &durable_write_options(),
         )?;
         Ok(())
@@ -335,6 +481,20 @@ fn encode_logical_key(key: &LogicalKey) -> Result<Vec<u8>> {
     encoded.extend_from_slice(&length.to_be_bytes());
     encoded.extend_from_slice(&key.application_key);
     Ok(encoded)
+}
+
+fn decode_logical_key(encoded: &[u8]) -> Result<LogicalKey> {
+    if encoded.len() < 6 {
+        bail!("invalid MVCC logical key");
+    }
+    let application_len = u32::from_be_bytes(encoded[2..6].try_into()?) as usize;
+    if encoded.len() != 6usize.saturating_add(application_len) {
+        bail!("invalid MVCC logical key length");
+    }
+    Ok(LogicalKey {
+        table_id: u16::from_be_bytes(encoded[..2].try_into()?),
+        application_key: encoded[6..].to_vec(),
+    })
 }
 
 fn encode_versioned_key(key: &LogicalKey, version: CommitVersion) -> Result<Vec<u8>> {
@@ -442,6 +602,71 @@ mod tests {
         assert_eq!(store.read_at(&row, 2).unwrap().unwrap().value, b"old");
         assert_eq!(store.read_at(&row, 4).unwrap().unwrap().value, b"old");
         assert_eq!(store.read_latest(&row).unwrap().unwrap().value, b"new");
+    }
+
+    #[test]
+    fn materialisation_leases_retry_and_recover_after_expiry() {
+        let temp = tempdir().unwrap();
+        let store = MvccStore::open(temp.path()).unwrap();
+        let job = ObjectMaterialisationJob {
+            schema: ObjectMaterialisationJob::SCHEMA.into(),
+            cluster_id: "cluster".into(),
+            transaction_id: "jobs".into(),
+            tenant_id: 1,
+            bucket_id: 2,
+            object_key: "object".into(),
+            object_version_id: "version".into(),
+            representation: serde_json::json!({"schema": "local"}),
+            requested_at_unix_ms: 1,
+        };
+        let id = job.job_id().unwrap();
+        store
+            .apply_certified_bundle(
+                1,
+                &bundle("jobs", |builder| {
+                    builder.add_materialisation_job(job.canonical_bytes().unwrap());
+                }),
+            )
+            .unwrap();
+
+        let (_, first) = store
+            .claim_object_materialisation("worker-a", 10, 10)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.attempts, 1);
+        assert!(
+            store
+                .claim_object_materialisation("worker-b", 19, 10)
+                .unwrap()
+                .is_none()
+        );
+        let (_, recovered) = store
+            .claim_object_materialisation("worker-b", 20, 10)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.attempts, 2);
+        store
+            .retry_object_materialisation(&id, "worker-b", 40, "transient")
+            .unwrap();
+        assert!(
+            store
+                .claim_object_materialisation("worker-a", 39, 10)
+                .unwrap()
+                .is_none()
+        );
+        store
+            .claim_object_materialisation("worker-a", 40, 10)
+            .unwrap()
+            .unwrap();
+        store
+            .complete_object_materialisation(&id, "worker-a")
+            .unwrap();
+        assert!(
+            store
+                .claim_object_materialisation("worker-b", 100, 10)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

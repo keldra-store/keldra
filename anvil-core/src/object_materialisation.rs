@@ -58,6 +58,8 @@ pub struct ObjectMaterialisationRecord {
     pub state: ObjectMaterialisationState,
     pub attempts: u32,
     pub next_attempt_unix_ms: u64,
+    pub lease_owner: Option<String>,
+    pub lease_expires_unix_ms: Option<u64>,
     pub last_error: Option<String>,
 }
 
@@ -76,8 +78,19 @@ impl ObjectMaterialisationRecord {
             state: ObjectMaterialisationState::Pending,
             attempts: 0,
             next_attempt_unix_ms: 0,
+            lease_owner: None,
+            lease_expires_unix_ms: None,
             last_error: None,
         }
+    }
+
+    pub fn claimable(&self, now_unix_ms: u64) -> bool {
+        (self.state == ObjectMaterialisationState::Pending
+            && self.next_attempt_unix_ms <= now_unix_ms)
+            || (self.state == ObjectMaterialisationState::Running
+                && self
+                    .lease_expires_unix_ms
+                    .is_some_and(|expiry| expiry <= now_unix_ms))
     }
 }
 
