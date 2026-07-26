@@ -33,6 +33,7 @@ use crate::anvil_api::{
     audit_service_server::AuditServiceServer, auth_service_server::AuthServiceServer,
     block_store_internal_server::BlockStoreInternalServer,
     bucket_service_server::BucketServiceServer,
+    consensus_transport_server::ConsensusTransportServer,
     coordination_service_server::CoordinationServiceServer,
     core_meta_replication_internal_server::CoreMetaReplicationInternalServer,
     cross_region_proxy_internal_server::CrossRegionProxyInternalServer,
@@ -45,6 +46,7 @@ use crate::anvil_api::{
     object_service_server::ObjectServiceServer,
     personal_db_service_server::PersonalDbServiceServer,
     registry_service_server::RegistryServiceServer, repair_service_server::RepairServiceServer,
+    replication_service_server::ReplicationServiceServer,
     root_register_internal_server::RootRegisterInternalServer,
     saga_service_server::SagaServiceServer, stream_service_server::StreamServiceServer,
     transaction_service_server::TransactionServiceServer,
@@ -162,6 +164,12 @@ pub fn create_grpc_router(state: AppState, auth_interceptor: AuthInterceptorFn) 
     .add_service(HfIngestionServiceServer::with_interceptor(
         state.clone(),
         auth_closure,
+    ))
+    .add_service(ConsensusTransportServer::new(
+        state.mvcc.consensus_service.clone(),
+    ))
+    .add_service(ReplicationServiceServer::new(
+        state.mvcc.replication_service.clone(),
     ))
 }
 

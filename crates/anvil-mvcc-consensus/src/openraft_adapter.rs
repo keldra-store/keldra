@@ -188,14 +188,24 @@ struct MachineState {
     snapshot_generation: u64,
 }
 
-impl Default for MachineState {
-    fn default() -> Self {
-        Self {
-            certification: CertificationState::default(),
+impl MachineState {
+    fn new(cluster_id_hash: [u8; 32]) -> Result<Self, RaftStorageError> {
+        Ok(Self {
+            certification: CertificationState::new(cluster_id_hash)
+                .map_err(|error| RaftStorageError::Codec(error.to_string()))?,
             last_applied_log_id: None,
             membership: StoredMembership::default(),
             snapshot_generation: 0,
+        })
+    }
+
+    fn verify_cluster(&self, expected: [u8; 32]) -> Result<(), RaftStorageError> {
+        if self.certification.cluster_id_hash() != expected {
+            return Err(RaftStorageError::Codec(
+                "persisted Raft state belongs to another cluster".into(),
+            ));
         }
+        Ok(())
     }
 }
 
@@ -209,19 +219,39 @@ pub(crate) struct OpenRaftLogStore {
 #[derive(Clone)]
 pub(crate) struct OpenRaftStateMachine {
     store: RocksRaftStore,
+    cluster_id_hash: [u8; 32],
 }
 
-pub(crate) fn stores(store: RocksRaftStore) -> (OpenRaftLogStore, OpenRaftStateMachine) {
-    (
+pub(crate) fn stores(
+    store: RocksRaftStore,
+    cluster_id_hash: [u8; 32],
+) -> Result<(OpenRaftLogStore, OpenRaftStateMachine), RaftStorageError> {
+    let state = match store.read_state_value::<MachineState>(KEY_OPENRAFT_STATE)? {
+        Some(state) => {
+            state.verify_cluster(cluster_id_hash)?;
+            state
+        }
+        None => {
+            let state = MachineState::new(cluster_id_hash)?;
+            store.sync_state_value(KEY_OPENRAFT_STATE, &state)?;
+            state
+        }
+    };
+    state.verify_cluster(cluster_id_hash)?;
+    Ok((
         OpenRaftLogStore {
             store: store.clone(),
         },
-        OpenRaftStateMachine { store },
-    )
+        OpenRaftStateMachine {
+            store,
+            cluster_id_hash,
+        },
+    ))
 }
 
 /// Running consensus service. OpenRaft remains fully contained behind Anvil's
 /// [`Consensus`] and transport interfaces.
+#[derive(Clone)]
 pub struct OpenRaftConsensus {
     raft: openraft::Raft<AnvilRaftConfig>,
 }
@@ -255,17 +285,19 @@ impl OpenRaftConsensus {
         node_id: NodeId,
         db: Arc<rocksdb::DB>,
         group_id: u64,
+        cluster_id_hash: [u8; 32],
         cluster_name: impl Into<String>,
         network: Arc<dyn ConsensusRpcFactory>,
     ) -> Result<Self, ConsensusError> {
         let store = RocksRaftStore::from_db(db, group_id)
             .map_err(|error| ConsensusError::Storage(error.to_string()))?;
-        Self::new(node_id, store, cluster_name, network).await
+        Self::new(node_id, store, cluster_id_hash, cluster_name, network).await
     }
 
     pub async fn new(
         node_id: NodeId,
         store: RocksRaftStore,
+        cluster_id_hash: [u8; 32],
         cluster_name: impl Into<String>,
         network: Arc<dyn ConsensusRpcFactory>,
     ) -> Result<Self, ConsensusError> {
@@ -275,7 +307,8 @@ impl OpenRaftConsensus {
         }
         .validate()
         .map_err(|error| ConsensusError::Rejected(error.to_string()))?;
-        let (log_store, state_machine) = stores(store);
+        let (log_store, state_machine) = stores(store, cluster_id_hash)
+            .map_err(|error| ConsensusError::Storage(error.to_string()))?;
         let raft = openraft::Raft::new(
             node_id.0,
             Arc::new(config),
@@ -547,6 +580,7 @@ impl RaftLogStorage<AnvilRaftConfig> for OpenRaftLogStore {
 #[derive(Clone)]
 pub(crate) struct OpenRaftSnapshotBuilder {
     store: RocksRaftStore,
+    cluster_id_hash: [u8; 32],
 }
 
 impl RaftSnapshotBuilder<AnvilRaftConfig> for OpenRaftSnapshotBuilder {
@@ -555,7 +589,16 @@ impl RaftSnapshotBuilder<AnvilRaftConfig> for OpenRaftSnapshotBuilder {
             .store
             .read_state_value(KEY_OPENRAFT_STATE)
             .map_err(read_error)?
-            .unwrap_or_default();
+            .ok_or_else(|| {
+                storage_error(
+                    ErrorSubject::StateMachine,
+                    ErrorVerb::Read,
+                    "initialized cluster state is missing",
+                )
+            })?;
+        state
+            .verify_cluster(self.cluster_id_hash)
+            .map_err(read_error)?;
         state.snapshot_generation = state.snapshot_generation.saturating_add(1);
         self.store
             .sync_state_value(KEY_OPENRAFT_STATE, &state)
@@ -588,7 +631,16 @@ impl RaftStateMachine<AnvilRaftConfig> for OpenRaftStateMachine {
             .store
             .read_state_value(KEY_OPENRAFT_STATE)
             .map_err(read_error)?
-            .unwrap_or_default();
+            .ok_or_else(|| {
+                storage_error(
+                    ErrorSubject::StateMachine,
+                    ErrorVerb::Read,
+                    "initialized cluster state is missing",
+                )
+            })?;
+        state
+            .verify_cluster(self.cluster_id_hash)
+            .map_err(read_error)?;
         Ok((state.last_applied_log_id, state.membership))
     }
 
@@ -601,7 +653,16 @@ impl RaftStateMachine<AnvilRaftConfig> for OpenRaftStateMachine {
             .store
             .read_state_value(KEY_OPENRAFT_STATE)
             .map_err(read_error)?
-            .unwrap_or_default();
+            .ok_or_else(|| {
+                storage_error(
+                    ErrorSubject::StateMachine,
+                    ErrorVerb::Read,
+                    "initialized cluster state is missing",
+                )
+            })?;
+        state
+            .verify_cluster(self.cluster_id_hash)
+            .map_err(read_error)?;
         let mut responses = Vec::new();
         for entry in entries {
             let log_id = entry.log_id;
@@ -631,6 +692,7 @@ impl RaftStateMachine<AnvilRaftConfig> for OpenRaftStateMachine {
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         OpenRaftSnapshotBuilder {
             store: self.store.clone(),
+            cluster_id_hash: self.cluster_id_hash,
         }
     }
 
@@ -659,11 +721,12 @@ impl RaftStateMachine<AnvilRaftConfig> for OpenRaftStateMachine {
         if consumed != bytes.len()
             || state.last_applied_log_id != meta.last_log_id
             || state.membership != meta.last_membership
+            || state.certification.cluster_id_hash() != self.cluster_id_hash
         {
             return Err(storage_error(
                 ErrorSubject::Snapshot(Some(meta.signature())),
                 ErrorVerb::Read,
-                "snapshot body does not match its metadata",
+                "snapshot body does not match its metadata or configured cluster",
             ));
         }
         self.store
@@ -721,15 +784,59 @@ mod tests {
         assert_state::<OpenRaftStateMachine>();
 
         let directory = TempDir::new().unwrap();
-        let (log, state) = stores(RocksRaftStore::open(directory.path(), 0).unwrap());
+        let (log, state) =
+            stores(RocksRaftStore::open(directory.path(), 0).unwrap(), [1; 32]).unwrap();
         drop((log, state));
+    }
+
+    #[test]
+    fn persisted_state_rejects_restart_under_another_cluster() {
+        let directory = TempDir::new().unwrap();
+        let store = RocksRaftStore::open(directory.path(), 7).unwrap();
+        stores(store.clone(), [1; 32]).unwrap();
+
+        let error = match stores(store, [2; 32]) {
+            Ok(_) => panic!("cross-cluster restart was accepted"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("persisted Raft state belongs to another cluster")
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_from_another_cluster_is_rejected() {
+        let source_directory = TempDir::new().unwrap();
+        let source_store = RocksRaftStore::open(source_directory.path(), 1).unwrap();
+        stores(source_store.clone(), [2; 32]).unwrap();
+        let mut builder = OpenRaftSnapshotBuilder {
+            store: source_store,
+            cluster_id_hash: [2; 32],
+        };
+        let snapshot = builder.build_snapshot().await.unwrap();
+
+        let target_directory = TempDir::new().unwrap();
+        let (_, mut target) = stores(
+            RocksRaftStore::open(target_directory.path(), 1).unwrap(),
+            [1; 32],
+        )
+        .unwrap();
+        let error = target
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("configured cluster"));
     }
 
     #[tokio::test]
     async fn duplicate_transaction_advances_raft_applied_id_but_keeps_commit_version() {
         let directory = TempDir::new().unwrap();
-        let (_, mut machine) = stores(RocksRaftStore::open(directory.path(), 0).unwrap());
+        let (_, mut machine) =
+            stores(RocksRaftStore::open(directory.path(), 0).unwrap(), [1; 32]).unwrap();
         let command = CertifyTransaction {
+            cluster_id_hash: [1; 32],
             transaction_id: TransactionId([1; 16]),
             snapshot_version: CommitVersion(0),
             point_observations: vec![],
@@ -779,6 +886,7 @@ mod tests {
         let runtime = OpenRaftConsensus::new(
             NodeId(1),
             RocksRaftStore::open(directory.path(), 0).unwrap(),
+            [1; 32],
             "test-cluster",
             Arc::new(NoRemoteFactory),
         )
@@ -818,6 +926,7 @@ mod tests {
 
     fn test_command(id: u8) -> CertifyTransaction {
         CertifyTransaction {
+            cluster_id_hash: [1; 32],
             transaction_id: TransactionId([id; 16]),
             snapshot_version: CommitVersion(0),
             point_observations: vec![],

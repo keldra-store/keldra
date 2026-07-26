@@ -95,6 +95,52 @@ pub struct Config {
     #[arg(long, env, default_value = "")]
     pub node_id: String,
 
+    /// Numeric identity used by the MVCC OpenRaft group.
+    #[arg(long, env, default_value_t = 1)]
+    pub mvcc_raft_node_id: u64,
+
+    /// Monotonically increasing incarnation for this physical node.
+    #[arg(long, env, default_value_t = 1)]
+    pub mvcc_node_incarnation: u64,
+
+    /// Failure domain used when validating transaction durability evidence.
+    #[arg(long, env, default_value = "local")]
+    pub mvcc_failure_domain: String,
+
+    /// JSON array of MVCC peers. An empty array describes a single-node cluster.
+    #[arg(long, env, default_value = "[]")]
+    pub mvcc_peers_json: String,
+
+    /// Initialize the configured voter set when the local Raft log is empty.
+    #[arg(long, env, default_value_t = true)]
+    pub mvcc_bootstrap_membership: bool,
+
+    /// Stable storage namespace for this cluster's OpenRaft group.
+    #[arg(long, env, default_value_t = 1)]
+    pub mvcc_raft_group_id: u64,
+
+    /// Cluster owning this MVCC and OpenRaft group. Commit versions are local
+    /// to this identifier and must never be compared across clusters.
+    #[arg(long, env, default_value = "default")]
+    pub mvcc_cluster_id: String,
+
+    /// Complete bundle holders required for quorum/erasure commits.
+    #[arg(long, env, default_value_t = 1)]
+    pub mvcc_bundle_quorum_holders: usize,
+
+    /// Failure-domain losses that erasure durability must tolerate.
+    #[arg(long, env, default_value_t = 0)]
+    pub mvcc_tolerated_failure_domains: usize,
+
+    /// Timeout applied to persistent Raft and replication stream operations.
+    #[arg(long, env, default_value_t = 10_000)]
+    pub mvcc_rpc_timeout_ms: u64,
+
+    /// Shared token authenticated once when a node stream connects. When empty,
+    /// it is deterministically derived from the cluster encryption key.
+    #[arg(long, env, default_value = "")]
+    pub mvcc_node_connection_token: String,
+
     /// Directory used for Anvil-owned object bytes, metadata journals, indexes, and manifests.
     #[arg(long, env, default_value = "anvil-data")]
     pub storage_path: String,
@@ -165,6 +211,17 @@ impl Default for Config {
             trusted_proxy_source_ranges: Vec::new(),
             cross_region_routing_policy: CrossRegionRoutingPolicy::RedirectPreferred,
             node_id: String::new(),
+            mvcc_raft_node_id: 1,
+            mvcc_node_incarnation: 1,
+            mvcc_failure_domain: "local".to_string(),
+            mvcc_peers_json: "[]".to_string(),
+            mvcc_bootstrap_membership: true,
+            mvcc_raft_group_id: 1,
+            mvcc_cluster_id: "default".to_string(),
+            mvcc_bundle_quorum_holders: 1,
+            mvcc_tolerated_failure_domains: 0,
+            mvcc_rpc_timeout_ms: 10_000,
+            mvcc_node_connection_token: String::new(),
             storage_path: "anvil-data".to_string(),
             personaldb_snapshot_entry_threshold: 1024,
             personaldb_snapshot_payload_bytes_threshold: 64 * 1024 * 1024,
@@ -190,6 +247,22 @@ fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
 }
 
 impl Config {
+    pub fn mvcc_node_token(&self) -> Result<String> {
+        if !self.mvcc_node_connection_token.is_empty() {
+            return Ok(self.mvcc_node_connection_token.clone());
+        }
+        if self.anvil_secret_encryption_key.is_empty() {
+            anyhow::bail!("MVCC node connection token requires a cluster encryption key");
+        }
+        Ok(blake3::derive_key(
+            "worka.anvil.mvcc.node-connection-token.v1",
+            self.anvil_secret_encryption_key.as_bytes(),
+        )
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+    }
+
     #[allow(unused)]
     pub fn from_ref(args: &Self) -> Self {
         let mut me = Self::default();

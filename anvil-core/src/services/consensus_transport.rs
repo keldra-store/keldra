@@ -86,9 +86,9 @@ impl<A: ConsensusConnectionAuthorizer> ConsensusTransport for ConsensusTransport
                 ));
             }
         };
-        if open.node_id == 0 || open.node_incarnation == 0 {
+        if open.node_id == 0 || open.node_incarnation == 0 || open.cluster_id.trim().is_empty() {
             return Err(Status::invalid_argument(
-                "node ID and incarnation must be non-zero",
+                "cluster ID and non-zero node identity are required",
             ));
         }
         self.authorizer.authorize(&metadata, &open).await?;
@@ -187,6 +187,7 @@ async fn dispatch(runtime: &OpenRaftConsensus, frame: ConsensusRpcFrame) -> Cons
 
 #[derive(Clone)]
 pub struct TonicConsensusRpcFactory {
+    cluster_id: Arc<str>,
     local_node_id: NodeId,
     local_incarnation: u64,
     node_token: Arc<str>,
@@ -196,12 +197,14 @@ pub struct TonicConsensusRpcFactory {
 
 impl TonicConsensusRpcFactory {
     pub fn new(
+        cluster_id: impl Into<Arc<str>>,
         local_node_id: NodeId,
         local_incarnation: u64,
         node_token: impl Into<Arc<str>>,
         request_timeout: Duration,
     ) -> Self {
         Self {
+            cluster_id: cluster_id.into(),
             local_node_id,
             local_incarnation,
             node_token: node_token.into(),
@@ -231,6 +234,7 @@ impl TonicConsensusRpcFactory {
 impl ConsensusRpcFactory for TonicConsensusRpcFactory {
     fn client(&self, _target: NodeId, node: &ConsensusNode) -> Box<dyn ConsensusRpcClient> {
         Box::new(TonicConsensusRpcClient {
+            cluster_id: self.cluster_id.clone(),
             channel: self.channel(&node.address),
             local_node_id: self.local_node_id,
             local_incarnation: self.local_incarnation,
@@ -248,6 +252,7 @@ struct ConnectedSession {
 }
 
 struct TonicConsensusRpcClient {
+    cluster_id: Arc<str>,
     channel: Result<Channel, String>,
     local_node_id: NodeId,
     local_incarnation: u64,
@@ -271,6 +276,7 @@ impl TonicConsensusRpcClient {
                     ConsensusSessionOpen {
                         node_id: self.local_node_id.0,
                         node_incarnation: self.local_incarnation,
+                        cluster_id: self.cluster_id.to_string(),
                     },
                 )),
             })
@@ -416,6 +422,7 @@ mod tests {
             OpenRaftConsensus::new(
                 NodeId(1),
                 RocksRaftStore::open(directory.path(), 1).unwrap(),
+                [1; 32],
                 "transport-test",
                 Arc::new(UnusedNetwork),
             )
@@ -437,8 +444,13 @@ mod tests {
                 .serve_with_incoming(TcpListenerStream::new(listener)),
         );
 
-        let factory =
-            TonicConsensusRpcFactory::new(NodeId(2), 1, "test-node-token", Duration::from_secs(5));
+        let factory = TonicConsensusRpcFactory::new(
+            "transport-test",
+            NodeId(2),
+            1,
+            "test-node-token",
+            Duration::from_secs(5),
+        );
         let mut client = factory.client(
             NodeId(1),
             &ConsensusNode {

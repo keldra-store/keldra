@@ -79,6 +79,7 @@ pub mod metadata_journal;
 pub mod middleware;
 pub mod model_journal;
 pub mod multipart_journal;
+pub mod mvcc_bootstrap;
 pub mod mvcc_consensus_adapter;
 pub mod mvcc_node_runtime;
 pub mod mvcc_open_transactions;
@@ -174,6 +175,7 @@ pub struct AppState {
     pub personaldb_commit_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     pub native_mutation_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     pub observability: observability::Observability,
+    pub mvcc: Arc<mvcc_bootstrap::MvccSubsystem>,
 }
 
 impl AppState {
@@ -266,6 +268,11 @@ impl AppState {
             .await
             .context("bootstrap system realm")?;
         }
+        let mvcc = Arc::new(
+            mvcc_bootstrap::MvccSubsystem::bootstrap(&arc_config)
+                .await
+                .context("bootstrap mandatory MVCC subsystem")?,
+        );
 
         Ok(Self {
             persistence,
@@ -283,6 +290,7 @@ impl AppState {
             personaldb_commit_locks,
             native_mutation_locks,
             observability,
+            mvcc,
         })
     }
 
