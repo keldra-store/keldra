@@ -203,6 +203,9 @@ impl ClusterControlState {
                 self.gc_safety_watermark = *watermark;
                 Ok(ControlApplyResult::GcWatermarkAdvanced(*watermark))
             }
+            ConsensusCommand::UpgradeDurability { .. } => {
+                Err("durability upgrade is not a cluster-control command".into())
+            }
         }
     }
 }

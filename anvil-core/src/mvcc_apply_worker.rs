@@ -237,7 +237,7 @@ impl MvccApplyWorker {
                         bundle_hash: violation.bundle_hash.0,
                         lost_holder_node_id: violation.lost_holder.node_id.0,
                         lost_holder_incarnation: violation.lost_holder.incarnation,
-                        detected_at_consensus_version: violation.detected_at.0,
+                        detected_at_log_index: violation.detected_at_log_index,
                     })?;
             if inserted {
                 crate::perf::record_local_durability_violation("sole_holder_removed");
@@ -245,7 +245,7 @@ impl MvccApplyWorker {
                     commit_version = violation.commit_version.0,
                     lost_holder_node_id = violation.lost_holder.node_id.0,
                     lost_holder_incarnation = violation.lost_holder.incarnation,
-                    detected_at = violation.detected_at.0,
+                    detected_at_log_index = violation.detected_at_log_index,
                     "committed local-durability data has lost its sole durable holder"
                 );
             }
@@ -737,7 +737,7 @@ mod tests {
                 node_id: anvil_mvcc_consensus::NodeId(11),
                 incarnation: 2,
             },
-            detected_at: CommitVersion(9),
+            detected_at_log_index: 9,
         };
         let source = Arc::new(Source {
             decisions: StdMutex::new(Vec::new()),
@@ -753,6 +753,6 @@ mod tests {
         assert_eq!(records[0].commit_version, 7);
         assert_eq!(records[0].lost_holder_node_id, 11);
         assert_eq!(records[0].lost_holder_incarnation, 2);
-        assert_eq!(records[0].detected_at_consensus_version, 9);
+        assert_eq!(records[0].detected_at_log_index, 9);
     }
 }

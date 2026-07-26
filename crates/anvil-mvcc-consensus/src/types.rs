@@ -139,6 +139,18 @@ pub enum ConsensusCommand {
         cluster_id_hash: [u8; 32],
         watermark: CommitVersion,
     },
+    /// Compact post-commit durability evidence for a completed upgrade.
+    ///
+    /// The physical bundle/shards remain outside Raft. This updates only the
+    /// retained transaction outcome after the new holders durably acknowledged
+    /// the immutable bundle.
+    UpgradeDurability {
+        cluster_id_hash: [u8; 32],
+        commit_version: CommitVersion,
+        bundle_hash: BundleHash,
+        durability: DurabilityLevel,
+        durable_holders: Vec<NodeIncarnation>,
+    },
 }
 
 impl ConsensusCommand {
@@ -158,6 +170,9 @@ impl ConsensusCommand {
                 cluster_id_hash, ..
             }
             | Self::AdvanceGcWatermark {
+                cluster_id_hash, ..
+            }
+            | Self::UpgradeDurability {
                 cluster_id_hash, ..
             } => *cluster_id_hash,
         }
@@ -187,6 +202,10 @@ pub enum ControlApplyResult {
     },
     DurabilityPolicySet(ConsensusDurabilityPolicy),
     GcWatermarkAdvanced(CommitVersion),
+    DurabilityUpgraded {
+        commit_version: CommitVersion,
+        durability: DurabilityLevel,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -203,7 +222,7 @@ pub struct LocalDurabilityViolation {
     pub commit_version: CommitVersion,
     pub bundle_hash: BundleHash,
     pub lost_holder: NodeIncarnation,
-    pub detected_at: CommitVersion,
+    pub detected_at_log_index: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

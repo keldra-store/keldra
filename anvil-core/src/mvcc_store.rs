@@ -87,7 +87,7 @@ pub struct LocalDurabilityViolationRecord {
     pub bundle_hash: [u8; 32],
     pub lost_holder_node_id: u64,
     pub lost_holder_incarnation: u64,
-    pub detected_at_consensus_version: CommitVersion,
+    pub detected_at_log_index: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

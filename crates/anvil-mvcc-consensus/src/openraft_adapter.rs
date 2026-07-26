@@ -245,6 +245,42 @@ fn holders_intersect_every_election_quorum(
         })
 }
 
+fn record_lost_local_holder(
+    state: &mut MachineState,
+    lost_holder: NodeIncarnation,
+    detected_at_log_index: u64,
+) {
+    for (commit_version, decision) in &state.decisions {
+        let Some(decision) = decision else {
+            continue;
+        };
+        if decision.durability == crate::DurabilityLevel::Local
+            && decision.durable_holders.contains(&lost_holder)
+            && !decision.durable_holders.iter().any(|holder| {
+                state.control.node_incarnation(holder.node_id) == Some(holder.incarnation)
+            })
+        {
+            state
+                .local_durability_violations
+                .entry(*commit_version)
+                .or_insert_with(|| crate::LocalDurabilityViolation {
+                    commit_version: *commit_version,
+                    bundle_hash: decision.bundle_hash,
+                    lost_holder,
+                    detected_at_log_index,
+                });
+        }
+    }
+}
+
+fn durability_rank(durability: crate::DurabilityLevel) -> u8 {
+    match durability {
+        crate::DurabilityLevel::Local => 0,
+        crate::DurabilityLevel::Quorum => 1,
+        crate::DurabilityLevel::Erasure => 2,
+    }
+}
+
 /// Concrete OpenRaft V2 log store backed by the existing RocksDB.
 #[derive(Clone)]
 pub(crate) struct OpenRaftLogStore {
@@ -482,6 +518,24 @@ impl OpenRaftConsensus {
         self.apply_control(ConsensusCommand::AdvanceGcWatermark {
             cluster_id_hash,
             watermark,
+        })
+        .await
+    }
+
+    pub async fn upgrade_durability(
+        &self,
+        cluster_id_hash: [u8; 32],
+        commit_version: CommitVersion,
+        bundle_hash: crate::BundleHash,
+        durability: crate::DurabilityLevel,
+        durable_holders: Vec<NodeIncarnation>,
+    ) -> Result<ControlApplyResult, ConsensusError> {
+        self.apply_control(ConsensusCommand::UpgradeDurability {
+            cluster_id_hash,
+            commit_version,
+            bundle_hash,
+            durability,
+            durable_holders,
         })
         .await
     }
@@ -977,6 +1031,69 @@ impl RaftStateMachine<AnvilRaftConfig> for OpenRaftStateMachine {
                         }
                     }
                 }
+                EntryPayload::Normal(ConsensusCommand::UpgradeDurability {
+                    cluster_id_hash,
+                    commit_version,
+                    bundle_hash,
+                    durability,
+                    durable_holders,
+                }) => {
+                    let policy = state.control.durability_policy();
+                    let live_holders = durable_holders
+                        .iter()
+                        .filter(|holder| {
+                            state.control.node_incarnation(holder.node_id)
+                                == Some(holder.incarnation)
+                        })
+                        .copied()
+                        .collect::<BTreeSet<_>>();
+                    let canonical_holders =
+                        durable_holders.iter().copied().collect::<BTreeSet<_>>();
+                    let holders_are_canonical =
+                        canonical_holders.iter().copied().collect::<Vec<_>>() == durable_holders;
+                    let holder_raft_ids = live_holders
+                        .iter()
+                        .filter_map(|holder| state.control.raft_node_id(holder.node_id))
+                        .map(|node_id| node_id.0)
+                        .collect::<BTreeSet<_>>();
+                    let required_holders = usize::from(policy.bundle_quorum_holders);
+                    let valid_level = matches!(
+                        durability,
+                        crate::DurabilityLevel::Quorum | crate::DurabilityLevel::Erasure
+                    );
+                    let target = state
+                        .decisions
+                        .get_mut(&commit_version)
+                        .and_then(Option::as_mut);
+                    match target {
+                        Some(decision)
+                            if cluster_id_hash == self.cluster_id_hash
+                                && decision.bundle_hash == bundle_hash
+                                && valid_level
+                                && holders_are_canonical
+                                && durability_rank(durability)
+                                    >= durability_rank(decision.durability)
+                                && required_holders > 0
+                                && live_holders.len() >= required_holders
+                                && holders_intersect_every_election_quorum(
+                                    &state.membership,
+                                    &holder_raft_ids,
+                                ) =>
+                        {
+                            decision.durability = durability;
+                            decision.durable_holders = durable_holders;
+                            state.local_durability_violations.remove(&commit_version);
+                            RaftApplyResult::Control(ControlApplyResult::DurabilityUpgraded {
+                                commit_version,
+                                durability,
+                            })
+                        }
+                        _ => RaftApplyResult::Rejected(
+                            "durability upgrade evidence violates the retained outcome or applied membership"
+                                .into(),
+                        ),
+                    }
+                }
                 EntryPayload::Normal(command) => {
                     if matches!(
                         &command,
@@ -988,33 +1105,24 @@ impl RaftStateMachine<AnvilRaftConfig> for OpenRaftStateMachine {
                                 .into(),
                         )
                     } else {
+                        let replaced_incarnation = match &command {
+                            ConsensusCommand::InstallNode { node, .. } => state
+                                .control
+                                .node_incarnation(node.node_id)
+                                .filter(|current| *current != node.incarnation)
+                                .map(|incarnation| NodeIncarnation {
+                                    node_id: node.node_id,
+                                    incarnation,
+                                }),
+                            _ => None,
+                        };
                         match state.control.apply(&command) {
                             Ok(result) => {
                                 if let ControlApplyResult::NodeRemoved(removed) = &result {
-                                    for (commit_version, decision) in &state.decisions {
-                                        let Some(decision) = decision else {
-                                            continue;
-                                        };
-                                        if decision.durability == crate::DurabilityLevel::Local
-                                            && decision.durable_holders.contains(removed)
-                                            && !decision.durable_holders.iter().any(|holder| {
-                                                state.control.node_incarnation(holder.node_id)
-                                                    == Some(holder.incarnation)
-                                            })
-                                        {
-                                            state
-                                                .local_durability_violations
-                                                .entry(*commit_version)
-                                                .or_insert_with(|| {
-                                                    crate::LocalDurabilityViolation {
-                                                        commit_version: *commit_version,
-                                                        bundle_hash: decision.bundle_hash,
-                                                        lost_holder: *removed,
-                                                        detected_at: CommitVersion(log_id.index),
-                                                    }
-                                                });
-                                        }
-                                    }
+                                    record_lost_local_holder(&mut state, *removed, log_id.index);
+                                }
+                                if let Some(replaced) = replaced_incarnation {
+                                    record_lost_local_holder(&mut state, replaced, log_id.index);
                                 }
                                 if let ControlApplyResult::GcWatermarkAdvanced(watermark) = &result
                                 {
@@ -1188,7 +1296,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_holder_removal_records_one_durable_violation_not_while_live() {
+    async fn upgrades_prevent_false_loss_and_incarnation_replacement_is_detected() {
         let directory = TempDir::new().unwrap();
         let store = RocksRaftStore::open(directory.path(), 0).unwrap();
         let (_, mut machine) = stores(store.clone(), [1; 32]).unwrap();
@@ -1264,13 +1372,23 @@ mod tests {
             .apply([
                 Entry {
                     log_id: LogId::new(leader, 6),
+                    payload: EntryPayload::Normal(ConsensusCommand::UpgradeDurability {
+                        cluster_id_hash: [1; 32],
+                        commit_version: CommitVersion(5),
+                        bundle_hash: BundleHash([7; 32]),
+                        durability: DurabilityLevel::Quorum,
+                        durable_holders: vec![holder, survivor],
+                    }),
+                },
+                Entry {
+                    log_id: LogId::new(leader, 7),
                     payload: EntryPayload::Membership(Membership::new(
                         vec![BTreeSet::from([2])],
                         BTreeSet::from([1, 2]),
                     )),
                 },
                 Entry {
-                    log_id: LogId::new(leader, 7),
+                    log_id: LogId::new(leader, 8),
                     payload: EntryPayload::Normal(ConsensusCommand::RemoveNode {
                         cluster_id_hash: [1; 32],
                         node: holder,
@@ -1279,20 +1397,63 @@ mod tests {
             ])
             .await
             .unwrap();
-        let violations = machine
+        assert!(
+            machine
+                .store
+                .read_state_value::<MachineState>(KEY_OPENRAFT_STATE)
+                .unwrap()
+                .unwrap()
+                .local_durability_violations
+                .is_empty()
+        );
+
+        let mut second = test_command(8);
+        second.durability = DurabilityLevel::Local;
+        second.durable_holders = vec![survivor];
+        machine
+            .apply([
+                Entry {
+                    log_id: LogId::new(leader, 9),
+                    payload: EntryPayload::Normal(ConsensusCommand::Certify(second)),
+                },
+                Entry {
+                    log_id: LogId::new(leader, 10),
+                    payload: EntryPayload::Normal(ConsensusCommand::InstallNode {
+                        cluster_id_hash: [1; 32],
+                        node: NodeIncarnation {
+                            node_id: survivor.node_id,
+                            incarnation: 2,
+                        },
+                        raft_node_id: NodeId(2),
+                        failure_domain: "zone-b".into(),
+                    }),
+                },
+            ])
+            .await
+            .unwrap();
+        let state = machine
             .store
             .read_state_value::<MachineState>(KEY_OPENRAFT_STATE)
             .unwrap()
-            .unwrap()
-            .local_durability_violations;
+            .unwrap();
+        assert_eq!(
+            state
+                .decisions
+                .get(&CommitVersion(5))
+                .and_then(Option::as_ref)
+                .unwrap()
+                .durability,
+            DurabilityLevel::Quorum
+        );
+        let violations = state.local_durability_violations;
         assert_eq!(violations.len(), 1);
         assert_eq!(
-            violations.get(&CommitVersion(5)),
+            violations.get(&CommitVersion(9)),
             Some(&crate::LocalDurabilityViolation {
-                commit_version: CommitVersion(5),
-                bundle_hash: BundleHash([7; 32]),
-                lost_holder: holder,
-                detected_at: CommitVersion(7),
+                commit_version: CommitVersion(9),
+                bundle_hash: BundleHash([8; 32]),
+                lost_holder: survivor,
+                detected_at_log_index: 10,
             })
         );
     }

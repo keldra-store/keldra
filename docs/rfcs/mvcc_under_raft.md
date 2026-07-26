@@ -629,7 +629,10 @@ Only the following application state may be proposed through OpenRaft:
 5. OpenRaft voter and learner membership;
 6. authoritative partition assignments and assignment epochs;
 7. durability-policy generations;
-8. garbage-collection safety watermarks requiring cluster-wide agreement.
+8. garbage-collection safety watermarks requiring cluster-wide agreement;
+9. compact durability-upgrade evidence that replaces the holder summary of a
+   retained transaction outcome after new holders durably acknowledge the
+   immutable bundle.
 
 OpenRaft also stores its own vote, term, log, committed index, applied index,
 membership, and snapshot metadata.
@@ -1374,6 +1377,12 @@ If the client, coordinator, or target fails before certification:
 `local` durability may use one append-only local data representation rather than
 generating remote shards. A later durability upgrade must read that local
 representation through the same streaming encoder.
+
+After the upgraded representation and transaction bundle satisfy the target
+durability policy, one compact consensus command replaces the retained
+transaction outcome's durability level and holder incarnations. This prevents
+later fencing of the original local holder from being misreported as data loss.
+The command contains no object, shard, manifest, or bundle body.
 
 The distributed `quorum` and `erasure` paths must not create complete remote
 object replicas.
