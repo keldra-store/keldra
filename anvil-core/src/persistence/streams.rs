@@ -404,7 +404,6 @@ impl Persistence {
         stream_id: uuid::Uuid,
     ) -> Result<Option<AppendStream>> {
         append_journal::get_active_append_stream_mvcc(
-            &self.storage,
             self.mvcc()?,
             tenant_id,
             bucket_id,
@@ -425,7 +424,6 @@ impl Persistence {
         transaction_principal: &str,
     ) -> Result<Option<AppendStream>> {
         append_journal::get_active_append_stream_in_transaction(
-            &self.storage,
             mvcc,
             tenant_id,
             bucket_id,
@@ -521,7 +519,7 @@ impl Persistence {
         stream: &AppendStream,
         transaction: Option<(&str, &str)>,
     ) -> Result<bool> {
-        append_journal::append_stream_has_records(&self.storage, mvcc, stream, transaction).await
+        append_journal::append_stream_has_records(mvcc.unwrap_or(self.mvcc()?), stream, transaction)
     }
 
     pub async fn list_append_streams_page(

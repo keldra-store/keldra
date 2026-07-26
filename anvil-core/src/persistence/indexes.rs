@@ -415,6 +415,7 @@ impl Persistence {
             "typed_json" => {
                 index_builder::build_typed_json_index(
                     &self.storage,
+                    self.mvcc()?,
                     &bucket,
                     &index,
                     &self.partition_owner_signing_key,

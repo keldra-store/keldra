@@ -373,6 +373,7 @@ pub(super) async fn build_typed_json_object_rows(
     bucket: &Bucket,
     index: &IndexDefinition,
     definition: &TypedJsonBuildDefinition,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     core_store: &CoreStore,
     partition_owner_signing_key: &[u8],
     source_cursor: u128,
@@ -460,26 +461,24 @@ pub(super) async fn build_typed_json_append_rows(
     let mut rows = Vec::new();
     let mut diagnostics = Vec::new();
     let mut boundary_values = BTreeSet::new();
-    let mut after_stream_id = None;
+    let mut stream_cursor = None;
     loop {
-        let stream_page = crate::append_journal::list_append_streams_page(
-            core_store.storage(),
+        let stream_page = crate::append_journal::list_append_streams_page_mvcc(
+            mvcc,
             bucket.tenant_id,
             bucket.id,
-            after_stream_id.as_deref(),
+            stream_cursor.as_deref(),
             128,
-        )
-        .await?;
+        )?;
         for stream in stream_page.streams {
-            let mut after_sequence = 0;
+            let mut record_cursor = None;
             loop {
-                let record_page = crate::append_journal::list_append_stream_records_page(
-                    core_store.storage(),
+                let record_page = crate::append_journal::list_append_stream_records_page_mvcc(
+                    mvcc,
                     &stream,
-                    after_sequence,
+                    record_cursor.as_deref(),
                     512,
-                )
-                .await?;
+                )?;
                 for record in record_page.records {
                     if (record.id.max(0) as u128) > source_cursor {
                         continue;
@@ -546,16 +545,16 @@ pub(super) async fn build_typed_json_append_rows(
                         }),
                     }
                 }
-                if !record_page.has_more {
+                let Some(next_cursor) = record_page.next_cursor else {
                     break;
-                }
-                after_sequence = record_page.next_sequence;
+                };
+                record_cursor = Some(next_cursor);
             }
         }
-        let Some(next_stream_id) = stream_page.next_stream_id else {
+        let Some(next_cursor) = stream_page.next_cursor else {
             break;
         };
-        after_stream_id = Some(next_stream_id);
+        stream_cursor = Some(next_cursor);
     }
     Ok((rows, diagnostics, boundary_values.into_iter().collect()))
 }

@@ -531,6 +531,7 @@ async fn build_full_text_index_from_source(
 
 pub(crate) async fn build_typed_json_index(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     index: &IndexDefinition,
     partition_owner_signing_key: &[u8],
@@ -546,6 +547,7 @@ pub(crate) async fn build_typed_json_index(
         source_cursor,
         builder_node_id,
         authority,
+        Some(mvcc),
         None,
     )
     .await
@@ -572,6 +574,7 @@ pub(crate) async fn build_frozen_typed_json_index(
         source_cursor,
         builder_node_id,
         authority,
+        None,
         Some(source),
     )
     .await
@@ -585,6 +588,7 @@ async fn build_typed_json_index_from_source(
     source_cursor: u128,
     builder_node_id: &str,
     authority: IndexBuildAuthority<'_>,
+    mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
     frozen_source: Option<FrozenObjectIndexSource>,
 ) -> Result<IndexBuildOutcome> {
     if index.kind != "typed_json" {
@@ -634,7 +638,9 @@ async fn build_typed_json_index_from_source(
                     bucket,
                     index,
                     &definition,
-                    core_store.as_ref().expect("legacy source has a CoreStore"),
+                    core_store
+                        .as_ref()
+                        .expect("object payload source has a physical byte store"),
                     partition_owner_signing_key,
                     source_cursor,
                 )
@@ -645,7 +651,10 @@ async fn build_typed_json_index_from_source(
                     bucket,
                     index,
                     &definition,
-                    core_store.as_ref().expect("legacy source has a CoreStore"),
+                    mvcc.ok_or_else(|| anyhow!("append_record index source requires MVCC"))?,
+                    core_store
+                        .as_ref()
+                        .expect("append payload source has a physical byte store"),
                     source_cursor,
                 )
                 .await?
@@ -794,7 +803,7 @@ async fn build_typed_json_index_from_source(
 }
 
 /// Extract one typed-JSON row from an immutable MVCC source. Unlike the
-/// legacy index builder this performs no source enumeration and reads no
+/// mutable-source builder this performs no source enumeration and reads no
 /// current object metadata.
 pub(crate) fn extract_frozen_typed_json_row(
     bucket: &Bucket,

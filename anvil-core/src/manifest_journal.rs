@@ -309,6 +309,17 @@ async fn append_manifest(
         next_manifest_cas_root_generation(&core_store, &data_root).await?
     };
     let root_publications = manifest_root_publications(data_root, scope_partition.clone());
+    let predicate_kind = current_payload
+        .as_ref()
+        .map(|payload| {
+            crate::mvcc_transaction::PredicateKind::ValueHash(*blake3::hash(payload).as_bytes())
+        })
+        .unwrap_or(crate::mvcc_transaction::PredicateKind::Absent);
+    let predicate_key = crate::mvcc_product::coremeta_logical_key(
+        CF_OBJECT_HEADS,
+        TABLE_MANIFEST_CAS_CURRENT_ROW,
+        &manifest_current_row_key(body.tenant_id, body.bucket_id, &body.object_key)?,
+    )?;
     let current_update = manifest_current_row_update_from_payload(
         &body,
         root_generation,
@@ -357,11 +368,19 @@ async fn append_manifest(
             let principal = transaction_principal
                 .ok_or_else(|| anyhow!("transaction principal is required"))?;
             mvcc.stage_product_mutations(&transaction_id, principal, mutations, now_unix_ms)?;
+            mvcc.stage_predicate(
+                &transaction_id,
+                principal,
+                predicate_key,
+                predicate_kind,
+                now_unix_ms,
+            )?;
         } else {
-            mvcc.autocommit_product_mutations(
+            mvcc.autocommit_product_mutations_with_predicates(
                 &manifest_cas_partition_principal(body.tenant_id, body.bucket_id),
                 &transaction_id,
                 mutations,
+                vec![(predicate_key, predicate_kind)],
                 crate::mvcc_transaction::DurabilityLevel::Local,
                 now_unix_ms,
             )
