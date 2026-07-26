@@ -24,9 +24,9 @@ use openraft::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CertificationResult, CertificationState, CertifyTransaction, ClusterControlState,
-    CommitVersion, Consensus, ConsensusCommand, ConsensusError, ControlApplyResult, NodeId,
-    NodeIncarnation, RaftStorageError, RocksRaftStore,
+    AppliedDecision, CertificationResult, CertificationState, CertifyTransaction,
+    ClusterControlState, CommitVersion, CommittedBundleDecision, Consensus, ConsensusCommand,
+    ConsensusError, ControlApplyResult, NodeId, NodeIncarnation, RaftStorageError, RocksRaftStore,
     storage::{KEY_LAST_PURGED_LOG_ID, KEY_OPENRAFT_STATE},
 };
 
@@ -186,6 +186,7 @@ impl RaftNetwork<AnvilRaftConfig> for NetworkAdapter {
 struct MachineState {
     certification: CertificationState,
     control: ClusterControlState,
+    decisions: BTreeMap<CommitVersion, Option<CommittedBundleDecision>>,
     last_applied_log_id: Option<LogId<u64>>,
     membership: StoredMembership<u64, BasicNode>,
     snapshot_generation: u64,
@@ -197,6 +198,7 @@ impl MachineState {
             certification: CertificationState::new(cluster_id_hash)
                 .map_err(|error| RaftStorageError::Codec(error.to_string()))?,
             control: ClusterControlState::new(cluster_id_hash).map_err(RaftStorageError::Codec)?,
+            decisions: BTreeMap::new(),
             last_applied_log_id: None,
             membership: StoredMembership::default(),
             snapshot_generation: 0,
@@ -263,9 +265,38 @@ pub(crate) fn stores(
 #[derive(Clone)]
 pub struct OpenRaftConsensus {
     raft: openraft::Raft<AnvilRaftConfig>,
+    store: RocksRaftStore,
 }
 
 impl OpenRaftConsensus {
+    pub fn applied_decisions_after(
+        &self,
+        position: CommitVersion,
+    ) -> Result<Vec<AppliedDecision>, ConsensusError> {
+        let state = self
+            .store
+            .read_state_value::<MachineState>(KEY_OPENRAFT_STATE)
+            .map_err(|error| ConsensusError::Storage(error.to_string()))?
+            .ok_or_else(|| ConsensusError::Storage("Raft state machine is missing".into()))?;
+        Ok(state
+            .decisions
+            .range(CommitVersion(position.0.saturating_add(1))..)
+            .map(|(position, bundle)| AppliedDecision {
+                position: *position,
+                committed_bundle: bundle.clone(),
+            })
+            .collect())
+    }
+
+    pub fn gc_safety_watermark(&self) -> Result<CommitVersion, ConsensusError> {
+        let state = self
+            .store
+            .read_state_value::<MachineState>(KEY_OPENRAFT_STATE)
+            .map_err(|error| ConsensusError::Storage(error.to_string()))?
+            .ok_or_else(|| ConsensusError::Storage("Raft state machine is missing".into()))?;
+        Ok(state.control.gc_safety_watermark())
+    }
+
     async fn apply_control(
         &self,
         command: ConsensusCommand,
@@ -404,6 +435,7 @@ impl OpenRaftConsensus {
         .map_err(|error| ConsensusError::Rejected(error.to_string()))?;
         let (log_store, state_machine) = stores(store, cluster_id_hash)
             .map_err(|error| ConsensusError::Storage(error.to_string()))?;
+        let runtime_store = state_machine.store.clone();
         let raft = openraft::Raft::new(
             node_id.0,
             Arc::new(config),
@@ -413,7 +445,10 @@ impl OpenRaftConsensus {
         )
         .await
         .map_err(|error| ConsensusError::Storage(error.to_string()))?;
-        Ok(Self { raft })
+        Ok(Self {
+            raft,
+            store: runtime_store,
+        })
     }
 
     pub async fn initialize(
@@ -764,6 +799,7 @@ impl RaftStateMachine<AnvilRaftConfig> for OpenRaftStateMachine {
         let mut responses = Vec::new();
         for entry in entries {
             let log_id = entry.log_id;
+            let mut committed_bundle = None;
             let response = match entry.payload {
                 EntryPayload::Blank => RaftApplyResult::Noop,
                 EntryPayload::Membership(membership) => {
@@ -771,11 +807,20 @@ impl RaftStateMachine<AnvilRaftConfig> for OpenRaftStateMachine {
                     RaftApplyResult::Noop
                 }
                 EntryPayload::Normal(ConsensusCommand::Certify(command)) => {
-                    match state
+                    let result = state
                         .certification
-                        .apply(CommitVersion(log_id.index), &command)
-                    {
-                        Ok(result) => RaftApplyResult::Certification(result),
+                        .apply(CommitVersion(log_id.index), &command);
+                    match result {
+                        Ok(result) => {
+                            if matches!(result, CertificationResult::Committed { .. }) {
+                                committed_bundle = Some(CommittedBundleDecision {
+                                    cluster_id_hash: command.cluster_id_hash,
+                                    bundle_hash: command.bundle_hash,
+                                    bundle_length: command.bundle_length,
+                                });
+                            }
+                            RaftApplyResult::Certification(result)
+                        }
                         Err(error) => RaftApplyResult::Rejected(error.to_string()),
                     }
                 }
@@ -784,6 +829,9 @@ impl RaftStateMachine<AnvilRaftConfig> for OpenRaftStateMachine {
                     Err(error) => RaftApplyResult::Rejected(error),
                 },
             };
+            state
+                .decisions
+                .insert(CommitVersion(log_id.index), committed_bundle);
             state.last_applied_log_id = Some(log_id);
             responses.push(response);
         }

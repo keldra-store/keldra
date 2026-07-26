@@ -375,10 +375,7 @@ impl ConsensusRpcClient for TonicConsensusRpcClient {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        net::SocketAddr,
-        sync::atomic::{AtomicUsize, Ordering},
-    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use anvil_mvcc_consensus::{
         BundleHash, CertificationResult, CertifyTransaction, CommitVersion, Consensus,
@@ -454,15 +451,14 @@ mod tests {
 
     async fn node(
         id: u64,
-        directory: &std::path::Path,
+        store: RocksRaftStore,
         cluster_id: &'static str,
         cluster_hash: [u8; 32],
-        addresses: &[SocketAddr],
     ) -> Arc<OpenRaftConsensus> {
         Arc::new(
             OpenRaftConsensus::new(
                 NodeId(id),
-                RocksRaftStore::open(directory, 1).unwrap(),
+                store,
                 cluster_hash,
                 cluster_id,
                 Arc::new(TonicConsensusRpcFactory::new(
@@ -605,13 +601,19 @@ mod tests {
             TcpListener::bind("127.0.0.1:0").await.unwrap(),
             TcpListener::bind("127.0.0.1:0").await.unwrap(),
         ];
-        let addresses = listeners
+        let mut addresses = listeners
             .iter()
             .map(|listener| listener.local_addr().unwrap())
             .collect::<Vec<_>>();
-        let first = node(1, directories[0].path(), CLUSTER, HASH, &addresses).await;
-        let second = node(2, directories[1].path(), CLUSTER, HASH, &addresses).await;
-        let third = node(3, directories[2].path(), CLUSTER, HASH, &addresses).await;
+        let stores = [
+            RocksRaftStore::open(directories[0].path(), 1).unwrap(),
+            RocksRaftStore::open(directories[1].path(), 1).unwrap(),
+            RocksRaftStore::open(directories[2].path(), 1).unwrap(),
+        ];
+        let third_db = stores[2].database().clone();
+        let first = node(1, stores[0].clone(), CLUSTER, HASH).await;
+        let second = node(2, stores[1].clone(), CLUSTER, HASH).await;
+        let third = node(3, stores[2].clone(), CLUSTER, HASH).await;
         let mut servers = Vec::new();
         for (listener, runtime) in
             listeners
@@ -677,9 +679,26 @@ mod tests {
         let _ = (&mut servers[2]).await;
         third.shutdown().await.unwrap();
         drop(third);
-        let listener = TcpListener::bind(addresses[2]).await.unwrap();
-        let restarted = node(3, directories[2].path(), CLUSTER, HASH, &addresses).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        addresses[2] = listener.local_addr().unwrap();
+        let restarted = node(
+            3,
+            RocksRaftStore::from_db(third_db, 1).unwrap(),
+            CLUSTER,
+            HASH,
+        )
+        .await;
         servers[2] = serve(listener, restarted.clone(), CLUSTER).await;
+        first
+            .add_learner(
+                NodeId(3),
+                ConsensusNode {
+                    address: format!("http://{}", addresses[2]),
+                },
+                true,
+            )
+            .await
+            .unwrap();
         first.certify(command(3, HASH)).await.unwrap();
         let latest = first.observed_commit_version();
         wait_until("restarted follower catch-up", || {

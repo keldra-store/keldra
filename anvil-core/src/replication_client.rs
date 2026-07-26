@@ -491,6 +491,16 @@ impl BundleTargetStream for TonicReplicationStreamManager {
     }
 }
 
+pub fn bundle_transfer_id(identity: &BundleIdentity) -> Result<Uuid> {
+    let final_hash = parse_identity_hash(&identity.hash)?;
+    Ok(deterministic_transfer_id(
+        ReplicationTransferKind::TransactionBundle,
+        identity.hash.as_bytes(),
+        final_hash,
+        identity.length,
+    ))
+}
+
 pub fn object_shard_transfer_id(
     object_identity: Uuid,
     encoding_generation: u64,

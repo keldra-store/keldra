@@ -80,6 +80,7 @@ pub mod metadata_journal;
 pub mod middleware;
 pub mod model_journal;
 pub mod multipart_journal;
+pub mod mvcc_apply_worker;
 pub mod mvcc_bootstrap;
 pub mod mvcc_consensus_adapter;
 pub mod mvcc_node_runtime;

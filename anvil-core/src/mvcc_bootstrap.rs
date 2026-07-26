@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -24,6 +24,7 @@ use crate::{
         StreamingBundleReplicator,
     },
     local_object_store::LocalObjectStore,
+    mvcc_apply_worker::{ApplyWorkerState, MvccApplyWorker},
     mvcc_node_runtime::MvccNodeRuntime,
     mvcc_open_transactions::OpenTransactionRegistry,
     mvcc_store::LocalMvccStore,
@@ -167,6 +168,9 @@ pub struct MvccSubsystem {
     pub consensus_service: ConsensusTransportService<NodeConnectionAuthorizer>,
     pub replication_service: ReplicationServiceImpl<NodeConnectionAuthorizer>,
     pub peers: Arc<[MvccPeerConfig]>,
+    pub apply_worker_state: Arc<tokio::sync::Mutex<ApplyWorkerState>>,
+    apply_shutdown: tokio::sync::watch::Sender<bool>,
+    apply_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl fmt::Debug for MvccSubsystem {
@@ -175,6 +179,12 @@ impl fmt::Debug for MvccSubsystem {
             .debug_struct("MvccSubsystem")
             .field("peers", &self.peers)
             .finish_non_exhaustive()
+    }
+}
+
+impl Drop for MvccSubsystem {
+    fn drop(&mut self) {
+        let _ = self.apply_shutdown.send(true);
     }
 }
 
@@ -302,15 +312,16 @@ impl MvccSubsystem {
                 failure_domain: peer.failure_domain.clone(),
             })
             .collect::<Vec<_>>();
+        let local_store = LocalMvccStore::from_db(core_meta_db.clone(), &config.mvcc_cluster_id)?;
         let runtime = Arc::new(MvccNodeRuntime::new(
-            prepared,
+            prepared.clone(),
             replicator,
             consensus.as_ref().clone(),
             DurabilityPolicy {
                 bundle_quorum_holders: config.mvcc_bundle_quorum_holders,
                 tolerated_failure_domains: config.mvcc_tolerated_failure_domains,
             },
-            LocalMvccStore::from_db(core_meta_db.clone(), &config.mvcc_cluster_id)?,
+            local_store.clone(),
         )?);
         let open_transactions = Arc::new(OpenTransactionRegistry::from_db(core_meta_db)?);
         let authorizer =
@@ -319,6 +330,25 @@ impl MvccSubsystem {
             ConsensusTransportService::new(consensus.clone(), authorizer.clone());
         let replication_service =
             ReplicationServiceImpl::open(authorizer, &paths.replication_inbox)?;
+        let remote_nodes = peers
+            .iter()
+            .filter(|peer| peer.raft_node_id != config.mvcc_raft_node_id)
+            .map(|peer| NodeIncarnation {
+                node_id: peer.node_id.clone(),
+                incarnation: peer.incarnation,
+            })
+            .collect::<Vec<_>>();
+        let worker = MvccApplyWorker::new(
+            consensus.clone(),
+            config.mvcc_cluster_id.clone(),
+            prepared,
+            replication_client.clone(),
+            remote_nodes,
+            local_store,
+        );
+        let apply_worker_state = worker.state_handle();
+        let (apply_shutdown, apply_shutdown_rx) = tokio::sync::watch::channel(false);
+        let apply_task = tokio::spawn(worker.run(apply_shutdown_rx));
 
         Ok(Self {
             consensus,
@@ -331,7 +361,19 @@ impl MvccSubsystem {
             consensus_service,
             replication_service,
             peers: peers.into(),
+            apply_worker_state,
+            apply_shutdown,
+            apply_task: Mutex::new(Some(apply_task)),
         })
+    }
+
+    pub async fn shutdown(&self) {
+        let _ = self.apply_shutdown.send(true);
+        let task = self.apply_task.lock().ok().and_then(|mut task| task.take());
+        if let Some(task) = task {
+            let _ = task.await;
+        }
+        let _ = self.consensus.shutdown().await;
     }
 }
 

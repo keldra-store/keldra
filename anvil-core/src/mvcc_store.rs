@@ -12,15 +12,23 @@ use rocksdb::{
 };
 
 use crate::mvcc_transaction::{CommitVersion, LogicalKey, TransactionBundle, WriteOperation};
+use crate::object_materialisation::{ObjectMaterialisationJob, ObjectMaterialisationRecord};
 
-pub const MVCC_COLUMN_FAMILIES: [&str; 4] =
-    ["mvcc_versions", "mvcc_heads", "mvcc_applied", "mvcc_meta"];
+pub const MVCC_COLUMN_FAMILIES: [&str; 5] = [
+    "mvcc_versions",
+    "mvcc_heads",
+    "mvcc_applied",
+    "mvcc_meta",
+    "cf_materialisation",
+];
 const CF_VERSIONS: &str = MVCC_COLUMN_FAMILIES[0];
 const CF_HEADS: &str = MVCC_COLUMN_FAMILIES[1];
 const CF_APPLIED: &str = MVCC_COLUMN_FAMILIES[2];
 const CF_META: &str = MVCC_COLUMN_FAMILIES[3];
+const CF_MATERIALISATION: &str = MVCC_COLUMN_FAMILIES[4];
 const APPLIED_VERSION_KEY: &[u8] = b"applied_version";
 const GC_WATERMARK_KEY: &[u8] = b"gc_watermark";
+const DECISION_WATERMARK_KEY: &[u8] = b"decision_watermark";
 const VALUE: u8 = 1;
 const TOMBSTONE: u8 = 0;
 
@@ -36,6 +44,7 @@ pub enum ApplyOutcome {
     Replayed,
 }
 
+#[derive(Clone)]
 pub struct MvccStore {
     db: Arc<DB>,
     cluster_id: String,
@@ -86,6 +95,24 @@ impl MvccStore {
         commit_version: CommitVersion,
         bundle: &TransactionBundle,
     ) -> Result<ApplyOutcome> {
+        self.apply_certified_bundle_at_decision(commit_version, bundle, None)
+    }
+
+    pub fn apply_certified_bundle_and_advance(
+        &self,
+        commit_version: CommitVersion,
+        bundle: &TransactionBundle,
+        decision_position: CommitVersion,
+    ) -> Result<ApplyOutcome> {
+        self.apply_certified_bundle_at_decision(commit_version, bundle, Some(decision_position))
+    }
+
+    fn apply_certified_bundle_at_decision(
+        &self,
+        commit_version: CommitVersion,
+        bundle: &TransactionBundle,
+        decision_position: Option<CommitVersion>,
+    ) -> Result<ApplyOutcome> {
         if bundle.cluster_id != self.cluster_id {
             bail!("transaction bundle belongs to another cluster");
         }
@@ -94,6 +121,9 @@ impl MvccStore {
         let applied_cf = self.cf(CF_APPLIED)?;
         if let Some(existing) = self.db.get_cf(applied_cf, &applied_key)? {
             if existing.as_slice() == identity.as_bytes() {
+                if let Some(position) = decision_position {
+                    self.advance_decision_watermark(position)?;
+                }
                 return Ok(ApplyOutcome::Replayed);
             }
             bail!("commit version {commit_version} was already applied with another bundle");
@@ -109,6 +139,7 @@ impl MvccStore {
         let versions_cf = self.cf(CF_VERSIONS)?;
         let heads_cf = self.cf(CF_HEADS)?;
         let meta_cf = self.cf(CF_META)?;
+        let materialisation_cf = self.cf(CF_MATERIALISATION)?;
         let mut batch = WriteBatch::default();
         for write in &bundle.writes {
             let key = write.key();
@@ -121,12 +152,33 @@ impl MvccStore {
             batch.put_cf(versions_cf, versioned_key, row);
             batch.put_cf(heads_cf, logical_key, commit_version.to_be_bytes());
         }
+        for encoded_job in &bundle.materialisation_jobs {
+            let job = ObjectMaterialisationJob::decode(encoded_job)?;
+            if job.cluster_id != self.cluster_id || job.transaction_id != bundle.transaction_id {
+                bail!("materialisation job belongs to another transaction or cluster");
+            }
+            let key = self.key(format!("object-job/{}", job.job_id()?).as_bytes());
+            let record = serde_json::to_vec(&ObjectMaterialisationRecord::pending(job))?;
+            if let Some(existing) = self.db.get_cf(materialisation_cf, &key)?
+                && existing.as_slice() != record.as_slice()
+            {
+                bail!("materialisation job identity collision");
+            }
+            batch.put_cf(materialisation_cf, key, record);
+        }
         batch.put_cf(applied_cf, applied_key, identity.as_bytes());
         batch.put_cf(
             meta_cf,
             self.key(APPLIED_VERSION_KEY),
             commit_version.to_be_bytes(),
         );
+        if let Some(position) = decision_position {
+            batch.put_cf(
+                meta_cf,
+                self.key(DECISION_WATERMARK_KEY),
+                position.to_be_bytes(),
+            );
+        }
         self.db.write_opt(batch, &durable_write_options())?;
         Ok(ApplyOutcome::Applied)
     }
@@ -181,6 +233,24 @@ impl MvccStore {
 
     pub fn gc_watermark(&self) -> Result<CommitVersion> {
         self.read_meta_version(GC_WATERMARK_KEY)
+    }
+
+    pub fn decision_watermark(&self) -> Result<CommitVersion> {
+        self.read_meta_version(DECISION_WATERMARK_KEY)
+    }
+
+    pub fn advance_decision_watermark(&self, position: CommitVersion) -> Result<()> {
+        let current = self.decision_watermark()?;
+        if position < current {
+            bail!("MVCC decision watermark cannot move backwards");
+        }
+        self.db.put_cf_opt(
+            self.cf(CF_META)?,
+            self.key(DECISION_WATERMARK_KEY),
+            position.to_be_bytes(),
+            &durable_write_options(),
+        )?;
+        Ok(())
     }
 
     /// Removes obsolete history below `safe_watermark`, retaining the newest

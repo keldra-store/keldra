@@ -152,6 +152,19 @@ pub enum ControlApplyResult {
     GcWatermarkAdvanced(CommitVersion),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommittedBundleDecision {
+    pub cluster_id_hash: [u8; 32],
+    pub bundle_hash: BundleHash,
+    pub bundle_length: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppliedDecision {
+    pub position: CommitVersion,
+    pub committed_bundle: Option<CommittedBundleDecision>,
+}
+
 /// Stable reason for a transaction certification abort.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CertificationAbort {

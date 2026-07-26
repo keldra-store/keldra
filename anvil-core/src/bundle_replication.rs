@@ -85,6 +85,20 @@ impl PreparedBundleLog {
         );
         Ok(())
     }
+
+    fn read(&mut self, identity: &BundleIdentity) -> Result<Option<Vec<u8>>> {
+        let Some(location) = self.index.get(&identity.hash).copied() else {
+            return Ok(None);
+        };
+        if location.payload_length != identity.length {
+            bail!("prepared bundle length differs from immutable identity");
+        }
+        self.file.seek(SeekFrom::Start(location.payload_offset))?;
+        let mut bytes = vec![0; location.payload_length as usize];
+        self.file.read_exact(&mut bytes)?;
+        verify_identity(identity, &bytes)?;
+        Ok(Some(bytes))
+    }
 }
 
 #[derive(Clone)]
@@ -117,6 +131,13 @@ impl AppendOnlyPreparedBundleStore {
             node,
             failure_domain,
         })
+    }
+
+    pub fn read(&self, identity: &BundleIdentity) -> Result<Option<Vec<u8>>> {
+        self.log
+            .lock()
+            .map_err(|_| anyhow::anyhow!("prepared bundle log lock poisoned"))?
+            .read(identity)
     }
 }
 
