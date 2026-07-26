@@ -147,6 +147,39 @@ impl TonicReplicationStreamManager {
         })
     }
 
+    /// Replaces the transport endpoint for one configured peer incarnation.
+    ///
+    /// The peer mutex serializes this topology transition with transfers. Any
+    /// authenticated stream bound to the previous channel is discarded, so
+    /// the next operation performs a fresh node-to-node authentication
+    /// handshake against the replacement endpoint.
+    pub async fn replace_peer_endpoint(
+        &self,
+        cluster_id: &str,
+        node: &NodeIncarnation,
+        endpoint: impl Into<String>,
+    ) -> Result<()> {
+        if cluster_id != &*self.cluster_id {
+            bail!("cross-cluster replication endpoint replacement is forbidden");
+        }
+        let endpoint = endpoint.into();
+        if endpoint.trim().is_empty() {
+            bail!("replacement replication endpoint must be non-empty");
+        }
+        let channel = Endpoint::from_shared(endpoint)?
+            .connect_timeout(self.options.operation_timeout)
+            .connect_lazy();
+        let peer = self
+            .peers
+            .get(&(cluster_id.to_string(), node.clone()))
+            .with_context(|| format!("no replication peer for {cluster_id}/{node:?}"))?
+            .clone();
+        let mut peer = peer.lock().await;
+        peer.channel = channel;
+        peer.session = None;
+        Ok(())
+    }
+
     async fn transfer(
         &self,
         target_cluster_id: &str,

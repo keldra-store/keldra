@@ -725,8 +725,8 @@ mod app_state_tests {
             consensus_transport_server::ConsensusTransportServer,
             replication_service_server::ReplicationServiceServer,
         };
-        use crate::mvcc_transaction::{DurabilityLevel, LogicalKey, ReadConsistency};
         use crate::bundle_replication::BundleTargetStream as _;
+        use crate::mvcc_transaction::{DurabilityLevel, LogicalKey, ReadConsistency};
         use anvil_mvcc_consensus::Consensus as _;
         use sha2::Digest as _;
         use tokio::net::TcpListener;
@@ -743,10 +743,6 @@ mod app_state_tests {
             TcpListener::bind("127.0.0.1:0").await.unwrap(),
             TcpListener::bind("127.0.0.1:0").await.unwrap(),
         ];
-        let addresses = listeners
-            .iter()
-            .map(|listener| listener.local_addr().unwrap())
-            .collect::<Vec<_>>();
         let endpoints = listeners
             .iter()
             .map(|listener| format!("http://{}", listener.local_addr().unwrap()))
@@ -779,8 +775,13 @@ mod app_state_tests {
                 node_id: format!("node-{}", index + 1),
                 bootstrap_system_admin_subject_kind: "app".into(),
                 bootstrap_system_admin_subject_id: "admin-principal".into(),
+                allow_test_only_embedding_provider: true,
                 bootstrap_node_ids: vec!["node-1".into(), "node-2".into(), "node-3".into()],
-                storage_path: directory.path().join("storage").to_string_lossy().into_owned(),
+                storage_path: directory
+                    .path()
+                    .join("storage")
+                    .to_string_lossy()
+                    .into_owned(),
                 mvcc_cluster_id: "distributed-e2e".into(),
                 mvcc_raft_node_id: index as u64 + 1,
                 mvcc_node_incarnation: 1,
@@ -816,7 +817,13 @@ mod app_state_tests {
         }
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                if states[0].mvcc.consensus.linearized_read_barrier().await.is_ok() {
+                if states[0]
+                    .mvcc
+                    .consensus
+                    .linearized_read_barrier()
+                    .await
+                    .is_ok()
+                {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -896,6 +903,126 @@ mod app_state_tests {
         .await
         .expect("followers apply the certified bundle in order");
 
+        states[0]
+            .persistence
+            .create_region("distributed")
+            .await
+            .unwrap();
+        let tenant = states[0]
+            .persistence
+            .create_tenant("distributed-e2e", "distributed-e2e")
+            .await
+            .unwrap();
+        let bucket = states[0]
+            .persistence
+            .create_bucket(tenant.id, "materialised", "distributed")
+            .await
+            .unwrap();
+        let claims = auth::Claims {
+            sub: "distributed-test-app".into(),
+            exp: usize::MAX,
+            tenant_id: tenant.id,
+            jti: None,
+        };
+        access_control::grant_storage_tenant_owner(
+            &states[0].persistence,
+            tenant.id,
+            &claims.sub,
+            "test",
+            "distributed materialisation",
+        )
+        .await
+        .unwrap();
+        access_control::grant_bucket_defaults(
+            &states[0].persistence,
+            &bucket,
+            &claims.sub,
+            "test",
+            "distributed materialisation",
+        )
+        .await
+        .unwrap();
+        for definition in [
+            persistence::IndexDefinitionMutation::Create {
+                name: "typed".into(),
+                kind: "typed_json".into(),
+                selector: serde_json::Value::Null,
+                extractor: serde_json::Value::Null,
+                authorization_mode: "inherit_object".into(),
+                build_policy: serde_json::json!({
+                    "source_kind": "object_current",
+                    "fields": [{"name": "title", "extractor": "/title"}],
+                }),
+            },
+            persistence::IndexDefinitionMutation::Create {
+                name: "text".into(),
+                kind: "full_text".into(),
+                selector: serde_json::Value::Null,
+                extractor: serde_json::json!({
+                    "fields": [{"source": "object_body_utf8"}],
+                }),
+                authorization_mode: "inherit_object".into(),
+                build_policy: serde_json::json!({}),
+            },
+            persistence::IndexDefinitionMutation::Create {
+                name: "vector".into(),
+                kind: "vector".into(),
+                selector: serde_json::Value::Null,
+                extractor: serde_json::json!({"kind": "object_body_utf8"}),
+                authorization_mode: "inherit_object".into(),
+                build_policy: serde_json::json!({
+                    "schema": formats::vector::VECTOR_INDEX_SCHEMA,
+                    "source": {"kind": "object_current", "prefix": ""},
+                    "extractor": {"kind": "object_body_utf8"},
+                    "embedding": {
+                        "provider": "test_only",
+                        "model": "test",
+                        "dimension": 4,
+                        "modality": "text",
+                        "normalisation": "unit_l2",
+                        "chunking": {"strategy": "whole_object"}
+                    },
+                    "ann": {"algorithm": "hnsw", "metric": "cosine"}
+                }),
+            },
+        ] {
+            states[0]
+                .persistence
+                .apply_index_definition_mutation(&bucket, &definition, None, None)
+                .await
+                .unwrap();
+        }
+        states[0]
+            .core_store
+            .put_boundary_schema(core_store::PutBoundarySchema {
+                schema: core_store::CoreBoundarySchema {
+                    schema: core_store::CORE_BOUNDARY_SCHEMA_SCHEMA.into(),
+                    bucket: core_store::boundary_schema_bucket_key(tenant.id, &bucket.name),
+                    generation: 1,
+                    dimensions: vec![core_store::CoreBoundaryDimension {
+                        name: "partition".into(),
+                        source: core_store::CoreBoundarySource::UserMetadataJsonPointer {
+                            pointer: "/partition".into(),
+                        },
+                        value_type: "string".into(),
+                        categories: vec!["storage_partition".into()],
+                        required: true,
+                        cardinality: "low".into(),
+                        max_values_per_block: 1,
+                        placement_affinity: "prefer_colocate".into(),
+                        compaction_scope: "require_same_value".into(),
+                        shared_ranges_allowed: false,
+                        shared_record_kinds: Vec::new(),
+                        deprecated: false,
+                    }],
+                    created_at: String::new(),
+                },
+                expected_generation: None,
+                mutation_id: "distributed-boundary-schema".into(),
+            })
+            .await
+            .unwrap();
+
         let erasure_key = LogicalKey {
             table_id: 0x7f01,
             application_key: b"ordered/erasure".to_vec(),
@@ -932,7 +1059,7 @@ mod app_state_tests {
                 &states[0].mvcc.shard_candidates,
             )
             .unwrap();
-        let payload = b"erasure transaction payload reconstructed from acknowledged shards";
+        let payload = br#"{"title":"distributed erasure payload"}"#;
         let mut payload_reader = std::io::Cursor::new(payload.as_slice());
         let ingest = shard_placement::DistributedIngest::encode(
             &states[0].mvcc.replication_client,
@@ -963,6 +1090,32 @@ mod app_state_tests {
             .mvcc
             .object_evidence
             .record_ingest(&ingest)
+            .unwrap();
+        let materialised_object = states[0]
+            .object_manager
+            .put_object(
+                &claims,
+                &bucket.name,
+                "distributed.json",
+                futures_util::stream::empty(),
+                object_manager::ObjectWriteOptions {
+                    content_type: Some("application/json".into()),
+                    user_metadata: Some(serde_json::json!({"partition": "alpha"})),
+                    transaction_id: Some(erasure_handle.transaction_id.clone()),
+                    transaction_principal: Some(principal.into()),
+                    prepared_ingest: Some(object_manager::PreparedObjectIngest {
+                        object_hash: manifest.object_hash.clone(),
+                        object_length: manifest.object_length,
+                        shard_map: serde_json::json!({
+                            "schema": "anvil.mvcc.object_shard_manifest.v1",
+                            "manifest": manifest,
+                        }),
+                    }),
+                    visibility: object_manager::ObjectWriteVisibility::strict(),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
         states[0]
             .mvcc
@@ -1000,6 +1153,50 @@ mod app_state_tests {
             erasure_outcome.certification,
             mvcc_transaction::CertificationResult::Committed { .. }
         ));
+        let materialisation_target = format!(
+            "tenant/{}/bucket/{}/object/{}/version/{}",
+            tenant.id, bucket.id, materialised_object.key, materialised_object.version_id
+        );
+        let materialisation_key =
+            object_materialisation::materialisation_status_key(&materialisation_target).unwrap();
+        let materialisation = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Some(row) = states[0]
+                    .mvcc
+                    .runtime
+                    .local_store()
+                    .read_latest(&materialisation_key)
+                    .unwrap()
+                {
+                    let result: object_materialisation::ObjectMaterialisationResult =
+                        serde_json::from_slice(&row.value).unwrap();
+                    if result.state == object_materialisation::ObjectMaterialisationState::Complete
+                    {
+                        break result;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("distributed materialisation completes");
+        assert_eq!(
+            materialisation.index_marker["outcomes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert!(
+            materialisation
+                .derived_boundaries
+                .as_array()
+                .is_some_and(|values| {
+                    values
+                        .iter()
+                        .any(|value| value["name"] == "partition" && value["value"] == "alpha")
+                })
+        );
         servers[2].abort();
         let _ = (&mut servers[2]).await;
         let reconstructed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1022,7 +1219,8 @@ mod app_state_tests {
             .await
             .unwrap();
         assert_eq!(&*reconstructed.lock().unwrap(), payload);
-        let restarted_listener = TcpListener::bind(addresses[2]).await.unwrap();
+        let restarted_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let restarted_address = restarted_listener.local_addr().unwrap();
         let consensus = states[2].mvcc.consensus_service.clone();
         let replication = states[2].mvcc.replication_service.clone();
         servers[2] = tokio::spawn(async move {
@@ -1033,6 +1231,61 @@ mod app_state_tests {
                 .await
                 .unwrap();
         });
+        let restarted_endpoint = format!("http://{restarted_address}");
+        states[0]
+            .mvcc
+            .replication_client
+            .replace_peer_endpoint(
+                "distributed-e2e",
+                &mvcc_transaction::NodeIncarnation {
+                    node_id: "node-3".into(),
+                    incarnation: 1,
+                },
+                restarted_endpoint.clone(),
+            )
+            .await
+            .unwrap();
+        states[0]
+            .mvcc
+            .consensus
+            .change_membership(
+                [
+                    anvil_mvcc_consensus::NodeId(1),
+                    anvil_mvcc_consensus::NodeId(2),
+                ]
+                .into_iter()
+                .collect(),
+                false,
+            )
+            .await
+            .unwrap();
+        states[0]
+            .mvcc
+            .consensus
+            .add_learner(
+                anvil_mvcc_consensus::NodeId(3),
+                anvil_mvcc_consensus::ConsensusNode {
+                    address: restarted_endpoint,
+                },
+                true,
+            )
+            .await
+            .unwrap();
+        states[0]
+            .mvcc
+            .consensus
+            .change_membership(
+                [
+                    anvil_mvcc_consensus::NodeId(1),
+                    anvil_mvcc_consensus::NodeId(2),
+                    anvil_mvcc_consensus::NodeId(3),
+                ]
+                .into_iter()
+                .collect(),
+                false,
+            )
+            .await
+            .unwrap();
         let reconnect_key = LogicalKey {
             table_id: 0x7f01,
             application_key: b"ordered/reconnect".to_vec(),
