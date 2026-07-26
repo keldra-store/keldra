@@ -228,26 +228,68 @@ impl ShardRepairRunner {
         else {
             return Ok(false);
         };
+        let started_at = std::time::Instant::now();
+        crate::perf::record_repair_age(
+            "mvcc_shard",
+            Duration::from_millis(now.saturating_sub(record.job.requested_at_unix_ms)),
+        );
+        tracing::info!(
+            operation = "repair.claim",
+            job_id = %job_id,
+            worker_id = %self.worker_id,
+            attempts = record.attempts,
+            "claimed durable shard repair job"
+        );
         let timeout = Duration::from_millis(self.lease_ms - 1_000);
         match tokio::time::timeout(timeout, self.execute(&record.job)).await {
-            Ok(Ok(())) => store.complete_shard_repair(&job_id, &self.worker_id)?,
-            Ok(Err(error)) => store.retry_shard_repair(
-                &job_id,
-                &self.worker_id,
-                retry_at(now, record.attempts),
-                &error.to_string(),
-            )?,
-            Err(_) => store.retry_shard_repair(
-                &job_id,
-                &self.worker_id,
-                retry_at(now, record.attempts),
-                "shard repair exceeded lease-safe timeout",
-            )?,
+            Ok(Ok(())) => {
+                crate::perf::record_repair_duration(
+                    "mvcc_shard",
+                    "erasure",
+                    "complete",
+                    started_at.elapsed(),
+                );
+                store.complete_shard_repair(&job_id, &self.worker_id)?
+            }
+            Ok(Err(error)) => {
+                crate::perf::record_repair_duration(
+                    "mvcc_shard",
+                    "erasure",
+                    "retry",
+                    started_at.elapsed(),
+                );
+                store.retry_shard_repair(
+                    &job_id,
+                    &self.worker_id,
+                    retry_at(now, record.attempts),
+                    &error.to_string(),
+                )?
+            }
+            Err(_) => {
+                crate::perf::record_repair_duration(
+                    "mvcc_shard",
+                    "erasure",
+                    "timeout",
+                    started_at.elapsed(),
+                );
+                store.retry_shard_repair(
+                    &job_id,
+                    &self.worker_id,
+                    retry_at(now, record.attempts),
+                    "shard repair exceeded lease-safe timeout",
+                )?
+            }
         }
         Ok(true)
     }
 
     async fn execute(&self, job: &ShardRepairJob) -> Result<()> {
+        tracing::info!(
+            operation = "repair.reconstruct",
+            transaction_id = %job.transaction_id,
+            missing_shards = job.missing.len(),
+            "reconstructing immutable object for shard repair"
+        );
         let overlay_key = crate::mvcc_transaction::LogicalKey {
             table_id: ShardPlacementOverlay::TABLE_ID,
             application_key: job.target_logical_identity.as_bytes().to_vec(),
@@ -323,6 +365,12 @@ impl ShardRepairRunner {
         {
             bail!("reconstructed repair payload does not match frozen manifest");
         }
+        tracing::info!(
+            operation = "repair.place",
+            transaction_id = %job.transaction_id,
+            placed_shards = sink.completed.len(),
+            "replacement shards received verified durable ACKs"
+        );
         let mut replacement = job.source_manifest.clone();
         for placement in sink.completed {
             replacement.placements.retain(|current| {
@@ -444,6 +492,11 @@ impl ShardRepairRunner {
         ) {
             bail!("replacement placement overlay transaction was not committed");
         }
+        tracing::info!(
+            operation = "repair.commit",
+            transaction_id = %job.transaction_id,
+            "committed replacement shard placement overlay"
+        );
         Ok(())
     }
 }

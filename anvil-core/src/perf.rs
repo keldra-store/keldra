@@ -414,6 +414,93 @@ pub fn record_erasure_reconstruction_total(erasure_profile: &str, status: &str) 
     );
 }
 
+pub fn record_replication_heartbeat(status: &str) {
+    record_counter(
+        "anvil_replication_heartbeat_total",
+        &[("status", status)],
+        1,
+    );
+}
+
+pub fn record_replication_reconnect(reason: &str) {
+    record_counter(
+        "anvil_replication_reconnect_total",
+        &[("reason", reason)],
+        1,
+    );
+}
+
+pub fn record_replication_stream_connected(connected: bool) {
+    record_gauge(
+        "anvil_replication_stream_connected",
+        &[],
+        i64::from(connected),
+    );
+}
+
+pub fn record_replication_ack_latency(status: &str, duration: Duration) {
+    record_histogram_duration_ms(
+        "anvil_replication_ack_latency_ms",
+        &[("status", status)],
+        duration,
+    );
+}
+
+pub fn record_replication_persist_latency(status: &str, duration: Duration) {
+    record_histogram_duration_ms(
+        "anvil_replication_persist_latency_ms",
+        &[("status", status)],
+        duration,
+    );
+}
+
+pub fn record_replication_resume_bytes(bytes: u64) {
+    record_counter("anvil_replication_resume_bytes_total", &[], bytes);
+}
+
+pub fn record_ingest_stripe_encode(status: &str, duration: Duration) {
+    record_histogram_duration_ms(
+        "anvil_ingest_stripe_encode_duration_ms",
+        &[("status", status)],
+        duration,
+    );
+}
+
+pub fn record_replication_unacked_bytes(kind: &str, bytes: u64) {
+    record_gauge(
+        "anvil_replication_unacked_bytes",
+        &[("kind", kind)],
+        bytes.min(i64::MAX as u64) as i64,
+    );
+}
+
+pub fn record_ingest_shard_stream(
+    durability: &str,
+    status: &str,
+    duration: Duration,
+    shard_bytes: u64,
+) {
+    record_histogram_duration_ms(
+        "anvil_ingest_shard_stream_duration_ms",
+        &[("durability", durability), ("status", status)],
+        duration,
+    );
+    record_counter(
+        "anvil_ingest_shard_ack_count",
+        &[("durability", durability), ("status", status)],
+        1,
+    );
+    record_gauge(
+        "anvil_erasure_shard_bytes",
+        &[("durability", durability)],
+        shard_bytes.min(i64::MAX as u64) as i64,
+    );
+}
+
+pub fn record_repair_age(repair_kind: &str, age: Duration) {
+    record_histogram_duration_ms("anvil_repair_age_ms", &[("repair_kind", repair_kind)], age);
+}
+
 pub fn record_query_plan_duration(
     query_kind: &str,
     index_kind: &str,

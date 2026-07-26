@@ -44,6 +44,8 @@ pub struct ReplicationStreamOptions {
     /// Number of replacement sessions after the initial session fails.
     pub reconnect_attempts: usize,
     pub queue_capacity: usize,
+    pub heartbeat_interval: Duration,
+    pub progress_timeout: Duration,
 }
 
 impl Default for ReplicationStreamOptions {
@@ -53,6 +55,8 @@ impl Default for ReplicationStreamOptions {
             frame_bytes: 256 * 1024,
             reconnect_attempts: 2,
             queue_capacity: 8,
+            heartbeat_interval: Duration::from_secs(5),
+            progress_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -62,6 +66,8 @@ struct ConnectedStream {
     next_sequence: u64,
     output: mpsc::Sender<ReplicationStreamRequest>,
     input: tonic::Streaming<ReplicationStreamResponse>,
+    last_progress: tokio::time::Instant,
+    last_acknowledged_sequence: u64,
 }
 
 struct PeerState {
@@ -110,6 +116,8 @@ impl TonicReplicationStreamManager {
         if options.operation_timeout.is_zero()
             || options.frame_bytes == 0
             || options.queue_capacity == 0
+            || options.heartbeat_interval.is_zero()
+            || options.progress_timeout.is_zero()
         {
             bail!("replication stream timeouts, frame size, and queue capacity must be non-zero");
         }
@@ -210,6 +218,23 @@ impl TonicReplicationStreamManager {
                     }
                 }
             }
+            if let Err(error) = self
+                .heartbeat_if_due(peer.session.as_mut().expect("session established"))
+                .await
+            {
+                crate::perf::record_replication_heartbeat("expired");
+                crate::perf::record_replication_reconnect("heartbeat_expired");
+                tracing::warn!(
+                    cluster_id = target_cluster_id,
+                    node_id = %target.node_id,
+                    incarnation = target.incarnation,
+                    %error,
+                    "replication heartbeat progress expired; reconnecting"
+                );
+                last_error = Some(error);
+                peer.session = None;
+                continue;
+            }
             let result = self
                 .transfer_on_session(
                     peer.session.as_mut().expect("session established"),
@@ -223,6 +248,14 @@ impl TonicReplicationStreamManager {
             match result {
                 Ok(ack) => return Ok(ack),
                 Err(error) => {
+                    crate::perf::record_replication_reconnect("transfer_progress_expired");
+                    tracing::warn!(
+                        cluster_id = target_cluster_id,
+                        node_id = %target.node_id,
+                        incarnation = target.incarnation,
+                        %error,
+                        "replication transfer lost ACK progress; reconnecting from durable watermark"
+                    );
                     last_error = Some(error);
                     peer.session = None;
                 }
@@ -259,6 +292,23 @@ impl TonicReplicationStreamManager {
                     }
                 }
             }
+            if let Err(error) = self
+                .heartbeat_if_due(peer.session.as_mut().expect("session established"))
+                .await
+            {
+                crate::perf::record_replication_heartbeat("expired");
+                crate::perf::record_replication_reconnect("heartbeat_expired");
+                tracing::warn!(
+                    cluster_id,
+                    node_id = %target.node_id,
+                    incarnation = target.incarnation,
+                    %error,
+                    "replication read heartbeat expired; reconnecting"
+                );
+                last_error = Some(error);
+                peer.session = None;
+                continue;
+            }
             match self
                 .read_on_session(
                     peer.session.as_mut().expect("session established"),
@@ -270,6 +320,14 @@ impl TonicReplicationStreamManager {
             {
                 Ok(bytes) => return Ok(bytes),
                 Err(error) => {
+                    crate::perf::record_replication_reconnect("read_progress_expired");
+                    tracing::warn!(
+                        cluster_id,
+                        node_id = %target.node_id,
+                        incarnation = target.incarnation,
+                        %error,
+                        "replication read lost progress; reconnecting"
+                    );
                     last_error = Some(error);
                     peer.session = None;
                 }
@@ -301,7 +359,7 @@ impl TonicReplicationStreamManager {
                 )),
             )
             .await?;
-            let response = timeout_message(self.options.operation_timeout, &mut session.input)
+            let response = timeout_message(self.options.progress_timeout, &mut session.input)
                 .await?
                 .context("replication stream ended while awaiting read chunk")?;
             let Some(replication_stream_response::Message::Read(chunk)) = response.message else {
@@ -351,7 +409,7 @@ impl TonicReplicationStreamManager {
             .context("invalid replication node token")?;
         request.metadata_mut().insert(NODE_TOKEN_HEADER, token);
         let response = tokio::time::timeout(
-            self.options.operation_timeout,
+            self.options.progress_timeout,
             ReplicationServiceClient::new(channel.clone()).replicate(request),
         )
         .await
@@ -370,12 +428,67 @@ impl TonicReplicationStreamManager {
         {
             bail!("replication peer accepted session for a different authenticated node");
         }
+        crate::perf::record_replication_stream_connected(true);
+        tracing::info!(
+            operation = "replication.stream",
+            session_id = %session_id,
+            peer_node_id = %accepted.peer_node_id,
+            peer_incarnation = accepted.peer_node_incarnation,
+            "persistent replication stream authenticated"
+        );
         Ok(ConnectedStream {
             session_id,
             next_sequence: 1,
             output,
             input,
+            last_progress: tokio::time::Instant::now(),
+            last_acknowledged_sequence: 0,
         })
+    }
+
+    async fn heartbeat_if_due(&self, session: &mut ConnectedStream) -> Result<()> {
+        if session.last_progress.elapsed() < self.options.heartbeat_interval {
+            return Ok(());
+        }
+        let sequence = session.next_sequence;
+        session.next_sequence = session
+            .next_sequence
+            .checked_add(1)
+            .context("replication heartbeat sequence exhausted")?;
+        send_timeout(
+            self.options.progress_timeout,
+            &session.output,
+            request(replication_stream_request::Message::Heartbeat(
+                crate::anvil_api::ReplicationHeartbeat {
+                    session_id: session.session_id.to_string(),
+                    sequence,
+                    last_acknowledged_sequence: session.last_acknowledged_sequence,
+                },
+            )),
+        )
+        .await?;
+        let response = timeout_message(self.options.progress_timeout, &mut session.input)
+            .await?
+            .context("replication stream ended while awaiting heartbeat")?;
+        let Some(replication_stream_response::Message::Heartbeat(heartbeat)) = response.message
+        else {
+            bail!("unexpected replication response while awaiting heartbeat");
+        };
+        if heartbeat.session_id != session.session_id.to_string()
+            || heartbeat.sequence != sequence
+            || heartbeat.last_acknowledged_sequence != session.last_acknowledged_sequence
+        {
+            bail!("replication heartbeat response does not match session progress");
+        }
+        session.last_progress = tokio::time::Instant::now();
+        crate::perf::record_replication_heartbeat("ok");
+        tracing::debug!(
+            session_id = %session.session_id,
+            sequence,
+            last_acknowledged_sequence = session.last_acknowledged_sequence,
+            "replication heartbeat acknowledged"
+        );
+        Ok(())
     }
 
     async fn transfer_on_session(
@@ -401,13 +514,16 @@ impl TonicReplicationStreamManager {
         )
         .await?;
         let watermark = receive_watermark(
-            self.options.operation_timeout,
+            self.options.progress_timeout,
             &mut session.input,
             transfer_id,
         )
         .await?;
         if watermark.persisted_through > bytes.len() as u64 {
             bail!("peer watermark exceeds immutable transfer length");
+        }
+        if watermark.persisted_through > 0 {
+            crate::perf::record_replication_resume_bytes(watermark.persisted_through);
         }
         if watermark.complete {
             let completed_hash = parse_optional_hash(&watermark.completed_hash)?
@@ -442,6 +558,15 @@ impl TonicReplicationStreamManager {
                 .next_sequence
                 .checked_add(1)
                 .context("replication session sequence exhausted")?;
+            let ack_started_at = std::time::Instant::now();
+            crate::perf::record_replication_unacked_bytes(
+                if kind == ReplicationTransferKind::TransactionBundle {
+                    "bundle"
+                } else {
+                    "shard"
+                },
+                payload.len() as u64,
+            );
             send_timeout(
                 self.options.operation_timeout,
                 &session.output,
@@ -464,14 +589,33 @@ impl TonicReplicationStreamManager {
             )
             .await?;
             let ack = receive_ack(
-                self.options.operation_timeout,
+                self.options.progress_timeout,
                 &mut session.input,
                 session.session_id,
             )
             .await?;
+            crate::perf::record_replication_ack_latency("received", ack_started_at.elapsed());
+            crate::perf::record_replication_unacked_bytes(
+                if kind == ReplicationTransferKind::TransactionBundle {
+                    "bundle"
+                } else {
+                    "shard"
+                },
+                0,
+            );
+            tracing::debug!(
+                operation = "replication.persist_ack",
+                session_id = %session.session_id,
+                transfer_id = %transfer_id,
+                sequence,
+                persisted_through = ack.persisted_through,
+                "replication frame received durable application ACK"
+            );
             if ack.transfer_id != transfer_id || ack.acknowledged_sequence != sequence {
                 bail!("replication ACK does not correlate to the outstanding frame");
             }
+            session.last_progress = tokio::time::Instant::now();
+            session.last_acknowledged_sequence = sequence;
             if ack.persisted_through < end as u64 || ack.persisted_through > bytes.len() as u64 {
                 bail!("replication ACK contains an invalid durable watermark");
             }
@@ -808,6 +952,8 @@ mod tests {
                 frame_bytes: 3,
                 reconnect_attempts: 1,
                 queue_capacity: 1,
+                heartbeat_interval: Duration::from_millis(25),
+                progress_timeout: Duration::from_secs(2),
             },
         )
         .unwrap();
@@ -836,6 +982,7 @@ mod tests {
                 .unwrap(),
             bytes
         );
+        tokio::time::sleep(Duration::from_millis(30)).await;
         let second = manager
             .send_bundle(&target, &identity, bytes)
             .await

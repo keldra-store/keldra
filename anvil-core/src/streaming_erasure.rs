@@ -94,7 +94,17 @@ impl StreamingErasureEncoder {
                 .collect();
             shards
                 .extend((0..self.profile.parity_shards).map(|_| vec![0; self.profile.shard_bytes]));
+            let encode_started_at = std::time::Instant::now();
             self.codec.encode(&mut shards)?;
+            crate::perf::record_ingest_stripe_encode("ok", encode_started_at.elapsed());
+            tracing::debug!(
+                operation = "ingest.erasure_encode",
+                stripe_ordinal,
+                data_shards = self.profile.data_shards,
+                parity_shards = self.profile.parity_shards,
+                plaintext_bytes = filled,
+                "encoded erasure stripe"
+            );
             for (ordinal, payload) in shards.iter().enumerate() {
                 sink.send(EncodedShard {
                     object_identity,

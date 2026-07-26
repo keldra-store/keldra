@@ -293,6 +293,7 @@ impl<A: ReplicationConnectionAuthorizer> ReplicationServiceImpl<A> {
                 }
             };
 
+            let persist_started_at = std::time::Instant::now();
             let receiver = self.receiver.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let result = receiver
@@ -315,8 +316,26 @@ impl<A: ReplicationConnectionAuthorizer> ReplicationServiceImpl<A> {
             };
             session = returned_session;
             let ack = match ack {
-                Ok(ack) => ack,
+                Ok(ack) => {
+                    crate::perf::record_replication_persist_latency(
+                        "ok",
+                        persist_started_at.elapsed(),
+                    );
+                    tracing::debug!(
+                        operation = "replication.persist_ack",
+                        session_id = %ack.session_id,
+                        transfer_id = %ack.transfer_id,
+                        sequence = ack.acknowledged_sequence,
+                        persisted_through = ack.persisted_through,
+                        "persisted replication frame before ACK"
+                    );
+                    ack
+                }
                 Err(error) => {
+                    crate::perf::record_replication_persist_latency(
+                        "error",
+                        persist_started_at.elapsed(),
+                    );
                     send_error(&output, Status::data_loss(error.to_string())).await;
                     return;
                 }

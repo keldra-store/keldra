@@ -280,6 +280,12 @@ impl<'a, T: ShardTargetStream> DistributedIngest<'a, T> {
 #[async_trait]
 impl<T: ShardTargetStream> ShardSink for DistributedIngest<'_, T> {
     async fn send(&mut self, shard: EncodedShard<'_>) -> Result<()> {
+        let started_at = std::time::Instant::now();
+        let durability = match self.durability {
+            DurabilityLevel::Local => "local",
+            DurabilityLevel::Quorum => "quorum",
+            DurabilityLevel::Erasure => "erasure",
+        };
         let target = self
             .plan
             .targets_by_ordinal
@@ -290,6 +296,21 @@ impl<T: ShardTargetStream> ShardSink for DistributedIngest<'_, T> {
                 if ack.status == AckStatus::Complete
                     && ack.completed_hash == Some(shard.payload_hash) =>
             {
+                crate::perf::record_ingest_shard_stream(
+                    durability,
+                    "complete",
+                    started_at.elapsed(),
+                    shard.payload.len() as u64,
+                );
+                tracing::debug!(
+                    operation = "shard.stream",
+                    node_id = %target.node.node_id,
+                    incarnation = target.node.incarnation,
+                    failure_domain = %target.failure_domain,
+                    stripe_ordinal = shard.stripe_ordinal,
+                    shard_ordinal = shard.shard_ordinal,
+                    "shard stream received durable completion ACK"
+                );
                 self.completed.push(CompletedShard {
                     stripe_ordinal: shard.stripe_ordinal,
                     shard_ordinal: shard.shard_ordinal,
@@ -300,6 +321,22 @@ impl<T: ShardTargetStream> ShardSink for DistributedIngest<'_, T> {
                 Ok(())
             }
             Ok(ack) => {
+                crate::perf::record_ingest_shard_stream(
+                    durability,
+                    "invalid_ack",
+                    started_at.elapsed(),
+                    shard.payload.len() as u64,
+                );
+                tracing::warn!(
+                    operation = "shard.stream",
+                    node_id = %target.node.node_id,
+                    incarnation = target.node.incarnation,
+                    failure_domain = %target.failure_domain,
+                    stripe_ordinal = shard.stripe_ordinal,
+                    shard_ordinal = shard.shard_ordinal,
+                    ack_status = ?ack.status,
+                    "shard stream received invalid completion ACK"
+                );
                 let failure = format!(
                     "shard {} received {:?} or a mismatched completion hash",
                     shard.shard_ordinal, ack.status
@@ -311,6 +348,22 @@ impl<T: ShardTargetStream> ShardSink for DistributedIngest<'_, T> {
                 Ok(())
             }
             Err(error) => {
+                crate::perf::record_ingest_shard_stream(
+                    durability,
+                    "error",
+                    started_at.elapsed(),
+                    shard.payload.len() as u64,
+                );
+                tracing::warn!(
+                    operation = "shard.stream",
+                    node_id = %target.node.node_id,
+                    incarnation = target.node.incarnation,
+                    failure_domain = %target.failure_domain,
+                    stripe_ordinal = shard.stripe_ordinal,
+                    shard_ordinal = shard.shard_ordinal,
+                    %error,
+                    "shard stream failed before durable completion ACK"
+                );
                 if self.durability == DurabilityLevel::Erasure {
                     return Err(error);
                 }
