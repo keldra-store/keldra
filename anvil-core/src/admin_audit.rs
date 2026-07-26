@@ -132,9 +132,7 @@ pub async fn append_audit_event(storage: &Storage, event: &AdminAuditEvent) -> R
 pub fn require_direct_audit_action(event: &AdminAuditEvent) -> Result<()> {
     let allowed = matches!(
         event.action.as_str(),
-        "admin.app.policy.grant"
-            | "admin.app.policy.revoke"
-            | "admin.cell.activate"
+        "admin.cell.activate"
             | "admin.cell.drain"
             | "admin.cell.register"
             | "admin.cell.remove"

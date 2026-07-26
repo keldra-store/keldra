@@ -183,20 +183,7 @@ impl AdminService for AppState {
             .action
             .parse::<crate::permissions::AnvilAction>()
             .map_err(|_| Status::invalid_argument("Invalid delegated action"))?;
-        crate::access_control::write_delegated_action_tuple(
-            &self.storage,
-            &self.persistence,
-            tenant_id,
-            &app.id.to_string(),
-            delegated_action,
-            &req.resource,
-            "add",
-            &principal.principal_id,
-            "admin access grant",
-        )
-        .await?;
-        let audit_event_id = record_admin_audit_event(
-            self,
+        let audit_event = build_admin_audit_event(
             &principal,
             context,
             "admin.app.policy.grant",
@@ -210,6 +197,19 @@ impl AdminService for AppState {
                 "action": &req.action,
                 "resource": &req.resource,
             }),
+        )?;
+        let audit_event_id = audit_event.audit_event_id.clone();
+        crate::access_control::write_delegated_action_tuple(
+            &self.storage,
+            &self.persistence,
+            tenant_id,
+            &app.id.to_string(),
+            delegated_action,
+            &req.resource,
+            "add",
+            &principal.principal_id,
+            "admin access grant",
+            &audit_event,
         )
         .await?;
         Ok(Response::new(ApplicationPolicyResponse {
@@ -236,20 +236,7 @@ impl AdminService for AppState {
             .action
             .parse::<crate::permissions::AnvilAction>()
             .map_err(|_| Status::invalid_argument("Invalid delegated action"))?;
-        crate::access_control::write_delegated_action_tuple(
-            &self.storage,
-            &self.persistence,
-            tenant_id,
-            &app.id.to_string(),
-            delegated_action,
-            &req.resource,
-            "remove",
-            &principal.principal_id,
-            "admin access revoke",
-        )
-        .await?;
-        let audit_event_id = record_admin_audit_event(
-            self,
+        let audit_event = build_admin_audit_event(
             &principal,
             context,
             "admin.app.policy.revoke",
@@ -263,6 +250,19 @@ impl AdminService for AppState {
                 "action": &req.action,
                 "resource": &req.resource,
             }),
+        )?;
+        let audit_event_id = audit_event.audit_event_id.clone();
+        crate::access_control::write_delegated_action_tuple(
+            &self.storage,
+            &self.persistence,
+            tenant_id,
+            &app.id.to_string(),
+            delegated_action,
+            &req.resource,
+            "remove",
+            &principal.principal_id,
+            "admin access revoke",
+            &audit_event,
         )
         .await?;
         Ok(Response::new(ApplicationPolicyResponse {
