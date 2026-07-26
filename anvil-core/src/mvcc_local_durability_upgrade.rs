@@ -10,7 +10,6 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::io::BufReader;
 use uuid::Uuid;
 
 use crate::{
@@ -268,12 +267,10 @@ where
             if placement.encoding_generation == 0 {
                 bail!("durability upgrade encoding generation must be non-zero");
             }
-            let bytes = self.local_objects.read_range(
-                &object.local_manifest,
-                0,
-                object.local_manifest.object_length,
-            )?;
-            let mut reader = BufReader::new(std::io::Cursor::new(bytes));
+            let mut reader = self
+                .local_objects
+                .open_verified(&object.local_manifest)
+                .await?;
             let ingest = DistributedIngest::encode(
                 &self.shard_transport,
                 &placement.plan,

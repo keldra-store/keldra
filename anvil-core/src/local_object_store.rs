@@ -159,6 +159,19 @@ impl LocalObjectStore {
         Ok(bytes)
     }
 
+    /// Opens a verified local representation for bounded streaming consumers.
+    ///
+    /// Verification happens before the handle is returned so a durability
+    /// upgrade never encodes bytes from a truncated or corrupted source.
+    pub async fn open_verified(&self, manifest: &LocalObjectManifest) -> Result<tokio::fs::File> {
+        if manifest.cluster_id != &*self.cluster_id || manifest.node != self.node {
+            bail!("local object manifest is invalid for this store");
+        }
+        let path = self.path_for_hash(&manifest.object_hash)?;
+        verify_file(&path, &manifest.object_hash, manifest.object_length)?;
+        Ok(tokio::fs::File::open(path).await?)
+    }
+
     fn path_for_hash(&self, object_hash: &str) -> Result<PathBuf> {
         let digest = object_hash
             .strip_prefix("sha256:")
