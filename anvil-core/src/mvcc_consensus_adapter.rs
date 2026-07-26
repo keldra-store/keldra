@@ -191,7 +191,11 @@ fn logical_key_hash(key: &product::LogicalKey) -> consensus::LogicalKeyHash {
 fn range_conflict_hash(key: &product::RangeStampKey) -> consensus::RangeConflictKey {
     consensus::RangeConflictKey(domain_hash(
         b"anvil.mvcc.range-conflict.v1",
-        &[&key.table_id.to_be_bytes(), &key.key_prefix],
+        &[
+            &key.scheme_version.to_be_bytes(),
+            &key.table_id.to_be_bytes(),
+            &key.key_prefix,
+        ],
     ))
 }
 
@@ -301,12 +305,14 @@ mod tests {
                 start_application_key: Some(b"a".to_vec()),
                 end_application_key: Some(b"z".to_vec()),
                 conflict_key: product::RangeStampKey {
+                    scheme_version: product::HierarchicalRangeStampScheme::SCHEME_VERSION,
                     table_id: 8,
                     key_prefix: Vec::new(),
                 },
                 observed_range_stamp: Some(5),
             }],
             advanced_range_stamps: vec![product::RangeStampKey {
+                scheme_version: product::HierarchicalRangeStampScheme::SCHEME_VERSION,
                 table_id: 8,
                 key_prefix: Vec::new(),
             }],
@@ -415,7 +421,7 @@ mod tests {
 
     #[test]
     fn insert_delete_and_rename_invalidate_an_earlier_range_scan() {
-        let scheme = product::HierarchicalRangeStampScheme::new(8).unwrap();
+        let scheme = product::HierarchicalRangeStampScheme::new();
         let writers = [
             {
                 let mut builder =
@@ -485,7 +491,7 @@ mod tests {
 
     #[test]
     fn one_cross_table_transaction_advances_each_table_hierarchy() {
-        let scheme = product::HierarchicalRangeStampScheme::new(4).unwrap();
+        let scheme = product::HierarchicalRangeStampScheme::new();
         let mut builder =
             product::TransactionBundleBuilder::new("cross-table", 0, "principal", scheme);
         builder

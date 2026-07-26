@@ -51,6 +51,7 @@ pub struct RangeObservation {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RangeStampKey {
+    pub scheme_version: u16,
     pub table_id: u16,
     pub key_prefix: Vec<u8>,
 }
@@ -160,12 +161,24 @@ impl TransactionBundle {
             if observation.table_id != observation.conflict_key.table_id {
                 bail!("range observation conflict key belongs to another table");
             }
+            if observation.conflict_key.scheme_version
+                != HierarchicalRangeStampScheme::SCHEME_VERSION
+            {
+                bail!("range observation uses an unsupported stamp scheme");
+            }
         }
         self.advanced_range_stamps.sort();
         ensure_unique(
             self.advanced_range_stamps.iter(),
             "advanced range conflict stamp",
         )?;
+        if self
+            .advanced_range_stamps
+            .iter()
+            .any(|stamp| stamp.scheme_version != HierarchicalRangeStampScheme::SCHEME_VERSION)
+        {
+            bail!("advanced range stamp uses an unsupported scheme");
+        }
         self.writes
             .sort_by(|left, right| left.key().cmp(right.key()));
         ensure_unique(self.writes.iter().map(WriteOperation::key), "written key")?;
@@ -208,20 +221,18 @@ impl TransactionBundle {
 /// Deterministic hierarchical range-stamp layout.
 ///
 /// The empty prefix is the table-wide stamp. A write advances that stamp and
-/// every byte-prefix ancestor of its key through `max_prefix_bytes`. A scan
-/// observes the deepest configured prefix shared by its half-open bounds.
+/// every byte-prefix ancestor of its key through [`Self::MAX_PREFIX_BYTES`]. A
+/// scan observes the deepest scheme prefix shared by its half-open bounds.
 /// Consequently every key inside the scan advances the observed stamp.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HierarchicalRangeStampScheme {
-    max_prefix_bytes: usize,
-}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HierarchicalRangeStampScheme;
 
 impl HierarchicalRangeStampScheme {
-    pub fn new(max_prefix_bytes: usize) -> Result<Self> {
-        if max_prefix_bytes > u16::MAX as usize {
-            bail!("range stamp prefix depth is too large");
-        }
-        Ok(Self { max_prefix_bytes })
+    pub const SCHEME_VERSION: u16 = 1;
+    pub const MAX_PREFIX_BYTES: usize = 8;
+
+    pub const fn new() -> Self {
+        Self
     }
 
     pub fn observation_key(
@@ -238,13 +249,14 @@ impl HierarchicalRangeStampScheme {
                 start
                     .iter()
                     .zip(end)
-                    .take(self.max_prefix_bytes)
+                    .take(Self::MAX_PREFIX_BYTES)
                     .take_while(|(left, right)| left == right)
                     .count()
             }
             _ => 0,
         };
         Ok(RangeStampKey {
+            scheme_version: Self::SCHEME_VERSION,
             table_id,
             key_prefix: start_application_key
                 .map(|start| start[..shared].to_vec())
@@ -253,9 +265,10 @@ impl HierarchicalRangeStampScheme {
     }
 
     pub fn write_keys(self, key: &LogicalKey) -> Vec<RangeStampKey> {
-        let depth = self.max_prefix_bytes.min(key.application_key.len());
+        let depth = Self::MAX_PREFIX_BYTES.min(key.application_key.len());
         (0..=depth)
             .map(|prefix_len| RangeStampKey {
+                scheme_version: Self::SCHEME_VERSION,
                 table_id: key.table_id,
                 key_prefix: key.application_key[..prefix_len].to_vec(),
             })
@@ -1205,7 +1218,7 @@ mod tests {
 
     #[test]
     fn hierarchical_scan_stamp_is_advanced_by_every_overlapping_write() {
-        let scheme = HierarchicalRangeStampScheme::new(8).unwrap();
+        let scheme = HierarchicalRangeStampScheme::new();
         let observed = scheme
             .observation_key(7, Some(b"orders/a"), Some(b"orders/z"))
             .unwrap();
@@ -1229,7 +1242,7 @@ mod tests {
 
     #[test]
     fn builder_advances_delete_and_cross_table_rename_stamps() {
-        let scheme = HierarchicalRangeStampScheme::new(4).unwrap();
+        let scheme = HierarchicalRangeStampScheme::new();
         let old_key = LogicalKey {
             table_id: 3,
             application_key: b"old/key".to_vec(),
@@ -1257,10 +1270,12 @@ mod tests {
                 .all(|stamp| bundle.advanced_range_stamps.contains(stamp))
         );
         assert!(bundle.advanced_range_stamps.contains(&RangeStampKey {
+            scheme_version: HierarchicalRangeStampScheme::SCHEME_VERSION,
             table_id: 3,
             key_prefix: Vec::new(),
         }));
         assert!(bundle.advanced_range_stamps.contains(&RangeStampKey {
+            scheme_version: HierarchicalRangeStampScheme::SCHEME_VERSION,
             table_id: 9,
             key_prefix: Vec::new(),
         }));
