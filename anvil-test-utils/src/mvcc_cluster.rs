@@ -123,6 +123,7 @@ impl RealMvccCluster {
             transports,
         };
         cluster.wait_for_any_leader(&[0, 1, 2]).await?;
+        cluster.wait_for_system_realm().await?;
         Ok(cluster)
     }
 
@@ -200,6 +201,31 @@ impl RealMvccCluster {
             }
         })
         .await?
+    }
+
+    async fn wait_for_system_realm(&self) -> anyhow::Result<()> {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut ready = [false; 3];
+            loop {
+                for (node, is_ready) in ready.iter_mut().enumerate() {
+                    if !*is_ready
+                        && self
+                            .state(node)
+                            .ensure_system_realm_bootstrapped()
+                            .await
+                            .is_ok()
+                    {
+                        *is_ready = true;
+                    }
+                }
+                if ready.into_iter().all(|is_ready| is_ready) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("system realm did not become visible on every cluster node"))
     }
 
     pub async fn commit(
