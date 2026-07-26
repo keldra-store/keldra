@@ -1332,7 +1332,7 @@ impl AuthService for AppState {
             .await
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
             authz_namespace_watch::append_authz_namespace_watch_record(
-                &self.storage,
+                &self.mvcc,
                 claims.tenant_id,
                 mutation_id_from_record_hash(&record.record_hash),
                 authz_namespace_watch::AuthzNamespaceWatchPayload {
@@ -1543,12 +1543,7 @@ impl AuthService for AppState {
         .await?;
 
         let after_cursor = join_u128(req.after_cursor_low, req.after_cursor_high);
-        let stream_id = authz_namespace_watch::authz_namespace_watch_stream_id(
-            claims.tenant_id,
-            &req.namespace,
-        );
-        let mut live = self.storage.subscribe_stream(&stream_id);
-        let storage = self.storage.clone();
+        let mvcc = self.mvcc.clone();
         let namespace = req.namespace;
         let tenant_id = claims.tenant_id;
         let (tx, rx) = mpsc::channel(32);
@@ -1557,7 +1552,7 @@ impl AuthService for AppState {
             loop {
                 loop {
                     let page = match authz_namespace_watch::list_authz_namespace_watch_event_page(
-                        &storage,
+                        &mvcc,
                         tenant_id,
                         &namespace,
                         last_cursor,
@@ -1586,10 +1581,7 @@ impl AuthService for AppState {
                         break;
                     }
                 }
-                match live.recv().await {
-                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         });
 
