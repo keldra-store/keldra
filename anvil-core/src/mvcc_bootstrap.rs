@@ -189,6 +189,13 @@ impl Drop for MvccSubsystem {
 }
 
 impl MvccSubsystem {
+    pub fn cluster_id(&self) -> &str {
+        self.peers
+            .first()
+            .map(|peer| peer.cluster_id.as_str())
+            .expect("validated MVCC topology is non-empty")
+    }
+
     pub async fn bootstrap(config: &Config, core_meta_db: Arc<DB>) -> Result<Self> {
         let peers = parse_and_validate_peers(config)?;
         let local = peers
