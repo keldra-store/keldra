@@ -39,7 +39,9 @@ pub struct LocalDurabilityUpgradeJob {
     pub cluster_id: String,
     pub transaction_id: String,
     pub commit_version: u64,
-    pub bundle: BundleIdentity,
+    /// Bound atomically during certified MVCC apply. It is `None` in the
+    /// pre-certification intent to avoid a self-referential bundle hash.
+    pub bundle: Option<BundleIdentity>,
     pub target: DurabilityLevel,
     pub objects: Vec<LocalDurabilityUpgradeObject>,
     pub requested_at_unix_ms: u64,
@@ -52,9 +54,10 @@ impl LocalDurabilityUpgradeJob {
         if self.schema != Self::SCHEMA
             || self.cluster_id.trim().is_empty()
             || self.transaction_id.trim().is_empty()
-            || self.commit_version == 0
-            || self.bundle.length == 0
-            || !is_sha256(&self.bundle.hash)
+            || self
+                .bundle
+                .as_ref()
+                .is_some_and(|bundle| bundle.length == 0 || !is_sha256(&bundle.hash))
             || self.target == DurabilityLevel::Local
             || self.objects.is_empty()
             || self.requested_at_unix_ms == 0
@@ -80,26 +83,22 @@ impl LocalDurabilityUpgradeJob {
     }
 
     pub fn job_id(&self) -> Result<String> {
-        Ok(hex::encode(Sha256::digest(self.canonical_bytes()?)))
+        let mut intent = self.clone();
+        // The commit version is assigned by certification, after the intent
+        // has entered the immutable bundle. It is deliberately excluded from
+        // the stable job identity and bound atomically during MVCC apply.
+        intent.commit_version = 0;
+        intent.bundle = None;
+        Ok(hex::encode(Sha256::digest(intent.canonical_bytes()?)))
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum LocalDurabilityUpgradeState {
     Pending,
-    Running {
-        attempt: u32,
-        worker: NodeIncarnation,
-    },
-    Complete {
-        completed_at_unix_ms: u64,
-    },
-    Retryable {
-        attempt: u32,
-        error: String,
-        retry_after_unix_ms: u64,
-    },
+    Running,
+    Complete,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -107,6 +106,11 @@ pub struct LocalDurabilityUpgradeRecord {
     pub schema: String,
     pub job: LocalDurabilityUpgradeJob,
     pub state: LocalDurabilityUpgradeState,
+    pub attempts: u32,
+    pub next_attempt_unix_ms: u64,
+    pub last_error: Option<String>,
+    pub lease_owner: Option<String>,
+    pub lease_expires_unix_ms: Option<u64>,
 }
 
 impl LocalDurabilityUpgradeRecord {
@@ -118,7 +122,21 @@ impl LocalDurabilityUpgradeRecord {
             schema: Self::SCHEMA.into(),
             job,
             state: LocalDurabilityUpgradeState::Pending,
+            attempts: 0,
+            next_attempt_unix_ms: 0,
+            last_error: None,
+            lease_owner: None,
+            lease_expires_unix_ms: None,
         })
+    }
+
+    pub fn claimable(&self, now_unix_ms: u64) -> bool {
+        (self.state == LocalDurabilityUpgradeState::Pending
+            && self.next_attempt_unix_ms <= now_unix_ms)
+            || (self.state == LocalDurabilityUpgradeState::Running
+                && self
+                    .lease_expires_unix_ms
+                    .is_some_and(|expiry| expiry <= now_unix_ms))
     }
 
     pub fn canonical_bytes(&self) -> Result<Vec<u8>> {
@@ -190,7 +208,11 @@ impl LocalUpgradeConsensus for anvil_mvcc_consensus::OpenRaftConsensus {
     ) -> Result<()> {
         let cluster_id_hash =
             domain_hash(b"anvil.mvcc.cluster-id.v1", &[job.cluster_id.as_bytes()]);
-        let bundle_hash = parse_sha256(&job.bundle.hash)?;
+        let bundle = job
+            .bundle
+            .as_ref()
+            .context("durability upgrade intent has no committed bundle identity")?;
+        let bundle_hash = parse_sha256(&bundle.hash)?;
         let durability = match job.target {
             DurabilityLevel::Local => bail!("local is not an upgrade target"),
             DurabilityLevel::Quorum => anvil_mvcc_consensus::DurabilityLevel::Quorum,
@@ -259,6 +281,9 @@ where
 {
     pub async fn execute(&self, job: &LocalDurabilityUpgradeJob) -> Result<()> {
         job.validate()?;
+        if job.commit_version == 0 || job.bundle.is_none() {
+            bail!("durability upgrade intent has not been bound to a committed transaction");
+        }
 
         let mut manifests = Vec::with_capacity(job.objects.len());
         let mut object_evidence = Vec::new();
@@ -309,6 +334,39 @@ where
 
         // This compact command is the sole consensus action in the workflow.
         self.consensus.publish_upgrade(job, holders).await
+    }
+
+    /// Claims and executes at most one durably persisted job. The caller's
+    /// continuous worker loop supplies clock/backoff values and must use an
+    /// assignment-fenced worker identity.
+    pub async fn run_once(
+        &self,
+        store: &crate::mvcc_store::LocalMvccStore,
+        worker_id: &str,
+        now_unix_ms: u64,
+        lease_ms: u64,
+        retry_after_unix_ms: u64,
+    ) -> Result<bool> {
+        let Some((job_id, record)) =
+            store.claim_local_durability_upgrade(worker_id, now_unix_ms, lease_ms)?
+        else {
+            return Ok(false);
+        };
+        match self.execute(&record.job).await {
+            Ok(()) => {
+                store.complete_local_durability_upgrade(&job_id, worker_id)?;
+                Ok(true)
+            }
+            Err(error) => {
+                store.retry_local_durability_upgrade(
+                    &job_id,
+                    worker_id,
+                    retry_after_unix_ms,
+                    &error.to_string(),
+                )?;
+                Err(error)
+            }
+        }
     }
 }
 

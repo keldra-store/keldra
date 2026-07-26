@@ -16,6 +16,9 @@ use rocksdb::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::mvcc_local_durability_upgrade::{
+    LocalDurabilityUpgradeJob, LocalDurabilityUpgradeRecord, LocalDurabilityUpgradeState,
+};
 use crate::mvcc_shard_repair::{ShardRepairJob, ShardRepairRecord, ShardRepairState};
 use crate::mvcc_transaction::{CommitVersion, LogicalKey, TransactionBundle, WriteOperation};
 use crate::object_materialisation::ObjectMaterialisationState;
@@ -129,6 +132,7 @@ impl MvccStore {
         for (prefix_suffix, kind) in [
             (b"object-job/".as_slice(), "object-materialisation"),
             (b"shard-repair/".as_slice(), "shard-repair"),
+            (b"local-upgrade/".as_slice(), "local-durability-upgrade"),
         ] {
             let prefix = self.key(prefix_suffix);
             for row in self.db.iterator_cf(
@@ -145,12 +149,18 @@ impl MvccStore {
                         continue;
                     }
                     record.job.target_logical_identity
-                } else {
+                } else if kind == "shard-repair" {
                     let record: ShardRepairRecord = serde_json::from_slice(&value)?;
                     if record.state == ShardRepairState::Complete {
                         continue;
                     }
                     record.job.target_logical_identity
+                } else {
+                    let record: LocalDurabilityUpgradeRecord = serde_json::from_slice(&value)?;
+                    if record.state == LocalDurabilityUpgradeState::Complete {
+                        continue;
+                    }
+                    format!("transaction/{}", record.job.transaction_id)
                 };
                 partitions.insert(crate::mvcc_worker_authority::work_partition_id(
                     kind,
@@ -281,11 +291,11 @@ impl MvccStore {
             batch.put_cf(heads_cf, logical_key, commit_version.to_be_bytes());
         }
         for encoded_job in &bundle.materialisation_jobs {
-            if serde_json::from_slice::<serde_json::Value>(encoded_job)?
+            let schema = serde_json::from_slice::<serde_json::Value>(encoded_job)?
                 .get("schema")
                 .and_then(serde_json::Value::as_str)
-                == Some(ShardRepairJob::SCHEMA)
-            {
+                .map(str::to_owned);
+            if schema.as_deref() == Some(ShardRepairJob::SCHEMA) {
                 let job = ShardRepairJob::decode(encoded_job)?;
                 if job.cluster_id != self.cluster_id || job.transaction_id != bundle.transaction_id
                 {
@@ -297,6 +307,29 @@ impl MvccStore {
                     && existing.as_slice() != record.as_slice()
                 {
                     bail!("shard repair job identity collision");
+                }
+                batch.put_cf(materialisation_cf, key, record);
+                continue;
+            }
+            if schema.as_deref() == Some(LocalDurabilityUpgradeJob::SCHEMA) {
+                let mut job: LocalDurabilityUpgradeJob = serde_json::from_slice(encoded_job)?;
+                job.validate()?;
+                if job.cluster_id != self.cluster_id
+                    || job.transaction_id != bundle.transaction_id
+                    || job.commit_version != 0
+                    || job.bundle.is_some()
+                {
+                    bail!("local durability upgrade intent is not valid for this commit");
+                }
+                let job_id = job.job_id()?;
+                job.commit_version = commit_version;
+                job.bundle = Some(bundle.identity()?);
+                let key = self.key(format!("local-upgrade/{job_id}").as_bytes());
+                let record = serde_json::to_vec(&LocalDurabilityUpgradeRecord::pending(job)?)?;
+                if let Some(existing) = self.db.get_cf(materialisation_cf, &key)?
+                    && existing.as_slice() != record.as_slice()
+                {
+                    bail!("local durability upgrade job identity collision");
                 }
                 batch.put_cf(materialisation_cf, key, record);
                 continue;
@@ -843,6 +876,80 @@ impl MvccStore {
         })
     }
 
+    pub fn claim_local_durability_upgrade(
+        &self,
+        worker_id: &str,
+        now_unix_ms: u64,
+        lease_ms: u64,
+    ) -> Result<Option<(String, LocalDurabilityUpgradeRecord)>> {
+        if worker_id.trim().is_empty() || lease_ms == 0 {
+            bail!("durability-upgrade worker and lease must be non-empty");
+        }
+        let _transition = self.materialisation_transition.lock().unwrap();
+        let cf = self.cf(CF_MATERIALISATION)?;
+        let prefix = self.key(b"local-upgrade/");
+        for row in self
+            .db
+            .iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward))
+        {
+            let (key, value) = row?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let mut record: LocalDurabilityUpgradeRecord = serde_json::from_slice(&value)?;
+            if !record.claimable(now_unix_ms) {
+                continue;
+            }
+            record.state = LocalDurabilityUpgradeState::Running;
+            record.attempts = record.attempts.saturating_add(1);
+            record.lease_owner = Some(worker_id.to_string());
+            record.lease_expires_unix_ms = Some(
+                now_unix_ms
+                    .checked_add(lease_ms)
+                    .context("durability-upgrade lease expiry overflow")?,
+            );
+            self.db.put_cf_opt(
+                cf,
+                &key,
+                serde_json::to_vec(&record)?,
+                &durable_write_options(),
+            )?;
+            let id = String::from_utf8(self.unscoped(&key)?.to_vec())?
+                .strip_prefix("local-upgrade/")
+                .context("invalid durability-upgrade job key")?
+                .to_string();
+            return Ok(Some((id, record)));
+        }
+        Ok(None)
+    }
+
+    pub fn retry_local_durability_upgrade(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        next_attempt_unix_ms: u64,
+        error: &str,
+    ) -> Result<()> {
+        self.transition_local_durability_upgrade(job_id, worker_id, |record| {
+            record.state = LocalDurabilityUpgradeState::Pending;
+            record.next_attempt_unix_ms = next_attempt_unix_ms;
+            record.last_error = Some(error.to_string());
+            record.lease_owner = None;
+            record.lease_expires_unix_ms = None;
+            Ok(())
+        })
+    }
+
+    pub fn complete_local_durability_upgrade(&self, job_id: &str, worker_id: &str) -> Result<()> {
+        self.transition_local_durability_upgrade(job_id, worker_id, |record| {
+            record.state = LocalDurabilityUpgradeState::Complete;
+            record.last_error = None;
+            record.lease_owner = None;
+            record.lease_expires_unix_ms = None;
+            Ok(())
+        })
+    }
+
     pub fn claim_shard_repair(
         &self,
         worker_id: &str,
@@ -1057,6 +1164,22 @@ impl MvccStore {
                 pins.transaction_ids.insert(record.job.transaction_id);
             }
         }
+        let upgrade_prefix = self.key(b"local-upgrade/");
+        for row in self.db.iterator_cf(
+            materialisation_cf,
+            IteratorMode::From(&upgrade_prefix, Direction::Forward),
+        ) {
+            let (key, value) = row?;
+            if !key.starts_with(&upgrade_prefix) {
+                break;
+            }
+            let record: LocalDurabilityUpgradeRecord = serde_json::from_slice(&value)?;
+            if record.state != LocalDurabilityUpgradeState::Complete {
+                pins.materialisation_snapshots
+                    .insert(record.job.commit_version);
+                pins.transaction_ids.insert(record.job.transaction_id);
+            }
+        }
         Ok(pins)
     }
 
@@ -1107,6 +1230,35 @@ impl MvccStore {
             || record.lease_owner.as_deref() != Some(worker_id)
         {
             bail!("shard repair is not leased by this worker");
+        }
+        update(&mut record)?;
+        self.db.put_cf_opt(
+            cf,
+            key,
+            serde_json::to_vec(&record)?,
+            &durable_write_options(),
+        )?;
+        Ok(())
+    }
+
+    fn transition_local_durability_upgrade(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        update: impl FnOnce(&mut LocalDurabilityUpgradeRecord) -> Result<()>,
+    ) -> Result<()> {
+        let _transition = self.materialisation_transition.lock().unwrap();
+        let cf = self.cf(CF_MATERIALISATION)?;
+        let key = self.key(format!("local-upgrade/{job_id}").as_bytes());
+        let bytes = self
+            .db
+            .get_cf(cf, &key)?
+            .context("local durability upgrade not found")?;
+        let mut record: LocalDurabilityUpgradeRecord = serde_json::from_slice(&bytes)?;
+        if record.state != LocalDurabilityUpgradeState::Running
+            || record.lease_owner.as_deref() != Some(worker_id)
+        {
+            bail!("local durability upgrade is not leased by this worker");
         }
         update(&mut record)?;
         self.db.put_cf_opt(
@@ -1224,6 +1376,14 @@ impl MvccStore {
             &mut deleted,
             &mut deleted_bytes,
         )?;
+        self.collect_completed_jobs(
+            materialisation_cf,
+            b"local-upgrade/",
+            safe_watermark,
+            &mut batch,
+            &mut deleted,
+            &mut deleted_bytes,
+        )?;
         batch.put_cf(
             meta_cf,
             self.key(GC_WATERMARK_KEY),
@@ -1263,10 +1423,14 @@ impl MvccStore {
                 let record: ObjectMaterialisationRecord = serde_json::from_slice(&value)?;
                 record.state == ObjectMaterialisationState::Complete
                     && record.job.originating_snapshot_version < safe_watermark
-            } else {
+            } else if suffix == b"shard-repair/" {
                 let record: ShardRepairRecord = serde_json::from_slice(&value)?;
                 record.state == ShardRepairState::Complete
                     && record.job.originating_snapshot_version < safe_watermark
+            } else {
+                let record: LocalDurabilityUpgradeRecord = serde_json::from_slice(&value)?;
+                record.state == LocalDurabilityUpgradeState::Complete
+                    && record.job.commit_version < safe_watermark
             };
             if completed_below_watermark {
                 batch.delete_cf(cf, &key);

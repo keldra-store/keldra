@@ -392,6 +392,36 @@ impl ObjectManager {
                 mvcc.open_transactions
                     .add_manifest(transaction_id, &binding.cluster_id, ingest.reference, now)
                     .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                let upgrade = crate::mvcc_local_durability_upgrade::LocalDurabilityUpgradeJob {
+                    schema: crate::mvcc_local_durability_upgrade::LocalDurabilityUpgradeJob::SCHEMA
+                        .into(),
+                    cluster_id: binding.cluster_id.clone(),
+                    transaction_id: transaction_id.to_string(),
+                    commit_version: 0,
+                    bundle: None,
+                    target: crate::mvcc_transaction::DurabilityLevel::Erasure,
+                    objects: vec![
+                        crate::mvcc_local_durability_upgrade::LocalDurabilityUpgradeObject {
+                            object_identity: provisional_mvcc_object_identity(
+                                &binding.cluster_id,
+                                transaction_id,
+                                bucket_name,
+                                object_key,
+                            ),
+                            local_manifest: ingest.manifest.clone(),
+                        },
+                    ],
+                    requested_at_unix_ms: now,
+                };
+                mvcc.open_transactions
+                    .add_job(
+                        transaction_id,
+                        upgrade
+                            .canonical_bytes()
+                            .map_err(|error| Status::internal(error.to_string()))?,
+                        now,
+                    )
+                    .map_err(|error| Status::failed_precondition(error.to_string()))?;
                 ObjectDataTarget::MvccLocal(ingest.manifest)
             }
             durability @ (crate::mvcc_transaction::DurabilityLevel::Quorum
