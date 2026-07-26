@@ -1,9 +1,8 @@
 use crate::{
     core_store::{
         CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
-        CoreMutationRootPublication, CoreStore, CoreTransactionState, CoreTransactionUpdate,
-        ReadStream, core_mutation_publication_attempt_id, decode_deterministic_proto,
-        encode_deterministic_proto,
+        CoreMutationRootPublication, CoreStore, ReadStream, core_mutation_publication_attempt_id,
+        decode_deterministic_proto, encode_deterministic_proto,
     },
     formats::{Hash32, hash32, watch::WatchRecord, writer::WriterFamily},
     storage::Storage,

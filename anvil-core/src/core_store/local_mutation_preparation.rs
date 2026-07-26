@@ -1,4 +1,4 @@
-use super::local_tx_rows::OwnedCoreMetaBatchOp;
+use super::local_batch_ops::OwnedCoreMetaBatchOp;
 use super::*;
 use crate::formats::writer::WriterFamily;
 
@@ -25,10 +25,9 @@ pub(super) async fn prepare_mutation_batch_operations(
     let mut stream_states = initialise_stream_states(store, batch).await?;
     let mut visibility_cache = super::local_internal_coremeta::CoreMetaVisibilityCache::default();
     let mut owned_ops = Vec::new();
-    let mut updates = vec![None; batch.operations.len()];
     let mut stream_appends = Vec::new();
 
-    for (operation_index, operation) in batch.operations.iter().enumerate() {
+    for operation in &batch.operations {
         match operation {
             CoreMutationOperation::CoreMetaPut {
                 cf,
@@ -37,7 +36,7 @@ pub(super) async fn prepare_mutation_batch_operations(
                 payload,
                 ..
             } => {
-                let (op, update) = prepare_coremeta_put(
+                let op = prepare_coremeta_put(
                     store,
                     batch,
                     &mut visibility_cache,
@@ -49,7 +48,6 @@ pub(super) async fn prepare_mutation_batch_operations(
                 if let Some(op) = op {
                     owned_ops.push(op);
                 }
-                updates[operation_index] = Some(update);
             }
             CoreMutationOperation::CoreMetaDelete {
                 cf,
@@ -60,15 +58,15 @@ pub(super) async fn prepare_mutation_batch_operations(
                 let rooted_generation = store
                     .rooted_delete_generation_unlocked(batch, cf, *table_id, tuple_key)
                     .await?;
-                let (op, update) = store.prepare_coremeta_delete_update_unlocked(
+                let op = prepare_coremeta_delete(
+                    store,
+                    batch,
                     cf,
                     *table_id,
                     tuple_key,
-                    batch.transaction_id.clone(),
                     rooted_generation,
                 )?;
                 owned_ops.push(op);
-                updates[operation_index] = Some(update);
             }
             CoreMutationOperation::StreamAppend {
                 partition_id,
@@ -146,7 +144,6 @@ pub(super) async fn prepare_mutation_batch_operations(
                     visible_sequence: record.sequence,
                     record_hash: record.event_hash.clone(),
                 });
-                updates[operation_index] = Some(stream_update_from_record(record));
             }
         }
     }
@@ -178,13 +175,6 @@ pub(super) async fn prepare_mutation_batch_operations(
         owned_ops.append(&mut prepared.owned_ops);
     }
 
-    let updates = updates
-        .into_iter()
-        .enumerate()
-        .map(|(index, update)| {
-            update.ok_or_else(|| anyhow!("CoreStore mutation operation {index} was not prepared"))
-        })
-        .collect::<Result<Vec<_>>>()?;
     Ok(PreparedMutationBatch {
         owned_ops,
         stream_appends,
@@ -321,7 +311,7 @@ fn prepare_coremeta_put(
     table_id: u16,
     tuple_key: &[u8],
     payload: &[u8],
-) -> Result<(Option<OwnedCoreMetaBatchOp>, CoreTransactionUpdate)> {
+) -> Result<Option<OwnedCoreMetaBatchOp>> {
     let cf = canonical_coremeta_cf_name(cf)?;
     let previous_payload =
         store.read_coremeta_row_with_visibility_cache(cf, table_id, tuple_key, visibility_cache)?;
@@ -330,28 +320,57 @@ fn prepare_coremeta_put(
         if !common.root_key_hash.is_empty() && common.transaction_id != batch.transaction_id {
             bail!("CoreMeta recovery payload is owned by another transaction");
         }
-        let previous_payload_hash =
-            matching_coremeta_precondition_hash(batch, cf, table_id, tuple_key)?;
-        return Ok((
-            None,
-            CoreTransactionUpdate::CoreMetaPut {
-                cf: cf.to_string(),
-                table_id,
-                tuple_key: tuple_key.to_vec(),
-                previous_payload_hash,
-                payload: payload.to_vec(),
-                payload_hash: core_meta_payload_digest(table_id, payload),
-            },
-        ));
+        matching_coremeta_precondition_hash(batch, cf, table_id, tuple_key)?;
+        return Ok(None);
     }
-    let (op, update) = store.prepare_coremeta_put_update_unlocked(
+    validate_coremeta_operation_payload(cf, table_id, tuple_key, payload)?;
+    Ok(Some(OwnedCoreMetaBatchOp::Put {
         cf,
         table_id,
-        tuple_key,
-        previous_payload,
-        payload,
-    )?;
-    Ok((Some(op), update))
+        tuple_key: tuple_key.to_vec(),
+        common: None,
+        payload: payload.to_vec(),
+    }))
+}
+
+fn prepare_coremeta_delete(
+    store: &CoreStore,
+    batch: &CoreMutationBatch,
+    cf: &str,
+    table_id: u16,
+    tuple_key: &[u8],
+    rooted_generation: Option<u64>,
+) -> Result<OwnedCoreMetaBatchOp> {
+    validate_coremeta_operation_key(cf, table_id, tuple_key)?;
+    let cf = canonical_coremeta_cf_name(cf)?;
+    let current_payload = store.committed_coremeta_payload_unlocked(cf, table_id, tuple_key)?;
+    let delete_common = current_payload
+        .as_ref()
+        .map(|payload| {
+            core_meta_row_common_from_payload(payload).and_then(|common| {
+                let root_generation = if common.root_key_hash.is_empty() {
+                    common.root_generation.saturating_add(1)
+                } else {
+                    rooted_generation.ok_or_else(|| {
+                        anyhow!("CoreMeta rooted delete has no bound publication generation")
+                    })?
+                };
+                Ok(core_meta_committed_row_common(
+                    common.realm_id,
+                    common.root_key_hash,
+                    root_generation,
+                    batch.transaction_id.clone(),
+                    current_unix_nanos_u64()?,
+                ))
+            })
+        })
+        .transpose()?;
+    Ok(OwnedCoreMetaBatchOp::Delete {
+        cf,
+        table_id,
+        tuple_key: tuple_key.to_vec(),
+        common: delete_common,
+    })
 }
 
 fn matching_coremeta_precondition_hash(
@@ -395,18 +414,4 @@ fn matching_coremeta_precondition_hash(
         bail!("CoreStore mutation batch declares a CoreMeta row precondition more than once");
     }
     Ok(first)
-}
-
-fn stream_update_from_record(record: StreamRecord) -> CoreTransactionUpdate {
-    CoreTransactionUpdate::StreamAppend {
-        partition_id: record.partition_id,
-        stream_id: record.stream_id,
-        record_kind: record.record_kind,
-        payload: record.payload,
-        idempotency_key_hash: record.idempotency_key_hash,
-        visible_sequence: record.sequence,
-        previous_event_hash: record.previous_event_hash,
-        prepared_record_hash: record.event_hash,
-        created_at: record.created_at,
-    }
 }

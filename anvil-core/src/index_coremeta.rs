@@ -2,7 +2,7 @@ use crate::{
     core_store::{
         CF_INDEX_DEFS, CF_INDEX_ROWS, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaRowCommonProto,
         CoreMetaTuplePart, CoreMetaVisibilityState, CoreMutationBatch, CoreMutationOperation,
-        CoreMutationPrecondition, CoreMutationRootPublication, CoreStore, CoreTransactionState,
+        CoreMutationPrecondition, CoreMutationRootPublication, CoreStore,
         TABLE_INDEX_DEFINITION_ROW, TABLE_INDEX_ROW, core_meta_record_tuple_key,
         core_meta_root_key_hash, core_meta_tuple_key, core_mutation_publication_attempt_id,
         decode_deterministic_proto, encode_deterministic_proto, sha256_hex,

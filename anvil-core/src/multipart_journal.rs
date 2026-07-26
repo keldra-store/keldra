@@ -2,7 +2,7 @@ use crate::core_store::{
     CF_OBJECT_HEADS, CoreCompressionDescriptor, CoreMetaRecord, CoreMetaTuplePart,
     CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
     CoreMutationRootPublication, CoreObjectEncoding, CoreObjectPlacement, CoreObjectRef, CoreStore,
-    CoreTransactionUpdate, TABLE_MULTIPART_PART_CURRENT_ROW, TABLE_MULTIPART_UPLOAD_CURRENT_ROW,
+    TABLE_MULTIPART_PART_CURRENT_ROW, TABLE_MULTIPART_UPLOAD_CURRENT_ROW,
     core_meta_committed_row_common, core_meta_record_tuple_key, core_meta_root_key_hash,
     core_meta_tuple_key,
 };

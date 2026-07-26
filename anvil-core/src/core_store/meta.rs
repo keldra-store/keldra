@@ -49,7 +49,6 @@ pub const TABLE_ROOT_CACHE_ROW: u16 = 0x8002;
 pub const TABLE_TRANSACTION_LOCATOR_ROW: u16 = 0x8003;
 pub const TABLE_TRANSACTION_COMMIT_EVIDENCE_ROW: u16 = 0x8004;
 pub const TABLE_INLINE_MANIFEST_BODY_ROW: u16 = 0x8005;
-pub const TABLE_EXPLICIT_TRANSACTION_ROW: u16 = 0x8006;
 pub const TABLE_PENDING_MUTATION_ROW: u16 = 0x8007;
 pub const TABLE_NATIVE_IDEMPOTENCY_ROW: u16 = 0x8008;
 pub const TABLE_LOCAL_ADMISSION_EVIDENCE_ROW: u16 = 0x8009;
@@ -1351,7 +1350,6 @@ fn table_spec(table_id: u16) -> Result<CoreMetaTableSpec> {
         TABLE_TRANSACTION_LOCATOR_ROW
         | TABLE_TRANSACTION_COMMIT_EVIDENCE_ROW
         | TABLE_INLINE_MANIFEST_BODY_ROW
-        | TABLE_EXPLICIT_TRANSACTION_ROW
         | TABLE_PENDING_MUTATION_ROW
         | TABLE_NATIVE_IDEMPOTENCY_ROW
         | TABLE_LOCAL_ADMISSION_EVIDENCE_ROW
@@ -1723,11 +1721,6 @@ fn expected_schema_markers(table_id: u16) -> Option<&'static [&'static str]> {
         super::local::local_coremeta_history::TABLE_COREMETA_GENERATION_INSTALL_ROW => {
             Some(&["anvil.coremeta.generation_install.v1"])
         }
-        TABLE_EXPLICIT_TRANSACTION_ROW => Some(&[
-            "anvil.core.transaction_header_row.v1",
-            "anvil.core.transaction_staged_update_row.v1",
-            "anvil.core.transaction_precondition_row.v3",
-        ]),
         TABLE_PENDING_MUTATION_ROW => Some(&[
             "anvil.core.pending_mutation_row.v1",
             "anvil.core.pending_mutation_finalisation_index.v1",

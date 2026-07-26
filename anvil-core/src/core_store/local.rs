@@ -28,17 +28,16 @@ use super::meta::{
     CoreMetaEncodedOwnedRow, CoreMetaEncodedRow, CoreMetaLocatorProto, CoreMetaReadSnapshot,
     CoreMetaReader, CoreMetaRecord, CoreMetaRowCommonProto, CoreMetaStore, CoreMetaTuplePart,
     CoreMetaVisibilityState, TABLE_BOUNDARY_SCHEMA_CURRENT_ROW, TABLE_BOUNDARY_SCHEMA_ROW,
-    TABLE_BOUNDARY_VALUE_ROW, TABLE_CORE_FENCE_ROW, TABLE_EXPLICIT_TRANSACTION_ROW,
-    TABLE_INLINE_MANIFEST_BODY_ROW, TABLE_INLINE_PAYLOAD_ROW, TABLE_LANDED_BYTE_REF_ROW,
-    TABLE_LOCAL_ADMISSION_EVIDENCE_ROW, TABLE_LOCAL_NODE_IDENTITY_ROW,
-    TABLE_MATERIALISATION_CURSOR_ROW, TABLE_NODE_SIGNING_KEYPAIR_ROW, TABLE_OBJECT_HEAD_ROW,
-    TABLE_OBJECT_SHARD_REPAIR_ROW, TABLE_OBJECT_VERSION_META_ROW, TABLE_PENDING_MUTATION_ROW,
-    TABLE_QUORUM_PROFILE_CURRENT_ROW, TABLE_REFCOUNT_ROW, TABLE_ROOT_CACHE_ROW,
-    TABLE_ROOT_CATALOG_CURRENT_ROW, TABLE_ROOT_FAILOVER_CERTIFICATE_ROW,
-    TABLE_ROOT_FAILOVER_VOTE_ROW, TABLE_ROOT_PUBLICATION_INTENT_ROW, TABLE_STREAM_HEAD_ROW,
-    TABLE_STREAM_IDEMPOTENCY_ROW, TABLE_STREAM_RECORD_INDEX_ROW,
-    TABLE_TRANSACTION_COMMIT_EVIDENCE_ROW, TABLE_TRANSACTION_LOCATOR_ROW,
-    TABLE_TRANSACTION_MANIFEST_BODY_ROW, canonical_coremeta_cf_name,
+    TABLE_BOUNDARY_VALUE_ROW, TABLE_CORE_FENCE_ROW, TABLE_INLINE_MANIFEST_BODY_ROW,
+    TABLE_INLINE_PAYLOAD_ROW, TABLE_LANDED_BYTE_REF_ROW, TABLE_LOCAL_ADMISSION_EVIDENCE_ROW,
+    TABLE_LOCAL_NODE_IDENTITY_ROW, TABLE_MATERIALISATION_CURSOR_ROW,
+    TABLE_NODE_SIGNING_KEYPAIR_ROW, TABLE_OBJECT_HEAD_ROW, TABLE_OBJECT_SHARD_REPAIR_ROW,
+    TABLE_OBJECT_VERSION_META_ROW, TABLE_PENDING_MUTATION_ROW, TABLE_QUORUM_PROFILE_CURRENT_ROW,
+    TABLE_REFCOUNT_ROW, TABLE_ROOT_CACHE_ROW, TABLE_ROOT_CATALOG_CURRENT_ROW,
+    TABLE_ROOT_FAILOVER_CERTIFICATE_ROW, TABLE_ROOT_FAILOVER_VOTE_ROW,
+    TABLE_ROOT_PUBLICATION_INTENT_ROW, TABLE_STREAM_HEAD_ROW, TABLE_STREAM_IDEMPOTENCY_ROW,
+    TABLE_STREAM_RECORD_INDEX_ROW, TABLE_TRANSACTION_COMMIT_EVIDENCE_ROW,
+    TABLE_TRANSACTION_LOCATOR_ROW, TABLE_TRANSACTION_MANIFEST_BODY_ROW, canonical_coremeta_cf_name,
     core_meta_bootstrap_row_common, core_meta_committed_row_common,
     core_meta_locator_from_manifest_locator, core_meta_locator_to_manifest_locator,
     core_meta_payload_digest, core_meta_pending_row_common, core_meta_record_table_id,
@@ -215,9 +214,7 @@ const CORE_LANDED_BYTES_SOFT_LIMIT_BYTES: u64 = 2 * CORE_PENDING_MUTATION_SOFT_L
 const CORE_LANDED_BYTES_HARD_LIMIT_BYTES: u64 = 3 * CORE_PENDING_MUTATION_SOFT_LIMIT_BYTES;
 const CORE_PENDING_MUTATION_SOFT_BACKPRESSURE_DELAY: Duration = Duration::from_millis(1);
 const CORE_TRANSACTION_STREAM_ID: &str = "core_transactions";
-const CORE_TRANSACTION_PARTITION_ID: &str = "core-control";
 const CORE_TRANSACTION_ROOT_PARTITION_ID: u64 = 0;
-const CORE_TRANSACTION_RECORD_KIND: &str = "core_transaction";
 const CORE_PIPELINE_KEY_LEN: usize = 32;
 const CORE_PIPELINE_NONCE_LEN: usize = 12;
 const LOCAL_INLINE_PAYLOAD_PROFILE_ID: &str = "inline-rocksdb";
@@ -767,7 +764,7 @@ struct StreamAppendOutcome {
 
 struct PreparedStreamMetadataWrite {
     transaction_id: String,
-    owned_ops: Vec<local_tx_rows::OwnedCoreMetaBatchOp>,
+    owned_ops: Vec<local_batch_ops::OwnedCoreMetaBatchOp>,
     root_publications: Vec<CoreMetaRootPublication>,
 }
 
@@ -961,6 +958,9 @@ pub(crate) fn core_mutation_publication_attempt_id(
     Ok(format!("{logical_id}:attempt:{preconditions_hash}"))
 }
 
+mod local_batch_ops;
+mod local_mutation_commit;
+mod local_mutation_validation;
 #[path = "local_root_binding.rs"]
 mod local_root_binding;
 #[path = "local_root_failover.rs"]
@@ -982,21 +982,15 @@ mod local_roots;
 mod local_roots_layout;
 #[path = "local_shard_recovery.rs"]
 mod local_shard_recovery;
+mod local_storage_helpers;
 #[path = "local_stream_control.rs"]
 mod local_stream_control;
 #[path = "local_stream_publication_recovery.rs"]
 mod local_stream_publication_recovery;
 #[path = "local_stream_records.rs"]
 mod local_stream_records;
-#[path = "local_transaction_visibility.rs"]
-mod local_transaction_visibility;
-#[path = "local_transactions.rs"]
-mod local_transactions;
-#[path = "local_tx_helpers.rs"]
-mod local_tx_helpers;
-#[path = "local_tx_rows.rs"]
-mod local_tx_rows;
 
+use self::local_batch_ops::*;
 use self::local_block_distribution::*;
 use self::local_boundaries::*;
 use self::local_codec::*;
@@ -1023,9 +1017,8 @@ pub(crate) use self::local_root_register::{
 pub(crate) use self::local_roots::encode_root_anchor_record;
 use self::local_roots::*;
 pub(crate) use self::local_shard_recovery::{ShardInventoryState, shard_inventory_response};
+use self::local_storage_helpers::*;
 use self::local_stream_records::*;
-use self::local_tx_helpers::*;
-use self::local_tx_rows::*;
 
 #[cfg(test)]
 #[path = "local_tests/mod.rs"]

@@ -772,33 +772,6 @@ fn coremeta_inline_payloads_are_explicit_rows_not_large_metadata_values() {
 }
 
 #[test]
-fn explicit_transaction_rows_store_large_payloads_as_corestore_locators() {
-    let rows = workspace_file("anvil-core/src/core_store/local_tx_rows.rs");
-
-    assert_contains_all(
-        "transaction staged payload locator guard",
-        &rows,
-        &[
-            "CORE_TRANSACTION_STAGED_INLINE_PAYLOAD_BYTES",
-            "payload.len() <= CORE_TRANSACTION_STAGED_INLINE_PAYLOAD_BYTES",
-            "write_logical_file_with_locator(WriteLogicalFileRequest",
-            "CoreTransactionPayloadRef::Locator",
-            "core_meta_locator_from_manifest_locator(&write.locator)?",
-            "read_transaction_payload_ref",
-            "core_meta_locator_to_manifest_locator(&locator)?",
-        ],
-    );
-    assert_contains_none(
-        "transaction staged payload forbidden large inline shortcut",
-        &rows,
-        &[
-            "if payload.len() <= CORE_META_MAX_VALUE_BYTES",
-            "payload.len() <= CORE_META_MAX_INLINE_PAYLOAD_BYTES",
-        ],
-    );
-}
-
-#[test]
 fn corestore_admission_uses_pending_rows_and_materialisation_rows_not_transaction_table_overload() {
     let admission = format!(
         "{}\n{}\n{}\n{}\n{}\n{}",

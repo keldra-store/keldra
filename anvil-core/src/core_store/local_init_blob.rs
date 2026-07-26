@@ -1,7 +1,7 @@
+use super::local_batch_ops::{OwnedCoreMetaBatchOp, borrow_owned_coremeta_batch_ops};
 use super::local_stream_control::control_record_proto::{
     encode_object_manifest_record, object_manifest_root_generation,
 };
-use super::local_tx_rows::{OwnedCoreMetaBatchOp, borrow_owned_coremeta_batch_ops};
 use super::*;
 use crate::formats::{
     hash32,

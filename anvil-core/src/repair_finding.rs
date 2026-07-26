@@ -2,10 +2,9 @@ use crate::{
     core_store::{
         CF_MESH, CoreMetaRowCommonProto, CoreMetaTuplePart, CoreMutationBatch,
         CoreMutationOperation, CoreMutationPrecondition, CoreMutationRootPublication, CoreStore,
-        CoreTransactionState, TABLE_REPAIR_FINDING_HEAD_ROW, TABLE_REPAIR_FINDING_ID_ROW,
-        TABLE_REPAIR_FINDING_ROW, core_meta_committed_row_common, core_meta_payload_digest,
-        core_meta_root_key_hash, core_meta_tuple_key, decode_deterministic_proto,
-        encode_deterministic_proto,
+        TABLE_REPAIR_FINDING_HEAD_ROW, TABLE_REPAIR_FINDING_ID_ROW, TABLE_REPAIR_FINDING_ROW,
+        core_meta_committed_row_common, core_meta_payload_digest, core_meta_root_key_hash,
+        core_meta_tuple_key, decode_deterministic_proto, encode_deterministic_proto,
     },
     formats::hash32,
     storage::Storage,

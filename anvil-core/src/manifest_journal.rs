@@ -1,6 +1,6 @@
 use crate::core_store::{
     CF_OBJECT_HEADS, CoreMetaTuplePart, CoreMutationBatch, CoreMutationOperation,
-    CoreMutationPrecondition, CoreMutationRootPublication, CoreStore, CoreTransactionUpdate,
+    CoreMutationPrecondition, CoreMutationRootPublication, CoreStore,
     TABLE_MANIFEST_CAS_CURRENT_ROW, core_meta_committed_row_common, core_meta_payload_digest,
     core_meta_root_key_hash, core_meta_tuple_key,
 };

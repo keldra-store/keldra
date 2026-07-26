@@ -246,7 +246,6 @@ impl CoreStore {
         self.validate_mutation_preconditions_unlocked(
             &batch.preconditions,
             &batch.committed_by_principal,
-            None,
         )
         .await?;
         crate::emit_test_timing(
@@ -455,7 +454,6 @@ impl CoreStore {
             self.validate_mutation_preconditions_unlocked(
                 &batch.preconditions,
                 &batch.committed_by_principal,
-                None,
             )
             .await
             .err()
@@ -740,130 +738,6 @@ fn validate_admitted_batch_root_bindings(batch: &CoreMutationBatch) -> Result<()
         }
     }
     Ok(())
-}
-
-pub(super) fn transaction_lists_stream_record(
-    transaction: &CoreTransaction,
-    record: &StreamRecord,
-) -> Result<bool> {
-    Ok(transaction_lists_stream_record_identity(
-        transaction,
-        &record.stream_id,
-        record.sequence,
-        &record.event_hash,
-    ))
-}
-
-pub(super) fn transaction_lists_stream_record_identity(
-    transaction: &CoreTransaction,
-    stream_id: &str,
-    sequence: u64,
-    event_hash: &str,
-) -> bool {
-    transaction.visible_updates.iter().any(|visible_update| {
-        matches!(
-            visible_update,
-            CoreTransactionUpdate::StreamAppend {
-                stream_id: update_stream_id,
-                visible_sequence,
-                prepared_record_hash,
-                ..
-            } if update_stream_id == stream_id
-                && *visible_sequence == sequence
-                && prepared_record_hash == event_hash
-        )
-    })
-}
-
-fn ensure_coremeta_payload_in_transaction_scope(
-    payload: &[u8],
-    transaction: &CoreTransaction,
-) -> Result<()> {
-    let common = core_meta_row_common_from_payload(payload)?;
-    if !common.root_key_hash.is_empty() && common.root_key_hash != transaction.root_key_hash {
-        bail!("TransactionScopeMismatch");
-    }
-    Ok(())
-}
-
-fn validate_explicit_transaction_scope(
-    batch: &CoreMutationBatch,
-    transaction: &CoreTransaction,
-) -> Result<()> {
-    if batch
-        .root_publications
-        .iter()
-        .any(|publication| publication.root_anchor_key != transaction.scope_partition)
-    {
-        bail!("TransactionScopeMismatch");
-    }
-    for operation in &batch.operations {
-        let partition_id = match operation {
-            CoreMutationOperation::StreamAppend { partition_id, .. }
-            | CoreMutationOperation::CoreMetaPut { partition_id, .. }
-            | CoreMutationOperation::CoreMetaDelete { partition_id, .. } => partition_id,
-        };
-        if partition_id != &transaction.scope_partition {
-            bail!("TransactionScopeMismatch");
-        }
-        match operation {
-            CoreMutationOperation::StreamAppend { .. } => {}
-            CoreMutationOperation::CoreMetaPut { payload, .. } => {
-                let common = core_meta_row_common_from_payload(payload)?;
-                if common.root_key_hash != transaction.root_key_hash
-                    || common.visibility_state_enum() != CoreMetaVisibilityState::Committed
-                {
-                    bail!("TransactionScopeMismatch");
-                }
-            }
-            CoreMutationOperation::CoreMetaDelete { .. } => {}
-        }
-    }
-    Ok(())
-}
-
-fn is_allowed_transaction_transition(existing: &CoreTransaction, next: &CoreTransaction) -> bool {
-    if existing.transaction_id != next.transaction_id
-        || existing.scope_partition != next.scope_partition
-        || existing.preconditions_hash != next.preconditions_hash
-        || existing.committed_by_principal != next.committed_by_principal
-        || existing.created_at_unix_nanos != next.created_at_unix_nanos
-        || existing.expires_at_unix_nanos != next.expires_at_unix_nanos
-        || existing.root_anchor_key != next.root_anchor_key
-        || existing.root_key_hash != next.root_key_hash
-    {
-        return false;
-    }
-
-    match existing.state {
-        CoreTransactionState::Open => match next.state {
-            CoreTransactionState::Open => {
-                has_prefix(&next.visible_updates, &existing.visible_updates)
-            }
-            CoreTransactionState::Prepared
-            | CoreTransactionState::Committed
-            | CoreTransactionState::FinalisationFailed
-            | CoreTransactionState::Aborted
-            | CoreTransactionState::RolledBack
-            | CoreTransactionState::Expired
-            | CoreTransactionState::Failed => true,
-        },
-        CoreTransactionState::Prepared => matches!(
-            next.state,
-            CoreTransactionState::Committed
-                | CoreTransactionState::FinalisationFailed
-                | CoreTransactionState::Aborted
-                | CoreTransactionState::RolledBack
-                | CoreTransactionState::Expired
-                | CoreTransactionState::Failed
-        ),
-        CoreTransactionState::Committed
-        | CoreTransactionState::FinalisationFailed
-        | CoreTransactionState::Aborted
-        | CoreTransactionState::RolledBack
-        | CoreTransactionState::Expired
-        | CoreTransactionState::Failed => false,
-    }
 }
 
 pub(super) fn validate_core_meta_row_precondition(

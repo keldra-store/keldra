@@ -1,7 +1,6 @@
 use super::*;
 use crate::core_store::{
-    CoreMutationBatch, CoreMutationBatchReceipt, CoreMutationOperation, CoreTransactionUpdate,
-    ReadStream,
+    CoreMutationBatch, CoreMutationBatchReceipt, CoreMutationOperation, ReadStream,
 };
 
 const CONTROL_STREAM_PAGE_MAX_ROWS: usize = 4_096;
@@ -49,10 +48,7 @@ async fn control_stream_append_cursor_with_store(
     partition: &str,
 ) -> AnyhowResult<ControlStreamAppendCursor> {
     let stream_id = control_stream_id(stream_family, partition)?;
-    let head_sequence = match store
-        .stream_head_precondition_visible_to_transaction(&stream_id, None)
-        .await?
-    {
+    let head_sequence = match store.stream_head_precondition(&stream_id).await? {
         CoreMutationPrecondition::StreamHead {
             expected_last_sequence,
             ..
@@ -117,16 +113,8 @@ pub(crate) async fn prepare_control_stream_append(
     let encoded = frame.encode()?;
     let record_stream_id = control_record_stream_id(stream_family, partition, &header.record_key)?;
     let mut preconditions: Vec<_> = precondition.into_iter().collect();
-    preconditions.push(
-        store
-            .stream_head_precondition_visible_to_transaction(&stream_id, None)
-            .await?,
-    );
-    preconditions.push(
-        store
-            .stream_head_precondition_visible_to_transaction(&record_stream_id, None)
-            .await?,
-    );
+    preconditions.push(store.stream_head_precondition(&stream_id).await?);
+    preconditions.push(store.stream_head_precondition(&record_stream_id).await?);
     let idempotency_key = header.idempotency_key.as_deref();
     let idempotency_scope = idempotency_key.map(|key| {
         format!(
@@ -528,20 +516,6 @@ fn decode_stored_frame(
         ));
     }
     Ok((frame, used))
-}
-
-fn visible_stream_update(updates: &[CoreTransactionUpdate], stream_id: &str) -> AnyhowResult<u64> {
-    updates
-        .iter()
-        .find_map(|update| match update {
-            CoreTransactionUpdate::StreamAppend {
-                stream_id: update_stream_id,
-                visible_sequence,
-                ..
-            } if update_stream_id == stream_id => Some(*visible_sequence),
-            _ => None,
-        })
-        .ok_or_else(|| anyhow!("CoreStore control stream batch did not append {stream_id}"))
 }
 
 fn control_record_stream_id(

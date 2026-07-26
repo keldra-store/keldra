@@ -1,6 +1,6 @@
 use crate::core_store::{
     CF_MESH, CoreMetaTuplePart, CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
-    CoreMutationRootPublication, CoreStore, CoreTransactionState, TABLE_CONTROL_CURRENT_ROW,
+    CoreMutationRootPublication, CoreStore, TABLE_CONTROL_CURRENT_ROW,
     core_meta_committed_row_common, core_meta_payload_digest, core_meta_record_tuple_key,
     core_meta_root_key_hash, core_meta_tuple_key, is_retryable_mutation_conflict,
 };

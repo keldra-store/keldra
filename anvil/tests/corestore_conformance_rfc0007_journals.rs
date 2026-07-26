@@ -561,7 +561,6 @@ fn rfc_0007_multipart_metadata_uses_direct_protobuf_stream_payloads_and_current_
             "multipart_current_row_update(",
             "multipart_current_row_operations",
             "CoreMutationPrecondition::CoreMetaRow",
-            "CoreTransactionUpdate::StreamAppend",
             "CoreMutationOperation::StreamAppend",
             "CoreMutationOperation::CoreMetaPut",
         ],
@@ -627,7 +626,7 @@ fn rfc_0007_authz_tuples_use_direct_protobuf_stream_payloads_and_coremeta_rows()
 fn rfc_0007_pending_mutation_admission_targets_are_typed_protobuf_not_json() {
     let pending = production_source("anvil-core/src/core_store/pending_mutation.rs");
     let admission = production_source("anvil-core/src/core_store/local_admission.rs");
-    let transactions = production_source("anvil-core/src/core_store/local_transactions.rs");
+    let transactions = production_source("anvil-core/src/core_store/local_mutation_commit.rs");
     let stream = production_source("anvil-core/src/core_store/local_stream_control.rs");
     let blob = production_source("anvil-core/src/core_store/local_init_blob.rs");
 

@@ -1,7 +1,7 @@
 use crate::core_store::{
     CoreCompressionDescriptor, CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
     CoreMutationRootPublication, CoreObjectEncoding, CoreObjectPlacement, CoreObjectRef, CoreStore,
-    CoreTransactionUpdate, ReadStream, StreamRecord,
+    ReadStream, StreamRecord,
 };
 use crate::formats::{Hash32, hash32, writer::WriterFamily};
 use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
@@ -825,19 +825,15 @@ async fn append_body(
         AppendMutationKind::AppendRecord => append_record_stream_id(&stream)?,
     };
     let journal_precondition = core_store
-        .stream_head_precondition_visible_to_transaction(&journal_stream_id, None)
+        .stream_head_precondition(&journal_stream_id)
         .await?;
     let exact_precondition = core_store
-        .stream_head_precondition_visible_to_transaction(&exact_stream_id, None)
+        .stream_head_precondition(&exact_stream_id)
         .await?;
     let record_cursor_stream_id = matches!(event, AppendMutationKind::AppendRecord)
         .then(|| append_record_cursor_stream_id(tenant_id, bucket_id));
     let record_cursor_precondition = if let Some(stream_id) = record_cursor_stream_id.as_deref() {
-        Some(
-            core_store
-                .stream_head_precondition_visible_to_transaction(stream_id, None)
-                .await?,
-        )
+        Some(core_store.stream_head_precondition(stream_id).await?)
     } else {
         None
     };
@@ -963,11 +959,7 @@ fn expected_stream_next_sequence(precondition: &CoreMutationPrecondition) -> Res
 }
 
 async fn next_stream_sequence(core_store: &CoreStore, stream_id: &str) -> Result<u64> {
-    expected_stream_next_sequence(
-        &core_store
-            .stream_head_precondition_visible_to_transaction(stream_id, None)
-            .await?,
-    )
+    expected_stream_next_sequence(&core_store.stream_head_precondition(stream_id).await?)
 }
 
 fn encode_append_body(

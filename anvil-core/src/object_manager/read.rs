@@ -1252,7 +1252,7 @@ impl ObjectManager {
                 .map_err(|error| Status::internal(error.to_string()))?
         } else {
             self.core_store
-                .object_metadata_precondition_snapshot(&bucket, object_key, None)
+                .object_metadata_precondition_snapshot(&bucket, object_key)
                 .map_err(|error| Status::internal(error.to_string()))?
         };
         Ok(ObjectMutationPreconditionSnapshot {

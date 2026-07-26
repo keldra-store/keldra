@@ -114,7 +114,7 @@ fn model_quorum_prepare_required() {
 }
 
 #[test]
-fn model_explicit_transaction_staged_rows_invisible() {
+fn model_staged_rows_are_invisible() {
     let mut state = state();
     state = apply(state, Action::BeginTransaction(TxId(0), RootKey(0)));
     state = apply(state, Action::StageMutation(TxId(0), RootKey(0)));
@@ -124,7 +124,7 @@ fn model_explicit_transaction_staged_rows_invisible() {
 }
 
 #[test]
-fn model_explicit_transaction_scope_mismatch_rejected() {
+fn model_transaction_scope_mismatch_rejected() {
     let mut state = state();
     state = apply(state, Action::BeginTransaction(TxId(0), RootKey(0)));
     state = apply(state, Action::StageMutation(TxId(0), RootKey(1)));
@@ -192,7 +192,6 @@ fn model_committed_transaction_rows_stay_on_scoped_root() {
     let root_one_rows = state.read_latest_committed(RootKey(1)).unwrap();
     assert!(staged.iter().all(|row| root_zero_rows.contains(row)));
     assert!(staged.iter().all(|row| !root_one_rows.contains(row)));
-    assert!(state.explicit_transactions_visible_only_on_their_root());
 }
 
 #[test]
@@ -298,7 +297,6 @@ proptest! {
             prop_assert!(state.visible_generations_have_persisted_certificates());
             prop_assert!(state.certificates_require_quorum_prepare());
             prop_assert!(state.staged_rows_are_invisible());
-            prop_assert!(state.explicit_transactions_visible_only_on_their_root());
             prop_assert!(state.published_batches_reference_durable_bytes());
         }
     }

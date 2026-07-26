@@ -1,8 +1,8 @@
 #[path = "control_record_proto.rs"]
 pub(in crate::core_store::local) mod control_record_proto;
 
-use super::local_transaction_visibility::StreamWatchVisibility;
-use super::local_tx_rows::borrow_owned_coremeta_batch_ops;
+use super::local_batch_ops::borrow_owned_coremeta_batch_ops;
+use super::local_mutation_validation::StreamWatchVisibility;
 use super::*;
 use crate::formats::{
     hash32,
@@ -774,18 +774,9 @@ impl CoreStore {
         &self,
         stream_id: &str,
     ) -> Result<CoreMutationPrecondition> {
-        self.stream_head_precondition_visible_to_transaction(stream_id, None)
-            .await
-    }
-
-    pub(crate) async fn stream_head_precondition_visible_to_transaction(
-        &self,
-        stream_id: &str,
-        transaction: Option<&CoreTransaction>,
-    ) -> Result<CoreMutationPrecondition> {
         validate_logical_id(stream_id, "stream id")?;
         let (expected_last_sequence, expected_last_event_hash) =
-            self.stream_head_visible_to_transaction_unlocked(stream_id, transaction)?;
+            self.stream_head_unlocked(stream_id)?;
         Ok(CoreMutationPrecondition::StreamHead {
             stream_id: stream_id.to_string(),
             expected_last_sequence,
@@ -793,34 +784,12 @@ impl CoreStore {
         })
     }
 
-    pub(super) fn stream_head_visible_to_transaction_unlocked(
-        &self,
-        stream_id: &str,
-        transaction: Option<&CoreTransaction>,
-    ) -> Result<(u64, String)> {
+    pub(super) fn stream_head_unlocked(&self, stream_id: &str) -> Result<(u64, String)> {
         let committed_head = self
             .read_stream_head_from_meta(stream_id)?
             .map(|head| (head.last_sequence, head.last_event_hash))
             .unwrap_or_else(|| (0, ZERO_HASH.to_string()));
-        let Some(transaction) = transaction else {
-            return Ok(committed_head);
-        };
-        transaction
-            .visible_updates
-            .iter()
-            .rev()
-            .find_map(|update| match update {
-                CoreTransactionUpdate::StreamAppend {
-                    stream_id: update_stream_id,
-                    visible_sequence,
-                    prepared_record_hash,
-                    ..
-                } if update_stream_id == stream_id => {
-                    Some((*visible_sequence, prepared_record_hash.clone()))
-                }
-                _ => None,
-            })
-            .map_or(Ok(committed_head), Ok)
+        Ok(committed_head)
     }
 
     pub async fn read_stream_page(&self, input: ReadStream) -> Result<ReadStreamPage> {

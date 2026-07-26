@@ -3,11 +3,11 @@ use crate::{
     core_store::{
         CF_PERSONALDB, CoreMetaRowCommonProto, CoreMetaTuplePart, CoreMutationBatch,
         CoreMutationBatchReceipt, CoreMutationOperation, CoreMutationPrecondition, CoreStore,
-        CoreTransactionState, TABLE_PERSONALDB_PROPOSAL_CLAIM_ROW,
-        TABLE_PERSONALDB_PROPOSAL_RESERVATION_ROW, TABLE_PERSONALDB_PROPOSAL_SLOT_ROW,
-        TABLE_PERSONALDB_WITNESS_CANDIDATE_ROW, TABLE_PERSONALDB_WITNESS_RECEIPT_ROW,
-        core_meta_committed_row_common, core_meta_payload_digest, core_meta_tuple_key,
-        decode_deterministic_proto, encode_deterministic_proto,
+        TABLE_PERSONALDB_PROPOSAL_CLAIM_ROW, TABLE_PERSONALDB_PROPOSAL_RESERVATION_ROW,
+        TABLE_PERSONALDB_PROPOSAL_SLOT_ROW, TABLE_PERSONALDB_WITNESS_CANDIDATE_ROW,
+        TABLE_PERSONALDB_WITNESS_RECEIPT_ROW, core_meta_committed_row_common,
+        core_meta_payload_digest, core_meta_tuple_key, decode_deterministic_proto,
+        encode_deterministic_proto,
     },
     formats::hash32,
     partition_fence::{

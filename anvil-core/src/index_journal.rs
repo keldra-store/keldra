@@ -1,6 +1,6 @@
 use crate::core_store::{
     CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
-    CoreMutationRootPublication, CoreStore, CoreTransactionState, ReadStream,
+    CoreMutationRootPublication, CoreStore, ReadStream,
 };
 use crate::formats::{Hash32, hash32, writer::WriterFamily};
 use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};

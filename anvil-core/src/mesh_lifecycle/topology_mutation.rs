@@ -1,5 +1,5 @@
 use super::*;
-use crate::core_store::{CoreMutationBatchReceipt, CoreTransactionState};
+use crate::core_store::CoreMutationBatchReceipt;
 use crate::mesh_control_stream::PreparedControlStreamAppend;
 
 pub(super) struct LifecycleControlMutation<'a> {

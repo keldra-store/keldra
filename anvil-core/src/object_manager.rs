@@ -3,8 +3,8 @@ use crate::{
     core_store::{
         AppendStreamRecord as CoreAppendStreamRecord, AuthzScopeRef, CoreBoundarySchema,
         CoreBoundarySource, CoreBoundaryValue, CoreByteRange, CoreManifestLocator,
-        CoreMutationPrecondition, CoreObjectRef, CorePrefetchPolicy, CoreStore, CoreTransaction,
-        GetBlob, PutBlob, SealStreamSegment, WriteLogicalFilePathRequest, WriteLogicalFileRequest,
+        CoreMutationPrecondition, CoreObjectRef, CorePrefetchPolicy, CoreStore, GetBlob, PutBlob,
+        SealStreamSegment, WriteLogicalFilePathRequest, WriteLogicalFileRequest,
         core_object_ref_from_logical_file_write, decode_core_object_ref_target,
         decode_manifest_locator_proto, encode_core_object_ref_target,
         encode_manifest_locator_proto,

@@ -10,8 +10,7 @@ use crate::{
     core_store::{
         CF_LEASES_FENCES, CoreMetaStore, CoreMutationBatch, CoreMutationBatchReceipt,
         CoreMutationOperation, CoreMutationPrecondition, CoreMutationRootPublication, CoreStore,
-        CoreTransactionState, TABLE_TASK_CURRENT_ROW, core_meta_payload_digest,
-        core_meta_record_tuple_key,
+        TABLE_TASK_CURRENT_ROW, core_meta_payload_digest, core_meta_record_tuple_key,
     },
     formats::writer::WriterFamily,
     persistence::{TaskPage, TaskRecord},

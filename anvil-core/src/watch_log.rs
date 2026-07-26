@@ -81,9 +81,7 @@ pub(crate) async fn prepare_object_watch_append(
 ) -> Result<PreparedObjectWatchAppend> {
     validate_event_scope(bucket, object, event)?;
     let stream_id = object_watch_stream_id(bucket.tenant_id, bucket.id);
-    let stream_precondition = core_store
-        .stream_head_precondition_visible_to_transaction(&stream_id, None)
-        .await?;
+    let stream_precondition = core_store.stream_head_precondition(&stream_id).await?;
     let sequence = next_sequence(&stream_precondition)?;
     prepare_object_watch_append_at_sequence(
         bucket,

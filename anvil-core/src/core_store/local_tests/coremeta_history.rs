@@ -157,7 +157,7 @@ fn history_input(
     })
     .unwrap();
     let profile = store.default_coremeta_quorum_profile().unwrap();
-    let node_ids = super::super::local_tx_helpers::local_control_node_ids();
+    let node_ids = super::super::local_storage_helpers::local_control_node_ids();
     let prepare_receipts = node_ids
         .iter()
         .take(profile.prepare_quorum)

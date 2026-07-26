@@ -292,17 +292,6 @@ impl CoreStoreState {
         })
     }
 
-    pub fn explicit_transactions_visible_only_on_their_root(&self) -> bool {
-        self.transactions.values().all(|tx| {
-            tx.staged_rows.iter().all(|row| {
-                self.visible_rows.iter().all(|((root_key, _), rows)| {
-                    !rows.contains(row)
-                        || (tx.status == TransactionStatus::Committed && *root_key == tx.root_key)
-                })
-            })
-        })
-    }
-
     pub fn stale_owner_never_published(&self) -> bool {
         self.batches.values().all(|batch| {
             batch.published_generation.is_none()
@@ -556,12 +545,6 @@ impl Model for CoreStoreModel {
             Property::<Self>::always("staged rows are invisible", |_, state: &CoreStoreState| {
                 state.staged_rows_are_invisible()
             }),
-            Property::<Self>::always(
-                "explicit transactions stay single-root",
-                |_, state: &CoreStoreState| {
-                    state.explicit_transactions_visible_only_on_their_root()
-                },
-            ),
             Property::<Self>::always("stale owners never publish", |_, state: &CoreStoreState| {
                 state.stale_owner_never_published()
             }),

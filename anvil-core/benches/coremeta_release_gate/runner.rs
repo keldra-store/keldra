@@ -4,8 +4,8 @@ use std::time::Instant;
 use anvil_core::anvil_api::{CoreMetaHistoryCursor, CoreMetaInventoryCursor};
 use anvil_core::core_store::{
     CF_INLINE_PAYLOADS, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaCatchUpProbe,
-    CoreMetaInventoryProbe, CoreMetaStore, CoreMutationBatch, CoreMutationOperation,
-    CoreMutationRootPublication, CoreStore, CoreTransactionState, TABLE_INLINE_PAYLOAD_ROW,
+    CoreMetaInventoryProbe, CoreMetaStore, CoreMutationBatch, CoreMutationBatchOutcome,
+    CoreMutationOperation, CoreMutationRootPublication, CoreStore, TABLE_INLINE_PAYLOAD_ROW,
     core_meta_root_key_hash, reset_coremeta_get_probe, take_coremeta_get_probe,
 };
 use anyhow::{Context, Result, bail};
@@ -654,13 +654,13 @@ fn measure_atomic_root_publication(
                 .and_then(Option::take)
                 .context("CoreMeta publication benchmark reused an operation")?;
             let receipt = runtime.block_on(store.commit_mutation_batch(batch))?;
-            if receipt.state != CoreTransactionState::Committed
+            if receipt.outcome != CoreMutationBatchOutcome::Committed
                 || receipt.finalisation_error.is_some()
             {
                 bail!(
-                    "CoreMeta publication {} did not commit cleanly: state={:?}, error={:?}",
+                    "CoreMeta publication {} did not commit cleanly: outcome={:?}, error={:?}",
                     receipt.transaction_id,
-                    receipt.state,
+                    receipt.outcome,
                     receipt.finalisation_error
                 );
             }
@@ -1179,9 +1179,8 @@ fn publish_atomic_root_generation(
         payload_bytes,
     )?;
     let receipt = runtime.block_on(store.commit_mutation_batch(batch))?;
-    if receipt.state != CoreTransactionState::Committed
+    if receipt.outcome != CoreMutationBatchOutcome::Committed
         || receipt.finalisation_error.is_some()
-        || receipt.visible_updates.len() != mutation_rows
     {
         bail!("CoreMeta history growth publication did not commit exactly {mutation_rows} rows");
     }

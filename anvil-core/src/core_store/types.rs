@@ -12,7 +12,6 @@ pub const CORE_OBJECT_MANIFEST_SCHEMA: &str = "anvil.core.object_manifest.v1";
 pub const CORE_LOGICAL_FILE_MANIFEST_SCHEMA: &str = "anvil.core.logical_file_manifest.v1";
 pub const CORE_LOGICAL_FILE_INLINE_REF_PREFIX: &str = "core-logical-file-inline:";
 pub const CORE_LOGICAL_FILE_LOCATOR_REF_PREFIX: &str = "core-logical-file-locator:";
-pub const CORE_TRANSACTION_SCHEMA: &str = "anvil.core.transaction.v1";
 pub const CORE_WATCH_EVENT_SCHEMA: &str = "anvil.core.watch_event.v1";
 pub const CORE_FENCE_SCHEMA: &str = "anvil.core.fence.v1";
 pub const CORE_ROOT_CATALOG_SCHEMA: &str = "anvil.core.root_catalog.v1";
@@ -803,72 +802,6 @@ pub struct CoreFencePrecondition {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CoreTransaction {
-    pub schema: String,
-    pub transaction_id: String,
-    pub scope_partition: String,
-    pub state: CoreTransactionState,
-    pub preconditions_hash: String,
-    pub operations_hash: String,
-    pub writer_families: Vec<String>,
-    pub visible_updates: Vec<CoreTransactionUpdate>,
-    pub finalisation_error: Option<String>,
-    pub committed_at: String,
-    pub committed_by_principal: String,
-    pub created_at_unix_nanos: u64,
-    pub expires_at_unix_nanos: u64,
-    pub root_anchor_key: String,
-    pub root_key_hash: String,
-    pub committed_root_generation: Option<u64>,
-    pub purpose: String,
-    pub failure_evidence: Option<String>,
-    pub outcome: String,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum CoreTransactionState {
-    Open,
-    Prepared,
-    Committed,
-    FinalisationFailed,
-    Aborted,
-    RolledBack,
-    Expired,
-    Failed,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum CoreTransactionUpdate {
-    StreamAppend {
-        partition_id: String,
-        stream_id: String,
-        record_kind: String,
-        payload: Vec<u8>,
-        idempotency_key_hash: Option<String>,
-        visible_sequence: u64,
-        previous_event_hash: String,
-        prepared_record_hash: String,
-        created_at: String,
-    },
-    CoreMetaPut {
-        cf: String,
-        table_id: u16,
-        tuple_key: Vec<u8>,
-        previous_payload_hash: Option<String>,
-        payload: Vec<u8>,
-        payload_hash: String,
-    },
-    CoreMetaDelete {
-        cf: String,
-        table_id: u16,
-        tuple_key: Vec<u8>,
-        previous_payload_hash: Option<String>,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CoreMutationBatch {
     pub transaction_id: String,
     pub scope_partition: String,
@@ -1031,27 +964,6 @@ mod mutation_batch_receipt_tests {
         );
         assert!(receipt.stream_append("stream-b").is_none());
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CoreExplicitTransactionReceipt {
-    pub transaction_id: String,
-    pub scope_partition: String,
-    pub state: CoreTransactionState,
-    pub visible_updates: Vec<CoreTransactionUpdate>,
-    pub finalisation_error: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CoreBeginTransaction {
-    pub idempotency_key: String,
-    pub root_anchor_key: String,
-    pub root_key_hash: String,
-    pub scope_partition: String,
-    pub ttl_ms: u64,
-    pub purpose: String,
-    pub principal: String,
-    pub preconditions_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

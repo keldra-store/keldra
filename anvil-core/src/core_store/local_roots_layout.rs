@@ -1,5 +1,5 @@
+use super::local_batch_ops::{OwnedCoreMetaBatchOp, borrow_owned_coremeta_batch_ops};
 use super::local_stream_control::control_record_proto::*;
-use super::local_tx_rows::{OwnedCoreMetaBatchOp, borrow_owned_coremeta_batch_ops};
 use super::*;
 use crate::formats::writer::WriterFamily;
 

@@ -147,11 +147,11 @@ async fn append_object_put_mutations_with_permit_inner(
 
     let metadata_stream_id = object_metadata_stream_id(bucket.tenant_id, bucket.id);
     let metadata_stream_precondition = core_store
-        .stream_head_precondition_visible_to_transaction(&metadata_stream_id, None)
+        .stream_head_precondition(&metadata_stream_id)
         .await?;
     let watch_stream_id = watch_log::object_watch_stream_id(bucket.tenant_id, bucket.id);
     let watch_stream_precondition = core_store
-        .stream_head_precondition_visible_to_transaction(&watch_stream_id, None)
+        .stream_head_precondition(&watch_stream_id)
         .await?;
     let first_watch_sequence = stream_precondition_next_sequence(&watch_stream_precondition)?;
 
@@ -169,7 +169,6 @@ async fn append_object_put_mutations_with_permit_inner(
                 ObjectMetadataProjectionMutation::Upsert,
                 &scope_partition,
                 transaction_id,
-                None,
             )
             .await?;
         let event = object_watch_event(bucket, object, ObjectJournalMutation::Put);
@@ -377,7 +376,7 @@ async fn append_object_mutation_inner_once(
     mutation: ObjectJournalMutation,
     fence_token: u64,
     partition_precondition: Option<CoreMutationPrecondition>,
-    explicit_transaction_id: Option<&str>,
+    mvcc_transaction_id: Option<&str>,
     transaction_principal: Option<&str>,
 ) -> Result<()> {
     let scope_partition = hex::encode(object_metadata_partition_id(bucket.tenant_id, bucket.id));
@@ -386,7 +385,7 @@ async fn append_object_mutation_inner_once(
         object.mutation_id,
         mutation.event_name()
     );
-    let transaction_id = explicit_transaction_id.unwrap_or(&implicit_transaction_id);
+    let transaction_id = mvcc_transaction_id.unwrap_or(&implicit_transaction_id);
     let committed_by_principal = transaction_principal
         .map(str::to_owned)
         .unwrap_or_else(|| object_metadata_partition_principal(bucket));
@@ -403,12 +402,11 @@ async fn append_object_mutation_inner_once(
             projection_mutation,
             &scope_partition,
             transaction_id,
-            None,
         )
         .await?;
     let metadata_stream_id = object_metadata_stream_id(bucket.tenant_id, bucket.id);
     let metadata_stream_precondition = core_store
-        .stream_head_precondition_visible_to_transaction(&metadata_stream_id, None)
+        .stream_head_precondition(&metadata_stream_id)
         .await?;
     let event = object_watch_event(bucket, object, mutation);
     let watch = watch_log::prepare_object_watch_append(
@@ -456,9 +454,9 @@ async fn append_object_mutation_inner_once(
         preconditions,
         operations,
     };
-    if explicit_transaction_id.is_some() {
+    if mvcc_transaction_id.is_some() {
         let transaction_principal = transaction_principal
-            .ok_or_else(|| anyhow!("object metadata explicit transaction principal missing"))?;
+            .ok_or_else(|| anyhow!("object metadata MVCC transaction principal missing"))?;
         let mvcc = mvcc.ok_or_else(|| anyhow!("MVCC staging handle is required"))?;
         let mutations = crate::mvcc_product::product_mutations_from_operations(batch.operations)?;
         mvcc.stage_product_mutations(

@@ -1,4 +1,4 @@
-use super::local_tx_rows::OwnedCoreMetaBatchOp;
+use super::local_batch_ops::OwnedCoreMetaBatchOp;
 use super::*;
 use crate::object_links;
 use crate::persistence::{Bucket, Object};

@@ -1,5 +1,5 @@
+use super::super::local_batch_ops::OwnedCoreMetaBatchOp;
 use super::super::local_stream_control::control_record_proto::encode_boundary_value_row;
-use super::super::local_tx_rows::OwnedCoreMetaBatchOp;
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -32,15 +32,9 @@ impl CoreStore {
         &self,
         bucket: &Bucket,
         object_key: &str,
-        explicit_transaction: Option<&CoreTransaction>,
     ) -> Result<ObjectMetadataPreconditionSnapshot> {
         let tuple_key = object_current_key(bucket, object_key);
-        let payload = self.object_metadata_payload_visible_to_transaction(
-            CF_OBJECT_HEADS,
-            TABLE_OBJECT_HEAD_ROW,
-            &tuple_key,
-            explicit_transaction,
-        )?;
+        let payload = self.read_coremeta_row(CF_OBJECT_HEADS, TABLE_OBJECT_HEAD_ROW, &tuple_key)?;
         object_metadata_precondition_snapshot_from_payload(bucket, object_key, tuple_key, payload)
     }
 
@@ -122,29 +116,14 @@ impl CoreStore {
         mutation: ObjectMetadataProjectionMutation,
         scope_partition: &str,
         transaction_id: &str,
-        explicit_transaction: Option<&CoreTransaction>,
     ) -> Result<PreparedObjectMetadataProjection> {
         validate_object_scope(bucket, object)?;
         if scope_partition != object_metadata_root_anchor_key(bucket.tenant_id, bucket.id) {
             bail!("object metadata mutation scope does not match its CoreMeta root");
         }
-        let root_generation = match explicit_transaction {
-            Some(transaction) => {
-                if transaction.transaction_id != transaction_id
-                    || transaction.root_anchor_key != scope_partition
-                    || transaction.root_key_hash
-                        != object_metadata_root_key_hash(bucket.tenant_id, bucket.id)
-                {
-                    bail!("object metadata explicit transaction scope mismatch");
-                }
-                self.infer_explicit_transaction_commit_root_generation(transaction)
-                    .await?
-            }
-            None => {
-                self.implicit_root_generation_unlocked(transaction_id, scope_partition, None)
-                    .await?
-            }
-        };
+        let root_generation = self
+            .implicit_root_generation_unlocked(transaction_id, scope_partition, None)
+            .await?;
         let operations = match mutation {
             ObjectMetadataProjectionMutation::Upsert => {
                 self.prepare_object_metadata_upsert_operations(
@@ -153,7 +132,6 @@ impl CoreStore {
                     scope_partition,
                     transaction_id,
                     root_generation,
-                    explicit_transaction,
                 )
                 .await?
             }
@@ -164,7 +142,6 @@ impl CoreStore {
                     scope_partition,
                     transaction_id,
                     root_generation,
-                    explicit_transaction,
                 )
                 .await?
             }
@@ -237,7 +214,6 @@ impl CoreStore {
                 ObjectMetadataProjectionMutation::Upsert,
                 &scope_partition,
                 &transaction_id,
-                None,
             )
             .await?;
         let receipt = self
@@ -278,7 +254,6 @@ impl CoreStore {
                 ObjectMetadataProjectionMutation::DeleteVersion,
                 &scope_partition,
                 &transaction_id,
-                None,
             )
             .await?;
         let receipt = self
@@ -367,25 +342,18 @@ impl CoreStore {
         scope_partition: &str,
         transaction_id: &str,
         root_generation: u64,
-        explicit_transaction: Option<&CoreTransaction>,
     ) -> Result<Vec<CoreMutationOperation>> {
         let payload = encode_object_metadata_row_at_generation_for_transaction(
             object,
             root_generation,
             transaction_id,
         )?;
-        let counter_payload = explicit_transaction
-            .is_none()
-            .then(|| {
-                self.object_id_counter_payload_at_generation(
-                    bucket,
-                    object.id,
-                    root_generation,
-                    transaction_id,
-                    explicit_transaction,
-                )
-            })
-            .transpose()?;
+        let counter_payload = self.object_id_counter_payload_at_generation(
+            bucket,
+            object.id,
+            root_generation,
+            transaction_id,
+        )?;
         let mut operations = vec![
             put_operation(
                 scope_partition,
@@ -444,15 +412,13 @@ impl CoreStore {
                 payload.clone(),
             ),
         ];
-        if let Some(counter_payload) = counter_payload {
-            operations.push(put_operation(
-                scope_partition,
-                CF_OBJECT_VERSIONS,
-                TABLE_OBJECT_VERSION_META_ROW,
-                object_id_counter_key(bucket),
-                counter_payload,
-            ));
-        }
+        operations.push(put_operation(
+            scope_partition,
+            CF_OBJECT_VERSIONS,
+            TABLE_OBJECT_VERSION_META_ROW,
+            object_id_counter_key(bucket),
+            counter_payload,
+        ));
         let current_page_key = object_current_page_key_for_object(bucket, object);
         if object.deleted_at.is_some() {
             operations.push(delete_operation(
@@ -480,7 +446,6 @@ impl CoreStore {
         scope_partition: &str,
         transaction_id: &str,
         root_generation: u64,
-        explicit_transaction: Option<&CoreTransaction>,
     ) -> Result<Vec<CoreMutationOperation>> {
         if deletion.deleted_at.is_none() {
             bail!("object version deletion projection requires deleted_at");
@@ -490,20 +455,14 @@ impl CoreStore {
         let current_key = object_current_key(bucket, object_key);
         let version_key = object_version_key(bucket, object_key, version_id);
         let current = self
-            .object_metadata_payload_visible_to_transaction(
-                CF_OBJECT_HEADS,
-                TABLE_OBJECT_HEAD_ROW,
-                &current_key,
-                explicit_transaction,
-            )?
+            .read_coremeta_row(CF_OBJECT_HEADS, TABLE_OBJECT_HEAD_ROW, &current_key)?
             .map(|payload| decode_object_metadata_row(&payload))
             .transpose()?;
         let original = self
-            .object_metadata_payload_visible_to_transaction(
+            .read_coremeta_row(
                 CF_OBJECT_VERSIONS,
                 TABLE_OBJECT_VERSION_META_ROW,
                 &version_key,
-                explicit_transaction,
             )?
             .map(|payload| decode_object_metadata_row_with_common(&payload))
             .transpose()?
@@ -516,12 +475,7 @@ impl CoreStore {
             .as_ref()
             .is_some_and(|object| object.key == object_key && object.version_id == version_id);
         let replacement = if deleted_is_current {
-            self.latest_object_version_for_key_after_delete_in_transaction(
-                bucket,
-                object_key,
-                version_id,
-                explicit_transaction,
-            )?
+            self.latest_object_version_for_key_after_delete(bucket, object_key, version_id)?
         } else {
             None
         };
@@ -544,18 +498,12 @@ impl CoreStore {
                 )
             })
             .transpose()?;
-        let counter_payload = explicit_transaction
-            .is_none()
-            .then(|| {
-                self.object_id_counter_payload_at_generation(
-                    bucket,
-                    deletion.id,
-                    root_generation,
-                    transaction_id,
-                    explicit_transaction,
-                )
-            })
-            .transpose()?;
+        let counter_payload = self.object_id_counter_payload_at_generation(
+            bucket,
+            deletion.id,
+            root_generation,
+            transaction_id,
+        )?;
         let mut operations = vec![
             delete_operation(
                 scope_partition,
@@ -587,15 +535,13 @@ impl CoreStore {
                 tombstone_payload.clone(),
             ),
         ];
-        if let Some(counter_payload) = counter_payload {
-            operations.push(put_operation(
-                scope_partition,
-                CF_OBJECT_VERSIONS,
-                TABLE_OBJECT_VERSION_META_ROW,
-                object_id_counter_key(bucket),
-                counter_payload,
-            ));
-        }
+        operations.push(put_operation(
+            scope_partition,
+            CF_OBJECT_VERSIONS,
+            TABLE_OBJECT_VERSION_META_ROW,
+            object_id_counter_key(bucket),
+            counter_payload,
+        ));
         if deleted_is_current {
             match (replacement.as_ref(), replacement_payload.as_ref()) {
                 (Some(replacement), Some(replacement_payload)) => {
@@ -677,17 +623,15 @@ impl CoreStore {
         candidate_id: i64,
         root_generation: u64,
         transaction_id: &str,
-        explicit_transaction: Option<&CoreTransaction>,
     ) -> Result<Vec<u8>> {
         if candidate_id <= 0 {
             bail!("object metadata id must be positive");
         }
         let counter_key = object_id_counter_key(bucket);
-        let current_max = match self.object_metadata_payload_visible_to_transaction(
+        let current_max = match self.read_coremeta_row(
             CF_OBJECT_VERSIONS,
             TABLE_OBJECT_VERSION_META_ROW,
             &counter_key,
-            explicit_transaction,
         )? {
             Some(bytes) => decode_object_metadata_counter_for_bucket(&bytes, bucket)?.max_id,
             None => i64::try_from(root_generation.saturating_sub(1))
@@ -720,119 +664,6 @@ impl CoreStore {
             .common
             .expect("counter decoder requires CoreMeta common")
             .root_generation)
-    }
-
-    fn object_metadata_payload_visible_to_transaction(
-        &self,
-        cf: &str,
-        table_id: u16,
-        tuple_key: &[u8],
-        transaction: Option<&CoreTransaction>,
-    ) -> Result<Option<Vec<u8>>> {
-        match transaction {
-            Some(transaction) => self.coremeta_payload_visible_to_transaction_unlocked(
-                cf,
-                table_id,
-                tuple_key,
-                transaction,
-            ),
-            None => self.read_coremeta_row(canonical_coremeta_cf_name(cf)?, table_id, tuple_key),
-        }
-    }
-
-    fn latest_object_version_for_key_after_delete_in_transaction(
-        &self,
-        bucket: &Bucket,
-        object_key: &str,
-        deleted_version_id: uuid::Uuid,
-        transaction: Option<&CoreTransaction>,
-    ) -> Result<Option<Object>> {
-        let Some(transaction) = transaction else {
-            return self.latest_object_version_for_key_after_delete(
-                bucket,
-                object_key,
-                deleted_version_id,
-            );
-        };
-        let prefix = object_version_page_prefix(bucket, object_key);
-        let mut overlay = BTreeMap::<Vec<u8>, Option<Vec<u8>>>::new();
-        for update in &transaction.visible_updates {
-            match update {
-                CoreTransactionUpdate::CoreMetaPut {
-                    cf,
-                    table_id,
-                    tuple_key,
-                    payload,
-                    ..
-                } if cf == CF_OBJECT_VERSIONS
-                    && *table_id == TABLE_OBJECT_VERSION_META_ROW
-                    && tuple_key.starts_with(&prefix) =>
-                {
-                    overlay.insert(tuple_key.clone(), Some(payload.clone()));
-                }
-                CoreTransactionUpdate::CoreMetaDelete {
-                    cf,
-                    table_id,
-                    tuple_key,
-                    ..
-                } if cf == CF_OBJECT_VERSIONS
-                    && *table_id == TABLE_OBJECT_VERSION_META_ROW
-                    && tuple_key.starts_with(&prefix) =>
-                {
-                    overlay.insert(tuple_key.clone(), None);
-                }
-                _ => {}
-            }
-        }
-        let mut best = overlay
-            .iter()
-            .filter_map(|(key, payload)| payload.as_ref().map(|payload| (key.clone(), payload)))
-            .map(|(key, payload)| Ok((key, decode_object_metadata_row_with_common(payload)?)))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .filter(|(_, decoded)| decoded.object.version_id != deleted_version_id)
-            .min_by(|left, right| left.0.cmp(&right.0));
-        let mut after = None;
-        loop {
-            let rows = self.scan_coremeta_prefix_page(
-                CF_OBJECT_VERSIONS,
-                TABLE_OBJECT_VERSION_META_ROW,
-                &prefix,
-                after.as_deref(),
-                VERSION_SCAN_PAGE_ROWS,
-            )?;
-            if rows.is_empty() {
-                break;
-            }
-            for row in &rows {
-                let tuple_key = core_meta_record_tuple_key(&row.key)?.to_vec();
-                let payload = match overlay.get(&tuple_key) {
-                    Some(Some(payload)) => payload,
-                    Some(None) => continue,
-                    None => &row.payload,
-                };
-                let decoded = decode_object_metadata_row_with_common(payload)?;
-                if decoded.object.version_id == deleted_version_id {
-                    continue;
-                }
-                if best.as_ref().is_none_or(|(key, _)| tuple_key < *key) {
-                    best = Some((tuple_key, decoded));
-                }
-                break;
-            }
-            if best.is_some() || rows.len() < VERSION_SCAN_PAGE_ROWS {
-                break;
-            }
-            after = rows
-                .last()
-                .map(|row| core_meta_record_tuple_key(&row.key).map(ToOwned::to_owned))
-                .transpose()?;
-        }
-        let Some((_, decoded)) = best else {
-            return Ok(None);
-        };
-        validate_object_scope(bucket, &decoded.object)?;
-        Ok(Some(decoded.object))
     }
 
     async fn prepare_object_boundary_value_projections(
