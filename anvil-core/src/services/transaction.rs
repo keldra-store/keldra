@@ -363,6 +363,9 @@ fn certification_abort_name(reason: &crate::mvcc_transaction::CertificationAbort
         crate::mvcc_transaction::CertificationAbort::RangeConflict { .. } => {
             "TransactionRangeConflict"
         }
+        crate::mvcc_transaction::CertificationAbort::PredicateConflict { .. } => {
+            "TransactionPredicateConflict"
+        }
     }
 }
 

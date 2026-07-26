@@ -28,6 +28,7 @@ pub use storage::{
 pub use types::{
     AppliedDecision, BundleHash, CertificationAbort, CertificationResult, CertifyTransaction,
     CommitVersion, CommittedBundleDecision, ConsensusCommand, ConsensusDurabilityPolicy,
-    ControlApplyResult, DurabilityLevel, LogicalKeyHash, NodeId, NodeIncarnation,
-    PartitionAssignment, PointObservation, RangeConflictKey, RangeObservation, TransactionId,
+    ControlApplyResult, DurabilityLevel, ExplicitPredicate, LogicalKeyHash, NodeId,
+    NodeIncarnation, PartitionAssignment, PointObservation, PredicateKind, RangeConflictKey,
+    RangeObservation, TransactionId, WrittenPoint,
 };

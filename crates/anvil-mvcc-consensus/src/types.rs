@@ -55,6 +55,27 @@ pub struct RangeObservation {
     pub observed_stamp: Option<CommitVersion>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum PredicateKind {
+    Unique,
+    Exists,
+    Absent,
+    ValueHash([u8; 32]),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ExplicitPredicate {
+    pub key: LogicalKeyHash,
+    pub kind: PredicateKind,
+    pub observed_version: Option<CommitVersion>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct WrittenPoint {
+    pub key: LogicalKeyHash,
+    pub value_hash: Option<[u8; 32]>,
+}
+
 /// Compact application entry placed in Raft.
 ///
 /// It intentionally contains no transaction bundle body or product row value.
@@ -65,7 +86,11 @@ pub struct CertifyTransaction {
     pub snapshot_version: CommitVersion,
     pub point_observations: Vec<PointObservation>,
     pub range_observations: Vec<RangeObservation>,
+    #[serde(default)]
+    pub predicates: Vec<ExplicitPredicate>,
     pub written_point_keys: Vec<LogicalKeyHash>,
+    #[serde(default)]
+    pub written_points: Vec<WrittenPoint>,
     pub advanced_range_stamps: Vec<RangeConflictKey>,
     pub bundle_hash: BundleHash,
     pub bundle_length: u64,
@@ -173,6 +198,12 @@ pub enum CertificationAbort {
         key: LogicalKeyHash,
         expected: Option<CommitVersion>,
         actual: Option<CommitVersion>,
+    },
+    PredicateConflict {
+        key: LogicalKeyHash,
+        predicate: PredicateKind,
+        expected_version: Option<CommitVersion>,
+        actual_version: Option<CommitVersion>,
     },
     RangeConflict {
         range: RangeConflictKey,

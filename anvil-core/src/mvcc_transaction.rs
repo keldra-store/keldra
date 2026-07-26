@@ -50,6 +50,22 @@ pub struct RangeObservation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PredicateKind {
+    Unique,
+    Exists,
+    Absent,
+    ValueHash([u8; 32]),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ExplicitPredicate {
+    pub key: LogicalKey,
+    pub kind: PredicateKind,
+    pub observed_version: Option<CommitVersion>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RangeStampKey {
     pub scheme_version: u16,
     pub table_id: u16,
@@ -164,6 +180,8 @@ pub struct TransactionBundle {
     pub authenticated_principal: String,
     pub point_observations: Vec<PointObservation>,
     pub range_observations: Vec<RangeObservation>,
+    #[serde(default)]
+    pub predicates: Vec<ExplicitPredicate>,
     pub advanced_range_stamps: Vec<RangeStampKey>,
     pub writes: Vec<WriteOperation>,
     pub shard_manifests: Vec<ObjectShardManifestReference>,
@@ -210,6 +228,12 @@ impl TransactionBundle {
                     &right.conflict_key,
                 ))
         });
+        self.predicates.sort();
+        ensure_unique_by(
+            self.predicates.iter(),
+            |predicate| &predicate.key,
+            "explicit predicate key",
+        )?;
         ensure_unique_by(
             self.range_observations.iter(),
             |entry| {
@@ -388,6 +412,7 @@ impl TransactionBundleBuilder {
                 authenticated_principal: authenticated_principal.into(),
                 point_observations: Vec::new(),
                 range_observations: Vec::new(),
+                predicates: Vec::new(),
                 advanced_range_stamps: Vec::new(),
                 writes: Vec::new(),
                 shard_manifests: Vec::new(),
@@ -407,6 +432,21 @@ impl TransactionBundleBuilder {
     ) -> &mut Self {
         self.bundle.point_observations.push(PointObservation {
             key: key.clone(),
+            observed_version,
+        });
+        self.claim(OwnedResource::LogicalKey(key));
+        self
+    }
+
+    pub fn predicate(
+        &mut self,
+        key: LogicalKey,
+        kind: PredicateKind,
+        observed_version: Option<CommitVersion>,
+    ) -> &mut Self {
+        self.bundle.predicates.push(ExplicitPredicate {
+            key: key.clone(),
+            kind,
             observed_version,
         });
         self.claim(OwnedResource::LogicalKey(key));
@@ -531,6 +571,12 @@ fn expected_ownership_claims(bundle: &TransactionBundle) -> Vec<ClusterOwnership
             .writes
             .iter()
             .map(|entry| OwnedResource::LogicalKey(entry.key().clone())),
+    );
+    resources.extend(
+        bundle
+            .predicates
+            .iter()
+            .map(|entry| OwnedResource::LogicalKey(entry.key.clone())),
     );
     resources.extend(
         bundle
@@ -720,6 +766,9 @@ impl TransactionResourceLimits {
         if bundle.point_observations.len() > self.max_point_observations {
             bail!("transaction exceeds point observation limit");
         }
+        if bundle.predicates.len() > self.max_point_observations {
+            bail!("transaction exceeds explicit predicate limit");
+        }
         if bundle.range_observations.len() > self.max_range_observations {
             bail!("transaction exceeds range observation limit");
         }
@@ -766,8 +815,10 @@ pub struct CertificationRequest {
     pub object_durability: Vec<ObjectDurabilityEvidence>,
     pub point_observations: Vec<PointObservation>,
     pub range_observations: Vec<RangeObservation>,
+    pub predicates: Vec<ExplicitPredicate>,
     pub advanced_range_stamps: Vec<RangeStampKey>,
     pub written_keys: Vec<LogicalKey>,
+    pub written_points: Vec<(LogicalKey, Option<[u8; 32]>)>,
     pub max_command_bytes: usize,
 }
 
@@ -777,6 +828,7 @@ pub enum CertificationAbort {
     InvalidCommand(String),
     PointConflict { key_hash: [u8; 32] },
     RangeConflict { range_hash: [u8; 32] },
+    PredicateConflict { key_hash: [u8; 32] },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -931,12 +983,20 @@ where
             replication_started_at.elapsed(),
         );
 
-        let written_keys = bundle
+        let written_points = bundle
             .writes
             .iter()
-            .map(|operation| operation.key().clone())
-            .collect();
+            .map(|operation| match operation {
+                WriteOperation::Put { key, value } => {
+                    (key.clone(), Some(*blake3::hash(value).as_bytes()))
+                }
+                WriteOperation::Delete { key } => (key.clone(), None),
+            })
+            .collect::<Vec<_>>();
+        let written_keys = written_points.iter().map(|(key, _)| key.clone()).collect();
         let certification_started_at = std::time::Instant::now();
+        #[cfg(test)]
+        crate::mvcc_fault_injection::hit(crate::mvcc_fault_injection::FaultPoint::BeforeProposal)?;
         let result = self
             .certifier
             .certify(CertificationRequest {
@@ -949,11 +1009,15 @@ where
                 object_durability: evidence.objects,
                 point_observations: bundle.point_observations,
                 range_observations: bundle.range_observations,
+                predicates: bundle.predicates,
                 advanced_range_stamps: bundle.advanced_range_stamps,
                 written_keys,
+                written_points,
                 max_command_bytes: self.resource_limits.max_certification_command_bytes,
             })
             .await?;
+        #[cfg(test)]
+        crate::mvcc_fault_injection::hit(crate::mvcc_fault_injection::FaultPoint::AfterProposal)?;
         crate::perf::record_transaction_duration(
             "certification",
             match &result {
@@ -966,6 +1030,7 @@ where
             crate::perf::record_transaction_conflict(match reason {
                 CertificationAbort::PointConflict { .. } => "point",
                 CertificationAbort::RangeConflict { .. } => "range",
+                CertificationAbort::PredicateConflict { .. } => "predicate",
                 CertificationAbort::InvalidCommand(_) => "invalid_command",
             });
         }

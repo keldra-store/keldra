@@ -136,6 +136,7 @@ enum DraftState {
 struct DraftMutations {
     points: Vec<PointObservation>,
     ranges: Vec<RangeObservation>,
+    predicates: Vec<crate::mvcc_transaction::ExplicitPredicate>,
     writes: Vec<WriteOperation>,
     manifests: Vec<ObjectShardManifestReference>,
     events: Vec<Vec<u8>>,
@@ -315,6 +316,29 @@ impl OpenTransactionRegistry {
             )?;
             let observation = builder.build()?.range_observations.remove(0);
             draft.mutations.ranges.push(observation);
+            Ok(())
+        })
+    }
+
+    pub fn add_predicate(
+        &self,
+        transaction_id: &str,
+        owning_cluster_id: &str,
+        key: LogicalKey,
+        kind: crate::mvcc_transaction::PredicateKind,
+        observed_version: Option<CommitVersion>,
+        now_unix_ms: u64,
+    ) -> Result<()> {
+        self.mutate(transaction_id, now_unix_ms, |draft| {
+            ensure_owning_cluster(draft, owning_cluster_id)?;
+            draft
+                .mutations
+                .predicates
+                .push(crate::mvcc_transaction::ExplicitPredicate {
+                    key,
+                    kind,
+                    observed_version,
+                });
             Ok(())
         })
     }
@@ -737,6 +761,13 @@ fn build_bundle(draft: &Draft) -> Result<TransactionBundle> {
             range.end_application_key.clone(),
             range.observed_range_stamp,
         )?;
+    }
+    for predicate in &draft.mutations.predicates {
+        builder.predicate(
+            predicate.key.clone(),
+            predicate.kind.clone(),
+            predicate.observed_version,
+        );
     }
     for write in &draft.mutations.writes {
         match write {

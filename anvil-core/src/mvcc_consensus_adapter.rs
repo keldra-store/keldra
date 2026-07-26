@@ -109,6 +109,25 @@ pub(crate) fn to_consensus_command(
     range_observations.sort();
     range_observations.dedup();
 
+    let mut predicates = request
+        .predicates
+        .iter()
+        .map(|predicate| consensus::ExplicitPredicate {
+            key: logical_key_hash(&request.cluster_id, &predicate.key),
+            kind: match predicate.kind {
+                product::PredicateKind::Unique => consensus::PredicateKind::Unique,
+                product::PredicateKind::Exists => consensus::PredicateKind::Exists,
+                product::PredicateKind::Absent => consensus::PredicateKind::Absent,
+                product::PredicateKind::ValueHash(hash) => {
+                    consensus::PredicateKind::ValueHash(hash)
+                }
+            },
+            observed_version: predicate.observed_version.map(consensus::CommitVersion),
+        })
+        .collect::<Vec<_>>();
+    predicates.sort();
+    predicates.dedup();
+
     let mut written_point_keys = request
         .written_keys
         .iter()
@@ -116,6 +135,16 @@ pub(crate) fn to_consensus_command(
         .collect::<Vec<_>>();
     written_point_keys.sort();
     written_point_keys.dedup();
+    let mut written_points = request
+        .written_points
+        .iter()
+        .map(|(key, value_hash)| consensus::WrittenPoint {
+            key: logical_key_hash(&request.cluster_id, key),
+            value_hash: *value_hash,
+        })
+        .collect::<Vec<_>>();
+    written_points.sort();
+    written_points.dedup();
 
     let mut advanced_range_stamps = request
         .advanced_range_stamps
@@ -131,7 +160,9 @@ pub(crate) fn to_consensus_command(
         snapshot_version: consensus::CommitVersion(request.snapshot_version),
         point_observations,
         range_observations,
+        predicates,
         written_point_keys,
+        written_points,
         advanced_range_stamps,
         bundle_hash: parse_bundle_hash(&request.bundle.hash)?,
         bundle_length: request.bundle.length,
@@ -206,6 +237,9 @@ fn from_consensus_result(result: consensus::CertificationResult) -> product::Cer
                     product::CertificationAbort::RangeConflict {
                         range_hash: range.0,
                     }
+                }
+                consensus::CertificationAbort::PredicateConflict { key, .. } => {
+                    product::CertificationAbort::PredicateConflict { key_hash: key.0 }
                 }
             };
             product::CertificationResult::Aborted { reason }
@@ -369,6 +403,7 @@ mod tests {
                 },
                 observed_range_stamp: Some(5),
             }],
+            predicates: Vec::new(),
             advanced_range_stamps: vec![product::RangeStampKey {
                 scheme_version: product::HierarchicalRangeStampScheme::SCHEME_VERSION,
                 table_id: 8,
@@ -378,6 +413,13 @@ mod tests {
                 table_id: 8,
                 application_key: b"key".to_vec(),
             }],
+            written_points: vec![(
+                product::LogicalKey {
+                    table_id: 8,
+                    application_key: b"key".to_vec(),
+                },
+                Some(*blake3::hash(b"value").as_bytes()),
+            )],
             max_command_bytes: product::TransactionResourceLimits::default()
                 .max_certification_command_bytes,
         }
@@ -420,6 +462,16 @@ mod tests {
             .iter()
             .map(|write| write.key().clone())
             .collect();
+        let written_points = bundle
+            .writes
+            .iter()
+            .map(|write| match write {
+                product::WriteOperation::Put { key, value } => {
+                    (key.clone(), Some(*blake3::hash(value).as_bytes()))
+                }
+                product::WriteOperation::Delete { key } => (key.clone(), None),
+            })
+            .collect();
         product::CertificationRequest {
             cluster_id: bundle.cluster_id,
             transaction_id: bundle.transaction_id,
@@ -430,8 +482,10 @@ mod tests {
             object_durability: Vec::new(),
             point_observations: bundle.point_observations,
             range_observations: bundle.range_observations,
+            predicates: bundle.predicates,
             advanced_range_stamps: bundle.advanced_range_stamps,
             written_keys,
+            written_points,
             max_command_bytes: product::TransactionResourceLimits::default()
                 .max_certification_command_bytes,
         }

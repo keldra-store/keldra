@@ -161,6 +161,41 @@ pub fn product_mutations_from_operations(
 }
 
 impl MvccSubsystem {
+    pub fn stage_predicate(
+        &self,
+        transaction_id: &str,
+        principal: &str,
+        key: LogicalKey,
+        kind: crate::mvcc_transaction::PredicateKind,
+        now_unix_ms: u64,
+    ) -> Result<()> {
+        let binding = self.open_transactions.binding(transaction_id, principal)?;
+        let snapshot = self
+            .open_transactions
+            .handle(transaction_id)?
+            .snapshot_version;
+        let visible = self.runtime.read_at(&key, snapshot)?;
+        let satisfied = match &kind {
+            crate::mvcc_transaction::PredicateKind::Unique
+            | crate::mvcc_transaction::PredicateKind::Absent => visible.is_none(),
+            crate::mvcc_transaction::PredicateKind::Exists => visible.is_some(),
+            crate::mvcc_transaction::PredicateKind::ValueHash(expected) => visible
+                .as_ref()
+                .is_some_and(|row| blake3::hash(&row.value).as_bytes() == expected),
+        };
+        if !satisfied {
+            bail!("MVCC transaction predicate is false at its snapshot");
+        }
+        self.open_transactions.add_predicate(
+            transaction_id,
+            &binding.cluster_id,
+            key,
+            kind,
+            visible.map(|row| row.commit_version),
+            now_unix_ms,
+        )
+    }
+
     /// Read the authoritative committed value at the node's latest applied MVCC
     /// version. Physical CoreStore projections are not consulted.
     pub fn read_latest_value(&self, key: &LogicalKey) -> Result<Option<Vec<u8>>> {

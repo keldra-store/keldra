@@ -5,7 +5,7 @@ use thiserror::Error;
 
 use crate::{
     CertificationAbort, CertificationResult, CertifyTransaction, CommitVersion, LogicalKeyHash,
-    RangeConflictKey, TransactionId,
+    PredicateKind, RangeConflictKey, TransactionId,
 };
 
 /// Complete deterministic state replicated by the certification state machine.
@@ -14,6 +14,7 @@ pub struct CertificationState {
     cluster_id_hash: [u8; 32],
     last_applied: CommitVersion,
     point_latest_write: BTreeMap<LogicalKeyHash, CommitVersion>,
+    point_latest_value_hash: BTreeMap<LogicalKeyHash, Option<[u8; 32]>>,
     range_latest_write: BTreeMap<RangeConflictKey, CommitVersion>,
     recent_results: BTreeMap<TransactionId, CertificationResult>,
 }
@@ -124,6 +125,10 @@ impl CertificationState {
                     for key in &command.written_point_keys {
                         self.point_latest_write.insert(*key, position);
                     }
+                    for point in &command.written_points {
+                        self.point_latest_value_hash
+                            .insert(point.key, point.value_hash);
+                    }
                     for range in &command.advanced_range_stamps {
                         self.range_latest_write.insert(*range, position);
                     }
@@ -162,6 +167,28 @@ impl CertificationState {
                 });
             }
         }
+        for predicate in &command.predicates {
+            let actual_version = self.point_latest_write.get(&predicate.key).copied();
+            let actual_hash = self
+                .point_latest_value_hash
+                .get(&predicate.key)
+                .copied()
+                .flatten();
+            let satisfied = actual_version == predicate.observed_version
+                && match predicate.kind {
+                    PredicateKind::Unique | PredicateKind::Absent => actual_hash.is_none(),
+                    PredicateKind::Exists => actual_hash.is_some(),
+                    PredicateKind::ValueHash(expected) => actual_hash == Some(expected),
+                };
+            if !satisfied {
+                return Some(CertificationAbort::PredicateConflict {
+                    key: predicate.key,
+                    predicate: predicate.kind,
+                    expected_version: predicate.observed_version,
+                    actual_version,
+                });
+            }
+        }
         None
     }
 }
@@ -193,7 +220,20 @@ fn validate_canonical(command: &CertifyTransaction) -> Result<(), CertificationA
     }
     check_sorted_unique(&command.point_observations, "point observations")?;
     check_sorted_unique(&command.range_observations, "range observations")?;
+    check_sorted_unique(&command.predicates, "explicit predicates")?;
     check_sorted_unique(&command.written_point_keys, "written point keys")?;
+    check_sorted_unique(&command.written_points, "written points")?;
+    if !command.written_points.is_empty()
+        && command
+            .written_points
+            .iter()
+            .map(|point| point.key)
+            .ne(command.written_point_keys.iter().copied())
+    {
+        return Err(CertificationAbort::InvalidCommand(
+            "written point hashes must correspond to written point keys".into(),
+        ));
+    }
     check_sorted_unique(&command.advanced_range_stamps, "advanced range stamps")?;
     check_sorted_unique(&command.durable_holders, "durable holders")?;
     if command.bundle_length == 0 {
@@ -222,7 +262,8 @@ fn check_sorted_unique<T: Ord>(items: &[T], field: &str) -> Result<(), Certifica
 mod tests {
     use super::*;
     use crate::{
-        BundleHash, DurabilityLevel, NodeId, NodeIncarnation, PointObservation, RangeObservation,
+        BundleHash, DurabilityLevel, ExplicitPredicate, NodeId, NodeIncarnation, PointObservation,
+        PredicateKind, RangeObservation, WrittenPoint,
     };
 
     fn hash(byte: u8) -> [u8; 32] {
@@ -236,7 +277,9 @@ mod tests {
             snapshot_version: CommitVersion(0),
             point_observations: vec![],
             range_observations: vec![],
+            predicates: vec![],
             written_point_keys: vec![],
+            written_points: vec![],
             advanced_range_stamps: vec![],
             bundle_hash: BundleHash(hash(id)),
             bundle_length: 1,
@@ -275,6 +318,33 @@ mod tests {
             }
         ));
         assert_eq!(state.point_version(untouched), None);
+    }
+
+    #[test]
+    fn value_hash_predicate_is_checked_without_row_bytes_in_raft() {
+        let key = LogicalKeyHash(hash(7));
+        let mut state = CertificationState::new([1; 32]).unwrap();
+        let mut create = command(1);
+        create.written_point_keys = vec![key];
+        create.written_points = vec![WrittenPoint {
+            key,
+            value_hash: Some(hash(8)),
+        }];
+        state.apply(CommitVersion(1), &create).unwrap();
+
+        let mut cas = command(2);
+        cas.predicates = vec![ExplicitPredicate {
+            key,
+            kind: PredicateKind::ValueHash(hash(9)),
+            observed_version: Some(CommitVersion(1)),
+        }];
+        assert!(matches!(
+            state.apply(CommitVersion(2), &cas).unwrap(),
+            CertificationResult::Aborted {
+                reason: CertificationAbort::PredicateConflict { .. },
+                ..
+            }
+        ));
     }
 
     #[test]

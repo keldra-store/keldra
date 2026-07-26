@@ -499,7 +499,12 @@ mod tests {
                 observed_version: None,
             }],
             range_observations: Vec::new(),
+            predicates: Vec::new(),
             written_point_keys: vec![key],
+            written_points: vec![anvil_mvcc_consensus::WrittenPoint {
+                key,
+                value_hash: Some([id; 32]),
+            }],
             advanced_range_stamps: Vec::new(),
             bundle_hash: BundleHash([id; 32]),
             bundle_length: 1,
