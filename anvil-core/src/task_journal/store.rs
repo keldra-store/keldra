@@ -274,6 +274,7 @@ impl<'a> TaskMutation<'a> {
 
     pub fn add_product_plan(&mut self, plan: crate::mvcc_product::ProductMutationPlan) {
         self.external_mutations.extend(plan.mutations);
+        self.additional_predicates.extend(plan.predicates);
         self.outbox_events.extend(plan.outbox_events);
     }
 

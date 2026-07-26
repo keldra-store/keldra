@@ -1,5 +1,5 @@
 use super::*;
-use crate::{core_store::CoreMutationBatchAdditions, persistence::ObjectBatchCreateInput};
+use crate::{mvcc_product::ProductMutationPlan, persistence::ObjectBatchCreateInput};
 use futures_util::future::try_join_all;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashSet};
@@ -57,7 +57,7 @@ impl ObjectManager {
     ) -> Result<Vec<Object>, Status>
     where
         F: FnOnce(&[Object]) -> Fut + Send,
-        Fut: Future<Output = Result<CoreMutationBatchAdditions, Status>> + Send,
+        Fut: Future<Output = Result<ProductMutationPlan, Status>> + Send,
     {
         if inputs.is_empty() {
             return Ok(Vec::new());
@@ -116,7 +116,7 @@ impl ObjectManager {
     ) -> Result<Vec<Object>, Status>
     where
         F: FnOnce(&[Object]) -> Fut + Send,
-        Fut: Future<Output = Result<CoreMutationBatchAdditions, Status>> + Send,
+        Fut: Future<Output = Result<ProductMutationPlan, Status>> + Send,
     {
         if inputs.is_empty() {
             return Ok(Vec::new());

@@ -930,9 +930,8 @@ mod local_mutation_preparation;
 #[path = "local_object_metadata.rs"]
 mod local_object_metadata;
 pub(crate) use local_object_metadata::{
-    CurrentObjectMetadataPage, ObjectMetadataMutationGuard, ObjectMetadataPageCursor,
-    ObjectMetadataPreconditionSnapshot, ObjectMetadataProjectionMutation,
-    ObjectVersionsMetadataPage, decode_object_metadata_max_id, decode_object_metadata_row,
+    CurrentObjectMetadataPage, ObjectMetadataPageCursor, ObjectVersionsMetadataPage,
+    decode_object_metadata_max_id, decode_object_metadata_row,
     decode_object_metadata_row_with_generation, encode_object_metadata_counter_at_generation,
     encode_object_metadata_row_at_generation_for_transaction,
     encode_object_metadata_row_at_generation_with_delete_marker_for_transaction,

@@ -219,6 +219,10 @@ fn logical_mutations_from_operations(
 #[derive(Debug, Clone, Default)]
 pub struct ProductMutationPlan {
     pub mutations: Vec<ProductMutation>,
+    pub predicates: Vec<(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )>,
     pub outbox_events: Vec<crate::mvcc_outbox::StreamOutboxEvent>,
 }
 
@@ -252,6 +256,7 @@ pub fn product_mutations_and_outbox_from_operations(
     }
     Ok(ProductMutationPlan {
         mutations: logical_mutations_from_operations(operations)?,
+        predicates: Vec::new(),
         outbox_events: outbox,
     })
 }

@@ -1,8 +1,7 @@
 use crate::{
     anvil_api::NativeMutationContext,
     core_store::{
-        CF_TRANSACTIONS, CoreMetaTuplePart, CoreMutationBatchAdditions, CoreMutationOperation,
-        CoreMutationPrecondition, TABLE_NATIVE_IDEMPOTENCY_ROW, core_meta_tuple_key,
+        CF_TRANSACTIONS, CoreMetaTuplePart, TABLE_NATIVE_IDEMPOTENCY_ROW, core_meta_tuple_key,
     },
     mvcc_bootstrap::MvccSubsystem,
     mvcc_product::ProductMutation,
@@ -192,7 +191,7 @@ pub(crate) async fn prepare_response_in_transaction<T>(
     context: &NativeMutationContext,
     target: &NativeIdempotencyTarget,
     response: &T,
-) -> Result<CoreMutationBatchAdditions, Status>
+) -> Result<crate::mvcc_product::ProductMutationPlan, Status>
 where
     T: Serialize,
 {
@@ -241,7 +240,7 @@ where
     )
     .map_err(|error| Status::failed_precondition(error.to_string()))?;
 
-    Ok(CoreMutationBatchAdditions::default())
+    Ok(crate::mvcc_product::ProductMutationPlan::default())
 }
 
 pub(crate) async fn prepare_response_for_implicit_batch<T>(
@@ -249,8 +248,7 @@ pub(crate) async fn prepare_response_for_implicit_batch<T>(
     context: &NativeMutationContext,
     target: &NativeIdempotencyTarget,
     response: &T,
-    publication_root_anchor: &str,
-) -> Result<CoreMutationBatchAdditions, Status>
+) -> Result<crate::mvcc_product::ProductMutationPlan, Status>
 where
     T: Serialize,
 {
@@ -262,11 +260,6 @@ where
         return Err(Status::already_exists("NativeIdempotencyRecordExists"));
     }
 
-    if publication_root_anchor.is_empty() {
-        return Err(Status::invalid_argument(
-            "Native idempotency publication root is empty",
-        ));
-    }
     let response_json = serde_json::to_value(response).map_err(|error| {
         Status::internal(format!("Serialize native idempotency response: {error}"))
     })?;
@@ -286,26 +279,11 @@ where
     };
     record.record_hash = record_hash(&record)?;
     let payload = encode_record(&record)?;
-    let tuple_key = record_tuple_key(context)?;
-
-    Ok(CoreMutationBatchAdditions {
-        root_publications: Vec::new(),
-        preconditions: vec![CoreMutationPrecondition::CoreMetaRow {
-            cf: CF_TRANSACTIONS.to_string(),
-            table_id: TABLE_NATIVE_IDEMPOTENCY_ROW,
-            tuple_key: tuple_key.clone(),
-            expected_payload_hash: None,
-            require_absent: true,
-            require_present: false,
-        }],
-        operations: vec![CoreMutationOperation::CoreMetaPut {
-            partition_id: publication_root_anchor.to_string(),
-            cf: CF_TRANSACTIONS.to_string(),
-            table_id: TABLE_NATIVE_IDEMPOTENCY_ROW,
-            tuple_key,
-            payload,
-        }],
-        mvcc_predicates: Vec::new(),
+    let logical_key = record_logical_key(context)?;
+    Ok(crate::mvcc_product::ProductMutationPlan {
+        mutations: vec![ProductMutation::put(logical_key.clone(), payload)],
+        predicates: vec![(logical_key, PredicateKind::Absent)],
+        outbox_events: Vec::new(),
     })
 }
 

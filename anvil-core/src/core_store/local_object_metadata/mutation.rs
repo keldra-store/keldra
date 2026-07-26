@@ -3,47 +3,7 @@ use super::super::local_stream_control::control_record_proto::encode_boundary_va
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ObjectMetadataProjectionMutation {
-    Upsert,
-    DeleteVersion,
-}
-
-pub(crate) struct ObjectMetadataMutationGuard {
-    _guard: super::super::CoreStoreLock,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ObjectMetadataPreconditionSnapshot {
-    pub(crate) object: Option<Object>,
-    pub(crate) precondition: CoreMutationPrecondition,
-}
-
 impl CoreStore {
-    pub(crate) fn object_metadata_precondition_snapshot(
-        &self,
-        bucket: &Bucket,
-        object_key: &str,
-    ) -> Result<ObjectMetadataPreconditionSnapshot> {
-        let tuple_key = object_current_key(bucket, object_key);
-        let payload = self.read_coremeta_row(CF_OBJECT_HEADS, TABLE_OBJECT_HEAD_ROW, &tuple_key)?;
-        object_metadata_precondition_snapshot_from_payload(bucket, object_key, tuple_key, payload)
-    }
-
-    pub(crate) fn object_metadata_precondition_snapshot_from_payload(
-        &self,
-        bucket: &Bucket,
-        object_key: &str,
-        payload: Option<Vec<u8>>,
-    ) -> Result<ObjectMetadataPreconditionSnapshot> {
-        object_metadata_precondition_snapshot_from_payload(
-            bucket,
-            object_key,
-            object_current_key(bucket, object_key),
-            payload,
-        )
-    }
-
     pub(crate) fn object_metadata_current_tuple_key(
         &self,
         bucket: &Bucket,
@@ -53,104 +13,7 @@ impl CoreStore {
     }
 }
 
-fn object_metadata_precondition_snapshot_from_payload(
-    bucket: &Bucket,
-    object_key: &str,
-    tuple_key: Vec<u8>,
-    payload: Option<Vec<u8>>,
-) -> Result<ObjectMetadataPreconditionSnapshot> {
-    let decoded = payload
-        .as_deref()
-        .map(decode_object_metadata_row)
-        .transpose()?;
-    if let Some(object) = decoded.as_ref() {
-        validate_object_scope(bucket, object)?;
-        if object.key != object_key {
-            bail!("CoreStore object metadata current row key mismatch");
-        }
-    }
-    let object = decoded.filter(|object| object.deleted_at.is_none());
-    let expected_payload_hash = payload
-        .as_ref()
-        .map(|payload| core_meta_payload_digest(TABLE_OBJECT_HEAD_ROW, payload));
-    Ok(ObjectMetadataPreconditionSnapshot {
-        object,
-        precondition: CoreMutationPrecondition::CoreMetaRow {
-            cf: CF_OBJECT_HEADS.to_string(),
-            table_id: TABLE_OBJECT_HEAD_ROW,
-            tuple_key,
-            require_absent: expected_payload_hash.is_none(),
-            require_present: expected_payload_hash.is_some(),
-            expected_payload_hash,
-        },
-    })
-}
-
 impl CoreStore {
-    pub(crate) async fn acquire_object_metadata_mutation_lock(
-        &self,
-        bucket: &Bucket,
-    ) -> Result<ObjectMetadataMutationGuard> {
-        Ok(ObjectMetadataMutationGuard {
-            _guard: self
-                .acquire_named_lock(
-                    "object-metadata-bucket",
-                    &object_metadata_bucket_lock_id(bucket),
-                )
-                .await?,
-        })
-    }
-
-    pub(crate) async fn materialize_object_metadata_ancillary_projections(
-        &self,
-        bucket: &Bucket,
-        object: &Object,
-        mutation: ObjectMetadataProjectionMutation,
-    ) -> Result<()> {
-        let transaction_id = object.mutation_id.to_string();
-        let projection = [(bucket, object, mutation)];
-        self.materialize_object_metadata_ancillary_projection_batch(&transaction_id, &projection)
-            .await
-    }
-
-    pub(crate) async fn materialize_object_metadata_ancillary_projection_batch(
-        &self,
-        transaction_id: &str,
-        projections: &[(&Bucket, &Object, ObjectMetadataProjectionMutation)],
-    ) -> Result<()> {
-        let mut prepared = PreparedAncillaryProjectionBatch::default();
-        for (bucket, object, mutation) in projections {
-            validate_object_scope(bucket, object)?;
-            let (payload_ops, payload_publications) = match mutation {
-                ObjectMetadataProjectionMutation::Upsert => {
-                    self.payload_reference_put_ops_for_object(bucket, object, transaction_id)
-                        .await?
-                }
-                ObjectMetadataProjectionMutation::DeleteVersion => {
-                    self.payload_reference_delete_ops_for_object(bucket, object, transaction_id)
-                        .await?
-                }
-            };
-            prepared.extend(payload_ops, payload_publications)?;
-
-            if *mutation == ObjectMetadataProjectionMutation::Upsert {
-                let (boundary_ops, boundary_publications) = self
-                    .prepare_object_boundary_value_projections(bucket, object)
-                    .await?;
-                prepared.extend(boundary_ops, boundary_publications)?;
-            }
-        }
-
-        let (owned_ops, publications) = prepared.finish()?;
-        if owned_ops.is_empty() {
-            return Ok(());
-        }
-        let ops = borrow_owned_coremeta_batch_ops(&owned_ops);
-        self.commit_coremeta_root_groups(transaction_id, &ops, &publications)
-            .await?;
-        Ok(())
-    }
-
     pub(super) async fn current_object_metadata_root_generation(
         &self,
         bucket: &Bucket,

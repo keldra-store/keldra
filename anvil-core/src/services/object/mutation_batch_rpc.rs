@@ -1,6 +1,5 @@
 use super::rpc::{native_transaction_id, object_write_visibility, write_state_for_transaction};
 use super::*;
-use crate::core_store::{CoreMutationBatchAdditions, CoreMutationPrecondition};
 use crate::object_manager;
 
 fn put_mutation_batch_response(
@@ -124,7 +123,12 @@ fn is_object_data_operation(operation: &MutationBatchOperation) -> bool {
     )
 }
 
-fn deduplicate_preconditions(preconditions: &mut Vec<CoreMutationPrecondition>) {
+fn deduplicate_preconditions(
+    preconditions: &mut Vec<(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )>,
+) {
     let mut unique = Vec::with_capacity(preconditions.len());
     for precondition in preconditions.drain(..) {
         if !unique.contains(&precondition) {
@@ -139,33 +143,20 @@ async fn prepare_put_batch_additions(
     context: NativeMutationContext,
     target: NativeIdempotencyTarget,
     response: MutationBatchResponse,
-    mut durable_preconditions: Vec<CoreMutationPrecondition>,
     mut mvcc_preconditions: Vec<(
         crate::mvcc_transaction::LogicalKey,
         crate::mvcc_transaction::PredicateKind,
     )>,
-) -> Result<CoreMutationBatchAdditions, Status> {
+) -> Result<crate::mvcc_product::ProductMutationPlan, Status> {
     let mut additions = if context.transaction_id.is_some() {
         native_idempotency::prepare_response_in_transaction(&mvcc, &context, &target, &response)
             .await?
     } else {
-        let publication_root_anchor =
-            hex::encode(crate::metadata_journal::object_metadata_partition_id(
-                context.tenant_id,
-                context.bucket_id,
-            ));
-        native_idempotency::prepare_response_for_implicit_batch(
-            &mvcc,
-            &context,
-            &target,
-            &response,
-            &publication_root_anchor,
-        )
-        .await?
+        native_idempotency::prepare_response_for_implicit_batch(&mvcc, &context, &target, &response)
+            .await?
     };
-    additions.preconditions.append(&mut durable_preconditions);
-    additions.mvcc_predicates.append(&mut mvcc_preconditions);
-    deduplicate_preconditions(&mut additions.preconditions);
+    additions.predicates.append(&mut mvcc_preconditions);
+    deduplicate_preconditions(&mut additions.predicates);
     Ok(additions)
 }
 
@@ -252,7 +243,7 @@ pub(super) async fn execute_mutation_batch(
         put_only_batch
     };
     let precondition_transaction = transaction_id.zip(transaction_principal.as_deref());
-    let mut durable_preconditions =
+    let mut mvcc_preconditions =
         prepare_mutation_batch_native_preconditions(state, &claims, &req, precondition_transaction)
             .await?;
     let write_preconditions = prepare_write_preconditions(
@@ -262,9 +253,8 @@ pub(super) async fn execute_mutation_batch(
         precondition_transaction,
     )
     .await?;
-    durable_preconditions.extend(write_preconditions.physical);
-    let mvcc_preconditions = write_preconditions.mvcc;
-    deduplicate_preconditions(&mut durable_preconditions);
+    mvcc_preconditions.extend(write_preconditions.mvcc);
+    deduplicate_preconditions(&mut mvcc_preconditions);
     if !put_only_batch
         && let (Some(transaction_id), Some(principal)) =
             (transaction_id, transaction_principal.as_deref())
@@ -326,7 +316,6 @@ pub(super) async fn execute_mutation_batch(
                             idempotency_context,
                             idempotency_target,
                             response,
-                            durable_preconditions,
                             mvcc_preconditions,
                         )
                     },
@@ -355,7 +344,6 @@ pub(super) async fn execute_mutation_batch(
                             idempotency_context,
                             idempotency_target,
                             response,
-                            durable_preconditions,
                             mvcc_preconditions,
                         )
                     },

@@ -18,10 +18,6 @@ pub(crate) use projections::{
 
 #[path = "local_object_metadata/mutation.rs"]
 mod mutation;
-pub(crate) use mutation::{
-    ObjectMetadataMutationGuard, ObjectMetadataPreconditionSnapshot,
-    ObjectMetadataProjectionMutation,
-};
 
 const CORE_OBJECT_METADATA_SCHEMA: &str = "anvil.core.object_metadata.v1";
 

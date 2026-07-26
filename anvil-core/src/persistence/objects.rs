@@ -196,7 +196,7 @@ impl Persistence {
         &self,
         prepared: PreparedObjectBatchCreate,
         transaction_id: &str,
-        additions: CoreMutationBatchAdditions,
+        additions: crate::mvcc_product::ProductMutationPlan,
     ) -> Result<Vec<Object>> {
         let permit = self
             .object_metadata_write_permit(prepared.bucket.tenant_id, prepared.bucket.id)
@@ -220,7 +220,7 @@ impl Persistence {
         prepared: PreparedObjectBatchCreate,
         transaction_id: &str,
         transaction_principal: &str,
-        additions: CoreMutationBatchAdditions,
+        additions: crate::mvcc_product::ProductMutationPlan,
     ) -> Result<Vec<Object>> {
         let permit = self
             .object_metadata_write_permit(prepared.bucket.tenant_id, prepared.bucket.id)

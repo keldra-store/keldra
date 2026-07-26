@@ -11,7 +11,7 @@ use crate::{
     bucket_journal::{self, BucketJournalMutation},
     config::Config,
     control_journal,
-    core_store::{CoreMutationBatchAdditions, CoreObjectRef, CoreStore},
+    core_store::{CoreObjectRef, CoreStore},
     directory_repair,
     embedding_provider::EmbeddingProviderRegistry,
     hf_journal, index_builder, index_diagnostic_journal, index_journal, index_repair,

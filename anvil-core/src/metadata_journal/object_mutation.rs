@@ -1,5 +1,4 @@
 use super::*;
-use crate::core_store::{CoreMutationBatchAdditions, CoreMutationPrecondition};
 use crate::persistence::ObjectWatchEvent;
 use crate::watch_log;
 
@@ -90,7 +89,7 @@ pub(crate) async fn append_object_put_mutations_with_permit_in_transaction(
     partition_owner_signing_key: &[u8],
     transaction_id: &str,
     transaction_principal: &str,
-    additions: CoreMutationBatchAdditions,
+    additions: crate::mvcc_product::ProductMutationPlan,
 ) -> Result<()> {
     append_object_put_mutations_with_permit_inner(
         storage,
@@ -114,7 +113,7 @@ pub(crate) async fn commit_object_put_mutations_with_permit(
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
     transaction_id: &str,
-    additions: CoreMutationBatchAdditions,
+    additions: crate::mvcc_product::ProductMutationPlan,
 ) -> Result<()> {
     append_object_put_mutations_with_permit_inner(
         storage,
@@ -140,17 +139,12 @@ async fn append_object_put_mutations_with_permit_inner(
     _partition_owner_signing_key: &[u8],
     transaction_id: &str,
     transaction_principal: Option<&str>,
-    mut additions: CoreMutationBatchAdditions,
+    mut additions: crate::mvcc_product::ProductMutationPlan,
 ) -> Result<()> {
     if objects.is_empty() {
         return Ok(());
     }
     require_object_metadata_permit(bucket, permit)?;
-    if !additions.root_publications.is_empty() {
-        return Err(anyhow!(
-            "object metadata MVCC transactions do not accept physical root publications"
-        ));
-    }
     let mvcc = mvcc.ok_or_else(|| anyhow!("MVCC staging handle is required"))?;
     let scope_partition = hex::encode(object_metadata_partition_id(bucket.tenant_id, bucket.id));
     let committed_by_principal = transaction_principal
@@ -194,9 +188,7 @@ async fn append_object_put_mutations_with_permit_inner(
             idempotency_key: Some(format!("object-metadata:{}:put", object.mutation_id)),
         });
     }
-    operations.append(&mut additions.operations);
     let operations = coalesce_coremeta_operations_last_write_wins(operations);
-    let predicates = object_batch_precondition_predicates(&additions.preconditions)?;
     let event_plan = plan_metadata_events(
         mvcc,
         bucket,
@@ -211,13 +203,13 @@ async fn append_object_put_mutations_with_permit_inner(
         transaction_principal.map(|principal| (transaction_id, principal)),
     )?;
     let mutations = event_plan.mutations;
-    let mut predicates = predicates;
-    predicates.append(&mut additions.mvcc_predicates);
+    let mut predicates = additions.predicates;
     predicates.push(event_plan.head_predicate);
     predicates.extend(watch_plan.predicates);
     let mut mutations = mutations;
     mutations.extend(watch_plan.mutations);
     mutations.extend(projection_mutations);
+    mutations.append(&mut additions.mutations);
     predicates.extend(projection_predicates);
     if let Some(transaction_principal) = transaction_principal {
         mvcc.stage_product_mutations(
@@ -238,6 +230,10 @@ async fn append_object_put_mutations_with_permit_inner(
         }
         stage_object_metadata_assignment_guard(mvcc, bucket, transaction_id, transaction_principal)
             .await?;
+        for event in additions.outbox_events {
+            mvcc.open_transactions
+                .add_stream_event(transaction_id, event, now_unix_ms)?;
+        }
         return Ok(());
     }
     commit_object_metadata_plan(
@@ -247,47 +243,10 @@ async fn append_object_put_mutations_with_permit_inner(
         transaction_id,
         mutations,
         predicates,
-        Vec::new(),
+        additions.outbox_events,
     )
     .await?;
     Ok(())
-}
-
-fn object_batch_precondition_predicates(
-    batch_preconditions: &[CoreMutationPrecondition],
-) -> Result<
-    Vec<(
-        crate::mvcc_transaction::LogicalKey,
-        crate::mvcc_transaction::PredicateKind,
-    )>,
-> {
-    use crate::mvcc_transaction::PredicateKind;
-
-    let mut predicates = Vec::new();
-    for precondition in batch_preconditions {
-        let CoreMutationPrecondition::CoreMetaRow {
-            cf,
-            table_id,
-            tuple_key,
-            expected_payload_hash,
-            require_absent: true,
-            require_present: false,
-        } = precondition
-        else {
-            continue;
-        };
-        if *table_id != crate::core_store::TABLE_NATIVE_IDEMPOTENCY_ROW
-            || cf != crate::core_store::CF_TRANSACTIONS
-            || expected_payload_hash.is_some()
-        {
-            continue;
-        }
-        let key = crate::mvcc_product::coremeta_logical_key(cf, *table_id, tuple_key)?;
-        if !predicates.iter().any(|(current, _)| current == &key) {
-            predicates.push((key, PredicateKind::Absent));
-        }
-    }
-    Ok(predicates)
 }
 
 fn coalesce_coremeta_operations_last_write_wins(

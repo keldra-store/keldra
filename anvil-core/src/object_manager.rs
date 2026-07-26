@@ -2,8 +2,8 @@ use crate::{
     access_control, auth, bucket_journal,
     core_store::{
         AuthzScopeRef, CoreBoundarySchema, CoreBoundarySource, CoreBoundaryValue, CoreByteRange,
-        CoreManifestLocator, CoreMutationPrecondition, CoreObjectRef, CorePrefetchPolicy,
-        CoreStore, GetBlob, PutBlob, WriteLogicalFilePathRequest, WriteLogicalFileRequest,
+        CoreManifestLocator, CoreObjectRef, CorePrefetchPolicy, CoreStore, GetBlob, PutBlob,
+        WriteLogicalFilePathRequest, WriteLogicalFileRequest,
         core_object_ref_from_logical_file_write, decode_core_object_ref_target,
         decode_manifest_locator_proto, encode_core_object_ref_target,
         encode_manifest_locator_proto,
@@ -162,7 +162,10 @@ pub struct ObjectHeadResult {
 
 pub(crate) struct ObjectMutationPreconditionSnapshot {
     pub(crate) object: Option<Object>,
-    pub(crate) precondition: CoreMutationPrecondition,
+    pub(crate) precondition: (
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    ),
 }
 
 #[derive(Debug, Clone)]

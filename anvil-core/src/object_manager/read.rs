@@ -1285,33 +1285,40 @@ impl ObjectManager {
         let bucket = self
             .get_tenant_bucket(claims.tenant_id, bucket_name)
             .await?;
-        let snapshot = if let Some((transaction_id, principal)) = transaction {
-            let tuple_key = self
-                .core_store
-                .object_metadata_current_tuple_key(&bucket, object_key);
-            let logical_key = crate::mvcc_product::coremeta_logical_key(
-                crate::core_store::CF_OBJECT_HEADS,
-                crate::core_store::TABLE_OBJECT_HEAD_ROW,
-                &tuple_key,
-            )
+        let tuple_key = self
+            .core_store
+            .object_metadata_current_tuple_key(&bucket, object_key);
+        let logical_key = crate::mvcc_product::coremeta_logical_key(
+            crate::core_store::CF_OBJECT_HEADS,
+            crate::core_store::TABLE_OBJECT_HEAD_ROW,
+            &tuple_key,
+        )
+        .map_err(|error| Status::internal(error.to_string()))?;
+        let mvcc = self
+            .persistence
+            .mvcc()
             .map_err(|error| Status::internal(error.to_string()))?;
-            let payload = self
-                .persistence
-                .mvcc()
-                .map_err(|error| Status::internal(error.to_string()))?
-                .read_transaction_value(transaction_id, principal, &logical_key)
-                .map_err(|error| Status::internal(error.to_string()))?;
-            self.core_store
-                .object_metadata_precondition_snapshot_from_payload(&bucket, object_key, payload)
+        let payload = if let Some((transaction_id, principal)) = transaction {
+            mvcc.read_transaction_value(transaction_id, principal, &logical_key)
                 .map_err(|error| Status::internal(error.to_string()))?
         } else {
-            self.core_store
-                .object_metadata_precondition_snapshot(&bucket, object_key)
+            mvcc.read_latest_value(&logical_key)
                 .map_err(|error| Status::internal(error.to_string()))?
         };
+        let object = payload
+            .as_deref()
+            .map(crate::core_store::decode_object_metadata_row)
+            .transpose()
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let predicate = payload
+            .as_deref()
+            .map(|value| {
+                crate::mvcc_transaction::PredicateKind::ValueHash(*blake3::hash(value).as_bytes())
+            })
+            .unwrap_or(crate::mvcc_transaction::PredicateKind::Absent);
         Ok(ObjectMutationPreconditionSnapshot {
-            object: snapshot.object,
-            precondition: snapshot.precondition,
+            object,
+            precondition: (logical_key, predicate),
         })
     }
 

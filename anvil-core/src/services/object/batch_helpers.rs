@@ -1,10 +1,7 @@
 use super::*;
-use crate::core_store::CoreMutationPrecondition;
-
 const MAX_MUTATION_BATCH_OPERATIONS: usize = 256;
 
 pub(super) struct PreparedWritePreconditions {
-    pub physical: Vec<CoreMutationPrecondition>,
     pub mvcc: Vec<(
         crate::mvcc_transaction::LogicalKey,
         crate::mvcc_transaction::PredicateKind,
@@ -28,10 +25,7 @@ pub(super) async fn prepare_write_preconditions(
     transaction: Option<(&str, &str)>,
 ) -> Result<PreparedWritePreconditions, Status> {
     let Some(precondition) = precondition else {
-        return Ok(PreparedWritePreconditions {
-            physical: Vec::new(),
-            mvcc: Vec::new(),
-        });
+        return Ok(PreparedWritePreconditions { mvcc: Vec::new() });
     };
     let object_checks = precondition
         .object_versions
@@ -83,10 +77,10 @@ pub(super) async fn prepare_write_preconditions(
                 )),
             }
         });
-    let mut durable_preconditions = Vec::with_capacity(precondition.object_versions.len() + 1);
-    let mut mvcc_preconditions = Vec::with_capacity(1);
+    let mut mvcc_preconditions =
+        Vec::with_capacity(precondition.object_versions.len().saturating_add(1));
     for result in futures_util::future::join_all(object_checks).await {
-        durable_preconditions.push(result?);
+        mvcc_preconditions.push(result?);
     }
 
     if let Some(lease_fence) = precondition.lease_fence.as_ref() {
@@ -119,7 +113,6 @@ pub(super) async fn prepare_write_preconditions(
     }
 
     Ok(PreparedWritePreconditions {
-        physical: durable_preconditions,
         mvcc: mvcc_preconditions,
     })
 }
@@ -291,7 +284,13 @@ pub(super) async fn prepare_mutation_batch_native_preconditions(
     claims: &auth::Claims,
     req: &MutationBatchRequest,
     transaction: Option<(&str, &str)>,
-) -> Result<Vec<CoreMutationPrecondition>, Status> {
+) -> Result<
+    Vec<(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )>,
+    Status,
+> {
     let mut preconditions = Vec::new();
     for operation in &req.operations {
         let Some(op) = operation.op.as_ref() else {
