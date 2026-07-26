@@ -958,7 +958,7 @@ fn object_current_history_object_prefix(bucket: &Bucket, object_key: &str) -> Ve
     ])
 }
 
-pub(super) fn object_current_history_key(
+pub(crate) fn object_current_history_key(
     bucket: &Bucket,
     object_key: &str,
     root_generation: u64,
@@ -1007,7 +1007,7 @@ fn object_version_history_object_prefix(
     ])
 }
 
-pub(super) fn object_version_history_key(
+pub(crate) fn object_version_history_key(
     bucket: &Bucket,
     object_key: &str,
     version_id: uuid::Uuid,
@@ -1041,7 +1041,7 @@ pub(crate) fn object_current_page_bucket_prefix(bucket: &Bucket) -> Vec<u8> {
     object_ordered_prefix(OBJECT_CURRENT_PAGE_FAMILY, bucket, "")
 }
 
-pub(super) fn object_key_catalog_key(bucket: &Bucket, object: &Object) -> Vec<u8> {
+pub(crate) fn object_key_catalog_key(bucket: &Bucket, object: &Object) -> Vec<u8> {
     object_current_page_key(OBJECT_KEY_CATALOG_FAMILY, bucket, &object.key)
 }
 
@@ -1053,7 +1053,7 @@ pub(crate) fn object_version_page_key_for_object(
     object_version_page_key(OBJECT_VERSION_PAGE_FAMILY, bucket, object, root_generation)
 }
 
-pub(super) fn object_version_catalog_key(
+pub(crate) fn object_version_catalog_key(
     bucket: &Bucket,
     object: &Object,
     root_generation: u64,

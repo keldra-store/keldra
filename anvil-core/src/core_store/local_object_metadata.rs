@@ -12,6 +12,8 @@ mod projections;
 use projections::*;
 pub(crate) use projections::{
     CurrentObjectMetadataPage, ObjectMetadataPageCursor, ObjectVersionsMetadataPage,
+    object_current_history_key, object_key_catalog_key, object_version_catalog_key,
+    object_version_history_key,
 };
 
 #[path = "local_object_metadata/mutation.rs"]
@@ -187,7 +189,7 @@ fn encode_object_metadata_row_at_generation(
     )
 }
 
-fn encode_object_metadata_row_at_generation_for_transaction(
+pub(crate) fn encode_object_metadata_row_at_generation_for_transaction(
     object: &Object,
     root_generation: u64,
     transaction_id: &str,
@@ -213,7 +215,7 @@ fn encode_object_metadata_row_at_generation_with_delete_marker(
     )
 }
 
-fn encode_object_metadata_row_at_generation_with_delete_marker_for_transaction(
+pub(crate) fn encode_object_metadata_row_at_generation_with_delete_marker_for_transaction(
     object: &Object,
     root_generation: u64,
     delete_marker: bool,
@@ -352,7 +354,7 @@ fn decode_object_metadata_row_with_common(bytes: &[u8]) -> Result<DecodedObjectM
     })
 }
 
-fn encode_object_metadata_counter_at_generation(
+pub(crate) fn encode_object_metadata_counter_at_generation(
     bucket: &Bucket,
     max_id: i64,
     root_generation: u64,

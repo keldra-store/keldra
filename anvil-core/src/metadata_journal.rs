@@ -2087,6 +2087,13 @@ pub(crate) use self::object_mutation::{
     commit_object_put_mutations_with_permit,
 };
 
+mod object_projection;
+pub(crate) use self::object_projection::{
+    ObjectProjectionSnapshot, ObjectVersionSnapshot, object_current_logical_key,
+    object_id_counter_logical_key, object_version_logical_key, plan_object_delete_version,
+    plan_object_upsert,
+};
+
 mod version_sort;
 use self::version_sort::{
     object_versions_by_key, sort_versions_for_key, sort_versions_for_key_descending,
