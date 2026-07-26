@@ -118,3 +118,32 @@ that each scanned head key is the canonical state key for the decoded stream.
 No production or disabled/test-only `CoreStore` append-journal helper remains.
 The journal stores only references to immutable payload objects; the referenced
 bytes continue to use the physical object/shard layer.
+
+## Object append-stream follow-up evidence
+
+The object API no longer duplicates each append payload into a physical
+CoreStore stream or reads mutable append records from that stream. It writes
+each payload once as an immutable logical object, certifies its reference and
+record metadata through the append MVCC journal, pages records at one MVCC
+snapshot, and resolves bytes through the immutable object reference only when
+requested. Payload hash and size are verified on resolution.
+
+Sealing no longer asks CoreStore to create a second physical stream segment.
+The sealed identity is a domain-separated digest of the canonical MVCC record
+head and immutable payload identity; its record count is the certified terminal
+sequence. Caller-owned transactions observe their staged record head when
+sealing. The old physical stream IDs, partitions, append calls, read fallback,
+and segment-seal helpers were removed.
+
+After this refresh, remaining production CoreStore calls outside the excluded
+PersonalDB/object-link/audit groups classify as:
+
+- immutable segment, manifest, blob, upload-part, or erasure-shard bytes;
+- compact-MVCC internal durability, materialisation, node identity, or fencing;
+- external mesh/region/cell/node streamed control, which must not be moved into
+  cluster MVCC;
+- external gateway security-audit ingestion;
+- node-local watch lag telemetry.
+
+The concurrently edited object metadata mutation group remains the only large
+cluster product cutover not classified by this refresh.

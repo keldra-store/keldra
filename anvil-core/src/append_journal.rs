@@ -207,9 +207,9 @@ mod read;
 
 pub use read::{
     AppendStreamPage, AppendStreamRecordPage, append_record_source_cursor_mvcc,
-    append_stream_has_records, get_active_append_stream_in_transaction,
-    get_active_append_stream_mvcc, list_append_stream_records_page_mvcc,
-    list_append_streams_page_mvcc,
+    append_stream_has_records, append_stream_segment_hash, get_active_append_stream_in_transaction,
+    get_active_append_stream_mvcc, list_append_stream_records_page_at_mvcc_snapshot,
+    list_append_stream_records_page_mvcc, list_append_streams_page_mvcc,
 };
 use read::{append_record_cursor_stream_id, append_record_stream_id, append_state_stream_id};
 

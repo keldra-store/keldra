@@ -1,10 +1,9 @@
 use crate::{
     access_control, auth, bucket_journal,
     core_store::{
-        AppendStreamRecord as CoreAppendStreamRecord, AuthzScopeRef, CoreBoundarySchema,
-        CoreBoundarySource, CoreBoundaryValue, CoreByteRange, CoreManifestLocator,
-        CoreMutationPrecondition, CoreObjectRef, CorePrefetchPolicy, CoreStore, GetBlob, PutBlob,
-        SealStreamSegment, WriteLogicalFilePathRequest, WriteLogicalFileRequest,
+        AuthzScopeRef, CoreBoundarySchema, CoreBoundarySource, CoreBoundaryValue, CoreByteRange,
+        CoreManifestLocator, CoreMutationPrecondition, CoreObjectRef, CorePrefetchPolicy,
+        CoreStore, GetBlob, PutBlob, WriteLogicalFilePathRequest, WriteLogicalFileRequest,
         core_object_ref_from_logical_file_write, decode_core_object_ref_target,
         decode_manifest_locator_proto, encode_core_object_ref_target,
         encode_manifest_locator_proto,
@@ -1591,7 +1590,6 @@ impl ObjectManager {
         .ok_or_else(|| Status::not_found("Append stream not found"))?;
 
         let payload_size = payload.len() as i64;
-        let core_stream_payload = payload.clone();
         let stream_payload_mutation_id = uuid::Uuid::new_v4().to_string();
         let object_ref = self
             .core_store
@@ -1613,31 +1611,6 @@ impl ObjectManager {
             .await
             .map_err(core_store_status)?;
         let payload_hash = object_ref.hash.clone();
-        if transaction_id.is_none() {
-            self.core_store
-                .append_stream_authenticated(
-                    CoreAppendStreamRecord {
-                        stream_id: core_append_stream_id(tenant_id, bucket.id, stream_id),
-                        partition_id: core_append_stream_partition_id(tenant_id, bucket.id),
-                        record_kind: "append_stream.record".to_string(),
-                        payload: core_stream_payload,
-                        content_type: content_type.clone(),
-                        user_metadata_json: user_metadata
-                            .as_ref()
-                            .map(serde_json::Value::to_string)
-                            .unwrap_or_else(|| "{}".to_string()),
-                        fence: None,
-                        transaction_id: None,
-                        idempotency_key: Some(format!(
-                            "append-stream:{tenant_id}:{}:{stream_id}:{}",
-                            bucket.id, stream_payload_mutation_id
-                        )),
-                    },
-                    &authenticated_principal,
-                )
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
-        }
         let mutation = if let Some(transaction_id) = transaction_id {
             self.persistence
                 .append_stream_record_in_transaction(
@@ -1744,18 +1717,11 @@ impl ObjectManager {
             ));
         }
 
-        let core_segment = self
-            .core_store
-            .seal_stream_segment(SealStreamSegment {
-                stream_id: core_append_stream_id(tenant_id, bucket.id, stream_id),
-                partition_id: core_append_stream_partition_id(tenant_id, bucket.id),
-                through_sequence: None,
-                segment_kind: "append_stream.segment".to_string(),
-                mutation_id: format!("append-stream-seal-{stream_id}-{}", uuid::Uuid::new_v4()),
-            })
+        let (segment_hash, record_count) = self
+            .persistence
+            .append_stream_segment_hash(mvcc.map(AsRef::as_ref), &stream, transaction)
             .await
-            .map_err(core_store_status)?;
-        let segment_hash = core_segment.object_ref.hash.clone();
+            .map_err(|error| Status::internal(error.to_string()))?;
         let sealed = if let Some(transaction_id) = transaction_id {
             let transaction_principal = transaction_principal.ok_or_else(|| {
                 Status::invalid_argument("transaction principal is required for append stream seal")
@@ -1783,7 +1749,7 @@ impl ObjectManager {
         };
 
         Ok(SealAppendStreamResult {
-            record_count: core_segment.record_count,
+            record_count,
             segment_hash,
             receipt,
         })
@@ -1812,50 +1778,58 @@ impl ObjectManager {
             &format!("{bucket_name}/{stream_key}"),
         )
         .await?;
-        let _stream = self
+        let stream = self
             .persistence
             .get_active_append_stream(claims.tenant_id, bucket.id, stream_key, stream_id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Append stream not found"))?;
         let limit = if limit == 0 { 100 } else { limit.min(1000) } as usize;
-        let read = crate::core_store::ReadStream {
-            stream_id: core_append_stream_id(claims.tenant_id, bucket.id, stream_id),
-            after_sequence,
-            limit,
+        let snapshot = match consistency {
+            ObjectReadConsistency::AtRootGeneration(generation) => generation,
+            ObjectReadConsistency::Latest | ObjectReadConsistency::AtAuthzRevision(_) => self
+                .persistence
+                .mvcc()
+                .and_then(|mvcc| mvcc.runtime.applied_version())
+                .map_err(|error| Status::internal(error.to_string()))?,
         };
-        let mut records = match consistency.root_generation() {
-            Some(root_generation) => {
-                self.core_store
-                    .read_stream_at_generation(read, root_generation)
-                    .await
-            }
-            None => self.core_store.read_stream(read).await,
-        }
-        .map_err(|e| Status::internal(e.to_string()))?;
-        records.sort_by_key(|record| record.sequence);
+        let records = self
+            .persistence
+            .list_append_stream_records_at_snapshot(&stream, snapshot, after_sequence, limit)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?
+            .records;
 
         let mut out = Vec::with_capacity(records.len());
         for record in records {
-            let user_metadata = serde_json::from_str::<JsonValue>(&record.user_metadata_json)
-                .ok()
-                .filter(|value| value.is_object());
             let payload = if include_payload {
-                Some(record.payload.clone())
+                let bytes = self
+                    .core_store
+                    .get_blob(crate::core_store::GetBlob {
+                        object_ref: record.payload_object_ref.clone(),
+                    })
+                    .await
+                    .map_err(|error| Status::internal(error.to_string()))?;
+                if record.payload_object_ref.hash != record.payload_hash
+                    || i64::try_from(bytes.len()).ok() != Some(record.payload_size)
+                {
+                    return Err(Status::data_loss(
+                        "Append record payload does not match its immutable reference",
+                    ));
+                }
+                Some(bytes)
             } else {
                 None
             };
             out.push(AppendStreamRecordRead {
-                record_sequence: record.sequence,
+                record_sequence: u64::try_from(record.record_sequence)
+                    .map_err(|_| Status::internal("Append record sequence is negative"))?,
                 payload_hash: record.payload_hash,
-                payload_size: i64::try_from(record.payload.len())
-                    .map_err(|_| Status::internal("Append record payload exceeds i64"))?,
+                payload_size: record.payload_size,
                 content_type: record.content_type,
-                user_metadata,
+                user_metadata: record.user_meta,
                 authenticated_principal: record.authenticated_principal,
-                created_at: chrono::DateTime::parse_from_rfc3339(&record.created_at)
-                    .map_err(|_| Status::internal("Invalid append record timestamp"))?
-                    .with_timezone(&chrono::Utc),
+                created_at: record.created_at,
                 payload,
             });
         }
@@ -2363,14 +2337,6 @@ fn normalise_boundary_value(value_type: &str, value: &JsonValue) -> AnyhowResult
 
 fn trim_s3_etag(value: &str) -> &str {
     value.trim().trim_matches('"')
-}
-
-fn core_append_stream_id(tenant_id: i64, bucket_id: i64, stream_id: uuid::Uuid) -> String {
-    format!("object-append-stream-{tenant_id}-{bucket_id}-{stream_id}")
-}
-
-fn core_append_stream_partition_id(tenant_id: i64, bucket_id: i64) -> String {
-    format!("object-append-partition-{tenant_id}-{bucket_id}")
 }
 
 fn core_store_status(error: anyhow::Error) -> Status {

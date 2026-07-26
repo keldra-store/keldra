@@ -26,6 +26,17 @@ pub fn list_append_stream_records_page_mvcc(
     ensure_page_size(limit)?;
     let (snapshot, after_sequence) =
         decode_append_cursor(after_cursor, mvcc.runtime.applied_version()?)?;
+    list_append_stream_records_page_at_mvcc_snapshot(mvcc, stream, snapshot, after_sequence, limit)
+}
+
+pub fn list_append_stream_records_page_at_mvcc_snapshot(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    stream: &AppendStream,
+    snapshot: u64,
+    after_sequence: u64,
+    limit: usize,
+) -> Result<AppendStreamRecordPage> {
+    ensure_page_size(limit)?;
     let stream_id = append_record_stream_id(stream)?;
     let prefix = crate::mvcc_product::stream_logical_key(
         crate::core_store::TABLE_STREAM_RECORD_INDEX_ROW,
@@ -281,6 +292,41 @@ pub fn append_stream_has_records(
         None,
     )?;
     Ok(mvcc.read_latest_value(&key)?.is_some())
+}
+
+pub fn append_stream_segment_hash(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    stream: &AppendStream,
+    transaction: Option<(&str, &str)>,
+) -> Result<(String, u64)> {
+    let key = crate::mvcc_product::stream_logical_key(
+        crate::core_store::TABLE_STREAM_HEAD_ROW,
+        &append_record_stream_id(stream)?,
+        None,
+    )?;
+    let value = if let Some((transaction_id, principal)) = transaction {
+        let value = mvcc.read_transaction_value(transaction_id, principal, &key)?;
+        stage_read_predicate(mvcc, transaction_id, principal, key, value.as_deref())?;
+        value
+    } else {
+        mvcc.read_latest_value(&key)?
+    }
+    .ok_or_else(|| anyhow!("append stream has no record head"))?;
+    let body = decode_append_body(&value)?;
+    let record = body
+        .record
+        .ok_or_else(|| anyhow!("append stream record head is missing its record"))?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"anvil.append.segment.v1\0");
+    hasher.update(stream.stream_id.as_bytes());
+    hasher.update(&record.record_sequence.to_be_bytes());
+    hasher.update(record.payload_hash.as_bytes());
+    hasher.update(&record.payload_size.to_be_bytes());
+    Ok((
+        hasher.finalize().to_hex().to_string(),
+        u64::try_from(record.record_sequence)
+            .map_err(|_| anyhow!("append record sequence is negative"))?,
+    ))
 }
 
 pub fn append_record_source_cursor_mvcc(
