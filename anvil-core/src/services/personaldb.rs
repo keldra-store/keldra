@@ -5,13 +5,11 @@ use crate::{
     anvil_personaldb_sqlite_changeset::iterate_changeset,
     auth, authz_journal,
     authz_scope::{DEFAULT_AUTHZ_REALM_ID, encode_realm_namespace},
-    core_store::CoreMutationPrecondition,
     error_codes::AnvilErrorCode,
     formats::{Hash32, hash32, personaldb::PersonalDbLogRecord as CorePersonalDbLogRecord},
     partition_fence::{
         PartitionOwnerStatus, PartitionRecoveryAcquire, PartitionWritePermit,
-        acquire_partition_recovery, partition_write_precondition, publish_partition_ready,
-        read_partition_owner,
+        acquire_partition_recovery, publish_partition_ready, read_partition_owner,
     },
     permissions::AnvilAction,
     personaldb_catchup::{
@@ -754,23 +752,6 @@ impl AppState {
         .map_err(internal_status)?;
         ready.write_permit().map_err(|err| {
             Status::failed_precondition(format!("PersonalDB partition is not writable: {err}"))
-        })
-    }
-
-    async fn personaldb_group_write_precondition(
-        &self,
-        permit: &PartitionWritePermit,
-    ) -> Result<CoreMutationPrecondition, Status> {
-        partition_write_precondition(
-            &self.storage,
-            permit,
-            self.persistence.partition_owner_signing_key(),
-        )
-        .await
-        .map_err(|err| {
-            Status::failed_precondition(format!(
-                "PersonalDB partition write fence is not current: {err}"
-            ))
         })
     }
 
