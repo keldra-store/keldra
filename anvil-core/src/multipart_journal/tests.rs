@@ -9,7 +9,7 @@ async fn create_multipart_upload(
     bucket_id: i64,
     key: &str,
 ) -> Result<MultipartUploadMutation> {
-    create_multipart_upload_inner(storage, tenant_id, bucket_id, key, 0, None, None).await
+    create_multipart_upload_inner(storage, tenant_id, bucket_id, key, 0, None, None, None).await
 }
 
 async fn upsert_multipart_part(
@@ -29,6 +29,7 @@ async fn upsert_multipart_part(
         etag,
         None,
         None,
+        None,
     )
     .await
 }
@@ -37,7 +38,7 @@ async fn complete_multipart_upload(
     storage: &Storage,
     upload_row_id: i64,
 ) -> Result<MultipartCompletionMutation> {
-    complete_multipart_upload_inner(storage, upload_row_id, None, None).await
+    complete_multipart_upload_inner(storage, upload_row_id, None, None, None).await
 }
 
 async fn read_events_from_store(
@@ -534,6 +535,7 @@ pub(crate) async fn multipart_journal_batch_rejects_stale_partition_precondition
         "obj",
         stale_permit.fence_token,
         Some(stale_precondition),
+        None,
         None,
     )
     .await

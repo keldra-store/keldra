@@ -466,6 +466,50 @@ impl OpenTransactionRegistry {
         })
     }
 
+    /// Return this transaction's latest staged value for `key`.
+    ///
+    /// `None` means the transaction has not written the key. `Some(None)` is a
+    /// staged tombstone and `Some(Some(value))` is a staged put.
+    pub fn staged_value(
+        &self,
+        transaction_id: &str,
+        principal: &str,
+        key: &LogicalKey,
+    ) -> Result<Option<Option<Vec<u8>>>> {
+        let draft = self.load_for_principal(transaction_id, principal)?;
+        if !matches!(
+            draft.state,
+            DraftState::Open | DraftState::Committing { .. }
+        ) {
+            bail!("transaction can no longer be read");
+        }
+        Ok(draft
+            .mutations
+            .writes
+            .iter()
+            .rev()
+            .find(|write| write.key() == key)
+            .map(|write| match write {
+                WriteOperation::Put { value, .. } => Some(value.clone()),
+                WriteOperation::Delete { .. } => None,
+            }))
+    }
+
+    pub fn staged_writes(
+        &self,
+        transaction_id: &str,
+        principal: &str,
+    ) -> Result<Vec<WriteOperation>> {
+        let draft = self.load_for_principal(transaction_id, principal)?;
+        if !matches!(
+            draft.state,
+            DraftState::Open | DraftState::Committing { .. }
+        ) {
+            bail!("transaction can no longer be read");
+        }
+        Ok(draft.mutations.writes.clone())
+    }
+
     pub fn status(
         &self,
         transaction_id: &str,
@@ -866,13 +910,7 @@ mod tests {
             )
             .unwrap();
         registry
-            .stage_logical_mutations(
-                &handle.transaction_id,
-                "alice",
-                "cluster",
-                mutations,
-                1_002,
-            )
+            .stage_logical_mutations(&handle.transaction_id, "alice", "cluster", mutations, 1_002)
             .unwrap();
         assert!(
             registry

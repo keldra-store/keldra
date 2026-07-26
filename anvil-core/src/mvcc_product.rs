@@ -7,9 +7,7 @@
 use anyhow::{Result, bail};
 
 use crate::{
-    core_store::{
-        CoreMutationOperation, TABLE_STREAM_RECORD_INDEX_ROW,
-    },
+    core_store::{CoreMutationOperation, TABLE_STREAM_RECORD_INDEX_ROW},
     mvcc_bootstrap::MvccSubsystem,
     mvcc_open_transactions::StagedLogicalMutation,
     mvcc_transaction::LogicalKey,
@@ -52,9 +50,8 @@ pub fn coremeta_logical_key(cf: &str, table_id: u16, tuple_key: &[u8]) -> Result
     if cf.is_empty() {
         bail!("CoreMeta column-family namespace must not be empty");
     }
-    let mut application_key = Vec::with_capacity(
-        CORE_META_KEY_SCHEMA.len() + 2 + cf.len() + tuple_key.len(),
-    );
+    let mut application_key =
+        Vec::with_capacity(CORE_META_KEY_SCHEMA.len() + 2 + cf.len() + tuple_key.len());
     application_key.extend_from_slice(CORE_META_KEY_SCHEMA);
     push_len_prefixed(&mut application_key, cf.as_bytes())?;
     application_key.extend_from_slice(tuple_key);
@@ -74,8 +71,7 @@ pub fn stream_logical_key(
     if stream_id.is_empty() {
         bail!("stream ID must not be empty");
     }
-    let mut application_key =
-        Vec::with_capacity(STREAM_KEY_SCHEMA.len() + 2 + stream_id.len() + 8);
+    let mut application_key = Vec::with_capacity(STREAM_KEY_SCHEMA.len() + 2 + stream_id.len() + 8);
     application_key.extend_from_slice(STREAM_KEY_SCHEMA);
     push_len_prefixed(&mut application_key, stream_id.as_bytes())?;
     if let Some(sequence) = sequence {
@@ -123,8 +119,9 @@ pub fn product_mutations_from_operations(
                 idempotency_key,
                 ..
             } => {
-                let idempotency_key = idempotency_key
-                    .ok_or_else(|| anyhow::anyhow!("MVCC stream append requires idempotency key"))?;
+                let idempotency_key = idempotency_key.ok_or_else(|| {
+                    anyhow::anyhow!("MVCC stream append requires idempotency key")
+                })?;
                 let key = stream_logical_key(
                     TABLE_STREAM_RECORD_INDEX_ROW,
                     &stream_id,
@@ -144,6 +141,30 @@ pub fn product_mutations_from_operations(
 }
 
 impl MvccSubsystem {
+    /// Read through this transaction's own write set, then through its fixed
+    /// MVCC snapshot. A staged tombstone is returned as an absent value.
+    pub fn read_transaction_value(
+        &self,
+        transaction_id: &str,
+        principal: &str,
+        key: &LogicalKey,
+    ) -> Result<Option<Vec<u8>>> {
+        if let Some(staged) = self
+            .open_transactions
+            .staged_value(transaction_id, principal, key)?
+        {
+            return Ok(staged);
+        }
+        let snapshot = self
+            .open_transactions
+            .handle(transaction_id)?
+            .snapshot_version;
+        Ok(self
+            .runtime
+            .read_at(key, snapshot)?
+            .map(|visible| visible.value))
+    }
+
     /// Observe and stage a complete product operation in one durable registry
     /// update. All reads use the transaction's original snapshot.
     pub fn stage_product_mutations(
@@ -154,7 +175,10 @@ impl MvccSubsystem {
         now_unix_ms: u64,
     ) -> Result<()> {
         let binding = self.open_transactions.binding(transaction_id, principal)?;
-        let snapshot = self.open_transactions.handle(transaction_id)?.snapshot_version;
+        let snapshot = self
+            .open_transactions
+            .handle(transaction_id)?
+            .snapshot_version;
         let staged = mutations
             .into_iter()
             .map(|mutation| {
@@ -189,7 +213,11 @@ fn push_len_prefixed(output: &mut Vec<u8>, value: &[u8]) -> Result<()> {
 fn stable_stream_ordinal(idempotency_key: &str) -> u64 {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(idempotency_key.as_bytes());
-    u64::from_be_bytes(digest[..8].try_into().expect("sha256 prefix is eight bytes"))
+    u64::from_be_bytes(
+        digest[..8]
+            .try_into()
+            .expect("sha256 prefix is eight bytes"),
+    )
 }
 
 #[cfg(test)]

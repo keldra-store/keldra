@@ -3,10 +3,11 @@ use crate::core_store::{
     CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
     CoreMutationRootPublication, CoreObjectEncoding, CoreObjectPlacement, CoreObjectRef, CoreStore,
     CoreTransaction, CoreTransactionUpdate, TABLE_MULTIPART_PART_CURRENT_ROW,
-    TABLE_MULTIPART_UPLOAD_CURRENT_ROW, canonical_coremeta_cf_name, core_meta_committed_row_common,
-    core_meta_record_tuple_key, core_meta_root_key_hash, core_meta_tuple_key,
+    TABLE_MULTIPART_UPLOAD_CURRENT_ROW, core_meta_committed_row_common, core_meta_record_tuple_key,
+    core_meta_root_key_hash, core_meta_tuple_key,
 };
 use crate::formats::{Hash32, hash32, writer::WriterFamily};
+use crate::mvcc_transaction::WriteOperation as CoreWriteOperation;
 use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
 use crate::persistence::{
     MetadataMutationReceipt, MultipartAbortMutation, MultipartCompletionMutation,
@@ -14,7 +15,7 @@ use crate::persistence::{
     MultipartUploadPartMutation, MultipartUploadsPage,
 };
 use crate::storage::Storage;
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use prost::Message;
 use std::collections::BTreeMap;
@@ -36,7 +37,6 @@ use codec::{
 };
 #[cfg(test)]
 use codec::{decode_multipart_event, decode_multipart_event_fence};
-use current_rows::*;
 #[cfg(test)]
 use current_rows::{
     MultipartActiveCountCurrentRow, MultipartCurrentRowUpdate, encode_active_count_current_row,
@@ -296,12 +296,14 @@ pub(crate) async fn create_multipart_upload_with_permit(
         permit.fence_token,
         Some(partition_precondition),
         None,
+        None,
     )
     .await
 }
 
 pub(crate) async fn create_multipart_upload_with_permit_in_transaction(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     bucket_id: i64,
     key: &str,
@@ -320,6 +322,7 @@ pub(crate) async fn create_multipart_upload_with_permit_in_transaction(
         key,
         permit.fence_token,
         Some(partition_precondition),
+        Some(mvcc),
         Some((transaction_id, transaction_principal)),
     )
     .await
@@ -332,6 +335,7 @@ async fn create_multipart_upload_inner(
     key: &str,
     fence_token: u64,
     partition_precondition: Option<CoreMutationPrecondition>,
+    mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
     transaction: Option<(&str, &str)>,
 ) -> Result<MultipartUploadMutation> {
     let upload_id = uuid::Uuid::new_v4();
@@ -354,6 +358,7 @@ async fn create_multipart_upload_inner(
         None,
         fence_token,
         partition_precondition,
+        mvcc,
         transaction,
     )
     .await?;
@@ -368,13 +373,14 @@ pub async fn get_active_multipart_upload(
     upload_id: uuid::Uuid,
 ) -> Result<Option<MultipartUpload>> {
     get_active_multipart_upload_for_optional_transaction(
-        storage, tenant_id, bucket_id, key, upload_id, None,
+        storage, None, tenant_id, bucket_id, key, upload_id, None,
     )
     .await
 }
 
 pub async fn get_active_multipart_upload_in_transaction(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     bucket_id: i64,
     key: &str,
@@ -384,6 +390,7 @@ pub async fn get_active_multipart_upload_in_transaction(
 ) -> Result<Option<MultipartUpload>> {
     get_active_multipart_upload_for_optional_transaction(
         storage,
+        Some(mvcc),
         tenant_id,
         bucket_id,
         key,
@@ -395,27 +402,25 @@ pub async fn get_active_multipart_upload_in_transaction(
 
 async fn get_active_multipart_upload_for_optional_transaction(
     storage: &Storage,
+    mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
     tenant_id: i64,
     bucket_id: i64,
     key: &str,
     upload_id: uuid::Uuid,
     transaction: Option<(&str, &str)>,
 ) -> Result<Option<MultipartUpload>> {
-    let core_store = CoreStore::new(storage.clone()).await?;
     let tuple_key = multipart_active_upload_key(bucket_id, key, upload_id)?;
     let transaction_scoped = transaction.is_some();
-    let payload = if let Some(transaction) = transaction {
-        let transaction = read_transaction_for_optional_scope(&core_store, Some(transaction))
-            .await?
-            .ok_or_else(|| anyhow!("multipart transaction scope is missing"))?;
-        coremeta_payload_visible_to_transaction(
-            &core_store,
-            &transaction,
+    let payload = if let Some((transaction_id, principal)) = transaction {
+        let mvcc = mvcc.ok_or_else(|| anyhow!("MVCC staging handle is required"))?;
+        let logical_key = crate::mvcc_product::coremeta_logical_key(
             CF_OBJECT_HEADS,
             TABLE_MULTIPART_UPLOAD_CURRENT_ROW,
             &tuple_key,
-        )?
+        )?;
+        mvcc.read_transaction_value(transaction_id, principal, &logical_key)?
     } else {
+        let core_store = CoreStore::new(storage.clone()).await?;
         core_store.read_coremeta_row(
             CF_OBJECT_HEADS,
             TABLE_MULTIPART_UPLOAD_CURRENT_ROW,
@@ -476,12 +481,14 @@ pub(crate) async fn upsert_multipart_part_with_permit(
         etag,
         Some((permit, partition_owner_signing_key)),
         None,
+        None,
     )
     .await
 }
 
 pub(crate) async fn upsert_multipart_part_with_permit_in_transaction(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     upload_row_id: i64,
     part_number: i32,
     object_ref: CoreObjectRef,
@@ -500,6 +507,7 @@ pub(crate) async fn upsert_multipart_part_with_permit_in_transaction(
         size,
         etag,
         Some((permit, partition_owner_signing_key)),
+        Some(mvcc),
         Some((transaction_id, transaction_principal)),
     )
     .await
@@ -513,6 +521,7 @@ async fn upsert_multipart_part_inner(
     size: i64,
     etag: &str,
     permit: Option<(&PartitionWritePermit, &[u8])>,
+    mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
     transaction: Option<(&str, &str)>,
 ) -> Result<MultipartUploadPartMutation> {
     if !(1..=MULTIPART_PART_NUMBER_MAX).contains(&part_number) {
@@ -521,7 +530,7 @@ async fn upsert_multipart_part_inner(
         ));
     }
     let (tenant_id, bucket_id, upload) =
-        find_upload_for_optional_transaction(storage, upload_row_id, transaction)
+        find_upload_for_optional_transaction(storage, mvcc, upload_row_id, transaction)
             .await?
             .ok_or_else(|| anyhow!("multipart upload not found"))?;
     if upload.completed_at.is_some() || upload.aborted_at.is_some() {
@@ -538,6 +547,7 @@ async fn upsert_multipart_part_inner(
     };
     let current = read_current_part_for_optional_transaction(
         storage,
+        mvcc,
         tenant_id,
         bucket_id,
         upload_row_id,
@@ -567,6 +577,7 @@ async fn upsert_multipart_part_inner(
         Some(part.clone()),
         fence_token,
         partition_precondition,
+        mvcc,
         transaction,
     )
     .await?;
@@ -577,17 +588,19 @@ pub async fn list_multipart_parts(
     storage: &Storage,
     upload_row_id: i64,
 ) -> Result<Vec<MultipartUploadPart>> {
-    list_multipart_parts_for_optional_transaction(storage, upload_row_id, None).await
+    list_multipart_parts_for_optional_transaction(storage, None, upload_row_id, None).await
 }
 
 pub async fn list_multipart_parts_in_transaction(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     upload_row_id: i64,
     transaction_id: &str,
     transaction_principal: &str,
 ) -> Result<Vec<MultipartUploadPart>> {
     list_multipart_parts_for_optional_transaction(
         storage,
+        Some(mvcc),
         upload_row_id,
         Some((transaction_id, transaction_principal)),
     )
@@ -692,12 +705,14 @@ pub(crate) async fn complete_multipart_upload_with_permit(
         upload_row_id,
         Some((permit, partition_owner_signing_key)),
         None,
+        None,
     )
     .await
 }
 
 pub(crate) async fn complete_multipart_upload_with_permit_in_transaction(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     upload_row_id: i64,
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
@@ -708,6 +723,7 @@ pub(crate) async fn complete_multipart_upload_with_permit_in_transaction(
         storage,
         upload_row_id,
         Some((permit, partition_owner_signing_key)),
+        Some(mvcc),
         Some((transaction_id, transaction_principal)),
     )
     .await
@@ -717,10 +733,11 @@ async fn complete_multipart_upload_inner(
     storage: &Storage,
     upload_row_id: i64,
     permit: Option<(&PartitionWritePermit, &[u8])>,
+    mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
     transaction: Option<(&str, &str)>,
 ) -> Result<MultipartCompletionMutation> {
     let Some((tenant_id, bucket_id, mut upload)) =
-        find_upload_for_optional_transaction(storage, upload_row_id, transaction).await?
+        find_upload_for_optional_transaction(storage, mvcc, upload_row_id, transaction).await?
     else {
         return Ok(MultipartCompletionMutation {
             completed: false,
@@ -752,6 +769,7 @@ async fn complete_multipart_upload_inner(
         None,
         fence_token,
         partition_precondition,
+        mvcc,
         transaction,
     )
     .await?;
@@ -782,12 +800,14 @@ pub(crate) async fn abort_multipart_upload_with_permit(
         permit.fence_token,
         Some(partition_precondition),
         None,
+        None,
     )
     .await
 }
 
 pub(crate) async fn abort_multipart_upload_with_permit_in_transaction(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     bucket_id: i64,
     key: &str,
@@ -808,6 +828,7 @@ pub(crate) async fn abort_multipart_upload_with_permit_in_transaction(
         upload_id,
         permit.fence_token,
         Some(partition_precondition),
+        Some(mvcc),
         Some((transaction_id, transaction_principal)),
     )
     .await
@@ -821,10 +842,12 @@ async fn abort_multipart_upload_inner(
     upload_id: uuid::Uuid,
     fence_token: u64,
     partition_precondition: Option<CoreMutationPrecondition>,
+    mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
     transaction: Option<(&str, &str)>,
 ) -> Result<MultipartAbortMutation> {
     let Some(mut upload) = get_active_multipart_upload_for_optional_transaction(
         storage,
+        mvcc,
         tenant_id,
         bucket_id,
         key,
@@ -848,6 +871,7 @@ async fn abort_multipart_upload_inner(
         None,
         fence_token,
         partition_precondition,
+        mvcc,
         transaction,
     )
     .await?;
@@ -868,12 +892,14 @@ pub async fn find_multipart_upload_partition(
 
 pub async fn find_multipart_upload_partition_in_transaction(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     upload_row_id: i64,
     transaction_id: &str,
     transaction_principal: &str,
 ) -> Result<Option<(i64, i64)>> {
     Ok(find_upload_for_optional_transaction(
         storage,
+        Some(mvcc),
         upload_row_id,
         Some((transaction_id, transaction_principal)),
     )
@@ -891,24 +917,24 @@ async fn find_upload(
 
 async fn find_upload_for_optional_transaction(
     storage: &Storage,
+    mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
     upload_row_id: i64,
     transaction: Option<(&str, &str)>,
 ) -> Result<Option<(i64, i64, MultipartUpload)>> {
     if transaction.is_none() {
         return find_upload(storage, upload_row_id).await;
     }
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let transaction = read_transaction_for_optional_scope(&core_store, transaction).await?;
     let tuple_key = multipart_upload_id_head_key(upload_row_id)?;
-    let payload = if let Some(transaction) = transaction.as_ref() {
-        coremeta_payload_visible_to_transaction(
-            &core_store,
-            transaction,
+    let payload = if let Some((transaction_id, principal)) = transaction {
+        let mvcc = mvcc.ok_or_else(|| anyhow!("MVCC staging handle is required"))?;
+        let logical_key = crate::mvcc_product::coremeta_logical_key(
             CF_OBJECT_HEADS,
             TABLE_MULTIPART_UPLOAD_CURRENT_ROW,
             &tuple_key,
-        )?
+        )?;
+        mvcc.read_transaction_value(transaction_id, principal, &logical_key)?
     } else {
+        let core_store = CoreStore::new(storage.clone()).await?;
         core_store.read_coremeta_row(
             CF_OBJECT_HEADS,
             TABLE_MULTIPART_UPLOAD_CURRENT_ROW,
@@ -918,43 +944,27 @@ async fn find_upload_for_optional_transaction(
     decode_upload_id_head(payload.as_deref(), upload_row_id, false)
 }
 
-async fn read_transaction_for_optional_scope<'a>(
-    core_store: &CoreStore,
-    transaction: Option<(&'a str, &'a str)>,
-) -> Result<Option<CoreTransaction>> {
-    let Some((transaction_id, principal)) = transaction else {
-        return Ok(None);
-    };
-    Ok(Some(
-        core_store
-            .read_explicit_transaction_for_principal(transaction_id, principal)
-            .await?,
-    ))
-}
-
 async fn read_current_part_for_optional_transaction(
     storage: &Storage,
+    mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
     tenant_id: i64,
     bucket_id: i64,
     upload_row_id: i64,
     part_number: i32,
     transaction: Option<(&str, &str)>,
 ) -> Result<Option<MultipartUploadPart>> {
-    let core_store = CoreStore::new(storage.clone()).await?;
     let tuple_key = multipart_part_row_key(tenant_id, bucket_id, upload_row_id, part_number)?;
     let transaction_scoped = transaction.is_some();
-    let payload = if let Some(transaction) = transaction {
-        let transaction = read_transaction_for_optional_scope(&core_store, Some(transaction))
-            .await?
-            .ok_or_else(|| anyhow!("multipart transaction scope is missing"))?;
-        coremeta_payload_visible_to_transaction(
-            &core_store,
-            &transaction,
+    let payload = if let Some((transaction_id, principal)) = transaction {
+        let mvcc = mvcc.ok_or_else(|| anyhow!("MVCC staging handle is required"))?;
+        let logical_key = crate::mvcc_product::coremeta_logical_key(
             CF_OBJECT_HEADS,
             TABLE_MULTIPART_PART_CURRENT_ROW,
             &tuple_key,
-        )?
+        )?;
+        mvcc.read_transaction_value(transaction_id, principal, &logical_key)?
     } else {
+        let core_store = CoreStore::new(storage.clone()).await?;
         core_store.read_coremeta_row(
             CF_OBJECT_HEADS,
             TABLE_MULTIPART_PART_CURRENT_ROW,
@@ -981,28 +991,75 @@ async fn read_current_part_for_optional_transaction(
 
 async fn list_multipart_parts_for_optional_transaction(
     storage: &Storage,
+    mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
     upload_row_id: i64,
     transaction: Option<(&str, &str)>,
 ) -> Result<Vec<MultipartUploadPart>> {
     let Some((tenant_id, bucket_id, _)) =
-        find_upload_for_optional_transaction(storage, upload_row_id, transaction).await?
+        find_upload_for_optional_transaction(storage, mvcc, upload_row_id, transaction).await?
     else {
         return Ok(Vec::new());
     };
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let mut parts =
-        read_all_multipart_parts_bounded(&core_store, tenant_id, bucket_id, upload_row_id)?;
-    if let Some(transaction) = transaction {
-        let transaction = read_transaction_for_optional_scope(&core_store, Some(transaction))
-            .await?
-            .ok_or_else(|| anyhow!("multipart transaction scope is missing"))?;
-        apply_transaction_parts(
-            &transaction,
-            tenant_id,
-            bucket_id,
-            upload_row_id,
-            &mut parts,
-        )?;
+    let tuple_prefix = multipart_upload_part_rows_prefix(tenant_id, bucket_id, upload_row_id)?;
+    let logical_prefix = crate::mvcc_product::coremeta_logical_key(
+        CF_OBJECT_HEADS,
+        TABLE_MULTIPART_PART_CURRENT_ROW,
+        &tuple_prefix,
+    )?;
+    let mut parts = if let Some((transaction_id, _)) = transaction {
+        let mvcc = mvcc.ok_or_else(|| anyhow!("MVCC staging handle is required"))?;
+        let snapshot = mvcc
+            .open_transactions
+            .handle(transaction_id)?
+            .snapshot_version;
+        let mut visible = BTreeMap::new();
+        for (_, row) in mvcc.runtime.scan_table_prefix_at(
+            TABLE_MULTIPART_PART_CURRENT_ROW,
+            &logical_prefix.application_key,
+            snapshot,
+        )? {
+            let row = decode_part_current_row(&row.value)?;
+            if row.tenant_id != tenant_id
+                || row.bucket_id != bucket_id
+                || row.part.upload_id != upload_row_id
+            {
+                bail!("multipart snapshot part row scope mismatch");
+            }
+            visible.insert(row.part.part_number, row.part);
+        }
+        visible
+    } else {
+        let core_store = CoreStore::new(storage.clone()).await?;
+        read_all_multipart_parts_bounded(&core_store, tenant_id, bucket_id, upload_row_id)?
+    };
+    if let Some((transaction_id, principal)) = transaction {
+        let mvcc = mvcc.ok_or_else(|| anyhow!("MVCC staging handle is required"))?;
+        for write in mvcc
+            .open_transactions
+            .staged_writes(transaction_id, principal)?
+        {
+            if write.key().table_id != TABLE_MULTIPART_PART_CURRENT_ROW
+                || !write
+                    .key()
+                    .application_key
+                    .starts_with(&logical_prefix.application_key)
+            {
+                continue;
+            }
+            match write {
+                CoreWriteOperation::Put { value, .. } => {
+                    let row = decode_part_current_row(&value)?;
+                    if row.tenant_id != tenant_id
+                        || row.bucket_id != bucket_id
+                        || row.part.upload_id != upload_row_id
+                    {
+                        bail!("multipart staged part row scope mismatch");
+                    }
+                    parts.insert(row.part.part_number, row.part);
+                }
+                CoreWriteOperation::Delete { .. } => {}
+            }
+        }
     }
     if parts.len() > MULTIPART_PART_COUNT_MAX {
         return Err(anyhow!(
@@ -1153,86 +1210,6 @@ fn page_multipart_parts_from_store(
     })
 }
 
-fn apply_transaction_parts(
-    transaction: &CoreTransaction,
-    tenant_id: i64,
-    bucket_id: i64,
-    upload_row_id: i64,
-    parts: &mut BTreeMap<i32, MultipartUploadPart>,
-) -> Result<()> {
-    let prefix = multipart_upload_part_rows_prefix(tenant_id, bucket_id, upload_row_id)?;
-    for update in &transaction.visible_updates {
-        match update {
-            CoreTransactionUpdate::CoreMetaPut {
-                cf,
-                table_id,
-                tuple_key,
-                payload,
-                ..
-            } => {
-                if canonical_coremeta_cf_name(cf)? != CF_OBJECT_HEADS
-                    || *table_id != TABLE_MULTIPART_PART_CURRENT_ROW
-                    || !tuple_key.starts_with(&prefix)
-                {
-                    continue;
-                }
-                let row = decode_part_current_row(payload)?;
-                if row.tenant_id != tenant_id
-                    || row.bucket_id != bucket_id
-                    || row.part.upload_id != upload_row_id
-                    || tuple_key
-                        != &multipart_part_row_key(
-                            tenant_id,
-                            bucket_id,
-                            upload_row_id,
-                            row.part.part_number,
-                        )?
-                {
-                    return Err(anyhow!("multipart transaction part row scope mismatch"));
-                }
-                parts.insert(row.part.part_number, row.part);
-                if parts.len() > MULTIPART_PART_COUNT_MAX {
-                    return Err(anyhow!(
-                        "multipart upload exceeds the bounded part count of {MULTIPART_PART_COUNT_MAX}"
-                    ));
-                }
-            }
-            CoreTransactionUpdate::CoreMetaDelete {
-                cf,
-                table_id,
-                tuple_key,
-                ..
-            } => {
-                if canonical_coremeta_cf_name(cf)? != CF_OBJECT_HEADS
-                    || *table_id != TABLE_MULTIPART_PART_CURRENT_ROW
-                    || !tuple_key.starts_with(&prefix)
-                {
-                    continue;
-                }
-                let mut deleted_part_number = None;
-                for part_number in parts.keys().copied() {
-                    if tuple_key
-                        == &multipart_part_row_key(
-                            tenant_id,
-                            bucket_id,
-                            upload_row_id,
-                            part_number,
-                        )?
-                    {
-                        deleted_part_number = Some(part_number);
-                        break;
-                    }
-                }
-                if let Some(part_number) = deleted_part_number {
-                    parts.remove(&part_number);
-                }
-            }
-            CoreTransactionUpdate::StreamAppend { .. } => {}
-        }
-    }
-    Ok(())
-}
-
 fn decode_active_upload_record(record: &CoreMetaRecord) -> Result<MultipartUpload> {
     let upload = decode_committed_upload_current_row(&record.payload)?.upload;
     if core_meta_record_tuple_key(&record.key)?
@@ -1363,6 +1340,7 @@ async fn append_body(
     part: Option<MultipartUploadPart>,
     fence_token: u64,
     partition_precondition: Option<CoreMutationPrecondition>,
+    mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
     transaction: Option<(&str, &str)>,
 ) -> Result<MetadataMutationReceipt> {
     let core_store = CoreStore::new(storage.clone()).await?;
@@ -1382,7 +1360,7 @@ async fn append_body(
     let payload_hash = hex::encode(hash32(&body));
     let partition_id = hex::encode(multipart_metadata_partition_id(tenant_id, bucket_id));
     let data_root = multipart_current_root_key(tenant_id, bucket_id);
-    let transaction_state = read_transaction_for_optional_scope(&core_store, transaction).await?;
+    let transaction_state: Option<CoreTransaction> = None;
     let scope_partition = transaction_state
         .as_ref()
         .map(|transaction| transaction.scope_partition.clone())
@@ -1433,7 +1411,22 @@ async fn append_body(
         operations,
     };
     let batch_receipt = if transaction.is_some() {
-        core_store.stage_explicit_transaction_batch(batch).await?
+        let mvcc = mvcc.ok_or_else(|| anyhow!("MVCC staging handle is required"))?;
+        let (transaction_id, principal) =
+            transaction.ok_or_else(|| anyhow!("transaction binding is required"))?;
+        let mutations = crate::mvcc_product::product_mutations_from_operations(batch.operations)?;
+        mvcc.stage_product_mutations(
+            transaction_id,
+            principal,
+            mutations,
+            u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default(),
+        )?;
+        return Ok(MetadataMutationReceipt {
+            mutation_id,
+            payload_hash: payload_hash.clone(),
+            record_hash: payload_hash,
+            watch_cursor: 0,
+        });
     } else {
         core_store.commit_mutation_batch(batch).await?
     };

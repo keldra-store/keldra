@@ -34,6 +34,7 @@ impl Persistence {
             .await?;
         multipart_journal::create_multipart_upload_with_permit_in_transaction(
             &self.storage,
+            self.mvcc()?,
             tenant_id,
             bucket_id,
             key,
@@ -73,6 +74,7 @@ impl Persistence {
     ) -> Result<Option<MultipartUpload>> {
         multipart_journal::get_active_multipart_upload_in_transaction(
             &self.storage,
+            self.mvcc()?,
             tenant_id,
             bucket_id,
             key,
@@ -124,6 +126,7 @@ impl Persistence {
         let (tenant_id, bucket_id) =
             multipart_journal::find_multipart_upload_partition_in_transaction(
                 &self.storage,
+                self.mvcc()?,
                 upload_row_id,
                 transaction_id,
                 transaction_principal,
@@ -135,6 +138,7 @@ impl Persistence {
             .await?;
         multipart_journal::upsert_multipart_part_with_permit_in_transaction(
             &self.storage,
+            self.mvcc()?,
             upload_row_id,
             part_number,
             object_ref,
@@ -163,6 +167,7 @@ impl Persistence {
     ) -> Result<Vec<MultipartUploadPart>> {
         multipart_journal::list_multipart_parts_in_transaction(
             &self.storage,
+            self.mvcc()?,
             upload_row_id,
             transaction_id,
             transaction_principal,
@@ -238,6 +243,7 @@ impl Persistence {
         let Some((tenant_id, bucket_id)) =
             multipart_journal::find_multipart_upload_partition_in_transaction(
                 &self.storage,
+                self.mvcc()?,
                 upload_row_id,
                 transaction_id,
                 transaction_principal,
@@ -254,6 +260,7 @@ impl Persistence {
             .await?;
         multipart_journal::complete_multipart_upload_with_permit_in_transaction(
             &self.storage,
+            self.mvcc()?,
             upload_row_id,
             &permit,
             &self.partition_owner_signing_key,
@@ -299,6 +306,7 @@ impl Persistence {
             .await?;
         multipart_journal::abort_multipart_upload_with_permit_in_transaction(
             &self.storage,
+            self.mvcc()?,
             tenant_id,
             bucket_id,
             key,
