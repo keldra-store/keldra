@@ -240,6 +240,20 @@ pub(super) async fn execute_mutation_batch(
     validate_mutation_precondition_transaction(state, &claims, transaction_id)?;
     let transaction_principal =
         transaction_id.map(|_| object_manager::transaction_principal_from_claims(&claims));
+    let put_only_batch = if let (Some(transaction_id), Some(principal)) =
+        (transaction_id, transaction_principal.as_deref())
+    {
+        put_only_batch
+            && state
+                .mvcc
+                .open_transactions
+                .binding(transaction_id, principal)
+                .map_err(|error| Status::failed_precondition(error.to_string()))?
+                .durability
+                == crate::mvcc_transaction::DurabilityLevel::Local
+    } else {
+        put_only_batch
+    };
     let precondition_transaction = transaction_id.zip(transaction_principal.as_deref());
     let mut durable_preconditions =
         prepare_mutation_batch_native_preconditions(state, &claims, &req, precondition_transaction)

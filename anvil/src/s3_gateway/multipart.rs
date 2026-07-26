@@ -189,12 +189,48 @@ pub(super) async fn complete_multipart_upload(
         })
         .collect();
 
-    match state
-        .object_manager
-        .complete_multipart_upload(&claims, &bucket, &key, upload_id, parts, None, None)
-        .await
+    let (transaction, principal) = match begin_s3_write_transaction(
+        &state,
+        &claims,
+        "complete-multipart",
+        &bucket,
+        &key,
+    )
+    .await
     {
+        Ok(binding) => binding,
+        Err(status) => {
+            return s3_status_to_response_for_auth(
+                status,
+                true,
+                "ServiceUnavailable",
+                state.config.cross_region_routing_policy,
+            );
+        }
+    };
+    let completion = state
+        .object_manager
+        .complete_multipart_upload(
+            &claims,
+            &bucket,
+            &key,
+            upload_id,
+            parts,
+            Some(&transaction.transaction_id),
+            Some(&principal),
+        )
+        .await;
+    match completion {
         Ok(object) => {
+            if let Err(status) = commit_s3_write_transaction(&state, &transaction, &principal).await
+            {
+                return s3_status_to_response_for_auth(
+                    status,
+                    true,
+                    "ServiceUnavailable",
+                    state.config.cross_region_routing_policy,
+                );
+            }
             let xml = format!(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  <Location>/{}/{}</Location>\n  <Bucket>{}</Bucket>\n  <Key>{}</Key>\n  <ETag>\"{}\"</ETag>\n</CompleteMultipartUploadResult>\n",
                 xml_escape(&bucket),
@@ -211,12 +247,19 @@ pub(super) async fn complete_multipart_upload(
                 .body(Body::from(xml))
                 .unwrap()
         }
-        Err(status) => s3_status_to_response_for_auth(
-            status,
-            true,
-            "NoSuchUpload",
-            state.config.cross_region_routing_policy,
-        ),
+        Err(status) => {
+            let _ = state.mvcc.open_transactions.rollback(
+                &transaction.transaction_id,
+                &principal,
+                s3_now_unix_ms().unwrap_or_default(),
+            );
+            s3_status_to_response_for_auth(
+                status,
+                true,
+                "NoSuchUpload",
+                state.config.cross_region_routing_policy,
+            )
+        }
     }
 }
 

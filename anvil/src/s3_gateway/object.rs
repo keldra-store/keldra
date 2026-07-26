@@ -542,6 +542,18 @@ pub(super) async fn put_object(
         }
     }
 
+    let (transaction, transaction_principal) =
+        match begin_s3_write_transaction(&state, &claims, "put", &bucket, &key).await {
+            Ok(binding) => binding,
+            Err(status) => {
+                return s3_status_to_response_for_auth(
+                    status,
+                    true,
+                    "ServiceUnavailable",
+                    state.config.cross_region_routing_policy,
+                );
+            }
+        };
     let options = ObjectWriteOptions {
         content_type: req
             .headers()
@@ -549,8 +561,8 @@ pub(super) async fn put_object(
             .and_then(|value| value.to_str().ok())
             .map(ToString::to_string),
         user_metadata: s3_user_metadata(req.headers()),
-        transaction_id: None,
-        transaction_principal: None,
+        transaction_id: Some(transaction.transaction_id.clone()),
+        transaction_principal: Some(transaction_principal.clone()),
         storage_class_id: None,
         ..Default::default()
     };
@@ -559,50 +571,70 @@ pub(super) async fn put_object(
             .map_err(|e| tonic::Status::internal(e.to_string()))
     });
 
-    match state
+    let put_result = state
         .object_manager
         .put_object(&claims, &bucket, &key, body_stream, options)
-        .await
-    {
-        Ok(object) => Response::builder()
-            .status(200)
-            .header("ETag", object.etag)
-            .header("x-amz-version-id", object.version_id.to_string())
-            .body(Body::empty())
-            .unwrap(),
-        Err(status) => match status.code() {
-            tonic::Code::FailedPrecondition => {
-                if let Some(response) = s3_remote_bucket_response_from_status(
+        .await;
+    match put_result {
+        Ok(object) => {
+            if let Err(status) =
+                commit_s3_write_transaction(&state, &transaction, &transaction_principal).await
+            {
+                return s3_status_to_response_for_auth(
+                    status,
+                    true,
+                    "ServiceUnavailable",
+                    state.config.cross_region_routing_policy,
+                );
+            }
+            Response::builder()
+                .status(200)
+                .header("ETag", object.etag)
+                .header("x-amz-version-id", object.version_id.to_string())
+                .body(Body::empty())
+                .unwrap()
+        }
+        Err(status) => {
+            let _ = state.mvcc.open_transactions.rollback(
+                &transaction.transaction_id,
+                &transaction_principal,
+                s3_now_unix_ms().unwrap_or_default(),
+            );
+            match status.code() {
+                tonic::Code::FailedPrecondition => {
+                    if let Some(response) = s3_remote_bucket_response_from_status(
+                        &status,
+                        state.config.cross_region_routing_policy,
+                    ) {
+                        return response;
+                    }
+                    s3_error(
+                        "PreconditionFailed",
+                        status.message(),
+                        axum::http::StatusCode::PRECONDITION_FAILED,
+                    )
+                }
+                tonic::Code::NotFound => s3_error(
+                    "NoSuchBucket",
+                    status.message(),
+                    axum::http::StatusCode::NOT_FOUND,
+                ),
+                tonic::Code::PermissionDenied => s3_error(
+                    "AccessDenied",
+                    status.message(),
+                    axum::http::StatusCode::FORBIDDEN,
+                ),
+                tonic::Code::Unavailable => s3_unavailable_status_to_response(
                     &status,
                     state.config.cross_region_routing_policy,
-                ) {
-                    return response;
-                }
-                s3_error(
-                    "PreconditionFailed",
+                ),
+                _ => s3_error(
+                    "InternalError",
                     status.message(),
-                    axum::http::StatusCode::PRECONDITION_FAILED,
-                )
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                ),
             }
-            tonic::Code::NotFound => s3_error(
-                "NoSuchBucket",
-                status.message(),
-                axum::http::StatusCode::NOT_FOUND,
-            ),
-            tonic::Code::PermissionDenied => s3_error(
-                "AccessDenied",
-                status.message(),
-                axum::http::StatusCode::FORBIDDEN,
-            ),
-            tonic::Code::Unavailable => {
-                s3_unavailable_status_to_response(&status, state.config.cross_region_routing_policy)
-            }
-            _ => s3_error(
-                "InternalError",
-                status.message(),
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            ),
-        },
+        }
     }
 }
 

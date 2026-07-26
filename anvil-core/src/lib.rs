@@ -1042,91 +1042,33 @@ mod app_state_tests {
             )
             .await
             .unwrap();
-        let erasure_profile = streaming_erasure::ErasureProfile {
-            data_shards: 1,
-            parity_shards: 1,
-            shard_bytes: 64,
-        };
-        let placement_policy = shard_placement::ShardPlacementPolicy {
-            tolerated_failure_domains: 1,
-        };
-        let object_identity = uuid::Uuid::from_u128(0x4455);
-        let placement = placement_policy
-            .plan(
-                object_identity,
-                1,
-                erasure_profile,
-                &states[0].mvcc.shard_candidates,
-            )
-            .unwrap();
         let payload = br#"{"title":"distributed erasure payload"}"#;
-        let mut payload_reader = std::io::Cursor::new(payload.as_slice());
-        let ingest = shard_placement::DistributedIngest::encode(
-            &states[0].mvcc.replication_client,
-            &placement,
-            placement_policy,
-            erasure_profile,
-            DurabilityLevel::Erasure,
-            &mut payload_reader,
-            object_identity,
-            None,
-            1,
-        )
-        .await
-        .unwrap();
-        assert_eq!(ingest.placements.len(), 2);
-        assert_eq!(ingest.evidence.len(), 2);
-        let manifest = object_shard_manifest::PhysicalObjectShardManifest::from_ingest(
-            "distributed-e2e",
-            object_identity,
-            1,
-            erasure_profile.data_shards,
-            erasure_profile.parity_shards,
-            erasure_profile.shard_bytes,
-            &ingest,
-        )
-        .unwrap();
-        states[0]
-            .mvcc
-            .object_evidence
-            .record_ingest(&ingest)
-            .unwrap();
         let materialised_object = states[0]
             .object_manager
             .put_object(
                 &claims,
                 &bucket.name,
                 "distributed.json",
-                futures_util::stream::empty(),
+                futures_util::stream::iter(vec![Ok(payload.to_vec())]),
                 object_manager::ObjectWriteOptions {
                     content_type: Some("application/json".into()),
                     user_metadata: Some(serde_json::json!({"partition": "alpha"})),
                     transaction_id: Some(erasure_handle.transaction_id.clone()),
                     transaction_principal: Some(principal.into()),
-                    prepared_ingest: Some(object_manager::PreparedObjectIngest {
-                        object_hash: manifest.object_hash.clone(),
-                        object_length: manifest.object_length,
-                        shard_map: serde_json::json!({
-                            "schema": "anvil.mvcc.object_shard_manifest.v1",
-                            "manifest": manifest,
-                        }),
-                    }),
                     visibility: object_manager::ObjectWriteVisibility::strict(),
                     ..Default::default()
                 },
             )
             .await
             .unwrap();
-        states[0]
-            .mvcc
-            .open_transactions
-            .add_manifest(
-                &erasure_handle.transaction_id,
-                "distributed-e2e",
-                manifest.reference().unwrap(),
-                now_ms(),
-            )
-            .unwrap();
+        let materialised_shard_map = materialised_object.shard_map.clone().unwrap();
+        assert_eq!(
+            materialised_shard_map["schema"],
+            "anvil.mvcc.object_shard_manifest.v1"
+        );
+        let manifest: object_shard_manifest::PhysicalObjectShardManifest =
+            serde_json::from_value(materialised_shard_map["manifest"].clone()).unwrap();
+        assert_eq!(manifest.placements.len(), 2);
         states[0]
             .mvcc
             .open_transactions

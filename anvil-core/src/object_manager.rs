@@ -19,7 +19,9 @@ use crate::{
     permissions::AnvilAction,
     persistence::{Bucket, MetadataMutationReceipt, Object, Persistence},
     routing::{self, CrossRegionRoutingPolicy},
+    shard_placement::{DistributedIngest, ShardPlacementPolicy},
     storage::Storage,
+    streaming_erasure::ErasureProfile,
     validation, watch_log,
 };
 use anyhow::{Context, Result as AnyhowResult, anyhow, bail};
@@ -441,6 +443,11 @@ impl ObjectManager {
         );
         let tenant_id = claims.tenant_id;
         let transaction_id = options.transaction_id.clone();
+        if transaction_id.is_some() != options.transaction_principal.is_some() {
+            return Err(Status::invalid_argument(
+                "transaction ID and transaction principal must be paired",
+            ));
+        }
         let total_start = std::time::Instant::now();
         if matches!(
             options.visibility.indexes,
@@ -561,29 +568,124 @@ impl ObjectManager {
 
         let (content_hash, shard_map) = if let Some(prepared) = prepared_ingest {
             (prepared.object_hash, Some(prepared.shard_map))
-        } else if transaction_id.is_some() {
+        } else if let (Some(transaction_id), Some(transaction_principal)) = (
+            transaction_id.as_deref(),
+            options.transaction_principal.as_deref(),
+        ) {
+            let mvcc = self.mvcc.get().ok_or_else(|| {
+                Status::failed_precondition(
+                    "MVCC subsystem is required for transactional object writes",
+                )
+            })?;
+            let binding = mvcc
+                .open_transactions
+                .binding(transaction_id, transaction_principal)
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
             let mut payload =
                 tokio::fs::File::open(temp_path.as_ref().expect("staged path exists"))
                     .await
                     .map_err(|error| Status::internal(error.to_string()))?;
-            let ingest = self
-                .mvcc
-                .get()
-                .ok_or_else(|| {
-                    Status::failed_precondition(
-                        "MVCC subsystem is required for transactional object writes",
+            match binding.durability {
+                crate::mvcc_transaction::DurabilityLevel::Local => {
+                    let ingest = mvcc
+                        .local_objects
+                        .persist(&mut payload)
+                        .await
+                        .map_err(|error| Status::internal(error.to_string()))?;
+                    mvcc.object_evidence
+                        .record(&ingest.manifest.object_hash, ingest.evidence)
+                        .map_err(|error| Status::internal(error.to_string()))?;
+                    mvcc.open_transactions
+                        .add_manifest(
+                            transaction_id,
+                            &binding.cluster_id,
+                            ingest.reference,
+                            Self::current_unix_ms_for_object()?,
+                        )
+                        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                    let content_hash = ingest.manifest.object_hash.clone();
+                    let shard_map = Some(
+                        object_data_target_to_shard_map(&ObjectDataTarget::MvccLocal(
+                            ingest.manifest,
+                        ))
+                        .map_err(|error| Status::internal(error.to_string()))?,
+                    );
+                    (content_hash, shard_map)
+                }
+                durability @ (crate::mvcc_transaction::DurabilityLevel::Quorum
+                | crate::mvcc_transaction::DurabilityLevel::Erasure) => {
+                    let candidates = &mvcc.shard_candidates;
+                    if candidates.len() < 2 {
+                        return Err(Status::failed_precondition(
+                            "distributed object durability requires at least two shard targets",
+                        ));
+                    }
+                    let parity_shards = mvcc
+                        .tolerated_failure_domains
+                        .max(1)
+                        .min(candidates.len() - 1);
+                    let profile = ErasureProfile {
+                        data_shards: candidates.len() - parity_shards,
+                        parity_shards,
+                        shard_bytes: 256 * 1024,
+                    };
+                    let policy = ShardPlacementPolicy {
+                        tolerated_failure_domains: mvcc.tolerated_failure_domains,
+                    };
+                    let object_identity = provisional_mvcc_object_identity(
+                        &binding.cluster_id,
+                        transaction_id,
+                        &bucket.name,
+                        object_key,
+                    );
+                    let plan = policy
+                        .plan(object_identity, 1, profile, candidates)
+                        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                    let ingest = DistributedIngest::encode(
+                        &mvcc.replication_client,
+                        &plan,
+                        policy,
+                        profile,
+                        durability,
+                        &mut payload,
+                        object_identity,
+                        None,
+                        1,
                     )
-                })?
-                .local_objects
-                .persist(&mut payload)
-                .await
-                .map_err(|error| Status::internal(error.to_string()))?;
-            let content_hash = ingest.manifest.object_hash.clone();
-            let shard_map = Some(
-                object_data_target_to_shard_map(&ObjectDataTarget::MvccLocal(ingest.manifest))
-                    .map_err(|error| Status::internal(error.to_string()))?,
-            );
-            (content_hash, shard_map)
+                    .await
+                    .map_err(|error| Status::unavailable(error.to_string()))?;
+                    let manifest =
+                        crate::object_shard_manifest::PhysicalObjectShardManifest::from_ingest(
+                            &binding.cluster_id,
+                            object_identity,
+                            1,
+                            profile.data_shards,
+                            profile.parity_shards,
+                            profile.shard_bytes,
+                            &ingest,
+                        )
+                        .map_err(|error| Status::internal(error.to_string()))?;
+                    mvcc.object_evidence
+                        .record_ingest(&ingest)
+                        .map_err(|error| Status::internal(error.to_string()))?;
+                    mvcc.open_transactions
+                        .add_manifest(
+                            transaction_id,
+                            &binding.cluster_id,
+                            manifest
+                                .reference()
+                                .map_err(|error| Status::internal(error.to_string()))?,
+                            Self::current_unix_ms_for_object()?,
+                        )
+                        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                    let content_hash = manifest.object_hash.clone();
+                    let shard_map = Some(
+                        object_data_target_to_shard_map(&ObjectDataTarget::MvccShards(manifest))
+                            .map_err(|error| Status::internal(error.to_string()))?,
+                    );
+                    (content_hash, shard_map)
+                }
+            }
         } else if inline_eligible {
             let payload = tokio::fs::read(temp_path.as_ref().expect("staged path exists"))
                 .await
@@ -1870,6 +1972,22 @@ fn object_data_target_from_shard_map(value: &JsonValue) -> AnyhowResult<ObjectDa
 
 fn canonical_json_bytes(value: &JsonValue) -> AnyhowResult<Vec<u8>> {
     serde_json::to_vec(&canonical_json(value)).map_err(Into::into)
+}
+
+fn provisional_mvcc_object_identity(
+    cluster_id: &str,
+    transaction_id: &str,
+    bucket_name: &str,
+    object_key: &str,
+) -> uuid::Uuid {
+    let mut hash = blake3::Hasher::new();
+    for value in [cluster_id, transaction_id, bucket_name, object_key] {
+        hash.update(&(value.len() as u64).to_be_bytes());
+        hash.update(value.as_bytes());
+    }
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&hash.finalize().as_bytes()[..16]);
+    uuid::Uuid::from_bytes(bytes)
 }
 
 fn canonical_json(value: &JsonValue) -> JsonValue {
