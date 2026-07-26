@@ -50,7 +50,7 @@ fn test_authz_relation(name: &str) -> crate::anvil_api::AuthzRelationSchema {
 
 async fn bind_persistence_test_authz_schema(persistence: &Persistence, tenant_id: i64) {
     let schema = crate::authz_realm_schema::put_schema_revision(
-        &persistence.storage,
+        persistence.mvcc().unwrap(),
         tenant_id,
         "persistence-test-authz",
         vec![

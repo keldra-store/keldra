@@ -348,12 +348,11 @@ impl Persistence {
         let latest_after = u64::try_from(latest_after.max(0))
             .context("authorization tuple revision exceeds supported range")?;
         append_authz_materialization_lag_watch(
-            &self.storage,
+            self.mvcc()?,
             tenant_id,
             latest_after,
             &outcome,
             guard,
-            &source_partition_precondition,
         )
         .await?;
         if latest_after > outcome.processed_revision {
@@ -1028,17 +1027,16 @@ impl Persistence {
 }
 
 async fn append_authz_materialization_lag_watch(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     latest_revision: u64,
     outcome: &authz_journal::AuthzMaterializationOutcome,
     guard: &TaskExecutionGuard,
-    source_partition_precondition: &crate::core_store::CoreMutationPrecondition,
 ) -> Result<()> {
     let derived_index_id = crate::authz_userset_index::DEFAULT_DERIVED_USERSET_INDEX_ID.to_string();
     if let Some(latest_event) =
         crate::authz_derived_lag_watch::latest_authz_derived_lag_watch_event(
-            storage,
+            mvcc,
             tenant_id,
             &derived_index_id,
         )
@@ -1057,18 +1055,15 @@ async fn append_authz_materialization_lag_watch(
     );
     let payload =
         authz_materialization_lag_watch_payload(derived_index_id, latest_revision, outcome);
-    let source_partition_precondition = source_partition_precondition.clone();
     guard
         .publication_permit()
         .await?
-        .publish_with(move |task_lease_precondition| async move {
-            let preconditions = [source_partition_precondition, task_lease_precondition];
+        .publish_with(move |_task_lease_precondition| async move {
             crate::authz_derived_lag_watch::append_authz_derived_lag_watch_record(
-                storage,
+                mvcc,
                 tenant_id,
                 mutation_id,
                 payload,
-                &preconditions,
             )
             .await
             .map(|_| ())

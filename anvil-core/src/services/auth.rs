@@ -1611,12 +1611,7 @@ impl AuthService for AppState {
         .await?;
 
         let after_cursor = join_u128(req.after_cursor_low, req.after_cursor_high);
-        let stream_id = authz_derived_lag_watch::authz_derived_lag_watch_stream_id(
-            claims.tenant_id,
-            &req.derived_index_id,
-        );
-        let mut live = self.storage.subscribe_stream(&stream_id);
-        let storage = self.storage.clone();
+        let mvcc = self.mvcc.clone();
         let derived_index_id = req.derived_index_id;
         let tenant_id = claims.tenant_id;
         let (tx, rx) = mpsc::channel(32);
@@ -1626,7 +1621,7 @@ impl AuthService for AppState {
                 loop {
                     let page =
                         match authz_derived_lag_watch::list_authz_derived_lag_watch_event_page(
-                            &storage,
+                            &mvcc,
                             tenant_id,
                             &derived_index_id,
                             last_cursor,
@@ -1655,10 +1650,7 @@ impl AuthService for AppState {
                         break;
                     }
                 }
-                match live.recv().await {
-                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         });
 

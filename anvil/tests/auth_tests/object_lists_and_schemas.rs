@@ -791,7 +791,7 @@ async fn test_public_authz_apis_reject_reserved_system_realm_scope() {
 }
 
 // This test stays in-process because it injects derived-lag watch records
-// through cluster.states.storage and asserts exact watch cursor positions.
+// through cluster.states.mvcc and asserts monotonic MVCC cursor positions.
 #[tokio::test]
 async fn test_authz_derived_lag_watch_streams_snapshot_and_new_events() {
     let mut cluster = isolated_test_cluster(
@@ -804,11 +804,10 @@ async fn test_authz_derived_lag_watch_streams_snapshot_and_new_events() {
         .await;
 
     append_authz_derived_lag_watch_record(
-        &cluster.states[0].storage,
+        &cluster.states[0].mvcc,
         1,
         [1; 16],
         derived_lag_watch_payload(90, 100, 1),
-        &[],
     )
     .await
     .unwrap();
@@ -836,7 +835,7 @@ async fn test_authz_derived_lag_watch_streams_snapshot_and_new_events() {
         .unwrap()
         .unwrap()
         .unwrap();
-    assert_eq!(snapshot.cursor_low, 1);
+    assert!(snapshot.cursor_low > 0);
     assert_eq!(snapshot.derived_index_id, "derived-userset-primary");
     assert_eq!(snapshot.derived_index_kind, "userset");
     assert_eq!(snapshot.processed_revision, 90);
@@ -846,11 +845,10 @@ async fn test_authz_derived_lag_watch_streams_snapshot_and_new_events() {
     assert_eq!(snapshot.authz_revision, 100);
 
     append_authz_derived_lag_watch_record(
-        &cluster.states[0].storage,
+        &cluster.states[0].mvcc,
         1,
         [2; 16],
         derived_lag_watch_payload(100, 100, 2),
-        &[],
     )
     .await
     .unwrap();
@@ -859,7 +857,7 @@ async fn test_authz_derived_lag_watch_streams_snapshot_and_new_events() {
         .unwrap()
         .unwrap()
         .unwrap();
-    assert_eq!(live.cursor_low, 2);
+    assert!(live.cursor_low > snapshot.cursor_low);
     assert_eq!(live.revision_lag, 0);
     assert_eq!(live.generation, 2);
 }
