@@ -143,6 +143,17 @@ impl MvccMaterialisationPublisher {
             ],
             now,
         )?;
+        self.mvcc.open_transactions.add_event(
+            &handle.transaction_id,
+            serde_json::to_vec(&serde_json::json!({
+                "schema": "anvil.mvcc.object-index-materialisation.v1",
+                "cluster_id": result.cluster_id,
+                "target_logical_identity": result.target_logical_identity,
+                "job_id": result.job_id,
+                "index_marker": result.index_marker,
+            }))?,
+            now,
+        )?;
         let outcome = self
             .mvcc
             .open_transactions
