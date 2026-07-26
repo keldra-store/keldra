@@ -411,7 +411,7 @@ impl LocalUpgradeConsensus for anvil_mvcc_consensus::OpenRaftConsensus {
         let holders = holders
             .into_iter()
             .map(|holder| anvil_mvcc_consensus::NodeIncarnation {
-                node_id: holder.node_id,
+                node_id: crate::mvcc_bootstrap::consensus_control_node_id(&holder.node_id),
                 incarnation: holder.incarnation,
             })
             .collect();

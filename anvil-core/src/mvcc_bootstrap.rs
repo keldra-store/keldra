@@ -584,7 +584,7 @@ impl MvccSubsystem {
         let worker = MvccApplyWorker::new(
             consensus.clone(),
             config.mvcc_cluster_id.clone(),
-            prepared,
+            prepared.clone(),
             replication_client.clone(),
             remote_nodes,
             local_store,
