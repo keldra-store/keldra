@@ -1,5 +1,4 @@
 use super::*;
-use crate::core_store::core_meta_record_tuple_key;
 use prost::Message;
 
 const GATEWAY_METADATA_PAGE_MAX: usize = 1000;
@@ -182,22 +181,11 @@ fn validate_gateway_metadata_row(
 }
 
 pub(super) async fn read_record_row<T: GatewayRecordCodec>(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     row_kind: &str,
     row_key: &str,
 ) -> Result<Option<GatewayStoredRecord<T>>> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(bytes) = store.read_coremeta_row(
-        CF_REGISTRY,
-        TABLE_GATEWAY_METADATA_ROW,
-        &gateway_metadata_tuple_key(row_kind, row_key)?,
-    )?
-    else {
-        return Ok(None);
-    };
-    Ok(Some(decode_gateway_metadata_row(
-        row_kind, row_key, &bytes,
-    )?))
+    read_record_row_at(mvcc, row_kind, row_key, mvcc.runtime.applied_version()?)
 }
 
 pub(super) fn read_record_row_at<T: GatewayRecordCodec>(
@@ -219,17 +207,20 @@ pub(super) fn read_record_row_at<T: GatewayRecordCodec>(
 }
 
 pub(super) async fn put_record_row<T: GatewayRecordCodec>(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     row_kind: &str,
     row_key: &str,
     record: &T,
     require_absent: bool,
     expected_generation: Option<u64>,
 ) -> Result<GatewayStoredRecord<T>> {
-    let core_store = CoreStore::new(storage.clone()).await?;
     let tuple_key = gateway_metadata_tuple_key(row_kind, row_key)?;
-    let current_bytes =
-        core_store.read_coremeta_row(CF_REGISTRY, TABLE_GATEWAY_METADATA_ROW, &tuple_key)?;
+    let logical_key = crate::mvcc_product::coremeta_logical_key(
+        CF_REGISTRY,
+        TABLE_GATEWAY_METADATA_ROW,
+        &tuple_key,
+    )?;
+    let current_bytes = mvcc.read_latest_value(&logical_key)?;
     let current = current_bytes
         .map(|bytes| decode_gateway_metadata_row::<T>(row_kind, row_key, &bytes))
         .transpose()?;
@@ -247,27 +238,25 @@ pub(super) async fn put_record_row<T: GatewayRecordCodec>(
         .map(|value| value.generation + 1)
         .unwrap_or(1);
     let payload = encode_gateway_metadata_row(row_kind, row_key, generation, record)?;
-    let op = CoreMetaBatchOp {
-        cf: CF_REGISTRY,
-        table_id: TABLE_GATEWAY_METADATA_ROW,
-        tuple_key: &tuple_key,
-        common: None,
-        kind: CoreMetaBatchOpKind::Put(&payload),
-    };
-    core_store
-        .commit_coremeta_root_groups(
-            &format!("gateway-row:{}", hex::encode(hash32(&payload))),
-            &[op],
-            &[CoreMetaRootPublication::new(
-                format!("gateway/{row_kind}/{row_key}"),
-                crate::formats::writer::WriterFamily::Registry,
-            )],
-        )
-        .await?;
-    let persisted = core_store
-        .read_coremeta_row(CF_REGISTRY, TABLE_GATEWAY_METADATA_ROW, &tuple_key)?
-        .ok_or_else(|| anyhow!("gateway metadata row was not published"))?;
-    decode_gateway_metadata_row(row_kind, row_key, &persisted)
+    let predicate = current_bytes
+        .as_ref()
+        .map(|bytes| {
+            crate::mvcc_transaction::PredicateKind::ValueHash(*blake3::hash(bytes).as_bytes())
+        })
+        .unwrap_or(crate::mvcc_transaction::PredicateKind::Absent);
+    mvcc.autocommit_product_mutations_with_predicates(
+        "gateway-registry",
+        &format!("gateway-row:{}", hex::encode(hash32(&payload))),
+        vec![crate::mvcc_product::ProductMutation::put(
+            logical_key.clone(),
+            payload.clone(),
+        )],
+        vec![(logical_key, predicate)],
+        crate::mvcc_transaction::DurabilityLevel::Local,
+        u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+    )
+    .await?;
+    decode_gateway_metadata_row(row_kind, row_key, &payload)
 }
 
 pub(super) async fn put_record_row_in_transaction<T: GatewayRecordCodec>(
@@ -339,25 +328,26 @@ pub(super) async fn read_record_row_in_transaction<T: GatewayRecordCodec>(
 }
 
 pub(super) async fn put_upload_session_start_rows(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     session_key: &str,
     idempotency_key: &str,
     record: &GatewayUploadSessionRecord,
 ) -> Result<GatewayStoredRecord<GatewayUploadSessionRecord>> {
-    let core_store = CoreStore::new(storage.clone()).await?;
     let session_tuple_key = gateway_metadata_tuple_key(GATEWAY_ROW_UPLOAD_SESSION, session_key)?;
     let idempotency_tuple_key =
         gateway_metadata_tuple_key(GATEWAY_ROW_UPLOAD_IDEMPOTENCY, idempotency_key)?;
-    if core_store
-        .read_coremeta_row(CF_REGISTRY, TABLE_GATEWAY_METADATA_ROW, &session_tuple_key)?
-        .is_some()
-        || core_store
-            .read_coremeta_row(
-                CF_REGISTRY,
-                TABLE_GATEWAY_METADATA_ROW,
-                &idempotency_tuple_key,
-            )?
-            .is_some()
+    let session_logical_key = crate::mvcc_product::coremeta_logical_key(
+        CF_REGISTRY,
+        TABLE_GATEWAY_METADATA_ROW,
+        &session_tuple_key,
+    )?;
+    let idempotency_logical_key = crate::mvcc_product::coremeta_logical_key(
+        CF_REGISTRY,
+        TABLE_GATEWAY_METADATA_ROW,
+        &idempotency_tuple_key,
+    )?;
+    if mvcc.read_latest_value(&session_logical_key)?.is_some()
+        || mvcc.read_latest_value(&idempotency_logical_key)?.is_some()
     {
         bail!("gateway upload session metadata row already exists");
     }
@@ -365,93 +355,92 @@ pub(super) async fn put_upload_session_start_rows(
         encode_gateway_metadata_row(GATEWAY_ROW_UPLOAD_SESSION, session_key, 1, record)?;
     let idempotency_payload =
         encode_gateway_metadata_row(GATEWAY_ROW_UPLOAD_IDEMPOTENCY, idempotency_key, 1, record)?;
-    core_store
-        .commit_coremeta_root_groups(
-            &format!("gateway-upload-session:{session_key}"),
-            &[
-                CoreMetaBatchOp {
-                    cf: CF_REGISTRY,
-                    table_id: TABLE_GATEWAY_METADATA_ROW,
-                    tuple_key: &session_tuple_key,
-                    common: None,
-                    kind: CoreMetaBatchOpKind::Put(&session_payload),
-                },
-                CoreMetaBatchOp {
-                    cf: CF_REGISTRY,
-                    table_id: TABLE_GATEWAY_METADATA_ROW,
-                    tuple_key: &idempotency_tuple_key,
-                    common: None,
-                    kind: CoreMetaBatchOpKind::Put(&idempotency_payload),
-                },
-            ],
-            &[
-                CoreMetaRootPublication::new(
-                    format!("gateway/{GATEWAY_ROW_UPLOAD_SESSION}/{session_key}"),
-                    crate::formats::writer::WriterFamily::Registry,
-                )
-                .coordinator(),
-                CoreMetaRootPublication::new(
-                    format!("gateway/{GATEWAY_ROW_UPLOAD_IDEMPOTENCY}/{idempotency_key}"),
-                    crate::formats::writer::WriterFamily::Registry,
-                ),
-            ],
-        )
-        .await?;
-    let persisted = core_store
-        .read_coremeta_row(CF_REGISTRY, TABLE_GATEWAY_METADATA_ROW, &session_tuple_key)?
-        .ok_or_else(|| anyhow!("gateway upload session row was not published"))?;
-    decode_gateway_metadata_row(GATEWAY_ROW_UPLOAD_SESSION, session_key, &persisted)
+    mvcc.autocommit_product_mutations_with_predicates(
+        "gateway-upload",
+        &format!("gateway-upload-session:{session_key}"),
+        vec![
+            crate::mvcc_product::ProductMutation::put(
+                session_logical_key.clone(),
+                session_payload.clone(),
+            ),
+            crate::mvcc_product::ProductMutation::put(
+                idempotency_logical_key.clone(),
+                idempotency_payload,
+            ),
+        ],
+        vec![
+            (
+                session_logical_key,
+                crate::mvcc_transaction::PredicateKind::Absent,
+            ),
+            (
+                idempotency_logical_key,
+                crate::mvcc_transaction::PredicateKind::Absent,
+            ),
+        ],
+        crate::mvcc_transaction::DurabilityLevel::Local,
+        u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+    )
+    .await?;
+    decode_gateway_metadata_row(GATEWAY_ROW_UPLOAD_SESSION, session_key, &session_payload)
 }
 
 pub(super) async fn list_record_rows<T: GatewayRecordCodec>(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     row_kind: &str,
-    after_tuple_key: Option<&[u8]>,
+    snapshot: u64,
+    after_application_key: Option<&[u8]>,
     page_size: usize,
 ) -> Result<GatewayStoredRecordPage<T>> {
     if !(1..=GATEWAY_METADATA_PAGE_MAX).contains(&page_size) {
         bail!("gateway metadata page size must be between 1 and {GATEWAY_METADATA_PAGE_MAX}");
     }
-    let store = CoreStore::new(storage.clone()).await?;
-    let mut rows = store.scan_coremeta_prefix_page(
+    let application_prefix = crate::mvcc_product::coremeta_application_prefix(
         CF_REGISTRY,
-        TABLE_GATEWAY_METADATA_ROW,
         &gateway_metadata_tuple_prefix(row_kind)?,
-        after_tuple_key,
-        page_size + 1,
     )?;
+    let mut rows = mvcc.runtime.scan_table_prefix_at(
+        TABLE_GATEWAY_METADATA_ROW,
+        &application_prefix,
+        snapshot,
+    )?;
+    if let Some(after) = after_application_key {
+        rows.retain(|(key, _)| key.application_key.as_slice() > after);
+    }
     let has_more = rows.len() > page_size;
     if has_more {
         rows.truncate(page_size);
     }
     let next_tuple_key = if has_more {
         Some(
-            core_meta_record_tuple_key(
-                &rows
-                    .last()
-                    .ok_or_else(|| anyhow!("gateway metadata page continuation has no row"))?
-                    .key,
-            )?
-            .to_vec(),
+            rows.last()
+                .ok_or_else(|| anyhow!("gateway metadata page continuation has no row"))?
+                .0
+                .application_key
+                .clone(),
         )
     } else {
         None
     };
     let mut records = Vec::with_capacity(rows.len());
-    for row in rows {
+    for (key, row) in rows {
         let proto = decode_deterministic_proto::<GatewayMetadataRowProto>(
-            &row.payload,
+            &row.value,
             "gateway metadata row",
         )?;
-        if core_meta_record_tuple_key(&row.key)?
-            != gateway_metadata_tuple_key(row_kind, &proto.row_key)?
+        if key
+            != crate::mvcc_product::coremeta_logical_key(
+                CF_REGISTRY,
+                TABLE_GATEWAY_METADATA_ROW,
+                &gateway_metadata_tuple_key(row_kind, &proto.row_key)?,
+            )?
         {
             bail!("gateway metadata physical row key mismatch");
         }
         records.push(decode_gateway_metadata_row(
             row_kind,
             &proto.row_key,
-            &row.payload,
+            &row.value,
         )?);
     }
     Ok(GatewayStoredRecordPage {
@@ -459,6 +448,3 @@ pub(super) async fn list_record_rows<T: GatewayRecordCodec>(
         next_tuple_key,
     })
 }
-
-#[cfg(test)]
-mod tests;

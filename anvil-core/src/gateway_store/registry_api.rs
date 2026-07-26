@@ -55,6 +55,7 @@ pub async fn put_registry_blob(
     }
     put_gateway_blob(
         storage,
+        mvcc,
         tenant_id,
         registry_kind,
         namespace,
@@ -145,6 +146,7 @@ pub async fn put_package_version(
     }
     update_gateway_tag(
         storage,
+        mvcc,
         tenant_id,
         registry_kind,
         namespace,
@@ -204,6 +206,7 @@ pub async fn put_registry_ref(
     }
     update_gateway_tag(
         storage,
+        mvcc,
         tenant_id,
         registry_kind,
         namespace,
@@ -218,6 +221,7 @@ pub async fn put_registry_ref(
 
 pub async fn get_package_version(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     registry_kind: &str,
     namespace: &str,
@@ -226,6 +230,8 @@ pub async fn get_package_version(
 ) -> Result<Option<GatewayPackageVersionRecord>> {
     let Some((tag, stored_handle)) = read_gateway_tag(
         storage,
+        mvcc,
+        mvcc,
         tenant_id,
         registry_kind,
         namespace,
@@ -243,7 +249,7 @@ pub async fn get_package_version(
 }
 
 pub async fn list_package_versions(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     registry_kind: &str,
     namespace: &str,
@@ -254,18 +260,27 @@ pub async fn list_package_versions(
     let registry_kind = normalize_gateway_identifier(registry_kind, "registry kind")?;
     let namespace = normalize_gateway_identifier(namespace, "namespace")?;
     let package_name = normalize_gateway_identifier(package_name, "package name")?;
-    let mut after_tuple_key = if page_token.is_empty() {
-        None
+    let (snapshot, mut after_application_key) = if page_token.is_empty() {
+        (mvcc.runtime.applied_version()?, None)
     } else {
-        Some(hex::decode(page_token).map_err(|_| anyhow!("registry page_token is invalid"))?)
+        let (snapshot, key) = page_token
+            .split_once(':')
+            .ok_or_else(|| anyhow!("registry page_token is invalid"))?;
+        (
+            snapshot
+                .parse::<u64>()
+                .map_err(|_| anyhow!("registry page_token snapshot is invalid"))?,
+            Some(hex::decode(key).map_err(|_| anyhow!("registry page_token is invalid"))?),
+        )
     };
     let effective_limit = limit.clamp(1, 1000);
     let mut versions = Vec::with_capacity(effective_limit);
     loop {
         let page = list_record_rows::<GatewayTagRecord>(
-            storage,
+            mvcc,
             GATEWAY_ROW_TAG,
-            after_tuple_key.as_deref(),
+            snapshot,
+            after_application_key.as_deref(),
             1,
         )
         .await?;
@@ -278,9 +293,11 @@ pub async fn list_package_versions(
                 versions.push(package_version_from_tag(row.record, row.generation));
             }
         }
-        after_tuple_key = page.next_tuple_key;
-        if versions.len() == effective_limit || after_tuple_key.is_none() {
-            let next = after_tuple_key.as_deref().map(hex::encode);
+        after_application_key = page.next_tuple_key;
+        if versions.len() == effective_limit || after_application_key.is_none() {
+            let next = after_application_key
+                .as_deref()
+                .map(|key| format!("{snapshot}:{}", hex::encode(key)));
             return Ok((versions, next));
         }
     }
@@ -296,9 +313,16 @@ async fn ensure_registry_repository(
     principal: &str,
     transaction_id: Option<&str>,
 ) -> Result<()> {
-    if read_gateway_repository(storage, tenant_id, registry_kind, namespace, repository)
-        .await?
-        .is_some()
+    if read_gateway_repository(
+        storage,
+        mvcc,
+        tenant_id,
+        registry_kind,
+        namespace,
+        repository,
+    )
+    .await?
+    .is_some()
     {
         return Ok(());
     }
@@ -317,6 +341,7 @@ async fn ensure_registry_repository(
     } else {
         create_gateway_repository(
             storage,
+            mvcc,
             tenant_id,
             registry_kind,
             namespace,
@@ -419,7 +444,7 @@ async fn put_gateway_blob_in_transaction(
         digest,
     )?;
     if let Some(existing) =
-        read_record_row::<GatewayBlobRecord>(storage, GATEWAY_ROW_BLOB, &ref_name).await?
+        read_record_row::<GatewayBlobRecord>(mvcc, GATEWAY_ROW_BLOB, &ref_name).await?
     {
         validate_blob_record(
             &existing.record,
@@ -643,6 +668,7 @@ async fn read_gateway_tag_for_transaction(
 ) -> Result<Option<(GatewayTagRecord, GatewayStoredHandle)>> {
     if let Some(committed) = read_gateway_tag(
         storage,
+        mvcc,
         tenant_id,
         gateway,
         registry_instance_id,

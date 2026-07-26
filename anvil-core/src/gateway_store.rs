@@ -3,10 +3,9 @@ use crate::{
         AppendStreamRecord, AuthzScopeRef, CF_REGISTRY, CoreLogicalFileWrite, CoreMetaBatchOp,
         CoreMetaBatchOpKind, CoreMetaRootPublication, CoreMetaTuplePart, CoreObjectRef,
         CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob, ReadStream, StreamAppendReceipt,
-        StreamRecord,
-        TABLE_GATEWAY_METADATA_ROW, TABLE_GATEWAY_MOUNT_ROUTE_ROW, WriteLogicalFileRequest,
-        core_meta_committed_row_common, core_meta_root_key_hash, core_meta_tuple_key,
-        core_object_ref_from_logical_file_write, decode_deterministic_proto,
+        StreamRecord, TABLE_GATEWAY_METADATA_ROW, TABLE_GATEWAY_MOUNT_ROUTE_ROW,
+        WriteLogicalFileRequest, core_meta_committed_row_common, core_meta_root_key_hash,
+        core_meta_tuple_key, core_object_ref_from_logical_file_write, decode_deterministic_proto,
         encode_deterministic_proto,
     },
     formats::{
@@ -326,6 +325,7 @@ pub fn validate_gateway_digest(digest: &str) -> Result<()> {
 
 pub async fn create_gateway_repository(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     gateway: &str,
     registry_instance_id: &str,
@@ -349,7 +349,7 @@ pub async fn create_gateway_repository(
     };
     record.record_hash = hash_record(&record)?;
     put_record_row(
-        storage,
+        mvcc,
         GATEWAY_ROW_REPOSITORY,
         &gateway_repository_ref_name(&record)?,
         &record,
@@ -362,18 +362,16 @@ pub async fn create_gateway_repository(
 
 pub async fn read_gateway_repository(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     gateway: &str,
     registry_instance_id: &str,
     repository: &str,
 ) -> Result<Option<GatewayRepositoryRecord>> {
     let key = GatewayRepositoryKey::new(tenant_id, gateway, registry_instance_id, repository)?;
-    let Some(row) = read_record_row::<GatewayRepositoryRecord>(
-        storage,
-        GATEWAY_ROW_REPOSITORY,
-        &key.ref_name(),
-    )
-    .await?
+    let Some(row) =
+        read_record_row::<GatewayRepositoryRecord>(mvcc, GATEWAY_ROW_REPOSITORY, &key.ref_name())
+            .await?
     else {
         return Ok(None);
     };
@@ -384,6 +382,7 @@ pub async fn read_gateway_repository(
 #[allow(clippy::too_many_arguments)]
 pub async fn put_gateway_blob(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     gateway: &str,
     registry_instance_id: &str,
@@ -412,7 +411,7 @@ pub async fn put_gateway_blob(
         digest,
     )?;
     if let Some(existing) =
-        read_record_row::<GatewayBlobRecord>(storage, GATEWAY_ROW_BLOB, &ref_name).await?
+        read_record_row::<GatewayBlobRecord>(mvcc, GATEWAY_ROW_BLOB, &ref_name).await?
     {
         validate_blob_record(
             &existing.record,
@@ -452,12 +451,13 @@ pub async fn put_gateway_blob(
     };
     record.record_hash = hash_record(&record)?;
     coremeta::write_registry_blob_locator_row(storage, &record, &payload_write.locator).await?;
-    put_record_row(storage, GATEWAY_ROW_BLOB, &ref_name, &record, true, None).await?;
+    put_record_row(mvcc, GATEWAY_ROW_BLOB, &ref_name, &record, true, None).await?;
     Ok(record)
 }
 
 pub async fn read_gateway_blob(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     gateway: &str,
     registry_instance_id: &str,
@@ -475,8 +475,7 @@ pub async fn read_gateway_blob(
         &repository,
         digest,
     )?;
-    let Some(row) =
-        read_record_row::<GatewayBlobRecord>(storage, GATEWAY_ROW_BLOB, &ref_name).await?
+    let Some(row) = read_record_row::<GatewayBlobRecord>(mvcc, GATEWAY_ROW_BLOB, &ref_name).await?
     else {
         return Ok(None);
     };
@@ -505,6 +504,7 @@ pub async fn read_gateway_blob(
 #[allow(clippy::too_many_arguments)]
 pub async fn update_gateway_tag(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     gateway: &str,
     registry_instance_id: &str,
@@ -544,7 +544,7 @@ pub async fn update_gateway_tag(
     .await?
     .ok_or_else(|| anyhow!("registry tag target blob is missing CoreMeta locator row"))?;
     let row = put_record_row(
-        storage,
+        mvcc,
         GATEWAY_ROW_TAG,
         &ref_name,
         &record,
@@ -561,6 +561,7 @@ pub async fn update_gateway_tag(
 
 pub async fn read_gateway_tag(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     gateway: &str,
     registry_instance_id: &str,
@@ -578,8 +579,7 @@ pub async fn read_gateway_tag(
         &repository,
         &tag,
     )?;
-    let Some(row) =
-        read_record_row::<GatewayTagRecord>(storage, GATEWAY_ROW_TAG, &ref_name).await?
+    let Some(row) = read_record_row::<GatewayTagRecord>(mvcc, GATEWAY_ROW_TAG, &ref_name).await?
     else {
         return Ok(None);
     };
@@ -598,6 +598,7 @@ pub async fn read_gateway_tag(
 
 pub async fn create_gateway_upload_session(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     gateway: &str,
     registry_instance_id: &str,
@@ -627,7 +628,7 @@ pub async fn create_gateway_upload_session(
         &idempotency_key_hash,
     )?;
     if let Some(existing) = read_record_row::<GatewayUploadSessionRecord>(
-        storage,
+        mvcc,
         GATEWAY_ROW_UPLOAD_IDEMPOTENCY,
         &idempotency_ref_name,
     )
@@ -670,16 +671,12 @@ pub async fn create_gateway_upload_session(
     };
     record.record_hash = hash_record(&record)?;
     let session_handle_name = gateway_upload_ref_name(&record)?;
-    if let Err(error) = put_upload_session_start_rows(
-        storage,
-        &session_handle_name,
-        &idempotency_ref_name,
-        &record,
-    )
-    .await
+    if let Err(error) =
+        put_upload_session_start_rows(mvcc, &session_handle_name, &idempotency_ref_name, &record)
+            .await
     {
         if let Some(existing) = read_record_row::<GatewayUploadSessionRecord>(
-            storage,
+            mvcc,
             GATEWAY_ROW_UPLOAD_IDEMPOTENCY,
             &idempotency_ref_name,
         )
@@ -697,6 +694,7 @@ pub async fn create_gateway_upload_session(
 #[allow(clippy::too_many_arguments)]
 pub async fn read_gateway_upload_session(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     gateway: &str,
     registry_instance_id: &str,
@@ -714,12 +712,9 @@ pub async fn read_gateway_upload_session(
         &repository,
         &upload_id,
     )?;
-    let Some(row) = read_record_row::<GatewayUploadSessionRecord>(
-        storage,
-        GATEWAY_ROW_UPLOAD_SESSION,
-        &ref_name,
-    )
-    .await?
+    let Some(row) =
+        read_record_row::<GatewayUploadSessionRecord>(mvcc, GATEWAY_ROW_UPLOAD_SESSION, &ref_name)
+            .await?
     else {
         return Ok(None);
     };
@@ -739,6 +734,7 @@ pub async fn read_gateway_upload_session(
 #[allow(clippy::too_many_arguments)]
 pub async fn abort_gateway_upload_session(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     gateway: &str,
     registry_instance_id: &str,
@@ -747,6 +743,7 @@ pub async fn abort_gateway_upload_session(
 ) -> Result<GatewayUploadSessionReceipt> {
     let Some((mut record, stored_handle)) = read_gateway_upload_session(
         storage,
+        mvcc,
         tenant_id,
         gateway,
         registry_instance_id,
@@ -763,7 +760,7 @@ pub async fn abort_gateway_upload_session(
             record.record_hash.clear();
             record.record_hash = hash_record(&record)?;
             let row = put_record_row(
-                storage,
+                mvcc,
                 GATEWAY_ROW_UPLOAD_SESSION,
                 &gateway_upload_ref_name(&record)?,
                 &record,
@@ -791,6 +788,7 @@ pub async fn abort_gateway_upload_session(
 #[allow(clippy::too_many_arguments)]
 pub async fn expire_gateway_upload_session(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     gateway: &str,
     registry_instance_id: &str,
@@ -799,6 +797,7 @@ pub async fn expire_gateway_upload_session(
 ) -> Result<GatewayUploadSessionReceipt> {
     let Some((mut record, stored_handle)) = read_gateway_upload_session(
         storage,
+        mvcc,
         tenant_id,
         gateway,
         registry_instance_id,
@@ -821,7 +820,7 @@ pub async fn expire_gateway_upload_session(
             record.record_hash.clear();
             record.record_hash = hash_record(&record)?;
             let row = put_record_row(
-                storage,
+                mvcc,
                 GATEWAY_ROW_UPLOAD_SESSION,
                 &gateway_upload_ref_name(&record)?,
                 &record,
@@ -848,6 +847,7 @@ pub async fn expire_gateway_upload_session(
 #[allow(clippy::too_many_arguments)]
 pub async fn append_gateway_upload_part(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     gateway: &str,
     registry_instance_id: &str,
@@ -860,6 +860,7 @@ pub async fn append_gateway_upload_part(
 ) -> Result<GatewayUploadSessionReceipt> {
     let Some((mut record, stored_handle)) = read_gateway_upload_session(
         storage,
+        mvcc,
         tenant_id,
         gateway,
         registry_instance_id,
@@ -875,7 +876,7 @@ pub async fn append_gateway_upload_part(
         record.record_hash.clear();
         record.record_hash = hash_record(&record)?;
         let row = put_record_row(
-            storage,
+            mvcc,
             GATEWAY_ROW_UPLOAD_SESSION,
             &gateway_upload_ref_name(&record)?,
             &record,
@@ -965,7 +966,7 @@ pub async fn append_gateway_upload_part(
     record.record_hash.clear();
     record.record_hash = hash_record(&record)?;
     let row = put_record_row(
-        storage,
+        mvcc,
         GATEWAY_ROW_UPLOAD_SESSION,
         &gateway_upload_ref_name(&record)?,
         &record,
@@ -982,6 +983,7 @@ pub async fn append_gateway_upload_part(
 #[allow(clippy::too_many_arguments)]
 pub async fn finalise_gateway_upload_session(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     gateway: &str,
     registry_instance_id: &str,
@@ -993,6 +995,7 @@ pub async fn finalise_gateway_upload_session(
 ) -> Result<GatewayBlobRecord> {
     let Some((session, session_handle)) = read_gateway_upload_session(
         storage,
+        mvcc,
         tenant_id,
         gateway,
         registry_instance_id,
@@ -1012,6 +1015,7 @@ pub async fn finalise_gateway_upload_session(
         };
         let Some((record, _bytes)) = read_gateway_blob(
             storage,
+            mvcc,
             tenant_id,
             &session.gateway,
             &session.registry_instance_id,
@@ -1081,7 +1085,7 @@ pub async fn finalise_gateway_upload_session(
         &target_digest,
     )?;
     if let Some(existing) =
-        read_record_row::<GatewayBlobRecord>(storage, GATEWAY_ROW_BLOB, &blob_ref_name).await?
+        read_record_row::<GatewayBlobRecord>(mvcc, GATEWAY_ROW_BLOB, &blob_ref_name).await?
     {
         validate_blob_record(
             &existing.record,
@@ -1091,15 +1095,9 @@ pub async fn finalise_gateway_upload_session(
             &repository,
             &target_digest,
         )?;
-        return commit_upload_session_record(
-            storage,
-            session,
-            session_handle,
-            &target_digest,
-            None,
-        )
-        .await
-        .map(|_| existing.record);
+        return commit_upload_session_record(mvcc, session, session_handle, &target_digest, None)
+            .await
+            .map(|_| existing.record);
     }
 
     let payload_write = write_gateway_logical_file_with_locator(
@@ -1132,7 +1130,7 @@ pub async fn finalise_gateway_upload_session(
     coremeta::write_registry_blob_locator_row(storage, &blob_record, &payload_write.locator)
         .await?;
     commit_upload_session_record(
-        storage,
+        mvcc,
         session,
         session_handle,
         &target_digest,
@@ -1144,6 +1142,7 @@ pub async fn finalise_gateway_upload_session(
 
 pub async fn put_gateway_credential_record(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     mut record: GatewayCredentialRecord,
     expected_generation: Option<u64>,
 ) -> Result<u64> {
@@ -1152,7 +1151,7 @@ pub async fn put_gateway_credential_record(
     record.record_hash = hash_record(&record)?;
     let ref_name = gateway_credential_ref_name(&record)?;
     let row = put_record_row(
-        storage,
+        mvcc,
         GATEWAY_ROW_CREDENTIAL,
         &ref_name,
         &record,
@@ -1165,6 +1164,7 @@ pub async fn put_gateway_credential_record(
 
 pub async fn read_gateway_credential_record(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     gateway: &str,
     credential_id: &str,
@@ -1173,8 +1173,7 @@ pub async fn read_gateway_credential_record(
     let credential_id = normalize_gateway_identifier(credential_id, "credential id")?;
     let ref_name = gateway_credential_ref_name_parts(tenant_id, &gateway, &credential_id)?;
     let Some(row) =
-        read_record_row::<GatewayCredentialRecord>(storage, GATEWAY_ROW_CREDENTIAL, &ref_name)
-            .await?
+        read_record_row::<GatewayCredentialRecord>(mvcc, GATEWAY_ROW_CREDENTIAL, &ref_name).await?
     else {
         return Ok(None);
     };
@@ -1192,20 +1191,21 @@ pub async fn read_gateway_credential_record(
 
 pub async fn revoke_gateway_credential_record(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     gateway: &str,
     credential_id: &str,
     expected_generation: u64,
 ) -> Result<u64> {
     let Some((mut record, _stored_handle)) =
-        read_gateway_credential_record(storage, tenant_id, gateway, credential_id).await?
+        read_gateway_credential_record(storage, mvcc, tenant_id, gateway, credential_id).await?
     else {
         bail!("gateway credential record not found");
     };
     if record.revoked_at.is_none() {
         record.revoked_at = Some(now_rfc3339());
     }
-    put_gateway_credential_record(storage, record, Some(expected_generation)).await
+    put_gateway_credential_record(storage, mvcc, record, Some(expected_generation)).await
 }
 
 pub fn hash_gateway_credential_secret(secret: &str) -> Result<String> {
@@ -1220,6 +1220,7 @@ pub fn hash_gateway_credential_secret(secret: &str) -> Result<String> {
 #[allow(clippy::too_many_arguments)]
 pub async fn issue_gateway_access_token(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     gateway: &str,
     registry_instance_id: &str,
@@ -1245,7 +1246,7 @@ pub async fn issue_gateway_access_token(
         bail!("gateway token requires at least one action");
     }
     let Some((credential, stored_handle)) =
-        read_gateway_credential_record(storage, tenant_id, &gateway, &credential_id).await?
+        read_gateway_credential_record(storage, mvcc, tenant_id, &gateway, &credential_id).await?
     else {
         bail!("gateway credential not found");
     };
@@ -1285,6 +1286,7 @@ pub async fn issue_gateway_access_token(
 
 pub async fn validate_gateway_access_token(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     token: &str,
     signing_secret: &str,
     requirement: Option<&GatewayTokenRequirement>,
@@ -1317,6 +1319,7 @@ pub async fn validate_gateway_access_token(
 
     let Some((credential, stored_handle)) = read_gateway_credential_record(
         storage,
+        mvcc,
         claims.tenant_id,
         &claims.gateway,
         &claims.credential_id,
@@ -1467,7 +1470,7 @@ pub async fn read_gateway_audit_page(
 }
 
 async fn commit_upload_session_record(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     mut session: GatewayUploadSessionRecord,
     session_handle: GatewayStoredHandle,
     committed_digest: &str,
@@ -1480,18 +1483,10 @@ async fn commit_upload_session_record(
     session.record_hash = hash_record(&session)?;
     let session_handle_name = gateway_upload_ref_name(&session)?;
     if let Some((blob_key, blob_record)) = blob_record {
-        put_record_row(
-            storage,
-            GATEWAY_ROW_BLOB,
-            &blob_key,
-            &blob_record,
-            true,
-            None,
-        )
-        .await?;
+        put_record_row(mvcc, GATEWAY_ROW_BLOB, &blob_key, &blob_record, true, None).await?;
     }
     let row = put_record_row(
-        storage,
+        mvcc,
         GATEWAY_ROW_UPLOAD_SESSION,
         &session_handle_name,
         &session,
@@ -1567,6 +1562,3 @@ use metadata_rows::*;
 pub use mount_routes::{put_gateway_mount_record, resolve_gateway_mount};
 use record_codec::*;
 pub use registry_api::*;
-
-#[cfg(test)]
-mod tests;

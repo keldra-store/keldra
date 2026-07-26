@@ -164,6 +164,7 @@ impl RegistryService for AppState {
         .await?;
         let version = gateway_store::get_package_version(
             &self.storage,
+            self.mvcc.as_ref(),
             claims.tenant_id,
             &req.registry_kind,
             &req.namespace,
@@ -190,7 +191,7 @@ impl RegistryService for AppState {
         )
         .await?;
         let (versions, next_page_token) = gateway_store::list_package_versions(
-            &self.storage,
+            self.mvcc.as_ref(),
             claims.tenant_id,
             &req.registry_kind,
             &req.namespace,
