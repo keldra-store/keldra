@@ -33,6 +33,9 @@ pub struct RealMvccCluster {
 
 impl RealMvccCluster {
     pub async fn start() -> anyhow::Result<Self> {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("warn,anvil_core=debug")
+            .try_init();
         let cluster_id = format!("e2e-{}", uuid::Uuid::new_v4().simple());
         let directories = (0..3)
             .map(|_| tempfile::tempdir())
