@@ -665,6 +665,54 @@ impl ObjectManager {
                             &ingest,
                         )
                         .map_err(|error| Status::internal(error.to_string()))?;
+                    if durability == crate::mvcc_transaction::DurabilityLevel::Quorum {
+                        let mut missing = Vec::new();
+                        for stripe_ordinal in 0..manifest.stripe_count {
+                            for (shard_ordinal, target) in
+                                plan.targets_by_ordinal.iter().enumerate()
+                            {
+                                let shard_ordinal = u16::try_from(shard_ordinal)
+                                    .map_err(|_| Status::internal("shard ordinal exceeds u16"))?;
+                                if !manifest.placements.iter().any(|placement| {
+                                    placement.stripe_ordinal == stripe_ordinal
+                                        && placement.shard_ordinal == shard_ordinal
+                                }) {
+                                    missing.push(crate::mvcc_shard_repair::MissingShardTarget {
+                                        stripe_ordinal,
+                                        shard_ordinal,
+                                        target: target.clone(),
+                                    });
+                                }
+                            }
+                        }
+                        if !missing.is_empty() {
+                            let repair = crate::mvcc_shard_repair::ShardRepairJob {
+                                schema: crate::mvcc_shard_repair::ShardRepairJob::SCHEMA
+                                    .to_string(),
+                                cluster_id: binding.cluster_id.clone(),
+                                transaction_id: transaction_id.to_string(),
+                                target_logical_identity: format!(
+                                    "cluster/{}/object/{}",
+                                    binding.cluster_id, manifest.object_hash
+                                ),
+                                source_manifest: manifest.clone(),
+                                missing,
+                                retiring: Vec::new(),
+                                originating_snapshot_version: binding.snapshot_version,
+                                requested_at_unix_ms: Self::current_unix_ms_for_object()?,
+                            };
+                            mvcc.open_transactions
+                                .add_job(
+                                    transaction_id,
+                                    &binding.cluster_id,
+                                    repair
+                                        .canonical_bytes()
+                                        .map_err(|error| Status::internal(error.to_string()))?,
+                                    Self::current_unix_ms_for_object()?,
+                                )
+                                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                        }
+                    }
                     mvcc.object_evidence
                         .record_ingest(&ingest)
                         .map_err(|error| Status::internal(error.to_string()))?;

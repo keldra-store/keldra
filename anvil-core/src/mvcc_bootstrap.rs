@@ -176,6 +176,7 @@ pub struct MvccSubsystem {
     apply_shutdown: tokio::sync::watch::Sender<bool>,
     apply_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     object_materialisation_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    shard_repair_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl fmt::Debug for MvccSubsystem {
@@ -386,6 +387,7 @@ impl MvccSubsystem {
             apply_shutdown,
             apply_task: Mutex::new(Some(apply_task)),
             object_materialisation_task: Mutex::new(None),
+            shard_repair_task: Mutex::new(None),
         })
     }
 
@@ -411,6 +413,21 @@ impl MvccSubsystem {
             bail!("object materialisation runner is already started");
         }
         *slot = Some(task);
+        drop(slot);
+        let repair = crate::mvcc_shard_repair::ShardRepairRunner::new(
+            self.clone(),
+            format!("shard-repair/{}", self.peers[0].node_id),
+        )?;
+        let repair_task = tokio::spawn(repair.run(self.apply_shutdown.subscribe()));
+        let mut repair_slot = self
+            .shard_repair_task
+            .lock()
+            .map_err(|_| anyhow::anyhow!("shard repair task lock poisoned"))?;
+        if repair_slot.is_some() {
+            repair_task.abort();
+            bail!("shard repair runner is already started");
+        }
+        *repair_slot = Some(repair_task);
         Ok(())
     }
 

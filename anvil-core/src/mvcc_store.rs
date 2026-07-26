@@ -15,6 +15,7 @@ use rocksdb::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::mvcc_shard_repair::{ShardRepairJob, ShardRepairRecord, ShardRepairState};
 use crate::mvcc_transaction::{CommitVersion, LogicalKey, TransactionBundle, WriteOperation};
 use crate::object_materialisation::ObjectMaterialisationState;
 use crate::object_materialisation::{ObjectMaterialisationJob, ObjectMaterialisationRecord};
@@ -186,6 +187,26 @@ impl MvccStore {
             batch.put_cf(heads_cf, logical_key, commit_version.to_be_bytes());
         }
         for encoded_job in &bundle.materialisation_jobs {
+            if serde_json::from_slice::<serde_json::Value>(encoded_job)?
+                .get("schema")
+                .and_then(serde_json::Value::as_str)
+                == Some(ShardRepairJob::SCHEMA)
+            {
+                let job = ShardRepairJob::decode(encoded_job)?;
+                if job.cluster_id != self.cluster_id || job.transaction_id != bundle.transaction_id
+                {
+                    bail!("shard repair job belongs to another transaction or cluster");
+                }
+                let key = self.key(format!("shard-repair/{}", job.job_id()?).as_bytes());
+                let record = serde_json::to_vec(&ShardRepairRecord::pending(job))?;
+                if let Some(existing) = self.db.get_cf(materialisation_cf, &key)?
+                    && existing.as_slice() != record.as_slice()
+                {
+                    bail!("shard repair job identity collision");
+                }
+                batch.put_cf(materialisation_cf, key, record);
+                continue;
+            }
             let job = ObjectMaterialisationJob::decode(encoded_job)?;
             if job.cluster_id != self.cluster_id || job.transaction_id != bundle.transaction_id {
                 bail!("materialisation job belongs to another transaction or cluster");
@@ -527,6 +548,80 @@ impl MvccStore {
         })
     }
 
+    pub fn claim_shard_repair(
+        &self,
+        worker_id: &str,
+        now_unix_ms: u64,
+        lease_ms: u64,
+    ) -> Result<Option<(String, ShardRepairRecord)>> {
+        if worker_id.trim().is_empty() || lease_ms == 0 {
+            bail!("shard repair worker and lease must be non-empty");
+        }
+        let _transition = self.materialisation_transition.lock().unwrap();
+        let cf = self.cf(CF_MATERIALISATION)?;
+        let prefix = self.key(b"shard-repair/");
+        for row in self
+            .db
+            .iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward))
+        {
+            let (key, value) = row?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let mut record: ShardRepairRecord = serde_json::from_slice(&value)?;
+            if !record.claimable(now_unix_ms) {
+                continue;
+            }
+            record.state = ShardRepairState::Running;
+            record.attempts = record.attempts.saturating_add(1);
+            record.lease_owner = Some(worker_id.to_string());
+            record.lease_expires_unix_ms = Some(
+                now_unix_ms
+                    .checked_add(lease_ms)
+                    .context("shard repair lease expiry overflow")?,
+            );
+            self.db.put_cf_opt(
+                cf,
+                &key,
+                serde_json::to_vec(&record)?,
+                &durable_write_options(),
+            )?;
+            let id = String::from_utf8(self.unscoped(&key)?.to_vec())?
+                .strip_prefix("shard-repair/")
+                .context("invalid shard repair key")?
+                .to_string();
+            return Ok(Some((id, record)));
+        }
+        Ok(None)
+    }
+
+    pub fn retry_shard_repair(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        next_attempt_unix_ms: u64,
+        error: &str,
+    ) -> Result<()> {
+        self.transition_shard_repair(job_id, worker_id, |record| {
+            record.state = ShardRepairState::Pending;
+            record.next_attempt_unix_ms = next_attempt_unix_ms;
+            record.lease_owner = None;
+            record.lease_expires_unix_ms = None;
+            record.last_error = Some(error.to_string());
+            Ok(())
+        })
+    }
+
+    pub fn complete_shard_repair(&self, job_id: &str, worker_id: &str) -> Result<()> {
+        self.transition_shard_repair(job_id, worker_id, |record| {
+            record.state = ShardRepairState::Complete;
+            record.lease_owner = None;
+            record.lease_expires_unix_ms = None;
+            record.last_error = None;
+            Ok(())
+        })
+    }
+
     pub fn has_incomplete_object_materialisations(&self) -> Result<bool> {
         let cf = self.cf(CF_MATERIALISATION)?;
         let prefix = self.key(b"object-job/");
@@ -580,6 +675,35 @@ impl MvccStore {
             || record.lease_owner.as_deref() != Some(worker_id)
         {
             bail!("materialisation job is not leased by this worker");
+        }
+        update(&mut record)?;
+        self.db.put_cf_opt(
+            cf,
+            key,
+            serde_json::to_vec(&record)?,
+            &durable_write_options(),
+        )?;
+        Ok(())
+    }
+
+    fn transition_shard_repair(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        update: impl FnOnce(&mut ShardRepairRecord) -> Result<()>,
+    ) -> Result<()> {
+        let _transition = self.materialisation_transition.lock().unwrap();
+        let cf = self.cf(CF_MATERIALISATION)?;
+        let key = self.key(format!("shard-repair/{job_id}").as_bytes());
+        let bytes = self
+            .db
+            .get_cf(cf, &key)?
+            .context("shard repair not found")?;
+        let mut record: ShardRepairRecord = serde_json::from_slice(&bytes)?;
+        if record.state != ShardRepairState::Running
+            || record.lease_owner.as_deref() != Some(worker_id)
+        {
+            bail!("shard repair is not leased by this worker");
         }
         update(&mut record)?;
         self.db.put_cf_opt(
