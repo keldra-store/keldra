@@ -239,19 +239,23 @@ impl MvccSubsystem {
         if !snapshot
             .nodes
             .iter()
-            .any(|(id, incarnation, _)| *id == node.node_id && *incarnation == node.incarnation)
+            .any(|(id, _raft_node_id, incarnation, _failure_domain)| {
+                *id == node.node_id && *incarnation == node.incarnation
+            })
         {
             return Ok(ControlApplyResult::NodeRemoved(node));
         }
         let remaining = snapshot
             .nodes
             .iter()
-            .filter(|(node_id, incarnation, _)| {
+            .filter(|(node_id, _raft_node_id, incarnation, _failure_domain)| {
                 *node_id != node.node_id || *incarnation != node.incarnation
             })
-            .map(|(node_id, incarnation, _)| ConsensusNodeIncarnation {
-                node_id: *node_id,
-                incarnation: *incarnation,
+            .map(|(node_id, _raft_node_id, incarnation, _failure_domain)| {
+                ConsensusNodeIncarnation {
+                    node_id: *node_id,
+                    incarnation: *incarnation,
+                }
             })
             .collect::<Vec<_>>();
         for (partition_id, assignment) in snapshot

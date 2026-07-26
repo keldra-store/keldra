@@ -103,10 +103,12 @@ pub(crate) async fn reconcile_partition_assignment(
     let installed = snapshot
         .nodes
         .iter()
-        .map(|(node_id, incarnation, _)| NodeIncarnation {
-            node_id: *node_id,
-            incarnation: *incarnation,
-        })
+        .map(
+            |(node_id, _raft_node_id, incarnation, _failure_domain)| NodeIncarnation {
+                node_id: *node_id,
+                incarnation: *incarnation,
+            },
+        )
         .collect::<Vec<_>>();
     let desired = rendezvous_owner(partition_id, &installed)
         .context("partition assignment requires at least one installed compact-Raft node")?;
