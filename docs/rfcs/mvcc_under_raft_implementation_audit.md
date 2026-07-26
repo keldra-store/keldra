@@ -90,9 +90,30 @@ disabled; that is distinct from missing production implementation.
 | No discarded internal protocol on the active write path | Implemented | Manifest, append, index and product autocommit paths now stage canonical MVCC mutations. Remaining CoreStore root/publication code supports separate CoreMeta durability internals rather than a reachable shadow application transaction protocol. |
 | Materialisation and outbox work are ordinary durable MVCC state | Implemented | Materialisation jobs and Section 11's required `cf_outbox` events are installed in the same durable RocksDB batch as product rows and the applied watermark. Outbox records carry commit version and deterministic identity; durable lease, reclaim and idempotent completion semantics are covered by focused tests. |
 
+## Direct-mutation classification
+
+Static call-chain inspection of current HEAD classifies production persistence as
+follows:
+
+| Boundary | Classification | Reachability/evidence |
+|---|---|---|
+| `mvcc_store.rs` | Canonical MVCC product state | The apply worker/runtime is the sole product-row RocksDB writer. One certified bundle atomically installs versions, heads, jobs, outbox rows and watermarks. Lease and GC transitions remain inside the same MVCC-owned database. |
+| `mvcc_open_transactions.rs` | Canonical MVCC transaction state | Durable drafts and retry/idempotency records are transaction-coordinator state, never visible product rows. Public transaction RPCs enter here before certification. |
+| `core_store/meta.rs` | Permitted internal CoreMeta state | Direct RocksDB access implements node-local/internal CoreMeta primitives and column-family ownership. Product APIs reach journals that now stage canonical MVCC mutations; they do not call this boundary to publish ordinary product visibility. |
+| `anvil-mvcc-consensus/src/storage.rs` | Permitted Raft/control state | Stores OpenRaft logs, votes, membership, compact certification/conflict state and GC control. Bundle bodies and product values are excluded by type. |
+| `bundle_replication.rs`, `replication.rs` | Permitted physical immutable bytes | Framed, checksummed prepared bundles and transfer files are invisible until a certified bundle is applied. |
+| `shard_store.rs`, distributed ingest targets | Permitted physical shard representation | Stores checksummed provisional/final erasure shards. Canonical manifests/placement overlays determine logical reachability; proof-driven GC handles retirement. |
+| Product service, journal, index, watch, authz and object modules | Canonical MVCC staging or permitted reads | No direct production RocksDB mutation primitive remains. Public writes stage into an explicit transaction or retry-stable product autocommit; control-plane-only topology operations remain separately classified consensus/CoreMeta control. |
+
+No current production direct-write call chain was classified as an RFC
+violation. `direct_mutation_contract.rs` makes the reviewed RocksDB writer
+allowlist executable and fails when a new source file introduces a direct
+mutation primitive without classification. Its test is present but unrun in
+this audit.
+
 ## Highest-priority next work
 
 1. Convert the declarative minority-loss, leader-change, lagging-follower-GC and restart boundaries into executable multi-node fault scenarios using the existing deterministic hooks.
 2. Replace the skeletal Section 29 harness bodies with real local and multi-node workloads, including proposal batching and RocksDB WAL group commit.
 3. Finish the stable trace-operation list at request/response, stripe and shard-fsync boundaries and validate metric emission/labels in focused tests.
-4. Audit any remaining product-specific direct mutation helpers and require canonical product autocommit or an explicit non-product CoreMeta classification.
+4. Replace the benchmark's deterministic in-process certifier with a real OpenRaft WAL/group-commit fixture if release acceptance requires consensus-storage numbers; the current harness honestly measures coordinator pressure and real local/erasure paths, not OpenRaft batching.
