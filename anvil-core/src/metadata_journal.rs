@@ -1328,6 +1328,120 @@ pub fn read_object_version_by_id_mvcc(
         .transpose()
 }
 
+pub fn read_current_directory_objects_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    bucket: &Bucket,
+) -> Result<Vec<Object>> {
+    let snapshot = mvcc.runtime.applied_version()?;
+    read_current_directory_objects_at_mvcc_snapshot(mvcc, bucket, snapshot)
+}
+
+pub fn list_current_objects_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    bucket: &Bucket,
+    prefix: &str,
+    start_after: &str,
+    limit: i32,
+    delimiter: &str,
+) -> Result<NativeObjectListing> {
+    let mut objects = read_current_directory_objects_mvcc(mvcc, bucket)?;
+    objects.retain(|object| {
+        object.key.starts_with(prefix)
+            && object.key.as_str() > start_after
+            && !crate::validation::is_reserved_internal_key(&object.key)
+    });
+    let limit = limit.max(1) as usize;
+    if delimiter.is_empty() {
+        objects.truncate(limit);
+        return Ok(NativeObjectListing {
+            objects,
+            common_prefixes: Vec::new(),
+        });
+    }
+    let mut selected = Vec::new();
+    let mut common_prefixes = std::collections::BTreeSet::new();
+    for object in objects {
+        let suffix = &object.key[prefix.len()..];
+        if let Some(position) = suffix.find(delimiter) {
+            common_prefixes.insert(format!(
+                "{}{}",
+                prefix,
+                &suffix[..position + delimiter.len()]
+            ));
+        } else {
+            selected.push(object);
+        }
+        if selected.len() + common_prefixes.len() >= limit {
+            break;
+        }
+    }
+    Ok(NativeObjectListing {
+        objects: selected,
+        common_prefixes: common_prefixes.into_iter().collect(),
+    })
+}
+
+pub fn read_current_directory_objects_at_mvcc_snapshot(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    bucket: &Bucket,
+    snapshot: u64,
+) -> Result<Vec<Object>> {
+    let tuple_prefix = crate::core_store::object_current_page_bucket_prefix(bucket);
+    let application_prefix = crate::mvcc_product::coremeta_application_prefix(
+        crate::core_store::CF_OBJECT_HEADS,
+        &tuple_prefix,
+    )?;
+    let mut objects = mvcc
+        .runtime
+        .scan_table_prefix_at(
+            crate::core_store::TABLE_OBJECT_HEAD_ROW,
+            &application_prefix,
+            snapshot,
+        )?
+        .into_iter()
+        .filter_map(
+            |(_, row)| match crate::core_store::decode_object_metadata_row(&row.value) {
+                Ok(object) if object.deleted_at.is_none() => Some(Ok(object)),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            },
+        )
+        .collect::<Result<Vec<_>>>()?;
+    objects.sort_by(|left, right| left.key.cmp(&right.key));
+    Ok(objects)
+}
+
+pub fn read_object_versions_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    bucket: &Bucket,
+) -> Result<Vec<ObjectVersion>> {
+    let snapshot = mvcc.runtime.applied_version()?;
+    let tuple_prefix = crate::core_store::object_version_page_bucket_prefix(bucket);
+    let application_prefix = crate::mvcc_product::coremeta_application_prefix(
+        crate::core_store::CF_OBJECT_VERSIONS,
+        &tuple_prefix,
+    )?;
+    let objects = mvcc
+        .runtime
+        .scan_table_prefix_at(
+            crate::core_store::TABLE_OBJECT_VERSION_META_ROW,
+            &application_prefix,
+            snapshot,
+        )?
+        .into_iter()
+        .map(|(_, row)| crate::core_store::decode_object_metadata_row(&row.value))
+        .collect::<Result<Vec<_>>>()?;
+    let mut seen_keys = std::collections::BTreeSet::new();
+    Ok(objects
+        .into_iter()
+        .map(|object| ObjectVersion {
+            is_delete_marker: object.deleted_at.is_some(),
+            is_latest: seen_keys.insert(object.key.clone()),
+            object,
+        })
+        .collect())
+}
+
 pub async fn read_current_object(
     storage: &Storage,
     bucket: &Bucket,

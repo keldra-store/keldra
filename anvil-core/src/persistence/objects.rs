@@ -988,12 +988,7 @@ impl Persistence {
     }
 
     pub async fn list_current_directory_objects(&self, bucket: &Bucket) -> Result<Vec<Object>> {
-        metadata_journal::read_current_directory_objects(
-            &self.storage,
-            bucket,
-            &self.partition_owner_signing_key,
-        )
-        .await
+        metadata_journal::read_current_directory_objects_mvcc(self.mvcc()?, bucket)
     }
 
     pub async fn list_objects(
@@ -1009,16 +1004,14 @@ impl Persistence {
         else {
             return Ok((Vec::new(), Vec::new()));
         };
-        let listing = metadata_journal::list_current_objects(
-            &self.storage,
+        let listing = metadata_journal::list_current_objects_mvcc(
+            self.mvcc()?,
             &bucket,
-            &self.partition_owner_signing_key,
             prefix,
             start_after,
             limit,
             delimiter,
-        )
-        .await?;
+        )?;
         Ok((listing.objects, listing.common_prefixes))
     }
 

@@ -1037,6 +1037,10 @@ pub(crate) fn object_current_page_key_for_object(bucket: &Bucket, object: &Objec
     object_current_page_key(OBJECT_CURRENT_PAGE_FAMILY, bucket, &object.key)
 }
 
+pub(crate) fn object_current_page_bucket_prefix(bucket: &Bucket) -> Vec<u8> {
+    object_ordered_prefix(OBJECT_CURRENT_PAGE_FAMILY, bucket, "")
+}
+
 pub(super) fn object_key_catalog_key(bucket: &Bucket, object: &Object) -> Vec<u8> {
     object_current_page_key(OBJECT_KEY_CATALOG_FAMILY, bucket, &object.key)
 }
@@ -1097,6 +1101,10 @@ fn object_ordered_full_key_prefix(family: &[u8], bucket: &Bucket, object_key: &s
 
 pub(crate) fn object_version_page_prefix(bucket: &Bucket, object_key: &str) -> Vec<u8> {
     object_ordered_full_key_prefix(OBJECT_VERSION_PAGE_FAMILY, bucket, object_key)
+}
+
+pub(crate) fn object_version_page_bucket_prefix(bucket: &Bucket) -> Vec<u8> {
+    object_ordered_prefix(OBJECT_VERSION_PAGE_FAMILY, bucket, "")
 }
 
 fn object_ordered_after_key(family: &[u8], bucket: &Bucket, object_key: &str) -> Vec<u8> {

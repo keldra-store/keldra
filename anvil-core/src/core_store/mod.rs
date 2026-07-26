@@ -50,9 +50,10 @@ pub(crate) use local::{
     ObjectMetadataMutationGuard, ObjectMetadataPageCursor, ObjectMetadataPreconditionSnapshot,
     ObjectMetadataProjectionMutation, ObjectVersionsMetadataPage, PreparedObjectMetadataProjection,
     core_mutation_publication_attempt_id, decode_object_metadata_max_id,
-    decode_object_metadata_row, object_current_key, object_current_page_key_for_object,
-    object_id_counter_key, object_version_id_key, object_version_key,
-    object_version_page_key_for_object, object_version_page_prefix,
+    decode_object_metadata_row, object_current_key, object_current_page_bucket_prefix,
+    object_current_page_key_for_object, object_id_counter_key, object_version_id_key,
+    object_version_key, object_version_page_bucket_prefix, object_version_page_key_for_object,
+    object_version_page_prefix,
 };
 pub use local::{
     CoreMetaRecoverySnapshot, CorePipelineKeyring, CoreStore, CoreStoreAvailabilityError,
