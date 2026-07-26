@@ -151,63 +151,6 @@ impl CoreStore {
         Ok(())
     }
 
-    pub async fn next_object_metadata_id(&self, bucket: &Bucket) -> Result<i64> {
-        let counter_key = object_id_counter_key(bucket);
-        let projected_max_id = match self.read_coremeta_row(
-            CF_OBJECT_VERSIONS,
-            TABLE_OBJECT_VERSION_META_ROW,
-            &counter_key,
-        )? {
-            Some(bytes) => decode_object_metadata_counter_for_bucket(&bytes, bucket)?.max_id,
-            None => 0,
-        };
-        self.next_object_metadata_id_after_counter(bucket, projected_max_id)
-            .await
-    }
-
-    pub(crate) async fn next_object_metadata_id_in_mvcc_transaction(
-        &self,
-        bucket: &Bucket,
-        mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
-        transaction_id: &str,
-        transaction_principal: &str,
-    ) -> Result<i64> {
-        let counter_key = object_id_counter_key(bucket);
-        let logical_key = crate::mvcc_product::coremeta_logical_key(
-            CF_OBJECT_VERSIONS,
-            TABLE_OBJECT_VERSION_META_ROW,
-            &counter_key,
-        )?;
-        let projected_max_id = match mvcc.read_transaction_value(
-            transaction_id,
-            transaction_principal,
-            &logical_key,
-        )? {
-            Some(bytes) => decode_object_metadata_counter_for_bucket(&bytes, bucket)?.max_id,
-            None => 0,
-        };
-        self.next_object_metadata_id_after_counter(bucket, projected_max_id)
-            .await
-    }
-
-    async fn next_object_metadata_id_after_counter(
-        &self,
-        bucket: &Bucket,
-        projected_max_id: i64,
-    ) -> Result<i64> {
-        let metadata_stream_id = format!(
-            "object_metadata:tenant:{}:bucket:{}",
-            bucket.tenant_id, bucket.id
-        );
-        let stream_sequence = self.stream_head_sequence(&metadata_stream_id).await?;
-        let stream_max_id = i64::try_from(stream_sequence)
-            .context("object metadata stream sequence exceeds i64")?;
-        projected_max_id
-            .max(stream_max_id)
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("object id overflow"))
-    }
-
     pub(super) async fn current_object_metadata_root_generation(
         &self,
         bucket: &Bucket,

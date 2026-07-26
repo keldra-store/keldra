@@ -1241,6 +1241,24 @@ pub fn next_object_id_mvcc(
         .ok_or_else(|| anyhow!("object id overflow"))
 }
 
+pub fn next_object_id_in_transaction_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    bucket: &Bucket,
+    transaction_id: &str,
+    transaction_principal: &str,
+) -> Result<i64> {
+    let logical_key = object_projection::object_id_counter_logical_key(bucket)?;
+    let max_id = mvcc
+        .read_transaction_value(transaction_id, transaction_principal, &logical_key)?
+        .as_deref()
+        .map(|payload| crate::core_store::decode_object_metadata_max_id(payload, bucket))
+        .transpose()?
+        .unwrap_or_default();
+    max_id
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("object id overflow"))
+}
+
 pub fn read_current_object_mvcc(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,

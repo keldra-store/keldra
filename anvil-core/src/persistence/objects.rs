@@ -123,17 +123,14 @@ impl Persistence {
         } else {
             0
         };
-        let core_store = CoreStore::new(self.storage.clone()).await?;
         let first_object_id = match (transaction_id, transaction_principal) {
             (Some(transaction_id), Some(transaction_principal)) => {
-                core_store
-                    .next_object_metadata_id_in_mvcc_transaction(
-                        &bucket,
-                        self.mvcc()?,
-                        transaction_id,
-                        transaction_principal,
-                    )
-                    .await?
+                metadata_journal::next_object_id_in_transaction_mvcc(
+                    self.mvcc()?,
+                    &bucket,
+                    transaction_id,
+                    transaction_principal,
+                )?
             }
             (None, None) => metadata_journal::next_object_id_mvcc(self.mvcc()?, &bucket)?,
             _ => {
