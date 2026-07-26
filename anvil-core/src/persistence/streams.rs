@@ -374,6 +374,7 @@ impl Persistence {
             .await?;
         append_journal::create_append_stream_with_permit_in_transaction(
             &self.storage,
+            self.mvcc()?,
             tenant_id,
             bucket_id,
             bucket_name,
@@ -471,6 +472,7 @@ impl Persistence {
             .await?;
         append_journal::append_stream_record_with_permit_in_partition_transaction(
             &self.storage,
+            self.mvcc()?,
             tenant_id,
             bucket_id,
             stream,
@@ -562,6 +564,7 @@ impl Persistence {
             .await?;
         append_journal::seal_append_stream_with_permit_in_partition_transaction(
             &self.storage,
+            self.mvcc()?,
             tenant_id,
             bucket_id,
             stream,
