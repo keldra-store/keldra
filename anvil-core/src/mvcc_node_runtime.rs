@@ -1,6 +1,6 @@
 //! Dependency-injected node facade for the complete MVCC transaction path.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use crate::{
     mvcc_consensus_adapter::ConsensusTransactionCertifier,
@@ -49,7 +49,23 @@ where
     }
 
     pub async fn snapshot(&self, consistency: ReadConsistency) -> Result<u64> {
-        self.coordinator.snapshot(consistency).await
+        if consistency == ReadConsistency::LocalSnapshot {
+            return self.local.readable_version();
+        }
+        let target = self.coordinator.snapshot(consistency).await?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let readable = self.local.readable_version()?;
+            if readable >= target {
+                return Ok(target);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!(
+                    "linearized MVCC snapshot {target} is not locally applied; readable watermark is {readable}"
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     /// Persists and replicates the bundle, certifies it, then makes a committed
@@ -74,7 +90,11 @@ where
     ) -> Result<CommitOutcome> {
         let local_apply = match certification {
             CertificationResult::Committed { commit_version } => {
-                Some(self.local.apply_certified_bundle(commit_version, &bundle)?)
+                Some(self.local.apply_certified_bundle_and_advance(
+                    commit_version,
+                    &bundle,
+                    commit_version,
+                )?)
             }
             CertificationResult::Aborted { .. } => None,
         };

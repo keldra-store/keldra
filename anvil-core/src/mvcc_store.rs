@@ -198,10 +198,10 @@ impl MvccStore {
         if snapshot_version < gc_watermark {
             bail!("snapshot {snapshot_version} is below local GC watermark {gc_watermark}");
         }
-        if snapshot_version > self.applied_version()? {
+        if snapshot_version > self.readable_version()? {
             bail!(
-                "snapshot {snapshot_version} is above local applied version {}",
-                self.applied_version()?
+                "snapshot {snapshot_version} is above local readable version {}",
+                self.readable_version()?
             );
         }
         let prefix = self.key(&encode_logical_key(key)?);
@@ -243,9 +243,9 @@ impl MvccStore {
         if snapshot_version < gc_watermark {
             bail!("snapshot {snapshot_version} is below local GC watermark {gc_watermark}");
         }
-        let applied_version = self.applied_version()?;
-        if snapshot_version > applied_version {
-            bail!("snapshot {snapshot_version} is above local applied version {applied_version}");
+        let readable_version = self.readable_version()?;
+        if snapshot_version > readable_version {
+            bail!("snapshot {snapshot_version} is above local readable version {readable_version}");
         }
 
         let heads_cf = self.cf(CF_HEADS)?;
@@ -271,6 +271,10 @@ impl MvccStore {
 
     pub fn applied_version(&self) -> Result<CommitVersion> {
         self.read_meta_version(APPLIED_VERSION_KEY)
+    }
+
+    pub fn readable_version(&self) -> Result<CommitVersion> {
+        Ok(self.applied_version()?.max(self.decision_watermark()?))
     }
 
     pub fn gc_watermark(&self) -> Result<CommitVersion> {
@@ -793,6 +797,27 @@ mod tests {
         assert!(store.read_at(&row, 7).unwrap().is_some());
         assert_eq!(store.read_at(&row, 8).unwrap(), None);
         assert_eq!(store.read_latest(&row).unwrap(), None);
+    }
+
+    #[test]
+    fn non_data_decisions_advance_the_readable_snapshot_watermark() {
+        let temp = tempdir().unwrap();
+        let store = MvccStore::open(temp.path()).unwrap();
+        let row = key(1, b"missing");
+
+        store.advance_decision_watermark(1).unwrap();
+
+        assert_eq!(store.applied_version().unwrap(), 0);
+        assert_eq!(store.decision_watermark().unwrap(), 1);
+        assert_eq!(store.readable_version().unwrap(), 1);
+        assert_eq!(store.read_at(&row, 1).unwrap(), None);
+        assert!(
+            store
+                .read_at(&row, 2)
+                .unwrap_err()
+                .to_string()
+                .contains("snapshot 2 is above local readable version 1")
+        );
     }
 
     #[test]
