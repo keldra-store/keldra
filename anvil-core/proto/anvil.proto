@@ -4404,3 +4404,94 @@ message ProxyShardRangeRequest {
   string shard_hash = 9;
   string boundary_summary_hash = 10;
 }
+
+// Persistent MVCC data replication. Authentication is performed once when this
+// stream is established; every subsequent frame is bound to that session.
+service ReplicationService {
+  rpc Replicate(stream ReplicationStreamRequest) returns (stream ReplicationStreamResponse);
+}
+
+message ReplicationSessionOpen {
+  string node_id = 1;
+  uint64 node_incarnation = 2;
+  string requested_session_id = 3;
+}
+
+message ReplicationSessionAccepted {
+  string session_id = 1;
+  string peer_node_id = 2;
+  uint64 peer_node_incarnation = 3;
+}
+
+message ReplicationTransferWatermark {
+  string transfer_id = 1;
+  uint64 persisted_through = 2;
+  bool complete = 3;
+  bytes completed_hash = 4;
+}
+
+enum ReplicationTransferKind {
+  REPLICATION_TRANSFER_KIND_UNSPECIFIED = 0;
+  REPLICATION_TRANSFER_KIND_TRANSACTION_BUNDLE = 1;
+  REPLICATION_TRANSFER_KIND_OBJECT_SHARD = 2;
+  REPLICATION_TRANSFER_KIND_MVCC_CATCH_UP = 3;
+  REPLICATION_TRANSFER_KIND_CONSENSUS_SNAPSHOT = 4;
+  REPLICATION_TRANSFER_KIND_REPAIR = 5;
+}
+
+message ReplicationDataFrame {
+  string session_id = 1;
+  uint64 sequence = 2;
+  string partition = 3;
+  string transfer_id = 4;
+  ReplicationTransferKind kind = 5;
+  uint64 offset = 6;
+  bytes payload = 7;
+  bytes payload_checksum = 8;
+  uint64 total_length = 9;
+  bytes final_hash = 10;
+  bool finish = 11;
+}
+
+enum ReplicationAckStatus {
+  REPLICATION_ACK_STATUS_UNSPECIFIED = 0;
+  REPLICATION_ACK_STATUS_RECEIVED = 1;
+  REPLICATION_ACK_STATUS_PERSISTED = 2;
+  REPLICATION_ACK_STATUS_COMPLETE = 3;
+  REPLICATION_ACK_STATUS_APPLIED = 4;
+  REPLICATION_ACK_STATUS_REJECTED = 5;
+}
+
+message ReplicationApplicationAck {
+  string session_id = 1;
+  uint64 acknowledged_sequence = 2;
+  string transfer_id = 3;
+  uint64 persisted_through = 4;
+  bytes completed_hash = 5;
+  ReplicationAckStatus status = 6;
+  string rejection_reason = 7;
+}
+
+message ReplicationHeartbeat {
+  string session_id = 1;
+  uint64 sequence = 2;
+  uint64 last_acknowledged_sequence = 3;
+}
+
+message ReplicationStreamRequest {
+  oneof message {
+    ReplicationSessionOpen open = 1;
+    ReplicationDataFrame frame = 2;
+    ReplicationTransferWatermark watermark = 3;
+    ReplicationHeartbeat heartbeat = 4;
+  }
+}
+
+message ReplicationStreamResponse {
+  oneof message {
+    ReplicationSessionAccepted accepted = 1;
+    ReplicationApplicationAck ack = 2;
+    ReplicationTransferWatermark watermark = 3;
+    ReplicationHeartbeat heartbeat = 4;
+  }
+}
