@@ -136,7 +136,6 @@ fn deduplicate_preconditions(preconditions: &mut Vec<CoreMutationPrecondition>) 
 }
 
 async fn prepare_put_batch_additions(
-    storage: crate::storage::Storage,
     mvcc: std::sync::Arc<crate::mvcc_bootstrap::MvccSubsystem>,
     context: NativeMutationContext,
     target: NativeIdempotencyTarget,
@@ -144,10 +143,8 @@ async fn prepare_put_batch_additions(
     mut durable_preconditions: Vec<CoreMutationPrecondition>,
 ) -> Result<CoreMutationBatchAdditions, Status> {
     let mut additions = if context.transaction_id.is_some() {
-        native_idempotency::prepare_response_in_transaction(
-            &storage, &mvcc, &context, &target, &response,
-        )
-        .await?
+        native_idempotency::prepare_response_in_transaction(&mvcc, &context, &target, &response)
+            .await?
     } else {
         let publication_root_anchor =
             hex::encode(crate::metadata_journal::object_metadata_partition_id(
@@ -155,7 +152,7 @@ async fn prepare_put_batch_additions(
                 context.bucket_id,
             ));
         native_idempotency::prepare_response_for_implicit_batch(
-            &storage,
+            &mvcc,
             &context,
             &target,
             &response,
@@ -203,13 +200,9 @@ pub(super) async fn execute_mutation_batch(
     let target = NativeIdempotencyTarget::new("MutationBatch", &req.bucket_name, "mutation_batch")
         .with_parameters(serde_json::json!({ "request_digest": operation_digest }));
     let _idempotency_guard = acquire_native_mutation_lock(state, &context).await?;
-    let replay = native_idempotency::load_response::<MutationBatchResponse>(
-        &state.storage,
-        Some(&state.mvcc),
-        &context,
-        &target,
-    )
-    .await?;
+    let replay =
+        native_idempotency::load_response::<MutationBatchResponse>(&state.mvcc, &context, &target)
+            .await?;
     if let Some(mut response) = replay {
         // The durable idempotency row is committed in the same root as the
         // object metadata. The exact cursor projection is part of that commit,
@@ -271,7 +264,6 @@ pub(super) async fn execute_mutation_batch(
     if put_only_batch {
         let idempotency_context = context.clone();
         let idempotency_target = target.clone();
-        let idempotency_storage = state.storage.clone();
         let idempotency_mvcc = state.mvcc.clone();
         let operation_digest_for_additions = operation_digest.clone();
         let inputs = req
@@ -308,7 +300,6 @@ pub(super) async fn execute_mutation_batch(
                             objects,
                         );
                         prepare_put_batch_additions(
-                            idempotency_storage,
                             idempotency_mvcc,
                             idempotency_context,
                             idempotency_target,
@@ -337,7 +328,6 @@ pub(super) async fn execute_mutation_batch(
                             objects,
                         );
                         prepare_put_batch_additions(
-                            idempotency_storage,
                             idempotency_mvcc,
                             idempotency_context,
                             idempotency_target,
@@ -562,7 +552,6 @@ pub(super) async fn execute_mutation_batch(
     };
     if transaction_id.is_some() {
         native_idempotency::prepare_response_in_transaction(
-            &state.storage,
             &state.mvcc,
             &context,
             &target,
@@ -570,14 +559,7 @@ pub(super) async fn execute_mutation_batch(
         )
         .await?;
     } else {
-        native_idempotency::store_response(
-            &state.storage,
-            Some(&state.mvcc),
-            &context,
-            &target,
-            &response,
-        )
-        .await?;
+        native_idempotency::store_response(&state.mvcc, &context, &target, &response).await?;
     }
     Ok(Response::new(response))
 }

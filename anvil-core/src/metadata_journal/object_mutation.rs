@@ -1,7 +1,7 @@
 use super::*;
 use crate::core_store::{
-    CoreMutationBatchAdditions, CoreMutationRootPublication, ObjectMetadataProjectionMutation,
-    core_meta_root_key_hash,
+    CoreMutationBatchAdditions, CoreMutationPrecondition, CoreMutationRootPublication,
+    ObjectMetadataProjectionMutation, core_meta_root_key_hash,
 };
 use crate::formats::writer::WriterFamily;
 use crate::persistence::ObjectWatchEvent;
@@ -226,8 +226,14 @@ async fn append_object_put_mutations_with_permit_inner(
         operations,
     };
     let mvcc = mvcc.ok_or_else(|| anyhow!("MVCC staging handle is required"))?;
-    let predicates =
-        object_put_predicates(mvcc, bucket, objects, transaction_id, transaction_principal)?;
+    let predicates = object_put_predicates(
+        mvcc,
+        bucket,
+        objects,
+        &batch.preconditions,
+        transaction_id,
+        transaction_principal,
+    )?;
     let mutations = crate::mvcc_product::product_mutations_from_operations(batch.operations)?;
     if let Some(transaction_principal) = transaction_principal {
         mvcc.stage_product_mutations(
@@ -264,6 +270,7 @@ fn object_put_predicates(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     objects: &[Object],
+    batch_preconditions: &[CoreMutationPrecondition],
     transaction_id: &str,
     transaction_principal: Option<&str>,
 ) -> Result<
@@ -297,7 +304,8 @@ fn object_put_predicates(
         crate::core_store::TABLE_OBJECT_VERSION_META_ROW,
         &crate::core_store::object_id_counter_key(bucket),
     )?);
-    keys.into_iter()
+    let mut predicates = keys
+        .into_iter()
         .map(|key| {
             let visible = match transaction_principal {
                 Some(principal) => mvcc.read_transaction_value(transaction_id, principal, &key)?,
@@ -308,7 +316,31 @@ fn object_put_predicates(
                 .unwrap_or(PredicateKind::Absent);
             Ok((key, kind))
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    for precondition in batch_preconditions {
+        let CoreMutationPrecondition::CoreMetaRow {
+            cf,
+            table_id,
+            tuple_key,
+            expected_payload_hash,
+            require_absent: true,
+            require_present: false,
+        } = precondition
+        else {
+            continue;
+        };
+        if *table_id != crate::core_store::TABLE_NATIVE_IDEMPOTENCY_ROW
+            || cf != crate::core_store::CF_TRANSACTIONS
+            || expected_payload_hash.is_some()
+        {
+            continue;
+        }
+        let key = crate::mvcc_product::coremeta_logical_key(cf, *table_id, tuple_key)?;
+        if !predicates.iter().any(|(current, _)| current == &key) {
+            predicates.push((key, PredicateKind::Absent));
+        }
+    }
+    Ok(predicates)
 }
 
 fn coalesce_coremeta_operations_last_write_wins(
