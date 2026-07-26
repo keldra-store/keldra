@@ -305,6 +305,7 @@ where
             tuple_key,
             payload,
         }],
+        mvcc_predicates: Vec::new(),
     })
 }
 

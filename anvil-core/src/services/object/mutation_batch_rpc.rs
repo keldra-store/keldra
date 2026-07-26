@@ -140,6 +140,10 @@ async fn prepare_put_batch_additions(
     target: NativeIdempotencyTarget,
     response: MutationBatchResponse,
     mut durable_preconditions: Vec<CoreMutationPrecondition>,
+    mut mvcc_preconditions: Vec<(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )>,
 ) -> Result<CoreMutationBatchAdditions, Status> {
     let mut additions = if context.transaction_id.is_some() {
         native_idempotency::prepare_response_in_transaction(&mvcc, &context, &target, &response)
@@ -160,6 +164,7 @@ async fn prepare_put_batch_additions(
         .await?
     };
     additions.preconditions.append(&mut durable_preconditions);
+    additions.mvcc_predicates.append(&mut mvcc_preconditions);
     deduplicate_preconditions(&mut additions.preconditions);
     Ok(additions)
 }
@@ -250,16 +255,34 @@ pub(super) async fn execute_mutation_batch(
     let mut durable_preconditions =
         prepare_mutation_batch_native_preconditions(state, &claims, &req, precondition_transaction)
             .await?;
-    durable_preconditions.extend(
-        prepare_write_preconditions(
-            state,
-            &claims,
-            req.precondition.as_ref(),
-            precondition_transaction,
-        )
-        .await?,
-    );
+    let write_preconditions = prepare_write_preconditions(
+        state,
+        &claims,
+        req.precondition.as_ref(),
+        precondition_transaction,
+    )
+    .await?;
+    durable_preconditions.extend(write_preconditions.physical);
+    let mvcc_preconditions = write_preconditions.mvcc;
     deduplicate_preconditions(&mut durable_preconditions);
+    if !put_only_batch
+        && let (Some(transaction_id), Some(principal)) =
+            (transaction_id, transaction_principal.as_deref())
+    {
+        let now_unix_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default();
+        for (key, kind) in &mvcc_preconditions {
+            state
+                .mvcc
+                .stage_predicate(
+                    transaction_id,
+                    principal,
+                    key.clone(),
+                    kind.clone(),
+                    now_unix_ms,
+                )
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        }
+    }
     if put_only_batch {
         let idempotency_context = context.clone();
         let idempotency_target = target.clone();
@@ -304,6 +327,7 @@ pub(super) async fn execute_mutation_batch(
                             idempotency_target,
                             response,
                             durable_preconditions,
+                            mvcc_preconditions,
                         )
                     },
                 )
@@ -332,6 +356,7 @@ pub(super) async fn execute_mutation_batch(
                             idempotency_target,
                             response,
                             durable_preconditions,
+                            mvcc_preconditions,
                         )
                     },
                 )

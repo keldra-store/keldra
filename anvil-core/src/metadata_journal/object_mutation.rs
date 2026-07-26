@@ -226,6 +226,7 @@ async fn append_object_put_mutations_with_permit_inner(
     )?;
     let mutations = event_plan.mutations;
     let mut predicates = predicates;
+    predicates.append(&mut additions.mvcc_predicates);
     predicates.push(event_plan.head_predicate);
     predicates.extend(watch_plan.predicates);
     let mut mutations = mutations;

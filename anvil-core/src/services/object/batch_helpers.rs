@@ -3,6 +3,14 @@ use crate::core_store::CoreMutationPrecondition;
 
 const MAX_MUTATION_BATCH_OPERATIONS: usize = 256;
 
+pub(super) struct PreparedWritePreconditions {
+    pub physical: Vec<CoreMutationPrecondition>,
+    pub mvcc: Vec<(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )>,
+}
+
 pub(crate) async fn enforce_write_precondition(
     state: &AppState,
     claims: &auth::Claims,
@@ -18,9 +26,12 @@ pub(super) async fn prepare_write_preconditions(
     claims: &auth::Claims,
     precondition: Option<&WritePrecondition>,
     transaction: Option<(&str, &str)>,
-) -> Result<Vec<CoreMutationPrecondition>, Status> {
+) -> Result<PreparedWritePreconditions, Status> {
     let Some(precondition) = precondition else {
-        return Ok(Vec::new());
+        return Ok(PreparedWritePreconditions {
+            physical: Vec::new(),
+            mvcc: Vec::new(),
+        });
     };
     let object_checks = precondition
         .object_versions
@@ -73,6 +84,7 @@ pub(super) async fn prepare_write_preconditions(
             }
         });
     let mut durable_preconditions = Vec::with_capacity(precondition.object_versions.len() + 1);
+    let mut mvcc_preconditions = Vec::with_capacity(1);
     for result in futures_util::future::join_all(object_checks).await {
         durable_preconditions.push(result?);
     }
@@ -95,17 +107,21 @@ pub(super) async fn prepare_write_preconditions(
         if lease.expires_at_nanos <= current_time_nanos()? {
             return Err(Status::failed_precondition(task_lease::LEASE_EXPIRED));
         }
-        // The lease itself is canonical MVCC state. Validate its exact epoch and
-        // value hash here; physical object-row preconditions remain separate
-        // until object publication is fully routed through MVCC.
-        state
-            .persistence
-            .named_task_lease_fenced_precondition(&lease, current_time_nanos()?)
-            .await
-            .map_err(lease_error_status)?;
+        // Carry the canonical lease's exact epoch/value-hash predicate into the
+        // same MVCC transaction as the object metadata publication.
+        mvcc_preconditions.push(
+            state
+                .persistence
+                .named_task_lease_fenced_precondition(&lease, current_time_nanos()?)
+                .await
+                .map_err(lease_error_status)?,
+        );
     }
 
-    Ok(durable_preconditions)
+    Ok(PreparedWritePreconditions {
+        physical: durable_preconditions,
+        mvcc: mvcc_preconditions,
+    })
 }
 
 pub(super) fn validate_mutation_precondition_transaction(

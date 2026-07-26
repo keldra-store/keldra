@@ -177,6 +177,11 @@ impl CoreStore {
     pub(crate) async fn publish_prepared_shard_repair(
         &self,
         prepared: PreparedShardRepair,
+        mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+        lease_predicate: (
+            crate::mvcc_transaction::LogicalKey,
+            crate::mvcc_transaction::PredicateKind,
+        ),
     ) -> Result<RebalanceShardTaskOutcome> {
         match prepared.0 {
             PreparedShardRepairState::Complete(outcome) => Ok(outcome),
@@ -194,6 +199,8 @@ impl CoreStore {
                     &repair_finding_id,
                     &repaired,
                     writer_family,
+                    mvcc,
+                    lease_predicate,
                 )
                 .await?;
                 Ok(outcome)

@@ -594,6 +594,11 @@ impl CoreStore {
         finding_id: &str,
         repaired: &[RepairedShard],
         writer_family: WriterFamily,
+        mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+        lease_predicate: (
+            crate::mvcc_transaction::LogicalKey,
+            crate::mvcc_transaction::PredicateKind,
+        ),
     ) -> Result<()> {
         if repaired.is_empty() {
             bail!("CoreStore shard repair overlay publication has no repaired placements");
@@ -629,6 +634,9 @@ impl CoreStore {
         );
         let mut preconditions = Vec::with_capacity(repaired.len());
         let mut operations = Vec::with_capacity(repaired.len());
+        let mut mvcc_mutations = Vec::with_capacity(repaired.len());
+        let mut mvcc_predicates = Vec::with_capacity(repaired.len() + 1);
+        mvcc_predicates.push(lease_predicate);
         for (repair, precondition) in repaired.iter().zip(overlay_preconditions) {
             let placement = &repair.replacement;
             let key = object_shard_repair_key(
@@ -663,6 +671,24 @@ impl CoreStore {
                 &key,
                 &payload,
             )?;
+            let logical_key = crate::mvcc_product::coremeta_logical_key(
+                CF_OBJECT_VERSIONS,
+                TABLE_OBJECT_SHARD_REPAIR_ROW,
+                &key,
+            )?;
+            let predicate = mvcc
+                .read_latest_value(&logical_key)?
+                .map(|current| {
+                    crate::mvcc_transaction::PredicateKind::ValueHash(
+                        *blake3::hash(&current).as_bytes(),
+                    )
+                })
+                .unwrap_or(crate::mvcc_transaction::PredicateKind::Absent);
+            mvcc_predicates.push((logical_key.clone(), predicate));
+            mvcc_mutations.push(crate::mvcc_product::ProductMutation::put(
+                logical_key,
+                payload.clone(),
+            ));
             preconditions.push(CoreMutationPrecondition::CoreMetaRow {
                 cf: CF_OBJECT_VERSIONS.to_string(),
                 table_id: TABLE_OBJECT_SHARD_REPAIR_ROW,
@@ -685,6 +711,17 @@ impl CoreStore {
         ];
         writer_families.sort();
         writer_families.dedup();
+        mvcc.autocommit_product_mutations_with_predicates(
+            "core_shard_repair",
+            &transaction_id,
+            mvcc_mutations,
+            mvcc_predicates,
+            crate::mvcc_transaction::DurabilityLevel::Quorum,
+            u64::try_from(created_at / 1_000_000).unwrap_or_default(),
+        )
+        .await?;
+        // CoreMeta is retained only as a rebuildable compatibility projection;
+        // the certified MVCC rows above are the authoritative publication.
         let receipt = self
             .commit_mutation_batch(CoreMutationBatch {
                 transaction_id,

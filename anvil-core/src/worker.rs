@@ -721,13 +721,10 @@ async fn handle_rebalance_shard(
         }
     };
     *lease = renew_execution_lease(persistence, core_store, lease, ttl_nanos).await?;
-    task_lease::check_task_lease_mvcc(
-        persistence.mvcc()?,
-        lease,
-        current_time_nanos()?,
-        persistence.partition_owner_signing_key(),
-    )?;
-    let outcome = core_store.publish_prepared_shard_repair(prepared).await?;
+    let lease_predicate = task_lease::task_lease_mvcc_predicate(lease)?;
+    let outcome = core_store
+        .publish_prepared_shard_repair(prepared, persistence.mvcc()?, lease_predicate)
+        .await?;
     if outcome.requires_retry() {
         let unresolved = outcome
             .unresolved_placements()
