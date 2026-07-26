@@ -280,6 +280,24 @@ pub(super) fn read_current_mvcc(
         .transpose()
 }
 
+pub(super) fn read_current_in_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    bucket_id: i64,
+    index_name: &str,
+    transaction_id: &str,
+    principal: &str,
+) -> Result<Option<CurrentDefinitionRecord>> {
+    let key = crate::mvcc_product::coremeta_logical_key(
+        CF_INDEX_DEFS,
+        TABLE_INDEX_DEFINITION_ROW,
+        &current_tuple_key(tenant_id, bucket_id, index_name)?,
+    )?;
+    mvcc.read_transaction_value(transaction_id, principal, &key)?
+        .map(|payload| decode_current_record(&payload, tenant_id, bucket_id))
+        .transpose()
+}
+
 pub(super) fn read_state_mvcc(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
@@ -291,6 +309,23 @@ pub(super) fn read_state_mvcc(
         &state_tuple_key(tenant_id, bucket_id)?,
     )?;
     mvcc.read_latest_value(&key)?
+        .map(|payload| decode_state(&payload, tenant_id, bucket_id))
+        .transpose()
+}
+
+pub(super) fn read_state_in_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    bucket_id: i64,
+    transaction_id: &str,
+    principal: &str,
+) -> Result<Option<IndexCurrentState>> {
+    let key = crate::mvcc_product::coremeta_logical_key(
+        CF_INDEX_DEFS,
+        TABLE_INDEX_DEFINITION_ROW,
+        &state_tuple_key(tenant_id, bucket_id)?,
+    )?;
+    mvcc.read_transaction_value(transaction_id, principal, &key)?
         .map(|payload| decode_state(&payload, tenant_id, bucket_id))
         .transpose()
 }

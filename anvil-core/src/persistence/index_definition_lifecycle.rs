@@ -79,10 +79,12 @@ impl Persistence {
 
         for attempt in 0..attempts {
             let prepared = prepare_index_definition_mutation(
-                &self.storage,
+                self,
                 bucket.tenant_id,
                 bucket.id,
                 mutation,
+                transaction_id,
+                transaction_principal,
             )
             .await?;
             let (index, event_type) = match prepared {
@@ -137,11 +139,37 @@ impl Persistence {
 }
 
 async fn prepare_index_definition_mutation(
-    storage: &Storage,
+    persistence: &Persistence,
     tenant_id: i64,
     bucket_id: i64,
     mutation: &IndexDefinitionMutation,
+    transaction_id: Option<&str>,
+    transaction_principal: Option<&str>,
 ) -> Result<PreparedIndexDefinitionMutation> {
+    let read_current = |name: &str| {
+        let result = match (transaction_id, transaction_principal) {
+            (Some(transaction_id), Some(principal)) => {
+                index_journal::read_current_index_definition_in_transaction(
+                    persistence.mvcc()?,
+                    tenant_id,
+                    bucket_id,
+                    name,
+                    transaction_id,
+                    principal,
+                )
+            }
+            (None, None) => index_journal::read_current_index_definition_mvcc(
+                persistence.mvcc()?,
+                tenant_id,
+                bucket_id,
+                name,
+            ),
+            _ => Err(anyhow!(
+                "index definition transaction id and principal must be provided together"
+            )),
+        };
+        result
+    };
     match mutation {
         IndexDefinitionMutation::Create {
             name,
@@ -151,17 +179,30 @@ async fn prepare_index_definition_mutation(
             authorization_mode,
             build_policy,
         } => {
-            if index_journal::read_current_index_definition(storage, tenant_id, bucket_id, name)
-                .await?
-                .is_some()
-            {
+            if read_current(name)?.is_some() {
                 return Ok(PreparedIndexDefinitionMutation::AlreadyExists);
             }
             let now = Utc::now();
+            let id = match (transaction_id, transaction_principal) {
+                (Some(transaction_id), Some(principal)) => {
+                    index_journal::next_index_definition_id_in_transaction(
+                        persistence.mvcc()?,
+                        tenant_id,
+                        bucket_id,
+                        transaction_id,
+                        principal,
+                    )?
+                }
+                (None, None) => index_journal::next_index_definition_id_mvcc(
+                    persistence.mvcc()?,
+                    tenant_id,
+                    bucket_id,
+                )?,
+                _ => unreachable!("transaction pairing was validated by read_current"),
+            };
             Ok(PreparedIndexDefinitionMutation::Publish {
                 index: IndexDefinition {
-                    id: index_journal::next_index_definition_id(storage, tenant_id, bucket_id)
-                        .await?,
+                    id,
                     tenant_id,
                     bucket_id,
                     name: name.clone(),
@@ -186,10 +227,7 @@ async fn prepare_index_definition_mutation(
             authorization_mode,
             build_policy,
         } => {
-            let Some(mut index) =
-                index_journal::read_current_index_definition(storage, tenant_id, bucket_id, name)
-                    .await?
-            else {
+            let Some(mut index) = read_current(name)? else {
                 return Ok(PreparedIndexDefinitionMutation::NotFound);
             };
             if index.kind != *expected_kind {
@@ -210,10 +248,7 @@ async fn prepare_index_definition_mutation(
             })
         }
         IndexDefinitionMutation::Disable { name } => {
-            let Some(mut index) =
-                index_journal::read_current_index_definition(storage, tenant_id, bucket_id, name)
-                    .await?
-            else {
+            let Some(mut index) = read_current(name)? else {
                 return Ok(PreparedIndexDefinitionMutation::NotFound);
             };
             index.enabled = false;
@@ -228,10 +263,7 @@ async fn prepare_index_definition_mutation(
             })
         }
         IndexDefinitionMutation::Drop { name } => {
-            let Some(index) =
-                index_journal::read_current_index_definition(storage, tenant_id, bucket_id, name)
-                    .await?
-            else {
+            let Some(index) = read_current(name)? else {
                 return Ok(PreparedIndexDefinitionMutation::NotFound);
             };
             Ok(PreparedIndexDefinitionMutation::Publish {

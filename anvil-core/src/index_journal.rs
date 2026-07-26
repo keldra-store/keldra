@@ -233,12 +233,47 @@ async fn append_index_definition_event_inner(
         if let Some(transaction_id) = transaction_id {
             let principal = transaction_principal
                 .ok_or_else(|| anyhow!("transaction principal is required"))?;
+            let snapshot = mvcc
+                .open_transactions
+                .handle(transaction_id)?
+                .snapshot_version;
+            let predicates = mutations
+                .iter()
+                .map(|mutation| {
+                    let visible = mvcc.runtime.read_at(&mutation.key, snapshot)?;
+                    let kind =
+                        visible.map_or(crate::mvcc_transaction::PredicateKind::Absent, |row| {
+                            crate::mvcc_transaction::PredicateKind::ValueHash(
+                                *blake3::hash(&row.value).as_bytes(),
+                            )
+                        });
+                    Ok((mutation.key.clone(), kind))
+                })
+                .collect::<Result<Vec<_>>>()?;
             mvcc.stage_product_mutations(transaction_id, principal, mutations, now_unix_ms)?;
+            for (key, kind) in predicates {
+                mvcc.stage_predicate(transaction_id, principal, key, kind, now_unix_ms)?;
+            }
         } else {
-            mvcc.autocommit_product_mutations(
+            let snapshot = mvcc.runtime.applied_version()?;
+            let predicates = mutations
+                .iter()
+                .map(|mutation| {
+                    let visible = mvcc.runtime.read_at(&mutation.key, snapshot)?;
+                    let kind =
+                        visible.map_or(crate::mvcc_transaction::PredicateKind::Absent, |row| {
+                            crate::mvcc_transaction::PredicateKind::ValueHash(
+                                *blake3::hash(&row.value).as_bytes(),
+                            )
+                        });
+                    Ok((mutation.key.clone(), kind))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            mvcc.autocommit_product_mutations_with_predicates(
                 &index_definition_partition_principal(event.tenant_id, event.bucket_id),
                 &batch.transaction_id,
                 mutations,
+                predicates,
                 crate::mvcc_transaction::DurabilityLevel::Local,
                 now_unix_ms,
             )
@@ -346,6 +381,57 @@ pub async fn read_index_definition_events(
             .await?
             .events,
     )
+}
+
+pub fn read_index_definition_event_page_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    bucket_id: i64,
+    after_cursor: i64,
+    limit: usize,
+) -> Result<IndexDefinitionEventPage> {
+    if after_cursor < 0 {
+        return Err(anyhow!(
+            "index definition watch cursor must be non-negative"
+        ));
+    }
+    let stream_id = index_definition_stream_id(tenant_id, bucket_id);
+    let prefix = crate::mvcc_product::stream_logical_key(
+        crate::core_store::TABLE_STREAM_RECORD_INDEX_ROW,
+        &stream_id,
+        None,
+    )?;
+    let snapshot = mvcc.runtime.applied_version()?;
+    let mut events = mvcc
+        .runtime
+        .scan_table_prefix_at(
+            crate::core_store::TABLE_STREAM_RECORD_INDEX_ROW,
+            &prefix.application_key,
+            snapshot,
+        )?
+        .into_iter()
+        .map(|(_, row)| {
+            let (record_kind, payload) =
+                crate::mvcc_product::decode_stream_record_value(&row.value)?;
+            if record_kind != INDEX_DEFINITION_RECORD_KIND {
+                return Err(anyhow!("index definition stream record kind mismatch"));
+            }
+            let event = index_event_body_from_proto(decode_index_event_body(&payload)?)?;
+            ensure_index_event_scope_matches(&event, tenant_id, bucket_id)?;
+            Ok(event)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    events.retain(|event| event.id > after_cursor);
+    events.sort_by_key(|event| event.id);
+    let page_size = limit.max(1);
+    let has_more = events.len() > page_size;
+    events.truncate(page_size);
+    let next_cursor = events.last().map(|event| event.id).unwrap_or(after_cursor);
+    Ok(IndexDefinitionEventPage {
+        events,
+        next_cursor,
+        has_more,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -524,6 +610,30 @@ pub fn read_current_index_definition_mvcc(
     index_definition_from_event(&current.event).map(Some)
 }
 
+pub fn read_current_index_definition_in_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    bucket_id: i64,
+    name: &str,
+    transaction_id: &str,
+    principal: &str,
+) -> Result<Option<IndexDefinition>> {
+    let Some(row) = current_definitions::read_current_in_transaction(
+        mvcc,
+        tenant_id,
+        bucket_id,
+        name,
+        transaction_id,
+        principal,
+    )?
+    else {
+        return Ok(None);
+    };
+    let current = index_current_from_coremeta_row(row)?;
+    ensure_index_event_name_matches(&current.event, tenant_id, bucket_id, name)?;
+    index_definition_from_event(&current.event).map(Some)
+}
+
 pub fn read_current_index_definitions_mvcc(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
@@ -547,6 +657,38 @@ pub fn next_index_definition_cursor_mvcc(
         .unwrap_or(0)
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("index definition cursor overflow"))
+}
+
+pub fn next_index_definition_id_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    bucket_id: i64,
+) -> Result<i64> {
+    current_definitions::read_state_mvcc(mvcc, tenant_id, bucket_id)?
+        .map(|state| state.max_index_id)
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("index definition id overflow"))
+}
+
+pub fn next_index_definition_id_in_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    bucket_id: i64,
+    transaction_id: &str,
+    principal: &str,
+) -> Result<i64> {
+    current_definitions::read_state_in_transaction(
+        mvcc,
+        tenant_id,
+        bucket_id,
+        transaction_id,
+        principal,
+    )?
+    .map(|state| state.max_index_id)
+    .unwrap_or(0)
+    .checked_add(1)
+    .ok_or_else(|| anyhow::anyhow!("index definition id overflow"))
 }
 
 pub async fn next_index_definition_id(

@@ -305,13 +305,9 @@ impl Persistence {
         tenant_id: i64,
         bucket_id: i64,
     ) -> Result<String> {
-        let defs = index_journal::read_current_index_definitions(
-            &self.storage,
-            tenant_id,
-            bucket_id,
-            false,
-        )
-        .await?;
+        let defs = self
+            .list_index_definitions(tenant_id, bucket_id, false)
+            .await?;
         let snapshot = ActiveIndexPolicySnapshotProto {
             definitions: defs
                 .iter()

@@ -101,8 +101,8 @@ impl Persistence {
         after_cursor: i64,
         limit: i32,
     ) -> Result<Vec<IndexDefinitionEvent>> {
-        index_journal::read_index_definition_events(
-            &self.storage,
+        Ok(index_journal::read_index_definition_event_page_mvcc(
+            self.mvcc()?,
             tenant_id,
             bucket_id,
             after_cursor,
@@ -111,8 +111,8 @@ impl Persistence {
             } else {
                 limit.max(1) as usize
             },
-        )
-        .await
+        )?
+        .events)
     }
 
     pub async fn enqueue_index_build_for_index(
@@ -231,13 +231,9 @@ impl Persistence {
     }
 
     pub async fn enqueue_index_builds_for_bucket(&self, bucket: &Bucket) -> Result<usize> {
-        let indexes = index_journal::read_current_index_definitions(
-            &self.storage,
-            bucket.tenant_id,
-            bucket.id,
-            false,
-        )
-        .await?;
+        let indexes = self
+            .list_index_definitions(bucket.tenant_id, bucket.id, false)
+            .await?;
         let mut scheduled = 0usize;
         for index in indexes {
             if self.enqueue_index_build_for_index(bucket, &index).await? {
@@ -256,13 +252,9 @@ impl Persistence {
         if object_keys.is_empty() {
             return Ok(0);
         }
-        let indexes = index_journal::read_current_index_definitions(
-            &self.storage,
-            bucket.tenant_id,
-            bucket.id,
-            false,
-        )
-        .await?;
+        let indexes = self
+            .list_index_definitions(bucket.tenant_id, bucket.id, false)
+            .await?;
         let mut scheduled = 0usize;
         for index in indexes {
             if index_selects_object_keys(&index, &object_keys)
@@ -332,15 +324,12 @@ impl Persistence {
         if bucket.tenant_id != tenant_id {
             return Err(anyhow!("index build bucket tenant mismatch"));
         }
-        let Some(index) = index_journal::read_current_index_definitions(
-            &self.storage,
-            tenant_id,
-            bucket_id,
-            true,
-        )
-        .await?
-        .into_iter()
-        .find(|index| index.id == index_id) else {
+        let Some(index) = self
+            .list_index_definitions(tenant_id, bucket_id, true)
+            .await?
+            .into_iter()
+            .find(|index| index.id == index_id)
+        else {
             return Ok(None);
         };
         if !index.enabled || index.version != index_version {
