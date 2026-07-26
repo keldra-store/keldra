@@ -1004,6 +1004,35 @@ impl CoreMutationBatchReceipt {
     }
 }
 
+#[cfg(test)]
+mod mutation_batch_receipt_tests {
+    use super::*;
+
+    #[test]
+    fn compact_receipt_reports_outcome_and_finds_stream_append() {
+        let receipt = CoreMutationBatchReceipt {
+            transaction_id: "tx-1".to_string(),
+            scope_partition: "partition-a".to_string(),
+            outcome: CoreMutationBatchOutcome::Committed,
+            stream_appends: vec![CoreCommittedStreamAppend {
+                stream_id: "stream-a".to_string(),
+                visible_sequence: 7,
+                record_hash: "sha256:record".to_string(),
+            }],
+            finalisation_error: None,
+        };
+
+        assert!(receipt.is_committed());
+        assert_eq!(
+            receipt
+                .stream_append("stream-a")
+                .map(|append| append.visible_sequence),
+            Some(7)
+        );
+        assert!(receipt.stream_append("stream-b").is_none());
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CoreExplicitTransactionReceipt {
     pub transaction_id: String,

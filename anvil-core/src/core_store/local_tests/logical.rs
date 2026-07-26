@@ -536,7 +536,7 @@ async fn direct_and_admitted_writers_publish_contiguous_root_generations() {
         .await
         .expect("same-root writers must serialize without deadlocking");
     assert_eq!(direct_outcomes.len(), 1);
-    assert_eq!(admitted_receipt.state, CoreTransactionState::Committed);
+    assert!(admitted_receipt.is_committed());
 
     let anchor = store
         .read_latest_root_anchor(root_anchor_key)
@@ -635,14 +635,8 @@ async fn admitted_same_root_writers_reserve_successor_generations_serially() {
     })
     .await
     .expect("same-root admitted writers did not complete");
-    assert_eq!(
-        first_receipt.unwrap().unwrap().state,
-        CoreTransactionState::Committed
-    );
-    assert_eq!(
-        second_receipt.unwrap().unwrap().state,
-        CoreTransactionState::Committed
-    );
+    assert!(first_receipt.unwrap().unwrap().is_committed());
+    assert!(second_receipt.unwrap().unwrap().is_committed());
 
     let anchor = store
         .read_latest_root_anchor(root_anchor_key)

@@ -76,8 +76,8 @@ async fn task_publication_successor_attempt_commits_after_stale_intent_terminali
     pause.release();
     let stale_receipt = stale_commit.await.unwrap().unwrap();
     assert_eq!(
-        stale_receipt.state,
-        CoreTransactionState::FinalisationFailed
+        stale_receipt.outcome,
+        CoreMutationBatchOutcome::FinalisationFailed
     );
     let stale_error = stale_receipt
         .finalisation_error
@@ -107,7 +107,7 @@ async fn task_publication_successor_attempt_commits_after_stale_intent_terminali
     );
 
     let receipt = store.commit_mutation_batch(fresh_batch).await.unwrap();
-    assert_eq!(receipt.state, CoreTransactionState::Committed);
+    assert!(receipt.is_committed());
     assert_eq!(receipt.transaction_id, fresh_attempt_id);
     assert_eq!(
         read_writer_segment_catalog_record(

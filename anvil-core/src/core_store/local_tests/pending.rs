@@ -873,7 +873,7 @@ async fn core_store_recovery_finalises_admitted_delete_after_winning_delete() {
         })
         .await
         .unwrap();
-    assert_eq!(winning_receipt.state, CoreTransactionState::Committed);
+    assert!(winning_receipt.is_committed());
     assert!(
         store
             .read_coremeta_row(CF_INLINE_PAYLOADS, TABLE_INLINE_PAYLOAD_ROW, &row_key)

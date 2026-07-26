@@ -13,14 +13,21 @@ struct StreamBatchState {
     new_records: Vec<StreamRecord>,
 }
 
+pub(super) struct PreparedMutationBatch {
+    pub owned_ops: Vec<OwnedCoreMetaBatchOp>,
+    pub legacy_updates: Vec<CoreTransactionUpdate>,
+    pub stream_appends: Vec<CoreCommittedStreamAppend>,
+}
+
 pub(super) async fn prepare_mutation_batch_operations(
     store: &CoreStore,
     batch: &CoreMutationBatch,
-) -> Result<(Vec<OwnedCoreMetaBatchOp>, Vec<CoreTransactionUpdate>)> {
+) -> Result<PreparedMutationBatch> {
     let mut stream_states = initialise_stream_states(store, batch).await?;
     let mut visibility_cache = super::local_internal_coremeta::CoreMetaVisibilityCache::default();
     let mut owned_ops = Vec::new();
     let mut updates = vec![None; batch.operations.len()];
+    let mut stream_appends = Vec::new();
 
     for (operation_index, operation) in batch.operations.iter().enumerate() {
         match operation {
@@ -135,6 +142,11 @@ pub(super) async fn prepare_mutation_batch_operations(
                 };
                 state.planned_sequence = record.sequence;
                 state.previous_event_hash = record.event_hash.clone();
+                stream_appends.push(CoreCommittedStreamAppend {
+                    stream_id: record.stream_id.clone(),
+                    visible_sequence: record.sequence,
+                    record_hash: record.event_hash.clone(),
+                });
                 updates[operation_index] = Some(stream_update_from_record(record));
             }
         }
@@ -174,7 +186,11 @@ pub(super) async fn prepare_mutation_batch_operations(
             update.ok_or_else(|| anyhow!("CoreStore mutation operation {index} was not prepared"))
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok((owned_ops, updates))
+    Ok(PreparedMutationBatch {
+        owned_ops,
+        legacy_updates: updates,
+        stream_appends,
+    })
 }
 
 async fn initialise_stream_states(

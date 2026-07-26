@@ -52,7 +52,7 @@ async fn implicit_mutation_exact_retry_returns_the_committed_receipt() {
     let replay = store.commit_mutation_batch(batch).await.unwrap();
 
     assert_eq!(replay, first);
-    assert_eq!(replay.state, CoreTransactionState::Committed);
+    assert!(replay.is_committed());
 }
 
 #[tokio::test]
@@ -90,7 +90,7 @@ async fn implicit_mutation_recovery_reuses_the_durable_publication_plan() {
         .await
         .unwrap();
 
-    assert_eq!(receipt.state, CoreTransactionState::Committed);
+    assert!(receipt.is_committed());
     assert!(
         store
             .read_root_publication_intent(transaction_id)

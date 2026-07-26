@@ -1,8 +1,8 @@
 use super::*;
 use crate::{
     core_store::{
-        CF_LEASES_FENCES, CoreMetaStore, CoreMutationBatchReceipt, CoreStore, CoreTransactionState,
-        TABLE_TASK_CURRENT_ROW, core_meta_record_tuple_key,
+        CF_LEASES_FENCES, CoreMetaStore, CoreMutationBatchOutcome, CoreMutationBatchReceipt,
+        CoreStore, TABLE_TASK_CURRENT_ROW, core_meta_record_tuple_key,
     },
     partition_fence::partition_write_precondition,
     persistence::TaskRecord,
@@ -72,14 +72,14 @@ fn failed_task_mutation_receipt_is_not_acknowledged() {
     let mut receipt = CoreMutationBatchReceipt {
         transaction_id: "task-receipt-failure".to_string(),
         scope_partition: "task_queue/global".to_string(),
-        state: CoreTransactionState::FinalisationFailed,
-        visible_updates: Vec::new(),
+        outcome: CoreMutationBatchOutcome::FinalisationFailed,
+        stream_appends: Vec::new(),
         finalisation_error: Some("CoreMetaPublicationTerminal: stale fence".to_string()),
     };
     let error = super::store::require_committed_task_mutation(&receipt).unwrap_err();
     assert!(format!("{error:#}").contains("CoreMetaPublicationTerminal: stale fence"));
 
-    receipt.state = CoreTransactionState::Committed;
+    receipt.outcome = CoreMutationBatchOutcome::Committed;
     receipt.finalisation_error = None;
     super::store::require_committed_task_mutation(&receipt).unwrap();
 }
@@ -89,8 +89,8 @@ fn failed_task_row_payload_cas_is_retryable() {
     let receipt = CoreMutationBatchReceipt {
         transaction_id: "task-receipt-conflict".to_string(),
         scope_partition: "task_queue/global".to_string(),
-        state: CoreTransactionState::FinalisationFailed,
-        visible_updates: Vec::new(),
+        outcome: CoreMutationBatchOutcome::FinalisationFailed,
+        stream_appends: Vec::new(),
         finalisation_error: Some(format!(
             "CoreMeta row {CF_LEASES_FENCES}/{TABLE_TASK_CURRENT_ROW:#06x}/01 precondition failed: payload hash mismatch: expected blake3:old, got blake3:new"
         )),

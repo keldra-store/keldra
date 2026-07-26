@@ -701,7 +701,7 @@ async fn implicit_delete_accepts_a_row_older_than_the_root_head() {
         .await
         .unwrap();
 
-    assert_eq!(receipt.state, CoreTransactionState::Committed);
+    assert!(receipt.is_committed());
     assert!(receipt.finalisation_error.is_none());
     assert!(
         store

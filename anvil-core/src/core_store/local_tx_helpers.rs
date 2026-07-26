@@ -1,23 +1,5 @@
 use super::*;
 
-pub(super) fn receipt_from_transaction(transaction: &CoreTransaction) -> CoreMutationBatchReceipt {
-    CoreMutationBatchReceipt {
-        transaction_id: transaction.transaction_id.clone(),
-        scope_partition: transaction.scope_partition.clone(),
-        outcome: if transaction.state == CoreTransactionState::Committed {
-            CoreMutationBatchOutcome::Committed
-        } else {
-            CoreMutationBatchOutcome::FinalisationFailed
-        },
-        stream_appends: transaction
-            .visible_updates
-            .iter()
-            .filter_map(committed_stream_append)
-            .collect(),
-        finalisation_error: transaction.finalisation_error.clone(),
-    }
-}
-
 pub(super) fn committed_stream_append(
     update: &CoreTransactionUpdate,
 ) -> Option<CoreCommittedStreamAppend> {
