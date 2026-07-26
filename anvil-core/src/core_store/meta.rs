@@ -62,7 +62,6 @@ pub const TABLE_MULTIPART_UPLOAD_CURRENT_ROW: u16 = 0x8105;
 pub const TABLE_MULTIPART_PART_CURRENT_ROW: u16 = 0x8106;
 pub const TABLE_OBJECT_METADATA_PARTITION_MANIFEST_ROW: u16 = 0x8107;
 pub const TABLE_OBJECT_WATCH_CURSOR_ROW: u16 = 0x8108;
-pub const TABLE_OBJECT_SHARD_REPAIR_ROW: u16 = 0x8109;
 pub const TABLE_STREAM_HEAD_ROW: u16 = 0x8201;
 pub const TABLE_STREAM_RECORD_INDEX_ROW: u16 = 0x8202;
 pub const TABLE_STREAM_IDEMPOTENCY_ROW: u16 = 0x8203;
@@ -1372,9 +1371,7 @@ fn table_spec(table_id: u16) -> Result<CoreMetaTableSpec> {
             cf: CF_OBJECT_HEADS,
             max_payload_bytes: CORE_META_OBJECT_VERSION_MAX_PAYLOAD_BYTES,
         },
-        TABLE_OBJECT_VERSION_META_ROW
-        | TABLE_OBJECT_WATCH_CURSOR_ROW
-        | TABLE_OBJECT_SHARD_REPAIR_ROW => CoreMetaTableSpec {
+        TABLE_OBJECT_VERSION_META_ROW | TABLE_OBJECT_WATCH_CURSOR_ROW => CoreMetaTableSpec {
             cf: CF_OBJECT_VERSIONS,
             max_payload_bytes: CORE_META_OBJECT_VERSION_MAX_PAYLOAD_BYTES,
         },
@@ -1733,7 +1730,6 @@ fn expected_schema_markers(table_id: u16) -> Option<&'static [&'static str]> {
             "anvil.core.object_metadata_counter.v1",
         ]),
         TABLE_OBJECT_WATCH_CURSOR_ROW => Some(&["anvil.core.object_watch_cursor.v1"]),
-        TABLE_OBJECT_SHARD_REPAIR_ROW => Some(&["anvil.core.object_shard_repair.v1"]),
         TABLE_STREAM_HEAD_ROW => Some(&["anvil.core.stream_head.v1"]),
         TABLE_STREAM_RECORD_INDEX_ROW => Some(&[
             "anvil.core.watch_event.v1",

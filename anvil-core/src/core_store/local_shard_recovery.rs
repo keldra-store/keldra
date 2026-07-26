@@ -20,7 +20,8 @@ mod task_executor;
 
 use repair_identity::physical_shard_repair_operation_id;
 
-const OBJECT_SHARD_REPAIR_SCHEMA: &str = "anvil.core.object_shard_repair.v1";
+const OBJECT_SHARD_REPAIR_SCHEMA: &str = "anvil.mvcc.object-shard-repair.v2";
+const MVCC_OBJECT_SHARD_REPAIR_TABLE_ID: u16 = 0x8109;
 const SHARD_INVENTORY_SCHEMA: &str = "anvil.core.shard_inventory.v1";
 const SHARD_RECOVERY_SCAN_ROWS: usize = 64;
 const SHARD_RECOVERY_PAGE_DELAY: Duration = Duration::from_secs(2);
@@ -29,8 +30,6 @@ const SHARD_RECOVERY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, PartialEq, Message)]
 struct ObjectShardRepairRowProto {
-    #[prost(message, optional, tag = "1")]
-    common: Option<CoreMetaRowCommonProto>,
     #[prost(string, tag = "2")]
     schema: String,
     #[prost(string, tag = "3")]
@@ -118,14 +117,43 @@ struct ShardRepairWriteOutcome {
     unresolved: Vec<UnresolvedShard>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct OverlayWritePrecondition {
-    expected_payload_hash: Option<String>,
-    require_absent: bool,
-    require_present: bool,
-}
-
 impl CoreStore {
+    fn apply_shard_repair_overlays_mvcc(
+        &self,
+        mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+        manifest: &mut CoreObjectManifest,
+        snapshot_version: u64,
+    ) -> Result<()> {
+        for placement in &mut manifest.placements {
+            let tuple_key = object_shard_repair_key(
+                &manifest.object_hash,
+                &manifest.encoding.block_id,
+                placement.shard_index,
+            );
+            let key = crate::mvcc_product::coremeta_logical_key(
+                CF_OBJECT_VERSIONS,
+                MVCC_OBJECT_SHARD_REPAIR_TABLE_ID,
+                &tuple_key,
+            )?;
+            let Some(row) = mvcc.runtime.read_at(&key, snapshot_version)? else {
+                continue;
+            };
+            let repair = decode_object_shard_repair_row(
+                &manifest.object_hash,
+                &manifest.encoding.block_id,
+                placement.shard_index,
+                &row.value,
+            )?;
+            if repair.placement_generation > placement.generation {
+                *placement = placement_from_repair_row(repair)?;
+            }
+        }
+        manifest
+            .placements
+            .sort_by_key(|placement| placement.shard_index);
+        Ok(())
+    }
+
     pub async fn run_distributed_shard_recovery(self) {
         if self.node_identity == CoreStoreNodeIdentity::default() {
             return;
@@ -152,38 +180,6 @@ impl CoreStore {
                 }
             }
         }
-    }
-
-    pub(super) fn apply_shard_repair_overlays(
-        &self,
-        manifest: &mut CoreObjectManifest,
-    ) -> Result<()> {
-        for placement in &mut manifest.placements {
-            let key = object_shard_repair_key(
-                &manifest.object_hash,
-                &manifest.encoding.block_id,
-                placement.shard_index,
-            );
-            let Some(payload) =
-                self.read_coremeta_row(CF_OBJECT_VERSIONS, TABLE_OBJECT_SHARD_REPAIR_ROW, &key)?
-            else {
-                continue;
-            };
-            let repair = decode_object_shard_repair_row(
-                &manifest.object_hash,
-                &manifest.encoding.block_id,
-                placement.shard_index,
-                &payload,
-            )?;
-            if repair.placement_generation <= placement.generation {
-                continue;
-            }
-            *placement = placement_from_repair_row(repair)?;
-        }
-        manifest
-            .placements
-            .sort_by_key(|placement| placement.shard_index);
-        Ok(())
     }
 
     pub(crate) async fn shard_inventory_state(
@@ -263,7 +259,6 @@ impl CoreStore {
         encoded_manifest: &[u8],
     ) -> Result<()> {
         let payload = task_executor::rebalance_payload_from_manifest(&manifest, encoded_manifest)?;
-        self.apply_shard_repair_overlays(&mut manifest)?;
         validate_repair_manifest_identity(&manifest)?;
         let profile = local_erasure_profile(&manifest.encoding.profile_id)?;
         let candidates = self.active_object_peer_placements().await?;
@@ -590,10 +585,8 @@ impl CoreStore {
     async fn publish_shard_repair_overlays(
         &self,
         canonical_manifest: &CoreObjectManifest,
-        effective_manifest: &CoreObjectManifest,
         finding_id: &str,
         repaired: &[RepairedShard],
-        writer_family: WriterFamily,
         mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
         lease_predicate: (
             crate::mvcc_transaction::LogicalKey,
@@ -603,41 +596,26 @@ impl CoreStore {
         if repaired.is_empty() {
             bail!("CoreStore shard repair overlay publication has no repaired placements");
         }
-        let root_anchor_key = object_shard_repair_root_anchor_key(&canonical_manifest.object_hash);
-        let overlay_preconditions = repaired
-            .iter()
-            .map(|repair| {
-                self.shard_repair_overlay_precondition(
-                    canonical_manifest,
-                    effective_manifest,
-                    repair,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let transaction_id =
-            shard_repair_overlay_transaction_id(finding_id, repaired, &overlay_preconditions)?;
+        let mut transaction_identity = finding_id.as_bytes().to_vec();
+        for repair in repaired {
+            transaction_identity.extend_from_slice(&repair.expected.shard_index.to_be_bytes());
+            transaction_identity.extend_from_slice(repair.replacement.shard_hash.as_bytes());
+            transaction_identity.extend_from_slice(&repair.replacement.generation.to_be_bytes());
+        }
+        let transaction_id = format!(
+            "shard-repair-overlay-{}",
+            hex::encode(hash32(&transaction_identity))
+        );
         let created_at = repaired
             .iter()
             .map(|repair| repair.replacement.written_at_unix_nanos)
             .max()
             .filter(|created_at| *created_at > 0)
             .ok_or_else(|| anyhow!("CoreStore shard repair receipts have no durable timestamp"))?;
-        let common = core_meta_committed_row_common(
-            format!(
-                "mesh/{}/region/{}",
-                canonical_manifest.mesh_id, canonical_manifest.region_id
-            ),
-            core_meta_root_key_hash(&root_anchor_key),
-            1,
-            &transaction_id,
-            created_at,
-        );
-        let mut preconditions = Vec::with_capacity(repaired.len());
-        let mut operations = Vec::with_capacity(repaired.len());
         let mut mvcc_mutations = Vec::with_capacity(repaired.len());
         let mut mvcc_predicates = Vec::with_capacity(repaired.len() + 1);
         mvcc_predicates.push(lease_predicate);
-        for (repair, precondition) in repaired.iter().zip(overlay_preconditions) {
+        for repair in repaired {
             let placement = &repair.replacement;
             let key = object_shard_repair_key(
                 &canonical_manifest.object_hash,
@@ -645,7 +623,6 @@ impl CoreStore {
                 placement.shard_index,
             );
             let payload = encode_deterministic_proto(&ObjectShardRepairRowProto {
-                common: Some(common.clone()),
                 schema: OBJECT_SHARD_REPAIR_SCHEMA.to_string(),
                 object_hash: canonical_manifest.object_hash.clone(),
                 block_id: canonical_manifest.encoding.block_id.clone(),
@@ -665,22 +642,38 @@ impl CoreStore {
                 repair_finding_id: finding_id.to_string(),
                 replaced_node_id: repair.expected.node_id.clone(),
             });
-            validate_coremeta_operation_payload(
-                CF_OBJECT_VERSIONS,
-                TABLE_OBJECT_SHARD_REPAIR_ROW,
-                &key,
-                &payload,
-            )?;
             let logical_key = crate::mvcc_product::coremeta_logical_key(
                 CF_OBJECT_VERSIONS,
-                TABLE_OBJECT_SHARD_REPAIR_ROW,
+                MVCC_OBJECT_SHARD_REPAIR_TABLE_ID,
                 &key,
             )?;
-            let predicate = mvcc
-                .read_latest_value(&logical_key)?
-                .map(|current| {
+            let current = mvcc.read_latest_value(&logical_key)?;
+            let canonical = canonical_manifest
+                .placements
+                .iter()
+                .find(|candidate| candidate.shard_index == repair.expected.shard_index)
+                .ok_or_else(|| anyhow!("canonical shard repair placement is missing"))?;
+            let current_effective = current
+                .as_deref()
+                .map(|bytes| {
+                    decode_object_shard_repair_row(
+                        &canonical_manifest.object_hash,
+                        &canonical_manifest.encoding.block_id,
+                        repair.expected.shard_index,
+                        bytes,
+                    )
+                    .and_then(placement_from_repair_row)
+                })
+                .transpose()?
+                .filter(|overlay| overlay.generation > canonical.generation)
+                .unwrap_or_else(|| canonical.clone());
+            if current_effective != repair.expected {
+                bail!("MVCC shard repair overlay changed after immutable shard preparation");
+            }
+            let predicate = current
+                .map(|bytes| {
                     crate::mvcc_transaction::PredicateKind::ValueHash(
-                        *blake3::hash(&current).as_bytes(),
+                        *blake3::hash(&bytes).as_bytes(),
                     )
                 })
                 .unwrap_or(crate::mvcc_transaction::PredicateKind::Absent);
@@ -689,28 +682,7 @@ impl CoreStore {
                 logical_key,
                 payload.clone(),
             ));
-            preconditions.push(CoreMutationPrecondition::CoreMetaRow {
-                cf: CF_OBJECT_VERSIONS.to_string(),
-                table_id: TABLE_OBJECT_SHARD_REPAIR_ROW,
-                tuple_key: key.clone(),
-                expected_payload_hash: precondition.expected_payload_hash,
-                require_absent: precondition.require_absent,
-                require_present: precondition.require_present,
-            });
-            operations.push(CoreMutationOperation::CoreMetaPut {
-                partition_id: root_anchor_key.clone(),
-                cf: CF_OBJECT_VERSIONS.to_string(),
-                table_id: TABLE_OBJECT_SHARD_REPAIR_ROW,
-                tuple_key: key,
-                payload,
-            });
         }
-        let mut writer_families = vec![
-            WriterFamily::CoreControl.as_str().to_string(),
-            writer_family.as_str().to_string(),
-        ];
-        writer_families.sort();
-        writer_families.dedup();
         mvcc.autocommit_product_mutations_with_predicates(
             "core_shard_repair",
             &transaction_id,
@@ -720,88 +692,7 @@ impl CoreStore {
             u64::try_from(created_at / 1_000_000).unwrap_or_default(),
         )
         .await?;
-        // CoreMeta is retained only as a rebuildable compatibility projection;
-        // the certified MVCC rows above are the authoritative publication.
-        let receipt = self
-            .commit_mutation_batch(CoreMutationBatch {
-                transaction_id,
-                scope_partition: root_anchor_key.clone(),
-                committed_by_principal: "core_shard_repair".to_string(),
-                root_publications: vec![CoreMutationRootPublication {
-                    root_anchor_key,
-                    writer_families,
-                    transaction_coordinator: true,
-                }],
-                preconditions,
-                operations,
-            })
-            .await?;
-        if !receipt.is_committed() {
-            bail!(
-                "CoreStore shard repair overlay transaction {} did not commit: {}",
-                receipt.transaction_id,
-                receipt
-                    .finalisation_error
-                    .unwrap_or_else(|| "unknown finalisation failure".to_string())
-            );
-        }
         Ok(())
-    }
-
-    fn shard_repair_overlay_precondition(
-        &self,
-        canonical_manifest: &CoreObjectManifest,
-        effective_manifest: &CoreObjectManifest,
-        repair: &RepairedShard,
-    ) -> Result<OverlayWritePrecondition> {
-        let shard_index = repair.expected.shard_index;
-        let canonical = canonical_manifest
-            .placements
-            .iter()
-            .find(|placement| placement.shard_index == shard_index)
-            .ok_or_else(|| {
-                anyhow!("CoreStore canonical repair placement {shard_index} is missing")
-            })?;
-        let effective = effective_manifest
-            .placements
-            .iter()
-            .find(|placement| placement.shard_index == shard_index)
-            .ok_or_else(|| {
-                anyhow!("CoreStore effective repair placement {shard_index} is missing")
-            })?;
-        if effective != &repair.expected {
-            bail!("CoreStore shard repair expected placement changed before publication");
-        }
-
-        let key = object_shard_repair_key(
-            &canonical_manifest.object_hash,
-            &canonical_manifest.encoding.block_id,
-            shard_index,
-        );
-        let current_payload =
-            self.read_coremeta_row(CF_OBJECT_VERSIONS, TABLE_OBJECT_SHARD_REPAIR_ROW, &key)?;
-        let current_overlay = current_payload
-            .as_deref()
-            .map(|payload| {
-                let row = decode_object_shard_repair_row(
-                    &canonical_manifest.object_hash,
-                    &canonical_manifest.encoding.block_id,
-                    shard_index,
-                    payload,
-                )?;
-                Ok::<_, anyhow::Error>((
-                    placement_from_repair_row(row)?,
-                    core_meta_payload_digest(TABLE_OBJECT_SHARD_REPAIR_ROW, payload),
-                ))
-            })
-            .transpose()?;
-        semantic_overlay_write_precondition(
-            canonical,
-            &repair.expected,
-            current_overlay
-                .as_ref()
-                .map(|(placement, digest)| (placement, digest.as_str())),
-        )
     }
 }
 
@@ -946,64 +837,6 @@ fn verify_reconstructed_shards(
     Ok(())
 }
 
-fn semantic_overlay_write_precondition(
-    canonical: &CoreObjectPlacement,
-    expected: &CoreObjectPlacement,
-    current_overlay: Option<(&CoreObjectPlacement, &str)>,
-) -> Result<OverlayWritePrecondition> {
-    let current_effective = current_overlay
-        .filter(|(placement, _)| placement.generation > canonical.generation)
-        .map_or(canonical, |(placement, _)| placement);
-    if current_effective != expected {
-        bail!(
-            "CoreStore shard repair overlay precondition failed for shard {}: expected node {} generation {}, current node {} generation {}",
-            expected.shard_index,
-            expected.node_id,
-            expected.generation,
-            current_effective.node_id,
-            current_effective.generation
-        );
-    }
-    Ok(match current_overlay {
-        Some((_, payload_hash)) => OverlayWritePrecondition {
-            expected_payload_hash: Some(payload_hash.to_string()),
-            require_absent: false,
-            require_present: true,
-        },
-        None => OverlayWritePrecondition {
-            expected_payload_hash: None,
-            require_absent: true,
-            require_present: false,
-        },
-    })
-}
-
-fn shard_repair_overlay_transaction_id(
-    finding_id: &str,
-    repaired: &[RepairedShard],
-    preconditions: &[OverlayWritePrecondition],
-) -> Result<String> {
-    if repaired.len() != preconditions.len() {
-        bail!("CoreStore shard repair overlay precondition plan is incomplete");
-    }
-    let mut bytes = b"anvil.shard_repair.overlay_transaction.v1".to_vec();
-    append_repair_identity_component(&mut bytes, finding_id.as_bytes());
-    for (repair, precondition) in repaired.iter().zip(preconditions) {
-        append_repair_placement_identity(&mut bytes, &repair.expected);
-        append_repair_placement_identity(&mut bytes, &repair.replacement);
-        match precondition.expected_payload_hash.as_deref() {
-            Some(hash) => {
-                bytes.push(1);
-                append_repair_identity_component(&mut bytes, hash.as_bytes());
-            }
-            None => bytes.push(0),
-        }
-        bytes.push(u8::from(precondition.require_absent));
-        bytes.push(u8::from(precondition.require_present));
-    }
-    Ok(format!("shard-repair-overlay-{}", sha256_hex(&bytes)))
-}
-
 fn object_shard_repair_key(object_hash: &str, block_id: &str, shard_index: u16) -> Vec<u8> {
     meta_tuple_key(&[
         b"object-shard-repair",
@@ -1011,10 +844,6 @@ fn object_shard_repair_key(object_hash: &str, block_id: &str, shard_index: u16) 
         block_id.as_bytes(),
         &shard_index.to_be_bytes(),
     ])
-}
-
-fn object_shard_repair_root_anchor_key(object_hash: &str) -> String {
-    format!("object-shard-repair/{object_hash}")
 }
 
 fn decode_object_shard_repair_row(
@@ -1033,16 +862,6 @@ fn decode_object_shard_repair_row(
         || row.shard_index != u32::from(shard_index)
     {
         bail!("CoreStore object shard repair row scope mismatch");
-    }
-    let common = row
-        .common
-        .as_ref()
-        .ok_or_else(|| anyhow!("CoreStore object shard repair row missing common metadata"))?;
-    if common.root_key_hash
-        != core_meta_root_key_hash(&object_shard_repair_root_anchor_key(object_hash))
-        || common.visibility_state_enum() != CoreMetaVisibilityState::Committed
-    {
-        bail!("CoreStore object shard repair row publication metadata mismatch");
     }
     Ok(row)
 }
@@ -1265,89 +1084,6 @@ mod tests {
         );
         assert_eq!(probe.state, PlacementProbeState::Repairable);
         assert!(probe.bytes.is_none());
-    }
-
-    #[test]
-    fn repair_overlay_precondition_rejects_newer_semantic_state() {
-        let canonical = object_placement(2, "node-a", 1);
-        let absent = semantic_overlay_write_precondition(&canonical, &canonical, None).unwrap();
-        assert_eq!(
-            absent,
-            OverlayWritePrecondition {
-                expected_payload_hash: None,
-                require_absent: true,
-                require_present: false,
-            }
-        );
-
-        let expected_overlay = object_placement(2, "node-b", 2);
-        let present = semantic_overlay_write_precondition(
-            &canonical,
-            &expected_overlay,
-            Some((&expected_overlay, "blake3:overlay-two")),
-        )
-        .unwrap();
-        assert_eq!(
-            present,
-            OverlayWritePrecondition {
-                expected_payload_hash: Some("blake3:overlay-two".to_string()),
-                require_absent: false,
-                require_present: true,
-            }
-        );
-
-        let newer_overlay = object_placement(2, "node-c", 3);
-        assert!(
-            semantic_overlay_write_precondition(
-                &canonical,
-                &expected_overlay,
-                Some((&newer_overlay, "blake3:overlay-three")),
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn repair_overlay_transaction_identity_is_deterministic_and_state_bound() {
-        let repair = RepairedShard {
-            expected: object_placement(1, "node-a", 1),
-            replacement: object_placement(1, "node-b", 2),
-        };
-        let precondition = OverlayWritePrecondition {
-            expected_payload_hash: None,
-            require_absent: true,
-            require_present: false,
-        };
-        let transaction_id = shard_repair_overlay_transaction_id(
-            "shard-repair-finding",
-            std::slice::from_ref(&repair),
-            std::slice::from_ref(&precondition),
-        )
-        .unwrap();
-        assert_eq!(
-            transaction_id,
-            shard_repair_overlay_transaction_id(
-                "shard-repair-finding",
-                std::slice::from_ref(&repair),
-                std::slice::from_ref(&precondition),
-            )
-            .unwrap()
-        );
-
-        let changed_precondition = OverlayWritePrecondition {
-            expected_payload_hash: Some(format!("blake3:{}", "3".repeat(64))),
-            require_absent: false,
-            require_present: true,
-        };
-        assert_ne!(
-            transaction_id,
-            shard_repair_overlay_transaction_id(
-                "shard-repair-finding",
-                &[repair],
-                &[changed_precondition],
-            )
-            .unwrap()
-        );
     }
 
     #[test]

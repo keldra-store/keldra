@@ -102,7 +102,6 @@ impl CoreStore {
         if is_inline_object_ref(object_ref) {
             return Ok(manifest);
         }
-        self.apply_shard_repair_overlays(&mut manifest)?;
         self.manifest_with_present_shard_placements(manifest)
     }
 

@@ -700,7 +700,8 @@ async fn handle_rebalance_shard(
     *lease = check_execution_lease(persistence, core_store, lease).await?;
     let repair_finding_id = open_finding.finding_id;
 
-    let preparation = core_store.prepare_shard_repair_for_task(&payload, &repair_finding_id);
+    let preparation =
+        core_store.prepare_shard_repair_for_task(&payload, &repair_finding_id, persistence.mvcc()?);
     tokio::pin!(preparation);
     let prepared = loop {
         let renewal_delay = task_lease_renewal_delay(&lease, current_time_nanos()?)?;

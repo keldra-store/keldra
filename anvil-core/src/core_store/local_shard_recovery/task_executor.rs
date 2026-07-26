@@ -51,10 +51,8 @@ enum PreparedShardRepairState {
     Complete(RebalanceShardTaskOutcome),
     Publish {
         canonical_manifest: CoreObjectManifest,
-        effective_manifest: CoreObjectManifest,
         repair_finding_id: String,
         repaired: Vec<RepairedShard>,
-        writer_family: WriterFamily,
         outcome: RebalanceShardTaskOutcome,
     },
 }
@@ -64,13 +62,18 @@ impl CoreStore {
         &self,
         payload: &RebalanceShardTaskPayload,
         repair_finding_id: &str,
+        mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     ) -> Result<PreparedShardRepair> {
         payload.validate()?;
         require_safe_repair_finding_id(repair_finding_id)?;
         let canonical_manifest = self.repair_task_manifest(payload)?;
         let mut manifest = canonical_manifest.clone();
-        self.apply_shard_repair_overlays(&mut manifest)?;
-        let writer_family = validate_repair_manifest_identity(&manifest)?;
+        self.apply_shard_repair_overlays_mvcc(
+            mvcc,
+            &mut manifest,
+            mvcc.runtime.applied_version()?,
+        )?;
+        validate_repair_manifest_identity(&manifest)?;
         let profile = local_erasure_profile(&manifest.encoding.profile_id)?;
         let candidates = self.active_object_peer_placements().await?;
         let probes = self
@@ -166,10 +169,8 @@ impl CoreStore {
         }
         Ok(PreparedShardRepair(PreparedShardRepairState::Publish {
             canonical_manifest,
-            effective_manifest: manifest,
             repair_finding_id: repair_finding_id.to_string(),
             repaired: write_outcome.repaired,
-            writer_family,
             outcome,
         }))
     }
@@ -187,18 +188,14 @@ impl CoreStore {
             PreparedShardRepairState::Complete(outcome) => Ok(outcome),
             PreparedShardRepairState::Publish {
                 canonical_manifest,
-                effective_manifest,
                 repair_finding_id,
                 repaired,
-                writer_family,
                 outcome,
             } => {
                 self.publish_shard_repair_overlays(
                     &canonical_manifest,
-                    &effective_manifest,
                     &repair_finding_id,
                     &repaired,
-                    writer_family,
                     mvcc,
                     lease_predicate,
                 )
