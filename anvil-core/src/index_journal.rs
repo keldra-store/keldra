@@ -97,6 +97,26 @@ async fn append_index_definition_event(
     append_index_definition_event_inner(storage, None, event, 0, None, None, None).await
 }
 
+pub(crate) async fn append_index_definition_event_with_permit_mvcc(
+    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    event: &IndexDefinitionEvent,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<()> {
+    append_index_definition_event_with_permit_in_transaction(
+        storage,
+        Some(mvcc),
+        event,
+        permit,
+        partition_owner_signing_key,
+        None,
+        None,
+    )
+    .await
+}
+
+#[cfg(test)]
 pub(crate) async fn append_index_definition_event_with_permit(
     storage: &Storage,
     event: &IndexDefinitionEvent,
@@ -156,19 +176,6 @@ async fn append_index_definition_event_inner(
             event.tenant_id, event.bucket_id, event.mutation_id
         )
     });
-    if transaction_id.is_none() {
-        let stream_head = core_store.stream_head_sequence(&stream_id).await?;
-        let expected_cursor = stream_head
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("index definition stream cursor overflow"))?;
-        if u64::try_from(event.id)? != expected_cursor {
-            return Err(anyhow!(
-                "index definition event cursor {} does not follow durable stream head {}",
-                event.id,
-                stream_head
-            ));
-        }
-    }
     let payload = encode_index_event_body(event, fence_token)?;
     let partition_id = hex::encode(index_definition_partition_id(
         event.tenant_id,
@@ -220,17 +227,23 @@ async fn append_index_definition_event_inner(
             preconditions,
             operations,
         };
-    if transaction_id.is_some() {
-        let mvcc = mvcc.ok_or_else(|| anyhow!("MVCC staging handle is required"))?;
-        let principal =
-            transaction_principal.ok_or_else(|| anyhow!("transaction principal is required"))?;
+    if let Some(mvcc) = mvcc {
         let mutations = crate::mvcc_product::product_mutations_from_operations(batch.operations)?;
-        mvcc.stage_product_mutations(
-            transaction_id.expect("checked above"),
-            principal,
-            mutations,
-            u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
-        )?;
+        let now_unix_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default();
+        if let Some(transaction_id) = transaction_id {
+            let principal = transaction_principal
+                .ok_or_else(|| anyhow!("transaction principal is required"))?;
+            mvcc.stage_product_mutations(transaction_id, principal, mutations, now_unix_ms)?;
+        } else {
+            mvcc.autocommit_product_mutations(
+                &index_definition_partition_principal(event.tenant_id, event.bucket_id),
+                &batch.transaction_id,
+                mutations,
+                crate::mvcc_transaction::DurabilityLevel::Local,
+                now_unix_ms,
+            )
+            .await?;
+        }
     } else {
         let receipt = core_store.commit_mutation_batch(batch).await?;
         if !receipt.is_committed() {
@@ -494,6 +507,46 @@ pub async fn read_current_index_definition(
     };
     ensure_index_event_name_matches(&current.event, tenant_id, bucket_id, name)?;
     index_definition_from_event(&current.event).map(Some)
+}
+
+pub fn read_current_index_definition_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    bucket_id: i64,
+    name: &str,
+) -> Result<Option<IndexDefinition>> {
+    let Some(row) = current_definitions::read_current_mvcc(mvcc, tenant_id, bucket_id, name)?
+    else {
+        return Ok(None);
+    };
+    let current = index_current_from_coremeta_row(row)?;
+    ensure_index_event_name_matches(&current.event, tenant_id, bucket_id, name)?;
+    index_definition_from_event(&current.event).map(Some)
+}
+
+pub fn read_current_index_definitions_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    bucket_id: i64,
+    include_disabled: bool,
+) -> Result<Vec<IndexDefinition>> {
+    current_definitions::page_mvcc(mvcc, tenant_id, bucket_id, include_disabled)?
+        .into_iter()
+        .map(index_current_from_coremeta_row)
+        .map(|current| current.and_then(|current| index_definition_from_event(&current.event)))
+        .collect()
+}
+
+pub fn next_index_definition_cursor_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    bucket_id: i64,
+) -> Result<i64> {
+    current_definitions::read_state_mvcc(mvcc, tenant_id, bucket_id)?
+        .map(|state| state.latest_cursor)
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("index definition cursor overflow"))
 }
 
 pub async fn next_index_definition_id(

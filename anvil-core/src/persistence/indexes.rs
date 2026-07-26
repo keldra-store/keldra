@@ -8,8 +8,7 @@ impl Persistence {
         bucket_id: i64,
         name: &str,
     ) -> Result<Option<IndexDefinition>> {
-        index_journal::read_current_index_definition(&self.storage, tenant_id, bucket_id, name)
-            .await
+        index_journal::read_current_index_definition_mvcc(self.mvcc()?, tenant_id, bucket_id, name)
     }
 
     pub async fn list_index_definitions(
@@ -18,8 +17,8 @@ impl Persistence {
         bucket_id: i64,
         include_disabled: bool,
     ) -> Result<Vec<IndexDefinition>> {
-        index_journal::read_current_index_definitions(
-            &self.storage,
+        index_journal::read_current_index_definitions_mvcc(
+            self.mvcc()?,
             tenant_id,
             bucket_id,
             include_disabled,
@@ -39,8 +38,11 @@ impl Persistence {
         transaction_principal: Option<&str>,
     ) -> Result<IndexDefinitionEvent> {
         let event = IndexDefinitionEvent {
-            id: index_journal::next_index_definition_cursor(&self.storage, tenant_id, bucket_id)
-                .await?,
+            id: index_journal::next_index_definition_cursor_mvcc(
+                self.mvcc()?,
+                tenant_id,
+                bucket_id,
+            )?,
             tenant_id,
             bucket_id,
             bucket_name: bucket_name.to_string(),
@@ -68,20 +70,27 @@ impl Persistence {
         let permit = self
             .index_definition_write_permit(tenant_id, bucket_id)
             .await?;
-        index_journal::append_index_definition_event_with_permit_in_transaction(
-            &self.storage,
-            if transaction_id.is_some() {
-                Some(self.mvcc()?)
-            } else {
-                None
-            },
-            &event,
-            &permit,
-            &self.partition_owner_signing_key,
-            transaction_id,
-            transaction_principal,
-        )
-        .await?;
+        if transaction_id.is_some() {
+            index_journal::append_index_definition_event_with_permit_in_transaction(
+                &self.storage,
+                Some(self.mvcc()?),
+                &event,
+                &permit,
+                &self.partition_owner_signing_key,
+                transaction_id,
+                transaction_principal,
+            )
+            .await?;
+        } else {
+            index_journal::append_index_definition_event_with_permit_mvcc(
+                &self.storage,
+                self.mvcc()?,
+                &event,
+                &permit,
+                &self.partition_owner_signing_key,
+            )
+            .await?;
+        }
         Ok(event)
     }
 

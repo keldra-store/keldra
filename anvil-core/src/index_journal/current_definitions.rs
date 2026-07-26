@@ -119,7 +119,6 @@ pub(super) async fn prepare_projection_mutation(
         .and_then(serde_json::Value::as_bool)
         .ok_or_else(|| anyhow!("index definition projection is missing enabled state"))?;
 
-    let store = CoreStore::new(storage.clone()).await?;
     let state_key = state_tuple_key(event.tenant_id, event.bucket_id)?;
     let existing_payload = match (mvcc, transaction_principal) {
         (Some(mvcc), Some(principal)) => {
@@ -130,7 +129,16 @@ pub(super) async fn prepare_projection_mutation(
             )?;
             mvcc.read_transaction_value(transaction_id, principal, &logical_key)?
         }
+        (Some(mvcc), None) => {
+            let logical_key = crate::mvcc_product::coremeta_logical_key(
+                CF_INDEX_DEFS,
+                TABLE_INDEX_DEFINITION_ROW,
+                &state_key,
+            )?;
+            mvcc.read_latest_value(&logical_key)?
+        }
         (None, None) => {
+            let store = CoreStore::new(storage.clone()).await?;
             store.read_coremeta_row(CF_INDEX_DEFS, TABLE_INDEX_DEFINITION_ROW, &state_key)?
         }
         _ => bail!("index definition MVCC handle and transaction principal must be paired"),
@@ -254,6 +262,69 @@ pub(super) async fn prepare_projection_mutation(
         precondition,
         operations: vec![current_op, enabled_op, state_op],
     })
+}
+
+pub(super) fn read_current_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    bucket_id: i64,
+    index_name: &str,
+) -> Result<Option<CurrentDefinitionRecord>> {
+    let key = crate::mvcc_product::coremeta_logical_key(
+        CF_INDEX_DEFS,
+        TABLE_INDEX_DEFINITION_ROW,
+        &current_tuple_key(tenant_id, bucket_id, index_name)?,
+    )?;
+    mvcc.read_latest_value(&key)?
+        .map(|payload| decode_current_record(&payload, tenant_id, bucket_id))
+        .transpose()
+}
+
+pub(super) fn read_state_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    bucket_id: i64,
+) -> Result<Option<IndexCurrentState>> {
+    let key = crate::mvcc_product::coremeta_logical_key(
+        CF_INDEX_DEFS,
+        TABLE_INDEX_DEFINITION_ROW,
+        &state_tuple_key(tenant_id, bucket_id)?,
+    )?;
+    mvcc.read_latest_value(&key)?
+        .map(|payload| decode_state(&payload, tenant_id, bucket_id))
+        .transpose()
+}
+
+pub(super) fn page_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    bucket_id: i64,
+    include_disabled: bool,
+) -> Result<Vec<CurrentDefinitionRecord>> {
+    let tuple_prefix = definition_tuple_prefix(
+        if include_disabled {
+            CURRENT_ROW_KIND
+        } else {
+            ENABLED_ROW_KIND
+        },
+        tenant_id,
+        bucket_id,
+    )?;
+    let logical_prefix = crate::mvcc_product::coremeta_logical_key(
+        CF_INDEX_DEFS,
+        TABLE_INDEX_DEFINITION_ROW,
+        &tuple_prefix,
+    )?;
+    let snapshot = mvcc.runtime.applied_version()?;
+    mvcc.runtime
+        .scan_table_prefix_at(
+            TABLE_INDEX_DEFINITION_ROW,
+            &logical_prefix.application_key,
+            snapshot,
+        )?
+        .into_iter()
+        .map(|(_, row)| decode_current_record(&row.value, tenant_id, bucket_id))
+        .collect()
 }
 
 pub(super) async fn read_current(
