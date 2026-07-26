@@ -94,6 +94,7 @@ pub mod node_signing;
 pub mod object_links;
 pub mod object_manager;
 pub mod object_materialisation;
+pub mod object_materialisation_runner;
 pub mod object_shard_manifest;
 pub mod observability;
 pub mod partition_fence;
