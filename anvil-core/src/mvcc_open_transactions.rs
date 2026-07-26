@@ -1,0 +1,715 @@
+//! Durable, scope-free transaction sessions for the public MVCC API path.
+
+use std::{path::Path, sync::Mutex, time::Duration};
+
+use anyhow::{Context, Result, anyhow, bail};
+use async_trait::async_trait;
+use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, DB, Options, WriteBatch, WriteOptions};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::{
+    mvcc_node_runtime::{CommitOutcome, MvccNodeRuntime},
+    mvcc_transaction::{
+        BundleReplicator, CertificationResult, CommitVersion, DurabilityLevel, LogicalKey,
+        ObjectShardManifestReference, PointObservation, PreparedBundleStore, RangeObservation,
+        ReadConsistency, TransactionBundle, TransactionBundleBuilder, WriteOperation,
+    },
+};
+
+const CF_TRANSACTIONS: &str = "open_transactions";
+const CF_IDEMPOTENCY: &str = "transaction_idempotency";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransactionHandle {
+    pub transaction_id: String,
+    pub snapshot_version: CommitVersion,
+    pub expires_at_unix_ms: u64,
+}
+
+#[async_trait]
+pub trait TransactionRuntime: Send + Sync {
+    async fn transaction_snapshot(&self, consistency: ReadConsistency) -> Result<CommitVersion>;
+    async fn commit_transaction_bundle(
+        &self,
+        bundle: TransactionBundle,
+        durability: DurabilityLevel,
+    ) -> Result<CommitOutcome>;
+    fn apply_transaction_decision(
+        &self,
+        bundle: TransactionBundle,
+        result: CertificationResult,
+    ) -> Result<CommitOutcome>;
+}
+
+#[async_trait]
+impl<S, R, C> TransactionRuntime for MvccNodeRuntime<S, R, C>
+where
+    S: PreparedBundleStore,
+    R: BundleReplicator,
+    C: anvil_mvcc_consensus::Consensus,
+{
+    async fn transaction_snapshot(&self, consistency: ReadConsistency) -> Result<CommitVersion> {
+        self.snapshot(consistency).await
+    }
+
+    async fn commit_transaction_bundle(
+        &self,
+        bundle: TransactionBundle,
+        durability: DurabilityLevel,
+    ) -> Result<CommitOutcome> {
+        self.commit(bundle, durability).await
+    }
+
+    fn apply_transaction_decision(
+        &self,
+        bundle: TransactionBundle,
+        result: CertificationResult,
+    ) -> Result<CommitOutcome> {
+        self.apply_certification(bundle, result)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Draft {
+    transaction_id: String,
+    idempotency_key: String,
+    principal: String,
+    snapshot_version: CommitVersion,
+    expires_at_unix_ms: u64,
+    state: DraftState,
+    mutations: DraftMutations,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum DraftState {
+    Open,
+    Committing {
+        bundle: TransactionBundle,
+    },
+    Resolved {
+        bundle: TransactionBundle,
+        result: CertificationResult,
+    },
+    Expired,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct DraftMutations {
+    points: Vec<PointObservation>,
+    ranges: Vec<RangeObservation>,
+    writes: Vec<WriteOperation>,
+    manifests: Vec<ObjectShardManifestReference>,
+    events: Vec<Vec<u8>>,
+    jobs: Vec<Vec<u8>>,
+}
+
+pub struct OpenTransactionRegistry {
+    db: DB,
+    transition: Mutex<()>,
+}
+
+impl OpenTransactionRegistry {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let mut options = Options::default();
+        options.create_if_missing(true);
+        options.create_missing_column_families(true);
+        let descriptors = [CF_TRANSACTIONS, CF_IDEMPOTENCY]
+            .into_iter()
+            .map(|name| ColumnFamilyDescriptor::new(name, Options::default()));
+        Ok(Self {
+            db: DB::open_cf_descriptors(&options, path.as_ref(), descriptors).with_context(
+                || {
+                    format!(
+                        "open MVCC transaction registry at {}",
+                        path.as_ref().display()
+                    )
+                },
+            )?,
+            transition: Mutex::new(()),
+        })
+    }
+
+    pub async fn begin(
+        &self,
+        runtime: &impl TransactionRuntime,
+        principal: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        ttl: Duration,
+        consistency: ReadConsistency,
+        now_unix_ms: u64,
+    ) -> Result<TransactionHandle> {
+        let principal = principal.into();
+        let idempotency_key = idempotency_key.into();
+        if principal.trim().is_empty() || idempotency_key.trim().is_empty() {
+            bail!("principal and idempotency key must be non-empty");
+        }
+        let ttl_ms = u64::try_from(ttl.as_millis()).context("transaction TTL exceeds u64")?;
+        if ttl_ms == 0 {
+            bail!("transaction TTL must be non-zero");
+        }
+
+        if let Some(existing) = self.find_by_idempotency(&idempotency_key)? {
+            return self.retry_handle(existing, &principal);
+        }
+        let snapshot_version = runtime.transaction_snapshot(consistency).await?;
+        let expires_at_unix_ms = now_unix_ms
+            .checked_add(ttl_ms)
+            .context("transaction expiry overflow")?;
+        let transaction_id = transaction_id(&principal, &idempotency_key);
+        let draft = Draft {
+            transaction_id: transaction_id.clone(),
+            idempotency_key: idempotency_key.clone(),
+            principal,
+            snapshot_version,
+            expires_at_unix_ms,
+            state: DraftState::Open,
+            mutations: DraftMutations::default(),
+        };
+
+        let _guard = self.transition.lock().unwrap();
+        if let Some(existing) = self.find_by_idempotency(&idempotency_key)? {
+            return self.retry_handle(existing, &draft.principal);
+        }
+        let mut batch = WriteBatch::default();
+        batch.put_cf(
+            self.cf(CF_TRANSACTIONS)?,
+            transaction_id.as_bytes(),
+            serde_json::to_vec(&draft)?,
+        );
+        batch.put_cf(
+            self.cf(CF_IDEMPOTENCY)?,
+            idempotency_key.as_bytes(),
+            transaction_id.as_bytes(),
+        );
+        self.db.write_opt(batch, &durable_write_options())?;
+        Ok(handle(&draft))
+    }
+
+    pub fn observe_point(
+        &self,
+        transaction_id: &str,
+        key: LogicalKey,
+        observed_version: Option<CommitVersion>,
+        now_unix_ms: u64,
+    ) -> Result<()> {
+        self.mutate(transaction_id, now_unix_ms, |draft| {
+            draft.mutations.points.push(PointObservation {
+                key,
+                observed_version,
+            });
+            Ok(())
+        })
+    }
+
+    pub fn observe_range(
+        &self,
+        transaction_id: &str,
+        table_id: u16,
+        start_application_key: Option<Vec<u8>>,
+        end_application_key: Option<Vec<u8>>,
+        observed_range_stamp: Option<CommitVersion>,
+        now_unix_ms: u64,
+    ) -> Result<()> {
+        self.mutate(transaction_id, now_unix_ms, |draft| {
+            let mut builder = TransactionBundleBuilder::new(
+                &draft.transaction_id,
+                draft.snapshot_version,
+                &draft.principal,
+                Default::default(),
+            );
+            builder.observe_scan(
+                table_id,
+                start_application_key.clone(),
+                end_application_key.clone(),
+                observed_range_stamp,
+            )?;
+            let observation = builder.build()?.range_observations.remove(0);
+            draft.mutations.ranges.push(observation);
+            Ok(())
+        })
+    }
+
+    pub fn put(
+        &self,
+        transaction_id: &str,
+        key: LogicalKey,
+        value: Vec<u8>,
+        now_unix_ms: u64,
+    ) -> Result<()> {
+        self.mutate(transaction_id, now_unix_ms, |draft| {
+            draft
+                .mutations
+                .writes
+                .push(WriteOperation::Put { key, value });
+            Ok(())
+        })
+    }
+
+    pub fn delete(&self, transaction_id: &str, key: LogicalKey, now_unix_ms: u64) -> Result<()> {
+        self.mutate(transaction_id, now_unix_ms, |draft| {
+            draft.mutations.writes.push(WriteOperation::Delete { key });
+            Ok(())
+        })
+    }
+
+    pub fn add_manifest(
+        &self,
+        transaction_id: &str,
+        manifest: ObjectShardManifestReference,
+        now_unix_ms: u64,
+    ) -> Result<()> {
+        self.mutate(transaction_id, now_unix_ms, |draft| {
+            draft.mutations.manifests.push(manifest);
+            Ok(())
+        })
+    }
+
+    pub fn add_event(&self, transaction_id: &str, event: Vec<u8>, now_unix_ms: u64) -> Result<()> {
+        self.mutate(transaction_id, now_unix_ms, |draft| {
+            draft.mutations.events.push(event);
+            Ok(())
+        })
+    }
+
+    pub fn add_job(&self, transaction_id: &str, job: Vec<u8>, now_unix_ms: u64) -> Result<()> {
+        self.mutate(transaction_id, now_unix_ms, |draft| {
+            draft.mutations.jobs.push(job);
+            Ok(())
+        })
+    }
+
+    pub async fn commit(
+        &self,
+        runtime: &impl TransactionRuntime,
+        transaction_id: &str,
+        durability: DurabilityLevel,
+        now_unix_ms: u64,
+    ) -> Result<CommitOutcome> {
+        let (bundle, resolved) = {
+            let _guard = self.transition.lock().unwrap();
+            let mut draft = self.load(transaction_id)?;
+            match &draft.state {
+                DraftState::Open => {
+                    if now_unix_ms >= draft.expires_at_unix_ms {
+                        draft.state = DraftState::Expired;
+                        self.save(&draft)?;
+                        bail!("transaction has expired");
+                    }
+                    let bundle = build_bundle(&draft)?;
+                    draft.state = DraftState::Committing {
+                        bundle: bundle.clone(),
+                    };
+                    self.save(&draft)?;
+                    (bundle, None)
+                }
+                DraftState::Committing { bundle } => (bundle.clone(), None),
+                DraftState::Resolved { bundle, result } => (bundle.clone(), Some(result.clone())),
+                DraftState::Expired => bail!("transaction has expired"),
+            }
+        };
+
+        let outcome = match resolved {
+            Some(result) => runtime.apply_transaction_decision(bundle.clone(), result)?,
+            None => {
+                runtime
+                    .commit_transaction_bundle(bundle.clone(), durability)
+                    .await?
+            }
+        };
+        let _guard = self.transition.lock().unwrap();
+        let mut draft = self.load(transaction_id)?;
+        draft.state = DraftState::Resolved {
+            bundle,
+            result: outcome.certification.clone(),
+        };
+        self.save(&draft)?;
+        Ok(outcome)
+    }
+
+    pub fn handle(&self, transaction_id: &str) -> Result<TransactionHandle> {
+        Ok(handle(&self.load(transaction_id)?))
+    }
+
+    fn mutate(
+        &self,
+        transaction_id: &str,
+        now_unix_ms: u64,
+        change: impl FnOnce(&mut Draft) -> Result<()>,
+    ) -> Result<()> {
+        let _guard = self.transition.lock().unwrap();
+        let mut draft = self.load(transaction_id)?;
+        if !matches!(draft.state, DraftState::Open) {
+            bail!("transaction is no longer open");
+        }
+        if now_unix_ms >= draft.expires_at_unix_ms {
+            draft.state = DraftState::Expired;
+            self.save(&draft)?;
+            bail!("transaction has expired");
+        }
+        change(&mut draft)?;
+        self.save(&draft)
+    }
+
+    fn retry_handle(&self, draft: Draft, principal: &str) -> Result<TransactionHandle> {
+        if draft.principal != principal {
+            bail!("idempotency key belongs to another principal");
+        }
+        Ok(handle(&draft))
+    }
+
+    fn find_by_idempotency(&self, key: &str) -> Result<Option<Draft>> {
+        let Some(transaction_id) = self.db.get_cf(self.cf(CF_IDEMPOTENCY)?, key.as_bytes())? else {
+            return Ok(None);
+        };
+        let transaction_id =
+            std::str::from_utf8(&transaction_id).context("invalid transaction ID index")?;
+        self.load(transaction_id).map(Some)
+    }
+
+    fn load(&self, transaction_id: &str) -> Result<Draft> {
+        let bytes = self
+            .db
+            .get_cf(self.cf(CF_TRANSACTIONS)?, transaction_id.as_bytes())?
+            .with_context(|| format!("unknown transaction {transaction_id}"))?;
+        serde_json::from_slice(&bytes).context("decode persisted transaction draft")
+    }
+
+    fn save(&self, draft: &Draft) -> Result<()> {
+        self.db.put_cf_opt(
+            self.cf(CF_TRANSACTIONS)?,
+            draft.transaction_id.as_bytes(),
+            serde_json::to_vec(draft)?,
+            &durable_write_options(),
+        )?;
+        Ok(())
+    }
+
+    fn cf(&self, name: &str) -> Result<&ColumnFamily> {
+        self.db
+            .cf_handle(name)
+            .ok_or_else(|| anyhow!("missing transaction registry column family {name}"))
+    }
+}
+
+fn build_bundle(draft: &Draft) -> Result<TransactionBundle> {
+    let mut builder = TransactionBundleBuilder::new(
+        &draft.transaction_id,
+        draft.snapshot_version,
+        &draft.principal,
+        Default::default(),
+    );
+    for point in &draft.mutations.points {
+        builder.observe_point(point.key.clone(), point.observed_version);
+    }
+    for range in &draft.mutations.ranges {
+        builder.observe_scan(
+            range.table_id,
+            range.start_application_key.clone(),
+            range.end_application_key.clone(),
+            range.observed_range_stamp,
+        )?;
+    }
+    for write in &draft.mutations.writes {
+        match write {
+            WriteOperation::Put { key, value } => {
+                builder.put(key.clone(), value.clone());
+            }
+            WriteOperation::Delete { key } => {
+                builder.delete(key.clone());
+            }
+        }
+    }
+    for manifest in &draft.mutations.manifests {
+        builder.add_shard_manifest(manifest.clone());
+    }
+    for event in &draft.mutations.events {
+        builder.add_outbox_event(event.clone());
+    }
+    for job in &draft.mutations.jobs {
+        builder.add_materialisation_job(job.clone());
+    }
+    builder.build()
+}
+
+fn transaction_id(principal: &str, idempotency_key: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"anvil.mvcc.open-transaction.v1");
+    hash.update((principal.len() as u64).to_be_bytes());
+    hash.update(principal.as_bytes());
+    hash.update((idempotency_key.len() as u64).to_be_bytes());
+    hash.update(idempotency_key.as_bytes());
+    format!("tx-{:x}", hash.finalize())
+}
+
+fn handle(draft: &Draft) -> TransactionHandle {
+    TransactionHandle {
+        transaction_id: draft.transaction_id.clone(),
+        snapshot_version: draft.snapshot_version,
+        expires_at_unix_ms: draft.expires_at_unix_ms,
+    }
+}
+
+fn durable_write_options() -> WriteOptions {
+    let mut options = WriteOptions::default();
+    options.set_sync(true);
+    options
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::mvcc_store::ApplyOutcome;
+
+    struct Runtime {
+        snapshot: u64,
+        committed: Mutex<Vec<TransactionBundle>>,
+    }
+
+    #[async_trait]
+    impl TransactionRuntime for Runtime {
+        async fn transaction_snapshot(
+            &self,
+            _consistency: ReadConsistency,
+        ) -> Result<CommitVersion> {
+            Ok(self.snapshot)
+        }
+
+        async fn commit_transaction_bundle(
+            &self,
+            bundle: TransactionBundle,
+            _durability: DurabilityLevel,
+        ) -> Result<CommitOutcome> {
+            self.committed.lock().unwrap().push(bundle);
+            Ok(CommitOutcome {
+                certification: CertificationResult::Committed { commit_version: 12 },
+                local_apply: Some(ApplyOutcome::Applied),
+            })
+        }
+
+        fn apply_transaction_decision(
+            &self,
+            bundle: TransactionBundle,
+            result: CertificationResult,
+        ) -> Result<CommitOutcome> {
+            self.committed.lock().unwrap().push(bundle);
+            Ok(CommitOutcome {
+                local_apply: matches!(result, CertificationResult::Committed { .. })
+                    .then_some(ApplyOutcome::Replayed),
+                certification: result,
+            })
+        }
+    }
+
+    fn runtime() -> Runtime {
+        Runtime {
+            snapshot: 9,
+            committed: Mutex::new(Vec::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn cross_table_draft_freezes_one_bundle() {
+        let temp = tempdir().unwrap();
+        let registry = OpenTransactionRegistry::open(temp.path()).unwrap();
+        let runtime = runtime();
+        let handle = registry
+            .begin(
+                &runtime,
+                "alice",
+                "request-1",
+                Duration::from_secs(30),
+                ReadConsistency::Linearized,
+                1_000,
+            )
+            .await
+            .unwrap();
+        registry
+            .put(
+                &handle.transaction_id,
+                LogicalKey {
+                    table_id: 1,
+                    application_key: b"a".to_vec(),
+                },
+                b"one".to_vec(),
+                1_001,
+            )
+            .unwrap();
+        registry
+            .put(
+                &handle.transaction_id,
+                LogicalKey {
+                    table_id: 8,
+                    application_key: b"b".to_vec(),
+                },
+                b"two".to_vec(),
+                1_002,
+            )
+            .unwrap();
+        registry
+            .add_event(&handle.transaction_id, b"event".to_vec(), 1_003)
+            .unwrap();
+        registry
+            .add_job(&handle.transaction_id, b"job".to_vec(), 1_004)
+            .unwrap();
+        registry
+            .commit(
+                &runtime,
+                &handle.transaction_id,
+                DurabilityLevel::Local,
+                1_005,
+            )
+            .await
+            .unwrap();
+
+        let bundles = runtime.committed.lock().unwrap();
+        assert_eq!(bundles[0].snapshot_version, 9);
+        assert_eq!(bundles[0].writes.len(), 2);
+        assert_eq!(bundles[0].outbox_events, [b"event".to_vec()]);
+        assert_eq!(bundles[0].materialisation_jobs, [b"job".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn expiry_is_durable_and_blocks_mutation_and_commit() {
+        let temp = tempdir().unwrap();
+        let registry = OpenTransactionRegistry::open(temp.path()).unwrap();
+        let runtime = runtime();
+        let handle = registry
+            .begin(
+                &runtime,
+                "alice",
+                "expires",
+                Duration::from_millis(5),
+                ReadConsistency::LocalSnapshot,
+                100,
+            )
+            .await
+            .unwrap();
+        assert!(
+            registry
+                .put(
+                    &handle.transaction_id,
+                    LogicalKey {
+                        table_id: 1,
+                        application_key: b"k".to_vec(),
+                    },
+                    vec![],
+                    105,
+                )
+                .is_err()
+        );
+        assert!(
+            registry
+                .commit(
+                    &runtime,
+                    &handle.transaction_id,
+                    DurabilityLevel::Local,
+                    105,
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_idempotency_is_principal_bound() {
+        let temp = tempdir().unwrap();
+        let registry = OpenTransactionRegistry::open(temp.path()).unwrap();
+        let runtime = runtime();
+        let first = registry
+            .begin(
+                &runtime,
+                "alice",
+                "same",
+                Duration::from_secs(1),
+                ReadConsistency::LocalSnapshot,
+                10,
+            )
+            .await
+            .unwrap();
+        let retry = registry
+            .begin(
+                &runtime,
+                "alice",
+                "same",
+                Duration::from_secs(99),
+                ReadConsistency::Linearized,
+                500,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first, retry);
+        assert!(
+            registry
+                .begin(
+                    &runtime,
+                    "mallory",
+                    "same",
+                    Duration::from_secs(1),
+                    ReadConsistency::LocalSnapshot,
+                    10,
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_resumes_open_and_resolves_frozen_transactions() {
+        let temp = tempdir().unwrap();
+        let runtime = runtime();
+        let transaction_id = {
+            let registry = OpenTransactionRegistry::open(temp.path()).unwrap();
+            let handle = registry
+                .begin(
+                    &runtime,
+                    "alice",
+                    "restart",
+                    Duration::from_secs(60),
+                    ReadConsistency::LocalSnapshot,
+                    0,
+                )
+                .await
+                .unwrap();
+            registry
+                .put(
+                    &handle.transaction_id,
+                    LogicalKey {
+                        table_id: 2,
+                        application_key: b"k".to_vec(),
+                    },
+                    b"v".to_vec(),
+                    1,
+                )
+                .unwrap();
+            handle.transaction_id
+        };
+        let reopened = OpenTransactionRegistry::open(temp.path()).unwrap();
+        assert_eq!(
+            reopened.handle(&transaction_id).unwrap().snapshot_version,
+            9
+        );
+        let first = reopened
+            .commit(&runtime, &transaction_id, DurabilityLevel::Local, 2)
+            .await
+            .unwrap();
+        assert_eq!(first.local_apply, Some(ApplyOutcome::Applied));
+        drop(reopened);
+
+        let reopened = OpenTransactionRegistry::open(temp.path()).unwrap();
+        let retry = reopened
+            .commit(&runtime, &transaction_id, DurabilityLevel::Local, 3)
+            .await
+            .unwrap();
+        assert_eq!(retry.local_apply, Some(ApplyOutcome::Replayed));
+        let committed = runtime.committed.lock().unwrap();
+        assert_eq!(
+            committed[0].identity().unwrap(),
+            committed[1].identity().unwrap()
+        );
+    }
+}
