@@ -383,6 +383,10 @@ pub enum CoreStoreStartupRecovery {
 }
 
 impl CoreStore {
+    pub(crate) fn core_meta_database(&self) -> Arc<rocksdb::DB> {
+        self.meta.database()
+    }
+
     pub(crate) async fn internal_grpc_channel(
         &self,
         public_api_addr: &str,

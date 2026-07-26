@@ -11,6 +11,7 @@ use std::{
 use anvil_mvcc_consensus::{ConsensusNode, NodeId, OpenRaftConsensus, RocksRaftStore};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use rocksdb::DB;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tonic::{Status, metadata::MetadataMap};
@@ -36,6 +37,7 @@ use crate::{
         },
         replication::{ReplicationConnectionAuthorizer, ReplicationServiceImpl},
     },
+    shard_placement::ShardTarget,
 };
 
 pub type ProductMvccRuntime = MvccNodeRuntime<
@@ -157,6 +159,9 @@ pub struct MvccSubsystem {
     pub consensus: Arc<OpenRaftConsensus>,
     pub runtime: Arc<ProductMvccRuntime>,
     pub open_transactions: Arc<OpenTransactionRegistry>,
+    pub replication_client: TonicReplicationStreamManager,
+    pub object_evidence: ObjectEvidenceRegistry,
+    pub shard_candidates: Arc<[ShardTarget]>,
     pub consensus_service: ConsensusTransportService<NodeConnectionAuthorizer>,
     pub replication_service: ReplicationServiceImpl<NodeConnectionAuthorizer>,
     pub peers: Arc<[MvccPeerConfig]>,
@@ -172,7 +177,7 @@ impl fmt::Debug for MvccSubsystem {
 }
 
 impl MvccSubsystem {
-    pub async fn bootstrap(config: &Config) -> Result<Self> {
+    pub async fn bootstrap(config: &Config, core_meta_db: Arc<DB>) -> Result<Self> {
         let peers = parse_and_validate_peers(config)?;
         let local = peers
             .iter()
@@ -185,8 +190,8 @@ impl MvccSubsystem {
         validate_cluster_id(&config.mvcc_cluster_id)?;
         let paths = MvccPaths::new(&config.storage_path, &config.mvcc_cluster_id);
         std::fs::create_dir_all(&paths.base)?;
-        let raft_store = RocksRaftStore::open(&paths.raft, config.mvcc_raft_group_id)
-            .context("open MVCC Raft store")?;
+        let raft_store = RocksRaftStore::from_db(core_meta_db.clone(), config.mvcc_raft_group_id)
+            .context("attach MVCC Raft store to CoreMeta RocksDB")?;
         let raft_is_empty = raft_store
             .last_log_index()
             .context("inspect MVCC Raft log")?
@@ -233,9 +238,8 @@ impl MvccSubsystem {
             node_id: local.node_id.clone(),
             incarnation: local.incarnation,
         };
-        let remote_peers = peers
+        let replication_peers = peers
             .iter()
-            .filter(|peer| peer.raft_node_id != config.mvcc_raft_node_id)
             .map(|peer| ReplicationPeer {
                 cluster_id: config.mvcc_cluster_id.clone(),
                 node: NodeIncarnation {
@@ -249,7 +253,7 @@ impl MvccSubsystem {
             config.mvcc_cluster_id.clone(),
             local_incarnation.clone(),
             token.clone(),
-            remote_peers,
+            replication_peers,
             ReplicationStreamOptions {
                 operation_timeout: Duration::from_millis(config.mvcc_rpc_timeout_ms),
                 ..ReplicationStreamOptions::default()
@@ -273,11 +277,23 @@ impl MvccSubsystem {
             local_incarnation,
             local.failure_domain.clone(),
         )?;
+        let object_evidence = ObjectEvidenceRegistry::default();
         let replicator = StreamingBundleReplicator::new(
-            replication_client,
+            replication_client.clone(),
             targets,
-            ObjectEvidenceRegistry::default(),
+            object_evidence.clone(),
         )?;
+        let shard_candidates = peers
+            .iter()
+            .map(|peer| ShardTarget {
+                cluster_id: config.mvcc_cluster_id.clone(),
+                node: NodeIncarnation {
+                    node_id: peer.node_id.clone(),
+                    incarnation: peer.incarnation,
+                },
+                failure_domain: peer.failure_domain.clone(),
+            })
+            .collect::<Vec<_>>();
         let runtime = Arc::new(MvccNodeRuntime::new(
             prepared,
             replicator,
@@ -286,9 +302,9 @@ impl MvccSubsystem {
                 bundle_quorum_holders: config.mvcc_bundle_quorum_holders,
                 tolerated_failure_domains: config.mvcc_tolerated_failure_domains,
             },
-            LocalMvccStore::open(&paths.rows)?,
+            LocalMvccStore::from_db(core_meta_db.clone(), &config.mvcc_cluster_id)?,
         )?);
-        let open_transactions = Arc::new(OpenTransactionRegistry::open(&paths.transactions)?);
+        let open_transactions = Arc::new(OpenTransactionRegistry::from_db(core_meta_db)?);
         let authorizer =
             NodeConnectionAuthorizer::new(config.mvcc_cluster_id.clone(), token, &peers);
         let consensus_service =
@@ -300,6 +316,9 @@ impl MvccSubsystem {
             consensus,
             runtime,
             open_transactions,
+            replication_client,
+            object_evidence,
+            shard_candidates: shard_candidates.into(),
             consensus_service,
             replication_service,
             peers: peers.into(),
@@ -309,9 +328,6 @@ impl MvccSubsystem {
 
 struct MvccPaths {
     base: PathBuf,
-    raft: PathBuf,
-    rows: PathBuf,
-    transactions: PathBuf,
     prepared_bundles: PathBuf,
     replication_inbox: PathBuf,
 }
@@ -320,9 +336,6 @@ impl MvccPaths {
     fn new(storage_path: impl AsRef<Path>, cluster_id: &str) -> Self {
         let base = storage_path.as_ref().join("mvcc").join(cluster_id);
         Self {
-            raft: base.join("raft"),
-            rows: base.join("rows"),
-            transactions: base.join("transactions"),
             prepared_bundles: base.join("prepared-bundles"),
             replication_inbox: base.join("replication-inbox"),
             base,
@@ -416,20 +429,16 @@ mod tests {
     #[tokio::test]
     async fn bootstraps_all_mandatory_local_stores_and_single_node_membership() {
         let directory = tempfile::tempdir().unwrap();
-        let subsystem = MvccSubsystem::bootstrap(&config(directory.path()))
+        let db_path = directory.path().join("coremeta");
+        let coremeta = crate::core_store::CoreMetaStore::open(&db_path).unwrap();
+        let subsystem = MvccSubsystem::bootstrap(&config(directory.path()), coremeta.database())
             .await
             .unwrap();
 
         assert_eq!(subsystem.peers.len(), 1);
         assert_eq!(subsystem.peers[0].endpoint, "http://127.0.0.1:50051");
         assert_eq!(subsystem.runtime.applied_version().unwrap(), 0);
-        for child in [
-            "raft",
-            "rows",
-            "transactions",
-            "prepared-bundles",
-            "replication-inbox",
-        ] {
+        for child in ["prepared-bundles", "replication-inbox"] {
             assert!(
                 directory
                     .path()

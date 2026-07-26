@@ -3,7 +3,7 @@
 //! Certification orders transactions; this store atomically installs one
 //! certified bundle and advances the node's locally applied version.
 
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 use anyhow::{Context, Result, anyhow, bail};
 use rocksdb::{
@@ -13,10 +13,12 @@ use rocksdb::{
 
 use crate::mvcc_transaction::{CommitVersion, LogicalKey, TransactionBundle, WriteOperation};
 
-const CF_VERSIONS: &str = "mvcc_versions";
-const CF_HEADS: &str = "mvcc_heads";
-const CF_APPLIED: &str = "mvcc_applied";
-const CF_META: &str = "mvcc_meta";
+pub const MVCC_COLUMN_FAMILIES: [&str; 4] =
+    ["mvcc_versions", "mvcc_heads", "mvcc_applied", "mvcc_meta"];
+const CF_VERSIONS: &str = MVCC_COLUMN_FAMILIES[0];
+const CF_HEADS: &str = MVCC_COLUMN_FAMILIES[1];
+const CF_APPLIED: &str = MVCC_COLUMN_FAMILIES[2];
+const CF_META: &str = MVCC_COLUMN_FAMILIES[3];
 const APPLIED_VERSION_KEY: &[u8] = b"applied_version";
 const GC_WATERMARK_KEY: &[u8] = b"gc_watermark";
 const VALUE: u8 = 1;
@@ -35,7 +37,9 @@ pub enum ApplyOutcome {
 }
 
 pub struct MvccStore {
-    db: DB,
+    db: Arc<DB>,
+    cluster_id: String,
+    scope: Vec<u8>,
 }
 
 pub type LocalMvccStore = MvccStore;
@@ -45,12 +49,31 @@ impl MvccStore {
         let mut options = Options::default();
         options.create_if_missing(true);
         options.create_missing_column_families(true);
-        let descriptors = [CF_VERSIONS, CF_HEADS, CF_APPLIED, CF_META]
+        let descriptors = MVCC_COLUMN_FAMILIES
             .into_iter()
             .map(|name| ColumnFamilyDescriptor::new(name, Options::default()));
         let db = DB::open_cf_descriptors(&options, path.as_ref(), descriptors)
             .with_context(|| format!("open MVCC RocksDB at {}", path.as_ref().display()))?;
-        Ok(Self { db })
+        Self::from_db(Arc::new(db), "cluster")
+    }
+
+    pub fn from_db(db: Arc<DB>, cluster_id: &str) -> Result<Self> {
+        if cluster_id.is_empty() {
+            bail!("MVCC store cluster ID is required");
+        }
+        for name in MVCC_COLUMN_FAMILIES {
+            if db.cf_handle(name).is_none() {
+                bail!("missing MVCC RocksDB column family {name}");
+            }
+        }
+        let mut scope = Vec::with_capacity(4 + cluster_id.len());
+        scope.extend_from_slice(&(cluster_id.len() as u32).to_be_bytes());
+        scope.extend_from_slice(cluster_id.as_bytes());
+        Ok(Self {
+            db,
+            cluster_id: cluster_id.to_string(),
+            scope,
+        })
     }
 
     /// Atomically applies a certified bundle and advances the applied version.
@@ -63,10 +86,13 @@ impl MvccStore {
         commit_version: CommitVersion,
         bundle: &TransactionBundle,
     ) -> Result<ApplyOutcome> {
+        if bundle.cluster_id != self.cluster_id {
+            bail!("transaction bundle belongs to another cluster");
+        }
         let identity = bundle.identity()?.hash;
-        let applied_key = commit_version.to_be_bytes();
+        let applied_key = self.key(&commit_version.to_be_bytes());
         let applied_cf = self.cf(CF_APPLIED)?;
-        if let Some(existing) = self.db.get_cf(applied_cf, applied_key)? {
+        if let Some(existing) = self.db.get_cf(applied_cf, &applied_key)? {
             if existing.as_slice() == identity.as_bytes() {
                 return Ok(ApplyOutcome::Replayed);
             }
@@ -86,8 +112,8 @@ impl MvccStore {
         let mut batch = WriteBatch::default();
         for write in &bundle.writes {
             let key = write.key();
-            let logical_key = encode_logical_key(key)?;
-            let versioned_key = encode_versioned_key(key, commit_version)?;
+            let logical_key = self.key(&encode_logical_key(key)?);
+            let versioned_key = self.key(&encode_versioned_key(key, commit_version)?);
             let row = match write {
                 WriteOperation::Put { value, .. } => encode_value(value),
                 WriteOperation::Delete { .. } => vec![TOMBSTONE],
@@ -96,7 +122,11 @@ impl MvccStore {
             batch.put_cf(heads_cf, logical_key, commit_version.to_be_bytes());
         }
         batch.put_cf(applied_cf, applied_key, identity.as_bytes());
-        batch.put_cf(meta_cf, APPLIED_VERSION_KEY, commit_version.to_be_bytes());
+        batch.put_cf(
+            meta_cf,
+            self.key(APPLIED_VERSION_KEY),
+            commit_version.to_be_bytes(),
+        );
         self.db.write_opt(batch, &durable_write_options())?;
         Ok(ApplyOutcome::Applied)
     }
@@ -116,8 +146,8 @@ impl MvccStore {
                 self.applied_version()?
             );
         }
-        let prefix = encode_logical_key(key)?;
-        let seek = encode_versioned_key(key, snapshot_version)?;
+        let prefix = self.key(&encode_logical_key(key)?);
+        let seek = self.key(&encode_versioned_key(key, snapshot_version)?);
         let versions_cf = self.cf(CF_VERSIONS)?;
         let mut rows = self
             .db
@@ -129,13 +159,16 @@ impl MvccStore {
         if !encoded_key.starts_with(&prefix) {
             return Ok(None);
         }
-        let version = decode_versioned_key(&encoded_key)?.1;
+        let version = decode_versioned_key(self.unscoped(&encoded_key)?)?.1;
         decode_visible_row(version, &encoded_value)
     }
 
     pub fn read_latest(&self, key: &LogicalKey) -> Result<Option<VisibleRow>> {
         let heads_cf = self.cf(CF_HEADS)?;
-        let Some(head) = self.db.get_cf(heads_cf, encode_logical_key(key)?)? else {
+        let Some(head) = self
+            .db
+            .get_cf(heads_cf, self.key(&encode_logical_key(key)?))?
+        else {
             return Ok(None);
         };
         let version = decode_u64(&head, "MVCC head")?;
@@ -168,9 +201,15 @@ impl MvccStore {
         let mut current_key: Option<Vec<u8>> = None;
         let mut retained_anchor = false;
 
-        for row in self.db.iterator_cf(versions_cf, IteratorMode::Start) {
+        for row in self.db.iterator_cf(
+            versions_cf,
+            IteratorMode::From(&self.scope, Direction::Forward),
+        ) {
             let (encoded_key, _) = row?;
-            let (logical_key, version) = decode_versioned_key(&encoded_key)?;
+            if !encoded_key.starts_with(&self.scope) {
+                break;
+            }
+            let (logical_key, version) = decode_versioned_key(self.unscoped(&encoded_key)?)?;
             if current_key.as_deref() != Some(logical_key.as_slice()) {
                 current_key = Some(logical_key);
                 retained_anchor = false;
@@ -182,14 +221,18 @@ impl MvccStore {
                 deleted += 1;
             }
         }
-        batch.put_cf(meta_cf, GC_WATERMARK_KEY, safe_watermark.to_be_bytes());
+        batch.put_cf(
+            meta_cf,
+            self.key(GC_WATERMARK_KEY),
+            safe_watermark.to_be_bytes(),
+        );
         self.db.write_opt(batch, &durable_write_options())?;
         Ok(deleted)
     }
 
     fn read_meta_version(&self, key: &[u8]) -> Result<CommitVersion> {
         self.db
-            .get_cf(self.cf(CF_META)?, key)?
+            .get_cf(self.cf(CF_META)?, self.key(key))?
             .map(|bytes| decode_u64(&bytes, "MVCC metadata version"))
             .transpose()
             .map(|value| value.unwrap_or(0))
@@ -199,6 +242,18 @@ impl MvccStore {
         self.db
             .cf_handle(name)
             .ok_or_else(|| anyhow!("missing MVCC RocksDB column family {name}"))
+    }
+
+    fn key(&self, suffix: &[u8]) -> Vec<u8> {
+        let mut key = Vec::with_capacity(self.scope.len() + suffix.len());
+        key.extend_from_slice(&self.scope);
+        key.extend_from_slice(suffix);
+        key
+    }
+
+    fn unscoped<'a>(&self, key: &'a [u8]) -> Result<&'a [u8]> {
+        key.strip_prefix(self.scope.as_slice())
+            .ok_or_else(|| anyhow!("MVCC key belongs to another cluster"))
     }
 }
 
@@ -317,6 +372,26 @@ mod tests {
         assert_eq!(store.read_at(&row, 2).unwrap().unwrap().value, b"old");
         assert_eq!(store.read_at(&row, 4).unwrap().unwrap().value, b"old");
         assert_eq!(store.read_latest(&row).unwrap().unwrap().value, b"new");
+    }
+
+    #[test]
+    fn rejects_a_bundle_from_another_cluster_before_writing() {
+        let temp = tempdir().unwrap();
+        let store = MvccStore::open(temp.path()).unwrap();
+        let mut builder = TransactionBundleBuilder::new(
+            "foreign",
+            "tx",
+            0,
+            "principal",
+            HierarchicalRangeStampScheme::new(),
+        );
+        builder.put(key(1, b"key"), b"value".to_vec());
+
+        let error = store
+            .apply_certified_bundle(1, &builder.build().unwrap())
+            .unwrap_err();
+        assert!(error.to_string().contains("another cluster"));
+        assert_eq!(store.applied_version().unwrap(), 0);
     }
 
     #[test]

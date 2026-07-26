@@ -384,6 +384,10 @@ struct CoreMetaPendingBatchMarkerRowProto {
 }
 
 impl CoreMetaStore {
+    pub(crate) fn database(&self) -> Arc<DB> {
+        self.db.clone()
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         if let Some(existing) = META_DB_CACHE
@@ -1140,6 +1144,16 @@ fn column_families() -> &'static [&'static str] {
         CF_MATERIALISATION,
         CF_REFCOUNTS,
         CF_OBSERVABILITY,
+        "cf_raft_vote",
+        "cf_raft_log",
+        "cf_raft_meta",
+        "cf_consensus_state",
+        "mvcc_versions",
+        "mvcc_heads",
+        "mvcc_applied",
+        "mvcc_meta",
+        "mvcc_open_transactions",
+        "mvcc_transaction_idempotency",
     ]
 }
 

@@ -375,10 +375,18 @@ impl ConsensusRpcClient for TonicConsensusRpcClient {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        net::SocketAddr,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
-    use anvil_mvcc_consensus::RocksRaftStore;
+    use anvil_mvcc_consensus::{
+        BundleHash, CertificationResult, CertifyTransaction, CommitVersion, Consensus,
+        DurabilityLevel, LogicalKeyHash, NodeIncarnation, PointObservation, RocksRaftStore,
+        TransactionId,
+    };
     use tokio::net::TcpListener;
+    use tokio::task::JoinHandle;
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::Server;
 
@@ -395,6 +403,113 @@ mod tests {
 
     struct CountingAuthorizer {
         calls: Arc<AtomicUsize>,
+    }
+
+    #[derive(Clone)]
+    struct ClusterAuthorizer {
+        cluster_id: &'static str,
+        token: &'static str,
+    }
+
+    #[async_trait]
+    impl ConsensusConnectionAuthorizer for ClusterAuthorizer {
+        async fn authorize(
+            &self,
+            metadata: &MetadataMap,
+            open: &ConsensusSessionOpen,
+        ) -> Result<(), Status> {
+            if open.cluster_id != self.cluster_id {
+                return Err(Status::permission_denied("wrong cluster"));
+            }
+            if metadata
+                .get(NODE_TOKEN_HEADER)
+                .and_then(|value| value.to_str().ok())
+                != Some(self.token)
+            {
+                return Err(Status::unauthenticated("wrong token"));
+            }
+            Ok(())
+        }
+    }
+
+    async fn serve(
+        listener: TcpListener,
+        runtime: Arc<OpenRaftConsensus>,
+        cluster_id: &'static str,
+    ) -> JoinHandle<Result<(), tonic::transport::Error>> {
+        tokio::spawn(
+            Server::builder()
+                .add_service(ConsensusTransportServer::new(
+                    ConsensusTransportService::new(
+                        runtime,
+                        ClusterAuthorizer {
+                            cluster_id,
+                            token: "cluster-token",
+                        },
+                    ),
+                ))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        )
+    }
+
+    async fn node(
+        id: u64,
+        directory: &std::path::Path,
+        cluster_id: &'static str,
+        cluster_hash: [u8; 32],
+        addresses: &[SocketAddr],
+    ) -> Arc<OpenRaftConsensus> {
+        Arc::new(
+            OpenRaftConsensus::new(
+                NodeId(id),
+                RocksRaftStore::open(directory, 1).unwrap(),
+                cluster_hash,
+                cluster_id,
+                Arc::new(TonicConsensusRpcFactory::new(
+                    cluster_id,
+                    NodeId(id),
+                    1,
+                    "cluster-token",
+                    Duration::from_secs(2),
+                )),
+            )
+            .await
+            .unwrap(),
+        )
+    }
+
+    fn command(id: u8, cluster_hash: [u8; 32]) -> CertifyTransaction {
+        let key = LogicalKeyHash([9; 32]);
+        CertifyTransaction {
+            cluster_id_hash: cluster_hash,
+            transaction_id: TransactionId([id; 16]),
+            snapshot_version: CommitVersion(0),
+            point_observations: vec![PointObservation {
+                key,
+                observed_version: None,
+            }],
+            range_observations: Vec::new(),
+            written_point_keys: vec![key],
+            advanced_range_stamps: Vec::new(),
+            bundle_hash: BundleHash([id; 32]),
+            bundle_length: 1,
+            durability: DurabilityLevel::Local,
+            durable_holders: vec![NodeIncarnation {
+                node_id: NodeId(1),
+                incarnation: 1,
+            }],
+        }
+    }
+
+    async fn wait_until(description: &str, mut condition: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !condition() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {description}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
     #[async_trait]
@@ -473,6 +588,151 @@ mod tests {
         ));
         assert_eq!(authorization_calls.load(Ordering::SeqCst), 1);
 
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn three_nodes_certify_one_conflict_converge_and_rejoin_after_restart() {
+        const CLUSTER: &str = "cluster-three";
+        const HASH: [u8; 32] = [3; 32];
+        let directories = [
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        ];
+        let listeners = [
+            TcpListener::bind("127.0.0.1:0").await.unwrap(),
+            TcpListener::bind("127.0.0.1:0").await.unwrap(),
+            TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        ];
+        let addresses = listeners
+            .iter()
+            .map(|listener| listener.local_addr().unwrap())
+            .collect::<Vec<_>>();
+        let first = node(1, directories[0].path(), CLUSTER, HASH, &addresses).await;
+        let second = node(2, directories[1].path(), CLUSTER, HASH, &addresses).await;
+        let third = node(3, directories[2].path(), CLUSTER, HASH, &addresses).await;
+        let mut servers = Vec::new();
+        for (listener, runtime) in
+            listeners
+                .into_iter()
+                .zip([first.clone(), second.clone(), third.clone()])
+        {
+            servers.push(serve(listener, runtime, CLUSTER).await);
+        }
+        let membership = addresses
+            .iter()
+            .enumerate()
+            .map(|(index, address)| {
+                (
+                    NodeId(index as u64 + 1),
+                    ConsensusNode {
+                        address: format!("http://{address}"),
+                    },
+                )
+            })
+            .collect();
+        first.initialize(membership).await.unwrap();
+        let leadership_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if tokio::time::timeout(Duration::from_millis(250), first.linearized_read_barrier())
+                .await
+                .is_ok_and(|result| result.is_ok())
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < leadership_deadline,
+                "timed out waiting for node one leadership"
+            );
+        }
+
+        let (left, right) = tokio::join!(
+            first.certify(command(1, HASH)),
+            first.certify(command(2, HASH))
+        );
+        let outcomes = [left.unwrap(), right.unwrap()];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|result| matches!(result, CertificationResult::Committed { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|result| matches!(result, CertificationResult::Aborted { .. }))
+                .count(),
+            1
+        );
+        let applied = first.observed_commit_version();
+        wait_until("followers to converge", || {
+            second.observed_commit_version() >= applied
+                && third.observed_commit_version() >= applied
+        })
+        .await;
+
+        servers[2].abort();
+        let _ = (&mut servers[2]).await;
+        third.shutdown().await.unwrap();
+        drop(third);
+        let listener = TcpListener::bind(addresses[2]).await.unwrap();
+        let restarted = node(3, directories[2].path(), CLUSTER, HASH, &addresses).await;
+        servers[2] = serve(listener, restarted.clone(), CLUSTER).await;
+        first.certify(command(3, HASH)).await.unwrap();
+        let latest = first.observed_commit_version();
+        wait_until("restarted follower catch-up", || {
+            restarted.observed_commit_version() >= latest
+        })
+        .await;
+
+        for server in servers {
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn consensus_stream_rejects_another_cluster_before_dispatch() {
+        let directory = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let runtime = Arc::new(
+            OpenRaftConsensus::new(
+                NodeId(1),
+                RocksRaftStore::open(directory.path(), 1).unwrap(),
+                [1; 32],
+                "cluster-a",
+                Arc::new(UnusedNetwork),
+            )
+            .await
+            .unwrap(),
+        );
+        let server = serve(listener, runtime, "cluster-a").await;
+        let factory = TonicConsensusRpcFactory::new(
+            "cluster-b",
+            NodeId(2),
+            1,
+            "cluster-token",
+            Duration::from_secs(2),
+        );
+        let mut client = factory.client(
+            NodeId(1),
+            &ConsensusNode {
+                address: format!("http://{address}"),
+            },
+        );
+
+        assert!(matches!(
+            client
+                .request(ConsensusRpc {
+                    schema_version: 1,
+                    kind: ConsensusRpcKind::Vote,
+                    payload: Vec::new(),
+                })
+                .await,
+            Err(ConsensusRpcError::Unreachable(error)) if error.contains("wrong cluster")
+        ));
         server.abort();
     }
 }

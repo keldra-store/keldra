@@ -1,6 +1,10 @@
 //! Durable, scope-free transaction sessions for the public MVCC API path.
 
-use std::{path::Path, sync::Mutex, time::Duration};
+use std::{
+    path::Path,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -17,8 +21,10 @@ use crate::{
     },
 };
 
-const CF_TRANSACTIONS: &str = "open_transactions";
-const CF_IDEMPOTENCY: &str = "transaction_idempotency";
+pub const MVCC_TRANSACTION_COLUMN_FAMILIES: [&str; 2] =
+    ["mvcc_open_transactions", "mvcc_transaction_idempotency"];
+const CF_TRANSACTIONS: &str = MVCC_TRANSACTION_COLUMN_FAMILIES[0];
+const CF_IDEMPOTENCY: &str = MVCC_TRANSACTION_COLUMN_FAMILIES[1];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransactionHandle {
@@ -127,7 +133,7 @@ struct DraftMutations {
 }
 
 pub struct OpenTransactionRegistry {
-    db: DB,
+    db: Arc<DB>,
     transition: Mutex<()>,
 }
 
@@ -136,18 +142,32 @@ impl OpenTransactionRegistry {
         let mut options = Options::default();
         options.create_if_missing(true);
         options.create_missing_column_families(true);
-        let descriptors = [CF_TRANSACTIONS, CF_IDEMPOTENCY]
+        let descriptors = MVCC_TRANSACTION_COLUMN_FAMILIES
             .into_iter()
             .map(|name| ColumnFamilyDescriptor::new(name, Options::default()));
         Ok(Self {
-            db: DB::open_cf_descriptors(&options, path.as_ref(), descriptors).with_context(
-                || {
-                    format!(
-                        "open MVCC transaction registry at {}",
-                        path.as_ref().display()
-                    )
-                },
-            )?,
+            db: Arc::new(
+                DB::open_cf_descriptors(&options, path.as_ref(), descriptors).with_context(
+                    || {
+                        format!(
+                            "open MVCC transaction registry at {}",
+                            path.as_ref().display()
+                        )
+                    },
+                )?,
+            ),
+            transition: Mutex::new(()),
+        })
+    }
+
+    pub fn from_db(db: Arc<DB>) -> Result<Self> {
+        for name in MVCC_TRANSACTION_COLUMN_FAMILIES {
+            if db.cf_handle(name).is_none() {
+                bail!("missing transaction registry column family {name}");
+            }
+        }
+        Ok(Self {
+            db,
             transition: Mutex::new(()),
         })
     }

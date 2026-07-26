@@ -90,6 +90,7 @@ pub mod node_identity;
 pub mod node_signing;
 pub mod object_links;
 pub mod object_manager;
+pub mod object_shard_manifest;
 pub mod observability;
 pub mod partition_fence;
 pub mod perf;
@@ -269,10 +270,13 @@ impl AppState {
             .context("bootstrap system realm")?;
         }
         let mvcc = Arc::new(
-            mvcc_bootstrap::MvccSubsystem::bootstrap(&arc_config)
+            mvcc_bootstrap::MvccSubsystem::bootstrap(&arc_config, core_store.core_meta_database())
                 .await
                 .context("bootstrap mandatory MVCC subsystem")?,
         );
+        object_manager
+            .install_mvcc_replication(mvcc.replication_client.clone())
+            .context("install MVCC object shard reader")?;
 
         Ok(Self {
             persistence,
