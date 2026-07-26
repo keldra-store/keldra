@@ -678,6 +678,56 @@ pub fn page_apps_for_tenant_mvcc(
     })
 }
 
+pub fn page_tenants_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    expected_revision: &str,
+    after_application_key: Option<&[u8]>,
+    page_size: usize,
+) -> Result<CurrentTenantPage> {
+    if page_size == 0 || page_size > 1_000 {
+        bail!("tenant page size must be between 1 and 1000");
+    }
+    if current_control_collection_revision_mvcc(mvcc)? != expected_revision {
+        bail!("control tenant collection revision changed");
+    }
+    let snapshot = mvcc.runtime.applied_version()?;
+    let tuple_prefix = tenant_id_tuple_prefix()?;
+    let application_prefix =
+        crate::mvcc_product::coremeta_application_prefix(CF_MESH, &tuple_prefix)?;
+    let mut rows = mvcc.runtime.scan_table_prefix_at(
+        TABLE_CONTROL_CURRENT_ROW,
+        &application_prefix,
+        snapshot,
+    )?;
+    if let Some(after) = after_application_key {
+        rows.retain(|(key, _)| key.application_key.as_slice() > after);
+    }
+    let has_more = rows.len() > page_size;
+    rows.truncate(page_size);
+    let next_tuple_key = has_more
+        .then(|| rows.last().map(|(key, _)| key.application_key.clone()))
+        .flatten();
+    let mut tenants = Vec::new();
+    for (_, row) in rows {
+        match decode_control_current_row(&row.value)? {
+            ControlCurrentRecord::Tenant {
+                id,
+                name,
+                active: true,
+            } => tenants.push(Tenant { id, name }),
+            ControlCurrentRecord::Tenant { active: false, .. } => {}
+            _ => bail!("control tenant collection contains a different record type"),
+        }
+    }
+    if current_control_collection_revision_mvcc(mvcc)? != expected_revision {
+        bail!("control tenant collection revision changed");
+    }
+    Ok(CurrentTenantPage {
+        tenants,
+        next_tuple_key,
+    })
+}
+
 fn read_control_current_mvcc(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tuple_key: &[u8],
@@ -874,6 +924,126 @@ pub(crate) async fn create_app_with_permit(
         }
     }
     unreachable!("control mutation retry loop always returns")
+}
+
+pub(crate) async fn create_app_with_permit_mvcc(
+    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    name: &str,
+    client_id: &str,
+    encrypted_secret: &[u8],
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<App> {
+    let partition_precondition =
+        control_write_precondition(storage, permit, partition_owner_signing_key).await?;
+    let _ = partition_precondition;
+    if read_app_by_tenant_name_mvcc(mvcc, tenant_id, name)?.is_some() {
+        bail!("app already exists");
+    }
+    if read_app_details_by_client_id_mvcc(mvcc, client_id)?.is_some() {
+        bail!("client_id already exists");
+    }
+    let max_allocated_id = match read_control_current_mvcc(mvcc, &id_allocator_tuple_key()?)? {
+        Some(ControlCurrentRecord::IdAllocator { max_allocated_id }) => max_allocated_id,
+        Some(_) => bail!("control ID allocator row contains a different record type"),
+        None => 0,
+    };
+    let id = max_allocated_id
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("control ID allocator overflow"))?;
+    let record = ControlCurrentRecord::App {
+        id,
+        tenant_id,
+        name: name.to_string(),
+        client_id: client_id.to_string(),
+        client_secret_encrypted: encrypted_secret.to_vec(),
+        active: true,
+    };
+    append_control_event_mvcc(
+        mvcc,
+        ControlEventBody::AppCreate {
+            id,
+            tenant_id,
+            name: name.to_string(),
+            client_id: client_id.to_string(),
+            client_secret_encrypted: encrypted_secret.to_vec(),
+        },
+        vec![
+            ControlCurrentRecord::IdAllocator {
+                max_allocated_id: id,
+            },
+            record,
+        ],
+        permit.fence_token,
+    )
+    .await?;
+    Ok(App {
+        id,
+        name: name.to_string(),
+        client_id: client_id.to_string(),
+    })
+}
+
+pub(crate) async fn update_app_secret_with_permit_mvcc(
+    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    app_id: i64,
+    encrypted_secret: &[u8],
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<()> {
+    let partition_precondition =
+        control_write_precondition(storage, permit, partition_owner_signing_key).await?;
+    let _ = partition_precondition;
+    let existing = read_stored_app_mvcc(mvcc, &app_id_tuple_key(app_id)?)?
+        .ok_or_else(|| anyhow!("app not found"))?;
+    append_control_event_mvcc(
+        mvcc,
+        ControlEventBody::AppSecretUpdate {
+            app_id,
+            client_secret_encrypted: encrypted_secret.to_vec(),
+        },
+        vec![ControlCurrentRecord::App {
+            id: existing.id,
+            tenant_id: existing.tenant_id,
+            name: existing.name,
+            client_id: existing.client_id,
+            client_secret_encrypted: encrypted_secret.to_vec(),
+            active: true,
+        }],
+        permit.fence_token,
+    )
+    .await
+}
+
+pub(crate) async fn delete_app_with_permit_mvcc(
+    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    app_id: i64,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<()> {
+    let partition_precondition =
+        control_write_precondition(storage, permit, partition_owner_signing_key).await?;
+    let _ = partition_precondition;
+    let existing = read_stored_app_mvcc(mvcc, &app_id_tuple_key(app_id)?)?
+        .ok_or_else(|| anyhow!("app not found"))?;
+    append_control_event_mvcc(
+        mvcc,
+        ControlEventBody::AppDelete { app_id },
+        vec![ControlCurrentRecord::App {
+            id: existing.id,
+            tenant_id: existing.tenant_id,
+            name: existing.name,
+            client_id: existing.client_id,
+            client_secret_encrypted: existing.client_secret_encrypted,
+            active: false,
+        }],
+        permit.fence_token,
+    )
+    .await
 }
 
 async fn create_app_inner(

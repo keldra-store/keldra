@@ -31,8 +31,12 @@ impl Persistence {
         after_tuple_key: Option<&[u8]>,
         page_size: usize,
     ) -> Result<control_journal::CurrentTenantPage> {
-        control_journal::page_tenants(&self.storage, expected_revision, after_tuple_key, page_size)
-            .await
+        control_journal::page_tenants_mvcc(
+            self.mvcc()?,
+            expected_revision,
+            after_tuple_key,
+            page_size,
+        )
     }
 
     pub async fn get_app_by_client_id(&self, client_id: &str) -> Result<Option<AppDetails>> {
@@ -62,8 +66,9 @@ impl Persistence {
         encrypted_secret: &[u8],
     ) -> Result<App> {
         let permit = self.control_write_permit().await?;
-        control_journal::create_app_with_permit(
+        control_journal::create_app_with_permit_mvcc(
             &self.storage,
+            self.mvcc()?,
             tenant_id,
             name,
             client_id,
@@ -100,8 +105,9 @@ impl Persistence {
 
     pub async fn update_app_secret(&self, app_id: i64, new_encrypted_secret: &[u8]) -> Result<()> {
         let permit = self.control_write_permit().await?;
-        control_journal::update_app_secret_with_permit(
+        control_journal::update_app_secret_with_permit_mvcc(
             &self.storage,
+            self.mvcc()?,
             app_id,
             new_encrypted_secret,
             &permit,
@@ -112,8 +118,9 @@ impl Persistence {
 
     pub async fn delete_app(&self, app_id: i64) -> Result<()> {
         let permit = self.control_write_permit().await?;
-        control_journal::delete_app_with_permit(
+        control_journal::delete_app_with_permit_mvcc(
             &self.storage,
+            self.mvcc()?,
             app_id,
             &permit,
             &self.partition_owner_signing_key,
