@@ -927,6 +927,63 @@ pub fn read_personaldb_data_locator_row_mvcc(
     )
 }
 
+pub fn list_personaldb_data_locator_rows_at_snapshot(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    group_id: &str,
+    after_tuple_key: Option<&[u8]>,
+    page_size: usize,
+    snapshot_version: u64,
+) -> Result<PersonalDbDataLocatorPage> {
+    if !(1..=PERSONALDB_DATA_LOCATOR_PAGE_MAX).contains(&page_size) {
+        bail!(
+            "PersonalDB data locator page size must be between 1 and {PERSONALDB_DATA_LOCATOR_PAGE_MAX}"
+        );
+    }
+    let tuple_prefix = personaldb_data_locator_tuple_prefix(tenant_id, group_id)?;
+    if after_tuple_key.is_some_and(|cursor| !cursor.starts_with(&tuple_prefix)) {
+        bail!("PersonalDB data locator cursor is outside the requested group");
+    }
+    let prefix = crate::mvcc_product::coremeta_application_prefix(CF_PERSONALDB, &tuple_prefix)?;
+    let mut rows = mvcc.runtime.scan_table_prefix_at(
+        TABLE_PERSONALDB_DATA_LOCATOR_ROW,
+        &prefix,
+        snapshot_version,
+    )?;
+    if let Some(after) = after_tuple_key {
+        rows.retain(|(key, _)| {
+            crate::mvcc_product::coremeta_tuple_from_logical_key(key, CF_PERSONALDB)
+                .is_ok_and(|tuple| tuple > after)
+        });
+    }
+    let has_more = rows.len() > page_size;
+    if has_more {
+        rows.truncate(page_size);
+    }
+    let next_tuple_key = if has_more {
+        Some(
+            crate::mvcc_product::coremeta_tuple_from_logical_key(
+                &rows
+                    .last()
+                    .ok_or_else(|| anyhow!("PersonalDB locator page lost final row"))?
+                    .0,
+                CF_PERSONALDB,
+            )?
+            .to_vec(),
+        )
+    } else {
+        None
+    };
+    let rows = rows
+        .into_iter()
+        .map(|(_, row)| decode_data_locator_row(&row.value))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(PersonalDbDataLocatorPage {
+        rows,
+        next_tuple_key,
+    })
+}
+
 pub async fn write_personaldb_data_locator_row_mvcc(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     row: &PersonalDbDataLocatorCoreMetaRow,
