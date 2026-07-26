@@ -323,6 +323,14 @@ impl AppState {
 #[cfg(test)]
 mod app_state_tests {
     use super::*;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
 
     #[tokio::test]
     async fn starts_without_personaldb_signing_keys() {
@@ -358,6 +366,294 @@ mod app_state_tests {
                 .list_public_records()
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn mvcc_object_job_publishes_all_frozen_index_kinds_before_completion() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config {
+            jwt_secret: "test-secret".to_string(),
+            anvil_secret_encryption_key:
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            public_api_addr: "127.0.0.1:0".to_string(),
+            api_listen_addr: "127.0.0.1:0".to_string(),
+            region: "local".to_string(),
+            node_id: "node-a".to_string(),
+            bootstrap_system_admin_subject_kind: "app".to_string(),
+            bootstrap_system_admin_subject_id: "admin-principal".to_string(),
+            allow_test_only_embedding_provider: true,
+            storage_path: directory
+                .path()
+                .join("storage")
+                .to_string_lossy()
+                .into_owned(),
+            ..Config::default()
+        };
+        let state = AppState::new(
+            config,
+            personaldb_signing::PersonalDbProtocolKeyring::disabled(),
+        )
+        .await
+        .unwrap();
+        state.persistence.create_region("local").await.unwrap();
+        let tenant = state
+            .persistence
+            .create_tenant("mvcc-index-test", "mvcc-index-test")
+            .await
+            .unwrap();
+        let bucket = state
+            .persistence
+            .create_bucket(tenant.id, "documents", "local")
+            .await
+            .unwrap();
+        let claims = auth::Claims {
+            sub: "test-app".to_string(),
+            exp: usize::MAX,
+            tenant_id: tenant.id,
+            jti: None,
+        };
+        access_control::grant_storage_tenant_owner(
+            &state.persistence,
+            tenant.id,
+            &claims.sub,
+            "test",
+            "materialisation e2e",
+        )
+        .await
+        .unwrap();
+        access_control::grant_bucket_defaults(
+            &state.persistence,
+            &bucket,
+            &claims.sub,
+            "test",
+            "materialisation e2e",
+        )
+        .await
+        .unwrap();
+        let definitions = [
+            persistence::IndexDefinitionMutation::Create {
+                name: "typed".into(),
+                kind: "typed_json".into(),
+                selector: serde_json::Value::Null,
+                extractor: serde_json::Value::Null,
+                authorization_mode: "inherit_object".into(),
+                build_policy: serde_json::json!({
+                    "source_kind": "object_current",
+                    "fields": [{"name": "title", "extractor": "/title"}],
+                }),
+            },
+            persistence::IndexDefinitionMutation::Create {
+                name: "text".into(),
+                kind: "full_text".into(),
+                selector: serde_json::Value::Null,
+                extractor: serde_json::json!({
+                    "fields": [{"source": "object_body_utf8"}],
+                }),
+                authorization_mode: "inherit_object".into(),
+                build_policy: serde_json::json!({}),
+            },
+            persistence::IndexDefinitionMutation::Create {
+                name: "vector".into(),
+                kind: "vector".into(),
+                selector: serde_json::Value::Null,
+                extractor: serde_json::json!({"kind": "object_body_utf8"}),
+                authorization_mode: "inherit_object".into(),
+                build_policy: serde_json::json!({
+                    "schema": formats::vector::VECTOR_INDEX_SCHEMA,
+                    "source": {"kind": "object_current", "prefix": ""},
+                    "extractor": {"kind": "object_body_utf8"},
+                    "embedding": {
+                        "provider": "test_only",
+                        "model": "test",
+                        "dimension": 4,
+                        "modality": "text",
+                        "normalisation": "unit_l2",
+                        "chunking": {"strategy": "whole_object"}
+                    },
+                    "ann": {"algorithm": "hnsw", "metric": "cosine"}
+                }),
+            },
+        ];
+        for definition in definitions {
+            let outcome = state
+                .persistence
+                .apply_index_definition_mutation(&bucket, &definition, None, None)
+                .await
+                .unwrap();
+            assert!(matches!(
+                outcome,
+                persistence::IndexDefinitionMutationOutcome::Published { .. }
+            ));
+        }
+
+        let principal = object_manager::transaction_principal_from_claims(&claims);
+        let handle = state
+            .mvcc
+            .open_transactions
+            .begin(
+                state.mvcc.runtime.as_ref(),
+                state.mvcc.cluster_id().to_string(),
+                &principal,
+                "materialisation-e2e",
+                Duration::from_secs(60),
+                mvcc_transaction::DurabilityLevel::Local,
+                mvcc_transaction::ReadConsistency::Snapshot,
+                now_ms(),
+            )
+            .await
+            .unwrap();
+        let object = state
+            .object_manager
+            .put_object(
+                &claims,
+                &bucket.name,
+                "document.json",
+                futures_util::stream::iter(vec![Ok(
+                    br#"{"title":"MVCC materialisation document"}"#.to_vec(),
+                )]),
+                object_manager::ObjectWriteOptions {
+                    content_type: Some("application/json".into()),
+                    transaction_id: Some(handle.transaction_id.clone()),
+                    transaction_principal: Some(principal.clone()),
+                    visibility: object_manager::ObjectWriteVisibility::strict(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let commit = state
+            .mvcc
+            .open_transactions
+            .commit(
+                state.mvcc.runtime.as_ref(),
+                &handle.transaction_id,
+                &principal,
+                now_ms(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            commit.certification,
+            mvcc_transaction::CertificationResult::Committed { .. }
+        ));
+
+        let target = format!(
+            "tenant/{}/bucket/{}/object/{}/version/{}",
+            tenant.id, bucket.id, object.key, object.version_id
+        );
+        let status_key = object_materialisation::materialisation_status_key(&target).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let Some(row) = state
+                    .mvcc
+                    .runtime
+                    .local_store()
+                    .read_latest(&status_key)
+                    .unwrap()
+                {
+                    break object_materialisation::ObjectMaterialisationResult::decode(&row.value)
+                        .unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            result.state,
+            object_materialisation::ObjectMaterialisationState::Complete
+        );
+        let outcomes = result.index_marker["outcomes"].as_array().unwrap();
+        assert_eq!(outcomes.len(), 3);
+        assert!(outcomes.iter().all(|outcome| {
+            outcome["segment_hashes"]
+                .as_array()
+                .is_some_and(|hashes| !hashes.is_empty())
+        }));
+
+        let unsupported = persistence::IndexDefinitionMutation::Create {
+            name: "unsupported".into(),
+            kind: "future_index_kind".into(),
+            selector: serde_json::Value::Null,
+            extractor: serde_json::Value::Null,
+            authorization_mode: "inherit_object".into(),
+            build_policy: serde_json::json!({}),
+        };
+        assert!(matches!(
+            state
+                .persistence
+                .apply_index_definition_mutation(&bucket, &unsupported, None, None)
+                .await
+                .unwrap(),
+            persistence::IndexDefinitionMutationOutcome::Published { .. }
+        ));
+        let unsupported_handle = state
+            .mvcc
+            .open_transactions
+            .begin(
+                state.mvcc.runtime.as_ref(),
+                state.mvcc.cluster_id().to_string(),
+                &principal,
+                "materialisation-unsupported",
+                Duration::from_secs(60),
+                mvcc_transaction::DurabilityLevel::Local,
+                mvcc_transaction::ReadConsistency::Snapshot,
+                now_ms(),
+            )
+            .await
+            .unwrap();
+        let unsupported_object = state
+            .object_manager
+            .put_object(
+                &claims,
+                &bucket.name,
+                "unsupported.json",
+                futures_util::stream::iter(vec![Ok(br#"{"title":"pending"}"#.to_vec())]),
+                object_manager::ObjectWriteOptions {
+                    content_type: Some("application/json".into()),
+                    transaction_id: Some(unsupported_handle.transaction_id.clone()),
+                    transaction_principal: Some(principal.clone()),
+                    visibility: object_manager::ObjectWriteVisibility::strict(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .mvcc
+            .open_transactions
+            .commit(
+                state.mvcc.runtime.as_ref(),
+                &unsupported_handle.transaction_id,
+                &principal,
+                now_ms(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let unsupported_target = format!(
+            "tenant/{}/bucket/{}/object/{}/version/{}",
+            tenant.id, bucket.id, unsupported_object.key, unsupported_object.version_id
+        );
+        let unsupported_status =
+            object_materialisation::materialisation_status_key(&unsupported_target).unwrap();
+        assert!(
+            state
+                .mvcc
+                .runtime
+                .local_store()
+                .read_latest(&unsupported_status)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            state
+                .mvcc
+                .runtime
+                .local_store()
+                .has_incomplete_object_materialisations()
+                .unwrap()
         );
     }
 

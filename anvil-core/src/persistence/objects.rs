@@ -45,7 +45,6 @@ impl ObjectCreateOptions {
             journal_mutation: metadata_journal::ObjectJournalMutation::Put,
         }
     }
-
 }
 
 impl Default for ObjectCreateOptions {
