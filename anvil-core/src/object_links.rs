@@ -88,6 +88,7 @@ pub struct PutObjectLinkRequest {
     pub created_by: String,
     pub transaction_id: Option<String>,
     pub transaction_principal: Option<String>,
+    pub audit_event: Option<crate::tenant_audit::TenantAuditEvent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +100,7 @@ pub struct DeleteObjectLinkRequest {
     pub idempotency_key: String,
     pub transaction_id: Option<String>,
     pub transaction_principal: Option<String>,
+    pub audit_event: Option<crate::tenant_audit::TenantAuditEvent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -320,6 +322,7 @@ mod tests {
             created_by: "principal:test".to_string(),
             transaction_id: None,
             transaction_principal: None,
+            audit_event: None,
         }
     }
 

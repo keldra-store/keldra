@@ -26,6 +26,14 @@ pub(super) async fn create_object_link(
     let bucket = public_link_bucket(state, &claims, &req.bucket_name).await?;
     let resolution = object_link_resolution_from_proto(req.resolution)?;
     let target_version = parse_optional_uuid("target_version", req.target_version)?;
+    let audit_event = crate::services::audit::build_tenant_audit_event(
+        &claims,
+        &context.request_id,
+        format!("{}/{}", bucket.name, req.link_key),
+        "object_link.create",
+        serde_json::json!({ "target_key": req.target_key, "generation": 1 }),
+    )?;
+    let audit_event_id = audit_event.audit_event_id.clone();
     let mutation = state
         .persistence
         .put_object_link(object_links::PutObjectLinkRequest {
@@ -42,25 +50,10 @@ pub(super) async fn create_object_link(
             created_by: format!("app:{}", claims.sub),
             transaction_id: transaction_id.map(ToOwned::to_owned),
             transaction_principal: transaction_principal.clone(),
+            audit_event: Some(audit_event),
         })
         .await
         .map_err(object_link_status)?;
-    let audit_event_id = if transaction_id.is_some() {
-        String::new()
-    } else {
-        crate::services::audit::record_tenant_audit_event(
-            state,
-            &claims,
-            &context.request_id,
-            format!("{}/{}", bucket.name, mutation.descriptor.link_key),
-            "object_link.create",
-            serde_json::json!({
-                "target_key": mutation.descriptor.target_key.clone(),
-                "generation": mutation.descriptor.generation
-            }),
-        )
-        .await?
-    };
 
     Ok(Response::new(ObjectLinkResponse {
         request_id: context.request_id.clone(),
@@ -94,6 +87,14 @@ pub(super) async fn update_object_link(
     let bucket = public_link_bucket(state, &claims, &req.bucket_name).await?;
     let resolution = object_link_resolution_from_proto(req.resolution)?;
     let target_version = parse_optional_uuid("target_version", req.target_version)?;
+    let audit_event = crate::services::audit::build_tenant_audit_event(
+        &claims,
+        &context.request_id,
+        format!("{}/{}", bucket.name, req.link_key),
+        "object_link.update",
+        serde_json::json!({ "target_key": req.target_key, "generation": context.expected_generation + 1 }),
+    )?;
+    let audit_event_id = audit_event.audit_event_id.clone();
     let mutation = state
         .persistence
         .put_object_link(object_links::PutObjectLinkRequest {
@@ -110,25 +111,10 @@ pub(super) async fn update_object_link(
             created_by: format!("app:{}", claims.sub),
             transaction_id: transaction_id.map(ToOwned::to_owned),
             transaction_principal: transaction_principal.clone(),
+            audit_event: Some(audit_event),
         })
         .await
         .map_err(object_link_status)?;
-    let audit_event_id = if transaction_id.is_some() {
-        String::new()
-    } else {
-        crate::services::audit::record_tenant_audit_event(
-            state,
-            &claims,
-            &context.request_id,
-            format!("{}/{}", bucket.name, mutation.descriptor.link_key),
-            "object_link.update",
-            serde_json::json!({
-                "target_key": mutation.descriptor.target_key.clone(),
-                "generation": mutation.descriptor.generation
-            }),
-        )
-        .await?
-    };
 
     Ok(Response::new(ObjectLinkResponse {
         request_id: context.request_id.clone(),
@@ -160,6 +146,14 @@ pub(super) async fn delete_object_link(
     )
     .await?;
     let bucket = public_link_bucket(state, &claims, &req.bucket_name).await?;
+    let audit_event = crate::services::audit::build_tenant_audit_event(
+        &claims,
+        &context.request_id,
+        format!("{}/{}", bucket.name, req.link_key),
+        "object_link.delete",
+        serde_json::json!({ "generation": context.expected_generation + 1 }),
+    )?;
+    let audit_event_id = audit_event.audit_event_id.clone();
     let deleted = state
         .persistence
         .delete_object_link(object_links::DeleteObjectLinkRequest {
@@ -170,22 +164,10 @@ pub(super) async fn delete_object_link(
             idempotency_key: context.idempotency_key.clone(),
             transaction_id: transaction_id.map(ToOwned::to_owned),
             transaction_principal: transaction_principal.clone(),
+            audit_event: Some(audit_event),
         })
         .await
         .map_err(object_link_status)?;
-    let audit_event_id = if transaction_id.is_some() {
-        String::new()
-    } else {
-        crate::services::audit::record_tenant_audit_event(
-            state,
-            &claims,
-            &context.request_id,
-            format!("{}/{}", bucket.name, deleted.link_key),
-            "object_link.delete",
-            serde_json::json!({ "generation": deleted.generation }),
-        )
-        .await?
-    };
 
     Ok(Response::new(MutationResponse {
         request_id: context.request_id.clone(),

@@ -29,6 +29,7 @@ pub(crate) async fn append_object_mutation_with_permit(
         partition_owner_signing_key,
         None,
         None,
+        None,
     )
     .await
 }
@@ -44,6 +45,34 @@ pub(crate) async fn append_object_mutation_with_permit_in_transaction(
     transaction_id: Option<&str>,
     transaction_principal: Option<&str>,
 ) -> Result<()> {
+    append_object_mutation_with_permit_in_transaction_and_audit(
+        storage,
+        mvcc,
+        bucket,
+        object,
+        mutation,
+        permit,
+        partition_owner_signing_key,
+        transaction_id,
+        transaction_principal,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn append_object_mutation_with_permit_in_transaction_and_audit(
+    storage: &Storage,
+    mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
+    bucket: &Bucket,
+    object: &Object,
+    mutation: ObjectJournalMutation,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+    transaction_id: Option<&str>,
+    transaction_principal: Option<&str>,
+    audit_event: Option<&crate::tenant_audit::TenantAuditEvent>,
+) -> Result<()> {
     require_object_metadata_permit(bucket, permit)?;
     let partition_precondition =
         partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
@@ -57,6 +86,7 @@ pub(crate) async fn append_object_mutation_with_permit_in_transaction(
         Some(partition_precondition),
         transaction_id,
         transaction_principal,
+        audit_event,
     )
     .await
 }
@@ -120,6 +150,7 @@ async fn append_object_put_mutations_with_permit_inner(
     partition_owner_signing_key: &[u8],
     transaction_id: &str,
     transaction_principal: Option<&str>,
+    audit_event: Option<&crate::tenant_audit::TenantAuditEvent>,
     mut additions: CoreMutationBatchAdditions,
 ) -> Result<()> {
     if objects.is_empty() {
@@ -237,6 +268,7 @@ async fn append_object_put_mutations_with_permit_inner(
         mvcc.stage_product_mutations(
             transaction_id,
             transaction_principal,
+            audit_event,
             mutations,
             u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
         )?;
@@ -363,6 +395,7 @@ pub(super) async fn append_object_mutation_inner(
     partition_precondition: Option<CoreMutationPrecondition>,
     transaction_id: Option<&str>,
     transaction_principal: Option<&str>,
+    audit_event: Option<&crate::tenant_audit::TenantAuditEvent>,
 ) -> Result<()> {
     let core_store = CoreStore::new(storage.clone()).await?;
     let _mutation_guard = core_store
@@ -494,6 +527,16 @@ async fn append_object_mutation_inner_once(
     let mut mutations = event_plan.mutations;
     mutations.extend(watch_plan.mutations);
     mutations.extend(projection_mutations);
+    let mut outbox_events = Vec::new();
+    if let Some(audit_event) = audit_event {
+        let audit_plan = crate::tenant_audit::tenant_audit_mvcc_plan(
+            audit_event,
+            u64::try_from(object.id).unwrap_or(1),
+            transaction_id,
+        )?;
+        mutations.extend(audit_plan.mutations);
+        outbox_events.extend(audit_plan.outbox_events);
+    }
     let mut predicates = predicates;
     predicates.push(event_plan.head_predicate);
     predicates.extend(watch_plan.predicates);
@@ -507,6 +550,13 @@ async fn append_object_mutation_inner_once(
             mutations,
             u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
         )?;
+        for event in outbox_events {
+            mvcc.open_transactions.add_stream_event(
+                transaction_id,
+                event,
+                u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+            )?;
+        }
         let now_unix_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default();
         for (key, kind) in predicates {
             mvcc.stage_predicate(
@@ -519,11 +569,12 @@ async fn append_object_mutation_inner_once(
         }
         return Ok(());
     }
-    mvcc.autocommit_product_mutations_with_predicates(
+    mvcc.autocommit_product_mutations_with_predicates_and_outbox(
         &committed_by_principal,
         transaction_id,
         mutations,
         predicates,
+        outbox_events,
         crate::mvcc_transaction::DurabilityLevel::Local,
         u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
     )

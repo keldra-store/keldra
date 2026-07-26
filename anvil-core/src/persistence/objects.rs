@@ -657,7 +657,7 @@ impl Persistence {
             .object_metadata_write_permit(bucket.tenant_id, bucket.id)
             .await?;
         if let Some(transaction_id) = request.transaction_id.as_deref() {
-            metadata_journal::append_object_mutation_with_permit_in_transaction(
+            metadata_journal::append_object_mutation_with_permit_in_transaction_and_audit(
                 &self.storage,
                 Some(self.mvcc()?),
                 &bucket,
@@ -667,17 +667,21 @@ impl Persistence {
                 &self.partition_owner_signing_key,
                 Some(transaction_id),
                 request.transaction_principal.as_deref(),
+                request.audit_event.as_ref(),
             )
             .await?;
         } else {
-            metadata_journal::append_object_mutation_with_permit(
+            metadata_journal::append_object_mutation_with_permit_in_transaction_and_audit(
                 &self.storage,
-                self.mvcc()?,
+                Some(self.mvcc()?),
                 &bucket,
                 &object,
                 metadata_journal::ObjectJournalMutation::Put,
                 &permit,
                 &self.partition_owner_signing_key,
+                None,
+                None,
+                request.audit_event.as_ref(),
             )
             .await?;
             if options.enqueue_index_maintenance {
@@ -868,7 +872,7 @@ impl Persistence {
             .object_metadata_write_permit(bucket.tenant_id, bucket.id)
             .await?;
         if let Some(transaction_id) = request.transaction_id.as_deref() {
-            metadata_journal::append_object_mutation_with_permit_in_transaction(
+            metadata_journal::append_object_mutation_with_permit_in_transaction_and_audit(
                 &self.storage,
                 Some(self.mvcc()?),
                 &bucket,
@@ -878,17 +882,21 @@ impl Persistence {
                 &self.partition_owner_signing_key,
                 Some(transaction_id),
                 request.transaction_principal.as_deref(),
+                request.audit_event.as_ref(),
             )
             .await?;
         } else {
-            metadata_journal::append_object_mutation_with_permit(
+            metadata_journal::append_object_mutation_with_permit_in_transaction_and_audit(
                 &self.storage,
-                self.mvcc()?,
+                Some(self.mvcc()?),
                 &bucket,
                 &object,
                 metadata_journal::ObjectJournalMutation::DeleteMarker,
                 &permit,
                 &self.partition_owner_signing_key,
+                None,
+                None,
+                request.audit_event.as_ref(),
             )
             .await?;
             if options.enqueue_index_maintenance {
