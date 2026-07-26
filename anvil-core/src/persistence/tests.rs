@@ -445,6 +445,7 @@ async fn empty_bucket_index_build_materialises_an_empty_typed_json_segment() {
         .unwrap();
     let stats = metadata_journal::active_object_journal_stats(
         &persistence.storage,
+        persistence.mvcc().unwrap(),
         &bucket,
         &persistence.partition_owner_signing_key,
     )

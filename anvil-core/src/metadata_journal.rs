@@ -1091,10 +1091,11 @@ fn decode_segment_file_with_footer(
 
 pub async fn recover_object_metadata_partition(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     manifest_signing_key: &[u8],
 ) -> Result<RecoveredObjectMetadataPartition> {
-    let manifest = read_latest_partition_manifest(storage, bucket, manifest_signing_key)
+    let manifest = read_latest_partition_manifest(storage, mvcc, bucket, manifest_signing_key)
         .await?
         .ok_or_else(|| anyhow!("object metadata partition manifest is missing"))?;
     let expected_partition_id =
@@ -1173,13 +1174,14 @@ pub async fn recover_object_metadata_partition(
 
 async fn recover_object_directory_partition(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     manifest_signing_key: &[u8],
 ) -> Result<(
     PartitionManifest,
     std::collections::BTreeMap<Vec<u8>, DirectoryEntryBody>,
 )> {
-    let manifest = read_latest_partition_manifest(storage, bucket, manifest_signing_key)
+    let manifest = read_latest_partition_manifest(storage, mvcc, bucket, manifest_signing_key)
         .await?
         .ok_or_else(|| anyhow!("object metadata partition manifest is missing"))?;
     let expected_partition_id =
@@ -1522,6 +1524,7 @@ pub fn list_object_versions_mvcc(
 
 pub async fn read_current_objects_through_sequence(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     manifest_signing_key: &[u8],
     max_sequence: u128,
@@ -1531,6 +1534,7 @@ pub async fn read_current_objects_through_sequence(
     }
     let body_records = read_object_version_bodies_through_sequence(
         storage,
+        mvcc,
         bucket,
         manifest_signing_key,
         max_sequence,
@@ -1541,41 +1545,51 @@ pub async fn read_current_objects_through_sequence(
 
 pub async fn compare_directory_index_to_metadata(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     manifest_signing_key: &[u8],
 ) -> Result<DirectoryIndexComparison> {
-    let stats = active_object_journal_stats(storage, bucket, manifest_signing_key).await?;
+    let stats = active_object_journal_stats(storage, mvcc, bucket, manifest_signing_key).await?;
     let source_cursor = u128::from(stats.last_sequence.max(stats.compacted_through_sequence));
     Ok(DirectoryIndexComparison {
         source_cursor,
         expected: expected_directory_index_snapshot_from_metadata(
             storage,
+            mvcc,
             bucket,
             manifest_signing_key,
         )
         .await?,
-        actual: current_directory_index_snapshot_from_index(storage, bucket, manifest_signing_key)
-            .await?,
+        actual: current_directory_index_snapshot_from_index(
+            storage,
+            mvcc,
+            bucket,
+            manifest_signing_key,
+        )
+        .await?,
     })
 }
 
 pub async fn expected_directory_index_snapshot_from_metadata(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     manifest_signing_key: &[u8],
 ) -> Result<DirectoryIndexSnapshot> {
     let expected_entries =
-        expected_directory_entries_from_metadata(storage, bucket, manifest_signing_key).await?;
+        expected_directory_entries_from_metadata(storage, mvcc, bucket, manifest_signing_key)
+            .await?;
     directory_index_snapshot(&expected_entries)
 }
 
 pub async fn current_directory_index_snapshot_from_index(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     manifest_signing_key: &[u8],
 ) -> Result<DirectoryIndexSnapshot> {
     let actual_entries =
-        current_directory_entries_from_index(storage, bucket, manifest_signing_key).await?;
+        current_directory_entries_from_index(storage, mvcc, bucket, manifest_signing_key).await?;
     directory_index_snapshot(&actual_entries)
 }
 
@@ -1592,7 +1606,7 @@ pub async fn rebuild_directory_index_from_metadata_with_permit(
     let partition_precondition =
         partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
     let body_records =
-        read_object_version_bodies_from_metadata_only(storage, bucket, manifest_signing_key)
+        read_object_version_bodies_from_metadata_only(storage, mvcc, bucket, manifest_signing_key)
             .await?;
     let records = read_all_metadata_journal_records(storage, bucket).await?;
     let generation = records
@@ -1652,6 +1666,7 @@ fn current_objects_from_version_bodies(
 
 pub async fn read_object_versions(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     manifest_signing_key: &[u8],
     prefix: &str,
@@ -1659,7 +1674,8 @@ pub async fn read_object_versions(
     version_id_marker: Option<uuid::Uuid>,
     limit: i32,
 ) -> Result<ObjectVersionsPage> {
-    let body_records = read_object_version_bodies(storage, bucket, manifest_signing_key).await?;
+    let body_records =
+        read_object_version_bodies(storage, mvcc, bucket, manifest_signing_key).await?;
     let mut versions_by_key = object_versions_by_key(body_records);
     let marker = if let Some(version_id_marker) = version_id_marker {
         let marker = versions_by_key
@@ -1762,26 +1778,35 @@ pub async fn read_object_versions(
 
 async fn read_object_version_bodies(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     manifest_signing_key: &[u8],
 ) -> Result<Vec<(usize, ObjectVersionBody)>> {
-    read_object_version_bodies_inner(storage, bucket, manifest_signing_key, None).await
+    read_object_version_bodies_inner(storage, mvcc, bucket, manifest_signing_key, None).await
 }
 
 async fn read_object_version_bodies_through_sequence(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     manifest_signing_key: &[u8],
     max_sequence: u128,
 ) -> Result<Vec<(usize, ObjectVersionBody)>> {
     let max_sequence = u64::try_from(max_sequence)
         .map_err(|_| anyhow!("object metadata source cursor exceeds u64 sequence range"))?;
-    read_object_version_bodies_inner(storage, bucket, manifest_signing_key, Some(max_sequence))
-        .await
+    read_object_version_bodies_inner(
+        storage,
+        mvcc,
+        bucket,
+        manifest_signing_key,
+        Some(max_sequence),
+    )
+    .await
 }
 
 async fn read_object_version_bodies_inner(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     manifest_signing_key: &[u8],
     max_sequence: Option<u64>,
@@ -1790,10 +1815,11 @@ async fn read_object_version_bodies_inner(
     let mut order = 0usize;
     let mut compacted_through_sequence = 0u64;
 
-    if partition_manifest_exists(storage, bucket).await? {
-        let recovered = recover_object_metadata_partition(storage, bucket, manifest_signing_key)
-            .await
-            .context("recover object metadata partition from CoreStore manifest")?;
+    if partition_manifest_exists(mvcc, bucket)? {
+        let recovered =
+            recover_object_metadata_partition(storage, mvcc, bucket, manifest_signing_key)
+                .await
+                .context("recover object metadata partition from CoreStore manifest")?;
         compacted_through_sequence = recovered.manifest.compacted_through_sequence;
         if let Some(max_sequence) = max_sequence {
             if compacted_through_sequence > max_sequence {
@@ -1826,6 +1852,7 @@ async fn read_object_version_bodies_inner(
 
 async fn read_object_version_bodies_from_metadata_only(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     manifest_signing_key: &[u8],
 ) -> Result<Vec<(usize, ObjectVersionBody)>> {
@@ -1834,7 +1861,7 @@ async fn read_object_version_bodies_from_metadata_only(
     let mut compacted_through_sequence = 0u64;
 
     if let Some(manifest) =
-        read_latest_partition_manifest(storage, bucket, manifest_signing_key).await?
+        read_latest_partition_manifest(storage, mvcc, bucket, manifest_signing_key).await?
     {
         let expected_partition_id =
             hex::encode(object_metadata_partition_id(bucket.tenant_id, bucket.id));
@@ -1881,15 +1908,16 @@ async fn read_object_version_bodies_from_metadata_only(
 
 async fn current_directory_entries_from_index(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     manifest_signing_key: &[u8],
 ) -> Result<std::collections::BTreeMap<Vec<u8>, DirectoryEntryBody>> {
     let mut directory_records = std::collections::BTreeMap::<Vec<u8>, DirectoryEntryBody>::new();
     let mut compacted_through_sequence = 0u64;
 
-    if partition_manifest_exists(storage, bucket).await? {
+    if partition_manifest_exists(mvcc, bucket)? {
         let (manifest, recovered_directory) =
-            recover_object_directory_partition(storage, bucket, manifest_signing_key)
+            recover_object_directory_partition(storage, mvcc, bucket, manifest_signing_key)
                 .await
                 .context("recover object directory partition from CoreStore manifest")?;
         compacted_through_sequence = manifest.compacted_through_sequence;
@@ -1908,11 +1936,12 @@ async fn current_directory_entries_from_index(
 
 async fn expected_directory_entries_from_metadata(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     manifest_signing_key: &[u8],
 ) -> Result<std::collections::BTreeMap<Vec<u8>, DirectoryEntryBody>> {
     directory_entries_from_object_version_bodies(
-        read_object_version_bodies_from_metadata_only(storage, bucket, manifest_signing_key)
+        read_object_version_bodies_from_metadata_only(storage, mvcc, bucket, manifest_signing_key)
             .await?,
     )
 }

@@ -45,16 +45,19 @@ pub async fn repair_directory_index(
     permit: &PartitionWritePermit,
     signing_key: &[u8],
 ) -> Result<DirectoryIndexRepairReport> {
-    let stats = metadata_journal::active_object_journal_stats(storage, bucket, signing_key).await?;
+    let stats =
+        metadata_journal::active_object_journal_stats(storage, mvcc, bucket, signing_key).await?;
     let source_cursor = u128::from(stats.last_sequence.max(stats.compacted_through_sequence));
     let expected = metadata_journal::expected_directory_index_snapshot_from_metadata(
         storage,
+        mvcc,
         bucket,
         signing_key,
     )
     .await?;
     let actual = match metadata_journal::current_directory_index_snapshot_from_index(
         storage,
+        mvcc,
         bucket,
         signing_key,
     )
@@ -177,7 +180,7 @@ async fn finish_repair(
         RepairFindingStatus::Open
     };
     let finding = write_repair_finding(
-        storage,
+        mvcc,
         repair_finding_write(
             bucket,
             source_cursor,

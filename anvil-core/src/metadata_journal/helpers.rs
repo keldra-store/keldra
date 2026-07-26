@@ -355,10 +355,11 @@ pub fn decode_partition_manifest(
 
 pub(crate) async fn read_latest_partition_manifest(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     manifest_signing_key: &[u8],
 ) -> Result<Option<PartitionManifest>> {
-    let Some(record) = read_object_metadata_partition_manifest_row(storage, bucket).await? else {
+    let Some(record) = read_object_metadata_partition_manifest_row(mvcc, bucket)? else {
         return Ok(None);
     };
     let store = CoreStore::new(storage.clone()).await?;
@@ -373,10 +374,11 @@ pub(crate) async fn read_latest_partition_manifest(
     )?))
 }
 
-pub(super) async fn partition_manifest_exists(storage: &Storage, bucket: &Bucket) -> Result<bool> {
-    Ok(read_object_metadata_partition_manifest_row(storage, bucket)
-        .await?
-        .is_some())
+pub(super) fn partition_manifest_exists(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    bucket: &Bucket,
+) -> Result<bool> {
+    Ok(read_object_metadata_partition_manifest_row(mvcc, bucket)?.is_some())
 }
 
 pub(super) async fn read_manifest_segment(
@@ -646,12 +648,13 @@ pub(super) fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRe
 
 pub async fn active_object_journal_stats(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     manifest_signing_key: &[u8],
 ) -> Result<ActiveObjectJournalStats> {
     let mut compacted_through_sequence = 0;
     if let Some(manifest) =
-        read_latest_partition_manifest(storage, bucket, manifest_signing_key).await?
+        read_latest_partition_manifest(storage, mvcc, bucket, manifest_signing_key).await?
     {
         compacted_through_sequence = manifest.compacted_through_sequence;
     }
@@ -701,11 +704,12 @@ pub async fn active_object_journal_stats(
 
 pub async fn object_metadata_source_cursor(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     manifest_signing_key: &[u8],
 ) -> Result<u128> {
     let compacted_through_sequence = if let Some(manifest) =
-        read_latest_partition_manifest(storage, bucket, manifest_signing_key).await?
+        read_latest_partition_manifest(storage, mvcc, bucket, manifest_signing_key).await?
     {
         manifest.compacted_through_sequence
     } else {
@@ -723,6 +727,7 @@ pub async fn object_metadata_source_cursor(
 
 pub async fn object_metadata_source_checkpoint_hash(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     manifest_signing_key: &[u8],
     max_sequence: u128,
@@ -738,7 +743,7 @@ pub async fn object_metadata_source_checkpoint_hash(
     let mut compacted_through_sequence = 0u64;
     let mut compacted_event_hash = String::new();
     if let Some(manifest) =
-        read_latest_partition_manifest(storage, bucket, manifest_signing_key).await?
+        read_latest_partition_manifest(storage, mvcc, bucket, manifest_signing_key).await?
     {
         compacted_through_sequence = manifest.compacted_through_sequence;
         if compacted_through_sequence > max_sequence {
@@ -1021,17 +1026,16 @@ pub(super) fn decode_object_metadata_partition_manifest_row(
     })
 }
 
-pub(super) async fn read_object_metadata_partition_manifest_row(
-    storage: &Storage,
+pub(super) fn read_object_metadata_partition_manifest_row(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
 ) -> Result<Option<ObjectMetadataPartitionManifestRow>> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(payload) = store.read_coremeta_row(
-        CF_OBJECT_HEADS,
-        TABLE_OBJECT_METADATA_PARTITION_MANIFEST_ROW,
-        &object_metadata_partition_manifest_row_key(bucket)?,
-    )?
-    else {
+    let key = metadata_product_key(
+        MetadataProductRowKind::ManifestPublication,
+        bucket,
+        Some(&object_metadata_partition_manifest_row_key(bucket)?),
+    )?;
+    let Some(payload) = read_metadata_product_latest(mvcc, &key)? else {
         return Ok(None);
     };
     Ok(Some(decode_object_metadata_partition_manifest_row(

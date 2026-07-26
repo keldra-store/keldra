@@ -1482,6 +1482,7 @@ mod tests {
         assert!(
             crate::metadata_journal::read_latest_partition_manifest(
                 &storage,
+                persistence.mvcc().unwrap(),
                 &bucket,
                 &hex::decode(&config.anvil_secret_encryption_key).unwrap()
             )

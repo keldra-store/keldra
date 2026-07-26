@@ -324,6 +324,7 @@ async fn build_full_text_index_from_source(
         None => {
             let objects = metadata_journal::read_current_objects_through_sequence(
                 storage,
+                authority.mvcc()?,
                 bucket,
                 partition_owner_signing_key,
                 source_cursor,
@@ -470,6 +471,7 @@ async fn build_full_text_index_from_source(
         None => {
             metadata_journal::object_metadata_source_checkpoint_hash(
                 storage,
+                authority.mvcc()?,
                 bucket,
                 partition_owner_signing_key,
                 source_cursor,
@@ -744,6 +746,7 @@ async fn build_typed_json_index_from_source(
         None => {
             typed_json_source_manifest_hash(
                 storage,
+                authority.mvcc()?,
                 bucket,
                 partition_owner_signing_key,
                 source_cursor,
@@ -863,6 +866,7 @@ pub(crate) async fn build_metadata_backed_index(
 
     let objects = metadata_journal::read_current_objects_through_sequence(
         storage,
+        authority.mvcc()?,
         bucket,
         partition_owner_signing_key,
         source_cursor,
@@ -949,6 +953,7 @@ pub(crate) async fn build_metadata_backed_index(
     let partition_id = hex::encode(hash32(index_storage_id.as_bytes()));
     let source_manifest_hash = metadata_journal::object_metadata_source_checkpoint_hash(
         storage,
+        authority.mvcc()?,
         bucket,
         partition_owner_signing_key,
         source_cursor,
@@ -1190,6 +1195,7 @@ async fn build_vector_index_with_policy(
         None => {
             let objects = metadata_journal::read_current_objects_through_sequence(
                 storage,
+                authority.mvcc()?,
                 bucket,
                 partition_owner_signing_key,
                 source_cursor,
@@ -1366,6 +1372,7 @@ async fn build_vector_index_with_policy(
         None => {
             metadata_journal::object_metadata_source_checkpoint_hash(
                 storage,
+                authority.mvcc()?,
                 bucket,
                 partition_owner_signing_key,
                 source_cursor,

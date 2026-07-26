@@ -384,6 +384,7 @@ pub(super) async fn build_typed_json_object_rows(
 )> {
     let objects = metadata_journal::read_current_objects_through_sequence(
         storage,
+        mvcc,
         bucket,
         partition_owner_signing_key,
         source_cursor,
@@ -585,6 +586,7 @@ pub(super) fn selector_matches_append(
 
 pub(super) async fn typed_json_source_manifest_hash(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     partition_owner_signing_key: &[u8],
     source_cursor: u128,
@@ -603,6 +605,7 @@ pub(super) async fn typed_json_source_manifest_hash(
     }
     metadata_journal::object_metadata_source_checkpoint_hash(
         storage,
+        mvcc,
         bucket,
         partition_owner_signing_key,
         source_cursor,

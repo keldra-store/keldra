@@ -1260,6 +1260,7 @@ impl Persistence {
         };
         let active_stats = metadata_journal::active_object_journal_stats(
             &self.storage,
+            self.mvcc()?,
             &bucket,
             &self.partition_owner_signing_key,
         )
@@ -1276,6 +1277,7 @@ impl Persistence {
     ) -> Result<()> {
         let stats = metadata_journal::active_object_journal_stats(
             &self.storage,
+            self.mvcc()?,
             bucket,
             &self.partition_owner_signing_key,
         )

@@ -148,6 +148,7 @@ impl Persistence {
             } else {
                 metadata_journal::object_metadata_source_cursor(
                     &self.storage,
+                    self.mvcc()?,
                     bucket,
                     &self.partition_owner_signing_key,
                 )
@@ -175,6 +176,7 @@ impl Persistence {
             } else {
                 metadata_journal::object_metadata_source_checkpoint_hash(
                     &self.storage,
+                    self.mvcc()?,
                     bucket,
                     &self.partition_owner_signing_key,
                     source_cursor,
@@ -476,6 +478,7 @@ impl Persistence {
 
         let source_cursor = metadata_journal::object_metadata_source_cursor(
             &self.storage,
+            self.mvcc()?,
             &bucket,
             &self.partition_owner_signing_key,
         )
@@ -487,6 +490,7 @@ impl Persistence {
         } else {
             metadata_journal::object_metadata_source_checkpoint_hash(
                 &self.storage,
+                self.mvcc()?,
                 &bucket,
                 &self.partition_owner_signing_key,
                 source_cursor,
@@ -540,7 +544,7 @@ impl Persistence {
             )?;
             finding = Some(
                 repair_finding::write_repair_finding(
-                    &self.storage,
+                    self.mvcc()?,
                     write,
                     &self.partition_owner_signing_key,
                 )
@@ -588,7 +592,7 @@ impl Persistence {
         scope_kind: &str,
         scope_id: &str,
     ) -> Result<u64> {
-        repair_finding::repair_finding_scope_revision(&self.storage, scope_kind, scope_id).await
+        repair_finding::repair_finding_scope_revision(self.mvcc()?, scope_kind, scope_id).await
     }
 
     pub async fn page_repair_findings(
@@ -600,7 +604,7 @@ impl Persistence {
         limit: usize,
     ) -> Result<Vec<repair_finding::RepairFinding>> {
         repair_finding::page_repair_findings(
-            &self.storage,
+            self.mvcc()?,
             scope_kind,
             scope_id,
             after_revision,
@@ -620,6 +624,7 @@ impl Persistence {
         let permit = self.authz_write_permit(tenant_id).await?;
         authz_repair::repair_authz_derived_userset_index(
             &self.storage,
+            self.mvcc()?,
             tenant_id,
             derived_index_id,
             rebuild,
@@ -639,6 +644,7 @@ impl Persistence {
         let permit = self.repair_write_permit("personaldb", &scope_id).await?;
         personaldb_repair::repair_personaldb_log_chain(
             &self.storage,
+            self.mvcc()?,
             tenant_id,
             database_id,
             permit.fence_token,

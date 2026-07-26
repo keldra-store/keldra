@@ -544,6 +544,7 @@ impl Persistence {
                         .ok_or_else(|| anyhow!("object metadata compaction bucket not found"))?;
                 let stats = metadata_journal::active_object_journal_stats(
                     &self.storage,
+                    self.mvcc()?,
                     &bucket,
                     &self.partition_owner_signing_key,
                 )
