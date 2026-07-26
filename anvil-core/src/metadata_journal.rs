@@ -1,24 +1,22 @@
 use crate::bucket_journal;
 use crate::core_store::{
-    CF_OBJECT_HEADS, CoreMetaRowCommonProto, CoreMetaTuplePart, CoreMutationBatch,
-    CoreMutationOperation, CoreMutationPrecondition, CorePipelinePolicy, CoreStore,
+    CF_OBJECT_HEADS, CoreMetaTuplePart, CoreMutationOperation, CorePipelinePolicy, CoreStore,
     CoreTraceContext, TABLE_OBJECT_METADATA_PARTITION_MANIFEST_ROW, TABLE_STREAM_HEAD_ROW,
-    TABLE_STREAM_RECORD_INDEX_ROW, WriteLogicalFileRequest, core_meta_committed_row_common,
-    core_meta_payload_digest, core_meta_root_key_hash, core_meta_tuple_key,
-    core_mutation_publication_attempt_id, decode_deterministic_proto, is_stream_head_mismatch,
+    TABLE_STREAM_RECORD_INDEX_ROW, WriteLogicalFileRequest, core_meta_payload_digest,
+    core_meta_tuple_key, decode_deterministic_proto,
 };
 use crate::formats::{
     FileFamily, Hash32, decode_writer_segment, encode_writer_segment_header, hash32,
     header_field_string, header_field_u64,
     segment::SegmentRecord,
-    single_body_range_index, unix_nanos_from_rfc3339,
+    single_body_range_index,
     writer::{
         WriterBuildOutput, WriterFamily, WriterSegmentBuildInput,
         build_writer_segment_logical_file, canonical_logical_file_id,
     },
 };
 use crate::object_links;
-use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
+use crate::partition_fence::PartitionWritePermit;
 use crate::persistence::{Bucket, Object, ObjectVersion, ObjectVersionsPage};
 use crate::storage::Storage;
 use crate::task_execution_guard::TaskExecutionGuard;
@@ -634,8 +632,6 @@ pub(super) struct ObjectMetadataPartitionManifestRow {
 
 #[derive(Clone, PartialEq, Message)]
 struct ObjectMetadataPartitionManifestRowProto {
-    #[prost(message, optional, tag = "1")]
-    common: Option<CoreMetaRowCommonProto>,
     #[prost(string, tag = "2")]
     schema: String,
     #[prost(string, tag = "3")]
@@ -691,7 +687,6 @@ struct StagedPartitionManifest {
     manifest_ref: String,
     manifest_payload: Vec<u8>,
     manifest_tuple_key: Vec<u8>,
-    manifest_root_anchor_key: String,
     transaction_id: String,
 }
 
@@ -828,11 +823,9 @@ pub(crate) async fn seal_object_journal_segments_with_permit(
     bucket: &Bucket,
     manifest_signing_key: &[u8],
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
+    _partition_owner_signing_key: &[u8],
 ) -> Result<SealedObjectMetadataSegments> {
     require_object_metadata_permit(bucket, permit)?;
-    let partition_precondition =
-        partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
     let compaction_started_at = std::time::Instant::now();
     let staged = stage_object_journal_segments(
         storage,
@@ -842,7 +835,7 @@ pub(crate) async fn seal_object_journal_segments_with_permit(
         permit.fence_token,
     )
     .await?;
-    publish_staged_compaction(storage, mvcc, bucket, &staged, &[partition_precondition]).await?;
+    publish_staged_compaction(mvcc, bucket, &staged, &[]).await?;
     complete_staged_compaction(staged, "object_metadata_seal", compaction_started_at)
 }
 
@@ -852,12 +845,10 @@ pub(crate) async fn seal_object_journal_segments_with_task_guard(
     bucket: &Bucket,
     manifest_signing_key: &[u8],
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
+    _partition_owner_signing_key: &[u8],
     task_guard: &TaskExecutionGuard,
 ) -> Result<SealedObjectMetadataSegments> {
     require_object_metadata_permit(bucket, permit)?;
-    let partition_precondition =
-        partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
     let compaction_started_at = std::time::Instant::now();
     let staged = stage_object_journal_segments(
         storage,
@@ -867,15 +858,7 @@ pub(crate) async fn seal_object_journal_segments_with_task_guard(
         permit.fence_token,
     )
     .await?;
-    publish_staged_compaction_for_task(
-        storage,
-        mvcc,
-        bucket,
-        &staged,
-        &partition_precondition,
-        task_guard,
-    )
-    .await?;
+    publish_staged_compaction_for_task(mvcc, bucket, &staged, task_guard).await?;
     complete_staged_compaction(staged, "object_metadata_seal", compaction_started_at)
 }
 
@@ -996,33 +979,32 @@ async fn stage_object_metadata_compaction(
 }
 
 async fn publish_staged_compaction(
-    storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     staged: &StagedObjectMetadataCompaction,
-    additional_preconditions: &[CoreMutationPrecondition],
+    additional_predicates: &[(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )],
 ) -> Result<()> {
     publish_partition_manifest(
         mvcc,
         bucket,
         &staged.partition_manifest,
         &staged.segments,
-        additional_preconditions,
+        additional_predicates,
     )
     .await
 }
 
 async fn publish_staged_compaction_for_task(
-    storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     staged: &StagedObjectMetadataCompaction,
-    partition_precondition: &CoreMutationPrecondition,
     task_guard: &TaskExecutionGuard,
 ) -> Result<()> {
     task_guard
         .publish_mvcc_with(|task_predicate| async move {
-            let _ = partition_precondition;
             publish_partition_manifest(
                 mvcc,
                 bucket,
@@ -1600,12 +1582,10 @@ pub async fn rebuild_directory_index_from_metadata_with_permit(
     bucket: &Bucket,
     manifest_signing_key: &[u8],
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
+    _partition_owner_signing_key: &[u8],
 ) -> Result<SealedObjectMetadataSegments> {
     let compaction_started_at = std::time::Instant::now();
     require_object_metadata_permit(bucket, permit)?;
-    let partition_precondition =
-        partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
     let body_records =
         read_object_version_bodies_from_metadata_only(storage, mvcc, bucket, manifest_signing_key)
             .await?;
@@ -1643,7 +1623,7 @@ pub async fn rebuild_directory_index_from_metadata_with_permit(
         permit.fence_token,
     )
     .await?;
-    publish_staged_compaction(storage, mvcc, bucket, &staged, &[partition_precondition]).await?;
+    publish_staged_compaction(mvcc, bucket, &staged, &[]).await?;
     complete_staged_compaction(staged, "directory_index_rebuild", compaction_started_at)
 }
 

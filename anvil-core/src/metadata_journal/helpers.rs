@@ -247,16 +247,11 @@ pub(super) async fn stage_partition_manifest(
         published_at: manifest.published_at.clone(),
     };
     let manifest_payload = encode_object_metadata_partition_manifest_row(bucket, &manifest_row)?;
-    let manifest_root_anchor_key = format!(
-        "object-metadata-manifest/{}/{}",
-        bucket.tenant_id, bucket.id
-    );
     Ok(StagedPartitionManifest {
         manifest,
         manifest_ref,
         manifest_payload,
         manifest_tuple_key: object_metadata_partition_manifest_row_key(bucket)?,
-        manifest_root_anchor_key,
         transaction_id: format!(
             "metadata-manifest:{}:{}:{}:{}",
             bucket.tenant_id, bucket.id, generation, manifest_hash
@@ -307,42 +302,42 @@ pub(super) async fn publish_partition_manifest(
         )?;
     }
     let principal = object_metadata_partition_principal(bucket);
-    plan.autocommit(
+    let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default();
+    let handle = mvcc
+        .open_transactions
+        .begin(
+            mvcc.runtime.as_ref(),
+            mvcc.cluster_id(),
+            &principal,
+            &staged.transaction_id,
+            std::time::Duration::from_secs(30),
+            crate::mvcc_transaction::DurabilityLevel::Quorum,
+            crate::mvcc_transaction::ReadConsistency::Linearized,
+            now,
+        )
+        .await?;
+    plan.stage(mvcc, &handle.transaction_id, &principal, now)?;
+    super::object_mutation::stage_object_metadata_assignment_guard(
         mvcc,
+        bucket,
+        &handle.transaction_id,
         &principal,
-        &staged.transaction_id,
-        crate::mvcc_transaction::DurabilityLevel::Local,
-        u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
     )
     .await?;
-    Ok(())
-}
-
-fn object_metadata_manifest_root_publications(
-    coordinator_root: &str,
-    data_root: &str,
-) -> Vec<crate::core_store::CoreMutationRootPublication> {
-    if coordinator_root == data_root {
-        return vec![crate::core_store::CoreMutationRootPublication {
-            root_anchor_key: data_root.to_string(),
-            writer_families: vec![
-                WriterFamily::CoreControl.as_str().to_string(),
-                WriterFamily::ObjectBlob.as_str().to_string(),
-            ],
-            transaction_coordinator: true,
-        }];
-    }
-    vec![
-        crate::core_store::CoreMutationRootPublication::new(
-            coordinator_root,
-            WriterFamily::CoreControl.as_str(),
+    let outcome = mvcc
+        .open_transactions
+        .commit(
+            mvcc.runtime.as_ref(),
+            &handle.transaction_id,
+            &principal,
+            u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
         )
-        .coordinator(),
-        crate::core_store::CoreMutationRootPublication::new(
-            data_root,
-            WriterFamily::ObjectBlob.as_str(),
-        ),
-    ]
+        .await?;
+    if let crate::mvcc_transaction::CertificationResult::Aborted { reason } = outcome.certification
+    {
+        bail!("object metadata manifest publication aborted: {reason:?}");
+    }
+    Ok(())
 }
 
 pub fn decode_partition_manifest(
@@ -810,10 +805,6 @@ pub(super) fn object_metadata_partition_principal(bucket: &Bucket) -> String {
     )
 }
 
-pub(super) fn object_metadata_manifest_scope(bucket: &Bucket) -> String {
-    format!("tenant/{}/bucket/{}", bucket.tenant_id, bucket.id)
-}
-
 pub(super) fn object_metadata_segment_scope(segment_ref: &str) -> Result<String> {
     let parsed = parse_object_metadata_segment_ref(segment_ref)?;
     Ok(format!(
@@ -884,19 +875,6 @@ pub(super) fn encode_object_metadata_partition_manifest_row(
     }
     validate_hex32(&row.manifest_hash, "object metadata manifest payload hash")?;
     encode_deterministic_proto(&ObjectMetadataPartitionManifestRowProto {
-        common: Some(core_meta_committed_row_common(
-            object_metadata_manifest_scope(bucket),
-            core_meta_root_key_hash(&format!(
-                "object-metadata-manifest/{}/{}",
-                bucket.tenant_id, bucket.id
-            )),
-            row.generation,
-            format!(
-                "object-metadata-manifest:{}:{}:{}",
-                bucket.tenant_id, bucket.id, row.generation
-            ),
-            unix_nanos_from_rfc3339(&row.published_at),
-        )),
         schema: OBJECT_METADATA_PARTITION_MANIFEST_ROW_SCHEMA.to_string(),
         manifest_ref: row.manifest_ref.clone(),
         object_ref_target: row.object_ref_target.clone(),
@@ -917,14 +895,6 @@ pub(super) fn decode_object_metadata_partition_manifest_row(
     if proto.schema != OBJECT_METADATA_PARTITION_MANIFEST_ROW_SCHEMA {
         return Err(anyhow!(
             "object metadata partition manifest row has invalid schema"
-        ));
-    }
-    let common = proto
-        .common
-        .ok_or_else(|| anyhow!("object metadata partition manifest row missing CoreMeta common"))?;
-    if common.realm_id != object_metadata_manifest_scope(bucket) {
-        return Err(anyhow!(
-            "object metadata partition manifest row realm mismatch"
         ));
     }
     if proto.manifest_ref != metadata_manifest_ref_name(bucket)? {
