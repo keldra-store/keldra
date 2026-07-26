@@ -273,18 +273,7 @@ impl Persistence {
         let has_objects = if let Some(bucket) =
             bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
         {
-            !metadata_journal::read_object_versions(
-                &self.storage,
-                &bucket,
-                &self.partition_owner_signing_key,
-                "",
-                "",
-                None,
-                1,
-            )
-            .await?
-            .versions
-            .is_empty()
+            !metadata_journal::read_object_versions_mvcc(self.mvcc()?, &bucket)?.is_empty()
         } else {
             false
         };

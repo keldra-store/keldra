@@ -1859,25 +1859,16 @@ impl AppState {
         object_version_id: [u8; 16],
     ) -> Result<Option<QueryObjectRef>, Status> {
         let version_id = uuid::Uuid::from_bytes(object_version_id);
-        let object = crate::metadata_journal::read_object_version(
-            &self.storage,
-            bucket,
-            &[],
-            object_key,
-            version_id,
+        let object = crate::metadata_journal::read_object_version_mvcc(
+            &self.mvcc, bucket, object_key, version_id,
         )
-        .await
         .map_err(|e| Status::internal(e.to_string()))?
         .or_else(|| None);
         let object = match object {
             Some(object) => object,
-            None => match crate::metadata_journal::read_current_object(
-                &self.storage,
-                bucket,
-                &[],
-                object_key,
+            None => match crate::metadata_journal::read_current_object_mvcc(
+                &self.mvcc, bucket, object_key,
             )
-            .await
             .map_err(|e| Status::internal(e.to_string()))?
             {
                 Some(object) => object,
