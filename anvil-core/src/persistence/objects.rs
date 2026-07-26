@@ -393,12 +393,7 @@ impl Persistence {
         });
         let step_start = std::time::Instant::now();
         let object = Object {
-            id: metadata_journal::next_object_id(
-                &self.storage,
-                &bucket,
-                &self.partition_owner_signing_key,
-            )
-            .await?,
+            id: metadata_journal::next_object_id_mvcc(self.mvcc()?, &bucket)?,
             tenant_id,
             bucket_id,
             key: key.to_string(),
@@ -514,13 +509,8 @@ impl Persistence {
             return Err(object_links::ObjectLinkError::BucketTenantMismatch);
         }
 
-        let current = metadata_journal::read_current_object(
-            &self.storage,
-            &bucket,
-            &self.partition_owner_signing_key,
-            &request.link_key,
-        )
-        .await?;
+        let current =
+            metadata_journal::read_current_object_mvcc(self.mvcc()?, &bucket, &request.link_key)?;
         if request.create_only && current.is_some() {
             return Err(object_links::ObjectLinkError::AlreadyExists);
         }
@@ -553,25 +543,17 @@ impl Persistence {
 
         if !request.allow_dangling {
             let target = match request.target_version {
-                Some(version_id) => {
-                    metadata_journal::read_object_version(
-                        &self.storage,
-                        &bucket,
-                        &self.partition_owner_signing_key,
-                        &request.target_key,
-                        version_id,
-                    )
-                    .await?
-                }
-                None => {
-                    metadata_journal::read_current_object(
-                        &self.storage,
-                        &bucket,
-                        &self.partition_owner_signing_key,
-                        &request.target_key,
-                    )
-                    .await?
-                }
+                Some(version_id) => metadata_journal::read_object_version_mvcc(
+                    self.mvcc()?,
+                    &bucket,
+                    &request.target_key,
+                    version_id,
+                )?,
+                None => metadata_journal::read_current_object_mvcc(
+                    self.mvcc()?,
+                    &bucket,
+                    &request.target_key,
+                )?,
             }
             .ok_or(object_links::ObjectLinkError::DanglingObjectLink)?;
             if target.deleted_at.is_some() {
@@ -649,12 +631,7 @@ impl Persistence {
             created_by: request.created_by,
         };
         let object = Object {
-            id: metadata_journal::next_object_id(
-                &self.storage,
-                &bucket,
-                &self.partition_owner_signing_key,
-            )
-            .await?,
+            id: metadata_journal::next_object_id_mvcc(self.mvcc()?, &bucket)?,
             tenant_id: request.tenant_id,
             bucket_id: bucket.id,
             key: request.link_key,
@@ -724,13 +701,7 @@ impl Persistence {
         else {
             return Ok(None);
         };
-        metadata_journal::read_current_object(
-            &self.storage,
-            &bucket,
-            &self.partition_owner_signing_key,
-            key,
-        )
-        .await
+        metadata_journal::read_current_object_mvcc(self.mvcc()?, &bucket, key)
     }
 
     pub async fn get_object_link(
@@ -746,13 +717,7 @@ impl Persistence {
         else {
             return Ok(None);
         };
-        let Some(object) = metadata_journal::read_current_object(
-            &self.storage,
-            &bucket,
-            &self.partition_owner_signing_key,
-            key,
-        )
-        .await?
+        let Some(object) = metadata_journal::read_current_object_mvcc(self.mvcc()?, &bucket, key)?
         else {
             return Ok(None);
         };
@@ -818,14 +783,9 @@ impl Persistence {
             return Err(object_links::ObjectLinkError::BucketTenantMismatch);
         }
 
-        let current = metadata_journal::read_current_object(
-            &self.storage,
-            &bucket,
-            &self.partition_owner_signing_key,
-            &request.link_key,
-        )
-        .await?
-        .ok_or(object_links::ObjectLinkError::NotFound)?;
+        let current =
+            metadata_journal::read_current_object_mvcc(self.mvcc()?, &bucket, &request.link_key)?
+                .ok_or(object_links::ObjectLinkError::NotFound)?;
         if current.kind != object_links::ObjectEntryKind::Link {
             return Err(object_links::ObjectLinkError::ExistingObjectIsNotLink);
         }
@@ -881,12 +841,7 @@ impl Persistence {
             delete_marker: true,
         });
         let object = Object {
-            id: metadata_journal::next_object_id(
-                &self.storage,
-                &bucket,
-                &self.partition_owner_signing_key,
-            )
-            .await?,
+            id: metadata_journal::next_object_id_mvcc(self.mvcc()?, &bucket)?,
             tenant_id: request.tenant_id,
             bucket_id: bucket.id,
             key: request.link_key.clone(),
@@ -972,24 +927,14 @@ impl Persistence {
         let mut seen = HashSet::new();
         for _ in 0..object_links::MAX_LINK_RESOLUTION_DEPTH {
             let object = match current_version {
-                Some(version_id) => {
-                    metadata_journal::read_object_version(
-                        &self.storage,
-                        &bucket,
-                        &self.partition_owner_signing_key,
-                        &current_key,
-                        version_id,
-                    )
-                    .await?
-                }
+                Some(version_id) => metadata_journal::read_object_version_mvcc(
+                    self.mvcc()?,
+                    &bucket,
+                    &current_key,
+                    version_id,
+                )?,
                 None => {
-                    metadata_journal::read_current_object(
-                        &self.storage,
-                        &bucket,
-                        &self.partition_owner_signing_key,
-                        &current_key,
-                    )
-                    .await?
+                    metadata_journal::read_current_object_mvcc(self.mvcc()?, &bucket, &current_key)?
                 }
             }
             .ok_or(object_links::ObjectLinkError::DanglingObjectLink)?;
@@ -1023,14 +968,7 @@ impl Persistence {
         else {
             return Ok(None);
         };
-        metadata_journal::read_object_version(
-            &self.storage,
-            &bucket,
-            &self.partition_owner_signing_key,
-            key,
-            version_id,
-        )
-        .await
+        metadata_journal::read_object_version_mvcc(self.mvcc()?, &bucket, key, version_id)
     }
 
     pub async fn get_object_version_by_id(
@@ -1043,13 +981,7 @@ impl Persistence {
         else {
             return Ok(None);
         };
-        metadata_journal::read_object_version_by_id(
-            &self.storage,
-            &bucket,
-            &self.partition_owner_signing_key,
-            version_id,
-        )
-        .await
+        metadata_journal::read_object_version_by_id_mvcc(self.mvcc()?, &bucket, version_id)
     }
 
     pub async fn list_current_directory_objects(&self, bucket: &Bucket) -> Result<Vec<Object>> {
@@ -1122,24 +1054,13 @@ impl Persistence {
         else {
             return Ok(None);
         };
-        let Some(base) = metadata_journal::read_current_object(
-            &self.storage,
-            &bucket,
-            &self.partition_owner_signing_key,
-            key,
-        )
-        .await?
+        let Some(base) = metadata_journal::read_current_object_mvcc(self.mvcc()?, &bucket, key)?
         else {
             return Ok(None);
         };
         let now = Utc::now();
         let object = Object {
-            id: metadata_journal::next_object_id(
-                &self.storage,
-                &bucket,
-                &self.partition_owner_signing_key,
-            )
-            .await?,
+            id: metadata_journal::next_object_id_mvcc(self.mvcc()?, &bucket)?,
             mutation_id: uuid::Uuid::new_v4(),
             version_id: uuid::Uuid::new_v4(),
             content_hash: String::new(),
@@ -1230,23 +1151,12 @@ impl Persistence {
         else {
             return Ok(None);
         };
-        let Some(mut object) = metadata_journal::read_object_version(
-            &self.storage,
-            &bucket,
-            &self.partition_owner_signing_key,
-            key,
-            version_id,
-        )
-        .await?
+        let Some(mut object) =
+            metadata_journal::read_object_version_mvcc(self.mvcc()?, &bucket, key, version_id)?
         else {
             return Ok(None);
         };
-        object.id = metadata_journal::next_object_id(
-            &self.storage,
-            &bucket,
-            &self.partition_owner_signing_key,
-        )
-        .await?;
+        object.id = metadata_journal::next_object_id_mvcc(self.mvcc()?, &bucket)?;
         object.mutation_id = uuid::Uuid::new_v4();
         object.deleted_at = Some(Utc::now());
         let permit = self
