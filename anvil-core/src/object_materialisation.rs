@@ -21,7 +21,10 @@ pub struct ObjectMaterialisationJob {
     pub object_version_id: String,
     pub target_logical_identity: String,
     pub representation: Value,
+    pub content_hash: String,
     pub payload_length: u64,
+    pub frozen_object: Value,
+    pub source_manifest_hash: String,
     pub content_type: Option<String>,
     pub user_metadata: Value,
     pub index_policy_snapshot: Value,
@@ -75,6 +78,9 @@ impl ObjectMaterialisationJob {
             || self.target_logical_identity.trim().is_empty()
             || self.requested_at_unix_ms == 0
             || !self.representation.is_object()
+            || self.content_hash.trim().is_empty()
+            || !self.frozen_object.is_object()
+            || !is_sha256_hash(&self.source_manifest_hash)
             || !self.user_metadata.is_object()
             || !self.index_policy_snapshot.is_object()
             || self
@@ -90,6 +96,24 @@ impl ObjectMaterialisationJob {
                 && !self.requested_operations.maintain_indexes)
         {
             bail!("invalid object materialisation job");
+        }
+        let expected_target = format!(
+            "tenant/{}/bucket/{}/object/{}/version/{}",
+            self.tenant_id, self.bucket_id, self.object_key, self.object_version_id
+        );
+        let frozen_version = self.frozen_object.get("version_id").and_then(Value::as_str);
+        let frozen_content_hash = self
+            .frozen_object
+            .get("content_hash")
+            .and_then(Value::as_str);
+        let frozen_length = self.frozen_object.get("size").and_then(Value::as_i64);
+        if self.target_logical_identity != expected_target
+            || frozen_version != Some(self.object_version_id.as_str())
+            || frozen_content_hash != Some(self.content_hash.as_str())
+            || frozen_length.and_then(|length| u64::try_from(length).ok())
+                != Some(self.payload_length)
+        {
+            bail!("frozen object does not match materialisation target");
         }
         let mut definitions = self.frozen_index_definitions.clone();
         definitions.sort_by_key(|definition| (definition.id, definition.version));
@@ -109,6 +133,12 @@ impl ObjectMaterialisationJob {
         }
         Ok(job)
     }
+}
+
+fn is_sha256_hash(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,7 +269,15 @@ mod tests {
             object_version_id: "version".into(),
             target_logical_identity: "tenant/1/bucket/2/object/key/version/version".into(),
             representation: serde_json::json!({"schema": "local"}),
+            content_hash: "sha256:payload".into(),
             payload_length: 3,
+            frozen_object: serde_json::json!({
+                "version_id": "version",
+                "content_hash": "sha256:payload",
+                "size": 3,
+            }),
+            source_manifest_hash:
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000".into(),
             content_type: Some("application/json".into()),
             user_metadata: serde_json::json!({}),
             index_policy_snapshot: serde_json::json!({}),

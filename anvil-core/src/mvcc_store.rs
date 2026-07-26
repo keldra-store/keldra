@@ -674,7 +674,15 @@ mod tests {
             object_version_id: "version".into(),
             target_logical_identity: "tenant/1/bucket/2/object/object/version/version".into(),
             representation: serde_json::json!({"schema": "local"}),
+            content_hash: "sha256:payload".into(),
             payload_length: 3,
+            frozen_object: serde_json::json!({
+                "version_id": "version",
+                "content_hash": "sha256:payload",
+                "size": 3,
+            }),
+            source_manifest_hash:
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000".into(),
             content_type: Some("application/json".into()),
             user_metadata: serde_json::json!({}),
             index_policy_snapshot: serde_json::json!({}),

@@ -725,6 +725,20 @@ impl ObjectManager {
                 )
                 .collect::<Vec<_>>();
             frozen_index_definitions.sort_by_key(|definition| (definition.id, definition.version));
+            let frozen_object = serde_json::to_value(&object)
+                .map(canonical_json)
+                .map_err(|error| Status::internal(error.to_string()))?;
+            let source_manifest_hash = {
+                use sha2::Digest as _;
+                let mut digest = sha2::Sha256::new();
+                digest.update(b"anvil.mvcc.object-materialisation-source.v1\0");
+                digest.update(binding.snapshot_version.to_be_bytes());
+                digest.update(
+                    canonical_json_bytes(&frozen_object)
+                        .map_err(|error| Status::internal(error.to_string()))?,
+                );
+                format!("sha256:{}", hex::encode(digest.finalize()))
+            };
             let job = crate::object_materialisation::ObjectMaterialisationJob {
                 schema: crate::object_materialisation::ObjectMaterialisationJob::SCHEMA.into(),
                 cluster_id: mvcc.cluster_id().to_string(),
@@ -736,7 +750,10 @@ impl ObjectManager {
                 object_version_id: object.version_id.to_string(),
                 target_logical_identity: target,
                 representation,
+                content_hash: object.content_hash.clone(),
                 payload_length: total_bytes_u64,
+                frozen_object,
+                source_manifest_hash,
                 content_type: materialisation_content_type,
                 user_metadata: materialisation_user_metadata,
                 index_policy_snapshot: serde_json::json!({
