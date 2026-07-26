@@ -22,7 +22,7 @@ impl Persistence {
     }
 
     pub async fn get_tenant_by_name(&self, name: &str) -> Result<Option<Tenant>> {
-        control_journal::read_tenant_by_name(&self.storage, name).await
+        control_journal::read_tenant_by_name_mvcc(self.mvcc()?, name)
     }
 
     pub async fn page_tenants(
@@ -41,8 +41,9 @@ impl Persistence {
 
     pub async fn create_tenant(&self, name: &str, idempotency_key: &str) -> Result<Tenant> {
         let permit = self.control_write_permit().await?;
-        let tenant = control_journal::create_tenant_with_permit(
+        let tenant = control_journal::create_tenant_with_permit_mvcc(
             &self.storage,
+            self.mvcc()?,
             name,
             &permit,
             &self.partition_owner_signing_key,

@@ -389,6 +389,176 @@ pub(crate) async fn create_tenant_with_permit(
     unreachable!("control mutation retry loop always returns")
 }
 
+pub(crate) async fn create_tenant_with_permit_mvcc(
+    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    name: &str,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<Tenant> {
+    let partition_precondition =
+        control_write_precondition(storage, permit, partition_owner_signing_key).await?;
+    let _ = partition_precondition;
+    if let Some(existing) = read_tenant_by_name_mvcc(mvcc, name)? {
+        return Ok(existing);
+    }
+    let max_allocated_id = match read_control_current_mvcc(mvcc, &id_allocator_tuple_key()?)? {
+        Some(ControlCurrentRecord::IdAllocator { max_allocated_id }) => max_allocated_id,
+        Some(_) => bail!("control ID allocator row contains a different record type"),
+        None => 0,
+    };
+    let tenant = Tenant {
+        id: max_allocated_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("control ID allocator overflow"))?,
+        name: name.to_string(),
+    };
+    append_control_event_mvcc(
+        mvcc,
+        ControlEventBody::TenantUpsert {
+            id: tenant.id,
+            name: tenant.name.clone(),
+        },
+        vec![
+            ControlCurrentRecord::IdAllocator {
+                max_allocated_id: tenant.id,
+            },
+            ControlCurrentRecord::Tenant {
+                id: tenant.id,
+                name: tenant.name.clone(),
+                active: true,
+            },
+        ],
+        permit.fence_token,
+    )
+    .await?;
+    Ok(tenant)
+}
+
+pub fn read_tenant_by_name_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    name: &str,
+) -> Result<Option<Tenant>> {
+    match read_control_current_mvcc(mvcc, &tenant_name_tuple_key(name)?)? {
+        Some(ControlCurrentRecord::Tenant {
+            id,
+            name: stored_name,
+            active,
+        }) if stored_name == name => Ok(active.then_some(Tenant {
+            id,
+            name: stored_name,
+        })),
+        Some(ControlCurrentRecord::Tenant { .. }) => {
+            bail!("control tenant-name row does not match its key")
+        }
+        Some(_) => bail!("control tenant-name row contains a different record type"),
+        None => Ok(None),
+    }
+}
+
+fn read_control_current_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tuple_key: &[u8],
+) -> Result<Option<ControlCurrentRecord>> {
+    let key =
+        crate::mvcc_product::coremeta_logical_key(CF_MESH, TABLE_CONTROL_CURRENT_ROW, tuple_key)?;
+    mvcc.read_latest_value(&key)?
+        .as_deref()
+        .map(decode_control_current_row)
+        .transpose()
+}
+
+async fn append_control_event_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    event: ControlEventBody,
+    mut current_updates: Vec<ControlCurrentRecord>,
+    fence_token: u64,
+) -> Result<()> {
+    use crate::mvcc_transaction::{DurabilityLevel, PredicateKind};
+
+    let revision_tuple_key = control_revision_tuple_key()?;
+    let revision_key = crate::mvcc_product::coremeta_logical_key(
+        CF_MESH,
+        TABLE_CONTROL_CURRENT_ROW,
+        &revision_tuple_key,
+    )?;
+    let revision_payload = mvcc.read_latest_value(&revision_key)?;
+    let revision = match revision_payload.as_deref() {
+        Some(payload) => match decode_control_current_row(payload)? {
+            ControlCurrentRecord::Revision { revision } => revision,
+            _ => bail!("control revision key contains a different record type"),
+        },
+        None => 0,
+    };
+    let next_revision = revision
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("control journal revision overflow"))?;
+    current_updates.push(ControlCurrentRecord::Revision {
+        revision: next_revision,
+    });
+
+    let mutation_id = uuid::Uuid::new_v4();
+    let mutation_id_string = mutation_id.to_string();
+    let created_at_unix_nanos = current_unix_nanos();
+    let mut operations = Vec::new();
+    for record in current_updates {
+        operations.extend(control_current_updates_at_generation(
+            record,
+            &mutation_id_string,
+            next_revision,
+            created_at_unix_nanos,
+        )?);
+    }
+    operations.push(CoreMutationOperation::StreamAppend {
+        partition_id: hex::encode(control_partition_id()),
+        stream_id: control_plane_stream_id(),
+        record_kind: "control_plane".to_string(),
+        payload: encode_control_event_body(&event, fence_token, mutation_id)?,
+        idempotency_key: Some(format!("control-plane:{mutation_id_string}")),
+    });
+
+    let mut predicate_keys = BTreeSet::new();
+    let mut predicates = Vec::new();
+    for operation in &operations {
+        let (cf, table_id, tuple_key) = match operation {
+            CoreMutationOperation::CoreMetaPut {
+                cf,
+                table_id,
+                tuple_key,
+                ..
+            }
+            | CoreMutationOperation::CoreMetaDelete {
+                cf,
+                table_id,
+                tuple_key,
+                ..
+            } => (cf, *table_id, tuple_key),
+            CoreMutationOperation::StreamAppend { .. } => continue,
+        };
+        let key = crate::mvcc_product::coremeta_logical_key(cf, table_id, tuple_key)?;
+        if !predicate_keys.insert(key.clone()) {
+            continue;
+        }
+        let kind = mvcc
+            .read_latest_value(&key)?
+            .map(|payload| PredicateKind::ValueHash(*blake3::hash(&payload).as_bytes()))
+            .unwrap_or(PredicateKind::Absent);
+        predicates.push((key, kind));
+    }
+    let mutations = crate::mvcc_product::product_mutations_from_operations(operations)?;
+    let principal = control_partition_principal();
+    mvcc.autocommit_product_mutations_with_predicates(
+        &principal,
+        &format!("control-plane:{mutation_id_string}"),
+        mutations,
+        predicates,
+        DurabilityLevel::Local,
+        u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+    )
+    .await?;
+    Ok(())
+}
+
 async fn create_tenant_inner(
     storage: &Storage,
     name: &str,
@@ -821,6 +991,20 @@ async fn control_current_updates(
     let root_generation = core_store
         .next_root_generation_for_anchor(&control_current_root_anchor_key(&record))
         .await?;
+    control_current_updates_at_generation(
+        record,
+        mutation_id,
+        root_generation,
+        created_at_unix_nanos,
+    )
+}
+
+fn control_current_updates_at_generation(
+    record: ControlCurrentRecord,
+    mutation_id: &str,
+    root_generation: u64,
+    created_at_unix_nanos: u64,
+) -> Result<Vec<CoreMutationOperation>> {
     let payload =
         encode_control_current_row(&record, mutation_id, root_generation, created_at_unix_nanos)?;
     let mut operations = Vec::new();
