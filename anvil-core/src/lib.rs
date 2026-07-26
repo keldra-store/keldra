@@ -335,7 +335,7 @@ impl AppState {
                             Ok(()) => return,
                             Err(error) => {
                                 tracing::debug!(
-                                    error = %error,
+                                    error = %format!("{error:#}"),
                                     "system realm bootstrap is waiting for its Raft assignment"
                                 );
                                 tokio::time::sleep(Duration::from_millis(250)).await;

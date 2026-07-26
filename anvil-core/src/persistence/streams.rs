@@ -739,6 +739,29 @@ impl Persistence {
             .await
     }
 
+    pub(crate) async fn write_system_authz_tuple_batch(
+        &self,
+        mutations: Vec<AuthzTupleBatchMutation>,
+        written_by: &str,
+    ) -> Result<Vec<AuthzTupleRecord>> {
+        let writes = mutations
+            .iter()
+            .map(|mutation| authz_journal::AuthzTupleWrite {
+                tenant_id: crate::system_realm::SYSTEM_STORAGE_TENANT_ID,
+                namespace: mutation.namespace.as_str(),
+                object_id: mutation.object_id.as_str(),
+                relation: mutation.relation.as_str(),
+                subject_kind: mutation.subject_kind.as_str(),
+                subject_id: mutation.subject_id.as_str(),
+                caveat_hash: mutation.caveat_hash.as_str(),
+                operation: mutation.operation.as_str(),
+                written_by,
+                reason: mutation.reason.as_str(),
+            })
+            .collect();
+        authz_journal::write_system_authz_tuple_batch(&self.storage, self.mvcc()?, writes).await
+    }
+
     pub async fn write_authz_tuple_batch_with_admin_audit(
         &self,
         tenant_id: i64,

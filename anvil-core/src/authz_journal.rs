@@ -227,6 +227,30 @@ pub(crate) async fn write_authz_tuple_batch_with_permit(
     .records)
 }
 
+pub(crate) async fn write_system_authz_tuple_batch(
+    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    inputs: Vec<AuthzTupleWrite<'_>>,
+) -> Result<Vec<AuthzTupleRecord>> {
+    if inputs.is_empty()
+        || inputs
+            .iter()
+            .any(|input| input.tenant_id != crate::system_realm::SYSTEM_STORAGE_TENANT_ID)
+    {
+        return Err(anyhow!(
+            "system authorization tuple bootstrap must target only the reserved system tenant"
+        ));
+    }
+    for input in &inputs {
+        validate_optional_caveat_hash(input.caveat_hash)?;
+    }
+    Ok(
+        write_authz_tuple_batch_mvcc(storage, mvcc, inputs, None, 0, None, None)
+            .await?
+            .records,
+    )
+}
+
 pub(crate) async fn replay_authz_tuple_batch(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     inputs: &[AuthzTupleWrite<'_>],

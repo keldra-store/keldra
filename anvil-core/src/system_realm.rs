@@ -1274,11 +1274,7 @@ async fn write_system_relation_tuples(
         });
     }
     persistence
-        .write_authz_tuple_batch(
-            SYSTEM_STORAGE_TENANT_ID,
-            mutations,
-            "system-realm-bootstrap",
-        )
+        .write_system_authz_tuple_batch(mutations, "system-realm-bootstrap")
         .await?;
     Ok(())
 }
