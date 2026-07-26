@@ -269,6 +269,40 @@ async fn majority_elects_and_commits_after_leader_transport_loss() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn committed_value_survives_leader_loss_after_proposal() {
+    let mut cluster = ThreeNodeFixture::start().await;
+    let key = LogicalKey {
+        table_id: 1,
+        application_key: b"leader-loss-after-commit".to_vec(),
+    };
+    cluster
+        .write(0, "leader-loss-after-commit", key.clone())
+        .await;
+
+    cluster.inject_transport_loss(0, FaultPoint::LeaderChange);
+    cluster.states[0].mvcc.consensus.shutdown().await.unwrap();
+    let leader = cluster.wait_for_any_leader(&[1, 2]).await;
+    cluster.states[leader]
+        .mvcc
+        .consensus
+        .linearized_read_barrier()
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if cluster.states[leader].mvcc.read_latest_value(&key).unwrap()
+                == Some(b"leader-loss-after-commit".to_vec())
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("new leader applies the value committed before leader loss");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn blind_writes_do_not_conflict_but_observed_writes_do() {
     let cluster = ThreeNodeFixture::start().await;
     let principal = "fault-principal";
