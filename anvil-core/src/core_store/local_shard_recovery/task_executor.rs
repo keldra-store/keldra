@@ -177,7 +177,6 @@ impl CoreStore {
     pub(crate) async fn publish_prepared_shard_repair(
         &self,
         prepared: PreparedShardRepair,
-        lease_precondition: CoreMutationPrecondition,
     ) -> Result<RebalanceShardTaskOutcome> {
         match prepared.0 {
             PreparedShardRepairState::Complete(outcome) => Ok(outcome),
@@ -195,7 +194,6 @@ impl CoreStore {
                     &repair_finding_id,
                     &repaired,
                     writer_family,
-                    lease_precondition,
                 )
                 .await?;
                 Ok(outcome)

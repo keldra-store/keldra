@@ -428,19 +428,11 @@ async fn recover_interrupted_tasks_at(
                 }
             };
             let lease_precondition = match lease.as_ref() {
-                Some(lease) => {
-                    task_lease::task_lease_exact_precondition(
-                        persistence.storage(),
-                        lease,
-                        persistence.partition_owner_signing_key(),
-                    )
-                    .await
-                }
-                None => task_lease::task_lease_precondition(
-                    persistence.storage(),
-                    0,
-                    &format!("task-{}", task.id),
-                ),
+                Some(lease) => task_lease::task_lease_mvcc_predicate(lease),
+                None => Ok((
+                    task_lease::task_lease_mvcc_key(0, &format!("task-{}", task.id))?,
+                    crate::mvcc_transaction::PredicateKind::Absent,
+                )),
             };
             let lease_precondition = match lease_precondition {
                 Ok(precondition) => precondition,
@@ -518,7 +510,6 @@ async fn execute_task_with_lease(
     }
 
     let guard = TaskExecutionGuard::new_mvcc(
-        core_store.storage().clone(),
         persistence
             .mvcc_arc()
             .map_err(|error| TaskExecutionFailure {
@@ -624,16 +615,19 @@ async fn check_execution_lease(
 
 async fn execution_lease_precondition(
     persistence: &Persistence,
-    core_store: &CoreStore,
+    _core_store: &CoreStore,
     lease: &TaskLease,
-) -> Result<crate::core_store::CoreMutationPrecondition> {
-    task_lease::task_lease_fenced_precondition(
-        core_store.storage(),
+) -> Result<(
+    crate::mvcc_transaction::LogicalKey,
+    crate::mvcc_transaction::PredicateKind,
+)> {
+    task_lease::check_task_lease_mvcc(
+        persistence.mvcc()?,
         lease,
         current_time_nanos()?,
         persistence.partition_owner_signing_key(),
-    )
-    .await
+    )?;
+    task_lease::task_lease_mvcc_predicate(lease)
 }
 
 async fn renew_execution_lease(
@@ -727,16 +721,13 @@ async fn handle_rebalance_shard(
         }
     };
     *lease = renew_execution_lease(persistence, core_store, lease, ttl_nanos).await?;
-    let lease_precondition = task_lease::task_lease_fenced_precondition(
-        core_store.storage(),
+    task_lease::check_task_lease_mvcc(
+        persistence.mvcc()?,
         lease,
         current_time_nanos()?,
         persistence.partition_owner_signing_key(),
-    )
-    .await?;
-    let outcome = core_store
-        .publish_prepared_shard_repair(prepared, lease_precondition)
-        .await?;
+    )?;
+    let outcome = core_store.publish_prepared_shard_repair(prepared).await?;
     if outcome.requires_retry() {
         let unresolved = outcome
             .unresolved_placements()

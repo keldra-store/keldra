@@ -27,7 +27,7 @@ impl Persistence {
     ) -> Result<()> {
         let permit = self.task_queue_write_permit().await?;
         task_journal::enqueue_task_with_permit(
-            &self.storage,
+            self.mvcc()?,
             task_type,
             payload,
             priority,
@@ -47,7 +47,7 @@ impl Persistence {
     ) -> Result<bool> {
         let permit = self.task_queue_write_permit().await?;
         let enqueued = task_journal::enqueue_task_if_absent_with_permit(
-            &self.storage,
+            self.mvcc()?,
             task_type,
             payload,
             priority,
@@ -223,7 +223,7 @@ impl Persistence {
                 Err(error) => return Err(error),
             };
             match task_journal::enqueue_index_build_task_with_permit(
-                &self.storage,
+                self.mvcc()?,
                 payload.clone(),
                 priority,
                 &permit,
@@ -268,7 +268,7 @@ impl Persistence {
                 Err(error) => return Err(error),
             };
             match task_journal::enqueue_authz_materialization_task_with_permit(
-                &self.storage,
+                self.mvcc()?,
                 payload.clone(),
                 30,
                 &permit,
@@ -435,8 +435,8 @@ impl Persistence {
         expected: &task_lease::TaskLease,
         committed_cursor: u128,
     ) -> Result<task_lease::TaskLease> {
-        task_lease::commit_task_lease(
-            &self.storage,
+        task_lease::commit_task_lease_mvcc(
+            self.mvcc()?,
             expected,
             committed_cursor,
             current_time_nanos()?,
@@ -450,27 +450,29 @@ impl Persistence {
         tenant_id: i64,
         task_id: &str,
     ) -> Result<Option<task_lease::TaskLease>> {
-        task_lease::read_task_lease(
-            &self.storage,
+        task_lease::read_task_lease_mvcc(
+            self.mvcc()?,
             tenant_id,
             task_id,
             &self.partition_owner_signing_key,
         )
-        .await
     }
 
     pub(crate) async fn named_task_lease_fenced_precondition(
         &self,
         lease: &task_lease::TaskLease,
         now_nanos: i64,
-    ) -> Result<crate::core_store::CoreMutationPrecondition> {
-        task_lease::task_lease_fenced_precondition(
-            &self.storage,
+    ) -> Result<(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )> {
+        task_lease::check_task_lease_mvcc(
+            self.mvcc()?,
             lease,
             now_nanos,
             &self.partition_owner_signing_key,
-        )
-        .await
+        )?;
+        task_lease::task_lease_mvcc_predicate(lease)
     }
 
     pub async fn read_expected_named_task_lease(
@@ -511,8 +513,8 @@ impl Persistence {
         tenant_id: i64,
         task_id: &str,
     ) -> Result<Option<task_lease::TaskLease>> {
-        task_lease::force_release_task_lease(
-            &self.storage,
+        task_lease::force_release_task_lease_mvcc(
+            self.mvcc()?,
             tenant_id,
             task_id,
             &self.partition_owner_signing_key,
@@ -524,13 +526,12 @@ impl Persistence {
         &self,
         task_id: i64,
     ) -> Result<Option<task_lease::TaskLease>> {
-        task_lease::read_task_lease(
-            &self.storage,
+        task_lease::read_task_lease_mvcc(
+            self.mvcc()?,
             0,
             &task_lease_id(task_id)?,
             &self.partition_owner_signing_key,
         )
-        .await
     }
 
     pub(super) async fn task_lease_target(&self, task: &TaskRecord) -> Result<TaskLeaseTarget> {
@@ -618,7 +619,7 @@ impl Persistence {
                 Err(error) => return Err(error),
             };
             match task_journal::claim_pending_tasks_with_permit(
-                &self.storage,
+                self.mvcc()?,
                 limit,
                 &permit,
                 &self.partition_owner_signing_key,
@@ -637,7 +638,7 @@ impl Persistence {
     }
 
     pub async fn has_due_task_work(&self) -> Result<bool> {
-        task_journal::has_due_tasks(&self.storage).await
+        task_journal::has_due_tasks(self.mvcc()?).await
     }
 
     pub async fn list_tasks_page(
@@ -645,7 +646,7 @@ impl Persistence {
         after_tuple_key: Option<&[u8]>,
         page_size: usize,
     ) -> Result<TaskPage> {
-        task_journal::list_tasks_page(&self.storage, after_tuple_key, page_size).await
+        task_journal::list_tasks_page(self.mvcc()?, after_tuple_key, page_size).await
     }
 
     pub async fn update_task_status(
@@ -665,7 +666,7 @@ impl Persistence {
                 Err(error) => return Err(error),
             };
             match task_journal::update_task_status_with_permit(
-                &self.storage,
+                self.mvcc()?,
                 task_id,
                 status,
                 &permit,
@@ -689,7 +690,10 @@ impl Persistence {
         task_id: i64,
         expected_attempts: i32,
         status: crate::tasks::TaskStatus,
-        lease_precondition: crate::core_store::CoreMutationPrecondition,
+        lease_predicate: (
+            crate::mvcc_transaction::LogicalKey,
+            crate::mvcc_transaction::PredicateKind,
+        ),
     ) -> Result<()> {
         let mut last_error = None;
         for _ in 0..5 {
@@ -703,13 +707,13 @@ impl Persistence {
                 Err(error) => return Err(error),
             };
             match task_journal::update_task_status_with_execution_guard(
-                &self.storage,
+                self.mvcc()?,
                 task_id,
                 expected_attempts,
                 status,
                 &permit,
                 &self.partition_owner_signing_key,
-                lease_precondition.clone(),
+                lease_predicate.clone(),
             )
             .await
             {
@@ -737,7 +741,7 @@ impl Persistence {
                 Err(error) => return Err(error),
             };
             match task_journal::fail_task_with_permit(
-                &self.storage,
+                self.mvcc()?,
                 task_id,
                 error,
                 &permit,
@@ -761,7 +765,10 @@ impl Persistence {
         task_id: i64,
         expected_attempts: i32,
         error: &str,
-        lease_precondition: crate::core_store::CoreMutationPrecondition,
+        lease_predicate: (
+            crate::mvcc_transaction::LogicalKey,
+            crate::mvcc_transaction::PredicateKind,
+        ),
     ) -> Result<()> {
         let mut last_error = None;
         for _ in 0..5 {
@@ -775,13 +782,13 @@ impl Persistence {
                 Err(failure) => return Err(failure),
             };
             match task_journal::fail_task_with_execution_guard(
-                &self.storage,
+                self.mvcc()?,
                 task_id,
                 expected_attempts,
                 error,
                 &permit,
                 &self.partition_owner_signing_key,
-                lease_precondition.clone(),
+                lease_predicate.clone(),
             )
             .await
             {
@@ -1059,9 +1066,7 @@ async fn append_authz_materialization_lag_watch(
     let payload =
         authz_materialization_lag_watch_payload(derived_index_id, latest_revision, outcome);
     guard
-        .publication_permit()
-        .await?
-        .publish_with(move |_task_lease_precondition| async move {
+        .publish_mvcc_with(move |_task_lease_predicate| async move {
             crate::authz_derived_lag_watch::append_authz_derived_lag_watch_record(
                 mvcc,
                 tenant_id,

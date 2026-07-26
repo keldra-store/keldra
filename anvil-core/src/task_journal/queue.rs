@@ -8,10 +8,10 @@ use super::{
     store::{QueueStore, TaskMutation, is_queue_cas_conflict, max_queue_cas_attempts},
 };
 use crate::{
-    core_store::{CoreMutationPrecondition, CoreStore},
-    partition_fence::{PartitionWritePermit, partition_write_precondition},
+    mvcc_bootstrap::MvccSubsystem,
+    mvcc_transaction::{LogicalKey, PredicateKind},
+    partition_fence::PartitionWritePermit,
     persistence::TaskRecord,
-    storage::Storage,
     task_lease::STALE_FENCE,
     tasks::{TaskStatus, TaskType},
 };
@@ -21,74 +21,48 @@ use serde_json::Value as JsonValue;
 
 const MAX_CLAIM_PAGE: usize = 4096;
 
-#[cfg(test)]
-pub(crate) async fn enqueue_task(
-    storage: &Storage,
-    task_type: TaskType,
-    payload: JsonValue,
-    priority: i32,
-) -> Result<()> {
-    enqueue_generic(storage, task_type, payload, priority, false, 0, None)
-        .await
-        .map(|_| ())
-}
-
 pub(crate) async fn enqueue_task_with_permit(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
     task_type: TaskType,
     payload: JsonValue,
     priority: i32,
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
+    _partition_owner_signing_key: &[u8],
 ) -> Result<()> {
-    require_task_queue_permit(permit)?;
-    let partition_precondition =
-        partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
+    require_task_queue_permit(mvcc, permit)?;
     enqueue_generic(
-        storage,
+        mvcc,
         task_type,
         payload,
         priority,
         false,
         permit.fence_token,
-        Some(partition_precondition),
     )
     .await
     .map(|_| ())
 }
 
 pub(crate) async fn enqueue_task_if_absent_with_permit(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
     task_type: TaskType,
     payload: JsonValue,
     priority: i32,
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
+    _partition_owner_signing_key: &[u8],
 ) -> Result<bool> {
-    require_task_queue_permit(permit)?;
-    let partition_precondition =
-        partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
-    enqueue_generic(
-        storage,
-        task_type,
-        payload,
-        priority,
-        true,
-        permit.fence_token,
-        Some(partition_precondition),
-    )
-    .await
+    require_task_queue_permit(mvcc, permit)?;
+    enqueue_generic(mvcc, task_type, payload, priority, true, permit.fence_token).await
 }
 
 pub(crate) async fn enqueue_index_build_task_with_permit(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
     payload: JsonValue,
     priority: i32,
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<bool> {
     enqueue_grouped_with_permit(
-        storage,
+        mvcc,
         TaskType::IndexBuild,
         payload,
         priority,
@@ -99,14 +73,14 @@ pub(crate) async fn enqueue_index_build_task_with_permit(
 }
 
 pub(crate) async fn enqueue_authz_materialization_task_with_permit(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
     payload: JsonValue,
     priority: i32,
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<bool> {
     enqueue_grouped_with_permit(
-        storage,
+        mvcc,
         TaskType::AuthzMaterialization,
         payload,
         priority,
@@ -117,41 +91,30 @@ pub(crate) async fn enqueue_authz_materialization_task_with_permit(
 }
 
 async fn enqueue_grouped_with_permit(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
     task_type: TaskType,
     payload: JsonValue,
     priority: i32,
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
+    _partition_owner_signing_key: &[u8],
 ) -> Result<bool> {
-    require_task_queue_permit(permit)?;
-    let partition_precondition =
-        partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
-    enqueue_grouped(
-        storage,
-        task_type,
-        payload,
-        priority,
-        permit.fence_token,
-        Some(partition_precondition),
-    )
-    .await
+    require_task_queue_permit(mvcc, permit)?;
+    enqueue_grouped(mvcc, task_type, payload, priority, permit.fence_token).await
 }
 
 async fn enqueue_generic(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
     task_type: TaskType,
     payload: JsonValue,
     priority: i32,
     deduplicate: bool,
     fence_token: u64,
-    partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<bool> {
     let dedupe_hash = deduplicate
         .then(|| task_identity_hash(task_type, &payload))
         .transpose()?;
     for attempt in 0..max_queue_cas_attempts() {
-        let mut mutation = TaskMutation::new(storage, fence_token, partition_precondition.clone())?;
+        let mut mutation = TaskMutation::new(mvcc, fence_token)?;
         if let Some(hash) = dedupe_hash.as_ref()
             && live_dedupe_task(&mut mutation, hash)?.is_some()
         {
@@ -203,17 +166,16 @@ async fn enqueue_generic(
 }
 
 async fn enqueue_grouped(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
     task_type: TaskType,
     payload: JsonValue,
     priority: i32,
     fence_token: u64,
-    partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<bool> {
     let group = task_group_identity(task_type, &payload)?
         .ok_or_else(|| anyhow!("grouped task type has no group identity"))?;
     for attempt in 0..max_queue_cas_attempts() {
-        let mut mutation = TaskMutation::new(storage, fence_token, partition_precondition.clone())?;
+        let mut mutation = TaskMutation::new(mvcc, fence_token)?;
         let mut head = read_group_head(&mut mutation, &group)?.unwrap_or(TaskGroupHead {
             kind: group.kind.clone(),
             group_hash: group.hash.clone(),
@@ -293,51 +255,33 @@ async fn enqueue_grouped(
     unreachable!("bounded grouped task enqueue loop returns on its final attempt")
 }
 
-#[cfg(test)]
-pub(crate) async fn claim_pending_tasks(storage: &Storage, limit: i64) -> Result<Vec<TaskRecord>> {
-    claim_pending_tasks_inner(storage, limit, 0, None).await
-}
-
 pub(crate) async fn claim_pending_tasks_with_permit(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
     limit: i64,
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
+    _partition_owner_signing_key: &[u8],
 ) -> Result<Vec<TaskRecord>> {
-    require_task_queue_permit(permit)?;
-    let partition_precondition =
-        partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
-    claim_pending_tasks_inner(
-        storage,
-        limit,
-        permit.fence_token,
-        Some(partition_precondition),
-    )
-    .await
+    require_task_queue_permit(mvcc, permit)?;
+    claim_pending_tasks_inner(mvcc, limit, permit.fence_token).await
 }
 
 async fn claim_pending_tasks_inner(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
     limit: i64,
     fence_token: u64,
-    partition_precondition: Option<CoreMutationPrecondition>,
 ) -> Result<Vec<TaskRecord>> {
     let limit = usize::try_from(limit.max(0)).map_err(|_| anyhow!("task claim limit overflow"))?;
     if limit > MAX_CLAIM_PAGE {
         bail!("task claim limit exceeds {MAX_CLAIM_PAGE}");
     }
     let mut claimed = Vec::with_capacity(limit);
-    let core_store = CoreStore::new(storage.clone()).await?;
     while claimed.len() < limit {
         let mut completed_slot = false;
         for attempt in 0..max_queue_cas_attempts() {
-            let Some(candidate) =
-                QueueStore::open(storage)?.first_due_task(&core_store, Utc::now())?
-            else {
+            let Some(candidate) = QueueStore::open(mvcc)?.first_due_task(Utc::now())? else {
                 return Ok(claimed);
             };
-            let mut mutation =
-                TaskMutation::new(storage, fence_token, partition_precondition.clone())?;
+            let mut mutation = TaskMutation::new(mvcc, fence_token)?;
             let Some(mut entry) = mutation.read_task(candidate.task.id)? else {
                 continue;
             };
@@ -391,89 +335,63 @@ async fn claim_pending_tasks_inner(
 }
 
 pub(crate) async fn list_tasks_page(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
     after_tuple_key: Option<&[u8]>,
     page_size: usize,
 ) -> Result<crate::persistence::TaskPage> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    QueueStore::open(storage)?.list_tasks_page(&core_store, after_tuple_key, page_size)
+    QueueStore::open(mvcc)?.list_tasks_page(after_tuple_key, page_size)
 }
 
-pub(crate) async fn has_due_tasks(storage: &Storage) -> Result<bool> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    Ok(QueueStore::open(storage)?
-        .first_due_task(&core_store, Utc::now())?
+pub(crate) async fn has_due_tasks(mvcc: &MvccSubsystem) -> Result<bool> {
+    Ok(QueueStore::open(mvcc)?
+        .first_due_task(Utc::now())?
         .is_some())
 }
 
-#[cfg(test)]
-pub(crate) async fn update_task_status(
-    storage: &Storage,
-    task_id: i64,
-    status: TaskStatus,
-) -> Result<()> {
-    update_task_status_inner(storage, task_id, status, 0, None, None, None).await
-}
-
 pub(crate) async fn update_task_status_with_permit(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
     task_id: i64,
     status: TaskStatus,
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
+    _partition_owner_signing_key: &[u8],
 ) -> Result<()> {
-    require_task_queue_permit(permit)?;
-    let partition_precondition =
-        partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
-    update_task_status_inner(
-        storage,
-        task_id,
-        status,
-        permit.fence_token,
-        Some(partition_precondition),
-        None,
-        None,
-    )
-    .await
+    require_task_queue_permit(mvcc, permit)?;
+    update_task_status_inner(mvcc, task_id, status, permit.fence_token, None).await
 }
 
 pub(crate) async fn update_task_status_with_execution_guard(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
     task_id: i64,
     expected_attempts: i32,
     status: TaskStatus,
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
-    lease_precondition: CoreMutationPrecondition,
+    _partition_owner_signing_key: &[u8],
+    lease_predicate: (LogicalKey, PredicateKind),
 ) -> Result<()> {
-    require_task_queue_permit(permit)?;
-    let partition_precondition =
-        partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
+    require_task_queue_permit(mvcc, permit)?;
     update_task_status_inner(
-        storage,
+        mvcc,
         task_id,
         status,
         permit.fence_token,
-        Some(partition_precondition),
-        Some(lease_precondition),
+        Some(lease_predicate),
         Some(expected_attempts),
     )
     .await
 }
 
 async fn update_task_status_inner(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
     task_id: i64,
     status: TaskStatus,
     fence_token: u64,
-    partition_precondition: Option<CoreMutationPrecondition>,
-    additional_precondition: Option<CoreMutationPrecondition>,
+    additional_predicate: Option<(LogicalKey, PredicateKind)>,
     expected_running_attempts: Option<i32>,
 ) -> Result<()> {
     for attempt in 0..max_queue_cas_attempts() {
-        let mut mutation = TaskMutation::new(storage, fence_token, partition_precondition.clone())?;
-        if let Some(precondition) = additional_precondition.clone() {
-            mutation.add_precondition(precondition);
+        let mut mutation = TaskMutation::new(mvcc, fence_token)?;
+        if let Some(predicate) = additional_predicate.clone() {
+            mutation.add_predicate(predicate);
         }
         let Some(mut entry) = mutation.read_task(task_id)? else {
             return Ok(());
@@ -508,70 +426,50 @@ async fn update_task_status_inner(
     unreachable!("bounded task status loop returns on its final attempt")
 }
 
-#[cfg(test)]
-pub(crate) async fn fail_task(storage: &Storage, task_id: i64, error: &str) -> Result<()> {
-    fail_task_inner(storage, task_id, error, 0, None, None, None).await
-}
-
 pub(crate) async fn fail_task_with_permit(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
     task_id: i64,
     error: &str,
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
+    _partition_owner_signing_key: &[u8],
 ) -> Result<()> {
-    require_task_queue_permit(permit)?;
-    let partition_precondition =
-        partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
-    fail_task_inner(
-        storage,
-        task_id,
-        error,
-        permit.fence_token,
-        Some(partition_precondition),
-        None,
-        None,
-    )
-    .await
+    require_task_queue_permit(mvcc, permit)?;
+    fail_task_inner(mvcc, task_id, error, permit.fence_token, None).await
 }
 
 pub(crate) async fn fail_task_with_execution_guard(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
     task_id: i64,
     expected_attempts: i32,
     error: &str,
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
-    lease_precondition: CoreMutationPrecondition,
+    _partition_owner_signing_key: &[u8],
+    lease_predicate: (LogicalKey, PredicateKind),
 ) -> Result<()> {
-    require_task_queue_permit(permit)?;
-    let partition_precondition =
-        partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
+    require_task_queue_permit(mvcc, permit)?;
     fail_task_inner(
-        storage,
+        mvcc,
         task_id,
         error,
         permit.fence_token,
-        Some(partition_precondition),
-        Some(lease_precondition),
+        Some(lease_predicate),
         Some(expected_attempts),
     )
     .await
 }
 
 async fn fail_task_inner(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
     task_id: i64,
     error: &str,
     fence_token: u64,
-    partition_precondition: Option<CoreMutationPrecondition>,
-    additional_precondition: Option<CoreMutationPrecondition>,
+    additional_predicate: Option<(LogicalKey, PredicateKind)>,
     expected_running_attempts: Option<i32>,
 ) -> Result<()> {
     for attempt in 0..max_queue_cas_attempts() {
-        let mut mutation = TaskMutation::new(storage, fence_token, partition_precondition.clone())?;
-        if let Some(precondition) = additional_precondition.clone() {
-            mutation.add_precondition(precondition);
+        let mut mutation = TaskMutation::new(mvcc, fence_token)?;
+        if let Some(predicate) = additional_predicate.clone() {
+            mutation.add_predicate(predicate);
         }
         let Some(mut entry) = mutation.read_task(task_id)? else {
             return Ok(());
@@ -897,51 +795,10 @@ fn release_dedupe(mutation: &mut TaskMutation, entry: &TaskEntry) -> Result<()> 
     }
 }
 
-#[cfg(test)]
-pub(crate) async fn force_task_schedule_for_test(
-    storage: &Storage,
-    task_id: i64,
-    scheduled_at: DateTime<Utc>,
-) -> Result<()> {
-    for attempt in 0..max_queue_cas_attempts() {
-        let mut mutation = TaskMutation::new(storage, 0, None)?;
-        let mut entry = mutation
-            .read_task(task_id)?
-            .ok_or_else(|| anyhow!("task not found"))?;
-        if matches!(entry.task.status, TaskStatus::Pending | TaskStatus::Failed) {
-            remove_pending_projection(&mut mutation, &entry)?;
-        }
-        entry.task.scheduled_at = scheduled_at;
-        entry.task.updated_at = Utc::now();
-        if matches!(entry.task.status, TaskStatus::Pending | TaskStatus::Failed) {
-            let active = if let Some(group) = entry.group.as_ref() {
-                read_group_head(&mut mutation, group)?.is_some_and(|head| {
-                    head.running_task_id.is_none() && head.pending_task_id == Some(task_id)
-                })
-            } else {
-                true
-            };
-            if active {
-                add_pending_projection(&mut mutation, &entry)?;
-            }
-        }
-        mutation.put(current_key(task_id)?, TaskQueueRow::Task(entry))?;
-        match mutation.commit().await {
-            Ok(()) => return Ok(()),
-            Err(error)
-                if attempt + 1 < max_queue_cas_attempts() && is_queue_cas_conflict(&error) =>
-            {
-                tokio::task::yield_now().await;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    unreachable!("bounded test task schedule loop returns on final attempt")
-}
-
-fn require_task_queue_permit(permit: &PartitionWritePermit) -> Result<()> {
+fn require_task_queue_permit(mvcc: &MvccSubsystem, permit: &PartitionWritePermit) -> Result<()> {
     if permit.partition_family != "task_queue"
         || permit.partition_id != hex::encode(super::task_queue_partition_id())
+        || permit.owner_node_id != mvcc.local_node.node_id
     {
         bail!("task queue write permit targets a different partition");
     }

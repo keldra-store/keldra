@@ -436,15 +436,14 @@ impl Persistence {
 
         let mut task_cursor: Option<Vec<u8>> = None;
         loop {
-            let page = task_lease::list_active_task_leases_for_node_page(
-                &self.storage,
+            let page = task_lease::list_active_task_leases_for_node_page_mvcc(
+                self.mvcc()?,
                 node_id,
                 now_nanos,
                 &self.partition_owner_signing_key,
                 task_cursor.as_deref(),
                 TASK_LEASE_PAGE_SIZE,
             )
-            .await
             .map_err(|err| {
                 crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
             })?;
@@ -587,21 +586,20 @@ impl Persistence {
 
         let mut task_cursor: Option<Vec<u8>> = None;
         loop {
-            let page = task_lease::list_active_task_leases_for_node_page(
-                &self.storage,
+            let page = task_lease::list_active_task_leases_for_node_page_mvcc(
+                self.mvcc()?,
                 node_id,
                 now_nanos,
                 &self.partition_owner_signing_key,
                 task_cursor.as_deref(),
                 TASK_LEASE_PAGE_SIZE,
             )
-            .await
             .map_err(|err| {
                 crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
             })?;
             for lease in page.leases {
-                task_lease::force_release_task_lease(
-                    &self.storage,
+                task_lease::force_release_task_lease_mvcc(
+                    self.mvcc()?,
                     lease.owner.tenant_id,
                     &lease.task_id,
                     &self.partition_owner_signing_key,

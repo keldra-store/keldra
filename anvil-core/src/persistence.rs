@@ -501,6 +501,7 @@ pub struct TaskRecord {
 pub struct TaskPage {
     pub tasks: Vec<TaskRecord>,
     pub next_tuple_key: Option<Vec<u8>>,
+    pub snapshot_version: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

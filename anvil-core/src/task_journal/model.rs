@@ -1,8 +1,5 @@
 use crate::{
-    core_store::{
-        CoreMetaRowCommonProto, CoreMetaTuplePart, CoreMetaVisibilityState,
-        core_meta_committed_row_common, core_meta_root_key_hash, core_meta_tuple_key,
-    },
+    core_store::{CoreMetaTuplePart, core_meta_tuple_key},
     formats::hash32,
     persistence::TaskRecord,
     tasks::{TaskStatus, TaskType},
@@ -12,12 +9,9 @@ use chrono::{DateTime, Utc};
 use prost::{Message, Oneof};
 use serde_json::Value as JsonValue;
 
-pub(super) const TASK_QUEUE_ROW_SCHEMA: &str = "anvil.core.task_queue_row.v1";
+pub(super) const TASK_QUEUE_ROW_SCHEMA: &str = "anvil.core.task_queue_row.v2";
 pub(super) const TASK_AUDIT_SCHEMA: &str = "anvil.core.task_audit.v1";
-pub(super) const TASK_QUEUE_REALM_ID: &str = "anvil.system.task_queue";
 pub(super) const TASK_ROW_MAX_PROTO_BYTES: usize = 16 * 1024;
-const TASK_QUEUE_CANDIDATE_GENERATION: u64 = 1;
-const TASK_QUEUE_CANDIDATE_TRANSACTION_ID: &str = "task-queue-candidate";
 
 const CURRENT_PREFIX: &str = "task_queue/current";
 const ALLOCATOR_KEY: &str = "task_queue/allocator";
@@ -118,7 +112,6 @@ pub(super) enum TaskQueueRow {
 #[derive(Debug, Clone)]
 pub(super) struct DecodedTaskQueueRow {
     pub row: TaskQueueRow,
-    pub publication_generation: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -157,8 +150,6 @@ impl TaskAuditEvent {
 
 #[derive(Clone, PartialEq, Message)]
 struct TaskQueueRowProto {
-    #[prost(message, optional, tag = "1")]
-    common: Option<CoreMetaRowCommonProto>,
     #[prost(string, tag = "2")]
     schema: String,
     #[prost(oneof = "task_queue_row_proto::Row", tags = "3, 4, 5, 7, 8, 9, 10")]
@@ -420,8 +411,7 @@ impl TaskAuditProto {
     }
 }
 
-pub(super) fn encode_queue_row(row: &TaskQueueRow, created_at_unix_nanos: u64) -> Result<Vec<u8>> {
-    let root_key_hash = core_meta_root_key_hash(&row_root_key(row));
+pub(super) fn encode_queue_row(row: &TaskQueueRow, _created_at_unix_nanos: u64) -> Result<Vec<u8>> {
     let row = match row {
         TaskQueueRow::Task(entry) => task_queue_row_proto::Row::Task(TaskEntryProto {
             task: Some(task_record_to_proto(&entry.task)?),
@@ -463,13 +453,6 @@ pub(super) fn encode_queue_row(row: &TaskQueueRow, created_at_unix_nanos: u64) -
     };
     encode_deterministic(
         &TaskQueueRowProto {
-            common: Some(core_meta_committed_row_common(
-                TASK_QUEUE_REALM_ID,
-                root_key_hash,
-                TASK_QUEUE_CANDIDATE_GENERATION,
-                TASK_QUEUE_CANDIDATE_TRANSACTION_ID,
-                created_at_unix_nanos,
-            )),
             schema: TASK_QUEUE_ROW_SCHEMA.to_string(),
             row: Some(row),
         },
@@ -485,9 +468,6 @@ pub(super) fn decode_queue_row(bytes: &[u8]) -> Result<DecodedTaskQueueRow> {
     if proto.schema != TASK_QUEUE_ROW_SCHEMA {
         bail!("task queue CoreMeta row has invalid schema");
     }
-    let common = proto
-        .common
-        .ok_or_else(|| anyhow!("task queue CoreMeta row is missing common metadata"))?;
     let row = match proto
         .row
         .ok_or_else(|| anyhow!("task queue CoreMeta row is missing row payload"))?
@@ -547,19 +527,7 @@ pub(super) fn decode_queue_row(bytes: &[u8]) -> Result<DecodedTaskQueueRow> {
             TaskQueueRow::Journal(entry)
         }
     };
-    if common.realm_id != TASK_QUEUE_REALM_ID
-        || common.root_key_hash != core_meta_root_key_hash(&row_root_key(&row))
-        || common.visibility_state != CoreMetaVisibilityState::Committed as i32
-        || common.root_generation == 0
-        || common.transaction_id.is_empty()
-        || common.payload_schema_version != 1
-    {
-        bail!("task queue CoreMeta row has invalid common metadata");
-    }
-    Ok(DecodedTaskQueueRow {
-        row,
-        publication_generation: common.root_generation,
-    })
+    Ok(DecodedTaskQueueRow { row })
 }
 
 pub(super) fn row_root_key(row: &TaskQueueRow) -> String {

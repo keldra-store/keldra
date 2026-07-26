@@ -594,7 +594,6 @@ impl CoreStore {
         finding_id: &str,
         repaired: &[RepairedShard],
         writer_family: WriterFamily,
-        lease_precondition: CoreMutationPrecondition,
     ) -> Result<()> {
         if repaired.is_empty() {
             bail!("CoreStore shard repair overlay publication has no repaired placements");
@@ -628,8 +627,7 @@ impl CoreStore {
             &transaction_id,
             created_at,
         );
-        let mut preconditions = Vec::with_capacity(repaired.len() + 1);
-        preconditions.push(lease_precondition);
+        let mut preconditions = Vec::with_capacity(repaired.len());
         let mut operations = Vec::with_capacity(repaired.len());
         for (repair, precondition) in repaired.iter().zip(overlay_preconditions) {
             let placement = &repair.replacement;

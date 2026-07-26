@@ -154,12 +154,8 @@ impl IndexBuildAuthority<'_> {
         let ownership_precondition = ownership.precondition(storage, signing_key).await?;
         match self {
             Self::Task(guard) => {
-                let permit = guard.publication_permit().await?;
-                permit
-                    .publish_with(|task_precondition| {
-                        publication(vec![ownership_precondition, task_precondition])
-                    })
-                    .await
+                guard.check().await?;
+                publication(vec![ownership_precondition]).await
             }
             Self::DirectRepair(_) => publication(vec![ownership_precondition]).await,
         }

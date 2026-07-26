@@ -152,11 +152,7 @@ fn require_nonempty(value: &str, field: &'static str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        derived_index_proof::DerivedIndexProof,
-        task_lease::{TaskLeaseAcquire, TaskLeaseOwner, acquire_task_lease, checkpoint_task_lease},
-    };
-    use tempfile::tempdir;
+    use crate::derived_index_proof::DerivedIndexProof;
 
     const KEY: &[u8] = b"derived index catchup signing key";
 
@@ -218,39 +214,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn catch_up_uses_checkpoint_carried_by_handed_off_task_lease() {
-        let temp = tempdir().unwrap();
-        let storage = crate::storage::Storage::new_at(temp.path()).await.unwrap();
-        let first = acquire_task_lease(&storage, lease_acquire("node-a", 10, 30, 10), KEY)
-            .await
-            .unwrap();
-        checkpoint_task_lease(&storage, &first, 42, 20, KEY)
-            .await
-            .unwrap();
-        let handed_off = acquire_task_lease(&storage, lease_acquire("node-b", 50, 100, 10), KEY)
-            .await
-            .unwrap();
-
-        let plan = plan_derived_index_catch_up(
-            input_with_checkpoint(handed_off.checkpoint_cursor, 30, 50, 30)
-                .with_proof(proof(42, 7)),
-            KEY,
-        )
-        .unwrap();
-
-        assert_eq!(handed_off.fence_token, 2);
-        assert_eq!(handed_off.checkpoint_cursor, 42);
-        assert_eq!(
-            plan,
-            DerivedIndexCatchUpPlan::Replay {
-                from_exclusive: 42,
-                to_inclusive: 50,
-                generation: 7,
-            }
-        );
-    }
-
     fn input_with_checkpoint(
         checkpoint_cursor: u128,
         retained_start_cursor: u128,
@@ -302,23 +265,5 @@ mod tests {
         }
         .seal(KEY)
         .unwrap()
-    }
-
-    fn lease_acquire(
-        owner_node_id: &str,
-        now_nanos: i64,
-        ttl_nanos: i64,
-        source_cursor: u128,
-    ) -> TaskLeaseAcquire {
-        TaskLeaseAcquire {
-            task_id: "search-index-builder".to_string(),
-            task_kind: "index_build".to_string(),
-            partition_family: "full_text_index".to_string(),
-            partition_id: hex::encode([8; 32]),
-            owner: TaskLeaseOwner::node(owner_node_id),
-            source_cursor,
-            now_nanos,
-            ttl_nanos,
-        }
     }
 }

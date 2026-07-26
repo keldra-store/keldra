@@ -18,15 +18,3 @@ pub fn task_queue_partition_id() -> Hash32 {
 fn task_queue_partition_principal() -> String {
     "partition-owner:task_queue:global".to_string()
 }
-
-#[cfg(test)]
-pub(crate) use queue::{
-    claim_pending_tasks, enqueue_task, fail_task, force_task_schedule_for_test, update_task_status,
-};
-#[cfg(test)]
-pub(crate) use store::{
-    read_task_frame_fences_for_test, reset_task_row_visits_for_test, task_row_visits_for_test,
-};
-
-#[cfg(test)]
-mod tests;

@@ -95,13 +95,14 @@ pub(super) async fn prepare_write_preconditions(
         if lease.expires_at_nanos <= current_time_nanos()? {
             return Err(Status::failed_precondition(task_lease::LEASE_EXPIRED));
         }
-        durable_preconditions.push(
-            state
-                .persistence
-                .named_task_lease_fenced_precondition(&lease, current_time_nanos()?)
-                .await
-                .map_err(lease_error_status)?,
-        );
+        // The lease itself is canonical MVCC state. Validate its exact epoch and
+        // value hash here; physical object-row preconditions remain separate
+        // until object publication is fully routed through MVCC.
+        state
+            .persistence
+            .named_task_lease_fenced_precondition(&lease, current_time_nanos()?)
+            .await
+            .map_err(lease_error_status)?;
     }
 
     Ok(durable_preconditions)

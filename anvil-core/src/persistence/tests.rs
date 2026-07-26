@@ -878,8 +878,8 @@ async fn node_drain_completion_requires_no_runtime_ownership_and_force_offline_e
     .await
     .unwrap();
 
-    let task_lease = crate::task_lease::acquire_task_lease(
-        &persistence.storage,
+    let task_lease = crate::task_lease::acquire_task_lease_mvcc(
+        persistence.mvcc().unwrap(),
         crate::task_lease::TaskLeaseAcquire {
             task_id: "worker-task".to_string(),
             task_kind: "index-build".to_string(),
@@ -971,8 +971,8 @@ async fn node_drain_completion_requires_no_runtime_ownership_and_force_offline_e
         crate::error_codes::AnvilErrorCode::PartitionNotOwned
     );
     assert!(
-        crate::task_lease::checkpoint_task_lease(
-            &persistence.storage,
+        crate::task_lease::checkpoint_task_lease_mvcc(
+            persistence.mvcc().unwrap(),
             &task_lease,
             task_lease.source_cursor,
             now_nanos.saturating_add(2),

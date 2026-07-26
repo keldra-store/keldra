@@ -269,7 +269,10 @@ pub(super) async fn publish_partition_manifest(
     bucket: &Bucket,
     staged: &StagedPartitionManifest,
     segments: &[WrittenSegment],
-    additional_preconditions: &[CoreMutationPrecondition],
+    additional_predicates: &[(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )],
 ) -> Result<()> {
     let key = metadata_product_key(
         MetadataProductRowKind::ManifestPublication,
@@ -283,8 +286,8 @@ pub(super) async fn publish_partition_manifest(
     {
         return Ok(());
     }
-    let _validated_physical_preconditions = additional_preconditions;
     let mut plan = MetadataMvccProjectionPlan::new();
+    plan.predicates.extend_from_slice(additional_predicates);
     plan.observe_and_put(mvcc, key, staged.manifest_payload.clone())?;
     plan.observe_and_put(
         mvcc,

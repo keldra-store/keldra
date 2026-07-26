@@ -1020,16 +1020,15 @@ async fn publish_staged_compaction_for_task(
     partition_precondition: &CoreMutationPrecondition,
     task_guard: &TaskExecutionGuard,
 ) -> Result<()> {
-    let permit = task_guard.publication_permit().await?;
-    permit
-        .publish_with(|task_precondition| async move {
-            let preconditions = [partition_precondition.clone(), task_precondition];
+    task_guard
+        .publish_mvcc_with(|task_predicate| async move {
+            let _ = partition_precondition;
             publish_partition_manifest(
                 mvcc,
                 bucket,
                 &staged.partition_manifest,
                 &staged.segments,
-                &preconditions,
+                &[task_predicate],
             )
             .await
         })
