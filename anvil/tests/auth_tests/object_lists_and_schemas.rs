@@ -204,7 +204,7 @@ async fn test_object_list_and_versions_filter_entries_by_read_relationship() {
 }
 
 // This test stays in-process because it injects namespace watch records through
-// cluster.states.storage and asserts exact watch cursor positions.
+// the cluster MVCC runtime and asserts snapshot-to-live cursor progression.
 #[tokio::test]
 async fn test_authz_namespace_watch_streams_snapshot_and_new_events() {
     let mut cluster = isolated_test_cluster(
@@ -217,7 +217,7 @@ async fn test_authz_namespace_watch_streams_snapshot_and_new_events() {
         .await;
 
     append_authz_namespace_watch_record(
-        &cluster.states[0].storage,
+        &cluster.states[0].mvcc,
         1,
         [1; 16],
         namespace_watch_payload(10),
@@ -248,7 +248,7 @@ async fn test_authz_namespace_watch_streams_snapshot_and_new_events() {
         .unwrap()
         .unwrap()
         .unwrap();
-    assert_eq!(snapshot.cursor_low, 1);
+    assert!(snapshot.cursor_low > 0);
     assert_eq!(snapshot.cursor_high, 0);
     assert_eq!(snapshot.namespace, "document");
     assert_eq!(snapshot.event_type, "schema_changed");
@@ -256,7 +256,7 @@ async fn test_authz_namespace_watch_streams_snapshot_and_new_events() {
     assert!(snapshot.invalidates_derived_usersets);
 
     append_authz_namespace_watch_record(
-        &cluster.states[0].storage,
+        &cluster.states[0].mvcc,
         1,
         [2; 16],
         namespace_watch_payload(11),
@@ -268,6 +268,7 @@ async fn test_authz_namespace_watch_streams_snapshot_and_new_events() {
         .unwrap()
         .unwrap()
         .unwrap();
+    assert!(live.cursor_low > snapshot.cursor_low);
     assert_eq!(live.cursor_low, 2);
     assert_eq!(live.authz_revision, 11);
 }
