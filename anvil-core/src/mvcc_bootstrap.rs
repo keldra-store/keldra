@@ -383,6 +383,12 @@ impl MvccSubsystem {
             .last_log_index()
             .context("inspect MVCC Raft log")?
             .is_none();
+        #[cfg(test)]
+        if !raft_is_empty {
+            crate::mvcc_fault_injection::hit(
+                crate::mvcc_fault_injection::FaultPoint::RestartRecovery,
+            )?;
+        }
         let token = config.mvcc_node_token()?;
         let raft_network = Arc::new(TonicConsensusRpcFactory::new(
             config.mvcc_cluster_id.clone(),
@@ -919,6 +925,34 @@ mod tests {
                     .exists()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn restart_recovery_fault_fails_before_runtime_reopens_and_is_retryable() {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("coremeta");
+        let coremeta = crate::core_store::CoreMetaStore::open(&db_path).unwrap();
+        let config = config(directory.path());
+        let subsystem = MvccSubsystem::bootstrap(&config, coremeta.database())
+            .await
+            .unwrap();
+        subsystem.shutdown().await;
+        drop(subsystem);
+
+        crate::mvcc_fault_injection::install(
+            crate::mvcc_fault_injection::DeterministicFaults::default()
+                .fail_at(crate::mvcc_fault_injection::FaultPoint::RestartRecovery, 1),
+        );
+        let error = MvccSubsystem::bootstrap(&config, coremeta.database())
+            .await
+            .unwrap_err();
+        crate::mvcc_fault_injection::clear();
+        assert!(error.to_string().contains("RestartRecovery"));
+
+        let recovered = MvccSubsystem::bootstrap(&config, coremeta.database())
+            .await
+            .unwrap();
+        recovered.shutdown().await;
     }
 
     #[test]

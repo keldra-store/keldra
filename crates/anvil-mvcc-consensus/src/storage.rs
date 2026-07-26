@@ -19,6 +19,12 @@ thread_local! {
     // Failure injection is thread-local so concurrently executing storage tests
     // cannot consume each other's write ordinal.
     static SYNC_WRITE_FAILURE: Cell<Option<(u64, u64)>> = const { Cell::new(None) };
+    static FAIL_NEXT_RAFT_LOG_WRITE: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_raft_log_write() {
+    FAIL_NEXT_RAFT_LOG_WRITE.with(|failure| failure.set(true));
 }
 
 use bincode::{
@@ -155,6 +161,12 @@ impl RocksRaftStore {
     pub fn append_logs(&self, entries: &[(u64, Vec<u8>)]) -> Result<(), RaftStorageError> {
         if entries.is_empty() {
             return Ok(());
+        }
+        #[cfg(test)]
+        if FAIL_NEXT_RAFT_LOG_WRITE.with(|failure| failure.replace(false)) {
+            return Err(RaftStorageError::Codec(
+                "injected RaftLogWrite fault".into(),
+            ));
         }
         let _writer = self
             .writer
@@ -601,6 +613,20 @@ mod tests {
         );
         assert_eq!(store.get_log(0).unwrap(), Some(vec![7]));
         assert_eq!(store.last_log_index().unwrap(), Some(0));
+    }
+
+    #[test]
+    fn raft_log_write_fault_leaves_log_and_index_unchanged() {
+        let dir = TempDir::new().unwrap();
+        let store = store(dir.path());
+        store.append_logs(&[(0, vec![0])]).unwrap();
+        fail_next_raft_log_write();
+
+        let error = store.append_logs(&[(1, vec![1])]).unwrap_err();
+        assert!(error.to_string().contains("RaftLogWrite"));
+        assert_eq!(store.last_log_index().unwrap(), Some(0));
+        assert_eq!(store.get_log(0).unwrap(), Some(vec![0]));
+        assert_eq!(store.get_log(1).unwrap(), None);
     }
 
     #[test]

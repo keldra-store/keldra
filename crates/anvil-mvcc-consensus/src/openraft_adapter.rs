@@ -30,6 +30,17 @@ use crate::{
     storage::{KEY_LAST_PURGED_LOG_ID, KEY_OPENRAFT_STATE},
 };
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_RESTART_RECOVERY: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn fail_next_restart_recovery() {
+    FAIL_NEXT_RESTART_RECOVERY.with(|failure| failure.set(true));
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum RaftApplyResult {
     Certification(CertificationResult),
@@ -324,6 +335,12 @@ pub(crate) fn stores(
     store: RocksRaftStore,
     cluster_id_hash: [u8; 32],
 ) -> Result<(OpenRaftLogStore, OpenRaftStateMachine), RaftStorageError> {
+    #[cfg(test)]
+    if FAIL_NEXT_RESTART_RECOVERY.with(|failure| failure.replace(false)) {
+        return Err(RaftStorageError::Codec(
+            "injected RestartRecovery fault".into(),
+        ));
+    }
     let state = match store.read_state_value::<MachineState>(KEY_OPENRAFT_STATE)? {
         Some(state) => {
             state.verify_cluster(cluster_id_hash)?;
@@ -1472,6 +1489,34 @@ mod tests {
             error
                 .to_string()
                 .contains("persisted Raft state belongs to another cluster")
+        );
+    }
+
+    #[test]
+    fn restart_recovery_fault_is_retryable_without_changing_persisted_state() {
+        let directory = TempDir::new().unwrap();
+        let store = RocksRaftStore::open(directory.path(), 7).unwrap();
+        stores(store.clone(), [1; 32]).unwrap();
+        let before: MachineState = store.read_state_value(KEY_OPENRAFT_STATE).unwrap().unwrap();
+
+        fail_next_restart_recovery();
+        let error = match stores(store.clone(), [1; 32]) {
+            Ok(_) => panic!("injected restart recovery unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("RestartRecovery"));
+
+        stores(store.clone(), [1; 32]).unwrap();
+        let after: MachineState = store.read_state_value(KEY_OPENRAFT_STATE).unwrap().unwrap();
+        assert_eq!(after.last_applied_log_id, before.last_applied_log_id);
+        assert_eq!(after.membership, before.membership);
+        assert_eq!(
+            after.certification.last_applied(),
+            before.certification.last_applied()
+        );
+        assert_eq!(
+            after.control.topology_epoch(),
+            before.control.topology_epoch()
         );
     }
 

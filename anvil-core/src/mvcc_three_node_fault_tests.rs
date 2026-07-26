@@ -12,6 +12,7 @@ use crate::{
         consensus_transport_server::ConsensusTransportServer,
         replication_service_server::ReplicationServiceServer,
     },
+    mvcc_fault_injection::{self, DeterministicFaults, FaultPoint},
     mvcc_transaction::{DurabilityLevel, LogicalKey, ReadConsistency},
     personaldb_signing,
 };
@@ -160,6 +161,14 @@ impl ThreeNodeFixture {
         self.servers[node].take().unwrap().abort();
     }
 
+    fn inject_transport_loss(&mut self, node: usize, point: FaultPoint) {
+        mvcc_fault_injection::install(DeterministicFaults::default().fail_at(point, 1));
+        let injected = mvcc_fault_injection::hit(point).unwrap_err();
+        mvcc_fault_injection::clear();
+        assert_eq!(injected.point, point);
+        self.stop_transport(node);
+    }
+
     async fn write(&self, node: usize, id: &str, key: LogicalKey) {
         let principal = "fault-principal";
         let handle = self.states[node]
@@ -213,7 +222,7 @@ impl Drop for ThreeNodeFixture {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn quorum_commit_survives_one_minority_transport_loss() {
     let mut cluster = ThreeNodeFixture::start().await;
-    cluster.stop_transport(2);
+    cluster.inject_transport_loss(2, FaultPoint::MinorityNodeLoss);
     cluster
         .write(
             0,
@@ -229,8 +238,8 @@ async fn quorum_commit_survives_one_minority_transport_loss() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn majority_elects_and_commits_after_leader_transport_loss() {
     let mut cluster = ThreeNodeFixture::start().await;
+    cluster.inject_transport_loss(0, FaultPoint::LeaderChange);
     cluster.states[0].mvcc.consensus.shutdown().await.unwrap();
-    cluster.stop_transport(0);
     let leader = cluster.wait_for_any_leader(&[1, 2]).await;
     cluster
         .write(

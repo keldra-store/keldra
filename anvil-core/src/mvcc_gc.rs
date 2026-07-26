@@ -32,6 +32,16 @@ pub fn plan_garbage_collection(
     cluster_head: CommitVersion,
     mut reported_pins: GarbageCollectionPins,
 ) -> Result<GarbageCollectionProposal> {
+    #[cfg(test)]
+    if reported_pins
+        .replica_applied_watermarks
+        .values()
+        .any(|watermark| watermark.0 < requested_watermark)
+    {
+        crate::mvcc_fault_injection::hit(
+            crate::mvcc_fault_injection::FaultPoint::LaggingFollowerGc,
+        )?;
+    }
     reported_pins.active_snapshots.extend(
         registry
             .active_snapshot_pins(now_unix_ms)?
@@ -92,6 +102,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        mvcc_fault_injection::{self, DeterministicFaults, FaultPoint},
         mvcc_node_runtime::CommitOutcome,
         mvcc_open_transactions::TransactionRuntime,
         mvcc_transaction::{
@@ -161,5 +172,33 @@ mod tests {
                 .active_snapshots
                 .contains(&ConsensusVersion(40))
         );
+    }
+
+    #[tokio::test]
+    async fn lagging_follower_fault_stops_gc_before_watermark_planning() {
+        let registry_dir = tempdir().unwrap();
+        let store_dir = tempdir().unwrap();
+        let registry = OpenTransactionRegistry::open(registry_dir.path()).unwrap();
+        let store = LocalMvccStore::open(store_dir.path()).unwrap();
+        let pins = GarbageCollectionPins {
+            replica_applied_watermarks: BTreeMap::from([(
+                NodeIncarnation {
+                    node_id: NodeId(2),
+                    incarnation: 1,
+                },
+                ConsensusVersion(20),
+            )]),
+            ..Default::default()
+        };
+        mvcc_fault_injection::install(
+            DeterministicFaults::default().fail_at(FaultPoint::LaggingFollowerGc, 1),
+        );
+        let error = plan_garbage_collection(&registry, &store, 1_000, 10, 80, 90, pins.clone())
+            .unwrap_err();
+        mvcc_fault_injection::clear();
+        assert!(error.to_string().contains("LaggingFollowerGc"));
+
+        let proposal = plan_garbage_collection(&registry, &store, 1_000, 10, 80, 90, pins).unwrap();
+        assert_eq!(proposal.watermark, 20);
     }
 }

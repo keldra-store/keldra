@@ -246,7 +246,26 @@ pub const RFC_FAULT_MATRIX: &[FaultScenario] = &[
 
 #[cfg(test)]
 mod tests {
+    use sha2::{Digest, Sha256};
+
     use super::*;
+    use crate::{
+        bundle_replication::AppendOnlyPreparedBundleStore,
+        mvcc_store::LocalMvccStore,
+        mvcc_transaction::{
+            BundleIdentity, HierarchicalRangeStampScheme, LogicalKey, NodeIncarnation,
+            PreparedBundleStore, TransactionBundleBuilder,
+        },
+        shard_store::{ShardKind, ShardRecord, ShardSegment},
+    };
+
+    struct ClearInstalledFaults;
+
+    impl Drop for ClearInstalledFaults {
+        fn drop(&mut self) {
+            clear();
+        }
+    }
 
     #[test]
     fn exact_ordinal_failures_are_repeatable() {
@@ -291,5 +310,84 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(names.len(), RFC_FAULT_MATRIX.len());
         assert_eq!(points.len(), 17);
+    }
+
+    #[tokio::test]
+    async fn prepared_bundle_disk_fault_never_returns_durability_evidence() {
+        let _clear = ClearInstalledFaults;
+        let directory = tempfile::tempdir().unwrap();
+        let store = AppendOnlyPreparedBundleStore::open(
+            directory.path(),
+            "cluster",
+            NodeIncarnation {
+                node_id: "node-a".into(),
+                incarnation: 1,
+            },
+            "zone-a",
+        )
+        .unwrap();
+        let bytes = b"immutable transaction bundle";
+        let mut hash = Sha256::new();
+        hash.update(b"anvil.mvcc.transaction-bundle.v1");
+        hash.update((bytes.len() as u64).to_be_bytes());
+        hash.update(bytes);
+        let identity = BundleIdentity {
+            hash: format!("sha256:{}", hex::encode(hash.finalize())),
+            length: bytes.len() as u64,
+        };
+        install(DeterministicFaults::default().fail_at(FaultPoint::PreparedBundleWrite, 1));
+
+        let error = store.persist(&identity, bytes).await.unwrap_err();
+        assert!(error.to_string().contains("PreparedBundleWrite"));
+        assert!(store.read(&identity).unwrap().is_none());
+    }
+
+    #[test]
+    fn shard_disk_fault_leaves_no_acknowledgeable_record() {
+        let _clear = ClearInstalledFaults;
+        let directory = tempfile::tempdir().unwrap();
+        let mut segment = ShardSegment::open(directory.path(), 1).unwrap();
+        let before = segment.path().metadata().unwrap().len();
+        let record = ShardRecord {
+            transaction_id: uuid::Uuid::from_u128(1),
+            object_identity: uuid::Uuid::from_u128(2),
+            encoding_generation: 1,
+            prepared_at_unix_ms: 1,
+            stripe_ordinal: 0,
+            shard_ordinal: 0,
+            shard_kind: ShardKind::Data,
+            payload: b"shard".to_vec(),
+        };
+        install(DeterministicFaults::default().fail_at(FaultPoint::ShardWrite, 1));
+
+        let error = segment.append(&record).unwrap_err();
+        assert!(error.to_string().contains("ShardWrite"));
+        assert_eq!(segment.path().metadata().unwrap().len(), before);
+    }
+
+    #[test]
+    fn mvcc_disk_fault_preserves_atomic_visibility_and_applied_watermark() {
+        let _clear = ClearInstalledFaults;
+        let directory = tempfile::tempdir().unwrap();
+        let store = LocalMvccStore::open(directory.path()).unwrap();
+        let key = LogicalKey {
+            table_id: 7,
+            application_key: b"row".to_vec(),
+        };
+        let mut builder = TransactionBundleBuilder::new(
+            "cluster",
+            "disk-full",
+            0,
+            "principal",
+            HierarchicalRangeStampScheme::new(),
+        );
+        builder.put(key.clone(), b"value".to_vec());
+        let bundle = builder.build().unwrap();
+        install(DeterministicFaults::default().fail_at(FaultPoint::MvccBatchWrite, 1));
+
+        let error = store.apply_certified_bundle(1, &bundle).unwrap_err();
+        assert!(error.to_string().contains("MvccBatchWrite"));
+        assert!(store.read_latest(&key).unwrap().is_none());
+        assert_eq!(store.applied_version().unwrap(), 0);
     }
 }
