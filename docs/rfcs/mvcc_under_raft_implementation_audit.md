@@ -70,7 +70,7 @@ Status values:
 
 | RFC requirement | Status | Evidence or gap |
 |---|---|---|
-| GC watermark must protect active snapshots, lagging replicas, history, backup and jobs | Missing | Consensus has a compact GC safety watermark and below-watermark reads fail, but complete MVCC version, prepared-bundle, shard and conflict-state GC policy is not implemented. |
+| GC watermark must protect active snapshots, lagging replicas, history, backup and jobs | Partial | `GarbageCollectionPins` computes the minimum safe candidate across durable open-session snapshots, reported replica apply positions, history retention, backup/audit pins and unfinished outbox/materialisation/repair work. Only `AdvanceGcWatermark` advances cluster safety state; followers collect after catch-up. Local MVCC GC retains the newest value or tombstone anchor at/below the watermark and all newer history, and reclaims delivered/completed queue rows plus old applied identities. Consensus retry/decision history, prepared-bundle logs and shard segments have conservative collectors. Automatic construction of prepared-bundle and shard reachability/retirement plans from committed manifests and retention timestamps remains incomplete. |
 | Required transaction/replication/MVCC/consensus/shard metrics | Missing | The exact metric set in Section 26 is not present. Existing performance guards do not satisfy the required counters, gauges and histograms. |
 | Required stable trace operations | Partial | Some consensus/transaction/replication tracing exists, but the complete stable operation list is not implemented. |
 | Required model/storage/transaction/replication tests | Partial | Strong unit and restart/recovery coverage exists for certification, storage, MVCC and replication. Several enumerated failure, repair, GC and cross-feature cases are absent. |
@@ -89,5 +89,5 @@ Status values:
 
 1. Finish deleting every reachable CoreStore explicit-transaction and receipt/publication path; remove MVCC/physical fallback reads rather than treating them as migration support.
 2. Wire the existing bounded-stripe `DistributedIngest` and final-target shard streams into every applicable public streaming upload path; remove legacy/raw alternatives and add public-API durability tests.
-3. Implement safe MVCC, bundle, shard and conflict-state GC with active-snapshot and catch-up protection.
+3. Complete automatic prepared-bundle and shard reachability/retirement plans, including retention timestamps, committed-manifest traversal, replacement-placement application acknowledgements and rollback grace windows.
 4. Add the required observability, fault matrix and benchmark suite.
