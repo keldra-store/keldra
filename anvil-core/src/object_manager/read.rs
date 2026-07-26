@@ -1863,7 +1863,7 @@ impl ObjectManager {
         Ok(())
     }
 
-    pub(super) async fn validate_write_request(
+    pub(crate) async fn validate_write_request(
         &self,
         claims: &auth::Claims,
         bucket_name: &str,

@@ -1977,6 +1977,22 @@ enum ObjectDataTarget {
     MvccLocal(crate::local_object_store::LocalObjectManifest),
 }
 
+pub(crate) fn local_object_manifest(
+    object: &crate::persistence::Object,
+) -> AnyhowResult<Option<crate::local_object_store::LocalObjectManifest>> {
+    let target = object
+        .shard_map
+        .as_ref()
+        .context("object shard map is missing")
+        .and_then(object_data_target_from_shard_map)?;
+    Ok(match target {
+        ObjectDataTarget::MvccLocal(manifest) => Some(manifest),
+        ObjectDataTarget::MvccShards(_)
+        | ObjectDataTarget::LogicalFile(_)
+        | ObjectDataTarget::ObjectRef(_) => None,
+    })
+}
+
 fn object_data_target_to_shard_map(target: &ObjectDataTarget) -> AnyhowResult<JsonValue> {
     match target {
         ObjectDataTarget::LogicalFile(locator) => Ok(serde_json::json!({

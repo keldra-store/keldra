@@ -923,6 +923,85 @@ impl MvccStore {
         Ok(None)
     }
 
+    /// Returns the durable promotion record for a committed local object.
+    ///
+    /// Local object hashes are content identities, so the same bytes may be
+    /// referenced by more than one object version. In that case every matching
+    /// record describes the same physical promotion and the oldest stable job
+    /// identity is returned.
+    pub fn local_durability_upgrade_for_object(
+        &self,
+        object_hash: &str,
+    ) -> Result<Option<(String, LocalDurabilityUpgradeRecord)>> {
+        let cf = self.cf(CF_MATERIALISATION)?;
+        let prefix = self.key(b"local-upgrade/");
+        let mut matches = Vec::new();
+        for row in self
+            .db
+            .iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward))
+        {
+            let (key, value) = row?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let record: LocalDurabilityUpgradeRecord = serde_json::from_slice(&value)?;
+            if record
+                .job
+                .objects
+                .iter()
+                .any(|object| object.local_manifest.object_hash == object_hash)
+            {
+                let id = String::from_utf8(self.unscoped(&key)?.to_vec())?
+                    .strip_prefix("local-upgrade/")
+                    .context("invalid durability-upgrade job key")?
+                    .to_string();
+                matches.push((id, record));
+            }
+        }
+        matches.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(matches.into_iter().next())
+    }
+
+    /// Idempotently makes an existing committed promotion immediately
+    /// claimable. The immutable commit-created job remains the authority; a
+    /// public request cannot weaken or rewrite its target.
+    pub fn request_local_durability_upgrade_for_object(
+        &self,
+        object_hash: &str,
+        target: crate::mvcc_transaction::DurabilityLevel,
+    ) -> Result<Option<(String, LocalDurabilityUpgradeRecord)>> {
+        let Some((job_id, _)) = self.local_durability_upgrade_for_object(object_hash)? else {
+            return Ok(None);
+        };
+        let _transition = self.materialisation_transition.lock().unwrap();
+        let cf = self.cf(CF_MATERIALISATION)?;
+        let key = self.key(format!("local-upgrade/{job_id}").as_bytes());
+        let bytes = self
+            .db
+            .get_cf(cf, &key)?
+            .context("local durability upgrade disappeared while requesting it")?;
+        let mut record: LocalDurabilityUpgradeRecord = serde_json::from_slice(&bytes)?;
+        let rank = |durability| match durability {
+            crate::mvcc_transaction::DurabilityLevel::Local => 0_u8,
+            crate::mvcc_transaction::DurabilityLevel::Quorum => 1,
+            crate::mvcc_transaction::DurabilityLevel::Erasure => 2,
+        };
+        if rank(record.job.target) < rank(target) {
+            bail!("committed durability-upgrade intent does not satisfy requested target");
+        }
+        if record.state == LocalDurabilityUpgradeState::Pending && record.next_attempt_unix_ms != 0
+        {
+            record.next_attempt_unix_ms = 0;
+            self.db.put_cf_opt(
+                cf,
+                &key,
+                serde_json::to_vec(&record)?,
+                &durable_write_options(),
+            )?;
+        }
+        Ok(Some((job_id, record)))
+    }
+
     pub fn retry_local_durability_upgrade(
         &self,
         job_id: &str,
@@ -1642,6 +1721,82 @@ mod tests {
         assert_eq!(store.read_at(&row, 2).unwrap().unwrap().value, b"old");
         assert_eq!(store.read_at(&row, 4).unwrap().unwrap().value, b"old");
         assert_eq!(store.read_latest(&row).unwrap().unwrap().value, b"new");
+    }
+
+    #[test]
+    fn committed_local_object_promotion_is_queryable_by_content_identity() {
+        let temp = tempdir().unwrap();
+        let store = MvccStore::open(temp.path()).unwrap();
+        let object_hash = format!("sha256:{}", "a".repeat(64));
+        let job = LocalDurabilityUpgradeJob {
+            schema: LocalDurabilityUpgradeJob::SCHEMA.to_string(),
+            cluster_id: "cluster".to_string(),
+            transaction_id: "local-object".to_string(),
+            commit_version: 0,
+            bundle: None,
+            target: crate::mvcc_transaction::DurabilityLevel::Erasure,
+            objects: vec![
+                crate::mvcc_local_durability_upgrade::LocalDurabilityUpgradeObject {
+                    object_identity: uuid::Uuid::from_u128(7),
+                    local_manifest: crate::local_object_store::LocalObjectManifest {
+                        schema_version: 1,
+                        cluster_id: "cluster".to_string(),
+                        object_hash: object_hash.clone(),
+                        object_length: 5,
+                        node: crate::mvcc_transaction::NodeIncarnation {
+                            node_id: "node-a".to_string(),
+                            incarnation: 1,
+                        },
+                        failure_domain: "zone-a".to_string(),
+                    },
+                },
+            ],
+            requested_at_unix_ms: 10,
+        };
+        store
+            .apply_certified_bundle(
+                3,
+                &bundle("local-object", |builder| {
+                    builder.add_materialisation_job(job.canonical_bytes().unwrap());
+                }),
+            )
+            .unwrap();
+
+        let (promotion_id, record) = store
+            .local_durability_upgrade_for_object(&object_hash)
+            .unwrap()
+            .expect("committed local object has a durable promotion");
+        assert_eq!(promotion_id, record.job.job_id().unwrap());
+        assert_eq!(record.job.commit_version, 3);
+        assert!(record.job.bundle.is_some());
+        assert_eq!(record.state, LocalDurabilityUpgradeState::Pending);
+        let (_, claimed) = store
+            .claim_local_durability_upgrade("worker", 10, 5)
+            .unwrap()
+            .expect("promotion is claimable");
+        store
+            .retry_local_durability_upgrade(
+                &promotion_id,
+                claimed.lease_owner.as_deref().unwrap(),
+                99,
+                "temporary failure",
+            )
+            .unwrap();
+        let (_, requested) = store
+            .request_local_durability_upgrade_for_object(
+                &object_hash,
+                crate::mvcc_transaction::DurabilityLevel::Quorum,
+            )
+            .unwrap()
+            .expect("explicit request reuses the committed promotion");
+        assert_eq!(requested.next_attempt_unix_ms, 0);
+        assert_eq!(requested.last_error.as_deref(), Some("temporary failure"));
+        assert!(
+            store
+                .local_durability_upgrade_for_object(&format!("sha256:{}", "b".repeat(64)))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

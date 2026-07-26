@@ -1393,6 +1393,8 @@ service ObjectService {
   rpc GetObject(GetObjectRequest) returns (stream GetObjectResponse);
   rpc DeleteObject(DeleteObjectRequest) returns (DeleteObjectResponse);
   rpc HeadObject(HeadObjectRequest) returns (HeadObjectResponse);
+  rpc PromoteObjectDurability(PromoteObjectDurabilityRequest) returns (ObjectDurabilityPromotionStatus);
+  rpc GetObjectDurabilityPromotion(GetObjectDurabilityPromotionRequest) returns (ObjectDurabilityPromotionStatus);
   rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
   rpc ListObjectVersions(ListObjectVersionsRequest) returns (ListObjectVersionsResponse);
   rpc CopyObject(CopyObjectRequest) returns (CopyObjectResponse);
@@ -1609,7 +1611,38 @@ message HeadObjectResponse {
     string index_policy_snapshot = 8;
     string content_type = 9;
     string user_metadata_json = 10;
-    string storage_class = 11;
+  string storage_class = 11;
+}
+
+// Idempotently requests post-commit promotion of an object written with local
+// durability. The object version makes the request stable when a key advances.
+message PromoteObjectDurabilityRequest {
+  string bucket_name = 1;
+  string object_key = 2;
+  optional string version_id = 3;
+  MvccDurability target_durability = 4;
+  string idempotency_key = 5;
+}
+
+// Reads the durable promotion state for the selected object version.
+message GetObjectDurabilityPromotionRequest {
+  string bucket_name = 1;
+  string object_key = 2;
+  optional string version_id = 3;
+}
+
+message ObjectDurabilityPromotionStatus {
+  string request_id = 1;
+  string promotion_id = 2;
+  string bucket_name = 3;
+  string object_key = 4;
+  string version_id = 5;
+  MvccDurability target_durability = 6;
+  string state = 7;
+  uint32 attempts = 8;
+  uint64 requested_at_unix_ms = 9;
+  uint64 next_attempt_unix_ms = 10;
+  optional string last_error = 11;
 }
 
 message ListObjectsRequest {

@@ -48,6 +48,51 @@ pub(super) fn write_state_for_transaction(transaction_id: Option<&str>) -> i32 {
     }
 }
 
+fn promotion_target(value: i32) -> Result<crate::mvcc_transaction::DurabilityLevel, Status> {
+    match MvccDurability::try_from(value).unwrap_or(MvccDurability::Unspecified) {
+        MvccDurability::Quorum => Ok(crate::mvcc_transaction::DurabilityLevel::Quorum),
+        MvccDurability::Erasure => Ok(crate::mvcc_transaction::DurabilityLevel::Erasure),
+        MvccDurability::Unspecified | MvccDurability::Local => Err(Status::invalid_argument(
+            "promotion target must be quorum or erasure",
+        )),
+    }
+}
+
+fn object_promotion_status(
+    request_id: String,
+    promotion_id: String,
+    bucket_name: &str,
+    object_key: &str,
+    version_id: uuid::Uuid,
+    record: &crate::mvcc_local_durability_upgrade::LocalDurabilityUpgradeRecord,
+) -> ObjectDurabilityPromotionStatus {
+    use crate::mvcc_local_durability_upgrade::LocalDurabilityUpgradeState;
+
+    let target_durability = match record.job.target {
+        crate::mvcc_transaction::DurabilityLevel::Local => MvccDurability::Local,
+        crate::mvcc_transaction::DurabilityLevel::Quorum => MvccDurability::Quorum,
+        crate::mvcc_transaction::DurabilityLevel::Erasure => MvccDurability::Erasure,
+    };
+    let state = match record.state {
+        LocalDurabilityUpgradeState::Pending => "pending",
+        LocalDurabilityUpgradeState::Running => "running",
+        LocalDurabilityUpgradeState::Complete => "complete",
+    };
+    ObjectDurabilityPromotionStatus {
+        request_id,
+        promotion_id,
+        bucket_name: bucket_name.to_string(),
+        object_key: object_key.to_string(),
+        version_id: version_id.to_string(),
+        target_durability: target_durability as i32,
+        state: state.to_string(),
+        attempts: record.attempts,
+        requested_at_unix_ms: record.job.requested_at_unix_ms,
+        next_attempt_unix_ms: record.next_attempt_unix_ms,
+        last_error: record.last_error.clone(),
+    }
+}
+
 pub(super) fn object_write_visibility(
     context: Option<&NativeMutationContext>,
 ) -> Result<ObjectWriteVisibility, Status> {
@@ -395,6 +440,99 @@ impl ObjectService for AppState {
             user_metadata_json: json_object_string(object.user_meta.as_ref()),
             storage_class,
         }))
+    }
+
+    async fn promote_object_durability(
+        &self,
+        request: Request<PromoteObjectDurabilityRequest>,
+    ) -> Result<Response<ObjectDurabilityPromotionStatus>, Status> {
+        let request_id = request_id(&request);
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        if req.idempotency_key.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "object durability promotion requires an idempotency key",
+            ));
+        }
+        let requested = promotion_target(req.target_durability)?;
+        self.object_manager
+            .validate_write_request(&claims, &req.bucket_name, &req.object_key)
+            .await?;
+        let object = self
+            .object_manager
+            .head_object(
+                Some(claims),
+                &req.bucket_name,
+                &req.object_key,
+                parse_optional_version_id(req.version_id.as_deref())?,
+            )
+            .await?;
+        let manifest = object_manager::local_object_manifest(&object)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?
+            .ok_or_else(|| {
+                Status::failed_precondition("ObjectDurabilityPromotionRequiresLocalRepresentation")
+            })?;
+        let (promotion_id, record) = self
+            .mvcc
+            .runtime
+            .local_store()
+            .request_local_durability_upgrade_for_object(&manifest.object_hash, requested)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?
+            .ok_or_else(|| Status::failed_precondition("ObjectDurabilityPromotionIntentMissing"))?;
+        Ok(Response::new(object_promotion_status(
+            request_id,
+            promotion_id,
+            &req.bucket_name,
+            &req.object_key,
+            object.version_id,
+            &record,
+        )))
+    }
+
+    async fn get_object_durability_promotion(
+        &self,
+        request: Request<GetObjectDurabilityPromotionRequest>,
+    ) -> Result<Response<ObjectDurabilityPromotionStatus>, Status> {
+        let request_id = request_id(&request);
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
+        let req = request.into_inner();
+        let object = self
+            .object_manager
+            .head_object(
+                Some(claims),
+                &req.bucket_name,
+                &req.object_key,
+                parse_optional_version_id(req.version_id.as_deref())?,
+            )
+            .await?;
+        let manifest = object_manager::local_object_manifest(&object)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?
+            .ok_or_else(|| {
+                Status::failed_precondition("ObjectDurabilityPromotionRequiresLocalRepresentation")
+            })?;
+        let (promotion_id, record) = self
+            .mvcc
+            .runtime
+            .local_store()
+            .local_durability_upgrade_for_object(&manifest.object_hash)
+            .map_err(|error| Status::internal(error.to_string()))?
+            .ok_or_else(|| Status::not_found("ObjectDurabilityPromotionNotFound"))?;
+        Ok(Response::new(object_promotion_status(
+            request_id,
+            promotion_id,
+            &req.bucket_name,
+            &req.object_key,
+            object.version_id,
+            &record,
+        )))
     }
 
     async fn list_objects(
