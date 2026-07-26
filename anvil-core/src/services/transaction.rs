@@ -12,6 +12,14 @@ impl TransactionService for AppState {
         let request_id = request_id(&request);
         let principal = transaction_principal(&request)?;
         let req = request.into_inner();
+        tracing::info!(
+            operation = "request.receive",
+            rpc = "transaction.begin",
+            request_id = %request_id,
+            cluster_id = %req.cluster_id,
+            session_id = %req.idempotency_key,
+            "received public transaction request"
+        );
         validate_local_cluster(self, &req.cluster_id)?;
         let consistency = read_consistency(req.read_consistency)?;
         let handle = self
@@ -30,6 +38,15 @@ impl TransactionService for AppState {
             .await
             .map_err(mvcc_status)?;
 
+        tracing::info!(
+            operation = "response.send",
+            rpc = "transaction.begin",
+            request_id = %request_id,
+            cluster_id = %handle.cluster_id,
+            transaction_id = %handle.transaction_id,
+            session_id = %handle.transaction_id,
+            "sending public transaction response"
+        );
         Ok(Response::new(BeginTransactionResponse {
             request_id,
             transaction_id: handle.transaction_id,
@@ -48,6 +65,15 @@ impl TransactionService for AppState {
         let request_id = request_id(&request);
         let principal = transaction_principal(&request)?;
         let req = request.into_inner();
+        tracing::info!(
+            operation = "request.receive",
+            rpc = "transaction.commit",
+            request_id = %request_id,
+            cluster_id = %req.cluster_id,
+            transaction_id = %req.transaction_id,
+            session_id = %req.transaction_id,
+            "received public transaction request"
+        );
         validate_local_cluster(self, &req.cluster_id)?;
         let outcome = self
             .mvcc
@@ -70,6 +96,15 @@ impl TransactionService for AppState {
             }
         };
 
+        tracing::info!(
+            operation = "response.send",
+            rpc = "transaction.commit",
+            request_id = %request_id,
+            cluster_id = %req.cluster_id,
+            transaction_id = %req.transaction_id,
+            session_id = %req.transaction_id,
+            "sending public transaction response"
+        );
         Ok(Response::new(WriteResponse {
             request_id,
             mutation_id: req.transaction_id,

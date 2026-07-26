@@ -103,6 +103,7 @@ impl ObjectService for AppState {
         &self,
         request: Request<tonic::Streaming<PutObjectRequest>>,
     ) -> Result<Response<PutObjectResponse>, Status> {
+        let trace_request_id = request_id(&request);
         let claims = request
             .extensions()
             .get::<auth::Claims>()
@@ -118,13 +119,41 @@ impl ObjectService for AppState {
             },
             _ => return Err(Status::invalid_argument("Empty stream")),
         };
+        tracing::info!(
+            operation = "request.receive",
+            rpc = "object.put",
+            request_id = %trace_request_id,
+            cluster_id = %self.config.mvcc_cluster_id,
+            session_id = %metadata.object_key,
+            bucket = %metadata.bucket_name,
+            object_key = %metadata.object_key,
+            "received public object request"
+        );
         if let Some(target) = native_put_route_target(self, &claims, &metadata).await? {
             let response = proxy_native_put(self, &target, &claims, metadata, stream).await?;
+            tracing::info!(
+                operation = "response.send",
+                rpc = "object.put",
+                request_id = %trace_request_id,
+                cluster_id = %self.config.mvcc_cluster_id,
+                session_id = %response.mutation_id,
+                transaction_id = %response.mutation_id,
+                "sending proxied public object response"
+            );
             return Ok(Response::new(response));
         }
 
         let data_stream = stream.map(native_put_data_chunk);
         let response = execute_native_put(self, claims, metadata, data_stream).await?;
+        tracing::info!(
+            operation = "response.send",
+            rpc = "object.put",
+            request_id = %trace_request_id,
+            cluster_id = %self.config.mvcc_cluster_id,
+            session_id = %response.mutation_id,
+            transaction_id = %response.mutation_id,
+            "sending public object response"
+        );
         Ok(Response::new(response))
     }
 
