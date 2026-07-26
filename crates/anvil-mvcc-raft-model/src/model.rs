@@ -643,29 +643,34 @@ impl Model for MvccRaftModel {
 
     fn properties(&self) -> Vec<Property<Self>> {
         vec![
-            Property::always("one outcome per transaction", |_, state| {
-                state.outcomes_are_unique()
-            }),
-            Property::always("committed bundles are atomically visible", |_, state| {
-                state.committed_writes_are_atomic()
-            }),
-            Property::always("prepared bundles remain invisible", |_, state| {
-                state.prepared_bundles_are_invisible()
-            }),
+            Property::always(
+                "one outcome per transaction",
+                |_: &Self, state: &MvccRaftState| state.outcomes_are_unique(),
+            ),
+            Property::always(
+                "committed bundles are atomically visible",
+                |_: &Self, state: &MvccRaftState| state.committed_writes_are_atomic(),
+            ),
+            Property::always(
+                "prepared bundles remain invisible",
+                |_: &Self, state: &MvccRaftState| state.prepared_bundles_are_invisible(),
+            ),
             Property::always(
                 "replica watermarks do not exceed commit order",
-                |_, state| state.applied_watermarks_are_bounded(),
+                |_: &Self, state: &MvccRaftState| state.applied_watermarks_are_bounded(),
             ),
-            Property::always("durability claims are backed by holders", |_, state| {
-                state.durability_claims_are_honest()
-            }),
+            Property::always(
+                "durability claims are backed by holders",
+                |_: &Self, state: &MvccRaftState| state.durability_claims_are_honest(),
+            ),
             Property::always(
                 "quorum and erasure survive one holder failure",
-                |_, state| state.minority_failure_is_reconstructable(),
+                |_: &Self, state: &MvccRaftState| state.minority_failure_is_reconstructable(),
             ),
-            Property::always("GC preserves active and lagging readers", |_, state| {
-                state.gc_respects_readers()
-            }),
+            Property::always(
+                "GC preserves active and lagging readers",
+                |_: &Self, state: &MvccRaftState| state.gc_respects_readers(),
+            ),
         ]
     }
 }
