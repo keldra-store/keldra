@@ -12,9 +12,19 @@ repair, and garbage collection
 
 Anvil will use a global MVCC commit sequencer backed by OpenRaft. Raft is used
 only to agree on compact cluster-control decisions and compact transaction
-certification decisions. Object bytes, CoreMeta rows, transaction bundles,
-indexes, streams, authorization data, jobs, manifests, and erasure-coded shards
-are never replicated through the Raft log.
+certification decisions. Each certification command contains the transaction
+identity and snapshot version, deterministic hashes of the point and range
+conflict keys it observed, their observed versions or stamps, the conflict keys
+it writes or advances, the prepared-bundle identity, and a compact durability
+summary. The replicated state machine retains the latest certified version for
+each point conflict key and range stamp, so concurrent transactions touching the
+same logical file, path, row, or scanned range cannot both commit from stale
+observations.
+
+The logical values behind those conflict keys remain outside Raft. Object bytes,
+CoreMeta row bodies, transaction bundle bodies, indexes, streams, authorization
+data, jobs, manifests, and erasure-coded shards are never replicated through the
+Raft log.
 
 Transaction data is transferred between nodes over persistent, authenticated,
 bidirectional gRPC streams. A receiver acknowledges data at the application
@@ -74,8 +84,8 @@ transaction order and outcome when nodes disagree, fail, or lose connectivity.
 The data path and decision path are therefore separated:
 
 ```text
-data path       persistent gRPC streams + local RocksDB/raw files
-decision path   compact OpenRaft certification commands
+data path       persistent gRPC streams + local RocksDB/data segments
+decision path   compact OpenRaft certification commands and conflict-key versions
 ```
 
 ## 3. Goals
