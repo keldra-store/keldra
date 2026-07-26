@@ -561,6 +561,29 @@ impl ObjectManager {
 
         let (content_hash, shard_map) = if let Some(prepared) = prepared_ingest {
             (prepared.object_hash, Some(prepared.shard_map))
+        } else if transaction_id.is_some() {
+            let mut payload =
+                tokio::fs::File::open(temp_path.as_ref().expect("staged path exists"))
+                    .await
+                    .map_err(|error| Status::internal(error.to_string()))?;
+            let ingest = self
+                .mvcc
+                .get()
+                .ok_or_else(|| {
+                    Status::failed_precondition(
+                        "MVCC subsystem is required for transactional object writes",
+                    )
+                })?
+                .local_objects
+                .persist(&mut payload)
+                .await
+                .map_err(|error| Status::internal(error.to_string()))?;
+            let content_hash = ingest.manifest.object_hash.clone();
+            let shard_map = Some(
+                object_data_target_to_shard_map(&ObjectDataTarget::MvccLocal(ingest.manifest))
+                    .map_err(|error| Status::internal(error.to_string()))?,
+            );
+            (content_hash, shard_map)
         } else if inline_eligible {
             let payload = tokio::fs::read(temp_path.as_ref().expect("staged path exists"))
                 .await
@@ -737,7 +760,7 @@ impl ObjectManager {
                     canonical_json_bytes(&frozen_object)
                         .map_err(|error| Status::internal(error.to_string()))?,
                 );
-                format!("sha256:{}", hex::encode(digest.finalize()))
+                hex::encode(digest.finalize())
             };
             let job = crate::object_materialisation::ObjectMaterialisationJob {
                 schema: crate::object_materialisation::ObjectMaterialisationJob::SCHEMA.into(),

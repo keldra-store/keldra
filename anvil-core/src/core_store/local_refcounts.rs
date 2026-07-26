@@ -128,6 +128,7 @@ impl CoreStore {
         let target = object_data_target_from_json(shard_map)?;
         let mut descriptors = BTreeMap::<String, PayloadReferenceDescriptor>::new();
         match target {
+            PayloadDataTarget::MvccOwned => {}
             PayloadDataTarget::ObjectRef { object_ref, target } => {
                 let storage_kind = if is_inline_object_ref(&object_ref) {
                     "inline_payload"
@@ -307,9 +308,16 @@ enum PayloadDataTarget {
         object_ref: CoreObjectRef,
         target: String,
     },
+    MvccOwned,
 }
 
 fn object_data_target_from_json(value: &JsonValue) -> Result<PayloadDataTarget> {
+    if matches!(
+        value.get("schema").and_then(JsonValue::as_str),
+        Some("anvil.mvcc.local_object_manifest.v1" | "anvil.mvcc.object_shard_manifest.v1")
+    ) {
+        return Ok(PayloadDataTarget::MvccOwned);
+    }
     if value.get("schema").and_then(JsonValue::as_str) != Some("anvil.core.object_data_target.v1") {
         bail!("CoreStore object metadata shard map is not canonical object data target");
     }

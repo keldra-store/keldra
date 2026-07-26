@@ -70,7 +70,20 @@ impl<E: ObjectMaterialisationExecutor> ObjectMaterialisationRunner<E> {
         else {
             return Ok(false);
         };
-        match self.executor.execute(&job_id, &record.job).await {
+        let execution_timeout = Duration::from_millis(self.lease_ms.saturating_sub(1_000));
+        let execution = tokio::time::timeout(
+            execution_timeout,
+            self.executor.execute(&job_id, &record.job),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "materialisation execution exceeded {} ms lease-safe timeout",
+                execution_timeout.as_millis()
+            )
+        })
+        .and_then(std::convert::identity);
+        match execution {
             Ok(()) => self
                 .store
                 .complete_object_materialisation(&job_id, &self.worker_id)?,
@@ -249,6 +262,7 @@ impl ObjectMaterialisationExecutor for MvccObjectMaterialisationExecutor {
         let payload = if job.requested_operations.extract_boundaries
             || job.requested_operations.maintain_indexes
         {
+            tracing::debug!(job_id, "reading frozen object materialisation payload");
             self.payload(job).await?
         } else {
             Vec::new()
@@ -291,6 +305,12 @@ impl ObjectMaterialisationExecutor for MvccObjectMaterialisationExecutor {
                 is_public_read: false,
             };
             for frozen in &job.frozen_index_definitions {
+                tracing::debug!(
+                    job_id,
+                    index_id = frozen.id,
+                    index_kind = %frozen.kind,
+                    "building frozen object index"
+                );
                 let index = IndexDefinition {
                     id: frozen.id,
                     tenant_id: job.tenant_id,
@@ -370,6 +390,7 @@ impl ObjectMaterialisationExecutor for MvccObjectMaterialisationExecutor {
             }
         }
         self.publisher
+            // Publishing is the final transactionally visible state transition.
             .publish(ObjectMaterialisationResult {
                 schema: ObjectMaterialisationResult::SCHEMA.into(),
                 cluster_id: job.cluster_id.clone(),

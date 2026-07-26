@@ -136,9 +136,10 @@ impl ObjectMaterialisationJob {
 }
 
 fn is_sha256_hash(value: &str) -> bool {
-    value.strip_prefix("sha256:").is_some_and(|digest| {
-        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-    })
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -277,7 +278,7 @@ mod tests {
                 "size": 3,
             }),
             source_manifest_hash:
-                "sha256:0000000000000000000000000000000000000000000000000000000000000000".into(),
+                "0000000000000000000000000000000000000000000000000000000000000000".into(),
             content_type: Some("application/json".into()),
             user_metadata: serde_json::json!({}),
             index_policy_snapshot: serde_json::json!({}),

@@ -472,6 +472,12 @@ enum ObjectDataTarget {
         target: String,
         bytes: Vec<u8>,
     },
+    MvccLocal {
+        bytes: Vec<u8>,
+    },
+    MvccShards {
+        bytes: Vec<u8>,
+    },
 }
 
 impl ObjectDataTarget {
@@ -479,6 +485,8 @@ impl ObjectDataTarget {
         match self {
             Self::LogicalFile { .. } => "logical_file",
             Self::ObjectRef { .. } => "object_ref",
+            Self::MvccLocal { .. } => "mvcc_local",
+            Self::MvccShards { .. } => "mvcc_shards",
         }
     }
 
@@ -486,6 +494,7 @@ impl ObjectDataTarget {
         match self {
             Self::LogicalFile { bytes, .. } => bytes,
             Self::ObjectRef { bytes, .. } => bytes,
+            Self::MvccLocal { bytes } | Self::MvccShards { bytes } => bytes,
         }
     }
 
@@ -493,6 +502,7 @@ impl ObjectDataTarget {
         match self {
             Self::LogicalFile { target, .. } => target,
             Self::ObjectRef { target, .. } => target,
+            Self::MvccLocal { .. } | Self::MvccShards { .. } => "",
         }
     }
 }
@@ -515,6 +525,17 @@ fn object_data_target_from_shard_map(
 }
 
 fn object_data_target_from_json(value: &JsonValue) -> Result<ObjectDataTarget> {
+    let canonical = serde_json::to_vec(&canonical_json(value))?;
+    if value.get("schema").and_then(JsonValue::as_str)
+        == Some("anvil.mvcc.local_object_manifest.v1")
+    {
+        return Ok(ObjectDataTarget::MvccLocal { bytes: canonical });
+    }
+    if value.get("schema").and_then(JsonValue::as_str)
+        == Some("anvil.mvcc.object_shard_manifest.v1")
+    {
+        return Ok(ObjectDataTarget::MvccShards { bytes: canonical });
+    }
     if value.get("schema").and_then(JsonValue::as_str) != Some("anvil.core.object_data_target.v1") {
         bail!("CoreStore object metadata shard map is not canonical object data target");
     }
@@ -571,6 +592,18 @@ fn shard_map_from_object_data_target(kind: &str, target: &[u8]) -> Result<JsonVa
                 "kind": "object_ref",
                 "target": target,
             }))
+        }
+        "mvcc_local" | "mvcc_shards" => {
+            let value = decode_canonical_json_bytes(target, "MVCC object data target")?;
+            let expected_schema = if kind == "mvcc_local" {
+                "anvil.mvcc.local_object_manifest.v1"
+            } else {
+                "anvil.mvcc.object_shard_manifest.v1"
+            };
+            if value.get("schema").and_then(JsonValue::as_str) != Some(expected_schema) {
+                bail!("MVCC object data target schema does not match kind");
+            }
+            Ok(value)
         }
         other => {
             bail!("CoreStore object metadata logical-file shard map kind {other:?} is unsupported")

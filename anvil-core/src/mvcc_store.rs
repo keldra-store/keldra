@@ -331,7 +331,6 @@ impl MvccStore {
                     .checked_add(lease_ms)
                     .context("materialisation lease expiry overflow")?,
             );
-            record.last_error = None;
             self.db.put_cf_opt(
                 cf,
                 &key,
@@ -391,6 +390,22 @@ impl MvccStore {
             }
         }
         Ok(false)
+    }
+
+    pub fn object_materialisation_record(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<ObjectMaterialisationRecord>> {
+        if job_id.trim().is_empty() {
+            bail!("materialisation job ID must be non-empty");
+        }
+        self.db
+            .get_cf(
+                self.cf(CF_MATERIALISATION)?,
+                self.key(format!("object-job/{job_id}").as_bytes()),
+            )?
+            .map(|bytes| serde_json::from_slice(&bytes).map_err(Into::into))
+            .transpose()
     }
 
     fn transition_object_materialisation(

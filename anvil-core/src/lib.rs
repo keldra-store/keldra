@@ -498,7 +498,7 @@ mod app_state_tests {
                 "materialisation-e2e",
                 Duration::from_secs(60),
                 mvcc_transaction::DurabilityLevel::Local,
-                mvcc_transaction::ReadConsistency::Snapshot,
+                mvcc_transaction::ReadConsistency::LocalSnapshot,
                 now_ms(),
             )
             .await
@@ -552,14 +552,41 @@ mod app_state_tests {
                     .read_latest(&status_key)
                     .unwrap()
                 {
-                    break object_materialisation::ObjectMaterialisationResult::decode(&row.value)
-                        .unwrap();
+                    let result: object_materialisation::ObjectMaterialisationResult =
+                        serde_json::from_slice(&row.value).unwrap();
+                    assert_eq!(result.canonical_bytes().unwrap(), row.value);
+                    if result.state == object_materialisation::ObjectMaterialisationState::Complete
+                    {
+                        break result;
+                    }
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
         })
         .await
-        .unwrap();
+        .unwrap_or_else(|_| {
+            let pending = state
+                .mvcc
+                .runtime
+                .local_store()
+                .read_latest(&status_key)
+                .unwrap()
+                .map(|row| {
+                    serde_json::from_slice::<object_materialisation::ObjectMaterialisationResult>(
+                        &row.value,
+                    )
+                    .unwrap()
+                });
+            let record = pending.as_ref().and_then(|result| {
+                state
+                    .mvcc
+                    .runtime
+                    .local_store()
+                    .object_materialisation_record(&result.job_id)
+                    .unwrap()
+            });
+            panic!("materialisation timed out; pending={pending:?}; queue_record={record:?}")
+        });
         assert_eq!(
             result.state,
             object_materialisation::ObjectMaterialisationState::Complete
@@ -598,7 +625,7 @@ mod app_state_tests {
                 "materialisation-unsupported",
                 Duration::from_secs(60),
                 mvcc_transaction::DurabilityLevel::Local,
-                mvcc_transaction::ReadConsistency::Snapshot,
+                mvcc_transaction::ReadConsistency::LocalSnapshot,
                 now_ms(),
             )
             .await
@@ -638,14 +665,18 @@ mod app_state_tests {
         );
         let unsupported_status =
             object_materialisation::materialisation_status_key(&unsupported_target).unwrap();
-        assert!(
-            state
-                .mvcc
-                .runtime
-                .local_store()
-                .read_latest(&unsupported_status)
-                .unwrap()
-                .is_none()
+        let unsupported_row = state
+            .mvcc
+            .runtime
+            .local_store()
+            .read_latest(&unsupported_status)
+            .unwrap()
+            .expect("unsupported job retains its pending status");
+        let unsupported_result: object_materialisation::ObjectMaterialisationResult =
+            serde_json::from_slice(&unsupported_row.value).unwrap();
+        assert_eq!(
+            unsupported_result.state,
+            object_materialisation::ObjectMaterialisationState::Pending
         );
         assert!(
             state
