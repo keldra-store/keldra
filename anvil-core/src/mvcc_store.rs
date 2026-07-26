@@ -803,6 +803,7 @@ impl MvccStore {
     /// commit/snapshot coordinate is strictly below the watermark. Pending or
     /// leased work is a hard pin and causes collection to fail.
     pub fn garbage_collect(&self, safe_watermark: CommitVersion) -> Result<usize> {
+        let started_at = std::time::Instant::now();
         let _materialisation_transition = self.materialisation_transition.lock().unwrap();
         let _outbox_transition = self.outbox_transition.lock().unwrap();
         let current = self.gc_watermark()?;
@@ -825,6 +826,7 @@ impl MvccStore {
         let meta_cf = self.cf(CF_META)?;
         let mut batch = WriteBatch::default();
         let mut deleted = 0;
+        let mut deleted_bytes = 0_u64;
         let mut current_key: Option<Vec<u8>> = None;
         let mut retained_anchor = false;
 
@@ -832,7 +834,7 @@ impl MvccStore {
             versions_cf,
             IteratorMode::From(&self.scope, Direction::Forward),
         ) {
-            let (encoded_key, _) = row?;
+            let (encoded_key, value) = row?;
             if !encoded_key.starts_with(&self.scope) {
                 break;
             }
@@ -846,20 +848,24 @@ impl MvccStore {
             } else if version < safe_watermark && retained_anchor {
                 batch.delete_cf(versions_cf, &encoded_key);
                 deleted += 1;
+                deleted_bytes = deleted_bytes
+                    .saturating_add((encoded_key.len() as u64).saturating_add(value.len() as u64));
             }
         }
         for row in self.db.iterator_cf(
             applied_cf,
             IteratorMode::From(&self.scope, Direction::Forward),
         ) {
-            let (encoded_key, _) = row?;
+            let (encoded_key, value) = row?;
             if !encoded_key.starts_with(&self.scope) {
                 break;
             }
             let version = decode_u64(self.unscoped(&encoded_key)?, "applied bundle version")?;
             if version < safe_watermark {
-                batch.delete_cf(applied_cf, encoded_key);
+                batch.delete_cf(applied_cf, &encoded_key);
                 deleted += 1;
+                deleted_bytes = deleted_bytes
+                    .saturating_add((encoded_key.len() as u64).saturating_add(value.len() as u64));
             }
         }
         let outbox_prefix = self.key(b"event/");
@@ -873,8 +879,10 @@ impl MvccStore {
             }
             let record: OutboxRecord = serde_json::from_slice(&value)?;
             if record.state == OutboxState::Delivered && record.commit_version < safe_watermark {
-                batch.delete_cf(outbox_cf, key);
+                batch.delete_cf(outbox_cf, &key);
                 deleted += 1;
+                deleted_bytes = deleted_bytes
+                    .saturating_add((key.len() as u64).saturating_add(value.len() as u64));
             }
         }
         self.collect_completed_jobs(
@@ -883,6 +891,7 @@ impl MvccStore {
             safe_watermark,
             &mut batch,
             &mut deleted,
+            &mut deleted_bytes,
         )?;
         self.collect_completed_jobs(
             materialisation_cf,
@@ -890,6 +899,7 @@ impl MvccStore {
             safe_watermark,
             &mut batch,
             &mut deleted,
+            &mut deleted_bytes,
         )?;
         batch.put_cf(
             meta_cf,
@@ -897,6 +907,14 @@ impl MvccStore {
             safe_watermark.to_be_bytes(),
         );
         self.db.write_opt(batch, &durable_write_options())?;
+        crate::perf::record_mvcc_gc(safe_watermark, deleted_bytes, started_at.elapsed());
+        tracing::info!(
+            operation = "gc.mvcc",
+            watermark = safe_watermark,
+            deleted_records = deleted,
+            reclaimed_bytes = deleted_bytes,
+            "completed MVCC garbage collection"
+        );
         Ok(deleted)
     }
 
@@ -907,6 +925,7 @@ impl MvccStore {
         safe_watermark: CommitVersion,
         batch: &mut WriteBatch,
         deleted: &mut usize,
+        deleted_bytes: &mut u64,
     ) -> Result<()> {
         let prefix = self.key(suffix);
         for row in self
@@ -927,8 +946,10 @@ impl MvccStore {
                     && record.job.originating_snapshot_version < safe_watermark
             };
             if completed_below_watermark {
-                batch.delete_cf(cf, key);
+                batch.delete_cf(cf, &key);
                 *deleted += 1;
+                *deleted_bytes = deleted_bytes
+                    .saturating_add((key.len() as u64).saturating_add(value.len() as u64));
             }
         }
         Ok(())

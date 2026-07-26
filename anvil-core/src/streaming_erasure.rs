@@ -122,6 +122,13 @@ impl StreamingErasureEncoder {
                 })
                 .await?;
             }
+            tracing::debug!(
+                operation = "ingest.stripe",
+                stripe_ordinal,
+                shard_count = shards.len(),
+                plaintext_bytes = filled,
+                "streamed complete erasure stripe"
+            );
             stripe_ordinal += 1;
             if filled < stripe_capacity {
                 break;

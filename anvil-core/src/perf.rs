@@ -561,6 +561,25 @@ pub fn record_mvcc_state(applied_watermark: u64, observed_commit: u64, versions_
     }
 }
 
+pub fn record_mvcc_gc(watermark: u64, reclaimed_bytes: u64, duration: Duration) {
+    record_gauge(
+        "anvil_mvcc_gc_watermark",
+        &[],
+        watermark.min(i64::MAX as u64) as i64,
+    );
+    if reclaimed_bytes > 0 {
+        record_bytes_counter("anvil_mvcc_gc_bytes_total", &[], reclaimed_bytes);
+    }
+    record_histogram_duration_ms("anvil_mvcc_gc_duration_ms", &[("status", "ok")], duration);
+}
+
+pub fn record_shard_gc(reclaimed_bytes: u64, duration: Duration) {
+    if reclaimed_bytes > 0 {
+        record_bytes_counter("anvil_shard_gc_bytes_total", &[], reclaimed_bytes);
+    }
+    record_histogram_duration_ms("anvil_shard_gc_duration_ms", &[("status", "ok")], duration);
+}
+
 pub fn record_consensus_phase(phase: &str, status: &str, duration: Duration) {
     let measurement = match phase {
         "proposal" => "anvil_consensus_proposal_duration_ms",

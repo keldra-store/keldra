@@ -116,6 +116,14 @@ impl ShardSegment {
         crate::mvcc_fault_injection::hit(crate::mvcc_fault_injection::FaultPoint::ShardWrite)?;
         let location = append_record(&mut self.file, self.id, record)?;
         self.file.sync_data()?;
+        tracing::debug!(
+            operation = "shard.fsync",
+            segment_id = self.id,
+            stripe_ordinal = record.stripe_ordinal,
+            shard_ordinal = record.shard_ordinal,
+            payload_bytes = record.payload.len(),
+            "durably persisted shard"
+        );
         Ok(location)
     }
 
@@ -144,6 +152,8 @@ impl ShardSegment {
     /// reader/repair/rebalance pins. This local append-only store intentionally
     /// cannot infer any of those distributed facts.
     pub fn compact_authorised(&mut self, retained: &BTreeSet<ShardIdentity>) -> Result<usize> {
+        let started_at = std::time::Instant::now();
+        let bytes_before = self.file.metadata()?.len();
         let records = read_records(&mut self.file)?;
         let removed = records
             .iter()
@@ -168,6 +178,15 @@ impl ShardSegment {
         fs::rename(&temporary_path, &self.path)?;
         self.file = OpenOptions::new().read(true).write(true).open(&self.path)?;
         self.file.seek(SeekFrom::End(0))?;
+        let reclaimed_bytes = bytes_before.saturating_sub(self.file.metadata()?.len());
+        crate::perf::record_shard_gc(reclaimed_bytes, started_at.elapsed());
+        tracing::info!(
+            operation = "gc.shard",
+            segment_id = self.id,
+            removed_shards = removed,
+            reclaimed_bytes,
+            "completed shard garbage collection"
+        );
         Ok(removed)
     }
 
