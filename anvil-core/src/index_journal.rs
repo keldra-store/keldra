@@ -1,8 +1,5 @@
-use crate::core_store::{
-    CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
-    CoreMutationRootPublication, CoreStore, ReadStream,
-};
-use crate::formats::{Hash32, hash32, writer::WriterFamily};
+use crate::core_store::{CoreMutationOperation, CoreMutationPrecondition};
+use crate::formats::{Hash32, hash32};
 use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
 #[cfg(test)]
 use crate::persistence::Bucket;
@@ -709,38 +706,6 @@ pub fn index_storage_id(tenant_id: i64, bucket_id: i64, index_id: i64) -> String
     format!("tenant-{tenant_id}-bucket-{bucket_id}-index-{index_id}")
 }
 
-#[cfg(test)]
-async fn read_index_journal_bodies(
-    core_store: &CoreStore,
-    stream_id: &str,
-) -> Result<Vec<IndexEventBodyProto>> {
-    let mut bodies = Vec::new();
-    let mut after_sequence = 0;
-    loop {
-        let page = core_store
-            .read_stream_page(ReadStream {
-                stream_id: stream_id.to_string(),
-                after_sequence,
-                limit: 1_000,
-            })
-            .await?;
-        for record in page.records {
-            if record.record_kind != INDEX_DEFINITION_RECORD_KIND {
-                continue;
-            }
-            bodies.push(decode_index_event_body(&record.payload)?);
-        }
-        if !page.has_more {
-            break;
-        }
-        if page.next_sequence <= after_sequence {
-            return Err(anyhow!("index definition journal cursor did not advance"));
-        }
-        after_sequence = page.next_sequence;
-    }
-    Ok(bodies)
-}
-
 pub fn index_definition_partition_id(tenant_id: i64, bucket_id: i64) -> Hash32 {
     hash32(format!("tenant/{tenant_id}/bucket/{bucket_id}/index_definition").as_bytes())
 }
@@ -751,23 +716,6 @@ pub(crate) fn index_definition_stream_id(tenant_id: i64, bucket_id: i64) -> Stri
 
 fn index_definition_partition_principal(tenant_id: i64, bucket_id: i64) -> String {
     format!("partition-owner:index_definition:{tenant_id}:{bucket_id}")
-}
-
-#[cfg(test)]
-pub(crate) async fn read_index_frame_fences_for_test(
-    storage: &Storage,
-    tenant_id: i64,
-    bucket_id: i64,
-) -> Result<Vec<u64>> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    Ok(read_index_journal_bodies(
-        &core_store,
-        &index_definition_stream_id(tenant_id, bucket_id),
-    )
-    .await?
-    .into_iter()
-    .map(|body| body.fence_token)
-    .collect())
 }
 
 fn require_index_definition_permit(
@@ -783,73 +731,6 @@ fn require_index_definition_permit(
         ));
     }
     Ok(())
-}
-
-#[cfg(test)]
-async fn write_index_current_coremeta_rows(
-    storage: &Storage,
-    event: &IndexDefinitionEvent,
-    event_payload: &[u8],
-) -> Result<()> {
-    let partition_id = hex::encode(index_definition_partition_id(
-        event.tenant_id,
-        event.bucket_id,
-    ));
-    let transaction_id = format!(
-        "index-definition-projection-test:{}:{}:{}",
-        event.tenant_id, event.bucket_id, event.id
-    );
-    let projection = current_definitions::prepare_projection_mutation(
-        storage,
-        None,
-        event,
-        event_payload,
-        &partition_id,
-        &transaction_id,
-        None,
-    )
-    .await?;
-    let root_publications = index_definition_root_publications(
-        current_definitions::projection_root_anchor_key(event.tenant_id, event.bucket_id),
-        partition_id.clone(),
-    );
-    CoreStore::new(storage.clone())
-        .await?
-        .commit_mutation_batch(CoreMutationBatch {
-            transaction_id,
-            scope_partition: partition_id,
-            committed_by_principal: index_definition_partition_principal(
-                event.tenant_id,
-                event.bucket_id,
-            ),
-            root_publications,
-            preconditions: vec![projection.precondition],
-            operations: projection.operations,
-        })
-        .await?;
-    Ok(())
-}
-
-fn index_definition_root_publications(
-    data_root: String,
-    coordinator_root: String,
-) -> Vec<CoreMutationRootPublication> {
-    if data_root == coordinator_root {
-        return vec![CoreMutationRootPublication {
-            root_anchor_key: data_root,
-            writer_families: vec![
-                WriterFamily::CoreControl.as_str().to_string(),
-                WriterFamily::TypedMetadata.as_str().to_string(),
-            ],
-            transaction_coordinator: true,
-        }];
-    }
-
-    vec![
-        CoreMutationRootPublication::new(coordinator_root, WriterFamily::CoreControl.as_str())
-            .coordinator(),
-        CoreMutationRootPublication::new(data_root, WriterFamily::TypedMetadata.as_str()),
-    ]
 }
 
 #[cfg(any())]
