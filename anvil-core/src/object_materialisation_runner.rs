@@ -271,6 +271,16 @@ impl ObjectMaterialisationExecutor for MvccObjectMaterialisationExecutor {
         };
         let mut index_outcomes = Vec::new();
         if job.requested_operations.maintain_indexes {
+            for definition in &job.frozen_index_definitions {
+                anyhow::ensure!(
+                    matches!(
+                        definition.kind.as_str(),
+                        "typed_json" | "full_text" | "vector"
+                    ),
+                    "MVCC materialisation for index kind `{}` is not available",
+                    definition.kind
+                );
+            }
             let object: Object = serde_json::from_value(job.frozen_object.clone())?;
             let bucket = Bucket {
                 id: job.bucket_id,
