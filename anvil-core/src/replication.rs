@@ -326,14 +326,23 @@ impl TransferReceiver {
                 bail!("completed transfer length differs from immutable metadata");
             }
             session.last_sequence = frame.sequence;
-            return Ok(ReplicationAck {
+            #[cfg(test)]
+            crate::mvcc_fault_injection::hit(
+                crate::mvcc_fault_injection::FaultPoint::BeforeCompleteAck,
+            )?;
+            let ack = ReplicationAck {
                 session_id: session.id(),
                 acknowledged_sequence: frame.sequence,
                 transfer_id: frame.transfer_id,
                 persisted_through,
                 completed_hash: Some(frame.final_hash),
                 status: AckStatus::Complete,
-            });
+            };
+            #[cfg(test)]
+            crate::mvcc_fault_injection::hit(
+                crate::mvcc_fault_injection::FaultPoint::AfterCompleteAck,
+            )?;
+            return Ok(ack);
         }
 
         let path = self.partial_path(frame.transfer_id);
@@ -396,7 +405,15 @@ impl TransferReceiver {
             fs::rename(&path, self.complete_path(frame.transfer_id))?;
             sync_directory(&self.directory)?;
             ack.completed_hash = Some(frame.final_hash);
+            #[cfg(test)]
+            crate::mvcc_fault_injection::hit(
+                crate::mvcc_fault_injection::FaultPoint::BeforeCompleteAck,
+            )?;
             ack.status = AckStatus::Complete;
+            #[cfg(test)]
+            crate::mvcc_fault_injection::hit(
+                crate::mvcc_fault_injection::FaultPoint::AfterCompleteAck,
+            )?;
         }
         Ok(ack)
     }

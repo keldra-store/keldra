@@ -102,10 +102,18 @@ where
         let local_apply = match certification {
             CertificationResult::Committed { commit_version } => {
                 let apply_started_at = std::time::Instant::now();
+                #[cfg(test)]
+                crate::mvcc_fault_injection::hit(
+                    crate::mvcc_fault_injection::FaultPoint::BeforeApply,
+                )?;
                 let outcome = self.local.apply_certified_bundle_and_advance(
                     commit_version,
                     &bundle,
                     commit_version,
+                )?;
+                #[cfg(test)]
+                crate::mvcc_fault_injection::hit(
+                    crate::mvcc_fault_injection::FaultPoint::AfterApply,
                 )?;
                 crate::perf::record_mvcc_state(
                     commit_version,

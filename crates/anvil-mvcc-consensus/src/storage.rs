@@ -1,7 +1,20 @@
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     path::Path,
     sync::{Arc, Mutex},
 };
+
+#[cfg(test)]
+static FAIL_SYNC_WRITE_AT: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static SYNC_WRITE_ORDINAL: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) fn fail_sync_write_at(ordinal: u64) {
+    SYNC_WRITE_ORDINAL.store(0, Ordering::SeqCst);
+    FAIL_SYNC_WRITE_AT.store(ordinal, Ordering::SeqCst);
+}
 
 use bincode::{
     config,
@@ -365,6 +378,15 @@ impl RocksRaftStore {
     }
 
     fn sync_write(&self, batch: WriteBatch) -> Result<(), RaftStorageError> {
+        #[cfg(test)]
+        {
+            let ordinal = SYNC_WRITE_ORDINAL.fetch_add(1, Ordering::SeqCst) + 1;
+            if FAIL_SYNC_WRITE_AT.load(Ordering::SeqCst) == ordinal {
+                return Err(RaftStorageError::Codec(
+                    "injected Raft durable write failure".into(),
+                ));
+            }
+        }
         let mut options = WriteOptions::default();
         options.set_sync(true);
         self.db.write_opt(batch, &options)?;

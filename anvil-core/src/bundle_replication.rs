@@ -55,6 +55,10 @@ impl PreparedBundleLog {
     }
 
     fn persist(&mut self, identity: &BundleIdentity, bytes: &[u8]) -> Result<()> {
+        #[cfg(test)]
+        crate::mvcc_fault_injection::hit(
+            crate::mvcc_fault_injection::FaultPoint::PreparedBundleWrite,
+        )?;
         verify_identity(identity, bytes)?;
         if let Some(location) = self.index.get(&identity.hash).copied() {
             if location.payload_length != identity.length {

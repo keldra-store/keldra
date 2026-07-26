@@ -83,6 +83,8 @@ pub mod multipart_journal;
 pub mod mvcc_apply_worker;
 pub mod mvcc_bootstrap;
 pub mod mvcc_consensus_adapter;
+#[cfg(test)]
+pub mod mvcc_fault_injection;
 pub mod mvcc_gc;
 pub mod mvcc_node_runtime;
 pub mod mvcc_open_transactions;
