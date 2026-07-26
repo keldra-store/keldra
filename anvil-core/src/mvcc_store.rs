@@ -1246,7 +1246,18 @@ mod tests {
                 3,
                 &bundle("with-outbox", |builder| {
                     builder.put(row.clone(), b"visible".to_vec());
-                    builder.add_outbox_event(b"notify-account".to_vec());
+                    builder.add_outbox_event(
+                        crate::mvcc_outbox::StreamOutboxEvent::new(
+                            7,
+                            "events",
+                            "partition-7",
+                            "account.changed",
+                            b"notify-account".to_vec(),
+                        )
+                        .unwrap()
+                        .encode()
+                        .unwrap(),
+                    );
                 }),
             )
             .unwrap();
@@ -1255,7 +1266,12 @@ mod tests {
         let records = store.outbox_records_after(0, 10).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].commit_version, 3);
-        assert_eq!(records[0].payload, b"notify-account");
+        assert_eq!(
+            crate::mvcc_outbox::StreamOutboxEvent::decode(&records[0].payload)
+                .unwrap()
+                .payload,
+            b"notify-account"
+        );
         assert_eq!(records[0].state, OutboxState::Pending);
 
         let first = store.claim_outbox("worker-a", 10, 5).unwrap().unwrap();
@@ -1557,7 +1573,18 @@ mod tests {
             .apply_certified_bundle(
                 2,
                 &bundle("outbox", |builder| {
-                    builder.add_outbox_event(b"event".to_vec());
+                    builder.add_outbox_event(
+                        crate::mvcc_outbox::StreamOutboxEvent::new(
+                            7,
+                            "events",
+                            "partition-7",
+                            "test.event",
+                            b"event".to_vec(),
+                        )
+                        .unwrap()
+                        .encode()
+                        .unwrap(),
+                    );
                 }),
             )
             .unwrap();

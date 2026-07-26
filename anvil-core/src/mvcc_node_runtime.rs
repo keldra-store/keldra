@@ -6,8 +6,9 @@ use crate::{
     mvcc_consensus_adapter::ConsensusTransactionCertifier,
     mvcc_store::{ApplyOutcome, LocalMvccStore, VisibleRow},
     mvcc_transaction::{
-        BundleReplicator, CertificationResult, DurabilityLevel, DurabilityPolicy, LogicalKey,
-        PreparedBundleStore, ReadConsistency, TransactionBundle, TransactionCoordinator,
+        BundleReplicator, CertificationResult, ClusterOwnershipResolver, DurabilityLevel,
+        DurabilityPolicy, LogicalKey, PreparedBundleStore, ReadConsistency, TransactionBundle,
+        TransactionCoordinator,
     },
 };
 
@@ -44,6 +45,26 @@ where
                 ConsensusTransactionCertifier::new(consensus),
                 policy,
             )?,
+            local,
+        })
+    }
+
+    pub fn new_with_ownership_resolver(
+        prepared_bundles: S,
+        replicator: R,
+        consensus: C,
+        policy: DurabilityPolicy,
+        local: LocalMvccStore,
+        ownership_resolver: std::sync::Arc<dyn ClusterOwnershipResolver>,
+    ) -> Result<Self> {
+        Ok(Self {
+            coordinator: TransactionCoordinator::new(
+                prepared_bundles,
+                replicator,
+                ConsensusTransactionCertifier::new(consensus),
+                policy,
+            )?
+            .with_ownership_resolver(ownership_resolver),
             local,
         })
     }

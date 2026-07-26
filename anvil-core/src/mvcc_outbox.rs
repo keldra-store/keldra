@@ -80,6 +80,23 @@ impl StreamOutboxEvent {
     }
 }
 
+/// Stable compact-control partition identity for one downstream stream
+/// partition. Operators assign this value through Raft before transactions may
+/// target it.
+pub fn stream_partition_id(stream_partition: &str) -> Result<u64> {
+    if stream_partition.trim().is_empty() {
+        bail!("stream partition is required");
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"anvil.mvcc.outbox-stream-partition.v1");
+    hasher.update(&(stream_partition.len() as u64).to_be_bytes());
+    hasher.update(stream_partition.as_bytes());
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&hasher.finalize().as_bytes()[..8]);
+    let id = u64::from_be_bytes(bytes);
+    if id == 0 { Ok(1) } else { Ok(id) }
+}
+
 #[derive(Clone)]
 pub struct DurableStreamOutboxConsumer {
     core_store: CoreStore,

@@ -435,10 +435,23 @@ impl OpenTransactionRegistry {
     }
 
     pub fn add_event(&self, transaction_id: &str, event: Vec<u8>, now_unix_ms: u64) -> Result<()> {
+        crate::mvcc_outbox::StreamOutboxEvent::decode(&event)
+            .context("stage versioned stream outbox event")?;
         self.mutate(transaction_id, now_unix_ms, |draft| {
-            draft.mutations.events.push(event);
+            if !draft.mutations.events.contains(&event) {
+                draft.mutations.events.push(event);
+            }
             Ok(())
         })
+    }
+
+    pub fn add_stream_event(
+        &self,
+        transaction_id: &str,
+        event: crate::mvcc_outbox::StreamOutboxEvent,
+        now_unix_ms: u64,
+    ) -> Result<()> {
+        self.add_event(transaction_id, event.encode()?, now_unix_ms)
     }
 
     pub fn add_job(&self, transaction_id: &str, job: Vec<u8>, now_unix_ms: u64) -> Result<()> {
@@ -1019,7 +1032,18 @@ mod tests {
             )
             .unwrap();
         registry
-            .add_event(&handle.transaction_id, b"event".to_vec(), 1_003)
+            .add_stream_event(
+                &handle.transaction_id,
+                crate::mvcc_outbox::StreamOutboxEvent::new(
+                    7,
+                    "events",
+                    "partition-7",
+                    "test.event",
+                    b"event".to_vec(),
+                )
+                .unwrap(),
+                1_003,
+            )
             .unwrap();
         registry
             .add_job(&handle.transaction_id, b"job".to_vec(), 1_004)
@@ -1032,7 +1056,13 @@ mod tests {
         let bundles = runtime.committed.lock().unwrap();
         assert_eq!(bundles[0].snapshot_version, 9);
         assert_eq!(bundles[0].writes.len(), 2);
-        assert_eq!(bundles[0].outbox_events, [b"event".to_vec()]);
+        assert_eq!(bundles[0].outbox_events.len(), 1);
+        assert_eq!(
+            crate::mvcc_outbox::StreamOutboxEvent::decode(&bundles[0].outbox_events[0])
+                .unwrap()
+                .payload,
+            b"event"
+        );
         assert_eq!(bundles[0].materialisation_jobs, [b"job".to_vec()]);
     }
 

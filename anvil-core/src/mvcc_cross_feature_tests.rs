@@ -140,7 +140,18 @@ fn stage_features(state: &AppState, transaction_id: &str, now: u64) {
     state
         .mvcc
         .open_transactions
-        .add_event(transaction_id, b"object-committed".to_vec(), now)
+        .add_stream_event(
+            transaction_id,
+            crate::mvcc_outbox::StreamOutboxEvent::new(
+                7,
+                "events",
+                "partition-7",
+                "object.committed",
+                b"object-committed".to_vec(),
+            )
+            .unwrap(),
+            now,
+        )
         .unwrap();
     state
         .mvcc

@@ -30,7 +30,10 @@ use crate::{
     mvcc_node_runtime::MvccNodeRuntime,
     mvcc_open_transactions::OpenTransactionRegistry,
     mvcc_store::LocalMvccStore,
-    mvcc_transaction::{DurabilityPolicy, NodeIncarnation},
+    mvcc_transaction::{
+        ClusterOwnershipClaim, ClusterOwnershipResolver, DurabilityPolicy, NodeIncarnation,
+        OwnedResource,
+    },
     replication::AuthenticatedPeer,
     replication_client::{
         ReplicationPeer, ReplicationStreamOptions, TonicReplicationStreamManager,
@@ -50,6 +53,41 @@ pub type ProductMvccRuntime = MvccNodeRuntime<
     StreamingBundleReplicator<TonicReplicationStreamManager>,
     OpenRaftConsensus,
 >;
+
+#[derive(Clone)]
+struct RaftClusterOwnershipResolver {
+    cluster_id: String,
+    consensus: Arc<OpenRaftConsensus>,
+}
+
+impl ClusterOwnershipResolver for RaftClusterOwnershipResolver {
+    fn validate_claim(
+        &self,
+        transaction_cluster_id: &str,
+        claim: &ClusterOwnershipClaim,
+    ) -> Result<()> {
+        if transaction_cluster_id != self.cluster_id || claim.cluster_id() != self.cluster_id {
+            bail!("transaction resource belongs to another cluster");
+        }
+        if let OwnedResource::OutboxEvent {
+            destination_partition_id,
+            ..
+        } = claim.resource()
+        {
+            let snapshot = self.consensus.applied_control_snapshot()?;
+            if !snapshot
+                .partitions
+                .iter()
+                .any(|(partition_id, _)| partition_id == destination_partition_id)
+            {
+                bail!(
+                    "outbox destination partition {destination_partition_id} has no applied Raft assignment"
+                );
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -462,7 +500,7 @@ impl MvccSubsystem {
             Arc::<[u8]>::from(hex::decode(&config.anvil_secret_encryption_key)?);
         let materialisation_embedding_providers =
             crate::embedding_provider::EmbeddingProviderRegistry::from_config(config)?;
-        let runtime = Arc::new(MvccNodeRuntime::new(
+        let runtime = Arc::new(MvccNodeRuntime::new_with_ownership_resolver(
             prepared.clone(),
             replicator,
             consensus.as_ref().clone(),
@@ -471,6 +509,10 @@ impl MvccSubsystem {
                 tolerated_failure_domains: config.mvcc_tolerated_failure_domains,
             },
             local_store.clone(),
+            Arc::new(RaftClusterOwnershipResolver {
+                cluster_id: config.mvcc_cluster_id.clone(),
+                consensus: consensus.clone(),
+            }),
         )?);
         let open_transactions = Arc::new(OpenTransactionRegistry::from_db(core_meta_db)?);
         let authorization_core_store =

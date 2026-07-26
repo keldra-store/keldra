@@ -113,6 +113,7 @@ pub enum OwnedResource {
         encoding_generation: u64,
     },
     OutboxEvent {
+        destination_partition_id: u64,
         payload_hash: [u8; 32],
     },
     MaterialisationJob {
@@ -127,7 +128,7 @@ pub struct ClusterOwnershipClaim {
 }
 
 impl ClusterOwnershipClaim {
-    fn new(cluster_id: impl Into<String>, resource: OwnedResource) -> Self {
+    pub(crate) fn new(cluster_id: impl Into<String>, resource: OwnedResource) -> Self {
         Self {
             cluster_id: cluster_id.into(),
             resource,
@@ -302,9 +303,14 @@ impl TransactionBundle {
                 bail!("materialisation job belongs to another transaction or cluster");
             }
         }
+        self.outbox_events.sort();
+        ensure_unique(self.outbox_events.iter(), "outbox event")?;
+        for encoded_event in &self.outbox_events {
+            crate::mvcc_outbox::StreamOutboxEvent::decode(encoded_event)?;
+        }
         self.ownership_claims.sort();
         ensure_unique(self.ownership_claims.iter(), "ownership claim")?;
-        if self.ownership_claims != expected_ownership_claims(self) {
+        if self.ownership_claims != expected_ownership_claims(self)? {
             bail!("transaction bundle ownership claims do not cover its resources");
         }
         Ok(())
@@ -528,7 +534,9 @@ impl TransactionBundleBuilder {
     }
 
     pub fn add_outbox_event(&mut self, event: Vec<u8>) -> &mut Self {
-        self.claim(payload_resource(&event, true));
+        if let Ok(resource) = outbox_resource(&event) {
+            self.claim(resource);
+        }
         self.bundle.outbox_events.push(event);
         self
     }
@@ -558,7 +566,7 @@ impl TransactionBundleBuilder {
     }
 }
 
-fn expected_ownership_claims(bundle: &TransactionBundle) -> Vec<ClusterOwnershipClaim> {
+fn expected_ownership_claims(bundle: &TransactionBundle) -> Result<Vec<ClusterOwnershipClaim>> {
     let mut resources = BTreeSet::new();
     resources.extend(
         bundle
@@ -589,22 +597,19 @@ fn expected_ownership_claims(bundle: &TransactionBundle) -> Vec<ClusterOwnership
             }),
     );
     resources.extend(bundle.shard_manifests.iter().map(manifest_resource));
-    resources.extend(
-        bundle
-            .outbox_events
-            .iter()
-            .map(|payload| payload_resource(payload, true)),
-    );
+    for payload in &bundle.outbox_events {
+        resources.insert(outbox_resource(payload)?);
+    }
     resources.extend(
         bundle
             .materialisation_jobs
             .iter()
             .map(|payload| payload_resource(payload, false)),
     );
-    resources
+    Ok(resources
         .into_iter()
         .map(|resource| ClusterOwnershipClaim::new(bundle.cluster_id.clone(), resource))
-        .collect()
+        .collect())
 }
 
 fn manifest_resource(manifest: &ObjectShardManifestReference) -> OwnedResource {
@@ -617,11 +622,19 @@ fn manifest_resource(manifest: &ObjectShardManifestReference) -> OwnedResource {
 
 fn payload_resource(payload: &[u8], outbox: bool) -> OwnedResource {
     let payload_hash = *blake3::hash(payload).as_bytes();
-    if outbox {
-        OwnedResource::OutboxEvent { payload_hash }
-    } else {
+    if !outbox {
         OwnedResource::MaterialisationJob { payload_hash }
+    } else {
+        unreachable!("outbox ownership includes its destination partition")
     }
+}
+
+fn outbox_resource(payload: &[u8]) -> Result<OwnedResource> {
+    let event = crate::mvcc_outbox::StreamOutboxEvent::decode(payload)?;
+    Ok(OwnedResource::OutboxEvent {
+        destination_partition_id: event.partition_id,
+        payload_hash: *blake3::hash(payload).as_bytes(),
+    })
 }
 
 fn ensure_unique_by<'a, T: 'a, K: PartialEq>(
@@ -1453,6 +1466,25 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("ownership claims")
+        );
+    }
+
+    #[test]
+    fn canonical_bundle_rejects_unversioned_outbox_payloads() {
+        let mut builder = TransactionBundleBuilder::new(
+            "cluster",
+            "invalid-outbox",
+            0,
+            "principal",
+            HierarchicalRangeStampScheme::new(),
+        );
+        builder.add_outbox_event(b"arbitrary event bytes".to_vec());
+        assert!(
+            builder
+                .build()
+                .unwrap_err()
+                .to_string()
+                .contains("decode stream outbox event")
         );
     }
 
