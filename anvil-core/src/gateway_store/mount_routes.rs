@@ -128,7 +128,7 @@ pub async fn put_gateway_mount_record(
         &transaction_id,
         mutations,
         vec![(main_key, predicate)],
-        crate::mvcc_transaction::DurabilityLevel::Local,
+        crate::mvcc_transaction::DurabilityLevel::Quorum,
         u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
     )
     .await?;
