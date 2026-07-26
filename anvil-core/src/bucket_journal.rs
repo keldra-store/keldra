@@ -1,10 +1,9 @@
 use crate::core_store::{
     CF_MESH, CoreMetaTuplePart, CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
-    CoreMutationRootPublication, CoreStore, CoreTransaction, CoreTransactionState,
-    CoreTransactionUpdate, ReadStream, TABLE_BUCKET_CURRENT_BY_ID_ROW,
-    TABLE_BUCKET_CURRENT_BY_NAME_ROW, TABLE_BUCKET_EVENT_HEAD_ROW, TABLE_BUCKET_ID_ALLOCATOR_ROW,
-    core_meta_committed_row_common, core_meta_payload_digest, core_meta_record_tuple_key,
-    core_meta_root_key_hash, core_meta_tuple_key,
+    CoreMutationRootPublication, CoreStore, CoreTransactionState, ReadStream,
+    TABLE_BUCKET_CURRENT_BY_ID_ROW, TABLE_BUCKET_CURRENT_BY_NAME_ROW, TABLE_BUCKET_EVENT_HEAD_ROW,
+    TABLE_BUCKET_ID_ALLOCATOR_ROW, core_meta_committed_row_common, core_meta_payload_digest,
+    core_meta_record_tuple_key, core_meta_root_key_hash, core_meta_tuple_key,
 };
 use crate::formats::{Hash32, hash32, writer::WriterFamily};
 use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
@@ -573,55 +572,6 @@ pub async fn latest_bucket_metadata_event(
         return Err(anyhow!("bucket event head payload scope mismatch"));
     }
     bucket_event_from_body(row.stream_sequence, body).map(Some)
-}
-
-pub async fn materialize_committed_bucket_metadata_transaction(
-    storage: &Storage,
-    transaction: &CoreTransaction,
-) -> Result<Vec<BucketMetadataEvent>> {
-    if transaction.state != CoreTransactionState::Committed {
-        return Ok(Vec::new());
-    }
-
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let mut events = Vec::new();
-    for update in &transaction.visible_updates {
-        let CoreTransactionUpdate::StreamAppend {
-            stream_id,
-            visible_sequence,
-            prepared_record_hash,
-            ..
-        } = update
-        else {
-            continue;
-        };
-        if !stream_id.starts_with("bucket_metadata:tenant:") {
-            continue;
-        }
-        let after_sequence = visible_sequence.saturating_sub(1);
-        let records = core_store
-            .read_stream(ReadStream {
-                stream_id: stream_id.clone(),
-                after_sequence,
-                limit: 1,
-            })
-            .await?;
-        let record = records
-            .into_iter()
-            .find(|record| {
-                record.sequence == *visible_sequence
-                    && record.event_hash == *prepared_record_hash
-                    && record.record_kind == BUCKET_METADATA_RECORD_KIND
-            })
-            .ok_or_else(|| {
-                anyhow!("committed bucket metadata transaction stream record missing")
-            })?;
-        events.push(bucket_event_from_body(
-            record.sequence,
-            decode_bucket_journal_body(&record.payload)?,
-        )?);
-    }
-    Ok(events)
 }
 
 #[derive(Debug, Clone)]

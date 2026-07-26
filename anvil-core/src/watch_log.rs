@@ -4,9 +4,9 @@ mod projection;
 mod tests;
 
 use crate::core_store::{
-    CoreMetaRowCommonProto, CoreMutationOperation, CoreMutationPrecondition, CoreStore,
-    CoreTransaction, ReadStream, StreamAppendReceipt, core_meta_committed_row_common,
-    decode_deterministic_proto, encode_deterministic_proto,
+    CoreMetaRowCommonProto, CoreMutationOperation, CoreMutationPrecondition, CoreStore, ReadStream,
+    StreamAppendReceipt, core_meta_committed_row_common, decode_deterministic_proto,
+    encode_deterministic_proto,
 };
 use crate::formats::{hash32, watch::WatchRecord};
 use crate::persistence::{Bucket, Object, ObjectWatchEvent};
@@ -78,12 +78,11 @@ pub(crate) async fn prepare_object_watch_append(
     projection_root_key_hash: &str,
     projection_root_generation: Option<u64>,
     projection_transaction_id: &str,
-    explicit_transaction: Option<&CoreTransaction>,
 ) -> Result<PreparedObjectWatchAppend> {
     validate_event_scope(bucket, object, event)?;
     let stream_id = object_watch_stream_id(bucket.tenant_id, bucket.id);
     let stream_precondition = core_store
-        .stream_head_precondition_visible_to_transaction(&stream_id, explicit_transaction)
+        .stream_head_precondition_visible_to_transaction(&stream_id, None)
         .await?;
     let sequence = next_sequence(&stream_precondition)?;
     prepare_object_watch_append_at_sequence(

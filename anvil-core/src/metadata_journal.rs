@@ -2,7 +2,7 @@ use crate::bucket_journal;
 use crate::core_store::{
     CF_OBJECT_HEADS, CoreMetaRowCommonProto, CoreMetaTuplePart, CoreMutationBatch,
     CoreMutationOperation, CoreMutationPrecondition, CorePipelinePolicy, CoreStore,
-    CoreTraceContext, CoreTransaction, CoreTransactionState, CoreTransactionUpdate, ReadStream,
+    CoreTraceContext, CoreTransactionState, CoreTransactionUpdate, ReadStream,
     TABLE_OBJECT_METADATA_PARTITION_MANIFEST_ROW, WriteLogicalFileRequest,
     core_meta_committed_row_common, core_meta_payload_digest, core_meta_root_key_hash,
     core_meta_tuple_key, core_mutation_publication_attempt_id, decode_deterministic_proto,
@@ -1863,9 +1863,6 @@ pub(crate) use self::object_mutation::{
     append_object_put_mutations_with_permit_in_transaction,
     commit_object_put_mutations_with_permit,
 };
-
-mod transaction_projection;
-pub use transaction_projection::*;
 
 mod version_sort;
 use self::version_sort::{

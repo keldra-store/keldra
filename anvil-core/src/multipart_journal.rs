@@ -2,9 +2,9 @@ use crate::core_store::{
     CF_OBJECT_HEADS, CoreCompressionDescriptor, CoreMetaRecord, CoreMetaTuplePart,
     CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
     CoreMutationRootPublication, CoreObjectEncoding, CoreObjectPlacement, CoreObjectRef, CoreStore,
-    CoreTransaction, CoreTransactionUpdate, TABLE_MULTIPART_PART_CURRENT_ROW,
-    TABLE_MULTIPART_UPLOAD_CURRENT_ROW, core_meta_committed_row_common, core_meta_record_tuple_key,
-    core_meta_root_key_hash, core_meta_tuple_key,
+    CoreTransactionUpdate, TABLE_MULTIPART_PART_CURRENT_ROW, TABLE_MULTIPART_UPLOAD_CURRENT_ROW,
+    core_meta_committed_row_common, core_meta_record_tuple_key, core_meta_root_key_hash,
+    core_meta_tuple_key,
 };
 use crate::formats::{Hash32, hash32, writer::WriterFamily};
 use crate::mvcc_transaction::WriteOperation as CoreWriteOperation;
@@ -44,7 +44,7 @@ use current_rows::{
 };
 use current_rows::{
     active_count_value, multipart_active_count_key, multipart_current_row_operations,
-    multipart_current_row_update, multipart_current_row_update_with_transaction,
+    multipart_current_row_update,
 };
 
 const MULTIPART_UPLOAD_SCHEMA: &str = "anvil.multipart.upload.v1";
@@ -1360,32 +1360,16 @@ async fn append_body(
     let payload_hash = hex::encode(hash32(&body));
     let partition_id = hex::encode(multipart_metadata_partition_id(tenant_id, bucket_id));
     let data_root = multipart_current_root_key(tenant_id, bucket_id);
-    let transaction_state: Option<CoreTransaction> = None;
-    let scope_partition = transaction_state
-        .as_ref()
-        .map(|transaction| transaction.scope_partition.clone())
-        .unwrap_or(partition_id);
+    let scope_partition = partition_id;
     let root_publications = multipart_root_publications(data_root, scope_partition.clone());
-    let current_update = if let Some(transaction_state) = transaction_state.as_ref() {
-        multipart_current_row_update_with_transaction(
-            &core_store,
-            transaction_state,
-            tenant_id,
-            bucket_id,
-            event,
-            upload.as_ref(),
-            part.as_ref(),
-        )?
-    } else {
-        multipart_current_row_update(
-            &core_store,
-            tenant_id,
-            bucket_id,
-            event,
-            upload.as_ref(),
-            part.as_ref(),
-        )?
-    };
+    let current_update = multipart_current_row_update(
+        &core_store,
+        tenant_id,
+        bucket_id,
+        event,
+        upload.as_ref(),
+        part.as_ref(),
+    )?;
     let mut preconditions = partition_precondition.into_iter().collect::<Vec<_>>();
     preconditions.extend(current_update.preconditions.clone());
     let mut operations = vec![CoreMutationOperation::StreamAppend {

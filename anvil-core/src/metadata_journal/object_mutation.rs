@@ -421,7 +421,6 @@ async fn append_object_mutation_inner_once(
         &core_meta_root_key_hash(&scope_partition),
         Some(projection.root_generation),
         transaction_id,
-        None,
     )
     .await?;
     let object_payload =

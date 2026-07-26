@@ -2,7 +2,6 @@ use super::*;
 use crate::core_store::core_meta_record_tuple_key;
 use prost::Message;
 
-const GATEWAY_METADATA_TRANSACTION_RECORD_KIND: &str = "gateway_metadata_row";
 const GATEWAY_METADATA_PAGE_MAX: usize = 1000;
 pub(super) const GATEWAY_METADATA_CANDIDATE_GENERATION: u64 = 1;
 pub(super) const GATEWAY_METADATA_CANDIDATE_TRANSACTION_ID: &str = "gateway-metadata-candidate";
@@ -270,14 +269,7 @@ pub(super) async fn put_record_row_in_transaction<T: GatewayRecordCodec>(
         TABLE_GATEWAY_METADATA_ROW,
         &tuple_key,
     )?;
-    let snapshot = mvcc
-        .open_transactions
-        .handle(transaction_id)?
-        .snapshot_version;
-    let base_payload = mvcc
-        .runtime
-        .read_at(&logical_key, snapshot)?
-        .map(|row| row.value);
+    let base_payload = mvcc.read_transaction_value(transaction_id, principal, &logical_key)?;
     let current = base_payload
         .as_deref()
         .map(|bytes| decode_gateway_metadata_row::<T>(row_kind, row_key, bytes))
@@ -317,122 +309,15 @@ pub(super) async fn read_record_row_in_transaction<T: GatewayRecordCodec>(
     principal: &str,
 ) -> Result<Option<GatewayStoredRecord<T>>> {
     let _ = storage;
-    mvcc.open_transactions.binding(transaction_id, principal)?;
     let tuple_key = gateway_metadata_tuple_key(row_kind, row_key)?;
     let logical_key = crate::mvcc_product::coremeta_logical_key(
         CF_REGISTRY,
         TABLE_GATEWAY_METADATA_ROW,
         &tuple_key,
     )?;
-    let snapshot = mvcc
-        .open_transactions
-        .handle(transaction_id)?
-        .snapshot_version;
-    mvcc.runtime
-        .read_at(&logical_key, snapshot)?
-        .map(|row| decode_gateway_metadata_row::<T>(row_kind, row_key, &row.value))
+    mvcc.read_transaction_value(transaction_id, principal, &logical_key)?
+        .map(|row| decode_gateway_metadata_row::<T>(row_kind, row_key, &row))
         .transpose()
-}
-
-pub async fn materialize_committed_gateway_transaction(
-    storage: &Storage,
-    transaction: &crate::core_store::CoreTransaction,
-) -> Result<usize> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let mut materialized = 0usize;
-    for update in &transaction.visible_updates {
-        let crate::core_store::CoreTransactionUpdate::StreamAppend {
-            stream_id,
-            visible_sequence,
-            prepared_record_hash,
-            ..
-        } = update
-        else {
-            continue;
-        };
-        let records = core_store
-            .read_stream(ReadStream {
-                stream_id: stream_id.clone(),
-                after_sequence: visible_sequence.saturating_sub(1),
-                limit: 1,
-            })
-            .await?;
-        let Some(record) = records.into_iter().find(|record| {
-            record.sequence == *visible_sequence
-                && &record.event_hash == prepared_record_hash
-                && record.record_kind == GATEWAY_METADATA_TRANSACTION_RECORD_KIND
-        }) else {
-            continue;
-        };
-        let row = decode_deterministic_proto::<GatewayMetadataRowProto>(
-            &record.payload,
-            "gateway metadata transaction row",
-        )?;
-        validate_gateway_metadata_row(&row, &row.row_kind, &row.row_key)?;
-        let tuple_key = gateway_metadata_tuple_key(&row.row_kind, &row.row_key)?;
-        let op = CoreMetaBatchOp {
-            cf: CF_REGISTRY,
-            table_id: TABLE_GATEWAY_METADATA_ROW,
-            tuple_key: &tuple_key,
-            common: None,
-            kind: CoreMetaBatchOpKind::Put(&record.payload),
-        };
-        core_store
-            .commit_coremeta_root_groups(
-                &format!(
-                    "gateway-materialize:{}:{}:{}",
-                    row.row_kind, row.row_key, row.generation
-                ),
-                &[op],
-                &[CoreMetaRootPublication::new(
-                    format!("gateway/{}/{}", row.row_kind, row.row_key),
-                    crate::formats::writer::WriterFamily::Registry,
-                )],
-            )
-            .await?;
-        materialize_gateway_side_effects(storage, &row).await?;
-        materialized = materialized.saturating_add(1);
-    }
-    Ok(materialized)
-}
-
-async fn materialize_gateway_side_effects(
-    storage: &Storage,
-    row: &GatewayMetadataRowProto,
-) -> Result<()> {
-    match row.row_kind.as_str() {
-        GATEWAY_ROW_BLOB => {
-            let record: GatewayBlobRecord = decode_gateway_record(&row.record_payload)?;
-            coremeta::write_registry_blob_locator_row_from_record(storage, &record).await?;
-        }
-        GATEWAY_ROW_TAG => {
-            let record: GatewayTagRecord = decode_gateway_record(&row.record_payload)?;
-            if let Some(blob) = coremeta::read_registry_blob_locator_row(
-                storage,
-                record.tenant_id,
-                &record.gateway,
-                &record.registry_instance_id,
-                &record.target_digest,
-            )
-            .await?
-            {
-                coremeta::write_registry_version_row_for_tag(
-                    storage,
-                    &record,
-                    &blob,
-                    row.generation,
-                )
-                .await?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn gateway_metadata_transaction_stream_id(row_kind: &str, row_key: &str) -> String {
-    let row_hash = hash32(format!("{row_kind}\0{row_key}").as_bytes());
-    format!("gateway_metadata_row:{row_kind}:{}", hex::encode(row_hash))
 }
 
 pub(super) async fn put_upload_session_start_rows(
