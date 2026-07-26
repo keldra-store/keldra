@@ -149,8 +149,7 @@ impl Persistence {
             step_start.elapsed(),
         );
         let step_start = std::time::Instant::now();
-        if bucket_journal::read_current_bucket(&self.storage, tenant_id, name)
-            .await
+        if bucket_journal::read_current_bucket_mvcc(self.mvcc()?, tenant_id, name)
             .map_err(|e| tonic::Status::internal(e.to_string()))?
             .is_some()
         {
@@ -183,15 +182,10 @@ impl Persistence {
         let (tenant_permit, global_permit) = tokio::join!(tenant_permit, global_permit);
         let tenant_permit = tenant_permit.map_err(|e| tonic::Status::internal(e.to_string()))?;
         let global_permit = global_permit.map_err(|e| tonic::Status::internal(e.to_string()))?;
+        let _validated_permits = (&tenant_permit, &global_permit);
         let step_start = std::time::Instant::now();
-        let bucket = Bucket {
-            id: bucket_journal::reserve_next_bucket_id_with_permit(
-                &self.storage,
-                &global_permit,
-                &self.partition_owner_signing_key,
-            )
-            .await
-            .map_err(|e| tonic::Status::internal(e.to_string()))?,
+        let mut bucket = Bucket {
+            id: 0,
             tenant_id,
             name: name.to_string(),
             region: region.to_string(),
@@ -203,16 +197,28 @@ impl Persistence {
             step_start.elapsed(),
         );
         let step_start = std::time::Instant::now();
-        bucket_journal::append_bucket_mutation_with_permits(
-            &self.storage,
+        let idempotency_key = format!(
+            "bucket-create:{tenant_id}:{}:{}",
+            name,
+            uuid::Uuid::new_v4()
+        );
+        let plan = bucket_journal::build_bucket_mvcc_mutation_plan(
+            self.mvcc()?,
             &bucket,
             BucketJournalMutation::Create,
-            &tenant_permit,
-            &global_permit,
-            &self.partition_owner_signing_key,
         )
-        .await
         .map_err(|e| tonic::Status::internal(e.to_string()))?;
+        let (allocated_id, _) = plan
+            .autocommit(
+                self.mvcc()?,
+                "bucket-metadata",
+                &idempotency_key,
+                crate::mvcc_transaction::DurabilityLevel::Local,
+                u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+            )
+            .await
+            .map_err(|e| tonic::Status::internal(e.to_string()))?;
+        bucket.id = allocated_id;
         crate::emit_test_timing(
             "persistence.create_bucket append_bucket_mutation",
             step_start.elapsed(),
@@ -230,7 +236,7 @@ impl Persistence {
     }
 
     pub async fn get_bucket_by_name(&self, tenant_id: i64, name: &str) -> Result<Option<Bucket>> {
-        bucket_journal::read_current_bucket(&self.storage, tenant_id, name).await
+        bucket_journal::read_current_bucket_mvcc(self.mvcc()?, tenant_id, name)
     }
 
     pub async fn set_bucket_public_access(
@@ -239,36 +245,46 @@ impl Persistence {
         bucket_name: &str,
         is_public: bool,
     ) -> Result<Bucket> {
-        let mut out = bucket_journal::read_current_bucket(&self.storage, tenant_id, bucket_name)
-            .await?
-            .ok_or_else(|| anyhow!("bucket not found"))?;
+        let mut out =
+            bucket_journal::read_current_bucket_mvcc(self.mvcc()?, tenant_id, bucket_name)?
+                .ok_or_else(|| anyhow!("bucket not found"))?;
         out.is_public_read = is_public;
         let tenant_permit = self.bucket_tenant_write_permit(out.tenant_id).await?;
         let global_permit = self.bucket_global_write_permit().await?;
-        bucket_journal::append_bucket_mutation_with_permits(
-            &self.storage,
+        let _validated_permits = (&tenant_permit, &global_permit);
+        bucket_journal::build_bucket_mvcc_mutation_plan(
+            self.mvcc()?,
             &out,
             BucketJournalMutation::Update,
-            &tenant_permit,
-            &global_permit,
-            &self.partition_owner_signing_key,
+        )
+        .autocommit(
+            self.mvcc()?,
+            "bucket-metadata",
+            &format!("bucket-update:{}:{}", out.id, uuid::Uuid::new_v4()),
+            crate::mvcc_transaction::DurabilityLevel::Local,
+            u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
         )
         .await?;
         Ok(out)
     }
 
     pub async fn soft_delete_bucket(&self, tenant_id: i64, name: &str) -> Result<Option<Bucket>> {
-        let deleted = bucket_journal::read_current_bucket(&self.storage, tenant_id, name).await?;
+        let deleted = bucket_journal::read_current_bucket_mvcc(self.mvcc()?, tenant_id, name)?;
         if let Some(bucket) = &deleted {
             let tenant_permit = self.bucket_tenant_write_permit(bucket.tenant_id).await?;
             let global_permit = self.bucket_global_write_permit().await?;
-            bucket_journal::append_bucket_mutation_with_permits(
-                &self.storage,
+            let _validated_permits = (&tenant_permit, &global_permit);
+            bucket_journal::build_bucket_mvcc_mutation_plan(
+                self.mvcc()?,
                 bucket,
                 BucketJournalMutation::Delete,
-                &tenant_permit,
-                &global_permit,
-                &self.partition_owner_signing_key,
+            )
+            .autocommit(
+                self.mvcc()?,
+                "bucket-metadata",
+                &format!("bucket-delete:{}:{}", bucket.id, uuid::Uuid::new_v4()),
+                crate::mvcc_transaction::DurabilityLevel::Local,
+                u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
             )
             .await?;
             self.mark_mesh_bucket_locator_deleted(bucket).await?;
@@ -278,7 +294,7 @@ impl Persistence {
 
     pub async fn bucket_has_retained_objects_or_uploads(&self, bucket_id: i64) -> Result<bool> {
         let has_objects = if let Some(bucket) =
-            bucket_journal::read_current_bucket_by_id(&self.storage, bucket_id).await?
+            bucket_journal::read_current_bucket_by_id_mvcc(self.mvcc()?, bucket_id)?
         {
             !metadata_journal::read_object_versions_mvcc(self.mvcc()?, &bucket)?.is_empty()
         } else {

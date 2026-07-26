@@ -241,61 +241,12 @@ pub(crate) async fn stage_bucket_mutation_in_transaction(
     transaction_id: &str,
     transaction_principal: &str,
 ) -> Result<()> {
-    let mutation_id = uuid::Uuid::new_v4().to_string();
-    let row_generation = current_unix_nanos();
-    let tenant_scope = BucketJournalScope::Tenant(bucket.tenant_id);
-    let common_realm_id = tenant_scope.realm_id();
-    let common_root_key_hash = tenant_scope.root_key_hash();
-    let operation_partition = hex::encode(tenant_scope.partition_id());
-    let mut operations = vec![CoreMutationOperation::StreamAppend {
-        partition_id: operation_partition.clone(),
-        stream_id: tenant_scope.stream_id(),
-        record_kind: BUCKET_METADATA_RECORD_KIND.to_string(),
-        payload: encode_bucket_journal_body(&BucketJournalBody {
-            event: mutation.event_name().to_string(),
-            tenant_id: bucket.tenant_id,
-            bucket_id: bucket.id,
-            bucket_name: bucket.name.clone(),
-            region: bucket.region.clone(),
-            is_public_read: bucket.is_public_read,
-            mutation_id: mutation_id.clone(),
-            fence_token: 0,
-            created_at: bucket.created_at.to_rfc3339(),
-            emitted_at: Some(chrono::Utc::now().to_rfc3339()),
-        })?,
-        idempotency_key: Some(format!(
-            "bucket-metadata:{}:{}",
-            tenant_scope.stream_id(),
-            mutation_id
-        )),
-    }];
-
-    for scope in [tenant_scope, BucketJournalScope::Global] {
-        operations.extend(bucket_current_coremeta_operations_with_root(
-            scope,
-            bucket,
-            mutation,
-            &operation_partition,
-            transaction_id,
-            row_generation,
-            common_realm_id.clone(),
-            common_root_key_hash.clone(),
-        )?);
-    }
-    let mutations = crate::mvcc_product::product_mutations_from_operations(operations)?;
-    mvcc.stage_product_mutations(
+    build_bucket_mvcc_mutation_plan(mvcc, bucket, mutation)?.stage(
+        mvcc,
         transaction_id,
         transaction_principal,
-        mutations,
         u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
     )?;
-    tracing::debug!(
-        transaction_id,
-        mutation_id,
-        bucket_id = bucket.id,
-        bucket_name = bucket.name.as_str(),
-        "staged bucket metadata mutation in explicit transaction"
-    );
     Ok(())
 }
 
