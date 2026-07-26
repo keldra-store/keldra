@@ -44,7 +44,43 @@ pub fn work_partition_id(kind: &str, logical_identity: &str) -> Result<u64> {
     Ok(if id == 0 { 1 } else { id })
 }
 
+pub fn authz_tuple_partition_id(tenant_id: i64) -> Result<u64> {
+    if tenant_id <= 0 {
+        bail!("authorization tuple tenant ID must be positive");
+    }
+    work_partition_id("authz-tuple", &tenant_id.to_string())
+}
+
 impl MvccSubsystem {
+    /// Ensures the tenant's authorization tuple partition has a current
+    /// compact-Raft assignment, then returns its guard only when this node is
+    /// the assigned writer. Callers must refuse write admission on `None`.
+    pub async fn reconcile_authz_tuple_assignment(
+        &self,
+        tenant_id: i64,
+    ) -> Result<Option<AssignmentGuard>> {
+        let partition_id = authz_tuple_partition_id(tenant_id)?;
+        self.consensus.linearized_read_barrier().await?;
+        let snapshot = self.consensus.applied_control_snapshot()?;
+        let assigned = snapshot
+            .partitions
+            .iter()
+            .any(|(candidate, _)| *candidate == partition_id);
+        if self.consensus.is_leader() {
+            crate::mvcc_assignment_reconciler::reconcile_partition_assignment(
+                self.cluster_id(),
+                &self.consensus,
+                partition_id,
+            )
+            .await?;
+        } else if !assigned {
+            bail!(
+                "authorization tuple partition is not assigned; retry admission through the compact-Raft leader"
+            );
+        }
+        self.claim_assignment("authz-tuple", &tenant_id.to_string())
+    }
+
     pub fn claim_assignment(
         &self,
         kind: &str,
@@ -130,5 +166,22 @@ mod tests {
             work_partition_id("materialisation", "object/a").unwrap(),
             work_partition_id("repair", "object/a").unwrap()
         );
+    }
+
+    #[test]
+    fn authz_tuple_partitions_are_stable_per_tenant() {
+        assert_eq!(
+            authz_tuple_partition_id(42).unwrap(),
+            authz_tuple_partition_id(42).unwrap()
+        );
+        assert_ne!(
+            authz_tuple_partition_id(42).unwrap(),
+            authz_tuple_partition_id(43).unwrap()
+        );
+        assert_eq!(
+            authz_tuple_partition_id(42).unwrap(),
+            work_partition_id("authz-tuple", "42").unwrap()
+        );
+        assert!(authz_tuple_partition_id(0).is_err());
     }
 }

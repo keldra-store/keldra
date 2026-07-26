@@ -76,43 +76,58 @@ impl BackgroundAssignmentReconciler {
             if !self.consensus.is_leader() {
                 break;
             }
-            let snapshot = self.consensus.applied_control_snapshot()?;
-            let installed = snapshot
-                .nodes
-                .iter()
-                .map(|(node_id, incarnation, _)| NodeIncarnation {
-                    node_id: *node_id,
-                    incarnation: *incarnation,
-                })
-                .collect::<Vec<_>>();
-            let desired = rendezvous_owner(partition_id, &installed)
-                .context("background work exists but compact Raft has no installed nodes")?;
-            let current = snapshot
-                .partitions
-                .iter()
-                .find(|(candidate, _)| *candidate == partition_id)
-                .map(|(_, assignment)| assignment);
-            if current.is_some_and(|assignment| assignment.owner == desired) {
-                continue;
-            }
-            let epoch = current
-                .map(|assignment| assignment.epoch.saturating_add(1))
-                .unwrap_or(1);
-            self.consensus
-                .assign_partition(
-                    cluster_id_hash(&self.cluster_id),
-                    partition_id,
-                    desired,
-                    epoch,
-                )
-                .await
-                .with_context(|| {
-                    format!("assign background partition {partition_id} at epoch {epoch}")
-                })?;
-            changed = changed.saturating_add(1);
+            changed = changed.saturating_add(usize::from(
+                reconcile_partition_assignment(&self.cluster_id, &self.consensus, partition_id)
+                    .await?,
+            ));
         }
         Ok(changed)
     }
+}
+
+/// Reconciles one deterministic compact-Raft partition assignment.
+///
+/// This is also used by foreground admission for domains whose first durable
+/// row does not exist yet and therefore cannot be discovered by the background
+/// store scan.
+pub(crate) async fn reconcile_partition_assignment(
+    cluster_id: &str,
+    consensus: &OpenRaftConsensus,
+    partition_id: u64,
+) -> Result<bool> {
+    if !consensus.is_leader() {
+        bail!("compact-Raft leader must reconcile a missing partition assignment");
+    }
+    consensus.linearized_read_barrier().await?;
+    let snapshot = consensus.applied_control_snapshot()?;
+    let installed = snapshot
+        .nodes
+        .iter()
+        .map(|(node_id, incarnation, _)| NodeIncarnation {
+            node_id: *node_id,
+            incarnation: *incarnation,
+        })
+        .collect::<Vec<_>>();
+    let desired = rendezvous_owner(partition_id, &installed)
+        .context("partition assignment requires at least one installed compact-Raft node")?;
+    let current = snapshot
+        .partitions
+        .iter()
+        .find(|(candidate, _)| *candidate == partition_id)
+        .map(|(_, assignment)| assignment);
+    if current.is_some_and(|assignment| assignment.owner == desired) {
+        return Ok(false);
+    }
+    let epoch = current
+        .map(|assignment| assignment.epoch.saturating_add(1))
+        .unwrap_or(1);
+    consensus
+        .assign_partition(cluster_id_hash(cluster_id), partition_id, desired, epoch)
+        .await
+        .with_context(|| {
+            format!("assign compact-Raft partition {partition_id} at epoch {epoch}")
+        })?;
+    Ok(true)
 }
 
 pub(crate) fn rendezvous_owner(
