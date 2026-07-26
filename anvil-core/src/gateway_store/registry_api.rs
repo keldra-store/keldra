@@ -16,6 +16,7 @@ pub struct GatewayPackageVersionRecord {
 #[allow(clippy::too_many_arguments)]
 pub async fn put_registry_blob(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     registry_kind: &str,
     namespace: &str,
@@ -27,6 +28,7 @@ pub async fn put_registry_blob(
 ) -> Result<GatewayBlobRecord> {
     ensure_registry_repository(
         storage,
+        mvcc,
         tenant_id,
         registry_kind,
         namespace,
@@ -38,6 +40,7 @@ pub async fn put_registry_blob(
     if let Some(transaction_id) = transaction_id {
         return put_gateway_blob_in_transaction(
             storage,
+            mvcc,
             tenant_id,
             registry_kind,
             namespace,
@@ -67,6 +70,7 @@ pub async fn put_registry_blob(
 #[allow(clippy::too_many_arguments)]
 pub async fn put_package_version(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     registry_kind: &str,
     namespace: &str,
@@ -82,6 +86,7 @@ pub async fn put_package_version(
         .map_err(|err| anyhow!("registry manifest_json is not valid JSON: {err}"))?;
     ensure_registry_repository(
         storage,
+        mvcc,
         tenant_id,
         registry_kind,
         namespace,
@@ -94,6 +99,7 @@ pub async fn put_package_version(
         validate_gateway_digest(digest)?;
         if !registry_blob_exists_for_transaction(
             storage,
+            mvcc,
             tenant_id,
             registry_kind,
             namespace,
@@ -110,6 +116,7 @@ pub async fn put_package_version(
     let manifest_digest = format!("sha256:{}", sha256_hex(manifest_json.as_bytes()));
     put_registry_blob(
         storage,
+        mvcc,
         tenant_id,
         registry_kind,
         namespace,
@@ -123,6 +130,7 @@ pub async fn put_package_version(
     if let Some(transaction_id) = transaction_id {
         return update_gateway_tag_in_transaction(
             storage,
+            mvcc,
             tenant_id,
             registry_kind,
             namespace,
@@ -152,6 +160,7 @@ pub async fn put_package_version(
 #[allow(clippy::too_many_arguments)]
 pub async fn put_registry_ref(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     registry_kind: &str,
     namespace: &str,
@@ -164,6 +173,7 @@ pub async fn put_registry_ref(
 ) -> Result<GatewayTagUpdateReceipt> {
     let Some((target, _)) = read_gateway_tag_for_transaction(
         storage,
+        mvcc,
         tenant_id,
         registry_kind,
         namespace,
@@ -179,6 +189,7 @@ pub async fn put_registry_ref(
     if let Some(transaction_id) = transaction_id {
         return update_gateway_tag_in_transaction(
             storage,
+            mvcc,
             tenant_id,
             registry_kind,
             namespace,
@@ -277,6 +288,7 @@ pub async fn list_package_versions(
 
 async fn ensure_registry_repository(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     registry_kind: &str,
     namespace: &str,
@@ -293,6 +305,7 @@ async fn ensure_registry_repository(
     if let Some(transaction_id) = transaction_id {
         create_gateway_repository_in_transaction(
             storage,
+            mvcc,
             tenant_id,
             registry_kind,
             namespace,
@@ -318,6 +331,7 @@ async fn ensure_registry_repository(
 #[allow(clippy::too_many_arguments)]
 async fn create_gateway_repository_in_transaction(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     gateway: &str,
     registry_instance_id: &str,
@@ -334,6 +348,7 @@ async fn create_gateway_repository_in_transaction(
     let transaction_principal = format!("tenant/{tenant_id}/principal/{created_by_principal}");
     if let Some(existing) = read_record_row_in_transaction::<GatewayRepositoryRecord>(
         storage,
+        mvcc,
         GATEWAY_ROW_REPOSITORY,
         &key.ref_name(),
         transaction_id,
@@ -357,6 +372,7 @@ async fn create_gateway_repository_in_transaction(
     record.record_hash = hash_record(&record)?;
     put_record_row_in_transaction(
         storage,
+        mvcc,
         GATEWAY_ROW_REPOSITORY,
         &key.ref_name(),
         &record,
@@ -372,6 +388,7 @@ async fn create_gateway_repository_in_transaction(
 #[allow(clippy::too_many_arguments)]
 async fn put_gateway_blob_in_transaction(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     gateway: &str,
     registry_instance_id: &str,
@@ -416,6 +433,7 @@ async fn put_gateway_blob_in_transaction(
     }
     if let Some(existing) = read_record_row_in_transaction::<GatewayBlobRecord>(
         storage,
+        mvcc,
         GATEWAY_ROW_BLOB,
         &ref_name,
         transaction_id,
@@ -462,6 +480,7 @@ async fn put_gateway_blob_in_transaction(
     record.record_hash = hash_record(&record)?;
     put_record_row_in_transaction(
         storage,
+        mvcc,
         GATEWAY_ROW_BLOB,
         &ref_name,
         &record,
@@ -477,6 +496,7 @@ async fn put_gateway_blob_in_transaction(
 #[allow(clippy::too_many_arguments)]
 async fn update_gateway_tag_in_transaction(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     gateway: &str,
     registry_instance_id: &str,
@@ -509,6 +529,7 @@ async fn update_gateway_tag_in_transaction(
     let ref_name = gateway_tag_ref_name(&record)?;
     if !registry_blob_exists_for_transaction(
         storage,
+        mvcc,
         tenant_id,
         &record.gateway,
         &record.registry_instance_id,
@@ -523,6 +544,7 @@ async fn update_gateway_tag_in_transaction(
     }
     let row = put_record_row_in_transaction(
         storage,
+        mvcc,
         GATEWAY_ROW_TAG,
         &ref_name,
         &record,
@@ -562,6 +584,7 @@ async fn registry_blob_locator_exists(
 #[allow(clippy::too_many_arguments)]
 async fn registry_blob_exists_for_transaction(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     registry_kind: &str,
     namespace: &str,
@@ -585,6 +608,7 @@ async fn registry_blob_exists_for_transaction(
     let transaction_principal = format!("tenant/{tenant_id}/principal/{principal}");
     let Some(row) = read_record_row_in_transaction::<GatewayBlobRecord>(
         storage,
+        mvcc,
         GATEWAY_ROW_BLOB,
         &ref_name,
         transaction_id,
@@ -608,6 +632,7 @@ async fn registry_blob_exists_for_transaction(
 #[allow(clippy::too_many_arguments)]
 async fn read_gateway_tag_for_transaction(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     gateway: &str,
     registry_instance_id: &str,
@@ -646,6 +671,7 @@ async fn read_gateway_tag_for_transaction(
     let transaction_principal = format!("tenant/{tenant_id}/principal/{principal}");
     let Some(row) = read_record_row_in_transaction::<GatewayTagRecord>(
         storage,
+        mvcc,
         GATEWAY_ROW_TAG,
         &ref_name,
         transaction_id,

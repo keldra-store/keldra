@@ -255,6 +255,7 @@ pub(super) async fn put_record_row<T: GatewayRecordCodec>(
 
 pub(super) async fn put_record_row_in_transaction<T: GatewayRecordCodec>(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     row_kind: &str,
     row_key: &str,
     record: &T,
@@ -263,49 +264,24 @@ pub(super) async fn put_record_row_in_transaction<T: GatewayRecordCodec>(
     transaction_id: &str,
     principal: &str,
 ) -> Result<GatewayStoredRecord<T>> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let transaction = core_store
-        .read_explicit_transaction_for_principal(transaction_id, principal)
-        .await?;
     let tuple_key = gateway_metadata_tuple_key(row_kind, row_key)?;
-    let base_payload =
-        core_store.read_coremeta_row(CF_REGISTRY, TABLE_GATEWAY_METADATA_ROW, &tuple_key)?;
-    let expected_payload_hash = base_payload.as_ref().map(|payload| {
-        crate::core_store::core_meta_payload_digest(TABLE_GATEWAY_METADATA_ROW, payload)
-    });
-    let mut current = base_payload
+    let logical_key = crate::mvcc_product::coremeta_logical_key(
+        CF_REGISTRY,
+        TABLE_GATEWAY_METADATA_ROW,
+        &tuple_key,
+    )?;
+    let snapshot = mvcc
+        .open_transactions
+        .handle(transaction_id)?
+        .snapshot_version;
+    let base_payload = mvcc
+        .runtime
+        .read_at(&logical_key, snapshot)?
+        .map(|row| row.value);
+    let current = base_payload
         .as_deref()
         .map(|bytes| decode_gateway_metadata_row::<T>(row_kind, row_key, bytes))
         .transpose()?;
-    let stream_id = gateway_metadata_transaction_stream_id(row_kind, row_key);
-    for update in transaction.visible_updates.iter().rev() {
-        let crate::core_store::CoreTransactionUpdate::StreamAppend {
-            stream_id: update_stream_id,
-            visible_sequence,
-            prepared_record_hash,
-            ..
-        } = update
-        else {
-            continue;
-        };
-        if update_stream_id != &stream_id {
-            continue;
-        }
-        // This authenticated transaction overlay reads only its own staged stream record.
-        if let Some(record) = core_store
-            .read_raw_stream_record(update_stream_id, *visible_sequence, prepared_record_hash)
-            .await?
-        {
-            if record.record_kind == GATEWAY_METADATA_TRANSACTION_RECORD_KIND {
-                current = Some(decode_gateway_metadata_row::<T>(
-                    row_kind,
-                    row_key,
-                    &record.payload,
-                )?);
-                break;
-            }
-        }
-    }
     if require_absent && current.is_some() {
         bail!("gateway metadata row {row_kind}/{row_key} already exists");
     }
@@ -320,83 +296,42 @@ pub(super) async fn put_record_row_in_transaction<T: GatewayRecordCodec>(
         .map(|value| value.generation + 1)
         .unwrap_or(1);
     let payload = encode_gateway_metadata_row(row_kind, row_key, generation, record)?;
-    let scope_partition = transaction.scope_partition.clone();
-    core_store
-        .stage_explicit_transaction_batch(crate::core_store::CoreMutationBatch {
-            transaction_id: transaction_id.to_string(),
-            scope_partition: scope_partition.clone(),
-            committed_by_principal: principal.to_string(),
-            root_publications: vec![
-                crate::core_store::CoreMutationRootPublication::new(
-                    scope_partition.clone(),
-                    crate::formats::writer::WriterFamily::CoreControl.as_str(),
-                )
-                .coordinator(),
-            ],
-            preconditions: vec![crate::core_store::CoreMutationPrecondition::CoreMetaRow {
-                cf: CF_REGISTRY.to_string(),
-                table_id: TABLE_GATEWAY_METADATA_ROW,
-                tuple_key,
-                expected_payload_hash,
-                require_absent,
-                require_present: expected_generation.is_some(),
-            }],
-            operations: vec![crate::core_store::CoreMutationOperation::StreamAppend {
-                partition_id: scope_partition,
-                stream_id: gateway_metadata_transaction_stream_id(row_kind, row_key),
-                record_kind: GATEWAY_METADATA_TRANSACTION_RECORD_KIND.to_string(),
-                payload: payload.clone(),
-                idempotency_key: Some(format!(
-                    "gateway-metadata-row:{row_kind}:{row_key}:{generation}"
-                )),
-            }],
-        })
-        .await?;
+    mvcc.stage_product_mutations(
+        transaction_id,
+        principal,
+        vec![crate::mvcc_product::ProductMutation::put(
+            logical_key,
+            payload.clone(),
+        )],
+        u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+    )?;
     decode_gateway_metadata_row(row_kind, row_key, &payload)
 }
 
 pub(super) async fn read_record_row_in_transaction<T: GatewayRecordCodec>(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     row_kind: &str,
     row_key: &str,
     transaction_id: &str,
     principal: &str,
 ) -> Result<Option<GatewayStoredRecord<T>>> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let transaction = core_store
-        .read_explicit_transaction_for_principal(transaction_id, principal)
-        .await?;
-    let stream_id = gateway_metadata_transaction_stream_id(row_kind, row_key);
-    for update in transaction.visible_updates.iter().rev() {
-        let crate::core_store::CoreTransactionUpdate::StreamAppend {
-            stream_id: update_stream_id,
-            visible_sequence,
-            prepared_record_hash,
-            ..
-        } = update
-        else {
-            continue;
-        };
-        if update_stream_id != &stream_id {
-            continue;
-        }
-        // This authenticated transaction overlay reads only its own staged stream record.
-        let Some(record) = core_store
-            .read_raw_stream_record(update_stream_id, *visible_sequence, prepared_record_hash)
-            .await?
-        else {
-            continue;
-        };
-        if record.record_kind != GATEWAY_METADATA_TRANSACTION_RECORD_KIND {
-            continue;
-        }
-        return Ok(Some(decode_gateway_metadata_row::<T>(
-            row_kind,
-            row_key,
-            &record.payload,
-        )?));
-    }
-    Ok(None)
+    let _ = storage;
+    mvcc.open_transactions.binding(transaction_id, principal)?;
+    let tuple_key = gateway_metadata_tuple_key(row_kind, row_key)?;
+    let logical_key = crate::mvcc_product::coremeta_logical_key(
+        CF_REGISTRY,
+        TABLE_GATEWAY_METADATA_ROW,
+        &tuple_key,
+    )?;
+    let snapshot = mvcc
+        .open_transactions
+        .handle(transaction_id)?
+        .snapshot_version;
+    mvcc.runtime
+        .read_at(&logical_key, snapshot)?
+        .map(|row| decode_gateway_metadata_row::<T>(row_kind, row_key, &row.value))
+        .transpose()
 }
 
 pub async fn materialize_committed_gateway_transaction(

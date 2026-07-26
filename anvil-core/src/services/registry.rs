@@ -24,6 +24,7 @@ impl RegistryService for AppState {
         let expected_digest = req.digest.clone();
         gateway_store::put_registry_blob(
             &self.storage,
+            self.mvcc.as_ref(),
             claims.tenant_id,
             &req.registry_kind,
             &req.namespace,
@@ -70,6 +71,7 @@ impl RegistryService for AppState {
         let manifest_digest = digest_bytes(req.manifest_json.as_bytes());
         gateway_store::put_package_version(
             &self.storage,
+            self.mvcc.as_ref(),
             claims.tenant_id,
             &req.registry_kind,
             &req.namespace,
@@ -117,6 +119,7 @@ impl RegistryService for AppState {
         let transaction_id = registry_transaction_id(req.options.as_ref())?;
         let receipt = gateway_store::put_registry_ref(
             &self.storage,
+            self.mvcc.as_ref(),
             claims.tenant_id,
             &req.registry_kind,
             &req.namespace,
