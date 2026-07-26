@@ -50,6 +50,8 @@ pub mod crypto;
 pub mod derived_index_catchup;
 pub mod derived_index_proof;
 pub mod diagnostic_store;
+#[cfg(test)]
+mod direct_mutation_contract;
 pub mod directory_repair;
 pub mod discovery;
 pub mod embedding_provider;
