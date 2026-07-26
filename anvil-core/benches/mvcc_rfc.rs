@@ -1,9 +1,12 @@
 use std::{
     collections::BTreeMap,
-    hint::black_box,
     time::{Duration, Instant},
 };
 
+use anvil_core::{
+    mvcc_store::LocalMvccStore,
+    mvcc_transaction::{HierarchicalRangeStampScheme, LogicalKey, TransactionBundleBuilder},
+};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Phase {
     StripeEncoding,
@@ -172,14 +175,7 @@ fn main() {
     println!("shape,keys,tables,payload_bytes,concurrency,phase,nanos");
     for shape in SHAPES {
         let mut timings = PhaseTimings::default();
-        timings.measure(Phase::EndToEnd, || {
-            black_box((
-                shape.logical_keys,
-                shape.tables,
-                shape.payload_bytes,
-                shape.concurrency,
-            ));
-        });
+        run_shape(*shape, &mut timings);
         for phase in [
             Phase::StripeEncoding,
             Phase::ShardStreaming,
@@ -206,4 +202,53 @@ fn main() {
             );
         }
     }
+}
+
+fn run_shape(shape: Shape, timings: &mut PhaseTimings) {
+    let directory = tempfile::tempdir().expect("create benchmark MVCC directory");
+    let store = LocalMvccStore::open(directory.path()).expect("open benchmark MVCC store");
+    let end_to_end = Instant::now();
+    let payload_per_key = shape.payload_bytes / shape.logical_keys.max(1);
+    let mut builder = TransactionBundleBuilder::new(
+        "benchmark-cluster",
+        format!("{}-tx", shape.name),
+        0,
+        "benchmark-principal",
+        HierarchicalRangeStampScheme::new(),
+    );
+    timings.measure(Phase::StripeEncoding, || {
+        for ordinal in 0..shape.logical_keys {
+            builder.put(
+                LogicalKey {
+                    table_id: u16::try_from(ordinal % shape.tables.max(1) + 1).unwrap(),
+                    application_key: format!("partition-{}/key-{ordinal}", ordinal % 8)
+                        .into_bytes(),
+                },
+                vec![u8::try_from(ordinal % 251).unwrap(); payload_per_key],
+            );
+        }
+    });
+    let bundle = timings.measure(Phase::RaftCertification, || {
+        let bundle = builder.build().expect("build benchmark transaction");
+        bundle.canonical_bytes().expect("encode benchmark bundle");
+        bundle
+    });
+    timings.measure(Phase::LocalMvccApply, || {
+        store
+            .apply_certified_bundle(1, &bundle)
+            .expect("apply benchmark transaction");
+    });
+    timings.measure(Phase::RemotePersistenceWait, || {
+        for write in &bundle.writes {
+            store
+                .read_at(write.key(), 1)
+                .expect("read benchmark MVCC row");
+        }
+    });
+    timings.measure(Phase::DeferredRepair, || {
+        store
+            .garbage_collect(1)
+            .expect("collect benchmark MVCC history");
+    });
+    timings.0.insert(Phase::EndToEnd, end_to_end.elapsed());
 }
