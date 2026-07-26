@@ -172,6 +172,15 @@ impl NodeConnectionAuthorizer {
         if self.allow_test_bypass {
             return Ok(());
         }
+        if !system_realm::bootstrap_marker_exists_in_runtime(self.runtime.as_ref(), &self.mesh_id)
+            .map_err(|error| Status::unavailable(error.to_string()))?
+        {
+            // The first system-realm transaction needs replication and Raft
+            // traffic before Zanzibar has any node tuples to evaluate. Static
+            // peer membership plus the cluster token is the bootstrap
+            // authority until the certified marker is visible locally.
+            return Ok(());
+        }
         if self
             .consensus
             .applied_control_snapshot()

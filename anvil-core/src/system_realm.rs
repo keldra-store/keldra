@@ -350,11 +350,15 @@ fn bootstrap_marker_exists(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     mesh_id: &str,
 ) -> Result<bool> {
-    let snapshot = mvcc.runtime.applied_version()?;
-    let Some(row) = mvcc
-        .runtime
-        .read_at(&bootstrap_marker_logical_key(mesh_id)?, snapshot)?
-    else {
+    bootstrap_marker_exists_in_runtime(mvcc.runtime.as_ref(), mesh_id)
+}
+
+pub(crate) fn bootstrap_marker_exists_in_runtime(
+    runtime: &crate::mvcc_bootstrap::ProductMvccRuntime,
+    mesh_id: &str,
+) -> Result<bool> {
+    let snapshot = runtime.applied_version()?;
+    let Some(row) = runtime.read_at(&bootstrap_marker_logical_key(mesh_id)?, snapshot)? else {
         return Ok(false);
     };
     let marker_row = BootstrapMarkerRowProto::decode(row.value.as_slice())?;
