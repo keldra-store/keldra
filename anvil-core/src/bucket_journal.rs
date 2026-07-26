@@ -1,25 +1,19 @@
 use crate::core_store::{
-    CF_MESH, CoreMetaTuplePart, CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
-    CoreMutationRootPublication, CoreStore, ReadStream, TABLE_BUCKET_CURRENT_BY_ID_ROW,
+    CF_MESH, CoreMetaTuplePart, CoreMutationOperation, TABLE_BUCKET_CURRENT_BY_ID_ROW,
     TABLE_BUCKET_CURRENT_BY_NAME_ROW, TABLE_BUCKET_EVENT_HEAD_ROW, TABLE_BUCKET_ID_ALLOCATOR_ROW,
-    core_meta_committed_row_common, core_meta_payload_digest, core_meta_record_tuple_key,
     core_meta_root_key_hash, core_meta_tuple_key,
 };
-use crate::formats::{Hash32, hash32, writer::WriterFamily};
-use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
+use crate::formats::{Hash32, hash32};
 use crate::persistence::{Bucket, BucketMetadataEvent};
-use crate::storage::Storage;
 use anyhow::{Context, Result, anyhow, bail};
 use prost::Message;
 use serde_json::{Value as JsonValue, json};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-const BUCKET_CURRENT_ROW_SCHEMA: &str = "anvil.core.bucket_current.v1";
-const BUCKET_EVENT_HEAD_ROW_SCHEMA: &str = "anvil.core.bucket_event_head.v1";
-const BUCKET_ID_ALLOCATOR_ROW_SCHEMA: &str = "anvil.core.bucket_id_allocator.v1";
-const BUCKET_ID_ALLOCATION_ATTEMPTS: usize = 32;
+const BUCKET_CURRENT_ROW_SCHEMA: &str = "anvil.mvcc.bucket-current.v2";
+const BUCKET_EVENT_HEAD_ROW_SCHEMA: &str = "anvil.mvcc.bucket-event-head.v2";
+const BUCKET_ID_ALLOCATOR_ROW_SCHEMA: &str = "anvil.mvcc.bucket-id-allocator.v2";
 const BUCKET_METADATA_BODY_SCHEMA: &str = "anvil.core.bucket_metadata.v1";
-const BUCKET_METADATA_RECORD_KIND: &str = "bucket_metadata";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BucketJournalMutation {
@@ -47,7 +41,6 @@ struct BucketJournalBody {
     region: String,
     is_public_read: bool,
     mutation_id: String,
-    fence_token: u64,
     created_at: String,
     emitted_at: Option<String>,
 }
@@ -74,55 +67,47 @@ struct BucketJournalBodyProto {
     created_at: String,
     #[prost(string, optional, tag = "10")]
     emitted_at: Option<String>,
-    #[prost(uint64, tag = "11")]
-    fence_token: u64,
 }
 
 #[derive(Clone, PartialEq, Message)]
 struct BucketCurrentRowProto {
-    #[prost(message, optional, tag = "1")]
-    common: Option<crate::core_store::CoreMetaRowCommonProto>,
-    #[prost(string, tag = "2")]
+    #[prost(string, tag = "1")]
     schema: String,
-    #[prost(bool, tag = "3")]
+    #[prost(bool, tag = "2")]
     deleted: bool,
-    #[prost(int64, tag = "4")]
+    #[prost(int64, tag = "3")]
     bucket_id: i64,
-    #[prost(int64, tag = "5")]
+    #[prost(int64, tag = "4")]
     tenant_id: i64,
-    #[prost(string, tag = "6")]
+    #[prost(string, tag = "5")]
     bucket_name: String,
-    #[prost(string, tag = "7")]
+    #[prost(string, tag = "6")]
     region: String,
-    #[prost(string, tag = "8")]
+    #[prost(string, tag = "7")]
     created_at: String,
-    #[prost(bool, tag = "9")]
+    #[prost(bool, tag = "8")]
     is_public_read: bool,
 }
 
 #[derive(Clone, PartialEq, Message)]
 struct BucketIdAllocatorRowProto {
-    #[prost(message, optional, tag = "1")]
-    common: Option<crate::core_store::CoreMetaRowCommonProto>,
-    #[prost(string, tag = "2")]
+    #[prost(string, tag = "1")]
     schema: String,
-    #[prost(int64, tag = "3")]
+    #[prost(int64, tag = "2")]
     max_allocated_id: i64,
 }
 
 #[derive(Clone, PartialEq, Message)]
 struct BucketEventHeadRowProto {
-    #[prost(message, optional, tag = "1")]
-    common: Option<crate::core_store::CoreMetaRowCommonProto>,
-    #[prost(string, tag = "2")]
+    #[prost(string, tag = "1")]
     schema: String,
-    #[prost(int64, tag = "3")]
+    #[prost(int64, tag = "2")]
     tenant_id: i64,
-    #[prost(string, tag = "4")]
+    #[prost(string, tag = "3")]
     bucket_name: String,
-    #[prost(uint64, tag = "5")]
+    #[prost(uint64, tag = "4")]
     stream_sequence: u64,
-    #[prost(bytes, tag = "6")]
+    #[prost(bytes, tag = "5")]
     event_payload: Vec<u8>,
 }
 
@@ -133,12 +118,14 @@ pub(crate) async fn stage_bucket_mutation_in_transaction(
     transaction_id: &str,
     transaction_principal: &str,
 ) -> Result<()> {
-    build_bucket_mvcc_mutation_plan(mvcc, bucket, mutation)?.stage(
-        mvcc,
-        transaction_id,
-        transaction_principal,
-        u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
-    )?;
+    build_bucket_mvcc_mutation_plan(mvcc, bucket, mutation)?
+        .stage(
+            mvcc,
+            transaction_id,
+            transaction_principal,
+            u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+        )
+        .await?;
     Ok(())
 }
 
@@ -161,21 +148,11 @@ fn bucket_event_head_put(
     event_payload: &[u8],
     stream_sequence: u64,
     partition_id: &str,
-    mutation_id: &str,
-    row_generation: u64,
 ) -> Result<CoreMutationOperation> {
     if stream_sequence == 0 || event_payload.is_empty() {
         return Err(anyhow!("bucket event head must reference a durable event"));
     }
-    let scope = BucketJournalScope::Tenant(bucket.tenant_id);
     let payload = encode_deterministic_proto(&BucketEventHeadRowProto {
-        common: Some(core_meta_committed_row_common(
-            scope.realm_id(),
-            scope.root_key_hash(),
-            row_generation,
-            mutation_id,
-            current_unix_nanos(),
-        )),
         schema: BUCKET_EVENT_HEAD_ROW_SCHEMA.to_string(),
         tenant_id: bucket.tenant_id,
         bucket_name: bucket.name.clone(),
@@ -234,18 +211,11 @@ pub async fn latest_bucket_metadata_event(
     };
     let row = BucketEventHeadRowProto::decode(payload.as_slice())?;
     ensure_deterministic_proto(&row, &payload, "bucket event head row")?;
-    let scope = BucketJournalScope::Tenant(tenant_id);
-    let common = row
-        .common
-        .as_ref()
-        .ok_or_else(|| anyhow!("bucket event head row is missing CoreMeta common"))?;
     if row.schema != BUCKET_EVENT_HEAD_ROW_SCHEMA
         || row.tenant_id != tenant_id
         || row.bucket_name != bucket_name
         || row.stream_sequence == 0
         || row.event_payload.is_empty()
-        || common.realm_id != scope.realm_id()
-        || common.root_key_hash != scope.root_key_hash()
     {
         return Err(anyhow!("bucket event head row scope mismatch"));
     }
@@ -311,20 +281,10 @@ pub async fn list_bucket_metadata_event_page(
     })
 }
 
-pub(crate) fn tenant_bucket_metadata_stream_id(tenant_id: i64) -> String {
-    BucketJournalScope::Tenant(tenant_id).stream_id()
-}
-
 #[derive(Debug, Clone)]
 struct BucketCurrentRow {
     deleted: bool,
     bucket: Bucket,
-}
-
-#[derive(Debug, Clone)]
-struct BucketIdAllocatorSnapshot {
-    max_allocated_id: i64,
-    expected_payload_hash: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -343,6 +303,7 @@ pub(crate) struct BucketMvccMutationPlan {
     pub outbox_events: Vec<crate::mvcc_outbox::StreamOutboxEvent>,
     pub allocated_bucket_id: i64,
     pub collection_revision: u64,
+    assignment_identity: String,
 }
 
 impl BucketMvccMutationPlan {
@@ -356,7 +317,7 @@ impl BucketMvccMutationPlan {
         self.outbox_events.extend(audit.outbox_events);
         Ok(self)
     }
-    pub fn stage(
+    pub async fn stage(
         self,
         mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
         transaction_id: &str,
@@ -371,6 +332,14 @@ impl BucketMvccMutationPlan {
         for (key, kind) in self.predicates {
             mvcc.stage_predicate(transaction_id, principal, key, kind, now_unix_ms)?;
         }
+        stage_bucket_assignment_guard(
+            mvcc,
+            &self.assignment_identity,
+            transaction_id,
+            principal,
+            now_unix_ms,
+        )
+        .await?;
         Ok((self.allocated_bucket_id, self.collection_revision))
     }
 
@@ -379,23 +348,83 @@ impl BucketMvccMutationPlan {
         mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
         principal: &str,
         idempotency_key: &str,
-        durability: crate::mvcc_transaction::DurabilityLevel,
+        _durability: crate::mvcc_transaction::DurabilityLevel,
         now_unix_ms: u64,
     ) -> Result<(i64, u64)> {
         let allocated_bucket_id = self.allocated_bucket_id;
         let collection_revision = self.collection_revision;
-        mvcc.autocommit_product_mutations_with_predicates_and_outbox(
-            principal,
-            idempotency_key,
-            self.mutations,
-            self.predicates,
-            self.outbox_events,
-            durability,
-            now_unix_ms,
-        )
-        .await?;
+        let handle = mvcc
+            .open_transactions
+            .begin(
+                mvcc.runtime.as_ref(),
+                mvcc.cluster_id(),
+                principal,
+                idempotency_key,
+                Duration::from_secs(30),
+                crate::mvcc_transaction::DurabilityLevel::Quorum,
+                crate::mvcc_transaction::ReadConsistency::Linearized,
+                now_unix_ms,
+            )
+            .await?;
+        let status =
+            mvcc.open_transactions
+                .status(&handle.transaction_id, principal, now_unix_ms)?;
+        if status.state == "open" {
+            mvcc.stage_product_mutations(
+                &handle.transaction_id,
+                principal,
+                self.mutations,
+                now_unix_ms,
+            )?;
+            for (key, kind) in self.predicates {
+                mvcc.stage_predicate(&handle.transaction_id, principal, key, kind, now_unix_ms)?;
+            }
+            for event in self.outbox_events {
+                mvcc.open_transactions.add_stream_event(
+                    &handle.transaction_id,
+                    event,
+                    now_unix_ms,
+                )?;
+            }
+            stage_bucket_assignment_guard(
+                mvcc,
+                &self.assignment_identity,
+                &handle.transaction_id,
+                principal,
+                now_unix_ms,
+            )
+            .await?;
+        }
+        let outcome = mvcc
+            .open_transactions
+            .commit(
+                mvcc.runtime.as_ref(),
+                &handle.transaction_id,
+                principal,
+                now_unix_ms,
+            )
+            .await?;
+        if let crate::mvcc_transaction::CertificationResult::Aborted { reason } =
+            outcome.certification
+        {
+            bail!("bucket MVCC transaction aborted: {reason:?}");
+        }
         Ok((allocated_bucket_id, collection_revision))
     }
+}
+
+async fn stage_bucket_assignment_guard(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    assignment_identity: &str,
+    transaction_id: &str,
+    principal: &str,
+    now_unix_ms: u64,
+) -> Result<()> {
+    let assignment = mvcc
+        .reconcile_work_assignment("bucket-metadata", assignment_identity)
+        .await?
+        .ok_or_else(|| anyhow!("this node does not own the bucket metadata assignment"))?;
+    mvcc.stage_assignment_guard(transaction_id, principal, &assignment, now_unix_ms)
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -606,7 +635,6 @@ pub(crate) fn build_bucket_mvcc_mutation_plan(
         .ok_or_else(|| anyhow!("bucket collection revision overflow"))?;
     let mutation_id = uuid::Uuid::new_v4();
     let mutation_id_string = mutation_id.to_string();
-    let row_generation = collection_revision;
     let partition_id = hex::encode(BucketJournalScope::Global.partition_id());
     let mut projected_bucket = bucket.clone();
     projected_bucket.id = allocated_bucket_id;
@@ -618,7 +646,6 @@ pub(crate) fn build_bucket_mvcc_mutation_plan(
         region: projected_bucket.region.clone(),
         is_public_read: projected_bucket.is_public_read,
         mutation_id: mutation_id_string.clone(),
-        fence_token: 0,
         created_at: projected_bucket.created_at.to_rfc3339(),
         emitted_at: Some(chrono::Utc::now().to_rfc3339()),
     };
@@ -629,32 +656,21 @@ pub(crate) fn build_bucket_mvcc_mutation_plan(
         &projected_bucket,
         mutation,
         &partition_id,
-        &mutation_id_string,
-        row_generation,
     )?);
     operations.extend(bucket_current_coremeta_operations(
         BucketJournalScope::Global,
         &projected_bucket,
         mutation,
         &partition_id,
-        &mutation_id_string,
-        row_generation,
     )?);
     operations.push(bucket_event_head_put(
         &projected_bucket,
         &event_payload,
         collection_revision,
         &partition_id,
-        &mutation_id_string,
-        row_generation,
     )?);
     if mutation == BucketJournalMutation::Create && allocated_bucket_id > allocator_max {
-        operations.push(bucket_id_allocator_put(
-            allocated_bucket_id,
-            &partition_id,
-            &mutation_id_string,
-            row_generation,
-        )?);
+        operations.push(bucket_id_allocator_put(allocated_bucket_id, &partition_id)?);
     }
     operations.push(CoreMutationOperation::CoreMetaPut {
         partition_id: partition_id.clone(),
@@ -728,6 +744,7 @@ pub(crate) fn build_bucket_mvcc_mutation_plan(
         outbox_events: plan.outbox_events,
         allocated_bucket_id,
         collection_revision,
+        assignment_identity: projected_bucket.tenant_id.to_string(),
     })
 }
 
@@ -753,21 +770,11 @@ impl BucketCurrentRow {
 fn bucket_id_allocator_put(
     max_allocated_id: i64,
     partition_id: &str,
-    transaction_id: &str,
-    row_generation: u64,
 ) -> Result<CoreMutationOperation> {
     if max_allocated_id <= 0 {
         return Err(anyhow!("bucket id allocator must be positive"));
     }
-    let scope = BucketJournalScope::Global;
     let payload = encode_deterministic_proto(&BucketIdAllocatorRowProto {
-        common: Some(core_meta_committed_row_common(
-            scope.realm_id(),
-            scope.root_key_hash(),
-            row_generation,
-            transaction_id.to_string(),
-            current_unix_nanos(),
-        )),
         schema: BUCKET_ID_ALLOCATOR_ROW_SCHEMA.to_string(),
         max_allocated_id,
     })?;
@@ -789,30 +796,6 @@ fn bucket_current_coremeta_operations(
     bucket: &Bucket,
     mutation: BucketJournalMutation,
     operation_partition_id: &str,
-    mutation_id: &str,
-    row_generation: u64,
-) -> Result<Vec<CoreMutationOperation>> {
-    bucket_current_coremeta_operations_with_root(
-        scope,
-        bucket,
-        mutation,
-        operation_partition_id,
-        mutation_id,
-        row_generation,
-        scope.realm_id(),
-        scope.root_key_hash(),
-    )
-}
-
-fn bucket_current_coremeta_operations_with_root(
-    scope: BucketJournalScope,
-    bucket: &Bucket,
-    mutation: BucketJournalMutation,
-    operation_partition_id: &str,
-    mutation_id: &str,
-    row_generation: u64,
-    common_realm_id: String,
-    common_root_key_hash: String,
 ) -> Result<Vec<CoreMutationOperation>> {
     let operations = match scope {
         BucketJournalScope::Tenant(tenant_id) if mutation == BucketJournalMutation::Delete => {
@@ -828,49 +811,21 @@ fn bucket_current_coremeta_operations_with_root(
             cf: CF_MESH.to_string(),
             table_id: TABLE_BUCKET_CURRENT_BY_NAME_ROW,
             tuple_key: tenant_bucket_name_current_tuple_key(tenant_id, &bucket.name)?,
-            payload: encode_bucket_current_row_with_root(
-                bucket,
-                false,
-                mutation_id,
-                row_generation,
-                common_realm_id,
-                common_root_key_hash,
-            )?,
+            payload: encode_bucket_current_row(bucket, false)?,
         }],
         BucketJournalScope::Global => vec![CoreMutationOperation::CoreMetaPut {
             partition_id: operation_partition_id.to_string(),
             cf: CF_MESH.to_string(),
             table_id: TABLE_BUCKET_CURRENT_BY_ID_ROW,
             tuple_key: global_bucket_id_current_tuple_key(bucket.id)?,
-            payload: encode_bucket_current_row_with_root(
-                bucket,
-                mutation == BucketJournalMutation::Delete,
-                mutation_id,
-                row_generation,
-                common_realm_id,
-                common_root_key_hash,
-            )?,
+            payload: encode_bucket_current_row(bucket, mutation == BucketJournalMutation::Delete)?,
         }],
     };
     Ok(operations)
 }
 
-fn encode_bucket_current_row_with_root(
-    bucket: &Bucket,
-    deleted: bool,
-    mutation_id: &str,
-    row_generation: u64,
-    common_realm_id: String,
-    common_root_key_hash: String,
-) -> Result<Vec<u8>> {
+fn encode_bucket_current_row(bucket: &Bucket, deleted: bool) -> Result<Vec<u8>> {
     let row = BucketCurrentRowProto {
-        common: Some(core_meta_committed_row_common(
-            common_realm_id,
-            common_root_key_hash,
-            row_generation,
-            mutation_id.to_string(),
-            row_generation,
-        )),
         schema: BUCKET_CURRENT_ROW_SCHEMA.to_string(),
         deleted,
         bucket_id: bucket.id,
@@ -887,14 +842,7 @@ fn decode_bucket_current_row(bytes: &[u8]) -> Result<BucketCurrentRow> {
     let row = BucketCurrentRowProto::decode(bytes)?;
     ensure_deterministic_proto(&row, bytes, "bucket current row")?;
     if row.schema != BUCKET_CURRENT_ROW_SCHEMA {
-        return Err(anyhow!("CoreStore bucket current row has invalid schema"));
-    }
-    let common = row
-        .common
-        .as_ref()
-        .ok_or_else(|| anyhow!("CoreStore bucket current row missing CoreMeta common"))?;
-    if common.root_key_hash.is_empty() {
-        return Err(anyhow!("CoreStore bucket current row missing root hash"));
+        return Err(anyhow!("MVCC bucket current row has invalid schema"));
     }
     let bucket = Bucket {
         id: row.bucket_id,
@@ -911,48 +859,6 @@ fn decode_bucket_current_row(bytes: &[u8]) -> Result<BucketCurrentRow> {
     })
 }
 
-#[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct BucketJournalEntry {
-    sequence: u64,
-    body: BucketJournalBody,
-}
-
-#[cfg(test)]
-async fn read_bucket_journal_entries(
-    storage: &Storage,
-    scope: BucketJournalScope,
-) -> Result<Vec<BucketJournalEntry>> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let mut entries = Vec::new();
-    let mut after_sequence = 0;
-    loop {
-        let page = core_store
-            .read_stream_page(ReadStream {
-                stream_id: scope.stream_id(),
-                after_sequence,
-                limit: 256,
-            })
-            .await?;
-        for record in page.records {
-            if record.record_kind != BUCKET_METADATA_RECORD_KIND {
-                continue;
-            }
-            entries.push(BucketJournalEntry {
-                sequence: record.sequence,
-                body: decode_bucket_journal_body(&record.payload).with_context(|| {
-                    format!("decode bucket metadata stream record {}", record.cursor)
-                })?,
-            });
-        }
-        if !page.has_more || page.next_sequence == after_sequence {
-            break;
-        }
-        after_sequence = page.next_sequence;
-    }
-    Ok(entries)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BucketJournalScope {
     Tenant(i64),
@@ -960,59 +866,10 @@ enum BucketJournalScope {
 }
 
 impl BucketJournalScope {
-    fn stream_id(self) -> String {
-        match self {
-            Self::Tenant(tenant_id) => format!("bucket_metadata:tenant:{tenant_id}"),
-            Self::Global => "bucket_metadata:global".to_string(),
-        }
-    }
-
     fn partition_id(self) -> Hash32 {
         match self {
             Self::Tenant(tenant_id) => tenant_bucket_partition_id(tenant_id),
             Self::Global => global_bucket_partition_id(),
-        }
-    }
-
-    fn partition_principal(self) -> String {
-        match self {
-            Self::Tenant(tenant_id) => {
-                format!("partition-owner:bucket_metadata:tenant:{tenant_id}")
-            }
-            Self::Global => "partition-owner:bucket_metadata:global".to_string(),
-        }
-    }
-
-    fn bucket_current_tuple_prefix(self) -> Result<(u16, Vec<u8>)> {
-        match self {
-            Self::Tenant(tenant_id) => Ok((
-                TABLE_BUCKET_CURRENT_BY_NAME_ROW,
-                tenant_bucket_name_current_tuple_prefix(tenant_id)?,
-            )),
-            Self::Global => Ok((
-                TABLE_BUCKET_CURRENT_BY_ID_ROW,
-                global_bucket_id_current_tuple_prefix()?,
-            )),
-        }
-    }
-
-    fn bucket_current_tuple_key(self, bucket: &Bucket) -> Result<(u16, Vec<u8>)> {
-        match self {
-            Self::Tenant(tenant_id) => Ok((
-                TABLE_BUCKET_CURRENT_BY_NAME_ROW,
-                tenant_bucket_name_current_tuple_key(tenant_id, &bucket.name)?,
-            )),
-            Self::Global => Ok((
-                TABLE_BUCKET_CURRENT_BY_ID_ROW,
-                global_bucket_id_current_tuple_key(bucket.id)?,
-            )),
-        }
-    }
-
-    fn realm_id(self) -> String {
-        match self {
-            Self::Tenant(tenant_id) => format!("tenant/{tenant_id}"),
-            Self::Global => "system".to_string(),
         }
     }
 
@@ -1032,27 +889,6 @@ pub(crate) fn tenant_bucket_root_key_hash(tenant_id: i64) -> String {
     BucketJournalScope::Tenant(tenant_id).root_key_hash()
 }
 
-fn bucket_root_publications(
-    coordinator_root: &str,
-    data_root: String,
-) -> Vec<CoreMutationRootPublication> {
-    if coordinator_root == data_root {
-        return vec![CoreMutationRootPublication {
-            root_anchor_key: data_root,
-            writer_families: vec![
-                WriterFamily::CoreControl.as_str().to_string(),
-                WriterFamily::MeshControl.as_str().to_string(),
-            ],
-            transaction_coordinator: true,
-        }];
-    }
-    vec![
-        CoreMutationRootPublication::new(coordinator_root, WriterFamily::CoreControl.as_str())
-            .coordinator(),
-        CoreMutationRootPublication::new(data_root, WriterFamily::MeshControl.as_str()),
-    ]
-}
-
 fn ensure_bucket_tenant_name_matches(
     bucket: &Bucket,
     tenant_id: i64,
@@ -1060,7 +896,7 @@ fn ensure_bucket_tenant_name_matches(
 ) -> Result<()> {
     if bucket.tenant_id != tenant_id || bucket.name != bucket_name {
         return Err(anyhow!(
-            "CoreStore bucket current tenant/name row scope mismatch"
+            "MVCC bucket current tenant/name row scope mismatch"
         ));
     }
     Ok(())
@@ -1069,7 +905,7 @@ fn ensure_bucket_tenant_name_matches(
 fn ensure_bucket_scope_matches(scope: BucketJournalScope, bucket: &Bucket) -> Result<()> {
     if let BucketJournalScope::Tenant(tenant_id) = scope {
         if bucket.tenant_id != tenant_id {
-            return Err(anyhow!("CoreStore bucket current list row scope mismatch"));
+            return Err(anyhow!("MVCC bucket current list row scope mismatch"));
         }
     }
     Ok(())
@@ -1081,38 +917,6 @@ pub fn tenant_bucket_partition_id(tenant_id: i64) -> Hash32 {
 
 pub fn global_bucket_partition_id() -> Hash32 {
     hash32(b"bucket_metadata/global")
-}
-
-#[cfg(test)]
-pub(crate) async fn read_bucket_frame_fences_for_test(
-    storage: &Storage,
-    tenant_id: i64,
-) -> Result<(Vec<u64>, Vec<u64>)> {
-    let tenant = read_bucket_journal_entries(storage, BucketJournalScope::Tenant(tenant_id))
-        .await?
-        .into_iter()
-        .map(|entry| entry.body.fence_token)
-        .collect();
-    let global = read_bucket_journal_entries(storage, BucketJournalScope::Global)
-        .await?
-        .into_iter()
-        .map(|entry| entry.body.fence_token)
-        .collect();
-    Ok((tenant, global))
-}
-
-fn require_bucket_scope_permit(
-    scope: BucketJournalScope,
-    permit: &PartitionWritePermit,
-) -> Result<()> {
-    if permit.partition_family != "bucket_metadata"
-        || permit.partition_id != hex::encode(scope.partition_id())
-    {
-        return Err(anyhow!(
-            "partition write permit does not target this bucket metadata partition"
-        ));
-    }
-    Ok(())
 }
 
 fn tenant_bucket_name_current_tuple_key(tenant_id: i64, bucket_name: &str) -> Result<Vec<u8>> {
@@ -1128,19 +932,6 @@ fn tenant_bucket_name_current_tuple_prefix(tenant_id: i64) -> Result<Vec<u8>> {
 
 fn global_bucket_id_current_tuple_key(bucket_id: i64) -> Result<Vec<u8>> {
     core_meta_tuple_key(&[CoreMetaTuplePart::I64(bucket_id)])
-}
-
-fn global_bucket_id_current_tuple_prefix() -> Result<Vec<u8>> {
-    Ok(Vec::new())
-}
-
-fn current_unix_nanos() -> u64 {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    now.as_secs()
-        .saturating_mul(1_000_000_000)
-        .saturating_add(u64::from(now.subsec_nanos()))
 }
 
 fn bucket_event_from_body(sequence: u64, body: BucketJournalBody) -> Result<BucketMetadataEvent> {
@@ -1195,7 +986,6 @@ fn encode_bucket_journal_body(body: &BucketJournalBody) -> Result<Vec<u8>> {
         region: body.region.clone(),
         is_public_read: body.is_public_read,
         mutation_id: body.mutation_id.clone(),
-        fence_token: body.fence_token,
         created_at: body.created_at.clone(),
         emitted_at: body.emitted_at.clone(),
     };
@@ -1218,7 +1008,6 @@ fn decode_bucket_journal_body(bytes: &[u8]) -> Result<BucketJournalBody> {
         region: proto.region,
         is_public_read: proto.is_public_read,
         mutation_id: proto.mutation_id,
-        fence_token: proto.fence_token,
         created_at: proto.created_at,
         emitted_at: proto.emitted_at,
     })
