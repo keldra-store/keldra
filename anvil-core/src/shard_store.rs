@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result, bail};
 use std::{
+    collections::BTreeSet,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -29,6 +30,27 @@ pub struct ShardRecord {
     pub shard_ordinal: u16,
     pub shard_kind: ShardKind,
     pub payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct ShardIdentity {
+    pub transaction_id: Uuid,
+    pub object_identity: Uuid,
+    pub encoding_generation: u64,
+    pub stripe_ordinal: u64,
+    pub shard_ordinal: u16,
+}
+
+impl From<&ShardRecord> for ShardIdentity {
+    fn from(record: &ShardRecord) -> Self {
+        Self {
+            transaction_id: record.transaction_id,
+            object_identity: record.object_identity,
+            encoding_generation: record.encoding_generation,
+            stripe_ordinal: record.stripe_ordinal,
+            shard_ordinal: record.shard_ordinal,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -61,30 +83,9 @@ impl ShardSegment {
 
     /// Returns only after the complete shard and its framing are fsynced.
     pub fn append(&mut self, record: &ShardRecord) -> Result<ShardLocation> {
-        let hash = *blake3::hash(&record.payload).as_bytes();
-        let offset = self.file.seek(SeekFrom::End(0))?;
-        let mut bytes = Vec::with_capacity(HEADER + record.payload.len() + TRAILER);
-        bytes.extend_from_slice(MAGIC);
-        bytes.extend_from_slice(&VERSION.to_be_bytes());
-        bytes.extend_from_slice(record.transaction_id.as_bytes());
-        bytes.extend_from_slice(record.object_identity.as_bytes());
-        bytes.extend_from_slice(&record.encoding_generation.to_be_bytes());
-        bytes.extend_from_slice(&record.stripe_ordinal.to_be_bytes());
-        bytes.extend_from_slice(&record.shard_ordinal.to_be_bytes());
-        bytes.push(record.shard_kind as u8);
-        bytes.extend_from_slice(&(record.payload.len() as u64).to_be_bytes());
-        bytes.extend_from_slice(&hash);
-        debug_assert_eq!(bytes.len(), HEADER);
-        bytes.extend_from_slice(&record.payload);
-        bytes.extend_from_slice(blake3::hash(&bytes).as_bytes());
-        self.file.write_all(&bytes)?;
+        let location = append_record(&mut self.file, self.id, record)?;
         self.file.sync_data()?;
-        Ok(ShardLocation {
-            segment_id: self.id,
-            payload_offset: offset + HEADER as u64,
-            payload_length: record.payload.len() as u64,
-            payload_hash: hash,
-        })
+        Ok(location)
     }
 
     pub fn read(&mut self, location: &ShardLocation) -> Result<Vec<u8>> {
@@ -103,6 +104,100 @@ impl ShardSegment {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Rewrites this segment retaining exactly the shards authorised by a
+    /// cluster-wide shard GC plan.
+    ///
+    /// The plan must already have proved manifest unreachability, replacement
+    /// durability/application, rollback-window expiry, and absence of
+    /// reader/repair/rebalance pins. This local append-only store intentionally
+    /// cannot infer any of those distributed facts.
+    pub fn compact_authorised(&mut self, retained: &BTreeSet<ShardIdentity>) -> Result<usize> {
+        let records = read_records(&mut self.file)?;
+        let removed = records
+            .iter()
+            .filter(|record| !retained.contains(&ShardIdentity::from(*record)))
+            .count();
+        if removed == 0 {
+            return Ok(0);
+        }
+        let temporary_path = self.path.with_extension("shards.compacting");
+        let mut replacement = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&temporary_path)?;
+        for record in records {
+            if retained.contains(&ShardIdentity::from(&record)) {
+                append_record(&mut replacement, self.id, &record)?;
+            }
+        }
+        replacement.sync_all()?;
+        fs::rename(&temporary_path, &self.path)?;
+        self.file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        self.file.seek(SeekFrom::End(0))?;
+        Ok(removed)
+    }
+}
+
+fn append_record(file: &mut File, segment_id: u64, record: &ShardRecord) -> Result<ShardLocation> {
+    let hash = *blake3::hash(&record.payload).as_bytes();
+    let offset = file.seek(SeekFrom::End(0))?;
+    let mut bytes = Vec::with_capacity(HEADER + record.payload.len() + TRAILER);
+    bytes.extend_from_slice(MAGIC);
+    bytes.extend_from_slice(&VERSION.to_be_bytes());
+    bytes.extend_from_slice(record.transaction_id.as_bytes());
+    bytes.extend_from_slice(record.object_identity.as_bytes());
+    bytes.extend_from_slice(&record.encoding_generation.to_be_bytes());
+    bytes.extend_from_slice(&record.stripe_ordinal.to_be_bytes());
+    bytes.extend_from_slice(&record.shard_ordinal.to_be_bytes());
+    bytes.push(record.shard_kind as u8);
+    bytes.extend_from_slice(&(record.payload.len() as u64).to_be_bytes());
+    bytes.extend_from_slice(&hash);
+    debug_assert_eq!(bytes.len(), HEADER);
+    bytes.extend_from_slice(&record.payload);
+    bytes.extend_from_slice(blake3::hash(&bytes).as_bytes());
+    file.write_all(&bytes)?;
+    Ok(ShardLocation {
+        segment_id,
+        payload_offset: offset + HEADER as u64,
+        payload_length: record.payload.len() as u64,
+        payload_hash: hash,
+    })
+}
+
+fn read_records(file: &mut File) -> Result<Vec<ShardRecord>> {
+    recover_tail(file)?;
+    let file_len = file.metadata()?.len();
+    let mut offset = 0;
+    let mut records = Vec::new();
+    while offset < file_len {
+        file.seek(SeekFrom::Start(offset))?;
+        let mut header = [0; HEADER];
+        file.read_exact(&mut header)?;
+        let payload_length = u64::from_be_bytes(header[61..69].try_into().unwrap());
+        let mut payload = vec![0; payload_length as usize];
+        file.read_exact(&mut payload)?;
+        file.seek(SeekFrom::Current(TRAILER as i64))?;
+        records.push(ShardRecord {
+            transaction_id: Uuid::from_slice(&header[10..26])?,
+            object_identity: Uuid::from_slice(&header[26..42])?,
+            encoding_generation: u64::from_be_bytes(header[42..50].try_into().unwrap()),
+            stripe_ordinal: u64::from_be_bytes(header[50..58].try_into().unwrap()),
+            shard_ordinal: u16::from_be_bytes(header[58..60].try_into().unwrap()),
+            shard_kind: match header[60] {
+                1 => ShardKind::Data,
+                2 => ShardKind::Parity,
+                _ => bail!("invalid shard kind"),
+            },
+            payload,
+        });
+        offset = offset
+            .checked_add(HEADER as u64 + payload_length + TRAILER as u64)
+            .context("shard offset overflow")?;
+    }
+    Ok(records)
 }
 
 fn recover_tail(file: &mut File) -> Result<()> {
@@ -221,5 +316,23 @@ mod tests {
         file.sync_all().unwrap();
         drop(segment);
         assert!(ShardSegment::open(dir.path(), 1).is_err());
+    }
+
+    #[test]
+    fn authorised_compaction_keeps_pinned_provisional_or_committed_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        let keep = record(b"visible or pinned");
+        let remove = record(b"expired provisional or safely retired");
+        let mut segment = ShardSegment::open(dir.path(), 1).unwrap();
+        segment.append(&keep).unwrap();
+        segment.append(&remove).unwrap();
+
+        let retained = [ShardIdentity::from(&keep)].into_iter().collect();
+        assert_eq!(segment.compact_authorised(&retained).unwrap(), 1);
+        drop(segment);
+
+        let mut reopened = ShardSegment::open(dir.path(), 1).unwrap();
+        let records = read_records(&mut reopened.file).unwrap();
+        assert_eq!(records, [keep]);
     }
 }
