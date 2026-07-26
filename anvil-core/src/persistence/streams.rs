@@ -706,6 +706,17 @@ impl Persistence {
         mutations: Vec<AuthzTupleBatchMutation>,
         written_by: &str,
     ) -> Result<Vec<AuthzTupleRecord>> {
+        self.write_authz_tuple_batch_with_admin_audit(tenant_id, mutations, written_by, None)
+            .await
+    }
+
+    pub async fn write_authz_tuple_batch_with_admin_audit(
+        &self,
+        tenant_id: i64,
+        mutations: Vec<AuthzTupleBatchMutation>,
+        written_by: &str,
+        audit_event: Option<&crate::admin_audit::AdminAuditEvent>,
+    ) -> Result<Vec<AuthzTupleRecord>> {
         let permit = self.authz_write_permit(tenant_id).await?;
         let writes = mutations
             .iter()
@@ -728,6 +739,7 @@ impl Persistence {
             writes,
             &permit,
             &self.partition_owner_signing_key,
+            audit_event,
         )
         .await?;
         if let Some(revision) = records.iter().map(|record| record.revision).max() {

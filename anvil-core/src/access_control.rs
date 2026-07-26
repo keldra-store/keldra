@@ -1067,6 +1067,7 @@ pub async fn write_delegated_action_tuple_batch(
     operation: &str,
     written_by: &str,
     reason: &str,
+    audit_event: &crate::admin_audit::AdminAuditEvent,
 ) -> Result<(), Status> {
     if policies.is_empty() {
         return Err(Status::invalid_argument(
@@ -1103,7 +1104,12 @@ pub async fn write_delegated_action_tuple_batch(
     }
 
     let records = persistence
-        .write_authz_tuple_batch(SYSTEM_STORAGE_TENANT_ID, mutations, written_by)
+        .write_authz_tuple_batch_with_admin_audit(
+            SYSTEM_STORAGE_TENANT_ID,
+            mutations,
+            written_by,
+            Some(audit_event),
+        )
         .await
         .map_err(authz_tuple_write_status)?;
     let revision = records

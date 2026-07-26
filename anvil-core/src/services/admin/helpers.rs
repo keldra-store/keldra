@@ -1013,17 +1013,6 @@ pub(super) async fn mutate_application_policy_batch(
     let tenant_id = resolve_tenant_id(state, &req.tenant_id).await?;
     let app = resolve_tenant_app(state, tenant_id, &req.app_name).await?;
     let parsed = parse_application_policy_batch(&req.policies)?;
-    crate::access_control::write_delegated_action_tuple_batch(
-        &state.storage,
-        &state.persistence,
-        tenant_id,
-        &app.id.to_string(),
-        &parsed,
-        operation,
-        &principal.principal_id,
-        reason,
-    )
-    .await?;
     let policy_details = req
         .policies
         .iter()
@@ -1034,8 +1023,7 @@ pub(super) async fn mutate_application_policy_batch(
             })
         })
         .collect::<Vec<_>>();
-    let audit_event_id = record_admin_audit_event(
-        state,
+    let audit_event = build_admin_audit_event(
         &principal,
         context,
         audit_action,
@@ -1046,8 +1034,21 @@ pub(super) async fn mutate_application_policy_batch(
             "app_id": app.id,
             "app_name": &app.name,
             "client_id": &app.client_id,
+            "operation": operation,
             "policies": policy_details,
         }),
+    )?;
+    let audit_event_id = audit_event.audit_event_id.clone();
+    crate::access_control::write_delegated_action_tuple_batch(
+        &state.storage,
+        &state.persistence,
+        tenant_id,
+        &app.id.to_string(),
+        &parsed,
+        operation,
+        &principal.principal_id,
+        reason,
+        &audit_event,
     )
     .await?;
     Ok(Response::new(ApplicationPoliciesResponse {
