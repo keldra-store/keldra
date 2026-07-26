@@ -691,11 +691,17 @@ impl ObjectManager {
                                     .to_string(),
                                 cluster_id: binding.cluster_id.clone(),
                                 transaction_id: transaction_id.to_string(),
+                                kind: crate::mvcc_shard_repair::ShardMaintenanceKind::Repair,
                                 target_logical_identity: format!(
                                     "cluster/{}/object/{}",
                                     binding.cluster_id, manifest.object_hash
                                 ),
                                 source_manifest: manifest.clone(),
+                                source_manifest_hash: hex::encode(blake3::hash(
+                                    &manifest
+                                        .canonical_bytes()
+                                        .map_err(|error| Status::internal(error.to_string()))?,
+                                )),
                                 missing,
                                 retiring: Vec::new(),
                                 originating_snapshot_version: binding.snapshot_version,

@@ -9,7 +9,7 @@ use tokio::sync::watch;
 use crate::{
     mvcc_transaction::CommitVersion,
     object_shard_manifest::{PhysicalObjectShardManifest, PhysicalShardPlacement},
-    shard_placement::ShardTarget,
+    shard_placement::{ShardPlacementPolicy, ShardTarget},
     streaming_erasure::{EncodedShard, ErasureProfile, ShardSink, StreamingErasureEncoder},
 };
 
@@ -28,17 +28,146 @@ pub struct MissingShardTarget {
     pub target: ShardTarget,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShardMaintenanceKind {
+    #[default]
+    Repair,
+    Rebalance,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShardRepairJob {
     pub schema: String,
     pub cluster_id: String,
     pub transaction_id: String,
+    #[serde(default)]
+    pub kind: ShardMaintenanceKind,
     pub target_logical_identity: String,
     pub source_manifest: PhysicalObjectShardManifest,
+    pub source_manifest_hash: String,
     pub missing: Vec<MissingShardTarget>,
     pub retiring: Vec<PhysicalShardPlacement>,
     pub originating_snapshot_version: CommitVersion,
     pub requested_at_unix_ms: u64,
+}
+
+/// Detect placement/failure-domain drift in an already snapshot-resolved
+/// manifest and build one canonical durable rebalance job.
+///
+/// The caller persists `canonical_bytes()` as a materialisation job in the
+/// transaction that observed `originating_snapshot_version`. Identical inputs
+/// produce an identical job ID, so registry insertion is naturally deduplicated.
+pub fn plan_rebalance_job(
+    manifest: &PhysicalObjectShardManifest,
+    transaction_id: impl Into<String>,
+    candidates: &[ShardTarget],
+    policy: ShardPlacementPolicy,
+    originating_snapshot_version: CommitVersion,
+    requested_at_unix_ms: u64,
+) -> Result<Option<ShardRepairJob>> {
+    manifest.validate()?;
+    let profile = ErasureProfile {
+        data_shards: usize::from(manifest.data_shards),
+        parity_shards: usize::from(manifest.parity_shards),
+        shard_bytes: usize::try_from(manifest.shard_bytes)?,
+    };
+    let desired = policy.plan(
+        manifest.object_identity,
+        manifest.encoding_generation,
+        profile,
+        candidates,
+    )?;
+    let mut missing = Vec::new();
+    let mut retiring = Vec::new();
+    for stripe_ordinal in 0..manifest.stripe_count {
+        for (ordinal, target) in desired.targets_by_ordinal.iter().enumerate() {
+            let shard_ordinal = u16::try_from(ordinal)?;
+            let current = manifest.placements.iter().find(|placement| {
+                placement.stripe_ordinal == stripe_ordinal
+                    && placement.shard_ordinal == shard_ordinal
+            });
+            let already_optimal = current.is_some_and(|placement| {
+                placement.node_id == target.node.node_id
+                    && placement.node_incarnation == target.node.incarnation
+                    && placement.failure_domain == target.failure_domain
+            });
+            if already_optimal {
+                continue;
+            }
+            missing.push(MissingShardTarget {
+                stripe_ordinal,
+                shard_ordinal,
+                target: target.clone(),
+            });
+            if let Some(current) = current {
+                retiring.push(current.clone());
+            }
+        }
+    }
+    if missing.is_empty() {
+        return Ok(None);
+    }
+    missing.sort_by_key(|entry| (entry.stripe_ordinal, entry.shard_ordinal));
+    retiring.sort_by_key(|entry| (entry.stripe_ordinal, entry.shard_ordinal));
+    let target_logical_identity =
+        String::from_utf8(placement_overlay_key(manifest).application_key)?;
+    let job = ShardRepairJob {
+        schema: ShardRepairJob::SCHEMA.to_string(),
+        cluster_id: manifest.cluster_id.clone(),
+        transaction_id: transaction_id.into(),
+        kind: ShardMaintenanceKind::Rebalance,
+        target_logical_identity,
+        source_manifest: manifest.clone(),
+        source_manifest_hash: hex::encode(blake3::hash(&manifest.canonical_bytes()?)),
+        missing,
+        retiring,
+        originating_snapshot_version,
+        requested_at_unix_ms,
+    };
+    job.validate()?;
+    Ok(Some(job))
+}
+
+/// Snapshot-resolve, detect drift, and durably stage a deduplicated rebalance
+/// job in an already-open MVCC transaction.
+pub fn stage_rebalance_if_drift(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    source_manifest: &PhysicalObjectShardManifest,
+    candidates: &[ShardTarget],
+    policy: ShardPlacementPolicy,
+    now_unix_ms: u64,
+) -> Result<bool> {
+    let binding = mvcc.open_transactions.binding(transaction_id, principal)?;
+    if binding.cluster_id != source_manifest.cluster_id {
+        bail!("rebalance source manifest belongs to another cluster");
+    }
+    let resolved = resolve_manifest_at_snapshot(
+        mvcc.runtime.local_store(),
+        source_manifest,
+        binding.snapshot_version,
+    )?;
+    let Some(mut job) = plan_rebalance_job(
+        &resolved,
+        transaction_id,
+        candidates,
+        policy,
+        binding.snapshot_version,
+        now_unix_ms,
+    )?
+    else {
+        return Ok(false);
+    };
+    job.source_manifest_hash = hex::encode(blake3::hash(&source_manifest.canonical_bytes()?));
+    mvcc.open_transactions.add_job(
+        transaction_id,
+        &binding.cluster_id,
+        job.canonical_bytes()?,
+        now_unix_ms,
+    )?;
+    Ok(true)
 }
 
 impl ShardRepairJob {
@@ -66,6 +195,11 @@ impl ShardRepairJob {
             || self.cluster_id.trim().is_empty()
             || self.transaction_id.trim().is_empty()
             || self.target_logical_identity.trim().is_empty()
+            || self.source_manifest_hash.len() != 64
+            || !self
+                .source_manifest_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
             || self.missing.is_empty()
             || self.requested_at_unix_ms == 0
         {
@@ -86,6 +220,30 @@ impl ShardRepairJob {
                 || !identities.insert((missing.stripe_ordinal, missing.shard_ordinal))
             {
                 bail!("invalid or duplicate missing shard target");
+            }
+        }
+        if self.missing.windows(2).any(|pair| {
+            (pair[0].stripe_ordinal, pair[0].shard_ordinal)
+                >= (pair[1].stripe_ordinal, pair[1].shard_ordinal)
+        }) {
+            bail!("shard maintenance targets must be canonically sorted");
+        }
+        let mut retired = std::collections::BTreeSet::new();
+        for placement in &self.retiring {
+            let identity = (placement.stripe_ordinal, placement.shard_ordinal);
+            if !identities.contains(&identity) || !retired.insert(identity) {
+                bail!("retiring placement must correspond to one replacement target");
+            }
+            let replacement = self
+                .missing
+                .iter()
+                .find(|missing| (missing.stripe_ordinal, missing.shard_ordinal) == identity)
+                .expect("checked replacement identity");
+            if placement.node_id == replacement.target.node.node_id
+                && placement.node_incarnation == replacement.target.node.incarnation
+                && placement.failure_domain == replacement.target.failure_domain
+            {
+                bail!("replacement target must differ from retiring placement");
             }
         }
         Ok(())
@@ -230,7 +388,7 @@ impl ShardRepairRunner {
         };
         let started_at = std::time::Instant::now();
         crate::perf::record_repair_age(
-            "mvcc_shard",
+            maintenance_label(record.job.kind),
             Duration::from_millis(now.saturating_sub(record.job.requested_at_unix_ms)),
         );
         tracing::info!(
@@ -244,7 +402,7 @@ impl ShardRepairRunner {
         match tokio::time::timeout(timeout, self.execute(&record.job)).await {
             Ok(Ok(())) => {
                 crate::perf::record_repair_duration(
-                    "mvcc_shard",
+                    maintenance_label(record.job.kind),
                     "erasure",
                     "complete",
                     started_at.elapsed(),
@@ -253,7 +411,7 @@ impl ShardRepairRunner {
             }
             Ok(Err(error)) => {
                 crate::perf::record_repair_duration(
-                    "mvcc_shard",
+                    maintenance_label(record.job.kind),
                     "erasure",
                     "retry",
                     started_at.elapsed(),
@@ -267,7 +425,7 @@ impl ShardRepairRunner {
             }
             Err(_) => {
                 crate::perf::record_repair_duration(
-                    "mvcc_shard",
+                    maintenance_label(record.job.kind),
                     "erasure",
                     "timeout",
                     started_at.elapsed(),
@@ -411,8 +569,7 @@ impl ShardRepairRunner {
                 now_unix_ms(),
             )
             .await?;
-        let source_manifest_hash =
-            hex::encode(blake3::hash(&job.source_manifest.canonical_bytes()?));
+        let source_manifest_hash = job.source_manifest_hash.clone();
         let overlay_key = crate::mvcc_transaction::LogicalKey {
             table_id: ShardPlacementOverlay::TABLE_ID,
             application_key: job.target_logical_identity.as_bytes().to_vec(),
@@ -422,6 +579,7 @@ impl ShardRepairRunner {
             .runtime
             .local_store()
             .read_at(&overlay_key, handle.snapshot_version)?;
+        let mut retired_after_commit = job.retiring.clone();
         if let Some(row) = &observed {
             let current: ShardPlacementOverlay = serde_json::from_slice(&row.value)?;
             if current.cluster_id != job.cluster_id
@@ -453,6 +611,16 @@ impl ShardRepairRunner {
                 .placements
                 .dedup_by_key(|placement| (placement.stripe_ordinal, placement.shard_ordinal));
             replacement_manifest.validate()?;
+            retired_after_commit.extend(current.retired_after_commit);
+            retired_after_commit.sort_by_key(|placement| {
+                (
+                    placement.stripe_ordinal,
+                    placement.shard_ordinal,
+                    placement.node_id.clone(),
+                    placement.node_incarnation,
+                )
+            });
+            retired_after_commit.dedup();
         }
         let overlay = ShardPlacementOverlay {
             schema: ShardPlacementOverlay::SCHEMA.to_string(),
@@ -460,7 +628,7 @@ impl ShardRepairRunner {
             target_logical_identity: job.target_logical_identity.clone(),
             source_manifest_hash,
             replacement_manifest,
-            retired_after_commit: job.retiring.clone(),
+            retired_after_commit,
         };
         self.mvcc.open_transactions.observe_point(
             &handle.transaction_id,
@@ -541,6 +709,13 @@ fn retry_at(now: u64, attempts: u32) -> u64 {
     now.saturating_add(250_u64.saturating_mul(1_u64 << attempts.min(10)))
 }
 
+fn maintenance_label(kind: ShardMaintenanceKind) -> &'static str {
+    match kind {
+        ShardMaintenanceKind::Repair => "mvcc_shard_repair",
+        ShardMaintenanceKind::Rebalance => "mvcc_shard_rebalance",
+    }
+}
+
 fn now_unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -580,12 +755,15 @@ mod tests {
                 failure_domain: "zone-a".into(),
             }],
         };
+        let source_manifest_hash = hex::encode(blake3::hash(&source.canonical_bytes().unwrap()));
         ShardRepairJob {
             schema: ShardRepairJob::SCHEMA.into(),
             cluster_id: "cluster".into(),
             transaction_id: "tx".into(),
+            kind: ShardMaintenanceKind::Repair,
             target_logical_identity: format!("cluster/cluster/object/{}", source.object_hash),
             source_manifest: source,
+            source_manifest_hash,
             missing: vec![MissingShardTarget {
                 stripe_ordinal: 0,
                 shard_ordinal: 1,
@@ -624,5 +802,40 @@ mod tests {
         let mut job = job();
         job.missing.push(job.missing[0].clone());
         assert!(job.validate().is_err());
+    }
+
+    #[test]
+    fn placement_drift_plans_canonical_rebalance_and_post_cutover_retirement() {
+        let source = job().source_manifest;
+        let candidates = ["b", "c"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, suffix)| ShardTarget {
+                cluster_id: "cluster".into(),
+                node: NodeIncarnation {
+                    node_id: format!("node-{suffix}"),
+                    incarnation: 1,
+                },
+                failure_domain: format!("zone-{index}"),
+            })
+            .collect::<Vec<_>>();
+        let planned = plan_rebalance_job(
+            &source,
+            "rebalance-tx",
+            &candidates,
+            ShardPlacementPolicy {
+                tolerated_failure_domains: 1,
+            },
+            4,
+            20,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(planned.kind, ShardMaintenanceKind::Rebalance);
+        assert_eq!(planned.retiring, source.placements);
+        assert_eq!(
+            ShardRepairJob::decode(&planned.canonical_bytes().unwrap()).unwrap(),
+            planned
+        );
     }
 }

@@ -443,7 +443,9 @@ impl OpenTransactionRegistry {
 
     pub fn add_job(&self, transaction_id: &str, job: Vec<u8>, now_unix_ms: u64) -> Result<()> {
         self.mutate(transaction_id, now_unix_ms, |draft| {
-            draft.mutations.jobs.push(job);
+            if !draft.mutations.jobs.contains(&job) {
+                draft.mutations.jobs.push(job);
+            }
             Ok(())
         })
     }
