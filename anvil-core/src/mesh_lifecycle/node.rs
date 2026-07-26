@@ -21,7 +21,6 @@ async fn register_node_inner(
     input: RegisterNodeDescriptor,
     authority: Option<LifecycleControlWriteAuthority<'_>>,
 ) -> LifecycleResult<NodeDescriptor> {
-    return Err(topology_transaction_error("node"));
     require_identifier(&input.mesh_id, "mesh id")?;
     require_identifier(&input.node_id, "node id")?;
     require_identifier(&input.region, "region")?;
@@ -111,140 +110,13 @@ async fn register_node_inner(
 }
 
 pub async fn put_node_in_transaction(
-    storage: &Storage,
-    input: RegisterNodeDescriptor,
-    target: Option<LifecycleState>,
-    transaction_id: &str,
-    principal: &str,
+    _storage: &Storage,
+    _input: RegisterNodeDescriptor,
+    _target: Option<LifecycleState>,
+    _transaction_id: &str,
+    _principal: &str,
 ) -> LifecycleResult<NodeDescriptor> {
-    require_identifier(&input.mesh_id, "mesh id")?;
-    require_identifier(&input.node_id, "node id")?;
-    require_identifier(&input.region, "region")?;
-    require_identifier(&input.cell_id, "cell id")?;
-    if input.receipt_signing_public_key.is_empty() {
-        return Err(LifecycleError::InvalidArgument(
-            "receipt signing public key must not be empty".to_string(),
-        ));
-    }
-    crate::node_signing::NodeVerifyingKey::from_bytes(&input.receipt_signing_public_key).map_err(
-        |err| {
-            LifecycleError::InvalidArgument(format!("receipt signing public key is invalid: {err}"))
-        },
-    )?;
-    require_nonempty(&input.public_api_addr, "public api addr")?;
-    if input.capabilities.is_empty() {
-        return Err(LifecycleError::InvalidArgument(
-            "node capabilities must not be empty".to_string(),
-        ));
-    }
-    let capacity_json_hash = capacity_json_hash(&input.capacity_json)?;
-
-    let mut state = read_state_for_transaction(storage, transaction_id, principal).await?;
-    let transaction_timestamp =
-        lifecycle_transaction_timestamp(storage, transaction_id, principal).await?;
-    if !state.regions.contains_key(&input.region) {
-        return Err(LifecycleError::NotFound {
-            resource_kind: "region",
-            resource_id: input.region,
-        });
-    }
-    let cell_key = cell_key(&input.region, &input.cell_id)?;
-    if !state.cells.contains_key(&cell_key) {
-        return Err(LifecycleError::NotFound {
-            resource_kind: "cell",
-            resource_id: input.cell_id,
-        });
-    }
-    let existing_generation = state
-        .nodes
-        .get(&input.node_id)
-        .map(|descriptor| descriptor.generation);
-    let mut descriptor = if let Some(existing) = state.nodes.get(&input.node_id).cloned() {
-        if existing.region != input.region
-            || existing.cell_id != input.cell_id
-            || existing.receipt_signing_public_key != input.receipt_signing_public_key
-            || existing.public_api_addr != input.public_api_addr
-            || existing.capabilities != input.capabilities
-            || existing.capacity_json_hash != capacity_json_hash
-        {
-            return Err(LifecycleError::InvalidArgument(format!(
-                "node {} already exists with different immutable descriptor fields",
-                existing.node_id
-            )));
-        }
-        existing
-    } else {
-        let now = transaction_timestamp.clone();
-        NodeDescriptor {
-            schema: NODE_DESCRIPTOR_SCHEMA.to_string(),
-            mesh_id: input.mesh_id,
-            node_id: input.node_id.clone(),
-            region: input.region,
-            cell_id: input.cell_id,
-            receipt_signing_public_key: input.receipt_signing_public_key,
-            public_api_addr: input.public_api_addr,
-            capabilities: input.capabilities,
-            capacity_json_hash,
-            state: LifecycleState::Joining,
-            drain: None,
-            last_heartbeat_at: None,
-            created_at: now.clone(),
-            updated_at: now,
-            generation: 1,
-        }
-    };
-
-    if let Some(target) = target
-        && descriptor.state != target
-    {
-        if target == LifecycleState::Active {
-            ensure_node_placement_is_active(&state, &descriptor)?;
-        }
-        validate_node_transition(descriptor.state, target).map_err(|_| {
-            LifecycleError::LifecycleTransitionDenied {
-                resource_kind: "node",
-                resource_id: descriptor.node_id.clone(),
-                from: descriptor.state,
-                to: target,
-            }
-        })?;
-        descriptor.state = target;
-        descriptor.drain = None;
-        descriptor.updated_at = transaction_timestamp;
-        descriptor.generation = descriptor.generation.saturating_add(1);
-    }
-
-    if existing_generation.is_some() && descriptor == state.nodes[&input.node_id] {
-        return Ok(descriptor);
-    }
-
-    state
-        .nodes
-        .insert(descriptor.node_id.clone(), descriptor.clone());
-    let record_key = node_record_key(&descriptor.region, &descriptor.cell_id, &descriptor.node_id)?;
-    let control = topology_mutation::transactional_control_mutation(
-        NODE_DESCRIPTOR_STREAM_FAMILY,
-        record_key,
-        if existing_generation.is_some() {
-            "upsert"
-        } else {
-            "create"
-        },
-        existing_generation,
-        descriptor.generation,
-        &descriptor.mesh_id,
-        &descriptor,
-        principal,
-    )?;
-    topology_mutation::stage_topology_mutation_in_transaction(
-        storage,
-        record_proto::encode_node_projection_row(&descriptor)?,
-        control,
-        transaction_id,
-        principal,
-    )
-    .await?;
-    Ok(descriptor)
+    Err(topology_transaction_error("node"))
 }
 
 #[cfg(test)]

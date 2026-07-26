@@ -1,8 +1,7 @@
 use crate::core_store::{
     CF_MESH, CoreMetaTuplePart, CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
-    CoreMutationRootPublication, CoreStore, CoreTransaction, CoreTransactionUpdate,
-    TABLE_MESH_NODE_ROW, TABLE_MESH_PARTITION_ROW, core_meta_payload_digest,
-    core_meta_record_tuple_key, core_meta_tuple_key,
+    CoreMutationRootPublication, CoreStore, TABLE_MESH_NODE_ROW, TABLE_MESH_PARTITION_ROW,
+    core_meta_payload_digest, core_meta_record_tuple_key, core_meta_tuple_key,
 };
 use crate::formats::writer::WriterFamily;
 use crate::mesh_control_stream::{
@@ -13,7 +12,7 @@ use crate::mesh_directory::{self, BucketLocatorDescriptor, BucketLocatorStatus};
 use crate::partition_fence::{self, PartitionWritePermit};
 use crate::routing::{self, HostAliasDescriptor, HostAliasState, RoutingConfig};
 use crate::storage::Storage;
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
@@ -56,22 +55,6 @@ const MESH_LIFECYCLE_PROJECTION_PARTITION_ID: &str = "mesh-lifecycle-projection"
 pub(crate) const LIFECYCLE_TOPOLOGY_ROOT_ANCHOR_KEY: &str = "mesh/lifecycle/topology";
 const LIFECYCLE_PROJECTION_PAGE_SIZE: usize = 256;
 const MAX_LIFECYCLE_PROJECTION_ROWS_PER_TABLE: usize = 8_192;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MeshLifecycleCommittedResource {
-    Region {
-        region: String,
-    },
-    Cell {
-        region: String,
-        cell_id: String,
-    },
-    Node {
-        region: String,
-        cell_id: String,
-        node_id: String,
-    },
-}
 
 #[derive(Debug, Error)]
 pub enum LifecycleError {
@@ -354,57 +337,6 @@ pub async fn read_state_with_core_store(
     let mut state = read_lifecycle_state_projection_with_core_store(store)?;
     overlay_lifecycle_control_streams_with_store(storage, store, &mut state).await?;
     Ok(state)
-}
-
-async fn read_state_for_transaction(
-    storage: &Storage,
-    transaction_id: &str,
-    principal: &str,
-) -> LifecycleResult<MeshLifecycleState> {
-    let mut state = read_state(storage).await?;
-    let store = CoreStore::new(storage.clone()).await?;
-    let transaction = store
-        .read_explicit_transaction_for_principal(transaction_id, principal)
-        .await?;
-    for update in &transaction.visible_updates {
-        let CoreTransactionUpdate::CoreMetaPut {
-            cf,
-            table_id,
-            payload,
-            ..
-        } = update
-        else {
-            continue;
-        };
-        if cf == CF_MESH && is_lifecycle_projection_table(*table_id) {
-            apply_lifecycle_projection_row(&mut state, *table_id, payload)?;
-        }
-    }
-    Ok(state)
-}
-
-async fn lifecycle_transaction_timestamp(
-    storage: &Storage,
-    transaction_id: &str,
-    principal: &str,
-) -> LifecycleResult<String> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let transaction = store
-        .read_explicit_transaction_for_principal(transaction_id, principal)
-        .await?;
-    let seconds =
-        i64::try_from(transaction.created_at_unix_nanos / 1_000_000_000).map_err(|_| {
-            LifecycleError::InvalidArgument(
-                "lifecycle transaction timestamp exceeds the supported range".to_string(),
-            )
-        })?;
-    let nanos = (transaction.created_at_unix_nanos % 1_000_000_000) as u32;
-    let timestamp = DateTime::<Utc>::from_timestamp(seconds, nanos).ok_or_else(|| {
-        LifecycleError::InvalidArgument(
-            "lifecycle transaction timestamp exceeds the supported range".to_string(),
-        )
-    })?;
-    Ok(timestamp.to_rfc3339_opts(SecondsFormat::Millis, true))
 }
 
 async fn write_state(storage: &Storage, state: &MeshLifecycleState) -> LifecycleResult<()> {
@@ -749,76 +681,6 @@ fn lifecycle_projection_root_publications(
         .collect()
 }
 
-async fn stage_lifecycle_projection_row_in_transaction(
-    storage: &Storage,
-    row: record_proto::EncodedLifecycleProjectionRow,
-    transaction_id: &str,
-    principal: &str,
-) -> LifecycleResult<()> {
-    let table_id = lifecycle_projection_table_id(row.kind)?;
-    let tuple_key = lifecycle_projection_row_key(row.kind, &row.record_key)?;
-    let store = CoreStore::new(storage.clone()).await?;
-    let current = transaction_visible_lifecycle_payload(
-        &store,
-        transaction_id,
-        principal,
-        table_id,
-        &tuple_key,
-    )
-    .await?;
-    store
-        .stage_coremeta_put_in_transaction(
-            transaction_id,
-            principal,
-            CF_MESH,
-            table_id,
-            tuple_key,
-            row.payload,
-            current
-                .as_ref()
-                .map(|payload| core_meta_payload_digest(table_id, payload)),
-            current.is_none(),
-            current.is_some(),
-        )
-        .await?;
-    Ok(())
-}
-
-async fn transaction_visible_lifecycle_payload(
-    store: &CoreStore,
-    transaction_id: &str,
-    principal: &str,
-    table_id: u16,
-    tuple_key: &[u8],
-) -> LifecycleResult<Option<Vec<u8>>> {
-    let transaction = store
-        .read_explicit_transaction_for_principal(transaction_id, principal)
-        .await?;
-    for update in transaction.visible_updates.iter().rev() {
-        match update {
-            CoreTransactionUpdate::CoreMetaPut {
-                cf,
-                table_id: update_table_id,
-                tuple_key: update_tuple_key,
-                payload,
-                ..
-            } if cf == CF_MESH && *update_table_id == table_id && update_tuple_key == tuple_key => {
-                return Ok(Some(payload.clone()));
-            }
-            CoreTransactionUpdate::CoreMetaDelete {
-                cf,
-                table_id: update_table_id,
-                tuple_key: update_tuple_key,
-                ..
-            } if cf == CF_MESH && *update_table_id == table_id && update_tuple_key == tuple_key => {
-                return Ok(None);
-            }
-            _ => {}
-        }
-    }
-    Ok(store.read_coremeta_row(CF_MESH, table_id, tuple_key)?)
-}
-
 fn apply_lifecycle_projection_row(
     state: &mut MeshLifecycleState,
     table_id: u16,
@@ -896,78 +758,6 @@ fn apply_lifecycle_projection_row(
         }
     }
     Ok(())
-}
-
-pub fn committed_topology_resources_from_transaction(
-    transaction: &CoreTransaction,
-) -> LifecycleResult<Vec<MeshLifecycleCommittedResource>> {
-    let mut regions = BTreeSet::new();
-    let mut cells = BTreeSet::new();
-    let mut nodes = BTreeSet::new();
-
-    for update in &transaction.visible_updates {
-        let CoreTransactionUpdate::CoreMetaPut {
-            cf,
-            table_id,
-            payload,
-            ..
-        } = update
-        else {
-            continue;
-        };
-        if cf != CF_MESH || !is_lifecycle_projection_table(*table_id) {
-            continue;
-        }
-
-        let projection = record_proto::decode_lifecycle_projection_row(payload)?;
-        match projection {
-            record_proto::LifecycleProjectionDescriptor::Region(descriptor) => {
-                ensure_lifecycle_projection_table(
-                    *table_id,
-                    record_proto::LIFECYCLE_PROJECTION_REGION_KIND,
-                )?;
-                regions.insert(descriptor.region);
-            }
-            record_proto::LifecycleProjectionDescriptor::Cell(descriptor) => {
-                ensure_lifecycle_projection_table(
-                    *table_id,
-                    record_proto::LIFECYCLE_PROJECTION_CELL_KIND,
-                )?;
-                cells.insert((descriptor.region, descriptor.cell_id));
-            }
-            record_proto::LifecycleProjectionDescriptor::Node(descriptor) => {
-                ensure_lifecycle_projection_table(
-                    *table_id,
-                    record_proto::LIFECYCLE_PROJECTION_NODE_KIND,
-                )?;
-                nodes.insert((descriptor.region, descriptor.cell_id, descriptor.node_id));
-            }
-            record_proto::LifecycleProjectionDescriptor::HostAlias(_)
-            | record_proto::LifecycleProjectionDescriptor::BucketDrainException(_)
-            | record_proto::LifecycleProjectionDescriptor::TopologyActivation(_)
-            | record_proto::LifecycleProjectionDescriptor::TopologyHead(_) => {}
-        }
-    }
-
-    let mut out = Vec::with_capacity(regions.len() + cells.len() + nodes.len());
-    out.extend(
-        regions
-            .into_iter()
-            .map(|region| MeshLifecycleCommittedResource::Region { region }),
-    );
-    out.extend(
-        cells
-            .into_iter()
-            .map(|(region, cell_id)| MeshLifecycleCommittedResource::Cell { region, cell_id }),
-    );
-    out.extend(nodes.into_iter().map(|(region, cell_id, node_id)| {
-        MeshLifecycleCommittedResource::Node {
-            region,
-            cell_id,
-            node_id,
-        }
-    }));
-    Ok(out)
 }
 
 fn ensure_lifecycle_projection_table(table_id: u16, kind: &str) -> LifecycleResult<()> {

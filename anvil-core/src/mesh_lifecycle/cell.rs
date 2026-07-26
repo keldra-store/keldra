@@ -21,7 +21,6 @@ async fn register_cell_inner(
     input: RegisterCellDescriptor,
     authority: Option<LifecycleControlWriteAuthority<'_>>,
 ) -> LifecycleResult<CellDescriptor> {
-    return Err(topology_transaction_error("cell"));
     require_identifier(&input.mesh_id, "mesh id")?;
     require_identifier(&input.region, "region")?;
     require_identifier(&input.cell_id, "cell id")?;
@@ -81,101 +80,13 @@ async fn register_cell_inner(
 }
 
 pub async fn put_cell_in_transaction(
-    storage: &Storage,
-    input: RegisterCellDescriptor,
-    target: Option<LifecycleState>,
-    transaction_id: &str,
-    principal: &str,
+    _storage: &Storage,
+    _input: RegisterCellDescriptor,
+    _target: Option<LifecycleState>,
+    _transaction_id: &str,
+    _principal: &str,
 ) -> LifecycleResult<CellDescriptor> {
-    require_identifier(&input.mesh_id, "mesh id")?;
-    require_identifier(&input.region, "region")?;
-    require_identifier(&input.cell_id, "cell id")?;
-    require_identifier(&input.failure_domain, "cell failure domain")?;
-
-    let mut state = read_state_for_transaction(storage, transaction_id, principal).await?;
-    let transaction_timestamp =
-        lifecycle_transaction_timestamp(storage, transaction_id, principal).await?;
-    if !state.regions.contains_key(&input.region) {
-        return Err(LifecycleError::NotFound {
-            resource_kind: "region",
-            resource_id: input.region.clone(),
-        });
-    }
-    let key = cell_key(&input.region, &input.cell_id)?;
-    let existing_generation = state
-        .cells
-        .get(&key)
-        .map(|descriptor| descriptor.generation);
-    let mut descriptor = if let Some(existing) = state.cells.get(&key).cloned() {
-        if existing.failure_domain != input.failure_domain {
-            return Err(LifecycleError::InvalidArgument(format!(
-                "cell {}/{} already exists with failure domain {}",
-                existing.region, existing.cell_id, existing.failure_domain
-            )));
-        }
-        existing
-    } else {
-        let now = transaction_timestamp.clone();
-        CellDescriptor {
-            schema: CELL_DESCRIPTOR_SCHEMA.to_string(),
-            mesh_id: input.mesh_id,
-            region: input.region,
-            cell_id: input.cell_id,
-            state: LifecycleState::Joining,
-            placement_weight: input.placement_weight,
-            failure_domain: input.failure_domain,
-            created_at: now.clone(),
-            updated_at: now,
-            generation: 1,
-        }
-    };
-
-    if let Some(target) = target
-        && descriptor.state != target
-    {
-        validate_region_transition(descriptor.state, target).map_err(|_| {
-            LifecycleError::LifecycleTransitionDenied {
-                resource_kind: "cell",
-                resource_id: descriptor.cell_id.clone(),
-                from: descriptor.state,
-                to: target,
-            }
-        })?;
-        descriptor.state = target;
-        descriptor.updated_at = transaction_timestamp;
-        descriptor.generation = descriptor.generation.saturating_add(1);
-    }
-
-    if existing_generation.is_some() && descriptor == state.cells[&key] {
-        return Ok(descriptor);
-    }
-
-    let key = cell_key(&descriptor.region, &descriptor.cell_id)?;
-    state.cells.insert(key, descriptor.clone());
-    let record_key = cell_record_key(&descriptor.region, &descriptor.cell_id)?;
-    let control = topology_mutation::transactional_control_mutation(
-        CELL_DESCRIPTOR_STREAM_FAMILY,
-        record_key,
-        if existing_generation.is_some() {
-            "upsert"
-        } else {
-            "create"
-        },
-        existing_generation,
-        descriptor.generation,
-        &descriptor.mesh_id,
-        &descriptor,
-        principal,
-    )?;
-    topology_mutation::stage_topology_mutation_in_transaction(
-        storage,
-        record_proto::encode_cell_projection_row(&descriptor)?,
-        control,
-        transaction_id,
-        principal,
-    )
-    .await?;
-    Ok(descriptor)
+    Err(topology_transaction_error("cell"))
 }
 
 #[cfg(test)]

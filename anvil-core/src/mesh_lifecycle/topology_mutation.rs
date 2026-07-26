@@ -16,7 +16,6 @@ pub(super) struct LifecycleControlMutation<'a> {
 
 enum LifecycleControlWriter<'a> {
     Fenced(LifecycleControlWriteAuthority<'a>),
-    Transaction { principal: &'a str },
 }
 
 struct PreparedTopologyMutation {
@@ -46,31 +45,6 @@ where
         mesh_id,
         payload,
         LifecycleControlWriter::Fenced(authority),
-    )
-}
-
-pub(super) fn transactional_control_mutation<'a, T>(
-    stream_family: &'a str,
-    record_key: String,
-    operation: &'a str,
-    expected_generation: Option<u64>,
-    new_generation: u64,
-    mesh_id: &'a str,
-    payload: &T,
-    principal: &'a str,
-) -> LifecycleResult<LifecycleControlMutation<'a>>
-where
-    T: record_proto::LifecycleControlPayload,
-{
-    lifecycle_control_mutation(
-        stream_family,
-        record_key,
-        operation,
-        expected_generation,
-        new_generation,
-        mesh_id,
-        payload,
-        LifecycleControlWriter::Transaction { principal },
     )
 }
 
@@ -112,7 +86,7 @@ pub(super) async fn commit_topology_mutation(
     control: Option<LifecycleControlMutation<'_>>,
 ) -> LifecycleResult<()> {
     let store = CoreStore::new(storage.clone()).await?;
-    let prepared = prepare_topology_mutation(storage, &store, row, control, None).await?;
+    let prepared = prepare_topology_mutation(storage, &store, row, control).await?;
     let receipt = store.commit_mutation_batch(prepared.batch).await?;
     ensure_committed(&receipt)?;
     if let Some(control) = prepared.control_append.as_ref() {
@@ -123,118 +97,11 @@ pub(super) async fn commit_topology_mutation(
     Ok(())
 }
 
-pub(super) async fn stage_topology_mutation_in_transaction(
-    storage: &Storage,
-    row: record_proto::EncodedLifecycleProjectionRow,
-    control: LifecycleControlMutation<'_>,
-    transaction_id: &str,
-    principal: &str,
-) -> LifecycleResult<()> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let transaction = store
-        .read_explicit_transaction_for_principal(transaction_id, principal)
-        .await?;
-    if transaction.root_anchor_key != LIFECYCLE_TOPOLOGY_ROOT_ANCHOR_KEY
-        || transaction.scope_partition != LIFECYCLE_TOPOLOGY_ROOT_ANCHOR_KEY
-    {
-        return Err(LifecycleError::InvalidArgument(format!(
-            "lifecycle topology transactions must use root anchor {LIFECYCLE_TOPOLOGY_ROOT_ANCHOR_KEY}"
-        )));
-    }
-    let mutation_identity = topology_mutation_identity(&row, Some(&control), Some(&transaction));
-    if transaction_contains_complete_topology_stage(&transaction, &row, &mutation_identity)? {
-        return Ok(());
-    }
-    let prepared =
-        prepare_topology_mutation(storage, &store, row, Some(control), Some(&transaction)).await?;
-    let receipt = store
-        .stage_explicit_transaction_batch(prepared.batch)
-        .await?;
-    if receipt.state != CoreTransactionState::Open {
-        return Err(LifecycleError::InvalidArgument(
-            "lifecycle topology transaction was not left open after staging".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn transaction_contains_complete_topology_stage(
-    transaction: &CoreTransaction,
-    row: &record_proto::EncodedLifecycleProjectionRow,
-    mutation_identity: &str,
-) -> LifecycleResult<bool> {
-    let table_id = lifecycle_projection_table_id(row.kind)?;
-    let tuple_key = lifecycle_projection_row_key(row.kind, &row.record_key)?;
-    let projection_is_staged = transaction.visible_updates.iter().any(|update| {
-        matches!(
-            update,
-            CoreTransactionUpdate::CoreMetaPut {
-                cf,
-                table_id: update_table_id,
-                tuple_key: update_tuple_key,
-                payload,
-                ..
-            } if cf == CF_MESH
-                && *update_table_id == table_id
-                && update_tuple_key == &tuple_key
-                && payload == &row.payload
-        )
-    });
-    if !projection_is_staged {
-        return Ok(false);
-    }
-
-    let topology_head_is_staged = transaction.visible_updates.iter().any(|update| {
-        let CoreTransactionUpdate::CoreMetaPut {
-            cf,
-            table_id,
-            payload,
-            ..
-        } = update
-        else {
-            return false;
-        };
-        cf == CF_MESH
-            && *table_id == TABLE_MESH_PARTITION_ROW
-            && matches!(
-                record_proto::decode_lifecycle_projection_row(payload),
-                Ok(record_proto::LifecycleProjectionDescriptor::TopologyHead(_))
-            )
-    });
-    let matching_control_records = transaction
-        .visible_updates
-        .iter()
-        .filter(|update| {
-            let CoreTransactionUpdate::StreamAppend { payload, .. } = update else {
-                return false;
-            };
-            let Ok((frame, used)) = ControlStreamFrame::decode(payload) else {
-                return false;
-            };
-            if used != payload.len() {
-                return false;
-            }
-            crate::mesh_control_stream::decode_control_mutation_header(&frame.header_proto)
-                .ok()
-                .and_then(|header| header.idempotency_key)
-                .as_deref()
-                == Some(mutation_identity)
-        })
-        .count();
-    if topology_head_is_staged && matching_control_records == 2 {
-        return Ok(true);
-    }
-    Err(LifecycleError::InvalidArgument(
-        "explicit lifecycle transaction contains a partial topology mutation stage".to_string(),
-    ))
-}
-
 async fn prepare_topology_mutation(
     storage: &Storage,
     store: &CoreStore,
     row: record_proto::EncodedLifecycleProjectionRow,
     control: Option<LifecycleControlMutation<'_>>,
-    transaction: Option<&CoreTransaction>,
 ) -> LifecycleResult<PreparedTopologyMutation> {
     if !matches!(
         row.kind,
@@ -250,9 +117,9 @@ async fn prepare_topology_mutation(
 
     let mutation_created_at = topology_mutation_created_at(&row)?;
     let activated_at_unix_nanos = topology_mutation_timestamp_nanos(&mutation_created_at)?;
-    let mutation_identity = topology_mutation_identity(&row, control.as_ref(), transaction);
+    let mutation_identity = topology_mutation_identity(&row, control.as_ref());
 
-    let mut state = topology_state_visible_to_transaction(store, transaction)?;
+    let mut state = read_lifecycle_state_projection_with_core_store(store)?;
     match state.topology_head.as_ref() {
         Some(head) => {
             record_proto::validate_topology_head(head)?;
@@ -346,8 +213,7 @@ async fn prepare_topology_mutation(
     for row in rows {
         let table_id = lifecycle_projection_table_id(row.kind)?;
         let tuple_key = lifecycle_projection_row_key(row.kind, &row.record_key)?;
-        let current =
-            lifecycle_payload_visible_to_transaction(store, transaction, table_id, &tuple_key)?;
+        let current = store.read_coremeta_row(CF_MESH, table_id, &tuple_key)?;
         preconditions.push(CoreMutationPrecondition::CoreMetaRow {
             cf: CF_MESH.to_string(),
             table_id,
@@ -394,26 +260,13 @@ async fn prepare_topology_mutation(
                     format!("partition-owner:{}", authority.permit.owner_node_id),
                 )
             }
-            LifecycleControlWriter::Transaction { principal } => {
-                (None, principal, 0, principal.to_string())
-            }
         };
-        let cursor = if let Some(transaction) = transaction {
-            crate::mesh_control_stream::control_stream_append_cursor_visible_to_transaction(
-                storage,
-                control.stream_family,
-                &control.partition,
-                transaction,
-            )
-            .await
-        } else {
-            crate::mesh_control_stream::control_stream_append_cursor(
-                storage,
-                control.stream_family,
-                &control.partition,
-            )
-            .await
-        }
+        let cursor = crate::mesh_control_stream::control_stream_append_cursor(
+            storage,
+            control.stream_family,
+            &control.partition,
+        )
+        .await
         .map_err(|error| LifecycleError::InvalidArgument(error.to_string()))?;
         let digest = ControlRecordDigest::blake3(&control.payload_proto);
         let frame = ControlStreamFrame::new(
@@ -444,7 +297,7 @@ async fn prepare_topology_mutation(
             &control.partition,
             &frame,
             partition_precondition,
-            transaction,
+            None,
             LIFECYCLE_TOPOLOGY_ROOT_ANCHOR_KEY,
         )
         .await
@@ -456,13 +309,9 @@ async fn prepare_topology_mutation(
         (None, "mesh-lifecycle-internal".to_string())
     };
 
-    let batch_transaction_id = transaction.map_or_else(
-        || mutation_identity.clone(),
-        |transaction| transaction.transaction_id.clone(),
-    );
     Ok(PreparedTopologyMutation {
         batch: CoreMutationBatch {
-            transaction_id: batch_transaction_id,
+            transaction_id: mutation_identity,
             scope_partition: LIFECYCLE_TOPOLOGY_ROOT_ANCHOR_KEY.to_string(),
             committed_by_principal,
             root_publications: vec![CoreMutationRootPublication {
@@ -523,16 +372,12 @@ fn topology_mutation_timestamp_nanos(created_at: &str) -> LifecycleResult<u64> {
 fn topology_mutation_identity(
     row: &record_proto::EncodedLifecycleProjectionRow,
     control: Option<&LifecycleControlMutation<'_>>,
-    transaction: Option<&CoreTransaction>,
 ) -> String {
     let mut bytes = Vec::new();
     append_identity_part(&mut bytes, b"anvil.mesh.lifecycle_topology_mutation.v1");
     append_identity_part(&mut bytes, row.kind.as_bytes());
     append_identity_part(&mut bytes, row.record_key.as_bytes());
     append_identity_part(&mut bytes, &row.payload);
-    if let Some(transaction) = transaction {
-        append_identity_part(&mut bytes, transaction.transaction_id.as_bytes());
-    }
     if let Some(control) = control {
         append_identity_part(&mut bytes, control.stream_family.as_bytes());
         append_identity_part(&mut bytes, control.partition.as_bytes());
@@ -553,9 +398,6 @@ fn topology_mutation_identity(
                 append_identity_part(&mut bytes, authority.permit.owner_node_id.as_bytes());
                 append_identity_part(&mut bytes, &authority.permit.fence_token.to_le_bytes());
             }
-            LifecycleControlWriter::Transaction { principal } => {
-                append_identity_part(&mut bytes, principal.as_bytes());
-            }
         }
     }
     format!(
@@ -567,70 +409,6 @@ fn topology_mutation_identity(
 fn append_identity_part(bytes: &mut Vec<u8>, part: &[u8]) {
     bytes.extend_from_slice(&(part.len() as u64).to_le_bytes());
     bytes.extend_from_slice(part);
-}
-
-fn topology_state_visible_to_transaction(
-    store: &CoreStore,
-    transaction: Option<&CoreTransaction>,
-) -> LifecycleResult<MeshLifecycleState> {
-    let mut state = read_lifecycle_state_projection_with_core_store(store)?;
-    let Some(transaction) = transaction else {
-        return Ok(state);
-    };
-    for update in &transaction.visible_updates {
-        let CoreTransactionUpdate::CoreMetaPut {
-            cf,
-            table_id,
-            payload,
-            ..
-        } = update
-        else {
-            continue;
-        };
-        if cf == CF_MESH && is_lifecycle_projection_table(*table_id) {
-            apply_lifecycle_projection_row(&mut state, *table_id, payload)?;
-        }
-    }
-    Ok(state)
-}
-
-fn lifecycle_payload_visible_to_transaction(
-    store: &CoreStore,
-    transaction: Option<&CoreTransaction>,
-    table_id: u16,
-    tuple_key: &[u8],
-) -> LifecycleResult<Option<Vec<u8>>> {
-    if let Some(transaction) = transaction {
-        for update in transaction.visible_updates.iter().rev() {
-            match update {
-                CoreTransactionUpdate::CoreMetaPut {
-                    cf,
-                    table_id: update_table_id,
-                    tuple_key: update_tuple_key,
-                    payload,
-                    ..
-                } if cf == CF_MESH
-                    && *update_table_id == table_id
-                    && update_tuple_key == tuple_key =>
-                {
-                    return Ok(Some(payload.clone()));
-                }
-                CoreTransactionUpdate::CoreMetaDelete {
-                    cf,
-                    table_id: update_table_id,
-                    tuple_key: update_tuple_key,
-                    ..
-                } if cf == CF_MESH
-                    && *update_table_id == table_id
-                    && update_tuple_key == tuple_key =>
-                {
-                    return Ok(None);
-                }
-                _ => {}
-            }
-        }
-    }
-    Ok(store.read_coremeta_row(CF_MESH, table_id, tuple_key)?)
 }
 
 fn validate_control_authority(
@@ -674,7 +452,7 @@ pub(super) async fn prepare_topology_batch_for_test(
     row: record_proto::EncodedLifecycleProjectionRow,
 ) -> LifecycleResult<CoreMutationBatch> {
     let store = CoreStore::new(storage.clone()).await?;
-    Ok(prepare_topology_mutation(storage, &store, row, None, None)
+    Ok(prepare_topology_mutation(storage, &store, row, None)
         .await?
         .batch)
 }
@@ -686,7 +464,7 @@ pub(super) async fn commit_topology_mutation_with_failure_injection_for_test(
     control: LifecycleControlMutation<'_>,
 ) -> LifecycleResult<()> {
     let store = CoreStore::new(storage.clone()).await?;
-    let mut prepared = prepare_topology_mutation(storage, &store, row, Some(control), None).await?;
+    let mut prepared = prepare_topology_mutation(storage, &store, row, Some(control)).await?;
     let state = read_lifecycle_state_projection_with_core_store(&store)?;
     let head = state.topology_head.ok_or_else(|| {
         LifecycleError::InvalidArgument(

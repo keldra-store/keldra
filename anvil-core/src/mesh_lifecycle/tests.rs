@@ -425,6 +425,78 @@ async fn lifecycle_store_persists_descriptors_and_enforces_transitions() {
 }
 
 #[tokio::test]
+async fn topology_transactions_are_rejected_without_mutating_fenced_paths() {
+    let temp = tempdir().unwrap();
+    let storage = Storage::new_at(temp.path()).await.unwrap();
+    let region_input = CreateRegionDescriptor {
+        mesh_id: "mesh-a".to_string(),
+        region: "eu-west-1".to_string(),
+        public_base_url: "https://eu-west-1.anvil-storage.test".to_string(),
+        virtual_host_suffix: "eu-west-1.anvil-storage.test".to_string(),
+        placement_weight: 100,
+        default_cell: Some("cell-a".to_string()),
+    };
+    let error = put_region_in_transaction(
+        &storage,
+        region_input.clone(),
+        None,
+        "transaction-a",
+        "principal-a",
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("cannot participate"));
+
+    create_region(&storage, region_input).await.unwrap();
+    let cell_input = RegisterCellDescriptor {
+        mesh_id: "mesh-a".to_string(),
+        region: "eu-west-1".to_string(),
+        cell_id: "cell-a".to_string(),
+        placement_weight: 100,
+        failure_domain: "rack-a".to_string(),
+    };
+    assert!(
+        put_cell_in_transaction(
+            &storage,
+            cell_input.clone(),
+            None,
+            "transaction-a",
+            "principal-a",
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("cannot participate")
+    );
+    register_cell(&storage, cell_input).await.unwrap();
+
+    let node_input = RegisterNodeDescriptor {
+        mesh_id: "mesh-a".to_string(),
+        node_id: "node-a".to_string(),
+        region: "eu-west-1".to_string(),
+        cell_id: "cell-a".to_string(),
+        receipt_signing_public_key: test_receipt_signing_public_key(),
+        public_api_addr: "http://127.0.0.1:50051".to_string(),
+        capabilities: vec![NodeCapability::Object],
+        capacity_json: "{}".to_string(),
+    };
+    assert!(
+        put_node_in_transaction(
+            &storage,
+            node_input.clone(),
+            None,
+            "transaction-a",
+            "principal-a",
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("cannot participate")
+    );
+    register_node(&storage, node_input).await.unwrap();
+}
+
+#[tokio::test]
 async fn lifecycle_read_model_replays_control_streams_as_source_of_truth() {
     let temp = tempdir().unwrap();
     let storage = Storage::new_at(temp.path()).await.unwrap();
