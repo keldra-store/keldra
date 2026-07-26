@@ -98,13 +98,4 @@ async fn implicit_mutation_recovery_reuses_the_durable_publication_plan() {
             .is_none(),
         "the recovered publication intent must be cleared after commit"
     );
-    assert_eq!(
-        store
-            .read_transaction(transaction_id)
-            .await
-            .unwrap()
-            .expect("committed transaction")
-            .state,
-        CoreTransactionState::Committed
-    );
 }

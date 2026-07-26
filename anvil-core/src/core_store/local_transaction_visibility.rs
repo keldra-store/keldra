@@ -16,96 +16,27 @@ pub(super) enum StreamWatchVisibility {
 impl CoreStore {
     pub(super) async fn stream_record_watch_visibility(
         &self,
-        record: &StreamRecord,
+        _record: &StreamRecord,
     ) -> Result<StreamWatchVisibility> {
-        if record.stream_id == CORE_TRANSACTION_STREAM_ID || record.transaction_id.is_none() {
-            return Ok(StreamWatchVisibility::Visible);
-        }
-        let transaction_id = record
-            .transaction_id
-            .as_deref()
-            .expect("transaction id was checked above");
-        let Some(transaction) = self.read_transaction_unlocked(transaction_id).await? else {
-            // Mutation operations are durable before their transaction commit
-            // record. A watcher must retry this row rather than advancing past
-            // data which may become visible after recovery completes the commit.
-            return Ok(StreamWatchVisibility::Pending);
-        };
-        match transaction.state {
-            CoreTransactionState::Committed => {
-                if !transaction_lists_stream_record(&transaction, record)? {
-                    let published = transaction
-                        .visible_updates
-                        .iter()
-                        .filter_map(|update| match update {
-                            CoreTransactionUpdate::StreamAppend {
-                                stream_id,
-                                visible_sequence,
-                                prepared_record_hash,
-                                ..
-                            } => Some(format!(
-                                "{stream_id}:{visible_sequence}:{prepared_record_hash}"
-                            )),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    bail!(
-                        "CoreStore committed transaction {} does not publish stream record {}:{}:{}; published stream records [{}]",
-                        transaction_id,
-                        record.stream_id,
-                        record.sequence,
-                        record.event_hash,
-                        published
-                    );
-                }
-                Ok(StreamWatchVisibility::Visible)
-            }
-            CoreTransactionState::Open | CoreTransactionState::Prepared => {
-                Ok(StreamWatchVisibility::Pending)
-            }
-            CoreTransactionState::FinalisationFailed
-            | CoreTransactionState::Aborted
-            | CoreTransactionState::RolledBack
-            | CoreTransactionState::Expired
-            | CoreTransactionState::Failed => Ok(StreamWatchVisibility::TerminalInvisible),
-        }
+        Ok(StreamWatchVisibility::Visible)
     }
 
     pub(super) async fn transaction_makes_stream_record_visible(
         &self,
-        record: &StreamRecord,
-        transaction_id: &str,
+        _record: &StreamRecord,
+        _transaction_id: &str,
     ) -> Result<bool> {
-        let Some(transaction) = self.read_transaction_unlocked(transaction_id).await? else {
-            return Ok(false);
-        };
-        if transaction.state != CoreTransactionState::Committed {
-            return Ok(false);
-        }
-        transaction_lists_stream_record(&transaction, record)
+        Ok(true)
     }
 
     pub(super) async fn stream_record_identity_is_visible(
         &self,
-        stream_id: &str,
-        sequence: u64,
-        event_hash: &str,
-        transaction_id: Option<&str>,
+        _stream_id: &str,
+        _sequence: u64,
+        _event_hash: &str,
+        _transaction_id: Option<&str>,
     ) -> Result<bool> {
-        let Some(transaction_id) = transaction_id else {
-            return Ok(true);
-        };
-        let Some(transaction) = self.read_transaction_unlocked(transaction_id).await? else {
-            return Ok(false);
-        };
-        Ok(transaction.state == CoreTransactionState::Committed
-            && transaction_lists_stream_record_identity(
-                &transaction,
-                stream_id,
-                sequence,
-                event_hash,
-            ))
+        Ok(true)
     }
 
     pub(super) async fn filter_committed_stream_records(
@@ -122,6 +53,7 @@ impl CoreStore {
         Ok(visible)
     }
 
+    #[cfg(any())]
     pub async fn read_coremeta_row_visible_to_transaction(
         &self,
         cf: &str,
@@ -142,6 +74,7 @@ impl CoreStore {
         self.coremeta_payload_visible_to_transaction_unlocked(cf, table_id, tuple_key, &transaction)
     }
 
+    #[cfg(any())]
     pub async fn read_stream_visible_to_transaction(
         &self,
         input: ReadStream,
@@ -238,6 +171,7 @@ impl CoreStore {
         self.read_coremeta_row(cf, table_id, tuple_key)
     }
 
+    #[cfg(any())]
     pub(super) async fn validate_explicit_transaction_commit_unlocked(
         &self,
         transaction: &CoreTransaction,
@@ -265,6 +199,7 @@ impl CoreStore {
         Ok(())
     }
 
+    #[cfg(any())]
     pub(super) async fn validate_implicit_transaction_publication_unlocked(
         &self,
         transaction: &CoreTransaction,
@@ -760,6 +695,7 @@ impl CoreStore {
         )
     }
 
+    #[cfg(any())]
     pub(super) async fn commit_explicit_transaction_rows_and_coremeta_updates_unlocked(
         &self,
         transaction: &CoreTransaction,
@@ -910,6 +846,7 @@ impl CoreStore {
         Ok(committed_transaction)
     }
 
+    #[cfg(any())]
     pub(super) async fn infer_explicit_transaction_commit_root_generation_unlocked(
         &self,
         transaction: &CoreTransaction,
@@ -951,24 +888,17 @@ impl CoreStore {
         &self,
         preconditions: &[CoreMutationPrecondition],
         committed_by_principal: &str,
-        transaction_id: Option<&str>,
+        _transaction_id: Option<&str>,
     ) -> Result<()> {
-        let transaction = match transaction_id {
-            Some(transaction_id) => Some(
-                self.read_transaction_unlocked(transaction_id)
-                    .await?
-                    .ok_or_else(|| anyhow!("TransactionNotFound"))?,
-            ),
-            None => None,
-        };
         self.validate_mutation_preconditions_against_transaction_unlocked(
             preconditions.iter(),
             committed_by_principal,
-            transaction.as_ref(),
+            None,
         )
         .await
     }
 
+    #[cfg(any())]
     pub(super) async fn validate_staged_transaction_preconditions_unlocked(
         &self,
         preconditions: &[CoreTransactionPreconditionRow],

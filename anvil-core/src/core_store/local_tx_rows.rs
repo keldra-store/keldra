@@ -2,14 +2,6 @@ use super::*;
 use crate::formats::writer::WriterFamily;
 use prost::{Message, Oneof};
 
-#[path = "local_tx_rows/publication_guard.rs"]
-mod publication_guard;
-
-pub(super) use publication_guard::{
-    CorePublicationGuardContext, CorePublicationGuardSummary, hydrate_publication_guard_context,
-    publication_guard_summary,
-};
-
 const CORE_TRANSACTION_HEADER_ROW_SCHEMA: &str = "anvil.core.transaction_header_row.v1";
 const CORE_TRANSACTION_STAGED_UPDATE_ROW_SCHEMA: &str =
     "anvil.core.transaction_staged_update_row.v1";

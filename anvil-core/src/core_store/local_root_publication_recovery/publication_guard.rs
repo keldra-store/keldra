@@ -4,7 +4,7 @@ const MAX_TERMINAL_REASON_CHARS: usize = 1_024;
 
 pub(super) fn append_publication_guard_plan_hash(
     bytes: &mut Vec<u8>,
-    _guard: Option<&super::super::local_tx_rows::CorePublicationGuardSummary>,
+    _guard: Option<&CorePublicationGuardSummary>,
 ) {
     append_hash_part(bytes, b"anvil.core.root_publication_guard.none.v1");
 }

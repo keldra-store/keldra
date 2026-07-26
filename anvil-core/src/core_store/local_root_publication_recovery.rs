@@ -51,9 +51,17 @@ pub(super) struct RootPublicationIntent {
     pub(super) created_at_unix_nanos: u64,
     pub(super) roots: Vec<RootPublicationIntentRoot>,
     pub(super) local_rows: Vec<CoreMetaEncodedOwnedRow>,
-    pub(super) guard: Option<super::local_tx_rows::CorePublicationGuardSummary>,
+    pub(super) guard: Option<CorePublicationGuardSummary>,
     pub(super) state: RootPublicationIntentState,
     pub(super) terminal_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CorePublicationGuardSummary {
+    pub(super) context_hash: String,
+    pub(super) transaction_expires_at_unix_nanos: u64,
+    pub(super) visible_update_count: u64,
+    pub(super) precondition_count: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

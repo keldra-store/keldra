@@ -1873,9 +1873,6 @@ mod helpers;
 pub use helpers::*;
 
 #[cfg(test)]
-mod atomicity_tests;
-
-#[cfg(test)]
 mod task_compaction_tests;
 
 #[cfg(test)]

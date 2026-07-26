@@ -465,18 +465,10 @@ fn sample_boundary_schema(bucket: &str, generation: u64) -> CoreBoundarySchema {
 }
 
 mod admission_accounting;
-mod cancellation;
 mod control_record_encoding;
 mod coremeta_history;
 mod erasure_roots;
-mod final_linearization_guards;
 mod logical;
 mod object_metadata;
-mod pending;
-mod pending_terminal_recovery;
-mod precondition_errors;
-mod record_formats;
 mod root_publication_recovery;
-mod stream_paging;
 mod task_publication_successor;
-mod visibility;

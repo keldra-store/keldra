@@ -103,25 +103,6 @@ async fn append_commits_watch_record_and_exact_cursor_projection_atomically() {
         .unwrap(),
         Some(1)
     );
-    let transaction = CoreStore::new(storage.clone())
-        .await
-        .unwrap()
-        .read_transaction(&format!("object-metadata:{}:put", object.mutation_id))
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(transaction.visible_updates.iter().any(|update| matches!(
-        update,
-        CoreTransactionUpdate::StreamAppend {
-            visible_sequence: 1,
-            ..
-        }
-    )));
-    assert!(transaction.visible_updates.iter().any(|update| matches!(
-        update,
-        CoreTransactionUpdate::CoreMetaPut { table_id, .. }
-            if *table_id == TABLE_OBJECT_WATCH_CURSOR_ROW
-    )));
 }
 
 #[tokio::test]

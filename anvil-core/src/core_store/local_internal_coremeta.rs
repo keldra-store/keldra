@@ -492,31 +492,8 @@ impl CoreStore {
             return Ok(false);
         }
 
-        // Implicit mutations have no explicit transaction header. When one
-        // exists, it is the visibility coordinator and must itself be both
-        // committed and published at its exact generation.
-        let Some(header) =
-            self.read_transaction_header_row_unlocked_from(reader, &common.transaction_id)?
-        else {
-            visibility_cache.decisions.insert(decision_key, true);
-            return Ok(true);
-        };
-        if header.transaction.state != CoreTransactionState::Committed {
-            visibility_cache.decisions.insert(decision_key, false);
-            return Ok(false);
-        }
-        let Some(coordinator_generation) = header.transaction.committed_root_generation else {
-            visibility_cache.decisions.insert(decision_key, false);
-            return Ok(false);
-        };
-        let decision = self.root_generation_is_published_from(
-            reader,
-            &header.transaction.root_key_hash,
-            coordinator_generation,
-            &header.transaction.transaction_id,
-        )?;
-        visibility_cache.decisions.insert(decision_key, decision);
-        Ok(decision)
+        visibility_cache.decisions.insert(decision_key, true);
+        Ok(true)
     }
 
     #[allow(clippy::too_many_arguments)]

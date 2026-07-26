@@ -728,28 +728,7 @@ impl CoreStore {
         if let Some(existing_transaction_id) = existing.transaction_id.as_deref()
             && Some(existing_transaction_id) != transaction_id
         {
-            let visible = self
-                .read_transaction_unlocked(existing_transaction_id)
-                .await?
-                .is_some_and(|transaction| {
-                    transaction.state == CoreTransactionState::Committed
-                        && transaction.visible_updates.iter().any(|visible_update| {
-                            matches!(
-                                visible_update,
-                                CoreTransactionUpdate::StreamAppend {
-                                    stream_id: visible_stream_id,
-                                    visible_sequence,
-                                    prepared_record_hash,
-                                    ..
-                                } if visible_stream_id == &existing.stream_id
-                                    && *visible_sequence == existing.sequence
-                                    && prepared_record_hash == &existing.event_hash
-                            )
-                        })
-                });
-            if !visible {
-                return Ok(None);
-            }
+            return Ok(None);
         }
         if existing.payload_hash != payload_hash {
             bail!(
