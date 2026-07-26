@@ -69,6 +69,9 @@ pub async fn append_authz_derived_lag_watch_record(
     payload: AuthzDerivedLagWatchPayload,
     additional_preconditions: &[CoreMutationPrecondition],
 ) -> Result<u128> {
+    // This is a mesh authorization projection stream, not a cluster MVCC
+    // transaction. CoreStore's mutation batch is used only for atomic fenced
+    // publication of the stream record and its preconditions.
     validate_payload(&payload)?;
     let core_store = CoreStore::new(storage.clone()).await?;
     let prepared = prepare_lag_watch_record(tenant_id, mutation_id, &payload);
@@ -92,10 +95,11 @@ pub async fn append_authz_derived_lag_watch_record(
     let mut preconditions = Vec::with_capacity(additional_preconditions.len() + 1);
     preconditions.push(stream_precondition);
     preconditions.extend_from_slice(additional_preconditions);
-    let transaction_id = lag_watch_transaction_id(&prepared.idempotency_key, &preconditions)?;
+    let publication_attempt_id =
+        lag_watch_publication_attempt_id(&prepared.idempotency_key, &preconditions)?;
     let receipt = core_store
         .commit_mutation_batch(CoreMutationBatch {
-            transaction_id: transaction_id.clone(),
+            transaction_id: publication_attempt_id.clone(),
             scope_partition: prepared.partition_id.clone(),
             committed_by_principal: principal,
             root_publications: vec![
@@ -117,7 +121,7 @@ pub async fn append_authz_derived_lag_watch_record(
         .await?;
     if receipt.state != CoreTransactionState::Committed {
         bail!(
-            "authorization derived lag watch publication {transaction_id} did not commit: {}",
+            "authorization derived lag watch publication {publication_attempt_id} did not commit: {}",
             receipt
                 .finalisation_error
                 .as_deref()
@@ -176,7 +180,7 @@ fn prepare_lag_watch_record(
     }
 }
 
-fn lag_watch_transaction_id(
+fn lag_watch_publication_attempt_id(
     idempotency_key: &str,
     preconditions: &[CoreMutationPrecondition],
 ) -> Result<String> {
@@ -489,8 +493,9 @@ mod tests {
             expires_at_unix_nanos: 9_000_000_000,
         };
         assert_eq!(
-            lag_watch_transaction_id(&first.idempotency_key, &[precondition.clone()]).unwrap(),
-            lag_watch_transaction_id(&second.idempotency_key, &[precondition]).unwrap()
+            lag_watch_publication_attempt_id(&first.idempotency_key, &[precondition.clone()])
+                .unwrap(),
+            lag_watch_publication_attempt_id(&second.idempotency_key, &[precondition]).unwrap()
         );
 
         let first_cursor =
