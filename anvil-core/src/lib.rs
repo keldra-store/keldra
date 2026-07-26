@@ -278,16 +278,6 @@ impl AppState {
             partition_signing_key,
             observability.clone(),
         );
-        if !core_store.startup_recovery_deferred() {
-            system_realm::ensure_bootstrapped(
-                &arc_config,
-                &persistence,
-                &storage,
-                secret_keyring.as_ref(),
-            )
-            .await
-            .context("bootstrap system realm")?;
-        }
         let mvcc = Arc::new(
             mvcc_bootstrap::MvccSubsystem::bootstrap(&arc_config, core_store.core_meta_database())
                 .await
@@ -299,6 +289,16 @@ impl AppState {
         object_manager
             .install_mvcc(mvcc.clone())
             .context("install MVCC object runtime")?;
+        if !core_store.startup_recovery_deferred() {
+            system_realm::ensure_bootstrapped(
+                &arc_config,
+                &persistence,
+                &storage,
+                secret_keyring.as_ref(),
+            )
+            .await
+            .context("bootstrap system realm")?;
+        }
         mvcc.start_background_work(core_store.clone(), observability.clone())
             .context("start MVCC background workers")?;
 
