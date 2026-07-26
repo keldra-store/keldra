@@ -27,7 +27,7 @@ pub struct RealMvccCluster {
     _directories: Vec<TempDir>,
     configs: Vec<Config>,
     endpoints: Vec<String>,
-    states: Vec<Arc<AppState>>,
+    states: Vec<Option<Arc<AppState>>>,
     transports: Vec<Option<JoinHandle<()>>>,
 }
 
@@ -92,17 +92,27 @@ impl RealMvccCluster {
                 ..Config::default()
             })
             .collect::<Vec<_>>();
-        let mut states = Vec::new();
-        for config in &configs {
-            states.push(Arc::new(
-                AppState::new(config.clone(), PersonalDbProtocolKeyring::disabled()).await?,
+        let mut listeners = listeners.into_iter().map(Some).collect::<Vec<_>>();
+        let mut states = vec![None, None, None];
+        let mut transports = vec![None, None, None];
+        // Followers must be accepting consensus RPCs before the bootstrap
+        // voter installs the three-node membership and initial control state.
+        // Constructing node zero first deadlocks its quorum proposals against
+        // peers whose AppState/transport has not yet been started.
+        for index in [1_usize, 2, 0] {
+            let state = Arc::new(
+                AppState::new(
+                    configs[index].clone(),
+                    PersonalDbProtocolKeyring::disabled(),
+                )
+                .await?,
+            );
+            transports[index] = Some(spawn_transport(
+                listeners[index].take().expect("listener started once"),
+                &state,
             ));
+            states[index] = Some(state);
         }
-        let transports = listeners
-            .into_iter()
-            .zip(&states)
-            .map(|(listener, state)| Some(spawn_transport(listener, state)))
-            .collect();
         let cluster = Self {
             _directories: directories,
             configs,
@@ -115,7 +125,9 @@ impl RealMvccCluster {
     }
 
     pub fn state(&self, node: usize) -> &Arc<AppState> {
-        &self.states[node]
+        self.states[node]
+            .as_ref()
+            .expect("requested MVCC cluster node is running")
     }
 
     pub fn endpoint(&self, node: usize) -> &str {
@@ -135,7 +147,12 @@ impl RealMvccCluster {
             transport.abort();
             let _ = transport.await;
         }
-        self.states[node].mvcc.consensus.shutdown().await?;
+        let previous = self.states[node]
+            .take()
+            .expect("restarted MVCC cluster node is running");
+        previous.mvcc.shutdown().await;
+        previous.mvcc.consensus.shutdown().await?;
+        drop(previous);
         let state = Arc::new(
             AppState::new(
                 self.configs[node].clone(),
@@ -146,7 +163,7 @@ impl RealMvccCluster {
         let listener =
             TcpListener::bind(self.endpoints[node].trim_start_matches("http://")).await?;
         self.transports[node] = Some(spawn_transport(listener, &state));
-        self.states[node] = state;
+        self.states[node] = Some(state);
         Ok(())
     }
 
@@ -154,7 +171,8 @@ impl RealMvccCluster {
         Ok(tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 for node in nodes {
-                    if self.states[*node]
+                    if self
+                        .state(*node)
                         .mvcc
                         .consensus
                         .linearized_read_barrier()
@@ -177,7 +195,7 @@ impl RealMvccCluster {
         key: LogicalKey,
         value: Vec<u8>,
     ) -> anyhow::Result<CommitOutcome> {
-        let state = &self.states[node];
+        let state = self.state(node);
         let principal = "e2e-principal";
         let handle = state
             .mvcc
