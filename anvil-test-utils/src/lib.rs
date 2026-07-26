@@ -1404,7 +1404,14 @@ impl TestCluster {
                 let encrypted_secret = state.secret_keyring.encrypt(b"test-secret").unwrap();
                 let app = state
                     .persistence
-                    .create_app(tenant.id, "test-app", "test-app", &encrypted_secret)
+                    .create_app(
+                        tenant.id,
+                        "test-app",
+                        "test-app",
+                        &encrypted_secret,
+                        None,
+                        None,
+                    )
                     .await
                     .unwrap();
                 access_control::grant_storage_tenant_owner(
