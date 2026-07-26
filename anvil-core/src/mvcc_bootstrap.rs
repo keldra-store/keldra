@@ -567,14 +567,22 @@ impl MvccSubsystem {
                 consensus: consensus.clone(),
             }),
         )?);
-        crate::mvcc_assignment_reconciler::BackgroundAssignmentReconciler::new(
-            config.mvcc_cluster_id.clone(),
-            consensus.clone(),
-            local_store.clone(),
-        )?
-        .run_once()
-        .await
-        .context("install initial background-work partition assignments")?;
+        let initial_assignment_reconciler =
+            crate::mvcc_assignment_reconciler::BackgroundAssignmentReconciler::new(
+                config.mvcc_cluster_id.clone(),
+                consensus.clone(),
+                local_store.clone(),
+            )?;
+        if let Err(error) = initial_assignment_reconciler.run_once().await {
+            // Startup is not an assignment transaction. Leadership can change
+            // between the cheap leader check and the proposal, and a
+            // restarting node may not have transport quorum until its service
+            // is listening. The continuous reconciler below owns retry.
+            tracing::debug!(
+                error = %error,
+                "initial background assignment reconciliation deferred"
+            );
+        }
         let open_transactions = Arc::new(OpenTransactionRegistry::from_db(core_meta_db)?);
         let authorization_core_store =
             crate::core_store::CoreStore::new(materialisation_storage.clone()).await?;
