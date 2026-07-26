@@ -1,7 +1,8 @@
 use crate::{
     anvil_api::SignatureEnvelopeV1 as WireSignatureEnvelopeV1,
     core_store::{
-        CoreMutationBatch, CoreMutationPrecondition, CoreMutationRootPublication, CoreStore,
+        CF_PERSONALDB, CoreMetaTuplePart, CoreMutationBatch, CoreMutationPrecondition,
+        CoreMutationRootPublication, CoreStore, TABLE_PERSONALDB_GROUP_ROW, core_meta_tuple_key,
         decode_deterministic_proto, encode_deterministic_proto,
     },
     formats::{hash32, writer::WriterFamily},
@@ -566,6 +567,100 @@ pub(crate) fn decode_committed_head(bytes: &[u8]) -> Result<PersonalDbCommittedH
         bytes,
         "personaldb committed head",
     )?)
+}
+
+pub(crate) fn encode_snapshots_head(head: &PersonalDbSnapshotsHead) -> Result<Vec<u8>> {
+    Ok(encode_deterministic_proto(&snapshots_head_to_proto(head)))
+}
+
+pub(crate) fn decode_snapshots_head(bytes: &[u8]) -> Result<PersonalDbSnapshotsHead> {
+    snapshots_head_from_proto(decode_deterministic_proto::<PersonalDbSnapshotsHeadProto>(
+        bytes,
+        "personaldb snapshots head",
+    )?)
+}
+
+fn snapshots_head_mvcc_key(
+    tenant_id: i64,
+    database_id: &str,
+) -> Result<crate::mvcc_transaction::LogicalKey> {
+    crate::mvcc_product::coremeta_logical_key(
+        CF_PERSONALDB,
+        TABLE_PERSONALDB_GROUP_ROW,
+        &core_meta_tuple_key(&[
+            CoreMetaTuplePart::Utf8(&format!("personaldb/tenant/{tenant_id}")),
+            CoreMetaTuplePart::Utf8("snapshots-head-current"),
+            CoreMetaTuplePart::Utf8(database_id),
+        ])?,
+    )
+}
+
+pub fn read_personaldb_snapshots_head_at_snapshot(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    database_id: &str,
+    trust_store: &PublicKeyTrustStore,
+    snapshot_version: u64,
+) -> Result<Option<PersonalDbSnapshotsHead>> {
+    let key = snapshots_head_mvcc_key(tenant_id, database_id)?;
+    mvcc.runtime
+        .read_at(&key, snapshot_version)?
+        .map(|row| {
+            let head = decode_snapshots_head(&row.value)?;
+            head.verify(trust_store)?;
+            ensure_head_scope(tenant_id, database_id, &head.tenant_id, &head.database_id)?;
+            Ok(head)
+        })
+        .transpose()
+}
+
+pub fn read_personaldb_snapshots_head_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    database_id: &str,
+    trust_store: &PublicKeyTrustStore,
+) -> Result<Option<PersonalDbSnapshotsHead>> {
+    read_personaldb_snapshots_head_at_snapshot(
+        mvcc,
+        tenant_id,
+        database_id,
+        trust_store,
+        mvcc.runtime.applied_version()?,
+    )
+}
+
+pub async fn write_personaldb_snapshots_head_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    database_id: &str,
+    expected: Option<&PersonalDbSnapshotsHead>,
+    next: &PersonalDbSnapshotsHead,
+    trust_store: &PublicKeyTrustStore,
+    principal: &str,
+) -> Result<u64> {
+    next.verify(trust_store)?;
+    let current = read_personaldb_snapshots_head_mvcc(mvcc, tenant_id, database_id, trust_store)?;
+    if current.as_ref() != expected {
+        return Err(anyhow!(
+            "personaldb snapshots head changed before publication"
+        ));
+    }
+    let tuple = core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8(&format!("personaldb/tenant/{tenant_id}")),
+        CoreMetaTuplePart::Utf8("snapshots-head-current"),
+        CoreMetaTuplePart::Utf8(database_id),
+    ])?;
+    crate::personaldb_coremeta::write_personaldb_product_row_mvcc(
+        mvcc,
+        tenant_id,
+        database_id,
+        principal,
+        next.head_hash.as_deref().unwrap_or("snapshots-head"),
+        TABLE_PERSONALDB_GROUP_ROW,
+        tuple,
+        encode_snapshots_head(next)?,
+    )
+    .await
 }
 
 impl PersonalDbHeadRecordCodec for PersonalDbSnapshotsHead {

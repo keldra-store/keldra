@@ -863,7 +863,7 @@ pub async fn write_personaldb_group_row_mvcc(
     .await
 }
 
-async fn write_personaldb_product_row_mvcc(
+pub(crate) async fn write_personaldb_product_row_mvcc(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     group_id: &str,
@@ -929,6 +929,59 @@ async fn write_personaldb_product_row_mvcc(
             bail!("PersonalDB MVCC row transaction aborted: {reason:?}")
         }
     }
+}
+
+pub fn read_personaldb_group_row_at_snapshot(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    group_id: &str,
+    generation: u64,
+    snapshot_version: u64,
+) -> Result<Option<PersonalDbGroupCoreMetaRow>> {
+    let tuple = personaldb_group_tuple_key(tenant_id, group_id, generation)?;
+    let key = crate::mvcc_product::coremeta_logical_key(
+        CF_PERSONALDB,
+        TABLE_PERSONALDB_GROUP_ROW,
+        &tuple,
+    )?;
+    mvcc.runtime
+        .read_at(&key, snapshot_version)?
+        .map(|row| decode_group_row(&row.value))
+        .transpose()
+}
+
+pub fn read_personaldb_group_row_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    group_id: &str,
+    generation: u64,
+) -> Result<Option<PersonalDbGroupCoreMetaRow>> {
+    read_personaldb_group_row_at_snapshot(
+        mvcc,
+        tenant_id,
+        group_id,
+        generation,
+        mvcc.runtime.applied_version()?,
+    )
+}
+
+pub fn list_personaldb_group_rows_at_snapshot(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    group_id: &str,
+    snapshot_version: u64,
+) -> Result<Vec<PersonalDbGroupCoreMetaRow>> {
+    validate_personaldb_scope(tenant_id, group_id)?;
+    let tuple_prefix = core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8(&personaldb_realm_id(tenant_id)),
+        CoreMetaTuplePart::Utf8(group_id),
+    ])?;
+    let prefix = crate::mvcc_product::coremeta_application_prefix(CF_PERSONALDB, &tuple_prefix)?;
+    mvcc.runtime
+        .scan_table_prefix_at(TABLE_PERSONALDB_GROUP_ROW, &prefix, snapshot_version)?
+        .into_iter()
+        .map(|(_, row)| decode_group_row(&row.value))
+        .collect()
 }
 
 #[cfg(test)]
