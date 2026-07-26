@@ -73,6 +73,85 @@ pub struct CertifyTransaction {
     pub durable_holders: Vec<NodeIncarnation>,
 }
 
+/// Compact state-machine commands. No variant may contain product data,
+/// transaction bundle bytes, mesh topology, regions, or network endpoints.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConsensusCommand {
+    Certify(CertifyTransaction),
+    InstallNode {
+        cluster_id_hash: [u8; 32],
+        node: NodeIncarnation,
+    },
+    RemoveNode {
+        cluster_id_hash: [u8; 32],
+        node: NodeIncarnation,
+    },
+    AssignPartition {
+        cluster_id_hash: [u8; 32],
+        partition_id: u64,
+        owner: NodeIncarnation,
+        epoch: u64,
+    },
+    SetDurabilityPolicy {
+        cluster_id_hash: [u8; 32],
+        generation: u64,
+        bundle_quorum_holders: u16,
+        tolerated_failure_domains: u16,
+    },
+    AdvanceGcWatermark {
+        cluster_id_hash: [u8; 32],
+        watermark: CommitVersion,
+    },
+}
+
+impl ConsensusCommand {
+    pub fn cluster_id_hash(&self) -> [u8; 32] {
+        match self {
+            Self::Certify(command) => command.cluster_id_hash,
+            Self::InstallNode {
+                cluster_id_hash, ..
+            }
+            | Self::RemoveNode {
+                cluster_id_hash, ..
+            }
+            | Self::AssignPartition {
+                cluster_id_hash, ..
+            }
+            | Self::SetDurabilityPolicy {
+                cluster_id_hash, ..
+            }
+            | Self::AdvanceGcWatermark {
+                cluster_id_hash, ..
+            } => *cluster_id_hash,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartitionAssignment {
+    pub owner: NodeIncarnation,
+    pub epoch: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ConsensusDurabilityPolicy {
+    pub generation: u64,
+    pub bundle_quorum_holders: u16,
+    pub tolerated_failure_domains: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ControlApplyResult {
+    NodeInstalled(NodeIncarnation),
+    NodeRemoved(NodeIncarnation),
+    PartitionAssigned {
+        partition_id: u64,
+        assignment: PartitionAssignment,
+    },
+    DurabilityPolicySet(ConsensusDurabilityPolicy),
+    GcWatermarkAdvanced(CommitVersion),
+}
+
 /// Stable reason for a transaction certification abort.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CertificationAbort {

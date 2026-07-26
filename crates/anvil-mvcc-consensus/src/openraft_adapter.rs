@@ -24,21 +24,23 @@ use openraft::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CertificationResult, CertificationState, CertifyTransaction, CommitVersion, Consensus,
-    ConsensusError, NodeId, RaftStorageError, RocksRaftStore,
+    CertificationResult, CertificationState, CertifyTransaction, ClusterControlState,
+    CommitVersion, Consensus, ConsensusCommand, ConsensusError, ControlApplyResult, NodeId,
+    NodeIncarnation, RaftStorageError, RocksRaftStore,
     storage::{KEY_LAST_PURGED_LOG_ID, KEY_OPENRAFT_STATE},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum RaftApplyResult {
     Certification(CertificationResult),
+    Control(ControlApplyResult),
     Noop,
     Rejected(String),
 }
 
 openraft::declare_raft_types!(
     pub(crate) AnvilRaftConfig:
-        D = CertifyTransaction,
+        D = ConsensusCommand,
         R = RaftApplyResult,
         NodeId = u64,
         Node = openraft::BasicNode,
@@ -183,6 +185,7 @@ impl RaftNetwork<AnvilRaftConfig> for NetworkAdapter {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MachineState {
     certification: CertificationState,
+    control: ClusterControlState,
     last_applied_log_id: Option<LogId<u64>>,
     membership: StoredMembership<u64, BasicNode>,
     snapshot_generation: u64,
@@ -193,6 +196,7 @@ impl MachineState {
         Ok(Self {
             certification: CertificationState::new(cluster_id_hash)
                 .map_err(|error| RaftStorageError::Codec(error.to_string()))?,
+            control: ClusterControlState::new(cluster_id_hash).map_err(RaftStorageError::Codec)?,
             last_applied_log_id: None,
             membership: StoredMembership::default(),
             snapshot_generation: 0,
@@ -203,6 +207,11 @@ impl MachineState {
         if self.certification.cluster_id_hash() != expected {
             return Err(RaftStorageError::Codec(
                 "persisted Raft state belongs to another cluster".into(),
+            ));
+        }
+        if self.control.cluster_id_hash() != expected {
+            return Err(RaftStorageError::Codec(
+                "persisted control state belongs to another cluster".into(),
             ));
         }
         Ok(())
@@ -257,6 +266,92 @@ pub struct OpenRaftConsensus {
 }
 
 impl OpenRaftConsensus {
+    async fn apply_control(
+        &self,
+        command: ConsensusCommand,
+    ) -> Result<ControlApplyResult, ConsensusError> {
+        let response = self
+            .raft
+            .client_write(command)
+            .await
+            .map_err(map_raft_error)?;
+        match response.data {
+            RaftApplyResult::Control(result) => Ok(result),
+            RaftApplyResult::Rejected(reason) => Err(ConsensusError::Rejected(reason)),
+            _ => Err(ConsensusError::Rejected(
+                "control command produced an unexpected response".into(),
+            )),
+        }
+    }
+
+    pub async fn install_node(
+        &self,
+        cluster_id_hash: [u8; 32],
+        node: NodeIncarnation,
+    ) -> Result<ControlApplyResult, ConsensusError> {
+        self.apply_control(ConsensusCommand::InstallNode {
+            cluster_id_hash,
+            node,
+        })
+        .await
+    }
+
+    pub async fn remove_node(
+        &self,
+        cluster_id_hash: [u8; 32],
+        node: NodeIncarnation,
+    ) -> Result<ControlApplyResult, ConsensusError> {
+        self.apply_control(ConsensusCommand::RemoveNode {
+            cluster_id_hash,
+            node,
+        })
+        .await
+    }
+
+    pub async fn assign_partition(
+        &self,
+        cluster_id_hash: [u8; 32],
+        partition_id: u64,
+        owner: NodeIncarnation,
+        epoch: u64,
+    ) -> Result<ControlApplyResult, ConsensusError> {
+        self.apply_control(ConsensusCommand::AssignPartition {
+            cluster_id_hash,
+            partition_id,
+            owner,
+            epoch,
+        })
+        .await
+    }
+
+    pub async fn set_durability_policy(
+        &self,
+        cluster_id_hash: [u8; 32],
+        generation: u64,
+        bundle_quorum_holders: u16,
+        tolerated_failure_domains: u16,
+    ) -> Result<ControlApplyResult, ConsensusError> {
+        self.apply_control(ConsensusCommand::SetDurabilityPolicy {
+            cluster_id_hash,
+            generation,
+            bundle_quorum_holders,
+            tolerated_failure_domains,
+        })
+        .await
+    }
+
+    pub async fn advance_gc_watermark(
+        &self,
+        cluster_id_hash: [u8; 32],
+        watermark: CommitVersion,
+    ) -> Result<ControlApplyResult, ConsensusError> {
+        self.apply_control(ConsensusCommand::AdvanceGcWatermark {
+            cluster_id_hash,
+            watermark,
+        })
+        .await
+    }
+
     /// Handle one opaque RPC received by the injected transport.
     pub async fn handle_rpc(&self, rpc: ConsensusRpc) -> Result<Vec<u8>, ConsensusRpcError> {
         if rpc.schema_version != 1 {
@@ -404,12 +499,15 @@ impl Consensus for OpenRaftConsensus {
     ) -> Result<CertificationResult, ConsensusError> {
         let response = self
             .raft
-            .client_write(command)
+            .client_write(ConsensusCommand::Certify(command))
             .await
             .map_err(map_raft_error)?;
         match response.data {
             RaftApplyResult::Certification(result) => Ok(result),
             RaftApplyResult::Rejected(reason) => Err(ConsensusError::Rejected(reason)),
+            RaftApplyResult::Control(_) => Err(ConsensusError::Rejected(
+                "certification produced a control response".into(),
+            )),
             RaftApplyResult::Noop => Err(ConsensusError::Rejected(
                 "certification produced a non-application response".into(),
             )),
@@ -672,12 +770,18 @@ impl RaftStateMachine<AnvilRaftConfig> for OpenRaftStateMachine {
                     state.membership = StoredMembership::new(Some(log_id), membership);
                     RaftApplyResult::Noop
                 }
-                EntryPayload::Normal(command) => match state
-                    .certification
-                    .apply(CommitVersion(log_id.index), &command)
-                {
-                    Ok(result) => RaftApplyResult::Certification(result),
-                    Err(error) => RaftApplyResult::Rejected(error.to_string()),
+                EntryPayload::Normal(ConsensusCommand::Certify(command)) => {
+                    match state
+                        .certification
+                        .apply(CommitVersion(log_id.index), &command)
+                    {
+                        Ok(result) => RaftApplyResult::Certification(result),
+                        Err(error) => RaftApplyResult::Rejected(error.to_string()),
+                    }
+                }
+                EntryPayload::Normal(command) => match state.control.apply(&command) {
+                    Ok(result) => RaftApplyResult::Control(result),
+                    Err(error) => RaftApplyResult::Rejected(error),
                 },
             };
             state.last_applied_log_id = Some(log_id);
@@ -722,6 +826,7 @@ impl RaftStateMachine<AnvilRaftConfig> for OpenRaftStateMachine {
             || state.last_applied_log_id != meta.last_log_id
             || state.membership != meta.last_membership
             || state.certification.cluster_id_hash() != self.cluster_id_hash
+            || state.control.cluster_id_hash() != self.cluster_id_hash
         {
             return Err(storage_error(
                 ErrorSubject::Snapshot(Some(meta.signature())),
@@ -770,7 +875,7 @@ mod tests {
 
     #[test]
     fn application_payload_is_the_compact_certification_command() {
-        fn assert_data_type<C: RaftTypeConfig<D = CertifyTransaction>>() {}
+        fn assert_data_type<C: RaftTypeConfig<D = ConsensusCommand>>() {}
         fn assert_response_type<C: RaftTypeConfig<R = RaftApplyResult>>() {}
         assert_data_type::<AnvilRaftConfig>();
         assert_response_type::<AnvilRaftConfig>();
@@ -831,6 +936,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn control_state_survives_snapshot_install_atomically() {
+        let source_directory = TempDir::new().unwrap();
+        let source_store = RocksRaftStore::open(source_directory.path(), 1).unwrap();
+        let (_, mut source) = stores(source_store.clone(), [4; 32]).unwrap();
+        let owner = NodeIncarnation {
+            node_id: NodeId(8),
+            incarnation: 3,
+        };
+        let commands = [
+            ConsensusCommand::InstallNode {
+                cluster_id_hash: [4; 32],
+                node: owner,
+            },
+            ConsensusCommand::AssignPartition {
+                cluster_id_hash: [4; 32],
+                partition_id: 12,
+                owner,
+                epoch: 7,
+            },
+            ConsensusCommand::SetDurabilityPolicy {
+                cluster_id_hash: [4; 32],
+                generation: 5,
+                bundle_quorum_holders: 3,
+                tolerated_failure_domains: 1,
+            },
+            ConsensusCommand::AdvanceGcWatermark {
+                cluster_id_hash: [4; 32],
+                watermark: CommitVersion(22),
+            },
+        ];
+        source
+            .apply(
+                commands
+                    .into_iter()
+                    .enumerate()
+                    .map(|(offset, command)| Entry {
+                        log_id: LogId::new(CommittedLeaderId::new(1, 1), offset as u64 + 1),
+                        payload: EntryPayload::Normal(command),
+                    }),
+            )
+            .await
+            .unwrap();
+        let mut builder = source.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+
+        let target_directory = TempDir::new().unwrap();
+        let target_store = RocksRaftStore::open(target_directory.path(), 1).unwrap();
+        let (_, mut target) = stores(target_store.clone(), [4; 32]).unwrap();
+        target
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        let restored: MachineState = target_store
+            .read_state_value(KEY_OPENRAFT_STATE)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.control.node_incarnation(NodeId(8)), Some(3));
+        assert_eq!(restored.control.partition(12).unwrap().epoch, 7);
+        assert_eq!(restored.control.durability_policy().generation, 5);
+        assert_eq!(restored.control.gc_safety_watermark(), CommitVersion(22));
+    }
+
+    #[tokio::test]
     async fn duplicate_transaction_advances_raft_applied_id_but_keeps_commit_version() {
         let directory = TempDir::new().unwrap();
         let (_, mut machine) =
@@ -856,14 +1024,14 @@ mod tests {
         let first = machine
             .apply([Entry {
                 log_id: log_id_1,
-                payload: EntryPayload::Normal(command.clone()),
+                payload: EntryPayload::Normal(ConsensusCommand::Certify(command.clone())),
             }])
             .await
             .unwrap();
         let retry = machine
             .apply([Entry {
                 log_id: log_id_9,
-                payload: EntryPayload::Normal(command),
+                payload: EntryPayload::Normal(ConsensusCommand::Certify(command)),
             }])
             .await
             .unwrap();
@@ -911,6 +1079,26 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
+        assert!(matches!(
+            runtime
+                .install_node(
+                    [1; 32],
+                    NodeIncarnation {
+                        node_id: NodeId(1),
+                        incarnation: 1,
+                    },
+                )
+                .await
+                .unwrap(),
+            ControlApplyResult::NodeInstalled(_)
+        ));
+        assert!(matches!(
+            runtime
+                .set_durability_policy([1; 32], 1, 1, 0)
+                .await
+                .unwrap(),
+            ControlApplyResult::DurabilityPolicySet(_)
+        ));
         let result = runtime.certify(test_command(8)).await.unwrap();
         let committed = match result {
             CertificationResult::Committed { commit_version, .. } => commit_version,

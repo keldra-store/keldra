@@ -5,6 +5,7 @@
 
 mod certification;
 mod consensus;
+mod control;
 // Concrete OpenRaft types stay private until the network-backed Consensus
 // runtime is constructed inside this crate.
 #[allow(dead_code)]
@@ -14,6 +15,7 @@ mod types;
 
 pub use certification::{CertificationError, CertificationState};
 pub use consensus::{Consensus, ConsensusError};
+pub use control::ClusterControlState;
 pub use openraft_adapter::{
     ConsensusNode, ConsensusRpc, ConsensusRpcClient, ConsensusRpcError, ConsensusRpcFactory,
     ConsensusRpcKind, OpenRaftConsensus,
@@ -23,6 +25,7 @@ pub use storage::{
 };
 pub use types::{
     BundleHash, CertificationAbort, CertificationResult, CertifyTransaction, CommitVersion,
-    DurabilityLevel, LogicalKeyHash, NodeId, NodeIncarnation, PointObservation, RangeConflictKey,
-    RangeObservation, TransactionId,
+    ConsensusCommand, ConsensusDurabilityPolicy, ControlApplyResult, DurabilityLevel,
+    LogicalKeyHash, NodeId, NodeIncarnation, PartitionAssignment, PointObservation,
+    RangeConflictKey, RangeObservation, TransactionId,
 };
