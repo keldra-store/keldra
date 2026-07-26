@@ -19,11 +19,13 @@ use tonic::{Status, metadata::MetadataMap};
 use crate::{
     Config,
     anvil_api::{ConsensusSessionOpen, ReplicationSessionOpen},
+    auth,
     bundle_replication::{
         AppendOnlyPreparedBundleStore, BundleTarget, ObjectEvidenceRegistry,
         StreamingBundleReplicator,
     },
     local_object_store::LocalObjectStore,
+    mesh_lifecycle::NodeCapability,
     mvcc_apply_worker::{ApplyWorkerState, MvccApplyWorker},
     mvcc_node_runtime::MvccNodeRuntime,
     mvcc_open_transactions::OpenTransactionRegistry,
@@ -40,6 +42,7 @@ use crate::{
         replication::{ReplicationConnectionAuthorizer, ReplicationServiceImpl},
     },
     shard_placement::ShardTarget,
+    system_realm,
 };
 
 pub type ProductMvccRuntime = MvccNodeRuntime<
@@ -71,6 +74,10 @@ pub struct NodeConnectionAuthorizer {
     token: Arc<str>,
     raft_nodes: Arc<BTreeMap<u64, MvccPeerConfig>>,
     replication_nodes: Arc<BTreeMap<(String, u64), MvccPeerConfig>>,
+    storage: crate::storage::Storage,
+    core_store: crate::core_store::CoreStore,
+    mesh_id: Arc<str>,
+    allow_test_bypass: bool,
 }
 
 impl NodeConnectionAuthorizer {
@@ -78,6 +85,10 @@ impl NodeConnectionAuthorizer {
         cluster_id: impl Into<Arc<str>>,
         token: impl Into<Arc<str>>,
         peers: &[MvccPeerConfig],
+        storage: crate::storage::Storage,
+        core_store: crate::core_store::CoreStore,
+        mesh_id: impl Into<Arc<str>>,
+        allow_test_bypass: bool,
     ) -> Self {
         Self {
             cluster_id: cluster_id.into(),
@@ -96,6 +107,10 @@ impl NodeConnectionAuthorizer {
                     .map(|peer| ((peer.node_id.clone(), peer.incarnation), peer))
                     .collect(),
             ),
+            storage,
+            core_store,
+            mesh_id: mesh_id.into(),
+            allow_test_bypass,
         }
     }
 
@@ -105,6 +120,34 @@ impl NodeConnectionAuthorizer {
             .and_then(|value| value.to_str().ok());
         if presented != Some(self.token.as_ref()) {
             return Err(Status::unauthenticated("invalid node connection token"));
+        }
+        Ok(())
+    }
+
+    async fn authorize_zanzibar(&self, node_id: &str) -> Result<(), Status> {
+        if self.allow_test_bypass {
+            return Ok(());
+        }
+        let claims = auth::Claims {
+            sub: node_id.to_string(),
+            exp: usize::MAX,
+            tenant_id: crate::system_realm::SYSTEM_STORAGE_TENANT_ID,
+            jti: None,
+        };
+        let allowed = system_realm::check_internal_node_access(
+            &self.storage,
+            &self.core_store,
+            &self.mesh_id,
+            &claims,
+            node_id,
+            NodeCapability::Metadata,
+        )
+        .await
+        .map_err(|error| Status::permission_denied(error.to_string()))?;
+        if !allowed {
+            return Err(Status::permission_denied(
+                "active Zanzibar node grant and metadata capability required",
+            ));
         }
         Ok(())
     }
@@ -130,6 +173,7 @@ impl ConsensusConnectionAuthorizer for NodeConnectionAuthorizer {
         if peer.incarnation != open.node_incarnation {
             return Err(Status::permission_denied("stale Raft node incarnation"));
         }
+        self.authorize_zanzibar(&peer.node_id).await?;
         Ok(())
     }
 }
@@ -147,13 +191,19 @@ impl ReplicationConnectionAuthorizer for NodeConnectionAuthorizer {
                 "replication stream belongs to another cluster",
             ));
         }
-        self.replication_nodes
+        let peer = self
+            .replication_nodes
             .get(&(open.node_id.clone(), open.node_incarnation))
             .ok_or_else(|| {
                 Status::permission_denied("node incarnation is not in peer configuration")
             })?;
-        AuthenticatedPeer::new(open.node_id.clone(), open.node_incarnation)
-            .map_err(|error| Status::permission_denied(error.to_string()))
+        self.authorize_zanzibar(&peer.node_id).await?;
+        AuthenticatedPeer::new_bound(
+            open.node_id.clone(),
+            open.node_incarnation,
+            peer.endpoint.clone(),
+        )
+        .map_err(|error| Status::permission_denied(error.to_string()))
     }
 }
 
@@ -204,6 +254,7 @@ impl MvccSubsystem {
 
     pub async fn bootstrap(config: &Config, core_meta_db: Arc<DB>) -> Result<Self> {
         let peers = parse_and_validate_peers(config)?;
+        validate_secure_peer_transport(config, &peers)?;
         let local = peers
             .iter()
             .find(|peer| peer.raft_node_id == config.mvcc_raft_node_id)
@@ -281,6 +332,7 @@ impl MvccSubsystem {
             replication_peers,
             ReplicationStreamOptions {
                 operation_timeout: Duration::from_millis(config.mvcc_rpc_timeout_ms),
+                allow_insecure_transport_for_tests: config.allow_test_only_insecure_mvcc_transport,
                 ..ReplicationStreamOptions::default()
             },
         )?;
@@ -342,8 +394,17 @@ impl MvccSubsystem {
             local_store.clone(),
         )?);
         let open_transactions = Arc::new(OpenTransactionRegistry::from_db(core_meta_db)?);
-        let authorizer =
-            NodeConnectionAuthorizer::new(config.mvcc_cluster_id.clone(), token, &peers);
+        let authorization_core_store =
+            crate::core_store::CoreStore::new(materialisation_storage.clone()).await?;
+        let authorizer = NodeConnectionAuthorizer::new(
+            config.mvcc_cluster_id.clone(),
+            token,
+            &peers,
+            materialisation_storage.clone(),
+            authorization_core_store,
+            config.mesh_id.clone(),
+            config.allow_test_only_insecure_mvcc_transport,
+        );
         let consensus_service =
             ConsensusTransportService::new(consensus.clone(), authorizer.clone());
         let replication_service =
@@ -518,6 +579,22 @@ fn validate_cluster_id(cluster_id: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_secure_peer_transport(config: &Config, peers: &[MvccPeerConfig]) -> Result<()> {
+    if config.allow_test_only_insecure_mvcc_transport {
+        return Ok(());
+    }
+    if let Some(peer) = peers
+        .iter()
+        .find(|peer| !peer.endpoint.starts_with("https://"))
+    {
+        bail!(
+            "MVCC node transport requires TLS; peer {} endpoint must use https://",
+            peer.node_id
+        );
+    }
+    Ok(())
+}
+
 fn cluster_id_hash(cluster_id: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
     let domain = b"anvil.mvcc.cluster-id.v1";
@@ -540,11 +617,27 @@ fn normalize_endpoint(endpoint: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn production_peer_transport_requires_https() {
+        let config = Config::default();
+        let peer = MvccPeerConfig {
+            cluster_id: "default".into(),
+            raft_node_id: 1,
+            node_id: "node-a".into(),
+            incarnation: 1,
+            endpoint: "http://node-a.example".into(),
+            failure_domain: "zone-a".into(),
+            voter: true,
+        };
+        assert!(validate_secure_peer_transport(&config, &[peer]).is_err());
+    }
+
     fn config(directory: &Path) -> Config {
         Config {
             node_id: "node-a".into(),
             public_api_addr: "127.0.0.1:50051".into(),
             storage_path: directory.to_string_lossy().into_owned(),
+            allow_test_only_insecure_mvcc_transport: true,
             anvil_secret_encryption_key:
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
             ..Config::default()

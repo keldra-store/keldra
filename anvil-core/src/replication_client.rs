@@ -30,6 +30,13 @@ use crate::{
 
 const NODE_TOKEN_HEADER: &str = "x-anvil-node-token";
 
+fn require_secure_endpoint(endpoint: &str, allow_insecure_for_tests: bool) -> Result<()> {
+    if endpoint.starts_with("https://") || allow_insecure_for_tests {
+        return Ok(());
+    }
+    bail!("replication endpoint requires TLS (https://)");
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReplicationPeer {
     pub cluster_id: String,
@@ -46,6 +53,7 @@ pub struct ReplicationStreamOptions {
     pub queue_capacity: usize,
     pub heartbeat_interval: Duration,
     pub progress_timeout: Duration,
+    pub allow_insecure_transport_for_tests: bool,
 }
 
 impl Default for ReplicationStreamOptions {
@@ -57,6 +65,7 @@ impl Default for ReplicationStreamOptions {
             queue_capacity: 8,
             heartbeat_interval: Duration::from_secs(5),
             progress_timeout: Duration::from_secs(10),
+            allow_insecure_transport_for_tests: false,
         }
     }
 }
@@ -130,6 +139,7 @@ impl TonicReplicationStreamManager {
             {
                 bail!("replication peers require a valid node incarnation and endpoint");
             }
+            require_secure_endpoint(&peer.endpoint, options.allow_insecure_transport_for_tests)?;
             let channel = Endpoint::from_shared(peer.endpoint.clone())?
                 .connect_timeout(options.operation_timeout)
                 .connect_lazy();
@@ -174,6 +184,7 @@ impl TonicReplicationStreamManager {
         if endpoint.trim().is_empty() {
             bail!("replacement replication endpoint must be non-empty");
         }
+        require_secure_endpoint(&endpoint, self.options.allow_insecure_transport_for_tests)?;
         let channel = Endpoint::from_shared(endpoint)?
             .connect_timeout(self.options.operation_timeout)
             .connect_lazy();
@@ -954,6 +965,7 @@ mod tests {
                 queue_capacity: 1,
                 heartbeat_interval: Duration::from_millis(25),
                 progress_timeout: Duration::from_secs(2),
+                allow_insecure_transport_for_tests: true,
             },
         )
         .unwrap();
@@ -1011,7 +1023,10 @@ mod tests {
                 node: remote.clone(),
                 endpoint: "http://127.0.0.1:9".into(),
             }],
-            ReplicationStreamOptions::default(),
+            ReplicationStreamOptions {
+                allow_insecure_transport_for_tests: true,
+                ..ReplicationStreamOptions::default()
+            },
         )
         .unwrap();
         let bytes = b"bundle";
@@ -1032,5 +1047,33 @@ mod tests {
                 .to_string()
                 .contains("cross-cluster replication cannot provide transaction durability")
         );
+    }
+
+    #[tokio::test]
+    async fn endpoint_replacement_rejects_plaintext_without_explicit_test_mode() {
+        let remote = NodeIncarnation {
+            node_id: "node-b".into(),
+            incarnation: 1,
+        };
+        let manager = TonicReplicationStreamManager::new(
+            "cluster-a",
+            NodeIncarnation {
+                node_id: "node-a".into(),
+                incarnation: 1,
+            },
+            "test-token",
+            [ReplicationPeer {
+                cluster_id: "cluster-a".into(),
+                node: remote.clone(),
+                endpoint: "https://node-b.example".into(),
+            }],
+            ReplicationStreamOptions::default(),
+        )
+        .unwrap();
+        let error = manager
+            .replace_peer_endpoint("cluster-a", &remote, "http://node-b.example")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("requires TLS"));
     }
 }

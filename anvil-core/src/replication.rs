@@ -31,6 +31,7 @@ pub struct NodeIncarnation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthenticatedPeer {
     incarnation: NodeIncarnation,
+    endpoint: Option<String>,
 }
 
 impl AuthenticatedPeer {
@@ -47,7 +48,22 @@ impl AuthenticatedPeer {
                 node_id,
                 incarnation,
             },
+            endpoint: None,
         })
+    }
+
+    pub fn new_bound(
+        node_id: impl Into<String>,
+        incarnation: u64,
+        endpoint: impl Into<String>,
+    ) -> Result<Self> {
+        let mut peer = Self::new(node_id, incarnation)?;
+        let endpoint = endpoint.into();
+        if endpoint.trim().is_empty() {
+            bail!("authenticated node endpoint must not be empty");
+        }
+        peer.endpoint = Some(endpoint);
+        Ok(peer)
     }
 }
 
@@ -56,6 +72,7 @@ pub struct ConnectionSession {
     id: Uuid,
     cluster_id: String,
     peer: NodeIncarnation,
+    peer_endpoint: Option<String>,
     last_sequence: u64,
 }
 
@@ -69,6 +86,7 @@ impl ConnectionSession {
             id: Uuid::new_v4(),
             cluster_id,
             peer: peer.incarnation,
+            peer_endpoint: peer.endpoint,
             last_sequence: 0,
         })
     }
@@ -83,6 +101,10 @@ impl ConnectionSession {
 
     pub fn cluster_id(&self) -> &str {
         &self.cluster_id
+    }
+
+    pub fn peer_endpoint(&self) -> Option<&str> {
+        self.peer_endpoint.as_deref()
     }
 
     fn validate_sequence(&self, session_id: Uuid, sequence: u64) -> Result<()> {

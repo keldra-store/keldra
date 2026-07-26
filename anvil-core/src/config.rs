@@ -145,6 +145,10 @@ pub struct Config {
     #[arg(long, env, default_value = "")]
     pub mvcc_node_connection_token: String,
 
+    /// Allows plaintext MVCC node endpoints in in-process test harnesses only.
+    #[arg(skip)]
+    pub allow_test_only_insecure_mvcc_transport: bool,
+
     /// Directory used for Anvil-owned object bytes, metadata journals, indexes, and manifests.
     #[arg(long, env, default_value = "anvil-data")]
     pub storage_path: String,
@@ -227,6 +231,7 @@ impl Default for Config {
             mvcc_tolerated_failure_domains: 0,
             mvcc_rpc_timeout_ms: 10_000,
             mvcc_node_connection_token: String::new(),
+            allow_test_only_insecure_mvcc_transport: false,
             storage_path: "anvil-data".to_string(),
             personaldb_snapshot_entry_threshold: 1024,
             personaldb_snapshot_payload_bytes_threshold: 64 * 1024 * 1024,
