@@ -339,6 +339,7 @@ async fn seeded_local_object_link() -> (tempfile::TempDir, AppState, Claims, Str
             created_by: "principal:test".to_string(),
             transaction_id: None,
             transaction_principal: None,
+            audit_event: None,
         })
         .await
         .unwrap();

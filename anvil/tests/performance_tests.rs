@@ -630,7 +630,8 @@ async fn performance_native_api_smoke() {
                     .unwrap()
             })
             .await;
-        assert_eq!(receipt.visible_updates.len(), 1);
+        assert!(receipt.is_committed());
+        assert!(receipt.finalisation_error.is_none());
         assert!(
             CoreMetaStore::open(storage.core_store_meta_path())
                 .unwrap()
