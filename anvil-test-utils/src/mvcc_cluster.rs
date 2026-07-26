@@ -188,6 +188,18 @@ impl RealMvccCluster {
         .await?)
     }
 
+    pub async fn wait_for_applied_version(&self, node: usize, version: u64) -> anyhow::Result<()> {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if self.state(node).mvcc.runtime.applied_version()? >= version {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?
+    }
+
     pub async fn commit(
         &self,
         node: usize,
