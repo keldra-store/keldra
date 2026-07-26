@@ -98,9 +98,13 @@ impl api::hugging_face_key_service_server::HuggingFaceKeyService for AppState {
 
         let page_size = crate::services::collection_cursor::page_size(req.page.as_ref())?;
         let principal_scope = format!("tenant:{}/subject:{}", claims.tenant_id, claims.sub);
-        let revision = crate::hf_journal::hf_collection_revision(&self.storage)
-            .await
-            .map_err(|error| Status::internal(error.to_string()))?;
+        let revision = crate::hf_journal::hf_collection_revision(
+            self.persistence
+                .mvcc()
+                .map_err(|error| Status::internal(error.to_string()))?,
+        )
+        .await
+        .map_err(|error| Status::internal(error.to_string()))?;
         let binding = crate::services::collection_cursor::CollectionCursorBinding {
             service_method: "anvil.HfKeyService/ListKeys",
             filters: &[],
@@ -122,9 +126,13 @@ impl api::hugging_face_key_service_server::HuggingFaceKeyService for AppState {
             .hf_list_key_page(claims.tenant_id, after_cursor.as_deref(), page_size)
             .await
             .map_err(|error| Status::internal(error.to_string()))?;
-        if crate::hf_journal::hf_collection_revision(&self.storage)
-            .await
-            .map_err(|error| Status::internal(error.to_string()))?
+        if crate::hf_journal::hf_collection_revision(
+            self.persistence
+                .mvcc()
+                .map_err(|error| Status::internal(error.to_string()))?,
+        )
+        .await
+        .map_err(|error| Status::internal(error.to_string()))?
             != revision
         {
             return Err(Status::aborted(

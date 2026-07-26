@@ -813,6 +813,7 @@ impl Persistence {
         let permit = self.hf_write_permit().await?;
         hf_journal::create_key_with_permit(
             &self.storage,
+            self.mvcc()?,
             tenant_id,
             name,
             token_encrypted,
@@ -827,6 +828,7 @@ impl Persistence {
         let permit = self.hf_write_permit().await?;
         hf_journal::delete_key_with_permit(
             &self.storage,
+            self.mvcc()?,
             tenant_id,
             name,
             &permit,
@@ -840,7 +842,7 @@ impl Persistence {
         tenant_id: i64,
         name: &str,
     ) -> Result<Option<(i64, Vec<u8>)>> {
-        hf_journal::get_key_encrypted(&self.storage, tenant_id, name).await
+        hf_journal::get_key_encrypted(self.mvcc()?, tenant_id, name).await
     }
 
     pub async fn hf_get_key_encrypted_by_id(
@@ -848,7 +850,7 @@ impl Persistence {
         tenant_id: i64,
         id: i64,
     ) -> Result<Option<Vec<u8>>> {
-        hf_journal::get_key_encrypted_by_id(&self.storage, tenant_id, id).await
+        hf_journal::get_key_encrypted_by_id(self.mvcc()?, tenant_id, id).await
     }
 
     pub(crate) async fn hf_list_encrypted_key_page(
@@ -856,13 +858,14 @@ impl Persistence {
         after_cursor: Option<&[u8]>,
         limit: usize,
     ) -> Result<hf_journal::HfKeyPage> {
-        hf_journal::list_encrypted_key_page(&self.storage, after_cursor, limit).await
+        hf_journal::list_encrypted_key_page(self.mvcc()?, after_cursor, limit).await
     }
 
     pub async fn hf_update_key_encrypted(&self, id: i64, token_encrypted: &[u8]) -> Result<()> {
         let permit = self.hf_write_permit().await?;
         hf_journal::update_key_encrypted_with_permit(
             &self.storage,
+            self.mvcc()?,
             id,
             token_encrypted,
             &permit,
@@ -877,7 +880,7 @@ impl Persistence {
         after_cursor: Option<&[u8]>,
         limit: usize,
     ) -> Result<hf_journal::HfKeyPage> {
-        hf_journal::list_key_page(&self.storage, tenant_id, after_cursor, limit).await
+        hf_journal::list_key_page(self.mvcc()?, tenant_id, after_cursor, limit).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -897,6 +900,7 @@ impl Persistence {
         let permit = self.hf_write_permit().await?;
         hf_journal::create_ingestion_with_permit(
             &self.storage,
+            self.mvcc()?,
             key_id,
             tenant_id,
             requester_app_id,
@@ -914,7 +918,7 @@ impl Persistence {
     }
 
     pub async fn hf_get_ingestion_job(&self, id: i64) -> Result<Option<HfIngestionJob>> {
-        hf_journal::get_ingestion_job(&self.storage, id).await
+        hf_journal::get_ingestion_job(self.mvcc()?, id).await
     }
 
     pub async fn hf_update_ingestion_state(
@@ -926,6 +930,7 @@ impl Persistence {
         let permit = self.hf_write_permit().await?;
         hf_journal::update_ingestion_state_with_permit(
             &self.storage,
+            self.mvcc()?,
             id,
             state_value,
             error,
@@ -939,6 +944,7 @@ impl Persistence {
         let permit = self.hf_write_permit().await?;
         hf_journal::cancel_ingestion_with_permit(
             &self.storage,
+            self.mvcc()?,
             id,
             &permit,
             &self.partition_owner_signing_key,
@@ -956,6 +962,7 @@ impl Persistence {
         let permit = self.hf_write_permit().await?;
         hf_journal::add_item_with_permit(
             &self.storage,
+            self.mvcc()?,
             ingestion_id,
             path,
             size,
@@ -975,6 +982,7 @@ impl Persistence {
         let permit = self.hf_write_permit().await?;
         hf_journal::update_item_state_with_permit(
             &self.storage,
+            self.mvcc()?,
             id,
             state_value,
             error,
@@ -988,6 +996,7 @@ impl Persistence {
         let permit = self.hf_write_permit().await?;
         hf_journal::update_item_success_with_permit(
             &self.storage,
+            self.mvcc()?,
             id,
             size,
             etag,
@@ -1003,13 +1012,8 @@ impl Persistence {
         after_cursor: Option<&[u8]>,
         limit: usize,
     ) -> Result<hf_journal::HfStoredItemPage> {
-        hf_journal::list_stored_ingestion_item_page(
-            &self.storage,
-            ingestion_id,
-            after_cursor,
-            limit,
-        )
-        .await
+        hf_journal::list_stored_ingestion_item_page(self.mvcc()?, ingestion_id, after_cursor, limit)
+            .await
     }
 
     pub async fn hf_list_stored_target_item_page(
@@ -1021,7 +1025,7 @@ impl Persistence {
         limit: usize,
     ) -> Result<hf_journal::HfStoredItemPage> {
         hf_journal::list_stored_target_item_page(
-            &self.storage,
+            self.mvcc()?,
             tenant_id,
             bucket,
             prefix,
@@ -1032,7 +1036,7 @@ impl Persistence {
     }
 
     pub async fn hf_get_ingestion_status(&self, id: i64) -> Result<hf_journal::HfIngestionStatus> {
-        hf_journal::get_ingestion_status(&self.storage, id).await
+        hf_journal::get_ingestion_status(self.mvcc()?, id).await
     }
 }
 

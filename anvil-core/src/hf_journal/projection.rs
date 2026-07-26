@@ -4,19 +4,19 @@ use super::{
     hf_ingestion_to_proto, hf_key_from_proto, hf_key_to_proto,
 };
 use crate::core_store::{
-    CF_OBSERVABILITY, CoreMetaTuplePart, CoreMutationOperation, CoreStore,
-    TABLE_OBSERVABILITY_CURSOR_ROW, core_meta_committed_row_common, core_meta_record_tuple_key,
-    core_meta_root_key_hash, core_meta_tuple_key,
+    CF_OBSERVABILITY, CoreMetaTuplePart, TABLE_OBSERVABILITY_CURSOR_ROW, core_meta_tuple_key,
 };
+use crate::mvcc_product::ProductMutation;
+use crate::mvcc_transaction::{LogicalKey, PredicateKind};
 use crate::persistence::{HfIngestion, HfIngestionItem, HfKey};
 use anyhow::{Result, anyhow};
 use prost::Message;
 
-const HF_KEY_PROJECTION_SCHEMA: &str = "anvil.hf.key_projection.v1";
-const HF_INGESTION_PROJECTION_SCHEMA: &str = "anvil.hf.ingestion_projection.v1";
-const HF_ITEM_PROJECTION_SCHEMA: &str = "anvil.hf.item_projection.v1";
-const HF_INGESTION_STATUS_PROJECTION_SCHEMA: &str = "anvil.hf.ingestion_status_projection.v1";
-const HF_TARGET_ITEM_PROJECTION_SCHEMA: &str = "anvil.hf.target_item_projection.v1";
+const HF_KEY_PROJECTION_SCHEMA: &str = "anvil.hf.key_projection.v2";
+const HF_INGESTION_PROJECTION_SCHEMA: &str = "anvil.hf.ingestion_projection.v2";
+const HF_ITEM_PROJECTION_SCHEMA: &str = "anvil.hf.item_projection.v2";
+const HF_INGESTION_STATUS_PROJECTION_SCHEMA: &str = "anvil.hf.ingestion_status_projection.v2";
+const HF_TARGET_ITEM_PROJECTION_SCHEMA: &str = "anvil.hf.target_item_projection.v2";
 const HF_PROJECTION_PAGE_MAX: usize = 1000;
 
 #[derive(Debug, Clone)]
@@ -63,8 +63,6 @@ struct HfIngestionStatusProjection {
 
 #[derive(Clone, PartialEq, Message)]
 struct HfKeyProjectionProto {
-    #[prost(message, optional, tag = "1")]
-    common: Option<crate::core_store::CoreMetaRowCommonProto>,
     #[prost(string, tag = "2")]
     schema: String,
     #[prost(message, optional, tag = "3")]
@@ -73,8 +71,6 @@ struct HfKeyProjectionProto {
 
 #[derive(Clone, PartialEq, Message)]
 struct HfIngestionProjectionProto {
-    #[prost(message, optional, tag = "1")]
-    common: Option<crate::core_store::CoreMetaRowCommonProto>,
     #[prost(string, tag = "2")]
     schema: String,
     #[prost(message, optional, tag = "3")]
@@ -83,8 +79,6 @@ struct HfIngestionProjectionProto {
 
 #[derive(Clone, PartialEq, Message)]
 struct HfItemProjectionProto {
-    #[prost(message, optional, tag = "1")]
-    common: Option<crate::core_store::CoreMetaRowCommonProto>,
     #[prost(string, tag = "2")]
     schema: String,
     #[prost(message, optional, tag = "3")]
@@ -93,8 +87,6 @@ struct HfItemProjectionProto {
 
 #[derive(Clone, PartialEq, Message)]
 struct HfIngestionStatusProjectionProto {
-    #[prost(message, optional, tag = "1")]
-    common: Option<crate::core_store::CoreMetaRowCommonProto>,
     #[prost(string, tag = "2")]
     schema: String,
     #[prost(message, optional, tag = "3")]
@@ -111,8 +103,6 @@ struct HfIngestionStatusProjectionProto {
 
 #[derive(Clone, PartialEq, Message)]
 struct HfTargetItemProjectionProto {
-    #[prost(message, optional, tag = "1")]
-    common: Option<crate::core_store::CoreMetaRowCommonProto>,
     #[prost(string, tag = "2")]
     schema: String,
     #[prost(int64, tag = "3")]
@@ -126,11 +116,12 @@ struct HfTargetItemProjectionProto {
 }
 
 pub(super) fn get_key_by_name(
-    store: &CoreStore,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    snapshot: u64,
     tenant_id: i64,
     name: &str,
 ) -> Result<Option<HfKey>> {
-    let key = read_key(store, &key_name_key(tenant_id, name)?)?;
+    let key = read_key(mvcc, snapshot, &key_name_key(tenant_id, name)?)?;
     if key
         .as_ref()
         .is_some_and(|key| key.tenant_id != tenant_id || key.name != name)
@@ -140,8 +131,12 @@ pub(super) fn get_key_by_name(
     Ok(key)
 }
 
-pub(super) fn get_key_by_id(store: &CoreStore, id: i64) -> Result<Option<HfKey>> {
-    let key = read_key(store, &key_id_key(id)?)?;
+pub(super) fn get_key_by_id(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    snapshot: u64,
+    id: i64,
+) -> Result<Option<HfKey>> {
+    let key = read_key(mvcc, snapshot, &key_id_key(id)?)?;
     if key.as_ref().is_some_and(|key| key.id != id) {
         return Err(anyhow!("hf key-id projection scope mismatch"));
     }
@@ -149,12 +144,19 @@ pub(super) fn get_key_by_id(store: &CoreStore, id: i64) -> Result<Option<HfKey>>
 }
 
 pub(super) fn list_tenant_keys(
-    store: &CoreStore,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    snapshot: u64,
     tenant_id: i64,
     after_cursor: Option<&[u8]>,
     limit: usize,
 ) -> Result<HfKeyPage> {
-    let page = read_key_page(store, &key_name_prefix(tenant_id)?, after_cursor, limit)?;
+    let page = read_key_page(
+        mvcc,
+        snapshot,
+        &key_name_prefix(tenant_id)?,
+        after_cursor,
+        limit,
+    )?;
     if page.keys.iter().any(|key| key.tenant_id != tenant_id) {
         return Err(anyhow!("hf tenant key projection scope mismatch"));
     }
@@ -162,20 +164,25 @@ pub(super) fn list_tenant_keys(
 }
 
 pub(super) fn list_all_keys(
-    store: &CoreStore,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    snapshot: u64,
     after_cursor: Option<&[u8]>,
     limit: usize,
 ) -> Result<HfKeyPage> {
-    read_key_page(store, &key_id_prefix()?, after_cursor, limit)
+    read_key_page(mvcc, snapshot, &key_id_prefix()?, after_cursor, limit)
 }
 
-pub(super) fn get_ingestion(store: &CoreStore, id: i64) -> Result<Option<HfIngestion>> {
-    let Some(payload) = read_payload(store, &ingestion_key(id)?)? else {
+pub(super) fn get_ingestion(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    snapshot: u64,
+    id: i64,
+) -> Result<Option<HfIngestion>> {
+    let Some(payload) = read_payload_at(mvcc, snapshot, &ingestion_key(id)?)? else {
         return Ok(None);
     };
     let row = HfIngestionProjectionProto::decode(payload.as_slice())?;
     ensure_deterministic_proto(&row, &payload, "hf ingestion projection")?;
-    if row.common.is_none() || row.schema != HF_INGESTION_PROJECTION_SCHEMA {
+    if row.schema != HF_INGESTION_PROJECTION_SCHEMA {
         return Err(anyhow!("hf ingestion projection schema mismatch"));
     }
     let ingestion = hf_ingestion_from_proto(
@@ -188,8 +195,12 @@ pub(super) fn get_ingestion(store: &CoreStore, id: i64) -> Result<Option<HfInges
     Ok(Some(ingestion))
 }
 
-pub(super) fn get_item(store: &CoreStore, id: i64) -> Result<Option<HfIngestionItem>> {
-    let item = read_item(store, &item_id_key(id)?)?;
+pub(super) fn get_item(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    snapshot: u64,
+    id: i64,
+) -> Result<Option<HfIngestionItem>> {
+    let item = read_item(mvcc, snapshot, &item_id_key(id)?)?;
     if item.as_ref().is_some_and(|item| item.id != id) {
         return Err(anyhow!("hf item-id projection scope mismatch"));
     }
@@ -197,11 +208,12 @@ pub(super) fn get_item(store: &CoreStore, id: i64) -> Result<Option<HfIngestionI
 }
 
 pub(super) fn get_item_by_path(
-    store: &CoreStore,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    snapshot: u64,
     ingestion_id: i64,
     path: &str,
 ) -> Result<Option<HfIngestionItem>> {
-    let item = read_item(store, &item_path_key(ingestion_id, path)?)?;
+    let item = read_item(mvcc, snapshot, &item_path_key(ingestion_id, path)?)?;
     if item
         .as_ref()
         .is_some_and(|item| item.ingestion_id != ingestion_id || item.path != path)
@@ -212,13 +224,15 @@ pub(super) fn get_item_by_path(
 }
 
 pub(super) fn list_stored_items_for_ingestion(
-    store: &CoreStore,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    snapshot: u64,
     ingestion_id: i64,
     after_cursor: Option<&[u8]>,
     limit: usize,
 ) -> Result<HfStoredItemPage> {
     read_stored_item_page(
-        store,
+        mvcc,
+        snapshot,
         &stored_item_ingestion_prefix(ingestion_id)?,
         after_cursor,
         limit,
@@ -235,7 +249,8 @@ pub(super) fn list_stored_items_for_ingestion(
 }
 
 pub(super) fn list_stored_items_for_target(
-    store: &CoreStore,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    snapshot: u64,
     tenant_id: i64,
     bucket: &str,
     prefix: &str,
@@ -243,7 +258,8 @@ pub(super) fn list_stored_items_for_target(
     limit: usize,
 ) -> Result<HfStoredItemPage> {
     read_stored_item_page(
-        store,
+        mvcc,
+        snapshot,
         &stored_item_target_prefix(tenant_id, bucket, prefix)?,
         after_cursor,
         limit,
@@ -252,62 +268,64 @@ pub(super) fn list_stored_items_for_target(
 }
 
 pub(super) fn get_ingestion_status(
-    store: &CoreStore,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    snapshot: u64,
     ingestion_id: i64,
 ) -> Result<Option<HfIngestionStatus>> {
     Ok(
-        read_status_projection(store, ingestion_id)?.map(|projection| HfIngestionStatus {
-            state: projection.ingestion.state,
-            queued: projection.queued,
-            downloading: projection.downloading,
-            stored: projection.stored,
-            failed: projection.failed,
-            error: projection.ingestion.error,
-            started_at: projection.ingestion.started_at,
-            finished_at: projection.ingestion.finished_at,
-            created_at: projection.ingestion.created_at,
+        read_status_projection_at(mvcc, snapshot, ingestion_id)?.map(|projection| {
+            HfIngestionStatus {
+                state: projection.ingestion.state,
+                queued: projection.queued,
+                downloading: projection.downloading,
+                stored: projection.stored,
+                failed: projection.failed,
+                error: projection.ingestion.error,
+                started_at: projection.ingestion.started_at,
+                finished_at: projection.ingestion.finished_at,
+                created_at: projection.ingestion.created_at,
+            }
         }),
     )
 }
 
-pub(super) fn projection_operations(
-    store: &CoreStore,
-    body: &HfBody,
-    stream_id: &str,
-    root_generation: u64,
+pub(super) struct HfProjectionPlan {
+    pub mutations: Vec<ProductMutation>,
+    pub predicates: Vec<(LogicalKey, PredicateKind)>,
+}
+
+pub(super) fn projection_plan(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     transaction_id: &str,
-    partition_id: &str,
-) -> Result<Vec<CoreMutationOperation>> {
-    let root_hash = core_meta_root_key_hash(&projection_root_anchor_key(stream_id));
+    principal: &str,
+    body: &HfBody,
+) -> Result<HfProjectionPlan> {
+    let mut desired = std::collections::BTreeMap::<Vec<u8>, Option<Vec<u8>>>::new();
     match body {
         HfBody::KeyUpsert { key, .. } => {
-            let payload = encode_key_projection(key, &root_hash, root_generation, transaction_id)?;
-            Ok(vec![
-                put(partition_id, key_id_key(key.id)?, payload.clone()),
-                put(
-                    partition_id,
-                    key_name_key(key.tenant_id, &key.name)?,
-                    payload,
-                ),
-            ])
+            let payload = encode_key_projection(key)?;
+            for tuple_key in [key_id_key(key.id)?, key_name_key(key.tenant_id, &key.name)?] {
+                if let Some(existing) =
+                    read_key_transaction(mvcc, transaction_id, principal, &tuple_key)?
+                    && existing.id != key.id
+                {
+                    return Err(anyhow!("hugging face key identity is already in use"));
+                }
+                desired.insert(tuple_key, Some(payload.clone()));
+            }
         }
         HfBody::KeyDelete {
             tenant_id,
             key_id,
             key_name,
             ..
-        } => Ok(vec![
-            delete(partition_id, key_id_key(*key_id)?),
-            delete(partition_id, key_name_key(*tenant_id, key_name)?),
-        ]),
+        } => {
+            desired.insert(key_id_key(*key_id)?, None);
+            desired.insert(key_name_key(*tenant_id, key_name)?, None);
+        }
         HfBody::IngestionUpsert { ingestion, .. } => {
-            let payload = encode_ingestion_projection(
-                ingestion,
-                &root_hash,
-                root_generation,
-                transaction_id,
-            )?;
-            let existing_status = read_status_projection(store, ingestion.id)?;
+            let existing_status =
+                read_status_projection_transaction(mvcc, transaction_id, principal, ingestion.id)?;
             if existing_status.as_ref().is_some_and(|status| {
                 status.ingestion.tenant_id != ingestion.tenant_id
                     || status.ingestion.target_bucket != ingestion.target_bucket
@@ -325,48 +343,45 @@ pub(super) fn projection_operations(
                 failed: 0,
             });
             status.ingestion = ingestion.clone();
-            let status_payload =
-                encode_status_projection(&status, &root_hash, root_generation, transaction_id)?;
-            Ok(vec![
-                put(partition_id, ingestion_key(ingestion.id)?, payload),
-                put(
-                    partition_id,
-                    ingestion_status_key(ingestion.id)?,
-                    status_payload,
-                ),
-            ])
+            desired.insert(
+                ingestion_key(ingestion.id)?,
+                Some(encode_ingestion_projection(ingestion)?),
+            );
+            desired.insert(
+                ingestion_status_key(ingestion.id)?,
+                Some(encode_status_projection(&status)?),
+            );
         }
         HfBody::ItemUpsert { item, .. } => {
-            let previous = get_item(store, item.id)?;
+            let previous =
+                read_item_transaction(mvcc, transaction_id, principal, &item_id_key(item.id)?)?;
             if previous.as_ref().is_some_and(|previous| {
                 previous.ingestion_id != item.ingestion_id || previous.path != item.path
             }) {
                 return Err(anyhow!("hf item identity cannot change during an upsert"));
             }
-            let mut status = read_status_projection(store, item.ingestion_id)?
-                .ok_or_else(|| anyhow!("hf item ingestion status projection is missing"))?;
+            let mut status = read_status_projection_transaction(
+                mvcc,
+                transaction_id,
+                principal,
+                item.ingestion_id,
+            )?
+            .ok_or_else(|| anyhow!("hf item ingestion status projection is missing"))?;
             apply_item_transition(
                 &mut status,
                 previous.as_ref().map(|previous| previous.state),
                 item.state,
             )?;
-            let payload =
-                encode_item_projection(item, &root_hash, root_generation, transaction_id)?;
-            let status_payload =
-                encode_status_projection(&status, &root_hash, root_generation, transaction_id)?;
-            let mut operations = vec![
-                put(partition_id, item_id_key(item.id)?, payload.clone()),
-                put(
-                    partition_id,
-                    item_path_key(item.ingestion_id, &item.path)?,
-                    payload,
-                ),
-                put(
-                    partition_id,
-                    ingestion_status_key(item.ingestion_id)?,
-                    status_payload,
-                ),
-            ];
+            let payload = encode_item_projection(item)?;
+            desired.insert(item_id_key(item.id)?, Some(payload.clone()));
+            desired.insert(
+                item_path_key(item.ingestion_id, &item.path)?,
+                Some(payload.clone()),
+            );
+            desired.insert(
+                ingestion_status_key(item.ingestion_id)?,
+                Some(encode_status_projection(&status)?),
+            );
             let was_stored = previous.as_ref().is_some_and(|previous| {
                 previous.state == crate::tasks::HFIngestionItemState::Stored
             });
@@ -375,40 +390,55 @@ pub(super) fn projection_operations(
             let target_item_key = stored_item_target_key(&status.ingestion, item.id)?;
             match (was_stored, is_stored) {
                 (_, true) => {
-                    let item_payload =
-                        encode_item_projection(item, &root_hash, root_generation, transaction_id)?;
-                    let target_payload = encode_target_item_projection(
-                        &status.ingestion,
-                        item,
-                        &root_hash,
-                        root_generation,
-                        transaction_id,
-                    )?;
-                    operations.push(put(partition_id, ingestion_item_key, item_payload));
-                    operations.push(put(partition_id, target_item_key, target_payload));
+                    desired.insert(ingestion_item_key, Some(payload));
+                    desired.insert(
+                        target_item_key,
+                        Some(encode_target_item_projection(&status.ingestion, item)?),
+                    );
                 }
                 (true, false) => {
-                    operations.push(delete(partition_id, ingestion_item_key));
-                    operations.push(delete(partition_id, target_item_key));
+                    desired.insert(ingestion_item_key, None);
+                    desired.insert(target_item_key, None);
                 }
                 (false, false) => {}
             }
-            Ok(operations)
         }
     }
+
+    let mut mutations = Vec::with_capacity(desired.len());
+    let mut predicates = Vec::with_capacity(desired.len());
+    for (tuple_key, value) in desired {
+        let key = logical_key(&tuple_key)?;
+        let observed = mvcc.read_transaction_value(transaction_id, principal, &key)?;
+        predicates.push((
+            key.clone(),
+            observed
+                .as_ref()
+                .map(|payload| PredicateKind::ValueHash(*blake3::hash(payload).as_bytes()))
+                .unwrap_or(PredicateKind::Absent),
+        ));
+        mutations.push(match value {
+            Some(payload) => ProductMutation::put(key, payload),
+            None => ProductMutation::delete(key),
+        });
+    }
+    Ok(HfProjectionPlan {
+        mutations,
+        predicates,
+    })
 }
 
-pub(super) fn projection_root_anchor_key(stream_id: &str) -> String {
-    format!("stream/{stream_id}")
-}
-
-fn read_key(store: &CoreStore, tuple_key: &[u8]) -> Result<Option<HfKey>> {
-    let Some(payload) = read_payload(store, tuple_key)? else {
+fn read_key(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    snapshot: u64,
+    tuple_key: &[u8],
+) -> Result<Option<HfKey>> {
+    let Some(payload) = read_payload_at(mvcc, snapshot, tuple_key)? else {
         return Ok(None);
     };
     let row = HfKeyProjectionProto::decode(payload.as_slice())?;
     ensure_deterministic_proto(&row, &payload, "hf key projection")?;
-    if row.common.is_none() || row.schema != HF_KEY_PROJECTION_SCHEMA {
+    if row.schema != HF_KEY_PROJECTION_SCHEMA {
         return Err(anyhow!("hf key projection schema mismatch"));
     }
     Ok(Some(hf_key_from_proto(row.key.ok_or_else(|| {
@@ -417,7 +447,8 @@ fn read_key(store: &CoreStore, tuple_key: &[u8]) -> Result<Option<HfKey>> {
 }
 
 fn read_key_page(
-    store: &CoreStore,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    snapshot: u64,
     prefix: &[u8],
     after_cursor: Option<&[u8]>,
     limit: usize,
@@ -427,33 +458,24 @@ fn read_key_page(
             "hf key page size must be between 1 and {HF_PROJECTION_PAGE_MAX}"
         ));
     }
-    let mut rows = store.scan_coremeta_prefix_page(
-        CF_OBSERVABILITY,
-        TABLE_OBSERVABILITY_CURSOR_ROW,
-        prefix,
-        after_cursor,
-        limit + 1,
-    )?;
+    let mut rows = scan_prefix_at(mvcc, snapshot, prefix, after_cursor, limit + 1)?;
     let has_more = rows.len() > limit;
     if has_more {
         rows.truncate(limit);
     }
     let next_cursor = if has_more {
         Some(
-            core_meta_record_tuple_key(
-                &rows
-                    .last()
-                    .ok_or_else(|| anyhow!("hf key continuation has no row"))?
-                    .key,
-            )?
-            .to_vec(),
+            rows.last()
+                .ok_or_else(|| anyhow!("hf key continuation has no row"))?
+                .0
+                .clone(),
         )
     } else {
         None
     };
     let keys = rows
         .into_iter()
-        .map(|row| read_key_payload(&row.payload))
+        .map(|(_, payload)| read_key_payload(&payload))
         .collect::<Result<Vec<_>>>()?;
     Ok(HfKeyPage { keys, next_cursor })
 }
@@ -461,7 +483,7 @@ fn read_key_page(
 fn read_key_payload(payload: &[u8]) -> Result<HfKey> {
     let row = HfKeyProjectionProto::decode(payload)?;
     ensure_deterministic_proto(&row, payload, "hf key projection")?;
-    if row.common.is_none() || row.schema != HF_KEY_PROJECTION_SCHEMA {
+    if row.schema != HF_KEY_PROJECTION_SCHEMA {
         return Err(anyhow!("hf key projection schema mismatch"));
     }
     hf_key_from_proto(
@@ -470,8 +492,12 @@ fn read_key_payload(payload: &[u8]) -> Result<HfKey> {
     )
 }
 
-fn read_item(store: &CoreStore, tuple_key: &[u8]) -> Result<Option<HfIngestionItem>> {
-    let Some(payload) = read_payload(store, tuple_key)? else {
+fn read_item(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    snapshot: u64,
+    tuple_key: &[u8],
+) -> Result<Option<HfIngestionItem>> {
+    let Some(payload) = read_payload_at(mvcc, snapshot, tuple_key)? else {
         return Ok(None);
     };
     Ok(Some(read_item_payload(&payload)?))
@@ -480,7 +506,7 @@ fn read_item(store: &CoreStore, tuple_key: &[u8]) -> Result<Option<HfIngestionIt
 fn read_item_payload(payload: &[u8]) -> Result<HfIngestionItem> {
     let row = HfItemProjectionProto::decode(payload)?;
     ensure_deterministic_proto(&row, payload, "hf item projection")?;
-    if row.common.is_none() || row.schema != HF_ITEM_PROJECTION_SCHEMA {
+    if row.schema != HF_ITEM_PROJECTION_SCHEMA {
         return Err(anyhow!("hf item projection schema mismatch"));
     }
     hf_ingestion_item_from_proto(
@@ -490,40 +516,32 @@ fn read_item_payload(payload: &[u8]) -> Result<HfIngestionItem> {
 }
 
 fn read_stored_item_page(
-    store: &CoreStore,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    snapshot: u64,
     prefix: &[u8],
     after_cursor: Option<&[u8]>,
     limit: usize,
     decode: impl Fn(&[u8]) -> Result<HfStoredItem>,
 ) -> Result<HfStoredItemPage> {
     validate_page_limit(limit, "hf stored item")?;
-    let mut rows = store.scan_coremeta_prefix_page(
-        CF_OBSERVABILITY,
-        TABLE_OBSERVABILITY_CURSOR_ROW,
-        prefix,
-        after_cursor,
-        limit + 1,
-    )?;
+    let mut rows = scan_prefix_at(mvcc, snapshot, prefix, after_cursor, limit + 1)?;
     let has_more = rows.len() > limit;
     if has_more {
         rows.truncate(limit);
     }
     let next_cursor = if has_more {
         Some(
-            core_meta_record_tuple_key(
-                &rows
-                    .last()
-                    .ok_or_else(|| anyhow!("hf stored item continuation has no row"))?
-                    .key,
-            )?
-            .to_vec(),
+            rows.last()
+                .ok_or_else(|| anyhow!("hf stored item continuation has no row"))?
+                .0
+                .clone(),
         )
     } else {
         None
     };
     let items = rows
         .into_iter()
-        .map(|row| decode(&row.payload))
+        .map(|(_, payload)| decode(&payload))
         .collect::<Result<Vec<_>>>()?;
     Ok(HfStoredItemPage { items, next_cursor })
 }
@@ -536,8 +554,7 @@ fn read_target_item_payload(
 ) -> Result<HfStoredItem> {
     let row = HfTargetItemProjectionProto::decode(payload)?;
     ensure_deterministic_proto(&row, payload, "hf target item projection")?;
-    if row.common.is_none()
-        || row.schema != HF_TARGET_ITEM_PROJECTION_SCHEMA
+    if row.schema != HF_TARGET_ITEM_PROJECTION_SCHEMA
         || row.tenant_id != tenant_id
         || row.bucket != bucket
         || row.prefix != prefix
@@ -551,16 +568,25 @@ fn read_target_item_payload(
     stored_item(item)
 }
 
-fn read_status_projection(
-    store: &CoreStore,
+fn read_status_projection_at(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    snapshot: u64,
     ingestion_id: i64,
 ) -> Result<Option<HfIngestionStatusProjection>> {
-    let Some(payload) = read_payload(store, &ingestion_status_key(ingestion_id)?)? else {
+    let Some(payload) = read_payload_at(mvcc, snapshot, &ingestion_status_key(ingestion_id)?)?
+    else {
         return Ok(None);
     };
-    let row = HfIngestionStatusProjectionProto::decode(payload.as_slice())?;
-    ensure_deterministic_proto(&row, &payload, "hf ingestion status projection")?;
-    if row.common.is_none() || row.schema != HF_INGESTION_STATUS_PROJECTION_SCHEMA {
+    decode_status_projection(&payload, ingestion_id).map(Some)
+}
+
+fn decode_status_projection(
+    payload: &[u8],
+    ingestion_id: i64,
+) -> Result<HfIngestionStatusProjection> {
+    let row = HfIngestionStatusProjectionProto::decode(payload)?;
+    ensure_deterministic_proto(&row, payload, "hf ingestion status projection")?;
+    if row.schema != HF_INGESTION_STATUS_PROJECTION_SCHEMA {
         return Err(anyhow!("hf ingestion status projection schema mismatch"));
     }
     if [row.queued, row.downloading, row.stored, row.failed]
@@ -578,13 +604,13 @@ fn read_status_projection(
     if ingestion.id != ingestion_id {
         return Err(anyhow!("hf ingestion status projection scope mismatch"));
     }
-    Ok(Some(HfIngestionStatusProjection {
+    Ok(HfIngestionStatusProjection {
         ingestion,
         queued: row.queued,
         downloading: row.downloading,
         stored: row.stored,
         failed: row.failed,
-    }))
+    })
 }
 
 fn stored_item(item: HfIngestionItem) -> Result<HfStoredItem> {
@@ -645,57 +671,29 @@ fn adjust_item_count(
     Ok(())
 }
 
-fn read_payload(store: &CoreStore, tuple_key: &[u8]) -> Result<Option<Vec<u8>>> {
-    store.read_coremeta_row(CF_OBSERVABILITY, TABLE_OBSERVABILITY_CURSOR_ROW, tuple_key)
-}
-
-fn encode_key_projection(
-    key: &HfKey,
-    root_hash: &str,
-    root_generation: u64,
-    transaction_id: &str,
-) -> Result<Vec<u8>> {
+fn encode_key_projection(key: &HfKey) -> Result<Vec<u8>> {
     encode_proto(&HfKeyProjectionProto {
-        common: Some(common(root_hash, root_generation, transaction_id)),
         schema: HF_KEY_PROJECTION_SCHEMA.to_string(),
         key: Some(hf_key_to_proto(key)),
     })
 }
 
-fn encode_ingestion_projection(
-    ingestion: &HfIngestion,
-    root_hash: &str,
-    root_generation: u64,
-    transaction_id: &str,
-) -> Result<Vec<u8>> {
+fn encode_ingestion_projection(ingestion: &HfIngestion) -> Result<Vec<u8>> {
     encode_proto(&HfIngestionProjectionProto {
-        common: Some(common(root_hash, root_generation, transaction_id)),
         schema: HF_INGESTION_PROJECTION_SCHEMA.to_string(),
         ingestion: Some(hf_ingestion_to_proto(ingestion)),
     })
 }
 
-fn encode_item_projection(
-    item: &HfIngestionItem,
-    root_hash: &str,
-    root_generation: u64,
-    transaction_id: &str,
-) -> Result<Vec<u8>> {
+fn encode_item_projection(item: &HfIngestionItem) -> Result<Vec<u8>> {
     encode_proto(&HfItemProjectionProto {
-        common: Some(common(root_hash, root_generation, transaction_id)),
         schema: HF_ITEM_PROJECTION_SCHEMA.to_string(),
         item: Some(hf_ingestion_item_to_proto(item)),
     })
 }
 
-fn encode_status_projection(
-    status: &HfIngestionStatusProjection,
-    root_hash: &str,
-    root_generation: u64,
-    transaction_id: &str,
-) -> Result<Vec<u8>> {
+fn encode_status_projection(status: &HfIngestionStatusProjection) -> Result<Vec<u8>> {
     encode_proto(&HfIngestionStatusProjectionProto {
-        common: Some(common(root_hash, root_generation, transaction_id)),
         schema: HF_INGESTION_STATUS_PROJECTION_SCHEMA.to_string(),
         ingestion: Some(hf_ingestion_to_proto(&status.ingestion)),
         queued: status.queued,
@@ -708,12 +706,8 @@ fn encode_status_projection(
 fn encode_target_item_projection(
     ingestion: &HfIngestion,
     item: &HfIngestionItem,
-    root_hash: &str,
-    root_generation: u64,
-    transaction_id: &str,
 ) -> Result<Vec<u8>> {
     encode_proto(&HfTargetItemProjectionProto {
-        common: Some(common(root_hash, root_generation, transaction_id)),
         schema: HF_TARGET_ITEM_PROJECTION_SCHEMA.to_string(),
         tenant_id: ingestion.tenant_id,
         bucket: ingestion.target_bucket.clone(),
@@ -722,43 +716,110 @@ fn encode_target_item_projection(
     })
 }
 
-fn common(
-    root_hash: &str,
-    root_generation: u64,
-    transaction_id: &str,
-) -> crate::core_store::CoreMetaRowCommonProto {
-    core_meta_committed_row_common(
-        "system",
-        root_hash,
-        root_generation,
-        transaction_id,
-        root_generation,
-    )
-}
-
 fn encode_proto(message: &impl Message) -> Result<Vec<u8>> {
     let mut bytes = Vec::with_capacity(message.encoded_len());
     message.encode(&mut bytes)?;
     Ok(bytes)
 }
 
-fn put(partition_id: &str, tuple_key: Vec<u8>, payload: Vec<u8>) -> CoreMutationOperation {
-    CoreMutationOperation::CoreMetaPut {
-        partition_id: partition_id.to_string(),
-        cf: CF_OBSERVABILITY.to_string(),
-        table_id: TABLE_OBSERVABILITY_CURSOR_ROW,
+fn logical_key(tuple_key: &[u8]) -> Result<LogicalKey> {
+    crate::mvcc_product::coremeta_logical_key(
+        CF_OBSERVABILITY,
+        TABLE_OBSERVABILITY_CURSOR_ROW,
         tuple_key,
-        payload,
-    }
+    )
 }
 
-fn delete(partition_id: &str, tuple_key: Vec<u8>) -> CoreMutationOperation {
-    CoreMutationOperation::CoreMetaDelete {
-        partition_id: partition_id.to_string(),
-        cf: CF_OBSERVABILITY.to_string(),
-        table_id: TABLE_OBSERVABILITY_CURSOR_ROW,
-        tuple_key,
-    }
+fn read_payload_at(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    snapshot: u64,
+    tuple_key: &[u8],
+) -> Result<Option<Vec<u8>>> {
+    Ok(mvcc
+        .runtime
+        .read_at(&logical_key(tuple_key)?, snapshot)?
+        .map(|row| row.value))
+}
+
+fn read_payload_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    tuple_key: &[u8],
+) -> Result<Option<Vec<u8>>> {
+    mvcc.read_transaction_value(transaction_id, principal, &logical_key(tuple_key)?)
+}
+
+fn read_key_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    tuple_key: &[u8],
+) -> Result<Option<HfKey>> {
+    read_payload_transaction(mvcc, transaction_id, principal, tuple_key)?
+        .as_deref()
+        .map(read_key_payload)
+        .transpose()
+}
+
+fn read_item_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    tuple_key: &[u8],
+) -> Result<Option<HfIngestionItem>> {
+    read_payload_transaction(mvcc, transaction_id, principal, tuple_key)?
+        .as_deref()
+        .map(read_item_payload)
+        .transpose()
+}
+
+fn read_status_projection_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    ingestion_id: i64,
+) -> Result<Option<HfIngestionStatusProjection>> {
+    let Some(payload) = read_payload_transaction(
+        mvcc,
+        transaction_id,
+        principal,
+        &ingestion_status_key(ingestion_id)?,
+    )?
+    else {
+        return Ok(None);
+    };
+    decode_status_projection(&payload, ingestion_id).map(Some)
+}
+
+fn scan_prefix_at(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    snapshot: u64,
+    tuple_prefix: &[u8],
+    after_cursor: Option<&[u8]>,
+    limit: usize,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let application_prefix =
+        crate::mvcc_product::coremeta_application_prefix(CF_OBSERVABILITY, tuple_prefix)?;
+    let mut rows = mvcc
+        .runtime
+        .scan_table_prefix_at(
+            TABLE_OBSERVABILITY_CURSOR_ROW,
+            &application_prefix,
+            snapshot,
+        )?
+        .into_iter()
+        .map(|(key, row)| {
+            Ok((
+                crate::mvcc_product::coremeta_tuple_from_logical_key(&key, CF_OBSERVABILITY)?
+                    .to_vec(),
+                row.value,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    rows.retain(|(tuple_key, _)| after_cursor.is_none_or(|after| tuple_key.as_slice() > after));
+    rows.truncate(limit);
+    Ok(rows)
 }
 
 fn key_id_prefix() -> Result<Vec<u8>> {

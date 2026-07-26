@@ -1,23 +1,25 @@
 use crate::core_store::{
-    CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
-    CoreMutationRootPublication, CoreStore,
+    CF_OBSERVABILITY, CoreMetaTuplePart, TABLE_OBSERVABILITY_CURSOR_ROW, core_meta_tuple_key,
 };
-use crate::formats::{Hash32, hash32, writer::WriterFamily};
-use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
+use crate::formats::{Hash32, hash32};
+use crate::mvcc_bootstrap::MvccSubsystem;
+use crate::mvcc_product::{ProductMutation, coremeta_logical_key};
+use crate::mvcc_transaction::{DurabilityLevel, LogicalKey, PredicateKind, ReadConsistency};
+use crate::partition_fence::PartitionWritePermit;
 use crate::persistence::{HfIngestion, HfIngestionItem, HfIngestionJob, HfKey};
 use crate::storage::Storage;
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use prost::{Message, Oneof};
+use std::time::Duration;
 
 mod projection;
 pub(crate) use projection::HfKeyPage;
 pub use projection::{HfIngestionStatus, HfStoredItem, HfStoredItemPage};
 
-#[cfg(test)]
-mod bounded_read_tests;
-
 const HF_METADATA_BODY_SCHEMA: &str = "anvil.core.hf_metadata.v3";
+const HF_JOURNAL_HEAD_SCHEMA: &str = "anvil.core.hf_journal_head.v1";
+const HF_JOURNAL_EVENT_SCHEMA: &str = "anvil.core.hf_journal_event.v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HfMutationKind {
@@ -72,6 +74,34 @@ struct HfJournalBodyProto {
     mutation_id: String,
     #[prost(oneof = "hf_journal_body_proto::Event", tags = "10, 11, 12, 13")]
     event: Option<hf_journal_body_proto::Event>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct HfJournalHeadProto {
+    #[prost(string, tag = "1")]
+    schema: String,
+    #[prost(uint64, tag = "2")]
+    last_sequence: u64,
+    #[prost(uint64, tag = "3")]
+    next_entity_id: u64,
+    #[prost(bytes, tag = "4")]
+    last_event_hash: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct HfJournalEventProto {
+    #[prost(string, tag = "1")]
+    schema: String,
+    #[prost(uint64, tag = "2")]
+    sequence: u64,
+    #[prost(bytes, tag = "3")]
+    previous_event_hash: Vec<u8>,
+    #[prost(bytes, tag = "4")]
+    event_hash: Vec<u8>,
+    #[prost(string, tag = "5")]
+    mutation_id: String,
+    #[prost(bytes, tag = "6")]
+    body: Vec<u8>,
 }
 
 mod hf_journal_body_proto {
@@ -201,7 +231,6 @@ enum HfIngestionItemStateProto {
 #[derive(Debug, Clone, Default)]
 struct HfWriteGuard {
     fence_token: u64,
-    partition_precondition: Option<CoreMutationPrecondition>,
 }
 
 #[cfg(test)]
@@ -225,6 +254,7 @@ async fn create_key(
 
 pub(crate) async fn create_key_with_permit(
     storage: &Storage,
+    mvcc: &MvccSubsystem,
     tenant_id: i64,
     name: &str,
     token_encrypted: &[u8],
@@ -233,28 +263,29 @@ pub(crate) async fn create_key_with_permit(
     partition_owner_signing_key: &[u8],
 ) -> Result<()> {
     let guard = hf_write_guard(storage, permit, partition_owner_signing_key).await?;
-    create_key_inner(storage, tenant_id, name, token_encrypted, note, guard).await
+    create_key_inner(storage, mvcc, tenant_id, name, token_encrypted, note, guard).await
 }
 
 async fn create_key_inner(
-    storage: &Storage,
+    _storage: &Storage,
+    mvcc: &MvccSubsystem,
     tenant_id: i64,
     name: &str,
     token_encrypted: &[u8],
     note: Option<&str>,
     guard: HfWriteGuard,
 ) -> Result<()> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    if projection::get_key_by_name(&core_store, tenant_id, name)?.is_some() {
+    if projection::get_key_by_name(mvcc, mvcc.runtime.applied_version()?, tenant_id, name)?
+        .is_some()
+    {
         return Err(anyhow!("hugging face key already exists"));
     }
-    let (stream_precondition, id) = next_hf_entity_id(storage).await?;
     let now = Utc::now();
     append_body(
-        storage,
+        mvcc,
         HfMutationKind::KeyUpsert,
         Some(HfKey {
-            id,
+            id: 0,
             tenant_id,
             name: name.to_string(),
             token_encrypted: token_encrypted.to_vec(),
@@ -266,9 +297,9 @@ async fn create_key_inner(
         None,
         None,
         guard,
-        Some(stream_precondition),
     )
     .await
+    .map(|_| ())
 }
 
 #[cfg(test)]
@@ -278,33 +309,33 @@ async fn delete_key(storage: &Storage, tenant_id: i64, name: &str) -> Result<u64
 
 pub(crate) async fn delete_key_with_permit(
     storage: &Storage,
+    mvcc: &MvccSubsystem,
     tenant_id: i64,
     name: &str,
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<u64> {
     let guard = hf_write_guard(storage, permit, partition_owner_signing_key).await?;
-    delete_key_inner(storage, tenant_id, name, guard).await
+    delete_key_inner(storage, mvcc, tenant_id, name, guard).await
 }
 
 async fn delete_key_inner(
-    storage: &Storage,
+    _storage: &Storage,
+    mvcc: &MvccSubsystem,
     tenant_id: i64,
     name: &str,
     guard: HfWriteGuard,
 ) -> Result<u64> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let key = projection::get_key_by_name(&core_store, tenant_id, name)?;
+    let key = projection::get_key_by_name(mvcc, mvcc.runtime.applied_version()?, tenant_id, name)?;
     if let Some(key) = key {
         append_body(
-            storage,
+            mvcc,
             HfMutationKind::KeyDelete,
             None,
             Some((tenant_id, key.id, name.to_string())),
             None,
             None,
             guard,
-            None,
         )
         .await?;
         return Ok(1);
@@ -313,76 +344,87 @@ async fn delete_key_inner(
 }
 
 pub async fn get_key_encrypted(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
     tenant_id: i64,
     name: &str,
 ) -> Result<Option<(i64, Vec<u8>)>> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    Ok(projection::get_key_by_name(&core_store, tenant_id, name)?
-        .map(|key| (key.id, key.token_encrypted)))
+    Ok(
+        projection::get_key_by_name(mvcc, mvcc.runtime.applied_version()?, tenant_id, name)?
+            .map(|key| (key.id, key.token_encrypted)),
+    )
 }
 
 pub async fn get_key_encrypted_by_id(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
     tenant_id: i64,
     id: i64,
 ) -> Result<Option<Vec<u8>>> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    Ok(projection::get_key_by_id(&core_store, id)?
-        .filter(|key| key.tenant_id == tenant_id)
-        .map(|key| key.token_encrypted))
+    Ok(
+        projection::get_key_by_id(mvcc, mvcc.runtime.applied_version()?, id)?
+            .filter(|key| key.tenant_id == tenant_id)
+            .map(|key| key.token_encrypted),
+    )
 }
 
 pub(crate) async fn list_encrypted_key_page(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
     after_cursor: Option<&[u8]>,
     limit: usize,
 ) -> Result<HfKeyPage> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    projection::list_all_keys(&core_store, after_cursor, limit)
+    projection::list_all_keys(mvcc, mvcc.runtime.applied_version()?, after_cursor, limit)
 }
 
 pub(crate) async fn update_key_encrypted_with_permit(
     storage: &Storage,
+    mvcc: &MvccSubsystem,
     id: i64,
     token_encrypted: &[u8],
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<()> {
     let guard = hf_write_guard(storage, permit, partition_owner_signing_key).await?;
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let mut key = projection::get_key_by_id(&core_store, id)?
+    let mut key = projection::get_key_by_id(mvcc, mvcc.runtime.applied_version()?, id)?
         .ok_or_else(|| anyhow!("hugging face key not found"))?;
     key.token_encrypted = token_encrypted.to_vec();
     key.updated_at = Utc::now();
     append_body(
-        storage,
+        mvcc,
         HfMutationKind::KeyUpsert,
         Some(key),
         None,
         None,
         None,
         guard,
-        None,
     )
     .await
+    .map(|_| ())
 }
 
 pub(crate) async fn list_key_page(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
     tenant_id: i64,
     after_cursor: Option<&[u8]>,
     limit: usize,
 ) -> Result<HfKeyPage> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    projection::list_tenant_keys(&core_store, tenant_id, after_cursor, limit)
+    projection::list_tenant_keys(
+        mvcc,
+        mvcc.runtime.applied_version()?,
+        tenant_id,
+        after_cursor,
+        limit,
+    )
 }
 
-pub(crate) async fn hf_collection_revision(storage: &Storage) -> Result<String> {
-    Ok(CoreStore::new(storage.clone())
-        .await?
-        .stream_head_sequence(&hf_metadata_stream_id())
-        .await?
+pub(crate) async fn hf_collection_revision(mvcc: &MvccSubsystem) -> Result<String> {
+    let snapshot = mvcc.runtime.applied_version()?;
+    Ok(mvcc
+        .runtime
+        .read_at(&hf_head_logical_key()?, snapshot)?
+        .as_ref()
+        .map(|row| decode_hf_head(&row.value))
+        .transpose()?
+        .map(|head| head.last_sequence)
+        .unwrap_or_default()
         .to_string())
 }
 
@@ -421,6 +463,7 @@ async fn create_ingestion(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_ingestion_with_permit(
     storage: &Storage,
+    mvcc: &MvccSubsystem,
     key_id: i64,
     tenant_id: i64,
     requester_app_id: i64,
@@ -437,6 +480,7 @@ pub(crate) async fn create_ingestion_with_permit(
     let guard = hf_write_guard(storage, permit, partition_owner_signing_key).await?;
     create_ingestion_inner(
         storage,
+        mvcc,
         key_id,
         tenant_id,
         requester_app_id,
@@ -454,7 +498,8 @@ pub(crate) async fn create_ingestion_with_permit(
 
 #[allow(clippy::too_many_arguments)]
 async fn create_ingestion_inner(
-    storage: &Storage,
+    _storage: &Storage,
+    mvcc: &MvccSubsystem,
     key_id: i64,
     tenant_id: i64,
     requester_app_id: i64,
@@ -467,14 +512,13 @@ async fn create_ingestion_inner(
     exclude_globs: &[String],
     guard: HfWriteGuard,
 ) -> Result<i64> {
-    let (stream_precondition, id) = next_hf_entity_id(storage).await?;
-    append_body(
-        storage,
+    let id = append_body(
+        mvcc,
         HfMutationKind::IngestionUpsert,
         None,
         None,
         Some(HfIngestion {
-            id,
+            id: 0,
             key_id,
             tenant_id,
             requester_app_id,
@@ -493,26 +537,27 @@ async fn create_ingestion_inner(
         }),
         None,
         guard,
-        Some(stream_precondition),
     )
-    .await?;
+    .await?
+    .ok_or_else(|| anyhow!("hf ingestion creation did not allocate an id"))?;
     Ok(id)
 }
 
-pub async fn get_ingestion_job(storage: &Storage, id: i64) -> Result<Option<HfIngestionJob>> {
-    let core_store = CoreStore::new(storage.clone()).await?;
+pub async fn get_ingestion_job(mvcc: &MvccSubsystem, id: i64) -> Result<Option<HfIngestionJob>> {
     Ok(
-        projection::get_ingestion(&core_store, id)?.map(|job| HfIngestionJob {
-            key_id: job.key_id,
-            tenant_id: job.tenant_id,
-            requester_app_id: job.requester_app_id,
-            repo: job.repo,
-            revision: job.revision,
-            target_bucket: job.target_bucket,
-            target_region: job.target_region,
-            target_prefix: job.target_prefix,
-            include_globs: job.include_globs,
-            exclude_globs: job.exclude_globs,
+        projection::get_ingestion(mvcc, mvcc.runtime.applied_version()?, id)?.map(|job| {
+            HfIngestionJob {
+                key_id: job.key_id,
+                tenant_id: job.tenant_id,
+                requester_app_id: job.requester_app_id,
+                repo: job.repo,
+                revision: job.revision,
+                target_bucket: job.target_bucket,
+                target_region: job.target_region,
+                target_prefix: job.target_prefix,
+                include_globs: job.include_globs,
+                exclude_globs: job.exclude_globs,
+            }
         }),
     )
 }
@@ -529,6 +574,7 @@ async fn update_ingestion_state(
 
 pub(crate) async fn update_ingestion_state_with_permit(
     storage: &Storage,
+    mvcc: &MvccSubsystem,
     id: i64,
     state_value: crate::tasks::HFIngestionState,
     error: Option<&str>,
@@ -536,18 +582,19 @@ pub(crate) async fn update_ingestion_state_with_permit(
     partition_owner_signing_key: &[u8],
 ) -> Result<()> {
     let guard = hf_write_guard(storage, permit, partition_owner_signing_key).await?;
-    update_ingestion_state_inner(storage, id, state_value, error, guard).await
+    update_ingestion_state_inner(storage, mvcc, id, state_value, error, guard).await
 }
 
 async fn update_ingestion_state_inner(
-    storage: &Storage,
+    _storage: &Storage,
+    mvcc: &MvccSubsystem,
     id: i64,
     state_value: crate::tasks::HFIngestionState,
     error: Option<&str>,
     guard: HfWriteGuard,
 ) -> Result<()> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let Some(mut job) = projection::get_ingestion(&core_store, id)? else {
+    let Some(mut job) = projection::get_ingestion(mvcc, mvcc.runtime.applied_version()?, id)?
+    else {
         return Ok(());
     };
     job.state = state_value;
@@ -564,31 +611,37 @@ async fn update_ingestion_state_inner(
         job.finished_at = Some(Utc::now());
     }
     append_body(
-        storage,
+        mvcc,
         HfMutationKind::IngestionUpsert,
         None,
         None,
         Some(job),
         None,
         guard,
-        None,
     )
     .await
+    .map(|_| ())
 }
 
 pub(crate) async fn cancel_ingestion_with_permit(
     storage: &Storage,
+    mvcc: &MvccSubsystem,
     id: i64,
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<u64> {
     let guard = hf_write_guard(storage, permit, partition_owner_signing_key).await?;
-    cancel_ingestion_inner(storage, id, guard).await
+    cancel_ingestion_inner(storage, mvcc, id, guard).await
 }
 
-async fn cancel_ingestion_inner(storage: &Storage, id: i64, guard: HfWriteGuard) -> Result<u64> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let Some(mut job) = projection::get_ingestion(&core_store, id)? else {
+async fn cancel_ingestion_inner(
+    _storage: &Storage,
+    mvcc: &MvccSubsystem,
+    id: i64,
+    guard: HfWriteGuard,
+) -> Result<u64> {
+    let Some(mut job) = projection::get_ingestion(mvcc, mvcc.runtime.applied_version()?, id)?
+    else {
         return Ok(0);
     };
     if !matches!(
@@ -600,14 +653,13 @@ async fn cancel_ingestion_inner(storage: &Storage, id: i64, guard: HfWriteGuard)
     job.state = crate::tasks::HFIngestionState::Canceled;
     job.finished_at = Some(Utc::now());
     append_body(
-        storage,
+        mvcc,
         HfMutationKind::IngestionUpsert,
         None,
         None,
         Some(job),
         None,
         guard,
-        None,
     )
     .await?;
     Ok(1)
@@ -634,6 +686,7 @@ async fn add_item(
 
 pub(crate) async fn add_item_with_permit(
     storage: &Storage,
+    mvcc: &MvccSubsystem,
     ingestion_id: i64,
     path: &str,
     size: Option<i64>,
@@ -642,25 +695,21 @@ pub(crate) async fn add_item_with_permit(
     partition_owner_signing_key: &[u8],
 ) -> Result<i64> {
     let guard = hf_write_guard(storage, permit, partition_owner_signing_key).await?;
-    add_item_inner(storage, ingestion_id, path, size, etag, guard).await
+    add_item_inner(storage, mvcc, ingestion_id, path, size, etag, guard).await
 }
 
 async fn add_item_inner(
-    storage: &Storage,
+    _storage: &Storage,
+    mvcc: &MvccSubsystem,
     ingestion_id: i64,
     path: &str,
     size: Option<i64>,
     etag: Option<&str>,
     guard: HfWriteGuard,
 ) -> Result<i64> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let existing = projection::get_item_by_path(&core_store, ingestion_id, path)?;
-    let (stream_precondition, id) = if let Some(item) = existing.as_ref() {
-        (None, item.id)
-    } else {
-        let (precondition, id) = next_hf_entity_id(storage).await?;
-        (Some(precondition), id)
-    };
+    let existing =
+        projection::get_item_by_path(mvcc, mvcc.runtime.applied_version()?, ingestion_id, path)?;
+    let id = existing.as_ref().map(|item| item.id).unwrap_or_default();
     let mut item = existing.unwrap_or_else(|| HfIngestionItem {
         id,
         ingestion_id,
@@ -675,23 +724,23 @@ async fn add_item_inner(
     });
     item.size = size;
     item.etag = etag.map(ToOwned::to_owned);
-    let id = item.id;
-    append_body(
-        storage,
+    let existing_id = item.id;
+    let allocated_id = append_body(
+        mvcc,
         HfMutationKind::ItemUpsert,
         None,
         None,
         None,
         Some(item),
         guard,
-        stream_precondition,
     )
     .await?;
-    Ok(id)
+    Ok(allocated_id.unwrap_or(existing_id))
 }
 
 pub(crate) async fn update_item_state_with_permit(
     storage: &Storage,
+    mvcc: &MvccSubsystem,
     id: i64,
     state_value: crate::tasks::HFIngestionItemState,
     error: Option<&str>,
@@ -699,18 +748,18 @@ pub(crate) async fn update_item_state_with_permit(
     partition_owner_signing_key: &[u8],
 ) -> Result<()> {
     let guard = hf_write_guard(storage, permit, partition_owner_signing_key).await?;
-    update_item_state_inner(storage, id, state_value, error, guard).await
+    update_item_state_inner(storage, mvcc, id, state_value, error, guard).await
 }
 
 async fn update_item_state_inner(
-    storage: &Storage,
+    _storage: &Storage,
+    mvcc: &MvccSubsystem,
     id: i64,
     state_value: crate::tasks::HFIngestionItemState,
     error: Option<&str>,
     guard: HfWriteGuard,
 ) -> Result<()> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let Some(mut item) = projection::get_item(&core_store, id)? else {
+    let Some(mut item) = projection::get_item(mvcc, mvcc.runtime.applied_version()?, id)? else {
         return Ok(());
     };
     item.state = state_value;
@@ -727,16 +776,16 @@ async fn update_item_state_inner(
         item.finished_at = Some(Utc::now());
     }
     append_body(
-        storage,
+        mvcc,
         HfMutationKind::ItemUpsert,
         None,
         None,
         None,
         Some(item),
         guard,
-        None,
     )
     .await
+    .map(|_| ())
 }
 
 #[cfg(test)]
@@ -746,6 +795,7 @@ async fn update_item_success(storage: &Storage, id: i64, size: i64, etag: &str) 
 
 pub(crate) async fn update_item_success_with_permit(
     storage: &Storage,
+    mvcc: &MvccSubsystem,
     id: i64,
     size: i64,
     etag: &str,
@@ -753,18 +803,18 @@ pub(crate) async fn update_item_success_with_permit(
     partition_owner_signing_key: &[u8],
 ) -> Result<()> {
     let guard = hf_write_guard(storage, permit, partition_owner_signing_key).await?;
-    update_item_success_inner(storage, id, size, etag, guard).await
+    update_item_success_inner(storage, mvcc, id, size, etag, guard).await
 }
 
 async fn update_item_success_inner(
-    storage: &Storage,
+    _storage: &Storage,
+    mvcc: &MvccSubsystem,
     id: i64,
     size: i64,
     etag: &str,
     guard: HfWriteGuard,
 ) -> Result<()> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let Some(mut item) = projection::get_item(&core_store, id)? else {
+    let Some(mut item) = projection::get_item(mvcc, mvcc.runtime.applied_version()?, id)? else {
         return Ok(());
     };
     item.state = crate::tasks::HFIngestionItemState::Stored;
@@ -772,39 +822,44 @@ async fn update_item_success_inner(
     item.etag = Some(etag.to_string());
     item.finished_at = Some(Utc::now());
     append_body(
-        storage,
+        mvcc,
         HfMutationKind::ItemUpsert,
         None,
         None,
         None,
         Some(item),
         guard,
-        None,
     )
     .await
+    .map(|_| ())
 }
 
 pub async fn list_stored_ingestion_item_page(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
     ingestion_id: i64,
     after_cursor: Option<&[u8]>,
     limit: usize,
 ) -> Result<HfStoredItemPage> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    projection::list_stored_items_for_ingestion(&core_store, ingestion_id, after_cursor, limit)
+    projection::list_stored_items_for_ingestion(
+        mvcc,
+        mvcc.runtime.applied_version()?,
+        ingestion_id,
+        after_cursor,
+        limit,
+    )
 }
 
 pub async fn list_stored_target_item_page(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
     tenant_id: i64,
     bucket: &str,
     prefix: &str,
     after_cursor: Option<&[u8]>,
     limit: usize,
 ) -> Result<HfStoredItemPage> {
-    let core_store = CoreStore::new(storage.clone()).await?;
     projection::list_stored_items_for_target(
-        &core_store,
+        mvcc,
+        mvcc.runtime.applied_version()?,
         tenant_id,
         bucket,
         prefix,
@@ -813,22 +868,20 @@ pub async fn list_stored_target_item_page(
     )
 }
 
-pub async fn get_ingestion_status(storage: &Storage, id: i64) -> Result<HfIngestionStatus> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    projection::get_ingestion_status(&core_store, id)?.ok_or_else(|| anyhow!("ingestion not found"))
+pub async fn get_ingestion_status(mvcc: &MvccSubsystem, id: i64) -> Result<HfIngestionStatus> {
+    projection::get_ingestion_status(mvcc, mvcc.runtime.applied_version()?, id)?
+        .ok_or_else(|| anyhow!("ingestion not found"))
 }
 
 async fn append_body(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
     event: HfMutationKind,
     key: Option<HfKey>,
     key_delete: Option<(i64, i64, String)>,
     ingestion: Option<HfIngestion>,
     item: Option<HfIngestionItem>,
     guard: HfWriteGuard,
-    stream_precondition: Option<CoreMutationPrecondition>,
-) -> Result<()> {
-    let core_store = CoreStore::new(storage.clone()).await?;
+) -> Result<Option<i64>> {
     let mutation_id = uuid::Uuid::new_v4();
     let key_text = key
         .as_ref()
@@ -845,52 +898,121 @@ async fn append_body(
         })
         .or_else(|| item.as_ref().map(|item| format!("item/{}", item.id)))
         .unwrap_or_else(|| event.as_str().to_string());
+    let principal = hf_partition_principal();
+    let now_unix_ms = current_unix_ms();
+    let assignment = mvcc
+        .reconcile_work_assignment("hf-metadata", "global")
+        .await?
+        .ok_or_else(|| anyhow!("this node does not own the hf metadata assignment"))?;
+    let handle = mvcc
+        .open_transactions
+        .begin(
+            mvcc.runtime.as_ref(),
+            mvcc.cluster_id(),
+            &principal,
+            &format!("hf-metadata:{key_text}:{mutation_id}"),
+            Duration::from_secs(30),
+            DurabilityLevel::Quorum,
+            ReadConsistency::Linearized,
+            now_unix_ms,
+        )
+        .await?;
+    let transaction_id = handle.transaction_id.as_str();
+    let head_key = hf_head_logical_key()?;
+    let observed_head = mvcc.read_transaction_value(transaction_id, &principal, &head_key)?;
+    let mut head = observed_head
+        .as_deref()
+        .map(decode_hf_head)
+        .transpose()?
+        .unwrap_or(HfJournalHeadProto {
+            schema: HF_JOURNAL_HEAD_SCHEMA.to_string(),
+            last_sequence: 0,
+            next_entity_id: 1,
+            last_event_hash: Vec::new(),
+        });
+    let allocated_id = assign_entity_id(event, &mut head, &key, &ingestion, &item)?;
+    let key = key.map(|mut value| {
+        if value.id == 0 {
+            value.id = allocated_id.expect("create key allocates an id");
+        }
+        value
+    });
+    let ingestion = ingestion.map(|mut value| {
+        if value.id == 0 {
+            value.id = allocated_id.expect("create ingestion allocates an id");
+        }
+        value
+    });
+    let item = item.map(|mut value| {
+        if value.id == 0 {
+            value.id = allocated_id.expect("create item allocates an id");
+        }
+        value
+    });
     let body = hf_body_from_parts(event, key, key_delete, ingestion, item, Utc::now())?;
     let payload = encode_hf_body(&body, guard.fence_token, mutation_id)?;
-    let partition_id = hex::encode(hf_partition_id());
-    let stream_id = hf_metadata_stream_id();
-    let stream_precondition = match stream_precondition {
-        Some(precondition) => precondition,
-        None => core_store.stream_head_precondition(&stream_id).await?,
-    };
-    let root_generation = next_stream_generation(&stream_precondition)?;
-    let transaction_id = format!("hf-metadata:{key_text}:{mutation_id}");
-    let mut operations = vec![CoreMutationOperation::StreamAppend {
-        partition_id: partition_id.clone(),
-        stream_id: stream_id.clone(),
-        record_kind: "hf_metadata".to_string(),
-        payload,
-        idempotency_key: Some(transaction_id.clone()),
-    }];
-    operations.extend(projection::projection_operations(
-        &core_store,
-        &body,
-        &stream_id,
-        root_generation,
-        &transaction_id,
-        &partition_id,
-    )?);
-    let projection_root = projection::projection_root_anchor_key(&stream_id);
-    let mut preconditions: Vec<_> = guard.partition_precondition.into_iter().collect();
-    preconditions.push(stream_precondition);
-    core_store
-        .commit_mutation_batch(CoreMutationBatch {
+    let sequence = head
+        .last_sequence
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("hf journal sequence overflow"))?;
+    let event_hash = hf_event_hash(
+        sequence,
+        &head.last_event_hash,
+        mutation_id.as_bytes(),
+        &payload,
+    );
+    let event_key = hf_event_logical_key(sequence)?;
+    let event_payload = encode_deterministic_proto(&HfJournalEventProto {
+        schema: HF_JOURNAL_EVENT_SCHEMA.to_string(),
+        sequence,
+        previous_event_hash: head.last_event_hash.clone(),
+        event_hash: event_hash.to_vec(),
+        mutation_id: mutation_id.to_string(),
+        body: payload,
+    })?;
+    head.last_sequence = sequence;
+    head.last_event_hash = event_hash.to_vec();
+    let mut plan = projection::projection_plan(mvcc, transaction_id, &principal, &body)?;
+    plan.mutations.push(ProductMutation::put(
+        head_key.clone(),
+        encode_deterministic_proto(&head)?,
+    ));
+    plan.mutations
+        .push(ProductMutation::put(event_key.clone(), event_payload));
+    mvcc.stage_product_mutations(transaction_id, &principal, plan.mutations, now_unix_ms)?;
+    mvcc.stage_predicate(
+        transaction_id,
+        &principal,
+        head_key,
+        value_predicate(observed_head.as_deref()),
+        now_unix_ms,
+    )?;
+    mvcc.stage_predicate(
+        transaction_id,
+        &principal,
+        event_key,
+        PredicateKind::Absent,
+        now_unix_ms,
+    )?;
+    for (key, predicate) in plan.predicates {
+        mvcc.stage_predicate(transaction_id, &principal, key, predicate, now_unix_ms)?;
+    }
+    mvcc.stage_assignment_guard(transaction_id, &principal, &assignment, now_unix_ms)?;
+    let outcome = mvcc
+        .open_transactions
+        .commit(
+            mvcc.runtime.as_ref(),
             transaction_id,
-            scope_partition: partition_id.clone(),
-            committed_by_principal: hf_partition_principal(),
-            root_publications: vec![
-                CoreMutationRootPublication::new(partition_id, WriterFamily::CoreControl.as_str())
-                    .coordinator(),
-                CoreMutationRootPublication::new(
-                    projection_root,
-                    WriterFamily::ObjectBlob.as_str(),
-                ),
-            ],
-            preconditions,
-            operations,
-        })
+            &principal,
+            current_unix_ms(),
+        )
         .await?;
-    Ok(())
+    match outcome.certification {
+        crate::mvcc_transaction::CertificationResult::Committed { .. } => Ok(allocated_id),
+        crate::mvcc_transaction::CertificationResult::Aborted { reason } => {
+            Err(anyhow!("hf metadata transaction aborted: {reason:?}"))
+        }
+    }
 }
 
 fn hf_body_from_parts(
@@ -1215,80 +1337,104 @@ fn ensure_deterministic_proto(message: &impl Message, bytes: &[u8], label: &str)
     Ok(())
 }
 
-async fn next_hf_entity_id(storage: &Storage) -> Result<(CoreMutationPrecondition, i64)> {
-    let precondition = CoreStore::new(storage.clone())
-        .await?
-        .stream_head_precondition(&hf_metadata_stream_id())
-        .await?;
-    let generation = next_stream_generation(&precondition)?;
-    Ok((
-        precondition,
-        i64::try_from(generation).map_err(|_| anyhow!("hf entity id exceeds i64"))?,
-    ))
+fn current_unix_ms() -> u64 {
+    u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default()
 }
 
-fn next_stream_generation(precondition: &CoreMutationPrecondition) -> Result<u64> {
-    let CoreMutationPrecondition::StreamHead {
-        expected_last_sequence,
-        ..
-    } = precondition
-    else {
-        return Err(anyhow!("hf stream precondition has wrong kind"));
+fn hf_head_logical_key() -> Result<LogicalKey> {
+    hf_logical_key(&core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("hf-journal"),
+        CoreMetaTuplePart::Utf8("head"),
+    ])?)
+}
+
+fn hf_event_logical_key(sequence: u64) -> Result<LogicalKey> {
+    hf_logical_key(&core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("hf-journal"),
+        CoreMetaTuplePart::Utf8("event"),
+        CoreMetaTuplePart::U64(sequence),
+    ])?)
+}
+
+fn hf_logical_key(tuple_key: &[u8]) -> Result<LogicalKey> {
+    coremeta_logical_key(CF_OBSERVABILITY, TABLE_OBSERVABILITY_CURSOR_ROW, tuple_key)
+}
+
+fn decode_hf_head(payload: &[u8]) -> Result<HfJournalHeadProto> {
+    let head = HfJournalHeadProto::decode(payload)?;
+    ensure_deterministic_proto(&head, payload, "hf journal head")?;
+    if head.schema != HF_JOURNAL_HEAD_SCHEMA || head.next_entity_id == 0 {
+        return Err(anyhow!("hf journal head has invalid schema or entity id"));
+    }
+    if head.last_sequence == 0 && !head.last_event_hash.is_empty()
+        || head.last_sequence != 0 && head.last_event_hash.len() != 32
+    {
+        return Err(anyhow!("hf journal head has invalid hash chain state"));
+    }
+    Ok(head)
+}
+
+fn value_predicate(value: Option<&[u8]>) -> PredicateKind {
+    value
+        .map(|payload| PredicateKind::ValueHash(*blake3::hash(payload).as_bytes()))
+        .unwrap_or(PredicateKind::Absent)
+}
+
+fn assign_entity_id(
+    event: HfMutationKind,
+    head: &mut HfJournalHeadProto,
+    key: &Option<HfKey>,
+    ingestion: &Option<HfIngestion>,
+    item: &Option<HfIngestionItem>,
+) -> Result<Option<i64>> {
+    let needs_id = match event {
+        HfMutationKind::KeyUpsert => key.as_ref().is_some_and(|value| value.id == 0),
+        HfMutationKind::IngestionUpsert => ingestion.as_ref().is_some_and(|value| value.id == 0),
+        HfMutationKind::ItemUpsert => item.as_ref().is_some_and(|value| value.id == 0),
+        HfMutationKind::KeyDelete => false,
     };
-    expected_last_sequence
+    if !needs_id {
+        return Ok(None);
+    }
+    let id = i64::try_from(head.next_entity_id).map_err(|_| anyhow!("hf entity id exceeds i64"))?;
+    head.next_entity_id = head
+        .next_entity_id
         .checked_add(1)
-        .ok_or_else(|| anyhow!("hf stream sequence overflow"))
+        .ok_or_else(|| anyhow!("hf entity id overflow"))?;
+    Ok(Some(id))
+}
+
+fn hf_event_hash(
+    sequence: u64,
+    previous_event_hash: &[u8],
+    mutation_id: &[u8],
+    payload: &[u8],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"anvil.hf.journal.event.v1\0");
+    hasher.update(&sequence.to_be_bytes());
+    hasher.update(previous_event_hash);
+    hasher.update(mutation_id);
+    hasher.update(payload);
+    *hasher.finalize().as_bytes()
 }
 
 pub fn hf_partition_id() -> Hash32 {
     hash32(b"hf_metadata/global")
 }
 
-fn hf_metadata_stream_id() -> String {
-    "hf_metadata:global".to_string()
-}
-
 fn hf_partition_principal() -> String {
     "partition-owner:hf_metadata:global".to_string()
 }
 
-#[cfg(test)]
-pub(crate) async fn read_hf_frame_fences_for_test(storage: &Storage) -> Result<Vec<u64>> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let mut after_sequence = 0;
-    let mut fences = Vec::new();
-    loop {
-        let page = core_store
-            .read_stream_page(crate::core_store::ReadStream {
-                stream_id: hf_metadata_stream_id(),
-                after_sequence,
-                limit: 256,
-            })
-            .await?;
-        for record in page.records {
-            if record.record_kind == "hf_metadata" {
-                fences.push(decode_hf_body_fence(&record.payload)?);
-            }
-        }
-        if !page.has_more || page.next_sequence == after_sequence {
-            break;
-        }
-        after_sequence = page.next_sequence;
-    }
-    Ok(fences)
-}
-
 async fn hf_write_guard(
-    storage: &Storage,
+    _storage: &Storage,
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
+    _partition_owner_signing_key: &[u8],
 ) -> Result<HfWriteGuard> {
     require_hf_permit(permit)?;
     Ok(HfWriteGuard {
         fence_token: permit.fence_token,
-        partition_precondition: Some(
-            partition_write_precondition(storage, permit, partition_owner_signing_key).await?,
-        ),
     })
 }
 
