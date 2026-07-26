@@ -494,21 +494,33 @@ async fn write_boundary_migration_row_in_transaction(
 ) -> Result<(), Status> {
     let payload = crate::core_store::encode_deterministic_proto(row);
     let tuple_key = boundary_migration_tuple_key(boundary_bucket_key, migration_id)?;
-    state
+    let logical_key = boundary_migration_logical_key(&tuple_key)?;
+    let visible_in_transaction = state
+        .mvcc
+        .read_transaction_value(transaction_id, principal, &logical_key)
+        .map_err(|error| Status::internal(error.to_string()))?;
+    let visible_in_legacy_projection = state
         .core_store
-        .stage_coremeta_put_in_transaction(
-            transaction_id,
-            principal,
+        .read_coremeta_row(
             crate::core_store::CF_BOUNDARY,
             crate::core_store::TABLE_BOUNDARY_MIGRATION_ROW,
-            tuple_key,
-            payload,
-            None,
-            true,
-            false,
+            &tuple_key,
         )
-        .await
-        .map(|_| ())
+        .map_err(|error| Status::internal(error.to_string()))?;
+    if visible_in_transaction.is_some() || visible_in_legacy_projection.is_some() {
+        return Err(Status::already_exists("BoundaryMigrationAlreadyExists"));
+    }
+    state
+        .mvcc
+        .stage_product_mutations(
+            transaction_id,
+            principal,
+            vec![crate::mvcc_product::ProductMutation::put(
+                logical_key,
+                payload,
+            )],
+            current_unix_millis_u64(),
+        )
         .map_err(|error| Status::internal(error.to_string()))
 }
 
@@ -564,6 +576,13 @@ fn current_unix_nanos_u64() -> u64 {
         .unwrap_or(0)
 }
 
+fn current_unix_millis_u64() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
 async fn write_boundary_migration_row(
     state: &AppState,
     boundary_bucket_key: &str,
@@ -600,6 +619,15 @@ async fn read_boundary_migration_row(
     migration_id: &str,
 ) -> Result<Option<BoundaryMigrationRow>, Status> {
     let tuple_key = boundary_migration_tuple_key(boundary_bucket_key, migration_id)?;
+    let logical_key = boundary_migration_logical_key(&tuple_key)?;
+    if let Some(visible) = state
+        .mvcc
+        .runtime
+        .read_latest(&logical_key)
+        .map_err(|error| Status::internal(error.to_string()))?
+    {
+        return decode_boundary_migration_row(&visible.value).map(Some);
+    }
     let Some(bytes) = state
         .core_store
         .read_coremeta_row(
@@ -611,11 +639,14 @@ async fn read_boundary_migration_row(
     else {
         return Ok(None);
     };
+    decode_boundary_migration_row(&bytes).map(Some)
+}
+
+fn decode_boundary_migration_row(bytes: &[u8]) -> Result<BoundaryMigrationRow, Status> {
     crate::core_store::decode_deterministic_proto::<BoundaryMigrationRow>(
-        &bytes,
+        bytes,
         "boundary migration row",
     )
-    .map(Some)
     .map_err(|error| Status::internal(error.to_string()))
 }
 
@@ -629,6 +660,17 @@ fn boundary_migration_tuple_key(
         crate::core_store::CoreMetaTuplePart::Utf8(migration_id),
     ])
     .map_err(|error| Status::invalid_argument(error.to_string()))
+}
+
+fn boundary_migration_logical_key(
+    tuple_key: &[u8],
+) -> Result<crate::mvcc_transaction::LogicalKey, Status> {
+    crate::mvcc_product::coremeta_logical_key(
+        crate::core_store::CF_BOUNDARY,
+        crate::core_store::TABLE_BOUNDARY_MIGRATION_ROW,
+        tuple_key,
+    )
+    .map_err(|error| Status::internal(error.to_string()))
 }
 
 fn boundary_migration_status(row: BoundaryMigrationRow) -> BoundaryMigrationStatus {
@@ -698,5 +740,12 @@ mod tests {
             &payload,
         )
         .unwrap();
+
+        let logical_key = boundary_migration_logical_key(&tuple_key).unwrap();
+        assert_eq!(
+            logical_key.table_id,
+            crate::core_store::TABLE_BOUNDARY_MIGRATION_ROW
+        );
+        assert!(logical_key.application_key.ends_with(&tuple_key));
     }
 }
