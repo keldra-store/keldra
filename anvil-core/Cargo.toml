@@ -20,11 +20,6 @@ name = "anvil_core"
 path = "src/lib.rs"
 
 [[bench]]
-name = "coremeta_release_gate"
-path = "benches/coremeta_release_gate/main.rs"
-harness = false
-
-[[bench]]
 name = "mvcc_rfc"
 path = "benches/mvcc_rfc.rs"
 harness = false

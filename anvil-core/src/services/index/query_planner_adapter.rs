@@ -982,15 +982,15 @@ mod tests {
         )
         .await
         .unwrap();
+        let mvcc = persistence.mvcc().unwrap();
         let revision = crate::authz_journal::latest_authz_revision(
-            &storage,
+            mvcc,
             crate::system_realm::SYSTEM_STORAGE_TENANT_ID,
         )
-        .await
         .unwrap() as u64;
 
         assert!(
-            principal_has_bucket_wide_object_access(&storage, &owner, &bucket, revision)
+            principal_has_bucket_wide_object_access(&storage, mvcc, &owner, &bucket, revision)
                 .await
                 .unwrap()
         );
@@ -1000,7 +1000,7 @@ mod tests {
             ..owner
         };
         assert!(
-            !principal_has_bucket_wide_object_access(&storage, &unrelated, &bucket, revision)
+            !principal_has_bucket_wide_object_access(&storage, mvcc, &unrelated, &bucket, revision)
                 .await
                 .unwrap()
         );
