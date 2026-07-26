@@ -92,6 +92,7 @@ pub mod node_identity;
 pub mod node_signing;
 pub mod object_links;
 pub mod object_manager;
+pub mod object_materialisation;
 pub mod object_shard_manifest;
 pub mod observability;
 pub mod partition_fence;

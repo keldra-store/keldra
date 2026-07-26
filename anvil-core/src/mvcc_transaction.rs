@@ -200,6 +200,14 @@ impl TransactionBundle {
                 bail!("shard manifest must declare data shards and stripes");
             }
         }
+        self.materialisation_jobs.sort();
+        ensure_unique(self.materialisation_jobs.iter(), "materialisation job")?;
+        for encoded_job in &self.materialisation_jobs {
+            let job = crate::object_materialisation::ObjectMaterialisationJob::decode(encoded_job)?;
+            if job.cluster_id != self.cluster_id || job.transaction_id != self.transaction_id {
+                bail!("materialisation job belongs to another transaction or cluster");
+            }
+        }
         Ok(())
     }
 
