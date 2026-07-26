@@ -280,8 +280,8 @@ impl AppState {
             .install_mvcc(mvcc.clone())
             .context("install MVCC transaction staging in persistence")?;
         object_manager
-            .install_mvcc_replication(mvcc.replication_client.clone(), mvcc.local_objects.clone())
-            .context("install MVCC object shard reader")?;
+            .install_mvcc(mvcc.clone())
+            .context("install MVCC object runtime")?;
 
         Ok(Self {
             persistence,

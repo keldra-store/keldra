@@ -56,10 +56,7 @@ pub struct ObjectManager {
     cross_region_routing_policy: CrossRegionRoutingPolicy,
     signing_key: Vec<u8>,
     observability: Observability,
-    mvcc_replication: std::sync::Arc<
-        std::sync::OnceLock<crate::replication_client::TonicReplicationStreamManager>,
-    >,
-    local_objects: std::sync::Arc<std::sync::OnceLock<crate::local_object_store::LocalObjectStore>>,
+    mvcc: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<crate::mvcc_bootstrap::MvccSubsystem>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -216,22 +213,17 @@ impl ObjectManager {
             cross_region_routing_policy,
             signing_key,
             observability,
-            mvcc_replication: Default::default(),
-            local_objects: Default::default(),
+            mvcc: Default::default(),
         }
     }
 
-    pub fn install_mvcc_replication(
+    pub fn install_mvcc(
         &self,
-        replication: crate::replication_client::TonicReplicationStreamManager,
-        local_objects: crate::local_object_store::LocalObjectStore,
+        mvcc: std::sync::Arc<crate::mvcc_bootstrap::MvccSubsystem>,
     ) -> AnyhowResult<()> {
-        self.mvcc_replication
-            .set(replication)
-            .map_err(|_| anyhow!("MVCC replication client is already installed"))?;
-        self.local_objects
-            .set(local_objects)
-            .map_err(|_| anyhow!("MVCC local object store is already installed"))
+        self.mvcc
+            .set(mvcc)
+            .map_err(|_| anyhow!("MVCC object runtime is already installed"))
     }
 
     fn record_reserved_namespace_rejection(&self, operation: &'static str) {

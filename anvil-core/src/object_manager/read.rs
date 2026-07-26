@@ -235,7 +235,7 @@ impl ObjectManager {
                         .await
                 }
                 ObjectDataTarget::MvccShards(manifest) => {
-                    let Some(replication) = app_state.mvcc_replication.get() else {
+                    let Some(mvcc) = app_state.mvcc.get() else {
                         let _ = tx
                             .send(Err(Status::failed_precondition(
                                 "MVCC replication reader is not installed",
@@ -249,7 +249,7 @@ impl ObjectManager {
                         .unwrap_or(manifest.object_length)
                         .min(manifest.object_length);
                     manifest
-                        .read_range_chunks(replication, start, end, |chunk| {
+                        .read_range_chunks(&mvcc.replication_client, start, end, |chunk| {
                             let tx = tx.clone();
                             async move {
                                 tx.send(Ok(chunk))
@@ -260,7 +260,7 @@ impl ObjectManager {
                         .await
                 }
                 ObjectDataTarget::MvccLocal(manifest) => {
-                    let Some(store) = app_state.local_objects.get() else {
+                    let Some(mvcc) = app_state.mvcc.get() else {
                         let _ = tx
                             .send(Err(Status::failed_precondition(
                                 "MVCC local object reader is not installed",
@@ -273,7 +273,7 @@ impl ObjectManager {
                         .map(|range| range.end_exclusive)
                         .unwrap_or(manifest.object_length)
                         .min(manifest.object_length);
-                    match store.read_range(&manifest, start, end) {
+                    match mvcc.local_objects.read_range(&manifest, start, end) {
                         Ok(bytes) => {
                             let mut result = Ok(());
                             for chunk in bytes.chunks(64 * 1024) {
