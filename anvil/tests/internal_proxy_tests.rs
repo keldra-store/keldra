@@ -235,8 +235,6 @@ async fn internal_proxy_native_put_preserves_context_and_idempotent_response() {
             authz_zookie_optional: String::new(),
             idempotency_key: idempotency_key.clone(),
             transaction_id: None,
-            saga_operation: None,
-            saga_compensation_operation: None,
             write_visibility: None,
         }),
         content_type: Some("text/plain".to_string()),

@@ -531,7 +531,7 @@ pub(super) async fn start_boundary_migration_rpc(
         last_error_code: String::new(),
         last_error_message: String::new(),
     };
-    let transaction_id = crate::services::saga_reserved::native_context_transaction_id(
+    let transaction_id = crate::services::transaction_context::native_context_transaction_id(
         req.mutation_context.as_ref(),
     )?;
     if let Some(transaction_id) = transaction_id {
@@ -562,7 +562,6 @@ pub(super) async fn start_boundary_migration_rpc(
         idempotency_outcome: "accepted".to_string(),
         retry_after_hint: None,
         finalisation_error: None,
-        saga: None,
     }))
 }
 

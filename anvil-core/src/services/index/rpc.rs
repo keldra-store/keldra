@@ -1,7 +1,7 @@
 use super::*;
 
 fn index_write_transaction_id(options: Option<&WriteOptions>) -> Result<Option<&str>, Status> {
-    crate::services::saga_reserved::write_options_transaction_id(options)
+    crate::services::transaction_context::write_options_transaction_id(options)
 }
 
 #[tonic::async_trait]

@@ -236,8 +236,6 @@ fn native_mutation_context(
         authz_zookie_optional: String::new(),
         idempotency_key: identity.idempotency_key.clone(),
         transaction_id: transaction_id.map(ToOwned::to_owned),
-        saga_operation: None,
-        saga_compensation_operation: None,
         write_visibility: None,
     }
 }

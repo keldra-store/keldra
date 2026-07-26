@@ -33,7 +33,6 @@ CoreStore is split into a metadata plane and a byte plane. CoreMeta uses RocksDB
 
 - **Server:** Docker image and release binaries. The server crate is not published to crates.io.
 - **Rust client:** `anvil-storage = "0.3.0"` on crates.io.
-- **Saga API:** reserved in the wire protocol and Rust client for forward compatibility; server-side saga execution is intentionally rejected in this release.
 - **CLIs:** `anvil` for tenant/public operations and `anvil-admin` for private admin-plane operations.
 - **Documentation:** Fission static site in `documentation/`, published by a separate docs workflow.
 - **Protocol bindings:** generated gRPC bindings are packaged with the Rust client.

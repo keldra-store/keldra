@@ -12,20 +12,19 @@ mod generated {
 pub mod proto {
     pub use super::generated::read_consistency;
     pub use super::generated::{
-        AbortMultipartRequest, AbortMultipartResponse, AbortSagaDraftRequest,
-        AcquireTaskLeaseRequest, AnvilError, AppendStreamRecordInfo, AppendStreamRecordRequest,
+        AbortMultipartRequest, AbortMultipartResponse, AcquireTaskLeaseRequest, AnvilError,
+        AppendStreamRecordInfo, AppendStreamRecordRequest,
         AppendStreamRecordResponse, ApplicationDescriptor, ApplyAuthzSchemaRequest,
-        ApplyAuthzSchemaResponse, ApplySagaRequest, ApplySagaResponse, AuditEventsResponse,
+        ApplyAuthzSchemaResponse, AuditEventsResponse,
         AuthzAllowedSubject, AuthzMaterializationMode, AuthzNamespaceSchema, AuthzRelationRule,
         AuthzRelationSchema, AuthzRevisionMode, AuthzSchemaMemberKind, AuthzSchemaRef, AuthzScope,
         AuthzSubject, AuthzSubjectSelectorKind, AuthzTuple, AuthzTupleMutation,
-        BeginSagaCompensationTransactionRequest, BeginSagaCompensationTransactionResponse,
-        BeginSagaTransactionRequest, BeginSagaTransactionResponse, BeginTransactionRequest,
-        BeginTransactionResponse, BindAuthzSchemaRequest, BindAuthzSchemaResponse,
+        BeginTransactionRequest, BeginTransactionResponse, BindAuthzSchemaRequest,
+        BindAuthzSchemaResponse,
         BoundaryDimension, BoundaryExtractionMode, BoundaryMigrationMode, BoundaryMigrationStatus,
         BoundarySchemaRecord, BoundarySchemaResponse, BoundarySource, BoundaryValue, Bucket,
-        ByteRange, CancelHfIngestionRequest, CancelHfIngestionResponse, CancelSagaRequest,
-        CheckPermissionRequest, CheckPermissionResponse, CheckPermissionsRequest,
+        ByteRange, CancelHfIngestionRequest, CancelHfIngestionResponse, CheckPermissionRequest,
+        CheckPermissionResponse, CheckPermissionsRequest,
         CheckPermissionsResponse, CheckpointTaskLeaseRequest, CommitTaskLeaseRequest,
         CommitTaskLeaseResponse, CommitTransactionRequest, CompareAndSwapManifestRequest,
         CompareAndSwapManifestResponse, CompleteMultipartPart, CompleteMultipartRequest,
@@ -46,8 +45,8 @@ pub mod proto {
         GetGitBlobByPathResponse, GetGitObjectRequest, GetGitObjectResponse,
         GetHfIngestionStatusRequest, GetHfIngestionStatusResponse, GetObjectRequest,
         GetObjectResponse, GetPackageVersionRequest, GetPartitionMapRequest,
-        GetPersonalDbGroupRequest, GetPersonalDbProjectionRequest, GetSagaRequest,
-        GetStorageClassRequest, GetTensorChunk, GetTensorRequest, GetTensorsRequest,
+        GetPersonalDbGroupRequest, GetPersonalDbProjectionRequest, GetStorageClassRequest,
+        GetTensorChunk, GetTensorRequest, GetTensorsRequest,
         GetTransactionRequest, GitBlobLocation, GitPackMetadata, GitTreeEntryRecord,
         GrantAccessRequest, GrantAccessResponse, HeadObjectRequest, HeadObjectResponse, HfKey,
         IndexBuildRecord, IndexDefinitionRecord, IndexDefinitionResponse, IndexDiagnosticRecord,
@@ -86,21 +85,13 @@ pub mod proto {
         RepairAuthzDerivedIndexRequest, RepairAuthzDerivedIndexResponse,
         RepairDirectoryIndexRequest, RepairDirectoryIndexResponse, RepairFindingRecord,
         RepairIndexRequest, RepairIndexResponse, RepairPersonalDbLogChainRequest,
-        RepairPersonalDbLogChainResponse, RepairSubjectRecord, ResolveBlockedSagaRequest,
-        RevokeAccessRequest, RevokeAccessResponse, RollbackTransactionRequest,
-        RollbackTransactionResponse, RotateApplicationCredentialSecretRequest, SagaBlockSemantics,
-        SagaCompensationKind, SagaCompensationOperationContext, SagaCompensationSpec, SagaEvent,
-        SagaExecutionPolicy, SagaLifecycleState, SagaOperationContext, SagaOutcome,
-        SagaRecordedCompensationOperationReceipt, SagaRecordedOperationReceipt, SagaRetryPolicy,
-        SagaStatus, SagaTargetRoot, SagaTransactionBlockState, SealAppendStreamSegmentRequest,
-        SealAppendStreamSegmentResponse, SealSagaCompensationProgramRequest,
-        SealSagaCompensationProgramResponse, SealSagaCompensationTransactionRequest,
-        SealSagaCompensationTransactionResponse, SealSagaTransactionRequest,
-        SealSagaTransactionResponse, SetPublicAccessRequest, SetPublicAccessResponse,
+        RepairPersonalDbLogChainResponse, RepairSubjectRecord, RevokeAccessRequest,
+        RevokeAccessResponse, RollbackTransactionRequest, RollbackTransactionResponse,
+        RotateApplicationCredentialSecretRequest, SealAppendStreamSegmentRequest,
+        SealAppendStreamSegmentResponse, SetPublicAccessRequest, SetPublicAccessResponse,
         StartBoundaryMigrationRequest, StartHfIngestionRequest, StartHfIngestionResponse,
-        StartSagaCompensationProgramRequest, StartSagaCompensationProgramResponse,
-        StartSagaRequest, StartSagaResponse, StorageClassDescriptor, StorageClassResponse,
-        SubmitPersonalDbChangesetRequest, SubmitPersonalDbChangesetResponse,
+        StorageClassDescriptor, StorageClassResponse, SubmitPersonalDbChangesetRequest,
+        SubmitPersonalDbChangesetResponse,
         TailAppendStreamRequest, TailAppendStreamResponse, TaskLease, TaskLeaseResponse,
         TenantScope, TensorIndexRow, TransactionScope, TransactionStatus, UpdateIndexRequest,
         UpdateObjectLinkRequest, UploadPartMetadata, UploadPartRequest, UploadPartResponse,
@@ -111,17 +102,16 @@ pub mod proto {
         WatchIndexDefinitionRequest, WatchIndexDefinitionResponse, WatchIndexPartitionRequest,
         WatchIndexPartitionResponse, WatchPersonalDbGroupRequest, WatchPersonalDbGroupResponse,
         WatchPersonalDbProjectionRequest, WatchPersonalDbProjectionResponse, WatchPrefixRequest,
-        WatchPrefixResponse, WatchSagaRequest, WatchVisibilityMode, WriteAuthzTupleRequest,
+        WatchPrefixResponse, WatchVisibilityMode, WriteAuthzTupleRequest,
         WriteAuthzTupleResponse, WriteAuthzTuplesRequest, WriteAuthzTuplesResponse, WriteOptions,
-        WritePrecondition, WriteResponse, WriteResponseSagaExtension, WriteState,
-        WriteVisibilityOptions, admin_service_client, audit_service_client, auth_service_client,
+        WritePrecondition, WriteResponse, WriteState, WriteVisibilityOptions, admin_service_client,
+        audit_service_client, auth_service_client,
         bucket_service_client, coordination_service_client, get_object_response,
         git_source_service_client, hf_ingestion_service_client, hugging_face_key_service_client,
         index_service_client, mesh_control_service_client, model_manifest, model_service_client,
         mutation_batch_operation, object_service_client, personal_db_service_client,
         put_git_pack_request, put_object_request, registry_service_client, repair_service_client,
-        saga_service_client, stream_service_client, transaction_service_client,
-        upload_part_request, write_options, write_response_saga_extension,
+        stream_service_client, transaction_service_client, upload_part_request, write_options,
     };
 }
 
@@ -710,279 +700,6 @@ impl AnvilClient {
         proto::audit_service_client::AuditServiceClient::with_interceptor(
             self.channel.clone(),
             self.interceptor.clone(),
-        )
-    }
-
-    pub fn sagas(&self) -> proto::saga_service_client::SagaServiceClient<InterceptedChannel> {
-        proto::saga_service_client::SagaServiceClient::with_interceptor(
-            self.channel.clone(),
-            self.interceptor.clone(),
-        )
-    }
-}
-
-pub mod saga {
-    use super::{AnvilClient, proto};
-    use std::marker::PhantomData;
-
-    const RESERVED_MESSAGE: &str =
-        "Anvil saga high-level client API is reserved in this release and is not implemented";
-
-    #[cold]
-    #[track_caller]
-    fn reserved() -> ! {
-        panic!("{RESERVED_MESSAGE}")
-    }
-
-    #[derive(Clone, Debug)]
-    pub struct StartSagaOptions {
-        pub idempotency_key: String,
-        pub realm_id: String,
-        pub draft_ttl_ms: u64,
-        pub purpose: String,
-        pub execution_policy: proto::SagaExecutionPolicy,
-    }
-
-    impl StartSagaOptions {
-        pub fn new(
-            idempotency_key: impl Into<String>,
-            realm_id: impl Into<String>,
-            purpose: impl Into<String>,
-        ) -> Self {
-            Self {
-                idempotency_key: idempotency_key.into(),
-                realm_id: realm_id.into(),
-                draft_ttl_ms: 0,
-                purpose: purpose.into(),
-                execution_policy: proto::SagaExecutionPolicy::default(),
-            }
-        }
-
-        pub fn with_draft_ttl_ms(mut self, draft_ttl_ms: u64) -> Self {
-            self.draft_ttl_ms = draft_ttl_ms;
-            self
-        }
-
-        pub fn with_execution_policy(
-            mut self,
-            execution_policy: proto::SagaExecutionPolicy,
-        ) -> Self {
-            self.execution_policy = execution_policy;
-            self
-        }
-
-        pub fn into_proto(self) -> proto::StartSagaRequest {
-            proto::StartSagaRequest {
-                idempotency_key: self.idempotency_key,
-                realm_id: self.realm_id,
-                draft_ttl_ms: self.draft_ttl_ms,
-                purpose: self.purpose,
-                execution_policy: Some(self.execution_policy),
-            }
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    pub struct OngoingSaga {
-        client: AnvilClient,
-        saga_id: String,
-        draft_revision: u64,
-    }
-
-    impl OngoingSaga {
-        pub async fn begin_transaction(
-            &mut self,
-            _target_root: proto::SagaTargetRoot,
-        ) -> SagaTransaction<'_> {
-            reserved()
-        }
-
-        pub async fn apply(self) -> AppliedSaga {
-            reserved()
-        }
-
-        pub fn saga_id(&self) -> &str {
-            &self.saga_id
-        }
-
-        pub fn draft_revision(&self) -> u64 {
-            self.draft_revision
-        }
-
-        pub fn raw_saga_client(
-            &self,
-        ) -> proto::saga_service_client::SagaServiceClient<super::InterceptedChannel> {
-            self.client.sagas()
-        }
-    }
-
-    #[derive(Debug)]
-    pub struct SagaTransaction<'saga> {
-        saga: &'saga mut OngoingSaga,
-        saga_transaction_id: String,
-    }
-
-    impl<'saga> SagaTransaction<'saga> {
-        pub async fn put_object(
-            &mut self,
-            _request: proto::PutObjectRequest,
-            _compensation: ObjectPutCompensation,
-        ) -> SagaObjectWriteRef {
-            reserved()
-        }
-
-        pub async fn delete_object(
-            &mut self,
-            _request: proto::DeleteObjectRequest,
-            _compensation: ObjectDeleteCompensation,
-        ) -> SagaObjectWriteRef {
-            reserved()
-        }
-
-        pub async fn commit(self) -> OngoingSaga {
-            reserved()
-        }
-
-        pub fn saga_transaction_id(&self) -> &str {
-            &self.saga_transaction_id
-        }
-
-        pub fn saga(&self) -> &OngoingSaga {
-            self.saga
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    pub struct AppliedSaga {
-        saga_id: String,
-        sealed_plan_hash: String,
-    }
-
-    impl AppliedSaga {
-        pub fn saga_id(&self) -> &str {
-            &self.saga_id
-        }
-
-        pub fn sealed_plan_hash(&self) -> &str {
-            &self.sealed_plan_hash
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    pub struct SagaObjectWriteRef {
-        pub operation_id: String,
-        pub object_key: String,
-    }
-
-    #[derive(Clone, Debug)]
-    pub enum ObjectPutCompensation {
-        RestorePreviousHeadV1,
-        ExplicitProgram(String),
-        CoveredByOperation(String),
-        IrreversiblePivotV1,
-    }
-
-    impl From<ObjectPutCompensation> for proto::SagaCompensationSpec {
-        fn from(value: ObjectPutCompensation) -> Self {
-            match value {
-                ObjectPutCompensation::RestorePreviousHeadV1 => proto::SagaCompensationSpec {
-                    kind: proto::SagaCompensationKind::ObjectPutRestorePreviousHeadV1 as i32,
-                    ..Default::default()
-                },
-                ObjectPutCompensation::ExplicitProgram(compensation_program_id) => {
-                    proto::SagaCompensationSpec {
-                        kind: proto::SagaCompensationKind::ExplicitProgramV1 as i32,
-                        compensation_program_id,
-                        ..Default::default()
-                    }
-                }
-                ObjectPutCompensation::CoveredByOperation(covered_by_operation_id) => {
-                    proto::SagaCompensationSpec {
-                        kind: proto::SagaCompensationKind::CoveredByOperationV1 as i32,
-                        covered_by_operation_id,
-                        ..Default::default()
-                    }
-                }
-                ObjectPutCompensation::IrreversiblePivotV1 => proto::SagaCompensationSpec {
-                    kind: proto::SagaCompensationKind::IrreversiblePivotV1 as i32,
-                    ..Default::default()
-                },
-            }
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    pub enum ObjectDeleteCompensation {
-        RestorePreviousHeadV1,
-        ExplicitProgram(String),
-        CoveredByOperation(String),
-    }
-
-    impl From<ObjectDeleteCompensation> for proto::SagaCompensationSpec {
-        fn from(value: ObjectDeleteCompensation) -> Self {
-            match value {
-                ObjectDeleteCompensation::RestorePreviousHeadV1 => proto::SagaCompensationSpec {
-                    kind: proto::SagaCompensationKind::ObjectDeleteRestorePreviousHeadV1 as i32,
-                    ..Default::default()
-                },
-                ObjectDeleteCompensation::ExplicitProgram(compensation_program_id) => {
-                    proto::SagaCompensationSpec {
-                        kind: proto::SagaCompensationKind::ExplicitProgramV1 as i32,
-                        compensation_program_id,
-                        ..Default::default()
-                    }
-                }
-                ObjectDeleteCompensation::CoveredByOperation(covered_by_operation_id) => {
-                    proto::SagaCompensationSpec {
-                        kind: proto::SagaCompensationKind::CoveredByOperationV1 as i32,
-                        covered_by_operation_id,
-                        ..Default::default()
-                    }
-                }
-            }
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    pub struct SagaRoot<T = ()> {
-        inner: proto::SagaTargetRoot,
-        _marker: PhantomData<T>,
-    }
-
-    impl<T> SagaRoot<T> {
-        pub fn new(inner: proto::SagaTargetRoot) -> Self {
-            Self {
-                inner,
-                _marker: PhantomData,
-            }
-        }
-
-        pub fn into_proto(self) -> proto::SagaTargetRoot {
-            self.inner
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        use tonic::transport::Endpoint;
-
-        #[tokio::test]
-        #[should_panic(expected = "Anvil saga high-level client API is reserved")]
-        async fn high_level_start_saga_panics_until_engine_is_implemented() {
-            let endpoint = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
-            let client = AnvilClient::from_channel(endpoint);
-            let _ = client
-                .start_saga(StartSagaOptions::new("idem", "realm", "purpose"))
-                .await;
-        }
-    }
-}
-
-impl AnvilClient {
-    pub async fn start_saga(&self, _options: saga::StartSagaOptions) -> saga::OngoingSaga {
-        panic!(
-            "Anvil saga high-level client API is reserved in this release and is not implemented"
         )
     }
 }

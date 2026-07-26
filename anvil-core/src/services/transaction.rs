@@ -121,7 +121,6 @@ impl TransactionService for AppState {
             },
             retry_after_hint: None,
             finalisation_error: None,
-            saga: None,
         }))
     }
 

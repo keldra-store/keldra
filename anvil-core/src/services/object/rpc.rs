@@ -4,7 +4,7 @@ use crate::object_manager;
 pub(super) fn native_transaction_id(
     context: Option<&NativeMutationContext>,
 ) -> Result<Option<&str>, Status> {
-    crate::services::saga_reserved::native_context_transaction_id(context)
+    crate::services::transaction_context::native_context_transaction_id(context)
 }
 
 fn native_route_tenant_id(metadata: &tonic::metadata::MetadataMap) -> Result<Option<i64>, Status> {

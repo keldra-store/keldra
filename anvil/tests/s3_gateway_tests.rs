@@ -61,8 +61,6 @@ fn public_mutation_context(tag: &str, expected_generation: u64) -> PublicMutatio
         idempotency_key: uuid::Uuid::new_v4().to_string(),
         expected_generation,
         transaction_id: None,
-        saga_operation: None,
-        saga_compensation_operation: None,
     }
 }
 

@@ -35,8 +35,6 @@ fn native_mutation_context(
         authz_zookie_optional: String::new(),
         idempotency_key: format!("{tag}-{nonce}-idempotency"),
         transaction_id: None,
-        saga_operation: None,
-        saga_compensation_operation: None,
         write_visibility: None,
     }
 }

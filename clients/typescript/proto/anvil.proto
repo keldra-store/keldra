@@ -68,8 +68,6 @@ message PublicMutationContext {
   string idempotency_key = 2;
   uint64 expected_generation = 3;
   optional string transaction_id = 4;
-  optional SagaOperationContext saga_operation = 5;
-  optional SagaCompensationOperationContext saga_compensation_operation = 6;
 }
 
 message AdminPrincipal {
@@ -1435,22 +1433,6 @@ service TransactionService {
   rpc GetTransaction(GetTransactionRequest) returns (TransactionStatus);
 }
 
-service SagaService {
-  rpc StartSaga(StartSagaRequest) returns (StartSagaResponse);
-  rpc BeginSagaTransaction(BeginSagaTransactionRequest) returns (BeginSagaTransactionResponse);
-  rpc SealSagaTransaction(SealSagaTransactionRequest) returns (SealSagaTransactionResponse);
-  rpc StartSagaCompensationProgram(StartSagaCompensationProgramRequest) returns (StartSagaCompensationProgramResponse);
-  rpc BeginSagaCompensationTransaction(BeginSagaCompensationTransactionRequest) returns (BeginSagaCompensationTransactionResponse);
-  rpc SealSagaCompensationTransaction(SealSagaCompensationTransactionRequest) returns (SealSagaCompensationTransactionResponse);
-  rpc SealSagaCompensationProgram(SealSagaCompensationProgramRequest) returns (SealSagaCompensationProgramResponse);
-  rpc ApplySaga(ApplySagaRequest) returns (ApplySagaResponse);
-  rpc GetSaga(GetSagaRequest) returns (SagaStatus);
-  rpc WatchSaga(WatchSagaRequest) returns (stream SagaEvent);
-  rpc CancelSaga(CancelSagaRequest) returns (SagaStatus);
-  rpc AbortSagaDraft(AbortSagaDraftRequest) returns (SagaStatus);
-  rpc ResolveBlockedSaga(ResolveBlockedSagaRequest) returns (SagaStatus);
-}
-
 service StreamService {
   rpc CreateStream(CreateAppendStreamRequest) returns (CreateAppendStreamResponse);
   rpc AppendRecord(AppendStreamRecordRequest) returns (AppendStreamRecordResponse);
@@ -1535,8 +1517,6 @@ message NativeMutationContext {
     string authz_zookie_optional = 6;
     string idempotency_key = 7;
     optional string transaction_id = 8;
-    optional SagaOperationContext saga_operation = 9;
-    optional SagaCompensationOperationContext saga_compensation_operation = 10;
     optional WriteVisibilityOptions write_visibility = 11;
 }
 
@@ -1988,8 +1968,6 @@ enum WriteState {
     WRITE_STATE_FINALISED = 2;
     WRITE_STATE_FINALISATION_FAILED = 3;
     WRITE_STATE_STAGED = 4;
-    WRITE_STATE_SAGA_OPERATION_RECORDED = 5;
-    WRITE_STATE_SAGA_COMPENSATION_RECORDED = 6;
 }
 
 message AnvilError {
@@ -2006,7 +1984,6 @@ message WriteResponse {
     string idempotency_outcome = 6;
     optional string retry_after_hint = 7;
     AnvilError finalisation_error = 8;
-    optional WriteResponseSagaExtension saga = 9;
 }
 
 message WriteOptions {
@@ -2017,312 +1994,7 @@ message WriteOptions {
     repeated BoundaryValue boundary_values = 5;
     oneof execution {
         string transaction_id = 6;
-        SagaOperationContext saga_operation = 7;
-        SagaCompensationOperationContext saga_compensation_operation = 8;
     }
-}
-
-message SagaOperationContext {
-    string saga_id = 1;
-    string saga_transaction_id = 2;
-    string operation_id = 3;
-    uint64 expected_draft_revision = 4;
-    SagaCompensationSpec compensation = 5;
-}
-
-message SagaCompensationOperationContext {
-    string saga_id = 1;
-    string compensation_program_id = 2;
-    string saga_compensation_transaction_id = 3;
-    string compensation_operation_id = 4;
-    uint64 expected_draft_revision = 5;
-}
-
-message SagaRecordedOperationReceipt {
-    string saga_id = 1;
-    string saga_transaction_id = 2;
-    string operation_id = 3;
-    uint32 operation_ordinal = 4;
-    uint64 draft_revision = 5;
-    string operation_hash = 6;
-}
-
-message SagaRecordedCompensationOperationReceipt {
-    string saga_id = 1;
-    string compensation_program_id = 2;
-    string saga_compensation_transaction_id = 3;
-    string compensation_operation_id = 4;
-    uint32 compensation_operation_ordinal = 5;
-    uint64 draft_revision = 6;
-    string operation_hash = 7;
-}
-
-message WriteResponseSagaExtension {
-    oneof receipt {
-        SagaRecordedOperationReceipt forward_operation = 1;
-        SagaRecordedCompensationOperationReceipt compensation_operation = 2;
-    }
-}
-
-enum SagaLifecycleState {
-    SAGA_LIFECYCLE_STATE_UNSPECIFIED = 0;
-    SAGA_LIFECYCLE_STATE_DRAFT = 1;
-    SAGA_LIFECYCLE_STATE_DRAFT_INVALID = 2;
-    SAGA_LIFECYCLE_STATE_SEALED = 3;
-    SAGA_LIFECYCLE_STATE_RUNNING = 4;
-    SAGA_LIFECYCLE_STATE_COMPENSATING = 5;
-    SAGA_LIFECYCLE_STATE_BLOCKED = 6;
-    SAGA_LIFECYCLE_STATE_RELEASING_REFERENCES = 7;
-    SAGA_LIFECYCLE_STATE_TERMINAL = 8;
-}
-
-enum SagaOutcome {
-    SAGA_OUTCOME_UNSPECIFIED = 0;
-    SAGA_OUTCOME_SUCCEEDED = 1;
-    SAGA_OUTCOME_COMPENSATED = 2;
-    SAGA_OUTCOME_ABORTED = 3;
-    SAGA_OUTCOME_CANCELLED = 4;
-    SAGA_OUTCOME_BLOCKED = 5;
-}
-
-enum SagaTransactionBlockState {
-    SAGA_TRANSACTION_BLOCK_STATE_UNSPECIFIED = 0;
-    SAGA_TRANSACTION_BLOCK_STATE_DRAFT_OPEN = 1;
-    SAGA_TRANSACTION_BLOCK_STATE_DRAFT_SEALED = 2;
-    SAGA_TRANSACTION_BLOCK_STATE_RUNNABLE = 3;
-    SAGA_TRANSACTION_BLOCK_STATE_RUNNING = 4;
-    SAGA_TRANSACTION_BLOCK_STATE_COMMITTED = 5;
-    SAGA_TRANSACTION_BLOCK_STATE_COMPENSATED = 6;
-    SAGA_TRANSACTION_BLOCK_STATE_BLOCKED = 7;
-}
-
-enum SagaBlockSemantics {
-    SAGA_BLOCK_SEMANTICS_UNSPECIFIED = 0;
-    SAGA_BLOCK_SEMANTICS_COMPENSATABLE = 1;
-    SAGA_BLOCK_SEMANTICS_PIVOT = 2;
-    SAGA_BLOCK_SEMANTICS_RETRY_FORWARD_ONLY = 3;
-}
-
-enum SagaCompensationKind {
-    SAGA_COMPENSATION_KIND_UNSPECIFIED = 0;
-    SAGA_COMPENSATION_KIND_OBJECT_PUT_RESTORE_PREVIOUS_HEAD_V1 = 1;
-    SAGA_COMPENSATION_KIND_OBJECT_DELETE_RESTORE_PREVIOUS_HEAD_V1 = 2;
-    SAGA_COMPENSATION_KIND_CREATED_CONTAINER_DELETION_V1 = 3;
-    SAGA_COMPENSATION_KIND_EXPLICIT_PROGRAM_V1 = 4;
-    SAGA_COMPENSATION_KIND_COVERED_BY_OPERATION_V1 = 5;
-    SAGA_COMPENSATION_KIND_IRREVERSIBLE_PIVOT_V1 = 6;
-    SAGA_COMPENSATION_KIND_RETRY_FORWARD_ONLY_V1 = 7;
-}
-
-message SagaCompensationSpec {
-    SagaCompensationKind kind = 1;
-    string compensation_program_id = 2;
-    string covered_by_operation_id = 3;
-    string policy_json = 4;
-}
-
-message SagaExecutionPolicy {
-    uint64 claim_ttl_ms = 1;
-    uint64 block_timeout_ms = 2;
-    uint32 max_retries = 3;
-    bool require_finalized_blocks = 4;
-}
-
-message SagaRetryPolicy {
-    uint32 max_attempts = 1;
-    uint64 initial_backoff_ms = 2;
-    uint64 max_backoff_ms = 3;
-}
-
-message SagaTargetRoot {
-    string realm_id = 1;
-    string root_kind = 2;
-    string resource_id = 3;
-    string root_anchor_key = 4;
-    string root_key_hash = 5;
-}
-
-message StartSagaRequest {
-    string idempotency_key = 1;
-    string realm_id = 2;
-    uint64 draft_ttl_ms = 3;
-    string purpose = 4;
-    SagaExecutionPolicy execution_policy = 5;
-}
-
-message StartSagaResponse {
-    string request_id = 1;
-    string saga_id = 2;
-    uint64 draft_revision = 3;
-    SagaLifecycleState lifecycle_state = 4;
-    uint64 draft_expires_at_unix_nanos = 5;
-}
-
-message BeginSagaTransactionRequest {
-    string saga_id = 1;
-    uint64 expected_draft_revision = 2;
-    string block_idempotency_key = 3;
-    SagaTargetRoot target_root = 4;
-    SagaBlockSemantics semantics = 5;
-    SagaRetryPolicy retry_policy = 6;
-}
-
-message BeginSagaTransactionResponse {
-    string request_id = 1;
-    string saga_id = 2;
-    string saga_transaction_id = 3;
-    uint64 block_ordinal = 4;
-    uint64 draft_revision = 5;
-    SagaTransactionBlockState block_state = 6;
-}
-
-message SealSagaTransactionRequest {
-    string saga_id = 1;
-    string saga_transaction_id = 2;
-    uint64 expected_draft_revision = 3;
-}
-
-message SealSagaTransactionResponse {
-    string request_id = 1;
-    string saga_id = 2;
-    string saga_transaction_id = 3;
-    uint64 block_ordinal = 4;
-    string block_hash = 5;
-    uint64 draft_revision = 6;
-    SagaTransactionBlockState block_state = 7;
-}
-
-message StartSagaCompensationProgramRequest {
-    string saga_id = 1;
-    uint64 expected_draft_revision = 2;
-    string idempotency_key = 3;
-    string purpose = 4;
-}
-
-message StartSagaCompensationProgramResponse {
-    string request_id = 1;
-    string saga_id = 2;
-    string compensation_program_id = 3;
-    uint64 draft_revision = 4;
-}
-
-message BeginSagaCompensationTransactionRequest {
-    string saga_id = 1;
-    string compensation_program_id = 2;
-    uint64 expected_draft_revision = 3;
-    string block_idempotency_key = 4;
-    SagaTargetRoot target_root = 5;
-    SagaRetryPolicy retry_policy = 6;
-}
-
-message BeginSagaCompensationTransactionResponse {
-    string request_id = 1;
-    string saga_id = 2;
-    string compensation_program_id = 3;
-    string saga_compensation_transaction_id = 4;
-    uint64 block_ordinal = 5;
-    uint64 draft_revision = 6;
-    SagaTransactionBlockState block_state = 7;
-}
-
-message SealSagaCompensationTransactionRequest {
-    string saga_id = 1;
-    string compensation_program_id = 2;
-    string saga_compensation_transaction_id = 3;
-    uint64 expected_draft_revision = 4;
-}
-
-message SealSagaCompensationTransactionResponse {
-    string request_id = 1;
-    string saga_id = 2;
-    string compensation_program_id = 3;
-    string saga_compensation_transaction_id = 4;
-    uint64 block_ordinal = 5;
-    string block_hash = 6;
-    uint64 draft_revision = 7;
-    SagaTransactionBlockState block_state = 8;
-}
-
-message SealSagaCompensationProgramRequest {
-    string saga_id = 1;
-    string compensation_program_id = 2;
-    uint64 expected_draft_revision = 3;
-}
-
-message SealSagaCompensationProgramResponse {
-    string request_id = 1;
-    string saga_id = 2;
-    string compensation_program_id = 3;
-    string program_hash = 4;
-    uint64 draft_revision = 5;
-}
-
-message ApplySagaRequest {
-    string saga_id = 1;
-    uint64 expected_draft_revision = 2;
-    string idempotency_key = 3;
-}
-
-message ApplySagaResponse {
-    string request_id = 1;
-    string saga_id = 2;
-    SagaLifecycleState lifecycle_state = 3;
-    string sealed_plan_hash = 4;
-    uint64 saga_revision = 5;
-    string idempotency_outcome = 6;
-}
-
-message GetSagaRequest {
-    string saga_id = 1;
-    string realm_id = 2;
-}
-
-message WatchSagaRequest {
-    string saga_id = 1;
-    string realm_id = 2;
-    uint64 after_saga_revision = 3;
-}
-
-message CancelSagaRequest {
-    string saga_id = 1;
-    uint64 expected_saga_revision = 2;
-    string reason = 3;
-}
-
-message AbortSagaDraftRequest {
-    string saga_id = 1;
-    uint64 expected_draft_revision = 2;
-    string reason = 3;
-}
-
-message ResolveBlockedSagaRequest {
-    string saga_id = 1;
-    uint64 expected_saga_revision = 2;
-    string resolution = 3;
-    string evidence_json = 4;
-}
-
-message SagaStatus {
-    string request_id = 1;
-    string saga_id = 2;
-    string realm_id = 3;
-    SagaLifecycleState lifecycle_state = 4;
-    SagaOutcome outcome = 5;
-    uint64 draft_revision = 6;
-    uint64 saga_revision = 7;
-    string sealed_plan_hash = 8;
-    string blocked_reason = 9;
-}
-
-message SagaEvent {
-    string request_id = 1;
-    string saga_id = 2;
-    uint64 saga_revision = 3;
-    SagaLifecycleState lifecycle_state = 4;
-    SagaOutcome outcome = 5;
-    string event_type = 6;
-    string event_hash = 7;
-    uint64 emitted_at_unix_nanos = 8;
 }
 
 message ReadConsistency {
@@ -2425,30 +2097,39 @@ message BoundaryMigrationStatus {
 
 message BeginTransactionRequest {
     string idempotency_key = 1;
-    TransactionScope scope = 2;
-    repeated WritePrecondition preconditions = 4;
-    repeated BoundaryValue boundary_values = 5;
+    reserved 2, 4, 5, 7;
+    reserved "scope", "preconditions", "boundary_values", "purpose";
     uint64 ttl_ms = 6;
-    string purpose = 7;
+    MvccReadConsistency read_consistency = 8;
+    string cluster_id = 9;
+    MvccDurability durability = 10;
 }
 
 message BeginTransactionResponse {
     string request_id = 1;
     string transaction_id = 2;
-    uint64 expires_at_unix_nanos = 3;
+    reserved 3;
+    reserved "expires_at_unix_nanos";
     string state = 4;
+    uint64 snapshot_version = 5;
+    string cluster_id = 6;
+    uint64 expires_at_unix_ms = 7;
+    MvccDurability durability = 8;
 }
 
 message CommitTransactionRequest {
     string transaction_id = 1;
-    ConsistencyMode consistency = 2;
-    bool wait_for_finalization = 3;
-    repeated WritePrecondition final_preconditions = 4;
+    reserved 2, 3, 4;
+    reserved "consistency", "wait_for_finalization", "final_preconditions";
+    reserved 5;
+    reserved "durability";
+    string cluster_id = 6;
 }
 
 message RollbackTransactionRequest {
     string transaction_id = 1;
     string reason = 2;
+    string cluster_id = 3;
 }
 
 message RollbackTransactionResponse {
@@ -2459,14 +2140,33 @@ message RollbackTransactionResponse {
 
 message GetTransactionRequest {
     string transaction_id = 1;
+    string cluster_id = 2;
 }
 
 message TransactionStatus {
     string transaction_id = 1;
     string state = 2;
-    string root_key_hash = 3;
-    optional uint64 committed_root_generation = 4;
+    reserved 3, 4;
+    reserved "root_key_hash", "committed_root_generation";
     AnvilError error = 5;
+    uint64 snapshot_version = 6;
+    uint64 expires_at_unix_ms = 7;
+    optional uint64 commit_version = 8;
+    string cluster_id = 9;
+    MvccDurability durability = 10;
+}
+
+enum MvccReadConsistency {
+    MVCC_READ_CONSISTENCY_UNSPECIFIED = 0;
+    MVCC_READ_CONSISTENCY_LOCAL_SNAPSHOT = 1;
+    MVCC_READ_CONSISTENCY_LINEARIZED = 2;
+}
+
+enum MvccDurability {
+    MVCC_DURABILITY_UNSPECIFIED = 0;
+    MVCC_DURABILITY_LOCAL = 1;
+    MVCC_DURABILITY_QUORUM = 2;
+    MVCC_DURABILITY_ERASURE = 3;
 }
 
 message CoreMetaRowMutation {

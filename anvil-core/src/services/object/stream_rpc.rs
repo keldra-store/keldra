@@ -2,7 +2,7 @@ use super::*;
 use crate::object_manager;
 
 fn native_transaction_id(context: Option<&NativeMutationContext>) -> Result<Option<&str>, Status> {
-    crate::services::saga_reserved::native_context_transaction_id(context)
+    crate::services::transaction_context::native_context_transaction_id(context)
 }
 
 fn write_state_for_transaction(transaction_id: Option<&str>) -> i32 {

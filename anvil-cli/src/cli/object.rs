@@ -212,8 +212,6 @@ pub(crate) async fn native_mutation_context(
         authz_zookie_optional: String::new(),
         idempotency_key: uuid::Uuid::new_v4().to_string(),
         transaction_id,
-        saga_operation: None,
-        saga_compensation_operation: None,
         write_visibility: None,
     })
 }
@@ -483,8 +481,6 @@ async fn handle_object_boundary_command(
                     authz_zookie_optional: String::new(),
                     idempotency_key: format!("boundary-migration-{}", uuid::Uuid::new_v4()),
                     transaction_id: transaction_id.clone(),
-                    saga_operation: None,
-                    saga_compensation_operation: None,
                     write_visibility: None,
                 }),
             });
@@ -722,8 +718,6 @@ fn public_link_context(
         idempotency_key: uuid::Uuid::new_v4().to_string(),
         expected_generation,
         transaction_id,
-        saga_operation: None,
-        saga_compensation_operation: None,
     }
 }
 

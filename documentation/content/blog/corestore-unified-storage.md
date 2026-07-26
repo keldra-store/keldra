@@ -93,14 +93,6 @@ The important property is not that a lease exists. The important property is tha
 
 The tutorials now explain the difference between acquiring a lease, checkpointing work, committing a lease, force-releasing a stuck lease, and using fenced write preconditions for actual state changes.
 
-## What changed for saga-shaped workflows
-
-This release reserves the saga protocol surface without enabling saga execution. The protobuf service, mutation execution contexts, response extension fields, and Rust client types now describe the shape of the durable saga API planned for multi-root workflows. That lets downstream client code compile against stable names while Anvil keeps the execution engine fail-closed until the state machine, recovery loop, and compensation records are implemented.
-
-The important release behaviour is explicit rejection. Every `SagaService` method returns `UNIMPLEMENTED`. Any public or native mutation context that carries a saga operation or compensation operation is rejected before it can mutate a bucket, object, index, registry record, mesh record, or other write target. The high-level Rust saga client API is also intentionally reserved: constructing the types is possible, but calling the high-level behavioural methods panics with a reserved API message.
-
-This is an API reservation, not hidden saga support. It does not create saga roots, saga writer segments, saga reference holds, or saga execution tasks in this release. Ordinary explicit transactions remain the implemented coordination primitive for writes that are scoped to one root.
-
 ## What changed for watches and derived data
 
 A watch stream is Anvil's way of saying that a committed change has a durable cursor. Consumers can process changes, write derived state, and store their checkpoint only after the derived work is durable. If a consumer crashes, it can resume from the last checkpoint. If it falls too far behind, repair or rebuild can use source records instead of pretending the cursor is still enough.

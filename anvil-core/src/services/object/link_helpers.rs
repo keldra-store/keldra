@@ -14,14 +14,13 @@ pub(super) fn public_link_context(
     if !create && context.expected_generation == 0 {
         return Err(Status::invalid_argument("expected_generation is required"));
     }
-    crate::services::saga_reserved::reject_public_saga_context(context)?;
     Ok(context)
 }
 
 pub(super) fn public_context_transaction_id(
     context: &PublicMutationContext,
 ) -> Result<Option<&str>, Status> {
-    crate::services::saga_reserved::public_context_transaction_id(context)
+    crate::services::transaction_context::public_context_transaction_id(context)
 }
 
 pub(super) fn validate_public_tenant_locator(

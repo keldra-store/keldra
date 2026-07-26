@@ -35,7 +35,9 @@ Do not reintroduce string-scope bypasses for admin operations. The admin plane u
 
 Explicit transactions stage writes. Normal readers ignore staged rows. Rollback records an aborted outcome. Commit validates preconditions, commits bytes and metadata, persists evidence, publishes a root generation, and only then makes data visible.
 
-If a new API needs multi-step work across roots, use the saga design rather than pretending a single CoreStore transaction can span every root atomically.
+Cluster-local MVCC transactions may span product tables and partitions. Keep all
+of a workflow's atomic mutations in one transaction and reject attempts to cross
+the cluster boundary.
 
 ## Prove the path from public API down to storage
 

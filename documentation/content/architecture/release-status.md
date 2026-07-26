@@ -43,12 +43,6 @@ CoreMeta metadata quorum traffic uses persistent bidirectional gRPC streams. The
 
 Prefix watches are implemented as bucket/prefix/cursor streams. They are suitable for object-change consumers that know their prefix. They are not intended to become a general query language. Index, authz, PersonalDB, and other derived systems expose watch or watch-like surfaces for maintenance and catch-up.
 
-## Saga API reservation status
-
-The 0.3.0 API includes a reserved saga surface so clients can see the intended durable workflow shape without Anvil accepting saga work yet. The protobuf package contains `SagaService`, saga operation contexts for write requests, saga response extension fields, and the Rust client exposes both the raw generated saga client and high-level saga helper types.
-
-The server rejects that surface in this release. `SagaService` methods return `UNIMPLEMENTED`, and mutation APIs reject any request carrying a saga operation or saga compensation operation. The high-level Rust helper methods panic with a reserved API message. This keeps the release honest: explicit transactions are available, saga execution is not, and no saga-specific durable storage is created until the engine lands.
-
 ## S3 compatibility status
 
 The S3-compatible gateway supports normal object-shaped operations through the official AWS SDK in the test suite: put, get, list, range get, multipart flows, public/private access, routing/alias cases, streaming upload, and index/compaction interactions. S3 remains a gateway. Use the native API or Rust client for Anvil-specific capabilities such as relationship-aware queries, typed indexes, watches, leases, PersonalDB, and repair workflows.

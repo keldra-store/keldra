@@ -249,7 +249,7 @@ fn registry_namespace_resource(registry_kind: &str, namespace: &str) -> String {
 }
 
 fn registry_transaction_id(options: Option<&WriteOptions>) -> Result<Option<&str>, Status> {
-    crate::services::saga_reserved::write_options_transaction_id(options)
+    crate::services::transaction_context::write_options_transaction_id(options)
 }
 
 fn write_response(
@@ -257,7 +257,7 @@ fn write_response(
     mutation_id: String,
     options: Option<&WriteOptions>,
 ) -> WriteResponse {
-    let state = if crate::services::saga_reserved::write_options_is_transactional(options) {
+    let state = if crate::services::transaction_context::write_options_is_transactional(options) {
         WriteState::Staged
     } else if options
         .map(|options| {
@@ -279,7 +279,6 @@ fn write_response(
         idempotency_outcome: "accepted".to_string(),
         retry_after_hint: None,
         finalisation_error: None,
-        saga: None,
     }
 }
 

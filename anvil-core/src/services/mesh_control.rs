@@ -16,7 +16,7 @@ const MAX_BOOTSTRAP_NODES: usize = 4096;
 const MAX_BOOTSTRAP_COREMETA_ROWS: usize = 4096;
 
 fn mesh_transaction_id(options: Option<&WriteOptions>) -> Result<Option<&str>, Status> {
-    crate::services::saga_reserved::write_options_transaction_id(options)
+    crate::services::transaction_context::write_options_transaction_id(options)
 }
 
 #[tonic::async_trait]
@@ -1002,7 +1002,6 @@ fn mesh_write_response(
         idempotency_outcome: "accepted".to_string(),
         retry_after_hint: None,
         finalisation_error: None,
-        saga: None,
     }
 }
 

@@ -21,8 +21,7 @@ pub mod repair;
 pub mod replication;
 #[cfg(feature = "root-publication-test-control")]
 mod root_publication_test_control;
-pub mod saga;
-pub(crate) mod saga_reserved;
+pub(crate) mod transaction_context;
 pub mod stream;
 pub mod transaction;
 pub(crate) mod watch_envelope;
@@ -48,7 +47,7 @@ use crate::anvil_api::{
     registry_service_server::RegistryServiceServer, repair_service_server::RepairServiceServer,
     replication_service_server::ReplicationServiceServer,
     root_register_internal_server::RootRegisterInternalServer,
-    saga_service_server::SagaServiceServer, stream_service_server::StreamServiceServer,
+    stream_service_server::StreamServiceServer,
     transaction_service_server::TransactionServiceServer,
 };
 use crate::{AppState, middleware};
@@ -122,10 +121,6 @@ pub fn create_grpc_router(state: AppState, auth_interceptor: AuthInterceptorFn) 
         auth_closure.clone(),
     ))
     .add_service(TransactionServiceServer::with_interceptor(
-        state.clone(),
-        auth_closure.clone(),
-    ))
-    .add_service(SagaServiceServer::with_interceptor(
         state.clone(),
         auth_closure.clone(),
     ))

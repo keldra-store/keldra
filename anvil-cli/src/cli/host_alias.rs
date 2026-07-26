@@ -174,8 +174,6 @@ fn public_context(
         idempotency_key: uuid::Uuid::new_v4().to_string(),
         expected_generation,
         transaction_id,
-        saga_operation: None,
-        saga_compensation_operation: None,
     }
 }
 

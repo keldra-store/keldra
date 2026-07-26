@@ -516,8 +516,6 @@ mod tests {
             authz_zookie_optional: String::new(),
             idempotency_key: "idem-1".to_string(),
             transaction_id: None,
-            saga_operation: None,
-            saga_compensation_operation: None,
             write_visibility: None,
         }
     }

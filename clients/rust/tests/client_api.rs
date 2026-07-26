@@ -96,15 +96,6 @@ fn generated_proto_exports_core_service_types() {
     assert_eq!(batch.operation_id.as_deref(), Some("grant-doc-1"));
     assert_eq!(batch.expected_revision, Some(41));
 
-    let start = proto::StartSagaRequest {
-        idempotency_key: "saga-idem".to_string(),
-        realm_id: "realm".to_string(),
-        draft_ttl_ms: 30_000,
-        purpose: "client-test".to_string(),
-        execution_policy: None,
-    };
-    assert_eq!(start.purpose, "client-test");
-
     let append_record = proto::AppendStreamRecordInfo {
         authenticated_principal: "tenant/7/principal/app-1".to_string(),
         ..Default::default()
@@ -188,8 +179,6 @@ fn mutation_batch_helper_wraps_typed_operations() {
         authz_zookie_optional: String::new(),
         idempotency_key: "batch-idem".to_string(),
         transaction_id: Some("tx-123".to_string()),
-        saga_operation: None,
-        saga_compensation_operation: None,
         write_visibility: None,
     };
     let precondition = proto::WritePrecondition {
@@ -300,5 +289,4 @@ async fn client_constructs_all_public_service_clients_from_channel() {
     let _hf = client.hf_ingestion();
     let _models = client.models();
     let _transactions = client.transactions();
-    let _sagas = client.sagas();
 }
