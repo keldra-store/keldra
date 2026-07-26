@@ -1,17 +1,15 @@
 use super::*;
 use crate::core_store::{
-    CF_MATERIALISATION, CF_OBJECT_HEADS, CoreMetaTuplePart, CoreMutationOperation,
-    TABLE_OBJECT_METADATA_PARTITION_MANIFEST_ROW, TABLE_STREAM_HEAD_ROW, TABLE_WRITER_SEGMENT_ROW,
-    core_meta_tuple_key,
+    CF_MATERIALISATION, CF_OBJECT_HEADS, CoreMetaTuplePart,
+    TABLE_OBJECT_METADATA_PARTITION_MANIFEST_ROW, TABLE_WRITER_SEGMENT_ROW, core_meta_tuple_key,
 };
-use crate::mvcc_product::{ProductMutation, coremeta_logical_key, stream_logical_key};
+use crate::mvcc_product::{ProductMutation, coremeta_logical_key};
 use crate::mvcc_transaction::{LogicalKey, PredicateKind};
 
 /// Immutable segment bodies and object payload bytes are deliberately absent
 /// from this API. This module owns only mutable product projection rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MetadataProductRowKind {
-    JournalHead,
     ManifestPublication,
     WriterCatalogReference,
     CompactionState,
@@ -60,27 +58,6 @@ impl MetadataMvccProjectionPlan {
         Ok(())
     }
 
-    pub fn append_event(
-        &mut self,
-        stream_id: &str,
-        record_kind: &str,
-        payload: Vec<u8>,
-        idempotency_key: &str,
-    ) -> Result<()> {
-        let operation = CoreMutationOperation::StreamAppend {
-            partition_id: "mvcc".to_string(),
-            stream_id: stream_id.to_string(),
-            record_kind: record_kind.to_string(),
-            payload,
-            idempotency_key: Some(idempotency_key.to_string()),
-        };
-        self.mutations
-            .extend(crate::mvcc_product::product_mutations_from_operations(
-                vec![operation],
-            )?);
-        Ok(())
-    }
-
     pub fn stage(
         self,
         mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
@@ -121,11 +98,6 @@ pub(crate) fn metadata_product_key(
     tuple_key: Option<&[u8]>,
 ) -> Result<LogicalKey> {
     match kind {
-        MetadataProductRowKind::JournalHead => stream_logical_key(
-            TABLE_STREAM_HEAD_ROW,
-            &object_metadata_stream_id(bucket.tenant_id, bucket.id),
-            None,
-        ),
         MetadataProductRowKind::ManifestPublication => coremeta_logical_key(
             CF_OBJECT_HEADS,
             TABLE_OBJECT_METADATA_PARTITION_MANIFEST_ROW,

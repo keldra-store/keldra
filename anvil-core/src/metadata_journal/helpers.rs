@@ -401,26 +401,6 @@ pub(super) async fn read_manifest_segment(
         .await
 }
 
-#[cfg(test)]
-pub(super) async fn read_core_ref_uri_payload(
-    storage: &Storage,
-    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
-    bucket: &Bucket,
-    ref_uri: &str,
-) -> Result<Vec<u8>> {
-    let ref_name = ref_uri
-        .strip_prefix(MANIFEST_SEGMENT_REF_PREFIX)
-        .unwrap_or(ref_uri);
-    let record = read_metadata_writer_catalog_record(mvcc, bucket, ref_name)?
-        .ok_or_else(|| anyhow!("CoreStore writer segment catalog row is missing"))?;
-    let store = CoreStore::new(storage.clone()).await?;
-    store
-        .get_blob(GetBlob {
-            object_ref: decode_core_object_ref_target(&record.core_object_ref_target)?,
-        })
-        .await
-}
-
 fn metadata_writer_catalog_tuple_key(record: &WriterSegmentCatalogRecord) -> Result<Vec<u8>> {
     core_meta_tuple_key(&[
         CoreMetaTuplePart::Utf8(&record.family),
