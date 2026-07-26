@@ -4495,3 +4495,41 @@ message ReplicationStreamResponse {
     ReplicationHeartbeat heartbeat = 4;
   }
 }
+
+// Persistent OpenRaft transport. The first frame authenticates one connection
+// session; subsequent RPC frames reuse that authorization decision.
+service ConsensusTransport {
+  rpc Exchange(stream ConsensusStreamRequest) returns (stream ConsensusStreamResponse);
+}
+
+message ConsensusSessionOpen {
+  uint64 node_id = 1;
+  uint64 node_incarnation = 2;
+}
+
+message ConsensusRpcFrame {
+  uint64 request_id = 1;
+  uint32 schema_version = 2;
+  uint32 kind = 3;
+  bytes payload = 4;
+}
+
+message ConsensusRpcReply {
+  uint64 request_id = 1;
+  bytes payload = 2;
+  string error = 3;
+}
+
+message ConsensusStreamRequest {
+  oneof message {
+    ConsensusSessionOpen open = 1;
+    ConsensusRpcFrame rpc = 2;
+  }
+}
+
+message ConsensusStreamResponse {
+  oneof message {
+    string accepted_session_id = 1;
+    ConsensusRpcReply reply = 2;
+  }
+}

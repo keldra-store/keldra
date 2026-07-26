@@ -5,6 +5,7 @@ pub mod auth;
 pub(crate) mod authz_status;
 pub mod bucket;
 pub mod collection_cursor;
+pub mod consensus_transport;
 pub mod coordination;
 pub(crate) mod core_store_status;
 pub mod corestore_internal;
