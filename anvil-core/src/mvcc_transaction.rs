@@ -4,7 +4,7 @@
 //! logical mutation. Bundle persistence and replication happen outside Raft;
 //! only [`CertificationRequest`] is submitted to consensus.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::Arc};
 
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
@@ -82,6 +82,75 @@ pub struct ObjectShardManifestReference {
     pub stripe_count: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OwnedResource {
+    LogicalKey(LogicalKey),
+    Range {
+        table_id: u16,
+        start_application_key: Option<Vec<u8>>,
+        end_application_key: Option<Vec<u8>>,
+    },
+    Manifest {
+        object_hash: String,
+        manifest_hash: String,
+        encoding_generation: u64,
+    },
+    OutboxEvent {
+        payload_hash: [u8; 32],
+    },
+    MaterialisationJob {
+        payload_hash: [u8; 32],
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ClusterOwnershipClaim {
+    cluster_id: String,
+    resource: OwnedResource,
+}
+
+impl ClusterOwnershipClaim {
+    fn new(cluster_id: impl Into<String>, resource: OwnedResource) -> Self {
+        Self {
+            cluster_id: cluster_id.into(),
+            resource,
+        }
+    }
+
+    pub fn cluster_id(&self) -> &str {
+        &self.cluster_id
+    }
+
+    pub fn resource(&self) -> &OwnedResource {
+        &self.resource
+    }
+}
+
+pub trait ClusterOwnershipResolver: Send + Sync {
+    fn validate_claim(
+        &self,
+        transaction_cluster_id: &str,
+        claim: &ClusterOwnershipClaim,
+    ) -> Result<()>;
+}
+
+#[derive(Debug)]
+pub struct RoutingIssuedOwnership;
+
+impl ClusterOwnershipResolver for RoutingIssuedOwnership {
+    fn validate_claim(
+        &self,
+        transaction_cluster_id: &str,
+        claim: &ClusterOwnershipClaim,
+    ) -> Result<()> {
+        if claim.cluster_id != transaction_cluster_id {
+            bail!("transaction resource belongs to another cluster");
+        }
+        Ok(())
+    }
+}
+
 /// Canonically encoded transaction data persisted and replicated outside Raft.
 ///
 /// A bundle deliberately has no partition or publication scope. One bundle may
@@ -100,6 +169,7 @@ pub struct TransactionBundle {
     pub shard_manifests: Vec<ObjectShardManifestReference>,
     pub outbox_events: Vec<Vec<u8>>,
     pub materialisation_jobs: Vec<Vec<u8>>,
+    pub ownership_claims: Vec<ClusterOwnershipClaim>,
 }
 
 impl TransactionBundle {
@@ -207,6 +277,11 @@ impl TransactionBundle {
             if job.cluster_id != self.cluster_id || job.transaction_id != self.transaction_id {
                 bail!("materialisation job belongs to another transaction or cluster");
             }
+        }
+        self.ownership_claims.sort();
+        ensure_unique(self.ownership_claims.iter(), "ownership claim")?;
+        if self.ownership_claims != expected_ownership_claims(self) {
+            bail!("transaction bundle ownership claims do not cover its resources");
         }
         Ok(())
     }
@@ -318,6 +393,7 @@ impl TransactionBundleBuilder {
                 shard_manifests: Vec::new(),
                 outbox_events: Vec::new(),
                 materialisation_jobs: Vec::new(),
+                ownership_claims: Vec::new(),
             },
             range_scheme,
             advanced_range_stamps: BTreeSet::new(),
@@ -330,9 +406,10 @@ impl TransactionBundleBuilder {
         observed_version: Option<CommitVersion>,
     ) -> &mut Self {
         self.bundle.point_observations.push(PointObservation {
-            key,
+            key: key.clone(),
             observed_version,
         });
+        self.claim(OwnedResource::LogicalKey(key));
         self
     }
 
@@ -365,21 +442,28 @@ impl TransactionBundleBuilder {
         )?;
         self.bundle.range_observations.push(RangeObservation {
             table_id,
-            start_application_key,
-            end_application_key,
+            start_application_key: start_application_key.clone(),
+            end_application_key: end_application_key.clone(),
             conflict_key,
             observed_range_stamp,
+        });
+        self.claim(OwnedResource::Range {
+            table_id,
+            start_application_key,
+            end_application_key,
         });
         Ok(self)
     }
 
     pub fn put(&mut self, key: LogicalKey, value: Vec<u8>) -> &mut Self {
+        self.claim(OwnedResource::LogicalKey(key.clone()));
         self.advance_write_stamps(&key);
         self.bundle.writes.push(WriteOperation::Put { key, value });
         self
     }
 
     pub fn delete(&mut self, key: LogicalKey) -> &mut Self {
+        self.claim(OwnedResource::LogicalKey(key.clone()));
         self.advance_write_stamps(&key);
         self.bundle.writes.push(WriteOperation::Delete { key });
         self
@@ -398,16 +482,19 @@ impl TransactionBundleBuilder {
     }
 
     pub fn add_shard_manifest(&mut self, manifest: ObjectShardManifestReference) -> &mut Self {
+        self.claim(manifest_resource(&manifest));
         self.bundle.shard_manifests.push(manifest);
         self
     }
 
     pub fn add_outbox_event(&mut self, event: Vec<u8>) -> &mut Self {
+        self.claim(payload_resource(&event, true));
         self.bundle.outbox_events.push(event);
         self
     }
 
     pub fn add_materialisation_job(&mut self, job: Vec<u8>) -> &mut Self {
+        self.claim(payload_resource(&job, false));
         self.bundle.materialisation_jobs.push(job);
         self
     }
@@ -421,6 +508,73 @@ impl TransactionBundleBuilder {
     fn advance_write_stamps(&mut self, key: &LogicalKey) {
         self.advanced_range_stamps
             .extend(self.range_scheme.write_keys(key));
+    }
+
+    fn claim(&mut self, resource: OwnedResource) {
+        let claim = ClusterOwnershipClaim::new(self.bundle.cluster_id.clone(), resource);
+        if !self.bundle.ownership_claims.contains(&claim) {
+            self.bundle.ownership_claims.push(claim);
+        }
+    }
+}
+
+fn expected_ownership_claims(bundle: &TransactionBundle) -> Vec<ClusterOwnershipClaim> {
+    let mut resources = BTreeSet::new();
+    resources.extend(
+        bundle
+            .point_observations
+            .iter()
+            .map(|entry| OwnedResource::LogicalKey(entry.key.clone())),
+    );
+    resources.extend(
+        bundle
+            .writes
+            .iter()
+            .map(|entry| OwnedResource::LogicalKey(entry.key().clone())),
+    );
+    resources.extend(
+        bundle
+            .range_observations
+            .iter()
+            .map(|entry| OwnedResource::Range {
+                table_id: entry.table_id,
+                start_application_key: entry.start_application_key.clone(),
+                end_application_key: entry.end_application_key.clone(),
+            }),
+    );
+    resources.extend(bundle.shard_manifests.iter().map(manifest_resource));
+    resources.extend(
+        bundle
+            .outbox_events
+            .iter()
+            .map(|payload| payload_resource(payload, true)),
+    );
+    resources.extend(
+        bundle
+            .materialisation_jobs
+            .iter()
+            .map(|payload| payload_resource(payload, false)),
+    );
+    resources
+        .into_iter()
+        .map(|resource| ClusterOwnershipClaim::new(bundle.cluster_id.clone(), resource))
+        .collect()
+}
+
+fn manifest_resource(manifest: &ObjectShardManifestReference) -> OwnedResource {
+    OwnedResource::Manifest {
+        object_hash: manifest.object_hash.clone(),
+        manifest_hash: manifest.manifest_hash.clone(),
+        encoding_generation: manifest.encoding_generation,
+    }
+}
+
+fn payload_resource(payload: &[u8], outbox: bool) -> OwnedResource {
+    let payload_hash = *blake3::hash(payload).as_bytes();
+    if outbox {
+        OwnedResource::OutboxEvent { payload_hash }
+    } else {
+        OwnedResource::MaterialisationJob { payload_hash }
     }
 }
 
@@ -669,6 +823,7 @@ pub struct TransactionCoordinator<S, R, C> {
     certifier: C,
     policy: DurabilityPolicy,
     resource_limits: TransactionResourceLimits,
+    ownership_resolver: Arc<dyn ClusterOwnershipResolver>,
 }
 
 impl<S, R, C> TransactionCoordinator<S, R, C>
@@ -687,6 +842,7 @@ where
             certifier,
             policy,
             resource_limits: TransactionResourceLimits::default(),
+            ownership_resolver: Arc::new(RoutingIssuedOwnership),
         })
     }
 
@@ -699,6 +855,14 @@ where
         Ok(self)
     }
 
+    pub fn with_ownership_resolver(
+        mut self,
+        ownership_resolver: Arc<dyn ClusterOwnershipResolver>,
+    ) -> Self {
+        self.ownership_resolver = ownership_resolver;
+        self
+    }
+
     pub async fn snapshot(&self, consistency: ReadConsistency) -> Result<CommitVersion> {
         self.certifier.observed_commit_version(consistency).await
     }
@@ -709,6 +873,10 @@ where
         durability: DurabilityLevel,
     ) -> Result<CertificationResult> {
         bundle.canonicalize()?;
+        for claim in &bundle.ownership_claims {
+            self.ownership_resolver
+                .validate_claim(&bundle.cluster_id, claim)?;
+        }
         let bytes = bundle.canonical_bytes()?;
         self.resource_limits.validate_bundle(&bundle, &bytes)?;
         let identity = bundle.identity()?;
@@ -1142,6 +1310,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn canonical_bundle_rejects_missing_or_forged_ownership_claims() {
+        let mut builder = TransactionBundleBuilder::new(
+            "cluster",
+            "ownership",
+            0,
+            "principal",
+            HierarchicalRangeStampScheme::new(),
+        );
+        builder.put(
+            LogicalKey {
+                table_id: 1,
+                application_key: b"key".to_vec(),
+            },
+            b"value".to_vec(),
+        );
+        let mut missing = builder.build().unwrap();
+        missing.ownership_claims.clear();
+        assert!(
+            missing
+                .canonicalize()
+                .unwrap_err()
+                .to_string()
+                .contains("ownership claims")
+        );
+    }
+
     struct Store;
 
     #[async_trait]
@@ -1228,48 +1423,58 @@ mod tests {
         format!("sha256:{}", "a".repeat(64))
     }
 
-    fn bundle(with_object: bool) -> TransactionBundle {
-        TransactionBundle {
-            schema: TransactionBundle::SCHEMA.to_string(),
-            cluster_id: "cluster".to_string(),
-            transaction_id: "tx-1".to_string(),
-            snapshot_version: 41,
-            authenticated_principal: "tenant/1/principal/app".to_string(),
-            point_observations: Vec::new(),
-            range_observations: Vec::new(),
-            advanced_range_stamps: Vec::new(),
-            writes: vec![
-                WriteOperation::Put {
-                    key: LogicalKey {
-                        table_id: 9,
-                        application_key: b"partition-b/key".to_vec(),
-                    },
-                    value: b"second".to_vec(),
-                },
-                WriteOperation::Put {
-                    key: LogicalKey {
-                        table_id: 3,
-                        application_key: b"partition-a/key".to_vec(),
-                    },
-                    value: b"first".to_vec(),
-                },
-            ],
-            shard_manifests: if with_object {
-                vec![ObjectShardManifestReference {
-                    object_hash: test_object_hash(),
-                    manifest_hash: format!("sha256:{}", "b".repeat(64)),
-                    object_length: 1024,
-                    encoding_generation: 1,
-                    data_shards: 2,
-                    parity_shards: 2,
-                    stripe_count: 1,
-                }]
-            } else {
-                Vec::new()
-            },
-            outbox_events: Vec::new(),
-            materialisation_jobs: Vec::new(),
+    struct RejectTableNine;
+
+    impl ClusterOwnershipResolver for RejectTableNine {
+        fn validate_claim(
+            &self,
+            _transaction_cluster_id: &str,
+            claim: &ClusterOwnershipClaim,
+        ) -> Result<()> {
+            if matches!(
+                claim.resource(),
+                OwnedResource::LogicalKey(LogicalKey { table_id: 9, .. })
+            ) {
+                bail!("routing resolved resource to another cluster");
+            }
+            Ok(())
         }
+    }
+
+    fn bundle(with_object: bool) -> TransactionBundle {
+        let mut builder = TransactionBundleBuilder::new(
+            "cluster",
+            "tx-1",
+            41,
+            "tenant/1/principal/app",
+            HierarchicalRangeStampScheme::new(),
+        );
+        builder.put(
+            LogicalKey {
+                table_id: 9,
+                application_key: b"partition-b/key".to_vec(),
+            },
+            b"second".to_vec(),
+        );
+        builder.put(
+            LogicalKey {
+                table_id: 3,
+                application_key: b"partition-a/key".to_vec(),
+            },
+            b"first".to_vec(),
+        );
+        if with_object {
+            builder.add_shard_manifest(ObjectShardManifestReference {
+                object_hash: test_object_hash(),
+                manifest_hash: format!("sha256:{}", "b".repeat(64)),
+                object_length: 1024,
+                encoding_generation: 1,
+                data_shards: 2,
+                parity_shards: 2,
+                stripe_count: 1,
+            });
+        }
+        builder.build().unwrap()
     }
 
     #[tokio::test]
@@ -1301,6 +1506,27 @@ mod tests {
         assert_eq!(request.written_keys.len(), 2);
         assert_eq!(request.written_keys[0].table_id, 3);
         assert_eq!(request.written_keys[1].table_id, 9);
+    }
+
+    #[tokio::test]
+    async fn routing_resolver_rejects_foreign_resource_before_preparation() {
+        let coordinator = TransactionCoordinator::new(
+            Store,
+            Replicator(ReplicationEvidence::default()),
+            Certifier::default(),
+            DurabilityPolicy {
+                bundle_quorum_holders: 1,
+                tolerated_failure_domains: 0,
+            },
+        )
+        .unwrap()
+        .with_ownership_resolver(Arc::new(RejectTableNine));
+
+        let error = coordinator
+            .commit(bundle(false), DurabilityLevel::Local)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("another cluster"));
     }
 
     #[tokio::test]

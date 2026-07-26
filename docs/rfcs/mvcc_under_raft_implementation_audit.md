@@ -38,7 +38,7 @@ Status values:
 | Tombstones must retain and hide older versions by snapshot | Implemented | `WriteOperation::Delete` stores a tombstone; snapshot/tombstone tests cover visibility before and after deletion. |
 | Read-only transactions must not create an application log entry | Implemented | `OpenTransactionRegistry::commit` now resolves a read-only bundle at its snapshot without invoking the runtime; focused retry/no-proposal test added in `972391d`. |
 | Transactions may cross arbitrary tables, partitions, tenants and features inside one cluster | Partial | Bundle and registry types are scope-free and cross-table tests exist. Several product paths have moved to logical MVCC mutations, but not every reachable write path has been converted. |
-| Transactions must reject keys owned by another cluster before preparation | Partial | The transaction is permanently cluster-bound and foreign `cluster_id` RPCs/bundles are rejected. `LogicalKey` has no general ownership resolver, so arbitrary staged keys are not independently resolved to a cluster. |
+| Transactions must reject resources owned by another cluster before preparation | Implemented | Routing remains authoritative rather than deriving ownership from key hashes. Canonical bundles carry an exact `ClusterOwnershipClaim` set for every observed/written logical key, range, manifest, outbox event and materialisation job. Canonicalization rejects missing/forged coverage, and the coordinator invokes an injectable `ClusterOwnershipResolver` for every claim before bundle persistence or replication. Open transaction staging also retains its routing-issued owning-cluster check. |
 | Explicit uniqueness/CAS predicates must certify deterministically | Partial | Point observations cover create/update conflicts, but the bundle and consensus command have no distinct `explicit_predicates` representation described by the RFC. |
 | Define limits for observations, writes, command bytes, bundle bytes and raw payload bytes | Implemented | `TransactionResourceLimits` provides validated configurable limits with conservative defaults. The coordinator rejects point/range/write counts, canonical bundle bytes and aggregate raw payload bytes before prepared persistence; the adapter independently rejects an oversized encoded certification command before Raft. Focused tests cover every dimension. |
 
@@ -89,6 +89,5 @@ Status values:
 
 1. Finish deleting every reachable CoreStore explicit-transaction and receipt/publication path; remove MVCC/physical fallback reads rather than treating them as migration support.
 2. Wire the existing bounded-stripe `DistributedIngest` and final-target shard streams into every applicable public streaming upload path; remove legacy/raw alternatives and add public-API durability tests.
-3. Add a general logical-key-to-cluster ownership resolver and validate every observation, mutation, manifest, event and job before bundle persistence.
-4. Implement safe MVCC, bundle, shard and conflict-state GC with active-snapshot and catch-up protection.
-5. Add the required observability, fault matrix and benchmark suite.
+3. Implement safe MVCC, bundle, shard and conflict-state GC with active-snapshot and catch-up protection.
+4. Add the required observability, fault matrix and benchmark suite.
