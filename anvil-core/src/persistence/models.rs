@@ -10,7 +10,7 @@ impl Persistence {
     ) -> Result<()> {
         let permit = self.model_write_permit().await?;
         model_journal::create_model_artifact_with_permit(
-            &self.storage,
+            self.mvcc()?,
             artifact_id,
             bucket_id,
             key,
@@ -28,7 +28,7 @@ impl Persistence {
     ) -> Result<()> {
         let permit = self.model_write_permit().await?;
         model_journal::create_model_tensors_with_permit(
-            &self.storage,
+            self.mvcc()?,
             artifact_id,
             tensors,
             &permit,
@@ -43,7 +43,7 @@ impl Persistence {
         after_cursor: Option<&[u8]>,
         limit: usize,
     ) -> Result<model_journal::ModelTensorPage> {
-        model_journal::list_tensor_page(&self.storage, artifact_id, after_cursor, limit).await
+        model_journal::list_tensor_page(self.mvcc()?, artifact_id, after_cursor, limit).await
     }
 
     pub async fn get_tensor_metadata(
@@ -51,14 +51,14 @@ impl Persistence {
         artifact_id: &str,
         tensor_name: &str,
     ) -> Result<Option<crate::anvil_api::TensorIndexRow>> {
-        model_journal::get_tensor_metadata(&self.storage, artifact_id, tensor_name).await
+        model_journal::get_tensor_metadata(self.mvcc()?, artifact_id, tensor_name)
     }
 
     pub async fn get_model_artifact(
         &self,
         artifact_id: &str,
     ) -> Result<Option<crate::anvil_api::ModelManifest>> {
-        model_journal::get_model_artifact(&self.storage, artifact_id).await
+        model_journal::get_model_artifact(self.mvcc()?, artifact_id)
     }
 
     pub async fn get_tensor_metadata_recursive(

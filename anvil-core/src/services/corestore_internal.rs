@@ -1626,7 +1626,7 @@ impl AntiEntropyInternal for AppState {
             .unwrap_or("cluster")
             .to_string();
         let diagnostic = diagnostic_store::write_diagnostic_object(
-            &self.storage,
+            &self.mvcc,
             diagnostic_store::DiagnosticWrite {
                 diagnostic_id: finding_id.clone(),
                 scope_kind,

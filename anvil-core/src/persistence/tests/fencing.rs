@@ -152,11 +152,6 @@ async fn persistence_global_journal_writes_use_current_fence_tokens() {
                 .await
                 .unwrap();
         assert!(task_fences.iter().all(|fence| *fence > 0));
-        let model_fences =
-            crate::model_journal::read_model_frame_fences_for_test(&persistence.storage)
-                .await
-                .unwrap();
-        assert!(model_fences.iter().all(|fence| *fence > 0));
         let hf_fences = crate::hf_journal::read_hf_frame_fences_for_test(&persistence.storage)
             .await
             .expect("hf metadata journal fences");
