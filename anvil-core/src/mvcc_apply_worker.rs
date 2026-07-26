@@ -492,6 +492,7 @@ mod tests {
                     cluster_id: "cluster".into(),
                     node: remote.clone(),
                     failure_domain: "zone-b".into(),
+                    voter: true,
                 },
                 &identity,
                 &bytes,

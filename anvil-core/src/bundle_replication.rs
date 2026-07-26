@@ -322,6 +322,12 @@ pub struct BundleTarget {
     pub cluster_id: String,
     pub node: NodeIncarnation,
     pub failure_domain: String,
+    /// Whether this target is a voter in the membership used for selection.
+    ///
+    /// Learners may hold opportunistic copies, but voters are attempted first.
+    /// The Raft state machine revalidates holder safety against its
+    /// authoritative applied membership.
+    pub voter: bool,
 }
 
 #[async_trait]
@@ -420,7 +426,12 @@ impl<T> StreamingBundleReplicator<T> {
         mut targets: Vec<BundleTarget>,
         objects: ObjectEvidenceRegistry,
     ) -> Result<Self> {
-        targets.sort_by(|left, right| left.node.cmp(&right.node));
+        targets.sort_by(|left, right| {
+            right
+                .voter
+                .cmp(&left.voter)
+                .then_with(|| left.node.cmp(&right.node))
+        });
         let mut nodes = BTreeSet::new();
         for target in &targets {
             if target.cluster_id.trim().is_empty()
@@ -455,7 +466,19 @@ impl<T: BundleTargetStream> BundleReplicator for StreamingBundleReplicator<T> {
         if durability != DurabilityLevel::Local {
             let expected_hash = parse_sha256(&identity.hash)?;
             for target in &self.targets {
-                let ack = self.transport.send_bundle(target, identity, bytes).await?;
+                let ack = match self.transport.send_bundle(target, identity, bytes).await {
+                    Ok(ack) => ack,
+                    Err(error) => {
+                        tracing::warn!(
+                            node_id = %target.node.node_id,
+                            incarnation = target.node.incarnation,
+                            voter = target.voter,
+                            %error,
+                            "bundle target failed before durable completion ACK"
+                        );
+                        continue;
+                    }
+                };
                 if ack.status == AckStatus::Complete
                     && ack.completed_hash == Some(expected_hash)
                     && ack.persisted_through == identity.length
@@ -759,6 +782,7 @@ mod tests {
     struct Transport {
         status_by_node: BTreeMap<String, AckStatus>,
         corrupt_hash_node: Option<String>,
+        failed_nodes: BTreeSet<String>,
     }
 
     #[async_trait]
@@ -769,6 +793,9 @@ mod tests {
             identity: &BundleIdentity,
             _bytes: &[u8],
         ) -> Result<ReplicationAck> {
+            if self.failed_nodes.contains(&target.node.node_id) {
+                bail!("target is unavailable");
+            }
             let status = self
                 .status_by_node
                 .get(&target.node.node_id)
@@ -795,6 +822,7 @@ mod tests {
             cluster_id: "cluster-a".into(),
             node: node(id),
             failure_domain: domain.to_string(),
+            voter: true,
         }
     }
 
@@ -838,6 +866,7 @@ mod tests {
             Transport {
                 status_by_node: BTreeMap::from([("node-b".into(), AckStatus::Persisted)]),
                 corrupt_hash_node: Some("node-c".into()),
+                failed_nodes: BTreeSet::new(),
             },
             vec![
                 target("node-a", "zone-a"),
@@ -921,5 +950,55 @@ mod tests {
             .unwrap();
         assert!(evidence.bundle_holders.is_empty());
         assert_eq!(evidence.objects, vec![local]);
+    }
+
+    #[tokio::test]
+    async fn quorum_collects_complete_acks_despite_optional_target_failure() {
+        let replicator = StreamingBundleReplicator::new(
+            Transport {
+                status_by_node: BTreeMap::new(),
+                corrupt_hash_node: None,
+                failed_nodes: BTreeSet::from(["node-c".into()]),
+            },
+            vec![
+                target("node-a", "zone-a"),
+                target("node-b", "zone-b"),
+                target("node-c", "zone-c"),
+            ],
+            ObjectEvidenceRegistry::default(),
+        )
+        .unwrap();
+        let bytes = b"bundle";
+        let evidence = replicator
+            .replicate(&identity(bytes), bytes, &[], DurabilityLevel::Quorum)
+            .await
+            .unwrap();
+        assert_eq!(
+            evidence
+                .bundle_holders
+                .iter()
+                .map(|holder| holder.node.node_id.as_str())
+                .collect::<Vec<_>>(),
+            ["node-a", "node-b"]
+        );
+    }
+
+    #[test]
+    fn voters_are_attempted_before_learners() {
+        let mut learner = target("node-a", "zone-a");
+        learner.voter = false;
+        let voter = target("node-z", "zone-z");
+        let replicator = StreamingBundleReplicator::new(
+            Transport {
+                status_by_node: BTreeMap::new(),
+                corrupt_hash_node: None,
+                failed_nodes: BTreeSet::new(),
+            },
+            vec![learner, voter],
+            ObjectEvidenceRegistry::default(),
+        )
+        .unwrap();
+        assert!(replicator.targets[0].voter);
+        assert_eq!(replicator.targets[0].node.node_id, "node-z");
     }
 }

@@ -220,6 +220,29 @@ impl MachineState {
     }
 }
 
+/// A holder set intersects every election quorum exactly when its complement
+/// cannot itself form an election quorum. For a joint membership, a valid
+/// election quorum must contain a majority of every constituent voter set, so
+/// holding at least half (rounded up) of any one constituent set is sufficient
+/// to force that intersection.
+fn holders_intersect_every_election_quorum(
+    membership: &StoredMembership<u64, BasicNode>,
+    holder_raft_ids: &BTreeSet<u64>,
+) -> bool {
+    membership
+        .membership()
+        .get_joint_config()
+        .iter()
+        .any(|voters| {
+            !voters.is_empty()
+                && voters
+                    .iter()
+                    .filter(|node_id| holder_raft_ids.contains(node_id))
+                    .count()
+                    >= voters.len().div_ceil(2)
+        })
+}
+
 /// Concrete OpenRaft V2 log store backed by the existing RocksDB.
 #[derive(Clone)]
 pub(crate) struct OpenRaftLogStore {
@@ -297,7 +320,7 @@ pub struct OpenRaftConsensus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppliedControlSnapshot {
     pub topology_epoch: u64,
-    pub nodes: Vec<(NodeId, u64, String)>,
+    pub nodes: Vec<(NodeId, NodeId, u64, String)>,
     pub partitions: Vec<(u64, crate::PartitionAssignment)>,
     pub durability_policy: crate::ConsensusDurabilityPolicy,
 }
@@ -314,7 +337,9 @@ impl OpenRaftConsensus {
             nodes: state
                 .control
                 .nodes()
-                .map(|(id, incarnation, domain)| (id, incarnation, domain.to_string()))
+                .map(|(id, raft_id, incarnation, domain)| {
+                    (id, raft_id, incarnation, domain.to_string())
+                })
                 .collect(),
             partitions: state
                 .control
@@ -885,7 +910,17 @@ impl RaftStateMachine<AnvilRaftConfig> for OpenRaftStateMachine {
                             state.control.node_incarnation(holder.node_id)
                                 == Some(holder.incarnation)
                         })
-                        .count();
+                        .collect::<Vec<_>>();
+                    let holder_raft_ids = current_holders
+                        .iter()
+                        .filter_map(|holder| state.control.raft_node_id(holder.node_id))
+                        .map(|node_id| node_id.0)
+                        .collect::<BTreeSet<_>>();
+                    let voter_safe = matches!(command.durability, crate::DurabilityLevel::Local)
+                        || holders_intersect_every_election_quorum(
+                            &state.membership,
+                            &holder_raft_ids,
+                        );
                     let assignments_current =
                         command.assignment_predicates.iter().all(|predicate| {
                             state.control.topology_epoch() == predicate.topology_epoch
@@ -898,7 +933,8 @@ impl RaftStateMachine<AnvilRaftConfig> for OpenRaftStateMachine {
                         });
                     if policy.generation == 0
                         || required_holders == 0
-                        || current_holders < required_holders
+                        || current_holders.len() < required_holders
+                        || !voter_safe
                     {
                         RaftApplyResult::Rejected(
                             "durability evidence violates applied Raft control state".into(),
@@ -1034,7 +1070,7 @@ mod tests {
         time::Duration,
     };
 
-    use openraft::{CommittedLeaderId, RaftTypeConfig, storage::RaftLogStorage};
+    use openraft::{CommittedLeaderId, Membership, RaftTypeConfig, storage::RaftLogStorage};
     use tempfile::TempDir;
 
     use super::*;
@@ -1070,6 +1106,44 @@ mod tests {
         let (log, state) =
             stores(RocksRaftStore::open(directory.path(), 0).unwrap(), [1; 32]).unwrap();
         drop((log, state));
+    }
+
+    #[test]
+    fn bundle_holders_must_intersect_every_regular_election_quorum() {
+        let membership = StoredMembership::new(
+            None,
+            Membership::new(
+                vec![BTreeSet::from([1, 2, 3, 4, 5])],
+                BTreeSet::from([1, 2, 3, 4, 5, 9]),
+            ),
+        );
+        assert!(holders_intersect_every_election_quorum(
+            &membership,
+            &BTreeSet::from([1, 2, 3]),
+        ));
+        assert!(!holders_intersect_every_election_quorum(
+            &membership,
+            &BTreeSet::from([1, 2, 9]),
+        ));
+    }
+
+    #[test]
+    fn joint_membership_uses_voters_and_never_counts_arbitrary_learners() {
+        let membership = StoredMembership::new(
+            None,
+            Membership::new(
+                vec![BTreeSet::from([1, 2, 3]), BTreeSet::from([3, 4, 5])],
+                BTreeSet::from([1, 2, 3, 4, 5, 9, 10]),
+            ),
+        );
+        assert!(holders_intersect_every_election_quorum(
+            &membership,
+            &BTreeSet::from([1, 2, 9]),
+        ));
+        assert!(!holders_intersect_every_election_quorum(
+            &membership,
+            &BTreeSet::from([1, 9, 10]),
+        ));
     }
 
     #[test]
@@ -1392,6 +1466,7 @@ mod tests {
                         node_id: NodeId(1),
                         incarnation: 1,
                     },
+                    NodeId(1),
                     "zone-a".into(),
                 )
                 .await

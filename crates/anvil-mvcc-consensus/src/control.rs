@@ -11,6 +11,7 @@ use crate::{
 pub struct ClusterControlState {
     cluster_id_hash: [u8; 32],
     nodes: BTreeMap<NodeId, u64>,
+    raft_node_ids: BTreeMap<NodeId, NodeId>,
     node_failure_domains: BTreeMap<NodeId, String>,
     incarnation_fences: BTreeMap<NodeId, u64>,
     partitions: BTreeMap<u64, PartitionAssignment>,
@@ -27,6 +28,7 @@ impl ClusterControlState {
         Ok(Self {
             cluster_id_hash,
             nodes: BTreeMap::new(),
+            raft_node_ids: BTreeMap::new(),
             node_failure_domains: BTreeMap::new(),
             incarnation_fences: BTreeMap::new(),
             partitions: BTreeMap::new(),
@@ -44,11 +46,17 @@ impl ClusterControlState {
         self.nodes.get(&node_id).copied()
     }
 
-    pub fn nodes(&self) -> impl Iterator<Item = (NodeId, u64, &str)> {
+    pub fn raft_node_id(&self, node_id: NodeId) -> Option<NodeId> {
+        self.raft_node_ids.get(&node_id).copied()
+    }
+
+    pub fn nodes(&self) -> impl Iterator<Item = (NodeId, NodeId, u64, &str)> {
         self.nodes.iter().filter_map(|(node_id, incarnation)| {
-            self.node_failure_domains
-                .get(node_id)
-                .map(|domain| (*node_id, *incarnation, domain.as_str()))
+            self.raft_node_ids.get(node_id).and_then(|raft_node_id| {
+                self.node_failure_domains
+                    .get(node_id)
+                    .map(|domain| (*node_id, *raft_node_id, *incarnation, domain.as_str()))
+            })
         })
     }
 
@@ -86,12 +94,23 @@ impl ClusterControlState {
             ConsensusCommand::Certify(_) => Err("certification is not a control command".into()),
             ConsensusCommand::InstallNode {
                 node,
+                raft_node_id,
                 failure_domain,
                 ..
             } => {
-                if node.node_id.0 == 0 || node.incarnation == 0 || failure_domain.trim().is_empty()
+                if node.node_id.0 == 0
+                    || raft_node_id.0 == 0
+                    || node.incarnation == 0
+                    || failure_domain.trim().is_empty()
                 {
                     return Err("node identity and incarnation must be non-zero".into());
+                }
+                if self
+                    .raft_node_ids
+                    .iter()
+                    .any(|(installed, id)| installed != &node.node_id && id == raft_node_id)
+                {
+                    return Err("Raft node ID is already bound to another product node".into());
                 }
                 let fence = self.incarnation_fence(node.node_id);
                 let current = self.node_incarnation(node.node_id).unwrap_or(0);
@@ -99,6 +118,7 @@ impl ClusterControlState {
                     return Err("node incarnation must advance its durable fence".into());
                 }
                 self.nodes.insert(node.node_id, node.incarnation);
+                self.raft_node_ids.insert(node.node_id, *raft_node_id);
                 self.node_failure_domains
                     .insert(node.node_id, failure_domain.clone());
                 self.incarnation_fences
@@ -118,6 +138,7 @@ impl ClusterControlState {
                     return Err("node still owns authoritative partitions".into());
                 }
                 self.nodes.remove(&node.node_id);
+                self.raft_node_ids.remove(&node.node_id);
                 self.node_failure_domains.remove(&node.node_id);
                 self.incarnation_fences
                     .insert(node.node_id, node.incarnation);
@@ -207,6 +228,7 @@ mod tests {
             .apply(&ConsensusCommand::InstallNode {
                 cluster_id_hash: CLUSTER,
                 node: node(1),
+                raft_node_id: NodeId(1),
                 failure_domain: "zone-a".into(),
             })
             .unwrap();
@@ -269,6 +291,7 @@ mod tests {
             .apply(&ConsensusCommand::InstallNode {
                 cluster_id_hash: CLUSTER,
                 node: node(1),
+                raft_node_id: NodeId(1),
                 failure_domain: "zone-a".into(),
             })
             .unwrap();
@@ -283,6 +306,7 @@ mod tests {
                 .apply(&ConsensusCommand::InstallNode {
                     cluster_id_hash: CLUSTER,
                     node: node(1),
+                    raft_node_id: NodeId(1),
                     failure_domain: "zone-a".into(),
                 })
                 .is_err()
@@ -291,6 +315,7 @@ mod tests {
             .apply(&ConsensusCommand::InstallNode {
                 cluster_id_hash: CLUSTER,
                 node: node(2),
+                raft_node_id: NodeId(1),
                 failure_domain: "zone-a".into(),
             })
             .unwrap();
@@ -303,13 +328,14 @@ mod tests {
             .apply(&ConsensusCommand::InstallNode {
                 cluster_id_hash: CLUSTER,
                 node: node(1),
+                raft_node_id: NodeId(1),
                 failure_domain: "zone-a".into(),
             })
             .unwrap();
         let node_epoch = state.topology_epoch();
         assert_eq!(
             state.nodes().collect::<Vec<_>>(),
-            vec![(NodeId(1), 1, "zone-a")]
+            vec![(NodeId(1), NodeId(1), 1, "zone-a")]
         );
         state
             .apply(&ConsensusCommand::SetDurabilityPolicy {

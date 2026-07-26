@@ -1333,6 +1333,7 @@ mod app_state_tests {
                 incarnation: 1,
             },
             failure_domain: "zone-2".into(),
+            voter: true,
         };
         let foreign_error = states[0]
             .mvcc

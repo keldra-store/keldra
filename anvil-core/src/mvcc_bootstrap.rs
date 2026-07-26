@@ -201,11 +201,16 @@ impl NodeConnectionAuthorizer {
             .consensus
             .applied_control_snapshot()
             .map_err(|error| Status::unavailable(error.to_string()))?;
-        let installed = snapshot.nodes.iter().any(|(node_id, incarnation, domain)| {
-            *node_id == consensus_control_node_id(&peer.node_id)
-                && *incarnation == peer.incarnation
-                && domain == &peer.failure_domain
-        });
+        let installed =
+            snapshot
+                .nodes
+                .iter()
+                .any(|(node_id, raft_node_id, incarnation, domain)| {
+                    *node_id == consensus_control_node_id(&peer.node_id)
+                        && raft_node_id.0 == peer.raft_node_id
+                        && *incarnation == peer.incarnation
+                        && domain == &peer.failure_domain
+                });
         if !installed {
             return Err(Status::permission_denied(
                 "node incarnation or failure-domain assignment is stale in Raft control state",
@@ -317,11 +322,11 @@ impl MvccSubsystem {
             bail!("Raft durability policy is not installed");
         }
         let mut candidates = Vec::new();
-        for (raft_node_id, incarnation, failure_domain) in snapshot.nodes {
+        for (control_node_id, _raft_node_id, incarnation, failure_domain) in snapshot.nodes {
             let peer = self
                 .peers
                 .iter()
-                .find(|peer| consensus_control_node_id(&peer.node_id) == raft_node_id)
+                .find(|peer| consensus_control_node_id(&peer.node_id) == control_node_id)
                 .context("Raft control state names a node without a transport route")?;
             if peer.incarnation != incarnation {
                 bail!("Raft control state node incarnation is newer than its transport route");
@@ -426,6 +431,7 @@ impl MvccSubsystem {
                             node_id: consensus_control_node_id(&peer.node_id),
                             incarnation: peer.incarnation,
                         },
+                        NodeId(peer.raft_node_id),
                         peer.failure_domain.clone(),
                     )
                     .await
@@ -478,6 +484,7 @@ impl MvccSubsystem {
                     incarnation: peer.incarnation,
                 },
                 failure_domain: peer.failure_domain.clone(),
+                voter: peer.voter,
             })
             .collect();
         let prepared = AppendOnlyPreparedBundleStore::open(

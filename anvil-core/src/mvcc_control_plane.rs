@@ -184,15 +184,23 @@ impl MvccSubsystem {
     pub async fn install_cluster_node(
         &self,
         authorization: &AuthorizedClusterControl,
+        raft_node_id: u64,
         node: NodeIncarnation,
         failure_domain: String,
     ) -> Result<ControlApplyResult> {
         authorization.require(self.cluster_id(), ClusterControlPermission::Nodes)?;
         let control_node_id = consensus_control_node_id(&node.node_id);
         let snapshot = self.consensus.applied_control_snapshot()?;
-        if snapshot.nodes.iter().any(|(id, incarnation, domain)| {
-            *id == control_node_id && *incarnation == node.incarnation && *domain == failure_domain
-        }) {
+        if snapshot
+            .nodes
+            .iter()
+            .any(|(id, installed_raft_id, incarnation, domain)| {
+                *id == control_node_id
+                    && installed_raft_id.0 == raft_node_id
+                    && *incarnation == node.incarnation
+                    && *domain == failure_domain
+            })
+        {
             return Ok(ControlApplyResult::NodeInstalled(
                 ConsensusNodeIncarnation {
                     node_id: control_node_id,
@@ -207,6 +215,7 @@ impl MvccSubsystem {
                     node_id: control_node_id,
                     incarnation: node.incarnation,
                 },
+                NodeId(raft_node_id),
                 failure_domain,
             )
             .await

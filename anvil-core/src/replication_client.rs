@@ -973,6 +973,7 @@ mod tests {
             cluster_id: "cluster-a".into(),
             node: remote,
             failure_domain: "zone-b".into(),
+            voter: true,
         };
         let bytes = b"persistent-stream-bundle";
         let identity = bundle_identity(bytes);
@@ -1036,6 +1037,7 @@ mod tests {
                     cluster_id: "cluster-b".into(),
                     node: remote,
                     failure_domain: "zone-b".into(),
+                    voter: true,
                 },
                 &bundle_identity(bytes),
                 bytes,

@@ -340,6 +340,7 @@ fn bundle_target(node: &str, domain: &str) -> BundleTarget {
             incarnation: 1,
         },
         failure_domain: domain.into(),
+        voter: true,
     }
 }
 
