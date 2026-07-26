@@ -549,6 +549,135 @@ pub fn read_tenant_by_name_mvcc(
     }
 }
 
+pub fn read_app_by_id_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    app_id: i64,
+) -> Result<Option<App>> {
+    let Some(app) = read_stored_app_mvcc(mvcc, &app_id_tuple_key(app_id)?)? else {
+        return Ok(None);
+    };
+    if app.id != app_id {
+        bail!("control app-id row does not match its key");
+    }
+    Ok(Some(app_record(&app)))
+}
+
+pub fn read_app_by_tenant_name_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    name: &str,
+) -> Result<Option<App>> {
+    let Some(app) = read_stored_app_mvcc(mvcc, &app_tenant_name_tuple_key(tenant_id, name)?)?
+    else {
+        return Ok(None);
+    };
+    if app.tenant_id != tenant_id || app.name != name {
+        bail!("control tenant-app row does not match its key");
+    }
+    Ok(Some(app_record(&app)))
+}
+
+pub fn read_app_details_by_client_id_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    client_id: &str,
+) -> Result<Option<AppDetails>> {
+    let Some(app) = read_stored_app_mvcc(mvcc, &app_client_id_tuple_key(client_id)?)? else {
+        return Ok(None);
+    };
+    if app.client_id != client_id {
+        bail!("control app-client row does not match its key");
+    }
+    Ok(Some(AppDetails {
+        id: app.id,
+        tenant_id: app.tenant_id,
+        client_secret_encrypted: app.client_secret_encrypted,
+    }))
+}
+
+fn read_stored_app_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tuple_key: &[u8],
+) -> Result<Option<StoredControlApp>> {
+    match read_control_current_mvcc(mvcc, tuple_key)? {
+        Some(ControlCurrentRecord::App {
+            id,
+            tenant_id,
+            name,
+            client_id,
+            client_secret_encrypted,
+            active: true,
+        }) => Ok(Some(StoredControlApp {
+            id,
+            tenant_id,
+            name,
+            client_id,
+            client_secret_encrypted,
+        })),
+        Some(ControlCurrentRecord::App { active: false, .. }) | None => Ok(None),
+        Some(_) => bail!("control application row contains a different record type"),
+    }
+}
+
+pub fn page_apps_for_tenant_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    expected_revision: &str,
+    after_application_key: Option<&[u8]>,
+    page_size: usize,
+) -> Result<CurrentAppPage> {
+    if page_size == 0 || page_size > 1_000 {
+        bail!("application page size must be between 1 and 1000");
+    }
+    if current_control_collection_revision_mvcc(mvcc)? != expected_revision {
+        bail!("control application collection revision changed");
+    }
+    let snapshot = mvcc.runtime.applied_version()?;
+    let tuple_prefix = app_tenant_name_tuple_prefix(tenant_id)?;
+    let application_prefix =
+        crate::mvcc_product::coremeta_application_prefix(CF_MESH, &tuple_prefix)?;
+    let mut rows = mvcc.runtime.scan_table_prefix_at(
+        TABLE_CONTROL_CURRENT_ROW,
+        &application_prefix,
+        snapshot,
+    )?;
+    if let Some(after) = after_application_key {
+        rows.retain(|(key, _)| key.application_key.as_slice() > after);
+    }
+    let has_more = rows.len() > page_size;
+    rows.truncate(page_size);
+    let next_tuple_key = has_more
+        .then(|| rows.last().map(|(key, _)| key.application_key.clone()))
+        .flatten();
+    let mut apps = Vec::new();
+    for (_, row) in rows {
+        match decode_control_current_row(&row.value)? {
+            ControlCurrentRecord::App {
+                id,
+                tenant_id: row_tenant_id,
+                name,
+                client_id,
+                active: true,
+                ..
+            } if row_tenant_id == tenant_id => apps.push(App {
+                id,
+                name,
+                client_id,
+            }),
+            ControlCurrentRecord::App { .. } => {
+                bail!("tenant application collection contains an invalid row")
+            }
+            _ => bail!("tenant application collection contains a different record type"),
+        }
+    }
+    if current_control_collection_revision_mvcc(mvcc)? != expected_revision {
+        bail!("control application collection revision changed");
+    }
+    Ok(CurrentAppPage {
+        apps,
+        next_tuple_key,
+    })
+}
+
 fn read_control_current_mvcc(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tuple_key: &[u8],

@@ -18,7 +18,7 @@ struct ActiveIndexPolicyDefinitionProto {
 
 impl Persistence {
     pub async fn current_control_collection_revision(&self) -> Result<String> {
-        control_journal::current_control_collection_revision(&self.storage).await
+        control_journal::current_control_collection_revision_mvcc(self.mvcc()?)
     }
 
     pub async fn get_tenant_by_name(&self, name: &str) -> Result<Option<Tenant>> {
@@ -36,7 +36,7 @@ impl Persistence {
     }
 
     pub async fn get_app_by_client_id(&self, client_id: &str) -> Result<Option<AppDetails>> {
-        control_journal::read_app_details_by_client_id(&self.storage, client_id).await
+        control_journal::read_app_details_by_client_id_mvcc(self.mvcc()?, client_id)
     }
 
     pub async fn create_tenant(&self, name: &str, idempotency_key: &str) -> Result<Tenant> {
@@ -75,11 +75,11 @@ impl Persistence {
     }
 
     pub async fn get_app_by_id(&self, id: i64) -> Result<Option<App>> {
-        control_journal::read_app_by_id(&self.storage, id).await
+        control_journal::read_app_by_id_mvcc(self.mvcc()?, id)
     }
 
     pub async fn get_app_by_tenant_name(&self, tenant_id: i64, name: &str) -> Result<Option<App>> {
-        control_journal::read_app_by_tenant_name(&self.storage, tenant_id, name).await
+        control_journal::read_app_by_tenant_name_mvcc(self.mvcc()?, tenant_id, name)
     }
 
     pub async fn page_apps_for_tenant(
@@ -89,14 +89,13 @@ impl Persistence {
         after_tuple_key: Option<&[u8]>,
         page_size: usize,
     ) -> Result<control_journal::CurrentAppPage> {
-        control_journal::page_apps_for_tenant(
-            &self.storage,
+        control_journal::page_apps_for_tenant_mvcc(
+            self.mvcc()?,
             tenant_id,
             expected_revision,
             after_tuple_key,
             page_size,
         )
-        .await
     }
 
     pub async fn update_app_secret(&self, app_id: i64, new_encrypted_secret: &[u8]) -> Result<()> {

@@ -364,8 +364,7 @@ impl AuthService for AppState {
         let req = request.into_inner();
         require_app_management_permission(self, &claims, AnvilAction::AppRead).await?;
         let page_size = crate::services::collection_cursor::page_size(req.page.as_ref())?;
-        let revision = control_journal::current_control_collection_revision(&self.storage)
-            .await
+        let revision = control_journal::current_control_collection_revision_mvcc(&self.mvcc)
             .map_err(|error| Status::internal(error.to_string()))?;
         let principal_scope = format!("tenant:{}/subject:{}", claims.tenant_id, claims.sub);
         let binding = crate::services::collection_cursor::CollectionCursorBinding {
