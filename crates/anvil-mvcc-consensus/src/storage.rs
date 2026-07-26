@@ -19,12 +19,6 @@ thread_local! {
     // Failure injection is thread-local so concurrently executing storage tests
     // cannot consume each other's write ordinal.
     static SYNC_WRITE_FAILURE: Cell<Option<(u64, u64)>> = const { Cell::new(None) };
-    static FAIL_NEXT_RAFT_LOG_WRITE: Cell<bool> = const { Cell::new(false) };
-}
-
-#[cfg(test)]
-pub(crate) fn fail_next_raft_log_write() {
-    FAIL_NEXT_RAFT_LOG_WRITE.with(|failure| failure.set(true));
 }
 
 use bincode::{
@@ -89,6 +83,7 @@ pub struct RocksRaftStore {
     db: Arc<DB>,
     group_id: u64,
     writer: Arc<Mutex<()>>,
+    log_write_fault_hook: Option<Arc<dyn Fn() -> Result<(), String> + Send + Sync>>,
     #[cfg(test)]
     active_sync_writes: Arc<AtomicU64>,
     #[cfg(test)]
@@ -123,6 +118,7 @@ impl RocksRaftStore {
             db,
             group_id,
             writer: Arc::new(Mutex::new(())),
+            log_write_fault_hook: None,
             #[cfg(test)]
             active_sync_writes: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
@@ -132,6 +128,17 @@ impl RocksRaftStore {
 
     pub fn database(&self) -> &Arc<DB> {
         &self.db
+    }
+
+    /// Installs the caller's deterministic fault catalog at the exact durable
+    /// Raft-log append boundary. Production construction leaves this unset.
+    #[doc(hidden)]
+    pub fn with_log_write_fault_hook(
+        mut self,
+        hook: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+    ) -> Self {
+        self.log_write_fault_hook = Some(hook);
+        self
     }
 
     pub fn save_vote<V: Serialize>(&self, vote: &V) -> Result<(), RaftStorageError> {
@@ -162,11 +169,8 @@ impl RocksRaftStore {
         if entries.is_empty() {
             return Ok(());
         }
-        #[cfg(test)]
-        if FAIL_NEXT_RAFT_LOG_WRITE.with(|failure| failure.replace(false)) {
-            return Err(RaftStorageError::Codec(
-                "injected RaftLogWrite fault".into(),
-            ));
+        if let Some(hook) = &self.log_write_fault_hook {
+            hook().map_err(RaftStorageError::Codec)?;
         }
         let _writer = self
             .writer
@@ -618,9 +622,10 @@ mod tests {
     #[test]
     fn raft_log_write_fault_leaves_log_and_index_unchanged() {
         let dir = TempDir::new().unwrap();
-        let store = store(dir.path());
+        let store = store(dir.path()).with_log_write_fault_hook(Arc::new(|| Ok(())));
         store.append_logs(&[(0, vec![0])]).unwrap();
-        fail_next_raft_log_write();
+        let store =
+            store.with_log_write_fault_hook(Arc::new(|| Err("injected RaftLogWrite fault".into())));
 
         let error = store.append_logs(&[(1, vec![1])]).unwrap_err();
         assert!(error.to_string().contains("RaftLogWrite"));
