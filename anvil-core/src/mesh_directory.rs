@@ -178,6 +178,13 @@ pub enum MeshDirectoryError {
 
 pub type MeshDirectoryResult<T> = Result<T, MeshDirectoryError>;
 
+fn routing_transaction_rejected() -> MeshDirectoryError {
+    MeshDirectoryError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "mesh routing projections are control-plane state and cannot participate in a cluster transaction",
+    ))
+}
+
 impl PartialEq for MeshDirectoryError {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -822,27 +829,13 @@ pub fn host_alias_descriptor_key(hostname: &str) -> MeshDirectoryResult<String> 
 }
 
 pub async fn write_host_alias_descriptor_in_transaction(
-    storage: &Storage,
-    descriptor: &routing::HostAliasDescriptor,
-    require_absent: bool,
-    transaction_id: &str,
-    principal: &str,
+    _storage: &Storage,
+    _descriptor: &routing::HostAliasDescriptor,
+    _require_absent: bool,
+    _transaction_id: &str,
+    _principal: &str,
 ) -> MeshDirectoryResult<()> {
-    let hostname = routing::normalize_alias_hostname(&descriptor.hostname).map_err(|_| {
-        MeshDirectoryError::InvalidIdentifier {
-            field: "hostname",
-            value: descriptor.hostname.clone(),
-        }
-    })?;
-    stage_descriptor_projection_in_transaction(
-        storage,
-        &host_alias_descriptor_key(&hostname)?,
-        descriptor,
-        require_absent,
-        transaction_id,
-        principal,
-    )
-    .await
+    Err(routing_transaction_rejected())
 }
 
 pub async fn write_host_alias_descriptor(
@@ -1289,21 +1282,13 @@ pub async fn write_bucket_locator(
 }
 
 pub async fn write_bucket_locator_in_transaction(
-    storage: &Storage,
-    locator: &BucketLocatorDescriptor,
-    require_absent: bool,
-    transaction_id: &str,
-    principal: &str,
+    _storage: &Storage,
+    _locator: &BucketLocatorDescriptor,
+    _require_absent: bool,
+    _transaction_id: &str,
+    _principal: &str,
 ) -> MeshDirectoryResult<()> {
-    stage_descriptor_projection_in_transaction(
-        storage,
-        &locator.descriptor_key(),
-        locator,
-        require_absent,
-        transaction_id,
-        principal,
-    )
-    .await
+    Err(routing_transaction_rejected())
 }
 
 pub async fn read_tenant_name_descriptor(

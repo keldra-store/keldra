@@ -113,54 +113,6 @@ pub(super) fn descriptor_projection_row_key(
     Ok((family, record_key, row_key))
 }
 
-pub(super) async fn stage_descriptor_projection_in_transaction<T: StoredRoutingRecord>(
-    storage: &Storage,
-    descriptor_key: &str,
-    descriptor: &T,
-    require_absent: bool,
-    transaction_id: &str,
-    principal: &str,
-) -> MeshDirectoryResult<()> {
-    let family = descriptor.routing_family();
-    let record_key = descriptor.routing_record_key();
-    let expected_descriptor_key = routing_record_descriptor_key_for_key(family, &record_key)?;
-    ensure_descriptor_key_matches(descriptor_key, &expected_descriptor_key)?;
-    let row_key = routing_projection_row_key(family, &record_key)?;
-    let store = CoreStore::new(storage.clone()).await?;
-    let current = store
-        .read_coremeta_row_visible_to_transaction(
-            CF_MESH,
-            TABLE_MESH_PARTITION_ROW,
-            &row_key,
-            transaction_id,
-            principal,
-        )
-        .await?;
-    if require_absent && current.is_some() {
-        return Err(MeshDirectoryError::Io(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            format!("routing descriptor already exists: {descriptor_key}"),
-        )));
-    }
-    let payload = record_proto::encode_routing_projection_row(descriptor_key, descriptor)?;
-    store
-        .stage_coremeta_put_in_transaction(
-            transaction_id,
-            principal,
-            CF_MESH,
-            TABLE_MESH_PARTITION_ROW,
-            row_key,
-            payload,
-            current
-                .as_ref()
-                .map(|payload| core_meta_payload_digest(TABLE_MESH_PARTITION_ROW, payload)),
-            require_absent || current.is_none(),
-            !require_absent && current.is_some(),
-        )
-        .await?;
-    Ok(())
-}
-
 pub(super) async fn write_descriptor_projection<T: StoredRoutingRecord>(
     storage: &Storage,
     descriptor_key: &str,

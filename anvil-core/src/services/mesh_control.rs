@@ -605,69 +605,13 @@ fn topology_transaction_rejected() -> Status {
 }
 
 async fn move_bucket_in_transaction(
-    state: &AppState,
-    claims: &auth::Claims,
-    tenant_id: i64,
-    req: &MoveBucketRequest,
-    transaction_id: &str,
+    _state: &AppState,
+    _claims: &auth::Claims,
+    _tenant_id: i64,
+    _req: &MoveBucketRequest,
+    _transaction_id: &str,
 ) -> Result<String, Status> {
-    let mut bucket =
-        bucket_journal::read_current_bucket(&state.storage, tenant_id, &req.bucket_name)
-            .await
-            .map_err(|err| Status::internal(err.to_string()))?
-            .ok_or_else(|| Status::not_found("bucket not found"))?;
-    if bucket.region == req.target_region_id {
-        return Ok(format!("bucket:{}:region:{}", bucket.name, bucket.region));
-    }
-    crate::mesh_lifecycle::ensure_region_accepts_new_writes(&state.storage, &req.target_region_id)
-        .await
-        .map_err(mesh_status)?;
-    let target_cell =
-        crate::mesh_lifecycle::list_cells(&state.storage, Some(&req.target_region_id))
-            .await
-            .map_err(mesh_status)?
-            .into_iter()
-            .filter(|cell| cell.state == CoreLifecycleState::Active)
-            .min_by(|left, right| left.cell_id.cmp(&right.cell_id))
-            .ok_or_else(|| Status::failed_precondition("target region has no active cell"))?;
-    let tenant =
-        crate::mesh_directory::TenantId::new(tenant_id.to_string()).map_err(mesh_status)?;
-    let name =
-        crate::mesh_directory::BucketName::canonicalize(&req.bucket_name).map_err(mesh_status)?;
-    let key = crate::mesh_directory::BucketLocatorKey::new(tenant, name);
-    let existing = crate::mesh_directory::read_bucket_locator(&state.storage, &key)
-        .await
-        .map_err(mesh_status)?
-        .ok_or_else(|| Status::not_found("bucket locator not found"))?;
-    let principal = mesh_transaction_principal(claims);
-    let mut moved = existing.clone();
-    moved.home_region = crate::mesh_directory::RegionName::new(req.target_region_id.clone())
-        .map_err(mesh_status)?;
-    moved.home_cell =
-        crate::mesh_directory::CellId::new(target_cell.cell_id.clone()).map_err(mesh_status)?;
-    moved.status = crate::mesh_directory::BucketLocatorStatus::Active;
-    moved.updated_at = chrono::Utc::now().to_rfc3339();
-    moved.generation = existing.generation.saturating_add(1);
-    bucket.region = req.target_region_id.clone();
-    bucket_journal::stage_bucket_mutation_in_transaction(
-        state.mvcc.as_ref(),
-        &bucket,
-        bucket_journal::BucketJournalMutation::Update,
-        transaction_id,
-        &principal,
-    )
-    .await
-    .map_err(mesh_status)?;
-    crate::mesh_directory::write_bucket_locator_in_transaction(
-        &state.storage,
-        &moved,
-        false,
-        transaction_id,
-        &principal,
-    )
-    .await
-    .map_err(mesh_status)?;
-    Ok(format!("bucket:{}:region:{}", bucket.name, bucket.region))
+    Err(topology_transaction_rejected())
 }
 
 fn mesh_transaction_principal(claims: &auth::Claims) -> String {

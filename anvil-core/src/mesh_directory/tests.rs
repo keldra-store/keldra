@@ -70,6 +70,45 @@ fn authority(permit: &PartitionWritePermit) -> MeshControlWriteAuthority<'_> {
     }
 }
 
+#[tokio::test]
+async fn mesh_routing_projections_reject_cluster_transactions() {
+    let temp = tempdir().unwrap();
+    let storage = Storage::new_at(temp.path()).await.unwrap();
+    let host_alias = routing::HostAliasDescriptor::active(
+        "api.example.com",
+        "tenant_01",
+        "releases",
+        "eu-west-1",
+        "objects/tenant_01/releases/",
+        &routing::RoutingConfig::new("anvil.example").unwrap(),
+    )
+    .unwrap();
+
+    let host_error = write_host_alias_descriptor_in_transaction(
+        &storage,
+        &host_alias,
+        true,
+        "transaction-1",
+        "principal-1",
+    )
+    .await
+    .unwrap_err();
+    let bucket_error = write_bucket_locator_in_transaction(
+        &storage,
+        &locator("tenant_01", "bucket_01"),
+        true,
+        "transaction-1",
+        "principal-1",
+    )
+    .await
+    .unwrap_err();
+
+    for error in [host_error, bucket_error] {
+        assert!(error.to_string().contains("control-plane"));
+        assert!(error.to_string().contains("cluster transaction"));
+    }
+}
+
 #[test]
 fn tenant_name_partition_path_is_stable() {
     let tenant_name = TenantName::canonicalize("Acme").unwrap();
