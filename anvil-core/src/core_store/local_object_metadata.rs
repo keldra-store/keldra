@@ -12,10 +12,6 @@ mod projections;
 use projections::*;
 pub(crate) use projections::{
     CurrentObjectMetadataPage, ObjectMetadataPageCursor, ObjectVersionsMetadataPage,
-    decode_object_metadata_max_id, decode_object_metadata_row,
-    decode_object_metadata_row_with_generation, encode_object_metadata_counter_at_generation,
-    encode_object_metadata_row_at_generation_for_transaction,
-    encode_object_metadata_row_at_generation_with_delete_marker_for_transaction,
     object_current_history_key, object_current_key, object_current_page_bucket_prefix,
     object_current_page_key_for_object, object_id_counter_key, object_key_catalog_key,
     object_version_catalog_key, object_version_history_key, object_version_id_key,
