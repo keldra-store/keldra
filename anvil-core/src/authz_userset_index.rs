@@ -1,11 +1,9 @@
 use crate::{
     authz_journal::{self, AuthzTupleFilter},
     core_store::{
-        CF_AUTHZ, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaRowCommonProto, CoreMetaStore,
-        CoreMetaTuplePart, CoreMetaVisibilityState, CoreObjectRef, CoreStore, GetBlob, PutBlob,
-        TABLE_AUTHZ_TUPLE_PAGE_ROW, commit_coremeta_batch_for_storage,
-        core_meta_committed_row_common, core_meta_root_key_hash, core_meta_tuple_key,
-        decode_deterministic_proto, encode_deterministic_proto,
+        CF_AUTHZ, CoreMetaTuplePart, CoreObjectRef, CoreStore, GetBlob, PutBlob,
+        TABLE_AUTHZ_TUPLE_PAGE_ROW, core_meta_tuple_key, decode_deterministic_proto,
+        encode_deterministic_proto,
     },
     formats::{
         hash32,
@@ -20,7 +18,7 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-const AUTHZ_DERIVED_USERSET_INDEX_ROW_SCHEMA: &str = "anvil.authz.derived_userset_index_row.v1";
+const AUTHZ_DERIVED_USERSET_INDEX_ROW_SCHEMA: &str = "anvil.authz.derived_userset_index_row.v2";
 const AUTHZ_DERIVED_USERSET_INDEX_ROW_KIND: &str = "derived_userset_index";
 const AUTHZ_SOURCE_HASH_DOMAIN: &[u8] = b"anvil.authz.source-record-chain.v1\0";
 
@@ -76,8 +74,6 @@ struct AuthzDerivedUsersetIndexProto {
 
 #[derive(Clone, PartialEq, Message)]
 struct AuthzDerivedUsersetIndexRowProto {
-    #[prost(message, optional, tag = "1")]
-    common: Option<CoreMetaRowCommonProto>,
     #[prost(string, tag = "2")]
     schema: String,
     #[prost(int64, tag = "3")]
@@ -202,6 +198,7 @@ impl From<&AuthzTupleRecord> for TupleViewKey {
 #[allow(clippy::too_many_arguments)]
 pub async fn lookup_derived_userset_index_at_revision(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     derived_index_id: &str,
     namespace: &str,
@@ -212,7 +209,8 @@ pub async fn lookup_derived_userset_index_at_revision(
     caveat_hash: &str,
     revision: u64,
 ) -> Result<Option<bool>> {
-    let Some(index) = read_derived_userset_index(storage, tenant_id, derived_index_id).await?
+    let Some(index) =
+        read_derived_userset_index(storage, mvcc, tenant_id, derived_index_id).await?
     else {
         return Ok(None);
     };
@@ -232,6 +230,7 @@ pub async fn lookup_derived_userset_index_at_revision(
 
 pub async fn list_derived_userset_objects_at_revision(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     derived_index_id: &str,
     namespace: &str,
@@ -241,7 +240,8 @@ pub async fn list_derived_userset_objects_at_revision(
     caveat_hash: &str,
     revision: u64,
 ) -> Result<Option<Vec<String>>> {
-    let Some(index) = read_derived_userset_index(storage, tenant_id, derived_index_id).await?
+    let Some(index) =
+        read_derived_userset_index(storage, mvcc, tenant_id, derived_index_id).await?
     else {
         return Ok(None);
     };
@@ -274,7 +274,7 @@ pub async fn rebuild_derived_userset_index(
 ) -> Result<AuthzDerivedUsersetIndex> {
     let index =
         build_expected_derived_userset_index(storage, mvcc, tenant_id, derived_index_id).await?;
-    write_derived_userset_index(storage, &index).await?;
+    write_derived_userset_index(storage, mvcc, &index).await?;
     Ok(index)
 }
 
@@ -298,19 +298,21 @@ pub async fn advance_derived_userset_index_from_batch(
         .into_iter()
         .max()
     else {
-        return read_derived_userset_index(storage, tenant_id, derived_index_id)
+        return read_derived_userset_index(storage, mvcc, tenant_id, derived_index_id)
             .await?
             .ok_or_else(|| anyhow!("authorization userset index does not exist"));
     };
 
-    let existing = match read_derived_userset_index(storage, tenant_id, derived_index_id).await? {
+    let existing = match read_derived_userset_index(storage, mvcc, tenant_id, derived_index_id)
+        .await?
+    {
         Some(existing) if existing.processed_revision + 1 >= target_revision => existing,
         _ => {
             let all_records =
                 authz_journal::collect_authz_tuple_log_for_rebuild(mvcc, tenant_id, None).await?;
             let rebuilt =
                 build_derived_userset_index_from_records(tenant_id, derived_index_id, all_records)?;
-            write_derived_userset_index(storage, &rebuilt).await?;
+            write_derived_userset_index(storage, mvcc, &rebuilt).await?;
             return Ok(rebuilt);
         }
     };
@@ -320,7 +322,7 @@ pub async fn advance_derived_userset_index_from_batch(
     }
 
     let impacted = impacted_usersets_from_projection(
-        storage,
+        mvcc,
         tenant_id,
         i64::try_from(target_revision)
             .map_err(|_| anyhow!("authorization userset revision exceeds supported range"))?,
@@ -341,7 +343,7 @@ pub async fn advance_derived_userset_index_from_batch(
         advanced.generation = target_revision;
         advanced.built_at = Utc::now().to_rfc3339();
         advanced.index_hash = hash_derived_userset_index(&advanced)?;
-        write_derived_userset_index(storage, &advanced).await?;
+        write_derived_userset_index(storage, mvcc, &advanced).await?;
         return Ok(advanced);
     }
 
@@ -359,6 +361,7 @@ pub async fn advance_derived_userset_index_from_batch(
     for userset in &impacted {
         for subject in collect_userset_subjects_from_projection(
             storage,
+            mvcc,
             tenant_id,
             userset,
             i64::try_from(target_revision)
@@ -391,12 +394,12 @@ pub async fn advance_derived_userset_index_from_batch(
     };
     advanced.index_hash = hash_derived_userset_index(&advanced)?;
     validate_derived_userset_index(&advanced, tenant_id, derived_index_id)?;
-    write_derived_userset_index(storage, &advanced).await?;
+    write_derived_userset_index(storage, mvcc, &advanced).await?;
     Ok(advanced)
 }
 
 pub async fn build_expected_derived_userset_index(
-    storage: &Storage,
+    _storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     derived_index_id: &str,
@@ -406,7 +409,7 @@ pub async fn build_expected_derived_userset_index(
 }
 
 pub(crate) async fn build_expected_derived_userset_index_at_revision(
-    storage: &Storage,
+    _storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     derived_index_id: &str,
@@ -421,13 +424,28 @@ pub(crate) async fn build_expected_derived_userset_index_at_revision(
 
 pub async fn read_derived_userset_index(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     derived_index_id: &str,
 ) -> Result<Option<AuthzDerivedUsersetIndex>> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(row) = read_derived_userset_index_row(&store, tenant_id, derived_index_id)? else {
+    let snapshot = mvcc.runtime.applied_version()?;
+    read_derived_userset_index_at_snapshot(storage, mvcc, tenant_id, derived_index_id, snapshot)
+        .await
+}
+
+async fn read_derived_userset_index_at_snapshot(
+    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    derived_index_id: &str,
+    snapshot: u64,
+) -> Result<Option<AuthzDerivedUsersetIndex>> {
+    let Some(row) =
+        read_derived_userset_index_row_at_snapshot(mvcc, tenant_id, derived_index_id, snapshot)?
+    else {
         return Ok(None);
     };
+    let store = CoreStore::new(storage.clone()).await?;
     let bytes = store
         .get_blob(GetBlob {
             object_ref: decode_core_object_ref_target(&row.core_object_ref_target)?,
@@ -439,22 +457,22 @@ pub async fn read_derived_userset_index(
     Ok(Some(index))
 }
 
-#[cfg(test)]
-pub(crate) fn test_delete_derived_userset_index_row(
-    storage: &Storage,
-    tenant_id: i64,
-    derived_index_id: &str,
-) -> Result<()> {
-    CoreMetaStore::open(storage.core_store_meta_path())?.delete(
-        CF_AUTHZ,
-        TABLE_AUTHZ_TUPLE_PAGE_ROW,
-        &derived_userset_index_tuple_key(tenant_id, derived_index_id)?,
-    )
-}
-
 pub async fn write_derived_userset_index(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     index: &AuthzDerivedUsersetIndex,
+) -> Result<()> {
+    write_derived_userset_index_with_predicates(storage, mvcc, index, &[]).await
+}
+
+pub(crate) async fn write_derived_userset_index_with_predicates(
+    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    index: &AuthzDerivedUsersetIndex,
+    additional_predicates: &[(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )],
 ) -> Result<()> {
     validate_derived_userset_index(index, index.tenant_id, &index.derived_index_id)?;
     let bytes = encode_derived_userset_index(index)?;
@@ -483,37 +501,45 @@ pub async fn write_derived_userset_index(
             WriterFamily::Authz,
         )
         .await?;
-    write_derived_userset_index_row(storage, index, writer_generation, &object_ref).await?;
+    write_derived_userset_index_row_mvcc(
+        mvcc,
+        index,
+        writer_generation,
+        &object_ref,
+        additional_predicates,
+    )
+    .await?;
     Ok(())
 }
 
-fn read_derived_userset_index_row(
-    store: &CoreStore,
+fn read_derived_userset_index_row_at_snapshot(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     derived_index_id: &str,
+    snapshot: u64,
 ) -> Result<Option<AuthzDerivedUsersetIndexRow>> {
-    let Some(payload) = store.read_coremeta_row(
-        CF_AUTHZ,
-        TABLE_AUTHZ_TUPLE_PAGE_ROW,
-        &derived_userset_index_tuple_key(tenant_id, derived_index_id)?,
-    )?
-    else {
+    let key = derived_userset_index_logical_key(tenant_id, derived_index_id)?;
+    let Some(payload) = mvcc.runtime.read_at(&key, snapshot)?.map(|row| row.value) else {
         return Ok(None);
     };
     let row = decode_derived_userset_index_row(&payload)?;
     if row.tenant_id != tenant_id || row.derived_index_id != derived_index_id {
         return Err(anyhow!(
-            "authorization userset index CoreMeta row scope mismatch"
+            "authorization userset index MVCC row scope mismatch"
         ));
     }
     Ok(Some(row))
 }
 
-async fn write_derived_userset_index_row(
-    storage: &Storage,
+async fn write_derived_userset_index_row_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     index: &AuthzDerivedUsersetIndex,
     writer_generation: u64,
     object_ref: &CoreObjectRef,
+    additional_predicates: &[(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )],
 ) -> Result<()> {
     let row = AuthzDerivedUsersetIndexRow {
         tenant_id: index.tenant_id,
@@ -527,26 +553,90 @@ async fn write_derived_userset_index_row(
         built_at: index.built_at.clone(),
     };
     validate_derived_userset_index_row(&row)?;
-    let tuple_key = derived_userset_index_tuple_key(index.tenant_id, &index.derived_index_id)?;
+    let logical_key = derived_userset_index_logical_key(index.tenant_id, &index.derived_index_id)?;
     let payload = encode_derived_userset_index_row(&row)?;
-    let op = CoreMetaBatchOp {
-        cf: CF_AUTHZ,
-        table_id: TABLE_AUTHZ_TUPLE_PAGE_ROW,
-        tuple_key: &tuple_key,
-        common: None,
-        kind: CoreMetaBatchOpKind::Put(&payload),
-    };
-    commit_coremeta_batch_for_storage(
-        storage,
-        &derived_userset_index_transaction_id(index),
-        &[op],
-        &[crate::core_store::CoreMetaRootPublication::new(
-            derived_userset_index_root_anchor_key(index.tenant_id, &index.derived_index_id),
-            crate::formats::writer::WriterFamily::Authz,
-        )],
-    )
-    .await?;
-    Ok(())
+    if mvcc.read_latest_value(&logical_key)?.as_deref() == Some(payload.as_slice()) {
+        return Ok(());
+    }
+
+    let assignment = mvcc
+        .reconcile_authz_tuple_assignment(index.tenant_id)
+        .await?
+        .ok_or_else(|| {
+            anyhow!("this node is not the assigned authorization userset index publisher")
+        })?;
+    let principal = format!("authz-derived-userset:tenant/{}", index.tenant_id);
+    let now_unix_ms = u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default();
+    let handle = mvcc
+        .open_transactions
+        .begin(
+            mvcc.runtime.as_ref(),
+            mvcc.cluster_id(),
+            &principal,
+            derived_userset_index_transaction_id(index),
+            std::time::Duration::from_secs(30),
+            crate::mvcc_transaction::DurabilityLevel::Quorum,
+            crate::mvcc_transaction::ReadConsistency::Linearized,
+            now_unix_ms,
+        )
+        .await?;
+    let status = mvcc
+        .open_transactions
+        .status(&handle.transaction_id, &principal, now_unix_ms)?;
+    if status.state == "open" {
+        let observed = mvcc
+            .runtime
+            .read_at(&logical_key, handle.snapshot_version)?;
+        let predicate = observed
+            .as_ref()
+            .map(|row| {
+                crate::mvcc_transaction::PredicateKind::ValueHash(
+                    *blake3::hash(&row.value).as_bytes(),
+                )
+            })
+            .unwrap_or(crate::mvcc_transaction::PredicateKind::Absent);
+        mvcc.stage_product_mutations(
+            &handle.transaction_id,
+            &principal,
+            vec![crate::mvcc_product::ProductMutation::put(
+                logical_key.clone(),
+                payload,
+            )],
+            now_unix_ms,
+        )?;
+        mvcc.stage_predicate(
+            &handle.transaction_id,
+            &principal,
+            logical_key,
+            predicate,
+            now_unix_ms,
+        )?;
+        for (key, predicate) in additional_predicates {
+            mvcc.stage_predicate(
+                &handle.transaction_id,
+                &principal,
+                key.clone(),
+                predicate.clone(),
+                now_unix_ms,
+            )?;
+        }
+        mvcc.stage_assignment_guard(&handle.transaction_id, &principal, &assignment, now_unix_ms)?;
+    }
+    let outcome = mvcc
+        .open_transactions
+        .commit(
+            mvcc.runtime.as_ref(),
+            &handle.transaction_id,
+            &principal,
+            u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default(),
+        )
+        .await?;
+    match outcome.certification {
+        crate::mvcc_transaction::CertificationResult::Committed { .. } => Ok(()),
+        crate::mvcc_transaction::CertificationResult::Aborted { reason } => Err(anyhow!(
+            "authorization userset publication aborted: {reason:?}"
+        )),
+    }
 }
 
 fn build_derived_userset_index_from_records(
@@ -614,7 +704,7 @@ fn current_tuple_map(records: Vec<AuthzTupleRecord>) -> BTreeMap<TupleViewKey, A
 }
 
 async fn impacted_usersets_from_projection(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     revision: i64,
     batch_records: &[AuthzTupleRecord],
@@ -651,7 +741,7 @@ async fn impacted_usersets_from_projection(
         let mut after_tuple_key = None;
         loop {
             let page = authz_journal::page_current_authz_tuples(
-                storage,
+                mvcc,
                 tenant_id,
                 &filter,
                 revision,
@@ -686,6 +776,7 @@ async fn impacted_usersets_from_projection(
 
 async fn collect_userset_subjects_from_projection(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     userset: &UsersetRef,
     revision: i64,
@@ -695,6 +786,7 @@ async fn collect_userset_subjects_from_projection(
     loop {
         let page = authz_journal::list_current_authz_subjects_page(
             storage,
+            mvcc,
             tenant_id,
             &userset.namespace,
             &userset.object_id,
@@ -818,24 +910,24 @@ fn validate_derived_userset_index_row(row: &AuthzDerivedUsersetIndexRow) -> Resu
     validate_derived_userset_index_key(row.tenant_id, &row.derived_index_id)?;
     if row.generation < row.processed_revision {
         return Err(anyhow!(
-            "authorization userset index CoreMeta row generation is stale"
+            "authorization userset index MVCC row generation is stale"
         ));
     }
     if row.writer_generation == 0 {
         return Err(anyhow!(
-            "authorization userset index CoreMeta row writer generation must be nonzero"
+            "authorization userset index MVCC row writer generation must be nonzero"
         ));
     }
     validate_hash_hex32(&row.source_records_hash, "source_records_hash")?;
     validate_hash_hex32(&row.index_hash, "index_hash")?;
     if !row.core_object_ref_target.starts_with("core-object-ref:") {
         return Err(anyhow!(
-            "authorization userset index CoreMeta row must point at a CoreStore object"
+            "authorization userset index MVCC row must point at an immutable object"
         ));
     }
     if row.built_at.is_empty() {
         return Err(anyhow!(
-            "authorization userset index CoreMeta row built_at must not be empty"
+            "authorization userset index MVCC row built_at must not be empty"
         ));
     }
     Ok(())
@@ -855,7 +947,7 @@ fn validate_derived_userset_index_row_matches(
         || row.built_at != index.built_at
     {
         return Err(anyhow!(
-            "authorization userset index CoreMeta row does not match payload"
+            "authorization userset index MVCC row does not match payload"
         ));
     }
     Ok(())
@@ -877,7 +969,6 @@ fn decode_derived_userset_index(bytes: &[u8]) -> Result<AuthzDerivedUsersetIndex
 fn encode_derived_userset_index_row(row: &AuthzDerivedUsersetIndexRow) -> Result<Vec<u8>> {
     Ok(encode_deterministic_proto(
         &AuthzDerivedUsersetIndexRowProto {
-            common: Some(derived_userset_index_row_common(row)?),
             schema: AUTHZ_DERIVED_USERSET_INDEX_ROW_SCHEMA.to_string(),
             tenant_id: row.tenant_id,
             derived_index_id: row.derived_index_id.clone(),
@@ -902,9 +993,6 @@ fn decode_derived_userset_index_row(bytes: &[u8]) -> Result<AuthzDerivedUsersetI
             "authorization derived userset index row schema mismatch"
         ));
     }
-    let common = proto.common.clone().ok_or_else(|| {
-        anyhow!("authorization derived userset index row missing CoreMeta common")
-    })?;
     let row = AuthzDerivedUsersetIndexRow {
         tenant_id: proto.tenant_id,
         derived_index_id: proto.derived_index_id,
@@ -917,89 +1005,14 @@ fn decode_derived_userset_index_row(bytes: &[u8]) -> Result<AuthzDerivedUsersetI
         built_at: proto.built_at,
     };
     validate_derived_userset_index_row(&row)?;
-    validate_derived_userset_index_row_common(&row, &common)?;
     Ok(row)
-}
-
-fn derived_userset_index_row_common(
-    row: &AuthzDerivedUsersetIndexRow,
-) -> Result<CoreMetaRowCommonProto> {
-    // CoreStore replaces the publication placeholders while committing the root.
-    Ok(core_meta_committed_row_common(
-        format!("tenant/{}", row.tenant_id),
-        derived_userset_index_root_key_hash(row.tenant_id, &row.derived_index_id),
-        1,
-        String::new(),
-        rfc3339_unix_nanos(&row.built_at)?,
-    ))
-}
-
-fn validate_derived_userset_index_row_common(
-    row: &AuthzDerivedUsersetIndexRow,
-    common: &CoreMetaRowCommonProto,
-) -> Result<()> {
-    if common.realm_id != format!("tenant/{}", row.tenant_id) {
-        return Err(anyhow!(
-            "authorization derived userset CoreMeta realm mismatch"
-        ));
-    }
-    if common.root_key_hash
-        != derived_userset_index_root_key_hash(row.tenant_id, &row.derived_index_id)
-    {
-        return Err(anyhow!(
-            "authorization derived userset CoreMeta root mismatch"
-        ));
-    }
-    if common.root_generation == 0 {
-        return Err(anyhow!(
-            "authorization derived userset CoreMeta publication generation must be nonzero"
-        ));
-    }
-    if common.transaction_id.is_empty() {
-        return Err(anyhow!(
-            "authorization derived userset CoreMeta transaction must not be empty"
-        ));
-    }
-    if common.visibility_state_enum() != CoreMetaVisibilityState::Committed {
-        return Err(anyhow!(
-            "authorization derived userset CoreMeta row is not committed"
-        ));
-    }
-    if common.payload_schema_version
-        != derived_userset_index_row_common(row)?.payload_schema_version
-    {
-        return Err(anyhow!(
-            "authorization derived userset CoreMeta payload version mismatch"
-        ));
-    }
-    Ok(())
-}
-
-fn derived_userset_index_root_anchor_key(tenant_id: i64, derived_index_id: &str) -> String {
-    format!("authz-derived-userset/tenant/{tenant_id}/index/{derived_index_id}")
-}
-
-fn derived_userset_index_root_key_hash(tenant_id: i64, derived_index_id: &str) -> String {
-    core_meta_root_key_hash(&derived_userset_index_root_anchor_key(
-        tenant_id,
-        derived_index_id,
-    ))
 }
 
 fn derived_userset_index_transaction_id(index: &AuthzDerivedUsersetIndex) -> String {
     format!(
-        "authz-derived-userset:{}:{}:{}",
-        index.tenant_id, index.derived_index_id, index.generation
+        "authz-derived-userset:{}:{}:{}:{}",
+        index.tenant_id, index.derived_index_id, index.generation, index.index_hash
     )
-}
-
-fn rfc3339_unix_nanos(value: &str) -> Result<u64> {
-    let parsed = chrono::DateTime::parse_from_rfc3339(value)
-        .map_err(|error| anyhow!("authorization derived userset built_at is invalid: {error}"))?;
-    let nanos = parsed
-        .timestamp_nanos_opt()
-        .ok_or_else(|| anyhow!("authorization derived userset built_at is out of range"))?;
-    u64::try_from(nanos).map_err(|_| anyhow!("authorization derived userset built_at is negative"))
 }
 
 fn derived_userset_index_to_proto(
@@ -1141,6 +1154,17 @@ fn derived_userset_index_tuple_key(tenant_id: i64, derived_index_id: &str) -> Re
         CoreMetaTuplePart::I64(tenant_id),
         CoreMetaTuplePart::Utf8(derived_index_id),
     ])
+}
+
+fn derived_userset_index_logical_key(
+    tenant_id: i64,
+    derived_index_id: &str,
+) -> Result<crate::mvcc_transaction::LogicalKey> {
+    crate::mvcc_product::coremeta_logical_key(
+        CF_AUTHZ,
+        TABLE_AUTHZ_TUPLE_PAGE_ROW,
+        &derived_userset_index_tuple_key(tenant_id, derived_index_id)?,
+    )
 }
 
 fn validate_derived_userset_index_key(tenant_id: i64, derived_index_id: &str) -> Result<()> {

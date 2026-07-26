@@ -307,6 +307,7 @@ async fn materialize_authz_state_at_revision_inner(
             )
             .await?
         };
+    publish_derived_userset_index(storage, mvcc, tenant_id, next_revision, publication).await?;
     let segment_ref = publish_staged_segment(mvcc, staged, publication).await?;
     let segment = load_materialized_segment(storage, mvcc, tenant_id, next_revision).await?;
     outcome_from_segment(segment, segment_ref, source_rows_visited)
@@ -357,6 +358,7 @@ async fn initialize_authz_materialization(
         event_fence_token.max(source_fence_token),
     )
     .await?;
+    publish_derived_userset_index(storage, mvcc, tenant_id, 1, publication).await?;
     let segment_ref = publish_staged_segment(mvcc, staged, publication).await?;
     let segment = load_materialized_segment(storage, mvcc, tenant_id, 1).await?;
     outcome_from_segment(segment, segment_ref, source_rows_visited)
@@ -387,6 +389,46 @@ async fn publish_staged_segment(
     }
 }
 
+async fn publish_derived_userset_index(
+    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    target_revision: u64,
+    publication: AuthzPublication<'_>,
+) -> Result<()> {
+    let derived = crate::authz_userset_index::build_expected_derived_userset_index_at_revision(
+        storage,
+        mvcc,
+        tenant_id,
+        DEFAULT_DERIVED_USERSET_INDEX_ID,
+        target_revision,
+    )
+    .await?;
+    match publication {
+        AuthzPublication::Direct => {
+            crate::authz_userset_index::write_derived_userset_index(storage, mvcc, &derived).await
+        }
+        AuthzPublication::Task {
+            guard,
+            source_head_predicate,
+        } => {
+            let source_head_predicate = source_head_predicate.clone();
+            guard
+                .publish_mvcc_with(move |task_lease_predicate| async move {
+                    let preconditions = [source_head_predicate, task_lease_predicate];
+                    crate::authz_userset_index::write_derived_userset_index_with_predicates(
+                        storage,
+                        mvcc,
+                        &derived,
+                        &preconditions,
+                    )
+                    .await
+                })
+                .await
+        }
+    }
+}
+
 pub(crate) async fn rebuild_authz_materialization_at_revision(
     storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
@@ -407,7 +449,7 @@ pub(crate) async fn rebuild_authz_materialization_at_revision(
         target_revision,
     )
     .await?;
-    crate::authz_userset_index::write_derived_userset_index(storage, &derived).await?;
+    crate::authz_userset_index::write_derived_userset_index(storage, mvcc, &derived).await?;
     let segment_ref = authz_segment::write_authz_tuple_checkpoint_segment(
         storage,
         mvcc,
