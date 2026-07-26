@@ -50,6 +50,7 @@ fn test_authz_relation(name: &str) -> crate::anvil_api::AuthzRelationSchema {
 
 async fn bind_persistence_test_authz_schema(persistence: &Persistence, tenant_id: i64) {
     let schema = crate::authz_realm_schema::put_schema_revision(
+        &persistence.storage,
         persistence.mvcc().unwrap(),
         tenant_id,
         "persistence-test-authz",
@@ -80,6 +81,7 @@ async fn bind_persistence_test_authz_schema(persistence: &Persistence, tenant_id
     .unwrap();
     crate::authz_realm_schema::bind_schema(
         &persistence.storage,
+        persistence.mvcc().unwrap(),
         tenant_id,
         crate::authz_scope::DEFAULT_AUTHZ_REALM_ID,
         schema.schema_ref,
@@ -110,8 +112,8 @@ async fn claim_authz_materialization_guard(
         .acquire_task_execution_lease(&task)
         .await
         .unwrap();
-    TaskExecutionGuard::new(
-        persistence.storage().clone(),
+    TaskExecutionGuard::new_mvcc(
+        persistence.mvcc_arc().unwrap(),
         persistence.partition_owner_signing_key().to_vec(),
         lease,
     )
@@ -157,6 +159,7 @@ async fn authz_tuple_write_enqueues_and_materializes_bounded_authorization_state
 
     let unavailable = crate::authz_segment::resolve_materialized_permission_at_revision(
         &persistence.storage,
+        persistence.mvcc().unwrap(),
         1,
         "document",
         "doc-a",
@@ -179,6 +182,7 @@ async fn authz_tuple_write_enqueues_and_materializes_bounded_authorization_state
     assert_eq!(outcome.source_rows_visited, 1);
     let materialized = crate::authz_segment::resolve_materialized_permission_at_revision(
         &persistence.storage,
+        persistence.mvcc().unwrap(),
         1,
         "document",
         "doc-a",
@@ -198,7 +202,7 @@ async fn authz_tuple_write_enqueues_and_materializes_bounded_authorization_state
     );
     assert_eq!(materialized.stats.table_rows_visited, 1);
     let lag = crate::authz_derived_lag_watch::latest_authz_derived_lag_watch_event(
-        &persistence.storage,
+        persistence.mvcc().unwrap(),
         1,
         crate::authz_userset_index::DEFAULT_DERIVED_USERSET_INDEX_ID,
     )
@@ -262,7 +266,7 @@ async fn authz_materialization_task_catches_up_a_grouped_revision_backlog() {
     for revision in 1..=target_revision {
         assert!(
             crate::authz_segment::existing_authz_tuple_segment_ref(
-                &persistence.storage,
+                persistence.mvcc().unwrap(),
                 42,
                 revision,
             )
@@ -327,7 +331,7 @@ async fn authz_materialization_job_latency_with_retained_history_perf() {
     let write_elapsed = write_started.elapsed();
 
     let immediate_check_ms =
-        measure_authz_permission_checks(&persistence.storage, 42, record.revision).await;
+        measure_authz_permission_checks(&persistence, 42, record.revision).await;
     let guard = claim_authz_materialization_guard(&persistence, 42, record.revision as u64).await;
     let materialize_started = std::time::Instant::now();
     let outcome = persistence
@@ -337,7 +341,7 @@ async fn authz_materialization_job_latency_with_retained_history_perf() {
     let materialize_elapsed = materialize_started.elapsed();
     assert_eq!(outcome.processed_revision, record.revision as u64);
     let post_materialization_check_ms =
-        measure_authz_permission_checks(&persistence.storage, 42, record.revision).await;
+        measure_authz_permission_checks(&persistence, 42, record.revision).await;
 
     eprintln!(
         "[authz-job-perf] retained={retained} seed_ms={} measured_write_ms={} immediate_check_ms={:?} materialize_job_ms={} post_materialization_check_ms={:?}",
@@ -350,7 +354,7 @@ async fn authz_materialization_job_latency_with_retained_history_perf() {
 }
 
 async fn measure_authz_permission_checks(
-    storage: &crate::storage::Storage,
+    persistence: &Persistence,
     tenant_id: i64,
     revision: i64,
 ) -> Vec<u128> {
@@ -358,7 +362,16 @@ async fn measure_authz_permission_checks(
     for _ in 0..10 {
         let check_started = std::time::Instant::now();
         let allowed = crate::authz_journal::resolve_permission_at_revision(
-            storage, tenant_id, "document", "measured", "reader", "user", "alice", "", revision,
+            &persistence.storage,
+            persistence.mvcc().unwrap(),
+            tenant_id,
+            "document",
+            "measured",
+            "reader",
+            "user",
+            "alice",
+            "",
+            revision,
         )
         .await
         .unwrap();
@@ -418,7 +431,7 @@ async fn empty_bucket_index_build_materialises_an_empty_typed_json_segment() {
     assert_eq!(outcome.source_cursor, 0);
     assert!(
         crate::typed_field_segment::latest_typed_field_segment_ref(
-            &persistence.storage,
+            persistence.mvcc().unwrap(),
             &outcome.index_storage_id,
         )
         .await
