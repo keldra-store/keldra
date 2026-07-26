@@ -258,7 +258,7 @@ impl Persistence {
                 self.mvcc()?,
                 "bucket-metadata",
                 &idempotency_key,
-                crate::mvcc_transaction::DurabilityLevel::Local,
+                crate::mvcc_transaction::DurabilityLevel::Quorum,
                 u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
             )
             .await
@@ -321,7 +321,7 @@ impl Persistence {
             self.mvcc()?,
             "bucket-metadata",
             &format!("bucket-update:{}:{}", out.id, uuid::Uuid::new_v4()),
-            crate::mvcc_transaction::DurabilityLevel::Local,
+            crate::mvcc_transaction::DurabilityLevel::Quorum,
             u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
         )
         .await?;
@@ -343,7 +343,7 @@ impl Persistence {
                 self.mvcc()?,
                 "bucket-metadata",
                 &format!("bucket-delete:{}:{}", bucket.id, uuid::Uuid::new_v4()),
-                crate::mvcc_transaction::DurabilityLevel::Local,
+                crate::mvcc_transaction::DurabilityLevel::Quorum,
                 u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
             )
             .await?;

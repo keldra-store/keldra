@@ -1,8 +1,6 @@
 use crate::core_store::{CoreMutationOperation, CoreMutationPrecondition};
 use crate::formats::{Hash32, hash32};
 use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
-#[cfg(test)]
-use crate::persistence::Bucket;
 use crate::persistence::{IndexDefinition, IndexDefinitionEvent};
 use crate::storage::Storage;
 use anyhow::{Context, Result, anyhow};
@@ -86,14 +84,6 @@ pub(crate) struct CurrentIndexDefinitionPage {
     pub(crate) rows_visited: usize,
 }
 
-#[cfg(any())]
-async fn append_index_definition_event(
-    storage: &Storage,
-    event: &IndexDefinitionEvent,
-) -> Result<()> {
-    append_index_definition_event_inner(storage, None, event, 0, None, None, None).await
-}
-
 pub(crate) async fn append_index_definition_event_with_permit_mvcc(
     storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
@@ -104,25 +94,6 @@ pub(crate) async fn append_index_definition_event_with_permit_mvcc(
     append_index_definition_event_with_permit_in_transaction(
         storage,
         mvcc,
-        event,
-        permit,
-        partition_owner_signing_key,
-        None,
-        None,
-    )
-    .await
-}
-
-#[cfg(any())]
-pub(crate) async fn append_index_definition_event_with_permit(
-    storage: &Storage,
-    event: &IndexDefinitionEvent,
-    permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
-) -> Result<()> {
-    append_index_definition_event_with_permit_in_transaction(
-        storage,
-        None,
         event,
         permit,
         partition_owner_signing_key,
@@ -259,101 +230,12 @@ async fn append_index_definition_event_inner(
             mutations,
             predicates,
             outbox_events,
-            crate::mvcc_transaction::DurabilityLevel::Local,
+            crate::mvcc_transaction::DurabilityLevel::Quorum,
             now_unix_ms,
         )
         .await?;
     }
     Ok(())
-}
-
-#[cfg(any())]
-async fn write_index_definition_event(
-    storage: &Storage,
-    bucket: &Bucket,
-    index: &IndexDefinition,
-    event_type: &str,
-) -> Result<IndexDefinitionEvent> {
-    write_index_definition_event_inner(storage, bucket, index, event_type, 0, None).await
-}
-
-#[cfg(any())]
-pub(crate) async fn write_index_definition_event_with_permit(
-    storage: &Storage,
-    bucket: &Bucket,
-    index: &IndexDefinition,
-    event_type: &str,
-    permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
-) -> Result<IndexDefinitionEvent> {
-    require_index_definition_permit(bucket.tenant_id, bucket.id, permit)?;
-    let partition_precondition =
-        partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
-    write_index_definition_event_inner(
-        storage,
-        bucket,
-        index,
-        event_type,
-        permit.fence_token,
-        Some(partition_precondition),
-    )
-    .await
-}
-
-#[cfg(any())]
-async fn write_index_definition_event_inner(
-    storage: &Storage,
-    bucket: &Bucket,
-    index: &IndexDefinition,
-    event_type: &str,
-    fence_token: u64,
-    partition_precondition: Option<CoreMutationPrecondition>,
-) -> Result<IndexDefinitionEvent> {
-    let cursor = read_index_current_state(storage, bucket.tenant_id, bucket.id)
-        .await?
-        .map(|state| state.latest_cursor)
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(|| anyhow::anyhow!("index definition cursor overflow"))?;
-    let event = IndexDefinitionEvent {
-        id: cursor,
-        tenant_id: bucket.tenant_id,
-        bucket_id: bucket.id,
-        bucket_name: bucket.name.clone(),
-        index_id: index.id,
-        index_name: index.name.clone(),
-        event_type: event_type.to_string(),
-        index_version: index.version,
-        mutation_id: uuid::Uuid::new_v4(),
-        definition: index_definition_json(&bucket.name, index),
-        created_at: chrono::Utc::now(),
-    };
-    append_index_definition_event_inner(
-        storage,
-        None,
-        &event,
-        fence_token,
-        partition_precondition,
-        None,
-        None,
-    )
-    .await?;
-    Ok(event)
-}
-
-#[cfg(any())]
-pub async fn read_index_definition_events(
-    storage: &Storage,
-    tenant_id: i64,
-    bucket_id: i64,
-    after_cursor: i64,
-    limit: usize,
-) -> Result<Vec<IndexDefinitionEvent>> {
-    Ok(
-        read_index_definition_event_page(storage, tenant_id, bucket_id, after_cursor, limit)
-            .await?
-            .events,
-    )
 }
 
 pub fn read_index_definition_event_page_mvcc(
@@ -414,38 +296,6 @@ pub struct IndexDefinitionEventPage {
     pub has_more: bool,
 }
 
-#[cfg(any())]
-pub async fn read_current_index_definition_events(
-    storage: &Storage,
-    tenant_id: i64,
-    bucket_id: i64,
-    include_disabled: bool,
-) -> Result<Vec<IndexDefinitionEvent>> {
-    let revision =
-        current_index_definition_collection_revision(storage, tenant_id, bucket_id).await?;
-    let mut events = Vec::new();
-    let mut after_tuple_key = None;
-    loop {
-        let page = page_current_index_definition_events(
-            storage,
-            tenant_id,
-            bucket_id,
-            include_disabled,
-            revision,
-            after_tuple_key.as_deref(),
-            1_000,
-        )
-        .await?;
-        events.extend(page.events);
-        let Some(next_tuple_key) = page.next_tuple_key else {
-            break;
-        };
-        after_tuple_key = Some(next_tuple_key);
-    }
-    Ok(events)
-}
-
-#[cfg(any())]
 pub(crate) async fn current_index_definition_collection_revision(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
@@ -454,7 +304,6 @@ pub(crate) async fn current_index_definition_collection_revision(
     current_definitions::collection_revision_mvcc(mvcc, tenant_id, bucket_id)
 }
 
-#[cfg(any())]
 pub(crate) async fn page_current_index_definition_events(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
@@ -496,35 +345,6 @@ pub(crate) async fn page_current_index_definition_events(
         #[cfg(test)]
         rows_visited: page.rows_visited,
     })
-}
-
-#[cfg(any())]
-pub async fn read_current_index_definitions(
-    storage: &Storage,
-    tenant_id: i64,
-    bucket_id: i64,
-    include_disabled: bool,
-) -> Result<Vec<IndexDefinition>> {
-    read_current_index_definition_events(storage, tenant_id, bucket_id, include_disabled)
-        .await?
-        .into_iter()
-        .map(|event| index_definition_from_event(&event))
-        .collect()
-}
-
-#[cfg(any())]
-pub async fn read_current_index_definition(
-    storage: &Storage,
-    tenant_id: i64,
-    bucket_id: i64,
-    name: &str,
-) -> Result<Option<IndexDefinition>> {
-    let current = read_index_current_row(storage, tenant_id, bucket_id, name).await?;
-    let Some(current) = current else {
-        return Ok(None);
-    };
-    ensure_index_event_name_matches(&current.event, tenant_id, bucket_id, name)?;
-    index_definition_from_event(&current.event).map(Some)
 }
 
 pub fn read_current_index_definition_mvcc(
@@ -621,20 +441,6 @@ pub fn next_index_definition_id_in_transaction(
     .unwrap_or(0)
     .checked_add(1)
     .ok_or_else(|| anyhow::anyhow!("index definition id overflow"))
-}
-
-#[cfg(any())]
-pub async fn next_index_definition_id(
-    storage: &Storage,
-    tenant_id: i64,
-    bucket_id: i64,
-) -> Result<i64> {
-    read_index_current_state(storage, tenant_id, bucket_id)
-        .await?
-        .map(|state| state.max_index_id)
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(|| anyhow::anyhow!("index definition id overflow"))
 }
 
 pub fn index_storage_id(tenant_id: i64, bucket_id: i64, index_id: i64) -> String {

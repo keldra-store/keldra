@@ -673,7 +673,7 @@ async fn write_boundary_migration_row(
                 logical_key,
                 payload,
             )],
-            crate::mvcc_transaction::DurabilityLevel::Local,
+            crate::mvcc_transaction::DurabilityLevel::Quorum,
             current_unix_millis_u64(),
         )
         .await

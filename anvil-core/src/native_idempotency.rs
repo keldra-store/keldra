@@ -172,7 +172,7 @@ where
             &idempotency_key,
             vec![ProductMutation::put(logical_key.clone(), bytes)],
             vec![(logical_key, PredicateKind::Absent)],
-            DurabilityLevel::Local,
+            DurabilityLevel::Quorum,
             current_unix_ms(),
         )
         .await
