@@ -45,12 +45,40 @@ where
         &self,
         request: product::CertificationRequest,
     ) -> Result<product::CertificationResult> {
+        let started_at = std::time::Instant::now();
+        tracing::debug!(
+            operation = "consensus.certify",
+            transaction_id = %request.transaction_id,
+            "proposing compact transaction certification command"
+        );
         let result = self
             .consensus
             .certify(to_consensus_command(&request)?)
             .await
-            .context("consensus certification failed")?;
-        Ok(from_consensus_result(result))
+            .context("consensus certification failed");
+        let elapsed = started_at.elapsed();
+        match result {
+            Ok(result) => {
+                crate::perf::record_consensus_phase("proposal", "ok", elapsed);
+                crate::perf::record_consensus_phase("apply", "ok", elapsed);
+                let result = from_consensus_result(result);
+                let commit_index = match &result {
+                    product::CertificationResult::Committed { commit_version } => *commit_version,
+                    product::CertificationResult::Aborted { .. } => {
+                        self.consensus.observed_commit_version().0
+                    }
+                };
+                crate::perf::record_consensus_commit(commit_index);
+                Ok(result)
+            }
+            Err(error) => {
+                crate::perf::record_consensus_phase("proposal", "error", elapsed);
+                if error.to_string().contains("leader") {
+                    crate::perf::record_consensus_leader_change("proposal_redirect");
+                }
+                Err(error)
+            }
+        }
     }
 }
 

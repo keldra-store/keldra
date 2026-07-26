@@ -501,6 +501,93 @@ pub fn record_repair_age(repair_kind: &str, age: Duration) {
     record_histogram_duration_ms("anvil_repair_age_ms", &[("repair_kind", repair_kind)], age);
 }
 
+pub fn record_transaction_duration(phase: &str, status: &str, duration: Duration) {
+    let measurement = match phase {
+        "build" => "anvil_transaction_build_duration_ms",
+        "replication" => "anvil_transaction_replication_duration_ms",
+        "certification" => "anvil_transaction_certification_duration_ms",
+        "apply" => "anvil_transaction_apply_duration_ms",
+        "total" => "anvil_transaction_total_duration_ms",
+        _ => return,
+    };
+    record_histogram_duration_ms(measurement, &[("status", status)], duration);
+}
+
+pub fn record_transaction_shape(
+    point_observations: u64,
+    range_observations: u64,
+    written_keys: u64,
+) {
+    record_gauge(
+        "anvil_transaction_point_observations",
+        &[],
+        point_observations.min(i64::MAX as u64) as i64,
+    );
+    record_gauge(
+        "anvil_transaction_range_observations",
+        &[],
+        range_observations.min(i64::MAX as u64) as i64,
+    );
+    record_gauge(
+        "anvil_transaction_written_keys",
+        &[],
+        written_keys.min(i64::MAX as u64) as i64,
+    );
+}
+
+pub fn record_transaction_conflict(reason: &str) {
+    record_counter(
+        "anvil_transaction_conflicts_total",
+        &[("reason", reason)],
+        1,
+    );
+}
+
+pub fn record_mvcc_state(applied_watermark: u64, observed_commit: u64, versions_created: u64) {
+    record_gauge(
+        "anvil_mvcc_applied_watermark",
+        &[],
+        applied_watermark.min(i64::MAX as u64) as i64,
+    );
+    record_gauge(
+        "anvil_mvcc_apply_lag_versions",
+        &[],
+        observed_commit
+            .saturating_sub(applied_watermark)
+            .min(i64::MAX as u64) as i64,
+    );
+    if versions_created > 0 {
+        record_counter("anvil_mvcc_versions_total", &[], versions_created);
+    }
+}
+
+pub fn record_consensus_phase(phase: &str, status: &str, duration: Duration) {
+    let measurement = match phase {
+        "proposal" => "anvil_consensus_proposal_duration_ms",
+        "apply" => "anvil_consensus_apply_duration_ms",
+        "snapshot" => "anvil_consensus_snapshot_duration_ms",
+        _ => return,
+    };
+    record_histogram_duration_ms(measurement, &[("status", status)], duration);
+}
+
+pub fn record_consensus_commit(commit_index: u64) {
+    record_gauge(
+        "anvil_consensus_commit_index",
+        &[],
+        commit_index.min(i64::MAX as u64) as i64,
+    );
+    record_counter("anvil_consensus_log_entries", &[("kind", "proposal")], 1);
+}
+
+pub fn record_consensus_leader_change(reason: &str) {
+    record_counter(
+        "anvil_consensus_leader_changes_total",
+        &[("reason", reason)],
+        1,
+    );
+}
+
 pub fn record_query_plan_duration(
     query_kind: &str,
     index_kind: &str,

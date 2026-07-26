@@ -864,7 +864,14 @@ where
     }
 
     pub async fn snapshot(&self, consistency: ReadConsistency) -> Result<CommitVersion> {
-        self.certifier.observed_commit_version(consistency).await
+        let version = self.certifier.observed_commit_version(consistency).await?;
+        tracing::debug!(
+            operation = "transaction.snapshot",
+            ?consistency,
+            snapshot_version = version,
+            "selected MVCC transaction snapshot"
+        );
+        Ok(version)
     }
 
     pub async fn commit(
@@ -872,6 +879,7 @@ where
         mut bundle: TransactionBundle,
         durability: DurabilityLevel,
     ) -> Result<CertificationResult> {
+        let build_started_at = std::time::Instant::now();
         bundle.canonicalize()?;
         for claim in &bundle.ownership_claims {
             self.ownership_resolver
@@ -880,7 +888,23 @@ where
         let bytes = bundle.canonical_bytes()?;
         self.resource_limits.validate_bundle(&bundle, &bytes)?;
         let identity = bundle.identity()?;
+        crate::perf::record_transaction_duration("build", "ok", build_started_at.elapsed());
+        crate::perf::record_transaction_shape(
+            bundle.point_observations.len() as u64,
+            bundle.range_observations.len() as u64,
+            bundle.writes.len() as u64,
+        );
+        tracing::debug!(
+            operation = "transaction.bundle_build",
+            transaction_id = %bundle.transaction_id,
+            point_observations = bundle.point_observations.len(),
+            range_observations = bundle.range_observations.len(),
+            written_keys = bundle.writes.len(),
+            bundle_bytes = bytes.len(),
+            "built canonical transaction bundle"
+        );
 
+        let replication_started_at = std::time::Instant::now();
         let local_bundle = self.store.persist(&identity, &bytes).await?;
         let coordinator_incarnation = local_bundle.node.clone();
         let mut evidence = self
@@ -901,13 +925,20 @@ where
             &evidence,
             &coordinator_incarnation,
         )?;
+        crate::perf::record_transaction_duration(
+            "replication",
+            "ok",
+            replication_started_at.elapsed(),
+        );
 
         let written_keys = bundle
             .writes
             .iter()
             .map(|operation| operation.key().clone())
             .collect();
-        self.certifier
+        let certification_started_at = std::time::Instant::now();
+        let result = self
+            .certifier
             .certify(CertificationRequest {
                 cluster_id: bundle.cluster_id,
                 transaction_id: bundle.transaction_id,
@@ -922,7 +953,23 @@ where
                 written_keys,
                 max_command_bytes: self.resource_limits.max_certification_command_bytes,
             })
-            .await
+            .await?;
+        crate::perf::record_transaction_duration(
+            "certification",
+            match &result {
+                CertificationResult::Committed { .. } => "committed",
+                CertificationResult::Aborted { .. } => "aborted",
+            },
+            certification_started_at.elapsed(),
+        );
+        if let CertificationResult::Aborted { ref reason } = result {
+            crate::perf::record_transaction_conflict(match reason {
+                CertificationAbort::PointConflict { .. } => "point",
+                CertificationAbort::RangeConflict { .. } => "range",
+                CertificationAbort::InvalidCommand(_) => "invalid_command",
+            });
+        }
+        Ok(result)
     }
 
     fn validate_durability(

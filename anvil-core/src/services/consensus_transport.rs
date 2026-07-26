@@ -164,14 +164,28 @@ async fn dispatch(runtime: &OpenRaftConsensus, frame: ConsensusRpcFrame) -> Cons
             };
         }
     };
-    match runtime
+    let snapshot_started_at =
+        (kind == ConsensusRpcKind::InstallSnapshot).then(std::time::Instant::now);
+    let result = runtime
         .handle_rpc(ConsensusRpc {
             schema_version: frame.schema_version as u16,
             kind,
             payload: frame.payload,
         })
-        .await
-    {
+        .await;
+    if let Some(started_at) = snapshot_started_at {
+        crate::perf::record_consensus_phase(
+            "snapshot",
+            if result.is_ok() { "ok" } else { "error" },
+            started_at.elapsed(),
+        );
+        tracing::debug!(
+            operation = "consensus.snapshot",
+            status = if result.is_ok() { "ok" } else { "error" },
+            "processed Raft snapshot installation"
+        );
+    }
+    match result {
         Ok(payload) => ConsensusRpcReply {
             request_id: frame.request_id,
             payload,

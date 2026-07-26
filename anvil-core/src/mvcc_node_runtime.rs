@@ -75,8 +75,19 @@ where
         bundle: TransactionBundle,
         durability: DurabilityLevel,
     ) -> Result<CommitOutcome> {
+        let total_started_at = std::time::Instant::now();
         let certification = self.coordinator.commit(bundle.clone(), durability).await?;
-        self.apply_certification(bundle, certification)
+        let outcome = self.apply_certification(bundle, certification)?;
+        crate::perf::record_transaction_duration(
+            "total",
+            if outcome.local_apply.is_some() {
+                "committed"
+            } else {
+                "aborted"
+            },
+            total_started_at.elapsed(),
+        );
+        Ok(outcome)
     }
 
     /// Applies an outcome received during restart recovery or replica catch-up.
@@ -90,11 +101,29 @@ where
     ) -> Result<CommitOutcome> {
         let local_apply = match certification {
             CertificationResult::Committed { commit_version } => {
-                Some(self.local.apply_certified_bundle_and_advance(
+                let apply_started_at = std::time::Instant::now();
+                let outcome = self.local.apply_certified_bundle_and_advance(
                     commit_version,
                     &bundle,
                     commit_version,
-                )?)
+                )?;
+                crate::perf::record_mvcc_state(
+                    commit_version,
+                    commit_version,
+                    bundle.writes.len() as u64,
+                );
+                crate::perf::record_transaction_duration(
+                    "apply",
+                    "committed",
+                    apply_started_at.elapsed(),
+                );
+                tracing::debug!(
+                    operation = "transaction.apply",
+                    transaction_id = %bundle.transaction_id,
+                    commit_version,
+                    "applied certified transaction bundle"
+                );
+                Some(outcome)
             }
             CertificationResult::Aborted { .. } => None,
         };

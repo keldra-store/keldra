@@ -1,5 +1,6 @@
 //! Ordered application of committed, metadata-only Raft decisions.
 
+use std::collections::BTreeSet;
 use std::{sync::Arc, time::Duration};
 
 use anvil_mvcc_consensus::{
@@ -33,6 +34,7 @@ pub struct MvccApplyWorker {
     local: LocalMvccStore,
     cluster_id_hash: [u8; 32],
     state: Arc<Mutex<ApplyWorkerState>>,
+    prepared_bundle_gc_grace_ms: Option<u64>,
 }
 
 pub trait DecisionSource: Send + Sync {
@@ -41,6 +43,7 @@ pub trait DecisionSource: Send + Sync {
         position: CommitVersion,
     ) -> std::result::Result<Vec<AppliedDecision>, ConsensusError>;
     fn gc_safety_watermark(&self) -> std::result::Result<CommitVersion, ConsensusError>;
+    fn observed_commit_version(&self) -> CommitVersion;
 }
 
 impl DecisionSource for OpenRaftConsensus {
@@ -53,6 +56,10 @@ impl DecisionSource for OpenRaftConsensus {
 
     fn gc_safety_watermark(&self) -> std::result::Result<CommitVersion, ConsensusError> {
         self.gc_safety_watermark()
+    }
+
+    fn observed_commit_version(&self) -> CommitVersion {
+        anvil_mvcc_consensus::Consensus::observed_commit_version(self)
     }
 }
 
@@ -75,7 +82,16 @@ impl MvccApplyWorker {
             peers: peers.into(),
             local,
             state: Arc::new(Mutex::new(ApplyWorkerState::Stopped)),
+            prepared_bundle_gc_grace_ms: None,
         }
+    }
+
+    pub fn with_prepared_bundle_gc_grace(mut self, grace_ms: u64) -> Result<Self> {
+        if grace_ms == 0 {
+            bail!("prepared bundle GC grace must be non-zero");
+        }
+        self.prepared_bundle_gc_grace_ms = Some(grace_ms);
+        Ok(self)
     }
 
     pub fn state_handle(&self) -> Arc<Mutex<ApplyWorkerState>> {
@@ -106,6 +122,8 @@ impl MvccApplyWorker {
 
     pub async fn apply_available(&self) -> Result<usize> {
         let mut watermark = CommitVersion(self.local.decision_watermark()?);
+        let observed_commit = self.consensus.observed_commit_version();
+        crate::perf::record_mvcc_state(watermark.0, observed_commit.0, 0);
         let gc = self.consensus.gc_safety_watermark()?;
         if watermark < gc {
             bail!(
@@ -116,6 +134,7 @@ impl MvccApplyWorker {
         }
         let decisions = self.consensus.applied_decisions_after(watermark)?;
         let mut applied = 0;
+        let mut reachable_bundles = Vec::new();
         for decision in decisions {
             let expected = watermark.0.saturating_add(1);
             if decision.position.0 != expected {
@@ -130,6 +149,7 @@ impl MvccApplyWorker {
                     bail!("unrecoverable MVCC bundle belongs to another cluster");
                 }
                 let identity = bundle_identity(committed.bundle_hash, committed.bundle_length);
+                reachable_bundles.push(identity.clone());
                 let bytes = self.fetch_bundle(&identity).await?;
                 let mut bundle: TransactionBundle = serde_json::from_slice(&bytes)
                     .context("unrecoverable MVCC: decode canonical transaction bundle")?;
@@ -153,16 +173,38 @@ impl MvccApplyWorker {
                     &bundle,
                     decision.position.0,
                 )?;
+                tracing::debug!(
+                    operation = "transaction.apply",
+                    transaction_id = %bundle.transaction_id,
+                    commit_version = decision.position.0,
+                    source = "consensus_catch_up",
+                    "applied committed bundle from ordered consensus decisions"
+                );
+                crate::perf::record_mvcc_state(
+                    decision.position.0,
+                    observed_commit.0,
+                    bundle.writes.len() as u64,
+                );
             } else {
                 self.local.advance_decision_watermark(decision.position.0)?;
             }
             watermark = decision.position;
+            crate::perf::record_mvcc_state(watermark.0, observed_commit.0, 0);
             applied += 1;
         }
         if self.local.gc_watermark()? < gc.0 {
             self.local
                 .garbage_collect(gc.0)
                 .context("apply consensus-approved MVCC GC watermark locally")?;
+        }
+        if let Some(grace_ms) = self.prepared_bundle_gc_grace_ms {
+            let retain = self.prepared.retain_plan(
+                &reachable_bundles,
+                &BTreeSet::new(),
+                unix_time_ms()?,
+                grace_ms,
+            )?;
+            self.prepared.compact_authorised(&retain)?;
         }
         Ok(applied)
     }
@@ -199,6 +241,15 @@ impl MvccApplyWorker {
             failures.join("; ")
         ))
     }
+}
+
+fn unix_time_ms() -> Result<u64> {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis(),
+    )
+    .context("system time exceeds u64 milliseconds")
 }
 
 fn bundle_identity(hash: BundleHash, length: u64) -> BundleIdentity {
@@ -288,6 +339,14 @@ mod tests {
 
         fn gc_safety_watermark(&self) -> std::result::Result<CommitVersion, ConsensusError> {
             Ok(self.gc)
+        }
+
+        fn observed_commit_version(&self) -> CommitVersion {
+            self.decisions
+                .lock()
+                .unwrap()
+                .last()
+                .map_or(CommitVersion(0), |decision| decision.position)
         }
     }
 
