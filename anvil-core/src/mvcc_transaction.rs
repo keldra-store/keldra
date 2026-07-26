@@ -48,6 +48,13 @@ pub struct RangeObservation {
     pub observed_range_stamp: CommitVersion,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct RangeConflict {
+    pub table_id: u16,
+    pub start_application_key: Vec<u8>,
+    pub end_application_key: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WriteOperation {
@@ -86,6 +93,7 @@ pub struct TransactionBundle {
     pub authenticated_principal: String,
     pub point_observations: Vec<PointObservation>,
     pub range_observations: Vec<RangeObservation>,
+    pub advanced_range_stamps: Vec<RangeConflict>,
     pub writes: Vec<WriteOperation>,
     pub shard_manifests: Vec<ObjectShardManifestReference>,
     pub outbox_events: Vec<Vec<u8>>,
@@ -139,6 +147,16 @@ impl TransactionBundle {
         for observation in &self.range_observations {
             if observation.start_application_key >= observation.end_application_key {
                 bail!("range observation must be a non-empty half-open interval");
+            }
+        }
+        self.advanced_range_stamps.sort();
+        ensure_unique(
+            self.advanced_range_stamps.iter(),
+            "advanced range conflict stamp",
+        )?;
+        for range in &self.advanced_range_stamps {
+            if range.start_application_key >= range.end_application_key {
+                bail!("advanced range stamp must be a non-empty half-open interval");
             }
         }
 
@@ -288,14 +306,23 @@ pub struct CertificationRequest {
     pub object_durability: Vec<ObjectDurabilityEvidence>,
     pub point_observations: Vec<PointObservation>,
     pub range_observations: Vec<RangeObservation>,
+    pub advanced_range_stamps: Vec<RangeConflict>,
     pub written_keys: Vec<LogicalKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CertificationAbort {
+    InvalidCommand(String),
+    PointConflict { key_hash: [u8; 32] },
+    RangeConflict { range_hash: [u8; 32] },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CertificationResult {
     Committed { commit_version: CommitVersion },
-    Aborted { conflicts: Vec<LogicalKey> },
+    Aborted { reason: CertificationAbort },
 }
 
 #[async_trait]
@@ -402,6 +429,7 @@ where
                 object_durability: evidence.objects,
                 point_observations: bundle.point_observations,
                 range_observations: bundle.range_observations,
+                advanced_range_stamps: bundle.advanced_range_stamps,
                 written_keys,
             })
             .await
@@ -737,6 +765,7 @@ mod tests {
             authenticated_principal: "tenant/1/principal/app".to_string(),
             point_observations: Vec::new(),
             range_observations: Vec::new(),
+            advanced_range_stamps: Vec::new(),
             writes: vec![
                 WriteOperation::Put {
                     key: LogicalKey {

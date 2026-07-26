@@ -78,6 +78,7 @@ pub mod metadata_journal;
 pub mod middleware;
 pub mod model_journal;
 pub mod multipart_journal;
+pub mod mvcc_consensus_adapter;
 pub mod mvcc_transaction;
 pub mod native_idempotency;
 pub mod node_identity;
