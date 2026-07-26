@@ -939,7 +939,7 @@ mod tests {
                 "live-pin",
                 Duration::from_secs(30),
                 DurabilityLevel::Local,
-                ReadConsistency::Local,
+                ReadConsistency::LocalSnapshot,
                 1_000,
             )
             .await
@@ -947,7 +947,7 @@ mod tests {
 
         assert_eq!(
             registry.active_snapshot_pins(1_001).unwrap(),
-            [CommitVersion(9)].into_iter().collect()
+            [9].into_iter().collect()
         );
         registry
             .commit(&runtime, &live.transaction_id, "alice", 1_002)
@@ -963,7 +963,7 @@ mod tests {
                 "expired-pin",
                 Duration::from_millis(5),
                 DurabilityLevel::Local,
-                ReadConsistency::Local,
+                ReadConsistency::LocalSnapshot,
                 2_000,
             )
             .await

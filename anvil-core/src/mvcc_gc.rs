@@ -138,7 +138,7 @@ mod tests {
                 "gc-pin",
                 Duration::from_secs(30),
                 DurabilityLevel::Local,
-                ReadConsistency::Local,
+                ReadConsistency::LocalSnapshot,
                 1_000,
             )
             .await

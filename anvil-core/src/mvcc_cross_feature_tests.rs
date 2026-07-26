@@ -109,7 +109,7 @@ async fn begin(
     state: &AppState,
     idempotency_key: &str,
     now: u64,
-) -> crate::mvcc_transaction::TransactionHandle {
+) -> crate::mvcc_open_transactions::TransactionHandle {
     state
         .mvcc
         .open_transactions
