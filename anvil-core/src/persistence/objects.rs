@@ -446,6 +446,7 @@ impl Persistence {
         } else {
             Box::pin(metadata_journal::append_object_mutation_with_permit(
                 &self.storage,
+                self.mvcc()?,
                 &bucket,
                 &object,
                 options.journal_mutation,
@@ -673,6 +674,7 @@ impl Persistence {
         } else {
             metadata_journal::append_object_mutation_with_permit(
                 &self.storage,
+                self.mvcc()?,
                 &bucket,
                 &object,
                 metadata_journal::ObjectJournalMutation::Put,
@@ -890,6 +892,7 @@ impl Persistence {
         } else {
             metadata_journal::append_object_mutation_with_permit(
                 &self.storage,
+                self.mvcc()?,
                 &bucket,
                 &object,
                 metadata_journal::ObjectJournalMutation::DeleteMarker,
@@ -1089,6 +1092,7 @@ impl Persistence {
         } else {
             metadata_journal::append_object_mutation_with_permit(
                 &self.storage,
+                self.mvcc()?,
                 &bucket,
                 &object,
                 metadata_journal::ObjectJournalMutation::DeleteMarker,
@@ -1178,6 +1182,7 @@ impl Persistence {
         } else {
             metadata_journal::append_object_mutation_with_permit(
                 &self.storage,
+                self.mvcc()?,
                 &bucket,
                 &object,
                 metadata_journal::ObjectJournalMutation::DeleteVersion,

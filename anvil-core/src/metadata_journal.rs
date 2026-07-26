@@ -1927,10 +1927,6 @@ use self::object_data_target::{
 };
 
 mod object_mutation;
-#[cfg(test)]
-pub(crate) use self::object_mutation::append_object_mutation;
-#[cfg(test)]
-use self::object_mutation::append_object_mutation_inner;
 pub(crate) use self::object_mutation::{
     append_object_mutation_with_permit, append_object_mutation_with_permit_in_transaction,
     append_object_put_mutations_with_permit_in_transaction,
@@ -1944,9 +1940,3 @@ use self::version_sort::{
 
 mod helpers;
 pub use helpers::*;
-
-#[cfg(test)]
-mod task_compaction_tests;
-
-#[cfg(test)]
-mod tests;

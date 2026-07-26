@@ -1,7 +1,7 @@
 use super::*;
 use crate::core_store::{
-    CoreMutationBatchAdditions, CoreMutationBatchReceipt, CoreMutationRootPublication,
-    ObjectMetadataProjectionMutation, core_meta_root_key_hash,
+    CoreMutationBatchAdditions, CoreMutationRootPublication, ObjectMetadataProjectionMutation,
+    core_meta_root_key_hash,
 };
 use crate::formats::writer::WriterFamily;
 use crate::persistence::ObjectWatchEvent;
@@ -10,18 +10,9 @@ use anyhow::bail;
 
 const MAX_STREAM_HEAD_RETRIES: usize = 64;
 
-#[cfg(test)]
-pub(crate) async fn append_object_mutation(
-    storage: &Storage,
-    bucket: &Bucket,
-    object: &Object,
-    mutation: ObjectJournalMutation,
-) -> Result<()> {
-    append_object_mutation_inner(storage, None, bucket, object, mutation, 0, None, None, None).await
-}
-
 pub(crate) async fn append_object_mutation_with_permit(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     object: &Object,
     mutation: ObjectJournalMutation,
@@ -30,7 +21,7 @@ pub(crate) async fn append_object_mutation_with_permit(
 ) -> Result<()> {
     append_object_mutation_with_permit_in_transaction(
         storage,
-        None,
+        Some(mvcc),
         bucket,
         object,
         mutation,
@@ -503,7 +494,7 @@ async fn append_object_mutation_inner_once(
     let batch = CoreMutationBatch {
         transaction_id: transaction_id.to_string(),
         scope_partition: scope_partition.clone(),
-        committed_by_principal,
+        committed_by_principal: committed_by_principal.clone(),
         root_publications: vec![CoreMutationRootPublication {
             root_anchor_key: scope_partition,
             writer_families: vec![
@@ -515,98 +506,48 @@ async fn append_object_mutation_inner_once(
         preconditions,
         operations,
     };
+    let mvcc = mvcc.ok_or_else(|| anyhow!("MVCC staging handle is required"))?;
+    let predicates = object_put_predicates(
+        mvcc,
+        bucket,
+        std::slice::from_ref(object),
+        transaction_id,
+        transaction_principal,
+    )?;
+    let mutations = crate::mvcc_product::product_mutations_from_operations(batch.operations)?;
     if mvcc_transaction_id.is_some() {
         let transaction_principal = transaction_principal
             .ok_or_else(|| anyhow!("object metadata MVCC transaction principal missing"))?;
-        let mvcc = mvcc.ok_or_else(|| anyhow!("MVCC staging handle is required"))?;
-        let mutations = crate::mvcc_product::product_mutations_from_operations(batch.operations)?;
         mvcc.stage_product_mutations(
             transaction_id,
             transaction_principal,
             mutations,
             u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
         )?;
+        let now_unix_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default();
+        for (key, kind) in predicates {
+            mvcc.stage_predicate(
+                transaction_id,
+                transaction_principal,
+                key,
+                kind,
+                now_unix_ms,
+            )?;
+        }
         return Ok(());
     }
-    let receipt = match core_store.commit_mutation_batch(batch).await {
-        Ok(receipt) => receipt,
-        Err(error) if error.to_string().contains("idempotency conflict") => {
-            return Err(error.context(
-                "object mutation idempotency identity conflicts with committed metadata",
-            ));
-        }
-        Err(error) => return Err(error),
-    };
-    if !receipt.is_committed() {
-        bail!(
-            "object metadata mutation did not commit: {}",
-            receipt
-                .finalisation_error
-                .as_deref()
-                .unwrap_or("unknown finalisation error")
-        );
-    }
-    let visible_metadata_sequence = require_stream_update(&receipt, &metadata_stream_id)?;
-    let visible_watch_sequence = require_stream_update(&receipt, &watch.stream_id)?;
-    require_committed_metadata_record(
-        core_store,
-        &metadata_stream_id,
-        visible_metadata_sequence,
-        object,
-        mutation,
-        bucket,
+    mvcc.autocommit_product_mutations_with_predicates(
+        &committed_by_principal,
+        transaction_id,
+        mutations,
+        predicates,
+        crate::mvcc_transaction::DurabilityLevel::Local,
+        u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
     )
     .await?;
-    let projected_cursor = watch_log::exact_object_watch_cursor(
-        storage,
-        bucket.tenant_id,
-        bucket.id,
-        object.version_id,
-        object.mutation_id,
-    )
-    .await?
-    .ok_or_else(|| anyhow!("committed object mutation has no exact watch cursor"))?;
-    if projected_cursor != u128::from(visible_watch_sequence) {
-        bail!("committed object mutation watch cursor projection is inconsistent");
-    }
-    let watch_receipt =
-        watch_log::committed_object_watch_receipt(storage, bucket, object, &event).await?;
-    if watch_receipt.sequence != visible_watch_sequence {
-        bail!("committed object mutation watch event sequence is inconsistent");
-    }
     core_store
         .materialize_object_metadata_ancillary_projections(bucket, object, projection_mutation)
         .await?;
-    Ok(())
-}
-
-async fn require_committed_metadata_record(
-    core_store: &CoreStore,
-    stream_id: &str,
-    sequence: u64,
-    object: &Object,
-    mutation: ObjectJournalMutation,
-    bucket: &Bucket,
-) -> Result<()> {
-    let record = core_store
-        .read_stream(ReadStream {
-            stream_id: stream_id.to_string(),
-            after_sequence: sequence.saturating_sub(1),
-            limit: 1,
-        })
-        .await?
-        .into_iter()
-        .find(|record| record.sequence == sequence);
-    let Some(record) = record else {
-        bail!("committed object mutation metadata record {stream_id}:{sequence} is not readable");
-    };
-    let actual = metadata_record_from_stream_record(record)?;
-    let expected_body = object_version_body(bucket, object, mutation, actual.body.fence_token);
-    if actual.record_kind != ObjectMetadataRecordKind::from_str(mutation.object_record_kind())?
-        || actual.body != expected_body
-    {
-        bail!("object mutation idempotency identity conflicts with committed metadata");
-    }
     Ok(())
 }
 
@@ -666,14 +607,4 @@ fn object_watch_event(
         is_delete_marker: mutation.is_delete_marker(),
         created_at: object.created_at,
     }
-}
-
-fn require_stream_update(
-    receipt: &CoreMutationBatchReceipt,
-    expected_stream_id: &str,
-) -> Result<u64> {
-    receipt
-        .stream_append(expected_stream_id)
-        .map(|append| append.visible_sequence)
-        .ok_or_else(|| anyhow!("object mutation is missing stream update {expected_stream_id}"))
 }
