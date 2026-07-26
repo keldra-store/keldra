@@ -234,7 +234,15 @@ async fn append_object_put_mutations_with_permit_inner(
         transaction_id,
         transaction_principal,
     )?;
-    let mutations = crate::mvcc_product::product_mutations_from_operations(batch.operations)?;
+    let event_plan = plan_metadata_events(
+        mvcc,
+        bucket,
+        batch.operations,
+        transaction_principal.map(|principal| (transaction_id, principal)),
+    )?;
+    let mutations = event_plan.mutations;
+    let mut predicates = predicates;
+    predicates.push(event_plan.head_predicate);
     if let Some(transaction_principal) = transaction_principal {
         mvcc.stage_product_mutations(
             transaction_id,
@@ -546,7 +554,15 @@ async fn append_object_mutation_inner_once(
         transaction_id,
         transaction_principal,
     )?;
-    let mutations = crate::mvcc_product::product_mutations_from_operations(batch.operations)?;
+    let event_plan = plan_metadata_events(
+        mvcc,
+        bucket,
+        batch.operations,
+        transaction_principal.map(|principal| (transaction_id, principal)),
+    )?;
+    let mutations = event_plan.mutations;
+    let mut predicates = predicates;
+    predicates.push(event_plan.head_predicate);
     if mvcc_transaction_id.is_some() {
         let transaction_principal = transaction_principal
             .ok_or_else(|| anyhow!("object metadata MVCC transaction principal missing"))?;

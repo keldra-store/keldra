@@ -2,10 +2,10 @@ use crate::bucket_journal;
 use crate::core_store::{
     CF_OBJECT_HEADS, CoreMetaRowCommonProto, CoreMetaTuplePart, CoreMutationBatch,
     CoreMutationOperation, CoreMutationPrecondition, CorePipelinePolicy, CoreStore,
-    CoreTraceContext, ReadStream, TABLE_OBJECT_METADATA_PARTITION_MANIFEST_ROW,
-    WriteLogicalFileRequest, core_meta_committed_row_common, core_meta_payload_digest,
-    core_meta_root_key_hash, core_meta_tuple_key, core_mutation_publication_attempt_id,
-    decode_deterministic_proto, is_stream_head_mismatch,
+    CoreTraceContext, TABLE_OBJECT_METADATA_PARTITION_MANIFEST_ROW, TABLE_STREAM_HEAD_ROW,
+    TABLE_STREAM_RECORD_INDEX_ROW, WriteLogicalFileRequest, core_meta_committed_row_common,
+    core_meta_payload_digest, core_meta_root_key_hash, core_meta_tuple_key,
+    core_mutation_publication_attempt_id, decode_deterministic_proto, is_stream_head_mismatch,
 };
 use crate::formats::{
     FileFamily, Hash32, decode_writer_segment, encode_writer_segment_header, hash32,
@@ -837,9 +837,14 @@ pub(crate) async fn seal_object_journal_segments_with_permit(
     let partition_precondition =
         partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
     let compaction_started_at = std::time::Instant::now();
-    let staged =
-        stage_object_journal_segments(storage, bucket, manifest_signing_key, permit.fence_token)
-            .await?;
+    let staged = stage_object_journal_segments(
+        storage,
+        mvcc,
+        bucket,
+        manifest_signing_key,
+        permit.fence_token,
+    )
+    .await?;
     publish_staged_compaction(storage, mvcc, bucket, &staged, &[partition_precondition]).await?;
     complete_staged_compaction(staged, "object_metadata_seal", compaction_started_at)
 }
@@ -857,9 +862,14 @@ pub(crate) async fn seal_object_journal_segments_with_task_guard(
     let partition_precondition =
         partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
     let compaction_started_at = std::time::Instant::now();
-    let staged =
-        stage_object_journal_segments(storage, bucket, manifest_signing_key, permit.fence_token)
-            .await?;
+    let staged = stage_object_journal_segments(
+        storage,
+        mvcc,
+        bucket,
+        manifest_signing_key,
+        permit.fence_token,
+    )
+    .await?;
     publish_staged_compaction_for_task(
         storage,
         mvcc,
@@ -874,11 +884,12 @@ pub(crate) async fn seal_object_journal_segments_with_task_guard(
 
 async fn stage_object_journal_segments(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     manifest_signing_key: &[u8],
     fence_token: u64,
 ) -> Result<StagedObjectMetadataCompaction> {
-    let records = read_all_metadata_journal_records(storage, bucket).await?;
+    let records = read_all_metadata_journal_records(mvcc, bucket)?;
     let generation = records
         .last()
         .map(|record| record.partition_sequence)
@@ -1136,7 +1147,7 @@ pub async fn recover_object_metadata_partition(
     }
 
     if let Some(active_journal) = &manifest.active_journal {
-        let records = read_manifest_journal_ref_records(storage, active_journal).await?;
+        let records = read_manifest_journal_ref_records(mvcc, bucket, active_journal).await?;
         let first = records
             .first()
             .ok_or_else(|| anyhow!("active journal manifest entry points at an empty stream"))?;
@@ -1215,7 +1226,7 @@ async fn recover_object_directory_partition(
     }
 
     if let Some(active_journal) = &manifest.active_journal {
-        let records = read_manifest_journal_ref_records(storage, active_journal).await?;
+        let records = read_manifest_journal_ref_records(mvcc, bucket, active_journal).await?;
         let first = records
             .first()
             .ok_or_else(|| anyhow!("active journal manifest entry points at an empty stream"))?;
@@ -1608,7 +1619,7 @@ pub async fn rebuild_directory_index_from_metadata_with_permit(
     let body_records =
         read_object_version_bodies_from_metadata_only(storage, mvcc, bucket, manifest_signing_key)
             .await?;
-    let records = read_all_metadata_journal_records(storage, bucket).await?;
+    let records = read_all_metadata_journal_records(mvcc, bucket)?;
     let generation = records
         .last()
         .map(|record| record.partition_sequence)
@@ -1835,7 +1846,7 @@ async fn read_object_version_bodies_inner(
         }
     }
 
-    for record in read_all_metadata_journal_records(storage, bucket).await? {
+    for record in read_all_metadata_journal_records(mvcc, bucket)? {
         if record.partition_sequence <= compacted_through_sequence {
             continue;
         }
@@ -1894,7 +1905,7 @@ async fn read_object_version_bodies_from_metadata_only(
         }
     }
 
-    for record in read_all_metadata_journal_records(storage, bucket).await? {
+    for record in read_all_metadata_journal_records(mvcc, bucket)? {
         if record.partition_sequence <= compacted_through_sequence {
             continue;
         }
@@ -1924,7 +1935,7 @@ async fn current_directory_entries_from_index(
         directory_records.extend(recovered_directory);
     }
 
-    for record in read_all_metadata_journal_records(storage, bucket).await? {
+    for record in read_all_metadata_journal_records(mvcc, bucket)? {
         if record.partition_sequence <= compacted_through_sequence {
             continue;
         }
@@ -2010,16 +2021,58 @@ fn directory_index_snapshot(
     })
 }
 
-async fn read_all_metadata_journal_records(
-    storage: &Storage,
+fn read_all_metadata_journal_records(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
 ) -> Result<Vec<ObjectMetadataRecord>> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    read_metadata_journal_records_from_store(
-        &core_store,
-        &object_metadata_stream_id(bucket.tenant_id, bucket.id),
-    )
-    .await
+    let snapshot = mvcc.runtime.applied_version()?;
+    let stream_id = object_metadata_stream_id(bucket.tenant_id, bucket.id);
+    let head_key =
+        crate::mvcc_product::stream_logical_key(TABLE_STREAM_HEAD_ROW, &stream_id, None)?;
+    let Some(head_payload) = read_metadata_product_at(mvcc, &head_key, snapshot)? else {
+        return Ok(Vec::new());
+    };
+    let head = decode_head(&head_payload)?;
+    let prefix =
+        crate::mvcc_product::stream_logical_key(TABLE_STREAM_RECORD_INDEX_ROW, &stream_id, None)?;
+    let mut events = mvcc
+        .runtime
+        .scan_table_prefix_at(
+            TABLE_STREAM_RECORD_INDEX_ROW,
+            &prefix.application_key,
+            snapshot,
+        )?
+        .into_iter()
+        .map(|(_, row)| decode_event(&row.value))
+        .collect::<Result<Vec<_>>>()?;
+    events.sort_by_key(|event| event.partition_sequence);
+    validate_event_chain(&events, 0, String::new())?;
+    if events
+        .last()
+        .map(|event| event.partition_sequence)
+        .unwrap_or(0)
+        != head.last_sequence
+        || events
+            .last()
+            .map(|event| event.event_hash.as_str())
+            .unwrap_or("")
+            != head.last_event_hash
+    {
+        bail!("object metadata journal head does not match its event chain");
+    }
+    events
+        .into_iter()
+        .map(|event| {
+            let body = decode_object_version_body(&event.payload)?;
+            Ok(ObjectMetadataRecord {
+                partition_sequence: event.partition_sequence,
+                event_hash: event.event_hash,
+                record_kind: ObjectMetadataRecordKind::from_str(&event.record_kind)?,
+                payload: event.payload,
+                body,
+            })
+        })
+        .collect()
 }
 
 mod object_data_target;
@@ -2032,6 +2085,9 @@ pub(crate) use self::mvcc_projection::{
     MetadataMvccProjectionPlan, MetadataProductRowKind, metadata_product_key,
     read_metadata_product_at, read_metadata_product_latest,
 };
+
+mod mvcc_event;
+use self::mvcc_event::*;
 
 mod object_mutation;
 pub(crate) use self::object_mutation::{

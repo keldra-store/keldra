@@ -2,15 +2,6 @@ use super::*;
 use crate::core_store::{CoreObjectRef, GetBlob};
 use base64::Engine;
 
-const METADATA_JOURNAL_PAGE_ROWS: usize = 512;
-
-#[derive(Debug)]
-pub(super) struct MetadataJournalRecordPage {
-    pub records: Vec<ObjectMetadataRecord>,
-    pub next_sequence: u64,
-    pub has_more: bool,
-}
-
 pub(super) fn version_sorts_after_marker(
     order: usize,
     body: &ObjectVersionBody,
@@ -303,6 +294,11 @@ pub(super) async fn publish_partition_manifest(
     let _validated_physical_preconditions = additional_preconditions;
     let mut plan = MetadataMvccProjectionPlan::new();
     plan.observe_and_put(mvcc, key, staged.manifest_payload.clone())?;
+    plan.observe_and_put(
+        mvcc,
+        metadata_product_key(MetadataProductRowKind::CompactionState, bucket, None)?,
+        staged.manifest_payload.clone(),
+    )?;
     let principal = object_metadata_partition_principal(bucket);
     plan.autocommit(
         mvcc,
@@ -659,12 +655,10 @@ pub async fn active_object_journal_stats(
         compacted_through_sequence = manifest.compacted_through_sequence;
     }
 
-    let stream_id = object_metadata_stream_id(bucket.tenant_id, bucket.id);
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let last_sequence = core_store
-        .visible_stream_head_metadata(&stream_id)
-        .await?
-        .map(|metadata| metadata.sequence)
+    let records = read_all_metadata_journal_records(mvcc, bucket)?;
+    let last_sequence = records
+        .last()
+        .map(|record| record.partition_sequence)
         .unwrap_or(0);
     let mut stats = ActiveObjectJournalStats {
         last_sequence,
@@ -672,31 +666,17 @@ pub async fn active_object_journal_stats(
         ..ActiveObjectJournalStats::default()
     };
     let mut tombstone_debt = 0_u64;
-    let mut after_sequence = compacted_through_sequence;
-    while after_sequence < last_sequence {
-        // The published head bounds this internal accounting scan; payload bytes are unnecessary.
-        let page = core_store.raw_stream_record_metadata_range(
-            &stream_id,
-            after_sequence,
-            last_sequence,
-            METADATA_JOURNAL_PAGE_ROWS,
-        )?;
-        if page.is_empty() {
-            break;
+    for record in records
+        .iter()
+        .filter(|record| record.partition_sequence > compacted_through_sequence)
+    {
+        stats.uncompacted_frame_count = stats.uncompacted_frame_count.saturating_add(1);
+        stats.uncompacted_encoded_bytes = stats
+            .uncompacted_encoded_bytes
+            .saturating_add(record.payload.len() as u64);
+        if record.record_kind == ObjectMetadataRecordKind::DeleteMarker {
+            tombstone_debt = tombstone_debt.saturating_add(1);
         }
-        for record in &page {
-            stats.uncompacted_frame_count = stats.uncompacted_frame_count.saturating_add(1);
-            stats.uncompacted_encoded_bytes = stats
-                .uncompacted_encoded_bytes
-                .saturating_add(record.payload_len);
-            if record.record_kind == DELETE_MARKER_RECORD_KIND {
-                tombstone_debt = tombstone_debt.saturating_add(1);
-            }
-        }
-        after_sequence = page
-            .last()
-            .ok_or_else(|| anyhow!("metadata journal page unexpectedly empty"))?
-            .sequence;
     }
     crate::perf::record_tombstone_debt("object_blob", tombstone_debt);
     Ok(stats)
@@ -715,12 +695,9 @@ pub async fn object_metadata_source_cursor(
     } else {
         0
     };
-    let stream_id = object_metadata_stream_id(bucket.tenant_id, bucket.id);
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let active_sequence = core_store
-        .visible_stream_head_metadata(&stream_id)
-        .await?
-        .map(|metadata| metadata.sequence)
+    let active_sequence = read_all_metadata_journal_records(mvcc, bucket)?
+        .last()
+        .map(|record| record.partition_sequence)
         .unwrap_or(0);
     Ok(u128::from(active_sequence.max(compacted_through_sequence)))
 }
@@ -761,11 +738,9 @@ pub async fn object_metadata_source_checkpoint_hash(
     let checkpoint_event_hash = if max_sequence == compacted_through_sequence {
         compacted_event_hash
     } else if max_sequence > compacted_through_sequence {
-        let stream_id = object_metadata_stream_id(bucket.tenant_id, bucket.id);
-        let core_store = CoreStore::new(storage.clone()).await?;
-        core_store
-            .visible_stream_record_metadata(&stream_id, max_sequence)
-            .await?
+        read_all_metadata_journal_records(mvcc, bucket)?
+            .into_iter()
+            .find(|record| record.partition_sequence == max_sequence)
             .ok_or_else(|| anyhow!("object metadata source cursor is not visible"))?
             .event_hash
     } else {
@@ -777,107 +752,25 @@ pub async fn object_metadata_source_checkpoint_hash(
 }
 
 pub(super) async fn read_manifest_journal_ref_records(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    bucket: &Bucket,
     journal_ref: &ManifestJournalRef,
 ) -> Result<Vec<ObjectMetadataRecord>> {
     let stream_id = journal_ref
         .path
         .strip_prefix("corestream:")
         .ok_or_else(|| anyhow!("object metadata manifest journal ref must use corestream:"))?;
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let mut records = Vec::new();
-    let mut after_sequence = journal_ref.first_sequence.saturating_sub(1);
-    while after_sequence < journal_ref.last_sequence {
-        let page = read_metadata_journal_records_page(
-            &core_store,
-            stream_id,
-            after_sequence,
-            METADATA_JOURNAL_PAGE_ROWS,
-        )
-        .await?;
-        for record in page.records {
-            if record.partition_sequence > journal_ref.last_sequence {
-                break;
-            }
-            records.push(record);
-        }
-        if !page.has_more
-            || page.next_sequence >= journal_ref.last_sequence
-            || page.next_sequence <= after_sequence
-        {
-            break;
-        }
-        after_sequence = page.next_sequence;
+    if stream_id != object_metadata_stream_id(bucket.tenant_id, bucket.id) {
+        bail!("object metadata manifest journal ref has wrong stream");
     }
-    Ok(records)
-}
-
-pub(super) async fn read_metadata_journal_records_from_store(
-    core_store: &CoreStore,
-    stream_id: &str,
-) -> Result<Vec<ObjectMetadataRecord>> {
-    let mut decoded = Vec::new();
-    let mut after_sequence = 0;
-    loop {
-        let page = read_metadata_journal_records_page(
-            core_store,
-            stream_id,
-            after_sequence,
-            METADATA_JOURNAL_PAGE_ROWS,
-        )
-        .await?;
-        decoded.extend(page.records);
-        if !page.has_more || page.next_sequence <= after_sequence {
-            break;
-        }
-        after_sequence = page.next_sequence;
-    }
-    Ok(decoded)
-}
-
-pub(super) async fn read_metadata_journal_records_page(
-    core_store: &CoreStore,
-    stream_id: &str,
-    after_sequence: u64,
-    limit: usize,
-) -> Result<MetadataJournalRecordPage> {
-    if !(1..=4_096).contains(&limit) {
-        return Err(anyhow!(
-            "object metadata journal page size must be between 1 and 4096"
-        ));
-    }
-    let page = core_store
-        .read_stream_page(ReadStream {
-            stream_id: stream_id.to_string(),
-            after_sequence,
-            limit,
+    let records = read_all_metadata_journal_records(mvcc, bucket)?
+        .into_iter()
+        .filter(|record| {
+            record.partition_sequence >= journal_ref.first_sequence
+                && record.partition_sequence <= journal_ref.last_sequence
         })
-        .await?;
-    let mut decoded = Vec::with_capacity(page.records.len());
-    for record in page.records {
-        if record.record_kind.starts_with("object_metadata.") {
-            decoded.push(metadata_record_from_stream_record(record)?);
-        }
-    }
-    Ok(MetadataJournalRecordPage {
-        records: decoded,
-        next_sequence: page.next_sequence,
-        has_more: page.has_more,
-    })
-}
-
-pub(super) fn metadata_record_from_stream_record(
-    record: crate::core_store::StreamRecord,
-) -> Result<ObjectMetadataRecord> {
-    let record_kind = ObjectMetadataRecordKind::from_str(&record.record_kind)?;
-    let body = decode_object_metadata_body_proto(&record.payload)?;
-    Ok(ObjectMetadataRecord {
-        partition_sequence: record.sequence,
-        event_hash: record.event_hash,
-        record_kind,
-        payload: record.payload,
-        body,
-    })
+        .collect();
+    Ok(records)
 }
 
 pub(super) fn object_metadata_stream_id(tenant_id: i64, bucket_id: i64) -> String {
@@ -1045,11 +938,10 @@ pub(super) fn read_object_metadata_partition_manifest_row(
 
 #[cfg(test)]
 pub(crate) async fn read_object_metadata_record_fences_for_test(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
 ) -> Result<Vec<u64>> {
-    Ok(read_all_metadata_journal_records(storage, bucket)
-        .await?
+    Ok(read_all_metadata_journal_records(mvcc, bucket)?
         .into_iter()
         .map(|record| record.body.fence_token)
         .collect())

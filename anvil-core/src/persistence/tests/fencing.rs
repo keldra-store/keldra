@@ -168,7 +168,7 @@ async fn persistence_global_journal_writes_use_current_fence_tokens() {
         assert!(tenant_bucket_fences.iter().all(|fence| *fence > 0));
         assert!(global_bucket_fences.iter().all(|fence| *fence > 0));
         let object_fences = crate::metadata_journal::read_object_metadata_record_fences_for_test(
-            &persistence.storage,
+            persistence.mvcc().unwrap(),
             &bucket,
         )
         .await
