@@ -65,6 +65,19 @@ impl CertificationState {
         self.recent_results.get(&transaction_id)
     }
 
+    /// Drops retry-deduplication outcomes strictly below a consensus-approved
+    /// GC watermark.
+    ///
+    /// Point versions and range stamps are intentionally retained. A compact
+    /// conflict marker represents current certification state, not history, and
+    /// cannot be removed merely because its last write is old.
+    pub fn garbage_collect_results(&mut self, watermark: CommitVersion) -> usize {
+        let before = self.recent_results.len();
+        self.recent_results
+            .retain(|_, result| certification_result_version(result) >= watermark);
+        before - self.recent_results.len()
+    }
+
     /// Apply one command at its committed Raft log position.
     ///
     /// Invalid commands are deterministic transaction aborts. Storage/order
@@ -150,6 +163,13 @@ impl CertificationState {
             }
         }
         None
+    }
+}
+
+fn certification_result_version(result: &CertificationResult) -> CommitVersion {
+    match result {
+        CertificationResult::Committed { commit_version, .. } => *commit_version,
+        CertificationResult::Aborted { at_version, .. } => *at_version,
     }
 }
 
@@ -300,6 +320,34 @@ mod tests {
         let retry = state.apply(CommitVersion(99), &tx).unwrap();
         assert_eq!(first, retry);
         assert_eq!(state.last_applied(), CommitVersion(99));
+    }
+
+    #[test]
+    fn result_gc_removes_only_outcomes_strictly_below_watermark() {
+        let mut state = CertificationState::new([1; 32]).unwrap();
+        let first = command(1);
+        let second = command(2);
+        state.apply(CommitVersion(4), &first).unwrap();
+        state.apply(CommitVersion(5), &second).unwrap();
+
+        assert_eq!(state.garbage_collect_results(CommitVersion(5)), 1);
+        assert!(state.transaction_result(first.transaction_id).is_none());
+        assert!(state.transaction_result(second.transaction_id).is_some());
+    }
+
+    #[test]
+    fn result_gc_never_discards_current_point_or_range_conflict_state() {
+        let point = LogicalKeyHash(hash(3));
+        let range = RangeConflictKey(hash(4));
+        let mut state = CertificationState::new([1; 32]).unwrap();
+        let mut write = command(1);
+        write.written_point_keys = vec![point];
+        write.advanced_range_stamps = vec![range];
+        state.apply(CommitVersion(4), &write).unwrap();
+
+        state.garbage_collect_results(CommitVersion(5));
+        assert_eq!(state.point_version(point), Some(CommitVersion(4)));
+        assert_eq!(state.range_stamp(range), Some(CommitVersion(4)));
     }
 
     #[test]

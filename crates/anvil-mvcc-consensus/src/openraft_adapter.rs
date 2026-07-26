@@ -824,10 +824,32 @@ impl RaftStateMachine<AnvilRaftConfig> for OpenRaftStateMachine {
                         Err(error) => RaftApplyResult::Rejected(error.to_string()),
                     }
                 }
-                EntryPayload::Normal(command) => match state.control.apply(&command) {
-                    Ok(result) => RaftApplyResult::Control(result),
-                    Err(error) => RaftApplyResult::Rejected(error),
-                },
+                EntryPayload::Normal(command) => {
+                    if matches!(
+                        &command,
+                        ConsensusCommand::AdvanceGcWatermark { watermark, .. }
+                            if *watermark > CommitVersion(log_id.index)
+                    ) {
+                        RaftApplyResult::Rejected(
+                            "GC safety watermark cannot exceed its committed consensus position"
+                                .into(),
+                        )
+                    } else {
+                        match state.control.apply(&command) {
+                            Ok(result) => {
+                                if let ControlApplyResult::GcWatermarkAdvanced(watermark) = &result
+                                {
+                                    state.certification.garbage_collect_results(*watermark);
+                                    state
+                                        .decisions
+                                        .retain(|position, _| *position >= *watermark);
+                                }
+                                RaftApplyResult::Control(result)
+                            }
+                            Err(error) => RaftApplyResult::Rejected(error),
+                        }
+                    }
+                }
             };
             state
                 .decisions
@@ -1011,7 +1033,7 @@ mod tests {
             },
             ConsensusCommand::AdvanceGcWatermark {
                 cluster_id_hash: [4; 32],
-                watermark: CommitVersion(22),
+                watermark: CommitVersion(4),
             },
         ];
         source
@@ -1043,7 +1065,31 @@ mod tests {
         assert_eq!(restored.control.node_incarnation(NodeId(8)), Some(3));
         assert_eq!(restored.control.partition(12).unwrap().epoch, 7);
         assert_eq!(restored.control.durability_policy().generation, 5);
-        assert_eq!(restored.control.gc_safety_watermark(), CommitVersion(22));
+        assert_eq!(restored.control.gc_safety_watermark(), CommitVersion(4));
+    }
+
+    #[tokio::test]
+    async fn gc_watermark_cannot_jump_beyond_its_consensus_position() {
+        let directory = TempDir::new().unwrap();
+        let store = RocksRaftStore::open(directory.path(), 0).unwrap();
+        let (_, mut machine) = stores(store.clone(), [1; 32]).unwrap();
+        let responses = machine
+            .apply([Entry {
+                log_id: LogId::new(CommittedLeaderId::new(1, 1), 7),
+                payload: EntryPayload::Normal(ConsensusCommand::AdvanceGcWatermark {
+                    cluster_id_hash: [1; 32],
+                    watermark: CommitVersion(8),
+                }),
+            }])
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            responses.as_slice(),
+            [RaftApplyResult::Rejected(reason)] if reason.contains("consensus position")
+        ));
+        let state: MachineState = store.read_state_value(KEY_OPENRAFT_STATE).unwrap().unwrap();
+        assert_eq!(state.control.gc_safety_watermark(), CommitVersion(0));
     }
 
     #[tokio::test]
