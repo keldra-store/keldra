@@ -1,7 +1,7 @@
 use crate::core_store::{
     CoreCompressionDescriptor, CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
     CoreMutationRootPublication, CoreObjectEncoding, CoreObjectPlacement, CoreObjectRef, CoreStore,
-    CoreTransaction, CoreTransactionUpdate, ReadStream, StreamRecord,
+    CoreTransactionUpdate, ReadStream, StreamRecord,
 };
 use crate::formats::{Hash32, hash32, writer::WriterFamily};
 use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
@@ -325,12 +325,10 @@ async fn create_append_stream_inner(
     transaction_principal: Option<&str>,
 ) -> Result<AppendStreamMutation> {
     let core_store = CoreStore::new(storage.clone()).await?;
-    let explicit_transaction: Option<CoreTransaction> = None;
     let id = i64::try_from(
-        next_stream_sequence_visible_to_transaction(
+        next_stream_sequence(
             &core_store,
             &append_metadata_stream_id(tenant_id, bucket_id),
-            explicit_transaction.as_ref(),
         )
         .await?,
     )
@@ -524,6 +522,7 @@ async fn append_stream_record_inner(
     let fence_token = permit.map(|permit| permit.fence_token).unwrap_or(0);
     let current = get_active_append_stream_for_optional_transaction(
         storage,
+        None,
         tenant_id,
         bucket_id,
         &stream.stream_key,
@@ -536,21 +535,14 @@ async fn append_stream_record_inner(
         bail!("append stream row id does not match stream identity");
     }
     let core_store = CoreStore::new(storage.clone()).await?;
-    let explicit_transaction: Option<CoreTransaction> = None;
     let next_seq = i64::try_from(
-        next_stream_sequence_visible_to_transaction(
-            &core_store,
-            &append_record_stream_id(&current)?,
-            explicit_transaction.as_ref(),
-        )
-        .await?,
+        next_stream_sequence(&core_store, &append_record_stream_id(&current)?).await?,
     )
     .map_err(|_| anyhow!("append record sequence overflow"))?;
     let next_record_id = i64::try_from(
-        next_stream_sequence_visible_to_transaction(
+        next_stream_sequence(
             &core_store,
             &append_metadata_stream_id(tenant_id, bucket_id),
-            explicit_transaction.as_ref(),
         )
         .await?,
     )
@@ -688,6 +680,7 @@ async fn seal_append_stream_inner(
     let bucket_id = expected_stream.bucket_id;
     let Some(mut stream) = get_active_append_stream_for_optional_transaction(
         storage,
+        None,
         tenant_id,
         bucket_id,
         &expected_stream.stream_key,
@@ -817,14 +810,9 @@ async fn append_body(
     committed_by_principal: Option<&str>,
 ) -> Result<MetadataMutationReceipt> {
     let core_store = CoreStore::new(storage.clone()).await?;
-    let explicit_transaction = match (transaction_id, transaction_principal) {
-        (Some(_), Some(_)) | (None, None) => None,
-        _ => {
-            return Err(anyhow!(
-                "append transaction id and principal must be provided together"
-            ));
-        }
-    };
+    if transaction_id.is_some() || transaction_principal.is_some() {
+        bail!("legacy append body cannot stage a cluster transaction");
+    }
     let journal_stream_id = append_metadata_stream_id(tenant_id, bucket_id);
     let stream = stream.ok_or_else(|| anyhow!("append event is missing stream identity"))?;
     if stream.tenant_id != tenant_id || stream.bucket_id != bucket_id {
@@ -837,26 +825,17 @@ async fn append_body(
         AppendMutationKind::AppendRecord => append_record_stream_id(&stream)?,
     };
     let journal_precondition = core_store
-        .stream_head_precondition_visible_to_transaction(
-            &journal_stream_id,
-            explicit_transaction.as_ref(),
-        )
+        .stream_head_precondition_visible_to_transaction(&journal_stream_id, None)
         .await?;
     let exact_precondition = core_store
-        .stream_head_precondition_visible_to_transaction(
-            &exact_stream_id,
-            explicit_transaction.as_ref(),
-        )
+        .stream_head_precondition_visible_to_transaction(&exact_stream_id, None)
         .await?;
     let record_cursor_stream_id = matches!(event, AppendMutationKind::AppendRecord)
         .then(|| append_record_cursor_stream_id(tenant_id, bucket_id));
     let record_cursor_precondition = if let Some(stream_id) = record_cursor_stream_id.as_deref() {
         Some(
             core_store
-                .stream_head_precondition_visible_to_transaction(
-                    stream_id,
-                    explicit_transaction.as_ref(),
-                )
+                .stream_head_precondition_visible_to_transaction(stream_id, None)
                 .await?,
         )
     } else {
@@ -901,10 +880,7 @@ async fn append_body(
     let payload = encode_append_body(&body, fence_token, mutation_id)?;
     let payload_hash = hex::encode(hash32(&payload));
     let partition_id = hex::encode(append_metadata_partition_id(tenant_id, bucket_id));
-    let scope_partition = explicit_transaction
-        .as_ref()
-        .map(|transaction| transaction.scope_partition.clone())
-        .unwrap_or(partition_id);
+    let scope_partition = partition_id;
     let mut preconditions: Vec<_> = partition_precondition.into_iter().collect();
     preconditions.push(journal_precondition);
     preconditions.push(exact_precondition);
@@ -947,9 +923,7 @@ async fn append_body(
         });
     }
     let batch = CoreMutationBatch {
-        transaction_id: transaction_id
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| format!("append-metadata:{tenant_id}:{bucket_id}:{mutation_id}")),
+        transaction_id: format!("append-metadata:{tenant_id}:{bucket_id}:{mutation_id}"),
         scope_partition: scope_partition.clone(),
         committed_by_principal: transaction_principal
             .or(committed_by_principal)
@@ -962,11 +936,7 @@ async fn append_body(
         preconditions,
         operations,
     };
-    let batch_receipt = if transaction_id.is_some() {
-        core_store.stage_explicit_transaction_batch(batch).await?
-    } else {
-        core_store.commit_mutation_batch(batch).await?
-    };
+    let batch_receipt = core_store.commit_mutation_batch(batch).await?;
     let stream_update = batch_receipt
         .visible_updates
         .iter()
@@ -1003,14 +973,10 @@ fn expected_stream_next_sequence(precondition: &CoreMutationPrecondition) -> Res
         .ok_or_else(|| anyhow!("append stream sequence overflow"))
 }
 
-async fn next_stream_sequence_visible_to_transaction(
-    core_store: &CoreStore,
-    stream_id: &str,
-    transaction: Option<&CoreTransaction>,
-) -> Result<u64> {
+async fn next_stream_sequence(core_store: &CoreStore, stream_id: &str) -> Result<u64> {
     expected_stream_next_sequence(
         &core_store
-            .stream_head_precondition_visible_to_transaction(stream_id, transaction)
+            .stream_head_precondition_visible_to_transaction(stream_id, None)
             .await?,
     )
 }

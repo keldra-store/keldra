@@ -414,6 +414,7 @@ impl Persistence {
 
     pub async fn get_active_append_stream_in_transaction(
         &self,
+        mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
         tenant_id: i64,
         bucket_id: i64,
         stream_key: &str,
@@ -423,6 +424,7 @@ impl Persistence {
     ) -> Result<Option<AppendStream>> {
         append_journal::get_active_append_stream_in_transaction(
             &self.storage,
+            mvcc,
             tenant_id,
             bucket_id,
             stream_key,
@@ -513,10 +515,11 @@ impl Persistence {
 
     pub async fn append_stream_has_records(
         &self,
+        mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
         stream: &AppendStream,
         transaction: Option<(&str, &str)>,
     ) -> Result<bool> {
-        append_journal::append_stream_has_records(&self.storage, stream, transaction).await
+        append_journal::append_stream_has_records(&self.storage, mvcc, stream, transaction).await
     }
 
     pub async fn list_append_streams_page(

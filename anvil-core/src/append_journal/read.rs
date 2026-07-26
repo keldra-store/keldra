@@ -23,13 +23,14 @@ pub async fn get_active_append_stream(
     stream_id: uuid::Uuid,
 ) -> Result<Option<AppendStream>> {
     get_active_append_stream_for_optional_transaction(
-        storage, tenant_id, bucket_id, stream_key, stream_id, None,
+        storage, None, tenant_id, bucket_id, stream_key, stream_id, None,
     )
     .await
 }
 
 pub async fn get_active_append_stream_in_transaction(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     bucket_id: i64,
     stream_key: &str,
@@ -39,6 +40,7 @@ pub async fn get_active_append_stream_in_transaction(
 ) -> Result<Option<AppendStream>> {
     get_active_append_stream_for_optional_transaction(
         storage,
+        Some(mvcc),
         tenant_id,
         bucket_id,
         stream_key,
@@ -50,6 +52,7 @@ pub async fn get_active_append_stream_in_transaction(
 
 pub(super) async fn get_active_append_stream_for_optional_transaction(
     storage: &Storage,
+    mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
     tenant_id: i64,
     bucket_id: i64,
     stream_key: &str,
@@ -58,14 +61,30 @@ pub(super) async fn get_active_append_stream_for_optional_transaction(
 ) -> Result<Option<AppendStream>> {
     let state_stream_id =
         append_state_stream_id_for_identity(tenant_id, bucket_id, stream_key, stream_id)?;
+    if let Some((transaction_id, principal)) = transaction {
+        let mvcc = mvcc.ok_or_else(|| anyhow!("MVCC transaction handle is required"))?;
+        let key = crate::mvcc_product::stream_logical_key(
+            crate::core_store::TABLE_STREAM_HEAD_ROW,
+            &state_stream_id,
+            None,
+        )?;
+        if let Some(payload) = mvcc.read_transaction_value(transaction_id, principal, &key)? {
+            return decode_active_stream_state(
+                &state_stream_id,
+                tenant_id,
+                bucket_id,
+                stream_key,
+                stream_id,
+                &payload,
+            )
+            .map(Some);
+        }
+    }
     let core_store = CoreStore::new(storage.clone()).await?;
-    let Some(sequence) =
-        latest_visible_sequence(&core_store, &state_stream_id, transaction).await?
-    else {
+    let Some(sequence) = latest_visible_sequence(&core_store, &state_stream_id).await? else {
         return Ok(None);
     };
-    let Some(record) = read_record_at(&core_store, &state_stream_id, sequence, transaction).await?
-    else {
+    let Some(record) = read_record_at(&core_store, &state_stream_id, sequence).await? else {
         return Err(anyhow!(
             "append stream state head {state_stream_id}:{sequence} is not readable"
         ));
@@ -73,7 +92,26 @@ pub(super) async fn get_active_append_stream_for_optional_transaction(
     if record.record_kind != "append_metadata.state" {
         bail!("append stream state contains a different record kind");
     }
-    let body = decode_append_body(&record.payload)?;
+    decode_active_stream_state(
+        &state_stream_id,
+        tenant_id,
+        bucket_id,
+        stream_key,
+        stream_id,
+        &record.payload,
+    )
+    .map(Some)
+}
+
+fn decode_active_stream_state(
+    state_stream_id: &str,
+    tenant_id: i64,
+    bucket_id: i64,
+    stream_key: &str,
+    stream_id: uuid::Uuid,
+    payload: &[u8],
+) -> Result<AppendStream> {
+    let body = decode_append_body(payload)?;
     if !matches!(body.event.as_str(), "create_stream" | "seal_stream") {
         bail!("append stream state contains a non-state event");
     }
@@ -88,7 +126,7 @@ pub(super) async fn get_active_append_stream_for_optional_transaction(
     {
         bail!("append stream state event does not match its physical stream");
     }
-    Ok(Some(stream))
+    Ok(stream)
 }
 
 pub async fn list_append_stream_records_page(
@@ -160,7 +198,7 @@ pub async fn list_append_streams_page(
         else {
             continue;
         };
-        let record = read_record_at(&core_store, state_stream_id, head.sequence, None)
+        let record = read_record_at(&core_store, state_stream_id, head.sequence)
             .await?
             .ok_or_else(|| anyhow!("append state stream head is not readable"))?;
         if record.record_kind != "append_metadata.state" {
@@ -189,12 +227,27 @@ pub async fn list_append_streams_page(
 
 pub async fn append_stream_has_records(
     storage: &Storage,
+    mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
     stream: &AppendStream,
     transaction: Option<(&str, &str)>,
 ) -> Result<bool> {
+    if let Some((transaction_id, principal)) = transaction {
+        let mvcc = mvcc.ok_or_else(|| anyhow!("MVCC transaction handle is required"))?;
+        let key = crate::mvcc_product::stream_logical_key(
+            crate::core_store::TABLE_STREAM_HEAD_ROW,
+            &append_record_stream_id(stream)?,
+            None,
+        )?;
+        if mvcc
+            .read_transaction_value(transaction_id, principal, &key)?
+            .is_some()
+        {
+            return Ok(true);
+        }
+    }
     let core_store = CoreStore::new(storage.clone()).await?;
     Ok(
-        latest_visible_sequence(&core_store, &append_record_stream_id(stream)?, transaction)
+        latest_visible_sequence(&core_store, &append_record_stream_id(stream)?)
             .await?
             .is_some(),
     )
@@ -210,7 +263,7 @@ pub async fn append_record_source_cursor(
     let Some(head) = core_store.visible_stream_head_metadata(&stream_id).await? else {
         return Ok(0);
     };
-    let record = read_record_at(&core_store, &stream_id, head.sequence, None)
+    let record = read_record_at(&core_store, &stream_id, head.sequence)
         .await?
         .ok_or_else(|| anyhow!("append record cursor head is not readable"))?;
     if record.record_kind != "append_metadata.record_cursor" {
@@ -275,31 +328,11 @@ fn append_stream_identity_hash(stream_key: &str, stream_id: uuid::Uuid) -> Strin
     hasher.finalize().to_hex().to_string()
 }
 
-async fn latest_visible_sequence(
-    core_store: &CoreStore,
-    stream_id: &str,
-    transaction: Option<(&str, &str)>,
-) -> Result<Option<u64>> {
-    let mut sequence = core_store
+async fn latest_visible_sequence(core_store: &CoreStore, stream_id: &str) -> Result<Option<u64>> {
+    let sequence = core_store
         .visible_stream_head_metadata(stream_id)
         .await?
         .map(|metadata| metadata.sequence);
-    if let Some((transaction_id, principal)) = transaction {
-        let transaction = core_store
-            .read_explicit_transaction_for_principal(transaction_id, principal)
-            .await?;
-        for update in transaction.visible_updates {
-            if let CoreTransactionUpdate::StreamAppend {
-                stream_id: update_stream_id,
-                visible_sequence,
-                ..
-            } = update
-                && update_stream_id == stream_id
-            {
-                sequence = Some(sequence.unwrap_or(0).max(visible_sequence));
-            }
-        }
-    }
     Ok(sequence.filter(|sequence| *sequence > 0))
 }
 
@@ -307,20 +340,13 @@ async fn read_record_at(
     core_store: &CoreStore,
     stream_id: &str,
     sequence: u64,
-    transaction: Option<(&str, &str)>,
 ) -> Result<Option<StreamRecord>> {
     let input = ReadStream {
         stream_id: stream_id.to_string(),
         after_sequence: sequence.saturating_sub(1),
         limit: 1,
     };
-    let records = if let Some((transaction_id, principal)) = transaction {
-        core_store
-            .read_stream_visible_to_transaction(input, transaction_id, principal)
-            .await?
-    } else {
-        core_store.read_stream_page(input).await?.records
-    };
+    let records = core_store.read_stream_page(input).await?.records;
     Ok(records
         .into_iter()
         .find(|record| record.sequence == sequence))
