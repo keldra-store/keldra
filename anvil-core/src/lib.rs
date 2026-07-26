@@ -87,6 +87,8 @@ pub mod mvcc_bootstrap;
 pub mod mvcc_consensus_adapter;
 pub mod mvcc_control_plane;
 #[cfg(test)]
+mod mvcc_crash_restart_acceptance;
+#[cfg(test)]
 mod mvcc_cross_feature_tests;
 #[cfg(test)]
 pub mod mvcc_fault_injection;
