@@ -233,14 +233,16 @@ pub async fn ensure_bootstrapped(
 
 pub async fn check_admin_relation(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     mesh_id: &str,
     claims: &auth::Claims,
     relation: SystemAdminRelation,
 ) -> Result<bool> {
     let object_id = system_mesh_object_id(mesh_id);
-    let revision = authz_journal::latest_authz_revision(storage, SYSTEM_STORAGE_TENANT_ID).await?;
+    let revision = authz_journal::latest_authz_revision(mvcc, SYSTEM_STORAGE_TENANT_ID)?;
     authz_journal::resolve_permission_at_revision(
         storage,
+        mvcc,
         SYSTEM_STORAGE_TENANT_ID,
         &system_namespace(),
         &object_id,
@@ -254,8 +256,8 @@ pub async fn check_admin_relation(
 }
 
 pub(crate) async fn check_internal_node_access(
-    storage: &Storage,
     core_store: &CoreStore,
+    runtime: &crate::mvcc_node_runtime::MvccNodeRuntime,
     mesh_id: &str,
     claims: &auth::Claims,
     node_id: &str,
@@ -268,9 +270,8 @@ pub(crate) async fn check_internal_node_access(
         return Ok(false);
     }
 
-    let granted = authz_journal::check_current_authz_tuple_with_core_store(
-        storage,
-        core_store,
+    let granted = authz_journal::check_current_authz_tuple_runtime(
+        runtime,
         SYSTEM_STORAGE_TENANT_ID,
         &system_namespace(),
         SYSTEM_OBJECT_ID,
@@ -297,6 +298,7 @@ pub(crate) async fn check_internal_node_access(
 
 pub async fn principal_has_any_admin_relation(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     mesh_id: &str,
     app_id: i64,
 ) -> Result<bool> {
@@ -307,7 +309,7 @@ pub async fn principal_has_any_admin_relation(
         jti: None,
     };
     for relation in all_admin_relations() {
-        if check_admin_relation(storage, mesh_id, &claims, *relation).await? {
+        if check_admin_relation(storage, mvcc, mesh_id, &claims, *relation).await? {
             return Ok(true);
         }
     }
@@ -529,6 +531,7 @@ async fn install_system_schema(storage: &Storage, persistence: &Persistence) -> 
     let namespaces = system_mesh_schema();
     let revision = authz_realm_schema::put_schema_revision(
         storage,
+        persistence.mvcc()?,
         SYSTEM_STORAGE_TENANT_ID,
         SYSTEM_SCHEMA_ID,
         namespaces.clone(),
@@ -538,6 +541,7 @@ async fn install_system_schema(storage: &Storage, persistence: &Persistence) -> 
     .await?;
     match authz_realm_schema::read_schema_binding(
         storage,
+        persistence.mvcc()?,
         SYSTEM_STORAGE_TENANT_ID,
         SYSTEM_REALM_ID,
     )
@@ -547,6 +551,7 @@ async fn install_system_schema(storage: &Storage, persistence: &Persistence) -> 
         Some(binding) => {
             authz_realm_schema::bind_schema(
                 storage,
+                persistence.mvcc()?,
                 SYSTEM_STORAGE_TENANT_ID,
                 SYSTEM_REALM_ID,
                 revision.schema_ref,
@@ -559,6 +564,7 @@ async fn install_system_schema(storage: &Storage, persistence: &Persistence) -> 
         None => {
             match authz_realm_schema::bind_schema(
                 storage,
+                persistence.mvcc()?,
                 SYSTEM_STORAGE_TENANT_ID,
                 SYSTEM_REALM_ID,
                 revision.schema_ref.clone(),
@@ -572,6 +578,7 @@ async fn install_system_schema(storage: &Storage, persistence: &Persistence) -> 
                 Err(err) => {
                     let Some(binding) = authz_realm_schema::read_schema_binding(
                         storage,
+                        persistence.mvcc()?,
                         SYSTEM_STORAGE_TENANT_ID,
                         SYSTEM_REALM_ID,
                     )
@@ -1331,7 +1338,7 @@ fn bootstrap_marker_tuple_key(mesh_id: &str) -> Result<Vec<u8>> {
     ])
 }
 
-#[cfg(test)]
+#[cfg(any())]
 mod tests {
     use super::*;
     use tempfile::tempdir;

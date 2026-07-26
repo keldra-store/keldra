@@ -56,6 +56,8 @@ struct BoundNamespace {
 
 struct CurrentResolver<'a> {
     storage: &'a Storage,
+    mvcc: &'a crate::mvcc_bootstrap::MvccSubsystem,
+    snapshot_version: u64,
     tenant_id: i64,
     subject: SubjectRef,
     schemas: BTreeMap<String, Option<BoundNamespace>>,
@@ -65,14 +67,18 @@ struct CurrentResolver<'a> {
 
 pub(crate) async fn resolve_at_current_revision(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     userset: UsersetRef,
     subject: SubjectRef,
     expected_revision: i64,
 ) -> Result<AuthzResolutionOutcome> {
-    require_revision(storage, tenant_id, expected_revision).await?;
+    let snapshot_version = mvcc.runtime.applied_version()?;
+    require_revision(mvcc, tenant_id, expected_revision, snapshot_version)?;
     let mut resolver = CurrentResolver {
         storage,
+        mvcc,
+        snapshot_version,
         tenant_id,
         subject,
         schemas: BTreeMap::new(),
@@ -80,7 +86,7 @@ pub(crate) async fn resolve_at_current_revision(
         stats: AuthzResolutionStats::default(),
     };
     let allowed = resolver.resolve(userset).await?;
-    require_revision(storage, tenant_id, expected_revision).await?;
+    require_revision(mvcc, tenant_id, expected_revision, snapshot_version)?;
     Ok(AuthzResolutionOutcome {
         allowed,
         stats: resolver.stats,
@@ -89,13 +95,17 @@ pub(crate) async fn resolve_at_current_revision(
 
 pub(crate) async fn collect_subjects_at_current_revision(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     userset: UsersetRef,
     expected_revision: i64,
 ) -> Result<AuthzSubjectCollectionOutcome> {
-    require_revision(storage, tenant_id, expected_revision).await?;
+    let snapshot_version = mvcc.runtime.applied_version()?;
+    require_revision(mvcc, tenant_id, expected_revision, snapshot_version)?;
     let mut resolver = CurrentResolver {
         storage,
+        mvcc,
+        snapshot_version,
         tenant_id,
         subject: SubjectRef {
             kind: String::new(),
@@ -107,7 +117,7 @@ pub(crate) async fn collect_subjects_at_current_revision(
         stats: AuthzResolutionStats::default(),
     };
     let subjects = resolver.collect_subjects(userset).await?;
-    require_revision(storage, tenant_id, expected_revision).await?;
+    require_revision(mvcc, tenant_id, expected_revision, snapshot_version)?;
     Ok(AuthzSubjectCollectionOutcome {
         subjects,
         stats: resolver.stats,
@@ -135,8 +145,9 @@ impl CurrentResolver<'_> {
             let member = self.schema_member(&userset).await?;
             if member.direct_relation {
                 self.record_projection_visits(1)?;
-                if projection::read_current_record(
-                    self.storage,
+                if projection::read_current_record_at(
+                    self.mvcc,
+                    self.snapshot_version,
                     self.tenant_id,
                     &userset.namespace,
                     &userset.object_id,
@@ -144,8 +155,7 @@ impl CurrentResolver<'_> {
                     &self.subject.kind,
                     &self.subject.id,
                     &self.subject.caveat_hash,
-                )
-                .await?
+                )?
                 .is_some()
                 {
                     return Ok(true);
@@ -289,11 +299,13 @@ impl CurrentResolver<'_> {
         if !self.schemas.contains_key(&userset.namespace) {
             let (realm_id, namespace) = namespace_realm_parts(&userset.namespace);
             self.stats.schema_point_reads += 1;
-            let schema = authz_realm_schema::read_bound_namespace_schema(
+            let schema = authz_realm_schema::read_bound_namespace_schema_mvcc_at(
                 self.storage,
+                self.mvcc,
                 self.tenant_id,
                 &realm_id,
                 &namespace,
+                self.snapshot_version,
             )
             .await?;
             self.schemas.insert(
@@ -334,14 +346,14 @@ impl CurrentResolver<'_> {
             return Ok(records.clone());
         }
         let rows = projection::read_current_relation_rows(
-            self.storage,
+            self.mvcc,
+            self.snapshot_version,
             self.tenant_id,
             &userset.namespace,
             &userset.object_id,
             &userset.relation,
             subject_kind,
-        )
-        .await?;
+        )?;
         self.record_projection_visits(rows.candidates_visited)?;
         self.relation_rows.insert(key, rows.records.clone());
         Ok(rows.records)
@@ -362,12 +374,14 @@ impl CurrentResolver<'_> {
     }
 }
 
-async fn require_revision(storage: &Storage, tenant_id: i64, expected_revision: i64) -> Result<()> {
+fn require_revision(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    expected_revision: i64,
+    snapshot_version: u64,
+) -> Result<()> {
     let actual = i64::try_from(
-        authz_head::read(storage, tenant_id)
-            .await?
-            .head
-            .committed_revision,
+        authz_head::read_at_mvcc(mvcc, tenant_id, snapshot_version)?.committed_revision,
     )?;
     if actual != expected_revision {
         bail!(

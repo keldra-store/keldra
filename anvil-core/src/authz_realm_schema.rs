@@ -11,7 +11,7 @@ use crate::core_store::{
 use crate::formats::{hash32, writer::WriterFamily};
 use crate::persistence::AuthzSchemaBindingPrecondition;
 use crate::storage::Storage;
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 
@@ -86,8 +86,6 @@ struct StoredSchemaRefProto {
 
 #[derive(Clone, PartialEq, Message)]
 struct StoredAuthzSchemaRevisionProto {
-    #[prost(message, optional, tag = "1")]
-    common: Option<crate::core_store::CoreMetaRowCommonProto>,
     #[prost(message, optional, tag = "2")]
     schema_ref: Option<StoredSchemaRefProto>,
     #[prost(message, repeated, tag = "3")]
@@ -104,8 +102,6 @@ struct StoredAuthzSchemaRevisionProto {
 
 #[derive(Clone, PartialEq, Message)]
 struct StoredAuthzSchemaBindingProto {
-    #[prost(message, optional, tag = "1")]
-    common: Option<crate::core_store::CoreMetaRowCommonProto>,
     #[prost(string, tag = "2")]
     realm_id: String,
     #[prost(message, optional, tag = "3")]
@@ -182,32 +178,64 @@ struct AuthzRelationRuleProto {
 
 pub async fn put_schema_revision(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     schema_id: &str,
     mut namespaces: Vec<AuthzNamespaceSchema>,
     written_by: &str,
     reason: &str,
 ) -> Result<StoredAuthzSchemaRevision> {
-    let write_lock = authz_head::tenant_write_lock(tenant_id)?;
-    let _guard = write_lock.lock().await;
     validate_schema_id(schema_id)?;
     crate::authz_schema_contract::validate_schema_set(&namespaces)?;
     crate::authz_schema_contract::canonicalize_schema_set(&mut namespaces);
     let schema_digest = schema_digest(&namespaces)?;
-    if let Some(existing) =
-        find_schema_by_digest(storage, tenant_id, schema_id, &schema_digest).await?
+    let digest_key = schema_digest_tuple_key(tenant_id, schema_id, &schema_digest)?;
+    if let Some(existing) = read_proto_row_latest_mvcc::<StoredAuthzSchemaRevision>(
+        storage,
+        mvcc,
+        tenant_id,
+        digest_key.clone(),
+    )
+    .await?
     {
         return Ok(existing);
     }
+    let assignment = mvcc
+        .reconcile_authz_tuple_assignment(tenant_id)
+        .await?
+        .ok_or_else(|| anyhow!("this node is not the assigned authorization schema writer"))?;
+    let principal = authz_head::transaction_principal(tenant_id);
+    let idempotency_key = format!("authz-schema:{tenant_id}:{schema_id}:{schema_digest}");
+    let now_unix_ms = current_unix_ms();
+    let handle = mvcc
+        .open_transactions
+        .begin(
+            mvcc.runtime.as_ref(),
+            mvcc.cluster_id(),
+            &principal,
+            idempotency_key,
+            std::time::Duration::from_secs(30),
+            crate::mvcc_transaction::DurabilityLevel::Quorum,
+            crate::mvcc_transaction::ReadConsistency::Linearized,
+            now_unix_ms,
+        )
+        .await?;
+    let transaction_id = handle.transaction_id.as_str();
     let latest_key = schema_latest_tuple_key(tenant_id, schema_id)?;
-    let latest =
-        read_proto_row_snapshot::<StoredAuthzSchemaRevision>(storage, tenant_id, latest_key)
-            .await?;
+    let latest = read_proto_row_transaction_mvcc::<StoredAuthzSchemaRevision>(
+        storage,
+        mvcc,
+        transaction_id,
+        &principal,
+        tenant_id,
+        latest_key.clone(),
+    )
+    .await?;
     let next_revision = latest
         .as_ref()
-        .map(|(record, _)| record.schema_ref.schema_revision.saturating_add(1))
+        .map(|record| record.schema_ref.schema_revision.saturating_add(1))
         .unwrap_or(1);
-    let head_snapshot = authz_head::read(storage, tenant_id).await?;
+    let head_snapshot = authz_head::read_mvcc(mvcc, transaction_id, &principal, tenant_id)?;
     let authz_revision = head_snapshot
         .head
         .committed_revision
@@ -225,46 +253,49 @@ pub async fn put_schema_revision(
         reason: reason.to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
     };
-    match write_schema_record(
-        storage,
-        tenant_id,
-        &record,
+    let revision_key = schema_revision_tuple_key(tenant_id, schema_id, next_revision)?;
+    let head = authz_head::advance_mvcc(
         &head_snapshot,
-        latest.map(|(_, payload_hash)| payload_hash),
-    )
-    .await
-    {
-        Ok(()) => {
-            crate::authz_journal::materialize_authz_tuple_segment(
-                storage,
-                tenant_id,
-                authz_revision,
-            )
-            .await?;
-            Ok(record)
-        }
-        Err(err) => {
-            // Concurrent bootstrap/schema writers may race on the same deterministic
-            // revision ref. If the winner wrote the identical schema digest, the
-            // operation is idempotent; otherwise surface the conflict.
-            if let Some(existing) = find_schema_by_digest(
-                storage,
-                tenant_id,
-                schema_id,
-                &record.schema_ref.schema_digest,
-            )
-            .await?
-            {
-                Ok(existing)
-            } else {
-                Err(err)
-            }
-        }
+        transaction_id,
+        AuthzHeadMutation::SchemaRevision,
+    )?;
+    let payload = record.encode_record(tenant_id, transaction_id)?;
+    let mutations = vec![
+        schema_row_mutation(revision_key.clone(), payload.clone())?,
+        schema_row_mutation(latest_key.clone(), payload.clone())?,
+        schema_row_mutation(digest_key.clone(), payload)?,
+        authz_head::mvcc_mutation(&head_snapshot, &head, transaction_id)?,
+    ];
+    let latest_predicate = schema_key_predicate(mvcc, transaction_id, &principal, &latest_key)?;
+    mvcc.stage_product_mutations(transaction_id, &principal, mutations, now_unix_ms)?;
+    for (tuple_key, predicate) in [
+        (revision_key, crate::mvcc_transaction::PredicateKind::Absent),
+        (latest_key, latest_predicate),
+        (digest_key, crate::mvcc_transaction::PredicateKind::Absent),
+    ] {
+        mvcc.stage_predicate(
+            transaction_id,
+            &principal,
+            schema_logical_key(&tuple_key)?,
+            predicate,
+            now_unix_ms,
+        )?;
     }
+    mvcc.stage_predicate(
+        transaction_id,
+        &principal,
+        head_snapshot.key,
+        head_snapshot.predicate,
+        now_unix_ms,
+    )?;
+    mvcc.stage_assignment_guard(transaction_id, &principal, &assignment, now_unix_ms)?;
+    commit_schema_transaction(mvcc, transaction_id, &principal).await?;
+    Ok(record)
 }
 
 pub async fn read_schema_revision(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     schema_id: &str,
     revision: Option<u64>,
@@ -272,19 +303,29 @@ pub async fn read_schema_revision(
     validate_schema_id(schema_id)?;
     match revision {
         Some(revision) => {
-            read_proto_row(
+            read_proto_row_latest_mvcc(
                 storage,
+                mvcc,
                 tenant_id,
                 schema_revision_tuple_key(tenant_id, schema_id, revision)?,
             )
             .await
         }
-        None => read_latest_schema_revision(storage, tenant_id, schema_id).await,
+        None => {
+            read_proto_row_latest_mvcc(
+                storage,
+                mvcc,
+                tenant_id,
+                schema_latest_tuple_key(tenant_id, schema_id)?,
+            )
+            .await
+        }
     }
 }
 
 pub async fn bind_schema(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     realm_id: &str,
     schema_ref: StoredSchemaRef,
@@ -292,34 +333,74 @@ pub async fn bind_schema(
     written_by: &str,
     reason: &str,
 ) -> Result<StoredAuthzSchemaBinding> {
-    let write_lock = authz_head::tenant_write_lock(tenant_id)?;
-    let _guard = write_lock.lock().await;
     validate_realm_id(realm_id)?;
-    let schema = read_schema_revision(
+    let revision_key =
+        schema_revision_tuple_key(tenant_id, &schema_ref.schema_id, schema_ref.schema_revision)?;
+    let schema = read_proto_row_latest_mvcc::<StoredAuthzSchemaRevision>(
         storage,
+        mvcc,
         tenant_id,
-        &schema_ref.schema_id,
-        Some(schema_ref.schema_revision),
+        revision_key,
     )
     .await?
     .ok_or_else(|| anyhow!("authorization schema revision not found"))?;
     validate_stored_schema_revision(&schema)?;
     if schema.schema_ref != schema_ref {
-        return Err(anyhow!("authorization schema reference digest mismatch"));
+        bail!("authorization schema reference digest mismatch");
     }
-    let binding_tuple_key = schema_binding_tuple_key(tenant_id, realm_id)?;
-    let current =
-        read_proto_row_snapshot::<StoredAuthzSchemaBinding>(storage, tenant_id, binding_tuple_key)
-            .await?;
-    let actual = current
-        .as_ref()
-        .map(|(binding, _)| binding.binding_generation);
+    let tuple_key = schema_binding_tuple_key(tenant_id, realm_id)?;
+    let current = read_proto_row_latest_mvcc::<StoredAuthzSchemaBinding>(
+        storage,
+        mvcc,
+        tenant_id,
+        tuple_key.clone(),
+    )
+    .await?;
+    let actual = current.as_ref().map(|binding| binding.binding_generation);
     match (expected_generation, actual) {
         (None, None) | (Some(0), None) => {}
         (Some(expected), Some(actual)) if expected == actual => {}
-        _ => return Err(anyhow!("schema binding generation conflict")),
+        _ => bail!("schema binding generation conflict"),
     }
-    let head_snapshot = authz_head::read(storage, tenant_id).await?;
+    let assignment = mvcc
+        .reconcile_authz_tuple_assignment(tenant_id)
+        .await?
+        .ok_or_else(|| anyhow!("this node is not the assigned authorization schema writer"))?;
+    let principal = authz_head::transaction_principal(tenant_id);
+    let idempotency_key = format!(
+        "authz-schema-binding:{tenant_id}:{realm_id}:{}:{}",
+        schema_ref.schema_id,
+        actual.unwrap_or(0).saturating_add(1)
+    );
+    let now_unix_ms = current_unix_ms();
+    let handle = mvcc
+        .open_transactions
+        .begin(
+            mvcc.runtime.as_ref(),
+            mvcc.cluster_id(),
+            &principal,
+            idempotency_key,
+            std::time::Duration::from_secs(30),
+            crate::mvcc_transaction::DurabilityLevel::Quorum,
+            crate::mvcc_transaction::ReadConsistency::Linearized,
+            now_unix_ms,
+        )
+        .await?;
+    let transaction_id = handle.transaction_id.as_str();
+    let current = read_proto_row_transaction_mvcc::<StoredAuthzSchemaBinding>(
+        storage,
+        mvcc,
+        transaction_id,
+        &principal,
+        tenant_id,
+        tuple_key.clone(),
+    )
+    .await?;
+    let actual_at_snapshot = current.as_ref().map(|binding| binding.binding_generation);
+    if actual_at_snapshot != actual {
+        bail!("schema binding generation changed before transaction snapshot");
+    }
+    let head_snapshot = authz_head::read_mvcc(mvcc, transaction_id, &principal, tenant_id)?;
     let authz_revision = head_snapshot
         .head
         .committed_revision
@@ -334,27 +415,59 @@ pub async fn bind_schema(
         reason: reason.to_string(),
         updated_at: chrono::Utc::now().to_rfc3339(),
     };
-    write_binding_record(
-        storage,
-        tenant_id,
-        &binding,
+    let head = authz_head::advance_mvcc(
         &head_snapshot,
-        current.map(|(_, payload_hash)| payload_hash),
-    )
-    .await?;
-    crate::authz_journal::materialize_authz_tuple_segment(storage, tenant_id, authz_revision)
-        .await?;
+        transaction_id,
+        AuthzHeadMutation::SchemaBinding {
+            realm_id,
+            schema_id: &binding.schema_ref.schema_id,
+            schema_revision: binding.schema_ref.schema_revision,
+            schema_digest: &binding.schema_ref.schema_digest,
+            binding_generation: binding.binding_generation,
+        },
+    )?;
+    let binding_predicate = schema_key_predicate(mvcc, transaction_id, &principal, &tuple_key)?;
+    mvcc.stage_product_mutations(
+        transaction_id,
+        &principal,
+        vec![
+            schema_row_mutation(
+                tuple_key.clone(),
+                binding.encode_record(tenant_id, transaction_id)?,
+            )?,
+            authz_head::mvcc_mutation(&head_snapshot, &head, transaction_id)?,
+        ],
+        now_unix_ms,
+    )?;
+    mvcc.stage_predicate(
+        transaction_id,
+        &principal,
+        schema_logical_key(&tuple_key)?,
+        binding_predicate,
+        now_unix_ms,
+    )?;
+    mvcc.stage_predicate(
+        transaction_id,
+        &principal,
+        head_snapshot.key,
+        head_snapshot.predicate,
+        now_unix_ms,
+    )?;
+    mvcc.stage_assignment_guard(transaction_id, &principal, &assignment, now_unix_ms)?;
+    commit_schema_transaction(mvcc, transaction_id, &principal).await?;
     Ok(binding)
 }
 
 pub async fn read_schema_binding(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     realm_id: &str,
 ) -> Result<Option<StoredAuthzSchemaBinding>> {
     validate_realm_id(realm_id)?;
-    read_proto_row(
+    read_proto_row_latest_mvcc(
         storage,
+        mvcc,
         tenant_id,
         schema_binding_tuple_key(tenant_id, realm_id)?,
     )
@@ -454,54 +567,100 @@ pub async fn read_bound_schema_snapshot_mvcc(
     })
 }
 
-pub async fn page_schema_revisions(
+pub async fn read_bound_namespace_schema_mvcc_at(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    realm_id: &str,
+    namespace: &str,
+    snapshot_version: u64,
+) -> Result<Option<AuthzNamespaceSchema>> {
+    validate_realm_id(realm_id)?;
+    let binding_key = crate::mvcc_product::coremeta_logical_key(
+        CF_AUTHZ,
+        TABLE_AUTHZ_SCHEMA_ROW,
+        &schema_binding_tuple_key(tenant_id, realm_id)?,
+    )?;
+    let Some(binding_row) = mvcc.runtime.read_at(&binding_key, snapshot_version)? else {
+        return Ok(None);
+    };
+    let binding = decode_schema_record_row::<StoredAuthzSchemaBinding>(
+        storage,
+        tenant_id,
+        &binding_row.value,
+    )
+    .await?;
+    let revision_key = crate::mvcc_product::coremeta_logical_key(
+        CF_AUTHZ,
+        TABLE_AUTHZ_SCHEMA_ROW,
+        &schema_revision_tuple_key(
+            tenant_id,
+            &binding.schema_ref.schema_id,
+            binding.schema_ref.schema_revision,
+        )?,
+    )?;
+    let schema_row = mvcc
+        .runtime
+        .read_at(&revision_key, snapshot_version)?
+        .ok_or_else(|| anyhow!("bound authorization schema revision not found"))?;
+    let schema = decode_schema_record_row::<StoredAuthzSchemaRevision>(
+        storage,
+        tenant_id,
+        &schema_row.value,
+    )
+    .await?;
+    validate_stored_schema_revision(&schema)?;
+    if schema.schema_ref != binding.schema_ref {
+        bail!("bound authorization schema reference mismatch");
+    }
+    Ok(schema
+        .namespaces
+        .into_iter()
+        .find(|candidate| candidate.namespace == namespace))
+}
+
+pub fn page_schema_revisions(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    snapshot_version: u64,
     tenant_id: i64,
     after_tuple_key: Option<&[u8]>,
     page_size: usize,
 ) -> Result<StoredAuthzSchemaRevisionPage> {
     validate_storage_tenant(tenant_id)?;
-    let store = CoreStore::new(storage.clone()).await?;
     let prefix = core_meta_tuple_key(&[
         CoreMetaTuplePart::Utf8(AUTHZ_SCHEMA_REVISION_ROW_KIND),
         CoreMetaTuplePart::I64(tenant_id),
     ])?;
     let (rows, next_tuple_key) =
-        scan_schema_rows_page(&store, &prefix, after_tuple_key, page_size)?;
-    let mut records = Vec::with_capacity(rows.len());
-    for row in rows {
-        records.push(
-            decode_schema_record_row::<StoredAuthzSchemaRevision>(storage, tenant_id, &row.payload)
-                .await?,
-        );
-    }
+        scan_schema_rows_page(mvcc, snapshot_version, &prefix, after_tuple_key, page_size)?;
+    let records = rows
+        .into_iter()
+        .map(|(_, payload)| StoredAuthzSchemaRevision::decode_record(&payload, tenant_id))
+        .collect::<Result<Vec<_>>>()?;
     Ok(StoredAuthzSchemaRevisionPage {
         records,
         next_tuple_key,
     })
 }
 
-pub async fn page_schema_bindings(
-    storage: &Storage,
+pub fn page_schema_bindings(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    snapshot_version: u64,
     tenant_id: i64,
     after_tuple_key: Option<&[u8]>,
     page_size: usize,
 ) -> Result<StoredAuthzSchemaBindingPage> {
     validate_storage_tenant(tenant_id)?;
-    let store = CoreStore::new(storage.clone()).await?;
     let prefix = core_meta_tuple_key(&[
         CoreMetaTuplePart::Utf8(AUTHZ_SCHEMA_BINDING_ROW_KIND),
         CoreMetaTuplePart::I64(tenant_id),
     ])?;
     let (rows, next_tuple_key) =
-        scan_schema_rows_page(&store, &prefix, after_tuple_key, page_size)?;
-    let mut records = Vec::with_capacity(rows.len());
-    for row in rows {
-        records.push(
-            decode_schema_record_row::<StoredAuthzSchemaBinding>(storage, tenant_id, &row.payload)
-                .await?,
-        );
-    }
+        scan_schema_rows_page(mvcc, snapshot_version, &prefix, after_tuple_key, page_size)?;
+    let records = rows
+        .into_iter()
+        .map(|(_, payload)| StoredAuthzSchemaBinding::decode_record(&payload, tenant_id))
+        .collect::<Result<Vec<_>>>()?;
     Ok(StoredAuthzSchemaBindingPage {
         records,
         next_tuple_key,
@@ -509,11 +668,12 @@ pub async fn page_schema_bindings(
 }
 
 fn scan_schema_rows_page(
-    store: &CoreStore,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    snapshot_version: u64,
     prefix: &[u8],
     after_tuple_key: Option<&[u8]>,
     page_size: usize,
-) -> Result<(Vec<CoreMetaRecord>, Option<Vec<u8>>)> {
+) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, Option<Vec<u8>>)> {
     if !(1..=AUTHZ_SCHEMA_PAGE_MAX).contains(&page_size) {
         return Err(anyhow!(
             "authorization schema page size must be between 1 and {AUTHZ_SCHEMA_PAGE_MAX}"
@@ -526,62 +686,39 @@ fn scan_schema_rows_page(
             "authorization schema cursor is outside the tenant prefix"
         ));
     }
-    let mut rows = store.scan_coremeta_prefix_page(
-        CF_AUTHZ,
-        TABLE_AUTHZ_SCHEMA_ROW,
-        prefix,
-        after_tuple_key,
-        page_size + 1,
-    )?;
+    let application_prefix = crate::mvcc_product::coremeta_application_prefix(CF_AUTHZ, prefix)?;
+    let mut rows = mvcc
+        .runtime
+        .scan_table_prefix_at(
+            TABLE_AUTHZ_SCHEMA_ROW,
+            &application_prefix,
+            snapshot_version,
+        )?
+        .into_iter()
+        .map(|(key, row)| {
+            Ok((
+                crate::mvcc_product::coremeta_tuple_from_logical_key(&key, CF_AUTHZ)?.to_vec(),
+                row.value,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    rows.retain(|(tuple_key, _)| after_tuple_key.is_none_or(|after| tuple_key.as_slice() > after));
+    rows.truncate(page_size.saturating_add(1));
     let has_more = rows.len() > page_size;
     if has_more {
         rows.truncate(page_size);
     }
     let next_tuple_key = if has_more {
         Some(
-            core_meta_record_tuple_key(
-                &rows
-                    .last()
-                    .ok_or_else(|| anyhow!("authorization schema page is empty"))?
-                    .key,
-            )?
-            .to_vec(),
+            rows.last()
+                .ok_or_else(|| anyhow!("authorization schema page is empty"))?
+                .0
+                .clone(),
         )
     } else {
         None
     };
     Ok((rows, next_tuple_key))
-}
-
-pub async fn read_bound_namespace_schema(
-    storage: &Storage,
-    tenant_id: i64,
-    realm_id: &str,
-    namespace: &str,
-) -> Result<Option<AuthzNamespaceSchema>> {
-    validate_realm_id(realm_id)?;
-    validate_component(namespace, "authorization namespace")?;
-    let Some(binding) = read_schema_binding(storage, tenant_id, realm_id).await? else {
-        return Ok(None);
-    };
-    let Some(revision) = read_schema_revision(
-        storage,
-        tenant_id,
-        &binding.schema_ref.schema_id,
-        Some(binding.schema_ref.schema_revision),
-    )
-    .await?
-    else {
-        return Err(anyhow!("bound authorization schema revision not found"));
-    };
-    validate_stored_schema_revision(&revision)?;
-    if revision.schema_ref != binding.schema_ref {
-        return Err(anyhow!("bound authorization schema reference mismatch"));
-    }
-    Ok(revision
-        .namespaces
-        .into_iter()
-        .find(|schema| schema.namespace == namespace))
 }
 
 async fn write_schema_record(
@@ -826,6 +963,98 @@ async fn read_proto_row<T: AuthzSchemaRecordCodec>(
         .map(|(record, _)| record))
 }
 
+fn schema_logical_key(tuple_key: &[u8]) -> Result<crate::mvcc_transaction::LogicalKey> {
+    crate::mvcc_product::coremeta_logical_key(CF_AUTHZ, TABLE_AUTHZ_SCHEMA_ROW, tuple_key)
+}
+
+fn schema_row_mutation(
+    tuple_key: Vec<u8>,
+    payload: Vec<u8>,
+) -> Result<crate::mvcc_product::ProductMutation> {
+    Ok(crate::mvcc_product::ProductMutation::put(
+        schema_logical_key(&tuple_key)?,
+        payload,
+    ))
+}
+
+fn schema_key_predicate(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    tuple_key: &[u8],
+) -> Result<crate::mvcc_transaction::PredicateKind> {
+    Ok(
+        match mvcc.read_transaction_value(
+            transaction_id,
+            principal,
+            &schema_logical_key(tuple_key)?,
+        )? {
+            Some(payload) => crate::mvcc_transaction::PredicateKind::ValueHash(
+                *blake3::hash(&payload).as_bytes(),
+            ),
+            None => crate::mvcc_transaction::PredicateKind::Absent,
+        },
+    )
+}
+
+async fn read_proto_row_latest_mvcc<T: AuthzSchemaRecordCodec>(
+    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    tuple_key: Vec<u8>,
+) -> Result<Option<T>> {
+    let Some(payload) = mvcc.read_latest_value(&schema_logical_key(&tuple_key)?)? else {
+        return Ok(None);
+    };
+    decode_schema_record_row::<T>(storage, tenant_id, &payload)
+        .await
+        .map(Some)
+}
+
+async fn read_proto_row_transaction_mvcc<T: AuthzSchemaRecordCodec>(
+    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    tenant_id: i64,
+    tuple_key: Vec<u8>,
+) -> Result<Option<T>> {
+    let Some(payload) =
+        mvcc.read_transaction_value(transaction_id, principal, &schema_logical_key(&tuple_key)?)?
+    else {
+        return Ok(None);
+    };
+    decode_schema_record_row::<T>(storage, tenant_id, &payload)
+        .await
+        .map(Some)
+}
+
+async fn commit_schema_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+) -> Result<()> {
+    let outcome = mvcc
+        .open_transactions
+        .commit(
+            mvcc.runtime.as_ref(),
+            transaction_id,
+            principal,
+            current_unix_ms(),
+        )
+        .await?;
+    match outcome.certification {
+        crate::mvcc_transaction::CertificationResult::Committed { .. } => Ok(()),
+        crate::mvcc_transaction::CertificationResult::Aborted { reason } => {
+            bail!("authorization schema transaction aborted: {reason:?}")
+        }
+    }
+}
+
+fn current_unix_ms() -> u64 {
+    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default()
+}
+
 async fn read_proto_row_snapshot<T: AuthzSchemaRecordCodec>(
     storage: &Storage,
     tenant_id: i64,
@@ -955,13 +1184,11 @@ impl AuthzSchemaRecordCodec for StoredAuthzSchemaBinding {
 }
 
 async fn decode_schema_record_row<T: AuthzSchemaRecordCodec>(
-    storage: &Storage,
+    _storage: &Storage,
     tenant_id: i64,
     row_payload: &[u8],
 ) -> Result<T> {
-    let record_payload =
-        decode_authz_payload_row(storage, tenant_id, row_payload, T::payload_kind()).await?;
-    T::decode_record(&record_payload, tenant_id)
+    T::decode_record(row_payload, tenant_id)
 }
 
 fn schema_ref_to_proto(schema_ref: &StoredSchemaRef) -> StoredSchemaRefProto {
@@ -982,11 +1209,10 @@ fn schema_ref_from_proto(proto: StoredSchemaRefProto) -> StoredSchemaRef {
 
 fn schema_revision_to_proto(
     record: &StoredAuthzSchemaRevision,
-    tenant_id: i64,
-    transaction_id: &str,
+    _tenant_id: i64,
+    _transaction_id: &str,
 ) -> Result<StoredAuthzSchemaRevisionProto> {
     Ok(StoredAuthzSchemaRevisionProto {
-        common: Some(schema_revision_common(record, tenant_id, transaction_id)?),
         schema_ref: Some(schema_ref_to_proto(&record.schema_ref)),
         namespaces: record.namespaces.iter().map(namespace_to_proto).collect(),
         authz_revision: record.authz_revision,
@@ -996,28 +1222,10 @@ fn schema_revision_to_proto(
     })
 }
 
-fn schema_revision_common(
-    record: &StoredAuthzSchemaRevision,
-    tenant_id: i64,
-    transaction_id: &str,
-) -> Result<crate::core_store::CoreMetaRowCommonProto> {
-    Ok(core_meta_committed_row_common(
-        format!("tenant/{tenant_id}/authz"),
-        core_meta_root_key_hash(&format!("authz/{tenant_id}")),
-        record.authz_revision,
-        transaction_id,
-        timestamp_nanos(&record.created_at, "authorization schema created_at")?,
-    ))
-}
-
 fn schema_revision_from_proto(
     proto: StoredAuthzSchemaRevisionProto,
-    tenant_id: i64,
+    _tenant_id: i64,
 ) -> Result<StoredAuthzSchemaRevision> {
-    let common = proto
-        .common
-        .clone()
-        .ok_or_else(|| anyhow!("authorization schema revision row missing CoreMeta common"))?;
     let record = StoredAuthzSchemaRevision {
         schema_ref: schema_ref_from_proto(
             proto
@@ -1034,22 +1242,15 @@ fn schema_revision_from_proto(
         reason: proto.reason,
         created_at: proto.created_at,
     };
-    let transaction_id = schema_revision_transaction_id(tenant_id, &record);
-    if common != schema_revision_common(&record, tenant_id, &transaction_id)? {
-        return Err(anyhow!(
-            "authorization schema revision CoreMeta common mismatch"
-        ));
-    }
     Ok(record)
 }
 
 fn schema_binding_to_proto(
     record: &StoredAuthzSchemaBinding,
-    tenant_id: i64,
-    transaction_id: &str,
+    _tenant_id: i64,
+    _transaction_id: &str,
 ) -> Result<StoredAuthzSchemaBindingProto> {
     Ok(StoredAuthzSchemaBindingProto {
-        common: Some(schema_binding_common(record, tenant_id, transaction_id)?),
         realm_id: record.realm_id.clone(),
         schema_ref: Some(schema_ref_to_proto(&record.schema_ref)),
         binding_generation: record.binding_generation,
@@ -1060,28 +1261,10 @@ fn schema_binding_to_proto(
     })
 }
 
-fn schema_binding_common(
-    record: &StoredAuthzSchemaBinding,
-    tenant_id: i64,
-    transaction_id: &str,
-) -> Result<crate::core_store::CoreMetaRowCommonProto> {
-    Ok(core_meta_committed_row_common(
-        format!("tenant/{tenant_id}/authz"),
-        core_meta_root_key_hash(&format!("authz/{tenant_id}")),
-        record.authz_revision,
-        transaction_id,
-        timestamp_nanos(&record.updated_at, "authorization binding updated_at")?,
-    ))
-}
-
 fn schema_binding_from_proto(
     proto: StoredAuthzSchemaBindingProto,
-    tenant_id: i64,
+    _tenant_id: i64,
 ) -> Result<StoredAuthzSchemaBinding> {
-    let common = proto
-        .common
-        .clone()
-        .ok_or_else(|| anyhow!("authorization schema binding row missing CoreMeta common"))?;
     let binding = StoredAuthzSchemaBinding {
         realm_id: proto.realm_id,
         schema_ref: schema_ref_from_proto(
@@ -1095,12 +1278,6 @@ fn schema_binding_from_proto(
         reason: proto.reason,
         updated_at: proto.updated_at,
     };
-    let transaction_id = schema_binding_transaction_id(tenant_id, &binding);
-    if common != schema_binding_common(&binding, tenant_id, &transaction_id)? {
-        return Err(anyhow!(
-            "authorization schema binding CoreMeta common mismatch"
-        ));
-    }
     Ok(binding)
 }
 

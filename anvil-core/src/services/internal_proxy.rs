@@ -460,6 +460,7 @@ async fn validate_internal_proxy_claims(
 ) -> Result<(), Status> {
     system_realm::check_admin_relation(
         &state.storage,
+        &state.mvcc,
         &state.config.mesh_id,
         claims,
         system_realm::SystemAdminRelation::ManageNodes,

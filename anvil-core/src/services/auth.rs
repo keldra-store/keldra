@@ -1467,26 +1467,23 @@ impl AuthService for AppState {
         .await?;
         let after_revision = i64::try_from(req.after_revision)
             .map_err(|_| Status::invalid_argument("after_revision exceeds supported range"))?;
-        let stream_id = authz_journal::authz_tuple_stream_id(claims.tenant_id);
-        let mut live = self.storage.subscribe_stream(&stream_id);
-        let storage = self.storage.clone();
+        let mvcc = self.mvcc.clone();
         let tenant_id = claims.tenant_id;
         let namespace = encode_optional_realm_namespace(&scope.authz_realm_id, &req.namespace);
 
         let (tx, rx) = mpsc::channel(32);
         tokio::spawn(async move {
             let mut last_revision = after_revision;
+            let mut poll = tokio::time::interval(std::time::Duration::from_millis(100));
             loop {
                 loop {
                     let page = match authz_journal::list_authz_tuple_log_page(
-                        &storage,
+                        &mvcc,
                         tenant_id,
                         last_revision,
                         &namespace,
                         256,
-                    )
-                    .await
-                    {
+                    ) {
                         Ok(page) => page,
                         Err(error) => {
                             let _ = tx.send(Err(Status::internal(error.to_string()))).await;
@@ -1512,10 +1509,7 @@ impl AuthService for AppState {
                     }
                 }
 
-                match live.recv().await {
-                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                }
+                poll.tick().await;
             }
         });
 

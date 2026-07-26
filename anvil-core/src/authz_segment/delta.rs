@@ -3,6 +3,7 @@ use crate::writer_segment_catalog::page_writer_segment_catalog_records;
 
 pub(crate) async fn write_authz_tuple_delta_segment(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     previous: &DecodedAuthzSegment,
     mutations: &[AuthzTupleRecord],
@@ -12,6 +13,7 @@ pub(crate) async fn write_authz_tuple_delta_segment(
 ) -> Result<String> {
     let staged = stage_authz_tuple_delta_segment(
         storage,
+        mvcc,
         tenant_id,
         previous,
         mutations,
@@ -20,11 +22,12 @@ pub(crate) async fn write_authz_tuple_delta_segment(
         source_fence_token,
     )
     .await?;
-    publish_staged_authz_tuple_segment(storage, staged, &[]).await
+    publish_staged_authz_tuple_segment(mvcc, staged, &[]).await
 }
 
 pub(crate) async fn stage_authz_tuple_delta_segment(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     previous: &DecodedAuthzSegment,
     mutations: &[AuthzTupleRecord],
@@ -42,19 +45,30 @@ pub(crate) async fn stage_authz_tuple_delta_segment(
         apply_active_tuple_mutations(tenant_id, &previous.records, mutations, target_revision)?;
     let segment_records = segment_records_from_authz_records(mutations)?;
 
-    let head = crate::authz_head::read(storage, tenant_id).await?.head;
+    let snapshot_version = mvcc.runtime.applied_version()?;
+    let head = crate::authz_head::read_at_mvcc(mvcc, tenant_id, snapshot_version)?;
     let schema_changed = head.schema_revision == target_revision;
     if head.schema_revision > previous.header.generation && head.schema_revision < target_revision {
         bail!("AuthzRevisionUnavailable: missing materialized schema revision");
     }
     let (schema_rows, relation_rule_rows) = if schema_changed {
-        let schema_rows =
-            materialized_state::schema_descriptor_rows(storage, tenant_id, &current_active).await?;
-        let bound =
-            materialized_state::bound_relation_rule_rows(storage, tenant_id, &current_active)
-                .await?;
+        let schema_rows = materialized_state::schema_descriptor_rows(
+            mvcc,
+            snapshot_version,
+            tenant_id,
+            &current_active,
+        )
+        .await?;
+        let bound = materialized_state::bound_relation_rule_rows(
+            mvcc,
+            snapshot_version,
+            tenant_id,
+            &current_active,
+        )
+        .await?;
         let relation_rows =
-            materialized_state::all_relation_rule_rows(storage, tenant_id, &bound).await?;
+            materialized_state::all_relation_rule_rows(mvcc, snapshot_version, tenant_id, &bound)
+                .await?;
         (schema_rows, relation_rows)
     } else {
         (
@@ -225,6 +239,7 @@ pub(crate) async fn stage_authz_tuple_delta_segment(
 
 pub(crate) async fn read_authz_tuple_segment_at_revision(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     revision: u64,
 ) -> Result<Option<DecodedAuthzSegment>> {
@@ -238,7 +253,7 @@ pub(crate) async fn read_authz_tuple_segment_at_revision(
     };
     let scope = authz_tuple_segment_scope(tenant_id)?;
     let page = page_writer_segment_catalog_records(
-        storage,
+        mvcc,
         AUTHZ_TUPLE_SEGMENT_CATALOG_FAMILY,
         &scope,
         checkpoint_generation.saturating_sub(1),
@@ -265,6 +280,7 @@ pub(crate) async fn read_authz_tuple_segment_at_revision(
     for record in page.records {
         let Some(segment) = read_authz_tuple_segment_ref(
             storage,
+            mvcc,
             tenant_id,
             record.generation,
             &record.segment_ref,

@@ -3,24 +3,21 @@ use super::{
 };
 use crate::{
     core_store::{
-        CF_AUTHZ, CoreMetaRowCommonProto, CoreMetaStore, CoreMetaTuplePart,
-        CoreMetaVisibilityState, CoreMutationOperation, CoreMutationPrecondition, CoreStore,
-        TABLE_AUTHZ_IDEMPOTENCY_RECEIPT_ROW, TABLE_AUTHZ_SCHEMA_ROW,
-        core_meta_committed_row_common, core_meta_payload_digest, core_meta_root_key_hash,
-        core_meta_tuple_key,
+        CF_AUTHZ, CoreMetaTuplePart, TABLE_AUTHZ_IDEMPOTENCY_RECEIPT_ROW, core_meta_tuple_key,
     },
+    mvcc_bootstrap::MvccSubsystem,
+    mvcc_product::ProductMutation,
+    mvcc_transaction::{LogicalKey, PredicateKind},
     persistence::{
-        AuthzSchemaBindingPrecondition, AuthzTupleBatchWriteError, AuthzTupleBatchWriteOptions,
-        AuthzTupleBatchWriteOutcome,
+        AuthzTupleBatchWriteError, AuthzTupleBatchWriteOptions, AuthzTupleBatchWriteOutcome,
     },
-    storage::Storage,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use prost::Message;
 
 pub(crate) const MAX_AUTHZ_BATCH_OPERATION_ID_BYTES: usize = 128;
 
-const AUTHZ_IDEMPOTENCY_RECEIPT_SCHEMA: &str = "anvil.authz.idempotency_receipt.v2";
+const AUTHZ_IDEMPOTENCY_RECEIPT_SCHEMA: &str = "anvil.authz.idempotency_receipt.v3";
 const CANONICAL_AUTHZ_BATCH_REQUEST_SCHEMA: &str = "anvil.authz.canonical_tuple_batch_request.v1";
 const AUTHZ_IDEMPOTENCY_ROW_KIND: &str = "authz-batch-idempotency";
 
@@ -64,8 +61,6 @@ struct CanonicalAuthzTupleBatchRequestProto {
 
 #[derive(Clone, PartialEq, Message)]
 struct AuthzIdempotencyReceiptProto {
-    #[prost(message, optional, tag = "1")]
-    common: Option<CoreMetaRowCommonProto>,
     #[prost(string, tag = "2")]
     schema: String,
     #[prost(int64, tag = "3")]
@@ -113,6 +108,23 @@ pub(super) struct PreparedAuthzIdempotencyReceipt {
     pub(super) transaction_id: String,
 }
 
+impl PreparedAuthzIdempotencyReceipt {
+    pub(super) fn logical_key(&self) -> Result<LogicalKey> {
+        crate::mvcc_product::coremeta_logical_key(
+            CF_AUTHZ,
+            TABLE_AUTHZ_IDEMPOTENCY_RECEIPT_ROW,
+            &self.tuple_key,
+        )
+    }
+
+    pub(super) fn mutation(&self) -> Result<ProductMutation> {
+        Ok(ProductMutation::put(
+            self.logical_key()?,
+            self.payload.clone(),
+        ))
+    }
+}
+
 pub(crate) fn validate_operation_id(operation_id: &str) -> Result<()> {
     if operation_id.is_empty() {
         bail!("operation_id must not be empty when provided");
@@ -129,7 +141,7 @@ pub(crate) fn validate_operation_id(operation_id: &str) -> Result<()> {
 }
 
 pub(super) async fn replay(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
     inputs: &[AuthzTupleWrite<'_>],
     options: &AuthzTupleBatchWriteOptions,
 ) -> Result<Option<AuthzTupleBatchWriteOutcome>> {
@@ -139,8 +151,7 @@ pub(super) async fn replay(
     validate_operation_id(operation_id)?;
     let (tenant_id, principal) = batch_context(inputs)?;
     let request_hash = canonical_request_hash(inputs, options, operation_id)?;
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(receipt) = read_receipt(&store, tenant_id, principal, operation_id)? else {
+    let Some(receipt) = read_receipt(mvcc, tenant_id, principal, operation_id)? else {
         return Ok(None);
     };
     validate_receipt_context(
@@ -210,64 +221,6 @@ pub(super) fn prepare_receipt(
     }))
 }
 
-pub(super) fn receipt_precondition(
-    receipt: &PreparedAuthzIdempotencyReceipt,
-) -> CoreMutationPrecondition {
-    CoreMutationPrecondition::CoreMetaRow {
-        cf: CF_AUTHZ.to_string(),
-        table_id: TABLE_AUTHZ_IDEMPOTENCY_RECEIPT_ROW,
-        tuple_key: receipt.tuple_key.clone(),
-        expected_payload_hash: None,
-        require_absent: true,
-        require_present: false,
-    }
-}
-
-pub(super) fn receipt_operation(
-    partition_id: &str,
-    receipt: &PreparedAuthzIdempotencyReceipt,
-) -> CoreMutationOperation {
-    CoreMutationOperation::CoreMetaPut {
-        partition_id: partition_id.to_string(),
-        cf: CF_AUTHZ.to_string(),
-        table_id: TABLE_AUTHZ_IDEMPOTENCY_RECEIPT_ROW,
-        tuple_key: receipt.tuple_key.clone(),
-        payload: receipt.payload.clone(),
-    }
-}
-
-pub(super) fn schema_binding_precondition(
-    fence: &AuthzSchemaBindingPrecondition,
-) -> CoreMutationPrecondition {
-    CoreMutationPrecondition::CoreMetaRow {
-        cf: CF_AUTHZ.to_string(),
-        table_id: TABLE_AUTHZ_SCHEMA_ROW,
-        tuple_key: fence.tuple_key.clone(),
-        expected_payload_hash: fence.expected_payload_hash.clone(),
-        require_absent: fence.expected_payload_hash.is_none(),
-        require_present: fence.expected_payload_hash.is_some(),
-    }
-}
-
-pub(super) fn schema_binding_is_current(
-    storage: &Storage,
-    fence: &AuthzSchemaBindingPrecondition,
-) -> Result<bool> {
-    // Compare the physical row used by the mutation precondition, not a visibility projection.
-    let current = CoreMetaStore::open(storage.core_store_meta_path())?.get(
-        CF_AUTHZ,
-        TABLE_AUTHZ_SCHEMA_ROW,
-        &fence.tuple_key,
-    )?;
-    Ok(match (current, fence.expected_payload_hash.as_deref()) {
-        (None, None) => true,
-        (Some(payload), Some(expected)) => {
-            core_meta_payload_digest(TABLE_AUTHZ_SCHEMA_ROW, &payload) == expected
-        }
-        _ => false,
-    })
-}
-
 fn batch_context<'a>(inputs: &'a [AuthzTupleWrite<'a>]) -> Result<(i64, &'a str)> {
     let first = inputs
         .first()
@@ -329,18 +282,18 @@ fn receipt_tuple_key(tenant_id: i64, operation_key_hash: &str) -> Result<Vec<u8>
 }
 
 fn read_receipt(
-    store: &CoreStore,
+    mvcc: &MvccSubsystem,
     tenant_id: i64,
     principal: &str,
     operation_id: &str,
 ) -> Result<Option<AuthzIdempotencyReceipt>> {
     let operation_key_hash = operation_key_hash(tenant_id, principal, operation_id);
-    let Some(payload) = store.read_coremeta_row(
+    let key = crate::mvcc_product::coremeta_logical_key(
         CF_AUTHZ,
         TABLE_AUTHZ_IDEMPOTENCY_RECEIPT_ROW,
         &receipt_tuple_key(tenant_id, &operation_key_hash)?,
-    )?
-    else {
+    )?;
+    let Some(payload) = mvcc.read_latest_value(&key)? else {
         return Ok(None);
     };
     decode_receipt(&payload).map(Some)
@@ -364,10 +317,6 @@ fn decode_receipt(bytes: &[u8]) -> Result<AuthzIdempotencyReceipt> {
         .cloned()
         .map(authz_record_from_proto)
         .collect::<Result<Vec<_>>>()?;
-    let common = proto
-        .common
-        .clone()
-        .ok_or_else(|| anyhow!("authorization idempotency receipt is missing CoreMeta common"))?;
     let receipt = AuthzIdempotencyReceipt {
         tenant_id: proto.tenant_id,
         principal: proto.principal,
@@ -381,13 +330,12 @@ fn decode_receipt(bytes: &[u8]) -> Result<AuthzIdempotencyReceipt> {
         receipt_hash: proto.receipt_hash,
         records,
     };
-    validate_receipt(&receipt, &common)?;
+    validate_receipt(&receipt)?;
     Ok(receipt)
 }
 
 fn receipt_to_proto(receipt: &AuthzIdempotencyReceipt) -> Result<AuthzIdempotencyReceiptProto> {
     Ok(AuthzIdempotencyReceiptProto {
-        common: Some(receipt_common(receipt)),
         schema: AUTHZ_IDEMPOTENCY_RECEIPT_SCHEMA.to_string(),
         tenant_id: receipt.tenant_id,
         principal: receipt.principal.clone(),
@@ -407,18 +355,6 @@ fn receipt_to_proto(receipt: &AuthzIdempotencyReceipt) -> Result<AuthzIdempotenc
     })
 }
 
-fn receipt_common(receipt: &AuthzIdempotencyReceipt) -> CoreMetaRowCommonProto {
-    let operation_key_hash =
-        operation_key_hash(receipt.tenant_id, &receipt.principal, &receipt.operation_id);
-    core_meta_committed_row_common(
-        format!("tenant/{}/authz", receipt.tenant_id),
-        core_meta_root_key_hash(&format!("authz/{}", receipt.tenant_id)),
-        receipt.revision.max(0) as u64,
-        receipt_transaction_id(&operation_key_hash),
-        receipt.committed_at_unix_nanos.max(0) as u64,
-    )
-}
-
 fn receipt_transaction_id(operation_key_hash: &str) -> String {
     format!(
         "authz-tuple-batch-idempotent:{}",
@@ -428,10 +364,7 @@ fn receipt_transaction_id(operation_key_hash: &str) -> String {
     )
 }
 
-fn validate_receipt(
-    receipt: &AuthzIdempotencyReceipt,
-    common: &CoreMetaRowCommonProto,
-) -> Result<()> {
+fn validate_receipt(receipt: &AuthzIdempotencyReceipt) -> Result<()> {
     validate_operation_id(&receipt.operation_id)?;
     if receipt.tenant_id < 0 || receipt.revision <= 0 || receipt.mutation_count == 0 {
         bail!("authorization idempotency receipt has invalid numeric fields");
@@ -447,16 +380,6 @@ fn validate_receipt(
     validate_hash(&receipt.request_hash, "request hash")?;
     validate_hash(&receipt.results_hash, "results hash")?;
     validate_hash(&receipt.receipt_hash, "receipt hash")?;
-    let expected_common = receipt_common(receipt);
-    if common.realm_id != expected_common.realm_id
-        || common.root_key_hash != expected_common.root_key_hash
-        || common.root_generation != expected_common.root_generation
-        || common.transaction_id != expected_common.transaction_id
-        || common.created_at_unix_nanos != expected_common.created_at_unix_nanos
-        || common.visibility_state_enum() != CoreMetaVisibilityState::Committed
-    {
-        bail!("authorization idempotency receipt CoreMeta common mismatch");
-    }
     if receipt_hash(receipt)? != receipt.receipt_hash {
         bail!("authorization idempotency receipt hash mismatch");
     }

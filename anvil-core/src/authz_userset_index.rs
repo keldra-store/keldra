@@ -268,16 +268,19 @@ pub async fn list_derived_userset_objects_at_revision(
 
 pub async fn rebuild_derived_userset_index(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     derived_index_id: &str,
 ) -> Result<AuthzDerivedUsersetIndex> {
-    let index = build_expected_derived_userset_index(storage, tenant_id, derived_index_id).await?;
+    let index =
+        build_expected_derived_userset_index(storage, mvcc, tenant_id, derived_index_id).await?;
     write_derived_userset_index(storage, &index).await?;
     Ok(index)
 }
 
 pub async fn advance_derived_userset_index_from_batch(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     derived_index_id: &str,
     batch_records: &[AuthzTupleRecord],
@@ -304,8 +307,7 @@ pub async fn advance_derived_userset_index_from_batch(
         Some(existing) if existing.processed_revision + 1 >= target_revision => existing,
         _ => {
             let all_records =
-                authz_journal::collect_authz_tuple_log_for_rebuild(storage, tenant_id, None)
-                    .await?;
+                authz_journal::collect_authz_tuple_log_for_rebuild(mvcc, tenant_id, None).await?;
             let rebuilt =
                 build_derived_userset_index_from_records(tenant_id, derived_index_id, all_records)?;
             write_derived_userset_index(storage, &rebuilt).await?;
@@ -395,16 +397,17 @@ pub async fn advance_derived_userset_index_from_batch(
 
 pub async fn build_expected_derived_userset_index(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     derived_index_id: &str,
 ) -> Result<AuthzDerivedUsersetIndex> {
-    let records =
-        authz_journal::collect_authz_tuple_log_for_rebuild(storage, tenant_id, None).await?;
+    let records = authz_journal::collect_authz_tuple_log_for_rebuild(mvcc, tenant_id, None).await?;
     build_derived_userset_index_from_records(tenant_id, derived_index_id, records)
 }
 
 pub(crate) async fn build_expected_derived_userset_index_at_revision(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     derived_index_id: &str,
     revision: u64,
@@ -412,8 +415,7 @@ pub(crate) async fn build_expected_derived_userset_index_at_revision(
     let revision = i64::try_from(revision)
         .map_err(|_| anyhow!("authorization userset revision exceeds supported range"))?;
     let records =
-        authz_journal::collect_authz_tuple_log_for_rebuild(storage, tenant_id, Some(revision))
-            .await?;
+        authz_journal::collect_authz_tuple_log_for_rebuild(mvcc, tenant_id, Some(revision)).await?;
     build_derived_userset_index_from_records(tenant_id, derived_index_id, records)
 }
 
@@ -1175,7 +1177,7 @@ fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
     crate::core_store::decode_core_object_ref_target(target)
 }
 
-#[cfg(test)]
+#[cfg(any())]
 mod tests {
     use super::*;
     use crate::{

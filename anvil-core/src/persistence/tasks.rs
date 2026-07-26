@@ -298,25 +298,20 @@ impl Persistence {
         requested_revision: u64,
         guard: &TaskExecutionGuard,
     ) -> Result<authz_journal::AuthzMaterializationOutcome> {
-        let latest_revision =
-            authz_journal::latest_authz_tuple_revision(&self.storage, tenant_id).await?;
+        let latest_revision = authz_journal::latest_authz_tuple_revision(self.mvcc()?, tenant_id)?;
         let latest_revision = u64::try_from(latest_revision.max(0))
             .context("authorization tuple revision exceeds supported range")?;
         let target_revision = requested_revision.max(latest_revision);
         let source_permit = self.authz_write_permit(tenant_id).await?;
-        let source_partition_precondition = crate::partition_fence::partition_write_precondition(
-            &self.storage,
-            &source_permit,
-            &self.partition_owner_signing_key,
-        )
-        .await?;
+        let source_head_predicate =
+            crate::authz_head::latest_mvcc_predicate(self.mvcc()?, tenant_id)?;
         let source_fence_token =
-            authz_journal::latest_authz_journal_fence_token(&self.storage, tenant_id).await?;
+            authz_journal::latest_authz_journal_fence_token(self.mvcc()?, tenant_id)?;
 
         let mut steps = 0usize;
         let mut source_rows_visited = 0usize;
         let mut step_target =
-            if crate::authz_segment::latest_authz_tuple_segment_record(&self.storage, tenant_id)
+            if crate::authz_segment::latest_authz_tuple_segment_record(self.mvcc()?, tenant_id)
                 .await?
                 .is_none()
             {
@@ -328,11 +323,12 @@ impl Persistence {
             let mut outcome =
                 authz_journal::AuthzMaterializationOutcome::materialize_for_task_at_revision(
                     &self.storage,
+                    self.mvcc()?,
                     tenant_id,
                     step_target,
                     source_fence_token,
                     guard,
-                    &source_partition_precondition,
+                    &source_head_predicate,
                 )
                 .await?;
             steps = steps.saturating_add(1);
@@ -346,8 +342,7 @@ impl Persistence {
             step_target = target_revision;
         };
 
-        let latest_after =
-            authz_journal::latest_authz_tuple_revision(&self.storage, tenant_id).await?;
+        let latest_after = authz_journal::latest_authz_tuple_revision(self.mvcc()?, tenant_id)?;
         let latest_after = u64::try_from(latest_after.max(0))
             .context("authorization tuple revision exceeds supported range")?;
         append_authz_materialization_lag_watch(

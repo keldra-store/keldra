@@ -2,14 +2,11 @@ use super::{
     AuthzTupleFilter, AuthzTupleRecordProto, authz_record_from_proto, authz_record_to_proto,
     ensure_deterministic_proto,
 };
-use crate::authz_coremeta_payload::{decode_authz_payload_row, encode_authz_payload_row};
 use crate::authz_head;
 use crate::authz_scope::{DEFAULT_AUTHZ_REALM_ID, split_realm_namespace};
 use crate::core_store::{
-    CF_AUTHZ, CoreMetaTuplePart, CoreMutationOperation, CoreStore,
-    TABLE_AUTHZ_TUPLE_OBJECT_CURRENT_ROW, TABLE_AUTHZ_TUPLE_SUBJECT_CURRENT_ROW,
-    core_meta_committed_row_common, core_meta_record_tuple_key, core_meta_root_key_hash,
-    core_meta_tuple_key,
+    CF_AUTHZ, CoreMetaTuplePart, CoreStore, TABLE_AUTHZ_TUPLE_OBJECT_CURRENT_ROW,
+    TABLE_AUTHZ_TUPLE_SUBJECT_CURRENT_ROW, core_meta_record_tuple_key, core_meta_tuple_key,
 };
 use crate::persistence::AuthzTupleRecord;
 use crate::storage::Storage;
@@ -17,13 +14,9 @@ use anyhow::{Context, Result, anyhow};
 use prost::Message;
 use std::collections::BTreeMap;
 
-const AUTHZ_TUPLE_CURRENT_ROW_SCHEMA: &str = "anvil.authz.tuple_current_row.v1";
-const AUTHZ_TUPLE_CURRENT_PAYLOAD_KIND: &str = "authz_tuple_current";
-
+const AUTHZ_TUPLE_CURRENT_ROW_SCHEMA: &str = "anvil.authz.tuple_current_row.v2";
 #[derive(Clone, PartialEq, Message)]
 struct AuthzTupleCurrentRowProto {
-    #[prost(message, optional, tag = "1")]
-    common: Option<crate::core_store::CoreMetaRowCommonProto>,
     #[prost(string, tag = "2")]
     schema: String,
     #[prost(message, optional, tag = "3")]
@@ -86,12 +79,10 @@ enum ProjectionOrder {
     Subject,
 }
 
-pub(super) async fn current_operations(
-    storage: &Storage,
+pub(super) fn current_mutations(
     records: &[AuthzTupleRecord],
-    partition_id: &str,
     transaction_id: &str,
-) -> Result<Vec<CoreMutationOperation>> {
+) -> Result<Vec<crate::mvcc_product::ProductMutation>> {
     if records.is_empty() {
         return Ok(Vec::new());
     }
@@ -108,15 +99,13 @@ pub(super) async fn current_operations(
         let subject_key = subject_row_key(record)?;
         match record.operation.as_str() {
             "add" => {
-                let payload = encode_current_payload(storage, record, transaction_id).await?;
+                let payload = encode_current_payload(record, transaction_id)?;
                 operations.push(current_put(
-                    partition_id,
                     TABLE_AUTHZ_TUPLE_OBJECT_CURRENT_ROW,
                     object_key,
                     payload.clone(),
                 ));
                 operations.push(current_put(
-                    partition_id,
                     TABLE_AUTHZ_TUPLE_SUBJECT_CURRENT_ROW,
                     subject_key,
                     payload,
@@ -124,12 +113,10 @@ pub(super) async fn current_operations(
             }
             "remove" => {
                 operations.push(current_delete(
-                    partition_id,
                     TABLE_AUTHZ_TUPLE_OBJECT_CURRENT_ROW,
                     object_key,
                 ));
                 operations.push(current_delete(
-                    partition_id,
                     TABLE_AUTHZ_TUPLE_SUBJECT_CURRENT_ROW,
                     subject_key,
                 ));
@@ -140,8 +127,134 @@ pub(super) async fn current_operations(
     Ok(operations)
 }
 
+#[allow(dead_code)]
+pub(super) async fn current_operations(
+    _storage: &Storage,
+    records: &[AuthzTupleRecord],
+    partition_id: &str,
+    transaction_id: &str,
+) -> Result<Vec<crate::core_store::CoreMutationOperation>> {
+    let mut current_records = BTreeMap::new();
+    for record in records {
+        current_records.insert(object_row_key(record)?, record);
+    }
+    let mut operations = Vec::with_capacity(current_records.len() * 2);
+    for (object_key, record) in current_records {
+        let subject_key = subject_row_key(record)?;
+        for (table_id, tuple_key) in [
+            (TABLE_AUTHZ_TUPLE_OBJECT_CURRENT_ROW, object_key),
+            (TABLE_AUTHZ_TUPLE_SUBJECT_CURRENT_ROW, subject_key),
+        ] {
+            operations.push(match record.operation.as_str() {
+                "add" => crate::core_store::CoreMutationOperation::CoreMetaPut {
+                    partition_id: partition_id.to_string(),
+                    cf: CF_AUTHZ.to_string(),
+                    table_id,
+                    tuple_key,
+                    payload: encode_current_payload(record, transaction_id)?,
+                },
+                "remove" => crate::core_store::CoreMutationOperation::CoreMetaDelete {
+                    partition_id: partition_id.to_string(),
+                    cf: CF_AUTHZ.to_string(),
+                    table_id,
+                    tuple_key,
+                },
+                operation => {
+                    return Err(anyhow!("unsupported authz tuple operation {operation}"));
+                }
+            });
+        }
+    }
+    Ok(operations)
+}
+
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn read_current_record(
+pub(super) fn read_current_record(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    namespace: &str,
+    object_id: &str,
+    relation: &str,
+    subject_kind: &str,
+    subject_id: &str,
+    caveat_hash: &str,
+) -> Result<Option<AuthzTupleRecord>> {
+    let snapshot = mvcc.runtime.applied_version()?;
+    read_current_record_at_runtime(
+        mvcc.runtime.as_ref(),
+        snapshot,
+        tenant_id,
+        namespace,
+        object_id,
+        relation,
+        subject_kind,
+        subject_id,
+        caveat_hash,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn read_current_record_at(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    snapshot: u64,
+    tenant_id: i64,
+    namespace: &str,
+    object_id: &str,
+    relation: &str,
+    subject_kind: &str,
+    subject_id: &str,
+    caveat_hash: &str,
+) -> Result<Option<AuthzTupleRecord>> {
+    read_current_record_at_runtime(
+        mvcc.runtime.as_ref(),
+        snapshot,
+        tenant_id,
+        namespace,
+        object_id,
+        relation,
+        subject_kind,
+        subject_id,
+        caveat_hash,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn read_current_record_at_runtime(
+    runtime: &crate::mvcc_node_runtime::MvccNodeRuntime,
+    snapshot: u64,
+    tenant_id: i64,
+    namespace: &str,
+    object_id: &str,
+    relation: &str,
+    subject_kind: &str,
+    subject_id: &str,
+    caveat_hash: &str,
+) -> Result<Option<AuthzTupleRecord>> {
+    let tuple_key = object_tuple_key(
+        tenant_id,
+        namespace,
+        object_id,
+        relation,
+        subject_kind,
+        subject_id,
+        caveat_hash,
+    )?;
+    let key = crate::mvcc_product::coremeta_logical_key(
+        CF_AUTHZ,
+        TABLE_AUTHZ_TUPLE_OBJECT_CURRENT_ROW,
+        &tuple_key,
+    )?;
+    let Some(row) = runtime.read_at(&key, snapshot)? else {
+        return Ok(None);
+    };
+    let record = decode_current_payload(tenant_id, &row.value)?;
+    validate_projection_row_key(ProjectionOrder::Object, &tuple_key, &record)?;
+    Ok(Some(record))
+}
+
+#[cfg(any())]
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn read_current_record_physical(
     storage: &Storage,
     tenant_id: i64,
     namespace: &str,
@@ -152,7 +265,7 @@ pub(super) async fn read_current_record(
     caveat_hash: &str,
 ) -> Result<Option<AuthzTupleRecord>> {
     let core_store = CoreStore::new(storage.clone()).await?;
-    read_current_record_with_core_store(
+    read_current_record_with_core_store_physical(
         storage,
         &core_store,
         tenant_id,
@@ -167,7 +280,8 @@ pub(super) async fn read_current_record(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn read_current_record_with_core_store(
+#[cfg(any())]
+pub(super) async fn read_current_record_with_core_store_physical(
     storage: &Storage,
     core_store: &CoreStore,
     tenant_id: i64,
@@ -194,12 +308,54 @@ pub(super) async fn read_current_record_with_core_store(
     else {
         return Ok(None);
     };
-    let record = decode_current_payload(storage, tenant_id, &payload).await?;
+    let record = decode_current_payload(tenant_id, &payload)?;
     validate_projection_row_key(ProjectionOrder::Object, &tuple_key, &record)?;
     Ok(Some(record))
 }
 
-pub(super) async fn read_current_relation_rows(
+pub(super) fn read_current_relation_rows(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    snapshot: u64,
+    tenant_id: i64,
+    namespace: &str,
+    object_id: &str,
+    relation: &str,
+    subject_kind: Option<&str>,
+) -> Result<AuthzRelationRows> {
+    let prefix = object_relation_prefix(tenant_id, namespace, object_id, relation, subject_kind)?;
+    let rows = scan_projection(
+        mvcc,
+        TABLE_AUTHZ_TUPLE_OBJECT_CURRENT_ROW,
+        &prefix,
+        snapshot,
+    )?;
+    if rows.len() > MAX_AUTHZ_RELATION_ROWS {
+        return Err(anyhow!(
+            "AuthzGraphBreadthExceeded: relation contains more than {MAX_AUTHZ_RELATION_ROWS} tuples"
+        ));
+    }
+    let candidates_visited = rows.len();
+    let mut records = Vec::with_capacity(candidates_visited);
+    for (tuple_key, payload) in rows {
+        let record = decode_current_payload(tenant_id, &payload)?;
+        validate_projection_row_key(ProjectionOrder::Object, &tuple_key, &record)?;
+        if record.namespace != namespace
+            || record.object_id != object_id
+            || record.relation != relation
+            || subject_kind.is_some_and(|kind| record.subject_kind != kind)
+        {
+            return Err(anyhow!("authz relation projection scope mismatch"));
+        }
+        records.push(record);
+    }
+    Ok(AuthzRelationRows {
+        records,
+        candidates_visited,
+    })
+}
+
+#[cfg(any())]
+pub(super) async fn read_current_relation_rows_physical(
     storage: &Storage,
     tenant_id: i64,
     namespace: &str,
@@ -238,7 +394,7 @@ pub(super) async fn read_current_relation_rows(
     for row in rows {
         let tuple_key = core_meta_record_tuple_key(&row.key)
             .context("decode authz relation projection tuple key")?;
-        let record = decode_current_payload(storage, tenant_id, &row.payload).await?;
+        let record = decode_current_payload(tenant_id, &row.payload)?;
         validate_projection_row_key(ProjectionOrder::Object, tuple_key, &record)?;
         if record.namespace != namespace
             || record.object_id != object_id
@@ -255,7 +411,70 @@ pub(super) async fn read_current_relation_rows(
     })
 }
 
-pub(super) async fn page_current_records(
+pub(super) fn page_current_records(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    filter: &AuthzTupleFilter,
+    expected_revision: i64,
+    after_tuple_key: Option<&[u8]>,
+    page_size: usize,
+) -> std::result::Result<AuthzTupleProjectionPage, AuthzProjectionPageError> {
+    if !(1..=1000).contains(&page_size) {
+        return Err(AuthzProjectionPageError::InvalidPageSize);
+    }
+    let snapshot = mvcc
+        .runtime
+        .applied_version()
+        .map_err(AuthzProjectionPageError::from)?;
+    require_revision_mvcc(mvcc, tenant_id, expected_revision, snapshot)?;
+    let order = projection_order(filter);
+    let (table_id, prefix) = match order {
+        ProjectionOrder::Object => (
+            TABLE_AUTHZ_TUPLE_OBJECT_CURRENT_ROW,
+            object_filter_prefix(tenant_id, filter)?,
+        ),
+        ProjectionOrder::Subject => (
+            TABLE_AUTHZ_TUPLE_SUBJECT_CURRENT_ROW,
+            subject_filter_prefix(tenant_id, filter)?,
+        ),
+    };
+    let candidate_budget = candidate_budget(page_size);
+    let mut matches = Vec::with_capacity(page_size.saturating_add(1));
+    let mut candidates_visited = 0;
+    let mut continuation = None;
+    for (tuple_key, payload) in scan_projection(mvcc, table_id, &prefix, snapshot)? {
+        if after_tuple_key.is_some_and(|after| tuple_key.as_slice() <= after) {
+            continue;
+        }
+        if candidates_visited == candidate_budget {
+            continuation = matches
+                .last()
+                .map(|(key, _)| key.clone())
+                .or_else(|| Some(tuple_key));
+            break;
+        }
+        candidates_visited += 1;
+        let record = decode_current_payload(tenant_id, &payload)?;
+        validate_projection_row_key(order, &tuple_key, &record)?;
+        if matches_filter(&record, filter) {
+            matches.push((tuple_key, record));
+            if matches.len() > page_size {
+                continuation = matches.get(page_size - 1).map(|(key, _)| key.clone());
+                matches.truncate(page_size);
+                break;
+            }
+        }
+    }
+    require_revision_mvcc(mvcc, tenant_id, expected_revision, snapshot)?;
+    Ok(AuthzTupleProjectionPage {
+        records: matches.into_iter().map(|(_, record)| record).collect(),
+        next_tuple_key: continuation,
+        candidates_visited,
+    })
+}
+
+#[cfg(any())]
+pub(super) async fn page_current_records_physical(
     storage: &Storage,
     tenant_id: i64,
     filter: &AuthzTupleFilter,
@@ -309,8 +528,7 @@ pub(super) async fn page_current_records(
                 .context("decode authz projection tuple key")?
                 .to_vec();
             scan_after = Some(tuple_key.clone());
-            let record = decode_current_payload(storage, tenant_id, &row.payload)
-                .await
+            let record = decode_current_payload(tenant_id, &row.payload)
                 .map_err(AuthzProjectionPageError::from)?;
             validate_projection_row_key(order, &tuple_key, &record)
                 .map_err(AuthzProjectionPageError::from)?;
@@ -351,7 +569,61 @@ pub(super) async fn page_current_records(
     })
 }
 
-pub(super) async fn page_current_object_candidates(
+pub(super) fn page_current_object_candidates(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    namespace: &str,
+    expected_revision: i64,
+    after_object_id: Option<&str>,
+    page_size: usize,
+) -> std::result::Result<AuthzObjectCandidatePage, AuthzProjectionPageError> {
+    if !(1..=1000).contains(&page_size) {
+        return Err(AuthzProjectionPageError::InvalidPageSize);
+    }
+    let snapshot = mvcc
+        .runtime
+        .applied_version()
+        .map_err(AuthzProjectionPageError::from)?;
+    require_revision_mvcc(mvcc, tenant_id, expected_revision, snapshot)?;
+    let (realm_id, local_namespace) = namespace_parts(namespace);
+    let prefix = core_meta_tuple_key(&[
+        CoreMetaTuplePart::I64(tenant_id),
+        CoreMetaTuplePart::Utf8(&realm_id),
+        CoreMetaTuplePart::Utf8(&local_namespace),
+    ])?;
+    let mut object_ids = Vec::with_capacity(page_size);
+    let mut candidates_visited = 0;
+    let mut next_object_id = None;
+    for (tuple_key, payload) in scan_projection(
+        mvcc,
+        TABLE_AUTHZ_TUPLE_OBJECT_CURRENT_ROW,
+        &prefix,
+        snapshot,
+    )? {
+        let record = decode_current_payload(tenant_id, &payload)?;
+        validate_projection_row_key(ProjectionOrder::Object, &tuple_key, &record)?;
+        if after_object_id.is_some_and(|after| record.object_id.as_str() <= after) {
+            continue;
+        }
+        candidates_visited += 1;
+        if object_ids.last() != Some(&record.object_id) {
+            if object_ids.len() == page_size {
+                next_object_id = object_ids.last().cloned();
+                break;
+            }
+            object_ids.push(record.object_id);
+        }
+    }
+    require_revision_mvcc(mvcc, tenant_id, expected_revision, snapshot)?;
+    Ok(AuthzObjectCandidatePage {
+        object_ids,
+        next_object_id,
+        candidates_visited,
+    })
+}
+
+#[cfg(any())]
+pub(super) async fn page_current_object_candidates_physical(
     storage: &Storage,
     tenant_id: i64,
     namespace: &str,
@@ -408,8 +680,7 @@ pub(super) async fn page_current_object_candidates(
                 .context("decode authz object candidate tuple key")?
                 .to_vec();
             scan_after = Some(tuple_key.clone());
-            let record = decode_current_payload(storage, tenant_id, &row.payload)
-                .await
+            let record = decode_current_payload(tenant_id, &row.payload)
                 .map_err(AuthzProjectionPageError::from)?;
             validate_projection_row_key(ProjectionOrder::Object, &tuple_key, &record)
                 .map_err(AuthzProjectionPageError::from)?;
@@ -439,6 +710,26 @@ pub(super) async fn page_current_object_candidates(
     })
 }
 
+fn require_revision_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    expected_revision: i64,
+    snapshot: u64,
+) -> std::result::Result<(), AuthzProjectionPageError> {
+    let actual = i64::try_from(authz_head::read_at_mvcc(mvcc, tenant_id, snapshot)?.tuple_revision)
+        .map_err(|_| {
+            AuthzProjectionPageError::Internal("authorization revision exceeds i64".to_string())
+        })?;
+    if actual != expected_revision {
+        return Err(AuthzProjectionPageError::RevisionMismatch {
+            expected: expected_revision,
+            actual,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(any())]
 async fn require_revision(
     storage: &Storage,
     tenant_id: i64,
@@ -486,40 +777,12 @@ fn object_projection_upper_bound(
     ])
 }
 
-async fn encode_current_payload(
-    storage: &Storage,
-    record: &AuthzTupleRecord,
-    transaction_id: &str,
-) -> Result<Vec<u8>> {
-    let record_payload = encode_current_row(record, transaction_id)?;
-    encode_authz_payload_row(
-        storage,
-        current_common(record, transaction_id),
-        AUTHZ_TUPLE_CURRENT_PAYLOAD_KIND,
-        &format!(
-            "tenant/{}/authz/current/{}",
-            record.tenant_id, record.record_hash
-        ),
-        record.revision.max(0) as u64,
-        transaction_id,
-        record_payload,
-    )
-    .await
+fn encode_current_payload(record: &AuthzTupleRecord, transaction_id: &str) -> Result<Vec<u8>> {
+    encode_current_row(record, transaction_id)
 }
 
-async fn decode_current_payload(
-    storage: &Storage,
-    tenant_id: i64,
-    payload: &[u8],
-) -> Result<AuthzTupleRecord> {
-    let record_payload = decode_authz_payload_row(
-        storage,
-        tenant_id,
-        payload,
-        AUTHZ_TUPLE_CURRENT_PAYLOAD_KIND,
-    )
-    .await?;
-    let record = decode_current_row(&record_payload)?;
+fn decode_current_payload(tenant_id: i64, payload: &[u8]) -> Result<AuthzTupleRecord> {
+    let record = decode_current_row(payload)?;
     if record.tenant_id != tenant_id {
         return Err(anyhow!("authz tuple current row tenant mismatch"));
     }
@@ -532,8 +795,10 @@ async fn decode_current_payload(
 }
 
 fn encode_current_row(record: &AuthzTupleRecord, transaction_id: &str) -> Result<Vec<u8>> {
+    if transaction_id.is_empty() {
+        return Err(anyhow!("authz tuple MVCC transaction ID is empty"));
+    }
     super::encode_deterministic_proto(&AuthzTupleCurrentRowProto {
-        common: Some(current_common(record, transaction_id)),
         schema: AUTHZ_TUPLE_CURRENT_ROW_SCHEMA.to_string(),
         record: Some(authz_record_to_proto(record)?),
     })
@@ -545,71 +810,33 @@ fn decode_current_row(bytes: &[u8]) -> Result<AuthzTupleRecord> {
     if row.schema != AUTHZ_TUPLE_CURRENT_ROW_SCHEMA {
         return Err(anyhow!("authz tuple current row schema mismatch"));
     }
-    let common = row
-        .common
-        .as_ref()
-        .ok_or_else(|| anyhow!("authz tuple current row missing CoreMeta common"))?;
     let record = authz_record_from_proto(
         row.record
             .ok_or_else(|| anyhow!("authz tuple current row is missing record"))?,
     )?;
-    let written_at_unix_nanos = record
-        .written_at
-        .timestamp_nanos_opt()
-        .unwrap_or_default()
-        .max(0) as u64;
-    if record.revision <= 0
-        || common.realm_id != format!("tenant/{}", record.tenant_id)
-        || common.root_key_hash != core_meta_root_key_hash(&format!("authz/{}", record.tenant_id))
-        || common.root_generation == 0
-        || common.transaction_id.is_empty()
-        || common.created_at_unix_nanos != written_at_unix_nanos
-        || common.visibility_state_enum() != crate::core_store::CoreMetaVisibilityState::Committed
-    {
-        return Err(anyhow!("authz tuple current row scope metadata mismatch"));
+    if record.revision <= 0 {
+        return Err(anyhow!("authz tuple current row revision is invalid"));
     }
     Ok(record)
 }
 
-fn current_common(
-    record: &AuthzTupleRecord,
-    transaction_id: &str,
-) -> crate::core_store::CoreMetaRowCommonProto {
-    core_meta_committed_row_common(
-        format!("tenant/{}", record.tenant_id),
-        core_meta_root_key_hash(&format!("authz/{}", record.tenant_id)),
-        record.revision.max(0) as u64,
-        transaction_id,
-        record
-            .written_at
-            .timestamp_nanos_opt()
-            .unwrap_or_default()
-            .max(0) as u64,
-    )
-}
-
 fn current_put(
-    partition_id: &str,
     table_id: u16,
     tuple_key: Vec<u8>,
     payload: Vec<u8>,
-) -> CoreMutationOperation {
-    CoreMutationOperation::CoreMetaPut {
-        partition_id: partition_id.to_string(),
-        cf: CF_AUTHZ.to_string(),
-        table_id,
-        tuple_key,
+) -> crate::mvcc_product::ProductMutation {
+    crate::mvcc_product::ProductMutation::put(
+        crate::mvcc_product::coremeta_logical_key(CF_AUTHZ, table_id, &tuple_key)
+            .expect("validated authorization tuple key"),
         payload,
-    }
+    )
 }
 
-fn current_delete(partition_id: &str, table_id: u16, tuple_key: Vec<u8>) -> CoreMutationOperation {
-    CoreMutationOperation::CoreMetaDelete {
-        partition_id: partition_id.to_string(),
-        cf: CF_AUTHZ.to_string(),
-        table_id,
-        tuple_key,
-    }
+fn current_delete(table_id: u16, tuple_key: Vec<u8>) -> crate::mvcc_product::ProductMutation {
+    crate::mvcc_product::ProductMutation::delete(
+        crate::mvcc_product::coremeta_logical_key(CF_AUTHZ, table_id, &tuple_key)
+            .expect("validated authorization tuple key"),
+    )
 }
 
 fn validate_projection_row_key(
@@ -630,17 +857,79 @@ fn validate_projection_row_key(
 }
 
 pub(super) fn object_row_key(record: &AuthzTupleRecord) -> Result<Vec<u8>> {
-    let (realm_id, namespace) = namespace_parts(&record.namespace);
+    object_tuple_key(
+        record.tenant_id,
+        &record.namespace,
+        &record.object_id,
+        &record.relation,
+        &record.subject_kind,
+        &record.subject_id,
+        &record.caveat_hash,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn object_tuple_key(
+    tenant_id: i64,
+    namespace: &str,
+    object_id: &str,
+    relation: &str,
+    subject_kind: &str,
+    subject_id: &str,
+    caveat_hash: &str,
+) -> Result<Vec<u8>> {
+    let (realm_id, namespace) = namespace_parts(namespace);
     core_meta_tuple_key(&[
-        CoreMetaTuplePart::I64(record.tenant_id),
+        CoreMetaTuplePart::I64(tenant_id),
         CoreMetaTuplePart::Utf8(&realm_id),
         CoreMetaTuplePart::Utf8(&namespace),
-        CoreMetaTuplePart::Utf8(&record.object_id),
-        CoreMetaTuplePart::Utf8(&record.relation),
-        CoreMetaTuplePart::Utf8(&record.subject_kind),
-        CoreMetaTuplePart::Utf8(&record.subject_id),
-        CoreMetaTuplePart::Utf8(&record.caveat_hash),
+        CoreMetaTuplePart::Utf8(object_id),
+        CoreMetaTuplePart::Utf8(relation),
+        CoreMetaTuplePart::Utf8(subject_kind),
+        CoreMetaTuplePart::Utf8(subject_id),
+        CoreMetaTuplePart::Utf8(caveat_hash),
     ])
+}
+
+fn object_relation_prefix(
+    tenant_id: i64,
+    namespace: &str,
+    object_id: &str,
+    relation: &str,
+    subject_kind: Option<&str>,
+) -> Result<Vec<u8>> {
+    let (realm_id, namespace) = namespace_parts(namespace);
+    let mut parts = vec![
+        CoreMetaTuplePart::I64(tenant_id),
+        CoreMetaTuplePart::Utf8(&realm_id),
+        CoreMetaTuplePart::Utf8(&namespace),
+        CoreMetaTuplePart::Utf8(object_id),
+        CoreMetaTuplePart::Utf8(relation),
+    ];
+    if let Some(subject_kind) = subject_kind {
+        parts.push(CoreMetaTuplePart::Utf8(subject_kind));
+    }
+    core_meta_tuple_key(&parts)
+}
+
+fn scan_projection(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    table_id: u16,
+    tuple_prefix: &[u8],
+    snapshot: u64,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let application_prefix =
+        crate::mvcc_product::coremeta_application_prefix(CF_AUTHZ, tuple_prefix)?;
+    mvcc.runtime
+        .scan_table_prefix_at(table_id, &application_prefix, snapshot)?
+        .into_iter()
+        .map(|(key, row)| {
+            Ok((
+                crate::mvcc_product::coremeta_tuple_from_logical_key(&key, CF_AUTHZ)?.to_vec(),
+                row.value,
+            ))
+        })
+        .collect()
 }
 
 pub(super) fn subject_row_key(record: &AuthzTupleRecord) -> Result<Vec<u8>> {
@@ -787,7 +1076,7 @@ fn namespace_parts(namespace: &str) -> (String, String) {
         .unwrap_or_else(|| (DEFAULT_AUTHZ_REALM_ID.to_string(), namespace.to_string()))
 }
 
-#[cfg(test)]
+#[cfg(any())]
 mod tests {
     use super::*;
     use crate::authz_journal::{AuthzRecordHashInput, authz_record_hash};

@@ -303,7 +303,7 @@ impl Persistence {
         if has_objects {
             return Ok(true);
         }
-        multipart_journal::has_active_multipart_upload(&self.storage, bucket_id)
+        multipart_journal::has_active_multipart_upload(self.mvcc()?, bucket_id)
     }
 
     pub async fn hard_delete_bucket_if_empty(&self, bucket_id: i64) -> Result<bool> {
@@ -342,6 +342,6 @@ impl Persistence {
     }
 
     pub async fn latest_authz_revision(&self, tenant_id: i64) -> Result<i64> {
-        authz_journal::latest_authz_revision(&self.storage, tenant_id).await
+        authz_journal::latest_authz_revision(self.mvcc()?, tenant_id)
     }
 }

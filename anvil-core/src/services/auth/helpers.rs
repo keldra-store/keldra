@@ -324,9 +324,10 @@ pub(super) async fn check_permission_response(
     .await?;
     let consistency = AuthzConsistency::from_request(&req.consistency, &req.zookie)?;
     let response_revision =
-        resolve_authz_response_revision(&state.storage, claims.tenant_id, consistency).await?;
+        resolve_authz_response_revision(&state.mvcc, claims.tenant_id, consistency).await?;
     let allowed = authz_journal::resolve_permission_at_revision(
         &state.storage,
+        &state.mvcc,
         claims.tenant_id,
         &encode_realm_namespace(&scope.authz_realm_id, &req.namespace),
         &req.object_id,
@@ -352,12 +353,11 @@ pub(super) async fn check_permission_response(
 }
 
 pub(super) async fn resolve_authz_response_revision(
-    storage: &crate::storage::Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     consistency: AuthzConsistency,
 ) -> Result<i64, Status> {
-    let latest_revision = authz_journal::latest_authz_revision(storage, tenant_id)
-        .await
+    let latest_revision = authz_journal::latest_authz_revision(mvcc, tenant_id)
         .map_err(|e| Status::internal(format!("{e:#}")))?;
     if let Some(required_revision) = consistency.required_revision()
         && latest_revision < required_revision
@@ -372,12 +372,11 @@ pub(super) async fn resolve_authz_response_revision(
 }
 
 pub(super) async fn require_current_authz_list_revision(
-    storage: &crate::storage::Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     requested_revision: i64,
 ) -> Result<(), Status> {
-    let current_revision = authz_journal::latest_authz_revision(storage, tenant_id)
-        .await
+    let current_revision = authz_journal::latest_authz_revision(mvcc, tenant_id)
         .map_err(|error| Status::internal(format!("{error:#}")))?;
     if current_revision != requested_revision {
         return Err(Status::failed_precondition(format!(

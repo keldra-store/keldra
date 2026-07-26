@@ -11,6 +11,7 @@ pub(super) async fn require_admin<T>(
         .ok_or_else(|| Status::unauthenticated("Missing authenticated admin principal"))?;
     let allowed = crate::system_realm::check_admin_relation(
         &state.storage,
+        &state.mvcc,
         &state.config.mesh_id,
         claims,
         capability,

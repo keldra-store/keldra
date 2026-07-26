@@ -1,11 +1,9 @@
 use super::TupleViewKey;
 use crate::anvil_api::AuthzRelationRule;
-use crate::authz_realm_schema;
 use crate::authz_scope::{
     DEFAULT_AUTHZ_REALM_ID, encode_realm_namespace, parse_userset_subject, split_realm_namespace,
 };
 use crate::persistence::AuthzTupleRecord;
-use crate::storage::Storage;
 use anyhow::{Result, anyhow};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -73,72 +71,6 @@ impl SchemaRuleIndex {
             members_by_userset,
             schema_bound_namespaces: bound_namespaces.into_iter().collect(),
         }
-    }
-
-    pub(crate) async fn load<'a, I>(
-        storage: &Storage,
-        tenant_id: i64,
-        current: &BTreeMap<TupleViewKey, AuthzTupleRecord>,
-        seed_namespaces: I,
-    ) -> Result<Self>
-    where
-        I: IntoIterator<Item = &'a str>,
-    {
-        let mut namespaces = seed_namespaces
-            .into_iter()
-            .filter(|namespace| !namespace.is_empty())
-            .map(str::to_string)
-            .collect::<BTreeSet<_>>();
-        for record in current.values().filter(|record| record.operation == "add") {
-            namespaces.insert(record.namespace.clone());
-            if record.subject_kind == "userset"
-                && let Some(subject) = parse_userset_subject(&record.subject_id)
-            {
-                namespaces.insert(normalize_namespace_for_scope(
-                    &record.namespace,
-                    subject.namespace,
-                ));
-            } else if !record.subject_kind.is_empty() {
-                namespaces.insert(normalize_namespace_for_scope(
-                    &record.namespace,
-                    &record.subject_kind,
-                ));
-            }
-        }
-
-        let mut members_by_userset = BTreeMap::new();
-        let mut schema_bound_namespaces = BTreeSet::new();
-        for namespace in namespaces {
-            let (realm_id, local_namespace) = namespace_realm_parts(&namespace);
-            let Some(schema) = authz_realm_schema::read_bound_namespace_schema(
-                storage,
-                tenant_id,
-                &realm_id,
-                &local_namespace,
-            )
-            .await?
-            else {
-                continue;
-            };
-            schema_bound_namespaces.insert(namespace.clone());
-            for relation in schema.relations {
-                let direct_relation = crate::authz_schema_contract::is_direct_relation(&relation);
-                members_by_userset.insert(
-                    UsersetRuleKey {
-                        namespace: namespace.clone(),
-                        relation: relation.relation,
-                    },
-                    SchemaMember {
-                        direct_relation,
-                        rules: relation.rules,
-                    },
-                );
-            }
-        }
-        Ok(Self {
-            members_by_userset,
-            schema_bound_namespaces,
-        })
     }
 
     fn relation_rules(&self, userset: &UsersetRef) -> &[AuthzRelationRule] {

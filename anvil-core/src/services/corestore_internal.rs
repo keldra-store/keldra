@@ -747,8 +747,8 @@ async fn ensure_internal_node_request<T: InternalHeaderCarrier>(
 
     let relation_started_at = Instant::now();
     let allowed = system_realm::check_internal_node_access(
-        &state.storage,
         &state.core_store,
+        state.mvcc.runtime.as_ref(),
         &state.config.mesh_id,
         claims,
         &header.source_node_id,

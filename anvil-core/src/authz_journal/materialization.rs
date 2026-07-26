@@ -1,13 +1,12 @@
 use super::{
-    AUTHZ_TUPLE_BATCH_RECORD_KIND, AUTHZ_TUPLE_RECORD_KIND, authz_tuple_stream_id,
-    decode_authz_tuple_batch_journal_body, decode_authz_tuple_batch_journal_body_fence,
-    decode_authz_tuple_journal_body, decode_authz_tuple_journal_body_fence, latest_authz_revision,
+    AUTHZ_TUPLE_JOURNAL_ROW_KIND, decode_authz_tuple_batch_journal_body,
+    decode_authz_tuple_batch_journal_body_fence, latest_authz_revision,
 };
 use crate::{
     authz_head,
     authz_segment::{self, DecodedAuthzSegment},
     authz_userset_index::DEFAULT_DERIVED_USERSET_INDEX_ID,
-    core_store::{CoreMutationPrecondition, CoreStore, ReadStream, StreamRecord},
+    core_store::{CF_AUTHZ, CoreMetaTuplePart, TABLE_AUTHZ_TUPLE_JOURNAL_ROW, core_meta_tuple_key},
     persistence::AuthzTupleRecord,
     storage::Storage,
     task_execution_guard::TaskExecutionGuard,
@@ -20,8 +19,6 @@ use std::{
     sync::{Arc, LazyLock, Weak},
 };
 
-const AUTHZ_INCREMENTAL_SOURCE_PAGE_SIZE: usize = 1;
-const AUTHZ_INCREMENTAL_SOURCE_SCAN_LIMIT: usize = 256;
 const AUTHZ_REBUILD_SOURCE_PAGE_SIZE: usize = 1_000;
 
 static AUTHZ_MATERIALIZATION_LOCKS: LazyLock<
@@ -45,7 +42,10 @@ enum AuthzPublication<'a> {
     Direct,
     Task {
         guard: &'a TaskExecutionGuard,
-        source_partition_precondition: &'a CoreMutationPrecondition,
+        source_head_predicate: &'a (
+            anvil_mvcc_consensus::LogicalKey,
+            anvil_mvcc_consensus::PredicateKind,
+        ),
     },
 }
 
@@ -72,13 +72,15 @@ struct RebuildSource {
 
 pub(crate) async fn materialize_authz_tuple_segment(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     source_fence_token: u64,
 ) -> Result<String> {
-    let target_revision = u64::try_from(latest_authz_revision(storage, tenant_id).await?)
+    let target_revision = u64::try_from(latest_authz_revision(mvcc, tenant_id)?)
         .context("authorization revision must be nonnegative")?;
     Ok(materialize_authz_state_at_revision(
         storage,
+        mvcc,
         tenant_id,
         target_revision,
         source_fence_token,
@@ -90,12 +92,14 @@ pub(crate) async fn materialize_authz_tuple_segment(
 
 pub(crate) async fn materialize_authz_tuple_segment_at_revision(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     target_revision: u64,
     source_fence_token: u64,
 ) -> Result<String> {
     Ok(materialize_authz_state_at_revision(
         storage,
+        mvcc,
         tenant_id,
         target_revision,
         source_fence_token,
@@ -107,12 +111,14 @@ pub(crate) async fn materialize_authz_tuple_segment_at_revision(
 
 pub(crate) async fn materialize_authz_derived_state_at_revision(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     target_revision: u64,
     source_fence_token: u64,
 ) -> Result<AuthzMaterializationOutcome> {
     materialize_authz_state_at_revision(
         storage,
+        mvcc,
         tenant_id,
         target_revision,
         source_fence_token,
@@ -123,12 +129,13 @@ pub(crate) async fn materialize_authz_derived_state_at_revision(
 
 pub(crate) async fn materialize_authz_derived_state_through_revision(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     target_revision: u64,
     source_fence_token: u64,
 ) -> Result<AuthzMaterializationOutcome> {
     let mut previous_revision = None;
-    let mut step_target = if authz_segment::latest_authz_tuple_segment_record(storage, tenant_id)
+    let mut step_target = if authz_segment::latest_authz_tuple_segment_record(mvcc, tenant_id)
         .await?
         .is_none()
     {
@@ -140,6 +147,7 @@ pub(crate) async fn materialize_authz_derived_state_through_revision(
     loop {
         let outcome = materialize_authz_state_at_revision(
             storage,
+            mvcc,
             tenant_id,
             step_target,
             source_fence_token,
@@ -162,20 +170,25 @@ pub(crate) async fn materialize_authz_derived_state_through_revision(
 impl AuthzMaterializationOutcome {
     pub(crate) async fn materialize_for_task_at_revision(
         storage: &Storage,
+        mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
         tenant_id: i64,
         target_revision: u64,
         source_fence_token: u64,
         guard: &TaskExecutionGuard,
-        source_partition_precondition: &CoreMutationPrecondition,
+        source_head_predicate: &(
+            anvil_mvcc_consensus::LogicalKey,
+            anvil_mvcc_consensus::PredicateKind,
+        ),
     ) -> Result<Self> {
         materialize_authz_state_at_revision(
             storage,
+            mvcc,
             tenant_id,
             target_revision,
             source_fence_token,
             AuthzPublication::Task {
                 guard,
-                source_partition_precondition,
+                source_head_predicate,
             },
         )
         .await
@@ -184,6 +197,7 @@ impl AuthzMaterializationOutcome {
 
 fn materialize_authz_state_at_revision<'a>(
     storage: &'a Storage,
+    mvcc: &'a crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     target_revision: u64,
     source_fence_token: u64,
@@ -191,6 +205,7 @@ fn materialize_authz_state_at_revision<'a>(
 ) -> Pin<Box<dyn Future<Output = Result<AuthzMaterializationOutcome>> + Send + 'a>> {
     Box::pin(materialize_authz_state_at_revision_inner(
         storage,
+        mvcc,
         tenant_id,
         target_revision,
         source_fence_token,
@@ -200,19 +215,21 @@ fn materialize_authz_state_at_revision<'a>(
 
 async fn materialize_authz_state_at_revision_inner(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     target_revision: u64,
     source_fence_token: u64,
     publication: AuthzPublication<'_>,
 ) -> Result<AuthzMaterializationOutcome> {
-    validate_target_revision(storage, tenant_id, target_revision).await?;
+    validate_target_revision(mvcc, tenant_id, target_revision)?;
     let lock = materialization_lock(tenant_id)?;
     let _guard = lock.lock().await;
 
-    let Some(head) = authz_segment::latest_authz_tuple_segment_record(storage, tenant_id).await?
+    let Some(head) = authz_segment::latest_authz_tuple_segment_record(mvcc, tenant_id).await?
     else {
         return initialize_authz_materialization(
             storage,
+            mvcc,
             tenant_id,
             target_revision,
             source_fence_token,
@@ -222,12 +239,12 @@ async fn materialize_authz_state_at_revision_inner(
     };
     if head.generation >= target_revision {
         let segment_ref =
-            authz_segment::existing_authz_tuple_segment_ref(storage, tenant_id, target_revision)
+            authz_segment::existing_authz_tuple_segment_ref(mvcc, tenant_id, target_revision)
                 .await?
                 .ok_or_else(|| {
                     anyhow!("AuthzRevisionUnavailable: materialized segment is missing")
                 })?;
-        let segment = load_materialized_segment(storage, tenant_id, target_revision).await?;
+        let segment = load_materialized_segment(storage, mvcc, tenant_id, target_revision).await?;
         return outcome_from_segment(segment, segment_ref, 0);
     }
 
@@ -241,7 +258,7 @@ async fn materialize_authz_state_at_revision_inner(
         cursor_before_event,
         scanned_cursor,
         source_rows_visited,
-    } = read_next_source_event(storage, tenant_id, head.source_cursor).await?;
+    } = read_next_source_event(mvcc, tenant_id, head.source_cursor)?;
     let (mutations, source_cursor, event_fence_token) = match next_event {
         Some(event) if event.revision == next_revision => {
             (event.records, event.source_cursor, event.fence_token)
@@ -253,57 +270,57 @@ async fn materialize_authz_state_at_revision_inner(
         ),
         None => (Vec::new(), scanned_cursor, 0),
     };
-    require_available_revision_source(storage, tenant_id, next_revision, &mutations).await?;
+    require_available_revision_source(mvcc, tenant_id, next_revision, &mutations)?;
     let effective_fence = event_fence_token.max(source_fence_token);
 
-    let staged = if authz_segment::authz_tuple_segment_requires_checkpoint(
-        storage,
-        tenant_id,
-        next_revision,
-    )
-    .await?
-    {
-        let active = authz_segment::apply_authz_tuple_mutations(
-            tenant_id,
-            &previous.records,
-            &mutations,
-            next_revision,
-        )?;
-        authz_segment::stage_authz_tuple_checkpoint_segment(
-            storage,
-            tenant_id,
-            &active,
-            Some(&previous),
-            next_revision,
-            source_cursor,
-            effective_fence,
-        )
-        .await?
-    } else {
-        authz_segment::stage_authz_tuple_delta_segment(
-            storage,
-            tenant_id,
-            &previous,
-            &mutations,
-            next_revision,
-            source_cursor,
-            effective_fence,
-        )
-        .await?
-    };
-    let segment_ref = publish_staged_segment(storage, staged, publication).await?;
-    let segment = load_materialized_segment(storage, tenant_id, next_revision).await?;
+    let staged =
+        if authz_segment::authz_tuple_segment_requires_checkpoint(mvcc, tenant_id, next_revision)
+            .await?
+        {
+            let active = authz_segment::apply_authz_tuple_mutations(
+                tenant_id,
+                &previous.records,
+                &mutations,
+                next_revision,
+            )?;
+            authz_segment::stage_authz_tuple_checkpoint_segment(
+                storage,
+                mvcc,
+                tenant_id,
+                &active,
+                Some(&previous),
+                next_revision,
+                source_cursor,
+                effective_fence,
+            )
+            .await?
+        } else {
+            authz_segment::stage_authz_tuple_delta_segment(
+                storage,
+                mvcc,
+                tenant_id,
+                &previous,
+                &mutations,
+                next_revision,
+                source_cursor,
+                effective_fence,
+            )
+            .await?
+        };
+    let segment_ref = publish_staged_segment(mvcc, staged, publication).await?;
+    let segment = load_materialized_segment(storage, mvcc, tenant_id, next_revision).await?;
     outcome_from_segment(segment, segment_ref, source_rows_visited)
 }
 
 async fn initialize_authz_materialization(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     target_revision: u64,
     source_fence_token: u64,
     publication: AuthzPublication<'_>,
 ) -> Result<AuthzMaterializationOutcome> {
-    let current_revision = u64::try_from(latest_authz_revision(storage, tenant_id).await?)
+    let current_revision = u64::try_from(latest_authz_revision(mvcc, tenant_id)?)
         .context("authorization revision must be nonnegative")?;
     if target_revision != 1 || current_revision != 1 {
         bail!(
@@ -315,7 +332,7 @@ async fn initialize_authz_materialization(
         cursor_before_event,
         scanned_cursor,
         source_rows_visited,
-    } = read_next_source_event(storage, tenant_id, 0).await?;
+    } = read_next_source_event(mvcc, tenant_id, 0)?;
     let (mutations, source_cursor, event_fence_token) = match event {
         Some(event) if event.revision == 1 => {
             (event.records, event.source_cursor, event.fence_token)
@@ -327,10 +344,11 @@ async fn initialize_authz_materialization(
         ),
         None => (Vec::new(), scanned_cursor, 0),
     };
-    require_available_revision_source(storage, tenant_id, 1, &mutations).await?;
+    require_available_revision_source(mvcc, tenant_id, 1, &mutations)?;
     let active = authz_segment::apply_authz_tuple_mutations(tenant_id, &[], &mutations, 1)?;
     let staged = authz_segment::stage_authz_tuple_checkpoint_segment(
         storage,
+        mvcc,
         tenant_id,
         &active,
         None,
@@ -339,36 +357,30 @@ async fn initialize_authz_materialization(
         event_fence_token.max(source_fence_token),
     )
     .await?;
-    let segment_ref = publish_staged_segment(storage, staged, publication).await?;
-    let segment = load_materialized_segment(storage, tenant_id, 1).await?;
+    let segment_ref = publish_staged_segment(mvcc, staged, publication).await?;
+    let segment = load_materialized_segment(storage, mvcc, tenant_id, 1).await?;
     outcome_from_segment(segment, segment_ref, source_rows_visited)
 }
 
 async fn publish_staged_segment(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     staged: authz_segment::StagedAuthzTupleSegment,
     publication: AuthzPublication<'_>,
 ) -> Result<String> {
     match publication {
         AuthzPublication::Direct => {
-            authz_segment::publish_staged_authz_tuple_segment(storage, staged, &[]).await
+            authz_segment::publish_staged_authz_tuple_segment(mvcc, staged, &[]).await
         }
         AuthzPublication::Task {
             guard,
-            source_partition_precondition,
+            source_head_predicate,
         } => {
-            let source_partition_precondition = source_partition_precondition.clone();
+            let source_head_predicate = source_head_predicate.clone();
             guard
-                .publication_permit()
-                .await?
-                .publish_with(move |task_lease_precondition| async move {
-                    let preconditions = [source_partition_precondition, task_lease_precondition];
-                    authz_segment::publish_staged_authz_tuple_segment(
-                        storage,
-                        staged,
-                        &preconditions,
-                    )
-                    .await
+                .publish_mvcc_with(move |task_lease_predicate| async move {
+                    let preconditions = [source_head_predicate, task_lease_predicate];
+                    authz_segment::publish_staged_authz_tuple_segment(mvcc, staged, &preconditions)
+                        .await
                 })
                 .await
         }
@@ -377,17 +389,19 @@ async fn publish_staged_segment(
 
 pub(crate) async fn rebuild_authz_materialization_at_revision(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     target_revision: u64,
     source_fence_token: u64,
 ) -> Result<AuthzMaterializationOutcome> {
-    validate_target_revision(storage, tenant_id, target_revision).await?;
+    validate_target_revision(mvcc, tenant_id, target_revision)?;
     let lock = materialization_lock(tenant_id)?;
     let _guard = lock.lock().await;
-    let source = collect_source_records_for_rebuild(storage, tenant_id, target_revision).await?;
+    let source = collect_source_records_for_rebuild(mvcc, tenant_id, target_revision)?;
     let active = active_records_at_revision(source.records, target_revision);
     let derived = crate::authz_userset_index::build_expected_derived_userset_index_at_revision(
         storage,
+        mvcc,
         tenant_id,
         DEFAULT_DERIVED_USERSET_INDEX_ID,
         target_revision,
@@ -396,6 +410,7 @@ pub(crate) async fn rebuild_authz_materialization_at_revision(
     crate::authz_userset_index::write_derived_userset_index(storage, &derived).await?;
     let segment_ref = authz_segment::write_authz_tuple_checkpoint_segment(
         storage,
+        mvcc,
         tenant_id,
         &active,
         None,
@@ -404,153 +419,83 @@ pub(crate) async fn rebuild_authz_materialization_at_revision(
         source.latest_fence_token.max(source_fence_token),
     )
     .await?;
-    let segment = load_materialized_segment(storage, tenant_id, target_revision).await?;
+    let segment = load_materialized_segment(storage, mvcc, tenant_id, target_revision).await?;
     outcome_from_segment(segment, segment_ref, source.events_visited)
 }
 
 pub(super) async fn collect_authz_tuple_records_for_rebuild(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     through_revision: Option<u64>,
 ) -> Result<Vec<AuthzTupleRecord>> {
     let through_revision = match through_revision {
         Some(revision) => revision,
-        None => u64::try_from(latest_authz_revision(storage, tenant_id).await?)
+        None => u64::try_from(latest_authz_revision(mvcc, tenant_id)?)
             .context("authorization revision must be nonnegative")?,
     };
-    Ok(
-        collect_source_records_for_rebuild(storage, tenant_id, through_revision)
-            .await?
-            .records,
-    )
+    Ok(collect_source_records_for_rebuild(mvcc, tenant_id, through_revision)?.records)
 }
 
-async fn read_next_source_event(
-    storage: &Storage,
+fn read_next_source_event(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     after_source_cursor: u64,
 ) -> Result<IncrementalSourceRead> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let mut scanned_cursor = after_source_cursor;
-    let mut source_rows_visited = 0_usize;
-    for _ in 0..AUTHZ_INCREMENTAL_SOURCE_SCAN_LIMIT {
-        let page_start_cursor = scanned_cursor;
-        let page = core_store
-            .read_stream_page(ReadStream {
-                stream_id: authz_tuple_stream_id(tenant_id),
-                after_sequence: page_start_cursor,
-                limit: AUTHZ_INCREMENTAL_SOURCE_PAGE_SIZE,
-            })
-            .await?;
-        if page.records.len() > AUTHZ_INCREMENTAL_SOURCE_PAGE_SIZE {
-            bail!("authorization source page exceeded its requested bound");
-        }
-        if let Some(record) = page.records.into_iter().next() {
-            if record.sequence <= scanned_cursor {
-                bail!("authorization source event did not advance its continuation");
-            }
-            // Stream sequences are continuation tokens and may be physically sparse.
-            source_rows_visited = source_rows_visited
-                .checked_add(1)
-                .ok_or_else(|| anyhow!("authorization source work count overflow"))?;
-            require_incremental_source_work_bound(source_rows_visited)?;
-            let cursor_before_event = scanned_cursor;
-            let event = decode_source_event(tenant_id, record)
-                .context("decode next authorization source event")?;
-            return Ok(IncrementalSourceRead {
-                scanned_cursor: event.source_cursor,
-                event: Some(event),
-                cursor_before_event,
-                source_rows_visited,
-            });
-        }
-
-        if page.next_sequence < page_start_cursor {
-            bail!("authorization source page moved its continuation backwards");
-        }
-        if page.next_sequence > page_start_cursor {
-            // An invisible source row is still one bounded unit of work.
-            source_rows_visited = source_rows_visited
-                .checked_add(1)
-                .ok_or_else(|| anyhow!("authorization source work count overflow"))?;
-            require_incremental_source_work_bound(source_rows_visited)?;
-            scanned_cursor = page.next_sequence;
-        }
-        if page.has_more && page.next_sequence == page_start_cursor {
-            bail!(
-                "AuthzMaterializationSourcePending: authorization source cannot advance past a pending row"
-            );
-        }
-        if !page.has_more {
-            return Ok(IncrementalSourceRead {
-                event: None,
-                cursor_before_event: scanned_cursor,
-                scanned_cursor,
-                source_rows_visited,
-            });
-        }
-    }
-    bail!(
-        "AuthzMaterializationSourceWindowExceeded: no visible authorization event within {AUTHZ_INCREMENTAL_SOURCE_SCAN_LIMIT} source rows"
-    )
+    let snapshot_version = mvcc.runtime.applied_version()?;
+    let mut events =
+        scan_source_events_at(mvcc, snapshot_version, tenant_id, after_source_cursor, 1)?;
+    let event = events.pop();
+    let scanned_cursor = event
+        .as_ref()
+        .map_or(after_source_cursor, |event| event.source_cursor);
+    Ok(IncrementalSourceRead {
+        event,
+        cursor_before_event: after_source_cursor,
+        scanned_cursor,
+        source_rows_visited: usize::from(scanned_cursor > after_source_cursor),
+    })
 }
 
-fn require_incremental_source_work_bound(source_rows_visited: usize) -> Result<()> {
-    if source_rows_visited > AUTHZ_INCREMENTAL_SOURCE_SCAN_LIMIT {
-        bail!(
-            "AuthzMaterializationSourceWindowExceeded: source read crossed more than {AUTHZ_INCREMENTAL_SOURCE_SCAN_LIMIT} rows"
-        );
-    }
-    Ok(())
-}
-
-async fn collect_source_records_for_rebuild(
-    storage: &Storage,
+fn collect_source_records_for_rebuild(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     through_revision: u64,
 ) -> Result<RebuildSource> {
-    let core_store = CoreStore::new(storage.clone()).await?;
+    let snapshot_version = mvcc.runtime.applied_version()?;
     let mut records = Vec::new();
     let mut source_cursor = 0_u64;
     let mut latest_fence_token = 0_u64;
     let mut events_visited = 0_usize;
     loop {
-        let previous_cursor = source_cursor;
-        let page = core_store
-            .read_stream_page(ReadStream {
-                stream_id: authz_tuple_stream_id(tenant_id),
-                after_sequence: previous_cursor,
-                limit: AUTHZ_REBUILD_SOURCE_PAGE_SIZE,
-            })
-            .await?;
-        let page_next_sequence = page.next_sequence;
-        let page_has_more = page.has_more;
-        let mut reached_later_revision = false;
-        for record in page.records {
+        let events = scan_source_events_at(
+            mvcc,
+            snapshot_version,
+            tenant_id,
+            source_cursor,
+            AUTHZ_REBUILD_SOURCE_PAGE_SIZE,
+        )?;
+        if events.is_empty() {
+            break;
+        }
+        let event_count = events.len();
+        for event in events {
             events_visited = events_visited
                 .checked_add(1)
                 .ok_or_else(|| anyhow!("authorization rebuild event count overflow"))?;
-            let event = decode_source_event(tenant_id, record)?;
             if event.revision > through_revision {
-                reached_later_revision = true;
-                break;
+                return Ok(RebuildSource {
+                    records,
+                    source_cursor,
+                    latest_fence_token,
+                    events_visited,
+                });
             }
             source_cursor = event.source_cursor;
             latest_fence_token = event.fence_token;
             records.extend(event.records);
         }
-        if reached_later_revision {
+        if event_count < AUTHZ_REBUILD_SOURCE_PAGE_SIZE {
             break;
-        }
-        if page_next_sequence < source_cursor {
-            bail!("authorization rebuild source page moved its continuation backwards");
-        }
-        source_cursor = page_next_sequence;
-        if !page_has_more {
-            break;
-        }
-        if source_cursor <= previous_cursor {
-            bail!("authorization rebuild source page did not advance its continuation");
         }
     }
     Ok(RebuildSource {
@@ -561,18 +506,13 @@ async fn collect_source_records_for_rebuild(
     })
 }
 
-fn decode_source_event(tenant_id: i64, record: StreamRecord) -> Result<AuthzSourceEvent> {
-    let (records, fence_token) = match record.record_kind.as_str() {
-        AUTHZ_TUPLE_RECORD_KIND => (
-            vec![decode_authz_tuple_journal_body(&record.payload)?],
-            decode_authz_tuple_journal_body_fence(&record.payload)?,
-        ),
-        AUTHZ_TUPLE_BATCH_RECORD_KIND => (
-            decode_authz_tuple_batch_journal_body(&record.payload)?,
-            decode_authz_tuple_batch_journal_body_fence(&record.payload)?,
-        ),
-        _ => bail!("authorization tuple stream record kind mismatch"),
-    };
+fn decode_source_event(
+    tenant_id: i64,
+    source_cursor: u64,
+    payload: &[u8],
+) -> Result<AuthzSourceEvent> {
+    let records = decode_authz_tuple_batch_journal_body(payload)?;
+    let fence_token = decode_authz_tuple_batch_journal_body_fence(payload)?;
     let revision = records
         .first()
         .ok_or_else(|| anyhow!("authorization source event has no tuple records"))?
@@ -585,11 +525,46 @@ fn decode_source_event(tenant_id: i64, record: StreamRecord) -> Result<AuthzSour
         bail!("authorization source event scope mismatch");
     }
     Ok(AuthzSourceEvent {
-        source_cursor: record.sequence,
+        source_cursor,
         revision: u64::try_from(revision)?,
         records,
         fence_token,
     })
+}
+
+fn scan_source_events_at(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    snapshot_version: u64,
+    tenant_id: i64,
+    after_revision: u64,
+    limit: usize,
+) -> Result<Vec<AuthzSourceEvent>> {
+    let prefix = core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8(AUTHZ_TUPLE_JOURNAL_ROW_KIND),
+        CoreMetaTuplePart::I64(tenant_id),
+    ])?;
+    let application_prefix = crate::mvcc_product::coremeta_application_prefix(CF_AUTHZ, &prefix)?;
+    let mut events = Vec::with_capacity(limit);
+    for (_, row) in mvcc.runtime.scan_table_prefix_at(
+        TABLE_AUTHZ_TUPLE_JOURNAL_ROW,
+        &application_prefix,
+        snapshot_version,
+    )? {
+        let records = decode_authz_tuple_batch_journal_body(&row.value)?;
+        let revision = records
+            .first()
+            .ok_or_else(|| anyhow!("authorization source event has no tuple records"))?
+            .revision;
+        let revision = u64::try_from(revision)?;
+        if revision <= after_revision {
+            continue;
+        }
+        events.push(decode_source_event(tenant_id, revision, &row.value)?);
+        if events.len() == limit {
+            break;
+        }
+    }
+    Ok(events)
 }
 
 fn active_records_at_revision(
@@ -600,13 +575,13 @@ fn active_records_at_revision(
     authz_segment::active_authz_tuple_records(&records)
 }
 
-async fn require_available_revision_source(
-    storage: &Storage,
+fn require_available_revision_source(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     revision: u64,
     mutations: &[AuthzTupleRecord],
 ) -> Result<()> {
-    let head = authz_head::read(storage, tenant_id).await?.head;
+    let head = authz_head::read_at_mvcc(mvcc, tenant_id, mvcc.runtime.applied_version()?)?;
     if mutations.is_empty() && head.schema_revision != revision {
         if head.tuple_revision >= revision {
             bail!("AuthzRevisionUnavailable: tuple source event is missing");
@@ -618,15 +593,15 @@ async fn require_available_revision_source(
     Ok(())
 }
 
-async fn validate_target_revision(
-    storage: &Storage,
+fn validate_target_revision(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     target_revision: u64,
 ) -> Result<()> {
     if target_revision == 0 {
         bail!("authorization materialization target revision must be nonzero");
     }
-    let current_revision = u64::try_from(latest_authz_revision(storage, tenant_id).await?)?;
+    let current_revision = u64::try_from(latest_authz_revision(mvcc, tenant_id)?)?;
     if target_revision > current_revision {
         bail!(
             "AuthzRevisionUnavailable: current authorization revision is {current_revision}, requested {target_revision}"
@@ -637,10 +612,11 @@ async fn validate_target_revision(
 
 async fn load_materialized_segment(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     revision: u64,
 ) -> Result<DecodedAuthzSegment> {
-    authz_segment::read_authz_tuple_segment_at_revision(storage, tenant_id, revision)
+    authz_segment::read_authz_tuple_segment_at_revision(storage, mvcc, tenant_id, revision)
         .await?
         .ok_or_else(|| anyhow!("AuthzRevisionUnavailable: materialized segment is missing"))
 }

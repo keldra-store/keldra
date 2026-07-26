@@ -12,6 +12,7 @@ impl Persistence {
             .await?;
         multipart_journal::create_multipart_upload_with_permit(
             &self.storage,
+            self.mvcc()?,
             tenant_id,
             bucket_id,
             key,
@@ -54,7 +55,7 @@ impl Persistence {
         upload_id: uuid::Uuid,
     ) -> Result<Option<MultipartUpload>> {
         multipart_journal::get_active_multipart_upload(
-            &self.storage,
+            self.mvcc()?,
             tenant_id,
             bucket_id,
             key,
@@ -73,7 +74,6 @@ impl Persistence {
         transaction_principal: &str,
     ) -> Result<Option<MultipartUpload>> {
         multipart_journal::get_active_multipart_upload_in_transaction(
-            &self.storage,
             self.mvcc()?,
             tenant_id,
             bucket_id,
@@ -94,14 +94,14 @@ impl Persistence {
         etag: &str,
     ) -> Result<MultipartUploadPartMutation> {
         let (tenant_id, bucket_id) =
-            multipart_journal::find_multipart_upload_partition(&self.storage, upload_row_id)
-                .await?
+            multipart_journal::find_multipart_upload_partition(self.mvcc()?, upload_row_id)?
                 .ok_or_else(|| anyhow!("multipart upload not found"))?;
         let permit = self
             .multipart_metadata_write_permit(tenant_id, bucket_id)
             .await?;
         multipart_journal::upsert_multipart_part_with_permit(
             &self.storage,
+            self.mvcc()?,
             upload_row_id,
             part_number,
             object_ref,
@@ -125,7 +125,6 @@ impl Persistence {
     ) -> Result<MultipartUploadPartMutation> {
         let (tenant_id, bucket_id) =
             multipart_journal::find_multipart_upload_partition_in_transaction(
-                &self.storage,
                 self.mvcc()?,
                 upload_row_id,
                 transaction_id,
@@ -156,7 +155,7 @@ impl Persistence {
         &self,
         upload_row_id: i64,
     ) -> Result<Vec<MultipartUploadPart>> {
-        multipart_journal::list_multipart_parts(&self.storage, upload_row_id).await
+        multipart_journal::list_multipart_parts(self.mvcc()?, upload_row_id).await
     }
 
     pub async fn list_multipart_parts_in_transaction(
@@ -166,7 +165,6 @@ impl Persistence {
         transaction_principal: &str,
     ) -> Result<Vec<MultipartUploadPart>> {
         multipart_journal::list_multipart_parts_in_transaction(
-            &self.storage,
             self.mvcc()?,
             upload_row_id,
             transaction_id,
@@ -182,7 +180,7 @@ impl Persistence {
         limit: i32,
     ) -> Result<MultipartPartsPage> {
         multipart_journal::list_multipart_parts_page(
-            &self.storage,
+            self.mvcc()?,
             upload_row_id,
             part_number_marker,
             limit,
@@ -199,7 +197,7 @@ impl Persistence {
         limit: i32,
     ) -> Result<MultipartUploadsPage> {
         multipart_journal::list_active_multipart_uploads(
-            &self.storage,
+            self.mvcc()?,
             bucket_id,
             prefix,
             key_marker,
@@ -214,8 +212,7 @@ impl Persistence {
         upload_row_id: i64,
     ) -> Result<MultipartCompletionMutation> {
         let Some((tenant_id, bucket_id)) =
-            multipart_journal::find_multipart_upload_partition(&self.storage, upload_row_id)
-                .await?
+            multipart_journal::find_multipart_upload_partition(self.mvcc()?, upload_row_id)?
         else {
             return Ok(MultipartCompletionMutation {
                 completed: false,
@@ -227,6 +224,7 @@ impl Persistence {
             .await?;
         multipart_journal::complete_multipart_upload_with_permit(
             &self.storage,
+            self.mvcc()?,
             upload_row_id,
             &permit,
             &self.partition_owner_signing_key,
@@ -242,7 +240,6 @@ impl Persistence {
     ) -> Result<MultipartCompletionMutation> {
         let Some((tenant_id, bucket_id)) =
             multipart_journal::find_multipart_upload_partition_in_transaction(
-                &self.storage,
                 self.mvcc()?,
                 upload_row_id,
                 transaction_id,
@@ -282,6 +279,7 @@ impl Persistence {
             .await?;
         multipart_journal::abort_multipart_upload_with_permit(
             &self.storage,
+            self.mvcc()?,
             tenant_id,
             bucket_id,
             key,
@@ -661,6 +659,7 @@ impl Persistence {
         let permit = self.authz_write_permit(tenant_id).await?;
         let record = authz_journal::write_authz_tuple_with_permit(
             &self.storage,
+            self.mvcc()?,
             authz_journal::AuthzTupleWrite {
                 tenant_id,
                 namespace,
@@ -690,9 +689,10 @@ impl Persistence {
         let target_revision = u64::try_from(revision)
             .map_err(|_| anyhow!("authorization revision must be nonnegative"))?;
         let source_fence_token =
-            authz_journal::latest_authz_journal_fence_token(&self.storage, tenant_id).await?;
+            authz_journal::latest_authz_journal_fence_token(self.mvcc()?, tenant_id)?;
         authz_journal::materialize_authz_derived_state_through_revision(
             &self.storage,
+            self.mvcc()?,
             tenant_id,
             target_revision,
             source_fence_token,
@@ -724,6 +724,7 @@ impl Persistence {
             .collect();
         let records = authz_journal::write_authz_tuple_batch_with_permit(
             &self.storage,
+            self.mvcc()?,
             writes,
             &permit,
             &self.partition_owner_signing_key,
@@ -744,7 +745,7 @@ impl Persistence {
         options: &AuthzTupleBatchWriteOptions,
     ) -> Result<Option<AuthzTupleBatchWriteOutcome>> {
         let writes = authz_tuple_batch_writes(tenant_id, mutations, written_by);
-        authz_journal::replay_authz_tuple_batch(&self.storage, &writes, options).await
+        authz_journal::replay_authz_tuple_batch(self.mvcc()?, &writes, options).await
     }
 
     pub async fn write_authz_tuple_batch_conditionally(
@@ -758,6 +759,7 @@ impl Persistence {
         let writes = authz_tuple_batch_writes(tenant_id, &mutations, written_by);
         let outcome = authz_journal::write_authz_tuple_batch_conditionally_with_permit(
             &self.storage,
+            self.mvcc()?,
             writes,
             options,
             &permit,
@@ -807,6 +809,7 @@ impl Persistence {
     ) -> Result<Option<AuthzTupleRecord>> {
         authz_journal::check_authz_tuple(
             &self.storage,
+            self.mvcc()?,
             tenant_id,
             namespace,
             object_id,
@@ -831,6 +834,7 @@ impl Persistence {
     ) -> Result<Option<AuthzTupleRecord>> {
         authz_journal::check_authz_tuple_at_revision(
             &self.storage,
+            self.mvcc()?,
             tenant_id,
             namespace,
             object_id,
@@ -851,7 +855,7 @@ impl Persistence {
         limit: i32,
     ) -> Result<Vec<AuthzTupleRecord>> {
         authz_journal::list_authz_tuple_log(
-            &self.storage,
+            self.mvcc()?,
             tenant_id,
             after_revision,
             namespace,

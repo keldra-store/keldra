@@ -1,4 +1,4 @@
-use crate::{authz_realm_schema, storage::Storage};
+use crate::{authz_realm_schema, mvcc_bootstrap::MvccSubsystem};
 use anyhow::{Result, anyhow, bail};
 use std::collections::BTreeMap;
 
@@ -6,7 +6,8 @@ const AUTHZ_SCHEMA_SOURCE_PAGE_SIZE: usize = 256;
 const MAX_AUTHZ_SCHEMA_SOURCE_ROWS: usize = 16_384;
 
 pub(super) async fn collect_latest_schema_revisions(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
+    snapshot_version: u64,
     tenant_id: i64,
 ) -> Result<Vec<authz_realm_schema::StoredAuthzSchemaRevision>> {
     let mut latest = BTreeMap::new();
@@ -14,12 +15,12 @@ pub(super) async fn collect_latest_schema_revisions(
     let mut visited = 0_usize;
     loop {
         let page = authz_realm_schema::page_schema_revisions(
-            storage,
+            mvcc,
+            snapshot_version,
             tenant_id,
             after_tuple_key.as_deref(),
             AUTHZ_SCHEMA_SOURCE_PAGE_SIZE,
-        )
-        .await?;
+        )?;
         visited = visited
             .checked_add(page.records.len())
             .ok_or_else(|| anyhow!("authorization schema source row count overflow"))?;
@@ -53,19 +54,20 @@ pub(super) async fn collect_latest_schema_revisions(
 }
 
 pub(super) async fn collect_schema_bindings(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
+    snapshot_version: u64,
     tenant_id: i64,
 ) -> Result<Vec<authz_realm_schema::StoredAuthzSchemaBinding>> {
     let mut bindings = Vec::new();
     let mut after_tuple_key = None;
     loop {
         let page = authz_realm_schema::page_schema_bindings(
-            storage,
+            mvcc,
+            snapshot_version,
             tenant_id,
             after_tuple_key.as_deref(),
             AUTHZ_SCHEMA_SOURCE_PAGE_SIZE,
-        )
-        .await?;
+        )?;
         if bindings.len().saturating_add(page.records.len()) > MAX_AUTHZ_SCHEMA_SOURCE_ROWS {
             bail!(
                 "AuthzMaterializationTooBroad: schema binding source exceeds {MAX_AUTHZ_SCHEMA_SOURCE_ROWS} rows"

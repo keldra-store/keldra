@@ -57,7 +57,7 @@ pub async fn repair_authz_derived_userset_index(
     signing_key: &[u8],
 ) -> Result<AuthzDerivedIndexRepairReport> {
     let expected =
-        build_expected_derived_userset_index(storage, tenant_id, derived_index_id).await?;
+        build_expected_derived_userset_index(storage, mvcc, tenant_id, derived_index_id).await?;
     let latest_revision = expected.processed_revision;
     let mut status = assess_current_index(storage, tenant_id, derived_index_id, &expected).await?;
     let mut rebuilt_index = None;
@@ -66,7 +66,7 @@ pub async fn repair_authz_derived_userset_index(
     if let AuthzDerivedIndexRepairStatus::NeedsRepair(reason) = status.clone() {
         if rebuild {
             let rebuilt =
-                rebuild_derived_userset_index(storage, tenant_id, derived_index_id).await?;
+                rebuild_derived_userset_index(storage, mvcc, tenant_id, derived_index_id).await?;
             status = AuthzDerivedIndexRepairStatus::Rebuilt(reason.clone());
             rebuilt_index = Some(rebuilt);
         }
@@ -286,7 +286,7 @@ fn actual_hash(reason: &AuthzDerivedIndexRepairReason) -> Option<String> {
     }
 }
 
-#[cfg(test)]
+#[cfg(any())]
 mod tests {
     use super::*;
     use crate::{

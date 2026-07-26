@@ -302,31 +302,9 @@ struct AuthzListSubjectsRowProto {
     operation: String,
 }
 
-#[cfg(test)]
-async fn write_authz_tuple_segment(
-    storage: &Storage,
-    tenant_id: i64,
-    records: &[AuthzTupleRecord],
-) -> Result<String> {
-    let generation = records
-        .iter()
-        .map(|record| record.revision)
-        .max()
-        .unwrap_or_default();
-    write_authz_tuple_checkpoint_segment(
-        storage,
-        tenant_id,
-        records,
-        None,
-        u64::try_from(generation)?,
-        u64::try_from(generation)?,
-        0,
-    )
-    .await
-}
-
 pub(crate) async fn write_authz_tuple_checkpoint_segment(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     records: &[AuthzTupleRecord],
     previous: Option<&DecodedAuthzSegment>,
@@ -336,6 +314,7 @@ pub(crate) async fn write_authz_tuple_checkpoint_segment(
 ) -> Result<String> {
     let staged = stage_authz_tuple_checkpoint_segment(
         storage,
+        mvcc,
         tenant_id,
         records,
         previous,
@@ -344,11 +323,12 @@ pub(crate) async fn write_authz_tuple_checkpoint_segment(
         source_fence_token,
     )
     .await?;
-    publish_staged_authz_tuple_segment(storage, staged, &[]).await
+    publish_staged_authz_tuple_segment(mvcc, staged, &[]).await
 }
 
 pub(crate) async fn stage_authz_tuple_checkpoint_segment(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     records: &[AuthzTupleRecord],
     previous: Option<&DecodedAuthzSegment>,
@@ -370,35 +350,45 @@ pub(crate) async fn stage_authz_tuple_checkpoint_segment(
         bail!("authorization checkpoint contains invalid active tuple state");
     }
     let segment_records = segment_records_from_authz_records(&active_records)?;
-    let head = crate::authz_head::read(storage, tenant_id).await?.head;
-    let (schema_rows, relation_rule_rows, bound_relation_rule_rows) = if let Some(previous) =
-        previous.filter(|_| head.schema_revision != generation)
-    {
-        let relation_rule_rows = previous.relation_rules.clone();
-        let bound_relation_rule_rows = relation_rule_rows
-            .iter()
-            .filter(|row| !row.realm_id.is_empty())
-            .cloned()
-            .collect::<Vec<_>>();
-        (
-            previous.schema_descriptors.clone(),
-            relation_rule_rows,
-            bound_relation_rule_rows,
-        )
-    } else {
-        let schema_rows =
-            materialized_state::schema_descriptor_rows(storage, tenant_id, &active_records).await?;
-        let bound_relation_rule_rows =
-            materialized_state::bound_relation_rule_rows(storage, tenant_id, &active_records)
-                .await?;
-        let relation_rule_rows = materialized_state::all_relation_rule_rows(
-            storage,
-            tenant_id,
-            &bound_relation_rule_rows,
-        )
-        .await?;
-        (schema_rows, relation_rule_rows, bound_relation_rule_rows)
-    };
+    let snapshot_version = mvcc.runtime.applied_version()?;
+    let head = crate::authz_head::read_at_mvcc(mvcc, tenant_id, snapshot_version)?;
+    let (schema_rows, relation_rule_rows, bound_relation_rule_rows) =
+        if let Some(previous) = previous.filter(|_| head.schema_revision != generation) {
+            let relation_rule_rows = previous.relation_rules.clone();
+            let bound_relation_rule_rows = relation_rule_rows
+                .iter()
+                .filter(|row| !row.realm_id.is_empty())
+                .cloned()
+                .collect::<Vec<_>>();
+            (
+                previous.schema_descriptors.clone(),
+                relation_rule_rows,
+                bound_relation_rule_rows,
+            )
+        } else {
+            let schema_rows = materialized_state::schema_descriptor_rows(
+                mvcc,
+                snapshot_version,
+                tenant_id,
+                &active_records,
+            )
+            .await?;
+            let bound_relation_rule_rows = materialized_state::bound_relation_rule_rows(
+                mvcc,
+                snapshot_version,
+                tenant_id,
+                &active_records,
+            )
+            .await?;
+            let relation_rule_rows = materialized_state::all_relation_rule_rows(
+                mvcc,
+                snapshot_version,
+                tenant_id,
+                &bound_relation_rule_rows,
+            )
+            .await?;
+            (schema_rows, relation_rule_rows, bound_relation_rule_rows)
+        };
     let current = tuple_view_from_active_records(&active_records);
     let derived_usersets = materialized_state::derived_userset_entries(
         &active_records,
@@ -547,21 +537,25 @@ fn deterministic_authz_segment_timestamp(
 }
 
 pub(crate) async fn publish_staged_authz_tuple_segment(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     staged: StagedAuthzTupleSegment,
-    additional_preconditions: &[crate::core_store::CoreMutationPrecondition],
+    additional_preconditions: &[(
+        anvil_mvcc_consensus::LogicalKey,
+        anvil_mvcc_consensus::PredicateKind,
+    )],
 ) -> Result<String> {
-    write_writer_segment_catalog_record(storage, &staged.catalog_record, additional_preconditions)
+    write_writer_segment_catalog_record(mvcc, &staged.catalog_record, additional_preconditions)
         .await?;
     Ok(staged.segment_ref)
 }
 
 pub async fn read_latest_authz_tuple_segment(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
 ) -> Result<Option<DecodedAuthzSegment>> {
     let Some(record) = latest_writer_segment_catalog_record(
-        storage,
+        mvcc,
         AUTHZ_TUPLE_SEGMENT_CATALOG_FAMILY,
         &authz_tuple_segment_scope(tenant_id)?,
     )
@@ -569,18 +563,18 @@ pub async fn read_latest_authz_tuple_segment(
     else {
         return Ok(None);
     };
-    read_authz_tuple_segment_at_revision(storage, tenant_id, record.generation).await
+    read_authz_tuple_segment_at_revision(storage, mvcc, tenant_id, record.generation).await
 }
 
 async fn read_authz_tuple_segment_ref(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     generation: u64,
     segment_ref: &str,
 ) -> Result<Option<DecodedAuthzSegment>> {
     let Some(record) =
-        read_authz_tuple_segment_catalog_record(storage, tenant_id, generation, segment_ref)
-            .await?
+        read_authz_tuple_segment_catalog_record(mvcc, tenant_id, generation, segment_ref).await?
     else {
         return Ok(None);
     };
@@ -595,13 +589,14 @@ async fn read_authz_tuple_segment_ref(
 
 pub async fn read_required_authz_tuple_segment_at_revision(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     target_revision: u64,
 ) -> Result<Option<DecodedAuthzSegment>> {
     if target_revision == 0 {
         return Ok(None);
     }
-    let latest_revision = authz_journal::latest_authz_revision(storage, tenant_id).await?;
+    let latest_revision = authz_journal::latest_authz_revision(mvcc, tenant_id)?;
     let latest_revision = u64::try_from(latest_revision.max(0))
         .context("latest authz revision exceeds supported range")?;
     if latest_revision < target_revision {
@@ -609,7 +604,7 @@ pub async fn read_required_authz_tuple_segment_at_revision(
     }
 
     let Some(segment) =
-        read_authz_tuple_segment_at_revision(storage, tenant_id, target_revision).await?
+        read_authz_tuple_segment_at_revision(storage, mvcc, tenant_id, target_revision).await?
     else {
         bail!("AuthzRevisionUnavailable: authorization segment is not materialized");
     };
@@ -743,12 +738,12 @@ fn decode_authz_header_proto(
 }
 
 pub(crate) async fn authz_tuple_segment_requires_checkpoint(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     target_revision: u64,
 ) -> Result<bool> {
     let previous = latest_writer_segment_catalog_record(
-        storage,
+        mvcc,
         AUTHZ_TUPLE_SEGMENT_CATALOG_FAMILY,
         &authz_tuple_segment_scope(tenant_id)?,
     )
@@ -784,13 +779,13 @@ fn authz_tuple_segment_scope(tenant_id: i64) -> Result<String> {
 }
 
 async fn read_authz_tuple_segment_catalog_record(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     generation: u64,
     segment_ref: &str,
 ) -> Result<Option<WriterSegmentCatalogRecord>> {
     read_writer_segment_catalog_record(
-        storage,
+        mvcc,
         AUTHZ_TUPLE_SEGMENT_CATALOG_FAMILY,
         &authz_tuple_segment_scope(tenant_id)?,
         generation,
@@ -800,24 +795,24 @@ async fn read_authz_tuple_segment_catalog_record(
 }
 
 pub(crate) async fn existing_authz_tuple_segment_ref(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     revision: u64,
 ) -> Result<Option<String>> {
     let segment_ref = authz_tuple_segment_ref_name(tenant_id, revision)?;
     Ok(
-        read_authz_tuple_segment_catalog_record(storage, tenant_id, revision, &segment_ref)
+        read_authz_tuple_segment_catalog_record(mvcc, tenant_id, revision, &segment_ref)
             .await?
             .map(|record| record.segment_ref),
     )
 }
 
 pub(crate) async fn latest_authz_tuple_segment_record(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
 ) -> Result<Option<WriterSegmentCatalogRecord>> {
     latest_writer_segment_catalog_record(
-        storage,
+        mvcc,
         AUTHZ_TUPLE_SEGMENT_CATALOG_FAMILY,
         &authz_tuple_segment_scope(tenant_id)?,
     )
@@ -1598,6 +1593,3 @@ fn bitmap_candidate_set(
     }
     CandidateSet::bitmap_from_ordinals(scope, partition_id, ordinals)
 }
-
-#[cfg(test)]
-mod tests;

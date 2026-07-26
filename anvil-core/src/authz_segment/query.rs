@@ -34,6 +34,7 @@ pub(crate) struct HistoricalTupleOutcome {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn resolve_materialized_permission_at_revision(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     namespace: &str,
     object_id: &str,
@@ -50,7 +51,7 @@ pub(crate) async fn resolve_materialized_permission_at_revision(
         });
     }
 
-    let records = historical_segment_window(storage, tenant_id, revision).await?;
+    let records = historical_segment_window(mvcc, tenant_id, revision).await?;
     let exact_key = key_parts(&[
         namespace,
         object_id,
@@ -112,6 +113,7 @@ pub(crate) async fn resolve_materialized_permission_at_revision(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn lookup_materialized_tuple_at_revision(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     namespace: &str,
     object_id: &str,
@@ -128,7 +130,7 @@ pub(crate) async fn lookup_materialized_tuple_at_revision(
         });
     }
 
-    let records = historical_segment_window(storage, tenant_id, revision).await?;
+    let records = historical_segment_window(mvcc, tenant_id, revision).await?;
     let exact_key = TupleKey {
         namespace: namespace.as_bytes().to_vec(),
         object_id: object_id.as_bytes().to_vec(),
@@ -195,7 +197,7 @@ pub(crate) async fn lookup_materialized_tuple_at_revision(
 }
 
 async fn historical_segment_window(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     revision: u64,
 ) -> Result<Vec<WriterSegmentCatalogRecord>> {
@@ -203,7 +205,7 @@ async fn historical_segment_window(
     let after_generation = checkpoint_generation.saturating_sub(1);
     let scope = authz_tuple_segment_scope(tenant_id)?;
     let page = page_writer_segment_catalog_records(
-        storage,
+        mvcc,
         AUTHZ_TUPLE_SEGMENT_CATALOG_FAMILY,
         &scope,
         after_generation,

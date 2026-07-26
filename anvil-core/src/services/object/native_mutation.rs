@@ -158,7 +158,7 @@ pub(super) async fn validate_native_mutation_context(
     }
 
     if let Some(required_revision) = parse_authz_zookie(&context.authz_zookie_optional)? {
-        let latest = authz_journal::latest_authz_revision(&state.storage, claims.tenant_id)
+        let latest = authz_journal::latest_authz_revision(&state.mvcc, claims.tenant_id)
             .map_err(|e| Status::internal(e.to_string()))?;
         if latest < required_revision {
             return Err(Status::failed_precondition("AuthzRevisionUnavailable"));

@@ -36,8 +36,7 @@ pub(super) fn append_stream_record_info(
 }
 
 pub(super) async fn latest_authz_revision(state: &AppState, tenant_id: i64) -> Result<u64, Status> {
-    let revision = authz_journal::latest_authz_revision(&state.storage, tenant_id)
-        .await
+    let revision = authz_journal::latest_authz_revision(&state.mvcc, tenant_id)
         .map_err(|e| Status::internal(e.to_string()))?;
     u64::try_from(revision).map_err(|_| Status::internal("Invalid authz revision"))
 }

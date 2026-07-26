@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 use crate::{
     core_store::{CoreMutationOperation, TABLE_STREAM_RECORD_INDEX_ROW},
@@ -91,6 +91,36 @@ pub fn coremeta_application_prefix(cf: &str, tuple_prefix: &[u8]) -> Result<Vec<
     push_len_prefixed(&mut application_prefix, cf.as_bytes())?;
     application_prefix.extend_from_slice(tuple_prefix);
     Ok(application_prefix)
+}
+
+pub fn coremeta_tuple_from_logical_key<'a>(
+    key: &'a LogicalKey,
+    expected_cf: &str,
+) -> Result<&'a [u8]> {
+    if !key.application_key.starts_with(CORE_META_KEY_SCHEMA) {
+        bail!("logical key is not in the CoreMeta MVCC namespace");
+    }
+    let offset = CORE_META_KEY_SCHEMA.len();
+    let length_bytes: [u8; 2] = key
+        .application_key
+        .get(offset..offset + 2)
+        .context("CoreMeta MVCC key is missing its column-family length")?
+        .try_into()?;
+    let cf_length = usize::from(u16::from_be_bytes(length_bytes));
+    let cf_start = offset + 2;
+    let tuple_start = cf_start
+        .checked_add(cf_length)
+        .context("CoreMeta MVCC key column-family length overflow")?;
+    let cf = key
+        .application_key
+        .get(cf_start..tuple_start)
+        .context("CoreMeta MVCC key has a truncated column-family name")?;
+    if cf != expected_cf.as_bytes() {
+        bail!("CoreMeta MVCC key belongs to a different column family");
+    }
+    key.application_key
+        .get(tuple_start..)
+        .context("CoreMeta MVCC key is missing its tuple")
 }
 
 /// Encode a stream position. Stream records and heads use their existing table

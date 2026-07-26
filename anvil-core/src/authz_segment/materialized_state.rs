@@ -2,7 +2,8 @@ use super::*;
 use crate::authz_journal::resolver::MaterializedSchemaRelation;
 
 pub(super) async fn schema_descriptor_rows(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    snapshot_version: u64,
     tenant_id: i64,
     active_records: &[AuthzTupleRecord],
 ) -> Result<Vec<AuthzSchemaDescriptorRow>> {
@@ -11,7 +12,10 @@ pub(super) async fn schema_descriptor_rows(
         .map(|record| namespace_realm_parts(&record.namespace))
         .collect::<BTreeSet<_>>();
     let mut rows = BTreeSet::new();
-    for revision in schema_state::collect_latest_schema_revisions(storage, tenant_id).await? {
+    let revisions =
+        schema_state::collect_latest_schema_revisions(mvcc, snapshot_version, tenant_id).await?;
+    let bindings = schema_state::collect_schema_bindings(mvcc, snapshot_version, tenant_id).await?;
+    for revision in &revisions {
         for namespace in &revision.namespaces {
             rows.insert(AuthzSchemaDescriptorRow {
                 tenant_id,
@@ -25,15 +29,11 @@ pub(super) async fn schema_descriptor_rows(
             });
         }
     }
-    for binding in schema_state::collect_schema_bindings(storage, tenant_id).await? {
-        let Some(revision) = authz_realm_schema::read_schema_revision(
-            storage,
-            tenant_id,
-            &binding.schema_ref.schema_id,
-            Some(binding.schema_ref.schema_revision),
-        )
-        .await?
-        else {
+    for binding in &bindings {
+        let Some(revision) = revisions.iter().find(|revision| {
+            revision.schema_ref.schema_id == binding.schema_ref.schema_id
+                && revision.schema_ref.schema_revision == binding.schema_ref.schema_revision
+        }) else {
             continue;
         };
         for namespace in &revision.namespaces {
@@ -50,9 +50,7 @@ pub(super) async fn schema_descriptor_rows(
         }
     }
     for (realm_id, namespace) in namespace_parts {
-        if let Some(binding) =
-            authz_realm_schema::read_schema_binding(storage, tenant_id, &realm_id).await?
-        {
+        if let Some(binding) = bindings.iter().find(|binding| binding.realm_id == realm_id) {
             rows.insert(AuthzSchemaDescriptorRow {
                 tenant_id,
                 realm_id,
@@ -92,7 +90,8 @@ pub(super) async fn schema_descriptor_rows(
 }
 
 pub(super) async fn bound_relation_rule_rows(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    snapshot_version: u64,
     tenant_id: i64,
     active_records: &[AuthzTupleRecord],
 ) -> Result<Vec<AuthzRelationRuleRow>> {
@@ -103,17 +102,24 @@ pub(super) async fn bound_relation_rule_rows(
             (realm_id, local_namespace, record.namespace.clone())
         })
         .collect::<BTreeSet<_>>();
+    let revisions =
+        schema_state::collect_latest_schema_revisions(mvcc, snapshot_version, tenant_id).await?;
+    let bindings = schema_state::collect_schema_bindings(mvcc, snapshot_version, tenant_id).await?;
     let mut rows = BTreeSet::new();
     for (realm_id, namespace, canonical_namespace) in namespace_parts {
-        let Some(binding) =
-            authz_realm_schema::read_schema_binding(storage, tenant_id, &realm_id).await?
-        else {
+        let Some(binding) = bindings.iter().find(|binding| binding.realm_id == realm_id) else {
             continue;
         };
-        let Some(schema) = authz_realm_schema::read_bound_namespace_schema(
-            storage, tenant_id, &realm_id, &namespace,
-        )
-        .await?
+        let Some(schema) = revisions
+            .iter()
+            .find(|revision| revision.schema_ref == binding.schema_ref)
+            .and_then(|revision| {
+                revision
+                    .namespaces
+                    .iter()
+                    .find(|candidate| candidate.namespace == namespace)
+            })
+            .cloned()
         else {
             continue;
         };
@@ -149,12 +155,15 @@ pub(super) async fn bound_relation_rule_rows(
 }
 
 pub(super) async fn all_relation_rule_rows(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    snapshot_version: u64,
     tenant_id: i64,
     bound_rows: &[AuthzRelationRuleRow],
 ) -> Result<Vec<AuthzRelationRuleRow>> {
     let mut rows = bound_rows.iter().cloned().collect::<BTreeSet<_>>();
-    for revision in schema_state::collect_latest_schema_revisions(storage, tenant_id).await? {
+    let revisions =
+        schema_state::collect_latest_schema_revisions(mvcc, snapshot_version, tenant_id).await?;
+    for revision in &revisions {
         for namespace in &revision.namespaces {
             insert_relation_rule_rows(
                 &mut rows,
@@ -165,15 +174,11 @@ pub(super) async fn all_relation_rule_rows(
             );
         }
     }
-    for binding in schema_state::collect_schema_bindings(storage, tenant_id).await? {
-        let Some(revision) = authz_realm_schema::read_schema_revision(
-            storage,
-            tenant_id,
-            &binding.schema_ref.schema_id,
-            Some(binding.schema_ref.schema_revision),
-        )
-        .await?
-        else {
+    for binding in schema_state::collect_schema_bindings(mvcc, snapshot_version, tenant_id).await? {
+        let Some(revision) = revisions.iter().find(|revision| {
+            revision.schema_ref.schema_id == binding.schema_ref.schema_id
+                && revision.schema_ref.schema_revision == binding.schema_ref.schema_revision
+        }) else {
             continue;
         };
         for namespace in &revision.namespaces {

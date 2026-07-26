@@ -146,6 +146,45 @@ pub(crate) fn read_mvcc(
     })
 }
 
+pub(crate) fn read_at_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    snapshot_version: u64,
+) -> Result<AuthzHead> {
+    validate_tenant_id(tenant_id)?;
+    let key = crate::mvcc_product::coremeta_logical_key(
+        CF_AUTHZ,
+        TABLE_AUTHZ_HEAD_ROW,
+        &tuple_key(tenant_id)?,
+    )?;
+    Ok(match mvcc.runtime.read_at(&key, snapshot_version)? {
+        Some(row) => decode(&row.value, tenant_id)?,
+        None => initial(tenant_id),
+    })
+}
+
+pub(crate) fn latest_mvcc_predicate(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+) -> Result<(
+    crate::mvcc_transaction::LogicalKey,
+    crate::mvcc_transaction::PredicateKind,
+)> {
+    validate_tenant_id(tenant_id)?;
+    let key = crate::mvcc_product::coremeta_logical_key(
+        CF_AUTHZ,
+        TABLE_AUTHZ_HEAD_ROW,
+        &tuple_key(tenant_id)?,
+    )?;
+    let predicate = mvcc.read_latest_value(&key)?.map_or(
+        crate::mvcc_transaction::PredicateKind::Absent,
+        |payload| {
+            crate::mvcc_transaction::PredicateKind::ValueHash(*blake3::hash(&payload).as_bytes())
+        },
+    );
+    Ok((key, predicate))
+}
+
 pub(crate) fn advance(
     snapshot: &AuthzHeadSnapshot,
     transaction_id: &str,
