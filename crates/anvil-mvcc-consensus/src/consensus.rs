@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::{CertificationResult, CertifyTransaction, CommitVersion};
+use crate::{CertificationResult, CertifyTransaction, CommitVersion, ConsensusDurabilityPolicy};
 
 /// Anvil-owned boundary hiding OpenRaft from product code.
 #[async_trait]
@@ -14,6 +14,10 @@ pub trait Consensus: Send + Sync {
     async fn linearized_read_barrier(&self) -> Result<CommitVersion, ConsensusError>;
 
     fn observed_commit_version(&self) -> CommitVersion;
+
+    fn durability_policy(&self) -> Option<ConsensusDurabilityPolicy> {
+        None
+    }
 }
 
 #[derive(Debug, Error)]

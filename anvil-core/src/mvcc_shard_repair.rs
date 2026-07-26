@@ -385,10 +385,9 @@ impl ShardRebalanceReconciler {
         if !self.mvcc.consensus.is_leader() {
             return Ok(false);
         }
-        let epoch = topology_epoch(
-            &self.mvcc.shard_candidates,
-            self.mvcc.tolerated_failure_domains,
-        )?;
+        let (candidates, tolerated_failure_domains, control_epoch) =
+            self.mvcc.live_shard_placement()?;
+        let epoch = topology_epoch(&candidates, tolerated_failure_domains, control_epoch)?;
         let checkpoint_key = crate::mvcc_transaction::LogicalKey {
             table_id: SHARD_REBALANCE_CHECKPOINT_TABLE_ID,
             application_key: b"reconciler/checkpoint".to_vec(),
@@ -478,9 +477,9 @@ impl ShardRebalanceReconciler {
             if let Some(mut job) = plan_rebalance_job(
                 &resolved,
                 &handle.transaction_id,
-                &self.mvcc.shard_candidates,
+                &candidates,
                 ShardPlacementPolicy {
-                    tolerated_failure_domains: self.mvcc.tolerated_failure_domains,
+                    tolerated_failure_domains,
                 },
                 checkpoint.snapshot_version,
                 now,
@@ -949,6 +948,7 @@ fn maintenance_label(kind: ShardMaintenanceKind) -> &'static str {
 fn topology_epoch(
     candidates: &[ShardTarget],
     tolerated_failure_domains: usize,
+    control_epoch: u64,
 ) -> Result<[u8; 32]> {
     let mut candidates = candidates.to_vec();
     candidates.sort_by(|left, right| {
@@ -958,7 +958,7 @@ fn topology_epoch(
             &right.failure_domain,
         ))
     });
-    let bytes = serde_json::to_vec(&(candidates, tolerated_failure_domains))?;
+    let bytes = serde_json::to_vec(&(candidates, tolerated_failure_domains, control_epoch))?;
     Ok(*blake3::hash(&bytes).as_bytes())
 }
 
@@ -1101,12 +1101,12 @@ mod tests {
         let mut reversed = candidates.clone();
         reversed.reverse();
         assert_eq!(
-            topology_epoch(&candidates, 1).unwrap(),
-            topology_epoch(&reversed, 1).unwrap()
+            topology_epoch(&candidates, 1, 9).unwrap(),
+            topology_epoch(&reversed, 1, 9).unwrap()
         );
         assert_ne!(
-            topology_epoch(&candidates, 0).unwrap(),
-            topology_epoch(&candidates, 1).unwrap()
+            topology_epoch(&candidates, 0, 9).unwrap(),
+            topology_epoch(&candidates, 1, 9).unwrap()
         );
     }
 }

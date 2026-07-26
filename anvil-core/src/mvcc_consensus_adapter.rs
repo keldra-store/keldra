@@ -26,6 +26,14 @@ impl<C> product::TransactionCertifier for ConsensusTransactionCertifier<C>
 where
     C: consensus::Consensus,
 {
+    fn durability_policy(&self) -> Option<product::DurabilityPolicy> {
+        let policy = self.consensus.durability_policy()?;
+        (policy.generation > 0).then_some(product::DurabilityPolicy {
+            bundle_quorum_holders: usize::from(policy.bundle_quorum_holders),
+            tolerated_failure_domains: usize::from(policy.tolerated_failure_domains),
+        })
+    }
+
     async fn observed_commit_version(
         &self,
         consistency: product::ReadConsistency,

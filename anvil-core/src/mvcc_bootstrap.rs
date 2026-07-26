@@ -78,6 +78,7 @@ pub struct NodeConnectionAuthorizer {
     core_store: crate::core_store::CoreStore,
     mesh_id: Arc<str>,
     allow_test_bypass: bool,
+    consensus: Arc<OpenRaftConsensus>,
 }
 
 impl NodeConnectionAuthorizer {
@@ -89,6 +90,7 @@ impl NodeConnectionAuthorizer {
         core_store: crate::core_store::CoreStore,
         mesh_id: impl Into<Arc<str>>,
         allow_test_bypass: bool,
+        consensus: Arc<OpenRaftConsensus>,
     ) -> Self {
         Self {
             cluster_id: cluster_id.into(),
@@ -111,6 +113,7 @@ impl NodeConnectionAuthorizer {
             core_store,
             mesh_id: mesh_id.into(),
             allow_test_bypass,
+            consensus,
         }
     }
 
@@ -151,6 +154,24 @@ impl NodeConnectionAuthorizer {
         }
         Ok(())
     }
+
+    fn authorize_control_incarnation(&self, peer: &MvccPeerConfig) -> Result<(), Status> {
+        let snapshot = self
+            .consensus
+            .applied_control_snapshot()
+            .map_err(|error| Status::unavailable(error.to_string()))?;
+        let installed = snapshot.nodes.iter().any(|(node_id, incarnation, domain)| {
+            *node_id == consensus_control_node_id(&peer.node_id)
+                && *incarnation == peer.incarnation
+                && domain == &peer.failure_domain
+        });
+        if !installed {
+            return Err(Status::permission_denied(
+                "node incarnation or failure-domain assignment is stale in Raft control state",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -173,6 +194,7 @@ impl ConsensusConnectionAuthorizer for NodeConnectionAuthorizer {
         if peer.incarnation != open.node_incarnation {
             return Err(Status::permission_denied("stale Raft node incarnation"));
         }
+        self.authorize_control_incarnation(peer)?;
         self.authorize_zanzibar(&peer.node_id).await?;
         Ok(())
     }
@@ -197,6 +219,7 @@ impl ReplicationConnectionAuthorizer for NodeConnectionAuthorizer {
             .ok_or_else(|| {
                 Status::permission_denied("node incarnation is not in peer configuration")
             })?;
+        self.authorize_control_incarnation(peer)?;
         self.authorize_zanzibar(&peer.node_id).await?;
         AuthenticatedPeer::new_bound(
             open.node_id.clone(),
@@ -213,8 +236,6 @@ pub struct MvccSubsystem {
     pub open_transactions: Arc<OpenTransactionRegistry>,
     pub replication_client: TonicReplicationStreamManager,
     pub object_evidence: ObjectEvidenceRegistry,
-    pub shard_candidates: Arc<[ShardTarget]>,
-    pub tolerated_failure_domains: usize,
     pub local_objects: LocalObjectStore,
     pub materialisation_storage: crate::storage::Storage,
     pub materialisation_signing_key: Arc<[u8]>,
@@ -246,6 +267,38 @@ impl Drop for MvccSubsystem {
 }
 
 impl MvccSubsystem {
+    pub fn live_shard_placement(&self) -> Result<(Arc<[ShardTarget]>, usize, u64)> {
+        let snapshot = self.consensus.applied_control_snapshot()?;
+        if snapshot.durability_policy.generation == 0 {
+            bail!("Raft durability policy is not installed");
+        }
+        let mut candidates = Vec::new();
+        for (raft_node_id, incarnation, failure_domain) in snapshot.nodes {
+            let peer = self
+                .peers
+                .iter()
+                .find(|peer| consensus_control_node_id(&peer.node_id) == raft_node_id)
+                .context("Raft control state names a node without a transport route")?;
+            if peer.incarnation != incarnation {
+                bail!("Raft control state node incarnation is newer than its transport route");
+            }
+            candidates.push(ShardTarget {
+                cluster_id: self.cluster_id().to_string(),
+                node: NodeIncarnation {
+                    node_id: peer.node_id.clone(),
+                    incarnation,
+                },
+                failure_domain,
+            });
+        }
+        candidates.sort_by(|left, right| left.node.cmp(&right.node));
+        Ok((
+            candidates.into(),
+            usize::from(snapshot.durability_policy.tolerated_failure_domains),
+            snapshot.topology_epoch,
+        ))
+    }
+
     pub fn cluster_id(&self) -> &str {
         self.peers
             .first()
@@ -309,6 +362,40 @@ impl MvccSubsystem {
                 .initialize(members)
                 .await
                 .context("initialize MVCC Raft membership")?;
+            for _ in 0..100 {
+                if consensus.is_leader() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            if !consensus.is_leader() {
+                bail!(
+                    "local node did not become leader while installing initial Raft control state"
+                );
+            }
+            let cluster_hash = cluster_id_hash(&config.mvcc_cluster_id);
+            for peer in &peers {
+                consensus
+                    .install_node(
+                        cluster_hash,
+                        anvil_mvcc_consensus::NodeIncarnation {
+                            node_id: consensus_control_node_id(&peer.node_id),
+                            incarnation: peer.incarnation,
+                        },
+                        peer.failure_domain.clone(),
+                    )
+                    .await
+                    .context("install initial node incarnation in Raft control state")?;
+            }
+            consensus
+                .set_durability_policy(
+                    cluster_hash,
+                    1,
+                    u16::try_from(config.mvcc_bundle_quorum_holders)?,
+                    u16::try_from(config.mvcc_tolerated_failure_domains)?,
+                )
+                .await
+                .context("install initial durability policy in Raft control state")?;
         }
 
         let local_incarnation = NodeIncarnation {
@@ -367,17 +454,6 @@ impl MvccSubsystem {
             targets,
             object_evidence.clone(),
         )?;
-        let shard_candidates = peers
-            .iter()
-            .map(|peer| ShardTarget {
-                cluster_id: config.mvcc_cluster_id.clone(),
-                node: NodeIncarnation {
-                    node_id: peer.node_id.clone(),
-                    incarnation: peer.incarnation,
-                },
-                failure_domain: peer.failure_domain.clone(),
-            })
-            .collect::<Vec<_>>();
         let local_store = LocalMvccStore::from_db(core_meta_db.clone(), &config.mvcc_cluster_id)?;
         let materialisation_storage = crate::storage::Storage::new_at(&config.storage_path).await?;
         let materialisation_signing_key =
@@ -405,6 +481,7 @@ impl MvccSubsystem {
             authorization_core_store,
             config.mesh_id.clone(),
             config.allow_test_only_insecure_mvcc_transport,
+            consensus.clone(),
         );
         let consensus_service =
             ConsensusTransportService::new(consensus.clone(), authorizer.clone());
@@ -438,8 +515,6 @@ impl MvccSubsystem {
             open_transactions,
             replication_client,
             object_evidence,
-            shard_candidates: shard_candidates.into(),
-            tolerated_failure_domains: config.mvcc_tolerated_failure_domains,
             local_objects,
             materialisation_storage,
             materialisation_signing_key,
@@ -637,6 +712,19 @@ fn cluster_id_hash(cluster_id: &str) -> [u8; 32] {
     hasher.update((cluster_id.len() as u64).to_be_bytes());
     hasher.update(cluster_id.as_bytes());
     hasher.finalize().into()
+}
+
+fn consensus_control_node_id(node_id: &str) -> NodeId {
+    let mut hasher = Sha256::new();
+    let domain = b"anvil.node-id.v1";
+    hasher.update((domain.len() as u64).to_be_bytes());
+    hasher.update(domain);
+    hasher.update((node_id.len() as u64).to_be_bytes());
+    hasher.update(node_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    NodeId(u64::from_be_bytes(bytes))
 }
 
 fn normalize_endpoint(endpoint: &str) -> String {

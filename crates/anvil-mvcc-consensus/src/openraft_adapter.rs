@@ -268,7 +268,30 @@ pub struct OpenRaftConsensus {
     store: RocksRaftStore,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedControlSnapshot {
+    pub topology_epoch: u64,
+    pub nodes: Vec<(NodeId, u64, String)>,
+    pub durability_policy: crate::ConsensusDurabilityPolicy,
+}
+
 impl OpenRaftConsensus {
+    pub fn applied_control_snapshot(&self) -> Result<AppliedControlSnapshot, ConsensusError> {
+        let state = self
+            .store
+            .read_state_value::<MachineState>(KEY_OPENRAFT_STATE)
+            .map_err(|error| ConsensusError::Storage(error.to_string()))?
+            .ok_or_else(|| ConsensusError::Storage("Raft state machine is missing".into()))?;
+        Ok(AppliedControlSnapshot {
+            topology_epoch: state.control.topology_epoch(),
+            nodes: state
+                .control
+                .nodes()
+                .map(|(id, incarnation, domain)| (id, incarnation, domain.to_string()))
+                .collect(),
+            durability_policy: state.control.durability_policy(),
+        })
+    }
     pub fn is_leader(&self) -> bool {
         let metrics = self.raft.metrics();
         let metrics = metrics.borrow();
@@ -325,10 +348,12 @@ impl OpenRaftConsensus {
         &self,
         cluster_id_hash: [u8; 32],
         node: NodeIncarnation,
+        failure_domain: String,
     ) -> Result<ControlApplyResult, ConsensusError> {
         self.apply_control(ConsensusCommand::InstallNode {
             cluster_id_hash,
             node,
+            failure_domain,
         })
         .await
     }
@@ -572,6 +597,12 @@ impl Consensus for OpenRaftConsensus {
                 .map_or(0, |log_id| log_id.index),
         )
     }
+
+    fn durability_policy(&self) -> Option<crate::ConsensusDurabilityPolicy> {
+        self.applied_control_snapshot()
+            .ok()
+            .map(|snapshot| snapshot.durability_policy)
+    }
 }
 
 fn storage_error(
@@ -813,21 +844,45 @@ impl RaftStateMachine<AnvilRaftConfig> for OpenRaftStateMachine {
                     RaftApplyResult::Noop
                 }
                 EntryPayload::Normal(ConsensusCommand::Certify(command)) => {
-                    let result = state
-                        .certification
-                        .apply(CommitVersion(log_id.index), &command);
-                    match result {
-                        Ok(result) => {
-                            if matches!(result, CertificationResult::Committed { .. }) {
-                                committed_bundle = Some(CommittedBundleDecision {
-                                    cluster_id_hash: command.cluster_id_hash,
-                                    bundle_hash: command.bundle_hash,
-                                    bundle_length: command.bundle_length,
-                                });
-                            }
-                            RaftApplyResult::Certification(result)
+                    let policy = state.control.durability_policy();
+                    let required_holders = match command.durability {
+                        crate::DurabilityLevel::Local => 1,
+                        crate::DurabilityLevel::Quorum | crate::DurabilityLevel::Erasure => {
+                            usize::from(policy.bundle_quorum_holders)
                         }
-                        Err(error) => RaftApplyResult::Rejected(error.to_string()),
+                    };
+                    let current_holders = command
+                        .durable_holders
+                        .iter()
+                        .filter(|holder| {
+                            state.control.node_incarnation(holder.node_id)
+                                == Some(holder.incarnation)
+                        })
+                        .count();
+                    if policy.generation == 0
+                        || required_holders == 0
+                        || current_holders < required_holders
+                    {
+                        RaftApplyResult::Rejected(
+                            "durability evidence violates applied Raft control state".into(),
+                        )
+                    } else {
+                        let result = state
+                            .certification
+                            .apply(CommitVersion(log_id.index), &command);
+                        match result {
+                            Ok(result) => {
+                                if matches!(result, CertificationResult::Committed { .. }) {
+                                    committed_bundle = Some(CommittedBundleDecision {
+                                        cluster_id_hash: command.cluster_id_hash,
+                                        bundle_hash: command.bundle_hash,
+                                        bundle_length: command.bundle_length,
+                                    });
+                                }
+                                RaftApplyResult::Certification(result)
+                            }
+                            Err(error) => RaftApplyResult::Rejected(error.to_string()),
+                        }
                     }
                 }
                 EntryPayload::Normal(command) => {
@@ -1024,6 +1079,7 @@ mod tests {
             ConsensusCommand::InstallNode {
                 cluster_id_hash: [4; 32],
                 node: owner,
+                failure_domain: "zone-a".into(),
             },
             ConsensusCommand::AssignPartition {
                 cluster_id_hash: [4; 32],
@@ -1121,7 +1177,32 @@ mod tests {
                 incarnation: 1,
             }],
         };
-        let log_id_1 = LogId::new(CommittedLeaderId::new(1, 1), 1);
+        machine
+            .apply([
+                Entry {
+                    log_id: LogId::new(CommittedLeaderId::new(1, 1), 1),
+                    payload: EntryPayload::Normal(ConsensusCommand::InstallNode {
+                        cluster_id_hash: [1; 32],
+                        node: NodeIncarnation {
+                            node_id: NodeId(1),
+                            incarnation: 1,
+                        },
+                        failure_domain: "zone-a".into(),
+                    }),
+                },
+                Entry {
+                    log_id: LogId::new(CommittedLeaderId::new(1, 1), 2),
+                    payload: EntryPayload::Normal(ConsensusCommand::SetDurabilityPolicy {
+                        cluster_id_hash: [1; 32],
+                        generation: 1,
+                        bundle_quorum_holders: 1,
+                        tolerated_failure_domains: 0,
+                    }),
+                },
+            ])
+            .await
+            .unwrap();
+        let log_id_1 = LogId::new(CommittedLeaderId::new(1, 1), 3);
         let log_id_9 = LogId::new(CommittedLeaderId::new(1, 1), 9);
         let first = machine
             .apply([Entry {
@@ -1142,7 +1223,7 @@ mod tests {
             retry.as_slice(),
             [RaftApplyResult::Certification(
                 CertificationResult::Committed {
-                    commit_version: CommitVersion(1),
+                    commit_version: CommitVersion(3),
                     ..
                 }
             )]
@@ -1189,6 +1270,7 @@ mod tests {
                         node_id: NodeId(1),
                         incarnation: 1,
                     },
+                    "zone-a".into(),
                 )
                 .await
                 .unwrap(),

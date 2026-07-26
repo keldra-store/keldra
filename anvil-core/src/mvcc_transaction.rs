@@ -866,6 +866,10 @@ pub trait BundleReplicator: Send + Sync {
 pub trait TransactionCertifier: Send + Sync {
     async fn observed_commit_version(&self, consistency: ReadConsistency) -> Result<CommitVersion>;
     async fn certify(&self, request: CertificationRequest) -> Result<CertificationResult>;
+
+    fn durability_policy(&self) -> Option<DurabilityPolicy> {
+        None
+    }
 }
 
 /// Coordinates the data path and the minimal consensus decision.
@@ -970,7 +974,9 @@ where
         evidence
             .bundle_holders
             .dedup_by(|left, right| left.node == right.node);
+        let live_policy = self.certifier.durability_policy().unwrap_or(self.policy);
         self.validate_durability(
+            live_policy,
             &bundle.cluster_id,
             durability,
             &bundle.shard_manifests,
@@ -1039,6 +1045,7 @@ where
 
     fn validate_durability(
         &self,
+        policy: DurabilityPolicy,
         cluster_id: &str,
         durability: DurabilityLevel,
         objects: &[ObjectShardManifestReference],
@@ -1058,7 +1065,7 @@ where
             .collect::<BTreeSet<_>>();
         let required_bundle_holders = match durability {
             DurabilityLevel::Local => 1,
-            DurabilityLevel::Quorum | DurabilityLevel::Erasure => self.policy.bundle_quorum_holders,
+            DurabilityLevel::Quorum | DurabilityLevel::Erasure => policy.bundle_quorum_holders,
         };
         if durable_bundle_nodes.len() < required_bundle_holders {
             bail!("transaction bundle durability was not satisfied");
@@ -1195,7 +1202,7 @@ where
             if !survives_failure_domains(
                 &stripe,
                 profile.0 as usize,
-                self.policy.tolerated_failure_domains,
+                policy.tolerated_failure_domains,
             ) {
                 bail!(
                     "shard placement for object {object_hash} is not reconstructable after configured failures"

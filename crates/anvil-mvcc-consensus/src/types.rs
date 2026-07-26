@@ -106,6 +106,7 @@ pub enum ConsensusCommand {
     InstallNode {
         cluster_id_hash: [u8; 32],
         node: NodeIncarnation,
+        failure_domain: String,
     },
     RemoveNode {
         cluster_id_hash: [u8; 32],

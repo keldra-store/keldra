@@ -614,23 +614,22 @@ impl ObjectManager {
                 }
                 durability @ (crate::mvcc_transaction::DurabilityLevel::Quorum
                 | crate::mvcc_transaction::DurabilityLevel::Erasure) => {
-                    let candidates = &mvcc.shard_candidates;
+                    let (candidates, tolerated_failure_domains, _) = mvcc
+                        .live_shard_placement()
+                        .map_err(|error| Status::failed_precondition(error.to_string()))?;
                     if candidates.len() < 2 {
                         return Err(Status::failed_precondition(
                             "distributed object durability requires at least two shard targets",
                         ));
                     }
-                    let parity_shards = mvcc
-                        .tolerated_failure_domains
-                        .max(1)
-                        .min(candidates.len() - 1);
+                    let parity_shards = tolerated_failure_domains.max(1).min(candidates.len() - 1);
                     let profile = ErasureProfile {
                         data_shards: candidates.len() - parity_shards,
                         parity_shards,
                         shard_bytes: 256 * 1024,
                     };
                     let policy = ShardPlacementPolicy {
-                        tolerated_failure_domains: mvcc.tolerated_failure_domains,
+                        tolerated_failure_domains,
                     };
                     let object_identity = provisional_mvcc_object_identity(
                         &binding.cluster_id,
@@ -639,7 +638,7 @@ impl ObjectManager {
                         object_key,
                     );
                     let plan = policy
-                        .plan(object_identity, 1, profile, candidates)
+                        .plan(object_identity, 1, profile, &candidates)
                         .map_err(|error| Status::failed_precondition(error.to_string()))?;
                     let ingest = DistributedIngest::encode(
                         &mvcc.replication_client,

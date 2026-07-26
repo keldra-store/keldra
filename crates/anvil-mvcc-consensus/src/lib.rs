@@ -19,8 +19,8 @@ pub use consensus::{Consensus, ConsensusError};
 pub use control::ClusterControlState;
 pub use gc::{GarbageCollectionPins, GarbageCollectionSafetyError};
 pub use openraft_adapter::{
-    ConsensusNode, ConsensusRpc, ConsensusRpcClient, ConsensusRpcError, ConsensusRpcFactory,
-    ConsensusRpcKind, OpenRaftConsensus,
+    AppliedControlSnapshot, ConsensusNode, ConsensusRpc, ConsensusRpcClient, ConsensusRpcError,
+    ConsensusRpcFactory, ConsensusRpcKind, OpenRaftConsensus,
 };
 pub use storage::{
     CONSENSUS_COLUMN_FAMILIES, PersistedConsensusState, RaftStorageError, RocksRaftStore,

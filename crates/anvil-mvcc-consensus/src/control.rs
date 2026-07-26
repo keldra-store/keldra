@@ -11,10 +11,12 @@ use crate::{
 pub struct ClusterControlState {
     cluster_id_hash: [u8; 32],
     nodes: BTreeMap<NodeId, u64>,
+    node_failure_domains: BTreeMap<NodeId, String>,
     incarnation_fences: BTreeMap<NodeId, u64>,
     partitions: BTreeMap<u64, PartitionAssignment>,
     durability_policy: ConsensusDurabilityPolicy,
     gc_safety_watermark: CommitVersion,
+    topology_epoch: u64,
 }
 
 impl ClusterControlState {
@@ -25,10 +27,12 @@ impl ClusterControlState {
         Ok(Self {
             cluster_id_hash,
             nodes: BTreeMap::new(),
+            node_failure_domains: BTreeMap::new(),
             incarnation_fences: BTreeMap::new(),
             partitions: BTreeMap::new(),
             durability_policy: ConsensusDurabilityPolicy::default(),
             gc_safety_watermark: CommitVersion(0),
+            topology_epoch: 0,
         })
     }
 
@@ -38,6 +42,14 @@ impl ClusterControlState {
 
     pub fn node_incarnation(&self, node_id: NodeId) -> Option<u64> {
         self.nodes.get(&node_id).copied()
+    }
+
+    pub fn nodes(&self) -> impl Iterator<Item = (NodeId, u64, &str)> {
+        self.nodes.iter().filter_map(|(node_id, incarnation)| {
+            self.node_failure_domains
+                .get(node_id)
+                .map(|domain| (*node_id, *incarnation, domain.as_str()))
+        })
     }
 
     pub fn incarnation_fence(&self, node_id: NodeId) -> u64 {
@@ -56,14 +68,23 @@ impl ClusterControlState {
         self.gc_safety_watermark
     }
 
+    pub fn topology_epoch(&self) -> u64 {
+        self.topology_epoch
+    }
+
     pub fn apply(&mut self, command: &ConsensusCommand) -> Result<ControlApplyResult, String> {
         if command.cluster_id_hash() != self.cluster_id_hash {
             return Err("control command belongs to another cluster".into());
         }
         match command {
             ConsensusCommand::Certify(_) => Err("certification is not a control command".into()),
-            ConsensusCommand::InstallNode { node, .. } => {
-                if node.node_id.0 == 0 || node.incarnation == 0 {
+            ConsensusCommand::InstallNode {
+                node,
+                failure_domain,
+                ..
+            } => {
+                if node.node_id.0 == 0 || node.incarnation == 0 || failure_domain.trim().is_empty()
+                {
                     return Err("node identity and incarnation must be non-zero".into());
                 }
                 let fence = self.incarnation_fence(node.node_id);
@@ -72,8 +93,11 @@ impl ClusterControlState {
                     return Err("node incarnation must advance its durable fence".into());
                 }
                 self.nodes.insert(node.node_id, node.incarnation);
+                self.node_failure_domains
+                    .insert(node.node_id, failure_domain.clone());
                 self.incarnation_fences
                     .insert(node.node_id, node.incarnation);
+                self.topology_epoch = self.topology_epoch.saturating_add(1);
                 Ok(ControlApplyResult::NodeInstalled(*node))
             }
             ConsensusCommand::RemoveNode { node, .. } => {
@@ -88,8 +112,10 @@ impl ClusterControlState {
                     return Err("node still owns authoritative partitions".into());
                 }
                 self.nodes.remove(&node.node_id);
+                self.node_failure_domains.remove(&node.node_id);
                 self.incarnation_fences
                     .insert(node.node_id, node.incarnation);
+                self.topology_epoch = self.topology_epoch.saturating_add(1);
                 Ok(ControlApplyResult::NodeRemoved(*node))
             }
             ConsensusCommand::AssignPartition {
@@ -116,6 +142,7 @@ impl ClusterControlState {
                     epoch: *epoch,
                 };
                 self.partitions.insert(*partition_id, assignment.clone());
+                self.topology_epoch = self.topology_epoch.saturating_add(1);
                 Ok(ControlApplyResult::PartitionAssigned {
                     partition_id: *partition_id,
                     assignment,
@@ -139,6 +166,7 @@ impl ClusterControlState {
                     tolerated_failure_domains: *tolerated_failure_domains,
                 };
                 self.durability_policy = policy;
+                self.topology_epoch = self.topology_epoch.saturating_add(1);
                 Ok(ControlApplyResult::DurabilityPolicySet(policy))
             }
             ConsensusCommand::AdvanceGcWatermark { watermark, .. } => {
@@ -173,6 +201,7 @@ mod tests {
             .apply(&ConsensusCommand::InstallNode {
                 cluster_id_hash: CLUSTER,
                 node: node(1),
+                failure_domain: "zone-a".into(),
             })
             .unwrap();
         state
@@ -234,6 +263,7 @@ mod tests {
             .apply(&ConsensusCommand::InstallNode {
                 cluster_id_hash: CLUSTER,
                 node: node(1),
+                failure_domain: "zone-a".into(),
             })
             .unwrap();
         state
@@ -247,6 +277,7 @@ mod tests {
                 .apply(&ConsensusCommand::InstallNode {
                     cluster_id_hash: CLUSTER,
                     node: node(1),
+                    failure_domain: "zone-a".into(),
                 })
                 .is_err()
         );
@@ -254,7 +285,35 @@ mod tests {
             .apply(&ConsensusCommand::InstallNode {
                 cluster_id_hash: CLUSTER,
                 node: node(2),
+                failure_domain: "zone-a".into(),
             })
             .unwrap();
+    }
+
+    #[test]
+    fn applied_node_domains_and_policy_advance_topology_epoch() {
+        let mut state = ClusterControlState::new(CLUSTER).unwrap();
+        state
+            .apply(&ConsensusCommand::InstallNode {
+                cluster_id_hash: CLUSTER,
+                node: node(1),
+                failure_domain: "zone-a".into(),
+            })
+            .unwrap();
+        let node_epoch = state.topology_epoch();
+        assert_eq!(
+            state.nodes().collect::<Vec<_>>(),
+            vec![(NodeId(1), 1, "zone-a")]
+        );
+        state
+            .apply(&ConsensusCommand::SetDurabilityPolicy {
+                cluster_id_hash: CLUSTER,
+                generation: 1,
+                bundle_quorum_holders: 1,
+                tolerated_failure_domains: 0,
+            })
+            .unwrap();
+        assert!(state.topology_epoch() > node_epoch);
+        assert_eq!(state.durability_policy().generation, 1);
     }
 }
