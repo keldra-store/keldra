@@ -1,7 +1,6 @@
 use crate::core_store::{
     CF_MESH, CoreMetaTuplePart, CoreMutationOperation, CoreMutationPrecondition,
-    TABLE_CONTROL_CURRENT_ROW, core_meta_committed_row_common, core_meta_root_key_hash,
-    core_meta_tuple_key,
+    TABLE_CONTROL_CURRENT_ROW, core_meta_tuple_key,
 };
 use crate::formats::{Hash32, hash32};
 use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
@@ -10,7 +9,6 @@ use crate::storage::Storage;
 use anyhow::{Result, anyhow, bail};
 use prost::{Message, Oneof};
 use std::collections::BTreeSet;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const CONTROL_EVENT_SCHEMA: &str = "anvil.control.event.v1";
 const CONTROL_CURRENT_SCHEMA: &str = "anvil.control.current.v1";
@@ -115,8 +113,6 @@ mod control_event_proto {
 
 #[derive(Clone, PartialEq, Message)]
 struct ControlCurrentProto {
-    #[prost(message, optional, tag = "1")]
-    common: Option<crate::core_store::CoreMetaRowCommonProto>,
     #[prost(string, tag = "2")]
     schema: String,
     #[prost(oneof = "control_current_proto::Record", tags = "10, 11, 12, 13, 14")]
@@ -618,15 +614,9 @@ async fn append_control_event_mvcc(
 
     let mutation_id = uuid::Uuid::new_v4();
     let mutation_id_string = mutation_id.to_string();
-    let created_at_unix_nanos = current_unix_nanos();
     let mut operations = Vec::new();
     for record in current_updates {
-        operations.extend(control_current_updates_at_generation(
-            record,
-            &mutation_id_string,
-            next_revision,
-            created_at_unix_nanos,
-        )?);
+        operations.extend(control_current_updates(record)?);
     }
     operations.push(CoreMutationOperation::StreamAppend {
         partition_id: hex::encode(control_partition_id()),
@@ -726,6 +716,78 @@ async fn append_control_event_mvcc(
         bail!("control-plane transaction aborted: {reason:?}");
     }
     Ok(())
+}
+
+fn control_current_updates(record: ControlCurrentRecord) -> Result<Vec<CoreMutationOperation>> {
+    let payload = encode_control_current_row(&record)?;
+    let mut operations = Vec::new();
+    match &record {
+        ControlCurrentRecord::Revision { .. } => {
+            operations.push(control_current_put(control_revision_tuple_key()?, payload));
+        }
+        ControlCurrentRecord::IdAllocator { .. } => {
+            operations.push(control_current_put(id_allocator_tuple_key()?, payload));
+        }
+        ControlCurrentRecord::Region { name, .. } => {
+            operations.push(control_current_put(region_tuple_key(name)?, payload));
+        }
+        ControlCurrentRecord::Tenant { id, name, active } => {
+            operations.push(control_current_put(
+                tenant_id_tuple_key(*id)?,
+                payload.clone(),
+            ));
+            if *active {
+                operations.push(control_current_put(tenant_name_tuple_key(name)?, payload));
+            } else {
+                operations.push(control_current_delete(tenant_name_tuple_key(name)?));
+            }
+        }
+        ControlCurrentRecord::App {
+            id,
+            tenant_id,
+            name,
+            client_id,
+            active,
+            ..
+        } => {
+            operations.push(control_current_put(app_id_tuple_key(*id)?, payload.clone()));
+            if *active {
+                operations.push(control_current_put(
+                    app_tenant_name_tuple_key(*tenant_id, name)?,
+                    payload.clone(),
+                ));
+                operations.push(control_current_put(
+                    app_client_id_tuple_key(client_id)?,
+                    payload,
+                ));
+            } else {
+                operations.push(control_current_delete(app_tenant_name_tuple_key(
+                    *tenant_id, name,
+                )?));
+                operations.push(control_current_delete(app_client_id_tuple_key(client_id)?));
+            }
+        }
+    }
+    Ok(operations)
+}
+
+fn control_current_put(tuple_key: Vec<u8>, payload: Vec<u8>) -> CoreMutationOperation {
+    CoreMutationOperation::CoreMetaPut {
+        partition_id: hex::encode(control_partition_id()),
+        cf: CF_MESH.to_string(),
+        table_id: TABLE_CONTROL_CURRENT_ROW,
+        tuple_key,
+        payload,
+    }
+}
+
+fn control_current_delete(tuple_key: Vec<u8>) -> CoreMutationOperation {
+    CoreMutationOperation::CoreMetaDelete {
+        partition_id: hex::encode(control_partition_id()),
+        cf: CF_MESH.to_string(),
+        table_id: TABLE_CONTROL_CURRENT_ROW,
+        tuple_key,
+    }
 }
 
 pub(crate) async fn create_app_with_permit_mvcc(
@@ -933,20 +995,8 @@ fn ensure_deterministic_control_proto(
     Ok(())
 }
 
-fn encode_control_current_row(
-    record: &ControlCurrentRecord,
-    mutation_id: &str,
-    root_generation: u64,
-    created_at_unix_nanos: u64,
-) -> Result<Vec<u8>> {
+fn encode_control_current_row(record: &ControlCurrentRecord) -> Result<Vec<u8>> {
     let proto = ControlCurrentProto {
-        common: Some(core_meta_committed_row_common(
-            control_current_realm_id(record),
-            control_current_root_key_hash(record),
-            root_generation,
-            mutation_id.to_string(),
-            created_at_unix_nanos,
-        )),
         schema: CONTROL_CURRENT_SCHEMA.to_string(),
         record: Some(match record {
             ControlCurrentRecord::Revision { revision } => {
@@ -1014,13 +1064,6 @@ fn decode_control_current_row(bytes: &[u8]) -> Result<ControlCurrentRecord> {
     ensure_deterministic_control_proto(&proto, bytes, "control current")?;
     if proto.schema != CONTROL_CURRENT_SCHEMA {
         bail!("control current protobuf has invalid schema");
-    }
-    let common = proto
-        .common
-        .as_ref()
-        .ok_or_else(|| anyhow!("control current row missing CoreMeta common"))?;
-    if common.root_key_hash.is_empty() {
-        bail!("control current row missing root hash");
     }
     match proto
         .record
@@ -1122,39 +1165,6 @@ fn app_client_id_tuple_key(client_id: &str) -> Result<Vec<u8>> {
         CoreMetaTuplePart::Utf8("app-client"),
         CoreMetaTuplePart::Utf8(client_id),
     ])
-}
-
-fn control_current_realm_id(record: &ControlCurrentRecord) -> String {
-    match record {
-        ControlCurrentRecord::Revision { .. }
-        | ControlCurrentRecord::IdAllocator { .. }
-        | ControlCurrentRecord::Region { .. } => "system".to_string(),
-        ControlCurrentRecord::Tenant { id, .. } => format!("tenant/{id}"),
-        ControlCurrentRecord::App { tenant_id, .. } => format!("tenant/{tenant_id}"),
-    }
-}
-
-fn control_current_root_key_hash(record: &ControlCurrentRecord) -> String {
-    core_meta_root_key_hash(&control_current_root_anchor_key(record))
-}
-
-fn control_current_root_anchor_key(record: &ControlCurrentRecord) -> String {
-    match record {
-        ControlCurrentRecord::Revision { .. } => "control/current-revision".to_string(),
-        ControlCurrentRecord::IdAllocator { .. } => "control/id-allocator".to_string(),
-        ControlCurrentRecord::Region { .. } => "control/regions".to_string(),
-        ControlCurrentRecord::Tenant { id, .. } => format!("control/tenant/{id}"),
-        ControlCurrentRecord::App { id, .. } => format!("control/app/{id}"),
-    }
-}
-
-fn current_unix_nanos() -> u64 {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    now.as_secs()
-        .saturating_mul(1_000_000_000)
-        .saturating_add(u64::from(now.subsec_nanos()))
 }
 
 pub fn control_partition_id() -> Hash32 {
