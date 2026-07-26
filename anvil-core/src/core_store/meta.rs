@@ -1093,6 +1093,7 @@ fn column_families() -> &'static [&'static str] {
         "mvcc_heads",
         "mvcc_applied",
         "mvcc_meta",
+        "cf_outbox",
         "mvcc_open_transactions",
         "mvcc_transaction_idempotency",
     ]

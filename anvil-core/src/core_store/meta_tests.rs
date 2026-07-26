@@ -603,3 +603,15 @@ fn nonempty_store_without_current_format_marker_is_rejected() {
             .contains("delete and recreate this pre-release store")
     );
 }
+#[test]
+fn fresh_core_meta_database_contains_every_mvcc_column_family() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = CoreMetaStore::open(directory.path()).unwrap();
+
+    for name in crate::mvcc_store::MVCC_COLUMN_FAMILIES {
+        assert!(
+            store.database().cf_handle(name).is_some(),
+            "fresh CoreMeta database is missing mandatory MVCC column family {name}"
+        );
+    }
+}
