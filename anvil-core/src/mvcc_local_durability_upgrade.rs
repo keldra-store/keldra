@@ -194,6 +194,16 @@ pub struct LocalUpgradePlacement {
 
 #[async_trait]
 pub trait LocalUpgradePlacementProvider: Send + Sync {
+    async fn assignment(
+        &self,
+        job: &LocalDurabilityUpgradeJob,
+    ) -> Result<crate::mvcc_worker_authority::AssignmentGuard>;
+
+    fn validate_assignment(
+        &self,
+        guard: &crate::mvcc_worker_authority::AssignmentGuard,
+    ) -> Result<()>;
+
     async fn placement(
         &self,
         job: &LocalDurabilityUpgradeJob,
@@ -203,6 +213,25 @@ pub trait LocalUpgradePlacementProvider: Send + Sync {
 
 #[async_trait]
 impl LocalUpgradePlacementProvider for Arc<crate::mvcc_bootstrap::MvccSubsystem> {
+    async fn assignment(
+        &self,
+        job: &LocalDurabilityUpgradeJob,
+    ) -> Result<crate::mvcc_worker_authority::AssignmentGuard> {
+        self.reconcile_work_assignment(
+            "local-durability-upgrade",
+            &format!("transaction/{}", job.transaction_id),
+        )
+        .await?
+        .context("local durability upgrade is assigned to another node")
+    }
+
+    fn validate_assignment(
+        &self,
+        guard: &crate::mvcc_worker_authority::AssignmentGuard,
+    ) -> Result<()> {
+        crate::mvcc_bootstrap::MvccSubsystem::validate_assignment(self, guard)
+    }
+
     async fn placement(
         &self,
         _job: &LocalDurabilityUpgradeJob,
@@ -270,6 +299,11 @@ impl LocalUpgradeManifestPublisher for Arc<crate::mvcc_bootstrap::MvccSubsystem>
     ) -> Result<()> {
         let principal = format!("local-durability-upgrade/{}", self.local_node.node_id);
         let now = unix_time_ms()?;
+        let logical_identity = format!("transaction/{}", job.transaction_id);
+        let guard = self
+            .reconcile_work_assignment("local-durability-upgrade", &logical_identity)
+            .await?
+            .context("local durability upgrade is assigned to another node")?;
         let handle = self
             .open_transactions
             .begin(
@@ -283,6 +317,7 @@ impl LocalUpgradeManifestPublisher for Arc<crate::mvcc_bootstrap::MvccSubsystem>
                 now,
             )
             .await?;
+        self.stage_assignment_guard(&handle.transaction_id, &principal, &guard, now)?;
         for manifest in manifests {
             manifest.validate()?;
             let key = crate::mvcc_transaction::LogicalKey {
@@ -439,6 +474,7 @@ where
         if job.commit_version == 0 || job.bundle.is_none() {
             bail!("durability upgrade intent has not been bound to a committed transaction");
         }
+        let assignment = self.placement.assignment(job).await?;
 
         let mut manifests = Vec::with_capacity(job.objects.len());
         let mut object_evidence = Vec::new();
@@ -478,6 +514,7 @@ where
 
         // Physical representation selection must be durable before the local
         // representation ceases to be the authoritative representation.
+        self.placement.validate_assignment(&assignment)?;
         self.manifests
             .publish(job, &manifests, &object_evidence)
             .await?;
@@ -488,6 +525,7 @@ where
         let holders = validate_bundle_holders(job, holder_evidence)?;
 
         // This compact command is the sole consensus action in the workflow.
+        self.placement.validate_assignment(&assignment)?;
         self.consensus.publish_upgrade(job, holders).await
     }
 
