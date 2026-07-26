@@ -933,6 +933,14 @@ fn append_body_mvcc_mutations(
     if matches!(event, AppendMutationKind::AppendRecord) {
         mutations.push(crate::mvcc_product::ProductMutation::put(
             crate::mvcc_product::stream_logical_key(
+                crate::core_store::TABLE_STREAM_RECORD_INDEX_ROW,
+                &exact_stream_id,
+                Some(stable_append_ordinal(mutation_id)),
+            )?,
+            payload.clone(),
+        ));
+        mutations.push(crate::mvcc_product::ProductMutation::put(
+            crate::mvcc_product::stream_logical_key(
                 crate::core_store::TABLE_STREAM_HEAD_ROW,
                 &append_record_cursor_stream_id(tenant_id, bucket_id),
                 None,
