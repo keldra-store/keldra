@@ -3,6 +3,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::{
+    core_store::{CF_MATERIALISATION, TABLE_OBJECT_MATERIALISATION_ROW},
+    mvcc_product::coremeta_logical_key,
+    mvcc_transaction::LogicalKey,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectMaterialisationJob {
     pub schema: String,
@@ -103,6 +109,75 @@ pub enum ObjectMaterialisationState {
     Complete,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectMaterialisationResult {
+    pub schema: String,
+    pub cluster_id: String,
+    pub target_logical_identity: String,
+    pub job_id: String,
+    pub state: ObjectMaterialisationState,
+    pub boundary_schema_hash: Option<String>,
+    pub derived_boundaries: Value,
+    pub index_marker: Value,
+    pub updated_at_unix_ms: u64,
+}
+
+impl ObjectMaterialisationResult {
+    pub const SCHEMA: &'static str = "anvil.mvcc.object-materialisation-result.v1";
+
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>> {
+        if self.schema != Self::SCHEMA
+            || self.cluster_id.trim().is_empty()
+            || self.target_logical_identity.trim().is_empty()
+            || self.job_id.trim().is_empty()
+            || !self.derived_boundaries.is_array()
+            || !self.index_marker.is_object()
+            || self.updated_at_unix_ms == 0
+        {
+            bail!("invalid object materialisation result");
+        }
+        Ok(serde_json::to_vec(self)?)
+    }
+
+    pub fn result_key(&self) -> Result<LogicalKey> {
+        materialisation_result_key(&self.target_logical_identity, &self.job_id)
+    }
+
+    pub fn status_key(&self) -> Result<LogicalKey> {
+        materialisation_status_key(&self.target_logical_identity)
+    }
+}
+
+pub fn materialisation_result_key(target: &str, job_id: &str) -> Result<LogicalKey> {
+    materialisation_key(b"result", target, Some(job_id))
+}
+
+pub fn materialisation_status_key(target: &str) -> Result<LogicalKey> {
+    materialisation_key(b"status", target, None)
+}
+
+fn materialisation_key(kind: &[u8], target: &str, job_id: Option<&str>) -> Result<LogicalKey> {
+    if target.is_empty() || job_id.is_some_and(str::is_empty) {
+        bail!("materialisation key identity is required");
+    }
+    let mut tuple = Vec::new();
+    tuple.extend_from_slice(b"object-materialisation/");
+    tuple.extend_from_slice(kind);
+    tuple.push(b'/');
+    push_key_part(&mut tuple, target)?;
+    if let Some(job_id) = job_id {
+        push_key_part(&mut tuple, job_id)?;
+    }
+    coremeta_logical_key(CF_MATERIALISATION, TABLE_OBJECT_MATERIALISATION_ROW, &tuple)
+}
+
+fn push_key_part(output: &mut Vec<u8>, value: &str) -> Result<()> {
+    let length = u32::try_from(value.len())?;
+    output.extend_from_slice(&length.to_be_bytes());
+    output.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
 impl ObjectMaterialisationRecord {
     pub fn pending(job: ObjectMaterialisationJob) -> Self {
         Self {
@@ -162,5 +237,17 @@ mod tests {
             ObjectMaterialisationJob::decode(&job.canonical_bytes().unwrap()).unwrap(),
             job
         );
+    }
+
+    #[test]
+    fn result_and_status_keys_are_distinct_and_target_scoped() {
+        let status = materialisation_status_key("object/version").unwrap();
+        let result = materialisation_result_key("object/version", "job").unwrap();
+        assert_ne!(status, result);
+        assert_ne!(
+            result,
+            materialisation_result_key("object/other", "job").unwrap()
+        );
+        assert_eq!(status.table_id, TABLE_OBJECT_MATERIALISATION_ROW);
     }
 }
