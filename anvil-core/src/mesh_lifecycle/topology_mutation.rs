@@ -297,7 +297,6 @@ async fn prepare_topology_mutation(
             &control.partition,
             &frame,
             partition_precondition,
-            None,
             LIFECYCLE_TOPOLOGY_ROOT_ANCHOR_KEY,
         )
         .await

@@ -351,8 +351,7 @@ pub use store::{
     list_current_control_stream_records_page, read_control_stream_page,
 };
 pub(crate) use store::{
-    PreparedControlStreamAppend, append_control_stream_frame,
-    control_stream_append_cursor_visible_to_transaction, finish_control_stream_append,
+    PreparedControlStreamAppend, append_control_stream_frame, finish_control_stream_append,
     prepare_control_stream_append,
 };
 

@@ -1,7 +1,7 @@
 use super::*;
 use crate::core_store::{
-    CoreMutationBatch, CoreMutationBatchReceipt, CoreMutationOperation, CoreTransaction,
-    CoreTransactionUpdate, ReadStream,
+    CoreMutationBatch, CoreMutationBatchReceipt, CoreMutationOperation, CoreTransactionUpdate,
+    ReadStream,
 };
 
 const CONTROL_STREAM_PAGE_MAX_ROWS: usize = 4_096;
@@ -40,18 +40,17 @@ pub async fn control_stream_append_cursor(
     partition: &str,
 ) -> AnyhowResult<ControlStreamAppendCursor> {
     let store = CoreStore::new(storage.clone()).await?;
-    control_stream_append_cursor_with_store(&store, stream_family, partition, None).await
+    control_stream_append_cursor_with_store(&store, stream_family, partition).await
 }
 
 async fn control_stream_append_cursor_with_store(
     store: &CoreStore,
     stream_family: &str,
     partition: &str,
-    transaction: Option<&CoreTransaction>,
 ) -> AnyhowResult<ControlStreamAppendCursor> {
     let stream_id = control_stream_id(stream_family, partition)?;
     let head_sequence = match store
-        .stream_head_precondition_visible_to_transaction(&stream_id, transaction)
+        .stream_head_precondition_visible_to_transaction(&stream_id, None)
         .await?
     {
         CoreMutationPrecondition::StreamHead {
@@ -62,29 +61,6 @@ async fn control_stream_append_cursor_with_store(
     };
     let byte_offset = if head_sequence == 0 {
         0
-    } else if let Some(encoded) = transaction.and_then(|transaction| {
-        transaction
-            .visible_updates
-            .iter()
-            .rev()
-            .find_map(|update| match update {
-                CoreTransactionUpdate::StreamAppend {
-                    stream_id: update_stream_id,
-                    payload,
-                    visible_sequence,
-                    ..
-                } if update_stream_id == &stream_id && *visible_sequence == head_sequence => {
-                    Some(payload.as_slice())
-                }
-                _ => None,
-            })
-    }) {
-        let (frame, encoded_len) = ControlStreamFrame::decode(encoded)?;
-        let header = decode_control_mutation_header(&frame.header_proto)?;
-        header
-            .byte_offset
-            .checked_add(encoded_len as u64)
-            .ok_or_else(|| anyhow!("CoreStore control stream {stream_id} byte offset overflow"))?
     } else {
         let record = read_exact_stream_record(&store, &stream_id, head_sequence).await?;
         let (frame, encoded_len) = decode_stored_frame(&stream_id, record, "mesh.control.frame")?;
@@ -104,24 +80,12 @@ async fn control_stream_append_cursor_with_store(
     })
 }
 
-pub(crate) async fn control_stream_append_cursor_visible_to_transaction(
-    storage: &Storage,
-    stream_family: &str,
-    partition: &str,
-    transaction: &CoreTransaction,
-) -> AnyhowResult<ControlStreamAppendCursor> {
-    let store = CoreStore::new(storage.clone()).await?;
-    control_stream_append_cursor_with_store(&store, stream_family, partition, Some(transaction))
-        .await
-}
-
 pub(crate) async fn prepare_control_stream_append(
     storage: &Storage,
     stream_family: &str,
     partition: &str,
     frame: &ControlStreamFrame,
     precondition: Option<CoreMutationPrecondition>,
-    transaction: Option<&CoreTransaction>,
     operation_partition: &str,
 ) -> AnyhowResult<PreparedControlStreamAppend> {
     let stream_id = control_stream_id(stream_family, partition)?;
@@ -139,9 +103,7 @@ pub(crate) async fn prepare_control_stream_append(
     }
 
     let store = CoreStore::new(storage.clone()).await?;
-    let cursor =
-        control_stream_append_cursor_with_store(&store, stream_family, partition, transaction)
-            .await?;
+    let cursor = control_stream_append_cursor_with_store(&store, stream_family, partition).await?;
     if metadata.sequence != cursor.sequence || header.byte_offset != cursor.byte_offset {
         return Err(anyhow!(
             "control stream append cursor changed: frame declares sequence {} offset {}, current sequence {} offset {}",
@@ -157,12 +119,12 @@ pub(crate) async fn prepare_control_stream_append(
     let mut preconditions: Vec<_> = precondition.into_iter().collect();
     preconditions.push(
         store
-            .stream_head_precondition_visible_to_transaction(&stream_id, transaction)
+            .stream_head_precondition_visible_to_transaction(&stream_id, None)
             .await?,
     );
     preconditions.push(
         store
-            .stream_head_precondition_visible_to_transaction(&record_stream_id, transaction)
+            .stream_head_precondition_visible_to_transaction(&record_stream_id, None)
             .await?,
     );
     let idempotency_key = header.idempotency_key.as_deref();
@@ -352,7 +314,6 @@ pub(crate) async fn append_control_stream_frame(
         partition,
         frame,
         precondition,
-        None,
         partition,
     )
     .await?;
