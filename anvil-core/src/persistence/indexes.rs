@@ -70,6 +70,7 @@ impl Persistence {
             .await?;
         index_journal::append_index_definition_event_with_permit_in_transaction(
             &self.storage,
+            Some(self.mvcc()?),
             &event,
             &permit,
             &self.partition_owner_signing_key,

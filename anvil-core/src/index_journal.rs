@@ -95,7 +95,7 @@ async fn append_index_definition_event(
     storage: &Storage,
     event: &IndexDefinitionEvent,
 ) -> Result<()> {
-    append_index_definition_event_inner(storage, event, 0, None, None, None).await
+    append_index_definition_event_inner(storage, None, event, 0, None, None, None).await
 }
 
 pub(crate) async fn append_index_definition_event_with_permit(
@@ -106,6 +106,7 @@ pub(crate) async fn append_index_definition_event_with_permit(
 ) -> Result<()> {
     append_index_definition_event_with_permit_in_transaction(
         storage,
+        None,
         event,
         permit,
         partition_owner_signing_key,
@@ -117,6 +118,7 @@ pub(crate) async fn append_index_definition_event_with_permit(
 
 pub(crate) async fn append_index_definition_event_with_permit_in_transaction(
     storage: &Storage,
+    mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
     event: &IndexDefinitionEvent,
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
@@ -128,6 +130,7 @@ pub(crate) async fn append_index_definition_event_with_permit_in_transaction(
         partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
     append_index_definition_event_inner(
         storage,
+        mvcc,
         event,
         permit.fence_token,
         Some(partition_precondition),
@@ -139,6 +142,7 @@ pub(crate) async fn append_index_definition_event_with_permit_in_transaction(
 
 async fn append_index_definition_event_inner(
     storage: &Storage,
+    mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
     event: &IndexDefinitionEvent,
     fence_token: u64,
     partition_precondition: Option<CoreMutationPrecondition>,
@@ -179,31 +183,15 @@ async fn append_index_definition_event_inner(
     ));
     let data_root =
         current_definitions::projection_root_anchor_key(event.tenant_id, event.bucket_id);
-    let explicit_transaction = match (transaction_id, transaction_principal) {
-        (Some(transaction_id), Some(transaction_principal)) => Some(
-            core_store
-                .read_explicit_transaction_for_principal(transaction_id, transaction_principal)
-                .await?,
-        ),
-        (None, None) => None,
+    match (transaction_id, transaction_principal) {
+        (Some(_), Some(_)) | (None, None) => {}
         _ => {
             return Err(anyhow!(
                 "index definition transaction id and principal must be provided together"
             ));
         }
-    };
-    if explicit_transaction
-        .as_ref()
-        .is_some_and(|transaction| transaction.root_anchor_key != data_root)
-    {
-        return Err(anyhow!(
-            "index definition transaction targets a different CoreMeta root"
-        ));
     }
-    let scope_partition = explicit_transaction
-        .as_ref()
-        .map(|transaction| transaction.scope_partition.clone())
-        .unwrap_or_else(|| partition_id.clone());
+    let scope_partition = partition_id;
     let root_publications = index_definition_root_publications(data_root, scope_partition.clone());
     let projection = current_definitions::prepare_projection_mutation(
         storage,
@@ -238,7 +226,16 @@ async fn append_index_definition_event_inner(
             operations,
         };
     if transaction_id.is_some() {
-        core_store.stage_explicit_transaction_batch(batch).await?;
+        let mvcc = mvcc.ok_or_else(|| anyhow!("MVCC staging handle is required"))?;
+        let principal =
+            transaction_principal.ok_or_else(|| anyhow!("transaction principal is required"))?;
+        let mutations = crate::mvcc_product::product_mutations_from_operations(batch.operations)?;
+        mvcc.stage_product_mutations(
+            transaction_id.expect("checked above"),
+            principal,
+            mutations,
+            u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+        )?;
     } else {
         let receipt = core_store.commit_mutation_batch(batch).await?;
         if receipt.state != CoreTransactionState::Committed {
@@ -367,6 +364,7 @@ async fn write_index_definition_event_inner(
     };
     append_index_definition_event_inner(
         storage,
+        None,
         &event,
         fence_token,
         partition_precondition,
@@ -1411,6 +1409,7 @@ mod tests {
 
         let rejected = append_index_definition_event_inner(
             &storage,
+            None,
             &event(1, "body", "create", true),
             stale.fence_token,
             Some(stale_precondition),

@@ -36,6 +36,7 @@ use crate::{
 pub struct Persistence {
     storage: Storage,
     core_store: Arc<OnceCell<CoreStore>>,
+    mvcc: Arc<OnceCell<Arc<crate::mvcc_bootstrap::MvccSubsystem>>>,
     task_notify: Arc<Notify>,
     mesh_id: String,
     region: String,

@@ -614,6 +614,7 @@ impl Persistence {
         let permit = self.manifest_cas_write_permit(tenant_id, bucket_id).await?;
         manifest_journal::compare_and_swap_manifest_with_permit_in_transaction(
             &self.storage,
+            self.mvcc()?,
             tenant_id,
             bucket_id,
             object_key,

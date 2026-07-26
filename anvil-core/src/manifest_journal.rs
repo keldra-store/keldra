@@ -99,6 +99,7 @@ async fn compare_and_swap_manifest(
 ) -> Result<Option<ManifestCasResult>> {
     compare_and_swap_manifest_inner(
         storage,
+        None,
         tenant_id,
         bucket_id,
         object_key,
@@ -130,6 +131,7 @@ pub(crate) async fn compare_and_swap_manifest_with_permit(
         partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
     compare_and_swap_manifest_inner(
         storage,
+        None,
         tenant_id,
         bucket_id,
         object_key,
@@ -147,6 +149,7 @@ pub(crate) async fn compare_and_swap_manifest_with_permit(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn compare_and_swap_manifest_with_permit_in_transaction(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     bucket_id: i64,
     object_key: &str,
@@ -163,6 +166,7 @@ pub(crate) async fn compare_and_swap_manifest_with_permit_in_transaction(
         partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
     compare_and_swap_manifest_inner(
         storage,
+        Some(mvcc),
         tenant_id,
         bucket_id,
         object_key,
@@ -180,6 +184,7 @@ pub(crate) async fn compare_and_swap_manifest_with_permit_in_transaction(
 #[allow(clippy::too_many_arguments)]
 async fn compare_and_swap_manifest_inner(
     storage: &Storage,
+    mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
     tenant_id: i64,
     bucket_id: i64,
     object_key: &str,
@@ -207,6 +212,7 @@ async fn compare_and_swap_manifest_inner(
         .ok_or_else(|| anyhow!("manifest revision overflow"))?;
     let receipt = append_manifest(
         storage,
+        mvcc,
         ManifestBody {
             tenant_id,
             bucket_id,
@@ -253,6 +259,7 @@ async fn current_revision(
 
 async fn append_manifest(
     storage: &Storage,
+    mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
     body: ManifestBody,
     fence_token: u64,
     partition_precondition: Option<CoreMutationPrecondition>,
@@ -263,19 +270,14 @@ async fn append_manifest(
     let stream_id = manifest_cas_stream_id(body.tenant_id, body.bucket_id);
     let mutation_id = uuid::Uuid::new_v4();
     let staged_transaction = transaction_id.is_some();
-    let explicit_transaction = match (transaction_id, transaction_principal) {
-        (Some(transaction_id), Some(transaction_principal)) => Some(
-            core_store
-                .read_explicit_transaction_for_principal(transaction_id, transaction_principal)
-                .await?,
-        ),
-        (None, None) => None,
+    match (transaction_id, transaction_principal) {
+        (Some(_), Some(_)) | (None, None) => {}
         _ => {
             return Err(anyhow!(
                 "manifest transaction id and principal must be provided together"
             ));
         }
-    };
+    }
     let transaction_id = transaction_id.map(ToOwned::to_owned).unwrap_or_else(|| {
         format!(
             "manifest-cas:{}:{}:{mutation_id}",
@@ -286,33 +288,15 @@ async fn append_manifest(
     let payload_hash = hex::encode(hash32(&body_bytes));
     let partition_id = hex::encode(manifest_cas_partition_id(body.tenant_id, body.bucket_id));
     let data_root = manifest_cas_current_root_key(body.tenant_id, body.bucket_id);
-    if explicit_transaction
-        .as_ref()
-        .is_some_and(|transaction| transaction.root_anchor_key != data_root)
-    {
-        return Err(anyhow!(
-            "manifest transaction targets a different CoreMeta root"
-        ));
-    }
-    let scope_partition = explicit_transaction
-        .as_ref()
-        .map(|transaction| transaction.scope_partition.clone())
-        .unwrap_or_else(|| partition_id.clone());
-    let root_generation = match explicit_transaction.as_ref() {
-        Some(transaction) => {
-            core_store
-                .infer_explicit_transaction_commit_root_generation(transaction)
-                .await?
-        }
-        None => next_manifest_cas_root_generation(&core_store, &data_root).await?,
-    };
+    let scope_partition = partition_id.clone();
+    let root_generation = next_manifest_cas_root_generation(&core_store, &data_root).await?;
     let root_publications = manifest_root_publications(data_root, scope_partition.clone());
     let current_payload = manifest_current_payload_for_optional_transaction(
         storage,
         body.tenant_id,
         body.bucket_id,
         &body.object_key,
-        Some(transaction_id.as_str()).zip(transaction_principal),
+        None,
     )
     .await?;
     let current_update = manifest_current_row_update_from_payload(
@@ -357,7 +341,22 @@ async fn append_manifest(
         ],
     };
     let batch_receipt = if staged_transaction {
-        core_store.stage_explicit_transaction_batch(batch).await?
+        let mvcc = mvcc.ok_or_else(|| anyhow!("MVCC staging handle is required"))?;
+        let principal =
+            transaction_principal.ok_or_else(|| anyhow!("transaction principal is required"))?;
+        let mutations = crate::mvcc_product::product_mutations_from_operations(batch.operations)?;
+        mvcc.stage_product_mutations(
+            &transaction_id,
+            principal,
+            mutations,
+            u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default(),
+        )?;
+        return Ok(MetadataMutationReceipt {
+            mutation_id,
+            payload_hash: payload_hash.clone(),
+            record_hash: payload_hash,
+            watch_cursor: 0,
+        });
     } else {
         core_store.commit_mutation_batch(batch).await?
     };
@@ -1126,6 +1125,7 @@ mod tests {
 
         let err = compare_and_swap_manifest_inner(
             &storage,
+            None,
             1,
             2,
             "manifest.json",

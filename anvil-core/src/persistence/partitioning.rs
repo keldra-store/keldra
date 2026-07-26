@@ -42,6 +42,7 @@ impl Persistence {
         Ok(Self {
             storage: Storage::new_at_sync(&config.storage_path)?,
             core_store: Arc::new(OnceCell::new()),
+            mvcc: Arc::new(OnceCell::new()),
             task_notify: Arc::new(Notify::new()),
             mesh_id: nonempty_or(&config.mesh_id, "default"),
             region: nonempty_or(&config.region, "default"),
@@ -67,6 +68,22 @@ impl Persistence {
             .get_or_try_init(|| async { CoreStore::new(self.storage.clone()).await })
             .await
             .cloned()
+    }
+
+    pub(crate) fn install_mvcc(
+        &self,
+        mvcc: Arc<crate::mvcc_bootstrap::MvccSubsystem>,
+    ) -> Result<()> {
+        self.mvcc
+            .set(mvcc)
+            .map_err(|_| anyhow!("MVCC subsystem is already installed"))
+    }
+
+    pub(crate) fn mvcc(&self) -> Result<&crate::mvcc_bootstrap::MvccSubsystem> {
+        self.mvcc
+            .get()
+            .map(Arc::as_ref)
+            .ok_or_else(|| anyhow!("MVCC subsystem is not installed"))
     }
 
     pub fn task_notify(&self) -> Arc<Notify> {
