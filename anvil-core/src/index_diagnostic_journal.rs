@@ -3,7 +3,7 @@ use crate::core_store::{
     core_meta_committed_row_common, core_meta_root_key_hash, core_meta_tuple_key,
 };
 use crate::formats::{Hash32, hash32, writer::WriterFamily};
-use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
+use crate::partition_fence::PartitionWritePermit;
 use crate::persistence::IndexDiagnostic;
 use crate::storage::Storage;
 use anyhow::{Context, Result, anyhow};
@@ -129,14 +129,13 @@ struct IndexDiagnosticJsonObjectEntryProto {
 }
 
 pub(crate) async fn write_index_diagnostic_with_permit(
-    storage: &Storage,
+    _storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     diagnostic: IndexDiagnostic,
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
+    _partition_owner_signing_key: &[u8],
 ) -> Result<IndexDiagnostic> {
     require_index_diagnostic_permit(diagnostic.tenant_id, diagnostic.bucket_id, permit)?;
-    let _ = partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
     write_index_diagnostic_inner(
         mvcc,
         diagnostic,
@@ -148,15 +147,14 @@ pub(crate) async fn write_index_diagnostic_with_permit(
 }
 
 pub(crate) async fn prepare_index_diagnostic_for_task(
-    storage: &Storage,
+    _storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     mut diagnostic: IndexDiagnostic,
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
+    _partition_owner_signing_key: &[u8],
     mutation_id: [u8; 16],
 ) -> Result<PreparedIndexDiagnostic> {
     require_index_diagnostic_permit(diagnostic.tenant_id, diagnostic.bucket_id, permit)?;
-    let _ = partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
     let head_key = diagnostic_head_key(diagnostic.tenant_id, diagnostic.bucket_id)?;
     let head_payload = mvcc.read_latest_value(&head_key)?;
     diagnostic.id = i64::try_from(next_diagnostic_sequence(head_payload.as_deref())?)

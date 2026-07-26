@@ -79,6 +79,7 @@ pub struct TenantAuditEventPage {
 /// Direct idempotent ingestion for external mesh/topology control events.
 /// Cluster product consequences must use `tenant_audit_mvcc_plan` atomically.
 pub async fn append_tenant_audit_event(storage: &Storage, event: &TenantAuditEvent) -> Result<()> {
+    require_direct_tenant_audit_action(event)?;
     let core_store = CoreStore::new(storage.clone()).await?;
     let stream_id = tenant_audit_stream_id(event.tenant_id);
     let stream_precondition = core_store.stream_head_precondition(&stream_id).await?;
@@ -121,6 +122,23 @@ pub async fn append_tenant_audit_event(storage: &Storage, event: &TenantAuditEve
             operations,
         })
         .await?;
+    Ok(())
+}
+
+/// Contract for tenant audit consequences whose authority lives in the
+/// mesh-routing control plane rather than in a cluster product transaction.
+/// All cluster-local product mutations must compose `tenant_audit_mvcc_plan`
+/// into their originating MVCC transaction instead.
+pub fn require_direct_tenant_audit_action(event: &TenantAuditEvent) -> Result<()> {
+    if !matches!(
+        event.action.as_str(),
+        "host_alias.create" | "host_alias.verify" | "host_alias.delete"
+    ) {
+        return Err(anyhow!(
+            "tenant action {} must publish audit in its originating cluster MVCC transaction",
+            event.action
+        ));
+    }
     Ok(())
 }
 
@@ -442,8 +460,8 @@ mod tests {
             request_id: format!("request-{id}"),
             tenant_id,
             principal_id: principal.to_string(),
-            resource_id: "bucket-a".to_string(),
-            action: "write".to_string(),
+            resource_id: "host_alias:docs.example.com".to_string(),
+            action: "host_alias.create".to_string(),
             created_at: format!("2026-07-02T20:00:{id}Z"),
             details_json: "{}".to_string(),
         }
@@ -471,8 +489,8 @@ mod tests {
 
         let filter = TenantAuditEventFilter {
             principal_id: Some("target"),
-            resource_id: Some("bucket-a"),
-            action: Some("write"),
+            resource_id: Some("host_alias:docs.example.com"),
+            action: Some("host_alias.create"),
         };
         let first = list_tenant_audit_event_page_after(&storage, 11, filter.clone(), None, 2)
             .await
@@ -490,5 +508,30 @@ mod tests {
         assert_eq!(second.events.len(), 1);
         assert!(second.next_cursor.is_none());
         assert!(second.events.iter().all(|event| event.tenant_id == 11));
+    }
+
+    #[test]
+    fn direct_tenant_audit_accepts_only_external_host_alias_actions() {
+        for action in [
+            "host_alias.create",
+            "host_alias.verify",
+            "host_alias.delete",
+        ] {
+            let mut candidate = event("01", 11, "principal");
+            candidate.action = action.to_string();
+            require_direct_tenant_audit_action(&candidate).unwrap();
+        }
+
+        for action in [
+            "object.put",
+            "bucket.update",
+            "policy.grant",
+            "host_alias.activate",
+        ] {
+            let mut candidate = event("01", 11, "principal");
+            candidate.action = action.to_string();
+            let error = require_direct_tenant_audit_action(&candidate).unwrap_err();
+            assert!(error.to_string().contains("originating cluster MVCC"));
+        }
     }
 }

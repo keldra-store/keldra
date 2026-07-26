@@ -1,9 +1,9 @@
 use crate::core_store::{
-    CF_MESH, CoreMetaTuplePart, CoreMutationOperation, CoreMutationPrecondition,
-    TABLE_CONTROL_CURRENT_ROW, core_meta_tuple_key,
+    CF_MESH, CoreMetaTuplePart, CoreMutationOperation, TABLE_CONTROL_CURRENT_ROW,
+    core_meta_tuple_key,
 };
 use crate::formats::{Hash32, hash32};
-use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
+use crate::partition_fence::PartitionWritePermit;
 use crate::persistence::{App, AppDetails, Tenant};
 use crate::storage::Storage;
 use anyhow::{Result, anyhow, bail};
@@ -226,15 +226,13 @@ struct AppCurrentProto {
 }
 
 pub(crate) async fn create_region_with_permit_mvcc(
-    storage: &Storage,
+    _storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     name: &str,
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
+    _partition_owner_signing_key: &[u8],
 ) -> Result<bool> {
-    let partition_precondition =
-        control_write_precondition(storage, permit, partition_owner_signing_key).await?;
-    let _ = partition_precondition;
+    require_control_permit(permit)?;
     if matches!(
         read_control_current_mvcc(mvcc, &region_tuple_key(name)?)?,
         Some(ControlCurrentRecord::Region { active: true, .. })
@@ -321,16 +319,14 @@ pub fn page_regions_mvcc(
 }
 
 pub(crate) async fn create_tenant_with_permit_mvcc(
-    storage: &Storage,
+    _storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     name: &str,
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
+    _partition_owner_signing_key: &[u8],
     admin_audit_event: Option<&crate::admin_audit::AdminAuditEvent>,
 ) -> Result<Tenant> {
-    let partition_precondition =
-        control_write_precondition(storage, permit, partition_owner_signing_key).await?;
-    let _ = partition_precondition;
+    require_control_permit(permit)?;
     if let Some(existing) = read_tenant_by_name_mvcc(mvcc, name)? {
         return Ok(existing);
     }
@@ -791,20 +787,18 @@ fn control_current_delete(tuple_key: Vec<u8>) -> CoreMutationOperation {
 }
 
 pub(crate) async fn create_app_with_permit_mvcc(
-    storage: &Storage,
+    _storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     name: &str,
     client_id: &str,
     encrypted_secret: &[u8],
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
+    _partition_owner_signing_key: &[u8],
     audit_event: Option<&crate::tenant_audit::TenantAuditEvent>,
     admin_audit_event: Option<&crate::admin_audit::AdminAuditEvent>,
 ) -> Result<App> {
-    let partition_precondition =
-        control_write_precondition(storage, permit, partition_owner_signing_key).await?;
-    let _ = partition_precondition;
+    require_control_permit(permit)?;
     if read_app_by_tenant_name_mvcc(mvcc, tenant_id, name)?.is_some() {
         bail!("app already exists");
     }
@@ -855,19 +849,16 @@ pub(crate) async fn create_app_with_permit_mvcc(
 }
 
 pub(crate) async fn update_app_secret_with_permit_mvcc(
-    storage: &Storage,
+    _storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     app_id: i64,
     encrypted_secret: &[u8],
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
+    _partition_owner_signing_key: &[u8],
     audit_event: Option<&crate::tenant_audit::TenantAuditEvent>,
     admin_audit_event: Option<&crate::admin_audit::AdminAuditEvent>,
-    admin_audit_event: Option<&crate::admin_audit::AdminAuditEvent>,
 ) -> Result<()> {
-    let partition_precondition =
-        control_write_precondition(storage, permit, partition_owner_signing_key).await?;
-    let _ = partition_precondition;
+    require_control_permit(permit)?;
     let existing = read_stored_app_mvcc(mvcc, &app_id_tuple_key(app_id)?)?
         .ok_or_else(|| anyhow!("app not found"))?;
     append_control_event_mvcc(
@@ -892,18 +883,15 @@ pub(crate) async fn update_app_secret_with_permit_mvcc(
 }
 
 pub(crate) async fn delete_app_with_permit_mvcc(
-    storage: &Storage,
+    _storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     app_id: i64,
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
+    _partition_owner_signing_key: &[u8],
     audit_event: Option<&crate::tenant_audit::TenantAuditEvent>,
     admin_audit_event: Option<&crate::admin_audit::AdminAuditEvent>,
-    admin_audit_event: Option<&crate::admin_audit::AdminAuditEvent>,
 ) -> Result<()> {
-    let partition_precondition =
-        control_write_precondition(storage, permit, partition_owner_signing_key).await?;
-    let _ = partition_precondition;
+    require_control_permit(permit)?;
     let existing = read_stored_app_mvcc(mvcc, &app_id_tuple_key(app_id)?)?
         .ok_or_else(|| anyhow!("app not found"))?;
     append_control_event_mvcc(
@@ -1177,15 +1165,6 @@ fn control_plane_stream_id() -> String {
 
 fn control_partition_principal() -> String {
     "partition-owner:control_plane:global".to_string()
-}
-
-async fn control_write_precondition(
-    storage: &Storage,
-    permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
-) -> Result<CoreMutationPrecondition> {
-    require_control_permit(permit)?;
-    Ok(partition_write_precondition(storage, permit, partition_owner_signing_key).await?)
 }
 
 fn require_control_permit(permit: &PartitionWritePermit) -> Result<()> {

@@ -1,6 +1,6 @@
-use crate::core_store::{CoreMutationOperation, CoreMutationPrecondition};
+use crate::core_store::CoreMutationOperation;
 use crate::formats::{Hash32, hash32};
-use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
+use crate::partition_fence::PartitionWritePermit;
 use crate::persistence::{IndexDefinition, IndexDefinitionEvent};
 use crate::storage::Storage;
 use anyhow::{Context, Result, anyhow};
@@ -89,14 +89,14 @@ pub(crate) async fn append_index_definition_event_with_permit_mvcc(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     event: &IndexDefinitionEvent,
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
+    _partition_owner_signing_key: &[u8],
 ) -> Result<()> {
     append_index_definition_event_with_permit_in_transaction(
         storage,
         mvcc,
         event,
         permit,
-        partition_owner_signing_key,
+        _partition_owner_signing_key,
         None,
         None,
     )
@@ -108,19 +108,16 @@ pub(crate) async fn append_index_definition_event_with_permit_in_transaction(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     event: &IndexDefinitionEvent,
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
+    _partition_owner_signing_key: &[u8],
     transaction_id: Option<&str>,
     transaction_principal: Option<&str>,
 ) -> Result<()> {
     require_index_definition_permit(event.tenant_id, event.bucket_id, permit)?;
-    let partition_precondition =
-        partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
     append_index_definition_event_inner(
         storage,
         mvcc,
         event,
         permit.fence_token,
-        Some(partition_precondition),
         transaction_id,
         transaction_principal,
     )
@@ -132,7 +129,6 @@ async fn append_index_definition_event_inner(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     event: &IndexDefinitionEvent,
     fence_token: u64,
-    partition_precondition: Option<CoreMutationPrecondition>,
     transaction_id: Option<&str>,
     transaction_principal: Option<&str>,
 ) -> Result<()> {
@@ -166,8 +162,6 @@ async fn append_index_definition_event_inner(
         transaction_principal,
     )
     .await?;
-    let _ = partition_precondition;
-    let _ = projection.precondition;
     let mut operations = vec![CoreMutationOperation::StreamAppend {
         partition_id: scope_partition.clone(),
         stream_id,

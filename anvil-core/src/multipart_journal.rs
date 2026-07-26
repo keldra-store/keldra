@@ -7,7 +7,7 @@ use crate::core_store::{
 };
 use crate::formats::{Hash32, hash32};
 use crate::mvcc_transaction::WriteOperation as CoreWriteOperation;
-use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
+use crate::partition_fence::PartitionWritePermit;
 use crate::persistence::{
     MetadataMutationReceipt, MultipartAbortMutation, MultipartCompletionMutation,
     MultipartPartsPage, MultipartUpload, MultipartUploadMutation, MultipartUploadPart,
@@ -258,48 +258,36 @@ struct CoreObjectPlacementProto {
 }
 
 pub(crate) async fn create_multipart_upload_with_permit(
-    storage: &Storage,
+    _storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     bucket_id: i64,
     key: &str,
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
+    _partition_owner_signing_key: &[u8],
 ) -> Result<MultipartUploadMutation> {
     require_multipart_metadata_permit(tenant_id, bucket_id, permit)?;
-    let _ = partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
-    create_multipart_upload_inner(
-        mvcc,
-        tenant_id,
-        bucket_id,
-        key,
-        permit.fence_token,
-        None,
-        None,
-    )
-    .await
+    create_multipart_upload_inner(mvcc, tenant_id, bucket_id, key, permit.fence_token, None).await
 }
 
 pub(crate) async fn create_multipart_upload_with_permit_in_transaction(
-    storage: &Storage,
+    _storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     bucket_id: i64,
     key: &str,
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
+    _partition_owner_signing_key: &[u8],
     transaction_id: &str,
     transaction_principal: &str,
 ) -> Result<MultipartUploadMutation> {
     require_multipart_metadata_permit(tenant_id, bucket_id, permit)?;
-    let _ = partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
     create_multipart_upload_inner(
         mvcc,
         tenant_id,
         bucket_id,
         key,
         permit.fence_token,
-        None,
         Some((transaction_id, transaction_principal)),
     )
     .await
@@ -311,10 +299,6 @@ async fn create_multipart_upload_inner(
     bucket_id: i64,
     key: &str,
     fence_token: u64,
-    partition_precondition: Option<(
-        crate::mvcc_transaction::LogicalKey,
-        crate::mvcc_transaction::PredicateKind,
-    )>,
     transaction: Option<(&str, &str)>,
 ) -> Result<MultipartUploadMutation> {
     let upload_id = uuid::Uuid::new_v4();
@@ -336,7 +320,6 @@ async fn create_multipart_upload_inner(
         Some(upload.clone()),
         None,
         fence_token,
-        partition_precondition,
         transaction,
     )
     .await?;
@@ -451,7 +434,7 @@ pub async fn has_active_multipart_upload(
 }
 
 pub(crate) async fn upsert_multipart_part_with_permit(
-    storage: &Storage,
+    _storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     upload_row_id: i64,
     part_number: i32,
@@ -462,7 +445,6 @@ pub(crate) async fn upsert_multipart_part_with_permit(
     partition_owner_signing_key: &[u8],
 ) -> Result<MultipartUploadPartMutation> {
     upsert_multipart_part_inner(
-        storage,
         mvcc,
         upload_row_id,
         part_number,
@@ -476,7 +458,7 @@ pub(crate) async fn upsert_multipart_part_with_permit(
 }
 
 pub(crate) async fn upsert_multipart_part_with_permit_in_transaction(
-    storage: &Storage,
+    _storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     upload_row_id: i64,
     part_number: i32,
@@ -489,7 +471,6 @@ pub(crate) async fn upsert_multipart_part_with_permit_in_transaction(
     transaction_principal: &str,
 ) -> Result<MultipartUploadPartMutation> {
     upsert_multipart_part_inner(
-        storage,
         mvcc,
         upload_row_id,
         part_number,
@@ -503,7 +484,6 @@ pub(crate) async fn upsert_multipart_part_with_permit_in_transaction(
 }
 
 async fn upsert_multipart_part_inner(
-    storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     upload_row_id: i64,
     part_number: i32,
@@ -525,9 +505,8 @@ async fn upsert_multipart_part_inner(
     if upload.completed_at.is_some() || upload.aborted_at.is_some() {
         return Err(anyhow!("multipart upload is no longer active"));
     }
-    let fence_token = if let Some((permit, signing_key)) = permit {
+    let fence_token = if let Some((permit, _signing_key)) = permit {
         require_multipart_metadata_permit(tenant_id, bucket_id, permit)?;
-        let _ = partition_write_precondition(storage, permit, signing_key).await?;
         permit.fence_token
     } else {
         0
@@ -562,7 +541,6 @@ async fn upsert_multipart_part_inner(
         None,
         Some(part.clone()),
         fence_token,
-        None,
         transaction,
     )
     .await?;
@@ -688,14 +666,13 @@ pub async fn list_active_multipart_uploads(
 }
 
 pub(crate) async fn complete_multipart_upload_with_permit(
-    storage: &Storage,
+    _storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     upload_row_id: i64,
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<MultipartCompletionMutation> {
     complete_multipart_upload_inner(
-        storage,
         mvcc,
         upload_row_id,
         Some((permit, partition_owner_signing_key)),
@@ -705,7 +682,7 @@ pub(crate) async fn complete_multipart_upload_with_permit(
 }
 
 pub(crate) async fn complete_multipart_upload_with_permit_in_transaction(
-    storage: &Storage,
+    _storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     upload_row_id: i64,
     permit: &PartitionWritePermit,
@@ -714,7 +691,6 @@ pub(crate) async fn complete_multipart_upload_with_permit_in_transaction(
     transaction_principal: &str,
 ) -> Result<MultipartCompletionMutation> {
     complete_multipart_upload_inner(
-        storage,
         mvcc,
         upload_row_id,
         Some((permit, partition_owner_signing_key)),
@@ -724,7 +700,6 @@ pub(crate) async fn complete_multipart_upload_with_permit_in_transaction(
 }
 
 async fn complete_multipart_upload_inner(
-    storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     upload_row_id: i64,
     permit: Option<(&PartitionWritePermit, &[u8])>,
@@ -744,9 +719,8 @@ async fn complete_multipart_upload_inner(
             receipt: None,
         });
     }
-    let fence_token = if let Some((permit, signing_key)) = permit {
+    let fence_token = if let Some((permit, _signing_key)) = permit {
         require_multipart_metadata_permit(tenant_id, bucket_id, permit)?;
-        let _ = partition_write_precondition(storage, permit, signing_key).await?;
         permit.fence_token
     } else {
         0
@@ -760,7 +734,6 @@ async fn complete_multipart_upload_inner(
         Some(upload),
         None,
         fence_token,
-        None,
         transaction,
     )
     .await?;
@@ -771,17 +744,16 @@ async fn complete_multipart_upload_inner(
 }
 
 pub(crate) async fn abort_multipart_upload_with_permit(
-    storage: &Storage,
+    _storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     bucket_id: i64,
     key: &str,
     upload_id: uuid::Uuid,
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
+    _partition_owner_signing_key: &[u8],
 ) -> Result<MultipartAbortMutation> {
     require_multipart_metadata_permit(tenant_id, bucket_id, permit)?;
-    let _ = partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
     abort_multipart_upload_inner(
         mvcc,
         tenant_id,
@@ -789,26 +761,24 @@ pub(crate) async fn abort_multipart_upload_with_permit(
         key,
         upload_id,
         permit.fence_token,
-        None,
         None,
     )
     .await
 }
 
 pub(crate) async fn abort_multipart_upload_with_permit_in_transaction(
-    storage: &Storage,
+    _storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     bucket_id: i64,
     key: &str,
     upload_id: uuid::Uuid,
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
+    _partition_owner_signing_key: &[u8],
     transaction_id: &str,
     transaction_principal: &str,
 ) -> Result<MultipartAbortMutation> {
     require_multipart_metadata_permit(tenant_id, bucket_id, permit)?;
-    let _ = partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
     abort_multipart_upload_inner(
         mvcc,
         tenant_id,
@@ -816,7 +786,6 @@ pub(crate) async fn abort_multipart_upload_with_permit_in_transaction(
         key,
         upload_id,
         permit.fence_token,
-        None,
         Some((transaction_id, transaction_principal)),
     )
     .await
@@ -829,10 +798,6 @@ async fn abort_multipart_upload_inner(
     key: &str,
     upload_id: uuid::Uuid,
     fence_token: u64,
-    partition_precondition: Option<(
-        crate::mvcc_transaction::LogicalKey,
-        crate::mvcc_transaction::PredicateKind,
-    )>,
     transaction: Option<(&str, &str)>,
 ) -> Result<MultipartAbortMutation> {
     let Some(mut upload) = get_active_multipart_upload_for_optional_transaction(
@@ -859,7 +824,6 @@ async fn abort_multipart_upload_inner(
         Some(upload),
         None,
         fence_token,
-        partition_precondition,
         transaction,
     )
     .await?;
@@ -1339,10 +1303,6 @@ async fn append_body(
     upload: Option<MultipartUpload>,
     part: Option<MultipartUploadPart>,
     fence_token: u64,
-    partition_precondition: Option<(
-        crate::mvcc_transaction::LogicalKey,
-        crate::mvcc_transaction::PredicateKind,
-    )>,
     transaction: Option<(&str, &str)>,
 ) -> Result<MetadataMutationReceipt> {
     let mutation_id = uuid::Uuid::new_v4();
@@ -1389,7 +1349,7 @@ async fn append_body(
         upload.as_ref(),
         part.as_ref(),
     )?;
-    let mut preconditions = partition_precondition.into_iter().collect::<Vec<_>>();
+    let mut preconditions = Vec::new();
     preconditions.extend(current_update.preconditions.clone());
     let event_key = multipart_event_logical_key(tenant_id, bucket_id, sequence)?;
     preconditions.extend([

@@ -2,148 +2,146 @@
 
 Audit date: 2026-07-26
 
-Scope: production Rust call sites outside `anvil-core/src/core_store`. Test-only
-code and the concurrently edited PersonalDB, admin-audit, and tenant-audit
-groups are excluded.
+Scope: production Rust call sites outside `anvil-core/src/core_store`, checked
+against `mvcc_under_raft.md`. Test-only code is excluded. This audit classifies
+every remaining direct physical CoreStore mutation site and the product
+features that retain CoreStore reads or immutable-byte writes.
 
-## Allowed immutable byte, segment, and shard I/O
+## Result
 
-- `authz_segment.rs`, `authz_segment/query.rs`, `authz_userset_index.rs`
-- `full_text_segment.rs`, `git_source_index.rs`, `registry_segment.rs`
-- `typed_field_segment.rs`, `vector_segment.rs`, `writer_segment_range.rs`
+No mutable cluster-product row, stream head, product root publication, or
+product precondition remains physically authoritative in CoreStore.
+
+Cluster product state is certified through MVCC. Non-transactional product
+autocommits use quorum durability; caller-owned transactions retain their
+explicit durability level. Product audit and strict outbox rows are composed
+into the originating transaction.
+
+The remaining physical CoreStore mutation sites are limited to:
+
+- immutable data, segment, logical-file, block, and erasure-shard storage;
+- MVCC durability and assignment-fencing internals;
+- external mesh, region, topology, routing, and security-control ingestion.
+
+There are no `#[cfg(any())]` compatibility paths in production Rust source.
+
+## Immutable bytes, segments, and shards
+
+The following product groups use CoreStore only for immutable artifacts or for
+reading those artifacts:
+
+- `authz_segment.rs`, `authz_segment/query.rs`, `authz_userset_index.rs`;
+- `full_text_segment.rs`, `git_source_index.rs`, `registry_segment.rs`;
+- `typed_field_segment.rs`, `vector_segment.rs`, `writer_segment_range.rs`;
 - immutable-byte portions of `index_builder.rs`, `object_manager.rs`, and
-  `gateway_store.rs`
+  `gateway_store`;
+- PersonalDB segment, changeset, snapshot, schema, row-index, and projection
+  payloads.
 
-These call sites store or retrieve immutable artifacts, segments, logical-file
-bytes, blocks, or erasure shards. Their locators and visible product state must
-remain in MVCC, but the bytes themselves correctly remain in CoreStore.
+Their visible locators, heads, manifests, indexes, and other mutable product
+metadata are MVCC rows. Writing a PersonalDB logical file before publishing its
+locator is an immutable-byte operation; the locator is subsequently published
+through the PersonalDB MVCC transaction.
 
-## Allowed external mesh and security-control ingestion
+## MVCC and fencing internals
 
-- `mesh_control_stream/store.rs`, `mesh_control_segment.rs`
-- `mesh_lifecycle.rs`, `mesh_lifecycle/topology_mutation.rs`
-- `mesh_directory/helpers.rs`, `mesh_directory/listing.rs`
-- `node_identity.rs`
+These physical operations are implementation machinery rather than ordinary
+product authority:
 
-These are cluster/region/mesh topology ingestion or durable node-identity
-operations. They are not ordinary product rows. Mesh directory projections
-should nevertheless be revisited after the transaction cutover because several
-helpers still publish mutable CoreMeta rows directly.
+- `mvcc_bootstrap.rs`, `mvcc_outbox.rs`, and bundle materialisation;
+- `partition_fence/coremeta.rs`;
+- shard transfer, repair, placement, and prepared-bundle recovery;
+- CoreStore construction and recovery-readiness wiring;
+- internal object, stream, and consensus transport adapters.
 
-## Allowed internal durability machinery
+`partition_fence/coremeta.rs` is the only production physical
+`commit_mutation_batch` site outside the external-control and direct-audit
+groups below. It stores assignment-fencing evidence used by the compact
+consensus boundary.
 
-- `mvcc_bootstrap.rs`, `mvcc_outbox.rs`
-- `partition_fence/coremeta.rs`
-- CoreStore construction in `lib.rs`
-- shard/task recovery portions of `worker.rs`
-- internal object/stream RPC adapters
+## External mesh and topology control
 
-These calls implement the durability substrate, assignment fencing, prepared
-bundle materialisation, or physical transport used by MVCC.
+The following physical mutation sites are outside the cluster transaction
+domain by design:
 
-## Forbidden mutable product state still requiring cutover
+- `mesh_control_stream/store.rs`;
+- `mesh_lifecycle.rs` and `mesh_lifecycle/topology_mutation.rs`;
+- `mesh_directory/helpers.rs`;
+- `mesh_control_segment.rs`;
+- `node_identity.rs`.
 
-- `metadata_journal/object_mutation.rs` and `metadata_journal/helpers.rs`:
-  legacy physical metadata stream/head and mutation paths remain.
-- Gateway mutable metadata is now MVCC-only. Remaining `CoreStore` calls are
-  immutable blob/upload-part I/O and external security-audit ingestion.
-- System-realm bootstrap completion is now canonical MVCC state. Mesh lifecycle
-  projections used to authorize internal nodes remain external control input.
-- `bucket_journal.rs`: legacy physical test/helper paths remain. Production
-  bucket current state already uses MVCC; the production watch event/head path
-  was moved to MVCC in the commit accompanying this audit.
-- Append journal heads, state, record indexes, cursors, and reads are now
-  canonical MVCC state. Referenced immutable payload objects remain outside the
-  journal rows.
+They ingest or project mesh, region, cell, node, and routing control state.
+Moving these rows into a cluster product transaction would incorrectly make
+one cluster authoritative for a wider mesh-control consequence.
 
-## Bucket watch cutover evidence
+## Direct security and topology audit ingestion
 
-The bucket mutation plan now writes an immutable event row keyed by
-`(tenant_id, collection_revision)` in the same MVCC transaction as both current
-bucket projections, the event head, allocator, and collection revision.
-Production latest-event and paged-watch reads use a single applied MVCC
-snapshot. The service no longer subscribes to the removed physical stream; it
-polls the MVCC event index while preserving cursor semantics.
+`admin_audit.rs` permits physical direct ingestion only for its explicit
+external control-plane allowlist. Cluster product actions must use
+`admin_audit_mvcc_plan` in the transaction that changes their product state.
+Single and batch application-policy changes now stage their audit rows with the
+authz tuple mutation.
 
-Static searches after the change show no production caller of the old bucket
-watch stream API. Legacy physical bucket helpers remain isolated to test-only
-coverage and should be deleted when that test group is rewritten for MVCC.
+`tenant_audit.rs` permits physical direct ingestion only for:
 
-## Gateway follow-up evidence
+- `host_alias.create`;
+- `host_alias.verify`;
+- `host_alias.delete`.
 
-Gateway repositories, blob locators, tags and manifests, credentials, upload
-sessions, idempotency rows, mounts, and mount routes use MVCC product rows.
-Transaction-scoped gateway reads and writes now stage exact `Absent` or
-`ValueHash` predicates. Non-transactional package-version and registry-ref APIs
-create one internal quorum, linearized MVCC transaction, stage a compact-Raft
-assignment guard, and certify all mutable rows together. Gateway metadata
-autocommits and upload finalisation request quorum durability.
+Those operations alter external mesh-routing control. Every other tenant
+action is rejected by `require_direct_tenant_audit_action` and must compose
+`tenant_audit_mvcc_plan` into its originating cluster MVCC transaction.
 
-The remaining production `CoreStore` calls in the gateway group are limited to
-immutable registry blob/upload-part bytes and the explicitly external gateway
-security-audit stream. No physical mutable-row fallback or gateway test module
-remains.
+## Product cutover evidence
 
-## System-realm follow-up evidence
+The following formerly physical product authorities are now MVCC-only:
 
-The cluster-local system-realm bootstrap marker is now an MVCC-v2 product row.
-Bootstrap admission obtains a compact-Raft work assignment, performs a
-linearized second existence check, and certifies the marker at quorum with an
-exact `Absent` predicate and assignment guard. Reads use one applied MVCC
-snapshot. The physical bootstrap fence, CoreMeta marker publication, legacy row
-common metadata, and disabled physical test suite were removed.
+- bucket current rows, allocators, watch events, revisions, and lifecycle
+  mutations;
+- object metadata events, current projections, watch rows, manifests, audit,
+  and outbox consequences;
+- append stream heads, record indexes, cursors, state, and sealing metadata;
+- gateway repositories, tags, manifests, routes, credentials, upload sessions,
+  idempotency records, mounts, and mount routes;
+- authorization schemas, tuples, usersets, journals, projections, and watches;
+- index definitions, locators, diagnostics, proof checkpoints, and watches;
+- full-text journals and projections;
+- tasks, leases, repair findings, and repair overlays;
+- Git source manifests and watches;
+- system-realm bootstrap state;
+- PersonalDB admission, committed heads, snapshot heads, group rows, and data
+  locators.
 
-The following dependencies deliberately remain outside this marker row:
+Index-definition compatibility functions that retained the old physical API
+were deleted. The live collection-revision and paginated-list APIs read MVCC
+state and are no longer hidden behind disabled configuration.
 
-- mesh/region/cell/node lifecycle projections are external mesh-control input;
-- the node capability check reads those external projections;
-- the operator bootstrap credential export is an immutable operator-owned file
-  outside Anvil storage;
-- authz schema and tuple state are canonical MVCC data owned by their existing
-  authz transactions.
+Control, index-definition, index-diagnostic, manifest, and multipart product
+writers no longer construct physical partition preconditions and discard them.
+They validate the permit scope, carry its fence token in the product record,
+and rely on the transaction's compact-Raft assignment guard and exact MVCC
+predicates for authority.
 
-## Append-journal follow-up evidence
+Mutable bucket, index, gateway-mount, native-idempotency, boundary-migration,
+and PersonalDB autocommits request quorum durability.
 
-Append stream creation, record publication, and sealing now certify at quorum
-through linearized MVCC transactions with exact predicates and a compact-Raft
-assignment guard. Caller-owned transactions stage the same exact predicates and
-guard. The retired physical partition precondition is no longer evaluated and
-discarded.
+## Static verification boundary
 
-Stream record-index values use the canonical MVCC stream-record envelope;
-heads retain the append event payload. Paged reads retain one MVCC snapshot,
-transactional point reads stage conflict predicates, and stream listings verify
-that each scanned head key is the canonical state key for the decoded stream.
+The final source search for physical `commit_mutation_batch`,
+`stream_head_precondition`, and `prepare_mutation_batch` calls outside
+`core_store` resolves only to:
 
-No production or disabled/test-only `CoreStore` append-journal helper remains.
-The journal stores only references to immutable payload objects; the referenced
-bytes continue to use the physical object/shard layer.
+- `partition_fence/coremeta.rs`;
+- `mesh_control_stream/store.rs`;
+- `mesh_lifecycle.rs` and `mesh_lifecycle/topology_mutation.rs`;
+- `mesh_directory/helpers.rs`;
+- `admin_audit.rs`;
+- `tenant_audit.rs`.
 
-## Object append-stream follow-up evidence
+These are exactly the internal-fencing and external-control categories
+documented above. No known production mutable product cutover remains in this
+audit.
 
-The object API no longer duplicates each append payload into a physical
-CoreStore stream or reads mutable append records from that stream. It writes
-each payload once as an immutable logical object, certifies its reference and
-record metadata through the append MVCC journal, pages records at one MVCC
-snapshot, and resolves bytes through the immutable object reference only when
-requested. Payload hash and size are verified on resolution.
-
-Sealing no longer asks CoreStore to create a second physical stream segment.
-The sealed identity is a domain-separated digest of the canonical MVCC record
-head and immutable payload identity; its record count is the certified terminal
-sequence. Caller-owned transactions observe their staged record head when
-sealing. The old physical stream IDs, partitions, append calls, read fallback,
-and segment-seal helpers were removed.
-
-After this refresh, remaining production CoreStore calls outside the excluded
-PersonalDB/object-link/audit groups classify as:
-
-- immutable segment, manifest, blob, upload-part, or erasure-shard bytes;
-- compact-MVCC internal durability, materialisation, node identity, or fencing;
-- external mesh/region/cell/node streamed control, which must not be moved into
-  cluster MVCC;
-- external gateway security-audit ingestion;
-- node-local watch lag telemetry.
-
-The concurrently edited object metadata mutation group remains the only large
-cluster product cutover not classified by this refresh.
+This is a source-level classification. Compilation, focused tests, multi-node
+fault tests, and end-to-end durability verification remain separate acceptance
+gates and are not claimed by this document.

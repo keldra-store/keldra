@@ -4,7 +4,7 @@ use crate::core_store::{
     core_meta_committed_row_common, core_meta_root_key_hash, core_meta_tuple_key,
 };
 use crate::formats::{Hash32, hash32};
-use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
+use crate::partition_fence::PartitionWritePermit;
 use crate::persistence::{ManifestCasResult, MetadataMutationReceipt};
 use crate::storage::Storage;
 use anyhow::{Result, anyhow};
@@ -88,7 +88,7 @@ struct ManifestCurrentRow {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn compare_and_swap_manifest_with_permit(
-    storage: &Storage,
+    _storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     bucket_id: i64,
@@ -97,10 +97,9 @@ pub(crate) async fn compare_and_swap_manifest_with_permit(
     manifest: JsonValue,
     manifest_hash: &str,
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
+    _partition_owner_signing_key: &[u8],
 ) -> Result<Option<ManifestCasResult>> {
     require_manifest_cas_permit(tenant_id, bucket_id, permit)?;
-    let _ = partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
     compare_and_swap_manifest_inner(
         mvcc,
         tenant_id,
@@ -118,7 +117,7 @@ pub(crate) async fn compare_and_swap_manifest_with_permit(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn compare_and_swap_manifest_with_permit_in_transaction(
-    storage: &Storage,
+    _storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     bucket_id: i64,
@@ -127,12 +126,11 @@ pub(crate) async fn compare_and_swap_manifest_with_permit_in_transaction(
     manifest: JsonValue,
     manifest_hash: &str,
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
+    _partition_owner_signing_key: &[u8],
     transaction_id: &str,
     transaction_principal: &str,
 ) -> Result<Option<ManifestCasResult>> {
     require_manifest_cas_permit(tenant_id, bucket_id, permit)?;
-    let _ = partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
     compare_and_swap_manifest_inner(
         mvcc,
         tenant_id,

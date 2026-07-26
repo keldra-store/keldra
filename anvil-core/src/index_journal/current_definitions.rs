@@ -2,9 +2,9 @@ use super::{IndexCurrentState, event_time_unix_nanos};
 use crate::{
     core_store::{
         CF_INDEX_DEFS, CoreMetaRowCommonProto, CoreMetaTuplePart, CoreMetaVisibilityState,
-        CoreMutationOperation, CoreMutationPrecondition, TABLE_INDEX_DEFINITION_ROW,
-        core_meta_committed_row_common, core_meta_payload_digest, core_meta_root_key_hash,
-        core_meta_tuple_key, decode_deterministic_proto, encode_deterministic_proto,
+        CoreMutationOperation, TABLE_INDEX_DEFINITION_ROW, core_meta_committed_row_common,
+        core_meta_root_key_hash, core_meta_tuple_key, decode_deterministic_proto,
+        encode_deterministic_proto,
     },
     persistence::IndexDefinitionEvent,
 };
@@ -39,7 +39,6 @@ pub(super) struct CurrentDefinitionPage {
 
 #[derive(Debug)]
 pub(super) struct ProjectionMutation {
-    pub(super) precondition: CoreMutationPrecondition,
     pub(super) operations: Vec<CoreMutationOperation>,
 }
 
@@ -240,18 +239,7 @@ pub(super) async fn prepare_projection_mutation(
         tuple_key: state_key.clone(),
         payload: state_payload,
     };
-    let precondition = CoreMutationPrecondition::CoreMetaRow {
-        cf: CF_INDEX_DEFS.to_string(),
-        table_id: TABLE_INDEX_DEFINITION_ROW,
-        tuple_key: state_key,
-        expected_payload_hash: existing_payload
-            .as_deref()
-            .map(|payload| core_meta_payload_digest(TABLE_INDEX_DEFINITION_ROW, payload)),
-        require_absent: existing_payload.is_none(),
-        require_present: existing_payload.is_some(),
-    };
     Ok(ProjectionMutation {
-        precondition,
         operations: vec![current_op, enabled_op, state_op],
     })
 }
