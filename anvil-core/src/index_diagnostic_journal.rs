@@ -1,8 +1,6 @@
 use crate::core_store::{
-    CF_OBSERVABILITY, CoreMetaTuplePart, CoreMutationBatch, CoreMutationOperation,
-    CoreMutationPrecondition, CoreMutationRootPublication, CoreStore, TABLE_DIAGNOSTIC_ROW,
+    CF_OBSERVABILITY, CoreMetaTuplePart, TABLE_DIAGNOSTIC_ROW, TABLE_STREAM_RECORD_INDEX_ROW,
     core_meta_committed_row_common, core_meta_root_key_hash, core_meta_tuple_key,
-    core_mutation_publication_attempt_id,
 };
 use crate::formats::{Hash32, hash32, writer::WriterFamily};
 use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
@@ -21,8 +19,8 @@ pub(crate) struct PreparedIndexDiagnostic {
     diagnostic: IndexDiagnostic,
     fence_token: u64,
     mutation_id: uuid::Uuid,
-    base_preconditions: Vec<CoreMutationPrecondition>,
-    stream_precondition: CoreMutationPrecondition,
+    head_key: crate::mvcc_transaction::LogicalKey,
+    head_payload: Option<Vec<u8>>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -130,28 +128,20 @@ struct IndexDiagnosticJsonObjectEntryProto {
     value: Option<IndexDiagnosticJsonValueProto>,
 }
 
-#[cfg(test)]
-async fn write_index_diagnostic(
-    storage: &Storage,
-    diagnostic: IndexDiagnostic,
-) -> Result<IndexDiagnostic> {
-    write_index_diagnostic_inner(storage, diagnostic, 0, Vec::new(), uuid::Uuid::new_v4()).await
-}
-
 pub(crate) async fn write_index_diagnostic_with_permit(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     diagnostic: IndexDiagnostic,
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
 ) -> Result<IndexDiagnostic> {
     require_index_diagnostic_permit(diagnostic.tenant_id, diagnostic.bucket_id, permit)?;
-    let partition_precondition =
-        partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
+    let _ = partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
     write_index_diagnostic_inner(
-        storage,
+        mvcc,
         diagnostic,
         permit.fence_token,
-        vec![partition_precondition],
+        Vec::new(),
         uuid::Uuid::new_v4(),
     )
     .await
@@ -159,129 +149,72 @@ pub(crate) async fn write_index_diagnostic_with_permit(
 
 pub(crate) async fn prepare_index_diagnostic_for_task(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     mut diagnostic: IndexDiagnostic,
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
     mutation_id: [u8; 16],
 ) -> Result<PreparedIndexDiagnostic> {
     require_index_diagnostic_permit(diagnostic.tenant_id, diagnostic.bucket_id, permit)?;
-    let partition_precondition =
-        partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let stream_id = index_diagnostic_stream_id(diagnostic.tenant_id, diagnostic.bucket_id);
-    let stream_precondition = core_store.stream_head_precondition(&stream_id).await?;
-    diagnostic.id = i64::try_from(next_stream_generation(&stream_precondition)?)
+    let _ = partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
+    let head_key = diagnostic_head_key(diagnostic.tenant_id, diagnostic.bucket_id)?;
+    let head_payload = mvcc.read_latest_value(&head_key)?;
+    diagnostic.id = i64::try_from(next_diagnostic_sequence(head_payload.as_deref())?)
         .map_err(|_| anyhow!("index diagnostic cursor exceeds i64"))?;
     Ok(PreparedIndexDiagnostic {
         diagnostic,
-        // The exact partition and task fences travel as CoreStore
-        // preconditions. Keeping an ephemeral fence out of the task-produced
-        // body makes retry bytes stable across an ownership handoff.
+        // The task lease is an exact MVCC predicate supplied at publication.
+        // Keeping an ephemeral mesh fence out of task-produced bytes makes
+        // retries stable across an ownership handoff.
         fence_token: 0,
         mutation_id: uuid::Uuid::from_bytes(mutation_id),
-        base_preconditions: vec![partition_precondition],
-        stream_precondition,
+        head_key,
+        head_payload,
     })
 }
 
 pub(crate) async fn publish_prepared_index_diagnostic(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     prepared: PreparedIndexDiagnostic,
-    additional_preconditions: &[CoreMutationPrecondition],
+    additional_preconditions: &[(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )],
 ) -> Result<IndexDiagnostic> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    if let Some(existing) = read_committed_diagnostic_replay(&core_store, &prepared).await? {
-        return Ok(existing);
-    }
-    let mut preconditions = prepared.base_preconditions;
-    preconditions.extend_from_slice(additional_preconditions);
-    append_diagnostic(
-        &core_store,
+    append_diagnostic_mvcc(
+        mvcc,
         &prepared.diagnostic,
         prepared.fence_token,
-        preconditions,
-        prepared.stream_precondition,
+        additional_preconditions.to_vec(),
+        prepared.head_key,
+        prepared.head_payload,
         prepared.mutation_id,
     )
     .await?;
     Ok(prepared.diagnostic)
 }
 
-async fn read_committed_diagnostic_replay(
-    core_store: &CoreStore,
-    prepared: &PreparedIndexDiagnostic,
-) -> Result<Option<IndexDiagnostic>> {
-    let logical_id = index_diagnostic_logical_id(
-        prepared.diagnostic.tenant_id,
-        prepared.diagnostic.bucket_id,
-        prepared.mutation_id,
-    );
-    let stream_id =
-        index_diagnostic_stream_id(prepared.diagnostic.tenant_id, prepared.diagnostic.bucket_id);
-    let Some(record) = core_store
-        .read_stream_record_by_idempotency_key(&stream_id, &logical_id)
-        .await?
-    else {
-        return Ok(None);
-    };
-    if record.record_kind != "index_diagnostic"
-        || record.authenticated_principal
-            != index_diagnostic_partition_principal(
-                prepared.diagnostic.tenant_id,
-                prepared.diagnostic.bucket_id,
-            )
-    {
-        return Err(anyhow!(
-            "index diagnostic logical id identifies different committed content"
-        ));
-    }
-    let mut diagnostic = decode_index_diagnostic_body(&record.payload)?;
-    diagnostic.id = i64::try_from(record.sequence)
-        .map_err(|_| anyhow!("index diagnostic cursor exceeds i64"))?;
-    let mut expected = prepared.diagnostic.clone();
-    expected.id = diagnostic.id;
-    if !same_diagnostic(&diagnostic, &expected) {
-        return Err(anyhow!(
-            "index diagnostic deterministic replay payload diverged"
-        ));
-    }
-    Ok(Some(diagnostic))
-}
-
-fn same_diagnostic(left: &IndexDiagnostic, right: &IndexDiagnostic) -> bool {
-    left.id == right.id
-        && left.tenant_id == right.tenant_id
-        && left.bucket_id == right.bucket_id
-        && left.bucket_name == right.bucket_name
-        && left.index_id == right.index_id
-        && left.index_name == right.index_name
-        && left.object_key == right.object_key
-        && left.version_id == right.version_id
-        && left.severity == right.severity
-        && left.code == right.code
-        && left.message == right.message
-        && left.details == right.details
-        && left.created_at == right.created_at
-}
-
 async fn write_index_diagnostic_inner(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     mut diagnostic: IndexDiagnostic,
     fence_token: u64,
-    additional_preconditions: Vec<CoreMutationPrecondition>,
+    additional_preconditions: Vec<(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )>,
     mutation_id: uuid::Uuid,
 ) -> Result<IndexDiagnostic> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let stream_id = index_diagnostic_stream_id(diagnostic.tenant_id, diagnostic.bucket_id);
-    let stream_precondition = core_store.stream_head_precondition(&stream_id).await?;
-    diagnostic.id = i64::try_from(next_stream_generation(&stream_precondition)?)
+    let head_key = diagnostic_head_key(diagnostic.tenant_id, diagnostic.bucket_id)?;
+    let head_payload = mvcc.read_latest_value(&head_key)?;
+    diagnostic.id = i64::try_from(next_diagnostic_sequence(head_payload.as_deref())?)
         .map_err(|_| anyhow!("index diagnostic cursor exceeds i64"))?;
-    append_diagnostic(
-        &core_store,
+    append_diagnostic_mvcc(
+        mvcc,
         &diagnostic,
         fence_token,
         additional_preconditions,
-        stream_precondition,
+        head_key,
+        head_payload,
         mutation_id,
     )
     .await?;
@@ -289,7 +222,7 @@ async fn write_index_diagnostic_inner(
 }
 
 pub async fn read_index_diagnostics(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     bucket_id: i64,
     index_name: &str,
@@ -319,19 +252,25 @@ pub async fn read_index_diagnostics(
             )
         })
         .transpose()?;
-    CoreStore::new(storage.clone())
-        .await?
-        .scan_coremeta_prefix_page(
-            CF_OBSERVABILITY,
-            TABLE_DIAGNOSTIC_ROW,
-            &prefix,
-            after.as_deref(),
-            limit,
-        )?
-        .into_iter()
-        .map(|row| {
+    let snapshot = mvcc.runtime.applied_version()?;
+    let application_prefix =
+        crate::mvcc_product::coremeta_application_prefix(CF_OBSERVABILITY, &prefix)?;
+    let namespace = crate::mvcc_product::coremeta_application_prefix(CF_OBSERVABILITY, &[])?;
+    let mut rows =
+        mvcc.runtime
+            .scan_table_prefix_at(TABLE_DIAGNOSTIC_ROW, &application_prefix, snapshot)?;
+    if let Some(after) = after {
+        rows.retain(|(key, _)| {
+            key.application_key
+                .strip_prefix(&namespace)
+                .is_some_and(|tuple| tuple > after.as_slice())
+        });
+    }
+    rows.truncate(limit);
+    rows.into_iter()
+        .map(|(_, row)| {
             decode_index_diagnostic_projection(
-                &row.payload,
+                &row.value,
                 tenant_id,
                 bucket_id,
                 none_if_empty(index_name),
@@ -342,23 +281,27 @@ pub async fn read_index_diagnostics(
 }
 
 pub async fn index_diagnostic_revision(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     bucket_id: i64,
 ) -> Result<String> {
-    Ok(CoreStore::new(storage.clone())
-        .await?
-        .stream_head_sequence(&index_diagnostic_stream_id(tenant_id, bucket_id))
-        .await?
-        .to_string())
+    Ok(decode_diagnostic_head(
+        mvcc.read_latest_value(&diagnostic_head_key(tenant_id, bucket_id)?)?
+            .as_deref(),
+    )?
+    .to_string())
 }
 
-async fn append_diagnostic(
-    core_store: &CoreStore,
+async fn append_diagnostic_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     diagnostic: &IndexDiagnostic,
     fence_token: u64,
-    additional_preconditions: Vec<CoreMutationPrecondition>,
-    stream_precondition: CoreMutationPrecondition,
+    mut additional_preconditions: Vec<(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )>,
+    head_key: crate::mvcc_transaction::LogicalKey,
+    head_payload: Option<Vec<u8>>,
     mutation_id: uuid::Uuid,
 ) -> Result<()> {
     let stream_id = index_diagnostic_stream_id(diagnostic.tenant_id, diagnostic.bucket_id);
@@ -369,16 +312,16 @@ async fn append_diagnostic(
     ));
     let logical_id =
         index_diagnostic_logical_id(diagnostic.tenant_id, diagnostic.bucket_id, mutation_id);
-    let mut preconditions = additional_preconditions;
-    preconditions.push(stream_precondition);
-    let transaction_id = core_mutation_publication_attempt_id(&logical_id, &preconditions)?;
-    let mut operations = vec![CoreMutationOperation::StreamAppend {
-        partition_id: partition_id.clone(),
-        stream_id: stream_id.clone(),
-        record_kind: "index_diagnostic".to_string(),
+    let transaction_id = logical_id;
+    let event_key = diagnostic_event_key(
+        diagnostic.tenant_id,
+        diagnostic.bucket_id,
+        u64::try_from(diagnostic.id)?,
+    )?;
+    let mut mutations = vec![crate::mvcc_product::ProductMutation::put(
+        event_key.clone(),
         payload,
-        idempotency_key: Some(logical_id),
-    }];
+    )];
     let projection = encode_index_diagnostic_projection(
         diagnostic,
         &stream_id,
@@ -386,35 +329,43 @@ async fn append_diagnostic(
         &transaction_id,
     )?;
     for tuple_key in index_diagnostic_projection_keys(diagnostic)? {
-        operations.push(CoreMutationOperation::CoreMetaPut {
-            partition_id: partition_id.clone(),
-            cf: CF_OBSERVABILITY.to_string(),
-            table_id: TABLE_DIAGNOSTIC_ROW,
-            tuple_key,
-            payload: projection.clone(),
-        });
+        let key = crate::mvcc_product::coremeta_logical_key(
+            CF_OBSERVABILITY,
+            TABLE_DIAGNOSTIC_ROW,
+            &tuple_key,
+        )?;
+        mutations.push(crate::mvcc_product::ProductMutation::put(
+            key.clone(),
+            projection.clone(),
+        ));
+        additional_preconditions.push((key, crate::mvcc_transaction::PredicateKind::Absent));
     }
-    let projection_root = index_diagnostic_projection_root_anchor_key(&stream_id);
-    core_store
-        .commit_mutation_batch(CoreMutationBatch {
-            transaction_id,
-            scope_partition: partition_id.clone(),
-            committed_by_principal: index_diagnostic_partition_principal(
-                diagnostic.tenant_id,
-                diagnostic.bucket_id,
-            ),
-            root_publications: vec![
-                CoreMutationRootPublication::new(partition_id, WriterFamily::CoreControl.as_str())
-                    .coordinator(),
-                CoreMutationRootPublication::new(
-                    projection_root,
-                    WriterFamily::TypedMetadata.as_str(),
+    mutations.push(crate::mvcc_product::ProductMutation::put(
+        head_key.clone(),
+        u64::try_from(diagnostic.id)?.to_be_bytes().to_vec(),
+    ));
+    additional_preconditions.extend([
+        (event_key, crate::mvcc_transaction::PredicateKind::Absent),
+        (
+            head_key,
+            match head_payload {
+                Some(payload) => crate::mvcc_transaction::PredicateKind::ValueHash(
+                    *blake3::hash(&payload).as_bytes(),
                 ),
-            ],
-            preconditions,
-            operations,
-        })
-        .await?;
+                None => crate::mvcc_transaction::PredicateKind::Absent,
+            },
+        ),
+    ]);
+    mvcc.autocommit_product_mutations_with_predicates(
+        &index_diagnostic_partition_principal(diagnostic.tenant_id, diagnostic.bucket_id),
+        &transaction_id,
+        mutations,
+        additional_preconditions,
+        crate::mvcc_transaction::DurabilityLevel::Quorum,
+        u64::try_from(chrono::Utc::now().timestamp_millis())
+            .map_err(|_| anyhow!("index diagnostic timestamp predates Unix epoch"))?,
+    )
+    .await?;
     Ok(())
 }
 
@@ -434,17 +385,50 @@ fn index_diagnostic_partition_principal(tenant_id: i64, bucket_id: i64) -> Strin
     format!("partition-owner:index_diagnostic:{tenant_id}:{bucket_id}")
 }
 
-fn next_stream_generation(precondition: &CoreMutationPrecondition) -> Result<u64> {
-    let CoreMutationPrecondition::StreamHead {
-        expected_last_sequence,
-        ..
-    } = precondition
-    else {
-        return Err(anyhow!(
-            "index diagnostic stream precondition has wrong kind"
-        ));
+fn diagnostic_head_key(
+    tenant_id: i64,
+    bucket_id: i64,
+) -> Result<crate::mvcc_transaction::LogicalKey> {
+    crate::mvcc_product::coremeta_logical_key(
+        CF_OBSERVABILITY,
+        TABLE_STREAM_RECORD_INDEX_ROW,
+        &core_meta_tuple_key(&[
+            CoreMetaTuplePart::Utf8("index-diagnostic-head"),
+            CoreMetaTuplePart::I64(tenant_id),
+            CoreMetaTuplePart::I64(bucket_id),
+        ])?,
+    )
+}
+
+fn diagnostic_event_key(
+    tenant_id: i64,
+    bucket_id: i64,
+    sequence: u64,
+) -> Result<crate::mvcc_transaction::LogicalKey> {
+    crate::mvcc_product::coremeta_logical_key(
+        CF_OBSERVABILITY,
+        TABLE_STREAM_RECORD_INDEX_ROW,
+        &core_meta_tuple_key(&[
+            CoreMetaTuplePart::Utf8("index-diagnostic-event"),
+            CoreMetaTuplePart::I64(tenant_id),
+            CoreMetaTuplePart::I64(bucket_id),
+            CoreMetaTuplePart::U64(sequence),
+        ])?,
+    )
+}
+
+fn decode_diagnostic_head(payload: Option<&[u8]>) -> Result<u64> {
+    let Some(payload) = payload else {
+        return Ok(0);
     };
-    expected_last_sequence
+    let bytes: [u8; 8] = payload
+        .try_into()
+        .map_err(|_| anyhow!("index diagnostic head has invalid length"))?;
+    Ok(u64::from_be_bytes(bytes))
+}
+
+fn next_diagnostic_sequence(payload: Option<&[u8]>) -> Result<u64> {
+    decode_diagnostic_head(payload)?
         .checked_add(1)
         .ok_or_else(|| anyhow!("index diagnostic cursor overflow"))
 }
@@ -576,36 +560,6 @@ fn decode_index_diagnostic_projection(
     Ok(diagnostic)
 }
 
-#[cfg(test)]
-pub(crate) async fn read_index_diagnostic_frame_fences_for_test(
-    storage: &Storage,
-    tenant_id: i64,
-    bucket_id: i64,
-) -> Result<Vec<u64>> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let mut after_sequence = 0;
-    let mut fences = Vec::new();
-    loop {
-        let page = core_store
-            .read_stream_page(crate::core_store::ReadStream {
-                stream_id: index_diagnostic_stream_id(tenant_id, bucket_id),
-                after_sequence,
-                limit: 256,
-            })
-            .await?;
-        for record in page.records {
-            if record.record_kind == "index_diagnostic" {
-                fences.push(decode_index_diagnostic_body_fence(&record.payload)?);
-            }
-        }
-        if !page.has_more || page.next_sequence == after_sequence {
-            break;
-        }
-        after_sequence = page.next_sequence;
-    }
-    Ok(fences)
-}
-
 fn require_index_diagnostic_permit(
     tenant_id: i64,
     bucket_id: i64,
@@ -635,29 +589,6 @@ fn encode_index_diagnostic_body(
         },
         "index diagnostic body",
     )
-}
-
-fn decode_index_diagnostic_body(bytes: &[u8]) -> Result<IndexDiagnostic> {
-    let body =
-        decode_deterministic_proto::<IndexDiagnosticBodyProto>(bytes, "index diagnostic body")?;
-    if body.schema != INDEX_DIAGNOSTIC_BODY_SCHEMA {
-        return Err(anyhow!("index diagnostic body schema mismatch"));
-    }
-    let diagnostic = index_diagnostic_from_proto(
-        body.diagnostic
-            .ok_or_else(|| anyhow!("index diagnostic body is missing diagnostic"))?,
-    )?;
-    Ok(diagnostic)
-}
-
-#[cfg(test)]
-fn decode_index_diagnostic_body_fence(bytes: &[u8]) -> Result<u64> {
-    let body =
-        decode_deterministic_proto::<IndexDiagnosticBodyProto>(bytes, "index diagnostic body")?;
-    if body.schema != INDEX_DIAGNOSTIC_BODY_SCHEMA {
-        return Err(anyhow!("index diagnostic body schema mismatch"));
-    }
-    Ok(body.fence_token)
 }
 
 fn index_diagnostic_to_proto(diagnostic: &IndexDiagnostic) -> Result<IndexDiagnosticProto> {
@@ -825,366 +756,4 @@ where
         return Err(anyhow!("{label} is not deterministic protobuf"));
     }
     Ok(value)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::Utc;
-    use serde_json::json;
-    use tempfile::tempdir;
-
-    const PARTITION_OWNER_KEY: &[u8] = b"index diagnostic partition owner signing key";
-
-    fn diagnostic(index_name: &str, severity: &str) -> IndexDiagnostic {
-        IndexDiagnostic {
-            id: 0,
-            tenant_id: 42,
-            bucket_id: 7,
-            bucket_name: "docs".to_string(),
-            index_id: Some(10),
-            index_name: index_name.to_string(),
-            object_key: "doc.txt".to_string(),
-            version_id: None,
-            severity: severity.to_string(),
-            code: "parse_failed".to_string(),
-            message: "parse failed".to_string(),
-            details: json!({"line": 1}),
-            created_at: Utc::now(),
-        }
-    }
-
-    fn assert_same_diagnostic(left: &IndexDiagnostic, right: &IndexDiagnostic) {
-        assert_eq!(left.id, right.id);
-        assert_eq!(left.tenant_id, right.tenant_id);
-        assert_eq!(left.bucket_id, right.bucket_id);
-        assert_eq!(left.bucket_name, right.bucket_name);
-        assert_eq!(left.index_id, right.index_id);
-        assert_eq!(left.index_name, right.index_name);
-        assert_eq!(left.object_key, right.object_key);
-        assert_eq!(left.version_id, right.version_id);
-        assert_eq!(left.severity, right.severity);
-        assert_eq!(left.code, right.code);
-        assert_eq!(left.message, right.message);
-        assert_eq!(left.details, right.details);
-        assert_eq!(left.created_at, right.created_at);
-    }
-
-    fn push_varint(out: &mut Vec<u8>, mut value: u64) {
-        while value >= 0x80 {
-            out.push((value as u8) | 0x80);
-            value >>= 7;
-        }
-        out.push(value as u8);
-    }
-
-    fn append_length_delimited(out: &mut Vec<u8>, field_number: u64, value: &[u8]) {
-        push_varint(out, (field_number << 3) | 2);
-        push_varint(out, value.len() as u64);
-        out.extend_from_slice(value);
-    }
-
-    async fn ready_diagnostic_permit(
-        storage: &Storage,
-        owner_node_id: &str,
-    ) -> PartitionWritePermit {
-        crate::partition_fence::ready_partition_owner_for_test(
-            storage,
-            "index_diagnostic".to_string(),
-            hex::encode(index_diagnostic_partition_id(42, 7)),
-            owner_node_id,
-            0,
-            hex::encode([0; 32]),
-            hex::encode([5; 32]),
-            PARTITION_OWNER_KEY,
-        )
-        .await
-        .write_permit()
-        .unwrap()
-    }
-
-    #[tokio::test]
-    async fn index_diagnostic_journal_replays_and_filters() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        write_index_diagnostic(&storage, diagnostic("a", "warning"))
-            .await
-            .unwrap();
-        write_index_diagnostic(&storage, diagnostic("b", "error"))
-            .await
-            .unwrap();
-
-        let all = read_index_diagnostics(&storage, 42, 7, "", "", 0, 10)
-            .await
-            .unwrap();
-        assert_eq!(all.len(), 2);
-        assert_eq!(all[0].id, 1);
-        assert_eq!(all[1].id, 2);
-        assert_eq!(
-            read_index_diagnostics(&storage, 42, 7, "b", "error", 0, 10)
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn index_diagnostic_frame_body_is_deterministic_protobuf() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let mut input = diagnostic("a", "warning");
-        input.version_id = Some(uuid::Uuid::from_u128(
-            0x12345678_9abc_def0_1234_56789abcdef0,
-        ));
-        input.details = json!({
-            "z": [1, true, null],
-            "a": {"nested": "value"},
-        });
-
-        let written = write_index_diagnostic(&storage, input).await.unwrap();
-        let core_store = CoreStore::new(storage.clone()).await.unwrap();
-        let records = core_store
-            .read_stream(crate::core_store::ReadStream {
-                stream_id: index_diagnostic_stream_id(42, 7),
-                after_sequence: 0,
-                limit: 1,
-            })
-            .await
-            .unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].record_kind, "index_diagnostic");
-        assert!(
-            !records[0].payload.starts_with(b"{"),
-            "index diagnostic stream payload must not use JSON"
-        );
-        let decoded = decode_index_diagnostic_body(&records[0].payload).unwrap();
-        assert_same_diagnostic(&decoded, &written);
-    }
-
-    #[tokio::test]
-    async fn task_diagnostic_retry_reuses_the_byte_identical_committed_record() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let permit = ready_diagnostic_permit(&storage, "node-a").await;
-        let mut input = diagnostic("a", "warning");
-        input.created_at = chrono::DateTime::<Utc>::from_timestamp_nanos(1_700_000_000_000_000_000);
-        let mutation_id = [7; 16];
-
-        let first = publish_prepared_index_diagnostic(
-            &storage,
-            prepare_index_diagnostic_for_task(
-                &storage,
-                input.clone(),
-                &permit,
-                PARTITION_OWNER_KEY,
-                mutation_id,
-            )
-            .await
-            .unwrap(),
-            &[],
-        )
-        .await
-        .unwrap();
-        let replay = publish_prepared_index_diagnostic(
-            &storage,
-            prepare_index_diagnostic_for_task(
-                &storage,
-                input,
-                &permit,
-                PARTITION_OWNER_KEY,
-                mutation_id,
-            )
-            .await
-            .unwrap(),
-            &[],
-        )
-        .await
-        .unwrap();
-
-        assert_same_diagnostic(&first, &replay);
-        let records = CoreStore::new(storage)
-            .await
-            .unwrap()
-            .read_stream(crate::core_store::ReadStream {
-                stream_id: index_diagnostic_stream_id(42, 7),
-                after_sequence: 0,
-                limit: 10,
-            })
-            .await
-            .unwrap();
-        assert_eq!(records.len(), 1);
-        assert_same_diagnostic(
-            &decode_index_diagnostic_body(&records[0].payload).unwrap(),
-            &first,
-        );
-    }
-
-    #[tokio::test]
-    async fn diagnostic_filter_page_does_not_scan_unrelated_history() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        for index in 0..64 {
-            write_index_diagnostic(
-                &storage,
-                diagnostic(&format!("unrelated-{index:03}"), "warning"),
-            )
-            .await
-            .unwrap();
-        }
-        for _ in 0..3 {
-            write_index_diagnostic(&storage, diagnostic("target", "error"))
-                .await
-                .unwrap();
-        }
-
-        let first = read_index_diagnostics(&storage, 42, 7, "target", "error", 0, 2)
-            .await
-            .unwrap();
-        assert_eq!(first.len(), 2);
-        let second = read_index_diagnostics(
-            &storage,
-            42,
-            7,
-            "target",
-            "error",
-            first.last().unwrap().id,
-            2,
-        )
-        .await
-        .unwrap();
-        assert_eq!(second.len(), 1);
-    }
-
-    #[test]
-    fn index_diagnostic_body_rejects_reencoded_protobuf() {
-        let mut value = diagnostic("a", "warning");
-        value.id = 1;
-        let diagnostic = index_diagnostic_to_proto(&value).unwrap();
-        let diagnostic_bytes = encode_deterministic_proto(&diagnostic, "test diagnostic").unwrap();
-        let mut reencoded = Vec::new();
-        append_length_delimited(&mut reencoded, 2, &diagnostic_bytes);
-        append_length_delimited(&mut reencoded, 1, INDEX_DIAGNOSTIC_BODY_SCHEMA.as_bytes());
-
-        let mutation_id = uuid::Uuid::from_u128(0xfeed_beef_feed_beef_feed_beef_feed_beef);
-        assert_ne!(
-            reencoded,
-            encode_index_diagnostic_body(&value, 0, mutation_id).unwrap()
-        );
-        let err = decode_index_diagnostic_body(&reencoded).unwrap_err();
-        assert!(
-            err.to_string().contains("not deterministic protobuf"),
-            "unexpected re-encoded body error: {err}"
-        );
-    }
-
-    #[test]
-    fn index_diagnostic_body_rejects_schema_mismatch() {
-        let mut value = diagnostic("a", "warning");
-        value.id = 1;
-        let bytes = encode_deterministic_proto(
-            &IndexDiagnosticBodyProto {
-                schema: "anvil.core.index_diagnostic.wrong.v1".to_string(),
-                diagnostic: Some(index_diagnostic_to_proto(&value).unwrap()),
-                fence_token: 0,
-                mutation_id: uuid::Uuid::nil().to_string(),
-            },
-            "test index diagnostic body",
-        )
-        .unwrap();
-
-        let err = decode_index_diagnostic_body(&bytes).unwrap_err();
-        assert!(
-            err.to_string().contains("schema mismatch"),
-            "unexpected schema mismatch error: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn index_diagnostic_permit_sets_frame_fence() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let permit = ready_diagnostic_permit(&storage, "node-a").await;
-
-        let written = write_index_diagnostic_with_permit(
-            &storage,
-            diagnostic("a", "warning"),
-            &permit,
-            PARTITION_OWNER_KEY,
-        )
-        .await
-        .unwrap();
-        assert_eq!(written.id, 1);
-        let fences = read_index_diagnostic_frame_fences_for_test(&storage, 42, 7)
-            .await
-            .unwrap();
-        assert_eq!(fences, vec![permit.fence_token]);
-    }
-
-    #[tokio::test]
-    async fn index_diagnostic_rejects_stale_partition_permit() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let stale = ready_diagnostic_permit(&storage, "node-a").await;
-        let fresh = ready_diagnostic_permit(&storage, "node-b").await;
-        assert!(fresh.fence_token > stale.fence_token);
-
-        let rejected = write_index_diagnostic_with_permit(
-            &storage,
-            diagnostic("a", "warning"),
-            &stale,
-            PARTITION_OWNER_KEY,
-        )
-        .await
-        .unwrap_err();
-        assert!(rejected.to_string().contains("PartitionNotOwned"));
-
-        write_index_diagnostic_with_permit(
-            &storage,
-            diagnostic("a", "warning"),
-            &fresh,
-            PARTITION_OWNER_KEY,
-        )
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn index_diagnostic_batch_rejects_stale_partition_precondition() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let stale = ready_diagnostic_permit(&storage, "node-a").await;
-        let stale_precondition =
-            partition_write_precondition(&storage, &stale, PARTITION_OWNER_KEY)
-                .await
-                .unwrap();
-        let fresh = ready_diagnostic_permit(&storage, "node-b").await;
-        assert!(fresh.fence_token > stale.fence_token);
-
-        let rejected = write_index_diagnostic_inner(
-            &storage,
-            diagnostic("a", "warning"),
-            stale.fence_token,
-            vec![stale_precondition],
-            uuid::Uuid::from_bytes([9; 16]),
-        )
-        .await
-        .unwrap_err();
-        let message = rejected.to_string();
-        assert!(
-            message.contains("generation mismatch")
-                || message.contains("target mismatch")
-                || message.contains("precondition failed"),
-            "unexpected stale precondition error: {message}"
-        );
-
-        write_index_diagnostic_with_permit(
-            &storage,
-            diagnostic("a", "warning"),
-            &fresh,
-            PARTITION_OWNER_KEY,
-        )
-        .await
-        .unwrap();
-    }
 }

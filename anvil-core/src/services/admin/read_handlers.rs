@@ -57,7 +57,7 @@ pub(super) async fn list_diagnostics(
         .collect::<Vec<_>>();
     if let Some((tenant_id, bucket_id)) = index_scope {
         let revision = crate::index_diagnostic_journal::index_diagnostic_revision(
-            &state.storage,
+            &state.mvcc,
             tenant_id,
             bucket_id,
         )

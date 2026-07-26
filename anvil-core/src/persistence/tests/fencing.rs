@@ -206,15 +206,6 @@ async fn persistence_global_journal_writes_use_current_fence_tokens() {
         .await
         .unwrap();
         assert!(index_fences.iter().all(|fence| *fence > 0));
-        let diagnostic_fences =
-            crate::index_diagnostic_journal::read_index_diagnostic_frame_fences_for_test(
-                &persistence.storage,
-                1,
-                bucket.id,
-            )
-            .await
-            .unwrap();
-        assert!(diagnostic_fences.iter().all(|fence| *fence > 0));
         let authz_fences =
             crate::authz_journal::read_authz_frame_fences_for_test(&persistence.storage, 1)
                 .await

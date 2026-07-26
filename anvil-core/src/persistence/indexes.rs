@@ -674,6 +674,7 @@ impl Persistence {
             .await?;
         index_diagnostic_journal::write_index_diagnostic_with_permit(
             &self.storage,
+            self.mvcc()?,
             IndexDiagnostic {
                 id: 0,
                 tenant_id,
@@ -742,6 +743,7 @@ impl Persistence {
             .await?;
         let prepared = index_diagnostic_journal::prepare_index_diagnostic_for_task(
             &self.storage,
+            self.mvcc()?,
             IndexDiagnostic {
                 id: 0,
                 tenant_id,
@@ -762,13 +764,13 @@ impl Persistence {
             mutation_id,
         )
         .await?;
-        let publication_permit = task_guard.publication_permit().await?;
-        publication_permit
-            .publish_with(|task_precondition| async move {
+        let mvcc = self.mvcc()?;
+        task_guard
+            .publish_mvcc_with(|task_predicate| async move {
                 index_diagnostic_journal::publish_prepared_index_diagnostic(
-                    &self.storage,
+                    mvcc,
                     prepared,
-                    &[task_precondition],
+                    &[task_predicate],
                 )
                 .await
             })
@@ -785,7 +787,7 @@ impl Persistence {
         limit: i32,
     ) -> Result<Vec<IndexDiagnostic>> {
         index_diagnostic_journal::read_index_diagnostics(
-            &self.storage,
+            self.mvcc()?,
             tenant_id,
             bucket_id,
             index_name,
