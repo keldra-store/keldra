@@ -139,14 +139,17 @@ fn deduplicate_preconditions(preconditions: &mut Vec<CoreMutationPrecondition>) 
 
 async fn prepare_put_batch_additions(
     storage: crate::storage::Storage,
+    mvcc: std::sync::Arc<crate::mvcc_bootstrap::MvccSubsystem>,
     context: NativeMutationContext,
     target: NativeIdempotencyTarget,
     response: MutationBatchResponse,
     mut durable_preconditions: Vec<CoreMutationPrecondition>,
 ) -> Result<CoreMutationBatchAdditions, Status> {
     let mut additions = if context.transaction_id.is_some() {
-        native_idempotency::prepare_response_in_transaction(&storage, &context, &target, &response)
-            .await?
+        native_idempotency::prepare_response_in_transaction(
+            &storage, &mvcc, &context, &target, &response,
+        )
+        .await?
     } else {
         let publication_root_anchor =
             hex::encode(crate::metadata_journal::object_metadata_partition_id(
@@ -204,6 +207,7 @@ pub(super) async fn execute_mutation_batch(
     let _idempotency_guard = acquire_native_mutation_lock(state, &context).await?;
     let replay = native_idempotency::load_response::<MutationBatchResponse>(
         &state.storage,
+        Some(&state.mvcc),
         &context,
         &target,
     )
@@ -255,6 +259,7 @@ pub(super) async fn execute_mutation_batch(
         let idempotency_context = context.clone();
         let idempotency_target = target.clone();
         let idempotency_storage = state.storage.clone();
+        let idempotency_mvcc = state.mvcc.clone();
         let operation_digest_for_additions = operation_digest.clone();
         let inputs = req
             .operations
@@ -291,6 +296,7 @@ pub(super) async fn execute_mutation_batch(
                         );
                         prepare_put_batch_additions(
                             idempotency_storage,
+                            idempotency_mvcc,
                             idempotency_context,
                             idempotency_target,
                             response,
@@ -319,6 +325,7 @@ pub(super) async fn execute_mutation_batch(
                         );
                         prepare_put_batch_additions(
                             idempotency_storage,
+                            idempotency_mvcc,
                             idempotency_context,
                             idempotency_target,
                             response,
@@ -572,6 +579,7 @@ pub(super) async fn execute_mutation_batch(
     if let Some(transaction_id) = transaction_id {
         let mut additions = native_idempotency::prepare_response_in_transaction(
             &state.storage,
+            &state.mvcc,
             &context,
             &target,
             &response,
@@ -597,7 +605,14 @@ pub(super) async fn execute_mutation_batch(
             ));
         }
     } else {
-        native_idempotency::store_response(&state.storage, &context, &target, &response).await?;
+        native_idempotency::store_response(
+            &state.storage,
+            Some(&state.mvcc),
+            &context,
+            &target,
+            &response,
+        )
+        .await?;
     }
     Ok(Response::new(response))
 }

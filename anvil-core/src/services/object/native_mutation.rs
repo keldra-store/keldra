@@ -21,7 +21,9 @@ where
     validate_native_mutation_target_authorization(state, claims, target, action).await?;
     let idempotency_guard = acquire_native_mutation_lock(state, context).await?;
     let target_guard = acquire_native_target_lock(state, context, target).await?;
-    let replay = native_idempotency::load_response(&state.storage, context, target).await?;
+    let replay =
+        native_idempotency::load_response(&state.storage, Some(&state.mvcc), context, target)
+            .await?;
     Ok((
         NativeMutationAttempt {
             context,
@@ -66,7 +68,14 @@ pub(super) async fn complete_native_mutation<T>(
 where
     T: Serialize,
 {
-    native_idempotency::store_response(&state.storage, attempt.context, target, response).await
+    native_idempotency::store_response(
+        &state.storage,
+        Some(&state.mvcc),
+        attempt.context,
+        target,
+        response,
+    )
+    .await
 }
 
 pub(super) async fn acquire_native_mutation_lock(
