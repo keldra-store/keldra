@@ -1,0 +1,21 @@
+[package]
+name = "anvil-mvcc-consensus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Anvil's MVCC certification state machine and OpenRaft storage adapter"
+publish = false
+
+[dependencies]
+async-trait = "0.1.89"
+bincode = { version = "2.0.1", features = ["serde"] }
+openraft = { version = "=0.9.24", features = ["serde", "storage-v2"] }
+rocksdb = { version = "0.24.0", default-features = false, features = ["bindgen-runtime", "lz4", "zstd"] }
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.17"
+
+[dev-dependencies]
+tempfile = "3.23.0"
+tokio = { version = "1.48.0", features = ["macros", "rt"] }

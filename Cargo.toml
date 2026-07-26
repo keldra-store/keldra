@@ -6,6 +6,7 @@ members = [
     "anvil-cli",
     "clients/rust",
     "crates/anvil-corestore-model",
+    "crates/anvil-mvcc-consensus",
     "documentation",
 ]
 
