@@ -49,6 +49,7 @@ impl BoundaryCandidateReader for PlannerBoundaryCandidateAdapter {
 #[derive(Debug, Clone)]
 pub(super) struct PlannerAuthzCandidateAdapter {
     storage: crate::storage::Storage,
+    mvcc: std::sync::Arc<crate::mvcc_bootstrap::MvccSubsystem>,
     claims: auth::Claims,
     authorization_mode: String,
     bucket: crate::persistence::Bucket,
@@ -58,6 +59,7 @@ pub(super) struct PlannerAuthzCandidateAdapter {
 impl PlannerAuthzCandidateAdapter {
     pub(super) fn new(
         storage: crate::storage::Storage,
+        mvcc: std::sync::Arc<crate::mvcc_bootstrap::MvccSubsystem>,
         claims: auth::Claims,
         authorization_mode: impl Into<String>,
         bucket: crate::persistence::Bucket,
@@ -65,6 +67,7 @@ impl PlannerAuthzCandidateAdapter {
     ) -> Self {
         Self {
             storage,
+            mvcc,
             claims,
             authorization_mode: authorization_mode.into(),
             bucket,
@@ -195,6 +198,7 @@ impl PlannerAuthzCandidateAdapter {
             };
             if principal_has_system_object_access(
                 &self.storage,
+                &self.mvcc,
                 &self.claims,
                 &self.bucket,
                 object_key,
@@ -219,6 +223,7 @@ impl PlannerAuthzCandidateAdapter {
 
 async fn principal_has_system_object_access(
     storage: &crate::storage::Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     claims: &auth::Claims,
     bucket: &crate::persistence::Bucket,
     object_key: &str,
@@ -228,6 +233,7 @@ async fn principal_has_system_object_access(
         .map_err(|_| anyhow::anyhow!("Invalid system authz revision"))?;
     access_control::system_realm_relationship_allows(
         storage,
+        mvcc,
         claims,
         crate::system_realm::SYSTEM_OBJECT_NAMESPACE,
         &access_control::object_object_id(bucket, object_key),
@@ -239,6 +245,7 @@ async fn principal_has_system_object_access(
 
 async fn principal_has_bucket_wide_object_access(
     storage: &crate::storage::Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     claims: &auth::Claims,
     bucket: &crate::persistence::Bucket,
     system_revision: u64,
@@ -247,6 +254,7 @@ async fn principal_has_bucket_wide_object_access(
         .map_err(|_| anyhow::anyhow!("Invalid system authz revision"))?;
     access_control::system_realm_relationship_allows(
         storage,
+        mvcc,
         claims,
         crate::system_realm::SYSTEM_BUCKET_NAMESPACE,
         &access_control::bucket_object_id(bucket),
@@ -283,6 +291,7 @@ impl IndexCandidateReader for PlannerIndexCandidateAdapter {
 
 pub(super) async fn execute_corestore_query_plan(
     storage: &crate::storage::Storage,
+    mvcc: std::sync::Arc<crate::mvcc_bootstrap::MvccSubsystem>,
     claims: &auth::Claims,
     bucket: &crate::persistence::Bucket,
     authorization_mode: &str,
@@ -296,6 +305,7 @@ pub(super) async fn execute_corestore_query_plan(
     let boundary_reader = PlannerBoundaryCandidateAdapter::new(snapshot.clone());
     let authz_reader = PlannerAuthzCandidateAdapter::new(
         storage.clone(),
+        mvcc,
         claims.clone(),
         authorization_mode.to_string(),
         bucket.clone(),

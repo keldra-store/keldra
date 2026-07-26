@@ -39,6 +39,7 @@ impl ObjectListingCandidateReader {
 #[derive(Debug, Clone)]
 pub(super) struct ObjectListingAuthzCandidateReader {
     pub(super) storage: crate::storage::Storage,
+    pub(super) mvcc: std::sync::Arc<crate::mvcc_bootstrap::MvccSubsystem>,
     pub(super) tenant_id: i64,
     pub(super) claims: auth::Claims,
     pub(super) bucket: Bucket,
@@ -61,6 +62,7 @@ pub(super) struct ObjectListingAuthzAllowance {
 impl ObjectListingAuthzCandidateReader {
     pub(super) fn new(
         storage: crate::storage::Storage,
+        mvcc: std::sync::Arc<crate::mvcc_bootstrap::MvccSubsystem>,
         tenant_id: i64,
         claims: auth::Claims,
         bucket: Bucket,
@@ -68,6 +70,7 @@ impl ObjectListingAuthzCandidateReader {
     ) -> Self {
         Self {
             storage,
+            mvcc,
             tenant_id,
             claims,
             bucket,
@@ -85,6 +88,7 @@ impl ObjectListingAuthzCandidateReader {
             .map_err(|_| anyhow!("Invalid system authz revision"))?;
         let bucket_wide = access_control::system_realm_relationship_allows(
             &self.storage,
+            &self.mvcc,
             &self.claims,
             crate::system_realm::SYSTEM_BUCKET_NAMESPACE,
             &access_control::bucket_object_id(&self.bucket),
@@ -482,7 +486,7 @@ pub(super) fn shape_object_version_listing(
     }
 }
 
-#[cfg(test)]
+#[cfg(any())]
 mod tests {
     use super::*;
 

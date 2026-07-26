@@ -209,6 +209,7 @@ impl ObjectManager {
         try_join_all(unique_keys.into_iter().map(|object_key| {
             access_control::require_object_permission(
                 &self.storage,
+                self.installed_mvcc()?,
                 claims,
                 &bucket,
                 object_key,

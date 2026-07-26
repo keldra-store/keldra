@@ -4,10 +4,9 @@ use crate::formats::writer::WriterFamily;
 impl AppState {
     pub(super) async fn latest_system_authz_revision_for_query(&self) -> Result<u64, Status> {
         crate::authz_journal::latest_authz_revision(
-            &self.storage,
+            &self.mvcc,
             crate::system_realm::SYSTEM_STORAGE_TENANT_ID,
         )
-        .await
         .map_err(|e| Status::internal(e.to_string()))
         .map(|revision| revision.max(0) as u64)
     }
@@ -471,6 +470,7 @@ impl AppState {
         )?;
         let planner_result = execute_corestore_query_plan(
             &self.storage,
+            self.mvcc.clone(),
             claims,
             bucket,
             &index.authorization_mode,
@@ -737,6 +737,7 @@ impl AppState {
         )?;
         let planner_result = execute_corestore_query_plan(
             &self.storage,
+            self.mvcc.clone(),
             claims,
             bucket,
             &index.authorization_mode,
@@ -1043,6 +1044,7 @@ impl AppState {
         )?;
         let planner_result = execute_corestore_query_plan(
             &self.storage,
+            self.mvcc.clone(),
             claims,
             bucket,
             &index.authorization_mode,
@@ -1412,6 +1414,7 @@ impl AppState {
         )?;
         let planner_result = execute_corestore_query_plan(
             &self.storage,
+            self.mvcc.clone(),
             claims,
             bucket,
             &index.authorization_mode,
@@ -1736,6 +1739,7 @@ impl AppState {
         )?;
         let planner_result = execute_corestore_query_plan(
             &self.storage,
+            self.mvcc.clone(),
             claims,
             bucket,
             &index.authorization_mode,
@@ -1906,10 +1910,9 @@ impl AppState {
                         .map_err(|_| Status::internal("Invalid system authz revision"))?
                 } else {
                     crate::authz_journal::latest_authz_revision(
-                        &self.storage,
+                        &self.mvcc,
                         crate::system_realm::SYSTEM_STORAGE_TENANT_ID,
                     )
-                    .await
                     .map_err(crate::services::authz_status::consistency_status)?
                 };
                 if let Some(scope) = authz_scope {
@@ -1917,6 +1920,7 @@ impl AppState {
                         .map_err(|_| Status::internal("Invalid authz revision"))?;
                     if authz_journal::resolve_permission_at_revision(
                         &self.storage,
+                        &self.mvcc,
                         claims.tenant_id,
                         &scope.object_namespace,
                         &format!("{bucket_name}/{object_key}"),
@@ -1936,6 +1940,7 @@ impl AppState {
                 let bucket = self.get_index_bucket(claims.tenant_id, bucket_name).await?;
                 Ok(access_control::system_realm_relationship_allows(
                     &self.storage,
+                    &self.mvcc,
                     claims,
                     crate::system_realm::SYSTEM_OBJECT_NAMESPACE,
                     &access_control::object_object_id(&bucket, object_key),
@@ -1946,6 +1951,7 @@ impl AppState {
                 .map_err(crate::services::authz_status::consistency_status)?
                     || access_control::system_realm_relationship_allows(
                         &self.storage,
+                        &self.mvcc,
                         claims,
                         crate::system_realm::SYSTEM_BUCKET_NAMESPACE,
                         &access_control::bucket_object_id(&bucket),

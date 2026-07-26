@@ -17,13 +17,6 @@ const OBJECT_LIST_CANDIDATE_MULTIPLIER: usize = 16;
 const MAX_OBJECT_LIST_CANDIDATES: usize = 16_384;
 
 impl ObjectManager {
-    fn installed_mvcc(&self) -> Result<&crate::mvcc_bootstrap::MvccSubsystem, Status> {
-        self.mvcc
-            .get()
-            .map(std::sync::Arc::as_ref)
-            .ok_or_else(|| Status::unavailable("MVCC object runtime is not installed"))
-    }
-
     pub async fn get_object(
         &self,
         claims: Option<auth::Claims>,
@@ -364,6 +357,7 @@ impl ObjectManager {
         let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
         access_control::require_object_permission(
             &self.storage,
+            self.installed_mvcc()?,
             claims,
             &bucket,
             object_key,
@@ -416,6 +410,7 @@ impl ObjectManager {
         let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
         access_control::require_object_permission(
             &self.storage,
+            self.installed_mvcc()?,
             claims,
             &bucket,
             object_key,
@@ -1100,10 +1095,12 @@ impl ObjectManager {
             return Ok(u64::try_from(revision.max(0))?);
         }
         let revision = crate::authz_journal::latest_authz_revision(
-            &self.storage,
+            self.mvcc
+                .get()
+                .map(std::sync::Arc::as_ref)
+                .ok_or_else(|| anyhow!("MVCC object runtime is not installed"))?,
             crate::system_realm::SYSTEM_STORAGE_TENANT_ID,
-        )
-        .await?;
+        )?;
         Ok(u64::try_from(revision.max(0))?)
     }
 
@@ -1161,6 +1158,7 @@ impl ObjectManager {
         let reader = ObjectListingCandidateReader::new(scope.clone(), partition_id, docs);
         let authz_reader = ObjectListingAuthzCandidateReader::new(
             self.storage.clone(),
+            self.installed_mvcc_arc()?,
             crate::system_realm::SYSTEM_STORAGE_TENANT_ID,
             claims.clone(),
             bucket.clone(),
@@ -1674,6 +1672,7 @@ impl ObjectManager {
         let object_id = access_control::object_object_id(&bucket, object_key);
         if access_control::system_realm_relationship_allows(
             &self.storage,
+            self.installed_mvcc()?,
             claims,
             crate::system_realm::SYSTEM_OBJECT_NAMESPACE,
             &object_id,
@@ -1687,6 +1686,7 @@ impl ObjectManager {
         }
         access_control::system_realm_relationship_allows(
             &self.storage,
+            self.installed_mvcc()?,
             claims,
             crate::system_realm::SYSTEM_BUCKET_NAMESPACE,
             &access_control::bucket_object_id(&bucket),
@@ -1734,6 +1734,7 @@ impl ObjectManager {
     ) -> Result<bool, Status> {
         access_control::system_realm_relationship_allows(
             &self.storage,
+            self.installed_mvcc()?,
             claims,
             crate::system_realm::SYSTEM_BUCKET_NAMESPACE,
             &access_control::bucket_object_id(bucket),
@@ -1850,6 +1851,7 @@ impl ObjectManager {
         };
         access_control::require_object_permission(
             &self.storage,
+            self.installed_mvcc()?,
             claims,
             &bucket,
             object_key,

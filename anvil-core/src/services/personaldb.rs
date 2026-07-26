@@ -250,6 +250,7 @@ impl PersonalDbService for AppState {
         validate_database_id(&req.database_id)?;
         if !personaldb_access_allowed(
             &self.storage,
+            &self.mvcc,
             &claims,
             &req.database_id,
             AnvilAction::PersonalDbRead,
@@ -369,6 +370,7 @@ impl PersonalDbService for AppState {
         validate_projection_id(&req.projection_id)?;
         if !personaldb_projection_access_allowed(
             &self.storage,
+            &self.mvcc,
             &claims,
             &req.database_id,
             &req.projection_id,
@@ -446,6 +448,7 @@ impl PersonalDbService for AppState {
         validate_database_id(&req.database_id)?;
         if !personaldb_access_allowed(
             &self.storage,
+            &self.mvcc,
             &claims,
             &req.database_id,
             AnvilAction::PersonalDbRead,
@@ -482,6 +485,7 @@ impl PersonalDbService for AppState {
         validate_database_id(&req.database_id)?;
         if !personaldb_access_allowed(
             &self.storage,
+            &self.mvcc,
             &claims,
             &req.database_id,
             AnvilAction::PersonalDbWatch,
@@ -553,6 +557,7 @@ impl PersonalDbService for AppState {
         validate_projection_id(&req.projection_id)?;
         if !personaldb_projection_access_allowed(
             &self.storage,
+            &self.mvcc,
             &claims,
             &req.database_id,
             &req.projection_id,
@@ -740,6 +745,7 @@ impl AppState {
         }
         if !personaldb_actor_access_allowed(
             &self.storage,
+            &self.mvcc,
             &actor,
             &request.database_id,
             AnvilAction::PersonalDbCommit,
@@ -908,6 +914,7 @@ impl AppState {
         if actor.require_public_commit_authorization
             && !personaldb_actor_access_allowed(
                 &self.storage,
+                &self.mvcc,
                 &actor,
                 &request.database_id,
                 AnvilAction::PersonalDbCommit,
@@ -1014,8 +1021,7 @@ impl AppState {
         .ok_or_else(|| Status::failed_precondition("PersonalDB schema SQL missing"))?;
         validate_changeset_tables_registered(&changes, &schema_sql)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
-        let authz_revision = authz_journal::latest_authz_revision(&self.storage, actor.tenant_id)
-            .await
+        let authz_revision = authz_journal::latest_authz_revision(&self.mvcc, actor.tenant_id)
             .map_err(internal_status)
             .and_then(|revision| {
                 u64::try_from(revision)
@@ -1043,7 +1049,7 @@ impl AppState {
                 .ok_or_else(|| Status::internal("Invalid current timestamp"))?,
         })
         .map_err(|err| Status::invalid_argument(err.to_string()))?;
-        authorize_personaldb_row_effects(&self.storage, &envelope, &actor).await?;
+        authorize_personaldb_row_effects(&self.storage, &self.mvcc, &envelope, &actor).await?;
         let envelope_hash = envelope.envelope_hash32().map_err(internal_status)?;
         let previous_log_hash = hex32_status(&previous_head.log_hash, "committed head log hash")?;
         let schema_hash = hex32_status(&manifest.schema_hash, "schema hash")?;
@@ -1703,6 +1709,7 @@ impl AppState {
             let scoped_namespace = encode_realm_namespace(DEFAULT_AUTHZ_REALM_ID, &check.namespace);
             let is_allowed = authz_journal::resolve_permission_at_revision(
                 &self.storage,
+                &self.mvcc,
                 tenant_id,
                 &scoped_namespace,
                 &check.object_id,
@@ -1757,6 +1764,7 @@ fn bind_personaldb_submit_session(
 
 async fn authorize_personaldb_row_effects(
     storage: &crate::storage::Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     envelope: &VerifiedMutationEnvelope,
     actor: &PersonalDbCommitActor,
 ) -> Result<(), Status> {
@@ -1772,6 +1780,7 @@ async fn authorize_personaldb_row_effects(
                 .map_err(|_| Status::internal("Invalid PersonalDB authz revision"))?;
             let allowed = authz_journal::resolve_permission_at_revision(
                 storage,
+                mvcc,
                 actor.tenant_id,
                 &encode_realm_namespace(DEFAULT_AUTHZ_REALM_ID, "personaldb_row"),
                 &resource,

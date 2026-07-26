@@ -472,6 +472,7 @@ async fn require_mesh_admin<T>(
     let claims = admin_claims(request)?;
     let allowed = crate::system_realm::check_admin_relation(
         &state.storage,
+        &state.mvcc,
         &state.config.mesh_id,
         &claims,
         relation,
@@ -516,6 +517,7 @@ async fn require_mesh_bucket_manage(
         .ok_or_else(|| Status::not_found("bucket not found"))?;
     access_control::require_system_realm_permission(
         &state.storage,
+        &state.mvcc,
         claims,
         crate::system_realm::SYSTEM_BUCKET_NAMESPACE,
         &access_control::bucket_object_id(&bucket),

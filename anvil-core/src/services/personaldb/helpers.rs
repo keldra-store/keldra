@@ -309,6 +309,7 @@ fn personaldb_relation_for_action(action: AnvilAction) -> Result<&'static str, S
 
 pub(super) async fn personaldb_access_allowed(
     storage: &crate::storage::Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     claims: &auth::Claims,
     database_id: &str,
     action: AnvilAction,
@@ -317,6 +318,7 @@ pub(super) async fn personaldb_access_allowed(
     let object_id = access_control::personaldb_group_object_id(claims.tenant_id, database_id);
     access_control::system_realm_relationship_allows(
         storage,
+        mvcc,
         claims,
         crate::system_realm::SYSTEM_PERSONALDB_GROUP_NAMESPACE,
         &object_id,
@@ -329,6 +331,7 @@ pub(super) async fn personaldb_access_allowed(
 
 pub(super) async fn personaldb_actor_access_allowed(
     storage: &crate::storage::Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     actor: &PersonalDbCommitActor,
     database_id: &str,
     action: AnvilAction,
@@ -339,7 +342,7 @@ pub(super) async fn personaldb_actor_access_allowed(
         tenant_id: actor.tenant_id,
         jti: None,
     };
-    personaldb_access_allowed(storage, &claims, database_id, action).await
+    personaldb_access_allowed(storage, mvcc, &claims, database_id, action).await
 }
 
 pub(super) fn personaldb_group_partition_family() -> &'static str {
@@ -362,6 +365,7 @@ pub(super) fn personaldb_projection_resource(
 
 pub(super) async fn personaldb_projection_access_allowed(
     storage: &crate::storage::Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     claims: &auth::Claims,
     database_id: &str,
     _projection_id: &str,
@@ -371,6 +375,7 @@ pub(super) async fn personaldb_projection_access_allowed(
     let object_id = access_control::personaldb_group_object_id(claims.tenant_id, database_id);
     access_control::system_realm_relationship_allows(
         storage,
+        mvcc,
         claims,
         crate::system_realm::SYSTEM_PERSONALDB_GROUP_NAMESPACE,
         &object_id,

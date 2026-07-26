@@ -228,6 +228,22 @@ impl ObjectManager {
             .map_err(|_| anyhow!("MVCC object runtime is already installed"))
     }
 
+    fn installed_mvcc(&self) -> Result<&crate::mvcc_bootstrap::MvccSubsystem, tonic::Status> {
+        self.mvcc
+            .get()
+            .map(std::sync::Arc::as_ref)
+            .ok_or_else(|| tonic::Status::unavailable("MVCC object runtime is not installed"))
+    }
+
+    fn installed_mvcc_arc(
+        &self,
+    ) -> Result<std::sync::Arc<crate::mvcc_bootstrap::MvccSubsystem>, tonic::Status> {
+        self.mvcc
+            .get()
+            .cloned()
+            .ok_or_else(|| tonic::Status::unavailable("MVCC object runtime is not installed"))
+    }
+
     fn record_reserved_namespace_rejection(&self, operation: &'static str) {
         self.observability.increment_counter(
             RESERVED_NAMESPACE_REJECTION_COUNT,
@@ -473,6 +489,7 @@ impl ObjectManager {
         let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
         access_control::require_object_permission(
             &self.storage,
+            self.installed_mvcc()?,
             claims,
             &bucket,
             object_key,
@@ -1456,8 +1473,14 @@ impl ObjectManager {
         let bucket = self
             .get_tenant_bucket(claims.tenant_id, bucket_name)
             .await?;
-        access_control::require_bucket_permission(&self.storage, &claims, &bucket, "list_objects")
-            .await?;
+        access_control::require_bucket_permission(
+            &self.storage,
+            self.installed_mvcc()?,
+            &claims,
+            &bucket,
+            "list_objects",
+        )
+        .await?;
         Ok(bucket.id)
     }
 

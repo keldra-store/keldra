@@ -556,10 +556,9 @@ impl AuthService for AppState {
         let revision = match authz_page_token_revision(supplied_page_token)? {
             Some(revision) => revision,
             None => authz_journal::latest_authz_revision(
-                &self.storage,
+                &self.mvcc,
                 crate::system_realm::SYSTEM_STORAGE_TENANT_ID,
             )
-            .await
             .map_err(|error| Status::internal(error.to_string()))?,
         };
         let filter_hash =
@@ -576,12 +575,11 @@ impl AuthService for AppState {
             &binding,
             self.config.jwt_secret.as_bytes(),
         )?;
-        require_current_authz_list_revision(&self.storage, SYSTEM_STORAGE_TENANT_ID, revision)
-            .await?;
+        require_current_authz_list_revision(&self.mvcc, SYSTEM_STORAGE_TENANT_ID, revision).await?;
         let after_tuple_key =
             decode_authz_page_position(token.as_ref().map(|token| token.position.as_str()))?;
         let grant_page = authz_journal::page_current_authz_tuples(
-            &self.storage,
+            &self.mvcc,
             SYSTEM_STORAGE_TENANT_ID,
             &authz_journal::AuthzTupleFilter {
                 realm_id: Some(SYSTEM_REALM_ID.to_string()),
@@ -817,8 +815,7 @@ impl AuthService for AppState {
             Some(revision) => revision,
             None => {
                 let consistency = AuthzConsistency::from_request(&req.consistency, &req.zookie)?;
-                resolve_authz_response_revision(&self.storage, claims.tenant_id, consistency)
-                    .await?
+                resolve_authz_response_revision(&self.mvcc, claims.tenant_id, consistency).await?
             }
         };
         let page_binding = AuthzPageBinding {
@@ -833,12 +830,12 @@ impl AuthService for AppState {
             &page_binding,
             self.config.jwt_secret.as_bytes(),
         )?;
-        require_current_authz_list_revision(&self.storage, claims.tenant_id, response_revision)
+        require_current_authz_list_revision(&self.mvcc, claims.tenant_id, response_revision)
             .await?;
         let after_tuple_key =
             decode_authz_page_position(page_token.as_ref().map(|token| token.position.as_str()))?;
         let page = authz_journal::page_current_authz_tuples(
-            &self.storage,
+            &self.mvcc,
             claims.tenant_id,
             &authz_journal::AuthzTupleFilter {
                 realm_id: Some(scope.authz_realm_id.clone()),
@@ -977,8 +974,7 @@ impl AuthService for AppState {
             Some(revision) => revision,
             None => {
                 let consistency = AuthzConsistency::from_request(&req.consistency, &req.zookie)?;
-                resolve_authz_response_revision(&self.storage, claims.tenant_id, consistency)
-                    .await?
+                resolve_authz_response_revision(&self.mvcc, claims.tenant_id, consistency).await?
             }
         };
         let page_binding = AuthzPageBinding {
@@ -993,10 +989,11 @@ impl AuthService for AppState {
             &page_binding,
             self.config.jwt_secret.as_bytes(),
         )?;
-        require_current_authz_list_revision(&self.storage, claims.tenant_id, response_revision)
+        require_current_authz_list_revision(&self.mvcc, claims.tenant_id, response_revision)
             .await?;
         let page = authz_journal::list_current_authz_objects_page(
             &self.storage,
+            &self.mvcc,
             claims.tenant_id,
             &encode_realm_namespace(&scope.authz_realm_id, &req.namespace),
             &req.relation,
@@ -1064,8 +1061,7 @@ impl AuthService for AppState {
             Some(revision) => revision,
             None => {
                 let consistency = AuthzConsistency::from_request(&req.consistency, &req.zookie)?;
-                resolve_authz_response_revision(&self.storage, claims.tenant_id, consistency)
-                    .await?
+                resolve_authz_response_revision(&self.mvcc, claims.tenant_id, consistency).await?
             }
         };
         let page_binding = AuthzPageBinding {
@@ -1080,10 +1076,11 @@ impl AuthService for AppState {
             &page_binding,
             self.config.jwt_secret.as_bytes(),
         )?;
-        require_current_authz_list_revision(&self.storage, claims.tenant_id, response_revision)
+        require_current_authz_list_revision(&self.mvcc, claims.tenant_id, response_revision)
             .await?;
         let page = authz_journal::list_current_authz_subjects_page(
             &self.storage,
+            &self.mvcc,
             claims.tenant_id,
             &encode_realm_namespace(&scope.authz_realm_id, &req.namespace),
             &req.object_id,
@@ -1156,6 +1153,7 @@ impl AuthService for AppState {
         .await?;
         let record = authz_realm_schema::put_schema_revision(
             &self.storage,
+            &self.mvcc,
             claims.tenant_id,
             &req.schema_id,
             req.namespaces,
@@ -1191,8 +1189,13 @@ impl AuthService for AppState {
         // owning storage-tenant relation first. The realm row may not exist yet,
         // so checking the realm relation before seeding its parent_tenant tuple
         // would make first bind impossible without a non-Zanzibar bypass.
-        access_control::require_storage_tenant_permission(&self.storage, &claims, "manage_tenant")
-            .await?;
+        access_control::require_storage_tenant_permission(
+            &self.storage,
+            &self.mvcc,
+            &claims,
+            "manage_tenant",
+        )
+        .await?;
         access_control::grant_authz_realm_defaults(
             &self.persistence,
             claims.tenant_id,
@@ -1205,6 +1208,7 @@ impl AuthService for AppState {
         .map_err(|e| Status::internal(e.to_string()))?;
         access_control::require_system_realm_permission(
             &self.storage,
+            &self.mvcc,
             &claims,
             crate::system_realm::SYSTEM_AUTHZ_REALM_NAMESPACE,
             &access_control::authz_realm_object_id(claims.tenant_id, &scope.authz_realm_id),
@@ -1213,6 +1217,7 @@ impl AuthService for AppState {
         .await?;
         let binding = authz_realm_schema::bind_schema(
             &self.storage,
+            &self.mvcc,
             claims.tenant_id,
             &scope.authz_realm_id,
             authz_realm_schema::StoredSchemaRef {
@@ -1257,6 +1262,7 @@ impl AuthService for AppState {
         .await?;
         let binding = authz_realm_schema::read_schema_binding(
             &self.storage,
+            &self.mvcc,
             claims.tenant_id,
             &scope.authz_realm_id,
         )
@@ -1311,8 +1317,7 @@ impl AuthService for AppState {
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
         let mut records = Vec::with_capacity(req.namespaces.len());
-        let authz_revision = authz_journal::latest_authz_revision(&self.storage, claims.tenant_id)
-            .await
+        let authz_revision = authz_journal::latest_authz_revision(&self.mvcc, claims.tenant_id)
             .map_err(|e| Status::internal(e.to_string()))
             .and_then(revision_to_u64)?
             .max(1);
@@ -1378,6 +1383,7 @@ impl AuthService for AppState {
             .await?;
             let record = authz_realm_schema::read_schema_revision(
                 &self.storage,
+                &self.mvcc,
                 claims.tenant_id,
                 &req.schema_id,
                 req.schema_revision,

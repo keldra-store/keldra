@@ -2,6 +2,7 @@ use crate::{
     auth, authz_journal,
     authz_scope::{DEFAULT_AUTHZ_REALM_ID, encode_realm_namespace},
     bucket_journal,
+    mvcc_bootstrap::MvccSubsystem,
     permissions::AnvilAction,
     persistence::{AuthzTupleBatchMutation, Bucket, Persistence},
     storage::Storage,
@@ -93,6 +94,9 @@ pub async fn action_allows(
         AnvilAction::TenantManage => {
             system_realm_relationship_allows(
                 storage,
+                persistence
+                    .mvcc()
+                    .map_err(|error| Status::internal(error.to_string()))?,
                 claims,
                 SYSTEM_STORAGE_TENANT_NAMESPACE,
                 &storage_tenant_object_id(claims.tenant_id),
@@ -104,6 +108,9 @@ pub async fn action_allows(
         AnvilAction::BucketCreate => {
             system_realm_relationship_allows(
                 storage,
+                persistence
+                    .mvcc()
+                    .map_err(|error| Status::internal(error.to_string()))?,
                 claims,
                 SYSTEM_STORAGE_TENANT_NAMESPACE,
                 &storage_tenant_object_id(claims.tenant_id),
@@ -115,6 +122,9 @@ pub async fn action_allows(
         AnvilAction::BucketList | AnvilAction::BucketWatch => {
             system_realm_relationship_allows(
                 storage,
+                persistence
+                    .mvcc()
+                    .map_err(|error| Status::internal(error.to_string()))?,
                 claims,
                 SYSTEM_STORAGE_TENANT_NAMESPACE,
                 &storage_tenant_object_id(claims.tenant_id),
@@ -132,6 +142,9 @@ pub async fn action_allows(
             };
             system_realm_relationship_allows(
                 storage,
+                persistence
+                    .mvcc()
+                    .map_err(|error| Status::internal(error.to_string()))?,
                 claims,
                 SYSTEM_BUCKET_NAMESPACE,
                 &bucket_object_id(&bucket),
@@ -146,6 +159,9 @@ pub async fn action_allows(
             let bucket = read_claims_bucket(persistence, claims, bucket_name).await?;
             system_realm_relationship_allows(
                 storage,
+                persistence
+                    .mvcc()
+                    .map_err(|error| Status::internal(error.to_string()))?,
                 claims,
                 SYSTEM_BUCKET_NAMESPACE,
                 &bucket_object_id(&bucket),
@@ -166,6 +182,9 @@ pub async fn action_allows(
             if let Some(key) = key {
                 return Ok(system_realm_relationship_allows(
                     storage,
+                    persistence
+                        .mvcc()
+                        .map_err(|error| Status::internal(error.to_string()))?,
                     claims,
                     SYSTEM_OBJECT_NAMESPACE,
                     &object_object_id(&bucket, key),
@@ -183,6 +202,9 @@ pub async fn action_allows(
                         };
                         system_realm_relationship_allows(
                             storage,
+                            persistence
+                                .mvcc()
+                                .map_err(|error| Status::internal(error.to_string()))?,
                             claims,
                             SYSTEM_BUCKET_NAMESPACE,
                             &bucket_object_id(&bucket),
@@ -201,6 +223,9 @@ pub async fn action_allows(
             };
             system_realm_relationship_allows(
                 storage,
+                persistence
+                    .mvcc()
+                    .map_err(|error| Status::internal(error.to_string()))?,
                 claims,
                 SYSTEM_BUCKET_NAMESPACE,
                 &bucket_object_id(&bucket),
@@ -215,6 +240,9 @@ pub async fn action_allows(
             let bucket = read_claims_bucket(persistence, claims, bucket_name).await?;
             system_realm_relationship_allows(
                 storage,
+                persistence
+                    .mvcc()
+                    .map_err(|error| Status::internal(error.to_string()))?,
                 claims,
                 SYSTEM_BUCKET_NAMESPACE,
                 &bucket_object_id(&bucket),
@@ -237,6 +265,9 @@ pub async fn action_allows(
             };
             system_realm_relationship_allows(
                 storage,
+                persistence
+                    .mvcc()
+                    .map_err(|error| Status::internal(error.to_string()))?,
                 claims,
                 SYSTEM_STREAM_NAMESPACE,
                 &stream_object_id(&bucket, stream_key),
@@ -263,6 +294,9 @@ pub async fn action_allows(
             if let Some(index_name) = index_name {
                 return Ok(system_realm_relationship_allows(
                     storage,
+                    persistence
+                        .mvcc()
+                        .map_err(|error| Status::internal(error.to_string()))?,
                     claims,
                     SYSTEM_INDEX_NAMESPACE,
                     &index_object_id(&bucket, index_name),
@@ -281,6 +315,9 @@ pub async fn action_allows(
                         };
                         system_realm_relationship_allows(
                             storage,
+                            persistence
+                                .mvcc()
+                                .map_err(|error| Status::internal(error.to_string()))?,
                             claims,
                             SYSTEM_BUCKET_NAMESPACE,
                             &bucket_object_id(&bucket),
@@ -300,6 +337,9 @@ pub async fn action_allows(
             };
             system_realm_relationship_allows(
                 storage,
+                persistence
+                    .mvcc()
+                    .map_err(|error| Status::internal(error.to_string()))?,
                 claims,
                 SYSTEM_BUCKET_NAMESPACE,
                 &bucket_object_id(&bucket),
@@ -318,6 +358,9 @@ pub async fn action_allows(
             if let Some(relation) = authz_runtime_relation_for_action(action.clone(), resource) {
                 system_realm_relationship_allows(
                     storage,
+                    persistence
+                        .mvcc()
+                        .map_err(|error| Status::internal(error.to_string()))?,
                     claims,
                     SYSTEM_AUTHZ_REALM_NAMESPACE,
                     &authz_realm_object_id(claims.tenant_id, resource),
@@ -333,6 +376,9 @@ pub async fn action_allows(
                 };
                 system_realm_relationship_allows(
                     storage,
+                    persistence
+                        .mvcc()
+                        .map_err(|error| Status::internal(error.to_string()))?,
                     claims,
                     SYSTEM_STORAGE_TENANT_NAMESPACE,
                     &storage_tenant_object_id(claims.tenant_id),
@@ -352,6 +398,9 @@ pub async fn action_allows(
             };
             system_realm_relationship_allows(
                 storage,
+                persistence
+                    .mvcc()
+                    .map_err(|error| Status::internal(error.to_string()))?,
                 claims,
                 SYSTEM_STORAGE_TENANT_NAMESPACE,
                 &storage_tenant_object_id(claims.tenant_id),
@@ -371,6 +420,9 @@ pub async fn action_allows(
         | AnvilAction::GitSourceWrite => {
             system_realm_relationship_allows(
                 storage,
+                persistence
+                    .mvcc()
+                    .map_err(|error| Status::internal(error.to_string()))?,
                 claims,
                 SYSTEM_STORAGE_TENANT_NAMESPACE,
                 &storage_tenant_object_id(claims.tenant_id),
@@ -387,6 +439,9 @@ pub async fn action_allows(
         | AnvilAction::GitSourceWatch => {
             system_realm_relationship_allows(
                 storage,
+                persistence
+                    .mvcc()
+                    .map_err(|error| Status::internal(error.to_string()))?,
                 claims,
                 SYSTEM_STORAGE_TENANT_NAMESPACE,
                 &storage_tenant_object_id(claims.tenant_id),
@@ -399,6 +454,9 @@ pub async fn action_allows(
         AnvilAction::PersonalDbCreate => {
             system_realm_relationship_allows(
                 storage,
+                persistence
+                    .mvcc()
+                    .map_err(|error| Status::internal(error.to_string()))?,
                 claims,
                 SYSTEM_STORAGE_TENANT_NAMESPACE,
                 &storage_tenant_object_id(claims.tenant_id),
@@ -410,6 +468,9 @@ pub async fn action_allows(
         AnvilAction::PersonalDbRead | AnvilAction::PersonalDbWatch => {
             system_realm_relationship_allows(
                 storage,
+                persistence
+                    .mvcc()
+                    .map_err(|error| Status::internal(error.to_string()))?,
                 claims,
                 SYSTEM_PERSONALDB_GROUP_NAMESPACE,
                 &personaldb_group_object_id(claims.tenant_id, resource),
@@ -428,6 +489,9 @@ pub async fn action_allows(
         | AnvilAction::PersonalDbDelete => {
             system_realm_relationship_allows(
                 storage,
+                persistence
+                    .mvcc()
+                    .map_err(|error| Status::internal(error.to_string()))?,
                 claims,
                 SYSTEM_PERSONALDB_GROUP_NAMESPACE,
                 &personaldb_group_object_id(claims.tenant_id, resource),
@@ -441,6 +505,9 @@ pub async fn action_allows(
         | AnvilAction::RegistryVersionWrite
         | AnvilAction::RegistryRefWrite => Ok(system_realm_relationship_allows(
             storage,
+            persistence
+                .mvcc()
+                .map_err(|error| Status::internal(error.to_string()))?,
             claims,
             SYSTEM_REGISTRY_NAMESPACE,
             &registry_namespace_object_id(claims.tenant_id, registry_namespace_resource(resource)),
@@ -451,6 +518,9 @@ pub async fn action_allows(
         .map_err(|error| Status::internal(error.to_string()))?
             || system_realm_relationship_allows(
                 storage,
+                persistence
+                    .mvcc()
+                    .map_err(|error| Status::internal(error.to_string()))?,
                 claims,
                 SYSTEM_STORAGE_TENANT_NAMESPACE,
                 &storage_tenant_object_id(claims.tenant_id),
@@ -462,6 +532,9 @@ pub async fn action_allows(
         AnvilAction::RegistryRead | AnvilAction::RegistryList => {
             Ok(system_realm_relationship_allows(
                 storage,
+                persistence
+                    .mvcc()
+                    .map_err(|error| Status::internal(error.to_string()))?,
                 claims,
                 SYSTEM_REGISTRY_NAMESPACE,
                 &registry_namespace_object_id(
@@ -475,6 +548,9 @@ pub async fn action_allows(
             .map_err(|error| Status::internal(error.to_string()))?
                 || system_realm_relationship_allows(
                     storage,
+                    persistence
+                        .mvcc()
+                        .map_err(|error| Status::internal(error.to_string()))?,
                     claims,
                     SYSTEM_STORAGE_TENANT_NAMESPACE,
                     &storage_tenant_object_id(claims.tenant_id),
@@ -488,6 +564,9 @@ pub async fn action_allows(
         AnvilAction::MeshManage | AnvilAction::InternalProxyObject => {
             crate::system_realm::check_admin_relation(
                 storage,
+                persistence
+                    .mvcc()
+                    .map_err(|error| Status::internal(error.to_string()))?,
                 "default",
                 claims,
                 crate::system_realm::SystemAdminRelation::ManageSystem,
@@ -497,6 +576,9 @@ pub async fn action_allows(
         AnvilAction::MeshRead => {
             crate::system_realm::check_admin_relation(
                 storage,
+                persistence
+                    .mvcc()
+                    .map_err(|error| Status::internal(error.to_string()))?,
                 "default",
                 claims,
                 crate::system_realm::SystemAdminRelation::ViewSystem,
@@ -511,6 +593,9 @@ pub async fn action_allows(
             };
             system_realm_relationship_allows(
                 storage,
+                persistence
+                    .mvcc()
+                    .map_err(|error| Status::internal(error.to_string()))?,
                 claims,
                 SYSTEM_STORAGE_TENANT_NAMESPACE,
                 &storage_tenant_object_id(claims.tenant_id),
@@ -530,6 +615,9 @@ pub async fn action_allows(
             };
             system_realm_relationship_allows(
                 storage,
+                persistence
+                    .mvcc()
+                    .map_err(|error| Status::internal(error.to_string()))?,
                 claims,
                 SYSTEM_STORAGE_TENANT_NAMESPACE,
                 &storage_tenant_object_id(claims.tenant_id),
@@ -1063,6 +1151,7 @@ fn authz_tuple_write_status(error: anyhow::Error) -> Status {
 
 pub async fn system_realm_relationship_allows(
     storage: &Storage,
+    mvcc: &MvccSubsystem,
     claims: &auth::Claims,
     namespace: &str,
     object_id: &str,
@@ -1074,6 +1163,7 @@ pub async fn system_realm_relationship_allows(
         Some(revision) => {
             authz_journal::resolve_permission_at_revision(
                 storage,
+                mvcc,
                 SYSTEM_STORAGE_TENANT_ID,
                 &namespace,
                 object_id,
@@ -1088,6 +1178,7 @@ pub async fn system_realm_relationship_allows(
         None => {
             authz_journal::resolve_current_permission(
                 storage,
+                mvcc,
                 SYSTEM_STORAGE_TENANT_ID,
                 &namespace,
                 object_id,
@@ -1103,12 +1194,13 @@ pub async fn system_realm_relationship_allows(
 
 pub async fn require_system_realm_permission(
     storage: &Storage,
+    mvcc: &MvccSubsystem,
     claims: &auth::Claims,
     namespace: &str,
     object_id: &str,
     relation: &str,
 ) -> Result<(), Status> {
-    if system_realm_relationship_allows(storage, claims, namespace, object_id, relation, None)
+    if system_realm_relationship_allows(storage, mvcc, claims, namespace, object_id, relation, None)
         .await
         .map_err(|error| Status::internal(error.to_string()))?
     {
@@ -1120,11 +1212,13 @@ pub async fn require_system_realm_permission(
 
 pub async fn require_storage_tenant_permission(
     storage: &Storage,
+    mvcc: &MvccSubsystem,
     claims: &auth::Claims,
     relation: &str,
 ) -> Result<(), Status> {
     require_system_realm_permission(
         storage,
+        mvcc,
         claims,
         SYSTEM_STORAGE_TENANT_NAMESPACE,
         &storage_tenant_object_id(claims.tenant_id),
@@ -1135,12 +1229,14 @@ pub async fn require_storage_tenant_permission(
 
 pub async fn require_bucket_permission(
     storage: &Storage,
+    mvcc: &MvccSubsystem,
     claims: &auth::Claims,
     bucket: &Bucket,
     relation: &str,
 ) -> Result<(), Status> {
     require_system_realm_permission(
         storage,
+        mvcc,
         claims,
         SYSTEM_BUCKET_NAMESPACE,
         &bucket_object_id(bucket),
@@ -1151,6 +1247,7 @@ pub async fn require_bucket_permission(
 
 pub async fn require_object_permission(
     storage: &Storage,
+    mvcc: &MvccSubsystem,
     claims: &auth::Claims,
     bucket: &Bucket,
     object_key: &str,
@@ -1158,6 +1255,7 @@ pub async fn require_object_permission(
 ) -> Result<(), Status> {
     if system_realm_relationship_allows(
         storage,
+        mvcc,
         claims,
         SYSTEM_OBJECT_NAMESPACE,
         &object_object_id(bucket, object_key),
@@ -1177,11 +1275,12 @@ pub async fn require_object_permission(
         "link" => "manage_links",
         other => other,
     };
-    require_bucket_permission(storage, claims, bucket, bucket_relation).await
+    require_bucket_permission(storage, mvcc, claims, bucket, bucket_relation).await
 }
 
 pub async fn require_index_permission(
     storage: &Storage,
+    mvcc: &MvccSubsystem,
     claims: &auth::Claims,
     bucket: &Bucket,
     index_name_or_id: &str,
@@ -1189,6 +1288,7 @@ pub async fn require_index_permission(
 ) -> Result<(), Status> {
     if system_realm_relationship_allows(
         storage,
+        mvcc,
         claims,
         SYSTEM_INDEX_NAMESPACE,
         &index_object_id(bucket, index_name_or_id),
@@ -1206,16 +1306,18 @@ pub async fn require_index_permission(
         "query" => "query_indexes",
         other => other,
     };
-    require_bucket_permission(storage, claims, bucket, bucket_relation).await
+    require_bucket_permission(storage, mvcc, claims, bucket, bucket_relation).await
 }
 
 pub async fn principal_has_any_system_realm_relation(
     storage: &Storage,
+    mvcc: &MvccSubsystem,
     principal_id: &str,
 ) -> Result<bool> {
-    let revision = authz_journal::latest_authz_revision(storage, SYSTEM_STORAGE_TENANT_ID).await?;
+    let revision = authz_journal::latest_authz_revision(mvcc, SYSTEM_STORAGE_TENANT_ID)?;
     let page = authz_journal::page_current_authz_tuples(
         storage,
+        mvcc,
         SYSTEM_STORAGE_TENANT_ID,
         &authz_journal::AuthzTupleFilter {
             subject_kind: Some(APP_SUBJECT_KIND.to_string()),

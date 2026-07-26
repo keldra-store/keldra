@@ -62,6 +62,7 @@ impl AuthorizedClusterControl {
 
 async fn authorize(
     storage: &Storage,
+    mvcc: &MvccSubsystem,
     claims: &auth::Claims,
     cluster_id: &str,
     permission: ClusterControlPermission,
@@ -71,6 +72,7 @@ async fn authorize(
     }
     access_control::require_system_realm_permission(
         storage,
+        mvcc,
         claims,
         SYSTEM_NAMESPACE,
         SYSTEM_OBJECT_ID,
@@ -85,19 +87,29 @@ async fn authorize(
 
 pub async fn authorize_node_control(
     storage: &Storage,
-    claims: &auth::Claims,
-    cluster_id: &str,
-) -> Result<AuthorizedClusterControl, Status> {
-    authorize(storage, claims, cluster_id, ClusterControlPermission::Nodes).await
-}
-
-pub async fn authorize_policy_control(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
     claims: &auth::Claims,
     cluster_id: &str,
 ) -> Result<AuthorizedClusterControl, Status> {
     authorize(
         storage,
+        mvcc,
+        claims,
+        cluster_id,
+        ClusterControlPermission::Nodes,
+    )
+    .await
+}
+
+pub async fn authorize_policy_control(
+    storage: &Storage,
+    mvcc: &MvccSubsystem,
+    claims: &auth::Claims,
+    cluster_id: &str,
+) -> Result<AuthorizedClusterControl, Status> {
+    authorize(
+        storage,
+        mvcc,
         claims,
         cluster_id,
         ClusterControlPermission::Policies,
@@ -107,11 +119,13 @@ pub async fn authorize_policy_control(
 
 pub async fn authorize_gc_control(
     storage: &Storage,
+    mvcc: &MvccSubsystem,
     claims: &auth::Claims,
     cluster_id: &str,
 ) -> Result<AuthorizedClusterControl, Status> {
     authorize(
         storage,
+        mvcc,
         claims,
         cluster_id,
         ClusterControlPermission::Partitions,
