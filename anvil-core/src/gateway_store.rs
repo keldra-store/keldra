@@ -1360,6 +1360,12 @@ pub async fn read_gateway_mount_record(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Ingests a security audit record produced by an external gateway or registry.
+///
+/// This is intentionally outside cluster-product MVCC: the gateway is the
+/// source of the event, and idempotent CoreStore stream ingestion is the trust
+/// boundary. Events caused by Anvil product transactions must use the strict
+/// MVCC stream outbox instead of this API.
 pub async fn append_gateway_audit_record(
     storage: &Storage,
     mut record: GatewayAuditRecord,

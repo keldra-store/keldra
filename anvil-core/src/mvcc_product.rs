@@ -277,6 +277,28 @@ impl MvccSubsystem {
         durability: DurabilityLevel,
         now_unix_ms: u64,
     ) -> Result<u64> {
+        self.autocommit_product_mutations_with_predicates_and_outbox(
+            principal,
+            idempotency_key,
+            mutations,
+            predicates,
+            Vec::new(),
+            durability,
+            now_unix_ms,
+        )
+        .await
+    }
+
+    pub async fn autocommit_product_mutations_with_predicates_and_outbox(
+        &self,
+        principal: &str,
+        idempotency_key: &str,
+        mutations: Vec<ProductMutation>,
+        predicates: Vec<(LogicalKey, crate::mvcc_transaction::PredicateKind)>,
+        outbox_events: Vec<crate::mvcc_outbox::StreamOutboxEvent>,
+        durability: DurabilityLevel,
+        now_unix_ms: u64,
+    ) -> Result<u64> {
         if mutations.is_empty() {
             bail!("MVCC autocommit requires at least one mutation");
         }
@@ -305,6 +327,13 @@ impl MvccSubsystem {
             )?;
             for (key, kind) in predicates {
                 self.stage_predicate(&handle.transaction_id, principal, key, kind, now_unix_ms)?;
+            }
+            for event in outbox_events {
+                self.open_transactions.add_stream_event(
+                    &handle.transaction_id,
+                    event,
+                    now_unix_ms,
+                )?;
             }
         }
         let outcome = self
