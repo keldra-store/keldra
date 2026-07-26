@@ -1674,7 +1674,7 @@ fn canonical_json(value: &JsonValue) -> JsonValue {
     }
 }
 
-fn extract_object_boundary_values(
+pub(crate) fn extract_object_boundary_values(
     schema: &CoreBoundarySchema,
     tenant_id: i64,
     bucket_name: &str,

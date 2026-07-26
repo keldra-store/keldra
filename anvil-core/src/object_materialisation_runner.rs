@@ -5,6 +5,11 @@ use async_trait::async_trait;
 use tokio::sync::watch;
 
 use crate::{
+    core_store::CoreBoundarySchema, local_object_store::LocalObjectManifest,
+    object_manager::extract_object_boundary_values,
+    object_shard_manifest::PhysicalObjectShardManifest,
+};
+use crate::{
     mvcc_bootstrap::MvccSubsystem,
     mvcc_product::ProductMutation,
     mvcc_transaction::{CertificationResult, DurabilityLevel, ReadConsistency},
@@ -153,5 +158,118 @@ impl MvccMaterialisationPublisher {
             "materialisation result transaction conflicted"
         );
         Ok(())
+    }
+}
+
+pub struct MvccObjectMaterialisationExecutor {
+    mvcc: Arc<MvccSubsystem>,
+    publisher: MvccMaterialisationPublisher,
+}
+
+impl MvccObjectMaterialisationExecutor {
+    pub fn new(mvcc: Arc<MvccSubsystem>) -> Self {
+        Self {
+            publisher: MvccMaterialisationPublisher::new(mvcc.clone()),
+            mvcc,
+        }
+    }
+
+    async fn payload(&self, job: &ObjectMaterialisationJob) -> Result<Vec<u8>> {
+        let schema = job
+            .representation
+            .get("schema")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let manifest = job
+            .representation
+            .get("manifest")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("materialisation representation has no manifest"))?;
+        match schema {
+            "anvil.mvcc.local_object_manifest.v1" => {
+                let manifest: LocalObjectManifest = serde_json::from_value(manifest)?;
+                anyhow::ensure!(
+                    manifest.cluster_id == job.cluster_id,
+                    "local representation belongs to another cluster"
+                );
+                self.mvcc
+                    .local_objects
+                    .read_range(&manifest, 0, manifest.object_length)
+            }
+            "anvil.mvcc.object_shard_manifest.v1" => {
+                let manifest: PhysicalObjectShardManifest = serde_json::from_value(manifest)?;
+                anyhow::ensure!(
+                    manifest.cluster_id == job.cluster_id,
+                    "shard representation belongs to another cluster"
+                );
+                let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+                manifest
+                    .read_range_chunks(&self.mvcc.replication_client, 0, manifest.object_length, {
+                        let bytes = bytes.clone();
+                        move |chunk| {
+                            let bytes = bytes.clone();
+                            async move {
+                                bytes.lock().unwrap().extend_from_slice(&chunk);
+                                Ok(())
+                            }
+                        }
+                    })
+                    .await?;
+                Ok(Arc::try_unwrap(bytes).unwrap().into_inner().unwrap())
+            }
+            _ => anyhow::bail!("unsupported MVCC materialisation representation"),
+        }
+    }
+}
+
+#[async_trait]
+impl ObjectMaterialisationExecutor for MvccObjectMaterialisationExecutor {
+    async fn execute(&self, job_id: &str, job: &ObjectMaterialisationJob) -> Result<()> {
+        anyhow::ensure!(
+            job.cluster_id == self.mvcc.cluster_id(),
+            "materialisation job belongs to another cluster"
+        );
+        anyhow::ensure!(
+            job.job_id()? == job_id,
+            "materialisation job identity mismatch"
+        );
+        let payload = if job.requested_operations.extract_boundaries {
+            self.payload(job).await?
+        } else {
+            Vec::new()
+        };
+        let boundaries = match &job.boundary_schema {
+            Some(schema) if job.requested_operations.extract_boundaries => {
+                let schema: CoreBoundarySchema = serde_json::from_value(schema.clone())?;
+                extract_object_boundary_values(
+                    &schema,
+                    job.tenant_id,
+                    &job.bucket_name,
+                    &job.object_key,
+                    job.content_type.as_deref(),
+                    Some(&job.user_metadata),
+                    job.payload_length,
+                    &payload,
+                )?
+            }
+            _ => Vec::new(),
+        };
+        self.publisher
+            .publish(ObjectMaterialisationResult {
+                schema: ObjectMaterialisationResult::SCHEMA.into(),
+                cluster_id: job.cluster_id.clone(),
+                target_logical_identity: job.target_logical_identity.clone(),
+                job_id: job_id.to_string(),
+                state: ObjectMaterialisationState::Complete,
+                boundary_schema_hash: job.boundary_schema_hash.clone(),
+                derived_boundaries: serde_json::to_value(boundaries)?,
+                index_marker: serde_json::json!({
+                    "requested": job.requested_operations.maintain_indexes,
+                    "policy_snapshot": job.index_policy_snapshot,
+                    "authz_revision": job.authz_revision,
+                }),
+                updated_at_unix_ms: now_unix_ms(),
+            })
+            .await
     }
 }

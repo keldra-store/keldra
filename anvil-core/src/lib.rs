@@ -285,6 +285,8 @@ impl AppState {
         object_manager
             .install_mvcc(mvcc.clone())
             .context("install MVCC object runtime")?;
+        mvcc.start_object_materialisation()
+            .context("start object materialisation runner")?;
 
         Ok(Self {
             persistence,

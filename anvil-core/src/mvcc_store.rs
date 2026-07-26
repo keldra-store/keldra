@@ -370,6 +370,25 @@ impl MvccStore {
         })
     }
 
+    pub fn has_incomplete_object_materialisations(&self) -> Result<bool> {
+        let cf = self.cf(CF_MATERIALISATION)?;
+        let prefix = self.key(b"object-job/");
+        for row in self
+            .db
+            .iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward))
+        {
+            let (key, value) = row?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let record: ObjectMaterialisationRecord = serde_json::from_slice(&value)?;
+            if record.state != ObjectMaterialisationState::Complete {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn transition_object_materialisation(
         &self,
         job_id: &str,

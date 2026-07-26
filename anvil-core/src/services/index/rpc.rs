@@ -504,8 +504,19 @@ impl IndexService for AppState {
                 .into_inner()
             }
         };
-        if spec.consistency.allow_stale_index == Some(false) && !response.is_caught_up {
-            return Err(Status::failed_precondition("IndexLagging"));
+        if spec.consistency.allow_stale_index == Some(false) {
+            if self
+                .mvcc
+                .runtime
+                .local_store()
+                .has_incomplete_object_materialisations()
+                .map_err(|error| Status::internal(error.to_string()))?
+            {
+                return Err(Status::failed_precondition("ObjectMaterialisationPending"));
+            }
+            if !response.is_caught_up {
+                return Err(Status::failed_precondition("IndexLagging"));
+            }
         }
 
         Ok(Response::new(QuerySpecResponse {

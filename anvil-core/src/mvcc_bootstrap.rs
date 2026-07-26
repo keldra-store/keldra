@@ -171,6 +171,7 @@ pub struct MvccSubsystem {
     pub apply_worker_state: Arc<tokio::sync::Mutex<ApplyWorkerState>>,
     apply_shutdown: tokio::sync::watch::Sender<bool>,
     apply_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    object_materialisation_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl fmt::Debug for MvccSubsystem {
@@ -371,13 +372,47 @@ impl MvccSubsystem {
             apply_worker_state,
             apply_shutdown,
             apply_task: Mutex::new(Some(apply_task)),
+            object_materialisation_task: Mutex::new(None),
         })
+    }
+
+    pub fn start_object_materialisation(self: &Arc<Self>) -> Result<()> {
+        let executor = Arc::new(
+            crate::object_materialisation_runner::MvccObjectMaterialisationExecutor::new(
+                self.clone(),
+            ),
+        );
+        let worker_id = format!("object-materialisation/{}", self.peers[0].node_id);
+        let runner = crate::object_materialisation_runner::ObjectMaterialisationRunner::new(
+            self.runtime.local_store().clone(),
+            executor,
+            worker_id,
+        )?;
+        let task = tokio::spawn(runner.run(self.apply_shutdown.subscribe()));
+        let mut slot = self
+            .object_materialisation_task
+            .lock()
+            .map_err(|_| anyhow::anyhow!("object materialisation task lock poisoned"))?;
+        if slot.is_some() {
+            task.abort();
+            bail!("object materialisation runner is already started");
+        }
+        *slot = Some(task);
+        Ok(())
     }
 
     pub async fn shutdown(&self) {
         let _ = self.apply_shutdown.send(true);
         let task = self.apply_task.lock().ok().and_then(|mut task| task.take());
         if let Some(task) = task {
+            let _ = task.await;
+        }
+        let object_task = self
+            .object_materialisation_task
+            .lock()
+            .ok()
+            .and_then(|mut task| task.take());
+        if let Some(task) = object_task {
             let _ = task.await;
         }
         let _ = self.consensus.shutdown().await;
