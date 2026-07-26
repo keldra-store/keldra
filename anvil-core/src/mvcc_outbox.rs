@@ -210,6 +210,13 @@ impl MvccOutboxRunner {
             return Ok(false);
         };
         let event = StreamOutboxEvent::decode(&record.payload)?;
+        let guard = self
+            .assignment_guard(event.partition_id)?
+            .context("outbox assignment changed after claim")?;
+        let lease_owner = guard.lease_owner(&self.worker_id);
+        let record = self
+            .store
+            .rebind_outbox_lease(&record, &self.worker_id, &lease_owner)?;
         let dispatch = tokio::time::timeout(
             Duration::from_millis(self.lease_ms.saturating_sub(1_000)),
             self.consumer.dispatch(&record, event.clone()),
@@ -217,12 +224,20 @@ impl MvccOutboxRunner {
         .await;
         let receipt = match dispatch {
             Ok(Ok(receipt)) => receipt,
-            Ok(Err(error)) => return self.retry(&record, now, error),
-            Err(_) => return self.retry(&record, now, anyhow!("outbox dispatch lease timeout")),
+            Ok(Err(error)) => return self.retry(&record, &lease_owner, now, error),
+            Err(_) => {
+                return self.retry(
+                    &record,
+                    &lease_owner,
+                    now,
+                    anyhow!("outbox dispatch lease timeout"),
+                );
+            }
         };
         if receipt.stream_id != event.stream_id {
             return self.retry(
                 &record,
+                &lease_owner,
                 now,
                 anyhow!("downstream durable ACK named another stream"),
             );
@@ -231,32 +246,63 @@ impl MvccOutboxRunner {
         // Leadership and assignment may change while CoreStore durably appends.
         // In that case leave the lease to expire. The new owner will replay the
         // deterministic downstream idempotency key and receive the same ACK.
-        if !self.consensus.is_leader() || !self.still_assigned(event.partition_id)? {
+        if !self.consensus.is_leader() || !self.still_assigned(&guard)? {
             return Ok(false);
         }
         let completed_at = unix_ms();
         self.store
-            .complete_outbox_at(&record, &self.worker_id, completed_at)?;
+            .complete_outbox_at(&record, &lease_owner, completed_at)?;
         self.publish_metrics(completed_at)?;
         Ok(true)
     }
 
-    fn still_assigned(&self, partition_id: u64) -> Result<bool> {
-        Ok(self
-            .consensus
-            .applied_control_snapshot()?
+    fn assignment_guard(
+        &self,
+        partition_id: u64,
+    ) -> Result<Option<crate::mvcc_worker_authority::AssignmentGuard>> {
+        let snapshot = self.consensus.applied_control_snapshot()?;
+        Ok(snapshot
             .partitions
             .iter()
-            .find(|(id, _)| *id == partition_id)
-            .is_some_and(|(_, assignment)| assignment.owner == self.local_node))
+            .find(|(id, assignment)| *id == partition_id && assignment.owner == self.local_node)
+            .map(
+                |(_, assignment)| crate::mvcc_worker_authority::AssignmentGuard {
+                    partition_id,
+                    assignment_epoch: assignment.epoch,
+                    topology_epoch: snapshot.topology_epoch,
+                    owner: NodeIncarnation {
+                        node_id: self.local_node.node_id.0.to_string(),
+                        incarnation: self.local_node.incarnation,
+                    },
+                },
+            ))
     }
 
-    fn retry(&self, record: &OutboxRecord, now: u64, error: anyhow::Error) -> Result<bool> {
+    fn still_assigned(
+        &self,
+        guard: &crate::mvcc_worker_authority::AssignmentGuard,
+    ) -> Result<bool> {
+        let snapshot = self.consensus.applied_control_snapshot()?;
+        Ok(snapshot.topology_epoch == guard.topology_epoch
+            && snapshot.partitions.iter().any(|(id, assignment)| {
+                *id == guard.partition_id
+                    && assignment.epoch == guard.assignment_epoch
+                    && assignment.owner == self.local_node
+            }))
+    }
+
+    fn retry(
+        &self,
+        record: &OutboxRecord,
+        lease_owner: &str,
+        now: u64,
+        error: anyhow::Error,
+    ) -> Result<bool> {
         let exponent = record.attempts.saturating_sub(1).min(10);
         let delay_ms = 100u64.saturating_mul(1u64 << exponent);
         self.store.retry_outbox(
             record,
-            &self.worker_id,
+            lease_owner,
             now.saturating_add(delay_ms),
             &error.to_string(),
         )?;

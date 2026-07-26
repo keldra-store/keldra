@@ -1,9 +1,10 @@
 use std::{sync::Arc, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use tokio::sync::watch;
 
+use crate::object_materialisation::ObjectMaterialisationJob;
 use crate::{
     core_store::CoreBoundarySchema,
     local_object_store::LocalObjectManifest,
@@ -17,15 +18,19 @@ use crate::{
     mvcc_transaction::{CertificationResult, DurabilityLevel, ReadConsistency},
     object_materialisation::{ObjectMaterialisationResult, ObjectMaterialisationState},
 };
-use crate::{mvcc_store::LocalMvccStore, object_materialisation::ObjectMaterialisationJob};
 
 #[async_trait]
 pub trait ObjectMaterialisationExecutor: Send + Sync + 'static {
-    async fn execute(&self, job_id: &str, job: &ObjectMaterialisationJob) -> Result<()>;
+    async fn execute(
+        &self,
+        job_id: &str,
+        job: &ObjectMaterialisationJob,
+        assignment: &crate::mvcc_worker_authority::AssignmentGuard,
+    ) -> Result<()>;
 }
 
 pub struct ObjectMaterialisationRunner<E> {
-    store: LocalMvccStore,
+    mvcc: Arc<MvccSubsystem>,
     executor: Arc<E>,
     worker_id: String,
     lease_ms: u64,
@@ -33,10 +38,10 @@ pub struct ObjectMaterialisationRunner<E> {
 }
 
 impl<E: ObjectMaterialisationExecutor> ObjectMaterialisationRunner<E> {
-    pub fn new(store: LocalMvccStore, executor: Arc<E>, worker_id: String) -> Result<Self> {
+    pub fn new(mvcc: Arc<MvccSubsystem>, executor: Arc<E>, worker_id: String) -> Result<Self> {
         anyhow::ensure!(!worker_id.trim().is_empty(), "worker ID is required");
         Ok(Self {
-            store,
+            mvcc,
             executor,
             worker_id,
             lease_ms: 30_000,
@@ -64,16 +69,43 @@ impl<E: ObjectMaterialisationExecutor> ObjectMaterialisationRunner<E> {
     }
 
     pub async fn run_once(&self, now_unix_ms: u64) -> Result<bool> {
-        let Some((job_id, record)) =
-            self.store
-                .claim_object_materialisation(&self.worker_id, now_unix_ms, self.lease_ms)?
+        let Some((job_id, record)) = self
+            .mvcc
+            .runtime
+            .local_store()
+            .claim_object_materialisation_authorized(
+                &self.worker_id,
+                now_unix_ms,
+                self.lease_ms,
+                |record| {
+                    self.mvcc
+                        .claim_assignment(
+                            "object-materialisation",
+                            &record.job.target_logical_identity,
+                        )
+                        .ok()
+                        .flatten()
+                        .map(|guard| guard.lease_owner(&self.worker_id))
+                },
+            )?
         else {
             return Ok(false);
         };
+        let guard = self
+            .mvcc
+            .claim_assignment(
+                "object-materialisation",
+                &record.job.target_logical_identity,
+            )?
+            .context("materialisation assignment changed after claim")?;
+        let lease_owner = guard.lease_owner(&self.worker_id);
+        if record.lease_owner.as_deref() != Some(&lease_owner) {
+            anyhow::bail!("materialisation lease is not bound to current assignment");
+        }
         let execution_timeout = Duration::from_millis(self.lease_ms.saturating_sub(1_000));
         let execution = tokio::time::timeout(
             execution_timeout,
-            self.executor.execute(&job_id, &record.job),
+            self.executor.execute(&job_id, &record.job, &guard),
         )
         .await
         .map_err(|_| {
@@ -84,18 +116,25 @@ impl<E: ObjectMaterialisationExecutor> ObjectMaterialisationRunner<E> {
         })
         .and_then(std::convert::identity);
         match execution {
-            Ok(()) => self
-                .store
-                .complete_object_materialisation(&job_id, &self.worker_id)?,
+            Ok(()) => {
+                self.mvcc.validate_assignment(&guard)?;
+                self.mvcc
+                    .runtime
+                    .local_store()
+                    .complete_object_materialisation(&job_id, &lease_owner)?
+            }
             Err(error) => {
                 let shift = record.attempts.saturating_sub(1).min(10);
                 let delay = 250_u64.saturating_mul(1_u64 << shift);
-                self.store.retry_object_materialisation(
-                    &job_id,
-                    &self.worker_id,
-                    now_unix_ms.saturating_add(delay),
-                    &error.to_string(),
-                )?;
+                self.mvcc
+                    .runtime
+                    .local_store()
+                    .retry_object_materialisation(
+                        &job_id,
+                        &lease_owner,
+                        now_unix_ms.saturating_add(delay),
+                        &error.to_string(),
+                    )?;
                 return Err(error);
             }
         }
@@ -258,7 +297,12 @@ impl MvccObjectMaterialisationExecutor {
 
 #[async_trait]
 impl ObjectMaterialisationExecutor for MvccObjectMaterialisationExecutor {
-    async fn execute(&self, job_id: &str, job: &ObjectMaterialisationJob) -> Result<()> {
+    async fn execute(
+        &self,
+        job_id: &str,
+        job: &ObjectMaterialisationJob,
+        assignment: &crate::mvcc_worker_authority::AssignmentGuard,
+    ) -> Result<()> {
         anyhow::ensure!(
             job.cluster_id == self.mvcc.cluster_id(),
             "materialisation job belongs to another cluster"
@@ -313,6 +357,7 @@ impl ObjectMaterialisationExecutor for MvccObjectMaterialisationExecutor {
                 is_public_read: false,
             };
             for frozen in &job.frozen_index_definitions {
+                self.mvcc.validate_assignment(assignment)?;
                 tracing::debug!(
                     job_id,
                     index_id = frozen.id,
@@ -351,7 +396,7 @@ impl ObjectMaterialisationExecutor for MvccObjectMaterialisationExecutor {
                             &index,
                             self.mvcc.materialisation_signing_key.as_ref(),
                             u128::from(job.originating_snapshot_version),
-                            &self.mvcc.peers[0].node_id,
+                            &self.mvcc.local_node.node_id,
                             authority,
                             source,
                         )
@@ -364,7 +409,7 @@ impl ObjectMaterialisationExecutor for MvccObjectMaterialisationExecutor {
                             &index,
                             self.mvcc.materialisation_signing_key.as_ref(),
                             u128::from(job.originating_snapshot_version),
-                            &self.mvcc.peers[0].node_id,
+                            &self.mvcc.local_node.node_id,
                             authority,
                             source,
                         )
@@ -377,7 +422,7 @@ impl ObjectMaterialisationExecutor for MvccObjectMaterialisationExecutor {
                             &index,
                             self.mvcc.materialisation_signing_key.as_ref(),
                             u128::from(job.originating_snapshot_version),
-                            &self.mvcc.peers[0].node_id,
+                            &self.mvcc.local_node.node_id,
                             &self.mvcc.materialisation_embedding_providers,
                             authority,
                             source,
@@ -397,6 +442,7 @@ impl ObjectMaterialisationExecutor for MvccObjectMaterialisationExecutor {
                 }));
             }
         }
+        self.mvcc.validate_assignment(assignment)?;
         self.publisher
             // Publishing is the final transactionally visible state transition.
             .publish(ObjectMaterialisationResult {

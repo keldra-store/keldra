@@ -100,6 +100,7 @@ pub mod mvcc_store;
 #[cfg(test)]
 mod mvcc_three_node_fault_tests;
 pub mod mvcc_transaction;
+pub mod mvcc_worker_authority;
 pub mod native_idempotency;
 pub mod node_identity;
 pub mod node_signing;

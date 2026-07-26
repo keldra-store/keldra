@@ -415,6 +415,36 @@ impl MvccStore {
         Ok(())
     }
 
+    pub fn rebind_outbox_lease(
+        &self,
+        record: &OutboxRecord,
+        current_owner: &str,
+        assignment_owner: &str,
+    ) -> Result<OutboxRecord> {
+        let _transition = self.outbox_transition.lock().unwrap();
+        let cf = self.cf(CF_OUTBOX)?;
+        let key = self.key(&outbox_event_key(record.commit_version, record.ordinal));
+        let bytes = self
+            .db
+            .get_cf(cf, &key)?
+            .context("outbox event not found")?;
+        let mut current: OutboxRecord = serde_json::from_slice(&bytes)?;
+        if current.event_id != record.event_id
+            || current.state != OutboxState::Running
+            || current.lease_owner.as_deref() != Some(current_owner)
+        {
+            bail!("outbox lease changed before assignment binding");
+        }
+        current.lease_owner = Some(assignment_owner.to_string());
+        self.db.put_cf_opt(
+            cf,
+            key,
+            serde_json::to_vec(&current)?,
+            &durable_write_options(),
+        )?;
+        Ok(current)
+    }
+
     pub fn outbox_backlog(&self, now_unix_ms: u64) -> Result<(u64, u64, u64)> {
         let records = self.outbox_records_after(0, usize::MAX)?;
         let mut count = 0u64;
@@ -596,6 +626,16 @@ impl MvccStore {
         now_unix_ms: u64,
         lease_ms: u64,
     ) -> Result<Option<(String, ObjectMaterialisationRecord)>> {
+        self.claim_object_materialisation_where(worker_id, now_unix_ms, lease_ms, |_| true)
+    }
+
+    pub fn claim_object_materialisation_where(
+        &self,
+        worker_id: &str,
+        now_unix_ms: u64,
+        lease_ms: u64,
+        eligible: impl Fn(&ObjectMaterialisationRecord) -> bool,
+    ) -> Result<Option<(String, ObjectMaterialisationRecord)>> {
         if worker_id.trim().is_empty() || lease_ms == 0 {
             bail!("materialisation worker and lease must be non-empty");
         }
@@ -612,6 +652,9 @@ impl MvccStore {
             }
             let mut record: ObjectMaterialisationRecord = serde_json::from_slice(&value)?;
             if !record.claimable(now_unix_ms) {
+                continue;
+            }
+            if !eligible(&record) {
                 continue;
             }
             record.state = ObjectMaterialisationState::Running;
@@ -635,6 +678,34 @@ impl MvccStore {
             return Ok(Some((id, record)));
         }
         Ok(None)
+    }
+
+    pub fn claim_object_materialisation_authorized(
+        &self,
+        worker_prefix: &str,
+        now_unix_ms: u64,
+        lease_ms: u64,
+        authority: impl Fn(&ObjectMaterialisationRecord) -> Option<String>,
+    ) -> Result<Option<(String, ObjectMaterialisationRecord)>> {
+        self.claim_object_materialisation_where(worker_prefix, now_unix_ms, lease_ms, |record| {
+            authority(record).is_some()
+        })
+        .and_then(|claimed| {
+            let Some((job_id, mut record)) = claimed else {
+                return Ok(None);
+            };
+            let owner =
+                authority(&record).context("materialisation assignment changed at claim")?;
+            // Rebind the just-acquired local lease to the exact assignment
+            // generation. The transition lock in the nested claim has been
+            // released, so use the normal fenced transition.
+            self.transition_object_materialisation(&job_id, worker_prefix, |current| {
+                current.lease_owner = Some(owner.clone());
+                Ok(())
+            })?;
+            record.lease_owner = Some(owner);
+            Ok(Some((job_id, record)))
+        })
     }
 
     pub fn retry_object_materialisation(
@@ -670,6 +741,16 @@ impl MvccStore {
         now_unix_ms: u64,
         lease_ms: u64,
     ) -> Result<Option<(String, ShardRepairRecord)>> {
+        self.claim_shard_repair_where(worker_id, now_unix_ms, lease_ms, |_| true)
+    }
+
+    pub fn claim_shard_repair_where(
+        &self,
+        worker_id: &str,
+        now_unix_ms: u64,
+        lease_ms: u64,
+        eligible: impl Fn(&ShardRepairRecord) -> bool,
+    ) -> Result<Option<(String, ShardRepairRecord)>> {
         if worker_id.trim().is_empty() || lease_ms == 0 {
             bail!("shard repair worker and lease must be non-empty");
         }
@@ -686,6 +767,9 @@ impl MvccStore {
             }
             let mut record: ShardRepairRecord = serde_json::from_slice(&value)?;
             if !record.claimable(now_unix_ms) {
+                continue;
+            }
+            if !eligible(&record) {
                 continue;
             }
             record.state = ShardRepairState::Running;
@@ -709,6 +793,30 @@ impl MvccStore {
             return Ok(Some((id, record)));
         }
         Ok(None)
+    }
+
+    pub fn claim_shard_repair_authorized(
+        &self,
+        worker_prefix: &str,
+        now_unix_ms: u64,
+        lease_ms: u64,
+        authority: impl Fn(&ShardRepairRecord) -> Option<String>,
+    ) -> Result<Option<(String, ShardRepairRecord)>> {
+        self.claim_shard_repair_where(worker_prefix, now_unix_ms, lease_ms, |record| {
+            authority(record).is_some()
+        })
+        .and_then(|claimed| {
+            let Some((job_id, mut record)) = claimed else {
+                return Ok(None);
+            };
+            let owner = authority(&record).context("repair assignment changed at claim")?;
+            self.transition_shard_repair(&job_id, worker_prefix, |current| {
+                current.lease_owner = Some(owner.clone());
+                Ok(())
+            })?;
+            record.lease_owner = Some(owner);
+            Ok(Some((job_id, record)))
+        })
     }
 
     pub fn retry_shard_repair(

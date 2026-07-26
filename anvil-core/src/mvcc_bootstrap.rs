@@ -589,7 +589,7 @@ impl MvccSubsystem {
         );
         let worker_id = format!("object-materialisation/{}", self.peers[0].node_id);
         let runner = crate::object_materialisation_runner::ObjectMaterialisationRunner::new(
-            self.runtime.local_store().clone(),
+            self.clone(),
             executor,
             worker_id,
         )?;

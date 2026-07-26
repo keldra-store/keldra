@@ -509,6 +509,16 @@ impl ShardRebalanceReconciler {
             serde_json::to_vec(&checkpoint)?,
             now,
         )?;
+        if !self.mvcc.consensus.is_leader()
+            || self
+                .mvcc
+                .consensus
+                .applied_control_snapshot()?
+                .topology_epoch
+                != control_epoch
+        {
+            bail!("rebalance leadership or compact-Raft topology changed before commit");
+        }
         let outcome = self
             .mvcc
             .open_transactions
@@ -611,10 +621,24 @@ impl ShardRepairRunner {
         self.mvcc.consensus.linearized_read_barrier().await?;
         let store = self.mvcc.runtime.local_store();
         let Some((job_id, record)) =
-            store.claim_shard_repair(&self.worker_id, now, self.lease_ms)?
+            store.claim_shard_repair_authorized(&self.worker_id, now, self.lease_ms, |record| {
+                self.mvcc
+                    .claim_assignment("shard-repair", &record.job.target_logical_identity)
+                    .ok()
+                    .flatten()
+                    .map(|guard| guard.lease_owner(&self.worker_id))
+            })?
         else {
             return Ok(false);
         };
+        let guard = self
+            .mvcc
+            .claim_assignment("shard-repair", &record.job.target_logical_identity)?
+            .context("shard repair assignment changed after claim")?;
+        let lease_owner = guard.lease_owner(&self.worker_id);
+        if record.lease_owner.as_deref() != Some(&lease_owner) {
+            bail!("shard repair lease is not bound to current assignment");
+        }
         let started_at = std::time::Instant::now();
         crate::perf::record_repair_age(
             maintenance_label(record.job.kind),
@@ -628,15 +652,16 @@ impl ShardRepairRunner {
             "claimed durable shard repair job"
         );
         let timeout = Duration::from_millis(self.lease_ms - 1_000);
-        match tokio::time::timeout(timeout, self.execute(&record.job)).await {
+        match tokio::time::timeout(timeout, self.execute(&record.job, &guard)).await {
             Ok(Ok(())) => {
+                self.mvcc.validate_assignment(&guard)?;
                 crate::perf::record_repair_duration(
                     maintenance_label(record.job.kind),
                     "erasure",
                     "complete",
                     started_at.elapsed(),
                 );
-                store.complete_shard_repair(&job_id, &self.worker_id)?
+                store.complete_shard_repair(&job_id, &lease_owner)?
             }
             Ok(Err(error)) => {
                 crate::perf::record_repair_duration(
@@ -647,7 +672,7 @@ impl ShardRepairRunner {
                 );
                 store.retry_shard_repair(
                     &job_id,
-                    &self.worker_id,
+                    &lease_owner,
                     retry_at(now, record.attempts),
                     &error.to_string(),
                 )?
@@ -661,7 +686,7 @@ impl ShardRepairRunner {
                 );
                 store.retry_shard_repair(
                     &job_id,
-                    &self.worker_id,
+                    &lease_owner,
                     retry_at(now, record.attempts),
                     "shard repair exceeded lease-safe timeout",
                 )?
@@ -670,7 +695,11 @@ impl ShardRepairRunner {
         Ok(true)
     }
 
-    async fn execute(&self, job: &ShardRepairJob) -> Result<()> {
+    async fn execute(
+        &self,
+        job: &ShardRepairJob,
+        guard: &crate::mvcc_worker_authority::AssignmentGuard,
+    ) -> Result<()> {
         tracing::info!(
             operation = "repair.reconstruct",
             transaction_id = %job.transaction_id,
@@ -775,6 +804,7 @@ impl ShardRepairRunner {
             )
         });
         replacement.validate()?;
+        self.mvcc.validate_assignment(guard)?;
         self.publish_overlay(job, replacement).await
     }
 
