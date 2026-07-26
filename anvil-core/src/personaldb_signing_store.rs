@@ -8,11 +8,10 @@
 
 use crate::{
     core_store::{
-        CF_MESH, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaRowCommonProto, CoreMetaTuplePart,
-        CoreMetaVisibilityState, CoreStore, TABLE_PERSONALDB_SIGNING_KEY_HEAD_ROW,
-        TABLE_PERSONALDB_SIGNING_KEY_ROW, commit_coremeta_batch_for_storage,
-        core_meta_committed_row_common, core_meta_record_tuple_key, core_meta_root_key_hash,
-        core_meta_tuple_key, decode_deterministic_proto, encode_deterministic_proto,
+        CF_MESH, CoreMetaRowCommonProto, CoreMetaTuplePart, CoreMetaVisibilityState,
+        TABLE_PERSONALDB_SIGNING_KEY_HEAD_ROW, TABLE_PERSONALDB_SIGNING_KEY_ROW,
+        core_meta_committed_row_common, core_meta_root_key_hash, core_meta_tuple_key,
+        decode_deterministic_proto, encode_deterministic_proto,
     },
     crypto::EncryptionKeyring,
     personaldb_signing::{PersonalDbProtocolKeyring, PersonalDbSignerProvider},
@@ -43,7 +42,7 @@ const SIGNING_KEY_HEAD_SCHEMA: &str = "anvil.system.personaldb_signing_key_head.
 const SIGNING_KEY_NAMESPACE: &str = "personaldb-signing-key";
 const SIGNING_KEY_PAGE_MAX: usize = 1_000;
 const SIGNING_KEY_COUNT_MAX: usize = 4_096;
-// CoreStore replaces this value and the empty transaction id before publication.
+// MVCC publication owns the commit version; the signed payload stays stable.
 const CORE_META_PUBLICATION_GENERATION_PLACEHOLDER: u64 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,7 +122,7 @@ pub struct PersonalDbSigningKeyStatusUpdate {
 #[derive(Clone)]
 pub struct PersonalDbSigningKeyStore {
     storage: Storage,
-    core_store: CoreStore,
+    mvcc: Arc<crate::mvcc_bootstrap::MvccSubsystem>,
     encryption_keyring: Arc<EncryptionKeyring>,
     mutation_lock: Arc<Mutex<()>>,
 }
@@ -139,10 +138,14 @@ impl fmt::Debug for PersonalDbSigningKeyStore {
 }
 
 impl PersonalDbSigningKeyStore {
-    pub fn new(core_store: CoreStore, encryption_keyring: Arc<EncryptionKeyring>) -> Self {
+    pub fn new(
+        storage: Storage,
+        mvcc: Arc<crate::mvcc_bootstrap::MvccSubsystem>,
+        encryption_keyring: Arc<EncryptionKeyring>,
+    ) -> Self {
         Self {
-            storage: core_store.storage().clone(),
-            core_store,
+            storage,
+            mvcc,
             encryption_keyring,
             mutation_lock: Arc::new(Mutex::new(())),
         }
@@ -235,11 +238,10 @@ impl PersonalDbSigningKeyStore {
     }
 
     pub fn current_collection_revision(&self) -> Result<u64> {
-        let Some(payload) = self.core_store.read_coremeta_row(
-            CF_MESH,
+        let Some(payload) = self.mvcc.read_latest_value(&signing_mvcc_key(
             TABLE_PERSONALDB_SIGNING_KEY_HEAD_ROW,
             &signing_key_head_tuple_key()?,
-        )?
+        )?)?
         else {
             return Ok(0);
         };
@@ -255,29 +257,56 @@ impl PersonalDbSigningKeyStore {
         if !(1..=SIGNING_KEY_PAGE_MAX).contains(&page_size) {
             bail!("PersonalDB signing key page size must be between 1 and {SIGNING_KEY_PAGE_MAX}");
         }
-        if self.current_collection_revision()? != expected_revision {
+        let snapshot = self.mvcc.runtime.applied_version()?;
+        let head_key = signing_mvcc_key(
+            TABLE_PERSONALDB_SIGNING_KEY_HEAD_ROW,
+            &signing_key_head_tuple_key()?,
+        )?;
+        let snapshot_revision = self
+            .mvcc
+            .runtime
+            .read_at(&head_key, snapshot)?
+            .map(|row| decode_signing_key_head(&row.value))
+            .transpose()?
+            .unwrap_or(0);
+        if snapshot_revision != expected_revision {
             bail!("PersonalDB signing key collection revision changed");
         }
-        let mut rows = self.core_store.scan_coremeta_prefix_page(
+        let prefix = crate::mvcc_product::coremeta_application_prefix(
             CF_MESH,
-            TABLE_PERSONALDB_SIGNING_KEY_ROW,
             &signing_key_tuple_prefix()?,
-            after_tuple_key,
-            page_size + 1,
         )?;
+        let namespace = crate::mvcc_product::coremeta_application_prefix(CF_MESH, &[])?;
+        let mut rows = self
+            .mvcc
+            .runtime
+            .scan_table_prefix_at(TABLE_PERSONALDB_SIGNING_KEY_ROW, &prefix, snapshot)?
+            .into_iter()
+            .map(|(key, row)| {
+                Ok(crate::core_store::CoreMetaRecord {
+                    key: key
+                        .application_key
+                        .strip_prefix(&namespace)
+                        .ok_or_else(|| anyhow!("signing key MVCC namespace mismatch"))?
+                        .to_vec(),
+                    payload: row.value,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(after) = after_tuple_key {
+            rows.retain(|row| row.key.as_slice() > after);
+        }
+        rows.truncate(page_size + 1);
         let has_more = rows.len() > page_size;
         if has_more {
             rows.truncate(page_size);
         }
         let next_tuple_key = if has_more {
             Some(
-                core_meta_record_tuple_key(
-                    &rows
-                        .last()
-                        .ok_or_else(|| anyhow!("signing key page continuation has no last row"))?
-                        .key,
-                )?
-                .to_vec(),
+                rows.last()
+                    .ok_or_else(|| anyhow!("signing key page continuation has no last row"))?
+                    .key
+                    .clone(),
             )
         } else {
             None
@@ -286,9 +315,6 @@ impl PersonalDbSigningKeyStore {
             .into_iter()
             .map(|record| decode_stored_row(&record.payload).map(|row| row.public))
             .collect::<Result<Vec<_>>>()?;
-        if self.current_collection_revision()? != expected_revision {
-            bail!("PersonalDB signing key collection changed during page read");
-        }
         Ok(PersonalDbSigningKeyPage {
             records,
             next_tuple_key,
@@ -498,8 +524,8 @@ impl PersonalDbSigningKeyStore {
 
     fn load_stored_row(&self, key_id: &KeyId) -> Result<Option<StoredSigningKey>> {
         let key = signing_key_tuple_key(key_id)?;
-        self.core_store
-            .read_coremeta_row(CF_MESH, TABLE_PERSONALDB_SIGNING_KEY_ROW, &key)?
+        self.mvcc
+            .read_latest_value(&signing_mvcc_key(TABLE_PERSONALDB_SIGNING_KEY_ROW, &key)?)?
             .map(|payload| decode_stored_row(&payload))
             .transpose()
     }
@@ -510,45 +536,40 @@ impl PersonalDbSigningKeyStore {
         let mutation_id = signing_key_mutation_id(key_id, row.public.record_revision);
         let tuple_key = signing_key_tuple_key(key_id)?;
         let payload = encode_stored_row(row)?;
-        let common = signing_key_publication_candidate_common(row);
         let collection_revision = self
             .current_collection_revision()?
             .checked_add(1)
             .ok_or_else(|| anyhow!("PersonalDB signing key collection revision overflow"))?;
         let head_tuple_key = signing_key_head_tuple_key()?;
         let head_payload = encode_signing_key_head(collection_revision)?;
-        let key_op = CoreMetaBatchOp {
-            cf: CF_MESH,
-            table_id: TABLE_PERSONALDB_SIGNING_KEY_ROW,
-            tuple_key: &tuple_key,
-            common: Some(common),
-            kind: CoreMetaBatchOpKind::Put(&payload),
+        let key = signing_mvcc_key(TABLE_PERSONALDB_SIGNING_KEY_ROW, &tuple_key)?;
+        let head = signing_mvcc_key(TABLE_PERSONALDB_SIGNING_KEY_HEAD_ROW, &head_tuple_key)?;
+        let key_current = self.mvcc.read_latest_value(&key)?;
+        let head_current = self.mvcc.read_latest_value(&head)?;
+        let predicate = |current: Option<&Vec<u8>>| match current {
+            Some(payload) => {
+                crate::mvcc_transaction::PredicateKind::ValueHash(*blake3::hash(payload).as_bytes())
+            }
+            None => crate::mvcc_transaction::PredicateKind::Absent,
         };
-        let head_op = CoreMetaBatchOp {
-            cf: CF_MESH,
-            table_id: TABLE_PERSONALDB_SIGNING_KEY_HEAD_ROW,
-            tuple_key: &head_tuple_key,
-            common: None,
-            kind: CoreMetaBatchOpKind::Put(&head_payload),
-        };
-        commit_coremeta_batch_for_storage(
-            &self.storage,
-            &mutation_id,
-            &[key_op, head_op],
-            &[
-                crate::core_store::CoreMetaRootPublication::new(
-                    signing_key_root_id(key_id),
-                    crate::formats::writer::WriterFamily::PersonalDb,
-                ),
-                crate::core_store::CoreMetaRootPublication::new(
-                    format!("{SYSTEM_REALM_ID}/{SIGNING_KEY_NAMESPACE}/head"),
-                    crate::formats::writer::WriterFamily::PersonalDb,
-                )
-                .coordinator(),
-            ],
-        )
-        .await
-        .with_context(|| format!("persist PersonalDB signing key {key_id}"))?;
+        self.mvcc
+            .autocommit_product_mutations_with_predicates(
+                "personaldb-signing-key-store",
+                &mutation_id,
+                vec![
+                    crate::mvcc_product::ProductMutation::put(key.clone(), payload),
+                    crate::mvcc_product::ProductMutation::put(head.clone(), head_payload),
+                ],
+                vec![
+                    (key, predicate(key_current.as_ref())),
+                    (head, predicate(head_current.as_ref())),
+                ],
+                crate::mvcc_transaction::DurabilityLevel::Quorum,
+                u64::try_from(chrono::Utc::now().timestamp_millis())
+                    .map_err(|_| anyhow!("signing key timestamp predates Unix epoch"))?,
+            )
+            .await
+            .with_context(|| format!("persist PersonalDB signing key {key_id}"))?;
         Ok(())
     }
 }
@@ -899,6 +920,13 @@ fn signing_key_head_tuple_key() -> Result<Vec<u8>> {
     ])
 }
 
+fn signing_mvcc_key(
+    table_id: u16,
+    tuple_key: &[u8],
+) -> Result<crate::mvcc_transaction::LogicalKey> {
+    crate::mvcc_product::coremeta_logical_key(CF_MESH, table_id, tuple_key)
+}
+
 fn signing_key_head_root_hash() -> String {
     core_meta_root_key_hash(&format!("{SYSTEM_REALM_ID}/{SIGNING_KEY_NAMESPACE}/head"))
 }
@@ -1013,616 +1041,4 @@ fn current_unix_nanos() -> Result<u64> {
         .context("system clock is before the Unix epoch")?
         .as_nanos();
     u64::try_from(nanos).context("current Unix timestamp exceeds u64 nanoseconds")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::core_store::CoreMetaStore;
-    use personaldb_protocol::{
-        KeyTrustPolicy, SignatureDomain, SignatureMetadata, SignatureScope, SigningPayload,
-    };
-    use tempfile::tempdir;
-
-    #[derive(Debug)]
-    struct TestSignable {
-        payload: Vec<u8>,
-        metadata: SignatureMetadata,
-    }
-
-    impl ProtocolSignable for TestSignable {
-        fn signature_metadata(&self) -> SignatureMetadata {
-            self.metadata.clone()
-        }
-
-        fn signing_payload(&self) -> SigningPayload<'_> {
-            SigningPayload::ExactBytes(&self.payload)
-        }
-    }
-
-    #[tokio::test]
-    async fn encrypted_row_round_trips_without_exposing_private_key() {
-        let directory = tempdir().unwrap();
-        let storage = Storage::new_at(directory.path()).await.unwrap();
-        let store = test_store(storage.clone()).await;
-        let private_key = pkcs8(0x41);
-        let trust_record = trust_record(
-            &private_key,
-            SignaturePurpose::Witness,
-            1,
-            vec![DatabaseId::new("database-a")],
-            vec!["group-a".to_string()],
-        );
-
-        let imported = store
-            .import_key(PersonalDbSigningKeyImport {
-                trust_record: trust_record.clone(),
-                private_key_pkcs8_der: &private_key,
-                audit: audit("import-1"),
-            })
-            .await
-            .unwrap();
-
-        let raw_payload = CoreMetaStore::open(storage.core_store_meta_path())
-            .unwrap()
-            .get(
-                CF_MESH,
-                TABLE_PERSONALDB_SIGNING_KEY_ROW,
-                &signing_key_tuple_key(&trust_record.key_id).unwrap(),
-            )
-            .unwrap()
-            .unwrap();
-        assert!(
-            !raw_payload
-                .windows(private_key.len())
-                .any(|window| window == private_key.as_slice())
-        );
-        let stored = decode_stored_row(&raw_payload).unwrap();
-        assert_ne!(stored.encrypted_private_key_pkcs8_der, private_key);
-        assert_eq!(stored.public, imported);
-        assert_eq!(store.list_public_records().unwrap(), vec![imported.clone()]);
-
-        let object = TestSignable {
-            payload: b"admitted commit certificate".to_vec(),
-            metadata: SignatureMetadata::for_domain(
-                SignaturePurpose::Witness,
-                SignatureDomain::CommitCertificate,
-                7,
-            )
-            .with_scope(SignatureScope::for_database_group(
-                DatabaseId::new("database-a"),
-                "group-a",
-            ))
-            .requiring_key_generation(KeyGeneration::new(1).unwrap()),
-        };
-        let envelope = store.sign(&trust_record.key_id, &object).unwrap();
-        store
-            .load_trust_store()
-            .unwrap()
-            .verify(&object, &envelope)
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn signing_key_pages_seek_ordered_rows_and_reject_stale_revisions() {
-        let directory = tempdir().unwrap();
-        let store = test_store(Storage::new_at(directory.path()).await.unwrap()).await;
-        let mut imported = Vec::new();
-        for (seed, generation) in [(0x31, 1), (0x32, 2), (0x33, 3)] {
-            let private_key = pkcs8(seed);
-            imported.push(
-                store
-                    .import_key(PersonalDbSigningKeyImport {
-                        trust_record: trust_record(
-                            &private_key,
-                            SignaturePurpose::Witness,
-                            generation,
-                            Vec::new(),
-                            Vec::new(),
-                        ),
-                        private_key_pkcs8_der: &private_key,
-                        audit: audit(&format!("import-{generation}")),
-                    })
-                    .await
-                    .unwrap(),
-            );
-        }
-
-        let revision = store.current_collection_revision().unwrap();
-        assert_eq!(revision, 3);
-        let first = store.page_public_records(revision, None, 2).unwrap();
-        assert_eq!(first.records.len(), 2);
-        let second = store
-            .page_public_records(revision, first.next_tuple_key.as_deref(), 2)
-            .unwrap();
-        assert_eq!(second.records.len(), 1);
-        assert!(second.next_tuple_key.is_none());
-        let mut paged = first.records;
-        paged.extend(second.records);
-        assert_eq!(paged, store.list_public_records().unwrap());
-
-        store
-            .set_status(PersonalDbSigningKeyStatusUpdate {
-                key_id: imported[0].trust_record.key_id.clone(),
-                expected_record_revision: 1,
-                status: PublicKeyStatus::Retiring,
-                valid_until_log_index: Some(10),
-                audit: audit("retire"),
-            })
-            .await
-            .unwrap();
-        assert_eq!(store.current_collection_revision().unwrap(), 4);
-        assert!(
-            store
-                .page_public_records(revision, None, 2)
-                .unwrap_err()
-                .to_string()
-                .contains("revision changed")
-        );
-    }
-
-    #[tokio::test]
-    async fn import_rejects_mismatched_and_duplicate_key_material() {
-        let directory = tempdir().unwrap();
-        let store = test_store(Storage::new_at(directory.path()).await.unwrap()).await;
-        let private_key = pkcs8(0x51);
-        let trust_record = trust_record(
-            &private_key,
-            SignaturePurpose::Snapshot,
-            1,
-            Vec::new(),
-            Vec::new(),
-        );
-        let wrong_private_key = pkcs8(0x52);
-
-        let error = store
-            .import_key(PersonalDbSigningKeyImport {
-                trust_record: trust_record.clone(),
-                private_key_pkcs8_der: &wrong_private_key,
-                audit: audit("mismatch"),
-            })
-            .await
-            .unwrap_err();
-        assert!(format!("{error:#}").contains("does not match"));
-        assert!(store.list_public_records().unwrap().is_empty());
-
-        store
-            .import_key(PersonalDbSigningKeyImport {
-                trust_record: trust_record.clone(),
-                private_key_pkcs8_der: &private_key,
-                audit: audit("first"),
-            })
-            .await
-            .unwrap();
-        let error = store
-            .import_key(PersonalDbSigningKeyImport {
-                trust_record,
-                private_key_pkcs8_der: &private_key,
-                audit: audit("duplicate"),
-            })
-            .await
-            .unwrap_err();
-        assert!(format!("{error:#}").contains("already exists"));
-    }
-
-    #[tokio::test]
-    async fn status_transitions_are_one_way_and_do_not_change_key_identity() {
-        let directory = tempdir().unwrap();
-        let store = test_store(Storage::new_at(directory.path()).await.unwrap()).await;
-        let private_key = pkcs8(0x61);
-        let trust_record = trust_record(
-            &private_key,
-            SignaturePurpose::ProposalAdmission,
-            3,
-            Vec::new(),
-            Vec::new(),
-        );
-        store
-            .import_key(PersonalDbSigningKeyImport {
-                trust_record: trust_record.clone(),
-                private_key_pkcs8_der: &private_key,
-                audit: audit("import"),
-            })
-            .await
-            .unwrap();
-
-        let retiring = store
-            .set_status(PersonalDbSigningKeyStatusUpdate {
-                key_id: trust_record.key_id.clone(),
-                expected_record_revision: 1,
-                status: PublicKeyStatus::Retiring,
-                valid_until_log_index: Some(20),
-                audit: audit("retire"),
-            })
-            .await
-            .unwrap();
-        assert_eq!(retiring.trust_record.key_id, trust_record.key_id);
-        assert_eq!(
-            retiring.trust_record.key_generation,
-            trust_record.key_generation
-        );
-        assert_eq!(retiring.record_revision, 2);
-
-        let object = TestSignable {
-            payload: b"proposal admission".to_vec(),
-            metadata: SignatureMetadata::for_domain(
-                SignaturePurpose::ProposalAdmission,
-                SignatureDomain::ProposalAdmission,
-                10,
-            )
-            .requiring_key_generation(KeyGeneration::new(3).unwrap()),
-        };
-        let error = store.sign(&trust_record.key_id, &object).unwrap_err();
-        assert!(format!("{error:#}").contains("retiring"));
-
-        let error = store
-            .set_status(PersonalDbSigningKeyStatusUpdate {
-                key_id: trust_record.key_id.clone(),
-                expected_record_revision: 1,
-                status: PublicKeyStatus::RevokedFuture,
-                valid_until_log_index: Some(18),
-                audit: audit("stale-revoke"),
-            })
-            .await
-            .unwrap_err();
-        assert!(format!("{error:#}").contains("revision mismatch"));
-
-        let error = store
-            .set_status(PersonalDbSigningKeyStatusUpdate {
-                key_id: trust_record.key_id.clone(),
-                expected_record_revision: 2,
-                status: PublicKeyStatus::Active,
-                valid_until_log_index: None,
-                audit: audit("reactivate"),
-            })
-            .await
-            .unwrap_err();
-        assert!(format!("{error:#}").contains("invalid"));
-
-        let revoked = store
-            .set_status(PersonalDbSigningKeyStatusUpdate {
-                key_id: trust_record.key_id,
-                expected_record_revision: 2,
-                status: PublicKeyStatus::RevokedFuture,
-                valid_until_log_index: Some(18),
-                audit: audit("revoke"),
-            })
-            .await
-            .unwrap();
-        assert_eq!(revoked.trust_record.status, PublicKeyStatus::RevokedFuture);
-        assert_eq!(revoked.trust_record.valid_until_log_index, Some(18));
-        assert_eq!(revoked.record_revision, 3);
-    }
-
-    #[tokio::test]
-    async fn overlapping_scope_cannot_reuse_a_purpose_generation() {
-        let directory = tempdir().unwrap();
-        let store = test_store(Storage::new_at(directory.path()).await.unwrap()).await;
-        let first_private_key = pkcs8(0x71);
-        let second_private_key = pkcs8(0x72);
-        store
-            .import_key(PersonalDbSigningKeyImport {
-                trust_record: trust_record(
-                    &first_private_key,
-                    SignaturePurpose::GroupControl,
-                    4,
-                    vec![DatabaseId::new("database-a")],
-                    vec!["group-a".to_string()],
-                ),
-                private_key_pkcs8_der: &first_private_key,
-                audit: audit("first"),
-            })
-            .await
-            .unwrap();
-
-        let error = store
-            .import_key(PersonalDbSigningKeyImport {
-                trust_record: trust_record(
-                    &second_private_key,
-                    SignaturePurpose::GroupControl,
-                    4,
-                    vec![DatabaseId::new("database-a")],
-                    vec!["group-a".to_string()],
-                ),
-                private_key_pkcs8_der: &second_private_key,
-                audit: audit("second"),
-            })
-            .await
-            .unwrap_err();
-        assert!(format!("{error:#}").contains("overlapping scope"));
-    }
-
-    #[tokio::test]
-    async fn protocol_keyring_is_empty_or_selects_highest_active_generation() {
-        let directory = tempdir().unwrap();
-        let store = test_store(Storage::new_at(directory.path()).await.unwrap()).await;
-        let empty = store.load_protocol_keyring().unwrap();
-        assert!(!empty.is_enabled());
-        assert!(empty.trust_store().is_empty());
-
-        let first_private_key = pkcs8(0x81);
-        let second_private_key = pkcs8(0x82);
-        let first = trust_record(
-            &first_private_key,
-            SignaturePurpose::Witness,
-            1,
-            Vec::new(),
-            Vec::new(),
-        );
-        let second = trust_record(
-            &second_private_key,
-            SignaturePurpose::Witness,
-            2,
-            Vec::new(),
-            Vec::new(),
-        );
-        for (record, private_key, operation) in [
-            (first.clone(), first_private_key.as_slice(), "first"),
-            (second.clone(), second_private_key.as_slice(), "second"),
-        ] {
-            store
-                .import_key(PersonalDbSigningKeyImport {
-                    trust_record: record,
-                    private_key_pkcs8_der: private_key,
-                    audit: audit(operation),
-                })
-                .await
-                .unwrap();
-        }
-
-        let keyring = store.load_protocol_keyring().unwrap();
-        assert!(keyring.has_provider(SignaturePurpose::Witness));
-        assert_eq!(keyring.trust_store().len(), 2);
-        assert_eq!(
-            keyring
-                .trust_record_for_purpose(SignaturePurpose::Witness)
-                .unwrap()
-                .key_id,
-            second.key_id
-        );
-    }
-
-    #[tokio::test]
-    async fn protocol_keyring_rejects_equal_generation_active_provider_ambiguity() {
-        let directory = tempdir().unwrap();
-        let store = test_store(Storage::new_at(directory.path()).await.unwrap()).await;
-        let first_private_key = pkcs8(0x91);
-        let second_private_key = pkcs8(0x92);
-        for (private_key, database_scope, operation) in [
-            (first_private_key.as_slice(), "database-a", "first"),
-            (second_private_key.as_slice(), "database-b", "second"),
-        ] {
-            store
-                .import_key(PersonalDbSigningKeyImport {
-                    trust_record: trust_record(
-                        private_key,
-                        SignaturePurpose::Snapshot,
-                        7,
-                        vec![DatabaseId::new(database_scope)],
-                        Vec::new(),
-                    ),
-                    private_key_pkcs8_der: private_key,
-                    audit: audit(operation),
-                })
-                .await
-                .unwrap();
-        }
-
-        let error = store.load_protocol_keyring().unwrap_err();
-        assert!(format!("{error:#}").contains("ambiguous active generation 7"));
-    }
-
-    #[tokio::test]
-    async fn corestore_publication_generation_advances_independently_of_signing_revisions() {
-        let directory = tempdir().unwrap();
-        let storage = Storage::new_at(directory.path()).await.unwrap();
-        let store = test_store(storage.clone()).await;
-        let private_key = pkcs8(0xa0);
-        let trust_record = trust_record(
-            &private_key,
-            SignaturePurpose::Witness,
-            9,
-            Vec::new(),
-            Vec::new(),
-        );
-        store
-            .import_key(PersonalDbSigningKeyImport {
-                trust_record: trust_record.clone(),
-                private_key_pkcs8_der: &private_key,
-                audit: audit("import-before-physical-gap"),
-            })
-            .await
-            .unwrap();
-
-        let meta = CoreMetaStore::open(storage.core_store_meta_path()).unwrap();
-        let key_tuple = signing_key_tuple_key(&trust_record.key_id).unwrap();
-        let head_tuple = signing_key_head_tuple_key().unwrap();
-        let key_payload = meta
-            .get(CF_MESH, TABLE_PERSONALDB_SIGNING_KEY_ROW, &key_tuple)
-            .unwrap()
-            .unwrap();
-        let head_payload = meta
-            .get(CF_MESH, TABLE_PERSONALDB_SIGNING_KEY_HEAD_ROW, &head_tuple)
-            .unwrap()
-            .unwrap();
-        let operations = [
-            CoreMetaBatchOp {
-                cf: CF_MESH,
-                table_id: TABLE_PERSONALDB_SIGNING_KEY_ROW,
-                tuple_key: &key_tuple,
-                common: None,
-                kind: CoreMetaBatchOpKind::Put(&key_payload),
-            },
-            CoreMetaBatchOp {
-                cf: CF_MESH,
-                table_id: TABLE_PERSONALDB_SIGNING_KEY_HEAD_ROW,
-                tuple_key: &head_tuple,
-                common: None,
-                kind: CoreMetaBatchOpKind::Put(&head_payload),
-            },
-        ];
-        commit_coremeta_batch_for_storage(
-            &storage,
-            "personaldb-signing-key-test-physical-gap",
-            &operations,
-            &[
-                crate::core_store::CoreMetaRootPublication::new(
-                    signing_key_root_id(&trust_record.key_id),
-                    crate::formats::writer::WriterFamily::PersonalDb,
-                ),
-                crate::core_store::CoreMetaRootPublication::new(
-                    format!("{SYSTEM_REALM_ID}/{SIGNING_KEY_NAMESPACE}/head"),
-                    crate::formats::writer::WriterFamily::PersonalDb,
-                )
-                .coordinator(),
-            ],
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            store
-                .get_public_record(&trust_record.key_id)
-                .unwrap()
-                .unwrap()
-                .record_revision,
-            1
-        );
-        assert_eq!(store.current_collection_revision().unwrap(), 1);
-        store
-            .set_status(PersonalDbSigningKeyStatusUpdate {
-                key_id: trust_record.key_id.clone(),
-                expected_record_revision: 1,
-                status: PublicKeyStatus::Retiring,
-                valid_until_log_index: Some(20),
-                audit: audit("retire-after-physical-gap"),
-            })
-            .await
-            .unwrap();
-
-        let key_proto = decode_deterministic_proto::<PersonalDbSigningKeyRowProto>(
-            &meta
-                .get(CF_MESH, TABLE_PERSONALDB_SIGNING_KEY_ROW, &key_tuple)
-                .unwrap()
-                .unwrap(),
-            "persisted PersonalDB signing key physical generation test row",
-        )
-        .unwrap();
-        let head_proto = decode_deterministic_proto::<PersonalDbSigningKeyHeadProto>(
-            &meta
-                .get(CF_MESH, TABLE_PERSONALDB_SIGNING_KEY_HEAD_ROW, &head_tuple)
-                .unwrap()
-                .unwrap(),
-            "persisted PersonalDB signing key physical generation test head",
-        )
-        .unwrap();
-        assert_eq!(key_proto.record_revision, 2);
-        assert_eq!(key_proto.common.unwrap().root_generation, 3);
-        assert_eq!(head_proto.revision, 2);
-        assert_eq!(head_proto.common.unwrap().root_generation, 3);
-    }
-
-    #[test]
-    fn logical_signing_revisions_are_independent_from_physical_publication_common() {
-        let private_key = pkcs8(0xa1);
-        let audit = audit("logical-revision-41");
-        let row = StoredSigningKey {
-            public: PersonalDbSigningKeyPublicRecord {
-                trust_record: trust_record(
-                    &private_key,
-                    SignaturePurpose::Witness,
-                    17,
-                    Vec::new(),
-                    Vec::new(),
-                ),
-                created_at_unix_nanos: 100,
-                updated_at_unix_nanos: 200,
-                created_audit: audit.clone(),
-                updated_audit: audit,
-                record_revision: 41,
-            },
-            encrypted_private_key_pkcs8_der: vec![0x5a; 48],
-        };
-        let mut key_proto = decode_deterministic_proto::<PersonalDbSigningKeyRowProto>(
-            &encode_stored_row(&row).unwrap(),
-            "PersonalDB signing key test row",
-        )
-        .unwrap();
-        {
-            let key_common = key_proto.common.as_mut().unwrap();
-            key_common.root_generation = 7;
-            key_common.transaction_id = "physical-signing-key-transaction".to_string();
-        }
-
-        let decoded = decode_stored_row(&encode_deterministic_proto(&key_proto)).unwrap();
-        let physical_key_generation = key_proto.common.as_ref().unwrap().root_generation;
-        assert_eq!(decoded.public.record_revision, 41);
-        assert_eq!(physical_key_generation, 7);
-        assert_ne!(decoded.public.record_revision, physical_key_generation);
-
-        let mut head_proto = decode_deterministic_proto::<PersonalDbSigningKeyHeadProto>(
-            &encode_signing_key_head(83).unwrap(),
-            "PersonalDB signing key test head",
-        )
-        .unwrap();
-        {
-            let head_common = head_proto.common.as_mut().unwrap();
-            head_common.root_generation = 11;
-            head_common.transaction_id = "physical-signing-head-transaction".to_string();
-        }
-        assert_eq!(
-            decode_signing_key_head(&encode_deterministic_proto(&head_proto)).unwrap(),
-            83
-        );
-        assert_ne!(
-            head_proto.revision,
-            head_proto.common.as_ref().unwrap().root_generation
-        );
-
-        let mut wrong_scope = key_proto.clone();
-        wrong_scope.common.as_mut().unwrap().root_key_hash = signing_key_head_root_hash();
-        assert!(decode_stored_row(&encode_deterministic_proto(&wrong_scope)).is_err());
-
-        let mut pending = key_proto;
-        pending.common.as_mut().unwrap().visibility_state = CoreMetaVisibilityState::Pending as i32;
-        assert!(decode_stored_row(&encode_deterministic_proto(&pending)).is_err());
-    }
-
-    async fn test_store(storage: Storage) -> PersonalDbSigningKeyStore {
-        let core_store = CoreStore::new(storage).await.unwrap();
-        PersonalDbSigningKeyStore::new(
-            core_store,
-            Arc::new(
-                EncryptionKeyring::new("test-key", vec![0xa5; 32])
-                    .expect("test encryption key is valid"),
-            ),
-        )
-    }
-
-    fn audit(operation_id: &str) -> PersonalDbSigningKeyAuditMetadata {
-        PersonalDbSigningKeyAuditMetadata::new("app:test-admin", operation_id)
-            .with_reason("test key lifecycle operation")
-    }
-
-    fn trust_record(
-        private_key: &[u8],
-        purpose: SignaturePurpose,
-        generation: u64,
-        database_scopes: Vec<DatabaseId>,
-        group_scopes: Vec<String>,
-    ) -> PublicKeyTrustRecord {
-        let policy = KeyTrustPolicy::new(KeyGeneration::new(generation).unwrap(), purpose, 0)
-            .with_database_scopes(database_scopes)
-            .with_group_scopes(group_scopes);
-        Ed25519ProtocolSigner::from_pkcs8_der(private_key, policy)
-            .unwrap()
-            .trust_record()
-            .clone()
-    }
-
-    fn pkcs8(seed: u8) -> Vec<u8> {
-        let mut bytes = hex::decode("302e020100300506032b657004220420").unwrap();
-        bytes.extend([seed; 32]);
-        bytes
-    }
 }

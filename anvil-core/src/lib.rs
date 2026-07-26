@@ -230,9 +230,15 @@ impl AppState {
             },
         )
         .await?;
+        let mvcc = Arc::new(
+            mvcc_bootstrap::MvccSubsystem::bootstrap(&arc_config, core_store.core_meta_database())
+                .await
+                .context("bootstrap mandatory MVCC subsystem")?,
+        );
         let personaldb_signing_key_store =
             Arc::new(personaldb_signing_store::PersonalDbSigningKeyStore::new(
-                core_store.clone(),
+                storage.clone(),
+                mvcc.clone(),
                 secret_keyring.clone(),
             ));
         let personaldb_protocol_keyring = if has_personaldb_keyring_override {
@@ -277,11 +283,6 @@ impl AppState {
             arc_config.cross_region_routing_policy,
             partition_signing_key,
             observability.clone(),
-        );
-        let mvcc = Arc::new(
-            mvcc_bootstrap::MvccSubsystem::bootstrap(&arc_config, core_store.core_meta_database())
-                .await
-                .context("bootstrap mandatory MVCC subsystem")?,
         );
         persistence
             .install_mvcc(mvcc.clone())
