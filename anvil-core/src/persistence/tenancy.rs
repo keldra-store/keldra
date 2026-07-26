@@ -64,6 +64,7 @@ impl Persistence {
         name: &str,
         client_id: &str,
         encrypted_secret: &[u8],
+        audit_event: Option<&crate::tenant_audit::TenantAuditEvent>,
     ) -> Result<App> {
         let permit = self.control_write_permit().await?;
         control_journal::create_app_with_permit_mvcc(
@@ -75,6 +76,7 @@ impl Persistence {
             encrypted_secret,
             &permit,
             &self.partition_owner_signing_key,
+            audit_event,
         )
         .await
     }
@@ -103,7 +105,12 @@ impl Persistence {
         )
     }
 
-    pub async fn update_app_secret(&self, app_id: i64, new_encrypted_secret: &[u8]) -> Result<()> {
+    pub async fn update_app_secret(
+        &self,
+        app_id: i64,
+        new_encrypted_secret: &[u8],
+        audit_event: Option<&crate::tenant_audit::TenantAuditEvent>,
+    ) -> Result<()> {
         let permit = self.control_write_permit().await?;
         control_journal::update_app_secret_with_permit_mvcc(
             &self.storage,
@@ -112,11 +119,16 @@ impl Persistence {
             new_encrypted_secret,
             &permit,
             &self.partition_owner_signing_key,
+            audit_event,
         )
         .await
     }
 
-    pub async fn delete_app(&self, app_id: i64) -> Result<()> {
+    pub async fn delete_app(
+        &self,
+        app_id: i64,
+        audit_event: Option<&crate::tenant_audit::TenantAuditEvent>,
+    ) -> Result<()> {
         let permit = self.control_write_permit().await?;
         control_journal::delete_app_with_permit_mvcc(
             &self.storage,
@@ -124,6 +136,7 @@ impl Persistence {
             app_id,
             &permit,
             &self.partition_owner_signing_key,
+            audit_event,
         )
         .await
     }

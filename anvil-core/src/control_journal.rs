@@ -255,6 +255,7 @@ pub(crate) async fn create_region_with_permit_mvcc(
             active: true,
         }],
         permit.fence_token,
+        None,
     )
     .await?;
     Ok(true)
@@ -363,6 +364,7 @@ pub(crate) async fn create_tenant_with_permit_mvcc(
             },
         ],
         permit.fence_token,
+        None,
     )
     .await?;
     Ok(tenant)
@@ -585,6 +587,7 @@ async fn append_control_event_mvcc(
     event: ControlEventBody,
     mut current_updates: Vec<ControlCurrentRecord>,
     fence_token: u64,
+    audit_event: Option<&crate::tenant_audit::TenantAuditEvent>,
 ) -> Result<()> {
     use crate::mvcc_transaction::{DurabilityLevel, PredicateKind};
 
@@ -657,7 +660,16 @@ async fn append_control_event_mvcc(
             .unwrap_or(PredicateKind::Absent);
         predicates.push((key, kind));
     }
-    let plan = crate::mvcc_product::product_mutations_and_outbox_from_operations(operations)?;
+    let mut plan = crate::mvcc_product::product_mutations_and_outbox_from_operations(operations)?;
+    if let Some(audit_event) = audit_event {
+        let audit_plan = crate::tenant_audit::tenant_audit_mvcc_plan(
+            audit_event,
+            next_revision,
+            &mutation_id_string,
+        )?;
+        plan.mutations.extend(audit_plan.mutations);
+        plan.outbox_events.extend(audit_plan.outbox_events);
+    }
     let mutations = plan.mutations;
     let outbox_events = plan.outbox_events;
     let principal = control_partition_principal();
@@ -683,6 +695,7 @@ pub(crate) async fn create_app_with_permit_mvcc(
     encrypted_secret: &[u8],
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
+    audit_event: Option<&crate::tenant_audit::TenantAuditEvent>,
 ) -> Result<App> {
     let partition_precondition =
         control_write_precondition(storage, permit, partition_owner_signing_key).await?;
@@ -725,6 +738,7 @@ pub(crate) async fn create_app_with_permit_mvcc(
             record,
         ],
         permit.fence_token,
+        audit_event,
     )
     .await?;
     Ok(App {
@@ -741,6 +755,7 @@ pub(crate) async fn update_app_secret_with_permit_mvcc(
     encrypted_secret: &[u8],
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
+    audit_event: Option<&crate::tenant_audit::TenantAuditEvent>,
 ) -> Result<()> {
     let partition_precondition =
         control_write_precondition(storage, permit, partition_owner_signing_key).await?;
@@ -762,6 +777,7 @@ pub(crate) async fn update_app_secret_with_permit_mvcc(
             active: true,
         }],
         permit.fence_token,
+        audit_event,
     )
     .await
 }
@@ -772,6 +788,7 @@ pub(crate) async fn delete_app_with_permit_mvcc(
     app_id: i64,
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
+    audit_event: Option<&crate::tenant_audit::TenantAuditEvent>,
 ) -> Result<()> {
     let partition_precondition =
         control_write_precondition(storage, permit, partition_owner_signing_key).await?;
@@ -790,6 +807,7 @@ pub(crate) async fn delete_app_with_permit_mvcc(
             active: false,
         }],
         permit.fence_token,
+        audit_event,
     )
     .await
 }

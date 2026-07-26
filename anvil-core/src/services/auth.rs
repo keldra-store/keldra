@@ -239,6 +239,14 @@ impl AuthService for AppState {
             .secret_keyring
             .encrypt(client_secret.as_bytes())
             .map_err(|e| Status::internal(e.to_string()))?;
+        let audit_event = crate::services::audit::build_tenant_audit_event(
+            &claims,
+            &req.request_id,
+            format!("app:{}", req.app_name),
+            "app.create",
+            serde_json::json!({ "client_id": client_id }),
+        )?;
+        let audit_event_id = audit_event.audit_event_id.clone();
         let app = self
             .persistence
             .create_app(
@@ -246,19 +254,10 @@ impl AuthService for AppState {
                 &req.app_name,
                 &client_id,
                 &encrypted_secret,
+                Some(&audit_event),
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        let audit_event_id = crate::services::audit::record_tenant_audit_event(
-            self,
-            &claims,
-            &req.request_id,
-            format!("app:{}", app.name),
-            "app.create",
-            serde_json::json!({ "app_id": app.id, "client_id": client_id }),
-        )
-        .await?;
-
         Ok(Response::new(ApplicationSecretResponse {
             request_id: req.request_id,
             tenant_id: claims.tenant_id.to_string(),
@@ -289,20 +288,18 @@ impl AuthService for AppState {
             .secret_keyring
             .encrypt(client_secret.as_bytes())
             .map_err(|e| Status::internal(e.to_string()))?;
-        self.persistence
-            .update_app_secret(app.id, &encrypted_secret)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let audit_event_id = crate::services::audit::record_tenant_audit_event(
-            self,
+        let audit_event = crate::services::audit::build_tenant_audit_event(
             &claims,
             &req.request_id,
             format!("app:{}", app.name),
             "app.rotate_secret",
             serde_json::json!({ "app_id": app.id, "client_id": app.client_id }),
-        )
-        .await?;
-
+        )?;
+        let audit_event_id = audit_event.audit_event_id.clone();
+        self.persistence
+            .update_app_secret(app.id, &encrypted_secret, Some(&audit_event))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(ApplicationSecretResponse {
             request_id: req.request_id,
             tenant_id: claims.tenant_id.to_string(),
@@ -328,20 +325,17 @@ impl AuthService for AppState {
         validate_public_app_request(&req.app_name, &req.request_id, &req.idempotency_key)?;
         let app = app_in_claims_tenant(self, claims.tenant_id, &req.app_name).await?;
 
-        self.persistence
-            .delete_app(app.id)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        crate::services::audit::record_tenant_audit_event(
-            self,
+        let audit_event = crate::services::audit::build_tenant_audit_event(
             &claims,
             &req.request_id,
             format!("app:{}", app.name),
             "app.delete",
             serde_json::json!({ "app_id": app.id }),
-        )
-        .await?;
-
+        )?;
+        self.persistence
+            .delete_app(app.id, Some(&audit_event))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(DeleteApplicationCredentialResponse {
             request_id: req.request_id,
             app_id: app.id.to_string(),

@@ -91,29 +91,45 @@ pub(crate) async fn record_tenant_audit_event(
     action: impl Into<String>,
     details: serde_json::Value,
 ) -> Result<String, Status> {
+    let event = build_tenant_audit_event(claims, request_id, resource_id, action, details)?;
+    let audit_event_id = event.audit_event_id.clone();
+    tenant_audit::append_tenant_audit_event(&state.storage, &event)
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?;
+    Ok(audit_event_id)
+}
+
+pub(crate) fn build_tenant_audit_event(
+    claims: &Claims,
+    request_id: &str,
+    resource_id: impl Into<String>,
+    action: impl Into<String>,
+    details: serde_json::Value,
+) -> Result<tenant_audit::TenantAuditEvent, Status> {
     let action = action.into();
+    let resource_id = resource_id.into();
+    let identity = format!(
+        "{}\0{}\0{}\0{}\0{}",
+        claims.tenant_id, request_id, claims.sub, resource_id, action
+    );
     let audit_event_id = format!(
         "tenant-audit:{}:{}:{}",
         claims.tenant_id,
         request_id,
-        uuid::Uuid::new_v4().simple()
+        hex::encode(&blake3::hash(identity.as_bytes()).as_bytes()[..16])
     );
-    let event = tenant_audit::TenantAuditEvent {
+    Ok(tenant_audit::TenantAuditEvent {
         schema: tenant_audit::TENANT_AUDIT_EVENT_SCHEMA.to_string(),
         audit_event_id: audit_event_id.clone(),
         request_id: request_id.to_string(),
         tenant_id: claims.tenant_id,
         principal_id: claims.sub.clone(),
-        resource_id: resource_id.into(),
+        resource_id,
         action,
         created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         details_json: serde_json::to_string(&details)
             .map_err(|_| Status::internal("Failed to encode tenant audit details"))?,
-    };
-    tenant_audit::append_tenant_audit_event(&state.storage, &event)
-        .await
-        .map_err(|err| Status::internal(err.to_string()))?;
-    Ok(audit_event_id)
+    })
 }
 
 fn none_if_empty(value: &str) -> Option<&str> {

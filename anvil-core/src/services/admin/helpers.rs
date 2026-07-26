@@ -1112,7 +1112,7 @@ pub(super) async fn rotate_application_secret_envelopes(
                             if !dry_run {
                                 state
                                     .persistence
-                                    .update_app_secret(details.id, &rotated)
+                                    .update_app_secret(details.id, &rotated, None)
                                     .await
                                     .map_err(|err| Status::internal(err.to_string()))?;
                             }

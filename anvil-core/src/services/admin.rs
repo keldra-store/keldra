@@ -92,7 +92,13 @@ impl AdminService for AppState {
         let encrypted_secret = encrypt_admin_client_secret(self, &client_secret)?;
         let app = self
             .persistence
-            .create_app(tenant_id, &req.app_name, &client_id, &encrypted_secret)
+            .create_app(
+                tenant_id,
+                &req.app_name,
+                &client_id,
+                &encrypted_secret,
+                None,
+            )
             .await
             .map_err(|err| Status::internal(err.to_string()))?;
         let audit_event_id = record_admin_audit_event(
@@ -138,7 +144,7 @@ impl AdminService for AppState {
         let client_secret = generated_client_secret();
         let encrypted_secret = encrypt_admin_client_secret(self, &client_secret)?;
         self.persistence
-            .update_app_secret(app.id, &encrypted_secret)
+            .update_app_secret(app.id, &encrypted_secret, None)
             .await
             .map_err(|err| Status::internal(err.to_string()))?;
         let audit_event_id = record_admin_audit_event(

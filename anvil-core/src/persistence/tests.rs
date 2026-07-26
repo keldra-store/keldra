@@ -1079,7 +1079,7 @@ async fn persistence_replays_anvil_owned_state_after_fresh_instance_body() {
         .unwrap();
     bind_persistence_test_authz_schema(&persistence, tenant.id).await;
     let app = persistence
-        .create_app(tenant.id, "app-a", "client-a", b"encrypted-secret")
+        .create_app(tenant.id, "app-a", "client-a", b"encrypted-secret", None)
         .await
         .unwrap();
     let bucket = persistence
