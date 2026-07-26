@@ -415,11 +415,23 @@ impl OpenTransactionRegistry {
                         bail!("transaction has expired");
                     }
                     let bundle = build_bundle(&draft)?;
-                    draft.state = DraftState::Committing {
-                        bundle: bundle.clone(),
-                    };
-                    self.save(&draft)?;
-                    (bundle, None, draft.durability)
+                    if is_read_only_bundle(&bundle) {
+                        let result = CertificationResult::Committed {
+                            commit_version: draft.snapshot_version,
+                        };
+                        draft.state = DraftState::Resolved {
+                            bundle: bundle.clone(),
+                            result: result.clone(),
+                        };
+                        self.save(&draft)?;
+                        (bundle, Some(result), draft.durability)
+                    } else {
+                        draft.state = DraftState::Committing {
+                            bundle: bundle.clone(),
+                        };
+                        self.save(&draft)?;
+                        (bundle, None, draft.durability)
+                    }
                 }
                 DraftState::Committing { bundle } => (bundle.clone(), None, draft.durability),
                 DraftState::Resolved { bundle, result } => {
@@ -431,6 +443,10 @@ impl OpenTransactionRegistry {
         };
 
         let outcome = match resolved {
+            Some(result) if is_read_only_bundle(&bundle) => CommitOutcome {
+                certification: result,
+                local_apply: None,
+            },
             Some(result) => runtime.apply_transaction_decision(bundle.clone(), result)?,
             None => {
                 runtime
@@ -669,6 +685,13 @@ impl OpenTransactionRegistry {
     }
 }
 
+fn is_read_only_bundle(bundle: &TransactionBundle) -> bool {
+    bundle.writes.is_empty()
+        && bundle.object_manifests.is_empty()
+        && bundle.outbox_events.is_empty()
+        && bundle.materialisation_jobs.is_empty()
+}
+
 fn build_bundle(draft: &Draft) -> Result<TransactionBundle> {
     let mut builder = TransactionBundleBuilder::new(
         &draft.cluster_id,
@@ -808,6 +831,44 @@ mod tests {
             snapshot: 9,
             committed: Mutex::new(Vec::new()),
         }
+    }
+
+    #[tokio::test]
+    async fn read_only_commit_accepts_snapshot_without_consensus_entry() {
+        let temp = tempdir().unwrap();
+        let registry = OpenTransactionRegistry::open(temp.path()).unwrap();
+        let runtime = runtime();
+        let handle = registry
+            .begin(
+                &runtime,
+                "cluster",
+                "alice",
+                "read-only",
+                Duration::from_secs(30),
+                DurabilityLevel::Quorum,
+                ReadConsistency::Linearized,
+                1_000,
+            )
+            .await
+            .unwrap();
+
+        let first = registry
+            .commit(&runtime, &handle.transaction_id, "alice", 1_001)
+            .await
+            .unwrap();
+        let retry = registry
+            .commit(&runtime, &handle.transaction_id, "alice", 1_002)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            first.certification,
+            CertificationResult::Committed { commit_version: 9 }
+        );
+        assert_eq!(retry.certification, first.certification);
+        assert_eq!(first.local_apply, None);
+        assert_eq!(retry.local_apply, None);
+        assert!(runtime.committed.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
