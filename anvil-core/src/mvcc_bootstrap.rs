@@ -289,6 +289,7 @@ pub struct MvccSubsystem {
     shard_repair_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     shard_rebalance_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     outbox_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    assignment_reconciler_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl fmt::Debug for MvccSubsystem {
@@ -514,6 +515,14 @@ impl MvccSubsystem {
                 consensus: consensus.clone(),
             }),
         )?);
+        crate::mvcc_assignment_reconciler::BackgroundAssignmentReconciler::new(
+            config.mvcc_cluster_id.clone(),
+            consensus.clone(),
+            local_store.clone(),
+        )?
+        .run_once()
+        .await
+        .context("install initial background-work partition assignments")?;
         let open_transactions = Arc::new(OpenTransactionRegistry::from_db(core_meta_db)?);
         let authorization_core_store =
             crate::core_store::CoreStore::new(materialisation_storage.clone()).await?;
@@ -574,6 +583,7 @@ impl MvccSubsystem {
             shard_repair_task: Mutex::new(None),
             shard_rebalance_task: Mutex::new(None),
             outbox_task: Mutex::new(None),
+            assignment_reconciler_task: Mutex::new(None),
         })
     }
 
@@ -582,6 +592,24 @@ impl MvccSubsystem {
         core_store: crate::core_store::CoreStore,
         observability: crate::observability::Observability,
     ) -> Result<()> {
+        let assignment_reconciler =
+            crate::mvcc_assignment_reconciler::BackgroundAssignmentReconciler::new(
+                self.cluster_id(),
+                self.consensus.clone(),
+                self.runtime.local_store().clone(),
+            )?;
+        let assignment_reconciler_task =
+            tokio::spawn(assignment_reconciler.run(self.apply_shutdown.subscribe()));
+        let mut assignment_slot = self
+            .assignment_reconciler_task
+            .lock()
+            .map_err(|_| anyhow::anyhow!("assignment reconciler task lock poisoned"))?;
+        if assignment_slot.is_some() {
+            assignment_reconciler_task.abort();
+            bail!("background assignment reconciler is already started");
+        }
+        *assignment_slot = Some(assignment_reconciler_task);
+        drop(assignment_slot);
         let executor = Arc::new(
             crate::object_materialisation_runner::MvccObjectMaterialisationExecutor::new(
                 self.clone(),
@@ -689,6 +717,14 @@ impl MvccSubsystem {
             .ok()
             .and_then(|mut task| task.take());
         if let Some(task) = outbox_task {
+            let _ = task.await;
+        }
+        let assignment_task = self
+            .assignment_reconciler_task
+            .lock()
+            .ok()
+            .and_then(|mut task| task.take());
+        if let Some(task) = assignment_task {
             let _ = task.await;
         }
         let _ = self.consensus.shutdown().await;

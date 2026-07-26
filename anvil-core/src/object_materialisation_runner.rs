@@ -153,6 +153,15 @@ pub struct MvccMaterialisationPublisher {
     mvcc: Arc<MvccSubsystem>,
 }
 
+pub fn object_materialisation_outbox_partition(cluster_id: &str) -> Result<(u64, String)> {
+    anyhow::ensure!(!cluster_id.trim().is_empty(), "cluster ID is required");
+    let stream_partition = format!("mvcc/{cluster_id}/object-materialisation");
+    Ok((
+        crate::mvcc_outbox::stream_partition_id(&stream_partition)?,
+        stream_partition,
+    ))
+}
+
 impl MvccMaterialisationPublisher {
     pub fn new(mvcc: Arc<MvccSubsystem>) -> Self {
         Self { mvcc }
@@ -197,7 +206,8 @@ impl MvccMaterialisationPublisher {
             ],
             now,
         )?;
-        let stream_partition = format!("mvcc/{}/object-materialisation", result.cluster_id);
+        let (outbox_partition_id, stream_partition) =
+            object_materialisation_outbox_partition(&result.cluster_id)?;
         let event_payload = serde_json::to_vec(&serde_json::json!({
             "schema": "anvil.mvcc.object-index-materialisation.v1",
             "cluster_id": result.cluster_id,
@@ -208,7 +218,7 @@ impl MvccMaterialisationPublisher {
         self.mvcc.open_transactions.add_stream_event(
             &handle.transaction_id,
             crate::mvcc_outbox::StreamOutboxEvent::new(
-                crate::mvcc_outbox::stream_partition_id(&stream_partition)?,
+                outbox_partition_id,
                 format!("mvcc/{}/events", result.cluster_id),
                 stream_partition,
                 "object.index-materialised",

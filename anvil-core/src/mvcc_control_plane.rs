@@ -220,6 +220,37 @@ impl MvccSubsystem {
         {
             return Ok(ControlApplyResult::NodeRemoved(node));
         }
+        let remaining = snapshot
+            .nodes
+            .iter()
+            .filter(|(node_id, incarnation, _)| {
+                *node_id != node.node_id || *incarnation != node.incarnation
+            })
+            .map(|(node_id, incarnation, _)| ConsensusNodeIncarnation {
+                node_id: *node_id,
+                incarnation: *incarnation,
+            })
+            .collect::<Vec<_>>();
+        for (partition_id, assignment) in snapshot
+            .partitions
+            .iter()
+            .filter(|(_, assignment)| assignment.owner == node)
+        {
+            let replacement =
+                crate::mvcc_assignment_reconciler::rendezvous_owner(*partition_id, &remaining)
+                    .context("cannot remove the final node while it owns partitions")?;
+            self.consensus
+                .assign_partition(
+                    crate::mvcc_bootstrap::cluster_id_hash(self.cluster_id()),
+                    *partition_id,
+                    replacement,
+                    assignment.epoch.saturating_add(1),
+                )
+                .await
+                .with_context(|| {
+                    format!("reassign partition {partition_id} before node removal")
+                })?;
+        }
         self.consensus
             .remove_node(
                 crate::mvcc_bootstrap::cluster_id_hash(self.cluster_id()),

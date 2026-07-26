@@ -111,6 +111,64 @@ pub struct MvccStore {
 pub type LocalMvccStore = MvccStore;
 
 impl MvccStore {
+    /// Enumerates compact-Raft partitions required by durable background work.
+    /// Delivered/completed rows no longer require assignment coverage.
+    pub fn required_background_work_partitions(&self) -> Result<BTreeSet<u64>> {
+        let mut partitions = BTreeSet::new();
+        let materialisation_cf = self.cf(CF_MATERIALISATION)?;
+        for (prefix_suffix, kind) in [
+            (b"object-job/".as_slice(), "object-materialisation"),
+            (b"shard-repair/".as_slice(), "shard-repair"),
+        ] {
+            let prefix = self.key(prefix_suffix);
+            for row in self.db.iterator_cf(
+                materialisation_cf,
+                IteratorMode::From(&prefix, Direction::Forward),
+            ) {
+                let (key, value) = row?;
+                if !key.starts_with(&prefix) {
+                    break;
+                }
+                let logical_identity = if kind == "object-materialisation" {
+                    let record: ObjectMaterialisationRecord = serde_json::from_slice(&value)?;
+                    if record.state == ObjectMaterialisationState::Complete {
+                        continue;
+                    }
+                    record.job.target_logical_identity
+                } else {
+                    let record: ShardRepairRecord = serde_json::from_slice(&value)?;
+                    if record.state == ShardRepairState::Complete {
+                        continue;
+                    }
+                    record.job.target_logical_identity
+                };
+                partitions.insert(crate::mvcc_worker_authority::work_partition_id(
+                    kind,
+                    &logical_identity,
+                )?);
+            }
+        }
+        let outbox_cf = self.cf(CF_OUTBOX)?;
+        let prefix = self.key(b"event/");
+        for row in self
+            .db
+            .iterator_cf(outbox_cf, IteratorMode::From(&prefix, Direction::Forward))
+        {
+            let (key, value) = row?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let record: OutboxRecord = serde_json::from_slice(&value)?;
+            if record.state == OutboxState::Delivered {
+                continue;
+            }
+            partitions.insert(
+                crate::mvcc_outbox::StreamOutboxEvent::decode(&record.payload)?.partition_id,
+            );
+        }
+        Ok(partitions)
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let mut options = Options::default();
         options.create_if_missing(true);
