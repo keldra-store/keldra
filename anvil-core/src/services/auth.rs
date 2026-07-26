@@ -255,6 +255,7 @@ impl AuthService for AppState {
                 &client_id,
                 &encrypted_secret,
                 Some(&audit_event),
+                None,
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -297,7 +298,7 @@ impl AuthService for AppState {
         )?;
         let audit_event_id = audit_event.audit_event_id.clone();
         self.persistence
-            .update_app_secret(app.id, &encrypted_secret, Some(&audit_event))
+            .update_app_secret(app.id, &encrypted_secret, Some(&audit_event), None)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(ApplicationSecretResponse {
@@ -333,7 +334,7 @@ impl AuthService for AppState {
             serde_json::json!({ "app_id": app.id }),
         )?;
         self.persistence
-            .delete_app(app.id, Some(&audit_event))
+            .delete_app(app.id, Some(&audit_event), None)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(DeleteApplicationCredentialResponse {

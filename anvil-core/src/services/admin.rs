@@ -90,6 +90,19 @@ impl AdminService for AppState {
         let client_id = generated_client_id();
         let client_secret = generated_client_secret();
         let encrypted_secret = encrypt_admin_client_secret(self, &client_secret)?;
+        let audit_event = build_admin_audit_event(
+            &principal,
+            context,
+            "admin.app.create",
+            &format!("app:{client_id}"),
+            json!({
+                "resource_kind": "application",
+                "tenant_id": tenant_id,
+                "app_name": &req.app_name,
+                "client_id": &client_id,
+            }),
+        )?;
+        let audit_event_id = audit_event.audit_event_id.clone();
         let app = self
             .persistence
             .create_app(
@@ -98,24 +111,10 @@ impl AdminService for AppState {
                 &client_id,
                 &encrypted_secret,
                 None,
+                Some(&audit_event),
             )
             .await
             .map_err(|err| Status::internal(err.to_string()))?;
-        let audit_event_id = record_admin_audit_event(
-            self,
-            &principal,
-            context,
-            "admin.app.create",
-            &format!("app:{}", app.client_id),
-            json!({
-                "resource_kind": "application",
-                "tenant_id": tenant_id,
-                "app_id": app.id,
-                "app_name": &app.name,
-                "client_id": &app.client_id,
-            }),
-        )
-        .await?;
         Ok(Response::new(ApplicationSecretResponse {
             request_id: context.request_id.clone(),
             tenant_id: tenant_id.to_string(),
@@ -143,12 +142,7 @@ impl AdminService for AppState {
             .ok_or_else(|| Status::not_found("Application not found"))?;
         let client_secret = generated_client_secret();
         let encrypted_secret = encrypt_admin_client_secret(self, &client_secret)?;
-        self.persistence
-            .update_app_secret(app.id, &encrypted_secret, None)
-            .await
-            .map_err(|err| Status::internal(err.to_string()))?;
-        let audit_event_id = record_admin_audit_event(
-            self,
+        let audit_event = build_admin_audit_event(
             &principal,
             context,
             "admin.app.secret.rotate",
@@ -160,8 +154,12 @@ impl AdminService for AppState {
                 "app_name": &app.name,
                 "client_id": &app.client_id,
             }),
-        )
-        .await?;
+        )?;
+        let audit_event_id = audit_event.audit_event_id.clone();
+        self.persistence
+            .update_app_secret(app.id, &encrypted_secret, None, Some(&audit_event))
+            .await
+            .map_err(|err| Status::internal(err.to_string()))?;
         Ok(Response::new(ApplicationSecretResponse {
             request_id: context.request_id.clone(),
             tenant_id: tenant_id.to_string(),

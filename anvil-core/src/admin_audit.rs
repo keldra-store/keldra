@@ -122,6 +122,32 @@ pub async fn append_audit_event(storage: &Storage, event: &AdminAuditEvent) -> R
     Ok(())
 }
 
+pub(crate) fn admin_audit_mvcc_plan(
+    event: &AdminAuditEvent,
+    generation: u64,
+    transaction_id: &str,
+) -> Result<crate::mvcc_product::ProductMutationPlan> {
+    let stream_id = audit_stream_id(&event.audit_event_id);
+    let projection = encode_audit_projection(event, &stream_id, generation, transaction_id);
+    let mut operations = vec![CoreMutationOperation::StreamAppend {
+        partition_id: "global".to_string(),
+        stream_id,
+        record_kind: "admin_audit_event".to_string(),
+        payload: encode_audit_event(event),
+        idempotency_key: Some(event.audit_event_id.clone()),
+    }];
+    for tuple_key in audit_projection_keys(event)? {
+        operations.push(CoreMutationOperation::CoreMetaPut {
+            partition_id: "global".to_string(),
+            cf: CF_OBSERVABILITY.to_string(),
+            table_id: TABLE_OBSERVABILITY_CURSOR_ROW,
+            tuple_key,
+            payload: projection.clone(),
+        });
+    }
+    crate::mvcc_product::product_mutations_and_outbox_from_operations(operations)
+}
+
 pub async fn list_audit_event_page(
     storage: &Storage,
     filter: AuditEventFilter<'_>,

@@ -839,6 +839,21 @@ pub(super) async fn record_admin_audit_event(
     resource_id: &str,
     details: serde_json::Value,
 ) -> Result<String, Status> {
+    let event = build_admin_audit_event(principal, context, action, resource_id, details)?;
+    let audit_event_id = event.audit_event_id.clone();
+    admin_audit::append_audit_event(&state.storage, &event)
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?;
+    Ok(audit_event_id)
+}
+
+pub(super) fn build_admin_audit_event(
+    principal: &AdminPrincipal,
+    context: &AdminRequestContext,
+    action: &str,
+    resource_id: &str,
+    details: serde_json::Value,
+) -> Result<AdminAuditEvent, Status> {
     let audit_event_id = audit_event_id(principal, context);
     let event = AdminAuditEvent {
         schema: admin_audit::ADMIN_AUDIT_EVENT_SCHEMA.to_string(),
@@ -851,10 +866,7 @@ pub(super) async fn record_admin_audit_event(
         created_at: Utc::now().to_rfc3339(),
         details_json: admin_audit_details_json(principal, context, details)?,
     };
-    admin_audit::append_audit_event(&state.storage, &event)
-        .await
-        .map_err(|err| Status::internal(err.to_string()))?;
-    Ok(audit_event_id)
+    Ok(event)
 }
 
 pub(super) async fn record_admin_audit_event_with_suffix(
@@ -1112,7 +1124,7 @@ pub(super) async fn rotate_application_secret_envelopes(
                             if !dry_run {
                                 state
                                     .persistence
-                                    .update_app_secret(details.id, &rotated, None)
+                                    .update_app_secret(details.id, &rotated, None, None)
                                     .await
                                     .map_err(|err| Status::internal(err.to_string()))?;
                             }

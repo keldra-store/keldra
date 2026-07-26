@@ -489,7 +489,14 @@ async fn create_bootstrap_app(
     let client_secret = format!("secret_{}", uuid::Uuid::new_v4().simple());
     let encrypted_secret = secret_keyring.encrypt(client_secret.as_bytes())?;
     let app = persistence
-        .create_app(tenant_id, app_name, &client_id, &encrypted_secret, None)
+        .create_app(
+            tenant_id,
+            app_name,
+            &client_id,
+            &encrypted_secret,
+            None,
+            None,
+        )
         .await?;
 
     let credential = BootstrapCredentialFile {
