@@ -137,6 +137,13 @@ pub struct ReplicationAck {
     pub status: AckStatus,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransferWatermark {
+    pub persisted_through: u64,
+    pub complete: bool,
+    pub completed_hash: Option<[u8; 32]>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct TransferMetadata {
     transfer_id: Uuid,
@@ -180,13 +187,31 @@ impl TransferReceiver {
     }
 
     pub fn persisted_watermark(&self, transfer_id: Uuid) -> Result<Option<u64>> {
+        Ok(self
+            .watermark(transfer_id)?
+            .map(|watermark| watermark.persisted_through))
+    }
+
+    pub fn watermark(&self, transfer_id: Uuid) -> Result<Option<TransferWatermark>> {
         let partial = self.partial_path(transfer_id);
         if partial.exists() {
-            return Ok(Some(partial.metadata()?.len()));
+            return Ok(Some(TransferWatermark {
+                persisted_through: partial.metadata()?.len(),
+                complete: false,
+                completed_hash: None,
+            }));
         }
         let complete = self.complete_path(transfer_id);
         if complete.exists() {
-            return Ok(Some(complete.metadata()?.len()));
+            let completed_hash = self
+                .metadata
+                .get(&transfer_id)
+                .map(|metadata| metadata.final_hash);
+            return Ok(Some(TransferWatermark {
+                persisted_through: complete.metadata()?.len(),
+                complete: true,
+                completed_hash,
+            }));
         }
         Ok(None)
     }

@@ -17,6 +17,7 @@ pub mod object;
 pub mod personaldb;
 pub mod registry;
 pub mod repair;
+pub mod replication;
 #[cfg(feature = "root-publication-test-control")]
 mod root_publication_test_control;
 pub mod saga;
