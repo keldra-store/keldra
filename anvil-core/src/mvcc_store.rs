@@ -4,6 +4,7 @@
 //! certified bundle and advances the node's locally applied version.
 
 use std::{
+    collections::BTreeSet,
     path::Path,
     sync::{Arc, Mutex},
 };
@@ -71,6 +72,24 @@ pub struct OutboxRecord {
     pub attempts: u32,
     pub lease_owner: Option<String>,
     pub lease_expires_unix_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UnfinishedWorkPins {
+    pub outbox_versions: BTreeSet<CommitVersion>,
+    pub materialisation_snapshots: BTreeSet<CommitVersion>,
+    pub repair_snapshots: BTreeSet<CommitVersion>,
+}
+
+impl UnfinishedWorkPins {
+    pub fn all(&self) -> BTreeSet<CommitVersion> {
+        self.outbox_versions
+            .iter()
+            .chain(self.materialisation_snapshots.iter())
+            .chain(self.repair_snapshots.iter())
+            .copied()
+            .collect()
+    }
 }
 
 #[derive(Clone)]
@@ -657,6 +676,61 @@ impl MvccStore {
             .transpose()
     }
 
+    /// Reports durable unfinished work which must constrain the candidate GC
+    /// watermark before `AdvanceGcWatermark` is proposed to consensus.
+    pub fn unfinished_work_pins(&self) -> Result<UnfinishedWorkPins> {
+        let mut pins = UnfinishedWorkPins::default();
+        let outbox_cf = self.cf(CF_OUTBOX)?;
+        let outbox_prefix = self.key(b"event/");
+        for row in self.db.iterator_cf(
+            outbox_cf,
+            IteratorMode::From(&outbox_prefix, Direction::Forward),
+        ) {
+            let (key, value) = row?;
+            if !key.starts_with(&outbox_prefix) {
+                break;
+            }
+            let record: OutboxRecord = serde_json::from_slice(&value)?;
+            if record.state != OutboxState::Delivered {
+                pins.outbox_versions.insert(record.commit_version);
+            }
+        }
+
+        let materialisation_cf = self.cf(CF_MATERIALISATION)?;
+        let object_prefix = self.key(b"object-job/");
+        for row in self.db.iterator_cf(
+            materialisation_cf,
+            IteratorMode::From(&object_prefix, Direction::Forward),
+        ) {
+            let (key, value) = row?;
+            if !key.starts_with(&object_prefix) {
+                break;
+            }
+            let record: ObjectMaterialisationRecord = serde_json::from_slice(&value)?;
+            if record.state != ObjectMaterialisationState::Complete {
+                pins.materialisation_snapshots
+                    .insert(record.job.originating_snapshot_version);
+            }
+        }
+
+        let repair_prefix = self.key(b"shard-repair/");
+        for row in self.db.iterator_cf(
+            materialisation_cf,
+            IteratorMode::From(&repair_prefix, Direction::Forward),
+        ) {
+            let (key, value) = row?;
+            if !key.starts_with(&repair_prefix) {
+                break;
+            }
+            let record: ShardRepairRecord = serde_json::from_slice(&value)?;
+            if record.state != ShardRepairState::Complete {
+                pins.repair_snapshots
+                    .insert(record.job.originating_snapshot_version);
+            }
+        }
+        Ok(pins)
+    }
+
     fn transition_object_materialisation(
         &self,
         job_id: &str,
@@ -715,9 +789,16 @@ impl MvccStore {
         Ok(())
     }
 
-    /// Removes obsolete history below `safe_watermark`, retaining the newest
-    /// version at or below the watermark as the visibility anchor.
+    /// Removes obsolete history below a consensus-approved watermark.
+    ///
+    /// The newest version at or below the watermark is retained as the
+    /// visibility anchor, including tombstones. All newer versions remain.
+    /// Delivered outbox events and completed jobs are removed only when their
+    /// commit/snapshot coordinate is strictly below the watermark. Pending or
+    /// leased work is a hard pin and causes collection to fail.
     pub fn garbage_collect(&self, safe_watermark: CommitVersion) -> Result<usize> {
+        let _materialisation_transition = self.materialisation_transition.lock().unwrap();
+        let _outbox_transition = self.outbox_transition.lock().unwrap();
         let current = self.gc_watermark()?;
         if safe_watermark < current {
             bail!("GC watermark cannot move backwards");
@@ -725,8 +806,16 @@ impl MvccStore {
         if safe_watermark > self.applied_version()? {
             bail!("GC watermark cannot exceed the applied version");
         }
+        if let Some(oldest_pin) = self.unfinished_work_pins()?.all().into_iter().next()
+            && oldest_pin < safe_watermark
+        {
+            bail!("GC watermark {safe_watermark} exceeds unfinished work pin {oldest_pin}");
+        }
 
         let versions_cf = self.cf(CF_VERSIONS)?;
+        let applied_cf = self.cf(CF_APPLIED)?;
+        let materialisation_cf = self.cf(CF_MATERIALISATION)?;
+        let outbox_cf = self.cf(CF_OUTBOX)?;
         let meta_cf = self.cf(CF_META)?;
         let mut batch = WriteBatch::default();
         let mut deleted = 0;
@@ -753,6 +842,49 @@ impl MvccStore {
                 deleted += 1;
             }
         }
+        for row in self.db.iterator_cf(
+            applied_cf,
+            IteratorMode::From(&self.scope, Direction::Forward),
+        ) {
+            let (encoded_key, _) = row?;
+            if !encoded_key.starts_with(&self.scope) {
+                break;
+            }
+            let version = decode_u64(self.unscoped(&encoded_key)?, "applied bundle version")?;
+            if version < safe_watermark {
+                batch.delete_cf(applied_cf, encoded_key);
+                deleted += 1;
+            }
+        }
+        let outbox_prefix = self.key(b"event/");
+        for row in self.db.iterator_cf(
+            outbox_cf,
+            IteratorMode::From(&outbox_prefix, Direction::Forward),
+        ) {
+            let (key, value) = row?;
+            if !key.starts_with(&outbox_prefix) {
+                break;
+            }
+            let record: OutboxRecord = serde_json::from_slice(&value)?;
+            if record.state == OutboxState::Delivered && record.commit_version < safe_watermark {
+                batch.delete_cf(outbox_cf, key);
+                deleted += 1;
+            }
+        }
+        self.collect_completed_jobs(
+            materialisation_cf,
+            b"object-job/",
+            safe_watermark,
+            &mut batch,
+            &mut deleted,
+        )?;
+        self.collect_completed_jobs(
+            materialisation_cf,
+            b"shard-repair/",
+            safe_watermark,
+            &mut batch,
+            &mut deleted,
+        )?;
         batch.put_cf(
             meta_cf,
             self.key(GC_WATERMARK_KEY),
@@ -760,6 +892,40 @@ impl MvccStore {
         );
         self.db.write_opt(batch, &durable_write_options())?;
         Ok(deleted)
+    }
+
+    fn collect_completed_jobs(
+        &self,
+        cf: &ColumnFamily,
+        suffix: &[u8],
+        safe_watermark: CommitVersion,
+        batch: &mut WriteBatch,
+        deleted: &mut usize,
+    ) -> Result<()> {
+        let prefix = self.key(suffix);
+        for row in self
+            .db
+            .iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward))
+        {
+            let (key, value) = row?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let completed_below_watermark = if suffix == b"object-job/" {
+                let record: ObjectMaterialisationRecord = serde_json::from_slice(&value)?;
+                record.state == ObjectMaterialisationState::Complete
+                    && record.job.originating_snapshot_version < safe_watermark
+            } else {
+                let record: ShardRepairRecord = serde_json::from_slice(&value)?;
+                record.state == ShardRepairState::Complete
+                    && record.job.originating_snapshot_version < safe_watermark
+            };
+            if completed_below_watermark {
+                batch.delete_cf(cf, key);
+                *deleted += 1;
+            }
+        }
+        Ok(())
     }
 
     fn read_meta_version(&self, key: &[u8]) -> Result<CommitVersion> {
@@ -1215,11 +1381,70 @@ mod tests {
                 .unwrap();
         }
 
-        assert_eq!(store.garbage_collect(6).unwrap(), 1);
+        assert_eq!(store.garbage_collect(6).unwrap(), 3);
         assert_eq!(store.gc_watermark().unwrap(), 6);
         assert_eq!(store.read_at(&row, 6).unwrap().unwrap().value, b"five");
         assert_eq!(store.read_latest(&row).unwrap().unwrap().value, b"nine");
         assert!(store.garbage_collect(5).is_err());
+    }
+
+    #[test]
+    fn gc_preserves_tombstone_anchor_at_the_watermark() {
+        let temp = tempdir().unwrap();
+        let store = MvccStore::open(temp.path()).unwrap();
+        let row = key(2, b"deleted");
+        store
+            .apply_certified_bundle(
+                2,
+                &bundle("put-before-delete", |builder| {
+                    builder.put(row.clone(), b"value".to_vec());
+                }),
+            )
+            .unwrap();
+        store
+            .apply_certified_bundle(
+                5,
+                &bundle("delete-anchor", |builder| {
+                    builder.delete(row.clone());
+                }),
+            )
+            .unwrap();
+        store
+            .apply_certified_bundle(8, &bundle("later-unrelated", |_| {}))
+            .unwrap();
+
+        store.garbage_collect(6).unwrap();
+        assert_eq!(store.read_at(&row, 6).unwrap(), None);
+        assert_eq!(store.read_latest(&row).unwrap(), None);
+    }
+
+    #[test]
+    fn unfinished_outbox_work_pins_gc_and_delivered_history_is_reclaimed() {
+        let temp = tempdir().unwrap();
+        let store = MvccStore::open(temp.path()).unwrap();
+        store
+            .apply_certified_bundle(
+                2,
+                &bundle("outbox", |builder| {
+                    builder.add_outbox_event(b"event".to_vec());
+                }),
+            )
+            .unwrap();
+        store
+            .apply_certified_bundle(5, &bundle("advance", |_| {}))
+            .unwrap();
+
+        assert_eq!(
+            store.unfinished_work_pins().unwrap().outbox_versions,
+            [2_u64].into_iter().collect()
+        );
+        assert!(store.garbage_collect(5).is_err());
+
+        let record = store.claim_outbox("worker", 10, 10).unwrap().unwrap();
+        store.complete_outbox(&record, "worker").unwrap();
+        assert!(store.unfinished_work_pins().unwrap().all().is_empty());
+        store.garbage_collect(5).unwrap();
+        assert!(store.outbox_records_after(0, 10).unwrap().is_empty());
     }
 
     #[test]
