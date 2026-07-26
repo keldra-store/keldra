@@ -346,6 +346,16 @@ pub(crate) struct BucketMvccMutationPlan {
 }
 
 impl BucketMvccMutationPlan {
+    pub fn with_admin_audit(mut self, event: &crate::admin_audit::AdminAuditEvent) -> Result<Self> {
+        let audit = crate::admin_audit::admin_audit_mvcc_plan(
+            event,
+            self.collection_revision,
+            &event.audit_event_id,
+        )?;
+        self.mutations.extend(audit.mutations);
+        self.outbox_events.extend(audit.outbox_events);
+        Ok(self)
+    }
     pub fn stage(
         self,
         mvcc: &crate::mvcc_bootstrap::MvccSubsystem,

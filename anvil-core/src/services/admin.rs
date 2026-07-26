@@ -565,9 +565,22 @@ impl AdminService for AppState {
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), true)?;
         let tenant_id = resolve_tenant_id(self, &req.tenant_id).await?;
+        let audit_event = build_admin_audit_event(
+            &principal,
+            context,
+            "admin.bucket.create",
+            &bucket_resource_id(tenant_id, &req.bucket_name),
+            json!({ "resource_kind": "bucket", "tenant_id": tenant_id, "bucket_name": &req.bucket_name, "region": &req.region }),
+        )?;
+        let audit_event_id = audit_event.audit_event_id.clone();
         let bucket = self
             .persistence
-            .create_bucket(tenant_id, &req.bucket_name, &req.region)
+            .create_bucket_with_admin_audit(
+                tenant_id,
+                &req.bucket_name,
+                &req.region,
+                Some(&audit_event),
+            )
             .await?;
         crate::access_control::grant_bucket_defaults(
             &self.persistence,
@@ -578,22 +591,6 @@ impl AdminService for AppState {
         )
         .await
         .map_err(|err| Status::internal(err.to_string()))?;
-        let audit_event_id = record_admin_audit_event(
-            self,
-            &principal,
-            context,
-            "admin.bucket.create",
-            &bucket_resource_id(tenant_id, &bucket.name),
-            json!({
-                "resource_kind": "bucket",
-                "tenant_id": tenant_id,
-                "bucket_id": bucket.id,
-                "bucket_name": &bucket.name,
-                "region": &bucket.region,
-                "is_public_read": bucket.is_public_read,
-            }),
-        )
-        .await?;
         Ok(Response::new(BucketAdminResponse {
             request_id: context.request_id.clone(),
             bucket: Some(bucket_to_proto(bucket)),
@@ -609,8 +606,21 @@ impl AdminService for AppState {
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let tenant_id = resolve_tenant_id(self, &req.tenant_id).await?;
+        let audit_event = build_admin_audit_event(
+            &principal,
+            context,
+            "admin.bucket.public_access.set",
+            &bucket_resource_id(tenant_id, &req.bucket_name),
+            json!({ "resource_kind": "bucket", "tenant_id": tenant_id, "bucket_name": &req.bucket_name, "allow_public_read": req.allow_public_read }),
+        )?;
+        let audit_event_id = audit_event.audit_event_id.clone();
         self.persistence
-            .set_bucket_public_access(tenant_id, &req.bucket_name, req.allow_public_read)
+            .set_bucket_public_access_with_admin_audit(
+                tenant_id,
+                &req.bucket_name,
+                req.allow_public_read,
+                Some(&audit_event),
+            )
             .await
             .map_err(|err| Status::internal(err.to_string()))?;
         let bucket = self
@@ -619,23 +629,6 @@ impl AdminService for AppState {
             .await
             .map_err(|err| Status::internal(err.to_string()))?
             .ok_or_else(|| Status::not_found("Bucket not found"))?;
-        let audit_event_id = record_admin_audit_event(
-            self,
-            &principal,
-            context,
-            "admin.bucket.public_access.set",
-            &bucket_resource_id(tenant_id, &bucket.name),
-            json!({
-                "resource_kind": "bucket",
-                "tenant_id": tenant_id,
-                "bucket_id": bucket.id,
-                "bucket_name": &bucket.name,
-                "region": &bucket.region,
-                "allow_public_read": req.allow_public_read,
-                "is_public_read": bucket.is_public_read,
-            }),
-        )
-        .await?;
         Ok(Response::new(BucketAdminResponse {
             request_id: context.request_id.clone(),
             bucket: Some(bucket_to_proto(bucket)),

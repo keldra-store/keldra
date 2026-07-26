@@ -153,6 +153,17 @@ impl Persistence {
         name: &str,
         region: &str,
     ) -> Result<Bucket, tonic::Status> {
+        self.create_bucket_with_admin_audit(tenant_id, name, region, None)
+            .await
+    }
+
+    pub async fn create_bucket_with_admin_audit(
+        &self,
+        tenant_id: i64,
+        name: &str,
+        region: &str,
+        audit_event: Option<&crate::admin_audit::AdminAuditEvent>,
+    ) -> Result<Bucket, tonic::Status> {
         let total_start = std::time::Instant::now();
         let step_start = std::time::Instant::now();
         crate::mesh_lifecycle::ensure_new_writable_placement(
@@ -226,6 +237,10 @@ impl Persistence {
             &bucket,
             BucketJournalMutation::Create,
         )
+        .and_then(|plan| match audit_event {
+            Some(event) => plan.with_admin_audit(event),
+            None => Ok(plan),
+        })
         .map_err(|e| tonic::Status::internal(e.to_string()))?;
         let (allocated_id, _) = plan
             .autocommit(
@@ -264,6 +279,17 @@ impl Persistence {
         bucket_name: &str,
         is_public: bool,
     ) -> Result<Bucket> {
+        self.set_bucket_public_access_with_admin_audit(tenant_id, bucket_name, is_public, None)
+            .await
+    }
+
+    pub async fn set_bucket_public_access_with_admin_audit(
+        &self,
+        tenant_id: i64,
+        bucket_name: &str,
+        is_public: bool,
+        audit_event: Option<&crate::admin_audit::AdminAuditEvent>,
+    ) -> Result<Bucket> {
         let mut out =
             bucket_journal::read_current_bucket_mvcc(self.mvcc()?, tenant_id, bucket_name)?
                 .ok_or_else(|| anyhow!("bucket not found"))?;
@@ -276,6 +302,10 @@ impl Persistence {
             &out,
             BucketJournalMutation::Update,
         )
+        .and_then(|plan| match audit_event {
+            Some(event) => plan.with_admin_audit(event),
+            None => Ok(plan),
+        })?
         .autocommit(
             self.mvcc()?,
             "bucket-metadata",
