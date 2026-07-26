@@ -424,7 +424,9 @@ impl MvccSubsystem {
             replication_client.clone(),
             remote_nodes,
             local_store,
-        );
+        )
+        .with_prepared_bundle_gc_grace(config.mvcc_prepared_bundle_gc_grace_ms)
+        .context("configure prepared bundle GC grace")?;
         let apply_worker_state = worker.state_handle();
         let (apply_shutdown, apply_shutdown_rx) = tokio::sync::watch::channel(false);
         let apply_task = tokio::spawn(worker.run(apply_shutdown_rx));

@@ -791,6 +791,7 @@ mod app_state_tests {
                 mvcc_peers_json: peers_json.clone(),
                 mvcc_bootstrap_membership: index == 0,
                 mvcc_bundle_quorum_holders: 2,
+                mvcc_prepared_bundle_gc_grace_ms: 86_400_000,
                 mvcc_tolerated_failure_domains: 1,
                 mvcc_rpc_timeout_ms: 5_000,
                 ..Config::default()

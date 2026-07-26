@@ -79,6 +79,7 @@ pub struct UnfinishedWorkPins {
     pub outbox_versions: BTreeSet<CommitVersion>,
     pub materialisation_snapshots: BTreeSet<CommitVersion>,
     pub repair_snapshots: BTreeSet<CommitVersion>,
+    pub transaction_ids: BTreeSet<String>,
 }
 
 impl UnfinishedWorkPins {
@@ -693,6 +694,7 @@ impl MvccStore {
             let record: OutboxRecord = serde_json::from_slice(&value)?;
             if record.state != OutboxState::Delivered {
                 pins.outbox_versions.insert(record.commit_version);
+                pins.transaction_ids.insert(record.transaction_id);
             }
         }
 
@@ -710,6 +712,7 @@ impl MvccStore {
             if record.state != ObjectMaterialisationState::Complete {
                 pins.materialisation_snapshots
                     .insert(record.job.originating_snapshot_version);
+                pins.transaction_ids.insert(record.job.transaction_id);
             }
         }
 
@@ -726,6 +729,7 @@ impl MvccStore {
             if record.state != ShardRepairState::Complete {
                 pins.repair_snapshots
                     .insert(record.job.originating_snapshot_version);
+                pins.transaction_ids.insert(record.job.transaction_id);
             }
         }
         Ok(pins)

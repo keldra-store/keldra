@@ -16,21 +16,22 @@ use crate::{
     mvcc_transaction::{
         BundleDurabilityEvidence, BundleIdentity, BundleReplicator, DurabilityLevel,
         NodeIncarnation, ObjectDurabilityEvidence, ObjectShardManifestReference,
-        PreparedBundleStore, ReplicationEvidence,
+        PreparedBundleStore, ReplicationEvidence, TransactionBundle,
     },
     replication::{AckStatus, ReplicationAck},
     shard_placement::DistributedIngestResult,
 };
 
 const MAGIC: &[u8; 8] = b"ANVBND01";
-const VERSION: u16 = 1;
-const HEADER: usize = 8 + 2 + 32 + 8;
+const VERSION: u16 = 2;
+const HEADER: usize = 8 + 2 + 32 + 8 + 8;
 const TRAILER: usize = 32;
 
 #[derive(Clone, Copy)]
 struct BundleLocation {
     payload_offset: u64,
     payload_length: u64,
+    prepared_at_unix_ms: u64,
 }
 
 struct PreparedBundleLog {
@@ -65,7 +66,13 @@ impl PreparedBundleLog {
             verify_identity(identity, &existing)?;
             return Ok(());
         }
-        append_record(&mut self.file, identity, bytes, &mut self.index)?;
+        append_record(
+            &mut self.file,
+            identity,
+            bytes,
+            unix_time_ms()?,
+            &mut self.index,
+        )?;
         self.file.sync_data()?;
         Ok(())
     }
@@ -114,7 +121,13 @@ impl PreparedBundleLog {
                 length: location.payload_length,
             };
             verify_identity(&identity, &bytes)?;
-            append_record(&mut replacement, &identity, &bytes, &mut replacement_index)?;
+            append_record(
+                &mut replacement,
+                &identity,
+                &bytes,
+                location.prepared_at_unix_ms,
+                &mut replacement_index,
+            )?;
         }
         replacement.sync_all()?;
         fs::rename(&temporary_path, &self.path)?;
@@ -129,6 +142,7 @@ fn append_record(
     file: &mut File,
     identity: &BundleIdentity,
     bytes: &[u8],
+    prepared_at_unix_ms: u64,
     index: &mut BTreeMap<String, BundleLocation>,
 ) -> Result<()> {
     let hash = parse_sha256(&identity.hash)?;
@@ -138,6 +152,7 @@ fn append_record(
     record.extend_from_slice(&VERSION.to_be_bytes());
     record.extend_from_slice(&hash);
     record.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+    record.extend_from_slice(&prepared_at_unix_ms.to_be_bytes());
     record.extend_from_slice(bytes);
     let checksum: [u8; 32] = Sha256::digest(&record).into();
     record.extend_from_slice(&checksum);
@@ -147,9 +162,19 @@ fn append_record(
         BundleLocation {
             payload_offset: offset + HEADER as u64,
             payload_length: bytes.len() as u64,
+            prepared_at_unix_ms,
         },
     );
     Ok(())
+}
+
+fn unix_time_ms() -> Result<u64> {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis(),
+    )
+    .context("system time exceeds u64 milliseconds")
 }
 
 #[derive(Clone)]
@@ -212,6 +237,52 @@ impl AppendOnlyPreparedBundleStore {
             retained_hashes.insert(identity.hash.clone());
         }
         log.compact(&retained_hashes)
+    }
+
+    pub fn retain_plan(
+        &self,
+        committed: &[BundleIdentity],
+        pinned_transaction_ids: &BTreeSet<String>,
+        now_unix_ms: u64,
+        preparation_grace_ms: u64,
+    ) -> Result<Vec<BundleIdentity>> {
+        let mut log = self
+            .log
+            .lock()
+            .map_err(|_| anyhow::anyhow!("prepared bundle log lock poisoned"))?;
+        let committed = committed
+            .iter()
+            .map(|identity| (identity.hash.as_str(), identity.length))
+            .collect::<BTreeMap<_, _>>();
+        let locations = log.index.clone();
+        let mut retained = Vec::new();
+        for (hash, location) in locations {
+            let identity = BundleIdentity {
+                hash,
+                length: location.payload_length,
+            };
+            let explicitly_committed = match committed.get(identity.hash.as_str()) {
+                Some(length) if *length == identity.length => true,
+                Some(_) => bail!("committed bundle retain evidence has the wrong length"),
+                None => false,
+            };
+            let grace_deadline = location
+                .prepared_at_unix_ms
+                .checked_add(preparation_grace_ms)
+                .context("prepared bundle grace deadline overflow")?;
+            let recent = now_unix_ms < grace_deadline;
+            let pinned_or_ambiguous = match log.read(&identity) {
+                Ok(Some(bytes)) => serde_json::from_slice::<TransactionBundle>(&bytes)
+                    .map(|bundle| pinned_transaction_ids.contains(&bundle.transaction_id))
+                    .unwrap_or(true),
+                Ok(None) | Err(_) => true,
+            };
+            if explicitly_committed || recent || pinned_or_ambiguous {
+                retained.push(identity);
+            }
+        }
+        retained.sort_by(|left, right| left.hash.cmp(&right.hash));
+        Ok(retained)
     }
 }
 
@@ -421,6 +492,7 @@ fn recover(file: &mut File) -> Result<BTreeMap<String, BundleLocation>> {
             bail!("prepared bundle log contains invalid framing at offset {offset}");
         }
         let length = u64::from_be_bytes(header[42..50].try_into().unwrap());
+        let prepared_at_unix_ms = u64::from_be_bytes(header[50..58].try_into().unwrap());
         let record_len = (HEADER as u64)
             .checked_add(length)
             .and_then(|value| value.checked_add(TRAILER as u64))
@@ -453,6 +525,7 @@ fn recover(file: &mut File) -> Result<BTreeMap<String, BundleLocation>> {
                 BundleLocation {
                     payload_offset: offset + HEADER as u64,
                     payload_length: length,
+                    prepared_at_unix_ms,
                 },
             )
             .is_some()
@@ -502,6 +575,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::mvcc_transaction::{
+        HierarchicalRangeStampScheme, LogicalKey, TransactionBundleBuilder,
+    };
 
     fn node(id: &str) -> NodeIncarnation {
         NodeIncarnation {
@@ -519,6 +595,25 @@ mod tests {
             hash: format!("sha256:{}", hex::encode(hash.finalize())),
             length: bytes.len() as u64,
         }
+    }
+
+    fn canonical_bundle(transaction_id: &str) -> (BundleIdentity, Vec<u8>) {
+        let mut builder = TransactionBundleBuilder::new(
+            "cluster-a",
+            transaction_id,
+            0,
+            "principal",
+            HierarchicalRangeStampScheme::new(),
+        );
+        builder.put(
+            LogicalKey {
+                table_id: 1,
+                application_key: transaction_id.as_bytes().to_vec(),
+            },
+            b"value".to_vec(),
+        );
+        let bytes = builder.build().unwrap().canonical_bytes().unwrap();
+        (identity(&bytes), bytes)
     }
 
     #[tokio::test]
@@ -588,6 +683,40 @@ mod tests {
         .unwrap();
         assert_eq!(reopened.read(&keep).unwrap().unwrap(), keep_bytes);
         assert!(reopened.read(&remove).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn retain_plan_uses_commit_reachability_transaction_pins_and_grace() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AppendOnlyPreparedBundleStore::open(
+            directory.path(),
+            "cluster-a",
+            node("node-a"),
+            "zone-a",
+        )
+        .unwrap();
+        let (committed, committed_bytes) = canonical_bundle("committed");
+        let (pinned, pinned_bytes) = canonical_bundle("pinned");
+        let (expired, expired_bytes) = canonical_bundle("expired");
+        store.persist(&committed, &committed_bytes).await.unwrap();
+        store.persist(&pinned, &pinned_bytes).await.unwrap();
+        store.persist(&expired, &expired_bytes).await.unwrap();
+        for location in store.log.lock().unwrap().index.values_mut() {
+            location.prepared_at_unix_ms = 1;
+        }
+
+        let retain = store
+            .retain_plan(
+                std::slice::from_ref(&committed),
+                &["pinned".to_string()].into_iter().collect(),
+                100,
+                10,
+            )
+            .unwrap();
+        assert!(retain.contains(&committed));
+        assert!(retain.contains(&pinned));
+        assert!(!retain.contains(&expired));
+        assert_eq!(store.compact_authorised(&retain).unwrap(), 1);
     }
 
     #[tokio::test]

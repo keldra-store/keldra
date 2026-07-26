@@ -1,6 +1,5 @@
 //! Ordered application of committed, metadata-only Raft decisions.
 
-use std::collections::BTreeSet;
 use std::{sync::Arc, time::Duration};
 
 use anvil_mvcc_consensus::{
@@ -134,7 +133,6 @@ impl MvccApplyWorker {
         }
         let decisions = self.consensus.applied_decisions_after(watermark)?;
         let mut applied = 0;
-        let mut reachable_bundles = Vec::new();
         for decision in decisions {
             let expected = watermark.0.saturating_add(1);
             if decision.position.0 != expected {
@@ -149,7 +147,6 @@ impl MvccApplyWorker {
                     bail!("unrecoverable MVCC bundle belongs to another cluster");
                 }
                 let identity = bundle_identity(committed.bundle_hash, committed.bundle_length);
-                reachable_bundles.push(identity.clone());
                 let bytes = self.fetch_bundle(&identity).await?;
                 let mut bundle: TransactionBundle = serde_json::from_slice(&bytes)
                     .context("unrecoverable MVCC: decode canonical transaction bundle")?;
@@ -192,15 +189,24 @@ impl MvccApplyWorker {
             crate::perf::record_mvcc_state(watermark.0, observed_commit.0, 0);
             applied += 1;
         }
-        if self.local.gc_watermark()? < gc.0 {
+        let advanced_gc = self.local.gc_watermark()? < gc.0;
+        if advanced_gc {
             self.local
                 .garbage_collect(gc.0)
                 .context("apply consensus-approved MVCC GC watermark locally")?;
         }
-        if let Some(grace_ms) = self.prepared_bundle_gc_grace_ms {
+        if advanced_gc && let Some(grace_ms) = self.prepared_bundle_gc_grace_ms {
+            let reachable_bundles = self
+                .consensus
+                .applied_decisions_after(CommitVersion(gc.0.saturating_sub(1)))?
+                .into_iter()
+                .filter_map(|decision| decision.committed_bundle)
+                .map(|bundle| bundle_identity(bundle.bundle_hash, bundle.bundle_length))
+                .collect::<Vec<_>>();
+            let unfinished_transaction_ids = self.local.unfinished_work_pins()?.transaction_ids;
             let retain = self.prepared.retain_plan(
                 &reachable_bundles,
-                &BTreeSet::new(),
+                &unfinished_transaction_ids,
                 unix_time_ms()?,
                 grace_ms,
             )?;
