@@ -73,7 +73,7 @@ impl Persistence {
         if transaction_id.is_some() {
             index_journal::append_index_definition_event_with_permit_in_transaction(
                 &self.storage,
-                Some(self.mvcc()?),
+                self.mvcc()?,
                 &event,
                 &permit,
                 &self.partition_owner_signing_key,

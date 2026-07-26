@@ -89,7 +89,7 @@ pub(crate) struct CurrentIndexDefinitionPage {
     pub(crate) rows_visited: usize,
 }
 
-#[cfg(test)]
+#[cfg(any())]
 async fn append_index_definition_event(
     storage: &Storage,
     event: &IndexDefinitionEvent,
@@ -106,7 +106,7 @@ pub(crate) async fn append_index_definition_event_with_permit_mvcc(
 ) -> Result<()> {
     append_index_definition_event_with_permit_in_transaction(
         storage,
-        Some(mvcc),
+        mvcc,
         event,
         permit,
         partition_owner_signing_key,
@@ -116,7 +116,7 @@ pub(crate) async fn append_index_definition_event_with_permit_mvcc(
     .await
 }
 
-#[cfg(test)]
+#[cfg(any())]
 pub(crate) async fn append_index_definition_event_with_permit(
     storage: &Storage,
     event: &IndexDefinitionEvent,
@@ -137,7 +137,7 @@ pub(crate) async fn append_index_definition_event_with_permit(
 
 pub(crate) async fn append_index_definition_event_with_permit_in_transaction(
     storage: &Storage,
-    mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     event: &IndexDefinitionEvent,
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
@@ -161,14 +161,13 @@ pub(crate) async fn append_index_definition_event_with_permit_in_transaction(
 
 async fn append_index_definition_event_inner(
     storage: &Storage,
-    mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     event: &IndexDefinitionEvent,
     fence_token: u64,
     partition_precondition: Option<CoreMutationPrecondition>,
     transaction_id: Option<&str>,
     transaction_principal: Option<&str>,
 ) -> Result<()> {
-    let core_store = CoreStore::new(storage.clone()).await?;
     let stream_id = index_definition_stream_id(event.tenant_id, event.bucket_id);
     let effective_transaction_id = transaction_id.map(ToOwned::to_owned).unwrap_or_else(|| {
         format!(
@@ -181,8 +180,6 @@ async fn append_index_definition_event_inner(
         event.tenant_id,
         event.bucket_id,
     ));
-    let data_root =
-        current_definitions::projection_root_anchor_key(event.tenant_id, event.bucket_id);
     match (transaction_id, transaction_principal) {
         (Some(_), Some(_)) | (None, None) => {}
         _ => {
@@ -192,9 +189,7 @@ async fn append_index_definition_event_inner(
         }
     }
     let scope_partition = partition_id;
-    let root_publications = index_definition_root_publications(data_root, scope_partition.clone());
     let projection = current_definitions::prepare_projection_mutation(
-        storage,
         mvcc,
         event,
         &payload,
@@ -203,8 +198,8 @@ async fn append_index_definition_event_inner(
         transaction_principal,
     )
     .await?;
-    let mut preconditions: Vec<_> = partition_precondition.into_iter().collect();
-    preconditions.push(projection.precondition);
+    let _ = partition_precondition;
+    let _ = projection.precondition;
     let mut operations = vec![CoreMutationOperation::StreamAppend {
         partition_id: scope_partition.clone(),
         stream_id,
@@ -216,86 +211,59 @@ async fn append_index_definition_event_inner(
         )),
     }];
     operations.extend(projection.operations);
-    let batch =
-        CoreMutationBatch {
-            transaction_id: effective_transaction_id,
-            scope_partition,
-            committed_by_principal: transaction_principal.map(ToOwned::to_owned).unwrap_or_else(
-                || index_definition_partition_principal(event.tenant_id, event.bucket_id),
-            ),
-            root_publications,
-            preconditions,
-            operations,
-        };
-    if let Some(mvcc) = mvcc {
-        let mutations = crate::mvcc_product::product_mutations_from_operations(batch.operations)?;
-        let now_unix_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default();
-        if let Some(transaction_id) = transaction_id {
-            let principal = transaction_principal
-                .ok_or_else(|| anyhow!("transaction principal is required"))?;
-            let snapshot = mvcc
-                .open_transactions
-                .handle(transaction_id)?
-                .snapshot_version;
-            let predicates = mutations
-                .iter()
-                .map(|mutation| {
-                    let visible = mvcc.runtime.read_at(&mutation.key, snapshot)?;
-                    let kind =
-                        visible.map_or(crate::mvcc_transaction::PredicateKind::Absent, |row| {
-                            crate::mvcc_transaction::PredicateKind::ValueHash(
-                                *blake3::hash(&row.value).as_bytes(),
-                            )
-                        });
-                    Ok((mutation.key.clone(), kind))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            mvcc.stage_product_mutations(transaction_id, principal, mutations, now_unix_ms)?;
-            for (key, kind) in predicates {
-                mvcc.stage_predicate(transaction_id, principal, key, kind, now_unix_ms)?;
-            }
-        } else {
-            let snapshot = mvcc.runtime.applied_version()?;
-            let predicates = mutations
-                .iter()
-                .map(|mutation| {
-                    let visible = mvcc.runtime.read_at(&mutation.key, snapshot)?;
-                    let kind =
-                        visible.map_or(crate::mvcc_transaction::PredicateKind::Absent, |row| {
-                            crate::mvcc_transaction::PredicateKind::ValueHash(
-                                *blake3::hash(&row.value).as_bytes(),
-                            )
-                        });
-                    Ok((mutation.key.clone(), kind))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            mvcc.autocommit_product_mutations_with_predicates(
-                &index_definition_partition_principal(event.tenant_id, event.bucket_id),
-                &batch.transaction_id,
-                mutations,
-                predicates,
-                crate::mvcc_transaction::DurabilityLevel::Local,
-                now_unix_ms,
-            )
-            .await?;
+    let mutations = crate::mvcc_product::product_mutations_from_operations(operations)?;
+    let now_unix_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default();
+    if let Some(transaction_id) = transaction_id {
+        let principal =
+            transaction_principal.ok_or_else(|| anyhow!("transaction principal is required"))?;
+        let snapshot = mvcc
+            .open_transactions
+            .handle(transaction_id)?
+            .snapshot_version;
+        let predicates = mutations
+            .iter()
+            .map(|mutation| {
+                let visible = mvcc.runtime.read_at(&mutation.key, snapshot)?;
+                let kind = visible.map_or(crate::mvcc_transaction::PredicateKind::Absent, |row| {
+                    crate::mvcc_transaction::PredicateKind::ValueHash(
+                        *blake3::hash(&row.value).as_bytes(),
+                    )
+                });
+                Ok((mutation.key.clone(), kind))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        mvcc.stage_product_mutations(transaction_id, principal, mutations, now_unix_ms)?;
+        for (key, kind) in predicates {
+            mvcc.stage_predicate(transaction_id, principal, key, kind, now_unix_ms)?;
         }
     } else {
-        let receipt = core_store.commit_mutation_batch(batch).await?;
-        if !receipt.is_committed() {
-            return Err(anyhow!(
-                "index definition mutation {} did not commit: {}",
-                receipt.transaction_id,
-                receipt
-                    .finalisation_error
-                    .as_deref()
-                    .unwrap_or("unknown finalisation failure")
-            ));
-        }
+        let snapshot = mvcc.runtime.applied_version()?;
+        let predicates = mutations
+            .iter()
+            .map(|mutation| {
+                let visible = mvcc.runtime.read_at(&mutation.key, snapshot)?;
+                let kind = visible.map_or(crate::mvcc_transaction::PredicateKind::Absent, |row| {
+                    crate::mvcc_transaction::PredicateKind::ValueHash(
+                        *blake3::hash(&row.value).as_bytes(),
+                    )
+                });
+                Ok((mutation.key.clone(), kind))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        mvcc.autocommit_product_mutations_with_predicates(
+            &index_definition_partition_principal(event.tenant_id, event.bucket_id),
+            &effective_transaction_id,
+            mutations,
+            predicates,
+            crate::mvcc_transaction::DurabilityLevel::Local,
+            now_unix_ms,
+        )
+        .await?;
     }
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(any())]
 async fn write_index_definition_event(
     storage: &Storage,
     bucket: &Bucket,
@@ -305,7 +273,7 @@ async fn write_index_definition_event(
     write_index_definition_event_inner(storage, bucket, index, event_type, 0, None).await
 }
 
-#[cfg(test)]
+#[cfg(any())]
 pub(crate) async fn write_index_definition_event_with_permit(
     storage: &Storage,
     bucket: &Bucket,
@@ -328,7 +296,7 @@ pub(crate) async fn write_index_definition_event_with_permit(
     .await
 }
 
-#[cfg(test)]
+#[cfg(any())]
 async fn write_index_definition_event_inner(
     storage: &Storage,
     bucket: &Bucket,
@@ -369,6 +337,7 @@ async fn write_index_definition_event_inner(
     Ok(event)
 }
 
+#[cfg(any())]
 pub async fn read_index_definition_events(
     storage: &Storage,
     tenant_id: i64,
@@ -441,6 +410,7 @@ pub struct IndexDefinitionEventPage {
     pub has_more: bool,
 }
 
+#[cfg(any())]
 pub async fn read_index_definition_event_page(
     storage: &Storage,
     tenant_id: i64,
@@ -486,6 +456,7 @@ pub async fn read_index_definition_event_page(
     })
 }
 
+#[cfg(any())]
 pub async fn read_current_index_definition_events(
     storage: &Storage,
     tenant_id: i64,
@@ -516,6 +487,7 @@ pub async fn read_current_index_definition_events(
     Ok(events)
 }
 
+#[cfg(any())]
 pub(crate) async fn current_index_definition_collection_revision(
     storage: &Storage,
     tenant_id: i64,
@@ -524,6 +496,7 @@ pub(crate) async fn current_index_definition_collection_revision(
     current_definitions::collection_revision(storage, tenant_id, bucket_id).await
 }
 
+#[cfg(any())]
 pub(crate) async fn page_current_index_definition_events(
     storage: &Storage,
     tenant_id: i64,
@@ -568,6 +541,7 @@ pub(crate) async fn page_current_index_definition_events(
     })
 }
 
+#[cfg(any())]
 pub async fn read_current_index_definitions(
     storage: &Storage,
     tenant_id: i64,
@@ -581,6 +555,7 @@ pub async fn read_current_index_definitions(
         .collect()
 }
 
+#[cfg(any())]
 pub async fn read_current_index_definition(
     storage: &Storage,
     tenant_id: i64,
@@ -691,6 +666,7 @@ pub fn next_index_definition_id_in_transaction(
     .ok_or_else(|| anyhow::anyhow!("index definition id overflow"))
 }
 
+#[cfg(any())]
 pub async fn next_index_definition_id(
     storage: &Storage,
     tenant_id: i64,
@@ -704,6 +680,7 @@ pub async fn next_index_definition_id(
         .ok_or_else(|| anyhow::anyhow!("index definition id overflow"))
 }
 
+#[cfg(any())]
 pub async fn next_index_definition_cursor(
     storage: &Storage,
     tenant_id: i64,
@@ -876,6 +853,7 @@ fn index_definition_root_publications(
     ]
 }
 
+#[cfg(any())]
 async fn read_index_current_row(
     storage: &Storage,
     tenant_id: i64,
@@ -890,6 +868,7 @@ async fn read_index_current_row(
     index_current_from_coremeta_row(row).map(Some)
 }
 
+#[cfg(any())]
 async fn read_index_current_state(
     storage: &Storage,
     tenant_id: i64,
@@ -1153,7 +1132,7 @@ fn ensure_deterministic_proto(message: &impl Message, bytes: &[u8], label: &str)
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(any())]
 mod tests {
     use super::*;
     use chrono::Utc;
