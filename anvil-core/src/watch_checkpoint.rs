@@ -311,7 +311,7 @@ pub fn watch_checkpoint_resource_id(
     format!("watch/{watch_stream_id}/partition/{partition_id}/consumer/{consumer_id}")
 }
 
-pub(crate) fn read_watch_checkpoint_mvcc(
+pub fn read_watch_checkpoint_mvcc(
     mvcc: &MvccSubsystem,
     watch_stream_id: &str,
     consumer_id: &str,

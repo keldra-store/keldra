@@ -259,7 +259,7 @@ pub(crate) fn stage_prepared_derived_index_proof(
     Ok(proof.clone())
 }
 
-pub(crate) fn read_latest_derived_index_proof_mvcc(
+pub fn read_latest_derived_index_proof_mvcc(
     mvcc: &MvccSubsystem,
     index_id: &str,
     signing_key: &[u8],

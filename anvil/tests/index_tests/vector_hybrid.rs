@@ -680,6 +680,7 @@ async fn test_query_full_text_index_reads_latest_segment() {
     ]);
     write_full_text_segment(
         &cluster.states[0].storage,
+        &cluster.states[0].mvcc,
         FullTextSegmentWrite {
             index_id: &index_storage_id,
             generation: 7,
@@ -802,6 +803,7 @@ async fn test_query_full_text_phrase_requires_position_enabled_index() {
         test_full_text_document_table(&[(11, 1, "docs/phrase.txt", phrase_version)]);
     write_full_text_segment(
         &cluster.states[0].storage,
+        &cluster.states[0].mvcc,
         FullTextSegmentWrite {
             index_id: &index_storage_id,
             generation: 1,
@@ -937,6 +939,7 @@ async fn test_query_vector_index_reads_latest_segment() {
     let manual_authz_revision = 21;
     write_vector_segment(
         &cluster.states[0].storage,
+        &cluster.states[0].mvcc,
         VectorSegmentWrite {
             index_id: &index_storage_id,
             definition_hash: "blake3:test-definition",
@@ -1156,6 +1159,7 @@ async fn test_query_hybrid_index_combines_full_text_and_vector_segments() {
     ]);
     write_full_text_segment(
         &cluster.states[0].storage,
+        &cluster.states[0].mvcc,
         FullTextSegmentWrite {
             index_id: &index_storage_id,
             generation: 5,
@@ -1172,6 +1176,7 @@ async fn test_query_hybrid_index_combines_full_text_and_vector_segments() {
     .unwrap();
     write_vector_segment(
         &cluster.states[0].storage,
+        &cluster.states[0].mvcc,
         VectorSegmentWrite {
             index_id: &index_storage_id,
             definition_hash: "blake3:test-definition",
@@ -1370,6 +1375,7 @@ async fn test_query_inherit_object_vector_filters_results_by_object_read_scope()
     );
     write_vector_segment(
         &cluster.states[0].storage,
+        &cluster.states[0].mvcc,
         VectorSegmentWrite {
             index_id: &index_storage_id,
             definition_hash: "blake3:test-definition",
@@ -1570,6 +1576,7 @@ async fn test_query_inherit_object_full_text_filters_results_by_object_read_scop
     ]);
     write_full_text_segment(
         &cluster.states[0].storage,
+        &cluster.states[0].mvcc,
         FullTextSegmentWrite {
             index_id: &index_storage_id,
             generation: 100,

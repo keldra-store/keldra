@@ -247,6 +247,7 @@ async fn test_typed_json_index_omits_reserved_internal_candidates() {
     let definition_hash = hex::encode(blake3::hash(b"typed-reserved-query").as_bytes());
     write_typed_field_segment(
         &cluster.states[0].storage,
+        &cluster.states[0].mvcc,
         TypedFieldSegmentWrite {
             index_id: &index_storage_id,
             generation: 99,

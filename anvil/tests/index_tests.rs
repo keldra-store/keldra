@@ -515,6 +515,7 @@ async fn wait_for_derived_authz_entry(
     while tokio::time::Instant::now() < deadline {
         let maybe_index = read_derived_userset_index(
             &cluster.states[0].storage,
+            &cluster.states[0].mvcc,
             1,
             DEFAULT_DERIVED_USERSET_INDEX_ID,
         )
