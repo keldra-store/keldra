@@ -1,6 +1,7 @@
 //! Durable, scope-free transaction sessions for the public MVCC API path.
 
 use std::{
+    collections::BTreeSet,
     path::Path,
     sync::{Arc, Mutex},
     time::Duration,
@@ -8,7 +9,9 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, DB, Options, WriteBatch, WriteOptions};
+use rocksdb::{
+    ColumnFamily, ColumnFamilyDescriptor, DB, IteratorMode, Options, WriteBatch, WriteOptions,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -177,6 +180,30 @@ impl OpenTransactionRegistry {
             db,
             transition: Mutex::new(()),
         })
+    }
+
+    /// Returns every snapshot still pinned by a live or committing durable
+    /// transaction session.
+    ///
+    /// Expiry is evaluated from persisted session data, so a crashed process
+    /// cannot lose an active-snapshot pin merely because an in-memory guard
+    /// disappeared.
+    pub fn active_snapshot_pins(&self, now_unix_ms: u64) -> Result<BTreeSet<CommitVersion>> {
+        let cf = self.cf(CF_TRANSACTIONS)?;
+        let mut snapshots = BTreeSet::new();
+        for row in self.db.iterator_cf(cf, IteratorMode::Start) {
+            let (_, value) = row?;
+            let draft: Draft = serde_json::from_slice(&value)?;
+            if draft.expires_at_unix_ms > now_unix_ms
+                && matches!(
+                    draft.state,
+                    DraftState::Open | DraftState::Committing { .. }
+                )
+            {
+                snapshots.insert(draft.snapshot_version);
+            }
+        }
+        Ok(snapshots)
     }
 
     pub async fn begin(
@@ -831,6 +858,51 @@ mod tests {
             snapshot: 9,
             committed: Mutex::new(Vec::new()),
         }
+    }
+
+    #[tokio::test]
+    async fn durable_open_sessions_pin_snapshots_until_resolution_or_expiry() {
+        let temp = tempdir().unwrap();
+        let registry = OpenTransactionRegistry::open(temp.path()).unwrap();
+        let runtime = runtime();
+        let live = registry
+            .begin(
+                &runtime,
+                "cluster",
+                "alice",
+                "live-pin",
+                Duration::from_secs(30),
+                DurabilityLevel::Local,
+                ReadConsistency::Local,
+                1_000,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            registry.active_snapshot_pins(1_001).unwrap(),
+            [CommitVersion(9)].into_iter().collect()
+        );
+        registry
+            .commit(&runtime, &live.transaction_id, "alice", 1_002)
+            .await
+            .unwrap();
+        assert!(registry.active_snapshot_pins(1_003).unwrap().is_empty());
+
+        registry
+            .begin(
+                &runtime,
+                "cluster",
+                "alice",
+                "expired-pin",
+                Duration::from_millis(5),
+                DurabilityLevel::Local,
+                ReadConsistency::Local,
+                2_000,
+            )
+            .await
+            .unwrap();
+        assert!(registry.active_snapshot_pins(2_005).unwrap().is_empty());
     }
 
     #[tokio::test]
