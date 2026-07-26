@@ -1139,12 +1139,13 @@ async fn handle_hf_ingestion(
                 attempt += 1;
                 info!("Putting object, attempt {}", attempt);
                 let res = object_manager
-                    .put_object(
+                    .put_object_with_implicit_quorum_transaction(
                         &requester_claims,
                         &target_bucket,
                         &full_key,
                         reader,
                         crate::object_manager::ObjectWriteOptions::default(),
+                        format!("hf-ingest-item:{ingestion_id}:{item_id}"),
                     )
                     .await;
                 match res {
@@ -1220,7 +1221,7 @@ async fn handle_hf_ingestion(
             }));
 
             let res: Result<Object, Status> = object_manager
-                .put_object(
+                .put_object_with_implicit_quorum_transaction(
                     &requester_claims,
                     &target_bucket,
                     &index_key,
@@ -1228,11 +1229,10 @@ async fn handle_hf_ingestion(
                     crate::object_manager::ObjectWriteOptions {
                         content_type: Some("application/json".to_string()),
                         user_metadata: None,
-                        transaction_id: None,
-                        transaction_principal: None,
                         storage_class_id: None,
                         ..Default::default()
                     },
+                    format!("hf-ingest-index:{ingestion_id}:{index_key}"),
                 )
                 .await;
             match res {

@@ -208,7 +208,7 @@ async fn proxy_put(
 
     let object = state
         .object_manager
-        .put_object(
+        .put_object_with_implicit_quorum_transaction(
             &original_claims,
             &header.bucket_name,
             &header.object_key,
@@ -216,11 +216,10 @@ async fn proxy_put(
             ObjectWriteOptions {
                 content_type,
                 user_metadata: proxy_user_metadata(&header.headers),
-                transaction_id: None,
-                transaction_principal: None,
                 storage_class_id: None,
                 ..Default::default()
             },
+            format!("proxy-put:{}", header.request_id),
         )
         .await?;
 

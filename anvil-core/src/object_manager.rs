@@ -2,7 +2,7 @@ use crate::{
     access_control, auth, bucket_journal,
     core_store::{
         AuthzScopeRef, CoreBoundarySchema, CoreBoundarySource, CoreBoundaryValue, CoreByteRange,
-        CoreManifestLocator, CoreObjectRef, CorePrefetchPolicy, CoreStore, GetBlob, PutBlob,
+        CoreManifestLocator, CoreObjectRef, CorePrefetchPolicy, CoreStore, GetBlob,
         WriteLogicalFilePathRequest, WriteLogicalFileRequest,
         core_object_ref_from_logical_file_write, decode_core_object_ref_target,
         decode_manifest_locator_proto, encode_core_object_ref_target,
@@ -28,7 +28,6 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{Stream, StreamExt, TryStreamExt};
 use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet, hash_map::Entry};
-use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -259,6 +258,76 @@ impl ObjectManager {
             RESERVED_NAMESPACE_REJECTION_COUNT,
             &[("api", "native"), ("operation", operation)],
         );
+    }
+
+    pub async fn put_object_with_implicit_quorum_transaction<S>(
+        &self,
+        claims: &auth::Claims,
+        bucket_name: &str,
+        object_key: &str,
+        data_stream: S,
+        mut options: ObjectWriteOptions,
+        idempotency_key: String,
+    ) -> Result<Object, Status>
+    where
+        S: Stream<Item = Result<Vec<u8>, Status>> + Unpin + Send,
+    {
+        if options.transaction_id.is_some() || options.transaction_principal.is_some() {
+            return Err(Status::invalid_argument(
+                "implicit object write must not provide an existing transaction",
+            ));
+        }
+        let mvcc = self.installed_mvcc()?;
+        let principal = transaction_principal_from_claims(claims);
+        let now = Self::current_unix_ms_for_object()?;
+        let handle = mvcc
+            .open_transactions
+            .begin(
+                mvcc.runtime.as_ref(),
+                mvcc.cluster_id().to_string(),
+                principal.clone(),
+                idempotency_key,
+                Duration::from_secs(300),
+                crate::mvcc_transaction::DurabilityLevel::Quorum,
+                crate::mvcc_transaction::ReadConsistency::Linearized,
+                now,
+            )
+            .await
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        options.transaction_id = Some(handle.transaction_id.clone());
+        options.transaction_principal = Some(principal.clone());
+        let object = match self
+            .put_object(claims, bucket_name, object_key, data_stream, options)
+            .await
+        {
+            Ok(object) => object,
+            Err(status) => {
+                let _ = mvcc.open_transactions.rollback(
+                    &handle.transaction_id,
+                    &principal,
+                    Self::current_unix_ms_for_object().unwrap_or(now),
+                );
+                return Err(status);
+            }
+        };
+        let outcome = mvcc
+            .open_transactions
+            .commit(
+                mvcc.runtime.as_ref(),
+                &handle.transaction_id,
+                &principal,
+                Self::current_unix_ms_for_object()?,
+            )
+            .await
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        if let crate::mvcc_transaction::CertificationResult::Aborted { reason } =
+            outcome.certification
+        {
+            return Err(Status::aborted(format!(
+                "implicit MVCC transaction aborted: {reason:?}"
+            )));
+        }
+        Ok(object)
     }
 
     /// Consume an object stream directly into its transaction durability
@@ -543,82 +612,6 @@ impl ObjectManager {
         .map_err(|error| Status::invalid_argument(error.to_string()))
     }
 
-    async fn object_write_boundary_values_from_file(
-        &self,
-        tenant_id: i64,
-        bucket_name: &str,
-        object_key: &str,
-        content_type: Option<&str>,
-        user_metadata: Option<&JsonValue>,
-        payload_path: &Path,
-        payload_len: u64,
-    ) -> Result<Vec<CoreBoundaryValue>, Status> {
-        let boundary_schema_key =
-            crate::core_store::boundary_schema_bucket_key(tenant_id, bucket_name);
-        let Some(schema) = self
-            .core_store
-            .read_boundary_schema(&boundary_schema_key)
-            .await
-            .map_err(|error| Status::internal(error.to_string()))?
-        else {
-            return Ok(Vec::new());
-        };
-        let requires_body = schema.dimensions.iter().any(|dimension| {
-            matches!(
-                &dimension.source,
-                CoreBoundarySource::BodyJsonPointer { .. }
-            )
-        });
-        if !requires_body {
-            return extract_object_boundary_values(
-                &schema,
-                tenant_id,
-                bucket_name,
-                object_key,
-                content_type,
-                user_metadata,
-                payload_len,
-                &[],
-            )
-            .map_err(|error| Status::invalid_argument(error.to_string()));
-        }
-        if let Some(limit) = schema
-            .dimensions
-            .iter()
-            .filter_map(|dimension| {
-                if let CoreBoundarySource::BodyJsonPointer { max_body_bytes, .. } =
-                    &dimension.source
-                {
-                    Some(*max_body_bytes)
-                } else {
-                    None
-                }
-            })
-            .min()
-            && payload_len > limit
-        {
-            return Err(Status::invalid_argument(format!(
-                "{}: boundary body exceeds {} bytes",
-                AnvilErrorCode::BoundaryExtractorBodyTooLarge.as_str(),
-                limit
-            )));
-        }
-        let payload = tokio::fs::read(payload_path)
-            .await
-            .map_err(|error| Status::internal(error.to_string()))?;
-        extract_object_boundary_values(
-            &schema,
-            tenant_id,
-            bucket_name,
-            object_key,
-            content_type,
-            user_metadata,
-            payload_len,
-            &payload,
-        )
-        .map_err(|error| Status::invalid_argument(error.to_string()))
-    }
-
     async fn object_write_boundary_values_from_hints(
         &self,
         tenant_id: i64,
@@ -750,12 +743,13 @@ impl ObjectManager {
             "put_object called"
         );
         let tenant_id = claims.tenant_id;
-        let transaction_id = options.transaction_id.clone();
-        if transaction_id.is_some() != options.transaction_principal.is_some() {
-            return Err(Status::invalid_argument(
-                "transaction ID and transaction principal must be paired",
-            ));
-        }
+        let transaction_id = options
+            .transaction_id
+            .clone()
+            .ok_or_else(|| Status::failed_precondition("ObjectWriteRequiresClusterTransaction"))?;
+        let transaction_principal = options.transaction_principal.clone().ok_or_else(|| {
+            Status::failed_precondition("ObjectWriteRequiresTransactionPrincipal")
+        })?;
         let total_start = std::time::Instant::now();
         if matches!(
             options.visibility.indexes,
@@ -793,78 +787,39 @@ impl ObjectManager {
             step_start.elapsed(),
         );
         let step_start = std::time::Instant::now();
-        let boundary_capture_limit = if transaction_id.is_some()
-            && options.visibility.requires_payload_boundary_extraction()
-        {
+        let boundary_capture_limit = if options.visibility.requires_payload_boundary_extraction() {
             self.object_boundary_capture_limit(tenant_id, &bucket.name)
                 .await?
         } else {
             None
         };
-        let (prepared_ingest, temp_path, total_bytes, stream_hash) =
-            if let (Some(transaction_id), Some(transaction_principal)) = (
-                transaction_id.as_deref(),
-                options.transaction_principal.as_deref(),
-            ) {
-                let prepared = self
-                    .prepare_mvcc_object_ingest(
-                        data_stream,
-                        transaction_id,
-                        transaction_principal,
-                        &bucket.name,
-                        object_key,
-                        boundary_capture_limit,
-                    )
-                    .await?;
-                let total_bytes = i64::try_from(prepared.object_length)
-                    .map_err(|_| Status::invalid_argument("Object exceeds supported size"))?;
-                (Some(prepared), None, total_bytes, String::new())
-            } else {
-                let (path, total_bytes, stream_hash) = self
-                    .storage
-                    .stream_to_temp_file(data_stream)
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
-                (None, Some(path), total_bytes, stream_hash)
-            };
+        let prepared_ingest = self
+            .prepare_mvcc_object_ingest(
+                data_stream,
+                &transaction_id,
+                &transaction_principal,
+                &bucket.name,
+                object_key,
+                boundary_capture_limit,
+            )
+            .await?;
+        let total_bytes = i64::try_from(prepared_ingest.object_length)
+            .map_err(|_| Status::invalid_argument("Object exceeds supported size"))?;
         crate::emit_test_timing(
             "object_manager.put_object prepare_payload",
             step_start.elapsed(),
         );
         let total_bytes_u64 =
             u64::try_from(total_bytes).map_err(|_| Status::internal("Negative payload size"))?;
-        let boundary_values = if let Some(prepared) = prepared_ingest.as_ref() {
-            if options.visibility.requires_payload_boundary_extraction() {
-                self.object_write_boundary_values_from_payload(
-                    tenant_id,
-                    &bucket.name,
-                    object_key,
-                    options.content_type.as_deref(),
-                    options.user_metadata.as_ref(),
-                    total_bytes_u64,
-                    prepared.boundary_payload.as_deref().unwrap_or(&[]),
-                )
-                .await?
-            } else {
-                self.object_write_boundary_values_from_hints(
-                    tenant_id,
-                    &bucket.name,
-                    object_key,
-                    options.content_type.as_deref(),
-                    options.user_metadata.as_ref(),
-                    total_bytes_u64,
-                )
-                .await?
-            }
-        } else if options.visibility.requires_payload_boundary_extraction() {
-            self.object_write_boundary_values_from_file(
+        let boundary_values = if options.visibility.requires_payload_boundary_extraction() {
+            self.object_write_boundary_values_from_payload(
                 tenant_id,
                 &bucket.name,
                 object_key,
                 options.content_type.as_deref(),
                 options.user_metadata.as_ref(),
-                temp_path.as_ref().expect("staged path exists"),
                 total_bytes_u64,
+                prepared_ingest.boundary_payload.as_deref().unwrap_or(&[]),
             )
             .await?
         } else {
@@ -878,106 +833,15 @@ impl ObjectManager {
             )
             .await?
         };
-        let step_start = std::time::Instant::now();
         let effective_storage_class_id = self
             .core_store
             .resolve_storage_class_id(options.storage_class_id.as_deref())
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let storage_class = self
-            .core_store
+        self.core_store
             .get_storage_class(&effective_storage_class_id)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let pipeline_policy = self
-            .core_store
-            .pipeline_policy_for_storage_class(Some(effective_storage_class_id.as_str()))
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let core_mutation_id = uuid::Uuid::new_v4().to_string();
-        let logical_file_id = format!(
-            "tenant:{tenant_id}/bucket:{}/object:{object_key}",
-            bucket.name
-        );
-        let inline_cap = storage_class
-            .inline_payload_policy
-            .effective_raw_payload_cap_bytes();
-        let inline_eligible =
-            storage_class.inline_payload_policy.enabled && total_bytes_u64 <= inline_cap;
-
-        let (content_hash, shard_map) = if let Some(prepared) = prepared_ingest {
-            (prepared.object_hash, Some(prepared.shard_map))
-        } else if inline_eligible {
-            let payload = tokio::fs::read(temp_path.as_ref().expect("staged path exists"))
-                .await
-                .map_err(|error| Status::internal(error.to_string()))?;
-            let object_ref = self
-                .core_store
-                .put_blob_with_storage_class(
-                    PutBlob {
-                        logical_name: logical_file_id,
-                        bytes: payload,
-                        boundary_values: boundary_values.clone(),
-                        region_id: self.region.clone(),
-                        mutation_id: core_mutation_id,
-                    },
-                    Some(effective_storage_class_id.as_str()),
-                )
-                .await
-                .map_err(core_store_status)?;
-            let content_hash = object_ref.hash.clone();
-            let shard_map = Some(
-                object_data_target_to_shard_map(&ObjectDataTarget::ObjectRef(object_ref))
-                    .map_err(|e| Status::internal(e.to_string()))?,
-            );
-            (content_hash, shard_map)
-        } else {
-            let logical_write = self
-                .core_store
-                .write_logical_file_path_with_locator(WriteLogicalFilePathRequest {
-                    writer_family: WriterFamily::ObjectBlob.as_str().to_string(),
-                    generation: 0,
-                    logical_file_id,
-                    source_path: temp_path.clone().expect("staged path exists"),
-                    source_len: total_bytes_u64,
-                    source_hash: format!("sha256:{stream_hash}"),
-                    range_hints: Vec::new(),
-                    pipeline_policy,
-                    trace_context: Default::default(),
-                    boundary_values: boundary_values.clone(),
-                    mutation_id: core_mutation_id,
-                    region_id: self.region.clone(),
-                })
-                .await
-                .map_err(core_store_status)?;
-            let content_hash = logical_write.manifest.content_hash.clone();
-            let shard_map = Some(
-                object_data_target_to_shard_map(&ObjectDataTarget::LogicalFile(
-                    logical_write.locator,
-                ))
-                .map_err(|e| Status::internal(e.to_string()))?,
-            );
-            (content_hash, shard_map)
-        };
-        if let Some(temp_path) = temp_path {
-            let io_start = Instant::now();
-            let remove_result = tokio::fs::remove_file(&temp_path).await;
-            crate::perf::record_io_duration(
-                "object_manager",
-                "remove_temp_payload",
-                &temp_path,
-                total_bytes_u64,
-                io_start.elapsed(),
-            );
-            if let Err(error) = remove_result {
-                tracing::warn!(
-                    path = %temp_path.display(),
-                    %error,
-                    "failed to remove non-authoritative staged object payload"
-                );
-            }
-        }
-        crate::emit_test_timing(
-            "object_manager.put_object core_store_write_logical_file_path",
-            step_start.elapsed(),
-        );
+        let content_hash = prepared_ingest.object_hash;
+        let shard_map = Some(prepared_ingest.shard_map);
 
         let step_start = std::time::Instant::now();
         let materialisation_content_type = options.content_type.clone();
@@ -985,11 +849,9 @@ impl ObjectManager {
             .user_metadata
             .clone()
             .unwrap_or_else(|| serde_json::json!({}));
-        let materialisation_representation = if transaction_id.is_some() {
-            shard_map.clone()
-        } else {
-            None
-        };
+        let materialisation_representation = shard_map
+            .clone()
+            .expect("transactional object ingest always produces a representation");
         let object = self
             .persistence
             .create_object_with_storage_class_with_options(
@@ -1003,19 +865,18 @@ impl ObjectManager {
                 options.user_metadata,
                 shard_map,
                 None,
-                transaction_id.as_deref(),
-                options.transaction_principal.as_deref(),
+                Some(&transaction_id),
+                Some(&transaction_principal),
                 Some(effective_storage_class_id),
                 options.visibility.persistence_options(),
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        if let (Some(transaction_id), Some(principal), Some(representation), Some(mvcc)) = (
-            transaction_id.as_deref(),
-            options.transaction_principal.as_deref(),
-            materialisation_representation,
-            self.mvcc.get(),
-        ) {
+        {
+            let transaction_id = transaction_id.as_str();
+            let principal = transaction_principal.as_str();
+            let representation = materialisation_representation;
+            let mvcc = self.installed_mvcc()?;
             let boundary_schema = self
                 .core_store
                 .read_boundary_schema(&crate::core_store::boundary_schema_bucket_key(
@@ -1138,7 +999,8 @@ impl ObjectManager {
                     job_id,
                     state: crate::object_materialisation::ObjectMaterialisationState::Pending,
                     boundary_schema_hash: job.boundary_schema_hash.clone(),
-                    derived_boundaries: serde_json::json!([]),
+                    derived_boundaries: serde_json::to_value(&boundary_values)
+                        .map_err(|error| Status::internal(error.to_string()))?,
                     index_marker: serde_json::json!({"pending": true}),
                     updated_at_unix_ms: now,
                 };
@@ -1170,26 +1032,6 @@ impl ObjectManager {
             "object_manager.put_object persistence_create_object",
             step_start.elapsed(),
         );
-        if transaction_id.is_none() {
-            if options.visibility.defers_write_maintenance() {
-                self.schedule_deferred_object_maintenance(bucket.clone(), object_key);
-            }
-            if options.visibility.requires_authz_materialization() {
-                let step_start = std::time::Instant::now();
-                access_control::grant_object_defaults(
-                    &self.persistence,
-                    &bucket,
-                    object_key,
-                    "grant object parent bucket relation",
-                )
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
-                crate::emit_test_timing(
-                    "object_manager.put_object grant_object_defaults",
-                    step_start.elapsed(),
-                );
-            }
-        }
         crate::emit_test_timing("object_manager.put_object total", total_start.elapsed());
 
         Ok(object)
@@ -1460,20 +1302,27 @@ impl ObjectManager {
             }
         });
 
-        let object = self
-            .put_object(
+        let options = ObjectWriteOptions {
+            transaction_id: transaction_id.map(ToOwned::to_owned),
+            transaction_principal: transaction_principal.map(ToOwned::to_owned),
+            visibility: ObjectWriteVisibility::strict(),
+            ..Default::default()
+        };
+        let part_stream = ReceiverStream::new(rx);
+        let object = if transaction_id.is_some() {
+            self.put_object(claims, bucket_name, object_key, part_stream, options)
+                .await?
+        } else {
+            self.put_object_with_implicit_quorum_transaction(
                 claims,
                 bucket_name,
                 object_key,
-                ReceiverStream::new(rx),
-                ObjectWriteOptions {
-                    transaction_id: transaction_id.map(ToOwned::to_owned),
-                    transaction_principal: transaction_principal.map(ToOwned::to_owned),
-                    visibility: ObjectWriteVisibility::strict(),
-                    ..Default::default()
-                },
+                part_stream,
+                options,
+                format!("complete-multipart:{upload_id}"),
             )
-            .await?;
+            .await?
+        };
 
         let completion = if let Some(transaction_id) = transaction_id {
             self.persistence

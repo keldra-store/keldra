@@ -1346,21 +1346,34 @@ impl ObjectManager {
         let transaction_principal =
             crate::object_manager::transaction_principal_from_claims(&claims);
 
-        self.put_object(
-            &claims,
-            destination_bucket_name,
-            destination_object_key,
-            source_stream,
-            ObjectWriteOptions {
-                content_type: source_object.content_type,
-                user_metadata: source_object.user_meta,
-                transaction_id: transaction_id.map(ToOwned::to_owned),
-                transaction_principal: transaction_id.map(|_| transaction_principal),
-                storage_class_id: source_object.storage_class,
-                visibility: ObjectWriteVisibility::strict(),
-            },
-        )
-        .await
+        let options = ObjectWriteOptions {
+            content_type: source_object.content_type,
+            user_metadata: source_object.user_meta,
+            transaction_id: transaction_id.map(ToOwned::to_owned),
+            transaction_principal: transaction_id.map(|_| transaction_principal),
+            storage_class_id: source_object.storage_class,
+            visibility: ObjectWriteVisibility::strict(),
+        };
+        if transaction_id.is_some() {
+            self.put_object(
+                &claims,
+                destination_bucket_name,
+                destination_object_key,
+                source_stream,
+                options,
+            )
+            .await
+        } else {
+            self.put_object_with_implicit_quorum_transaction(
+                &claims,
+                destination_bucket_name,
+                destination_object_key,
+                source_stream,
+                options,
+                format!("copy-object:{}", uuid::Uuid::new_v4()),
+            )
+            .await
+        }
     }
 
     pub async fn compose_object(
@@ -1416,20 +1429,33 @@ impl ObjectManager {
             },
         ));
 
-        self.put_object(
-            &claims,
-            destination_bucket_name,
-            destination_object_key,
-            composed_stream,
-            ObjectWriteOptions {
-                transaction_id: transaction_id.map(ToOwned::to_owned),
-                transaction_principal: transaction_id
-                    .map(|_| crate::object_manager::transaction_principal_from_claims(&claims)),
-                visibility: ObjectWriteVisibility::strict(),
-                ..Default::default()
-            },
-        )
-        .await
+        let options = ObjectWriteOptions {
+            transaction_id: transaction_id.map(ToOwned::to_owned),
+            transaction_principal: transaction_id
+                .map(|_| crate::object_manager::transaction_principal_from_claims(&claims)),
+            visibility: ObjectWriteVisibility::strict(),
+            ..Default::default()
+        };
+        if transaction_id.is_some() {
+            self.put_object(
+                &claims,
+                destination_bucket_name,
+                destination_object_key,
+                composed_stream,
+                options,
+            )
+            .await
+        } else {
+            self.put_object_with_implicit_quorum_transaction(
+                &claims,
+                destination_bucket_name,
+                destination_object_key,
+                composed_stream,
+                options,
+                format!("compose-object:{}", uuid::Uuid::new_v4()),
+            )
+            .await
+        }
     }
 
     pub async fn patch_json_object(
@@ -1461,22 +1487,30 @@ impl ObjectManager {
         let patched_bytes = serde_json::to_vec(&document)
             .map_err(|e| Status::internal(format!("Failed to serialize patched JSON: {}", e)))?;
 
-        self.put_object(
-            &claims,
-            bucket_name,
-            object_key,
-            tokio_stream::iter(vec![Ok(patched_bytes)]),
-            ObjectWriteOptions {
-                content_type: Some("application/json".to_string()),
-                user_metadata: None,
-                transaction_id: transaction_id.map(ToOwned::to_owned),
-                transaction_principal: transaction_id
-                    .map(|_| crate::object_manager::transaction_principal_from_claims(&claims)),
-                storage_class_id: None,
-                visibility: ObjectWriteVisibility::strict(),
-            },
-        )
-        .await
+        let options = ObjectWriteOptions {
+            content_type: Some("application/json".to_string()),
+            user_metadata: None,
+            transaction_id: transaction_id.map(ToOwned::to_owned),
+            transaction_principal: transaction_id
+                .map(|_| crate::object_manager::transaction_principal_from_claims(&claims)),
+            storage_class_id: None,
+            visibility: ObjectWriteVisibility::strict(),
+        };
+        let payload = tokio_stream::iter(vec![Ok(patched_bytes)]);
+        if transaction_id.is_some() {
+            self.put_object(&claims, bucket_name, object_key, payload, options)
+                .await
+        } else {
+            self.put_object_with_implicit_quorum_transaction(
+                &claims,
+                bucket_name,
+                object_key,
+                payload,
+                options,
+                format!("patch-json-object:{}", uuid::Uuid::new_v4()),
+            )
+            .await
+        }
     }
 
     async fn get_authorized_bucket(

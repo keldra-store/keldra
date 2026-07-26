@@ -53,7 +53,7 @@ impl GitSourceService for AppState {
         );
         let pack_object = self
             .object_manager
-            .put_object(
+            .put_object_with_implicit_quorum_transaction(
                 &claims,
                 &metadata.bucket_name,
                 &object_key,
@@ -64,11 +64,13 @@ impl GitSourceService for AppState {
                         "object_kind": "git_pack",
                         "repository_id": metadata.repository_id.clone(),
                     })),
-                    transaction_id: None,
-                    transaction_principal: None,
                     storage_class_id: None,
                     ..Default::default()
                 },
+                format!(
+                    "git-pack:{}:{}:{}",
+                    claims.tenant_id, metadata.repository_id, source_hash_hex
+                ),
             )
             .await?;
 

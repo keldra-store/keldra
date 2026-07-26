@@ -197,6 +197,9 @@ fn distributed_object_writes_stream_without_complete_local_file_staging() {
     let native_put = workspace_file("anvil-core/src/services/object/native_put_rpc.rs");
     let mutation_batch = workspace_file("anvil-core/src/services/object/mutation_batch_rpc.rs");
     let encoder = workspace_file("anvil-core/src/streaming_erasure.rs");
+    let git_source = workspace_file("anvil-core/src/services/git_source.rs");
+    let internal_proxy = workspace_file("anvil-core/src/services/internal_proxy.rs");
+    let worker = workspace_file("anvil-core/src/worker.rs");
 
     assert_contains_all(
         "shared transactional object ingest",
@@ -211,6 +214,9 @@ fn distributed_object_writes_stream_without_complete_local_file_staging() {
             "object_boundary_capture_limit(",
             "capture_bytes = boundary_capture_limit",
             "object_write_boundary_values_from_payload(",
+            "derived_boundaries: serde_json::to_value(&boundary_values)",
+            "ObjectWriteRequiresClusterTransaction",
+            "put_object_with_implicit_quorum_transaction",
         ],
     );
     assert_contains_all(
@@ -222,6 +228,34 @@ fn distributed_object_writes_stream_without_complete_local_file_staging() {
             ".prepare_mvcc_object_ingest(",
         ],
     );
+    let put_body = object_manager
+        .split("pub async fn put_object(")
+        .nth(1)
+        .expect("put_object definition")
+        .split("pub async fn initiate_multipart_upload(")
+        .next()
+        .expect("put_object body");
+    assert_contains_none(
+        "public object put has no physical fallback",
+        put_body,
+        &[
+            "stream_to_temp_file",
+            "write_logical_file_path_with_locator",
+            "put_blob_with_storage_class",
+            "temp_path",
+        ],
+    );
+    for (label, caller) in [
+        ("Git source", git_source.as_str()),
+        ("internal proxy", internal_proxy.as_str()),
+        ("HF worker", worker.as_str()),
+    ] {
+        assert_contains_all(
+            &format!("{label} production object caller"),
+            caller,
+            &["put_object_with_implicit_quorum_transaction("],
+        );
+    }
     assert_contains_none(
         "mutation batches have no physical payload bypass",
         &batch,
@@ -258,6 +292,22 @@ fn distributed_object_writes_stream_without_complete_local_file_staging() {
             "let stripe_capacity = self.profile.data_shards * self.profile.shard_bytes",
             "let mut stripe = vec![0; stripe_capacity]",
             "sink.send(EncodedShard",
+        ],
+    );
+}
+
+#[test]
+fn multipart_completion_streams_staged_parts_through_final_mvcc_ingest() {
+    let object_manager = workspace_file("anvil-core/src/object_manager.rs");
+    assert_contains_all(
+        "multipart completion final ingest",
+        &object_manager,
+        &[
+            "read_object_ref_chunks(object_ref, None, 1024 * 64",
+            "let part_stream = ReceiverStream::new(rx)",
+            "self.put_object(",
+            "self.put_object_with_implicit_quorum_transaction(",
+            "format!(\"complete-multipart:{upload_id}\")",
         ],
     );
 }
