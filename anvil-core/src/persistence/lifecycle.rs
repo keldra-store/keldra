@@ -17,8 +17,9 @@ fn runtime_cursor_error(kind: &str) -> crate::mesh_lifecycle::LifecycleError {
 impl Persistence {
     pub async fn create_region(&self, name: &str) -> Result<bool> {
         let permit = self.control_write_permit().await?;
-        control_journal::create_region_with_permit(
+        control_journal::create_region_with_permit_mvcc(
             &self.storage,
+            self.mvcc()?,
             name,
             &permit,
             &self.partition_owner_signing_key,
@@ -27,13 +28,16 @@ impl Persistence {
     }
 
     pub async fn list_regions(&self) -> Result<Vec<String>> {
-        let revision = control_journal::current_control_collection_revision(&self.storage).await?;
+        let revision = control_journal::current_control_collection_revision_mvcc(self.mvcc()?)?;
         let mut cursor = None;
         let mut regions = Vec::new();
         loop {
-            let page =
-                control_journal::page_regions(&self.storage, &revision, cursor.as_deref(), 512)
-                    .await?;
+            let page = control_journal::page_regions_mvcc(
+                self.mvcc()?,
+                &revision,
+                cursor.as_deref(),
+                512,
+            )?;
             regions.extend(page.regions);
             let Some(next) = page.next_tuple_key else {
                 return Ok(regions);

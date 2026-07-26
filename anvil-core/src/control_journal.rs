@@ -329,6 +329,99 @@ pub(crate) async fn create_region_with_permit(
     unreachable!("control mutation retry loop always returns")
 }
 
+pub(crate) async fn create_region_with_permit_mvcc(
+    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    name: &str,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<bool> {
+    let partition_precondition =
+        control_write_precondition(storage, permit, partition_owner_signing_key).await?;
+    let _ = partition_precondition;
+    if matches!(
+        read_control_current_mvcc(mvcc, &region_tuple_key(name)?)?,
+        Some(ControlCurrentRecord::Region { active: true, .. })
+    ) {
+        return Ok(false);
+    }
+    append_control_event_mvcc(
+        mvcc,
+        ControlEventBody::RegionUpsert {
+            name: name.to_string(),
+        },
+        vec![ControlCurrentRecord::Region {
+            name: name.to_string(),
+            active: true,
+        }],
+        permit.fence_token,
+    )
+    .await?;
+    Ok(true)
+}
+
+pub fn current_control_collection_revision_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+) -> Result<String> {
+    match read_control_current_mvcc(mvcc, &control_revision_tuple_key()?)? {
+        Some(ControlCurrentRecord::Revision { revision }) => Ok(revision.to_string()),
+        Some(_) => bail!("control revision key contains a different record type"),
+        None => Ok("0".to_string()),
+    }
+}
+
+pub fn page_regions_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    expected_revision: &str,
+    after_application_key: Option<&[u8]>,
+    page_size: usize,
+) -> Result<CurrentRegionPage> {
+    if page_size == 0 || page_size > 1_000 {
+        bail!("region page size must be between 1 and 1000");
+    }
+    let current_revision = current_control_collection_revision_mvcc(mvcc)?;
+    if current_revision != expected_revision {
+        bail!(
+            "control region collection revision changed: expected {expected_revision}, actual {current_revision}"
+        );
+    }
+    let snapshot = mvcc.runtime.applied_version()?;
+    let tuple_prefix = region_tuple_prefix()?;
+    let application_prefix =
+        crate::mvcc_product::coremeta_application_prefix(CF_MESH, &tuple_prefix)?;
+    let mut rows = mvcc.runtime.scan_table_prefix_at(
+        TABLE_CONTROL_CURRENT_ROW,
+        &application_prefix,
+        snapshot,
+    )?;
+    if let Some(after) = after_application_key {
+        rows.retain(|(key, _)| key.application_key.as_slice() > after);
+    }
+    let has_more = rows.len() > page_size;
+    rows.truncate(page_size);
+    let next_tuple_key = has_more
+        .then(|| rows.last().map(|(key, _)| key.application_key.clone()))
+        .flatten();
+    let mut regions = Vec::new();
+    for (_, row) in rows {
+        match decode_control_current_row(&row.value)? {
+            ControlCurrentRecord::Region { name, active: true } => regions.push(name),
+            ControlCurrentRecord::Region { active: false, .. } => {}
+            _ => bail!("control region collection contains a different record type"),
+        }
+    }
+    let final_revision = current_control_collection_revision_mvcc(mvcc)?;
+    if final_revision != expected_revision {
+        bail!(
+            "control region collection revision changed: expected {expected_revision}, actual {final_revision}"
+        );
+    }
+    Ok(CurrentRegionPage {
+        regions,
+        next_tuple_key,
+    })
+}
+
 async fn create_region_inner(
     storage: &Storage,
     name: &str,
