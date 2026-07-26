@@ -172,6 +172,20 @@ impl NodeConnectionAuthorizer {
         if self.allow_test_bypass {
             return Ok(());
         }
+        if self
+            .consensus
+            .applied_control_snapshot()
+            .map_err(|error| Status::unavailable(error.to_string()))?
+            .durability_policy
+            .generation
+            == 0
+        {
+            // Zanzibar itself is installed by the first certified product
+            // transaction. Before that point, possession of the cluster token
+            // plus membership in the static peer configuration is the only
+            // non-circular bootstrap authority.
+            return Ok(());
+        }
         let claims = auth::Claims {
             sub: node_id.to_string(),
             exp: usize::MAX,
@@ -201,6 +215,14 @@ impl NodeConnectionAuthorizer {
             .consensus
             .applied_control_snapshot()
             .map_err(|error| Status::unavailable(error.to_string()))?;
+        // Initial membership has to exchange Raft traffic before Raft can
+        // certify its own node-incarnation records. During that closed
+        // bootstrap window the authenticated, statically configured peer set
+        // is the authority. Installing the first durability policy closes the
+        // window; every reconnect thereafter must match Raft control state.
+        if snapshot.durability_policy.generation == 0 {
+            return Ok(());
+        }
         let installed =
             snapshot
                 .nodes
