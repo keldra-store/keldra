@@ -28,6 +28,7 @@ mod docker_observation;
 mod docker_process;
 mod docker_response_fault;
 mod docker_topology;
+pub mod mvcc_cluster;
 
 use coremeta_bootstrap::*;
 pub use docker_cluster_control::{DockerNetworkPartition, DockerPeer};

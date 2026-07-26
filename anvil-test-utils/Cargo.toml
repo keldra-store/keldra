@@ -25,6 +25,7 @@ enterprise = ["anvil/enterprise"]
 [dependencies]
 anvil = { package = "anvil-server", path = "../anvil", version = "0.3.0" }
 anvil-core = { package = "anvil-storage-core", path = "../anvil-core", version = "0.3.0", features = ["test-in-process-personaldb-signers"] }
+anvil-mvcc-consensus = { path = "../crates/anvil-mvcc-consensus", version = "0.3.0" }
 anyhow = "1"
 base64 = "0.22"
 personaldb-protocol = "=0.1.0"
@@ -39,6 +40,8 @@ reqwest = { version = "0.12.23", default-features = false, features = ["rustls-t
 uuid = { version = "1.18.1", features = ["v4"] }
 dotenvy = "0.15.7"
 tonic = "0.14.2"
+tokio-stream = { version = "0.1.17", features = ["net"] }
+tempfile = "3"
 tracing = { version = "0.1.16" }
 tracing-subscriber = { version = "0.3", features = ["tracing-log", "fmt", "env-filter"] }
 
