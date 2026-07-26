@@ -90,6 +90,7 @@ impl PreparedBundleLog {
 #[derive(Clone)]
 pub struct AppendOnlyPreparedBundleStore {
     log: Arc<Mutex<PreparedBundleLog>>,
+    cluster_id: String,
     node: NodeIncarnation,
     failure_domain: String,
 }
@@ -97,11 +98,14 @@ pub struct AppendOnlyPreparedBundleStore {
 impl AppendOnlyPreparedBundleStore {
     pub fn open(
         directory: impl AsRef<Path>,
+        cluster_id: impl Into<String>,
         node: NodeIncarnation,
         failure_domain: impl Into<String>,
     ) -> Result<Self> {
+        let cluster_id = cluster_id.into();
         let failure_domain = failure_domain.into();
-        if node.node_id.trim().is_empty()
+        if cluster_id.trim().is_empty()
+            || node.node_id.trim().is_empty()
             || node.incarnation == 0
             || failure_domain.trim().is_empty()
         {
@@ -109,6 +113,7 @@ impl AppendOnlyPreparedBundleStore {
         }
         Ok(Self {
             log: Arc::new(Mutex::new(PreparedBundleLog::open(directory.as_ref())?)),
+            cluster_id,
             node,
             failure_domain,
         })
@@ -132,6 +137,7 @@ impl PreparedBundleStore for AppendOnlyPreparedBundleStore {
         })
         .await??;
         Ok(BundleDurabilityEvidence {
+            cluster_id: self.cluster_id.clone(),
             node: self.node.clone(),
             failure_domain: self.failure_domain.clone(),
             complete: true,
@@ -143,6 +149,7 @@ impl PreparedBundleStore for AppendOnlyPreparedBundleStore {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BundleTarget {
+    pub cluster_id: String,
     pub node: NodeIncarnation,
     pub failure_domain: String,
 }
@@ -246,7 +253,8 @@ impl<T> StreamingBundleReplicator<T> {
         targets.sort_by(|left, right| left.node.cmp(&right.node));
         let mut nodes = BTreeSet::new();
         for target in &targets {
-            if target.node.node_id.trim().is_empty()
+            if target.cluster_id.trim().is_empty()
+                || target.node.node_id.trim().is_empty()
                 || target.node.incarnation == 0
                 || target.failure_domain.trim().is_empty()
                 || !nodes.insert(target.node.clone())
@@ -283,6 +291,7 @@ impl<T: BundleTargetStream> BundleReplicator for StreamingBundleReplicator<T> {
                     && ack.persisted_through == identity.length
                 {
                     bundle_holders.push(BundleDurabilityEvidence {
+                        cluster_id: target.cluster_id.clone(),
                         node: target.node.clone(),
                         failure_domain: target.failure_domain.clone(),
                         complete: true,
@@ -422,8 +431,13 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let bytes = b"canonical bundle";
         let identity = identity(bytes);
-        let store = AppendOnlyPreparedBundleStore::open(directory.path(), node("node-a"), "zone-a")
-            .unwrap();
+        let store = AppendOnlyPreparedBundleStore::open(
+            directory.path(),
+            "cluster-a",
+            node("node-a"),
+            "zone-a",
+        )
+        .unwrap();
         let first = store.persist(&identity, bytes).await.unwrap();
         assert!(first.complete && first.hash_verified && first.fsynced);
         let path = directory.path().join("prepared-bundles.log");
@@ -432,9 +446,13 @@ mod tests {
         assert_eq!(path.metadata().unwrap().len(), length);
         drop(store);
 
-        let reopened =
-            AppendOnlyPreparedBundleStore::open(directory.path(), node("node-a"), "zone-a")
-                .unwrap();
+        let reopened = AppendOnlyPreparedBundleStore::open(
+            directory.path(),
+            "cluster-a",
+            node("node-a"),
+            "zone-a",
+        )
+        .unwrap();
         reopened.persist(&identity, bytes).await.unwrap();
         assert_eq!(path.metadata().unwrap().len(), length);
     }
@@ -444,8 +462,13 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let bytes = b"canonical bundle";
         let identity = identity(bytes);
-        let store = AppendOnlyPreparedBundleStore::open(directory.path(), node("node-a"), "zone-a")
-            .unwrap();
+        let store = AppendOnlyPreparedBundleStore::open(
+            directory.path(),
+            "cluster-a",
+            node("node-a"),
+            "zone-a",
+        )
+        .unwrap();
         store.persist(&identity, bytes).await.unwrap();
         let path = directory.path().join("prepared-bundles.log");
         let valid_length = path.metadata().unwrap().len();
@@ -455,9 +478,13 @@ mod tests {
         file.sync_all().unwrap();
         drop(file);
 
-        let recovered =
-            AppendOnlyPreparedBundleStore::open(directory.path(), node("node-a"), "zone-a")
-                .unwrap();
+        let recovered = AppendOnlyPreparedBundleStore::open(
+            directory.path(),
+            "cluster-a",
+            node("node-a"),
+            "zone-a",
+        )
+        .unwrap();
         assert_eq!(path.metadata().unwrap().len(), valid_length);
         recovered.persist(&identity, bytes).await.unwrap();
         assert_eq!(path.metadata().unwrap().len(), valid_length);
@@ -499,6 +526,7 @@ mod tests {
 
     fn target(id: &str, domain: &str) -> BundleTarget {
         BundleTarget {
+            cluster_id: "cluster-a".into(),
             node: node(id),
             failure_domain: domain.to_string(),
         }
@@ -518,6 +546,7 @@ mod tests {
 
     fn shard_evidence(manifest: &ObjectShardManifestReference) -> ObjectDurabilityEvidence {
         ObjectDurabilityEvidence::ShardPlacement {
+            cluster_id: "cluster-a".into(),
             object_hash: manifest.object_hash.clone(),
             encoding_generation: manifest.encoding_generation,
             stripe_ordinal: 0,
@@ -604,6 +633,7 @@ mod tests {
         assert!(error.to_string().contains("no ingest evidence"));
 
         let local = ObjectDurabilityEvidence::LocalRepresentation {
+            cluster_id: "cluster-a".into(),
             object_hash: manifest.object_hash.clone(),
             node: node("local"),
             failure_domain: "zone-a".into(),

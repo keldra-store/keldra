@@ -249,6 +249,7 @@ mod tests {
         fsynced: bool,
     ) -> product::BundleDurabilityEvidence {
         product::BundleDurabilityEvidence {
+            cluster_id: "cluster".into(),
             node: node(id),
             failure_domain: format!("zone-{id}"),
             complete,
@@ -272,6 +273,7 @@ mod tests {
             ],
             object_durability: vec![
                 product::ObjectDurabilityEvidence::ShardPlacement {
+                    cluster_id: "cluster".into(),
                     object_hash: format!("sha256:{}", "b".repeat(64)),
                     encoding_generation: 1,
                     stripe_ordinal: 0,
@@ -285,6 +287,7 @@ mod tests {
                     fsynced: true,
                 },
                 product::ObjectDurabilityEvidence::LocalRepresentation {
+                    cluster_id: "cluster".into(),
                     object_hash: format!("sha256:{}", "b".repeat(64)),
                     node: node("invalid"),
                     failure_domain: "zone-invalid".to_string(),

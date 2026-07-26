@@ -95,7 +95,13 @@ impl<A: ReplicationConnectionAuthorizer> ReplicationServiceImpl<A> {
                 return;
             }
         };
-        let mut session = ConnectionSession::establish(peer);
+        let mut session = match ConnectionSession::establish(open.cluster_id, peer) {
+            Ok(session) => session,
+            Err(error) => {
+                send_error(&output, Status::invalid_argument(error.to_string())).await;
+                return;
+            }
+        };
         if output
             .send(Ok(response(
                 replication_stream_response::Message::Accepted(ReplicationSessionAccepted {
@@ -313,6 +319,7 @@ fn decode_frame(frame: ReplicationDataFrame) -> Result<ReplicationFrame, Status>
     };
     Ok(ReplicationFrame {
         session_id,
+        cluster_id: frame.cluster_id,
         sequence: frame.sequence,
         partition: frame.partition,
         transfer_id,
@@ -417,6 +424,7 @@ mod tests {
                     node_id: "node-b".into(),
                     node_incarnation: 2,
                     requested_session_id: String::new(),
+                    cluster_id: "cluster-a".into(),
                 },
             ))))
             .await
@@ -432,6 +440,7 @@ mod tests {
             .send(Ok(request(replication_stream_request::Message::Frame(
                 ReplicationDataFrame {
                     session_id: session_id.clone(),
+                    cluster_id: "cluster-a".into(),
                     sequence: 1,
                     partition: "partition-a".into(),
                     transfer_id: transfer_id.to_string(),

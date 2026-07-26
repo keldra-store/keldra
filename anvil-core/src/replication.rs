@@ -14,6 +14,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -53,17 +54,23 @@ impl AuthenticatedPeer {
 #[derive(Clone, Debug)]
 pub struct ConnectionSession {
     id: Uuid,
+    cluster_id: String,
     peer: NodeIncarnation,
     last_sequence: u64,
 }
 
 impl ConnectionSession {
-    pub fn establish(peer: AuthenticatedPeer) -> Self {
-        Self {
+    pub fn establish(cluster_id: impl Into<String>, peer: AuthenticatedPeer) -> Result<Self> {
+        let cluster_id = cluster_id.into();
+        if cluster_id.trim().is_empty() {
+            bail!("replication session cluster ID must not be empty");
+        }
+        Ok(Self {
             id: Uuid::new_v4(),
+            cluster_id,
             peer: peer.incarnation,
             last_sequence: 0,
-        }
+        })
     }
 
     pub fn id(&self) -> Uuid {
@@ -72,6 +79,10 @@ impl ConnectionSession {
 
     pub fn peer(&self) -> &NodeIncarnation {
         &self.peer
+    }
+
+    pub fn cluster_id(&self) -> &str {
+        &self.cluster_id
     }
 
     fn validate_sequence(&self, session_id: Uuid, sequence: u64) -> Result<()> {
@@ -100,6 +111,7 @@ pub enum TransferKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReplicationFrame {
     pub session_id: Uuid,
+    pub cluster_id: String,
     pub sequence: u64,
     pub partition: String,
     pub transfer_id: Uuid,
@@ -147,6 +159,7 @@ pub struct TransferWatermark {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct TransferMetadata {
     transfer_id: Uuid,
+    cluster_id: String,
     partition: String,
     kind: TransferKind,
     total_length: u64,
@@ -225,12 +238,16 @@ impl TransferReceiver {
         if frame.payload_checksum != ReplicationFrame::checksum(&frame.payload) {
             bail!("replication frame payload checksum mismatch");
         }
+        if frame.cluster_id != session.cluster_id {
+            bail!("replication frame belongs to a different cluster");
+        }
         if frame.offset.saturating_add(frame.payload.len() as u64) > frame.total_length {
             bail!("replication frame exceeds declared transfer length");
         }
 
         let expected = TransferMetadata {
             transfer_id: frame.transfer_id,
+            cluster_id: frame.cluster_id.clone(),
             partition: frame.partition.clone(),
             kind: frame.kind,
             total_length: frame.total_length,
@@ -300,14 +317,20 @@ impl TransferReceiver {
                 }
                 hasher.update(&buffer[..read]);
             }
-            let actual = *hasher.finalize().as_bytes();
-            if actual != frame.final_hash {
+            let blake3_hash = *hasher.finalize().as_bytes();
+            if !final_hash_matches(
+                frame.kind,
+                frame.total_length,
+                &path,
+                frame.final_hash,
+                blake3_hash,
+            )? {
                 bail!("completed replication transfer hash mismatch");
             }
             drop(file);
             fs::rename(&path, self.complete_path(frame.transfer_id))?;
             sync_directory(&self.directory)?;
-            ack.completed_hash = Some(actual);
+            ack.completed_hash = Some(frame.final_hash);
             ack.status = AckStatus::Complete;
         }
         Ok(ack)
@@ -362,6 +385,31 @@ impl TransferReceiver {
     }
 }
 
+fn final_hash_matches(
+    kind: TransferKind,
+    total_length: u64,
+    path: &Path,
+    expected: [u8; 32],
+    blake3_hash: [u8; 32],
+) -> Result<bool> {
+    if expected == blake3_hash {
+        return Ok(true);
+    }
+    let bytes = fs::read(path)?;
+    let raw_sha256: [u8; 32] = Sha256::digest(&bytes).into();
+    if expected == raw_sha256 {
+        return Ok(true);
+    }
+    if kind == TransferKind::TransactionBundle {
+        let mut hash = Sha256::new();
+        hash.update(b"anvil.mvcc.transaction-bundle.v1");
+        hash.update(total_length.to_be_bytes());
+        hash.update(&bytes);
+        return Ok(expected == <[u8; 32]>::from(hash.finalize()));
+    }
+    Ok(false)
+}
+
 fn sync_directory(path: &Path) -> Result<()> {
     File::open(path)?.sync_all()?;
     Ok(())
@@ -382,6 +430,7 @@ mod tests {
     ) -> ReplicationFrame {
         ReplicationFrame {
             session_id: session.id(),
+            cluster_id: "cluster-a".into(),
             sequence,
             partition: "p0".into(),
             transfer_id,
@@ -400,7 +449,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut receiver = TransferReceiver::open(directory.path()).unwrap();
         let peer = AuthenticatedPeer::new("node-b", 3).unwrap();
-        let mut first_session = ConnectionSession::establish(peer.clone());
+        let mut first_session = ConnectionSession::establish("cluster-a", peer.clone()).unwrap();
         let transfer_id = Uuid::new_v4();
         let whole = b"persistent-stream";
 
@@ -420,7 +469,7 @@ mod tests {
         drop(receiver);
         let mut receiver = TransferReceiver::open(directory.path()).unwrap();
         assert_eq!(receiver.persisted_watermark(transfer_id).unwrap(), Some(10));
-        let mut resumed_session = ConnectionSession::establish(peer);
+        let mut resumed_session = ConnectionSession::establish("cluster-a", peer).unwrap();
         let resumed = frame(
             &resumed_session,
             transfer_id,
@@ -440,13 +489,13 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut receiver = TransferReceiver::open(directory.path()).unwrap();
         let peer = AuthenticatedPeer::new("node-b", 1).unwrap();
-        let mut session = ConnectionSession::establish(peer.clone());
+        let mut session = ConnectionSession::establish("cluster-a", peer.clone()).unwrap();
         let transfer_id = Uuid::new_v4();
         let whole = b"abcdef";
         let first = frame(&session, transfer_id, 1, 0, b"abc", whole, false);
         receiver.receive(&mut session, &first).unwrap();
 
-        let mut retry_session = ConnectionSession::establish(peer);
+        let mut retry_session = ConnectionSession::establish("cluster-a", peer).unwrap();
         let retry = frame(&retry_session, transfer_id, 1, 0, b"abc", whole, false);
         receiver.receive(&mut retry_session, &retry).unwrap();
         let mut corrupt = frame(&retry_session, transfer_id, 2, 0, b"abd", whole, false);
@@ -460,7 +509,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut receiver = TransferReceiver::open(directory.path()).unwrap();
         let mut session =
-            ConnectionSession::establish(AuthenticatedPeer::new("node-b", 1).unwrap());
+            ConnectionSession::establish("cluster-a", AuthenticatedPeer::new("node-b", 1).unwrap())
+                .unwrap();
         let transfer_id = Uuid::new_v4();
         let mut item = frame(&session, transfer_id, 1, 0, b"abc", b"abc", true);
         item.session_id = Uuid::new_v4();
@@ -477,12 +527,12 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut receiver = TransferReceiver::open(directory.path()).unwrap();
         let peer = AuthenticatedPeer::new("node-b", 1).unwrap();
-        let mut session = ConnectionSession::establish(peer.clone());
+        let mut session = ConnectionSession::establish("cluster-a", peer.clone()).unwrap();
         let transfer_id = Uuid::new_v4();
         let first = frame(&session, transfer_id, 1, 0, b"shard", b"shard", true);
         receiver.receive(&mut session, &first).unwrap();
 
-        let mut resumed = ConnectionSession::establish(peer);
+        let mut resumed = ConnectionSession::establish("cluster-a", peer).unwrap();
         let retry = frame(&resumed, transfer_id, 1, 0, b"shard", b"shard", true);
         let ack = receiver.receive(&mut resumed, &retry).unwrap();
         assert_eq!(ack.status, AckStatus::Complete);

@@ -18,6 +18,7 @@ use crate::{
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShardTarget {
+    pub cluster_id: String,
     pub node: NodeIncarnation,
     pub failure_domain: String,
 }
@@ -50,7 +51,8 @@ impl ShardPlacementPolicy {
         let mut seen_nodes = BTreeSet::new();
         let mut domains = BTreeMap::<String, Vec<ShardTarget>>::new();
         for candidate in candidates {
-            if candidate.node.node_id.trim().is_empty()
+            if candidate.cluster_id.trim().is_empty()
+                || candidate.node.node_id.trim().is_empty()
                 || candidate.node.incarnation == 0
                 || candidate.failure_domain.trim().is_empty()
             {
@@ -196,6 +198,7 @@ impl<'a, T: ShardTargetStream> DistributedIngest<'a, T> {
             .completed
             .into_iter()
             .map(|completed| ObjectDurabilityEvidence::ShardPlacement {
+                cluster_id: completed.target.cluster_id.clone(),
                 object_hash: expected_object_hash.to_string(),
                 encoding_generation,
                 stripe_ordinal: completed.stripe_ordinal,
@@ -287,6 +290,7 @@ impl<T: ShardTargetStream> ShardSink for DistributedIngest<'_, T> {
 }
 
 pub struct LocalRepresentationAck {
+    pub cluster_id: String,
     pub node: NodeIncarnation,
     pub failure_domain: String,
     pub status: AckStatus,
@@ -302,6 +306,7 @@ pub fn local_durability_evidence(
         bail!("local representation requires a matching Complete ACK");
     }
     Ok(ObjectDurabilityEvidence::LocalRepresentation {
+        cluster_id: ack.cluster_id,
         object_hash: object_hash.to_string(),
         node: ack.node,
         failure_domain: ack.failure_domain,
@@ -379,6 +384,7 @@ mod tests {
 
     fn target(index: usize, domain: &str) -> ShardTarget {
         ShardTarget {
+            cluster_id: "cluster-a".into(),
             node: NodeIncarnation {
                 node_id: format!("node-{index}"),
                 incarnation: 1,
@@ -591,6 +597,7 @@ mod tests {
             incarnation: 1,
         };
         let incomplete = LocalRepresentationAck {
+            cluster_id: "cluster-a".into(),
             node: node.clone(),
             failure_domain: "zone-a".into(),
             status: AckStatus::Persisted,
@@ -598,6 +605,7 @@ mod tests {
         };
         assert!(local_durability_evidence(&hash, incomplete).is_err());
         let complete = LocalRepresentationAck {
+            cluster_id: "cluster-a".into(),
             node,
             failure_domain: "zone-a".into(),
             status: AckStatus::Complete,

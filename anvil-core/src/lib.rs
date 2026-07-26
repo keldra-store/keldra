@@ -120,6 +120,7 @@ pub mod query_planner;
 pub mod registry_segment;
 pub mod repair_finding;
 pub mod replication;
+pub mod replication_client;
 pub mod routing;
 pub mod search_query;
 pub mod services;

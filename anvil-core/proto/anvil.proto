@@ -4415,6 +4415,7 @@ message ReplicationSessionOpen {
   string node_id = 1;
   uint64 node_incarnation = 2;
   string requested_session_id = 3;
+  string cluster_id = 4;
 }
 
 message ReplicationSessionAccepted {
@@ -4451,6 +4452,7 @@ message ReplicationDataFrame {
   uint64 total_length = 9;
   bytes final_hash = 10;
   bool finish = 11;
+  string cluster_id = 12;
 }
 
 enum ReplicationAckStatus {

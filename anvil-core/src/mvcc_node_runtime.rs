@@ -134,6 +134,7 @@ mod tests {
         ) -> Result<BundleDurabilityEvidence> {
             self.stages.lock().unwrap().push("persist");
             Ok(BundleDurabilityEvidence {
+                cluster_id: "cluster".into(),
                 node: NodeIncarnation {
                     node_id: "node-a".into(),
                     incarnation: 1,

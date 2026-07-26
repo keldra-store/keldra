@@ -89,6 +89,7 @@ pub struct ObjectShardManifestReference {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransactionBundle {
     pub schema: String,
+    pub cluster_id: String,
     pub transaction_id: String,
     pub snapshot_version: CommitVersion,
     pub authenticated_principal: String,
@@ -107,6 +108,9 @@ impl TransactionBundle {
     pub fn canonicalize(&mut self) -> Result<()> {
         if self.schema != Self::SCHEMA {
             bail!("unsupported transaction bundle schema");
+        }
+        if self.cluster_id.trim().is_empty() {
+            bail!("cluster ID must not be empty");
         }
         if self.transaction_id.is_empty() {
             bail!("transaction ID must not be empty");
@@ -286,6 +290,7 @@ pub struct TransactionBundleBuilder {
 
 impl TransactionBundleBuilder {
     pub fn new(
+        cluster_id: impl Into<String>,
         transaction_id: impl Into<String>,
         snapshot_version: CommitVersion,
         authenticated_principal: impl Into<String>,
@@ -294,6 +299,7 @@ impl TransactionBundleBuilder {
         Self {
             bundle: TransactionBundle {
                 schema: TransactionBundle::SCHEMA.to_string(),
+                cluster_id: cluster_id.into(),
                 transaction_id: transaction_id.into(),
                 snapshot_version,
                 authenticated_principal: authenticated_principal.into(),
@@ -460,6 +466,7 @@ pub struct NodeIncarnation {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BundleDurabilityEvidence {
+    pub cluster_id: String,
     pub node: NodeIncarnation,
     pub failure_domain: String,
     pub complete: bool,
@@ -471,6 +478,7 @@ pub struct BundleDurabilityEvidence {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ObjectDurabilityEvidence {
     LocalRepresentation {
+        cluster_id: String,
         object_hash: String,
         node: NodeIncarnation,
         failure_domain: String,
@@ -479,6 +487,7 @@ pub enum ObjectDurabilityEvidence {
         fsynced: bool,
     },
     ShardPlacement {
+        cluster_id: String,
         object_hash: String,
         encoding_generation: u64,
         stripe_ordinal: u64,
@@ -509,6 +518,7 @@ pub struct DurabilityPolicy {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CertificationRequest {
+    pub cluster_id: String,
     pub transaction_id: String,
     pub snapshot_version: CommitVersion,
     pub bundle: BundleIdentity,
@@ -619,6 +629,7 @@ where
             .bundle_holders
             .dedup_by(|left, right| left.node == right.node);
         self.validate_durability(
+            &bundle.cluster_id,
             durability,
             &bundle.shard_manifests,
             &evidence,
@@ -632,6 +643,7 @@ where
             .collect();
         self.certifier
             .certify(CertificationRequest {
+                cluster_id: bundle.cluster_id,
                 transaction_id: bundle.transaction_id,
                 snapshot_version: bundle.snapshot_version,
                 bundle: identity,
@@ -648,6 +660,7 @@ where
 
     fn validate_durability(
         &self,
+        cluster_id: &str,
         durability: DurabilityLevel,
         objects: &[ObjectShardManifestReference],
         evidence: &ReplicationEvidence,
@@ -656,7 +669,12 @@ where
         let durable_bundle_nodes = evidence
             .bundle_holders
             .iter()
-            .filter(|holder| holder.complete && holder.hash_verified && holder.fsynced)
+            .filter(|holder| {
+                holder.cluster_id == cluster_id
+                    && holder.complete
+                    && holder.hash_verified
+                    && holder.fsynced
+            })
             .map(|holder| &holder.node)
             .collect::<BTreeSet<_>>();
         let required_bundle_holders = match durability {
@@ -674,6 +692,7 @@ where
                         matches!(
                             entry,
                             ObjectDurabilityEvidence::LocalRepresentation {
+                                cluster_id: evidence_cluster,
                                 object_hash,
                                 node,
                                 complete: true,
@@ -681,6 +700,7 @@ where
                                 fsynced: true,
                                 ..
                             } if object_hash == &object.object_hash
+                                && evidence_cluster == cluster_id
                                 && node == coordinator_incarnation
                         )
                     });
@@ -692,10 +712,10 @@ where
                     }
                 }
                 DurabilityLevel::Quorum => {
-                    self.validate_shard_placement(object, &evidence.objects, false)?
+                    self.validate_shard_placement(cluster_id, object, &evidence.objects, false)?
                 }
                 DurabilityLevel::Erasure => {
-                    self.validate_shard_placement(object, &evidence.objects, true)?
+                    self.validate_shard_placement(cluster_id, object, &evidence.objects, true)?
                 }
             }
         }
@@ -704,6 +724,7 @@ where
 
     fn validate_shard_placement(
         &self,
+        cluster_id: &str,
         manifest: &ObjectShardManifestReference,
         evidence: &[ObjectDurabilityEvidence],
         require_complete_plan: bool,
@@ -712,6 +733,7 @@ where
         let mut placements = Vec::new();
         for entry in evidence {
             let ObjectDurabilityEvidence::ShardPlacement {
+                cluster_id: evidence_cluster,
                 object_hash: placed_object,
                 encoding_generation,
                 stripe_ordinal,
@@ -727,7 +749,12 @@ where
             else {
                 continue;
             };
-            if placed_object == object_hash && *complete && *hash_verified && *fsynced {
+            if evidence_cluster == cluster_id
+                && placed_object == object_hash
+                && *complete
+                && *hash_verified
+                && *fsynced
+            {
                 placements.push(ShardEvidenceRef {
                     encoding_generation: *encoding_generation,
                     stripe_ordinal: *stripe_ordinal,
@@ -934,6 +961,7 @@ mod tests {
 
     fn bundle_holder(node_id: &str, failure_domain: &str) -> BundleDurabilityEvidence {
         BundleDurabilityEvidence {
+            cluster_id: "cluster".into(),
             node: NodeIncarnation {
                 node_id: node_id.to_string(),
                 incarnation: 1,
@@ -947,6 +975,7 @@ mod tests {
 
     fn shard(shard_ordinal: u16, node_id: &str, failure_domain: &str) -> ObjectDurabilityEvidence {
         ObjectDurabilityEvidence::ShardPlacement {
+            cluster_id: "cluster".into(),
             object_hash: test_object_hash(),
             encoding_generation: 1,
             stripe_ordinal: 0,
@@ -971,6 +1000,7 @@ mod tests {
     fn bundle(with_object: bool) -> TransactionBundle {
         TransactionBundle {
             schema: TransactionBundle::SCHEMA.to_string(),
+            cluster_id: "cluster".to_string(),
             transaction_id: "tx-1".to_string(),
             snapshot_version: 41,
             authenticated_principal: "tenant/1/principal/app".to_string(),
@@ -1181,6 +1211,7 @@ mod tests {
             Replicator(ReplicationEvidence {
                 bundle_holders: Vec::new(),
                 objects: vec![ObjectDurabilityEvidence::LocalRepresentation {
+                    cluster_id: "cluster".into(),
                     object_hash: test_object_hash(),
                     node: NodeIncarnation {
                         node_id: "a".to_string(),
@@ -1251,8 +1282,13 @@ mod tests {
             table_id: 9,
             application_key: b"new/key".to_vec(),
         };
-        let mut builder =
-            TransactionBundleBuilder::new("rename", 10, "tenant/1/principal/app", scheme);
+        let mut builder = TransactionBundleBuilder::new(
+            "cluster",
+            "rename",
+            10,
+            "tenant/1/principal/app",
+            scheme,
+        );
         builder.rename(old_key.clone(), new_key.clone(), b"value".to_vec());
         let bundle = builder.build().unwrap();
 
