@@ -64,9 +64,14 @@ impl WriteOperation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RawObjectReference {
-    pub content_hash: String,
-    pub payload_length: u64,
+pub struct ObjectShardManifestReference {
+    pub object_hash: String,
+    pub manifest_hash: String,
+    pub object_length: u64,
+    pub encoding_generation: u64,
+    pub data_shards: u16,
+    pub parity_shards: u16,
+    pub stripe_count: u64,
 }
 
 /// Canonically encoded transaction data persisted and replicated outside Raft.
@@ -82,7 +87,7 @@ pub struct TransactionBundle {
     pub point_observations: Vec<PointObservation>,
     pub range_observations: Vec<RangeObservation>,
     pub writes: Vec<WriteOperation>,
-    pub raw_objects: Vec<RawObjectReference>,
+    pub shard_manifests: Vec<ObjectShardManifestReference>,
     pub outbox_events: Vec<Vec<u8>>,
     pub materialisation_jobs: Vec<Vec<u8>>,
 }
@@ -140,15 +145,18 @@ impl TransactionBundle {
         self.writes
             .sort_by(|left, right| left.key().cmp(right.key()));
         ensure_unique(self.writes.iter().map(WriteOperation::key), "written key")?;
-        self.raw_objects
-            .sort_by(|left, right| left.content_hash.cmp(&right.content_hash));
+        self.shard_manifests
+            .sort_by(|left, right| left.object_hash.cmp(&right.object_hash));
         ensure_unique(
-            self.raw_objects.iter().map(|entry| &entry.content_hash),
-            "raw object",
+            self.shard_manifests.iter().map(|entry| &entry.object_hash),
+            "object shard manifest",
         )?;
-        for raw_object in &self.raw_objects {
-            if !is_sha256_hash(&raw_object.content_hash) {
-                bail!("raw object content hash must be a sha256 hash");
+        for manifest in &self.shard_manifests {
+            if !is_sha256_hash(&manifest.object_hash) || !is_sha256_hash(&manifest.manifest_hash) {
+                bail!("object and shard manifest hashes must be sha256 hashes");
+            }
+            if manifest.data_shards == 0 || manifest.stripe_count == 0 {
+                bail!("shard manifest must declare data shards and stripes");
             }
         }
         Ok(())
@@ -209,43 +217,82 @@ fn ensure_unique<'a, T: Ord + ?Sized + 'a>(
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BundleIdentity {
     pub hash: String,
     pub length: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct NodeIncarnation {
     pub node_id: String,
     pub incarnation: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DurableRepresentation {
-    Raw,
-    Erasure,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DurableHolder {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BundleDurabilityEvidence {
     pub node: NodeIncarnation,
-    pub representation: DurableRepresentation,
+    pub failure_domain: String,
+    pub complete: bool,
+    pub hash_verified: bool,
+    pub fsynced: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ObjectDurabilityEvidence {
+    LocalRepresentation {
+        object_hash: String,
+        node: NodeIncarnation,
+        failure_domain: String,
+        complete: bool,
+        hash_verified: bool,
+        fsynced: bool,
+    },
+    ShardPlacement {
+        object_hash: String,
+        encoding_generation: u64,
+        stripe_ordinal: u64,
+        shard_ordinal: u16,
+        data_shards: u16,
+        parity_shards: u16,
+        node: NodeIncarnation,
+        failure_domain: String,
+        complete: bool,
+        hash_verified: bool,
+        fsynced: bool,
+    },
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReplicationEvidence {
+    pub bundle_holders: Vec<BundleDurabilityEvidence>,
+    pub objects: Vec<ObjectDurabilityEvidence>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurabilityPolicy {
+    /// Number of distinct nodes that must hold the complete transaction bundle.
+    pub bundle_quorum_holders: usize,
+    /// Number of simultaneous failure-domain losses object placement must survive.
+    pub tolerated_failure_domains: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CertificationRequest {
     pub transaction_id: String,
     pub snapshot_version: CommitVersion,
     pub bundle: BundleIdentity,
     pub durability: DurabilityLevel,
-    pub durable_holders: Vec<DurableHolder>,
+    pub bundle_holders: Vec<BundleDurabilityEvidence>,
+    pub object_durability: Vec<ObjectDurabilityEvidence>,
     pub point_observations: Vec<PointObservation>,
     pub range_observations: Vec<RangeObservation>,
     pub written_keys: Vec<LogicalKey>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CertificationResult {
     Committed { commit_version: CommitVersion },
     Aborted { conflicts: Vec<LogicalKey> },
@@ -254,18 +301,25 @@ pub enum CertificationResult {
 #[async_trait]
 pub trait PreparedBundleStore: Send + Sync {
     /// Persist and fsync the complete canonical bundle before returning.
-    async fn persist(&self, identity: &BundleIdentity, bytes: &[u8]) -> Result<DurableHolder>;
+    async fn persist(
+        &self,
+        identity: &BundleIdentity,
+        bytes: &[u8],
+    ) -> Result<BundleDurabilityEvidence>;
 }
 
 #[async_trait]
 pub trait BundleReplicator: Send + Sync {
-    /// Return only complete, hash-verified, fsynced remote holders.
+    /// Stream the bundle and final object shards, returning application-level
+    /// durability evidence. Implementations must not report transport delivery
+    /// as completed persistence.
     async fn replicate(
         &self,
         identity: &BundleIdentity,
         bytes: &[u8],
+        objects: &[ObjectShardManifestReference],
         durability: DurabilityLevel,
-    ) -> Result<Vec<DurableHolder>>;
+    ) -> Result<ReplicationEvidence>;
 }
 
 #[async_trait]
@@ -279,8 +333,7 @@ pub struct TransactionCoordinator<S, R, C> {
     store: S,
     replicator: R,
     certifier: C,
-    quorum_holders: usize,
-    erasure_holders: usize,
+    policy: DurabilityPolicy,
 }
 
 impl<S, R, C> TransactionCoordinator<S, R, C>
@@ -289,22 +342,15 @@ where
     R: BundleReplicator,
     C: TransactionCertifier,
 {
-    pub fn new(
-        store: S,
-        replicator: R,
-        certifier: C,
-        quorum_holders: usize,
-        erasure_holders: usize,
-    ) -> Result<Self> {
-        if quorum_holders == 0 || erasure_holders == 0 {
-            bail!("durability holder thresholds must be non-zero");
+    pub fn new(store: S, replicator: R, certifier: C, policy: DurabilityPolicy) -> Result<Self> {
+        if policy.bundle_quorum_holders == 0 {
+            bail!("bundle quorum holder threshold must be non-zero");
         }
         Ok(Self {
             store,
             replicator,
             certifier,
-            quorum_holders,
-            erasure_holders,
+            policy,
         })
     }
 
@@ -321,23 +367,25 @@ where
         let bytes = bundle.canonical_bytes()?;
         let identity = bundle.identity()?;
 
-        let local = self.store.persist(&identity, &bytes).await?;
-        let mut holders = vec![local];
-        holders.extend(
-            self.replicator
-                .replicate(&identity, &bytes, durability)
-                .await?,
-        );
-        // Prefer erasure evidence when the same node reports both its raw
-        // receipt and final shard receipt.
-        holders.sort_by(|left, right| {
-            left.node.cmp(&right.node).then_with(|| {
-                representation_rank(right.representation)
-                    .cmp(&representation_rank(left.representation))
-            })
-        });
-        holders.dedup_by(|left, right| left.node == right.node);
-        self.validate_durability(durability, &holders)?;
+        let local_bundle = self.store.persist(&identity, &bytes).await?;
+        let coordinator_incarnation = local_bundle.node.clone();
+        let mut evidence = self
+            .replicator
+            .replicate(&identity, &bytes, &bundle.shard_manifests, durability)
+            .await?;
+        evidence.bundle_holders.push(local_bundle);
+        evidence
+            .bundle_holders
+            .sort_by(|left, right| left.node.cmp(&right.node));
+        evidence
+            .bundle_holders
+            .dedup_by(|left, right| left.node == right.node);
+        self.validate_durability(
+            durability,
+            &bundle.shard_manifests,
+            &evidence,
+            &coordinator_incarnation,
+        )?;
 
         let written_keys = bundle
             .writes
@@ -350,7 +398,8 @@ where
                 snapshot_version: bundle.snapshot_version,
                 bundle: identity,
                 durability,
-                durable_holders: holders,
+                bundle_holders: evidence.bundle_holders,
+                object_durability: evidence.objects,
                 point_observations: bundle.point_observations,
                 range_observations: bundle.range_observations,
                 written_keys,
@@ -361,37 +410,233 @@ where
     fn validate_durability(
         &self,
         durability: DurabilityLevel,
-        holders: &[DurableHolder],
+        objects: &[ObjectShardManifestReference],
+        evidence: &ReplicationEvidence,
+        coordinator_incarnation: &NodeIncarnation,
     ) -> Result<()> {
-        let distinct_nodes = holders
+        let durable_bundle_nodes = evidence
+            .bundle_holders
             .iter()
+            .filter(|holder| holder.complete && holder.hash_verified && holder.fsynced)
             .map(|holder| &holder.node)
-            .collect::<BTreeSet<_>>()
-            .len();
-        match durability {
-            DurabilityLevel::Local if distinct_nodes >= 1 => Ok(()),
-            DurabilityLevel::Quorum if distinct_nodes >= self.quorum_holders => Ok(()),
-            DurabilityLevel::Erasure
-                if holders
-                    .iter()
-                    .filter(|holder| holder.representation == DurableRepresentation::Erasure)
-                    .count()
-                    >= self.erasure_holders =>
-            {
-                Ok(())
-            }
-            DurabilityLevel::Local => bail!("local durability was not satisfied"),
-            DurabilityLevel::Quorum => bail!("quorum durability was not satisfied"),
-            DurabilityLevel::Erasure => bail!("erasure durability was not satisfied"),
+            .collect::<BTreeSet<_>>();
+        let required_bundle_holders = match durability {
+            DurabilityLevel::Local => 1,
+            DurabilityLevel::Quorum | DurabilityLevel::Erasure => self.policy.bundle_quorum_holders,
+        };
+        if durable_bundle_nodes.len() < required_bundle_holders {
+            bail!("transaction bundle durability was not satisfied");
         }
+
+        for object in objects {
+            match durability {
+                DurabilityLevel::Local => {
+                    let locally_durable = evidence.objects.iter().any(|entry| {
+                        matches!(
+                            entry,
+                            ObjectDurabilityEvidence::LocalRepresentation {
+                                object_hash,
+                                node,
+                                complete: true,
+                                hash_verified: true,
+                                fsynced: true,
+                                ..
+                            } if object_hash == &object.object_hash
+                                && node == coordinator_incarnation
+                        )
+                    });
+                    if !locally_durable {
+                        bail!(
+                            "local durability was not satisfied for object {}",
+                            object.object_hash
+                        );
+                    }
+                }
+                DurabilityLevel::Quorum => {
+                    self.validate_shard_placement(object, &evidence.objects, false)?
+                }
+                DurabilityLevel::Erasure => {
+                    self.validate_shard_placement(object, &evidence.objects, true)?
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_shard_placement(
+        &self,
+        manifest: &ObjectShardManifestReference,
+        evidence: &[ObjectDurabilityEvidence],
+        require_complete_plan: bool,
+    ) -> Result<()> {
+        let object_hash = manifest.object_hash.as_str();
+        let mut placements = Vec::new();
+        for entry in evidence {
+            let ObjectDurabilityEvidence::ShardPlacement {
+                object_hash: placed_object,
+                encoding_generation,
+                stripe_ordinal,
+                shard_ordinal,
+                data_shards,
+                parity_shards,
+                node,
+                failure_domain,
+                complete,
+                hash_verified,
+                fsynced,
+            } = entry
+            else {
+                continue;
+            };
+            if placed_object == object_hash && *complete && *hash_verified && *fsynced {
+                placements.push(ShardEvidenceRef {
+                    encoding_generation: *encoding_generation,
+                    stripe_ordinal: *stripe_ordinal,
+                    shard_ordinal: *shard_ordinal,
+                    data_shards: *data_shards,
+                    parity_shards: *parity_shards,
+                    node,
+                    failure_domain,
+                });
+            }
+        }
+        if placements.is_empty() {
+            bail!("no durable shard placement for object {object_hash}");
+        }
+
+        let profile = (manifest.data_shards, manifest.parity_shards);
+        if profile.0 == 0
+            || placements
+                .iter()
+                .any(|entry| (entry.data_shards, entry.parity_shards) != profile)
+        {
+            bail!("object {object_hash} has inconsistent erasure profiles");
+        }
+
+        let generations = placements
+            .iter()
+            .map(|entry| entry.encoding_generation)
+            .collect::<BTreeSet<_>>();
+        if generations != BTreeSet::from([manifest.encoding_generation]) {
+            bail!("object {object_hash} has mixed encoding generations");
+        }
+
+        let stripe_ordinals = placements
+            .iter()
+            .map(|entry| entry.stripe_ordinal)
+            .collect::<BTreeSet<_>>();
+        if stripe_ordinals != (0..manifest.stripe_count).collect::<BTreeSet<_>>() {
+            bail!("object {object_hash} has incomplete or unexpected stripe evidence");
+        }
+        for stripe_ordinal in 0..manifest.stripe_count {
+            let stripe = placements
+                .iter()
+                .copied()
+                .filter(|entry| entry.stripe_ordinal == stripe_ordinal)
+                .collect::<Vec<_>>();
+            validate_unique_shard_targets(object_hash, stripe_ordinal, &stripe)?;
+            let planned = profile.0.saturating_add(profile.1);
+            if stripe.iter().any(|entry| entry.shard_ordinal >= planned) {
+                bail!("object {object_hash} has a shard ordinal outside its k+m profile");
+            }
+            if require_complete_plan
+                && (0..planned)
+                    .any(|ordinal| !stripe.iter().any(|entry| entry.shard_ordinal == ordinal))
+            {
+                bail!(
+                    "erasure durability requires complete k+m placement for object {object_hash}"
+                );
+            }
+            if !survives_failure_domains(
+                &stripe,
+                profile.0 as usize,
+                self.policy.tolerated_failure_domains,
+            ) {
+                bail!(
+                    "shard placement for object {object_hash} is not reconstructable after configured failures"
+                );
+            }
+        }
+        Ok(())
     }
 }
 
-fn representation_rank(representation: DurableRepresentation) -> u8 {
-    match representation {
-        DurableRepresentation::Raw => 0,
-        DurableRepresentation::Erasure => 1,
+#[derive(Clone, Copy)]
+struct ShardEvidenceRef<'a> {
+    encoding_generation: u64,
+    stripe_ordinal: u64,
+    shard_ordinal: u16,
+    data_shards: u16,
+    parity_shards: u16,
+    node: &'a NodeIncarnation,
+    failure_domain: &'a str,
+}
+
+fn validate_unique_shard_targets(
+    object_hash: &str,
+    stripe_ordinal: u64,
+    placements: &[ShardEvidenceRef<'_>],
+) -> Result<()> {
+    let mut ordinals = BTreeSet::new();
+    let mut nodes = BTreeSet::new();
+    for placement in placements {
+        if !ordinals.insert(placement.shard_ordinal) {
+            bail!("object {object_hash} stripe {stripe_ordinal} has duplicate shard ordinal");
+        }
+        if !nodes.insert(placement.node) {
+            bail!("object {object_hash} stripe {stripe_ordinal} places several shards on one node");
+        }
     }
+    Ok(())
+}
+
+fn survives_failure_domains(
+    placements: &[ShardEvidenceRef<'_>],
+    required_shards: usize,
+    tolerated_failures: usize,
+) -> bool {
+    let domains = placements
+        .iter()
+        .map(|entry| entry.failure_domain)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let failures = tolerated_failures.min(domains.len());
+    failure_combinations(&domains, failures)
+        .into_iter()
+        .all(|lost| {
+            placements
+                .iter()
+                .filter(|entry| !lost.contains(entry.failure_domain))
+                .map(|entry| entry.shard_ordinal)
+                .collect::<BTreeSet<_>>()
+                .len()
+                >= required_shards
+        })
+}
+
+fn failure_combinations<'a>(domains: &[&'a str], count: usize) -> Vec<BTreeSet<&'a str>> {
+    fn visit<'a>(
+        domains: &[&'a str],
+        count: usize,
+        offset: usize,
+        current: &mut BTreeSet<&'a str>,
+        output: &mut Vec<BTreeSet<&'a str>>,
+    ) {
+        if current.len() == count {
+            output.push(current.clone());
+            return;
+        }
+        for index in offset..domains.len() {
+            current.insert(domains[index]);
+            visit(domains, count, index + 1, current, output);
+            current.remove(domains[index]);
+        }
+    }
+
+    let mut output = Vec::new();
+    visit(domains, count, 0, &mut BTreeSet::new(), &mut output);
+    output
 }
 
 #[cfg(test)]
@@ -408,12 +653,12 @@ mod tests {
             &self,
             _identity: &BundleIdentity,
             _bytes: &[u8],
-        ) -> Result<DurableHolder> {
-            Ok(holder("a", DurableRepresentation::Raw))
+        ) -> Result<BundleDurabilityEvidence> {
+            Ok(bundle_holder("a", "zone-a"))
         }
     }
 
-    struct Replicator(Vec<DurableHolder>);
+    struct Replicator(ReplicationEvidence);
 
     #[async_trait]
     impl BundleReplicator for Replicator {
@@ -421,8 +666,9 @@ mod tests {
             &self,
             _identity: &BundleIdentity,
             _bytes: &[u8],
+            _objects: &[ObjectShardManifestReference],
             _durability: DurabilityLevel,
-        ) -> Result<Vec<DurableHolder>> {
+        ) -> Result<ReplicationEvidence> {
             Ok(self.0.clone())
         }
     }
@@ -447,17 +693,43 @@ mod tests {
         }
     }
 
-    fn holder(node_id: &str, representation: DurableRepresentation) -> DurableHolder {
-        DurableHolder {
+    fn bundle_holder(node_id: &str, failure_domain: &str) -> BundleDurabilityEvidence {
+        BundleDurabilityEvidence {
             node: NodeIncarnation {
                 node_id: node_id.to_string(),
                 incarnation: 1,
             },
-            representation,
+            failure_domain: failure_domain.to_string(),
+            complete: true,
+            hash_verified: true,
+            fsynced: true,
         }
     }
 
-    fn bundle() -> TransactionBundle {
+    fn shard(shard_ordinal: u16, node_id: &str, failure_domain: &str) -> ObjectDurabilityEvidence {
+        ObjectDurabilityEvidence::ShardPlacement {
+            object_hash: test_object_hash(),
+            encoding_generation: 1,
+            stripe_ordinal: 0,
+            shard_ordinal,
+            data_shards: 2,
+            parity_shards: 2,
+            node: NodeIncarnation {
+                node_id: node_id.to_string(),
+                incarnation: 1,
+            },
+            failure_domain: failure_domain.to_string(),
+            complete: true,
+            hash_verified: true,
+            fsynced: true,
+        }
+    }
+
+    fn test_object_hash() -> String {
+        format!("sha256:{}", "a".repeat(64))
+    }
+
+    fn bundle(with_object: bool) -> TransactionBundle {
         TransactionBundle {
             schema: TransactionBundle::SCHEMA.to_string(),
             transaction_id: "tx-1".to_string(),
@@ -481,7 +753,19 @@ mod tests {
                     value: b"first".to_vec(),
                 },
             ],
-            raw_objects: Vec::new(),
+            shard_manifests: if with_object {
+                vec![ObjectShardManifestReference {
+                    object_hash: test_object_hash(),
+                    manifest_hash: format!("sha256:{}", "b".repeat(64)),
+                    object_length: 1024,
+                    encoding_generation: 1,
+                    data_shards: 2,
+                    parity_shards: 2,
+                    stripe_count: 1,
+                }]
+            } else {
+                Vec::new()
+            },
             outbox_events: Vec::new(),
             materialisation_jobs: Vec::new(),
         }
@@ -491,15 +775,20 @@ mod tests {
     async fn one_certification_covers_unrelated_tables_and_partitions() {
         let coordinator = TransactionCoordinator::new(
             Store,
-            Replicator(vec![holder("b", DurableRepresentation::Raw)]),
+            Replicator(ReplicationEvidence {
+                bundle_holders: vec![bundle_holder("b", "zone-b")],
+                objects: Vec::new(),
+            }),
             Certifier::default(),
-            2,
-            2,
+            DurabilityPolicy {
+                bundle_quorum_holders: 2,
+                tolerated_failure_domains: 1,
+            },
         )
         .unwrap();
 
         let result = coordinator
-            .commit(bundle(), DurabilityLevel::Quorum)
+            .commit(bundle(false), DurabilityLevel::Quorum)
             .await
             .unwrap();
         assert_eq!(
@@ -515,21 +804,173 @@ mod tests {
 
     #[tokio::test]
     async fn consensus_is_not_called_before_quorum_durability() {
-        let coordinator =
-            TransactionCoordinator::new(Store, Replicator(Vec::new()), Certifier::default(), 2, 2)
-                .unwrap();
+        let coordinator = TransactionCoordinator::new(
+            Store,
+            Replicator(ReplicationEvidence::default()),
+            Certifier::default(),
+            DurabilityPolicy {
+                bundle_quorum_holders: 2,
+                tolerated_failure_domains: 1,
+            },
+        )
+        .unwrap();
 
         let error = coordinator
-            .commit(bundle(), DurabilityLevel::Quorum)
+            .commit(bundle(false), DurabilityLevel::Quorum)
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("quorum durability"));
+        assert!(error.to_string().contains("bundle durability"));
         assert!(coordinator.certifier.request.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn quorum_requires_reconstruction_after_each_tolerated_domain_loss() {
+        let unsafe_coordinator = TransactionCoordinator::new(
+            Store,
+            Replicator(ReplicationEvidence {
+                bundle_holders: vec![bundle_holder("b", "zone-b")],
+                objects: vec![
+                    shard(0, "a", "zone-a"),
+                    shard(1, "b", "zone-a"),
+                    shard(2, "c", "zone-b"),
+                ],
+            }),
+            Certifier::default(),
+            DurabilityPolicy {
+                bundle_quorum_holders: 2,
+                tolerated_failure_domains: 1,
+            },
+        )
+        .unwrap();
+        let error = unsafe_coordinator
+            .commit(bundle(true), DurabilityLevel::Quorum)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not reconstructable"));
+        assert!(
+            unsafe_coordinator
+                .certifier
+                .request
+                .lock()
+                .unwrap()
+                .is_none()
+        );
+
+        let safe_coordinator = TransactionCoordinator::new(
+            Store,
+            Replicator(ReplicationEvidence {
+                bundle_holders: vec![bundle_holder("b", "zone-b")],
+                objects: vec![
+                    shard(0, "a", "zone-a"),
+                    shard(1, "b", "zone-b"),
+                    shard(2, "c", "zone-c"),
+                ],
+            }),
+            Certifier::default(),
+            DurabilityPolicy {
+                bundle_quorum_holders: 2,
+                tolerated_failure_domains: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            safe_coordinator
+                .commit(bundle(true), DurabilityLevel::Quorum)
+                .await
+                .unwrap(),
+            CertificationResult::Committed { commit_version: 42 }
+        );
+    }
+
+    #[tokio::test]
+    async fn erasure_requires_every_planned_shard() {
+        let coordinator = TransactionCoordinator::new(
+            Store,
+            Replicator(ReplicationEvidence {
+                bundle_holders: vec![bundle_holder("b", "zone-b")],
+                objects: vec![
+                    shard(0, "a", "zone-a"),
+                    shard(1, "b", "zone-b"),
+                    shard(2, "c", "zone-c"),
+                ],
+            }),
+            Certifier::default(),
+            DurabilityPolicy {
+                bundle_quorum_holders: 2,
+                tolerated_failure_domains: 1,
+            },
+        )
+        .unwrap();
+        let error = coordinator
+            .commit(bundle(true), DurabilityLevel::Erasure)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("complete k+m placement"));
+
+        let complete = TransactionCoordinator::new(
+            Store,
+            Replicator(ReplicationEvidence {
+                bundle_holders: vec![bundle_holder("b", "zone-b")],
+                objects: vec![
+                    shard(0, "a", "zone-a"),
+                    shard(1, "b", "zone-b"),
+                    shard(2, "c", "zone-c"),
+                    shard(3, "d", "zone-d"),
+                ],
+            }),
+            Certifier::default(),
+            DurabilityPolicy {
+                bundle_quorum_holders: 2,
+                tolerated_failure_domains: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            complete
+                .commit(bundle(true), DurabilityLevel::Erasure)
+                .await
+                .unwrap(),
+            CertificationResult::Committed { commit_version: 42 }
+        );
+    }
+
+    #[tokio::test]
+    async fn local_requires_verified_fsynced_local_representation() {
+        let coordinator = TransactionCoordinator::new(
+            Store,
+            Replicator(ReplicationEvidence {
+                bundle_holders: Vec::new(),
+                objects: vec![ObjectDurabilityEvidence::LocalRepresentation {
+                    object_hash: test_object_hash(),
+                    node: NodeIncarnation {
+                        node_id: "a".to_string(),
+                        incarnation: 1,
+                    },
+                    failure_domain: "zone-a".to_string(),
+                    complete: true,
+                    hash_verified: true,
+                    fsynced: true,
+                }],
+            }),
+            Certifier::default(),
+            DurabilityPolicy {
+                bundle_quorum_holders: 2,
+                tolerated_failure_domains: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            coordinator
+                .commit(bundle(true), DurabilityLevel::Local)
+                .await
+                .unwrap(),
+            CertificationResult::Committed { commit_version: 42 }
+        );
     }
 
     #[test]
     fn canonical_identity_does_not_depend_on_input_write_order() {
-        let first = bundle();
+        let first = bundle(false);
         let mut second = first.clone();
         second.writes.reverse();
         assert_eq!(first.identity().unwrap(), second.identity().unwrap());
