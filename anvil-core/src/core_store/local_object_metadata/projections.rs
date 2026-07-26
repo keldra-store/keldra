@@ -619,30 +619,6 @@ impl CoreStore {
         })
     }
 
-    pub(super) fn latest_object_version_for_key_after_delete(
-        &self,
-        bucket: &Bucket,
-        object_key: &str,
-        deleted_version_id: uuid::Uuid,
-    ) -> Result<Option<Object>> {
-        let prefix = object_ordered_full_key_prefix(OBJECT_VERSION_PAGE_FAMILY, bucket, object_key);
-        for row in self.scan_coremeta_prefix_page(
-            CF_OBJECT_VERSIONS,
-            TABLE_OBJECT_VERSION_META_ROW,
-            &prefix,
-            None,
-            2,
-        )? {
-            let decoded = decode_object_metadata_row_with_common(&row.payload)?;
-            validate_object_scope(bucket, &decoded.object)?;
-            validate_version_page_row_key(OBJECT_VERSION_PAGE_FAMILY, bucket, &decoded, &row.key)?;
-            if decoded.object.version_id != deleted_version_id {
-                return Ok(Some(decoded.object));
-            }
-        }
-        Ok(None)
-    }
-
     fn read_current_object_metadata_row_at_generation(
         &self,
         bucket: &Bucket,
