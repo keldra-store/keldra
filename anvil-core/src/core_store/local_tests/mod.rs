@@ -469,8 +469,6 @@ mod cancellation;
 mod control_record_encoding;
 mod coremeta_history;
 mod erasure_roots;
-mod explicit_precondition_boundaries;
-mod explicit_stream_transactions;
 mod final_linearization_guards;
 mod logical;
 mod object_metadata;

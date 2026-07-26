@@ -988,8 +988,6 @@ mod local_stream_control;
 mod local_stream_publication_recovery;
 #[path = "local_stream_records.rs"]
 mod local_stream_records;
-#[path = "local_transaction_finalise.rs"]
-mod local_transaction_finalise;
 #[path = "local_transaction_visibility.rs"]
 mod local_transaction_visibility;
 #[path = "local_transactions.rs"]
