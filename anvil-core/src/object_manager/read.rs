@@ -1358,7 +1358,6 @@ impl ObjectManager {
                 transaction_principal: transaction_id.map(|_| transaction_principal),
                 storage_class_id: source_object.storage_class,
                 visibility: ObjectWriteVisibility::strict(),
-                prepared_ingest: None,
             },
         )
         .await
@@ -1475,7 +1474,6 @@ impl ObjectManager {
                     .map(|_| crate::object_manager::transaction_principal_from_claims(&claims)),
                 storage_class_id: None,
                 visibility: ObjectWriteVisibility::strict(),
-                prepared_ingest: None,
             },
         )
         .await

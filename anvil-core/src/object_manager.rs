@@ -25,7 +25,7 @@ use crate::{
 };
 use anyhow::{Context, Result as AnyhowResult, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use futures_util::{Stream, StreamExt};
+use futures_util::{Stream, StreamExt, TryStreamExt};
 use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::path::Path;
@@ -35,6 +35,7 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::io::StreamReader;
 use tonic::Status;
 use tonic::metadata::MetadataValue;
 use tracing::info;
@@ -45,7 +46,7 @@ pub(crate) use batch_write::ObjectBatchPut;
 pub use write_visibility::{
     AuthzMaterializationVisibility, AuthzRevisionVisibility, BoundaryExtractionVisibility,
     IndexMaintenanceVisibility, IndexPolicySnapshotVisibility, ObjectWriteOptions,
-    ObjectWriteVisibility, PreparedObjectIngest, WatchVisibility,
+    ObjectWriteVisibility, WatchVisibility,
 };
 
 #[derive(Debug, Clone)]
@@ -84,6 +85,13 @@ pub struct UploadPartResult {
     pub etag: String,
     pub payload_hash: String,
     pub receipt: MetadataMutationReceipt,
+}
+
+struct PreparedMvccObjectIngest {
+    object_hash: String,
+    object_length: u64,
+    shard_map: JsonValue,
+    boundary_payload: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -251,6 +259,288 @@ impl ObjectManager {
             RESERVED_NAMESPACE_REJECTION_COUNT,
             &[("api", "native"), ("operation", operation)],
         );
+    }
+
+    /// Consume an object stream directly into its transaction durability
+    /// representation. Distributed durability is encoded one bounded stripe at
+    /// a time and each shard is sent to its final holder; no complete local
+    /// payload file is created.
+    async fn prepare_mvcc_object_ingest<S>(
+        &self,
+        data_stream: S,
+        transaction_id: &str,
+        transaction_principal: &str,
+        bucket_name: &str,
+        object_key: &str,
+        boundary_capture_limit: Option<u64>,
+    ) -> Result<PreparedMvccObjectIngest, Status>
+    where
+        S: Stream<Item = Result<Vec<u8>, Status>> + Unpin + Send,
+    {
+        let mvcc = self.installed_mvcc()?;
+        let binding = mvcc
+            .open_transactions
+            .binding(transaction_id, transaction_principal)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        if binding.cluster_id != mvcc.cluster_id() {
+            return Err(Status::failed_precondition(
+                "transaction belongs to another cluster",
+            ));
+        }
+        let boundary_capture =
+            boundary_capture_limit.map(|_| std::sync::Arc::new(Mutex::new(Vec::new())));
+        let capture = boundary_capture.clone();
+        let capture_bytes = boundary_capture_limit
+            .map(|limit| limit.saturating_add(1))
+            .unwrap_or(0);
+        let reader_stream = data_stream
+            .map_ok(move |bytes| {
+                if let Some(capture) = &capture {
+                    let mut captured = capture
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let remaining = usize::try_from(capture_bytes)
+                        .unwrap_or(usize::MAX)
+                        .saturating_sub(captured.len());
+                    captured.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+                }
+                std::io::Cursor::new(bytes)
+            })
+            .map_err(|status| std::io::Error::other(status.to_string()));
+        let mut reader = StreamReader::new(reader_stream);
+        let now = Self::current_unix_ms_for_object()?;
+
+        let target = match binding.durability {
+            crate::mvcc_transaction::DurabilityLevel::Local => {
+                let ingest = mvcc
+                    .local_objects
+                    .persist(&mut reader)
+                    .await
+                    .map_err(|error| Status::internal(error.to_string()))?;
+                mvcc.object_evidence
+                    .record(&ingest.manifest.object_hash, ingest.evidence)
+                    .map_err(|error| Status::internal(error.to_string()))?;
+                mvcc.open_transactions
+                    .add_manifest(transaction_id, &binding.cluster_id, ingest.reference, now)
+                    .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                ObjectDataTarget::MvccLocal(ingest.manifest)
+            }
+            durability @ (crate::mvcc_transaction::DurabilityLevel::Quorum
+            | crate::mvcc_transaction::DurabilityLevel::Erasure) => {
+                let (candidates, tolerated_failure_domains, _) = mvcc
+                    .live_shard_placement()
+                    .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                if candidates.len() < 2 {
+                    return Err(Status::failed_precondition(
+                        "distributed object durability requires at least two shard targets",
+                    ));
+                }
+                let parity_shards = tolerated_failure_domains.max(1).min(candidates.len() - 1);
+                let profile = ErasureProfile {
+                    data_shards: candidates.len() - parity_shards,
+                    parity_shards,
+                    shard_bytes: 256 * 1024,
+                };
+                let policy = ShardPlacementPolicy {
+                    tolerated_failure_domains,
+                };
+                let object_identity = provisional_mvcc_object_identity(
+                    &binding.cluster_id,
+                    transaction_id,
+                    bucket_name,
+                    object_key,
+                );
+                let plan = policy
+                    .plan(object_identity, 1, profile, &candidates)
+                    .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                let ingest = DistributedIngest::encode(
+                    &mvcc.replication_client,
+                    &plan,
+                    policy,
+                    profile,
+                    durability,
+                    &mut reader,
+                    object_identity,
+                    None,
+                    1,
+                )
+                .await
+                .map_err(|error| Status::unavailable(error.to_string()))?;
+                let manifest =
+                    crate::object_shard_manifest::PhysicalObjectShardManifest::from_ingest(
+                        &binding.cluster_id,
+                        object_identity,
+                        1,
+                        profile.data_shards,
+                        profile.parity_shards,
+                        profile.shard_bytes,
+                        &ingest,
+                    )
+                    .map_err(|error| Status::internal(error.to_string()))?;
+                if durability == crate::mvcc_transaction::DurabilityLevel::Quorum {
+                    let mut missing = Vec::new();
+                    for stripe_ordinal in 0..manifest.stripe_count {
+                        for (shard_ordinal, target) in plan.targets_by_ordinal.iter().enumerate() {
+                            let shard_ordinal = u16::try_from(shard_ordinal)
+                                .map_err(|_| Status::internal("shard ordinal exceeds u16"))?;
+                            if !manifest.placements.iter().any(|placement| {
+                                placement.stripe_ordinal == stripe_ordinal
+                                    && placement.shard_ordinal == shard_ordinal
+                            }) {
+                                missing.push(crate::mvcc_shard_repair::MissingShardTarget {
+                                    stripe_ordinal,
+                                    shard_ordinal,
+                                    target: target.clone(),
+                                });
+                            }
+                        }
+                    }
+                    if !missing.is_empty() {
+                        let repair = crate::mvcc_shard_repair::ShardRepairJob {
+                            schema: crate::mvcc_shard_repair::ShardRepairJob::SCHEMA.to_string(),
+                            cluster_id: binding.cluster_id.clone(),
+                            transaction_id: transaction_id.to_string(),
+                            kind: crate::mvcc_shard_repair::ShardMaintenanceKind::Repair,
+                            target_logical_identity: format!(
+                                "cluster/{}/object/{}",
+                                binding.cluster_id, manifest.object_hash
+                            ),
+                            source_manifest: manifest.clone(),
+                            source_manifest_hash: hex::encode(
+                                blake3::hash(
+                                    &manifest
+                                        .canonical_bytes()
+                                        .map_err(|error| Status::internal(error.to_string()))?,
+                                )
+                                .as_bytes(),
+                            ),
+                            missing,
+                            retiring: Vec::new(),
+                            originating_snapshot_version: mvcc
+                                .open_transactions
+                                .handle(transaction_id)
+                                .map_err(|error| Status::failed_precondition(error.to_string()))?
+                                .snapshot_version,
+                            requested_at_unix_ms: now,
+                        };
+                        mvcc.open_transactions
+                            .add_job(
+                                transaction_id,
+                                repair
+                                    .canonical_bytes()
+                                    .map_err(|error| Status::internal(error.to_string()))?,
+                                now,
+                            )
+                            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                    }
+                }
+                mvcc.object_evidence
+                    .record_ingest(&ingest)
+                    .map_err(|error| Status::internal(error.to_string()))?;
+                mvcc.open_transactions
+                    .add_manifest(
+                        transaction_id,
+                        &binding.cluster_id,
+                        manifest
+                            .reference()
+                            .map_err(|error| Status::internal(error.to_string()))?,
+                        now,
+                    )
+                    .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                crate::mvcc_shard_repair::stage_manifest_catalog_entry(
+                    mvcc,
+                    transaction_id,
+                    transaction_principal,
+                    &manifest,
+                    now,
+                )
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                ObjectDataTarget::MvccShards(manifest)
+            }
+        };
+        let (object_hash, object_length) = match &target {
+            ObjectDataTarget::MvccLocal(manifest) => {
+                (manifest.object_hash.clone(), manifest.object_length)
+            }
+            ObjectDataTarget::MvccShards(manifest) => {
+                (manifest.object_hash.clone(), manifest.object_length)
+            }
+            ObjectDataTarget::LogicalFile(_) | ObjectDataTarget::ObjectRef(_) => {
+                unreachable!("MVCC ingest produced a legacy object target")
+            }
+        };
+        let boundary_payload = boundary_capture.map(|capture| {
+            capture
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        });
+        Ok(PreparedMvccObjectIngest {
+            object_hash,
+            object_length,
+            shard_map: object_data_target_to_shard_map(&target)
+                .map_err(|error| Status::internal(error.to_string()))?,
+            boundary_payload,
+        })
+    }
+
+    async fn object_boundary_capture_limit(
+        &self,
+        tenant_id: i64,
+        bucket_name: &str,
+    ) -> Result<Option<u64>, Status> {
+        let boundary_schema_key =
+            crate::core_store::boundary_schema_bucket_key(tenant_id, bucket_name);
+        let schema = self
+            .core_store
+            .read_boundary_schema(&boundary_schema_key)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+        Ok(schema.and_then(|schema| {
+            schema
+                .dimensions
+                .iter()
+                .filter_map(|dimension| match &dimension.source {
+                    CoreBoundarySource::BodyJsonPointer { max_body_bytes, .. } => {
+                        Some(*max_body_bytes)
+                    }
+                    _ => None,
+                })
+                .min()
+        }))
+    }
+
+    async fn object_write_boundary_values_from_payload(
+        &self,
+        tenant_id: i64,
+        bucket_name: &str,
+        object_key: &str,
+        content_type: Option<&str>,
+        user_metadata: Option<&JsonValue>,
+        payload_len: u64,
+        payload: &[u8],
+    ) -> Result<Vec<CoreBoundaryValue>, Status> {
+        let boundary_schema_key =
+            crate::core_store::boundary_schema_bucket_key(tenant_id, bucket_name);
+        let Some(schema) = self
+            .core_store
+            .read_boundary_schema(&boundary_schema_key)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?
+        else {
+            return Ok(Vec::new());
+        };
+        extract_object_boundary_values(
+            &schema,
+            tenant_id,
+            bucket_name,
+            object_key,
+            content_type,
+            user_metadata,
+            payload_len,
+            payload,
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))
     }
 
     async fn object_write_boundary_values_from_file(
@@ -446,7 +736,7 @@ impl ObjectManager {
         claims: &auth::Claims,
         bucket_name: &str,
         object_key: &str,
-        data_stream: impl Stream<Item = Result<Vec<u8>, Status>> + Unpin,
+        data_stream: impl Stream<Item = Result<Vec<u8>, Status>> + Unpin + Send,
         options: ObjectWriteOptions,
     ) -> Result<Object, Status> {
         let _latency = self
@@ -503,31 +793,58 @@ impl ObjectManager {
             step_start.elapsed(),
         );
         let step_start = std::time::Instant::now();
-        let prepared_ingest = options.prepared_ingest.clone();
-        let (temp_path, total_bytes, stream_hash) = if let Some(prepared) = &prepared_ingest {
-            (
-                None,
-                i64::try_from(prepared.object_length)
-                    .map_err(|_| Status::invalid_argument("Object exceeds supported size"))?,
-                String::new(),
-            )
+        let boundary_capture_limit = if transaction_id.is_some()
+            && options.visibility.requires_payload_boundary_extraction()
+        {
+            self.object_boundary_capture_limit(tenant_id, &bucket.name)
+                .await?
         } else {
-            let (path, total_bytes, stream_hash) = self
-                .storage
-                .stream_to_temp_file(data_stream)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
-            (Some(path), total_bytes, stream_hash)
+            None
         };
+        let (prepared_ingest, temp_path, total_bytes, stream_hash) =
+            if let (Some(transaction_id), Some(transaction_principal)) = (
+                transaction_id.as_deref(),
+                options.transaction_principal.as_deref(),
+            ) {
+                let prepared = self
+                    .prepare_mvcc_object_ingest(
+                        data_stream,
+                        transaction_id,
+                        transaction_principal,
+                        &bucket.name,
+                        object_key,
+                        boundary_capture_limit,
+                    )
+                    .await?;
+                let total_bytes = i64::try_from(prepared.object_length)
+                    .map_err(|_| Status::invalid_argument("Object exceeds supported size"))?;
+                (Some(prepared), None, total_bytes, String::new())
+            } else {
+                let (path, total_bytes, stream_hash) = self
+                    .storage
+                    .stream_to_temp_file(data_stream)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                (None, Some(path), total_bytes, stream_hash)
+            };
         crate::emit_test_timing(
-            "object_manager.put_object stream_to_temp_file",
+            "object_manager.put_object prepare_payload",
             step_start.elapsed(),
         );
         let total_bytes_u64 =
             u64::try_from(total_bytes).map_err(|_| Status::internal("Negative payload size"))?;
-        let boundary_values = if prepared_ingest.is_some() {
+        let boundary_values = if let Some(prepared) = prepared_ingest.as_ref() {
             if options.visibility.requires_payload_boundary_extraction() {
-                Vec::new()
+                self.object_write_boundary_values_from_payload(
+                    tenant_id,
+                    &bucket.name,
+                    object_key,
+                    options.content_type.as_deref(),
+                    options.user_metadata.as_ref(),
+                    total_bytes_u64,
+                    prepared.boundary_payload.as_deref().unwrap_or(&[]),
+                )
+                .await?
             } else {
                 self.object_write_boundary_values_from_hints(
                     tenant_id,
@@ -587,192 +904,6 @@ impl ObjectManager {
 
         let (content_hash, shard_map) = if let Some(prepared) = prepared_ingest {
             (prepared.object_hash, Some(prepared.shard_map))
-        } else if let (Some(transaction_id), Some(transaction_principal)) = (
-            transaction_id.as_deref(),
-            options.transaction_principal.as_deref(),
-        ) {
-            let mvcc = self.mvcc.get().ok_or_else(|| {
-                Status::failed_precondition(
-                    "MVCC subsystem is required for transactional object writes",
-                )
-            })?;
-            let binding = mvcc
-                .open_transactions
-                .binding(transaction_id, transaction_principal)
-                .map_err(|error| Status::failed_precondition(error.to_string()))?;
-            let mut payload =
-                tokio::fs::File::open(temp_path.as_ref().expect("staged path exists"))
-                    .await
-                    .map_err(|error| Status::internal(error.to_string()))?;
-            match binding.durability {
-                crate::mvcc_transaction::DurabilityLevel::Local => {
-                    let ingest = mvcc
-                        .local_objects
-                        .persist(&mut payload)
-                        .await
-                        .map_err(|error| Status::internal(error.to_string()))?;
-                    mvcc.object_evidence
-                        .record(&ingest.manifest.object_hash, ingest.evidence)
-                        .map_err(|error| Status::internal(error.to_string()))?;
-                    mvcc.open_transactions
-                        .add_manifest(
-                            transaction_id,
-                            &binding.cluster_id,
-                            ingest.reference,
-                            Self::current_unix_ms_for_object()?,
-                        )
-                        .map_err(|error| Status::failed_precondition(error.to_string()))?;
-                    let content_hash = ingest.manifest.object_hash.clone();
-                    let shard_map = Some(
-                        object_data_target_to_shard_map(&ObjectDataTarget::MvccLocal(
-                            ingest.manifest,
-                        ))
-                        .map_err(|error| Status::internal(error.to_string()))?,
-                    );
-                    (content_hash, shard_map)
-                }
-                durability @ (crate::mvcc_transaction::DurabilityLevel::Quorum
-                | crate::mvcc_transaction::DurabilityLevel::Erasure) => {
-                    let (candidates, tolerated_failure_domains, _) = mvcc
-                        .live_shard_placement()
-                        .map_err(|error| Status::failed_precondition(error.to_string()))?;
-                    if candidates.len() < 2 {
-                        return Err(Status::failed_precondition(
-                            "distributed object durability requires at least two shard targets",
-                        ));
-                    }
-                    let parity_shards = tolerated_failure_domains.max(1).min(candidates.len() - 1);
-                    let profile = ErasureProfile {
-                        data_shards: candidates.len() - parity_shards,
-                        parity_shards,
-                        shard_bytes: 256 * 1024,
-                    };
-                    let policy = ShardPlacementPolicy {
-                        tolerated_failure_domains,
-                    };
-                    let object_identity = provisional_mvcc_object_identity(
-                        &binding.cluster_id,
-                        transaction_id,
-                        &bucket.name,
-                        object_key,
-                    );
-                    let plan = policy
-                        .plan(object_identity, 1, profile, &candidates)
-                        .map_err(|error| Status::failed_precondition(error.to_string()))?;
-                    let ingest = DistributedIngest::encode(
-                        &mvcc.replication_client,
-                        &plan,
-                        policy,
-                        profile,
-                        durability,
-                        &mut payload,
-                        object_identity,
-                        None,
-                        1,
-                    )
-                    .await
-                    .map_err(|error| Status::unavailable(error.to_string()))?;
-                    let manifest =
-                        crate::object_shard_manifest::PhysicalObjectShardManifest::from_ingest(
-                            &binding.cluster_id,
-                            object_identity,
-                            1,
-                            profile.data_shards,
-                            profile.parity_shards,
-                            profile.shard_bytes,
-                            &ingest,
-                        )
-                        .map_err(|error| Status::internal(error.to_string()))?;
-                    if durability == crate::mvcc_transaction::DurabilityLevel::Quorum {
-                        let mut missing = Vec::new();
-                        for stripe_ordinal in 0..manifest.stripe_count {
-                            for (shard_ordinal, target) in
-                                plan.targets_by_ordinal.iter().enumerate()
-                            {
-                                let shard_ordinal = u16::try_from(shard_ordinal)
-                                    .map_err(|_| Status::internal("shard ordinal exceeds u16"))?;
-                                if !manifest.placements.iter().any(|placement| {
-                                    placement.stripe_ordinal == stripe_ordinal
-                                        && placement.shard_ordinal == shard_ordinal
-                                }) {
-                                    missing.push(crate::mvcc_shard_repair::MissingShardTarget {
-                                        stripe_ordinal,
-                                        shard_ordinal,
-                                        target: target.clone(),
-                                    });
-                                }
-                            }
-                        }
-                        if !missing.is_empty() {
-                            let repair =
-                                crate::mvcc_shard_repair::ShardRepairJob {
-                                    schema: crate::mvcc_shard_repair::ShardRepairJob::SCHEMA
-                                        .to_string(),
-                                    cluster_id: binding.cluster_id.clone(),
-                                    transaction_id: transaction_id.to_string(),
-                                    kind: crate::mvcc_shard_repair::ShardMaintenanceKind::Repair,
-                                    target_logical_identity: format!(
-                                        "cluster/{}/object/{}",
-                                        binding.cluster_id, manifest.object_hash
-                                    ),
-                                    source_manifest: manifest.clone(),
-                                    source_manifest_hash: hex::encode(
-                                        blake3::hash(&manifest.canonical_bytes().map_err(
-                                            |error| Status::internal(error.to_string()),
-                                        )?)
-                                        .as_bytes(),
-                                    ),
-                                    missing,
-                                    retiring: Vec::new(),
-                                    originating_snapshot_version: mvcc
-                                        .open_transactions
-                                        .handle(transaction_id)
-                                        .map_err(|error| {
-                                            Status::failed_precondition(error.to_string())
-                                        })?
-                                        .snapshot_version,
-                                    requested_at_unix_ms: Self::current_unix_ms_for_object()?,
-                                };
-                            mvcc.open_transactions
-                                .add_job(
-                                    transaction_id,
-                                    repair
-                                        .canonical_bytes()
-                                        .map_err(|error| Status::internal(error.to_string()))?,
-                                    Self::current_unix_ms_for_object()?,
-                                )
-                                .map_err(|error| Status::failed_precondition(error.to_string()))?;
-                        }
-                    }
-                    mvcc.object_evidence
-                        .record_ingest(&ingest)
-                        .map_err(|error| Status::internal(error.to_string()))?;
-                    mvcc.open_transactions
-                        .add_manifest(
-                            transaction_id,
-                            &binding.cluster_id,
-                            manifest
-                                .reference()
-                                .map_err(|error| Status::internal(error.to_string()))?,
-                            Self::current_unix_ms_for_object()?,
-                        )
-                        .map_err(|error| Status::failed_precondition(error.to_string()))?;
-                    crate::mvcc_shard_repair::stage_manifest_catalog_entry(
-                        mvcc,
-                        transaction_id,
-                        transaction_principal,
-                        &manifest,
-                        Self::current_unix_ms_for_object()?,
-                    )
-                    .map_err(|error| Status::failed_precondition(error.to_string()))?;
-                    let content_hash = manifest.object_hash.clone();
-                    let shard_map = Some(
-                        object_data_target_to_shard_map(&ObjectDataTarget::MvccShards(manifest))
-                            .map_err(|error| Status::internal(error.to_string()))?,
-                    );
-                    (content_hash, shard_map)
-                }
-            }
         } else if inline_eligible {
             let payload = tokio::fs::read(temp_path.as_ref().expect("staged path exists"))
                 .await

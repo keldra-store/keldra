@@ -155,7 +155,10 @@ fn object_and_index_payloads_publish_corestore_locators_not_metadata_values() {
         "object blob payload CoreStore path",
         &object_manager,
         &[
-            "stream_to_temp_file(data_stream)",
+            "prepare_mvcc_object_ingest",
+            "StreamReader::new(reader_stream)",
+            "DistributedIngest::encode(",
+            "local_objects\n                    .persist(&mut reader)",
             "write_logical_file_path_with_locator(WriteLogicalFilePathRequest",
             "put_blob_with_storage_class",
             "source_path: temp_path.clone()",
@@ -184,6 +187,78 @@ fn object_and_index_payloads_publish_corestore_locators_not_metadata_values() {
         "metadata manifest and segment logical files",
         &metadata_helpers,
         &["write_logical_file_ref(WriteLogicalFileRequest"],
+    );
+}
+
+#[test]
+fn distributed_object_writes_stream_without_complete_local_file_staging() {
+    let object_manager = workspace_file("anvil-core/src/object_manager.rs");
+    let batch = workspace_file("anvil-core/src/object_manager/batch_write.rs");
+    let native_put = workspace_file("anvil-core/src/services/object/native_put_rpc.rs");
+    let mutation_batch = workspace_file("anvil-core/src/services/object/mutation_batch_rpc.rs");
+    let encoder = workspace_file("anvil-core/src/streaming_erasure.rs");
+
+    assert_contains_all(
+        "shared transactional object ingest",
+        &object_manager,
+        &[
+            "prepare_mvcc_object_ingest(",
+            "data_stream,\n                        transaction_id,",
+            "DistributedIngest::encode(",
+            "shard_bytes: 256 * 1024",
+            "record_ingest(&ingest)",
+            "stage_manifest_catalog_entry(",
+            "object_boundary_capture_limit(",
+            "capture_bytes = boundary_capture_limit",
+            "object_write_boundary_values_from_payload(",
+        ],
+    );
+    assert_contains_all(
+        "mutation batch direct ingest",
+        &batch,
+        &[
+            "stage_payloads_for_mvcc_transaction(",
+            "futures_util::stream::iter(vec![Ok(payload)])",
+            ".prepare_mvcc_object_ingest(",
+        ],
+    );
+    assert_contains_none(
+        "mutation batches have no physical payload bypass",
+        &batch,
+        &[
+            "stage_physical_inline_batch",
+            "stage_payloads_through_established_paths",
+            "put_objects_batch<F",
+        ],
+    );
+    assert_contains_all(
+        "implicit mutation batches use cluster MVCC",
+        &mutation_batch,
+        &[
+            "let implicit_transaction = if transaction_id.is_none() && put_only_batch",
+            ".open_transactions\n                .begin(",
+            "put_objects_batch_in_transaction(",
+            ".open_transactions\n                .commit(",
+        ],
+    );
+    assert_contains_none(
+        "native RPC delegates streaming to ObjectManager",
+        &native_put,
+        &[
+            "DistributedIngest::encode(",
+            "stream_to_temp_file",
+            "PreparedObjectIngest {",
+        ],
+    );
+    assert_contains_all(
+        "distributed encoder retains one bounded stripe",
+        &encoder,
+        &[
+            "Holds only one stripe plus its parity shards",
+            "let stripe_capacity = self.profile.data_shards * self.profile.shard_bytes",
+            "let mut stripe = vec![0; stripe_capacity]",
+            "sink.send(EncodedShard",
+        ],
     );
 }
 
@@ -1126,7 +1201,7 @@ fn low_level_manifests_and_shard_receipts_carry_boundary_summaries() {
 }
 
 #[test]
-fn object_upload_scratch_files_are_not_the_durability_boundary() {
+fn legacy_and_multipart_upload_scratch_files_are_not_the_durability_boundary() {
     let storage = workspace_file("anvil-core/src/storage.rs");
 
     assert_contains_all(

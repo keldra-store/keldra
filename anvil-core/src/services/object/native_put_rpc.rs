@@ -1,13 +1,6 @@
 use super::rpc::{native_transaction_id, object_write_visibility, write_state_for_transaction};
 use super::*;
-use crate::{
-    mvcc_transaction::{CertificationResult, DurabilityLevel, ReadConsistency},
-    object_shard_manifest::PhysicalObjectShardManifest,
-    shard_placement::{DistributedIngest, ShardPlacementPolicy},
-    streaming_erasure::ErasureProfile,
-};
-use futures_util::TryStreamExt;
-use tokio_util::io::StreamReader;
+use crate::mvcc_transaction::{CertificationResult, DurabilityLevel, ReadConsistency};
 
 pub(crate) async fn execute_native_put(
     state: &AppState,
@@ -78,145 +71,6 @@ pub(crate) async fn execute_native_put(
         &internal_transaction_id
     };
 
-    let mut data_stream: std::pin::Pin<
-        Box<dyn futures_core::Stream<Item = Result<Vec<u8>, Status>> + Send>,
-    > = Box::pin(data_stream);
-    let prepared_ingest = {
-        let binding = state
-            .mvcc
-            .open_transactions
-            .binding(transaction_id, &transaction_principal)
-            .map_err(|error| Status::failed_precondition(error.to_string()))?;
-        if binding.cluster_id != state.config.mvcc_cluster_id {
-            return Err(Status::failed_precondition(
-                "transaction belongs to another cluster",
-            ));
-        }
-        match binding.durability {
-            DurabilityLevel::Local => {
-                let reader_stream = data_stream
-                    .by_ref()
-                    .map_ok(std::io::Cursor::new)
-                    .map_err(|status| std::io::Error::other(status.to_string()));
-                let mut reader = StreamReader::new(reader_stream);
-                let ingest = state
-                    .mvcc
-                    .local_objects
-                    .persist(&mut reader)
-                    .await
-                    .map_err(|error| Status::internal(error.to_string()))?;
-                state
-                    .mvcc
-                    .object_evidence
-                    .record(&ingest.manifest.object_hash, ingest.evidence)
-                    .map_err(|error| Status::internal(error.to_string()))?;
-                state
-                    .mvcc
-                    .open_transactions
-                    .add_manifest(
-                        transaction_id,
-                        &binding.cluster_id,
-                        ingest.reference,
-                        current_unix_ms()?,
-                    )
-                    .map_err(|error| Status::failed_precondition(error.to_string()))?;
-                data_stream = Box::pin(futures_util::stream::empty());
-                Some(crate::object_manager::PreparedObjectIngest {
-                    object_hash: ingest.manifest.object_hash.clone(),
-                    object_length: ingest.manifest.object_length,
-                    shard_map: serde_json::json!({
-                        "schema": "anvil.mvcc.local_object_manifest.v1",
-                        "manifest": ingest.manifest,
-                    }),
-                })
-            }
-            durability @ (DurabilityLevel::Quorum | DurabilityLevel::Erasure) => {
-                let (candidates, tolerated_failure_domains, _) = state
-                    .mvcc
-                    .live_shard_placement()
-                    .map_err(|error| Status::failed_precondition(error.to_string()))?;
-                if candidates.len() < 2 {
-                    return Err(Status::failed_precondition(
-                        "distributed object durability requires at least two shard targets",
-                    ));
-                }
-                let parity_shards = tolerated_failure_domains.max(1).min(candidates.len() - 1);
-                let profile = ErasureProfile {
-                    data_shards: candidates.len() - parity_shards,
-                    parity_shards,
-                    shard_bytes: 256 * 1024,
-                };
-                let policy = ShardPlacementPolicy {
-                    tolerated_failure_domains,
-                };
-                let object_identity = provisional_object_identity(
-                    &binding.cluster_id,
-                    transaction_id,
-                    &bucket_name,
-                    &object_key,
-                );
-                let plan = policy
-                    .plan(object_identity, 1, profile, &candidates)
-                    .map_err(|error| Status::failed_precondition(error.to_string()))?;
-                let reader_stream = data_stream
-                    .by_ref()
-                    .map_ok(std::io::Cursor::new)
-                    .map_err(|status| std::io::Error::other(status.to_string()));
-                let mut reader = StreamReader::new(reader_stream);
-                let ingest = DistributedIngest::encode(
-                    &state.mvcc.replication_client,
-                    &plan,
-                    policy,
-                    profile,
-                    durability,
-                    &mut reader,
-                    object_identity,
-                    None,
-                    1,
-                )
-                .await
-                .map_err(|error| Status::unavailable(error.to_string()))?;
-                let manifest = PhysicalObjectShardManifest::from_ingest(
-                    &binding.cluster_id,
-                    object_identity,
-                    1,
-                    profile.data_shards,
-                    profile.parity_shards,
-                    profile.shard_bytes,
-                    &ingest,
-                )
-                .map_err(|error| Status::internal(error.to_string()))?;
-                let manifest_reference = manifest
-                    .reference()
-                    .map_err(|error| Status::internal(error.to_string()))?;
-                state
-                    .mvcc
-                    .object_evidence
-                    .record_ingest(&ingest)
-                    .map_err(|error| Status::internal(error.to_string()))?;
-                state
-                    .mvcc
-                    .open_transactions
-                    .add_manifest(
-                        transaction_id,
-                        &binding.cluster_id,
-                        manifest_reference,
-                        current_unix_ms()?,
-                    )
-                    .map_err(|error| Status::failed_precondition(error.to_string()))?;
-                data_stream = Box::pin(futures_util::stream::empty());
-                Some(crate::object_manager::PreparedObjectIngest {
-                    object_hash: manifest.object_hash.clone(),
-                    object_length: manifest.object_length,
-                    shard_map: serde_json::json!({
-                        "schema": "anvil.mvcc.object_shard_manifest.v1",
-                        "manifest": manifest,
-                    }),
-                })
-            }
-        }
-    };
-
     let object = state
         .object_manager
         .put_object(
@@ -231,7 +85,6 @@ pub(crate) async fn execute_native_put(
                 transaction_principal: Some(transaction_principal.clone()),
                 storage_class_id: storage_class,
                 visibility: write_visibility,
-                prepared_ingest,
             },
         )
         .await?;
@@ -275,7 +128,7 @@ pub(crate) async fn execute_native_put(
     Ok(response)
 }
 
-fn configured_default_durability(value: &str) -> Result<DurabilityLevel, Status> {
+pub(super) fn configured_default_durability(value: &str) -> Result<DurabilityLevel, Status> {
     match value.trim().to_ascii_lowercase().as_str() {
         "local" => Ok(DurabilityLevel::Local),
         "quorum" => Ok(DurabilityLevel::Quorum),
@@ -302,22 +155,6 @@ fn implicit_transaction_idempotency_key(
         hash.update(value.as_bytes());
     }
     format!("implicit-put:{}", hash.finalize().to_hex())
-}
-
-fn provisional_object_identity(
-    cluster_id: &str,
-    transaction_id: &str,
-    bucket_name: &str,
-    object_key: &str,
-) -> uuid::Uuid {
-    let mut hash = blake3::Hasher::new();
-    for value in [cluster_id, transaction_id, bucket_name, object_key] {
-        hash.update(&(value.len() as u64).to_be_bytes());
-        hash.update(value.as_bytes());
-    }
-    let mut bytes = [0; 16];
-    bytes.copy_from_slice(&hash.finalize().as_bytes()[..16]);
-    uuid::Uuid::from_bytes(bytes)
 }
 
 fn current_unix_ms() -> Result<u64, Status> {

@@ -1,6 +1,9 @@
 use super::rpc::{native_transaction_id, object_write_visibility, write_state_for_transaction};
 use super::*;
-use crate::object_manager;
+use crate::{
+    mvcc_transaction::{CertificationResult, ReadConsistency},
+    object_manager,
+};
 
 fn put_mutation_batch_response(
     operation_digest: &str,
@@ -110,6 +113,13 @@ fn implicit_batch_transaction_id(
     format!("mutation-batch:{}", hasher.finalize().to_hex())
 }
 
+fn mutation_batch_now_unix_ms() -> Result<u64, Status> {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| Status::internal("system clock precedes Unix epoch"))?;
+    u64::try_from(elapsed.as_millis()).map_err(|_| Status::internal("system time exceeds u64"))
+}
+
 fn is_object_data_operation(operation: &MutationBatchOperation) -> bool {
     matches!(
         operation.op.as_ref(),
@@ -217,6 +227,34 @@ pub(super) async fn execute_mutation_batch(
                 Some(mutation_batch_operation::Op::PutObject(_))
             )
         });
+    let implicit_transaction = if transaction_id.is_none() && put_only_batch {
+        Some(
+            state
+                .mvcc
+                .open_transactions
+                .begin(
+                    state.mvcc.runtime.as_ref(),
+                    state.config.mvcc_cluster_id.clone(),
+                    object_manager::transaction_principal_from_claims(&claims),
+                    implicit_batch_transaction_id(&context, &operation_digest),
+                    std::time::Duration::from_secs(300),
+                    super::native_put_rpc::configured_default_durability(
+                        &state.config.mvcc_default_durability,
+                    )?,
+                    ReadConsistency::Linearized,
+                    mutation_batch_now_unix_ms()?,
+                )
+                .await
+                .map_err(|error| Status::failed_precondition(error.to_string()))?,
+        )
+    } else {
+        None
+    };
+    let effective_transaction_id = transaction_id.or_else(|| {
+        implicit_transaction
+            .as_ref()
+            .map(|handle| handle.transaction_id.as_str())
+    });
     if transaction_id.is_none()
         && !put_only_batch
         && req.operations.iter().any(is_object_data_operation)
@@ -225,24 +263,10 @@ pub(super) async fn execute_mutation_batch(
             "ExplicitTransactionRequiredForNonPutMutationBatch",
         ));
     }
-    validate_mutation_precondition_transaction(state, &claims, transaction_id)?;
-    let transaction_principal =
-        transaction_id.map(|_| object_manager::transaction_principal_from_claims(&claims));
-    let put_only_batch = if let (Some(transaction_id), Some(principal)) =
-        (transaction_id, transaction_principal.as_deref())
-    {
-        put_only_batch
-            && state
-                .mvcc
-                .open_transactions
-                .binding(transaction_id, principal)
-                .map_err(|error| Status::failed_precondition(error.to_string()))?
-                .durability
-                == crate::mvcc_transaction::DurabilityLevel::Local
-    } else {
-        put_only_batch
-    };
-    let precondition_transaction = transaction_id.zip(transaction_principal.as_deref());
+    validate_mutation_precondition_transaction(state, &claims, effective_transaction_id)?;
+    let transaction_principal = effective_transaction_id
+        .map(|_| object_manager::transaction_principal_from_claims(&claims));
+    let precondition_transaction = effective_transaction_id.zip(transaction_principal.as_deref());
     let mut mvcc_preconditions =
         prepare_mutation_batch_native_preconditions(state, &claims, &req, precondition_transaction)
             .await?;
@@ -257,7 +281,7 @@ pub(super) async fn execute_mutation_batch(
     deduplicate_preconditions(&mut mvcc_preconditions);
     if !put_only_batch
         && let (Some(transaction_id), Some(principal)) =
-            (transaction_id, transaction_principal.as_deref())
+            (effective_transaction_id, transaction_principal.as_deref())
     {
         let now_unix_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default();
         for (key, kind) in &mvcc_preconditions {
@@ -294,62 +318,56 @@ pub(super) async fn execute_mutation_batch(
                 })
             })
             .collect::<Result<Vec<_>, Status>>()?;
-        let objects = if let Some(transaction_id) = transaction_id {
-            state
-                .object_manager
-                .put_objects_batch_in_transaction(
-                    &claims,
-                    &req.bucket_name,
-                    inputs,
+        let transaction_id = effective_transaction_id
+            .expect("put-only batches always have an explicit or implicit transaction");
+        let objects = state
+            .object_manager
+            .put_objects_batch_in_transaction(
+                &claims,
+                &req.bucket_name,
+                inputs,
+                transaction_id,
+                transaction_principal
+                    .as_deref()
+                    .expect("effective transaction has a principal"),
+                write_visibility,
+                move |objects| {
+                    let response = put_mutation_batch_response(
+                        &operation_digest_for_additions,
+                        &idempotency_context.request_id,
+                        idempotency_context.transaction_id.as_deref(),
+                        objects,
+                    );
+                    prepare_put_batch_additions(
+                        idempotency_mvcc,
+                        idempotency_context,
+                        idempotency_target,
+                        response,
+                        mvcc_preconditions,
+                    )
+                },
+            )
+            .await?;
+        if implicit_transaction.is_some() {
+            let outcome = state
+                .mvcc
+                .open_transactions
+                .commit(
+                    state.mvcc.runtime.as_ref(),
                     transaction_id,
-                    &object_manager::transaction_principal_from_claims(&claims),
-                    write_visibility,
-                    move |objects| {
-                        let response = put_mutation_batch_response(
-                            &operation_digest_for_additions,
-                            &idempotency_context.request_id,
-                            idempotency_context.transaction_id.as_deref(),
-                            objects,
-                        );
-                        prepare_put_batch_additions(
-                            idempotency_mvcc,
-                            idempotency_context,
-                            idempotency_target,
-                            response,
-                            mvcc_preconditions,
-                        )
-                    },
+                    transaction_principal
+                        .as_deref()
+                        .expect("effective transaction has a principal"),
+                    mutation_batch_now_unix_ms()?,
                 )
-                .await?
-        } else {
-            let publication_transaction_id =
-                implicit_batch_transaction_id(&idempotency_context, &operation_digest);
-            state
-                .object_manager
-                .put_objects_batch(
-                    &claims,
-                    &req.bucket_name,
-                    inputs,
-                    &publication_transaction_id,
-                    write_visibility,
-                    move |objects| {
-                        let response = put_mutation_batch_response(
-                            &operation_digest_for_additions,
-                            &idempotency_context.request_id,
-                            idempotency_context.transaction_id.as_deref(),
-                            objects,
-                        );
-                        prepare_put_batch_additions(
-                            idempotency_mvcc,
-                            idempotency_context,
-                            idempotency_target,
-                            response,
-                            mvcc_preconditions,
-                        )
-                    },
-                )
-                .await?
-        };
+                .await
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            if let CertificationResult::Aborted { reason } = outcome.certification {
+                return Err(Status::aborted(format!(
+                    "implicit MVCC transaction aborted: {reason:?}"
+                )));
+            }
+        }
         let mut response = put_mutation_batch_response(
             &operation_digest,
             &context.request_id,
@@ -386,7 +404,6 @@ pub(super) async fn execute_mutation_batch(
                             }),
                             storage_class_id: op.storage_class,
                             visibility: write_visibility,
-                            prepared_ingest: None,
                         },
                     )
                     .await?;
