@@ -187,6 +187,7 @@ struct MachineState {
     certification: CertificationState,
     control: ClusterControlState,
     decisions: BTreeMap<CommitVersion, Option<CommittedBundleDecision>>,
+    local_durability_violations: BTreeMap<CommitVersion, crate::LocalDurabilityViolation>,
     last_applied_log_id: Option<LogId<u64>>,
     membership: StoredMembership<u64, BasicNode>,
     snapshot_generation: u64,
@@ -199,6 +200,7 @@ impl MachineState {
                 .map_err(|error| RaftStorageError::Codec(error.to_string()))?,
             control: ClusterControlState::new(cluster_id_hash).map_err(RaftStorageError::Codec)?,
             decisions: BTreeMap::new(),
+            local_durability_violations: BTreeMap::new(),
             last_applied_log_id: None,
             membership: StoredMembership::default(),
             snapshot_generation: 0,
@@ -381,6 +383,17 @@ impl OpenRaftConsensus {
             .map_err(|error| ConsensusError::Storage(error.to_string()))?
             .ok_or_else(|| ConsensusError::Storage("Raft state machine is missing".into()))?;
         Ok(state.control.gc_safety_watermark())
+    }
+
+    pub fn local_durability_violations(
+        &self,
+    ) -> Result<Vec<crate::LocalDurabilityViolation>, ConsensusError> {
+        let state = self
+            .store
+            .read_state_value::<MachineState>(KEY_OPENRAFT_STATE)
+            .map_err(|error| ConsensusError::Storage(error.to_string()))?
+            .ok_or_else(|| ConsensusError::Storage("Raft state machine is missing".into()))?;
+        Ok(state.local_durability_violations.into_values().collect())
     }
 
     async fn apply_control(
@@ -954,6 +967,8 @@ impl RaftStateMachine<AnvilRaftConfig> for OpenRaftStateMachine {
                                         cluster_id_hash: command.cluster_id_hash,
                                         bundle_hash: command.bundle_hash,
                                         bundle_length: command.bundle_length,
+                                        durability: command.durability,
+                                        durable_holders: command.durable_holders.clone(),
                                     });
                                 }
                                 RaftApplyResult::Certification(result)
@@ -975,6 +990,32 @@ impl RaftStateMachine<AnvilRaftConfig> for OpenRaftStateMachine {
                     } else {
                         match state.control.apply(&command) {
                             Ok(result) => {
+                                if let ControlApplyResult::NodeRemoved(removed) = &result {
+                                    for (commit_version, decision) in &state.decisions {
+                                        let Some(decision) = decision else {
+                                            continue;
+                                        };
+                                        if decision.durability == crate::DurabilityLevel::Local
+                                            && decision.durable_holders.contains(removed)
+                                            && !decision.durable_holders.iter().any(|holder| {
+                                                state.control.node_incarnation(holder.node_id)
+                                                    == Some(holder.incarnation)
+                                            })
+                                        {
+                                            state
+                                                .local_durability_violations
+                                                .entry(*commit_version)
+                                                .or_insert_with(|| {
+                                                    crate::LocalDurabilityViolation {
+                                                        commit_version: *commit_version,
+                                                        bundle_hash: decision.bundle_hash,
+                                                        lost_holder: *removed,
+                                                        detected_at: CommitVersion(log_id.index),
+                                                    }
+                                                });
+                                        }
+                                    }
+                                }
                                 if let ControlApplyResult::GcWatermarkAdvanced(watermark) = &result
                                 {
                                     state.certification.garbage_collect_results(*watermark);
@@ -1144,6 +1185,116 @@ mod tests {
             &membership,
             &BTreeSet::from([1, 9, 10]),
         ));
+    }
+
+    #[tokio::test]
+    async fn local_holder_removal_records_one_durable_violation_not_while_live() {
+        let directory = TempDir::new().unwrap();
+        let store = RocksRaftStore::open(directory.path(), 0).unwrap();
+        let (_, mut machine) = stores(store.clone(), [1; 32]).unwrap();
+        let leader = CommittedLeaderId::new(1, 1);
+        let holder = NodeIncarnation {
+            node_id: NodeId(11),
+            incarnation: 1,
+        };
+        let survivor = NodeIncarnation {
+            node_id: NodeId(22),
+            incarnation: 1,
+        };
+        machine
+            .apply([
+                Entry {
+                    log_id: LogId::new(leader, 1),
+                    payload: EntryPayload::Membership(Membership::new(
+                        vec![BTreeSet::from([1, 2])],
+                        (),
+                    )),
+                },
+                Entry {
+                    log_id: LogId::new(leader, 2),
+                    payload: EntryPayload::Normal(ConsensusCommand::InstallNode {
+                        cluster_id_hash: [1; 32],
+                        node: holder,
+                        raft_node_id: NodeId(1),
+                        failure_domain: "zone-a".into(),
+                    }),
+                },
+                Entry {
+                    log_id: LogId::new(leader, 3),
+                    payload: EntryPayload::Normal(ConsensusCommand::InstallNode {
+                        cluster_id_hash: [1; 32],
+                        node: survivor,
+                        raft_node_id: NodeId(2),
+                        failure_domain: "zone-b".into(),
+                    }),
+                },
+                Entry {
+                    log_id: LogId::new(leader, 4),
+                    payload: EntryPayload::Normal(ConsensusCommand::SetDurabilityPolicy {
+                        cluster_id_hash: [1; 32],
+                        generation: 1,
+                        bundle_quorum_holders: 1,
+                        tolerated_failure_domains: 0,
+                    }),
+                },
+            ])
+            .await
+            .unwrap();
+        let mut command = test_command(7);
+        command.durability = DurabilityLevel::Local;
+        command.durable_holders = vec![holder];
+        machine
+            .apply([Entry {
+                log_id: LogId::new(leader, 5),
+                payload: EntryPayload::Normal(ConsensusCommand::Certify(command)),
+            }])
+            .await
+            .unwrap();
+        assert!(
+            machine
+                .store
+                .read_state_value::<MachineState>(KEY_OPENRAFT_STATE)
+                .unwrap()
+                .unwrap()
+                .local_durability_violations
+                .is_empty()
+        );
+
+        machine
+            .apply([
+                Entry {
+                    log_id: LogId::new(leader, 6),
+                    payload: EntryPayload::Membership(Membership::new(
+                        vec![BTreeSet::from([2])],
+                        BTreeSet::from([1, 2]),
+                    )),
+                },
+                Entry {
+                    log_id: LogId::new(leader, 7),
+                    payload: EntryPayload::Normal(ConsensusCommand::RemoveNode {
+                        cluster_id_hash: [1; 32],
+                        node: holder,
+                    }),
+                },
+            ])
+            .await
+            .unwrap();
+        let violations = machine
+            .store
+            .read_state_value::<MachineState>(KEY_OPENRAFT_STATE)
+            .unwrap()
+            .unwrap()
+            .local_durability_violations;
+        assert_eq!(violations.len(), 1);
+        assert_eq!(
+            violations.get(&CommitVersion(5)),
+            Some(&crate::LocalDurabilityViolation {
+                commit_version: CommitVersion(5),
+                bundle_hash: BundleHash([7; 32]),
+                lost_holder: holder,
+                detected_at: CommitVersion(7),
+            })
+        );
     }
 
     #[test]

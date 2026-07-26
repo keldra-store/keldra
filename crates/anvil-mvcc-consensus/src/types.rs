@@ -194,6 +194,16 @@ pub struct CommittedBundleDecision {
     pub cluster_id_hash: [u8; 32],
     pub bundle_hash: BundleHash,
     pub bundle_length: u64,
+    pub durability: DurabilityLevel,
+    pub durable_holders: Vec<NodeIncarnation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalDurabilityViolation {
+    pub commit_version: CommitVersion,
+    pub bundle_hash: BundleHash,
+    pub lost_holder: NodeIncarnation,
+    pub detected_at: CommitVersion,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

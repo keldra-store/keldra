@@ -3,7 +3,8 @@
 use std::{sync::Arc, time::Duration};
 
 use anvil_mvcc_consensus::{
-    AppliedDecision, BundleHash, CommitVersion, ConsensusError, OpenRaftConsensus,
+    AppliedDecision, BundleHash, CommitVersion, ConsensusError, LocalDurabilityViolation,
+    OpenRaftConsensus,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha256};
@@ -11,7 +12,7 @@ use tokio::sync::{Mutex, watch};
 
 use crate::{
     bundle_replication::AppendOnlyPreparedBundleStore,
-    mvcc_store::LocalMvccStore,
+    mvcc_store::{LocalDurabilityViolationRecord, LocalMvccStore},
     mvcc_transaction::NodeIncarnation,
     mvcc_transaction::{BundleIdentity, PreparedBundleStore, TransactionBundle},
     replication_client::{TonicReplicationStreamManager, bundle_transfer_id},
@@ -43,6 +44,11 @@ pub trait DecisionSource: Send + Sync {
     ) -> std::result::Result<Vec<AppliedDecision>, ConsensusError>;
     fn gc_safety_watermark(&self) -> std::result::Result<CommitVersion, ConsensusError>;
     fn observed_commit_version(&self) -> CommitVersion;
+    fn local_durability_violations(
+        &self,
+    ) -> std::result::Result<Vec<LocalDurabilityViolation>, ConsensusError> {
+        Ok(Vec::new())
+    }
 }
 
 impl DecisionSource for OpenRaftConsensus {
@@ -59,6 +65,12 @@ impl DecisionSource for OpenRaftConsensus {
 
     fn observed_commit_version(&self) -> CommitVersion {
         anvil_mvcc_consensus::Consensus::observed_commit_version(self)
+    }
+
+    fn local_durability_violations(
+        &self,
+    ) -> std::result::Result<Vec<LocalDurabilityViolation>, ConsensusError> {
+        self.local_durability_violations()
     }
 }
 
@@ -120,6 +132,7 @@ impl MvccApplyWorker {
     }
 
     pub async fn apply_available(&self) -> Result<usize> {
+        self.persist_local_durability_violations()?;
         let mut watermark = CommitVersion(self.local.decision_watermark()?);
         let observed_commit = self.consensus.observed_commit_version();
         crate::perf::record_mvcc_state(watermark.0, observed_commit.0, 0);
@@ -213,6 +226,34 @@ impl MvccApplyWorker {
             self.prepared.compact_authorised(&retain)?;
         }
         Ok(applied)
+    }
+
+    fn persist_local_durability_violations(&self) -> Result<()> {
+        for violation in self.consensus.local_durability_violations()? {
+            let inserted =
+                self.local
+                    .record_local_durability_violation(&LocalDurabilityViolationRecord {
+                        commit_version: violation.commit_version.0,
+                        bundle_hash: violation.bundle_hash.0,
+                        lost_holder_node_id: violation.lost_holder.node_id.0,
+                        lost_holder_incarnation: violation.lost_holder.incarnation,
+                        detected_at_consensus_version: violation.detected_at.0,
+                    })?;
+            if inserted {
+                crate::perf::record_local_durability_violation("sole_holder_removed");
+                tracing::error!(
+                    commit_version = violation.commit_version.0,
+                    lost_holder_node_id = violation.lost_holder.node_id.0,
+                    lost_holder_incarnation = violation.lost_holder.incarnation,
+                    detected_at = violation.detected_at.0,
+                    "committed local-durability data has lost its sole durable holder"
+                );
+            }
+        }
+        crate::perf::record_local_durability_violation_status(
+            self.local.local_durability_violations()?.len() as u64,
+        );
+        Ok(())
     }
 
     async fn fetch_bundle(&self, identity: &BundleIdentity) -> Result<Vec<u8>> {
@@ -326,6 +367,7 @@ mod tests {
     struct Source {
         decisions: StdMutex<Vec<AppliedDecision>>,
         gc: CommitVersion,
+        violations: Vec<LocalDurabilityViolation>,
     }
 
     impl DecisionSource for Source {
@@ -353,6 +395,12 @@ mod tests {
                 .unwrap()
                 .last()
                 .map_or(CommitVersion(0), |decision| decision.position)
+        }
+
+        fn local_durability_violations(
+            &self,
+        ) -> std::result::Result<Vec<LocalDurabilityViolation>, ConsensusError> {
+            Ok(self.violations.clone())
         }
     }
 
@@ -407,6 +455,8 @@ mod tests {
                 cluster_id_hash: cluster_id_hash(&bundle.cluster_id),
                 bundle_hash: BundleHash(parse_hash(&identity.hash).unwrap()),
                 bundle_length: identity.length,
+                durability: anvil_mvcc_consensus::DurabilityLevel::Quorum,
+                durable_holders: Vec::new(),
             }),
         }
     }
@@ -430,6 +480,7 @@ mod tests {
         let source = Arc::new(Source {
             decisions: StdMutex::new(vec![committed(&bundle, 1)]),
             gc: CommitVersion(0),
+            violations: vec![],
         });
         let running = worker(source.clone(), prepared.clone(), local.clone());
 
@@ -516,6 +567,7 @@ mod tests {
         let source = Arc::new(Source {
             decisions: StdMutex::new(vec![committed(&bundle, 1)]),
             gc: CommitVersion(0),
+            violations: vec![],
         });
         let downloader = TonicReplicationStreamManager::new(
             "cluster",
@@ -579,6 +631,7 @@ mod tests {
                 committed_bundle: None,
             }]),
             gc: CommitVersion(0),
+            violations: vec![],
         });
         let error = worker(gap, prepared.clone(), local.clone())
             .apply_available()
@@ -589,6 +642,7 @@ mod tests {
         let collected = Arc::new(Source {
             decisions: StdMutex::new(Vec::new()),
             gc: CommitVersion(1),
+            violations: vec![],
         });
         let error = worker(collected, prepared, local)
             .apply_available()
@@ -616,6 +670,7 @@ mod tests {
         let source = Arc::new(Source {
             decisions: StdMutex::new(Vec::new()),
             gc: CommitVersion(1),
+            violations: vec![],
         });
 
         assert_eq!(
@@ -650,6 +705,7 @@ mod tests {
         let source = Arc::new(Source {
             decisions: StdMutex::new(vec![decision]),
             gc: CommitVersion(0),
+            violations: vec![],
         });
 
         let error = worker(source, prepared, local)
@@ -657,5 +713,46 @@ mod tests {
             .await
             .unwrap_err();
         assert!(is_unrecoverable(&error));
+    }
+
+    #[tokio::test]
+    async fn local_holder_loss_is_reported_durably_and_idempotently() {
+        let prepared_directory = tempdir().unwrap();
+        let local_directory = tempdir().unwrap();
+        let prepared = AppendOnlyPreparedBundleStore::open(
+            prepared_directory.path(),
+            "cluster",
+            NodeIncarnation {
+                node_id: "node-a".into(),
+                incarnation: 1,
+            },
+            "zone-a",
+        )
+        .unwrap();
+        let local = LocalMvccStore::open(local_directory.path()).unwrap();
+        let violation = LocalDurabilityViolation {
+            commit_version: CommitVersion(7),
+            bundle_hash: BundleHash([3; 32]),
+            lost_holder: anvil_mvcc_consensus::NodeIncarnation {
+                node_id: anvil_mvcc_consensus::NodeId(11),
+                incarnation: 2,
+            },
+            detected_at: CommitVersion(9),
+        };
+        let source = Arc::new(Source {
+            decisions: StdMutex::new(Vec::new()),
+            gc: CommitVersion(0),
+            violations: vec![violation],
+        });
+        let worker = worker(source, prepared, local.clone());
+
+        assert_eq!(worker.apply_available().await.unwrap(), 0);
+        assert_eq!(worker.apply_available().await.unwrap(), 0);
+        let records = local.local_durability_violations().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].commit_version, 7);
+        assert_eq!(records[0].lost_holder_node_id, 11);
+        assert_eq!(records[0].lost_holder_incarnation, 2);
+        assert_eq!(records[0].detected_at_consensus_version, 9);
     }
 }

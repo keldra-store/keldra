@@ -316,6 +316,14 @@ impl Drop for MvccSubsystem {
 }
 
 impl MvccSubsystem {
+    /// Durable operator-visible records for committed `local` writes whose
+    /// sole holder incarnation has been removed from cluster control state.
+    pub fn local_durability_violations(
+        &self,
+    ) -> Result<Vec<crate::mvcc_store::LocalDurabilityViolationRecord>> {
+        self.runtime.local_store().local_durability_violations()
+    }
+
     pub fn live_shard_placement(&self) -> Result<(Arc<[ShardTarget]>, usize, u64)> {
         let snapshot = self.consensus.applied_control_snapshot()?;
         if snapshot.durability_policy.generation == 0 {

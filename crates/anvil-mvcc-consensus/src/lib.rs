@@ -29,6 +29,7 @@ pub use types::{
     AppliedDecision, AssignmentPredicate, BundleHash, CertificationAbort, CertificationResult,
     CertifyTransaction, CommitVersion, CommittedBundleDecision, ConsensusCommand,
     ConsensusDurabilityPolicy, ControlApplyResult, DurabilityLevel, ExplicitPredicate,
-    LogicalKeyHash, NodeId, NodeIncarnation, PartitionAssignment, PointObservation, PredicateKind,
-    RangeConflictKey, RangeObservation, TransactionId, WrittenPoint,
+    LocalDurabilityViolation, LogicalKeyHash, NodeId, NodeIncarnation, PartitionAssignment,
+    PointObservation, PredicateKind, RangeConflictKey, RangeObservation, TransactionId,
+    WrittenPoint,
 };

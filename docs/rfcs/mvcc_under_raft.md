@@ -1663,6 +1663,8 @@ anvil_mvcc_apply_lag_versions
 anvil_mvcc_versions_total
 anvil_mvcc_gc_watermark
 anvil_mvcc_gc_bytes_total
+anvil_local_durability_violations
+anvil_local_durability_violations_total
 ```
 
 Required consensus metrics:

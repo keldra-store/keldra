@@ -236,6 +236,22 @@ pub fn record_counter(measurement: &str, labels: &[(&str, &str)], value: u64) {
     });
 }
 
+pub fn record_local_durability_violation(reason: &str) {
+    record_counter(
+        "anvil_local_durability_violations_total",
+        &[("reason", reason)],
+        1,
+    );
+}
+
+pub fn record_local_durability_violation_status(active: u64) {
+    record_gauge(
+        "anvil_local_durability_violations",
+        &[],
+        active.min(i64::MAX as u64) as i64,
+    );
+}
+
 pub fn record_gauge(measurement: &str, labels: &[(&str, &str)], value: i64) {
     if !enabled() {
         return;

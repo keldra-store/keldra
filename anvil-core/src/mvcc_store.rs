@@ -38,6 +38,7 @@ const CF_OUTBOX: &str = MVCC_COLUMN_FAMILIES[5];
 const APPLIED_VERSION_KEY: &[u8] = b"applied_version";
 const GC_WATERMARK_KEY: &[u8] = b"gc_watermark";
 const DECISION_WATERMARK_KEY: &[u8] = b"decision_watermark";
+const LOCAL_DURABILITY_VIOLATION_PREFIX: &[u8] = b"local-durability-violation/";
 const VALUE: u8 = 1;
 const TOMBSTONE: u8 = 0;
 
@@ -78,6 +79,15 @@ pub struct OutboxRecord {
     pub last_error: Option<String>,
     pub lease_owner: Option<String>,
     pub lease_expires_unix_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalDurabilityViolationRecord {
+    pub commit_version: CommitVersion,
+    pub bundle_hash: [u8; 32],
+    pub lost_holder_node_id: u64,
+    pub lost_holder_incarnation: u64,
+    pub detected_at_consensus_version: CommitVersion,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -676,6 +686,46 @@ impl MvccStore {
             &durable_write_options(),
         )?;
         Ok(())
+    }
+
+    /// Durably records that a committed `local` transaction lost its sole
+    /// holder. Re-observing the same consensus-derived violation is
+    /// idempotent; conflicting evidence for one commit version fails closed.
+    pub fn record_local_durability_violation(
+        &self,
+        record: &LocalDurabilityViolationRecord,
+    ) -> Result<bool> {
+        let cf = self.cf(CF_META)?;
+        let mut suffix = LOCAL_DURABILITY_VIOLATION_PREFIX.to_vec();
+        suffix.extend_from_slice(&record.commit_version.to_be_bytes());
+        let key = self.key(&suffix);
+        let bytes = serde_json::to_vec(record)?;
+        if let Some(existing) = self.db.get_cf(cf, &key)? {
+            if existing.as_slice() != bytes {
+                bail!("local durability violation identity collision");
+            }
+            return Ok(false);
+        }
+        self.db
+            .put_cf_opt(cf, key, bytes, &durable_write_options())?;
+        Ok(true)
+    }
+
+    pub fn local_durability_violations(&self) -> Result<Vec<LocalDurabilityViolationRecord>> {
+        let cf = self.cf(CF_META)?;
+        let prefix = self.key(LOCAL_DURABILITY_VIOLATION_PREFIX);
+        let mut records = Vec::new();
+        for row in self
+            .db
+            .iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward))
+        {
+            let (key, value) = row?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            records.push(serde_json::from_slice(&value)?);
+        }
+        Ok(records)
     }
 
     pub fn claim_object_materialisation(
