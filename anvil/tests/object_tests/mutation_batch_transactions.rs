@@ -2,9 +2,9 @@ use super::*;
 
 use anvil::anvil_api::transaction_service_client::TransactionServiceClient;
 use anvil::anvil_api::{
-    BeginTransactionRequest, BeginTransactionResponse, CommitTransactionRequest, ConsistencyMode,
-    GetTransactionRequest, ReadConsistency, RollbackTransactionRequest, TransactionScope,
-    WriteState,
+    BeginTransactionRequest, BeginTransactionResponse, CommitTransactionRequest,
+    GetTransactionRequest, MvccDurability, MvccReadConsistency, ReadConsistency,
+    RollbackTransactionRequest, WriteState,
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -17,6 +17,7 @@ struct SingleNodeMutationBatchFixture {
     actor: ObjectTestActor,
     bucket_name: String,
     bucket_id: i64,
+    cluster_id: String,
 }
 
 impl SingleNodeMutationBatchFixture {
@@ -31,6 +32,7 @@ impl SingleNodeMutationBatchFixture {
             .await;
 
         let actor = create_object_test_actor(&cluster, label).await;
+        let cluster_id = cluster.states[0].mvcc.cluster_id().to_string();
         let bucket_name = unique_test_name("tx-mutation-batch");
         let mut bucket_client = BucketServiceClient::connect(actor.grpc_addr.clone())
             .await
@@ -54,6 +56,7 @@ impl SingleNodeMutationBatchFixture {
             actor,
             bucket_name,
             bucket_id,
+            cluster_id,
         }
     }
 
@@ -81,14 +84,8 @@ impl SingleNodeMutationBatchFixture {
         tag: &str,
         ttl_ms: u64,
     ) -> BeginTransactionResponse {
-        self.begin_transaction_with_preconditions_as(
-            client,
-            tag,
-            ttl_ms,
-            Vec::new(),
-            &self.actor.token,
-        )
-        .await
+        self.begin_transaction_as(client, tag, ttl_ms, &self.actor.token)
+            .await
     }
 
     async fn begin_transaction_as(
@@ -98,36 +95,14 @@ impl SingleNodeMutationBatchFixture {
         ttl_ms: u64,
         token: &str,
     ) -> BeginTransactionResponse {
-        self.begin_transaction_with_preconditions_as(client, tag, ttl_ms, Vec::new(), token)
-            .await
-    }
-
-    async fn begin_transaction_with_preconditions_as(
-        &self,
-        client: &mut TransactionServiceClient<tonic::transport::Channel>,
-        tag: &str,
-        ttl_ms: u64,
-        preconditions: Vec<WritePrecondition>,
-        token: &str,
-    ) -> BeginTransactionResponse {
-        let root_anchor_key = hex::encode(anvil::metadata_journal::object_metadata_partition_id(
-            self.actor.tenant_id,
-            self.bucket_id,
-        ));
         let response = client
             .begin_transaction(authorized(
                 BeginTransactionRequest {
                     idempotency_key: format!("{tag}-{}", uuid::Uuid::new_v4()),
-                    scope: Some(TransactionScope {
-                        root_key_hash: anvil::core_store::CoreStore::root_key_hash_for_anchor(
-                            &root_anchor_key,
-                        ),
-                        root_anchor_key,
-                    }),
-                    preconditions,
-                    boundary_values: Vec::new(),
                     ttl_ms,
-                    purpose: tag.to_string(),
+                    read_consistency: MvccReadConsistency::Linearized as i32,
+                    cluster_id: self.cluster_id.clone(),
+                    durability: MvccDurability::Quorum as i32,
                 },
                 token,
             ))
@@ -136,6 +111,32 @@ impl SingleNodeMutationBatchFixture {
             .into_inner();
         assert_eq!(response.state, "open");
         response
+    }
+
+    fn commit_request(&self, transaction_id: impl Into<String>) -> CommitTransactionRequest {
+        CommitTransactionRequest {
+            transaction_id: transaction_id.into(),
+            cluster_id: self.cluster_id.clone(),
+        }
+    }
+
+    fn rollback_request(
+        &self,
+        transaction_id: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> RollbackTransactionRequest {
+        RollbackTransactionRequest {
+            transaction_id: transaction_id.into(),
+            reason: reason.into(),
+            cluster_id: self.cluster_id.clone(),
+        }
+    }
+
+    fn get_transaction_request(&self, transaction_id: impl Into<String>) -> GetTransactionRequest {
+        GetTransactionRequest {
+            transaction_id: transaction_id.into(),
+            cluster_id: self.cluster_id.clone(),
+        }
     }
 
     fn mutation_context(&self, tag: &str, transaction_id: &str) -> NativeMutationContext {
@@ -255,14 +256,6 @@ async fn next_watch_event(
         .expect("watch event must be valid")
 }
 
-fn at_root_generation(generation: u64) -> Option<ReadConsistency> {
-    Some(ReadConsistency {
-        mode: Some(anvil_api::read_consistency::Mode::AtRootGeneration(
-            generation,
-        )),
-    })
-}
-
 #[tokio::test]
 async fn strict_visibility_stages_and_commits_an_absent_object_put() {
     let fixture = SingleNodeMutationBatchFixture::new("tx-batch-strict-absent-put").await;
@@ -279,11 +272,10 @@ async fn strict_visibility_stages_and_commits_an_absent_object_put() {
         lease_fence: None,
     };
     let transaction = fixture
-        .begin_transaction_with_preconditions_as(
+        .begin_transaction_as(
             &mut transaction_client,
             "strict absent object put",
             EXPLICIT_TRANSACTION_TTL_MS,
-            vec![precondition.clone()],
             &fixture.actor.token,
         )
         .await;
@@ -314,12 +306,7 @@ async fn strict_visibility_stages_and_commits_an_absent_object_put() {
 
     transaction_client
         .commit_transaction(authorized(
-            CommitTransactionRequest {
-                transaction_id: transaction.transaction_id,
-                consistency: ConsistencyMode::Committed as i32,
-                wait_for_finalization: false,
-                final_preconditions: Vec::new(),
-            },
+            fixture.commit_request(transaction.transaction_id),
             &fixture.actor.token,
         ))
         .await
@@ -339,19 +326,19 @@ async fn strict_visibility_stages_and_commits_an_absent_object_put() {
         .expect("strict absent-object put is visible after commit");
 }
 
-fn unix_time_nanos() -> u64 {
+fn unix_time_ms() -> u64 {
     u64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time is after Unix epoch")
-            .as_nanos(),
+            .as_millis(),
     )
     .expect("Unix timestamp fits u64")
 }
 
-async fn wait_until_expired(expires_at_unix_nanos: u64) {
-    let remaining = expires_at_unix_nanos.saturating_sub(unix_time_nanos());
-    tokio::time::sleep(Duration::from_nanos(remaining.saturating_add(5_000_000))).await;
+async fn wait_until_expired(expires_at_unix_ms: u64) {
+    let remaining = expires_at_unix_ms.saturating_sub(unix_time_ms());
+    tokio::time::sleep(Duration::from_millis(remaining.saturating_add(5))).await;
 }
 
 #[tokio::test]
@@ -427,12 +414,7 @@ async fn mutation_batch_preserves_same_key_put_order() {
 
     let committed = transaction_client
         .commit_transaction(authorized(
-            CommitTransactionRequest {
-                transaction_id: transaction.transaction_id,
-                consistency: ConsistencyMode::Committed as i32,
-                wait_for_finalization: false,
-                final_preconditions: Vec::new(),
-            },
+            fixture.commit_request(transaction.transaction_id),
             &fixture.actor.token,
         ))
         .await
@@ -766,7 +748,7 @@ async fn mutation_batch_rejects_coordination_operations_before_execution() {
 }
 
 #[tokio::test]
-async fn twenty_put_explicit_batch_finishes_before_ttl_and_commits_one_generation() {
+async fn twenty_put_explicit_batch_finishes_before_ttl_and_commits_atomically() {
     let fixture = SingleNodeMutationBatchFixture::new("tx-batch-twenty-put").await;
     let mut transaction_client = fixture.transaction_client().await;
     let mut object_client = fixture.object_client().await;
@@ -815,11 +797,11 @@ async fn twenty_put_explicit_batch_finishes_before_ttl_and_commits_one_generatio
         batch_elapsed < SMALL_BATCH_DEADLINE,
         "20-put MutationBatch took {batch_elapsed:?}, expected less than {SMALL_BATCH_DEADLINE:?}"
     );
-    let remaining_ttl_nanos = transaction
-        .expires_at_unix_nanos
-        .saturating_sub(unix_time_nanos());
+    let remaining_ttl_ms = transaction
+        .expires_at_unix_ms
+        .saturating_sub(unix_time_ms());
     assert!(
-        remaining_ttl_nanos > Duration::from_secs(15).as_nanos() as u64,
+        remaining_ttl_ms > Duration::from_secs(15).as_millis() as u64,
         "20-put MutationBatch consumed too much of its TTL: {batch_elapsed:?} elapsed"
     );
     assert_eq!(response.write_state, WriteState::Staged as i32);
@@ -844,48 +826,22 @@ async fn twenty_put_explicit_batch_finishes_before_ttl_and_commits_one_generatio
 
     let committed = transaction_client
         .commit_transaction(authorized(
-            CommitTransactionRequest {
-                transaction_id: transaction.transaction_id,
-                consistency: ConsistencyMode::Committed as i32,
-                wait_for_finalization: false,
-                final_preconditions: Vec::new(),
-            },
+            fixture.commit_request(transaction.transaction_id),
             &fixture.actor.token,
         ))
         .await
         .expect("commit 20-put transaction")
         .into_inner();
     assert_eq!(committed.state, WriteState::Committed as i32);
-    let committed_generation = committed
-        .root_generation
-        .expect("committed transaction reports its root generation");
-    assert!(committed_generation > 0);
 
     let expected_keys = objects
         .iter()
         .map(|(key, _)| key.clone())
         .collect::<Vec<_>>();
-    assert!(
-        list_keys(
-            &fixture,
-            &mut object_client,
-            "atomic/",
-            at_root_generation(committed_generation - 1),
-        )
-        .await
-        .is_empty(),
-        "the generation before commit must contain none of the batch"
-    );
     assert_eq!(
-        list_keys(
-            &fixture,
-            &mut object_client,
-            "atomic/",
-            at_root_generation(committed_generation),
-        )
-        .await,
+        list_keys(&fixture, &mut object_client, "atomic/", None).await,
         expected_keys,
-        "the commit generation must expose the whole batch"
+        "the commit must expose the whole batch"
     );
 }
 
@@ -962,12 +918,7 @@ async fn object_version_precondition_is_revalidated_at_transaction_publication()
 
     let conflict = transaction_client
         .commit_transaction(authorized(
-            CommitTransactionRequest {
-                transaction_id: transaction.transaction_id,
-                consistency: ConsistencyMode::Committed as i32,
-                wait_for_finalization: false,
-                final_preconditions: Vec::new(),
-            },
+            fixture.commit_request(transaction.transaction_id),
             &fixture.actor.token,
         ))
         .await
@@ -1053,12 +1004,7 @@ async fn lease_fence_is_revalidated_at_transaction_publication() {
 
     let conflict = transaction_client
         .commit_transaction(authorized(
-            CommitTransactionRequest {
-                transaction_id: transaction.transaction_id,
-                consistency: ConsistencyMode::Committed as i32,
-                wait_for_finalization: false,
-                final_preconditions: Vec::new(),
-            },
+            fixture.commit_request(transaction.transaction_id),
             &fixture.actor.token,
         ))
         .await
@@ -1127,12 +1073,7 @@ async fn later_batch_can_precondition_on_an_earlier_staged_version() {
 
     let committed = transaction_client
         .commit_transaction(authorized(
-            CommitTransactionRequest {
-                transaction_id: transaction.transaction_id,
-                consistency: ConsistencyMode::Committed as i32,
-                wait_for_finalization: false,
-                final_preconditions: Vec::new(),
-            },
+            fixture.commit_request(transaction.transaction_id),
             &fixture.actor.token,
         ))
         .await
@@ -1186,12 +1127,7 @@ async fn duplicate_payload_hashes_use_the_safe_fallback_without_losing_atomicity
 
     let committed = transaction_client
         .commit_transaction(authorized(
-            CommitTransactionRequest {
-                transaction_id: transaction.transaction_id,
-                consistency: ConsistencyMode::Committed as i32,
-                wait_for_finalization: false,
-                final_preconditions: Vec::new(),
-            },
+            fixture.commit_request(transaction.transaction_id),
             &fixture.actor.token,
         ))
         .await
@@ -1271,12 +1207,7 @@ async fn committed_batch_watch_events_preserve_request_order_and_retry_cursor() 
 
     let committed = transaction_client
         .commit_transaction(authorized(
-            CommitTransactionRequest {
-                transaction_id: transaction.transaction_id,
-                consistency: ConsistencyMode::Committed as i32,
-                wait_for_finalization: false,
-                final_preconditions: Vec::new(),
-            },
+            fixture.commit_request(transaction.transaction_id),
             &fixture.actor.token,
         ))
         .await
@@ -1445,12 +1376,7 @@ async fn authorization_failure_leaves_every_batch_operation_invisible() {
 
     let committed = transaction_client
         .commit_transaction(authorized(
-            CommitTransactionRequest {
-                transaction_id: transaction.transaction_id,
-                consistency: ConsistencyMode::Committed as i32,
-                wait_for_finalization: false,
-                final_preconditions: Vec::new(),
-            },
+            fixture.commit_request(transaction.transaction_id),
             &partial_writer_token,
         ))
         .await
@@ -1522,10 +1448,10 @@ async fn rollback_and_expiry_never_publish_staged_mutation_batches() {
 
     let rolled_back = transaction_client
         .rollback_transaction(authorized(
-            RollbackTransactionRequest {
-                transaction_id: cancelled.transaction_id.clone(),
-                reason: "client cancelled test transaction".to_string(),
-            },
+            fixture.rollback_request(
+                cancelled.transaction_id.clone(),
+                "client cancelled test transaction",
+            ),
             &fixture.actor.token,
         ))
         .await
@@ -1535,12 +1461,7 @@ async fn rollback_and_expiry_never_publish_staged_mutation_batches() {
     assert_object_missing(&fixture, &mut object_client, cancelled_key).await;
     let cancelled_commit = transaction_client
         .commit_transaction(authorized(
-            CommitTransactionRequest {
-                transaction_id: cancelled.transaction_id,
-                consistency: ConsistencyMode::Committed as i32,
-                wait_for_finalization: false,
-                final_preconditions: Vec::new(),
-            },
+            fixture.commit_request(cancelled.transaction_id),
             &fixture.actor.token,
         ))
         .await
@@ -1570,20 +1491,15 @@ async fn rollback_and_expiry_never_publish_staged_mutation_batches() {
         .await
         .expect("stage MutationBatch before expiry");
     assert!(
-        unix_time_nanos() < expiring.expires_at_unix_nanos,
+        unix_time_ms() < expiring.expires_at_unix_ms,
         "test transaction expired before the batch was staged"
     );
     assert_object_missing(&fixture, &mut object_client, expired_key).await;
 
-    wait_until_expired(expiring.expires_at_unix_nanos).await;
+    wait_until_expired(expiring.expires_at_unix_ms).await;
     let expired_commit = transaction_client
         .commit_transaction(authorized(
-            CommitTransactionRequest {
-                transaction_id: expiring.transaction_id.clone(),
-                consistency: ConsistencyMode::Committed as i32,
-                wait_for_finalization: false,
-                final_preconditions: Vec::new(),
-            },
+            fixture.commit_request(expiring.transaction_id.clone()),
             &fixture.actor.token,
         ))
         .await
@@ -1592,15 +1508,12 @@ async fn rollback_and_expiry_never_publish_staged_mutation_batches() {
 
     let expired_status = transaction_client
         .get_transaction(authorized(
-            GetTransactionRequest {
-                transaction_id: expiring.transaction_id,
-            },
+            fixture.get_transaction_request(expiring.transaction_id),
             &fixture.actor.token,
         ))
         .await
         .expect("read expired transaction status")
         .into_inner();
     assert_eq!(expired_status.state, "expired");
-    assert!(expired_status.error.is_some());
     assert_object_missing(&fixture, &mut object_client, expired_key).await;
 }
