@@ -1442,6 +1442,57 @@ pub fn read_object_versions_mvcc(
         .collect())
 }
 
+pub fn list_object_versions_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    bucket: &Bucket,
+    prefix: &str,
+    key_marker: &str,
+    version_id_marker: Option<uuid::Uuid>,
+    limit: i32,
+) -> Result<ObjectVersionsPage> {
+    let mut versions = read_object_versions_mvcc(mvcc, bucket)?
+        .into_iter()
+        .filter(|version| version.object.key.starts_with(prefix))
+        .collect::<Vec<_>>();
+    let start = match version_id_marker {
+        Some(marker) => versions
+            .iter()
+            .position(|version| {
+                version.object.key == key_marker && version.object.version_id == marker
+            })
+            .map(|position| position + 1)
+            .unwrap_or_else(|| {
+                versions.partition_point(|version| version.object.key.as_str() <= key_marker)
+            }),
+        None => versions.partition_point(|version| version.object.key.as_str() <= key_marker),
+    };
+    versions.drain(..start);
+    let limit = limit.max(1) as usize;
+    let is_truncated = versions.len() > limit;
+    if is_truncated {
+        versions.truncate(limit);
+    }
+    let (next_key_marker, next_version_id_marker) = if is_truncated {
+        versions
+            .last()
+            .map(|version| {
+                (
+                    Some(version.object.key.clone()),
+                    Some(version.object.version_id),
+                )
+            })
+            .unwrap_or((None, None))
+    } else {
+        (None, None)
+    };
+    Ok(ObjectVersionsPage {
+        versions,
+        is_truncated,
+        next_key_marker,
+        next_version_id_marker,
+    })
+}
+
 pub async fn read_current_object(
     storage: &Storage,
     bucket: &Bucket,

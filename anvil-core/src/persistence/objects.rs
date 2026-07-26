@@ -740,21 +740,17 @@ impl Persistence {
         else {
             return Err(object_links::ObjectLinkError::BucketNotFound);
         };
-        let mut links = metadata_journal::read_current_directory_objects(
-            &self.storage,
-            &bucket,
-            &self.partition_owner_signing_key,
-        )
-        .await?
-        .into_iter()
-        .filter(|object| object.kind == object_links::ObjectEntryKind::Link)
-        .filter_map(|object| object_links::link_descriptor(&bucket.name, &object))
-        .filter(|descriptor| {
-            prefix
-                .map(|prefix| descriptor.link_key.starts_with(prefix))
-                .unwrap_or(true)
-        })
-        .collect::<Vec<_>>();
+        let mut links =
+            metadata_journal::read_current_directory_objects_mvcc(self.mvcc()?, &bucket)?
+                .into_iter()
+                .filter(|object| object.kind == object_links::ObjectEntryKind::Link)
+                .filter_map(|object| object_links::link_descriptor(&bucket.name, &object))
+                .filter(|descriptor| {
+                    prefix
+                        .map(|prefix| descriptor.link_key.starts_with(prefix))
+                        .unwrap_or(true)
+                })
+                .collect::<Vec<_>>();
         links.sort_by(|left, right| left.link_key.cmp(&right.link_key));
         Ok(links)
     }
@@ -1213,16 +1209,14 @@ impl Persistence {
                 next_version_id_marker: None,
             });
         };
-        metadata_journal::read_object_versions(
-            &self.storage,
+        metadata_journal::list_object_versions_mvcc(
+            self.mvcc()?,
             &bucket,
-            &self.partition_owner_signing_key,
             prefix,
             key_marker,
             version_id_marker,
             limit,
         )
-        .await
     }
 
     pub async fn compact_object_metadata(
