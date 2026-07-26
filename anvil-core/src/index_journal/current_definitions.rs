@@ -89,10 +89,12 @@ struct CurrentDefinitionStateProto {
 
 pub(super) async fn prepare_projection_mutation(
     storage: &Storage,
+    mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
     event: &IndexDefinitionEvent,
     event_payload: &[u8],
     partition_id: &str,
     transaction_id: &str,
+    transaction_principal: Option<&str>,
 ) -> Result<ProjectionMutation> {
     validate_scope(event.tenant_id, event.bucket_id)?;
     validate_index_name(&event.index_name)?;
@@ -119,8 +121,20 @@ pub(super) async fn prepare_projection_mutation(
 
     let store = CoreStore::new(storage.clone()).await?;
     let state_key = state_tuple_key(event.tenant_id, event.bucket_id)?;
-    let existing_payload =
-        store.read_coremeta_row(CF_INDEX_DEFS, TABLE_INDEX_DEFINITION_ROW, &state_key)?;
+    let existing_payload = match (mvcc, transaction_principal) {
+        (Some(mvcc), Some(principal)) => {
+            let logical_key = crate::mvcc_product::coremeta_logical_key(
+                CF_INDEX_DEFS,
+                TABLE_INDEX_DEFINITION_ROW,
+                &state_key,
+            )?;
+            mvcc.read_transaction_value(transaction_id, principal, &logical_key)?
+        }
+        (None, None) => {
+            store.read_coremeta_row(CF_INDEX_DEFS, TABLE_INDEX_DEFINITION_ROW, &state_key)?
+        }
+        _ => bail!("index definition MVCC handle and transaction principal must be paired"),
+    };
     let existing = existing_payload
         .as_deref()
         .map(|payload| decode_state(payload, event.tenant_id, event.bucket_id))

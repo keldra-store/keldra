@@ -1,7 +1,6 @@
 use crate::core_store::{
     CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
-    CoreMutationRootPublication, CoreStore, CoreTransaction, CoreTransactionState,
-    CoreTransactionUpdate, ReadStream,
+    CoreMutationRootPublication, CoreStore, CoreTransactionState, ReadStream,
 };
 use crate::formats::{Hash32, hash32, writer::WriterFamily};
 use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
@@ -157,24 +156,18 @@ async fn append_index_definition_event_inner(
             event.tenant_id, event.bucket_id, event.mutation_id
         )
     });
-    if transaction_id.is_none()
-        && core_store
-            .read_transaction(&effective_transaction_id)
-            .await?
-            .is_some_and(|transaction| transaction.state == CoreTransactionState::Committed)
-    {
-        return Ok(());
-    }
-    let stream_head = core_store.stream_head_sequence(&stream_id).await?;
-    let expected_cursor = stream_head
-        .checked_add(1)
-        .ok_or_else(|| anyhow!("index definition stream cursor overflow"))?;
-    if u64::try_from(event.id)? != expected_cursor {
-        return Err(anyhow!(
-            "index definition event cursor {} does not follow durable stream head {}",
-            event.id,
-            stream_head
-        ));
+    if transaction_id.is_none() {
+        let stream_head = core_store.stream_head_sequence(&stream_id).await?;
+        let expected_cursor = stream_head
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("index definition stream cursor overflow"))?;
+        if u64::try_from(event.id)? != expected_cursor {
+            return Err(anyhow!(
+                "index definition event cursor {} does not follow durable stream head {}",
+                event.id,
+                stream_head
+            ));
+        }
     }
     let payload = encode_index_event_body(event, fence_token)?;
     let partition_id = hex::encode(index_definition_partition_id(
@@ -195,10 +188,12 @@ async fn append_index_definition_event_inner(
     let root_publications = index_definition_root_publications(data_root, scope_partition.clone());
     let projection = current_definitions::prepare_projection_mutation(
         storage,
+        mvcc,
         event,
         &payload,
         &scope_partition,
         &effective_transaction_id,
+        transaction_principal,
     )
     .await?;
     let mut preconditions: Vec<_> = partition_precondition.into_iter().collect();
@@ -250,55 +245,6 @@ async fn append_index_definition_event_inner(
         }
     }
     Ok(())
-}
-
-pub async fn materialize_committed_index_definition_transaction(
-    storage: &Storage,
-    transaction: &CoreTransaction,
-) -> Result<Vec<IndexDefinitionEvent>> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let mut materialized = Vec::new();
-    for update in &transaction.visible_updates {
-        let CoreTransactionUpdate::StreamAppend {
-            stream_id,
-            visible_sequence,
-            prepared_record_hash,
-            ..
-        } = update
-        else {
-            continue;
-        };
-        let Some((tenant_id, bucket_id)) = parse_index_definition_stream_id(stream_id) else {
-            continue;
-        };
-        let records = core_store
-            .read_stream(ReadStream {
-                stream_id: stream_id.clone(),
-                after_sequence: visible_sequence.saturating_sub(1),
-                limit: 1,
-            })
-            .await?;
-        let Some(record) = records.into_iter().find(|record| {
-            record.sequence == *visible_sequence && &record.event_hash == prepared_record_hash
-        }) else {
-            return Err(anyhow!(
-                "index definition transaction {} committed stream record {stream_id}:{visible_sequence} is not readable",
-                transaction.transaction_id
-            ));
-        };
-        if record.record_kind != INDEX_DEFINITION_RECORD_KIND {
-            continue;
-        }
-        let event = index_event_body_from_proto(decode_index_event_body(&record.payload)?)?;
-        if event.tenant_id != tenant_id || event.bucket_id != bucket_id {
-            return Err(anyhow!(
-                "index definition transaction {} stream scope does not match payload",
-                transaction.transaction_id
-            ));
-        }
-        materialized.push(event);
-    }
-    Ok(materialized)
 }
 
 #[cfg(test)]
@@ -632,12 +578,6 @@ pub(crate) fn index_definition_stream_id(tenant_id: i64, bucket_id: i64) -> Stri
     format!("index_definition:tenant:{tenant_id}:bucket:{bucket_id}")
 }
 
-fn parse_index_definition_stream_id(stream_id: &str) -> Option<(i64, i64)> {
-    let rest = stream_id.strip_prefix("index_definition:tenant:")?;
-    let (tenant, bucket_part) = rest.split_once(":bucket:")?;
-    Some((tenant.parse().ok()?, bucket_part.parse().ok()?))
-}
-
 fn index_definition_partition_principal(tenant_id: i64, bucket_id: i64) -> String {
     format!("partition-owner:index_definition:{tenant_id}:{bucket_id}")
 }
@@ -690,10 +630,12 @@ async fn write_index_current_coremeta_rows(
     );
     let projection = current_definitions::prepare_projection_mutation(
         storage,
+        None,
         event,
         event_payload,
         &partition_id,
         &transaction_id,
+        None,
     )
     .await?;
     let root_publications = index_definition_root_publications(
