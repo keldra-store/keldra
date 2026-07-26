@@ -1,5 +1,4 @@
 use super::local_stream_control::control_record_proto::decode_stream_head_record;
-use super::local_tx_rows::CoreTransactionPreconditionRow;
 use super::*;
 use crate::formats::writer::WriterFamily;
 
@@ -131,12 +130,6 @@ impl CoreStore {
             lock_keys.insert((
                 "coremeta-root".to_string(),
                 root_key_hash(&publication.root_anchor_key),
-            ));
-        }
-        if let Some(header) = self.read_transaction_header_row_unlocked(&batch.transaction_id)? {
-            lock_keys.insert((
-                "coremeta-root".to_string(),
-                header.transaction.root_key_hash,
             ));
         }
         for precondition in &batch.preconditions {
@@ -693,53 +686,6 @@ impl CoreStore {
         for append in appends {
             self.storage.notify_stream(&append.stream_id);
         }
-    }
-
-    pub(super) async fn write_transaction_unlocked(
-        &self,
-        transaction: &CoreTransaction,
-    ) -> Result<()> {
-        if let Some(existing) = self
-            .read_transaction_unlocked(&transaction.transaction_id)
-            .await?
-        {
-            if existing.state == transaction.state
-                && existing.preconditions_hash == transaction.preconditions_hash
-                && existing.operations_hash == transaction.operations_hash
-                && existing.visible_updates == transaction.visible_updates
-                && existing.finalisation_error == transaction.finalisation_error
-                && existing.committed_by_principal == transaction.committed_by_principal
-                && existing.root_anchor_key == transaction.root_anchor_key
-                && existing.root_key_hash == transaction.root_key_hash
-                && existing.scope_partition == transaction.scope_partition
-                && existing.failure_evidence == transaction.failure_evidence
-                && existing.outcome == transaction.outcome
-            {
-                return Ok(());
-            }
-            if !is_allowed_transaction_transition(&existing, transaction) {
-                bail!(
-                    "CoreStore transaction {} idempotency conflict",
-                    transaction.transaction_id
-                );
-            }
-        }
-        if transaction.state == CoreTransactionState::Committed {
-            self.commit_explicit_transaction_rows_and_coremeta_updates_unlocked(transaction)
-                .await?;
-        } else {
-            self.write_pending_transaction_with_staged_rows_unlocked(transaction, &[])
-                .await?;
-        }
-        Ok(())
-    }
-
-    pub(super) async fn read_transaction_unlocked(
-        &self,
-        transaction_id: &str,
-    ) -> Result<Option<CoreTransaction>> {
-        self.read_transaction_from_rows_unlocked(transaction_id)
-            .await
     }
 }
 
