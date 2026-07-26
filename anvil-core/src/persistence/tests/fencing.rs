@@ -169,14 +169,6 @@ async fn persistence_global_journal_writes_use_current_fence_tokens() {
         .await
         .expect("object metadata journal fences");
         assert!(object_fences.iter().all(|fence| *fence > 0));
-        let multipart_fences = crate::multipart_journal::read_multipart_frame_fences_for_test(
-            &persistence.storage,
-            1,
-            bucket.id,
-        )
-        .await
-        .expect("multipart journal fences");
-        assert!(multipart_fences.iter().all(|fence| *fence > 0));
         let append_fences = crate::append_journal::read_append_frame_fences_for_test(
             &persistence.storage,
             1,

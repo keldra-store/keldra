@@ -19,47 +19,13 @@ pub(super) fn encode_multipart_event(
     encode_proto(&proto, "multipart event")
 }
 
-#[cfg(test)]
-pub(super) fn decode_multipart_event(bytes: &[u8]) -> Result<MultipartEventProto> {
-    let proto = decode_deterministic_proto::<MultipartEventProto>(bytes, "multipart event")?;
-    if proto.schema != MULTIPART_EVENT_SCHEMA {
-        anyhow::bail!("multipart event has invalid schema");
-    }
-    let _mutation_id = uuid::Uuid::parse_str(&proto.mutation_id)
-        .map_err(|_| anyhow!("multipart event has invalid mutation id"))?;
-    match proto.event.as_str() {
-        "create_upload" | "complete_upload" | "abort_upload" => {
-            let upload = proto
-                .upload
-                .clone()
-                .ok_or_else(|| anyhow!("multipart upload event is missing upload"))?;
-            let _ = upload_from_proto(upload)?;
-        }
-        "upsert_part" => {
-            let part = proto
-                .part
-                .clone()
-                .ok_or_else(|| anyhow!("multipart part event is missing part"))?;
-            let _ = part_from_proto(part)?;
-        }
-        other => anyhow::bail!("unknown multipart metadata event {other}"),
-    }
-    Ok(proto)
-}
-
-#[cfg(test)]
-pub(super) fn decode_multipart_event_fence(bytes: &[u8]) -> Result<u64> {
-    Ok(decode_multipart_event(bytes)?.fence_token)
-}
-
 pub(super) fn current_upload_payload(
-    store: &CoreStore,
+    read: &mut impl FnMut(u16, &[u8]) -> Result<Option<Vec<u8>>>,
     tenant_id: i64,
     bucket_id: i64,
     upload_row_id: i64,
 ) -> Result<(Option<Vec<u8>>, Option<MultipartUploadCurrentRow>)> {
-    let payload = store.read_coremeta_row(
-        CF_OBJECT_HEADS,
+    let payload = read(
         TABLE_MULTIPART_UPLOAD_CURRENT_ROW,
         &multipart_upload_row_key(tenant_id, bucket_id, upload_row_id)?,
     )?;
@@ -71,14 +37,13 @@ pub(super) fn current_upload_payload(
 }
 
 pub(super) fn current_part_payload(
-    store: &CoreStore,
+    read: &mut impl FnMut(u16, &[u8]) -> Result<Option<Vec<u8>>>,
     tenant_id: i64,
     bucket_id: i64,
     upload_row_id: i64,
     part_number: i32,
 ) -> Result<(Option<Vec<u8>>, Option<MultipartPartCurrentRow>)> {
-    let payload = store.read_coremeta_row(
-        CF_OBJECT_HEADS,
+    let payload = read(
         TABLE_MULTIPART_PART_CURRENT_ROW,
         &multipart_part_row_key(tenant_id, bucket_id, upload_row_id, part_number)?,
     )?;
@@ -87,39 +52,6 @@ pub(super) fn current_part_payload(
         .map(decode_committed_part_current_row)
         .transpose()?;
     Ok((payload, row))
-}
-
-pub(super) fn decode_upload_current_record(
-    record: &CoreMetaRecord,
-) -> Result<MultipartUploadCurrentRow> {
-    let row = decode_committed_upload_current_row(&record.payload)?;
-    let tuple_key = core_meta_record_tuple_key(&record.key)?;
-    if tuple_key
-        != multipart_upload_row_key(row.upload.tenant_id, row.upload.bucket_id, row.upload.id)?
-    {
-        return Err(anyhow!(
-            "multipart upload current CoreMeta row key mismatch"
-        ));
-    }
-    Ok(row)
-}
-
-pub(super) fn decode_part_current_record(
-    record: &CoreMetaRecord,
-) -> Result<MultipartPartCurrentRow> {
-    let row = decode_committed_part_current_row(&record.payload)?;
-    let tuple_key = core_meta_record_tuple_key(&record.key)?;
-    if tuple_key
-        != multipart_part_row_key(
-            row.tenant_id,
-            row.bucket_id,
-            row.part.upload_id,
-            row.part.part_number,
-        )?
-    {
-        return Err(anyhow!("multipart part current CoreMeta row key mismatch"));
-    }
-    Ok(row)
 }
 
 pub(super) fn encode_upload_current_row(row: &MultipartUploadCurrentRow) -> Result<Vec<u8>> {
@@ -643,10 +575,6 @@ pub(super) fn next_part_id(state: &MultipartState) -> Result<i64> {
 
 pub fn multipart_metadata_partition_id(tenant_id: i64, bucket_id: i64) -> Hash32 {
     hash32(format!("tenant/{tenant_id}/bucket/{bucket_id}/multipart").as_bytes())
-}
-
-pub(super) fn multipart_metadata_stream_id(tenant_id: i64, bucket_id: i64) -> String {
-    format!("multipart_metadata:tenant:{tenant_id}:bucket:{bucket_id}")
 }
 
 pub(super) fn multipart_metadata_partition_principal(tenant_id: i64, bucket_id: i64) -> String {
