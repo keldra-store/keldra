@@ -91,14 +91,14 @@ fn delete_index_segment_coremeta_row(
 }
 
 async fn collect_index_segments_for_test(
-    storage: &anvil::storage::Storage,
+    mvcc: &anvil::mvcc_bootstrap::MvccSubsystem,
     index_id: &str,
 ) -> Vec<anvil::index_coremeta::IndexSegmentCoreMetaRecord> {
     let mut cursor: Option<Vec<u8>> = None;
     let mut records = Vec::new();
     loop {
         let page = anvil::index_coremeta::page_index_segment_coremeta_records(
-            storage,
+            mvcc,
             index_id,
             cursor.as_deref(),
             256,
@@ -886,6 +886,7 @@ async fn test_repair_rebuilds_missing_full_text_segment_from_base_journal() {
     let signing_key = hex::decode(&cluster.states[0].config.anvil_secret_encryption_key).unwrap();
     let stats = anvil::metadata_journal::active_object_journal_stats(
         &cluster.states[0].storage,
+        &cluster.states[0].mvcc,
         &bucket,
         &signing_key,
     )
@@ -912,7 +913,7 @@ async fn test_repair_rebuilds_missing_full_text_segment_from_base_journal() {
     .unwrap()
     .expect("proof exists before deleting segment");
     assert!(!proof.segment_hashes.is_empty());
-    for segment in collect_index_segments_for_test(&cluster.states[0].storage, &index_storage_id)
+    for segment in collect_index_segments_for_test(&cluster.states[0].mvcc, &index_storage_id)
         .await
         .into_iter()
         .filter(|record| record.index_kind == "full_text")
@@ -1043,6 +1044,7 @@ async fn test_repair_rebuilds_missing_vector_segment_from_base_journal() {
     let signing_key = hex::decode(&cluster.states[0].config.anvil_secret_encryption_key).unwrap();
     let stats = anvil::metadata_journal::active_object_journal_stats(
         &cluster.states[0].storage,
+        &cluster.states[0].mvcc,
         &bucket,
         &signing_key,
     )
@@ -1068,7 +1070,7 @@ async fn test_repair_rebuilds_missing_vector_segment_from_base_journal() {
     .unwrap()
     .expect("proof exists before deleting segment");
     assert!(!proof.segment_hashes.is_empty());
-    for segment in collect_index_segments_for_test(&cluster.states[0].storage, &index_storage_id)
+    for segment in collect_index_segments_for_test(&cluster.states[0].mvcc, &index_storage_id)
         .await
         .into_iter()
         .filter(|record| record.index_kind == "vector")

@@ -270,6 +270,7 @@ async fn put_index_object_bytes(
         .expect("test bucket should exist before object write");
     let has_bucket_write = anvil::access_control::system_realm_relationship_allows(
         &cluster.states[0].storage,
+        &cluster.states[0].mvcc,
         &claims,
         anvil::system_realm::SYSTEM_BUCKET_NAMESPACE,
         &anvil::access_control::bucket_object_id(&bucket),
@@ -463,6 +464,17 @@ async fn grant_bucket_index_query_for_principal(
     bucket_name: &str,
     principal_id: &str,
 ) {
+    let audit_event = anvil::tenant_audit::TenantAuditEvent {
+        schema: anvil::tenant_audit::TENANT_AUDIT_EVENT_SCHEMA.to_string(),
+        audit_event_id: format!("index-test-grant-{principal_id}-{bucket_name}"),
+        request_id: "index-test-grant".to_string(),
+        tenant_id: 1,
+        principal_id: "index-test".to_string(),
+        resource_id: bucket_name.to_string(),
+        action: "index.query.grant".to_string(),
+        created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        details_json: serde_json::json!({ "principal_id": principal_id }).to_string(),
+    };
     anvil::access_control::write_delegated_action_tuple(
         &cluster.states[0].storage,
         &cluster.states[0].persistence,
@@ -473,6 +485,7 @@ async fn grant_bucket_index_query_for_principal(
         "add",
         "index-test",
         "grant test principal bucket index query access",
+        &audit_event,
     )
     .await
     .expect("test principal should receive index query access");
