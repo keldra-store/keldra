@@ -40,7 +40,7 @@ Status values:
 | Transactions may cross arbitrary tables, partitions, tenants and features inside one cluster | Partial | Bundle and registry types are scope-free and cross-table tests exist. Several product paths have moved to logical MVCC mutations, but not every reachable write path has been converted. |
 | Transactions must reject keys owned by another cluster before preparation | Partial | The transaction is permanently cluster-bound and foreign `cluster_id` RPCs/bundles are rejected. `LogicalKey` has no general ownership resolver, so arbitrary staged keys are not independently resolved to a cluster. |
 | Explicit uniqueness/CAS predicates must certify deterministically | Partial | Point observations cover create/update conflicts, but the bundle and consensus command have no distinct `explicit_predicates` representation described by the RFC. |
-| Define limits for observations, writes, command bytes, bundle bytes and raw payload bytes | Missing | No comprehensive transaction resource-limit policy is enforced. |
+| Define limits for observations, writes, command bytes, bundle bytes and raw payload bytes | Implemented | `TransactionResourceLimits` provides validated configurable limits with conservative defaults. The coordinator rejects point/range/write counts, canonical bundle bytes and aggregate raw payload bytes before prepared persistence; the adapter independently rejects an oversized encoded certification command before Raft. Focused tests cover every dimension. |
 
 ## Durability, replication and recovery
 
@@ -90,6 +90,5 @@ Status values:
 1. Finish deleting every reachable CoreStore explicit-transaction and receipt/publication path; remove MVCC/physical fallback reads rather than treating them as migration support.
 2. Wire the existing bounded-stripe `DistributedIngest` and final-target shard streams into every applicable public streaming upload path; remove legacy/raw alternatives and add public-API durability tests.
 3. Add a general logical-key-to-cluster ownership resolver and validate every observation, mutation, manifest, event and job before bundle persistence.
-4. Define and enforce transaction/command/bundle/raw-payload resource limits.
-5. Implement safe MVCC, bundle, shard and conflict-state GC with active-snapshot and catch-up protection.
-6. Add the required observability, fault matrix and benchmark suite.
+4. Implement safe MVCC, bundle, shard and conflict-state GC with active-snapshot and catch-up protection.
+5. Add the required observability, fault matrix and benchmark suite.

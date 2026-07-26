@@ -524,6 +524,83 @@ pub struct DurabilityPolicy {
     pub tolerated_failure_domains: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransactionResourceLimits {
+    pub max_point_observations: usize,
+    pub max_range_observations: usize,
+    pub max_written_keys: usize,
+    pub max_certification_command_bytes: usize,
+    pub max_bundle_bytes: usize,
+    pub max_raw_payload_bytes: usize,
+}
+
+impl Default for TransactionResourceLimits {
+    fn default() -> Self {
+        Self {
+            max_point_observations: 65_536,
+            max_range_observations: 16_384,
+            max_written_keys: 65_536,
+            max_certification_command_bytes: 8 * 1024 * 1024,
+            max_bundle_bytes: 64 * 1024 * 1024,
+            max_raw_payload_bytes: 512 * 1024 * 1024,
+        }
+    }
+}
+
+impl TransactionResourceLimits {
+    fn validate(self) -> Result<()> {
+        if self.max_point_observations == 0
+            || self.max_range_observations == 0
+            || self.max_written_keys == 0
+            || self.max_certification_command_bytes == 0
+            || self.max_bundle_bytes == 0
+            || self.max_raw_payload_bytes == 0
+        {
+            bail!("transaction resource limits must be non-zero");
+        }
+        Ok(())
+    }
+
+    fn validate_bundle(self, bundle: &TransactionBundle, canonical_bytes: &[u8]) -> Result<()> {
+        self.validate()?;
+        if bundle.point_observations.len() > self.max_point_observations {
+            bail!("transaction exceeds point observation limit");
+        }
+        if bundle.range_observations.len() > self.max_range_observations {
+            bail!("transaction exceeds range observation limit");
+        }
+        if bundle.writes.len() > self.max_written_keys {
+            bail!("transaction exceeds written key limit");
+        }
+        if canonical_bytes.len() > self.max_bundle_bytes {
+            bail!("transaction exceeds canonical bundle byte limit");
+        }
+        let mut raw_payload_bytes = bundle
+            .writes
+            .iter()
+            .map(|write| match write {
+                WriteOperation::Put { value, .. } => value.len(),
+                WriteOperation::Delete { .. } => 0,
+            })
+            .chain(bundle.outbox_events.iter().map(Vec::len))
+            .chain(bundle.materialisation_jobs.iter().map(Vec::len))
+            .try_fold(0usize, |total, length| total.checked_add(length))
+            .context("transaction raw payload byte count overflow")?;
+        for manifest in &bundle.shard_manifests {
+            raw_payload_bytes = raw_payload_bytes
+                .checked_add(
+                    usize::try_from(manifest.object_length)
+                        .context("object payload length exceeds address space")?,
+                )
+                .context("transaction raw payload byte count overflow")?;
+        }
+        if raw_payload_bytes > self.max_raw_payload_bytes {
+            bail!("transaction exceeds raw payload byte limit");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CertificationRequest {
     pub cluster_id: String,
@@ -537,6 +614,7 @@ pub struct CertificationRequest {
     pub range_observations: Vec<RangeObservation>,
     pub advanced_range_stamps: Vec<RangeStampKey>,
     pub written_keys: Vec<LogicalKey>,
+    pub max_command_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -590,6 +668,7 @@ pub struct TransactionCoordinator<S, R, C> {
     replicator: R,
     certifier: C,
     policy: DurabilityPolicy,
+    resource_limits: TransactionResourceLimits,
 }
 
 impl<S, R, C> TransactionCoordinator<S, R, C>
@@ -607,7 +686,17 @@ where
             replicator,
             certifier,
             policy,
+            resource_limits: TransactionResourceLimits::default(),
         })
+    }
+
+    pub fn with_resource_limits(
+        mut self,
+        resource_limits: TransactionResourceLimits,
+    ) -> Result<Self> {
+        resource_limits.validate()?;
+        self.resource_limits = resource_limits;
+        Ok(self)
     }
 
     pub async fn snapshot(&self, consistency: ReadConsistency) -> Result<CommitVersion> {
@@ -621,6 +710,7 @@ where
     ) -> Result<CertificationResult> {
         bundle.canonicalize()?;
         let bytes = bundle.canonical_bytes()?;
+        self.resource_limits.validate_bundle(&bundle, &bytes)?;
         let identity = bundle.identity()?;
 
         let local_bundle = self.store.persist(&identity, &bytes).await?;
@@ -662,6 +752,7 @@ where
                 range_observations: bundle.range_observations,
                 advanced_range_stamps: bundle.advanced_range_stamps,
                 written_keys,
+                max_command_bytes: self.resource_limits.max_certification_command_bytes,
             })
             .await
     }
@@ -918,6 +1009,138 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+
+    fn restrictive_limits() -> TransactionResourceLimits {
+        TransactionResourceLimits {
+            max_point_observations: 1,
+            max_range_observations: 1,
+            max_written_keys: 1,
+            max_certification_command_bytes: 128,
+            max_bundle_bytes: 1024,
+            max_raw_payload_bytes: 1,
+        }
+    }
+
+    #[test]
+    fn resource_limits_cover_conflict_sets_bundle_and_raw_payload_bytes() {
+        let mut builder = TransactionBundleBuilder::new(
+            "cluster",
+            "limited",
+            0,
+            "principal",
+            HierarchicalRangeStampScheme::new(),
+        );
+        builder.put(
+            LogicalKey {
+                table_id: 1,
+                application_key: b"key".to_vec(),
+            },
+            b"two".to_vec(),
+        );
+        let bundle = builder.build().unwrap();
+        let bytes = bundle.canonical_bytes().unwrap();
+        let limits = restrictive_limits();
+        assert!(
+            limits
+                .validate_bundle(&bundle, &bytes)
+                .unwrap_err()
+                .to_string()
+                .contains("raw payload byte limit")
+        );
+
+        let mut oversized_bundle = limits;
+        oversized_bundle.max_raw_payload_bytes = usize::MAX;
+        oversized_bundle.max_bundle_bytes = 1;
+        assert!(
+            oversized_bundle
+                .validate_bundle(&bundle, &bytes)
+                .unwrap_err()
+                .to_string()
+                .contains("canonical bundle byte limit")
+        );
+
+        let mut two_writes = TransactionBundleBuilder::new(
+            "cluster",
+            "two-writes",
+            0,
+            "principal",
+            HierarchicalRangeStampScheme::new(),
+        );
+        two_writes.put(
+            LogicalKey {
+                table_id: 1,
+                application_key: b"a".to_vec(),
+            },
+            Vec::new(),
+        );
+        two_writes.put(
+            LogicalKey {
+                table_id: 1,
+                application_key: b"b".to_vec(),
+            },
+            Vec::new(),
+        );
+        let two_writes = two_writes.build().unwrap();
+        let two_writes_bytes = two_writes.canonical_bytes().unwrap();
+        let mut write_limit = TransactionResourceLimits::default();
+        write_limit.max_written_keys = 1;
+        assert!(
+            write_limit
+                .validate_bundle(&two_writes, &two_writes_bytes)
+                .unwrap_err()
+                .to_string()
+                .contains("written key limit")
+        );
+
+        let mut observations = TransactionBundleBuilder::new(
+            "cluster",
+            "observations",
+            0,
+            "principal",
+            HierarchicalRangeStampScheme::new(),
+        );
+        observations
+            .observe_point(
+                LogicalKey {
+                    table_id: 1,
+                    application_key: b"a".to_vec(),
+                },
+                None,
+            )
+            .observe_point(
+                LogicalKey {
+                    table_id: 1,
+                    application_key: b"b".to_vec(),
+                },
+                None,
+            );
+        observations
+            .observe_range(1, b"a".to_vec(), b"m".to_vec(), None)
+            .unwrap();
+        observations
+            .observe_range(1, b"m".to_vec(), b"z".to_vec(), None)
+            .unwrap();
+        let observed = observations.build().unwrap();
+        let observed_bytes = observed.canonical_bytes().unwrap();
+        let mut point_limit = TransactionResourceLimits::default();
+        point_limit.max_point_observations = 1;
+        assert!(
+            point_limit
+                .validate_bundle(&observed, &observed_bytes)
+                .unwrap_err()
+                .to_string()
+                .contains("point observation limit")
+        );
+        let mut range_limit = TransactionResourceLimits::default();
+        range_limit.max_range_observations = 1;
+        assert!(
+            range_limit
+                .validate_bundle(&observed, &observed_bytes)
+                .unwrap_err()
+                .to_string()
+                .contains("range observation limit")
+        );
+    }
 
     struct Store;
 

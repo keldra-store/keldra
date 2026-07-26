@@ -97,7 +97,7 @@ pub(crate) fn to_consensus_command(
     advanced_range_stamps.sort();
     advanced_range_stamps.dedup();
 
-    Ok(consensus::CertifyTransaction {
+    let command = consensus::CertifyTransaction {
         cluster_id_hash: cluster_id_hash(&request.cluster_id),
         transaction_id: transaction_id(&request.cluster_id, &request.transaction_id),
         snapshot_version: consensus::CommitVersion(request.snapshot_version),
@@ -113,7 +113,11 @@ pub(crate) fn to_consensus_command(
             product::DurabilityLevel::Erasure => consensus::DurabilityLevel::Erasure,
         },
         durable_holders: valid_durable_holders(request),
-    })
+    };
+    if serde_json::to_vec(&command)?.len() > request.max_command_bytes {
+        anyhow::bail!("transaction exceeds certification command byte limit");
+    }
+    Ok(command)
 }
 
 fn valid_durable_holders(
@@ -346,6 +350,8 @@ mod tests {
                 table_id: 8,
                 application_key: b"key".to_vec(),
             }],
+            max_command_bytes: product::TransactionResourceLimits::default()
+                .max_certification_command_bytes,
         }
     }
 
@@ -398,6 +404,8 @@ mod tests {
             range_observations: bundle.range_observations,
             advanced_range_stamps: bundle.advanced_range_stamps,
             written_keys,
+            max_command_bytes: product::TransactionResourceLimits::default()
+                .max_certification_command_bytes,
         }
     }
 
@@ -409,6 +417,18 @@ mod tests {
             !command
                 .durable_holders
                 .contains(&node_incarnation(&node("invalid")))
+        );
+    }
+
+    #[test]
+    fn certification_command_byte_limit_is_enforced_before_raft() {
+        let mut request = request();
+        request.max_command_bytes = 1;
+        let error = to_consensus_command(&request).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("certification command byte limit")
         );
     }
 
