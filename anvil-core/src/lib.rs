@@ -51,8 +51,6 @@ pub mod derived_index_proof;
 pub mod diagnostic_store;
 #[cfg(test)]
 mod direct_mutation_contract;
-#[cfg(test)]
-mod mvcc_observability_contract;
 pub mod directory_repair;
 pub mod discovery;
 pub mod embedding_provider;
@@ -97,6 +95,8 @@ pub mod mvcc_fault_injection;
 pub mod mvcc_gc;
 pub mod mvcc_local_durability_upgrade;
 pub mod mvcc_node_runtime;
+#[cfg(test)]
+mod mvcc_observability_contract;
 pub mod mvcc_open_transactions;
 pub mod mvcc_outbox;
 pub mod mvcc_product;
@@ -294,7 +294,12 @@ impl AppState {
         object_manager
             .install_mvcc(mvcc.clone())
             .context("install MVCC object runtime")?;
-        if !core_store.startup_recovery_deferred() {
+        // Only the node explicitly responsible for initial Raft membership may
+        // create the cluster-wide system realm. Followers must be able to
+        // start before that node so they can form its initial quorum; they
+        // receive the bootstrap transaction through Raft and the MVCC apply
+        // worker once the cluster is initialized.
+        if !core_store.startup_recovery_deferred() && arc_config.mvcc_bootstrap_membership {
             system_realm::ensure_bootstrapped(
                 &arc_config,
                 &persistence,
