@@ -5,8 +5,8 @@ Status: Proposed for review
 Audience: Anvil implementors, storage engineers, operators, and reviewers
 
 Scope: transaction ordering, MVCC visibility, atomic transactions, replication,
-durability, OpenRaft integration, local storage, recovery, materialisation, and
-garbage collection
+durability, OpenRaft integration, local storage, streaming erasure coding,
+repair, and garbage collection
 
 ## 1. Decision
 
@@ -91,9 +91,11 @@ decision path   compact OpenRaft certification commands
   application acknowledgements.
 - Preserve acknowledged-write safety according to an explicit durability level.
 - Store OpenRaft state in the existing local RocksDB instance.
-- Keep foreground writes free of erasure coding unless the caller explicitly
-  requests erasure durability.
-- Make erasure coding, placement improvement, derived indexing, and other
+- Erasure-code replicated object data incrementally during ingest and stream
+  each shard directly to its final target node.
+- Avoid remote full-file replicas and avoid a second background rewrite from
+  replicated complete files into erasure-coded storage.
+- Make shard repair, placement improvement, derived indexing, and other
   maintenance durable background jobs.
 - Remove per-request and per-record cryptographic signatures from internal node
   communication.
@@ -110,8 +112,7 @@ decision path   compact OpenRaft certification commands
 - Make libp2p, gRPC, RocksDB, or MVCC act as an implicit consensus protocol.
 - Provide write availability on both sides of a network partition.
 - Acknowledge `local` durability as though it survived node loss.
-- Require final erasure-coded placement before acknowledging `local` or
-  `quorum` writes.
+- Replicate complete object files to several nodes before erasure coding them.
 - Preserve existing internal storage formats or internal transaction machinery.
 - Add storage-format upgrade logic or a dual-protocol operation mode.
 - Preserve a public API when doing so would retain misleading or incorrect
@@ -261,7 +262,7 @@ It contains:
 - transaction identity and snapshot version;
 - MVCC puts and deletes;
 - read observations and predicates;
-- object and raw-byte references;
+- object shard-manifest references;
 - idempotency results;
 - watch and outbox events;
 - materialisation jobs;
@@ -279,29 +280,57 @@ yet assigned a committed certification result.
 
 Prepared bundles are invisible to ordinary reads.
 
-### 6.19 Raw Object
+### 6.19 Ingest Pipeline
 
-A **raw object** is the first durable representation of an object's bytes. It is
-immutable and content addressed.
+The **ingest pipeline** incrementally hashes, optionally compresses and encrypts,
+forms stripes, erasure-codes each stripe, and sends the resulting shards to
+their target nodes while the client is still uploading.
 
-A raw object is stored directly in a local append-only data segment. It is not a
-disposable upload copy and is not a separate admission-protocol object. It may
-serve reads until background materialisation creates a better representation.
+The pipeline must not require a complete object file before shard transfer can
+begin.
 
-### 6.20 Raw Replica
+### 6.20 Stripe
 
-A **raw replica** is one complete, hash-verified, fsynced raw-object copy on one
-node incarnation.
+A **stripe** is a bounded consecutive portion of an object's encoded byte
+stream. It is divided into `k` data shards and `m` parity shards.
 
-### 6.21 Materialised Object
+Only one bounded stripe, plus configured pipeline buffers, needs to be resident
+in memory at a time.
 
-A **materialised object** is a final or improved physical representation,
-including compressed, encrypted, chunked, deduplicated, or erasure-coded bytes
-and their placement metadata.
+### 6.21 Shard
 
-Materialisation does not change the logical object's commit version.
+A **shard** is one immutable data or parity fragment of one stripe. It is
+identified by the object identity, encoding generation, stripe ordinal, shard
+ordinal, length, and content hash.
 
-### 6.22 MVCC
+### 6.22 Shard Target
+
+A **shard target** is the node incarnation and failure domain selected to store
+one shard.
+
+### 6.23 Shard Manifest
+
+A **shard manifest** describes the encoding profile, object length and hash,
+stripe layout, shard identities, target nodes, and durable shard evidence for
+one object representation.
+
+The manifest is part of the transaction bundle. Shard bytes are not.
+
+### 6.24 Local Representation
+
+A **local representation** is the single-node durable form permitted by
+`local` durability. It may be a sequential local data segment or locally stored
+data fragments. It is not copied in full to remote nodes.
+
+### 6.25 Materialised Object
+
+A **materialised object** is a verified physical representation described by a
+shard manifest or, for `local`, a local representation.
+
+Producing or repairing a physical representation does not change the logical
+object's commit version.
+
+### 6.26 MVCC
 
 **Multi-Version Concurrency Control (MVCC)** stores multiple committed versions
 of a logical key and makes visibility a function of a read snapshot.
@@ -312,7 +341,7 @@ A versioned row is conceptually identified by:
 (logical_key, commit_version)
 ```
 
-### 6.23 Snapshot Version
+### 6.27 Snapshot Version
 
 A **snapshot version** is the greatest global commit version visible to a
 transaction's ordinary reads.
@@ -320,7 +349,7 @@ transaction's ordinary reads.
 Every read in a transaction uses the same snapshot version unless a public API
 explicitly requests weaker behavior.
 
-### 6.24 Commit Version
+### 6.28 Commit Version
 
 A **commit version** is the globally ordered version assigned to a committed
 transaction. The initial implementation derives it from the committed Raft log
@@ -330,33 +359,33 @@ Commit versions are unique and monotonically increasing. They need not be
 contiguous because aborted certifications, membership entries, and control
 decisions may consume log positions.
 
-### 6.25 Row Version
+### 6.29 Row Version
 
 A **row version** is one committed value or tombstone for one logical key at one
 commit version.
 
-### 6.26 Head
+### 6.30 Head
 
 A **head** is a local performance index from a logical key to its newest locally
 applied committed row version. It is updated atomically with the row version.
 
 A head is not a separate publication or consensus object.
 
-### 6.27 Tombstone
+### 6.31 Tombstone
 
 A **tombstone** is a row version indicating that its logical key is deleted as
 of the tombstone's commit version.
 
-### 6.28 Read Set
+### 6.32 Read Set
 
 A transaction's **read set** contains the point observations, range
 observations, and explicit predicates whose state influenced the transaction.
 
-### 6.29 Write Set
+### 6.33 Write Set
 
 A transaction's **write set** contains its logical-key puts and deletes.
 
-### 6.30 Point Observation
+### 6.34 Point Observation
 
 A **point observation** records the version observed for one logical key:
 
@@ -364,7 +393,7 @@ A **point observation** records the version observed for one logical key:
 PointObservation = (logical_key_hash, observed_version_or_absent)
 ```
 
-### 6.31 Range Observation
+### 6.35 Range Observation
 
 A **range observation** records the version of an ordered interval used by a
 transaction:
@@ -376,7 +405,7 @@ RangeObservation =
 
 Range observations prevent phantoms without listing every row returned.
 
-### 6.32 Range Stamp
+### 6.36 Range Stamp
 
 A **range stamp** is a monotonically increasing conflict marker for a bounded
 portion of ordered key space. A write advances every range stamp required by
@@ -385,7 +414,7 @@ the configured range-indexing scheme.
 The range-stamp scheme must guarantee that any insertion, deletion, or update
 that could change a prior range result invalidates that range observation.
 
-### 6.33 Conflict Key
+### 6.37 Conflict Key
 
 A **conflict key** is the compact identifier used by certification to serialize
 conflicting operations. Point conflict keys represent logical keys; range
@@ -393,7 +422,7 @@ conflict keys represent range stamps or explicit predicates.
 
 Conflict keys are transaction-certification metadata, not product data.
 
-### 6.34 Certification
+### 6.38 Certification
 
 **Certification** is deterministic validation that decides whether a
 transaction may commit after the transactions ordered before it.
@@ -401,24 +430,24 @@ transaction may commit after the transactions ordered before it.
 Certification is performed by the OpenRaft state machine using compact conflict
 state. It does not read arbitrary local product data.
 
-### 6.35 Certification Command
+### 6.39 Certification Command
 
 A **certification command** is the compact application entry proposed to
 OpenRaft. It identifies the prepared bundle, requested durability, read
 observations, and write conflict keys.
 
-### 6.36 Certification Result
+### 6.40 Certification Result
 
 A **certification result** is the committed or aborted outcome produced when a
 certification command is applied.
 
-### 6.37 Durable Holder
+### 6.41 Durable Holder
 
 A **durable holder** is a node incarnation that has acknowledged complete,
-hash-verified, fsynced storage of a transaction bundle and any raw bytes required
-by the requested durability level.
+hash-verified, fsynced storage of a transaction bundle, local representation,
+or shard required by the requested durability level.
 
-### 6.38 Durability Level
+### 6.42 Durability Level
 
 A **durability level** determines which physical writes must finish before
 certification may be proposed:
@@ -431,7 +460,7 @@ erasure
 
 Durability level is distinct from read consistency and transaction isolation.
 
-### 6.39 Read Consistency
+### 6.43 Read Consistency
 
 **Read consistency** controls how a reader selects or verifies its visible
 snapshot. Examples include a local snapshot read and a leader-confirmed
@@ -439,12 +468,12 @@ linearized read.
 
 Read consistency does not determine how many physical copies a write has.
 
-### 6.40 Transaction Isolation
+### 6.44 Transaction Isolation
 
 **Transaction isolation** defines which concurrent histories are permitted.
 This RFC requires serializable outcomes through optimistic MVCC certification.
 
-### 6.41 Application Acknowledgement
+### 6.45 Application Acknowledgement
 
 An **application acknowledgement** is a replication response emitted after the
 receiver has performed the operation represented by the acknowledgement.
@@ -452,31 +481,31 @@ receiver has performed the operation represented by the acknowledgement.
 A `Persisted` or `Complete` acknowledgement is not inferred from TCP delivery,
 HTTP/2 flow control, or successful gRPC message transmission.
 
-### 6.42 Connection Session
+### 6.46 Connection Session
 
 A **connection session** is one authenticated node-to-node connection lifetime.
 It has a unique session ID and is bound to the authenticated peer's node
 incarnation.
 
-### 6.43 Materialisation Job
+### 6.47 Materialisation Job
 
 A **materialisation job** is an ordinary durable MVCC row committed atomically
 with the logical state requiring background transformation.
 
 Materialisation jobs are not Raft entries.
 
-### 6.44 Outbox Event
+### 6.48 Outbox Event
 
 An **outbox event** is a durable event row committed atomically with the state
 change it describes. Watch delivery, index maintenance, replication catch-up,
 and other derived work consume outbox events.
 
-### 6.45 Applied Watermark
+### 6.49 Applied Watermark
 
 A node's **applied watermark** is the greatest consecutive commit version for
 which the node has applied every required transaction bundle locally.
 
-### 6.46 Garbage Collection Watermark
+### 6.50 Garbage Collection Watermark
 
 A **garbage collection watermark** is a commit version below which obsolete
 MVCC versions may be removed, subject to active snapshots, retention policy,
@@ -499,11 +528,14 @@ replica catch-up, backup, and audit requirements.
                    +----------------+----------------+
                    |                                 |
                    v                                 v
-          local raw data segments          local prepared bundle
-                   |                                 |
-                   +---------- persistent gRPC ------+
-                                    |
-                       remote durable acknowledgements
+              streaming ingest              prepared bundle
+             hash/compress/stripe                   |
+                   |                                |
+              erasure encode                        |
+                   |                                |
+            shard target streams -------- persistent gRPC
+                   |                                |
+                   +------ durable shard ACKs -------+
                                     |
                                     v
                       OpenRaft certification command
@@ -520,7 +552,7 @@ replica catch-up, backup, and audit requirements.
                                       visible to snapshot C+
                                                   |
                                       background workers
-                                      materialise/index/repair
+                                      index/repair/rebalance
 ```
 
 ## 8. Why MVCC Does Not Replace Consensus
@@ -570,7 +602,7 @@ membership, and snapshot metadata.
 The following must not appear in Raft application entries or snapshots:
 
 - object payload bytes;
-- raw data segments;
+- local data segments;
 - erasure-coded shards;
 - transaction bundle bodies;
 - ordinary CoreMeta row bodies;
@@ -778,8 +810,9 @@ and no newer row version <= S supersedes it
 and the selected row version is not a tombstone
 ```
 
-Prepared bundles and raw objects have no MVCC visibility until their
-certification decision commits and local application reaches that version.
+Prepared bundles, provisional shards, and provisional local representations
+have no MVCC visibility until their certification decision commits and local
+application reaches that version.
 
 ### 12.5 Global Snapshot
 
@@ -809,10 +842,10 @@ point_observations
 range_observations
 explicit_predicates
 write_operations
-raw_object_references
+object_shard_manifests
 idempotency_results
 outbox_events
-materialisation_jobs
+derived_maintenance_jobs
 ```
 
 ### 13.3 Canonical Encoding
@@ -954,21 +987,38 @@ raised without changing transaction semantics.
 
 ### 15.2 Build
 
-1. Stream object payloads directly into immutable local raw segments.
-2. Compute hashes while streaming.
-3. Construct one immutable transaction bundle.
-4. Store the prepared bundle locally.
+For each object payload, the coordinator:
 
-An implementation must not first write a disposable temporary file and then copy
-it into another admission file.
+1. computes the logical content hash while receiving the client stream;
+2. incrementally applies configured compression and encryption;
+3. fills one bounded erasure stripe;
+4. generates `k` data shards and `m` parity shards for that stripe;
+5. streams each shard directly to its selected final target;
+6. repeats until end of input;
+7. closes and verifies every shard stream;
+8. constructs the shard manifest from final lengths, hashes, placements, and
+   acknowledgements.
+
+The coordinator constructs one immutable transaction bundle containing the
+resulting shard manifests and stores the prepared bundle locally.
+
+The normal distributed path must not write a complete local object merely to
+copy it to other nodes or re-read it for later erasure coding. Memory use must
+be bounded by stripe and transport buffers rather than object size.
+
+For `local` durability, the coordinator may stream the object into one local
+representation because no remote durability is requested.
 
 ### 15.3 Replicate
 
-1. Select target nodes according to requested durability.
-2. Stream the bundle and required raw data over existing authenticated gRPC
+1. Select shard targets and failure domains before or during ingest.
+2. Stream generated shards to those targets over existing authenticated gRPC
    streams.
-3. Wait for the required `Complete` acknowledgements.
-4. Record the node incarnations that supplied those acknowledgements.
+3. Stream the completed transaction bundle to its metadata durability targets.
+4. Wait for the shard and bundle acknowledgements required by the requested
+   durability.
+5. Record shard identities, node incarnations, and failure domains in durability
+   evidence.
 
 ### 15.4 Certify
 
@@ -990,7 +1040,7 @@ The normal response is sent after:
 
 It does not wait for:
 
-- erasure coding under `local` or `quorum`;
+- optional shard copies beyond the requested durability threshold;
 - index construction unless explicitly requested;
 - compaction;
 - remote application beyond the durability contract;
@@ -1003,11 +1053,11 @@ It does not wait for:
 Before certification:
 
 - the bundle is fsynced on the coordinator;
-- required raw objects are fsynced on the coordinator.
+- each object has one fsynced local representation on the coordinator.
 
 The certification decision still goes through Raft for global transaction
-order. If the sole durable holder is lost before replication or
-materialisation, committed data may be unrecoverable.
+order. If the sole durable holder is lost before a durability upgrade, committed
+data may be unrecoverable.
 
 The API and metrics must label this durability accurately.
 
@@ -1017,11 +1067,18 @@ Before certification:
 
 - the complete bundle is fsynced on a durability set that intersects every
   valid election quorum;
-- required raw objects are fsynced on the required data durability set;
-- hashes and lengths are verified by every acknowledged holder.
+- object streams have already been erasure-coded incrementally;
+- enough final shards are complete, hash verified, and fsynced across distinct
+  failure domains to reconstruct the object after every failure covered by the
+  quorum policy;
+- the committed bundle contains the shard manifest and acknowledged placement
+  evidence.
 
-For an ordinary three-voter majority, two appropriate durable holders satisfy
-the intersection rule.
+For an encoding with `k` data shards and `m` planned parity shards, quorum
+durability must acknowledge a set that still leaves at least `k` available
+shards after the configured tolerated failures. It is not sufficient merely to
+receive any `k` acknowledgements if losing one acknowledged target would make
+the object unrecoverable.
 
 `quorum` is the default durability level.
 
@@ -1029,16 +1086,19 @@ the intersection rule.
 
 Before certification:
 
-- final erasure shards are durably stored across required failure domains;
-- enough verified shards exist to satisfy configured erasure durability;
-- the transaction bundle references the final materialised representation.
+- every shard required by the complete configured `k+m` placement is durable;
+- all placement and failure-domain constraints are satisfied;
+- the transaction bundle references the complete shard manifest.
 
-This has greater foreground latency and is opt-in unless policy requires it.
+Both `quorum` and `erasure` use the same streaming encoder and final shard
+format. `erasure` waits for the complete planned placement; `quorum` may return
+after the smaller policy-safe shard set is durable. Missing optional shards are
+created later by ordinary shard repair, not by rewriting full-file replicas.
 
 ### 16.4 Durability Versus Consensus
 
 Raft commitment proves that the certification decision reached a voter quorum.
-It does not prove that object bytes or a transaction bundle were stored on that
+It does not prove that object shards or a transaction bundle were stored on that
 same quorum.
 
 Anvil enforces data durability before proposing certification. The command
@@ -1078,8 +1138,7 @@ struct ReplicationFrame {
 
 ```text
 TransactionBundle
-RawObject
-MaterialisedShard
+ObjectShard
 MvccCatchUp
 ConsensusSnapshot
 Repair
@@ -1137,77 +1196,120 @@ On reconnect:
 4. retransmit frames whose durable status is unknown;
 5. deduplicate by transfer ID, offset, checksum, and final hash.
 
-## 18. Raw Data Storage
+## 18. Streaming Erasure-Coded Storage
 
-### 18.1 Append-Only Segments
+### 18.1 Pipeline Order
 
-Raw objects are written to append-only segment files:
+The distributed ingest pipeline is:
 
 ```text
-raw/<segment-id>
+client bytes
+    -> logical content hash
+    -> optional streaming compression
+    -> optional streaming encryption
+    -> bounded stripe buffer
+    -> erasure encode k data + m parity shards
+    -> persistent shard streams to final targets
 ```
 
-Each record contains:
+The precise compression/encryption order is fixed by the selected storage
+profile and recorded in the shard manifest.
+
+### 18.2 Bounded Stripe Encoding
+
+The encoder must operate one bounded stripe at a time. It may begin transferring
+stripe zero before the client has sent the final object byte.
+
+Backpressure from shard targets propagates to the client stream. The
+coordinator must not buffer an unbounded remainder of the object when a target
+is slow.
+
+### 18.3 Shard Records
+
+Target nodes store shards in append-only shard segments. Each record contains:
 
 ```text
 magic
 format_version
 transaction_id
-content_hash
+object_content_hash_or_provisional_id
+encoding_generation
+stripe_ordinal
+shard_ordinal
+shard_kind
 payload_length
 payload_checksum
 payload
 record_checksum
 ```
 
-### 18.2 Provisional and Live Records
+The final object hash may be unknown when early stripes are sent. A provisional
+transfer ID binds those stripes to the transaction; the completed manifest
+binds the transfer to the final object hash.
 
-A raw record is provisional until a committed bundle references it. A
-provisional record is invisible to ordinary reads.
+### 18.4 Provisional and Live Shards
 
-After commit it becomes a live raw representation. It may serve reads until a
-verified materialised representation replaces it.
+A shard is provisional until a committed transaction bundle references its
+manifest. Provisional shards are invisible to ordinary reads.
 
-### 18.3 Segment Recovery
+After commit, acknowledged shards in the manifest become the live physical
+representation.
 
-After a crash, a node scans only the tail of the last open raw segment,
-validates framing and checksums, and truncates an incomplete tail record. Closed
-segments have durable indexes and do not require full rescans.
+### 18.5 Incomplete Ingest
 
-## 19. Background Materialisation
+If the client, coordinator, or target fails before certification:
 
-### 19.1 Job Creation
+- no logical object becomes visible;
+- complete provisional shards may be reused only by a retry with the same
+  transaction and content identity;
+- incomplete shard tails are truncated during segment recovery;
+- unreferenced provisional shards are garbage-collected after retention expiry.
 
-For `local` and `quorum` writes requiring final transformation, the transaction
-bundle contains a materialisation job row. The job becomes visible atomically
-with the object.
+### 18.6 Local Durability
+
+`local` durability may use one append-only local data representation rather than
+generating remote shards. A later durability upgrade must read that local
+representation through the same streaming encoder.
+
+The distributed `quorum` and `erasure` paths must not create complete remote
+object replicas.
+
+## 19. Background Repair and Maintenance
+
+### 19.1 Repair Job Creation
+
+If a `quorum` write commits before every optional planned shard is present, the
+transaction bundle contains repair jobs for the missing shard placements. Node
+loss or corruption creates the same job type.
 
 ### 19.2 Worker Loop
 
 Workers continuously:
 
-1. list eligible committed jobs;
+1. list eligible committed repair or rebalance jobs;
 2. claim a job with MVCC compare-and-swap;
-3. read a valid raw representation;
-4. chunk, compress, encrypt, deduplicate, or erasure-code as policy requires;
-5. stream shards to target nodes;
+3. fetch any `k` verified shards required for reconstruction;
+4. reconstruct only the missing shard data;
+5. stream missing shards directly to target nodes;
 6. wait for complete durable acknowledgements;
-7. verify the resulting representation;
-8. commit an MVCC placement update;
-9. mark the job complete;
-10. schedule obsolete raw copies for delayed deletion.
+7. commit an MVCC placement update;
+8. mark the job complete;
+9. remove obsolete shards after the grace period.
+
+Workers must not reconstruct a complete object file when the codec can
+reconstruct the required shard or stripe directly.
 
 ### 19.3 Idempotency
 
-Materialised blocks and shards are content addressed. Repeating a job produces
-the same identities or safely replaces an incomplete attempt.
+Shards are content addressed. Repeating a repair produces the same identity or
+safely replaces an incomplete attempt.
 
 Job claims are an efficiency mechanism, not a correctness boundary. Duplicate
 workers must not corrupt data or produce divergent logical versions.
 
 ### 19.4 Placement Update
 
-Changing physical representation is an ordinary MVCC transaction. It does not
+Changing physical placement is an ordinary MVCC transaction. It does not
 require a special consensus command beyond normal certification.
 
 ## 20. Reads
@@ -1236,18 +1338,20 @@ A linearized read:
 For a visible logical object version, a reader chooses a verified available
 representation:
 
-1. preferred final materialised representation;
-2. alternate materialised representation;
-3. raw replica.
+1. the shard manifest selected by object metadata;
+2. the minimum shard ranges needed to satisfy the requested byte range;
+3. a local representation only when the object was committed with `local`
+   durability or has not yet completed a requested durability upgrade.
 
-Materialisation must never create a period with no readable representation.
+Repair and rebalancing must never create a period with no readable
+representation.
 
 ## 21. Recovery
 
 ### 21.1 Coordinator Failure Before Certification
 
-No committed decision exists. Prepared bundles and raw records remain invisible
-and are eventually garbage-collected.
+No committed decision exists. Prepared bundles and provisional shards remain
+invisible and are eventually garbage-collected.
 
 ### 21.2 Failure After Proposal but Before Response
 
@@ -1261,7 +1365,7 @@ A node observing a committed decision but lacking the referenced bundle:
 1. does not advance its applied watermark past the missing commit;
 2. fetches the bundle from a recorded durable holder;
 3. verifies hash and length;
-4. fetches required raw data if necessary;
+4. verifies that the manifest's required shard durability was satisfied;
 5. applies the bundle;
 6. resumes watermark advancement.
 
@@ -1273,9 +1377,9 @@ comparing product rows.
 
 ### 21.5 Durable Holder Loss
 
-For `quorum`, the holder set must intersect a surviving election quorum under
-the advertised failure model. The new leader locates a surviving holder and
-repairs missing copies.
+For `quorum`, the bundle-holder set must intersect a surviving election quorum
+and the acknowledged shard set must remain reconstructable under the advertised
+failure model. Missing optional shards are repaired from surviving shards.
 
 For `local`, loss of the sole holder may make committed data unrecoverable. The
 cluster reports a durability violation rather than inventing or silently
@@ -1300,15 +1404,15 @@ An uncommitted prepared bundle may be removed when:
 - its preparation retention period expired;
 - no active certification attempt may still refer to it.
 
-### 22.2 Raw Object GC
+### 22.2 Shard GC
 
-A raw object may be removed only when:
+A shard may be removed only when:
 
-- no visible MVCC version requires it;
-- a replacement representation satisfies policy;
-- required replicas applied the placement update;
+- no visible MVCC version references it;
+- the remaining placement satisfies durability policy;
+- required replicas applied any replacement placement update;
 - the rollback/grace window expired;
-- no reader or materialisation job pins it.
+- no reader, repair, or rebalance job pins it.
 
 ### 22.3 MVCC Version GC
 
@@ -1319,7 +1423,7 @@ A version below the GC watermark may be deleted only when it is not needed by:
 - a supported lagging replica;
 - backup or export;
 - audit retention;
-- an unfinished materialisation or repair job.
+- an unfinished repair or rebalance job.
 
 ### 22.4 Conflict-State GC
 
@@ -1381,8 +1485,8 @@ Nodes advertise stream credit for:
 - in-flight bytes;
 - unfsynced bytes;
 - prepared bundle bytes;
-- raw-segment capacity;
-- materialisation backlog;
+- shard-segment capacity;
+- repair backlog;
 - MVCC apply lag.
 
 The sender must stop or reroute before exceeding receiver credit. A transaction
@@ -1468,13 +1572,15 @@ anvil_consensus_log_entries
 anvil_consensus_snapshot_duration_ms
 ```
 
-Required materialisation metrics:
+Required shard-pipeline and repair metrics:
 
 ```text
-anvil_materialisation_queue_depth
-anvil_materialisation_age_ms
-anvil_materialisation_duration_ms
-anvil_raw_replica_bytes
+anvil_ingest_stripe_encode_duration_ms
+anvil_ingest_shard_stream_duration_ms
+anvil_ingest_shard_ack_count
+anvil_repair_queue_depth
+anvil_repair_age_ms
+anvil_repair_duration_ms
 anvil_erasure_shard_bytes
 ```
 
@@ -1484,19 +1590,21 @@ Stable trace operations:
 request.receive
 transaction.snapshot
 transaction.bundle_build
-raw.append
-raw.fsync
+ingest.stripe
+ingest.erasure_encode
+shard.stream
+shard.fsync
 replication.stream
 replication.persist_ack
 consensus.certify
 transaction.apply
 response.send
-materialisation.claim
-materialisation.encode
-materialisation.place
-materialisation.commit
+repair.claim
+repair.reconstruct
+repair.place
+repair.commit
 gc.mvcc
-gc.raw
+gc.shard
 ```
 
 ## 27. Correctness Invariants
@@ -1516,14 +1624,15 @@ The implementation must preserve:
 9. **Phantom safety:** an invalidated range observation cannot certify.
 10. **Durability honesty:** acknowledgement satisfies the requested durability
     level and no stronger level is claimed.
-11. **Quorum recoverability:** a quorum commit's bundle and required raw data
-    remain obtainable under the advertised minority-failure model.
+11. **Quorum recoverability:** a quorum commit's bundle and acknowledged shard
+    set remain obtainable and reconstructable under the advertised
+    minority-failure model.
 12. **Hash identity:** one transaction ID cannot refer to two bundle hashes.
 13. **Monotonic application:** a node's applied watermark never decreases.
 14. **No visibility gaps:** a node does not expose commit `C+1` while required
     application for `C` is incomplete.
-15. **Safe materialisation:** a physical representation is not retired until a
-    policy-satisfying replacement is verified.
+15. **Safe repair:** a shard is not retired until the remaining or replacement
+    placement satisfies policy.
 16. **Fenced membership:** obsolete node incarnations cannot supply current
     durability acknowledgements.
 
@@ -1549,7 +1658,7 @@ An executable model must cover:
 - network partition and leader change;
 - node-incarnation replacement;
 - local-durability data loss reporting;
-- materialisation worker duplication;
+- repair worker duplication;
 - garbage collection with active snapshots;
 - garbage collection with lagging replicas.
 
@@ -1590,7 +1699,7 @@ An executable model must cover:
 At minimum:
 
 - process kill before and after every durability boundary;
-- disk-full during raw append;
+- disk-full during shard append;
 - disk-full during bundle persistence;
 - disk-full during Raft append;
 - delayed and reordered replication frames;
@@ -1604,18 +1713,19 @@ At minimum:
 
 The implementation must report separately:
 
-- raw streaming time;
+- stripe encoding time;
+- shard streaming time;
 - remote persistence wait;
 - Raft certification time;
 - local MVCC application time;
-- deferred materialisation time.
+- deferred repair time.
 
 Required benchmarks:
 
 ```text
 metadata-only transaction
 small inline-object transaction
-large raw-object transaction
+large streaming-erasure object transaction
 transaction touching one logical key
 transaction touching ten logical keys
 transaction spanning several tables and partitions
@@ -1653,7 +1763,7 @@ This is a clean implementation, not an in-place protocol transition.
 
 - Implement authenticated persistent gRPC sessions.
 - Implement framing, persisted acknowledgements, resume, and deduplication.
-- Implement transaction-bundle and raw-object transfer.
+- Implement transaction-bundle and shard transfer.
 
 ### Phase 4: MVCC CoreMeta
 
@@ -1668,16 +1778,17 @@ This is a clean implementation, not an in-place protocol transition.
 - Preserve public API shapes where useful and change them where semantics
   require it.
 
-### Phase 6: Background Materialisation
+### Phase 6: Streaming Erasure and Repair
 
-- Use raw records as the initial durable representation.
-- Run erasure coding and final placement in durable workers.
-- Add representation swap and safe raw-data retirement.
+- Implement bounded stripe encoding on the ingest path.
+- Stream shards directly to final target nodes.
+- Implement policy-aware shard acknowledgement thresholds.
+- Add missing-shard repair, rebalancing, and safe shard retirement.
 
 ### Phase 7: Remove Discarded Internals
 
 - Delete superseded transaction and publication machinery.
-- Delete redundant admission representations.
+- Delete redundant admission and complete-file replication representations.
 - Delete internal receipt-signature protocols.
 - Delete compensation workflows that exist only because atomic transactions
   were unavailable.
@@ -1690,8 +1801,8 @@ This is a clean implementation, not an in-place protocol transition.
 2. What retention period is required for transaction-result deduplication?
 3. Should `local` durability be available to external clients or only internal
    reconstructable workloads?
-4. Which node set must hold data for `quorum` when Raft voters and storage nodes
-   differ?
+4. What `k+m`, failure-domain, and acknowledgement policies should each storage
+   class use for `quorum` and `erasure`?
 5. Should cluster-control decisions share the transaction certifier group or
    eventually use a separate small OpenRaft group?
 6. What transaction command and bundle size limits are appropriate?
@@ -1714,7 +1825,9 @@ This RFC is implemented only when:
 - connection authorization is performed on connect/reconnect rather than every
   operation;
 - `local`, `quorum`, and `erasure` durability have tested distinct semantics;
-- ordinary `local` and `quorum` writes do not synchronously erasure-code data;
+- distributed object ingest incrementally erasure-codes bounded stripes;
+- shard bytes stream directly to final target nodes;
+- no distributed write persists complete remote file replicas before encoding;
 - committed bundles apply atomically to MVCC state;
 - prepared bundles remain invisible;
 - point and range certification provide serializable conflict detection;
