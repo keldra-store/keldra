@@ -307,7 +307,7 @@ pub fn system_mesh_object_id(_mesh_id: &str) -> String {
     SYSTEM_OBJECT_ID.to_string()
 }
 
-fn normalized_mesh_id(mesh_id: &str) -> String {
+pub(crate) fn normalized_mesh_id(mesh_id: &str) -> String {
     let trimmed = mesh_id.trim();
     if trimmed.is_empty() {
         "default".to_string()

@@ -204,30 +204,20 @@ impl RealMvccCluster {
     }
 
     async fn wait_for_system_realm(&self) -> anyhow::Result<()> {
-        let mut last_errors = [String::new(), String::new(), String::new()];
-        let result = tokio::time::timeout(Duration::from_secs(15), async {
-            let mut ready = [false; 3];
+        tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                for (node, is_ready) in ready.iter_mut().enumerate() {
-                    if !*is_ready {
-                        match self.state(node).ensure_system_realm_bootstrapped().await {
-                            Ok(()) => *is_ready = true,
-                            Err(error) => last_errors[node] = format!("{error:#}"),
-                        }
-                    }
-                }
-                if ready.into_iter().all(|is_ready| is_ready) {
-                    return;
+                if (0..3).all(|node| {
+                    self.state(node)
+                        .system_realm_is_bootstrapped()
+                        .unwrap_or(false)
+                }) {
+                    return Ok::<_, anyhow::Error>(());
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
         })
-        .await;
-        result.map_err(|_| {
-            anyhow::anyhow!(
-                "system realm did not become visible on every cluster node: {last_errors:?}"
-            )
-        })
+        .await
+        .map_err(|_| anyhow::anyhow!("system realm did not become visible on every cluster node"))?
     }
 
     pub async fn commit(

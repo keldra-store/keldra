@@ -317,6 +317,13 @@ impl AppState {
                 let bootstrap_keyring = secret_keyring.clone();
                 tokio::spawn(async move {
                     loop {
+                        if !bootstrap_persistence
+                            .mvcc()
+                            .is_ok_and(|mvcc| mvcc.consensus.is_leader())
+                        {
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                            continue;
+                        }
                         match system_realm::ensure_bootstrapped(
                             &bootstrap_config,
                             &bootstrap_persistence,
@@ -370,6 +377,13 @@ impl AppState {
         )
         .await
         .context("bootstrap system realm")
+    }
+
+    pub fn system_realm_is_bootstrapped(&self) -> Result<bool> {
+        system_realm::bootstrap_marker_exists_in_runtime(
+            self.mvcc.runtime.as_ref(),
+            &system_realm::normalized_mesh_id(&self.config.mesh_id),
+        )
     }
 }
 
