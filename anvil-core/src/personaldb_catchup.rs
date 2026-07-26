@@ -68,12 +68,14 @@ pub async fn personaldb_catch_up(
     trust_store: &PublicKeyTrustStore,
 ) -> Result<PersonalDbCatchUpResponse> {
     validate_request(&request)?;
+    let snapshot_version = mvcc.runtime.applied_version()?;
     let Some(committed_head) =
-        crate::personaldb_proposal_admission::read_personaldb_committed_head_mvcc(
+        crate::personaldb_proposal_admission::read_personaldb_committed_head_at_snapshot(
             mvcc,
             request.tenant_id,
             &request.database_id,
             trust_store,
+            snapshot_version,
         )?
     else {
         return Ok(snapshot_required(

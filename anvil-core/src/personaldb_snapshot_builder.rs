@@ -66,6 +66,7 @@ pub async fn maybe_build_personaldb_snapshot(
     protocol_keyring: &PersonalDbProtocolKeyring,
 ) -> Result<Option<PersonalDbSnapshotBuildResult>> {
     validate_request(&request)?;
+    let snapshot_version = mvcc.runtime.applied_version()?;
     let manifest = read_personaldb_group_manifest(
         storage,
         request.tenant_id,
@@ -74,13 +75,15 @@ pub async fn maybe_build_personaldb_snapshot(
     )
     .await?
     .ok_or_else(|| anyhow!("personaldb group manifest missing"))?;
-    let committed_head = crate::personaldb_proposal_admission::read_personaldb_committed_head_mvcc(
-        mvcc,
-        request.tenant_id,
-        request.database_id,
-        protocol_keyring.trust_store(),
-    )?
-    .ok_or_else(|| anyhow!("personaldb committed head missing"))?;
+    let committed_head =
+        crate::personaldb_proposal_admission::read_personaldb_committed_head_at_snapshot(
+            mvcc,
+            request.tenant_id,
+            request.database_id,
+            protocol_keyring.trust_store(),
+            snapshot_version,
+        )?
+        .ok_or_else(|| anyhow!("personaldb committed head missing"))?;
     if committed_head.log_index == 0 {
         return Ok(None);
     }

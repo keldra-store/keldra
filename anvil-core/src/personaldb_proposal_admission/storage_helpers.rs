@@ -151,8 +151,30 @@ pub(super) fn read_committed_head_mvcc(
     database_id: &str,
     trust_store: &PublicKeyTrustStore,
 ) -> Result<Option<(Vec<u8>, PersonalDbCommittedHead)>> {
+    read_committed_head_mvcc_at_snapshot(
+        mvcc,
+        tenant_id,
+        database_id,
+        trust_store,
+        mvcc.runtime.applied_version()?,
+    )
+}
+
+pub(super) fn read_committed_head_mvcc_at_snapshot(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    database_id: &str,
+    trust_store: &PublicKeyTrustStore,
+    snapshot_version: u64,
+) -> Result<Option<(Vec<u8>, PersonalDbCommittedHead)>> {
     let key = committed_head_key(tenant_id, database_id)?;
-    let Some(payload) = read_raw_row(mvcc, TABLE_PERSONALDB_GROUP_ROW, &key)? else {
+    let logical_key =
+        crate::mvcc_product::coremeta_logical_key(CF_PERSONALDB, TABLE_PERSONALDB_GROUP_ROW, &key)?;
+    let Some(payload) = mvcc
+        .runtime
+        .read_at(&logical_key, snapshot_version)?
+        .map(|row| row.value)
+    else {
         return Ok(None);
     };
     let head = decode_committed_head(&payload)?;

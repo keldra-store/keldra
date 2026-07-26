@@ -629,6 +629,23 @@ pub fn read_personaldb_committed_head_mvcc(
     Ok(read_committed_head_mvcc(mvcc, tenant_id, database_id, trust_store)?.map(|(_, head)| head))
 }
 
+pub fn read_personaldb_committed_head_at_snapshot(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    database_id: &str,
+    trust_store: &PublicKeyTrustStore,
+    snapshot_version: u64,
+) -> Result<Option<PersonalDbCommittedHead>> {
+    Ok(read_committed_head_mvcc_at_snapshot(
+        mvcc,
+        tenant_id,
+        database_id,
+        trust_store,
+        snapshot_version,
+    )?
+    .map(|(_, head)| head))
+}
+
 pub async fn write_personaldb_committed_head_mvcc(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
