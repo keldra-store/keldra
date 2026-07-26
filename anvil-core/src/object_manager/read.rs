@@ -17,6 +17,13 @@ const OBJECT_LIST_CANDIDATE_MULTIPLIER: usize = 16;
 const MAX_OBJECT_LIST_CANDIDATES: usize = 16_384;
 
 impl ObjectManager {
+    fn installed_mvcc(&self) -> Result<&crate::mvcc_bootstrap::MvccSubsystem, Status> {
+        self.mvcc
+            .get()
+            .map(std::sync::Arc::as_ref)
+            .ok_or_else(|| Status::unavailable("MVCC object runtime is not installed"))
+    }
+
     pub async fn get_object(
         &self,
         claims: Option<auth::Claims>,
@@ -106,19 +113,21 @@ impl ObjectManager {
 
         let mut object = match version_id {
             Some(version_id) => {
-                let object = if let Some(root_generation) = consistency.root_generation() {
-                    self.core_store
-                        .read_object_version_metadata_at_generation(
-                            &bucket,
-                            &object_key,
-                            version_id,
-                            root_generation,
-                        )
-                        .await
+                let object = if let Some(snapshot) = consistency.root_generation() {
+                    crate::metadata_journal::read_object_version_at_mvcc_snapshot(
+                        self.installed_mvcc()?,
+                        &bucket,
+                        &object_key,
+                        version_id,
+                        snapshot,
+                    )
                 } else {
-                    self.core_store
-                        .read_object_version_metadata(&bucket, &object_key, version_id)
-                        .await
+                    crate::metadata_journal::read_object_version_mvcc(
+                        self.installed_mvcc()?,
+                        &bucket,
+                        &object_key,
+                        version_id,
+                    )
                 }
                 .map_err(|e| Status::internal(e.to_string()))?
                 .ok_or_else(|| Status::not_found("Object version not found"))?;
@@ -128,18 +137,19 @@ impl ObjectManager {
                 object
             }
             None => {
-                let object = if let Some(root_generation) = consistency.root_generation() {
-                    self.core_store
-                        .read_current_object_metadata_at_generation(
-                            &bucket,
-                            &object_key,
-                            root_generation,
-                        )
-                        .await
+                let object = if let Some(snapshot) = consistency.root_generation() {
+                    crate::metadata_journal::read_current_object_at_mvcc_snapshot(
+                        self.installed_mvcc()?,
+                        &bucket,
+                        &object_key,
+                        snapshot,
+                    )
                 } else {
-                    self.core_store
-                        .read_current_object_metadata(&bucket, &object_key)
-                        .await
+                    crate::metadata_journal::read_current_object_mvcc(
+                        self.installed_mvcc()?,
+                        &bucket,
+                        &object_key,
+                    )
                 };
                 object
                     .map_err(|e| Status::internal(e.to_string()))?
@@ -534,19 +544,21 @@ impl ObjectManager {
 
         let mut object = match version_id {
             Some(version_id) => {
-                let object = if let Some(root_generation) = consistency.root_generation() {
-                    self.core_store
-                        .read_object_version_metadata_at_generation(
-                            &bucket,
-                            object_key,
-                            version_id,
-                            root_generation,
-                        )
-                        .await
+                let object = if let Some(snapshot) = consistency.root_generation() {
+                    crate::metadata_journal::read_object_version_at_mvcc_snapshot(
+                        self.installed_mvcc()?,
+                        &bucket,
+                        object_key,
+                        version_id,
+                        snapshot,
+                    )
                 } else {
-                    self.core_store
-                        .read_object_version_metadata(&bucket, object_key, version_id)
-                        .await
+                    crate::metadata_journal::read_object_version_mvcc(
+                        self.installed_mvcc()?,
+                        &bucket,
+                        object_key,
+                        version_id,
+                    )
                 }
                 .map_err(|e| Status::internal(e.to_string()))?
                 .ok_or_else(|| Status::not_found("Object version not found"))?;
@@ -556,18 +568,19 @@ impl ObjectManager {
                 object
             }
             None => {
-                let object = if let Some(root_generation) = consistency.root_generation() {
-                    self.core_store
-                        .read_current_object_metadata_at_generation(
-                            &bucket,
-                            object_key,
-                            root_generation,
-                        )
-                        .await
+                let object = if let Some(snapshot) = consistency.root_generation() {
+                    crate::metadata_journal::read_current_object_at_mvcc_snapshot(
+                        self.installed_mvcc()?,
+                        &bucket,
+                        object_key,
+                        snapshot,
+                    )
                 } else {
-                    self.core_store
-                        .read_current_object_metadata(&bucket, object_key)
-                        .await
+                    crate::metadata_journal::read_current_object_mvcc(
+                        self.installed_mvcc()?,
+                        &bucket,
+                        object_key,
+                    )
                 };
                 object
                     .map_err(|e| Status::internal(e.to_string()))?
@@ -641,37 +654,40 @@ impl ObjectManager {
 
         let object = match version_id {
             Some(version_id) => {
-                let object = if let Some(root_generation) = consistency.root_generation() {
-                    self.core_store
-                        .read_object_version_metadata_at_generation(
-                            &bucket,
-                            object_key,
-                            version_id,
-                            root_generation,
-                        )
-                        .await
+                let object = if let Some(snapshot) = consistency.root_generation() {
+                    crate::metadata_journal::read_object_version_at_mvcc_snapshot(
+                        self.installed_mvcc()?,
+                        &bucket,
+                        object_key,
+                        version_id,
+                        snapshot,
+                    )
                 } else {
-                    self.core_store
-                        .read_object_version_metadata(&bucket, object_key, version_id)
-                        .await
+                    crate::metadata_journal::read_object_version_mvcc(
+                        self.installed_mvcc()?,
+                        &bucket,
+                        object_key,
+                        version_id,
+                    )
                 };
                 object
                     .map_err(|e| Status::internal(e.to_string()))?
                     .ok_or_else(|| Status::not_found("Object link not found"))?
             }
             None => {
-                let object = if let Some(root_generation) = consistency.root_generation() {
-                    self.core_store
-                        .read_current_object_metadata_at_generation(
-                            &bucket,
-                            object_key,
-                            root_generation,
-                        )
-                        .await
+                let object = if let Some(snapshot) = consistency.root_generation() {
+                    crate::metadata_journal::read_current_object_at_mvcc_snapshot(
+                        self.installed_mvcc()?,
+                        &bucket,
+                        object_key,
+                        snapshot,
+                    )
                 } else {
-                    self.core_store
-                        .read_current_object_metadata(&bucket, object_key)
-                        .await
+                    crate::metadata_journal::read_current_object_mvcc(
+                        self.installed_mvcc()?,
+                        &bucket,
+                        object_key,
+                    )
                 };
                 object
                     .map_err(|e| Status::internal(e.to_string()))?
@@ -1174,10 +1190,12 @@ impl ObjectManager {
         let bucket = self
             .get_tenant_bucket(claims.tenant_id, bucket_name)
             .await?;
-        self.core_store
-            .read_current_object_metadata(&bucket, object_key)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))
+        crate::metadata_journal::read_current_object_mvcc(
+            self.installed_mvcc()?,
+            &bucket,
+            object_key,
+        )
+        .map_err(|e| Status::internal(e.to_string()))
     }
 
     pub async fn current_object_for_mutation_precondition(
@@ -1210,10 +1228,12 @@ impl ObjectManager {
         let bucket = self
             .get_tenant_bucket(claims.tenant_id, bucket_name)
             .await?;
-        self.core_store
-            .read_current_object_metadata(&bucket, object_key)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))
+        crate::metadata_journal::read_current_object_mvcc(
+            self.installed_mvcc()?,
+            &bucket,
+            object_key,
+        )
+        .map_err(|e| Status::internal(e.to_string()))
     }
 
     pub(crate) async fn object_mutation_precondition_snapshot(
@@ -1533,37 +1553,36 @@ impl ObjectManager {
 
             let target = match link.target_version {
                 Some(version_id) => match consistency.root_generation() {
-                    Some(root_generation) => {
-                        self.core_store
-                            .read_object_version_metadata_at_generation(
-                                bucket,
-                                &link.target_key,
-                                version_id,
-                                root_generation,
-                            )
-                            .await
+                    Some(snapshot) => {
+                        crate::metadata_journal::read_object_version_at_mvcc_snapshot(
+                            self.installed_mvcc()?,
+                            bucket,
+                            &link.target_key,
+                            version_id,
+                            snapshot,
+                        )
                     }
-                    None => {
-                        self.core_store
-                            .read_object_version_metadata(bucket, &link.target_key, version_id)
-                            .await
-                    }
+                    None => crate::metadata_journal::read_object_version_mvcc(
+                        self.installed_mvcc()?,
+                        bucket,
+                        &link.target_key,
+                        version_id,
+                    ),
                 },
                 None => match consistency.root_generation() {
-                    Some(root_generation) => {
-                        self.core_store
-                            .read_current_object_metadata_at_generation(
-                                bucket,
-                                &link.target_key,
-                                root_generation,
-                            )
-                            .await
+                    Some(snapshot) => {
+                        crate::metadata_journal::read_current_object_at_mvcc_snapshot(
+                            self.installed_mvcc()?,
+                            bucket,
+                            &link.target_key,
+                            snapshot,
+                        )
                     }
-                    None => {
-                        self.core_store
-                            .read_current_object_metadata(bucket, &link.target_key)
-                            .await
-                    }
+                    None => crate::metadata_journal::read_current_object_mvcc(
+                        self.installed_mvcc()?,
+                        bucket,
+                        &link.target_key,
+                    ),
                 },
             }
             .map_err(|e| Status::internal(e.to_string()))?

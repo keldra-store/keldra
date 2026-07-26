@@ -1293,6 +1293,25 @@ pub fn read_current_object_mvcc(
         .map(|object| object.filter(|object| object.deleted_at.is_none()))
 }
 
+pub fn read_current_object_at_mvcc_snapshot(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    bucket: &Bucket,
+    object_key: &str,
+    snapshot: u64,
+) -> Result<Option<Object>> {
+    let tuple_key = crate::core_store::object_current_key(bucket, object_key);
+    let logical_key = crate::mvcc_product::coremeta_logical_key(
+        crate::core_store::CF_OBJECT_HEADS,
+        crate::core_store::TABLE_OBJECT_HEAD_ROW,
+        &tuple_key,
+    )?;
+    mvcc.runtime
+        .read_at(&logical_key, snapshot)?
+        .map(|row| crate::core_store::decode_object_metadata_row(&row.value))
+        .transpose()
+        .map(|object| object.filter(|object| object.deleted_at.is_none()))
+}
+
 pub fn read_object_version_mvcc(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
@@ -1308,6 +1327,25 @@ pub fn read_object_version_mvcc(
     mvcc.read_latest_value(&logical_key)?
         .as_deref()
         .map(crate::core_store::decode_object_metadata_row)
+        .transpose()
+}
+
+pub fn read_object_version_at_mvcc_snapshot(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    bucket: &Bucket,
+    object_key: &str,
+    version_id: uuid::Uuid,
+    snapshot: u64,
+) -> Result<Option<Object>> {
+    let tuple_key = crate::core_store::object_version_key(bucket, object_key, version_id);
+    let logical_key = crate::mvcc_product::coremeta_logical_key(
+        crate::core_store::CF_OBJECT_VERSIONS,
+        crate::core_store::TABLE_OBJECT_VERSION_META_ROW,
+        &tuple_key,
+    )?;
+    mvcc.runtime
+        .read_at(&logical_key, snapshot)?
+        .map(|row| crate::core_store::decode_object_metadata_row(&row.value))
         .transpose()
 }
 
