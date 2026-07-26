@@ -69,6 +69,7 @@ pub mod index_diagnostic_journal;
 pub mod index_journal;
 pub mod index_partition_watch;
 pub mod index_repair;
+pub mod local_object_store;
 pub mod manifest_journal;
 pub mod media_extraction;
 pub mod mesh_control_segment;
@@ -279,7 +280,7 @@ impl AppState {
             .install_mvcc(mvcc.clone())
             .context("install MVCC transaction staging in persistence")?;
         object_manager
-            .install_mvcc_replication(mvcc.replication_client.clone())
+            .install_mvcc_replication(mvcc.replication_client.clone(), mvcc.local_objects.clone())
             .context("install MVCC object shard reader")?;
 
         Ok(Self {

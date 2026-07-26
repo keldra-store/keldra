@@ -59,6 +59,7 @@ pub struct ObjectManager {
     mvcc_replication: std::sync::Arc<
         std::sync::OnceLock<crate::replication_client::TonicReplicationStreamManager>,
     >,
+    local_objects: std::sync::Arc<std::sync::OnceLock<crate::local_object_store::LocalObjectStore>>,
 }
 
 #[derive(Debug, Clone)]
@@ -216,16 +217,21 @@ impl ObjectManager {
             signing_key,
             observability,
             mvcc_replication: Default::default(),
+            local_objects: Default::default(),
         }
     }
 
     pub fn install_mvcc_replication(
         &self,
         replication: crate::replication_client::TonicReplicationStreamManager,
+        local_objects: crate::local_object_store::LocalObjectStore,
     ) -> AnyhowResult<()> {
         self.mvcc_replication
             .set(replication)
-            .map_err(|_| anyhow!("MVCC replication client is already installed"))
+            .map_err(|_| anyhow!("MVCC replication client is already installed"))?;
+        self.local_objects
+            .set(local_objects)
+            .map_err(|_| anyhow!("MVCC local object store is already installed"))
     }
 
     fn record_reserved_namespace_rejection(&self, operation: &'static str) {
@@ -1582,6 +1588,7 @@ enum ObjectDataTarget {
     LogicalFile(CoreManifestLocator),
     ObjectRef(CoreObjectRef),
     MvccShards(crate::object_shard_manifest::PhysicalObjectShardManifest),
+    MvccLocal(crate::local_object_store::LocalObjectManifest),
 }
 
 fn object_data_target_to_shard_map(target: &ObjectDataTarget) -> AnyhowResult<JsonValue> {
@@ -1600,10 +1607,25 @@ fn object_data_target_to_shard_map(target: &ObjectDataTarget) -> AnyhowResult<Js
             "schema": "anvil.mvcc.object_shard_manifest.v1",
             "manifest": manifest,
         })),
+        ObjectDataTarget::MvccLocal(manifest) => Ok(serde_json::json!({
+            "schema": "anvil.mvcc.local_object_manifest.v1",
+            "manifest": manifest,
+        })),
     }
 }
 
 fn object_data_target_from_shard_map(value: &JsonValue) -> AnyhowResult<ObjectDataTarget> {
+    if value.get("schema").and_then(JsonValue::as_str)
+        == Some("anvil.mvcc.local_object_manifest.v1")
+    {
+        let manifest = serde_json::from_value(
+            value
+                .get("manifest")
+                .cloned()
+                .context("MVCC local object manifest is missing")?,
+        )?;
+        return Ok(ObjectDataTarget::MvccLocal(manifest));
+    }
     if value.get("schema").and_then(JsonValue::as_str)
         == Some("anvil.mvcc.object_shard_manifest.v1")
     {

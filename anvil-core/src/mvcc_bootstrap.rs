@@ -23,6 +23,7 @@ use crate::{
         AppendOnlyPreparedBundleStore, BundleTarget, ObjectEvidenceRegistry,
         StreamingBundleReplicator,
     },
+    local_object_store::LocalObjectStore,
     mvcc_node_runtime::MvccNodeRuntime,
     mvcc_open_transactions::OpenTransactionRegistry,
     mvcc_store::LocalMvccStore,
@@ -162,6 +163,7 @@ pub struct MvccSubsystem {
     pub replication_client: TonicReplicationStreamManager,
     pub object_evidence: ObjectEvidenceRegistry,
     pub shard_candidates: Arc<[ShardTarget]>,
+    pub local_objects: LocalObjectStore,
     pub consensus_service: ConsensusTransportService<NodeConnectionAuthorizer>,
     pub replication_service: ReplicationServiceImpl<NodeConnectionAuthorizer>,
     pub peers: Arc<[MvccPeerConfig]>,
@@ -274,6 +276,12 @@ impl MvccSubsystem {
         let prepared = AppendOnlyPreparedBundleStore::open(
             &paths.prepared_bundles,
             config.mvcc_cluster_id.clone(),
+            local_incarnation.clone(),
+            local.failure_domain.clone(),
+        )?;
+        let local_objects = LocalObjectStore::open(
+            &paths.local_objects,
+            config.mvcc_cluster_id.clone(),
             local_incarnation,
             local.failure_domain.clone(),
         )?;
@@ -319,6 +327,7 @@ impl MvccSubsystem {
             replication_client,
             object_evidence,
             shard_candidates: shard_candidates.into(),
+            local_objects,
             consensus_service,
             replication_service,
             peers: peers.into(),
@@ -330,6 +339,7 @@ struct MvccPaths {
     base: PathBuf,
     prepared_bundles: PathBuf,
     replication_inbox: PathBuf,
+    local_objects: PathBuf,
 }
 
 impl MvccPaths {
@@ -338,6 +348,7 @@ impl MvccPaths {
         Self {
             prepared_bundles: base.join("prepared-bundles"),
             replication_inbox: base.join("replication-inbox"),
+            local_objects: base.join("local-objects"),
             base,
         }
     }

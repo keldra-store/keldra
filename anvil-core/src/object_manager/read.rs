@@ -259,6 +259,34 @@ impl ObjectManager {
                         })
                         .await
                 }
+                ObjectDataTarget::MvccLocal(manifest) => {
+                    let Some(store) = app_state.local_objects.get() else {
+                        let _ = tx
+                            .send(Err(Status::failed_precondition(
+                                "MVCC local object reader is not installed",
+                            )))
+                            .await;
+                        return;
+                    };
+                    let start = range.map(|range| range.start).unwrap_or(0);
+                    let end = range
+                        .map(|range| range.end_exclusive)
+                        .unwrap_or(manifest.object_length)
+                        .min(manifest.object_length);
+                    match store.read_range(&manifest, start, end) {
+                        Ok(bytes) => {
+                            let mut result = Ok(());
+                            for chunk in bytes.chunks(64 * 1024) {
+                                if tx.send(Ok(chunk.to_vec())).await.is_err() {
+                                    result = Err(anyhow!("object read response stream closed"));
+                                    break;
+                                }
+                            }
+                            result
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
             };
 
             match read_result {

@@ -128,6 +128,10 @@ pub struct Config {
     #[arg(long, env, default_value_t = 1)]
     pub mvcc_bundle_quorum_holders: usize,
 
+    /// Durability used by single-operation writes that create an internal MVCC transaction.
+    #[arg(long, env, default_value = "local")]
+    pub mvcc_default_durability: String,
+
     /// Failure-domain losses that erasure durability must tolerate.
     #[arg(long, env, default_value_t = 0)]
     pub mvcc_tolerated_failure_domains: usize,
@@ -219,6 +223,7 @@ impl Default for Config {
             mvcc_raft_group_id: 1,
             mvcc_cluster_id: "default".to_string(),
             mvcc_bundle_quorum_holders: 1,
+            mvcc_default_durability: "local".to_string(),
             mvcc_tolerated_failure_domains: 0,
             mvcc_rpc_timeout_ms: 10_000,
             mvcc_node_connection_token: String::new(),
