@@ -2004,6 +2004,12 @@ use self::object_data_target::{
     object_data_target_bytes, object_data_target_kind, shard_map_from_object_data_target,
 };
 
+mod mvcc_projection;
+pub(crate) use self::mvcc_projection::{
+    MetadataMvccProjectionPlan, MetadataProductRowKind, metadata_product_key,
+    read_metadata_product_at, read_metadata_product_latest,
+};
+
 mod object_mutation;
 pub(crate) use self::object_mutation::{
     append_object_mutation_with_permit, append_object_mutation_with_permit_in_transaction,
