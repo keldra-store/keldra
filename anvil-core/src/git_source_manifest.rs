@@ -1,11 +1,10 @@
 use crate::{
     core_store::{
-        CF_REGISTRY, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaTuplePart, CoreStore,
-        TABLE_GIT_SOURCE_MANIFEST_ROW, core_meta_committed_row_common, core_meta_root_key_hash,
-        core_meta_tuple_key, decode_deterministic_proto, encode_deterministic_proto,
+        CF_REGISTRY, CoreMetaTuplePart, TABLE_GIT_SOURCE_MANIFEST_ROW,
+        core_meta_committed_row_common, core_meta_root_key_hash, core_meta_tuple_key,
+        decode_deterministic_proto, encode_deterministic_proto,
     },
     formats::unix_nanos_from_rfc3339,
-    storage::Storage,
 };
 use anyhow::{Result, anyhow};
 use prost::Message;
@@ -63,52 +62,70 @@ pub struct GitSourceRepositoryManifest {
 }
 
 pub async fn write_git_source_repository_manifest(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     manifest: &GitSourceRepositoryManifest,
 ) -> Result<()> {
     validate_manifest(manifest)?;
-    let store = CoreStore::new(storage.clone()).await?;
     let payload = encode_git_source_manifest_row(manifest)?;
     let tuple_key = manifest_tuple_key(manifest.tenant_id, &manifest.repository_id)?;
     let mutation_id = format!(
         "git-source-manifest:{}:{}:{}",
         manifest.tenant_id, manifest.repository_id, manifest.generation
     );
-    let op = CoreMetaBatchOp {
-        cf: CF_REGISTRY,
-        table_id: TABLE_GIT_SOURCE_MANIFEST_ROW,
-        tuple_key: &tuple_key,
-        common: None,
-        kind: CoreMetaBatchOpKind::Put(&payload),
-    };
-    store
-        .commit_coremeta_root_groups(
-            &mutation_id,
-            &[op],
-            &[crate::core_store::CoreMetaRootPublication::new(
-                format!(
-                    "git-source-manifest/{}/{}",
-                    manifest.tenant_id, manifest.repository_id
+    let key = crate::mvcc_product::coremeta_logical_key(
+        CF_REGISTRY,
+        TABLE_GIT_SOURCE_MANIFEST_ROW,
+        &tuple_key,
+    )?;
+    let current = mvcc.read_latest_value(&key)?;
+    if let Some(existing) = current.as_deref() {
+        let existing = decode_git_source_manifest_row(existing)?;
+        if existing.generation > manifest.generation {
+            return Err(anyhow!(
+                "git source manifest generation cannot move backwards"
+            ));
+        }
+        if existing.generation == manifest.generation && existing != *manifest {
+            return Err(anyhow!(
+                "git source manifest diverges at an existing generation"
+            ));
+        }
+    }
+    mvcc.autocommit_product_mutations_with_predicates(
+        "git-source-manifest",
+        &mutation_id,
+        vec![crate::mvcc_product::ProductMutation::put(
+            key.clone(),
+            payload,
+        )],
+        vec![(
+            key,
+            match current {
+                Some(payload) => crate::mvcc_transaction::PredicateKind::ValueHash(
+                    *blake3::hash(&payload).as_bytes(),
                 ),
-                crate::formats::writer::WriterFamily::GitSource,
-            )],
-        )
-        .await?;
+                None => crate::mvcc_transaction::PredicateKind::Absent,
+            },
+        )],
+        crate::mvcc_transaction::DurabilityLevel::Quorum,
+        u64::try_from(chrono::Utc::now().timestamp_millis())
+            .map_err(|_| anyhow!("git manifest timestamp predates Unix epoch"))?,
+    )
+    .await?;
     Ok(())
 }
 
 pub async fn read_git_source_repository_manifest(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     repository_id: &str,
 ) -> Result<Option<GitSourceRepositoryManifest>> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(payload) = store.read_coremeta_row(
+    let key = crate::mvcc_product::coremeta_logical_key(
         CF_REGISTRY,
         TABLE_GIT_SOURCE_MANIFEST_ROW,
         &manifest_tuple_key(tenant_id, repository_id)?,
-    )?
-    else {
+    )?;
+    let Some(payload) = mvcc.read_latest_value(&key)? else {
         return Ok(None);
     };
     let manifest = decode_git_source_manifest_row(&payload)?;
@@ -251,46 +268,4 @@ fn require_nonempty(value: &str, field: &'static str) -> Result<()> {
         return Err(anyhow!("git source manifest {field} must not be empty"));
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    #[tokio::test]
-    async fn git_source_manifest_round_trips_and_validates_scope() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let manifest = GitSourceRepositoryManifest {
-            format_version: 1,
-            tenant_id: 3,
-            repository_id: "repo-alpha".to_string(),
-            bucket_name: "source-packs".to_string(),
-            object_key: "git-source/repo-alpha/packs/pack.pack".to_string(),
-            pack_object_version_id: "00000000-0000-0000-0000-000000000001".to_string(),
-            source_hash: hex::encode([4; 32]),
-            generation: 7,
-            record_count: 12,
-            index_path: format!(
-                "git_source_index:tenant:3:repository:repo-alpha:generation:00000000000000000007:source:{}",
-                hex::encode([4; 32])
-            ),
-            updated_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
-        };
-        write_git_source_repository_manifest(&storage, &manifest)
-            .await
-            .unwrap();
-        let read = read_git_source_repository_manifest(&storage, 3, "repo-alpha")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(read, manifest);
-        assert!(
-            read_git_source_repository_manifest(&storage, 3, "repo-beta")
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
 }

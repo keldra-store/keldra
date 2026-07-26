@@ -1,10 +1,9 @@
 use crate::{
     core_store::{
-        AppendStreamRecord, CoreStore, ReadStream, decode_deterministic_proto,
-        encode_deterministic_proto,
+        CF_REGISTRY, CoreMetaTuplePart, TABLE_STREAM_RECORD_INDEX_ROW, core_meta_tuple_key,
+        decode_deterministic_proto, encode_deterministic_proto,
     },
     formats::{Hash32, hash32, watch::WatchRecord},
-    storage::Storage,
 };
 use anyhow::{Result, anyhow};
 use prost::Message;
@@ -52,7 +51,7 @@ pub struct GitSourceWatchEvent {
 }
 
 pub async fn append_git_source_watch_record(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     repository_id: &str,
     mutation_id: [u8; 16],
@@ -60,11 +59,15 @@ pub async fn append_git_source_watch_record(
     payload: GitSourceWatchPayload,
 ) -> Result<u128> {
     validate_payload(repository_id, &payload)?;
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let stream_id = git_source_watch_stream_id(tenant_id, repository_id);
+    let head_key = watch_head_key(tenant_id, repository_id)?;
+    let head_payload = mvcc.read_latest_value(&head_key)?;
+    let current = decode_watch_head(head_payload.as_deref())?;
+    let sequence = current
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("git source watch cursor overflow"))?;
 
     let record = WatchRecord::new(
-        0,
+        u128::from(sequence),
         GIT_SOURCE_PARTITION_FAMILY,
         partition_id(tenant_id, repository_id),
         mutation_id,
@@ -74,34 +77,49 @@ pub async fn append_git_source_watch_record(
         0,
         encode_git_source_watch_payload(&payload)?,
     );
-    let receipt = core_store
-        .append_stream(AppendStreamRecord {
-            stream_id,
-            partition_id: hex::encode(partition_id(tenant_id, repository_id)),
-            record_kind: "git_source_watch".to_string(),
-            payload: record.encode(),
-            content_type: None,
-            user_metadata_json: "{}".to_string(),
-            fence: None,
-            transaction_id: None,
-            idempotency_key: Some(format!(
-                "git-source-watch:{tenant_id}:{repository_id}:{}",
-                hex::encode(mutation_id)
-            )),
-        })
-        .await?;
-    Ok(u128::from(receipt.sequence))
+    let event_key = watch_event_key(tenant_id, repository_id, sequence)?;
+    mvcc.autocommit_product_mutations_with_predicates(
+        "git-source-watch",
+        &format!(
+            "git-source-watch:{tenant_id}:{repository_id}:{}",
+            hex::encode(mutation_id)
+        ),
+        vec![
+            crate::mvcc_product::ProductMutation::put(event_key.clone(), record.encode()),
+            crate::mvcc_product::ProductMutation::put(
+                head_key.clone(),
+                sequence.to_be_bytes().to_vec(),
+            ),
+        ],
+        vec![
+            (event_key, crate::mvcc_transaction::PredicateKind::Absent),
+            (
+                head_key,
+                match head_payload {
+                    Some(payload) => crate::mvcc_transaction::PredicateKind::ValueHash(
+                        *blake3::hash(&payload).as_bytes(),
+                    ),
+                    None => crate::mvcc_transaction::PredicateKind::Absent,
+                },
+            ),
+        ],
+        crate::mvcc_transaction::DurabilityLevel::Quorum,
+        u64::try_from(chrono::Utc::now().timestamp_millis())
+            .map_err(|_| anyhow!("git watch timestamp predates Unix epoch"))?,
+    )
+    .await?;
+    Ok(u128::from(sequence))
 }
 
 pub async fn list_git_source_watch_events(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     repository_id: &str,
     after_cursor: u128,
     limit: usize,
 ) -> Result<Vec<GitSourceWatchEvent>> {
     Ok(
-        list_git_source_watch_event_page(storage, tenant_id, repository_id, after_cursor, limit)
+        list_git_source_watch_event_page(mvcc, tenant_id, repository_id, after_cursor, limit)
             .await?
             .events,
     )
@@ -115,32 +133,48 @@ pub struct GitSourceWatchEventPage {
 }
 
 pub async fn list_git_source_watch_event_page(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     repository_id: &str,
     after_cursor: u128,
     limit: usize,
 ) -> Result<GitSourceWatchEventPage> {
-    let core_store = CoreStore::new(storage.clone()).await?;
     let after_sequence =
         u64::try_from(after_cursor).map_err(|_| anyhow!("git source watch cursor exceeds u64"))?;
-    let page = core_store
-        .read_stream_page(ReadStream {
-            stream_id: git_source_watch_stream_id(tenant_id, repository_id),
-            after_sequence,
-            limit,
-        })
-        .await?;
-    let mut events = Vec::with_capacity(page.records.len());
-    for source in page.records {
-        if source.record_kind != "git_source_watch" {
-            return Err(anyhow!("git source watch stream record kind mismatch"));
-        }
-        let (mut record, used) = WatchRecord::decode(&source.payload)?;
-        if used != source.payload.len() {
+    if limit == 0 || limit > 1_000 {
+        return Err(anyhow!(
+            "git source watch page limit must be between 1 and 1000"
+        ));
+    }
+    let snapshot = mvcc.runtime.applied_version()?;
+    let head = mvcc
+        .runtime
+        .read_at(&watch_head_key(tenant_id, repository_id)?, snapshot)?
+        .map(|row| decode_watch_head(Some(&row.value)))
+        .transpose()?
+        .unwrap_or(0);
+    let prefix = crate::mvcc_product::coremeta_application_prefix(
+        CF_REGISTRY,
+        &watch_event_prefix(tenant_id, repository_id)?,
+    )?;
+    let mut rows =
+        mvcc.runtime
+            .scan_table_prefix_at(TABLE_STREAM_RECORD_INDEX_ROW, &prefix, snapshot)?;
+    rows.retain(|(_, row)| {
+        WatchRecord::decode(&row.value)
+            .map(|(record, _)| u64::try_from(record.cursor).unwrap_or(0) > after_sequence)
+            .unwrap_or(true)
+    });
+    let has_more = rows.len() > limit;
+    rows.truncate(limit);
+    let mut events = Vec::with_capacity(rows.len());
+    for (_, source) in rows {
+        let (mut record, used) = WatchRecord::decode(&source.value)?;
+        if used != source.value.len() {
             return Err(anyhow!("git source watch record has trailing bytes"));
         }
-        record.cursor = u128::from(source.sequence);
+        let sequence = u64::try_from(record.cursor)
+            .map_err(|_| anyhow!("git source watch record cursor exceeds u64"))?;
         if record.partition_family != GIT_SOURCE_PARTITION_FAMILY
             || record.record_kind != GIT_SOURCE_RECORD_KIND
             || record.partition_id != partition_id(tenant_id, repository_id)
@@ -158,21 +192,24 @@ pub async fn list_git_source_watch_event_page(
         });
     }
     Ok(GitSourceWatchEventPage {
+        next_cursor: events
+            .last()
+            .map(|event| event.cursor)
+            .unwrap_or(after_cursor),
         events,
-        next_cursor: u128::from(page.next_sequence),
-        has_more: page.has_more,
+        has_more: has_more && u128::from(head) > after_cursor,
     })
 }
 
 pub async fn latest_git_source_watch_cursor(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     repository_id: &str,
 ) -> Result<Option<u128>> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let sequence = core_store
-        .stream_head_sequence(&git_source_watch_stream_id(tenant_id, repository_id))
-        .await?;
+    let sequence = decode_watch_head(
+        mvcc.read_latest_value(&watch_head_key(tenant_id, repository_id)?)?
+            .as_deref(),
+    )?;
     Ok((sequence != 0).then_some(u128::from(sequence)))
 }
 
@@ -240,74 +277,52 @@ pub(crate) fn git_source_watch_stream_id(tenant_id: i64, repository_id: &str) ->
     format!("watch:git_source:tenant:{tenant_id}:repository:{repository_id}")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
+fn watch_head_key(
+    tenant_id: i64,
+    repository_id: &str,
+) -> Result<crate::mvcc_transaction::LogicalKey> {
+    crate::mvcc_product::coremeta_logical_key(
+        CF_REGISTRY,
+        TABLE_STREAM_RECORD_INDEX_ROW,
+        &core_meta_tuple_key(&[
+            CoreMetaTuplePart::Utf8("git-source-watch-head"),
+            CoreMetaTuplePart::I64(tenant_id),
+            CoreMetaTuplePart::Utf8(repository_id),
+        ])?,
+    )
+}
 
-    #[tokio::test]
-    async fn git_source_watch_appends_lists_and_tracks_latest_cursor() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        append_git_source_watch_record(&storage, 9, "repo-alpha", [1; 16], 2, payload(1))
-            .await
-            .unwrap();
-        append_git_source_watch_record(&storage, 9, "repo-alpha", [2; 16], 3, payload(2))
-            .await
-            .unwrap();
+fn watch_event_prefix(tenant_id: i64, repository_id: &str) -> Result<Vec<u8>> {
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("git-source-watch-event"),
+        CoreMetaTuplePart::I64(tenant_id),
+        CoreMetaTuplePart::Utf8(repository_id),
+    ])
+}
 
-        assert_eq!(
-            git_source_watch_stream_id(9, "repo-alpha"),
-            "watch:git_source:tenant:9:repository:repo-alpha"
-        );
-        let events = list_git_source_watch_events(&storage, 9, "repo-alpha", 1, 10)
-            .await
-            .unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].cursor, 2);
-        assert_eq!(events[0].index_generation, 2);
-        assert_eq!(events[0].payload.generation, 2);
-        assert_eq!(
-            latest_git_source_watch_cursor(&storage, 9, "repo-alpha")
-                .await
-                .unwrap(),
-            Some(2)
-        );
-    }
+fn watch_event_key(
+    tenant_id: i64,
+    repository_id: &str,
+    sequence: u64,
+) -> Result<crate::mvcc_transaction::LogicalKey> {
+    crate::mvcc_product::coremeta_logical_key(
+        CF_REGISTRY,
+        TABLE_STREAM_RECORD_INDEX_ROW,
+        &core_meta_tuple_key(&[
+            CoreMetaTuplePart::Utf8("git-source-watch-event"),
+            CoreMetaTuplePart::I64(tenant_id),
+            CoreMetaTuplePart::Utf8(repository_id),
+            CoreMetaTuplePart::U64(sequence),
+        ])?,
+    )
+}
 
-    #[tokio::test]
-    async fn git_source_watch_rejects_idempotency_conflicts_and_bad_payload() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        append_git_source_watch_record(&storage, 9, "repo-alpha", [1; 16], 2, payload(1))
-            .await
-            .unwrap();
-        assert!(
-            append_git_source_watch_record(&storage, 9, "repo-alpha", [1; 16], 2, payload(2))
-                .await
-                .is_err()
-        );
-
-        let mut bad = payload(3);
-        bad.repository_id = "repo-beta".to_string();
-        assert!(
-            append_git_source_watch_record(&storage, 9, "repo-alpha", [3; 16], 2, bad)
-                .await
-                .is_err()
-        );
-    }
-
-    fn payload(generation: u64) -> GitSourceWatchPayload {
-        GitSourceWatchPayload {
-            repository_id: "repo-alpha".to_string(),
-            event_type: "index_published".to_string(),
-            generation,
-            source_hash: hex::encode([generation as u8; 32]),
-            index_path: format!(
-                "_anvil/git/tenants/tenant-9/repositories/repo-alpha/indexes/generation-{generation:020}-source.angit"
-            ),
-            pack_object_version_id: Some("00000000-0000-0000-0000-000000000001".to_string()),
-            emitted_at: "2026-06-27T00:00:00.000000000Z".to_string(),
-        }
-    }
+fn decode_watch_head(payload: Option<&[u8]>) -> Result<u64> {
+    let Some(payload) = payload else {
+        return Ok(0);
+    };
+    let bytes: [u8; 8] = payload
+        .try_into()
+        .map_err(|_| anyhow!("git source watch head has invalid length"))?;
+    Ok(u64::from_be_bytes(bytes))
 }

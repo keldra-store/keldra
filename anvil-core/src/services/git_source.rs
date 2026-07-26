@@ -96,7 +96,7 @@ impl GitSourceService for AppState {
         .map_err(|err| Status::internal(format!("{err:#}")))?;
         let updated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
         git_source_manifest::write_git_source_repository_manifest(
-            &self.storage,
+            &self.mvcc,
             &git_source_manifest::GitSourceRepositoryManifest {
                 format_version: 1,
                 tenant_id: claims.tenant_id,
@@ -113,8 +113,7 @@ impl GitSourceService for AppState {
         )
         .await
         .map_err(|err| Status::internal(err.to_string()))?;
-        let authz_revision = authz_journal::latest_authz_revision(&self.storage, claims.tenant_id)
-            .await
+        let authz_revision = authz_journal::latest_authz_revision(&self.mvcc, claims.tenant_id)
             .map_err(|err| Status::internal(err.to_string()))?;
         let authz_revision = u64::try_from(authz_revision)
             .map_err(|_| Status::internal("Invalid authorization revision"))?;
@@ -128,7 +127,7 @@ impl GitSourceService for AppState {
             emitted_at: updated_at,
         };
         let watch_cursor = git_source_watch::append_git_source_watch_record(
-            &self.storage,
+            &self.mvcc,
             claims.tenant_id,
             &metadata.repository_id,
             *pack_object.mutation_id.as_bytes(),
@@ -300,6 +299,7 @@ impl GitSourceService for AppState {
             git_source_watch::git_source_watch_stream_id(claims.tenant_id, &req.repository_id);
         let mut live = self.storage.subscribe_stream(&stream_id);
         let storage = self.storage.clone();
+        let mvcc = self.mvcc.clone();
         let repository_id = req.repository_id;
         let tenant_id = claims.tenant_id;
         let (tx, rx) = mpsc::channel(32);
@@ -308,7 +308,7 @@ impl GitSourceService for AppState {
             loop {
                 loop {
                     let page = match git_source_watch::list_git_source_watch_event_page(
-                        &storage,
+                        &mvcc,
                         tenant_id,
                         &repository_id,
                         last_cursor,
@@ -377,7 +377,7 @@ impl AppState {
         repository_id: &str,
     ) -> Result<git_source_index::DecodedGitSourceIndex, Status> {
         let manifest = git_source_manifest::read_git_source_repository_manifest(
-            &self.storage,
+            &self.mvcc,
             claims.tenant_id,
             repository_id,
         )
@@ -427,7 +427,7 @@ impl AppState {
             updated.record_count = parsed.records.len() as u64;
             updated.updated_at =
                 chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
-            git_source_manifest::write_git_source_repository_manifest(&self.storage, &updated)
+            git_source_manifest::write_git_source_repository_manifest(&self.mvcc, &updated)
                 .await
                 .map_err(|err| Status::internal(err.to_string()))?;
         }
