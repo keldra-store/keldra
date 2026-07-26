@@ -272,7 +272,7 @@ async fn personaldb_submit_commits_and_is_available_to_catch_up_and_watch() {
 
     let row_index_data_id =
         personaldb_row_index_data_id(1, &database_id, 1, &committed.log_hash).unwrap();
-    let mvcc = cluster.states[0].mvcc.get().expect("MVCC subsystem");
+    let mvcc = cluster.states[0].mvcc.as_ref();
     let snapshot_version = mvcc.runtime.local_store().readable_version().unwrap();
     let row_index = read_personaldb_row_index(
         &cluster.states[0].storage,
@@ -718,7 +718,7 @@ async fn personaldb_submit_builds_snapshot_when_threshold_is_reached() {
     let snapshots_head = divergent.snapshots_head.expect("snapshots head");
     assert_eq!(snapshots_head.latest_snapshot_log_index, 1);
     assert_eq!(snapshots_head.latest_snapshot_log_hash, committed.log_hash);
-    let mvcc = cluster.states[0].mvcc.get().expect("MVCC subsystem");
+    let mvcc = cluster.states[0].mvcc.as_ref();
     let snapshot_version = mvcc.runtime.local_store().readable_version().unwrap();
     let snapshot_manifest = read_personaldb_snapshot_manifest_by_ref(
         &cluster.states[0].storage,

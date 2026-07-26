@@ -7,6 +7,7 @@ async fn admin_authorisation_uses_zanzibar_system_realm() {
     let claims = node.state.jwt_manager.verify_token(&admin_token).unwrap();
     let allowed = anvil::system_realm::check_admin_relation(
         &node.state.storage,
+        &node.state.mvcc,
         &node.state.config.mesh_id,
         &claims,
         anvil::system_realm::SystemAdminRelation::ManageRegions,

@@ -74,7 +74,7 @@ async fn personaldb_projection_definition_create_get_and_watch_are_native_api_ba
         emitted_at: "2026-06-28T00:00:00Z".to_string(),
     };
     append_personaldb_projection_watch_record(
-        cluster.states[0].mvcc.get().expect("MVCC subsystem"),
+        cluster.states[0].mvcc.as_ref(),
         1,
         &projection_database_id,
         "projection-items",
