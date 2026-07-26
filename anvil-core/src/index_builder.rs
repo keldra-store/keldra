@@ -1686,6 +1686,7 @@ async fn publish_index_build_watch(
     .await?;
     let prepared = index_partition_watch::prepare_index_partition_watch_record(
         storage,
+        authority.mvcc()?,
         tenant_id,
         bucket_id,
         partition_id,
@@ -1697,13 +1698,13 @@ async fn publish_index_build_watch(
     )
     .await?;
     authority
-        .publish_with(
+        .publish_mvcc_with(
             storage,
             ownership,
             signing_key,
             |preconditions| async move {
                 index_partition_watch::publish_prepared_index_partition_watch(
-                    storage,
+                    authority.mvcc()?,
                     prepared,
                     &preconditions,
                 )

@@ -646,20 +646,15 @@ impl IndexService for AppState {
         let index_name = index.name.clone();
         let tenant_id = claims.tenant_id;
         let bucket_id = bucket.id;
-        let stream_id = index_partition_watch::index_partition_watch_stream_id_for_scope(
-            tenant_id,
-            bucket_id,
-            &index_storage_id,
-            &partition_id,
-        );
-        let mut live = self.storage.subscribe_stream(&stream_id);
+        let mvcc = self.mvcc.clone();
         let (tx, rx) = mpsc::channel(32);
         tokio::spawn(async move {
+            let mut poll = tokio::time::interval(std::time::Duration::from_millis(250));
             let mut last_cursor = after_cursor;
             loop {
                 loop {
                     let page = match index_partition_watch::list_index_partition_watch_event_page(
-                        &storage,
+                        &mvcc,
                         tenant_id,
                         bucket_id,
                         &index_storage_id,
@@ -696,10 +691,7 @@ impl IndexService for AppState {
                         break;
                     }
                 }
-                match live.recv().await {
-                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                }
+                poll.tick().await;
             }
         });
 

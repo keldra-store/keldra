@@ -164,6 +164,35 @@ impl IndexBuildAuthority<'_> {
             Self::DirectRepair(_) => publication(vec![ownership_precondition]).await,
         }
     }
+
+    /// Revalidates the mesh ownership lease at admission and, for task
+    /// execution, publishes with the exact MVCC task-lease predicate.
+    pub(crate) async fn publish_mvcc_with<T, F, Fut>(
+        self,
+        storage: &Storage,
+        ownership: &IndexBuildOwnership,
+        signing_key: &[u8],
+        publication: F,
+    ) -> Result<T>
+    where
+        F: FnOnce(
+            Vec<(
+                crate::mvcc_transaction::LogicalKey,
+                crate::mvcc_transaction::PredicateKind,
+            )>,
+        ) -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        let _ = ownership.precondition(storage, signing_key).await?;
+        match self {
+            Self::Task(guard) => {
+                guard
+                    .publish_mvcc_with(|predicate| publication(vec![predicate]))
+                    .await
+            }
+            Self::DirectRepair(_) => publication(Vec::new()).await,
+        }
+    }
 }
 
 fn current_time_nanos() -> Result<i64> {
