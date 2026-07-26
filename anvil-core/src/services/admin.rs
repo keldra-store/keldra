@@ -49,25 +49,23 @@ impl AdminService for AppState {
         } else {
             req.home_region.clone()
         };
-        let tenant = self
-            .persistence
-            .create_tenant(&req.name, "admin-created")
-            .await
-            .map_err(|err| Status::internal(err.to_string()))?;
-        let audit_event_id = record_admin_audit_event(
-            self,
+        let audit_event = build_admin_audit_event(
             &principal,
             context,
             "admin.tenant.create",
-            &format!("tenant:{}", tenant.id),
+            &format!("tenant-name:{}", req.name),
             json!({
                 "resource_kind": "tenant",
-                "tenant_id": tenant.id,
-                "tenant_name": &tenant.name,
+                "tenant_name": &req.name,
                 "home_region": &home_region,
             }),
-        )
-        .await?;
+        )?;
+        let audit_event_id = audit_event.audit_event_id.clone();
+        let tenant = self
+            .persistence
+            .create_tenant_with_admin_audit(&req.name, "admin-created", Some(&audit_event))
+            .await
+            .map_err(|err| Status::internal(err.to_string()))?;
         Ok(Response::new(TenantAdminResponse {
             request_id: context.request_id.clone(),
             tenant: Some(TenantAdminDescriptor {

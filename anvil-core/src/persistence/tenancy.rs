@@ -44,6 +44,16 @@ impl Persistence {
     }
 
     pub async fn create_tenant(&self, name: &str, idempotency_key: &str) -> Result<Tenant> {
+        self.create_tenant_with_admin_audit(name, idempotency_key, None)
+            .await
+    }
+
+    pub async fn create_tenant_with_admin_audit(
+        &self,
+        name: &str,
+        idempotency_key: &str,
+        admin_audit_event: Option<&crate::admin_audit::AdminAuditEvent>,
+    ) -> Result<Tenant> {
         let permit = self.control_write_permit().await?;
         let tenant = control_journal::create_tenant_with_permit_mvcc(
             &self.storage,
@@ -51,6 +61,7 @@ impl Persistence {
             name,
             &permit,
             &self.partition_owner_signing_key,
+            admin_audit_event,
         )
         .await?;
         self.write_mesh_tenant_locators(&tenant, idempotency_key)

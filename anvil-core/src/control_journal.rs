@@ -330,6 +330,7 @@ pub(crate) async fn create_tenant_with_permit_mvcc(
     name: &str,
     permit: &PartitionWritePermit,
     partition_owner_signing_key: &[u8],
+    admin_audit_event: Option<&crate::admin_audit::AdminAuditEvent>,
 ) -> Result<Tenant> {
     let partition_precondition =
         control_write_precondition(storage, permit, partition_owner_signing_key).await?;
@@ -366,7 +367,7 @@ pub(crate) async fn create_tenant_with_permit_mvcc(
         ],
         permit.fence_token,
         None,
-        None,
+        admin_audit_event,
     )
     .await?;
     Ok(tenant)
@@ -682,19 +683,48 @@ async fn append_control_event_mvcc(
         plan.mutations.extend(audit_plan.mutations);
         plan.outbox_events.extend(audit_plan.outbox_events);
     }
-    let mutations = plan.mutations;
-    let outbox_events = plan.outbox_events;
+    predicates.extend(plan.predicates);
     let principal = control_partition_principal();
-    mvcc.autocommit_product_mutations_with_predicates_and_outbox(
-        &principal,
-        &format!("control-plane:{mutation_id_string}"),
-        mutations,
-        predicates,
-        outbox_events,
-        DurabilityLevel::Local,
-        u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
-    )
-    .await?;
+    let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default();
+    let handle = mvcc
+        .open_transactions
+        .begin(
+            mvcc.runtime.as_ref(),
+            mvcc.cluster_id(),
+            &principal,
+            &format!("control-plane:{mutation_id_string}"),
+            std::time::Duration::from_secs(30),
+            DurabilityLevel::Quorum,
+            crate::mvcc_transaction::ReadConsistency::Linearized,
+            now,
+        )
+        .await?;
+    mvcc.stage_product_mutations(&handle.transaction_id, &principal, plan.mutations, now)?;
+    for (key, kind) in predicates {
+        mvcc.stage_predicate(&handle.transaction_id, &principal, key, kind, now)?;
+    }
+    for event in plan.outbox_events {
+        mvcc.open_transactions
+            .add_stream_event(&handle.transaction_id, event, now)?;
+    }
+    let assignment = mvcc
+        .reconcile_work_assignment("control-plane", mvcc.cluster_id())
+        .await?
+        .ok_or_else(|| anyhow!("this node does not own the cluster control-plane assignment"))?;
+    mvcc.stage_assignment_guard(&handle.transaction_id, &principal, &assignment, now)?;
+    let outcome = mvcc
+        .open_transactions
+        .commit(
+            mvcc.runtime.as_ref(),
+            &handle.transaction_id,
+            &principal,
+            u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+        )
+        .await?;
+    if let crate::mvcc_transaction::CertificationResult::Aborted { reason } = outcome.certification
+    {
+        bail!("control-plane transaction aborted: {reason:?}");
+    }
     Ok(())
 }
 
