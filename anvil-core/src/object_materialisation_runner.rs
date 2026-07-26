@@ -281,11 +281,6 @@ impl ObjectMaterialisationExecutor for MvccObjectMaterialisationExecutor {
                 is_public_read: false,
             };
             for frozen in &job.frozen_index_definitions {
-                anyhow::ensure!(
-                    frozen.kind == "typed_json",
-                    "MVCC materialisation for index kind `{}` is not available",
-                    frozen.kind
-                );
                 let index = IndexDefinition {
                     id: frozen.id,
                     tenant_id: job.tenant_id,
@@ -301,24 +296,60 @@ impl ObjectMaterialisationExecutor for MvccObjectMaterialisationExecutor {
                     created_at: object.created_at,
                     updated_at: object.created_at,
                 };
-                let outcome = crate::index_builder::build_frozen_typed_json_index(
-                    &self.mvcc.materialisation_storage,
-                    &bucket,
-                    &index,
-                    self.mvcc.materialisation_signing_key.as_ref(),
-                    u128::from(job.originating_snapshot_version),
-                    &self.mvcc.peers[0].node_id,
-                    crate::index_builder::IndexBuildAuthority::DirectRepair(
-                        crate::index_builder::DirectRepairIndexBuildAuthority::new(),
+                let source = crate::index_builder::FrozenObjectIndexSource {
+                    object: object.clone(),
+                    payload: payload.clone(),
+                    boundary_values: boundaries.clone(),
+                    source_manifest_hash: job.source_manifest_hash.clone(),
+                };
+                let authority = crate::index_builder::IndexBuildAuthority::DirectRepair(
+                    crate::index_builder::DirectRepairIndexBuildAuthority::new(),
+                );
+                let outcome = match frozen.kind.as_str() {
+                    "typed_json" => {
+                        crate::index_builder::build_frozen_typed_json_index(
+                            &self.mvcc.materialisation_storage,
+                            &bucket,
+                            &index,
+                            self.mvcc.materialisation_signing_key.as_ref(),
+                            u128::from(job.originating_snapshot_version),
+                            &self.mvcc.peers[0].node_id,
+                            authority,
+                            source,
+                        )
+                        .await?
+                    }
+                    "full_text" => {
+                        crate::index_builder::build_frozen_full_text_index(
+                            &self.mvcc.materialisation_storage,
+                            &bucket,
+                            &index,
+                            self.mvcc.materialisation_signing_key.as_ref(),
+                            u128::from(job.originating_snapshot_version),
+                            &self.mvcc.peers[0].node_id,
+                            authority,
+                            source,
+                        )
+                        .await?
+                    }
+                    "vector" => {
+                        crate::index_builder::build_frozen_vector_index(
+                            &self.mvcc.materialisation_storage,
+                            &bucket,
+                            &index,
+                            self.mvcc.materialisation_signing_key.as_ref(),
+                            u128::from(job.originating_snapshot_version),
+                            &self.mvcc.peers[0].node_id,
+                            &self.mvcc.materialisation_embedding_providers,
+                            authority,
+                            source,
+                        )
+                        .await?
+                    }
+                    kind => anyhow::bail!(
+                        "MVCC materialisation for index kind `{kind}` is not available"
                     ),
-                    crate::index_builder::FrozenTypedJsonIndexSource {
-                        object: object.clone(),
-                        payload: payload.clone(),
-                        boundary_values: boundaries.clone(),
-                        source_manifest_hash: job.source_manifest_hash.clone(),
-                    },
-                )
-                .await?;
+                };
                 index_outcomes.push(serde_json::json!({
                     "index_id": frozen.id,
                     "index_version": frozen.version,

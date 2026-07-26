@@ -228,6 +228,13 @@ async fn latest_index_segment_generation(storage: &Storage, index_storage_id: &s
     )
 }
 
+pub(crate) struct FrozenObjectIndexSource {
+    pub object: Object,
+    pub payload: Vec<u8>,
+    pub boundary_values: Vec<CoreBoundaryValue>,
+    pub source_manifest_hash: String,
+}
+
 pub(crate) async fn build_full_text_index(
     storage: &Storage,
     bucket: &Bucket,
@@ -236,6 +243,52 @@ pub(crate) async fn build_full_text_index(
     source_cursor: u128,
     builder_node_id: &str,
     authority: IndexBuildAuthority<'_>,
+) -> Result<IndexBuildOutcome> {
+    build_full_text_index_from_source(
+        storage,
+        bucket,
+        index,
+        partition_owner_signing_key,
+        source_cursor,
+        builder_node_id,
+        authority,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn build_frozen_full_text_index(
+    storage: &Storage,
+    bucket: &Bucket,
+    index: &IndexDefinition,
+    partition_owner_signing_key: &[u8],
+    source_cursor: u128,
+    builder_node_id: &str,
+    authority: IndexBuildAuthority<'_>,
+    source: FrozenObjectIndexSource,
+) -> Result<IndexBuildOutcome> {
+    build_full_text_index_from_source(
+        storage,
+        bucket,
+        index,
+        partition_owner_signing_key,
+        source_cursor,
+        builder_node_id,
+        authority,
+        Some(source),
+    )
+    .await
+}
+
+async fn build_full_text_index_from_source(
+    storage: &Storage,
+    bucket: &Bucket,
+    index: &IndexDefinition,
+    partition_owner_signing_key: &[u8],
+    source_cursor: u128,
+    builder_node_id: &str,
+    authority: IndexBuildAuthority<'_>,
+    frozen_source: Option<FrozenObjectIndexSource>,
 ) -> Result<IndexBuildOutcome> {
     if index.kind != "full_text" {
         return Err(anyhow!("index build only supports full_text indexes"));
@@ -257,14 +310,26 @@ pub(crate) async fn build_full_text_index(
         .max(u64::try_from(source_cursor).unwrap_or(u64::MAX))
         .max(1);
 
-    let objects = metadata_journal::read_current_objects_through_sequence(
-        storage,
-        bucket,
-        partition_owner_signing_key,
-        source_cursor,
-    )
-    .await?;
-    let boundary_values = boundary_values_for_objects(storage, &objects).await?;
+    let frozen_source_manifest_hash = frozen_source
+        .as_ref()
+        .map(|source| source.source_manifest_hash.clone());
+    let frozen_payload = frozen_source
+        .as_ref()
+        .map(|source| (source.object.version_id, source.payload.clone()));
+    let (objects, boundary_values) = match frozen_source {
+        Some(source) => (vec![source.object], source.boundary_values),
+        None => {
+            let objects = metadata_journal::read_current_objects_through_sequence(
+                storage,
+                bucket,
+                partition_owner_signing_key,
+                source_cursor,
+            )
+            .await?;
+            let boundary_values = boundary_values_for_objects(storage, &objects).await?;
+            (objects, boundary_values)
+        }
+    };
     let core_store = CoreStore::new(storage.clone()).await?;
     let mut owned_documents = Vec::new();
     let mut diagnostics = Vec::new();
@@ -272,7 +337,10 @@ pub(crate) async fn build_full_text_index(
         if object.deleted_at.is_some() || !selector_matches(&index.selector, &object) {
             continue;
         }
-        let payload = read_object_payload(&core_store, &object).await?;
+        let payload = match &frozen_payload {
+            Some((version_id, payload)) if *version_id == object.version_id => payload.clone(),
+            _ => read_object_payload(&core_store, &object).await?,
+        };
         let extracted = extract_text_fields(&index.extractor, &object, &payload);
         let diagnostic_count = extracted.diagnostics.len();
         for diagnostic in extracted.diagnostics {
@@ -394,13 +462,18 @@ pub(crate) async fn build_full_text_index(
         .await?;
     let segment_hash = staged_segment.segment_hash.clone();
     let partition_id = hex::encode(hash32(index_storage_id.as_bytes()));
-    let source_manifest_hash = metadata_journal::object_metadata_source_checkpoint_hash(
-        storage,
-        bucket,
-        partition_owner_signing_key,
-        source_cursor,
-    )
-    .await?;
+    let source_manifest_hash = match frozen_source_manifest_hash {
+        Some(hash) => hash,
+        None => {
+            metadata_journal::object_metadata_source_checkpoint_hash(
+                storage,
+                bucket,
+                partition_owner_signing_key,
+                source_cursor,
+            )
+            .await?
+        }
+    };
     let proof = publish_index_build_proof_and_checkpoint(
         storage,
         bucket,
@@ -478,13 +551,6 @@ pub(crate) async fn build_typed_json_index(
     .await
 }
 
-pub(crate) struct FrozenTypedJsonIndexSource {
-    pub object: Object,
-    pub payload: Vec<u8>,
-    pub boundary_values: Vec<CoreBoundaryValue>,
-    pub source_manifest_hash: String,
-}
-
 /// Build and publish a typed-JSON segment from transaction-frozen inputs. The
 /// supplied source-manifest hash is carried into the proof/checkpoint without
 /// re-enumerating mutable object metadata.
@@ -496,7 +562,7 @@ pub(crate) async fn build_frozen_typed_json_index(
     source_cursor: u128,
     builder_node_id: &str,
     authority: IndexBuildAuthority<'_>,
-    source: FrozenTypedJsonIndexSource,
+    source: FrozenObjectIndexSource,
 ) -> Result<IndexBuildOutcome> {
     build_typed_json_index_from_source(
         storage,
@@ -519,7 +585,7 @@ async fn build_typed_json_index_from_source(
     source_cursor: u128,
     builder_node_id: &str,
     authority: IndexBuildAuthority<'_>,
-    frozen_source: Option<FrozenTypedJsonIndexSource>,
+    frozen_source: Option<FrozenObjectIndexSource>,
 ) -> Result<IndexBuildOutcome> {
     if index.kind != "typed_json" {
         return Err(anyhow!("index build only supports typed_json indexes"));
@@ -952,6 +1018,38 @@ pub(crate) async fn build_vector_index(
         "vector",
         embedding_providers,
         authority,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn build_frozen_vector_index(
+    storage: &Storage,
+    bucket: &Bucket,
+    index: &IndexDefinition,
+    partition_owner_signing_key: &[u8],
+    source_cursor: u128,
+    builder_node_id: &str,
+    embedding_providers: &EmbeddingProviderRegistry,
+    authority: IndexBuildAuthority<'_>,
+    source: FrozenObjectIndexSource,
+) -> Result<IndexBuildOutcome> {
+    if index.kind != "vector" {
+        return Err(anyhow!("index build only supports vector indexes"));
+    }
+    build_vector_index_with_policy(
+        storage,
+        bucket,
+        index,
+        &index.build_policy,
+        &index.extractor,
+        partition_owner_signing_key,
+        source_cursor,
+        builder_node_id,
+        "vector",
+        embedding_providers,
+        authority,
+        Some(source),
     )
     .await
 }
@@ -1011,6 +1109,7 @@ pub(crate) async fn build_hybrid_index(
         "hybrid",
         embedding_providers,
         authority,
+        None,
     )
     .await?;
 
@@ -1043,6 +1142,7 @@ async fn build_vector_index_with_policy(
     outcome_kind: &str,
     embedding_providers: &EmbeddingProviderRegistry,
     authority: IndexBuildAuthority<'_>,
+    frozen_source: Option<FrozenObjectIndexSource>,
 ) -> Result<IndexBuildOutcome> {
     if !index.enabled {
         return Err(anyhow!("index build requires an enabled index"));
@@ -1061,14 +1161,26 @@ async fn build_vector_index_with_policy(
         .max(u64::try_from(source_cursor).unwrap_or(u64::MAX))
         .max(1);
 
-    let objects = metadata_journal::read_current_objects_through_sequence(
-        storage,
-        bucket,
-        partition_owner_signing_key,
-        source_cursor,
-    )
-    .await?;
-    let boundary_values = boundary_values_for_objects(storage, &objects).await?;
+    let frozen_source_manifest_hash = frozen_source
+        .as_ref()
+        .map(|source| source.source_manifest_hash.clone());
+    let frozen_payload = frozen_source
+        .as_ref()
+        .map(|source| (source.object.version_id, source.payload.clone()));
+    let (objects, boundary_values) = match frozen_source {
+        Some(source) => (vec![source.object], source.boundary_values),
+        None => {
+            let objects = metadata_journal::read_current_objects_through_sequence(
+                storage,
+                bucket,
+                partition_owner_signing_key,
+                source_cursor,
+            )
+            .await?;
+            let boundary_values = boundary_values_for_objects(storage, &objects).await?;
+            (objects, boundary_values)
+        }
+    };
     let core_store = CoreStore::new(storage.clone()).await?;
     let mut vector_documents = Vec::new();
     let mut diagnostics = Vec::new();
@@ -1076,7 +1188,10 @@ async fn build_vector_index_with_policy(
         if object.deleted_at.is_some() || !selector_matches(&index.selector, &object) {
             continue;
         }
-        let payload = read_object_payload(&core_store, &object).await?;
+        let payload = match &frozen_payload {
+            Some((version_id, payload)) if *version_id == object.version_id => payload.clone(),
+            _ => read_object_payload(&core_store, &object).await?,
+        };
         let extraction = extract_vectors(
             &definition.extractor,
             &payload,
@@ -1228,13 +1343,18 @@ async fn build_vector_index_with_policy(
         .await?;
     let segment_hash = staged_segment.segment_hash.clone();
     let partition_id = hex::encode(hash32(index_storage_id.as_bytes()));
-    let source_manifest_hash = metadata_journal::object_metadata_source_checkpoint_hash(
-        storage,
-        bucket,
-        partition_owner_signing_key,
-        source_cursor,
-    )
-    .await?;
+    let source_manifest_hash = match frozen_source_manifest_hash {
+        Some(hash) => hash,
+        None => {
+            metadata_journal::object_metadata_source_checkpoint_hash(
+                storage,
+                bucket,
+                partition_owner_signing_key,
+                source_cursor,
+            )
+            .await?
+        }
+    };
     let proof = publish_index_build_proof_and_checkpoint(
         storage,
         bucket,
