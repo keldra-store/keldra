@@ -234,6 +234,31 @@ impl ObjectManager {
                         })
                         .await
                 }
+                ObjectDataTarget::MvccShards(manifest) => {
+                    let Some(replication) = app_state.mvcc_replication.get() else {
+                        let _ = tx
+                            .send(Err(Status::failed_precondition(
+                                "MVCC replication reader is not installed",
+                            )))
+                            .await;
+                        return;
+                    };
+                    let start = range.map(|range| range.start).unwrap_or(0);
+                    let end = range
+                        .map(|range| range.end_exclusive)
+                        .unwrap_or(manifest.object_length)
+                        .min(manifest.object_length);
+                    manifest
+                        .read_range_chunks(replication, start, end, |chunk| {
+                            let tx = tx.clone();
+                            async move {
+                                tx.send(Ok(chunk))
+                                    .await
+                                    .map_err(|_| anyhow!("object read response stream closed"))
+                            }
+                        })
+                        .await
+                }
             };
 
             match read_result {
@@ -1328,6 +1353,7 @@ impl ObjectManager {
                     .map(|_| crate::object_manager::transaction_principal_from_claims(&claims)),
                 storage_class_id: None,
                 visibility: ObjectWriteVisibility::strict(),
+                prepared_ingest: None,
             },
         )
         .await

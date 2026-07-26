@@ -16,8 +16,8 @@ use uuid::Uuid;
 use crate::{
     anvil_api::{
         ReplicationAckStatus, ReplicationApplicationAck, ReplicationDataFrame,
-        ReplicationSessionOpen, ReplicationStreamRequest, ReplicationStreamResponse,
-        ReplicationTransferKind, ReplicationTransferWatermark,
+        ReplicationReadRequest, ReplicationSessionOpen, ReplicationStreamRequest,
+        ReplicationStreamResponse, ReplicationTransferKind, ReplicationTransferWatermark,
         replication_service_client::ReplicationServiceClient, replication_stream_request,
         replication_stream_response,
     },
@@ -79,6 +79,17 @@ pub struct TonicReplicationStreamManager {
     node_token: Arc<str>,
     options: ReplicationStreamOptions,
     peers: Arc<BTreeMap<(String, NodeIncarnation), Arc<AsyncMutex<PeerState>>>>,
+}
+
+impl std::fmt::Debug for TonicReplicationStreamManager {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TonicReplicationStreamManager")
+            .field("cluster_id", &self.cluster_id)
+            .field("local_node", &self.local_node)
+            .field("peer_count", &self.peers.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl TonicReplicationStreamManager {
@@ -185,6 +196,106 @@ impl TonicReplicationStreamManager {
             }
         }
         Err(last_error.unwrap_or_else(|| anyhow!("replication transfer failed")))
+    }
+
+    pub async fn read_complete_transfer(
+        &self,
+        cluster_id: &str,
+        target: &NodeIncarnation,
+        transfer_id: Uuid,
+        expected_length: u64,
+        expected_hash: [u8; 32],
+    ) -> Result<Vec<u8>> {
+        let peer = self
+            .peers
+            .get(&(cluster_id.to_string(), target.clone()))
+            .with_context(|| format!("no replication endpoint for {cluster_id}/{target:?}"))?
+            .clone();
+        if cluster_id != &*self.cluster_id {
+            bail!("cross-cluster replication reads require a separate replication boundary");
+        }
+        let mut peer = peer.lock().await;
+        let mut last_error = None;
+        for _ in 0..=self.options.reconnect_attempts {
+            if peer.session.is_none() {
+                match self.connect(&peer.channel).await {
+                    Ok(session) => peer.session = Some(session),
+                    Err(error) => {
+                        last_error = Some(error);
+                        continue;
+                    }
+                }
+            }
+            match self
+                .read_on_session(
+                    peer.session.as_mut().expect("session established"),
+                    transfer_id,
+                    expected_length,
+                    expected_hash,
+                )
+                .await
+            {
+                Ok(bytes) => return Ok(bytes),
+                Err(error) => {
+                    last_error = Some(error);
+                    peer.session = None;
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow!("replication read failed")))
+    }
+
+    async fn read_on_session(
+        &self,
+        session: &mut ConnectedStream,
+        transfer_id: Uuid,
+        expected_length: u64,
+        expected_hash: [u8; 32],
+    ) -> Result<Vec<u8>> {
+        let capacity =
+            usize::try_from(expected_length).context("replication read exceeds address space")?;
+        let mut bytes = Vec::with_capacity(capacity);
+        loop {
+            send_timeout(
+                self.options.operation_timeout,
+                &session.output,
+                request(replication_stream_request::Message::Read(
+                    ReplicationReadRequest {
+                        transfer_id: transfer_id.to_string(),
+                        offset: bytes.len() as u64,
+                        max_bytes: self.options.frame_bytes as u64,
+                    },
+                )),
+            )
+            .await?;
+            let response = timeout_message(self.options.operation_timeout, &mut session.input)
+                .await?
+                .context("replication stream ended while awaiting read chunk")?;
+            let Some(replication_stream_response::Message::Read(chunk)) = response.message else {
+                bail!("unexpected replication response while awaiting read chunk");
+            };
+            if chunk.transfer_id != transfer_id.to_string()
+                || chunk.offset != bytes.len() as u64
+                || chunk.total_length != expected_length
+                || parse_optional_hash(&chunk.completed_hash)? != Some(expected_hash)
+                || chunk.payload_checksum != ReplicationFrame::checksum(&chunk.payload)
+            {
+                bail!("replication read chunk failed immutable metadata verification");
+            }
+            bytes.extend_from_slice(&chunk.payload);
+            if bytes.len() as u64 > expected_length {
+                bail!("replication read exceeded immutable length");
+            }
+            if chunk.finish {
+                if bytes.len() as u64 != expected_length {
+                    bail!("replication read finished before immutable length");
+                }
+                return Ok(bytes);
+            }
+            if chunk.payload.is_empty() {
+                bail!("replication read made no progress");
+            }
+        }
     }
 
     async fn connect(&self, channel: &Channel) -> Result<ConnectedStream> {
@@ -380,6 +491,25 @@ impl BundleTargetStream for TonicReplicationStreamManager {
     }
 }
 
+pub fn object_shard_transfer_id(
+    object_identity: Uuid,
+    encoding_generation: u64,
+    stripe_ordinal: u64,
+    shard_ordinal: u16,
+    payload_hash: [u8; 32],
+    payload_length: u64,
+) -> Uuid {
+    let partition = format!(
+        "object/{object_identity}/generation/{encoding_generation}/stripe/{stripe_ordinal}/shard/{shard_ordinal}"
+    );
+    deterministic_transfer_id(
+        ReplicationTransferKind::ObjectShard,
+        partition.as_bytes(),
+        payload_hash,
+        payload_length,
+    )
+}
+
 #[async_trait]
 impl ShardTargetStream for TonicReplicationStreamManager {
     async fn send(&self, target: &ShardTarget, shard: &EncodedShard<'_>) -> Result<ReplicationAck> {
@@ -390,9 +520,11 @@ impl ShardTargetStream for TonicReplicationStreamManager {
             shard.stripe_ordinal,
             shard.shard_ordinal
         );
-        let transfer_id = deterministic_transfer_id(
-            ReplicationTransferKind::ObjectShard,
-            partition.as_bytes(),
+        let transfer_id = object_shard_transfer_id(
+            shard.object_identity,
+            shard.encoding_generation,
+            shard.stripe_ordinal,
+            shard.shard_ordinal,
             shard.payload_hash,
             shard.payload.len() as u64,
         );
@@ -648,6 +780,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first.status, AckStatus::Complete);
+        assert_eq!(
+            manager
+                .read_complete_transfer(
+                    "cluster-a",
+                    &target.node,
+                    first.transfer_id,
+                    identity.length,
+                    parse_identity_hash(&identity.hash).unwrap(),
+                )
+                .await
+                .unwrap(),
+            bytes
+        );
         let second = manager
             .send_bundle(&target, &identity, bytes)
             .await

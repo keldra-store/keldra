@@ -11,10 +11,10 @@ use uuid::Uuid;
 use crate::{
     anvil_api::{
         ReplicationAckStatus, ReplicationApplicationAck, ReplicationDataFrame,
-        ReplicationSessionAccepted, ReplicationSessionOpen, ReplicationStreamRequest,
-        ReplicationStreamResponse, ReplicationTransferKind, ReplicationTransferWatermark,
-        replication_service_server::ReplicationService, replication_stream_request,
-        replication_stream_response,
+        ReplicationReadChunk, ReplicationSessionAccepted, ReplicationSessionOpen,
+        ReplicationStreamRequest, ReplicationStreamResponse, ReplicationTransferKind,
+        ReplicationTransferWatermark, replication_service_server::ReplicationService,
+        replication_stream_request, replication_stream_response,
     },
     replication::{
         AckStatus, AuthenticatedPeer, ConnectionSession, ReplicationFrame, TransferKind,
@@ -208,6 +208,66 @@ impl<A: ReplicationConnectionAuthorizer> ReplicationServiceImpl<A> {
                                 },
                             ),
                         )))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
+                Some(replication_stream_request::Message::Read(read)) => {
+                    let transfer_id = match parse_uuid("transfer_id", &read.transfer_id) {
+                        Ok(transfer_id) => transfer_id,
+                        Err(error) => {
+                            send_error(&output, error).await;
+                            return;
+                        }
+                    };
+                    let max_bytes = match usize::try_from(read.max_bytes) {
+                        Ok(max_bytes) if max_bytes > 0 => max_bytes,
+                        _ => {
+                            send_error(
+                                &output,
+                                Status::invalid_argument(
+                                    "replication read max_bytes must fit usize and be non-zero",
+                                ),
+                            )
+                            .await;
+                            return;
+                        }
+                    };
+                    let receiver = self.receiver.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        receiver
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("replication receiver lock poisoned"))?
+                            .read_complete_chunk(transfer_id, read.offset, max_bytes)
+                    })
+                    .await;
+                    let chunk = match result {
+                        Ok(Ok(chunk)) => chunk,
+                        Ok(Err(error)) => {
+                            send_error(&output, Status::not_found(error.to_string())).await;
+                            return;
+                        }
+                        Err(error) => {
+                            send_error(&output, Status::internal(error.to_string())).await;
+                            return;
+                        }
+                    };
+                    if output
+                        .send(Ok(response(replication_stream_response::Message::Read(
+                            ReplicationReadChunk {
+                                transfer_id: transfer_id.to_string(),
+                                offset: chunk.offset,
+                                payload_checksum: ReplicationFrame::checksum(&chunk.payload)
+                                    .to_vec(),
+                                payload: chunk.payload,
+                                total_length: chunk.total_length,
+                                completed_hash: chunk.completed_hash.to_vec(),
+                                finish: chunk.finish,
+                            },
+                        ))))
                         .await
                         .is_err()
                     {

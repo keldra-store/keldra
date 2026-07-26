@@ -22,7 +22,7 @@ use crate::{
     storage::Storage,
     validation, watch_log,
 };
-use anyhow::{Result as AnyhowResult, anyhow, bail};
+use anyhow::{Context, Result as AnyhowResult, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{Stream, StreamExt};
 use serde_json::Value as JsonValue;
@@ -44,7 +44,7 @@ pub(crate) use batch_write::ObjectBatchPut;
 pub use write_visibility::{
     AuthzMaterializationVisibility, AuthzRevisionVisibility, BoundaryExtractionVisibility,
     IndexMaintenanceVisibility, IndexPolicySnapshotVisibility, ObjectWriteOptions,
-    ObjectWriteVisibility, WatchVisibility,
+    ObjectWriteVisibility, PreparedObjectIngest, WatchVisibility,
 };
 
 #[derive(Debug, Clone)]
@@ -56,6 +56,9 @@ pub struct ObjectManager {
     cross_region_routing_policy: CrossRegionRoutingPolicy,
     signing_key: Vec<u8>,
     observability: Observability,
+    mvcc_replication: std::sync::Arc<
+        std::sync::OnceLock<crate::replication_client::TonicReplicationStreamManager>,
+    >,
 }
 
 #[derive(Debug, Clone)]
@@ -212,7 +215,17 @@ impl ObjectManager {
             cross_region_routing_policy,
             signing_key,
             observability,
+            mvcc_replication: Default::default(),
         }
+    }
+
+    pub fn install_mvcc_replication(
+        &self,
+        replication: crate::replication_client::TonicReplicationStreamManager,
+    ) -> AnyhowResult<()> {
+        self.mvcc_replication
+            .set(replication)
+            .map_err(|_| anyhow!("MVCC replication client is already installed"))
     }
 
     fn record_reserved_namespace_rejection(&self, operation: &'static str) {
@@ -466,25 +479,51 @@ impl ObjectManager {
             step_start.elapsed(),
         );
         let step_start = std::time::Instant::now();
-        let (temp_path, total_bytes, stream_hash) = self
-            .storage
-            .stream_to_temp_file(data_stream)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let prepared_ingest = options.prepared_ingest.clone();
+        let (temp_path, total_bytes, stream_hash) = if let Some(prepared) = &prepared_ingest {
+            (
+                None,
+                i64::try_from(prepared.object_length)
+                    .map_err(|_| Status::invalid_argument("Object exceeds supported size"))?,
+                String::new(),
+            )
+        } else {
+            let (path, total_bytes, stream_hash) = self
+                .storage
+                .stream_to_temp_file(data_stream)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+            (Some(path), total_bytes, stream_hash)
+        };
         crate::emit_test_timing(
             "object_manager.put_object stream_to_temp_file",
             step_start.elapsed(),
         );
         let total_bytes_u64 =
             u64::try_from(total_bytes).map_err(|_| Status::internal("Negative payload size"))?;
-        let boundary_values = if options.visibility.requires_payload_boundary_extraction() {
+        let boundary_values = if prepared_ingest.is_some() {
+            if options.visibility.requires_payload_boundary_extraction() {
+                return Err(Status::failed_precondition(
+                    "streaming MVCC ingest requires boundary hints; synchronous payload extraction is unavailable",
+                ));
+            }
+            self.object_write_boundary_values_from_hints(
+                tenant_id,
+                &bucket.name,
+                object_key,
+                options.content_type.as_deref(),
+                options.user_metadata.as_ref(),
+                total_bytes_u64,
+            )
+            .await?
+        } else if options.visibility.requires_payload_boundary_extraction() {
             self.object_write_boundary_values_from_file(
                 tenant_id,
                 &bucket.name,
                 object_key,
                 options.content_type.as_deref(),
                 options.user_metadata.as_ref(),
-                &temp_path,
+                temp_path.as_ref().expect("staged path exists"),
                 total_bytes_u64,
             )
             .await?
@@ -523,8 +562,10 @@ impl ObjectManager {
         let inline_eligible =
             storage_class.inline_payload_policy.enabled && total_bytes_u64 <= inline_cap;
 
-        let (content_hash, shard_map) = if inline_eligible {
-            let payload = tokio::fs::read(&temp_path)
+        let (content_hash, shard_map) = if let Some(prepared) = prepared_ingest {
+            (prepared.object_hash, Some(prepared.shard_map))
+        } else if inline_eligible {
+            let payload = tokio::fs::read(temp_path.as_ref().expect("staged path exists"))
                 .await
                 .map_err(|error| Status::internal(error.to_string()))?;
             let object_ref = self
@@ -554,7 +595,7 @@ impl ObjectManager {
                     writer_family: WriterFamily::ObjectBlob.as_str().to_string(),
                     generation: 0,
                     logical_file_id,
-                    source_path: temp_path.clone(),
+                    source_path: temp_path.clone().expect("staged path exists"),
                     source_len: total_bytes_u64,
                     source_hash: format!("sha256:{stream_hash}"),
                     range_hints: Vec::new(),
@@ -575,21 +616,23 @@ impl ObjectManager {
             );
             (content_hash, shard_map)
         };
-        let io_start = Instant::now();
-        let remove_result = tokio::fs::remove_file(&temp_path).await;
-        crate::perf::record_io_duration(
-            "object_manager",
-            "remove_temp_payload",
-            &temp_path,
-            total_bytes_u64,
-            io_start.elapsed(),
-        );
-        if let Err(error) = remove_result {
-            tracing::warn!(
-                path = %temp_path.display(),
-                %error,
-                "failed to remove non-authoritative staged object payload"
+        if let Some(temp_path) = temp_path {
+            let io_start = Instant::now();
+            let remove_result = tokio::fs::remove_file(&temp_path).await;
+            crate::perf::record_io_duration(
+                "object_manager",
+                "remove_temp_payload",
+                &temp_path,
+                total_bytes_u64,
+                io_start.elapsed(),
             );
+            if let Err(error) = remove_result {
+                tracing::warn!(
+                    path = %temp_path.display(),
+                    %error,
+                    "failed to remove non-authoritative staged object payload"
+                );
+            }
         }
         crate::emit_test_timing(
             "object_manager.put_object core_store_write_logical_file_path",
@@ -1538,6 +1581,7 @@ fn validate_multipart_part_number(part_number: i32) -> Result<(), Status> {
 enum ObjectDataTarget {
     LogicalFile(CoreManifestLocator),
     ObjectRef(CoreObjectRef),
+    MvccShards(crate::object_shard_manifest::PhysicalObjectShardManifest),
 }
 
 fn object_data_target_to_shard_map(target: &ObjectDataTarget) -> AnyhowResult<JsonValue> {
@@ -1552,10 +1596,25 @@ fn object_data_target_to_shard_map(target: &ObjectDataTarget) -> AnyhowResult<Js
             "kind": "object_ref",
             "target": encode_core_object_ref_target(object_ref)?,
         })),
+        ObjectDataTarget::MvccShards(manifest) => Ok(serde_json::json!({
+            "schema": "anvil.mvcc.object_shard_manifest.v1",
+            "manifest": manifest,
+        })),
     }
 }
 
 fn object_data_target_from_shard_map(value: &JsonValue) -> AnyhowResult<ObjectDataTarget> {
+    if value.get("schema").and_then(JsonValue::as_str)
+        == Some("anvil.mvcc.object_shard_manifest.v1")
+    {
+        let manifest = serde_json::from_value(
+            value
+                .get("manifest")
+                .cloned()
+                .context("MVCC object shard manifest is missing")?,
+        )?;
+        return Ok(ObjectDataTarget::MvccShards(manifest));
+    }
     if value.get("schema").and_then(JsonValue::as_str) == Some("anvil.core.object_data_target.v1") {
         let kind = value
             .get("kind")

@@ -393,6 +393,7 @@ pub(super) async fn execute_mutation_batch(
                             }),
                             storage_class_id: op.storage_class,
                             visibility: write_visibility,
+                            prepared_ingest: None,
                         },
                     )
                     .await?;

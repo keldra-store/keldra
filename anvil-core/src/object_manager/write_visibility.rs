@@ -1,6 +1,13 @@
 use crate::persistence::ObjectCreateOptions;
 use serde_json::Value as JsonValue;
 
+#[derive(Debug, Clone)]
+pub struct PreparedObjectIngest {
+    pub object_hash: String,
+    pub object_length: u64,
+    pub shard_map: JsonValue,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ObjectWriteOptions {
     pub content_type: Option<String>,
@@ -9,6 +16,7 @@ pub struct ObjectWriteOptions {
     pub transaction_principal: Option<String>,
     pub storage_class_id: Option<String>,
     pub visibility: ObjectWriteVisibility,
+    pub prepared_ingest: Option<PreparedObjectIngest>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

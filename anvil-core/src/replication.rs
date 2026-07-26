@@ -156,6 +156,15 @@ pub struct TransferWatermark {
     pub completed_hash: Option<[u8; 32]>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompleteTransferChunk {
+    pub offset: u64,
+    pub payload: Vec<u8>,
+    pub total_length: u64,
+    pub completed_hash: [u8; 32],
+    pub finish: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct TransferMetadata {
     transfer_id: Uuid,
@@ -227,6 +236,40 @@ impl TransferReceiver {
             }));
         }
         Ok(None)
+    }
+
+    pub fn read_complete_chunk(
+        &self,
+        transfer_id: Uuid,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<CompleteTransferChunk> {
+        if max_bytes == 0 {
+            bail!("replication read chunk size must be non-zero");
+        }
+        let metadata = self
+            .metadata
+            .get(&transfer_id)
+            .context("replication transfer metadata is missing")?;
+        let path = self.complete_path(transfer_id);
+        let mut file = File::open(&path).context("replication transfer is not complete")?;
+        let total_length = file.metadata()?.len();
+        if total_length != metadata.total_length || offset > total_length {
+            bail!("replication read offset or immutable length is invalid");
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        let remaining = total_length - offset;
+        let read_len = usize::try_from(remaining.min(max_bytes as u64))
+            .context("replication read length exceeds address space")?;
+        let mut payload = vec![0; read_len];
+        file.read_exact(&mut payload)?;
+        Ok(CompleteTransferChunk {
+            offset,
+            payload,
+            total_length,
+            completed_hash: metadata.final_hash,
+            finish: offset + read_len as u64 == total_length,
+        })
     }
 
     pub fn receive(

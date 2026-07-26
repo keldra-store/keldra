@@ -149,6 +149,8 @@ pub struct DistributedIngest<'a, T> {
 struct CompletedShard {
     stripe_ordinal: u64,
     shard_ordinal: u16,
+    payload_length: u64,
+    payload_hash: [u8; 32],
     target: ShardTarget,
 }
 
@@ -156,6 +158,16 @@ struct CompletedShard {
 pub struct DistributedIngestResult {
     pub encoded: EncodedObject,
     pub evidence: Vec<ObjectDurabilityEvidence>,
+    pub placements: Vec<CompletedShardPlacement>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompletedShardPlacement {
+    pub stripe_ordinal: u64,
+    pub shard_ordinal: u16,
+    pub payload_length: u64,
+    pub payload_hash: [u8; 32],
+    pub target: ShardTarget,
 }
 
 impl<'a, T: ShardTargetStream> DistributedIngest<'a, T> {
@@ -167,7 +179,7 @@ impl<'a, T: ShardTargetStream> DistributedIngest<'a, T> {
         durability: DurabilityLevel,
         reader: &mut R,
         object_identity: Uuid,
-        expected_object_hash: &str,
+        expected_object_hash: Option<&str>,
         encoding_generation: u64,
     ) -> Result<DistributedIngestResult> {
         if durability == DurabilityLevel::Local {
@@ -189,17 +201,31 @@ impl<'a, T: ShardTargetStream> DistributedIngest<'a, T> {
         let encoded = encoder
             .encode(reader, object_identity, encoding_generation, &mut sink)
             .await?;
-        let expected_hash = parse_sha256(expected_object_hash)?;
-        if encoded.content_hash != expected_hash {
-            bail!("streamed object content hash does not match expected object identity");
+        if let Some(expected_object_hash) = expected_object_hash {
+            let expected_hash = parse_sha256(expected_object_hash)?;
+            if encoded.content_hash != expected_hash {
+                bail!("streamed object content hash does not match expected object identity");
+            }
         }
+        let object_hash = format!("sha256:{}", hex::encode(encoded.content_hash));
         sink.validate(encoded.stripe_count)?;
+        let placements = sink
+            .completed
+            .iter()
+            .map(|completed| CompletedShardPlacement {
+                stripe_ordinal: completed.stripe_ordinal,
+                shard_ordinal: completed.shard_ordinal,
+                payload_length: completed.payload_length,
+                payload_hash: completed.payload_hash,
+                target: completed.target.clone(),
+            })
+            .collect();
         let evidence = sink
             .completed
             .into_iter()
             .map(|completed| ObjectDurabilityEvidence::ShardPlacement {
                 cluster_id: completed.target.cluster_id.clone(),
-                object_hash: expected_object_hash.to_string(),
+                object_hash: object_hash.clone(),
                 encoding_generation,
                 stripe_ordinal: completed.stripe_ordinal,
                 shard_ordinal: completed.shard_ordinal,
@@ -212,7 +238,11 @@ impl<'a, T: ShardTargetStream> DistributedIngest<'a, T> {
                 fsynced: true,
             })
             .collect();
-        Ok(DistributedIngestResult { encoded, evidence })
+        Ok(DistributedIngestResult {
+            encoded,
+            evidence,
+            placements,
+        })
     }
 
     fn validate(&self, stripe_count: u64) -> Result<()> {
@@ -263,6 +293,8 @@ impl<T: ShardTargetStream> ShardSink for DistributedIngest<'_, T> {
                 self.completed.push(CompletedShard {
                     stripe_ordinal: shard.stripe_ordinal,
                     shard_ordinal: shard.shard_ordinal,
+                    payload_length: shard.payload.len() as u64,
+                    payload_hash: shard.payload_hash,
                     target: target.clone(),
                 });
                 Ok(())
@@ -512,7 +544,7 @@ mod tests {
             DurabilityLevel::Quorum,
             &mut Cursor::new(bytes),
             object_identity,
-            &object_hash(bytes),
+            Some(&object_hash(bytes)),
             1,
         )
         .await
@@ -550,7 +582,7 @@ mod tests {
             DurabilityLevel::Erasure,
             &mut Cursor::new(bytes),
             object_identity,
-            &object_hash(bytes),
+            Some(&object_hash(bytes)),
             1,
         )
         .await
@@ -580,7 +612,7 @@ mod tests {
             DurabilityLevel::Quorum,
             &mut Cursor::new(bytes),
             object_identity,
-            &object_hash(bytes),
+            Some(&object_hash(bytes)),
             1,
         )
         .await
