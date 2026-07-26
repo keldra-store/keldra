@@ -6,9 +6,7 @@ use crate::{
     },
     personaldb_control::PersonalDbSnapshotManifest,
     personaldb_heads::{
-        PersonalDbCommittedHead, PersonalDbSnapshotsHead, read_personaldb_committed_head,
-        read_personaldb_group_manifest, read_personaldb_snapshots_head,
-        write_personaldb_snapshots_head,
+        PersonalDbCommittedHead, PersonalDbSnapshotsHead, read_personaldb_group_manifest,
     },
     personaldb_segment::{list_personaldb_log_segment_refs, read_personaldb_log_segment},
     personaldb_signing::PersonalDbProtocolKeyring,
@@ -91,13 +89,13 @@ pub async fn maybe_build_personaldb_snapshot(
         return Err(anyhow!("personaldb snapshot schema hash mismatch"));
     }
 
-    let previous_snapshot = read_personaldb_snapshots_head(
-        storage,
+    let previous_snapshot = crate::personaldb_heads::read_personaldb_snapshots_head_at_snapshot(
+        mvcc,
         request.tenant_id,
         request.database_id,
         protocol_keyring.trust_store(),
-    )
-    .await?;
+        snapshot_version,
+    )?;
     let base_log_index = previous_snapshot
         .as_ref()
         .map(|head| head.latest_snapshot_log_index)
@@ -295,12 +293,14 @@ async fn publish_snapshots_head(
     }
     .seal(protocol_keyring)
     .await?;
-    write_personaldb_snapshots_head(
-        storage,
+    crate::personaldb_heads::write_personaldb_snapshots_head_mvcc(
+        mvcc,
         request.tenant_id,
         request.database_id,
+        previous_snapshot.as_ref(),
         &head,
         protocol_keyring.trust_store(),
+        request.created_by_node,
     )
     .await
 }

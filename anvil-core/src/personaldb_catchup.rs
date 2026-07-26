@@ -7,8 +7,7 @@ use crate::{
     },
     personaldb_control::PersonalDbCommitCertificate,
     personaldb_heads::{
-        PersonalDbCommittedHead, PersonalDbSnapshotsHead, read_personaldb_committed_head,
-        read_personaldb_group_manifest, read_personaldb_snapshots_head,
+        PersonalDbCommittedHead, PersonalDbSnapshotsHead, read_personaldb_group_manifest,
     },
     personaldb_segment::{list_personaldb_log_segment_refs, read_personaldb_log_segment},
     storage::Storage,
@@ -80,6 +79,8 @@ pub async fn personaldb_catch_up(
     else {
         return Ok(snapshot_required(
             storage,
+            mvcc,
+            snapshot_version,
             &request,
             None,
             trust_store,
@@ -93,6 +94,8 @@ pub async fn personaldb_catch_up(
     if !is_replica_position_on_chain(storage, &request, trust_store, &records).await? {
         return Ok(snapshot_required(
             storage,
+            mvcc,
+            snapshot_version,
             &request,
             Some(committed_head),
             trust_store,
@@ -218,18 +221,20 @@ async fn is_replica_position_on_chain(
 
 async fn snapshot_required(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    snapshot_version: u64,
     request: &PersonalDbCatchUpRequest,
     committed_head: Option<PersonalDbCommittedHead>,
     trust_store: &PublicKeyTrustStore,
     reason: PersonalDbSnapshotRestoreReason,
 ) -> Result<PersonalDbCatchUpResponse> {
-    let snapshots_head = read_personaldb_snapshots_head(
-        storage,
+    let snapshots_head = crate::personaldb_heads::read_personaldb_snapshots_head_at_snapshot(
+        mvcc,
         request.tenant_id,
         &request.database_id,
         trust_store,
-    )
-    .await?;
+        snapshot_version,
+    )?;
     Ok(PersonalDbCatchUpResponse::SnapshotRequired(
         PersonalDbSnapshotRestore {
             committed_head,

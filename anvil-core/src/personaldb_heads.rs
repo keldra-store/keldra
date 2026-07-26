@@ -311,42 +311,6 @@ pub async fn read_personaldb_group_manifest(
     Ok(Some(manifest))
 }
 
-pub async fn write_personaldb_snapshots_head(
-    storage: &Storage,
-    tenant_id: i64,
-    database_id: &str,
-    head: &PersonalDbSnapshotsHead,
-    trust_store: &PublicKeyTrustStore,
-) -> Result<()> {
-    head.verify(trust_store)?;
-    ensure_head_scope(tenant_id, database_id, &head.tenant_id, &head.database_id)?;
-    write_head_record(
-        storage,
-        &personaldb_head_data_id(tenant_id, database_id, "snapshots_head")?,
-        head,
-    )
-    .await
-}
-
-pub async fn read_personaldb_snapshots_head(
-    storage: &Storage,
-    tenant_id: i64,
-    database_id: &str,
-    trust_store: &PublicKeyTrustStore,
-) -> Result<Option<PersonalDbSnapshotsHead>> {
-    let Some(head) = read_head_record::<PersonalDbSnapshotsHead>(
-        storage,
-        &personaldb_head_data_id(tenant_id, database_id, "snapshots_head")?,
-    )
-    .await?
-    else {
-        return Ok(None);
-    };
-    head.verify(trust_store)?;
-    ensure_head_scope(tenant_id, database_id, &head.tenant_id, &head.database_id)?;
-    Ok(Some(head))
-}
-
 pub(crate) fn validate_committed_head_unsigned(head: &PersonalDbCommittedHead) -> Result<()> {
     if head.format_version != 2 {
         return Err(anyhow!("unsupported personaldb committed head version"));
