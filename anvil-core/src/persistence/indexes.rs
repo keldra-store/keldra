@@ -301,7 +301,7 @@ impl Persistence {
             index_version,
             source_cursor,
             index_builder::IndexBuildAuthority::DirectRepair(
-                index_builder::DirectRepairIndexBuildAuthority::new(),
+                index_builder::DirectRepairIndexBuildAuthority::new(self.mvcc()?),
             ),
         )
         .await
@@ -577,6 +577,7 @@ impl Persistence {
             .await?;
         directory_repair::repair_directory_index(
             &self.storage,
+            self.mvcc()?,
             &bucket,
             rebuild,
             &permit,

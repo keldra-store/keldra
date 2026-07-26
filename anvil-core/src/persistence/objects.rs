@@ -1219,6 +1219,7 @@ impl Persistence {
             .await?;
         metadata_journal::seal_object_journal_segments_with_permit(
             &self.storage,
+            self.mvcc()?,
             &bucket,
             &self.partition_owner_signing_key,
             &permit,
@@ -1241,6 +1242,7 @@ impl Persistence {
             .await?;
         metadata_journal::seal_object_journal_segments_with_task_guard(
             &self.storage,
+            self.mvcc()?,
             &bucket,
             &self.partition_owner_signing_key,
             &permit,

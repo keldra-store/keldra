@@ -825,20 +825,9 @@ struct SegmentHeader {
     bloom_bits_per_key: u8,
 }
 
-#[cfg(test)]
-async fn seal_object_journal_segments(
-    storage: &Storage,
-    bucket: &Bucket,
-    manifest_signing_key: &[u8],
-) -> Result<SealedObjectMetadataSegments> {
-    let compaction_started_at = std::time::Instant::now();
-    let staged = stage_object_journal_segments(storage, bucket, manifest_signing_key, 0).await?;
-    publish_staged_compaction(storage, bucket, &staged, &[]).await?;
-    complete_staged_compaction(staged, "object_metadata_seal", compaction_started_at)
-}
-
 pub(crate) async fn seal_object_journal_segments_with_permit(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     manifest_signing_key: &[u8],
     permit: &PartitionWritePermit,
@@ -851,12 +840,13 @@ pub(crate) async fn seal_object_journal_segments_with_permit(
     let staged =
         stage_object_journal_segments(storage, bucket, manifest_signing_key, permit.fence_token)
             .await?;
-    publish_staged_compaction(storage, bucket, &staged, &[partition_precondition]).await?;
+    publish_staged_compaction(storage, mvcc, bucket, &staged, &[partition_precondition]).await?;
     complete_staged_compaction(staged, "object_metadata_seal", compaction_started_at)
 }
 
 pub(crate) async fn seal_object_journal_segments_with_task_guard(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     manifest_signing_key: &[u8],
     permit: &PartitionWritePermit,
@@ -872,6 +862,7 @@ pub(crate) async fn seal_object_journal_segments_with_task_guard(
             .await?;
     publish_staged_compaction_for_task(
         storage,
+        mvcc,
         bucket,
         &staged,
         &partition_precondition,
@@ -998,6 +989,7 @@ async fn stage_object_metadata_compaction(
 
 async fn publish_staged_compaction(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     staged: &StagedObjectMetadataCompaction,
     additional_preconditions: &[CoreMutationPrecondition],
@@ -1006,7 +998,7 @@ async fn publish_staged_compaction(
         publish_segment_catalog(storage, segment, additional_preconditions).await?;
     }
     publish_partition_manifest(
-        storage,
+        mvcc,
         bucket,
         &staged.partition_manifest,
         additional_preconditions,
@@ -1016,6 +1008,7 @@ async fn publish_staged_compaction(
 
 async fn publish_staged_compaction_for_task(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     staged: &StagedObjectMetadataCompaction,
     partition_precondition: &CoreMutationPrecondition,
@@ -1035,7 +1028,7 @@ async fn publish_staged_compaction_for_task(
     permit
         .publish_with(|task_precondition| async move {
             let preconditions = [partition_precondition.clone(), task_precondition];
-            publish_partition_manifest(storage, bucket, &staged.partition_manifest, &preconditions)
+            publish_partition_manifest(mvcc, bucket, &staged.partition_manifest, &preconditions)
                 .await
         })
         .await
@@ -1588,6 +1581,7 @@ pub async fn current_directory_index_snapshot_from_index(
 
 pub async fn rebuild_directory_index_from_metadata_with_permit(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     manifest_signing_key: &[u8],
     permit: &PartitionWritePermit,
@@ -1634,7 +1628,7 @@ pub async fn rebuild_directory_index_from_metadata_with_permit(
         permit.fence_token,
     )
     .await?;
-    publish_staged_compaction(storage, bucket, &staged, &[partition_precondition]).await?;
+    publish_staged_compaction(storage, mvcc, bucket, &staged, &[partition_precondition]).await?;
     complete_staged_compaction(staged, "directory_index_rebuild", compaction_started_at)
 }
 

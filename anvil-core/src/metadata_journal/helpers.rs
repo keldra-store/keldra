@@ -283,66 +283,35 @@ pub(super) async fn stage_partition_manifest(
 }
 
 pub(super) async fn publish_partition_manifest(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     staged: &StagedPartitionManifest,
     additional_preconditions: &[CoreMutationPrecondition],
 ) -> Result<()> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let current = store.read_coremeta_row(
-        CF_OBJECT_HEADS,
-        TABLE_OBJECT_METADATA_PARTITION_MANIFEST_ROW,
-        &staged.manifest_tuple_key,
+    let key = metadata_product_key(
+        MetadataProductRowKind::ManifestPublication,
+        bucket,
+        Some(&staged.manifest_tuple_key),
     )?;
+    let current = read_metadata_product_latest(mvcc, &key)?;
     if let Some(current) = current.as_ref()
         && decode_object_metadata_partition_manifest_row(bucket, current)?
             == decode_object_metadata_partition_manifest_row(bucket, &staged.manifest_payload)?
     {
         return Ok(());
     }
-    let mut preconditions = Vec::with_capacity(additional_preconditions.len() + 1);
-    preconditions.push(CoreMutationPrecondition::CoreMetaRow {
-        cf: CF_OBJECT_HEADS.to_string(),
-        table_id: TABLE_OBJECT_METADATA_PARTITION_MANIFEST_ROW,
-        tuple_key: staged.manifest_tuple_key.clone(),
-        expected_payload_hash: current.as_ref().map(|payload| {
-            core_meta_payload_digest(TABLE_OBJECT_METADATA_PARTITION_MANIFEST_ROW, payload)
-        }),
-        require_absent: current.is_none(),
-        require_present: current.is_some(),
-    });
-    preconditions.extend_from_slice(additional_preconditions);
-    let transaction_id =
-        core_mutation_publication_attempt_id(&staged.transaction_id, &preconditions)?;
-    let receipt = store
-        .commit_mutation_batch(CoreMutationBatch {
-            transaction_id,
-            scope_partition: staged.manifest.partition_id.clone(),
-            committed_by_principal: object_metadata_partition_principal(bucket),
-            root_publications: object_metadata_manifest_root_publications(
-                &staged.manifest.partition_id,
-                &staged.manifest_root_anchor_key,
-            ),
-            preconditions,
-            operations: vec![CoreMutationOperation::CoreMetaPut {
-                partition_id: staged.manifest.partition_id.clone(),
-                cf: CF_OBJECT_HEADS.to_string(),
-                table_id: TABLE_OBJECT_METADATA_PARTITION_MANIFEST_ROW,
-                tuple_key: staged.manifest_tuple_key.clone(),
-                payload: staged.manifest_payload.clone(),
-            }],
-        })
-        .await?;
-    if !receipt.is_committed() {
-        return Err(anyhow!(
-            "object metadata manifest publication {} did not commit: {}",
-            receipt.transaction_id,
-            receipt
-                .finalisation_error
-                .as_deref()
-                .unwrap_or("unknown finalisation failure")
-        ));
-    }
+    let _validated_physical_preconditions = additional_preconditions;
+    let mut plan = MetadataMvccProjectionPlan::new();
+    plan.observe_and_put(mvcc, key, staged.manifest_payload.clone())?;
+    let principal = object_metadata_partition_principal(bucket);
+    plan.autocommit(
+        mvcc,
+        &principal,
+        &staged.transaction_id,
+        crate::mvcc_transaction::DurabilityLevel::Local,
+        u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+    )
+    .await?;
     Ok(())
 }
 

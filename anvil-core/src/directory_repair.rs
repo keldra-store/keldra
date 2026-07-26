@@ -39,6 +39,7 @@ pub struct DirectoryIndexRepairReport {
 
 pub async fn repair_directory_index(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     rebuild: bool,
     permit: &PartitionWritePermit,
@@ -64,6 +65,7 @@ pub async fn repair_directory_index(
             let reason = DirectoryIndexRepairReason::InvalidDirectoryIndex(error.to_string());
             return finish_repair(
                 storage,
+                mvcc,
                 bucket,
                 rebuild,
                 permit,
@@ -96,6 +98,7 @@ pub async fn repair_directory_index(
         };
         return finish_repair(
             storage,
+            mvcc,
             bucket,
             rebuild,
             permit,
@@ -114,6 +117,7 @@ pub async fn repair_directory_index(
         };
         return finish_repair(
             storage,
+            mvcc,
             bucket,
             rebuild,
             permit,
@@ -140,6 +144,7 @@ pub async fn repair_directory_index(
 #[allow(clippy::too_many_arguments)]
 async fn finish_repair(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     rebuild: bool,
     permit: &PartitionWritePermit,
@@ -154,6 +159,7 @@ async fn finish_repair(
         rebuilt = Some(
             metadata_journal::rebuild_directory_index_from_metadata_with_permit(
                 storage,
+                mvcc,
                 bucket,
                 signing_key,
                 permit,
