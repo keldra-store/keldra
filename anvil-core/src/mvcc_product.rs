@@ -150,7 +150,7 @@ pub fn stream_logical_key(
 /// Publication roots and physical partitions are intentionally absent. Stream
 /// appends require an idempotency key, which is their stable logical record
 /// identity before a commit version is assigned.
-pub fn product_mutations_from_operations(
+fn logical_mutations_from_operations(
     operations: Vec<CoreMutationOperation>,
 ) -> Result<Vec<ProductMutation>> {
     operations
@@ -200,6 +200,46 @@ pub fn product_mutations_from_operations(
             }
         })
         .collect()
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ProductMutationPlan {
+    pub mutations: Vec<ProductMutation>,
+    pub outbox_events: Vec<crate::mvcc_outbox::StreamOutboxEvent>,
+}
+
+/// Converts legacy-shaped product operations while also extracting every
+/// stream append into the strict delivery outbox. The logical stream row
+/// remains part of the certified product state; the outbox event is certified
+/// in the same transaction and is the only mechanism that publishes it to
+/// CoreStore.
+pub fn product_mutations_and_outbox_from_operations(
+    operations: Vec<CoreMutationOperation>,
+) -> Result<ProductMutationPlan> {
+    let mut outbox = Vec::new();
+    for operation in &operations {
+        let CoreMutationOperation::StreamAppend {
+            partition_id,
+            stream_id,
+            record_kind,
+            payload,
+            ..
+        } = operation
+        else {
+            continue;
+        };
+        outbox.push(crate::mvcc_outbox::StreamOutboxEvent::new(
+            crate::mvcc_outbox::stream_partition_id(partition_id)?,
+            stream_id,
+            partition_id,
+            record_kind,
+            payload.clone(),
+        )?);
+    }
+    Ok(ProductMutationPlan {
+        mutations: logical_mutations_from_operations(operations)?,
+        outbox_events: outbox,
+    })
 }
 
 impl MvccSubsystem {

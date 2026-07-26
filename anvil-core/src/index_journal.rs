@@ -208,7 +208,9 @@ async fn append_index_definition_event_inner(
         )),
     }];
     operations.extend(projection.operations);
-    let mutations = crate::mvcc_product::product_mutations_from_operations(operations)?;
+    let plan = crate::mvcc_product::product_mutations_and_outbox_from_operations(operations)?;
+    let mutations = plan.mutations;
+    let outbox_events = plan.outbox_events;
     let now_unix_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default();
     if let Some(transaction_id) = transaction_id {
         let principal =
@@ -230,6 +232,10 @@ async fn append_index_definition_event_inner(
             })
             .collect::<Result<Vec<_>>>()?;
         mvcc.stage_product_mutations(transaction_id, principal, mutations, now_unix_ms)?;
+        for outbox_event in outbox_events {
+            mvcc.open_transactions
+                .add_stream_event(transaction_id, outbox_event, now_unix_ms)?;
+        }
         for (key, kind) in predicates {
             mvcc.stage_predicate(transaction_id, principal, key, kind, now_unix_ms)?;
         }
@@ -247,11 +253,12 @@ async fn append_index_definition_event_inner(
                 Ok((mutation.key.clone(), kind))
             })
             .collect::<Result<Vec<_>>>()?;
-        mvcc.autocommit_product_mutations_with_predicates(
+        mvcc.autocommit_product_mutations_with_predicates_and_outbox(
             &index_definition_partition_principal(event.tenant_id, event.bucket_id),
             &effective_transaction_id,
             mutations,
             predicates,
+            outbox_events,
             crate::mvcc_transaction::DurabilityLevel::Local,
             now_unix_ms,
         )

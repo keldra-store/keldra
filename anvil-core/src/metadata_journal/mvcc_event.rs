@@ -117,9 +117,14 @@ pub(super) fn plan_metadata_events(
                     serde_json::to_vec(&event)?,
                 ));
             }
-            other => mutations.extend(crate::mvcc_product::product_mutations_from_operations(
-                vec![other],
-            )?),
+            other => {
+                let plan =
+                    crate::mvcc_product::product_mutations_and_outbox_from_operations(vec![other])?;
+                if !plan.outbox_events.is_empty() {
+                    bail!("metadata event planning must handle stream appends explicitly");
+                }
+                mutations.extend(plan.mutations);
+            }
         }
     }
     mutations.push(ProductMutation::put(head_key, serde_json::to_vec(&head)?));

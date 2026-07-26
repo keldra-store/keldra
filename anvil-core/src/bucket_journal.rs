@@ -311,6 +311,7 @@ pub(crate) struct BucketMvccMutationPlan {
         crate::mvcc_transaction::LogicalKey,
         crate::mvcc_transaction::PredicateKind,
     )>,
+    pub outbox_events: Vec<crate::mvcc_outbox::StreamOutboxEvent>,
     pub allocated_bucket_id: i64,
     pub collection_revision: u64,
 }
@@ -324,6 +325,10 @@ impl BucketMvccMutationPlan {
         now_unix_ms: u64,
     ) -> Result<(i64, u64)> {
         mvcc.stage_product_mutations(transaction_id, principal, self.mutations, now_unix_ms)?;
+        for event in self.outbox_events {
+            mvcc.open_transactions
+                .add_stream_event(transaction_id, event, now_unix_ms)?;
+        }
         for (key, kind) in self.predicates {
             mvcc.stage_predicate(transaction_id, principal, key, kind, now_unix_ms)?;
         }
@@ -340,11 +345,12 @@ impl BucketMvccMutationPlan {
     ) -> Result<(i64, u64)> {
         let allocated_bucket_id = self.allocated_bucket_id;
         let collection_revision = self.collection_revision;
-        mvcc.autocommit_product_mutations_with_predicates(
+        mvcc.autocommit_product_mutations_with_predicates_and_outbox(
             principal,
             idempotency_key,
             self.mutations,
             self.predicates,
+            self.outbox_events,
             durability,
             now_unix_ms,
         )
@@ -674,9 +680,11 @@ pub(crate) fn build_bucket_mvcc_mutation_plan(
         };
         predicates.push((key, kind));
     }
+    let plan = crate::mvcc_product::product_mutations_and_outbox_from_operations(operations)?;
     Ok(BucketMvccMutationPlan {
-        mutations: crate::mvcc_product::product_mutations_from_operations(operations)?,
+        mutations: plan.mutations,
         predicates,
+        outbox_events: plan.outbox_events,
         allocated_bucket_id,
         collection_revision,
     })

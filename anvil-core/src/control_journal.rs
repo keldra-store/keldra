@@ -657,13 +657,16 @@ async fn append_control_event_mvcc(
             .unwrap_or(PredicateKind::Absent);
         predicates.push((key, kind));
     }
-    let mutations = crate::mvcc_product::product_mutations_from_operations(operations)?;
+    let plan = crate::mvcc_product::product_mutations_and_outbox_from_operations(operations)?;
+    let mutations = plan.mutations;
+    let outbox_events = plan.outbox_events;
     let principal = control_partition_principal();
-    mvcc.autocommit_product_mutations_with_predicates(
+    mvcc.autocommit_product_mutations_with_predicates_and_outbox(
         &principal,
         &format!("control-plane:{mutation_id_string}"),
         mutations,
         predicates,
+        outbox_events,
         DurabilityLevel::Local,
         u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
     )
