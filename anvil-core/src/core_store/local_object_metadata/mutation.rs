@@ -15,12 +15,6 @@ pub(crate) struct ObjectMetadataMutationGuard {
     _guard: super::super::CoreStoreLock,
 }
 
-#[derive(Debug)]
-pub(crate) struct PreparedObjectMetadataProjection {
-    pub(crate) root_generation: u64,
-    pub(crate) operations: Vec<CoreMutationOperation>,
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct ObjectMetadataPreconditionSnapshot {
     pub(crate) object: Option<Object>,
@@ -109,49 +103,6 @@ impl CoreStore {
         })
     }
 
-    pub(crate) async fn prepare_object_metadata_projection(
-        &self,
-        bucket: &Bucket,
-        object: &Object,
-        mutation: ObjectMetadataProjectionMutation,
-        scope_partition: &str,
-        transaction_id: &str,
-    ) -> Result<PreparedObjectMetadataProjection> {
-        validate_object_scope(bucket, object)?;
-        if scope_partition != object_metadata_root_anchor_key(bucket.tenant_id, bucket.id) {
-            bail!("object metadata mutation scope does not match its CoreMeta root");
-        }
-        let root_generation = self
-            .implicit_root_generation_unlocked(transaction_id, scope_partition, None)
-            .await?;
-        let operations = match mutation {
-            ObjectMetadataProjectionMutation::Upsert => {
-                self.prepare_object_metadata_upsert_operations(
-                    bucket,
-                    object,
-                    scope_partition,
-                    transaction_id,
-                    root_generation,
-                )
-                .await?
-            }
-            ObjectMetadataProjectionMutation::DeleteVersion => {
-                self.prepare_object_metadata_delete_version_operations(
-                    bucket,
-                    object,
-                    scope_partition,
-                    transaction_id,
-                    root_generation,
-                )
-                .await?
-            }
-        };
-        Ok(PreparedObjectMetadataProjection {
-            root_generation,
-            operations,
-        })
-    }
-
     pub(crate) async fn materialize_object_metadata_ancillary_projections(
         &self,
         bucket: &Bucket,
@@ -200,82 +151,6 @@ impl CoreStore {
         self.commit_coremeta_root_groups(transaction_id, &ops, &publications)
             .await?;
         Ok(())
-    }
-
-    #[cfg(test)]
-    pub async fn put_object_metadata(&self, bucket: &Bucket, object: &Object) -> Result<()> {
-        let _guard = self.acquire_object_metadata_mutation_lock(bucket).await?;
-        let transaction_id = format!("object-metadata-projection:{}", object.mutation_id);
-        let scope_partition = object_metadata_root_anchor_key(bucket.tenant_id, bucket.id);
-        let prepared = self
-            .prepare_object_metadata_projection(
-                bucket,
-                object,
-                ObjectMetadataProjectionMutation::Upsert,
-                &scope_partition,
-                &transaction_id,
-            )
-            .await?;
-        let receipt = self
-            .commit_mutation_batch(CoreMutationBatch {
-                transaction_id,
-                root_publications: vec![object_metadata_root_publication(&scope_partition)],
-                scope_partition,
-                committed_by_principal: format!(
-                    "object-metadata-projection:{}:{}",
-                    bucket.tenant_id, bucket.id
-                ),
-                preconditions: Vec::new(),
-                operations: prepared.operations,
-            })
-            .await?;
-        require_committed_projection_receipt(&receipt)?;
-        self.materialize_object_metadata_ancillary_projections(
-            bucket,
-            object,
-            ObjectMetadataProjectionMutation::Upsert,
-        )
-        .await
-    }
-
-    #[cfg(test)]
-    pub async fn delete_object_version_metadata(
-        &self,
-        bucket: &Bucket,
-        object: &Object,
-    ) -> Result<()> {
-        let _guard = self.acquire_object_metadata_mutation_lock(bucket).await?;
-        let transaction_id = format!("object-metadata-projection:{}", object.mutation_id);
-        let scope_partition = object_metadata_root_anchor_key(bucket.tenant_id, bucket.id);
-        let prepared = self
-            .prepare_object_metadata_projection(
-                bucket,
-                object,
-                ObjectMetadataProjectionMutation::DeleteVersion,
-                &scope_partition,
-                &transaction_id,
-            )
-            .await?;
-        let receipt = self
-            .commit_mutation_batch(CoreMutationBatch {
-                transaction_id,
-                root_publications: vec![object_metadata_root_publication(&scope_partition)],
-                scope_partition,
-                committed_by_principal: format!(
-                    "object-metadata-projection:{}:{}",
-                    bucket.tenant_id, bucket.id
-                ),
-                preconditions: Vec::new(),
-                operations: prepared.operations,
-            })
-            .await?;
-        require_committed_projection_receipt(&receipt)?;
-        self.materialize_object_metadata_ancillary_projections(
-            bucket,
-            object,
-            ObjectMetadataProjectionMutation::DeleteVersion,
-        )
-        .await
     }
 
     pub async fn next_object_metadata_id(&self, bucket: &Bucket) -> Result<i64> {
@@ -919,31 +794,5 @@ fn delete_operation(
         cf: cf.to_string(),
         table_id,
         tuple_key,
-    }
-}
-
-#[cfg(test)]
-fn require_committed_projection_receipt(receipt: &CoreMutationBatchReceipt) -> Result<()> {
-    if !receipt.is_committed() {
-        bail!(
-            "object metadata projection mutation did not commit: {}",
-            receipt
-                .finalisation_error
-                .as_deref()
-                .unwrap_or("unknown finalisation error")
-        );
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-fn object_metadata_root_publication(root_anchor_key: &str) -> CoreMutationRootPublication {
-    CoreMutationRootPublication {
-        root_anchor_key: root_anchor_key.to_string(),
-        writer_families: vec![
-            WriterFamily::CoreControl.as_str().to_string(),
-            WriterFamily::ObjectBlob.as_str().to_string(),
-        ],
-        transaction_coordinator: true,
     }
 }

@@ -1,15 +1,17 @@
 use super::*;
 use crate::core_store::{
     CF_OBJECT_HEADS, CF_OBJECT_VERSIONS, TABLE_OBJECT_HEAD_ROW, TABLE_OBJECT_VERSION_META_ROW,
-    encode_object_metadata_counter_at_generation,
+    decode_object_metadata_max_id, decode_object_metadata_row,
+    decode_object_metadata_row_with_generation, encode_object_metadata_counter_at_generation,
     encode_object_metadata_row_at_generation_for_transaction,
     encode_object_metadata_row_at_generation_with_delete_marker_for_transaction,
     object_current_history_key, object_current_key, object_current_page_key_for_object,
     object_id_counter_key, object_key_catalog_key, object_version_catalog_key,
     object_version_history_key, object_version_id_key, object_version_key,
-    object_version_page_key_for_object,
+    object_version_page_key_for_object, object_version_page_prefix,
 };
 use crate::mvcc_product::{ProductMutation, coremeta_logical_key};
+use crate::mvcc_transaction::{LogicalKey, PredicateKind, WriteOperation};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ObjectVersionSnapshot {
@@ -27,6 +29,160 @@ pub(crate) struct ObjectProjectionSnapshot {
     /// Latest surviving version at the transaction snapshot, excluding the
     /// version being deleted. Callers obtain this with one fixed MVCC scan.
     pub delete_current_successor: Option<Object>,
+}
+
+pub(crate) struct LoadedObjectProjectionSnapshot {
+    pub snapshot: ObjectProjectionSnapshot,
+    pub predicates: Vec<(LogicalKey, PredicateKind)>,
+}
+
+pub(crate) fn load_object_projection_snapshot(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    bucket: &Bucket,
+    object: &Object,
+    transaction: Option<(&str, &str)>,
+) -> Result<LoadedObjectProjectionSnapshot> {
+    let snapshot_version = transaction
+        .map(|(transaction_id, _)| {
+            mvcc.open_transactions
+                .handle(transaction_id)
+                .map(|handle| handle.snapshot_version)
+        })
+        .transpose()?
+        .unwrap_or(mvcc.runtime.applied_version()?);
+    let current_key = object_current_logical_key(bucket, &object.key)?;
+    let original_key = object_version_logical_key(bucket, &object.key, object.version_id)?;
+    let counter_key = object_id_counter_logical_key(bucket)?;
+    let mut predicates = Vec::new();
+    let current_payload = read_observed(
+        mvcc,
+        &current_key,
+        snapshot_version,
+        transaction,
+        &mut predicates,
+    )?;
+    let original_payload = read_observed(
+        mvcc,
+        &original_key,
+        snapshot_version,
+        transaction,
+        &mut predicates,
+    )?;
+    let counter_payload = read_observed(
+        mvcc,
+        &counter_key,
+        snapshot_version,
+        transaction,
+        &mut predicates,
+    )?;
+    let current = current_payload
+        .as_deref()
+        .map(decode_object_metadata_row)
+        .transpose()?;
+    let original = original_payload
+        .as_deref()
+        .map(decode_object_metadata_row_with_generation)
+        .transpose()?
+        .map(|(object, row_generation)| ObjectVersionSnapshot {
+            object,
+            row_generation,
+        });
+    let counter_max_id = counter_payload
+        .as_deref()
+        .map(|payload| decode_object_metadata_max_id(payload, bucket))
+        .transpose()?
+        .unwrap_or(0);
+    let delete_current_successor = if current
+        .as_ref()
+        .is_some_and(|current| current.version_id == object.version_id)
+    {
+        latest_surviving_version(
+            mvcc,
+            bucket,
+            object,
+            snapshot_version,
+            transaction,
+            &mut predicates,
+        )?
+    } else {
+        None
+    };
+    Ok(LoadedObjectProjectionSnapshot {
+        snapshot: ObjectProjectionSnapshot {
+            snapshot_version,
+            projection_generation: snapshot_version.saturating_add(1).max(1),
+            counter_max_id,
+            current,
+            original,
+            delete_current_successor,
+        },
+        predicates,
+    })
+}
+
+fn read_observed(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    key: &LogicalKey,
+    snapshot: u64,
+    transaction: Option<(&str, &str)>,
+    _predicates: &mut Vec<(LogicalKey, PredicateKind)>,
+) -> Result<Option<Vec<u8>>> {
+    let base = mvcc.runtime.read_at(key, snapshot)?.map(|row| row.value);
+    predicates.push((
+        key.clone(),
+        base.as_ref()
+            .map(|payload| PredicateKind::ValueHash(*blake3::hash(payload).as_bytes()))
+            .unwrap_or(PredicateKind::Absent),
+    ));
+    if let Some((transaction_id, principal)) = transaction {
+        mvcc.read_transaction_value(transaction_id, principal, key)
+    } else {
+        Ok(base)
+    }
+}
+
+fn latest_surviving_version(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    bucket: &Bucket,
+    deletion: &Object,
+    snapshot: u64,
+    transaction: Option<(&str, &str)>,
+    predicates: &mut Vec<(LogicalKey, PredicateKind)>,
+) -> Result<Option<Object>> {
+    let application_prefix = crate::mvcc_product::coremeta_application_prefix(
+        CF_OBJECT_VERSIONS,
+        &object_version_page_prefix(bucket, &deletion.key),
+    )?;
+    let mut rows = mvcc
+        .runtime
+        .scan_table_prefix_at(TABLE_OBJECT_VERSION_META_ROW, &application_prefix, snapshot)?
+        .into_iter()
+        .map(|(key, row)| (key, row.value))
+        .collect::<Vec<_>>();
+    if let Some((transaction_id, principal)) = transaction {
+        for write in mvcc
+            .open_transactions
+            .staged_writes(transaction_id, principal)?
+        {
+            if write.key().table_id != TABLE_OBJECT_VERSION_META_ROW
+                || !write.key().application_key.starts_with(&application_prefix)
+            {
+                continue;
+            }
+            rows.retain(|(key, _)| key != write.key());
+            if let WriteOperation::Put { key, value } = write {
+                rows.push((key, value));
+            }
+        }
+    }
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    for (_, value) in rows {
+        let candidate = decode_object_metadata_row(&value)?;
+        if candidate.version_id != deletion.version_id {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
 }
 
 pub(crate) fn object_current_logical_key(

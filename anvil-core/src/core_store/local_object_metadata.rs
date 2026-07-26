@@ -20,7 +20,7 @@ pub(crate) use projections::{
 mod mutation;
 pub(crate) use mutation::{
     ObjectMetadataMutationGuard, ObjectMetadataPreconditionSnapshot,
-    ObjectMetadataProjectionMutation, PreparedObjectMetadataProjection,
+    ObjectMetadataProjectionMutation,
 };
 
 const CORE_OBJECT_METADATA_SCHEMA: &str = "anvil.core.object_metadata.v1";
@@ -281,6 +281,11 @@ struct DecodedObjectMetadataRow {
 
 pub(crate) fn decode_object_metadata_row(bytes: &[u8]) -> Result<Object> {
     Ok(decode_object_metadata_row_with_common(bytes)?.object)
+}
+
+pub(crate) fn decode_object_metadata_row_with_generation(bytes: &[u8]) -> Result<(Object, u64)> {
+    let decoded = decode_object_metadata_row_with_common(bytes)?;
+    Ok((decoded.object, decoded.root_generation))
 }
 
 fn decode_object_metadata_row_with_common(bytes: &[u8]) -> Result<DecodedObjectMetadataRow> {

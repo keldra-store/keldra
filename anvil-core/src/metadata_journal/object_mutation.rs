@@ -153,16 +153,22 @@ async fn append_object_put_mutations_with_permit_inner(
         watch_stream_precondition,
     ];
     let mut operations = Vec::with_capacity(objects.len() * 16);
+    let mut projection_mutations = Vec::new();
+    let mut projection_predicates = Vec::new();
     for (index, object) in objects.iter().enumerate() {
-        let projection = core_store
-            .prepare_object_metadata_projection(
-                bucket,
-                object,
-                ObjectMetadataProjectionMutation::Upsert,
-                &scope_partition,
-                transaction_id,
-            )
-            .await?;
+        let loaded = load_object_projection_snapshot(
+            mvcc.ok_or_else(|| anyhow!("MVCC staging handle is required"))?,
+            bucket,
+            object,
+            transaction_principal.map(|principal| (transaction_id, principal)),
+        )?;
+        projection_mutations.extend(plan_object_upsert(
+            bucket,
+            object,
+            &loaded.snapshot,
+            transaction_id,
+        )?);
+        projection_predicates.extend(loaded.predicates);
         let event = object_watch_event(bucket, object, ObjectJournalMutation::Put);
         let sequence = first_watch_sequence
             .checked_add(index as u64)
@@ -173,7 +179,7 @@ async fn append_object_put_mutations_with_permit_inner(
             &event,
             &scope_partition,
             &core_meta_root_key_hash(&scope_partition),
-            Some(projection.root_generation),
+            Some(loaded.snapshot.projection_generation),
             transaction_id,
             sequence,
             None,
@@ -192,7 +198,6 @@ async fn append_object_put_mutations_with_permit_inner(
             idempotency_key: Some(format!("object-metadata:{}:put", object.mutation_id)),
         });
         operations.extend(watch.operations);
-        operations.extend(projection.operations);
     }
     preconditions.append(&mut additions.preconditions);
     operations.append(&mut additions.operations);
@@ -226,14 +231,7 @@ async fn append_object_put_mutations_with_permit_inner(
         operations,
     };
     let mvcc = mvcc.ok_or_else(|| anyhow!("MVCC staging handle is required"))?;
-    let predicates = object_put_predicates(
-        mvcc,
-        bucket,
-        objects,
-        &batch.preconditions,
-        transaction_id,
-        transaction_principal,
-    )?;
+    let predicates = object_batch_precondition_predicates(&batch.preconditions)?;
     let event_plan = plan_metadata_events(
         mvcc,
         bucket,
@@ -243,6 +241,9 @@ async fn append_object_put_mutations_with_permit_inner(
     let mutations = event_plan.mutations;
     let mut predicates = predicates;
     predicates.push(event_plan.head_predicate);
+    let mut mutations = mutations;
+    mutations.extend(projection_mutations);
+    predicates.extend(projection_predicates);
     if let Some(transaction_principal) = transaction_principal {
         mvcc.stage_product_mutations(
             transaction_id,
@@ -274,13 +275,8 @@ async fn append_object_put_mutations_with_permit_inner(
     Ok(())
 }
 
-fn object_put_predicates(
-    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
-    bucket: &Bucket,
-    objects: &[Object],
+fn object_batch_precondition_predicates(
     batch_preconditions: &[CoreMutationPrecondition],
-    transaction_id: &str,
-    transaction_principal: Option<&str>,
 ) -> Result<
     Vec<(
         crate::mvcc_transaction::LogicalKey,
@@ -289,42 +285,7 @@ fn object_put_predicates(
 > {
     use crate::mvcc_transaction::PredicateKind;
 
-    let mut keys = Vec::with_capacity(objects.len() * 3 + 1);
-    for object in objects {
-        keys.push(crate::mvcc_product::coremeta_logical_key(
-            crate::core_store::CF_OBJECT_HEADS,
-            crate::core_store::TABLE_OBJECT_HEAD_ROW,
-            &crate::core_store::object_current_key(bucket, &object.key),
-        )?);
-        keys.push(crate::mvcc_product::coremeta_logical_key(
-            crate::core_store::CF_OBJECT_VERSIONS,
-            crate::core_store::TABLE_OBJECT_VERSION_META_ROW,
-            &crate::core_store::object_version_key(bucket, &object.key, object.version_id),
-        )?);
-        keys.push(crate::mvcc_product::coremeta_logical_key(
-            crate::core_store::CF_OBJECT_VERSIONS,
-            crate::core_store::TABLE_OBJECT_VERSION_META_ROW,
-            &crate::core_store::object_version_id_key(bucket, object.version_id),
-        )?);
-    }
-    keys.push(crate::mvcc_product::coremeta_logical_key(
-        crate::core_store::CF_OBJECT_VERSIONS,
-        crate::core_store::TABLE_OBJECT_VERSION_META_ROW,
-        &crate::core_store::object_id_counter_key(bucket),
-    )?);
-    let mut predicates = keys
-        .into_iter()
-        .map(|key| {
-            let visible = match transaction_principal {
-                Some(principal) => mvcc.read_transaction_value(transaction_id, principal, &key)?,
-                None => mvcc.read_latest_value(&key)?,
-            };
-            let kind = visible
-                .map(|payload| PredicateKind::ValueHash(*blake3::hash(&payload).as_bytes()))
-                .unwrap_or(PredicateKind::Absent);
-            Ok((key, kind))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut predicates = Vec::new();
     for precondition in batch_preconditions {
         let CoreMutationPrecondition::CoreMetaRow {
             cf,
@@ -481,21 +442,30 @@ async fn append_object_mutation_inner_once(
     let committed_by_principal = transaction_principal
         .map(str::to_owned)
         .unwrap_or_else(|| object_metadata_partition_principal(bucket));
-    let projection_mutation = match mutation {
+    let ancillary_projection_mutation = match mutation {
         ObjectJournalMutation::Put
         | ObjectJournalMutation::Copy
         | ObjectJournalMutation::DeleteMarker => ObjectMetadataProjectionMutation::Upsert,
         ObjectJournalMutation::DeleteVersion => ObjectMetadataProjectionMutation::DeleteVersion,
     };
-    let projection = core_store
-        .prepare_object_metadata_projection(
-            bucket,
-            object,
-            projection_mutation,
-            &scope_partition,
-            transaction_id,
-        )
-        .await?;
+    let mvcc = mvcc.ok_or_else(|| anyhow!("MVCC staging handle is required"))?;
+    let loaded = load_object_projection_snapshot(
+        mvcc,
+        bucket,
+        object,
+        transaction_principal.map(|principal| (transaction_id, principal)),
+    )?;
+    let projection_mutations = match mutation {
+        ObjectJournalMutation::Put
+        | ObjectJournalMutation::Copy
+        | ObjectJournalMutation::DeleteMarker => {
+            plan_object_upsert(bucket, object, &loaded.snapshot, transaction_id)?
+        }
+        ObjectJournalMutation::DeleteVersion => {
+            plan_object_delete_version(bucket, object, &loaded.snapshot, transaction_id)?
+        }
+    };
+    let projection_predicates = loaded.predicates;
     let metadata_stream_id = object_metadata_stream_id(bucket.tenant_id, bucket.id);
     let metadata_stream_precondition = core_store
         .stream_head_precondition(&metadata_stream_id)
@@ -508,7 +478,7 @@ async fn append_object_mutation_inner_once(
         &event,
         &scope_partition,
         &core_meta_root_key_hash(&scope_partition),
-        Some(projection.root_generation),
+        Some(loaded.snapshot.projection_generation),
         transaction_id,
     )
     .await?;
@@ -517,7 +487,7 @@ async fn append_object_mutation_inner_once(
     let mut preconditions = partition_precondition.into_iter().collect::<Vec<_>>();
     preconditions.push(metadata_stream_precondition);
     preconditions.extend(watch.preconditions);
-    let mut operations = Vec::with_capacity(3 + projection.operations.len());
+    let mut operations = Vec::with_capacity(3);
     operations.push(CoreMutationOperation::StreamAppend {
         partition_id: scope_partition.clone(),
         stream_id: metadata_stream_id.clone(),
@@ -530,7 +500,6 @@ async fn append_object_mutation_inner_once(
         )),
     });
     operations.extend(watch.operations);
-    operations.extend(projection.operations);
     let batch = CoreMutationBatch {
         transaction_id: transaction_id.to_string(),
         scope_partition: scope_partition.clone(),
@@ -546,23 +515,18 @@ async fn append_object_mutation_inner_once(
         preconditions,
         operations,
     };
-    let mvcc = mvcc.ok_or_else(|| anyhow!("MVCC staging handle is required"))?;
-    let predicates = object_put_predicates(
-        mvcc,
-        bucket,
-        std::slice::from_ref(object),
-        transaction_id,
-        transaction_principal,
-    )?;
+    let predicates = object_batch_precondition_predicates(&batch.preconditions)?;
     let event_plan = plan_metadata_events(
         mvcc,
         bucket,
         batch.operations,
         transaction_principal.map(|principal| (transaction_id, principal)),
     )?;
-    let mutations = event_plan.mutations;
+    let mut mutations = event_plan.mutations;
+    mutations.extend(projection_mutations);
     let mut predicates = predicates;
     predicates.push(event_plan.head_predicate);
+    predicates.extend(projection_predicates);
     if mvcc_transaction_id.is_some() {
         let transaction_principal = transaction_principal
             .ok_or_else(|| anyhow!("object metadata MVCC transaction principal missing"))?;
@@ -594,7 +558,11 @@ async fn append_object_mutation_inner_once(
     )
     .await?;
     core_store
-        .materialize_object_metadata_ancillary_projections(bucket, object, projection_mutation)
+        .materialize_object_metadata_ancillary_projections(
+            bucket,
+            object,
+            ancillary_projection_mutation,
+        )
         .await?;
     Ok(())
 }
