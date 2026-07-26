@@ -433,7 +433,7 @@ fn validate_control_authority(
 }
 
 fn ensure_committed(receipt: &CoreMutationBatchReceipt) -> LifecycleResult<()> {
-    if receipt.state == CoreTransactionState::Committed {
+    if receipt.is_committed() {
         return Ok(());
     }
     Err(LifecycleError::InvalidArgument(format!(

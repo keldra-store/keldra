@@ -119,7 +119,7 @@ pub async fn append_authz_derived_lag_watch_record(
             }],
         })
         .await?;
-    if receipt.state != CoreTransactionState::Committed {
+    if !receipt.is_committed() {
         bail!(
             "authorization derived lag watch publication {publication_attempt_id} did not commit: {}",
             receipt
@@ -129,16 +129,8 @@ pub async fn append_authz_derived_lag_watch_record(
         );
     }
     receipt
-        .visible_updates
-        .into_iter()
-        .find_map(|update| match update {
-            CoreTransactionUpdate::StreamAppend {
-                stream_id,
-                visible_sequence,
-                ..
-            } if stream_id == prepared.stream_id => Some(u128::from(visible_sequence)),
-            _ => None,
-        })
+        .stream_append(&prepared.stream_id)
+        .map(|append| u128::from(append.visible_sequence))
         .ok_or_else(|| anyhow!("authorization derived lag watch publication produced no cursor"))
 }
 

@@ -777,7 +777,7 @@ async fn write_repair_finding_records(
             ],
         })
         .await?;
-    if receipt.state != CoreTransactionState::Committed {
+    if !receipt.is_committed() {
         return Err(anyhow!(
             "repair finding transaction {} did not commit: {}",
             receipt.transaction_id,

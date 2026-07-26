@@ -510,7 +510,7 @@ async fn write_watch_checkpoint(
             }],
         })
         .await?;
-    if receipt.state != CoreTransactionState::Committed {
+    if !receipt.is_committed() {
         return Err(anyhow!(
             "watch checkpoint publication {} did not commit: {}",
             receipt.transaction_id,

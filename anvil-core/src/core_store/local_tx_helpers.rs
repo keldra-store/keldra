@@ -4,14 +4,37 @@ pub(super) fn receipt_from_transaction(transaction: &CoreTransaction) -> CoreMut
     CoreMutationBatchReceipt {
         transaction_id: transaction.transaction_id.clone(),
         scope_partition: transaction.scope_partition.clone(),
-        state: transaction.state,
-        visible_updates: if transaction.state == CoreTransactionState::Committed {
-            transaction.visible_updates.clone()
+        outcome: if transaction.state == CoreTransactionState::Committed {
+            CoreMutationBatchOutcome::Committed
         } else {
-            Vec::new()
+            CoreMutationBatchOutcome::FinalisationFailed
         },
+        stream_appends: transaction
+            .visible_updates
+            .iter()
+            .filter_map(committed_stream_append)
+            .collect(),
         finalisation_error: transaction.finalisation_error.clone(),
     }
+}
+
+pub(super) fn committed_stream_append(
+    update: &CoreTransactionUpdate,
+) -> Option<CoreCommittedStreamAppend> {
+    let CoreTransactionUpdate::StreamAppend {
+        stream_id,
+        visible_sequence,
+        prepared_record_hash,
+        ..
+    } = update
+    else {
+        return None;
+    };
+    Some(CoreCommittedStreamAppend {
+        stream_id: stream_id.clone(),
+        visible_sequence: *visible_sequence,
+        record_hash: prepared_record_hash.clone(),
+    })
 }
 
 pub(super) fn core_transaction_state_name(state: CoreTransactionState) -> &'static str {

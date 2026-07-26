@@ -454,7 +454,12 @@ impl CoreStore {
                         store
                             .mark_pending_mutation_finalised_unlocked(
                                 &admission,
-                                core_transaction_state_name(receipt.state),
+                                match receipt.outcome {
+                                    CoreMutationBatchOutcome::Committed => "committed",
+                                    CoreMutationBatchOutcome::FinalisationFailed => {
+                                        "finalisation_failed"
+                                    }
+                                },
                             )
                             .await?;
                         if retryable_conflict {
@@ -473,7 +478,7 @@ impl CoreStore {
             format!("core_store.commit_mutation_batch total tx={timing_name}"),
             total_start.elapsed(),
         );
-        self.notify_stream_updates(&receipt.visible_updates);
+        self.notify_committed_stream_appends(&receipt.stream_appends);
         Ok(receipt)
     }
 
@@ -583,8 +588,15 @@ impl CoreStore {
         Ok(CoreMutationBatchReceipt {
             transaction_id: batch.transaction_id.clone(),
             scope_partition: batch.scope_partition.clone(),
-            state: transaction_state,
-            visible_updates: transaction_visible_updates,
+            outcome: if transaction_state == CoreTransactionState::Committed {
+                CoreMutationBatchOutcome::Committed
+            } else {
+                CoreMutationBatchOutcome::FinalisationFailed
+            },
+            stream_appends: transaction_visible_updates
+                .iter()
+                .filter_map(committed_stream_append)
+                .collect(),
             finalisation_error,
         })
     }
@@ -1085,7 +1097,7 @@ impl CoreStore {
     pub async fn stage_explicit_transaction_batch(
         &self,
         mut batch: CoreMutationBatch,
-    ) -> Result<CoreMutationBatchReceipt> {
+    ) -> Result<CoreExplicitTransactionReceipt> {
         validate_logical_id(&batch.transaction_id, "transaction id")?;
         validate_logical_id(&batch.scope_partition, "transaction scope partition")?;
         validate_logical_id(&batch.committed_by_principal, "transaction principal")?;
@@ -1261,7 +1273,7 @@ impl CoreStore {
             &batch.preconditions,
         )
         .await?;
-        Ok(CoreMutationBatchReceipt {
+        Ok(CoreExplicitTransactionReceipt {
             transaction_id: batch.transaction_id,
             scope_partition: batch.scope_partition,
             state: CoreTransactionState::Open,
@@ -1372,7 +1384,7 @@ impl CoreStore {
         expected_payload_hash: Option<String>,
         require_absent: bool,
         require_present: bool,
-    ) -> Result<CoreMutationBatchReceipt> {
+    ) -> Result<CoreExplicitTransactionReceipt> {
         validate_logical_id(transaction_id, "transaction id")?;
         validate_logical_id(principal, "transaction principal")?;
         validate_coremeta_operation_payload(cf, table_id, &tuple_key, &payload)?;
@@ -1415,7 +1427,7 @@ impl CoreStore {
         transaction_id: &str,
         principal: &str,
         additions: CoreMutationBatchAdditions,
-    ) -> Result<CoreMutationBatchReceipt> {
+    ) -> Result<CoreExplicitTransactionReceipt> {
         validate_logical_id(transaction_id, "transaction id")?;
         validate_logical_id(principal, "transaction principal")?;
         if additions.operations.is_empty() && additions.preconditions.is_empty() {
@@ -1455,7 +1467,7 @@ impl CoreStore {
         tuple_key: Vec<u8>,
         expected_payload_hash: Option<String>,
         require_present: bool,
-    ) -> Result<CoreMutationBatchReceipt> {
+    ) -> Result<CoreExplicitTransactionReceipt> {
         validate_logical_id(transaction_id, "transaction id")?;
         validate_logical_id(principal, "transaction principal")?;
         validate_coremeta_operation_key(cf, table_id, &tuple_key)?;
@@ -1633,6 +1645,12 @@ impl CoreStore {
             if let CoreTransactionUpdate::StreamAppend { stream_id, .. } = update {
                 self.storage.notify_stream(stream_id);
             }
+        }
+    }
+
+    fn notify_committed_stream_appends(&self, appends: &[CoreCommittedStreamAppend]) {
+        for append in appends {
+            self.storage.notify_stream(&append.stream_id);
         }
     }
 

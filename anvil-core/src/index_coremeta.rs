@@ -253,7 +253,7 @@ pub async fn write_index_segment_coremeta_record(
             operations,
         })
         .await?;
-    if receipt.state != CoreTransactionState::Committed {
+    if !receipt.is_committed() {
         bail!(
             "index segment locator publication {} did not commit: {}",
             receipt.transaction_id,

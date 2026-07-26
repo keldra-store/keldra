@@ -359,17 +359,9 @@ async fn append_manifest(
         core_store.commit_mutation_batch(batch).await?
     };
     let stream_update = batch_receipt
-        .visible_updates
-        .iter()
-        .find_map(|update| match update {
-            CoreTransactionUpdate::StreamAppend {
-                visible_sequence,
-                prepared_record_hash,
-                ..
-            } => Some((*visible_sequence, prepared_record_hash.clone())),
-            CoreTransactionUpdate::CoreMetaPut { .. }
-            | CoreTransactionUpdate::CoreMetaDelete { .. } => None,
-        })
+        .stream_appends
+        .first()
+        .map(|append| (append.visible_sequence, append.record_hash.clone()))
         .ok_or_else(|| anyhow!("manifest CAS batch did not append a stream record"))?;
     let receipt = MetadataMutationReceipt {
         mutation_id,

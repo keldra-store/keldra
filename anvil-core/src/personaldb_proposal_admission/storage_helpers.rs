@@ -61,7 +61,7 @@ pub(super) async fn commit_group_batch(
 }
 
 pub(super) fn ensure_committed_receipt(receipt: &CoreMutationBatchReceipt) -> Result<()> {
-    if receipt.state != CoreTransactionState::Committed {
+    if !receipt.is_committed() {
         bail!(
             "PersonalDB admission CoreStore transaction {} did not commit: {}",
             receipt.transaction_id,

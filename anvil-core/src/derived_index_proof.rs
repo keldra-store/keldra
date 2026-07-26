@@ -434,7 +434,7 @@ async fn write_derived_index_proof_rows(
             ],
         })
         .await?;
-    if receipt.state != CoreTransactionState::Committed {
+    if !receipt.is_committed() {
         return Err(anyhow!(
             "derived index proof publication {} did not commit: {}",
             receipt.transaction_id,

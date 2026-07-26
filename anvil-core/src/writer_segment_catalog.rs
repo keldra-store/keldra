@@ -96,7 +96,7 @@ pub async fn write_writer_segment_catalog_record(
     let current = head::read(&store, &record.family, &record.scope)?;
     let batch = mutation_batch(record, current.as_ref(), additional_preconditions)?;
     let receipt = store.commit_mutation_batch(batch).await?;
-    if receipt.state != CoreTransactionState::Committed {
+    if !receipt.is_committed() {
         bail!(
             "writer segment catalog publication {} did not commit: {}",
             receipt.transaction_id,

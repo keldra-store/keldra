@@ -1086,7 +1086,7 @@ fn delete_operation(
 
 #[cfg(test)]
 fn require_committed_projection_receipt(receipt: &CoreMutationBatchReceipt) -> Result<()> {
-    if receipt.state != CoreTransactionState::Committed {
+    if !receipt.is_committed() {
         bail!(
             "object metadata projection mutation did not commit: {}",
             receipt

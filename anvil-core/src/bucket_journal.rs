@@ -466,7 +466,7 @@ async fn append_bucket_mutation_to_stream(
             operations,
         })
         .await?;
-    if receipt.state != CoreTransactionState::Committed {
+    if !receipt.is_committed() {
         return Err(anyhow!(
             "bucket metadata mutation {} did not commit: {}",
             receipt.transaction_id,

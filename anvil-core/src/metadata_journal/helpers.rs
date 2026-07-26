@@ -333,7 +333,7 @@ pub(super) async fn publish_partition_manifest(
             }],
         })
         .await?;
-    if receipt.state != CoreTransactionState::Committed {
+    if !receipt.is_committed() {
         return Err(anyhow!(
             "object metadata manifest publication {} did not commit: {}",
             receipt.transaction_id,

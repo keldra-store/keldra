@@ -759,7 +759,7 @@ async fn append_control_event(
             operations,
         })
         .await?;
-    if receipt.state != CoreTransactionState::Committed {
+    if !receipt.is_committed() {
         bail!(
             "control mutation failed to commit: {}",
             receipt

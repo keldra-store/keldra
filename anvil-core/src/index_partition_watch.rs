@@ -207,7 +207,7 @@ pub(crate) async fn publish_prepared_index_partition_watch(
             }],
         })
         .await?;
-    if receipt.state != CoreTransactionState::Committed {
+    if !receipt.is_committed() {
         return Err(anyhow!(
             "index partition watch publication {} did not commit: {}",
             receipt.transaction_id,

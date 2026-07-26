@@ -175,7 +175,7 @@ pub(crate) async fn finish_control_stream_append(
     // The authoritative stream records and lifecycle state are already visible
     // through the committed CoreMutationBatch. This phase only validates the
     // receipt and materialises an optional derived segment.
-    if receipt.state != crate::core_store::CoreTransactionState::Committed {
+    if !receipt.is_committed() {
         return Err(anyhow!(
             "CoreStore control stream batch failed: {}",
             receipt
@@ -184,9 +184,14 @@ pub(crate) async fn finish_control_stream_append(
                 .unwrap_or("unknown finalisation failure")
         ));
     }
-    let visible_sequence = visible_stream_update(&receipt.visible_updates, &prepared.stream_id)?;
-    let _record_sequence =
-        visible_stream_update(&receipt.visible_updates, &prepared.record_stream_id)?;
+    let visible_sequence = receipt
+        .stream_append(&prepared.stream_id)
+        .map(|append| append.visible_sequence)
+        .ok_or_else(|| anyhow!("missing committed control stream append"))?;
+    let _record_sequence = receipt
+        .stream_append(&prepared.record_stream_id)
+        .map(|append| append.visible_sequence)
+        .ok_or_else(|| anyhow!("missing committed control record append"))?;
     if visible_sequence != prepared.metadata.sequence.get() {
         return Err(anyhow!(
             "CoreStore control stream {} assigned sequence {visible_sequence}, but frame declared {}",

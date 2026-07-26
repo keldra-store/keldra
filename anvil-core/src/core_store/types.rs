@@ -973,6 +973,41 @@ pub enum CoreMutationOperation {
 pub struct CoreMutationBatchReceipt {
     pub transaction_id: String,
     pub scope_partition: String,
+    pub outcome: CoreMutationBatchOutcome,
+    pub stream_appends: Vec<CoreCommittedStreamAppend>,
+    pub finalisation_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CoreMutationBatchOutcome {
+    Committed,
+    FinalisationFailed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreCommittedStreamAppend {
+    pub stream_id: String,
+    pub visible_sequence: u64,
+    pub record_hash: String,
+}
+
+impl CoreMutationBatchReceipt {
+    pub fn is_committed(&self) -> bool {
+        self.outcome == CoreMutationBatchOutcome::Committed
+    }
+
+    pub fn stream_append(&self, stream_id: &str) -> Option<&CoreCommittedStreamAppend> {
+        self.stream_appends
+            .iter()
+            .find(|append| append.stream_id == stream_id)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreExplicitTransactionReceipt {
+    pub transaction_id: String,
+    pub scope_partition: String,
     pub state: CoreTransactionState,
     pub visible_updates: Vec<CoreTransactionUpdate>,
     pub finalisation_error: Option<String>,

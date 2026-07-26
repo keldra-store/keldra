@@ -1415,17 +1415,9 @@ async fn append_body(
         core_store.commit_mutation_batch(batch).await?
     };
     let stream_update = batch_receipt
-        .visible_updates
-        .iter()
-        .find_map(|update| match update {
-            CoreTransactionUpdate::StreamAppend {
-                visible_sequence,
-                prepared_record_hash,
-                ..
-            } => Some((*visible_sequence, prepared_record_hash.clone())),
-            CoreTransactionUpdate::CoreMetaPut { .. }
-            | CoreTransactionUpdate::CoreMetaDelete { .. } => None,
-        })
+        .stream_appends
+        .first()
+        .map(|append| (append.visible_sequence, append.record_hash.clone()))
         .ok_or_else(|| anyhow!("multipart metadata batch did not append stream record"))?;
     Ok(MetadataMutationReceipt {
         mutation_id,

@@ -233,7 +233,7 @@ async fn append_index_definition_event_inner(
         )?;
     } else {
         let receipt = core_store.commit_mutation_batch(batch).await?;
-        if receipt.state != CoreTransactionState::Committed {
+        if !receipt.is_committed() {
             return Err(anyhow!(
                 "index definition mutation {} did not commit: {}",
                 receipt.transaction_id,

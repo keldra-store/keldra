@@ -402,7 +402,7 @@ impl TaskMutation {
 }
 
 pub(super) fn require_committed_task_mutation(receipt: &CoreMutationBatchReceipt) -> Result<()> {
-    if receipt.state == CoreTransactionState::Committed {
+    if receipt.is_committed() {
         return Ok(());
     }
     bail!(

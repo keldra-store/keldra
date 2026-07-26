@@ -938,19 +938,8 @@ async fn append_body(
     };
     let batch_receipt = core_store.commit_mutation_batch(batch).await?;
     let stream_update = batch_receipt
-        .visible_updates
-        .iter()
-        .find_map(|update| match update {
-            CoreTransactionUpdate::StreamAppend {
-                stream_id,
-                visible_sequence,
-                prepared_record_hash,
-                ..
-            } if stream_id == &journal_stream_id => {
-                Some((*visible_sequence, prepared_record_hash.clone()))
-            }
-            _ => None,
-        })
+        .stream_append(&journal_stream_id)
+        .map(|append| (append.visible_sequence, append.record_hash.clone()))
         .ok_or_else(|| anyhow!("append metadata batch did not append stream record"))?;
     Ok(MetadataMutationReceipt {
         mutation_id,

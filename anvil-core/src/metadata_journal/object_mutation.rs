@@ -1,6 +1,6 @@
 use super::*;
 use crate::core_store::{
-    CoreMutationBatchAdditions, CoreMutationRootPublication, CoreTransactionState,
+    CoreMutationBatchAdditions, CoreMutationBatchReceipt, CoreMutationRootPublication,
     ObjectMetadataProjectionMutation, core_meta_root_key_hash,
 };
 use crate::formats::writer::WriterFamily;
@@ -246,18 +246,17 @@ async fn append_object_put_mutations_with_permit_inner(
         return Ok(());
     }
     let receipt = { core_store.commit_mutation_batch(batch).await? };
-    let expected_state = CoreTransactionState::Committed;
-    if receipt.state != expected_state {
+    if !receipt.is_committed() {
         bail!(
-            "object metadata mutation batch did not reach expected state {expected_state:?}: {}",
+            "object metadata mutation batch did not commit: {}",
             receipt
                 .finalisation_error
                 .as_deref()
                 .unwrap_or("unknown finalisation error")
         );
     }
-    require_stream_update(&receipt.visible_updates, &metadata_stream_id)?;
-    require_stream_update(&receipt.visible_updates, &watch_stream_id)?;
+    require_stream_update(&receipt, &metadata_stream_id)?;
+    require_stream_update(&receipt, &watch_stream_id)?;
     Ok(())
 }
 
@@ -479,7 +478,7 @@ async fn append_object_mutation_inner_once(
         }
         Err(error) => return Err(error),
     };
-    if receipt.state != CoreTransactionState::Committed {
+    if !receipt.is_committed() {
         bail!(
             "object metadata mutation did not commit: {}",
             receipt
@@ -488,9 +487,8 @@ async fn append_object_mutation_inner_once(
                 .unwrap_or("unknown finalisation error")
         );
     }
-    let visible_metadata_sequence =
-        require_stream_update(&receipt.visible_updates, &metadata_stream_id)?;
-    let visible_watch_sequence = require_stream_update(&receipt.visible_updates, &watch.stream_id)?;
+    let visible_metadata_sequence = require_stream_update(&receipt, &metadata_stream_id)?;
+    let visible_watch_sequence = require_stream_update(&receipt, &watch.stream_id)?;
     require_committed_metadata_record(
         core_store,
         &metadata_stream_id,
@@ -628,18 +626,11 @@ fn object_watch_event(
 }
 
 fn require_stream_update(
-    updates: &[CoreTransactionUpdate],
+    receipt: &CoreMutationBatchReceipt,
     expected_stream_id: &str,
 ) -> Result<u64> {
-    updates
-        .iter()
-        .find_map(|update| match update {
-            CoreTransactionUpdate::StreamAppend {
-                stream_id,
-                visible_sequence,
-                ..
-            } if stream_id == expected_stream_id => Some(*visible_sequence),
-            _ => None,
-        })
+    receipt
+        .stream_append(expected_stream_id)
+        .map(|append| append.visible_sequence)
         .ok_or_else(|| anyhow!("object mutation is missing stream update {expected_stream_id}"))
 }

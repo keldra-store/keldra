@@ -421,7 +421,7 @@ async fn commit_projected_point_put(
             operations,
         })
         .await?;
-    if receipt.state != crate::core_store::CoreTransactionState::Committed {
+    if !receipt.is_committed() {
         bail!(
             "partition fence CoreStore mutation failed: {}",
             receipt

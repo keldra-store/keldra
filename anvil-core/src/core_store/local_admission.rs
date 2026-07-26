@@ -837,7 +837,10 @@ impl CoreStore {
                 let batch = decode_core_mutation_batch(&payload)?;
                 let receipt = self.recover_admitted_mutation_batch(batch, record).await?;
                 Ok(CorePendingMutationReplayOutcome {
-                    state: core_transaction_state_name(receipt.state),
+                    state: match receipt.outcome {
+                        CoreMutationBatchOutcome::Committed => "committed",
+                        CoreMutationBatchOutcome::FinalisationFailed => "finalisation_failed",
+                    },
                     result: None,
                 })
             }

@@ -701,7 +701,7 @@ impl CoreStore {
                 operations,
             })
             .await?;
-        if receipt.state != CoreTransactionState::Committed {
+        if !receipt.is_committed() {
             bail!(
                 "CoreStore shard repair overlay transaction {} did not commit: {}",
                 receipt.transaction_id,

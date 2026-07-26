@@ -1029,7 +1029,7 @@ fn ensure_task_lease_mutation_committed(
     receipt: &crate::core_store::CoreMutationBatchReceipt,
     operation: &str,
 ) -> Result<()> {
-    if receipt.state == crate::core_store::CoreTransactionState::Committed {
+    if receipt.is_committed() {
         return Ok(());
     }
     bail!(
