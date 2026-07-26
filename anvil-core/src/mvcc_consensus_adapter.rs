@@ -72,12 +72,10 @@ pub(crate) fn to_consensus_command(
         .range_observations
         .iter()
         .map(|observation| consensus::RangeObservation {
-            range: range_conflict_hash(
-                observation.table_id,
-                &observation.start_application_key,
-                &observation.end_application_key,
-            ),
-            observed_stamp: Some(consensus::CommitVersion(observation.observed_range_stamp)),
+            range: range_conflict_hash(&observation.conflict_key),
+            observed_stamp: observation
+                .observed_range_stamp
+                .map(consensus::CommitVersion),
         })
         .collect::<Vec<_>>();
     range_observations.sort();
@@ -94,13 +92,7 @@ pub(crate) fn to_consensus_command(
     let mut advanced_range_stamps = request
         .advanced_range_stamps
         .iter()
-        .map(|range| {
-            range_conflict_hash(
-                range.table_id,
-                &range.start_application_key,
-                &range.end_application_key,
-            )
-        })
+        .map(range_conflict_hash)
         .collect::<Vec<_>>();
     advanced_range_stamps.sort();
     advanced_range_stamps.dedup();
@@ -196,10 +188,10 @@ fn logical_key_hash(key: &product::LogicalKey) -> consensus::LogicalKeyHash {
     ))
 }
 
-fn range_conflict_hash(table_id: u16, start: &[u8], end: &[u8]) -> consensus::RangeConflictKey {
+fn range_conflict_hash(key: &product::RangeStampKey) -> consensus::RangeConflictKey {
     consensus::RangeConflictKey(domain_hash(
         b"anvil.mvcc.range-conflict.v1",
-        &[&table_id.to_be_bytes(), start, end],
+        &[&key.table_id.to_be_bytes(), &key.key_prefix],
     ))
 }
 
@@ -306,19 +298,43 @@ mod tests {
             }],
             range_observations: vec![product::RangeObservation {
                 table_id: 8,
-                start_application_key: b"a".to_vec(),
-                end_application_key: b"z".to_vec(),
-                observed_range_stamp: 5,
+                start_application_key: Some(b"a".to_vec()),
+                end_application_key: Some(b"z".to_vec()),
+                conflict_key: product::RangeStampKey {
+                    table_id: 8,
+                    key_prefix: Vec::new(),
+                },
+                observed_range_stamp: Some(5),
             }],
-            advanced_range_stamps: vec![product::RangeConflict {
+            advanced_range_stamps: vec![product::RangeStampKey {
                 table_id: 8,
-                start_application_key: b"a".to_vec(),
-                end_application_key: b"z".to_vec(),
+                key_prefix: Vec::new(),
             }],
             written_keys: vec![product::LogicalKey {
                 table_id: 8,
                 application_key: b"key".to_vec(),
             }],
+        }
+    }
+
+    fn request_for_bundle(bundle: product::TransactionBundle) -> product::CertificationRequest {
+        let identity = bundle.identity().unwrap();
+        let written_keys = bundle
+            .writes
+            .iter()
+            .map(|write| write.key().clone())
+            .collect();
+        product::CertificationRequest {
+            transaction_id: bundle.transaction_id,
+            snapshot_version: bundle.snapshot_version,
+            bundle: identity,
+            durability: product::DurabilityLevel::Local,
+            bundle_holders: vec![bundle_evidence("a", true, true, true)],
+            object_durability: Vec::new(),
+            point_observations: bundle.point_observations,
+            range_observations: bundle.range_observations,
+            advanced_range_stamps: bundle.advanced_range_stamps,
+            written_keys,
         }
     }
 
@@ -395,5 +411,100 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn insert_delete_and_rename_invalidate_an_earlier_range_scan() {
+        let scheme = product::HierarchicalRangeStampScheme::new(8).unwrap();
+        let writers = [
+            {
+                let mut builder =
+                    product::TransactionBundleBuilder::new("insert", 0, "principal", scheme);
+                builder.put(
+                    product::LogicalKey {
+                        table_id: 7,
+                        application_key: b"orders/m".to_vec(),
+                    },
+                    b"value".to_vec(),
+                );
+                builder.build().unwrap()
+            },
+            {
+                let mut builder =
+                    product::TransactionBundleBuilder::new("delete", 0, "principal", scheme);
+                builder.delete(product::LogicalKey {
+                    table_id: 7,
+                    application_key: b"orders/n".to_vec(),
+                });
+                builder.build().unwrap()
+            },
+            {
+                let mut builder =
+                    product::TransactionBundleBuilder::new("rename", 0, "principal", scheme);
+                builder.rename(
+                    product::LogicalKey {
+                        table_id: 3,
+                        application_key: b"partition-a/source".to_vec(),
+                    },
+                    product::LogicalKey {
+                        table_id: 7,
+                        application_key: b"orders/p".to_vec(),
+                    },
+                    b"value".to_vec(),
+                );
+                builder.build().unwrap()
+            },
+        ];
+
+        for (index, writer) in writers.into_iter().enumerate() {
+            let mut scan = product::TransactionBundleBuilder::new(
+                format!("scan-{index}"),
+                0,
+                "principal",
+                scheme,
+            );
+            scan.observe_range(7, b"orders/a".to_vec(), b"orders/z".to_vec(), None)
+                .unwrap();
+
+            let writer = to_consensus_command(&request_for_bundle(writer)).unwrap();
+            let scanner = to_consensus_command(&request_for_bundle(scan.build().unwrap())).unwrap();
+            let mut state = consensus::CertificationState::default();
+            assert!(matches!(
+                state.apply(consensus::CommitVersion(1), &writer).unwrap(),
+                consensus::CertificationResult::Committed { .. }
+            ));
+            assert!(matches!(
+                state.apply(consensus::CommitVersion(2), &scanner).unwrap(),
+                consensus::CertificationResult::Aborted {
+                    reason: consensus::CertificationAbort::RangeConflict { .. },
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn one_cross_table_transaction_advances_each_table_hierarchy() {
+        let scheme = product::HierarchicalRangeStampScheme::new(4).unwrap();
+        let mut builder =
+            product::TransactionBundleBuilder::new("cross-table", 0, "principal", scheme);
+        builder
+            .put(
+                product::LogicalKey {
+                    table_id: 2,
+                    application_key: b"partition-a/key".to_vec(),
+                },
+                b"a".to_vec(),
+            )
+            .put(
+                product::LogicalKey {
+                    table_id: 11,
+                    application_key: b"partition-z/key".to_vec(),
+                },
+                b"z".to_vec(),
+            );
+        let command = to_consensus_command(&request_for_bundle(builder.build().unwrap())).unwrap();
+        assert_eq!(command.written_point_keys.len(), 2);
+        assert!(command.advanced_range_stamps.len() >= 4);
     }
 }

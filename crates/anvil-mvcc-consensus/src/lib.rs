@@ -14,6 +14,10 @@ mod types;
 
 pub use certification::{CertificationError, CertificationState};
 pub use consensus::{Consensus, ConsensusError};
+pub use openraft_adapter::{
+    ConsensusNode, ConsensusRpc, ConsensusRpcClient, ConsensusRpcError, ConsensusRpcFactory,
+    ConsensusRpcKind, OpenRaftConsensus,
+};
 pub use storage::{
     CONSENSUS_COLUMN_FAMILIES, PersistedConsensusState, RaftStorageError, RocksRaftStore,
 };

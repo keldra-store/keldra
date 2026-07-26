@@ -43,16 +43,16 @@ pub struct PointObservation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RangeObservation {
     pub table_id: u16,
-    pub start_application_key: Vec<u8>,
-    pub end_application_key: Vec<u8>,
-    pub observed_range_stamp: CommitVersion,
+    pub start_application_key: Option<Vec<u8>>,
+    pub end_application_key: Option<Vec<u8>>,
+    pub conflict_key: RangeStampKey,
+    pub observed_range_stamp: Option<CommitVersion>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct RangeConflict {
+pub struct RangeStampKey {
     pub table_id: u16,
-    pub start_application_key: Vec<u8>,
-    pub end_application_key: Vec<u8>,
+    pub key_prefix: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,7 +93,7 @@ pub struct TransactionBundle {
     pub authenticated_principal: String,
     pub point_observations: Vec<PointObservation>,
     pub range_observations: Vec<RangeObservation>,
-    pub advanced_range_stamps: Vec<RangeConflict>,
+    pub advanced_range_stamps: Vec<RangeStampKey>,
     pub writes: Vec<WriteOperation>,
     pub shard_manifests: Vec<ObjectShardManifestReference>,
     pub outbox_events: Vec<Vec<u8>>,
@@ -126,11 +126,13 @@ impl TransactionBundle {
                 left.table_id,
                 &left.start_application_key,
                 &left.end_application_key,
+                &left.conflict_key,
             )
                 .cmp(&(
                     right.table_id,
                     &right.start_application_key,
                     &right.end_application_key,
+                    &right.conflict_key,
                 ))
         });
         ensure_unique_by(
@@ -138,15 +140,25 @@ impl TransactionBundle {
             |entry| {
                 (
                     entry.table_id,
-                    entry.start_application_key.as_slice(),
-                    entry.end_application_key.as_slice(),
+                    entry.start_application_key.as_deref(),
+                    entry.end_application_key.as_deref(),
+                    &entry.conflict_key,
                 )
             },
             "range observation",
         )?;
         for observation in &self.range_observations {
-            if observation.start_application_key >= observation.end_application_key {
+            if matches!(
+                (
+                    observation.start_application_key.as_deref(),
+                    observation.end_application_key.as_deref(),
+                ),
+                (Some(start), Some(end)) if start >= end
+            ) {
                 bail!("range observation must be a non-empty half-open interval");
+            }
+            if observation.table_id != observation.conflict_key.table_id {
+                bail!("range observation conflict key belongs to another table");
             }
         }
         self.advanced_range_stamps.sort();
@@ -154,12 +166,6 @@ impl TransactionBundle {
             self.advanced_range_stamps.iter(),
             "advanced range conflict stamp",
         )?;
-        for range in &self.advanced_range_stamps {
-            if range.start_application_key >= range.end_application_key {
-                bail!("advanced range stamp must be a non-empty half-open interval");
-            }
-        }
-
         self.writes
             .sort_by(|left, right| left.key().cmp(right.key()));
         ensure_unique(self.writes.iter().map(WriteOperation::key), "written key")?;
@@ -196,6 +202,198 @@ impl TransactionBundle {
             hash: format!("sha256:{:x}", hasher.finalize()),
             length: u64::try_from(bytes.len()).map_err(|_| anyhow!("bundle is too large"))?,
         })
+    }
+}
+
+/// Deterministic hierarchical range-stamp layout.
+///
+/// The empty prefix is the table-wide stamp. A write advances that stamp and
+/// every byte-prefix ancestor of its key through `max_prefix_bytes`. A scan
+/// observes the deepest configured prefix shared by its half-open bounds.
+/// Consequently every key inside the scan advances the observed stamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HierarchicalRangeStampScheme {
+    max_prefix_bytes: usize,
+}
+
+impl HierarchicalRangeStampScheme {
+    pub fn new(max_prefix_bytes: usize) -> Result<Self> {
+        if max_prefix_bytes > u16::MAX as usize {
+            bail!("range stamp prefix depth is too large");
+        }
+        Ok(Self { max_prefix_bytes })
+    }
+
+    pub fn observation_key(
+        self,
+        table_id: u16,
+        start_application_key: Option<&[u8]>,
+        end_application_key: Option<&[u8]>,
+    ) -> Result<RangeStampKey> {
+        let shared = match (start_application_key, end_application_key) {
+            (Some(start), Some(end)) => {
+                if start >= end {
+                    bail!("range observation must be a non-empty half-open interval");
+                }
+                start
+                    .iter()
+                    .zip(end)
+                    .take(self.max_prefix_bytes)
+                    .take_while(|(left, right)| left == right)
+                    .count()
+            }
+            _ => 0,
+        };
+        Ok(RangeStampKey {
+            table_id,
+            key_prefix: start_application_key
+                .map(|start| start[..shared].to_vec())
+                .unwrap_or_default(),
+        })
+    }
+
+    pub fn write_keys(self, key: &LogicalKey) -> Vec<RangeStampKey> {
+        let depth = self.max_prefix_bytes.min(key.application_key.len());
+        (0..=depth)
+            .map(|prefix_len| RangeStampKey {
+                table_id: key.table_id,
+                key_prefix: key.application_key[..prefix_len].to_vec(),
+            })
+            .collect()
+    }
+}
+
+/// Builds one scope-free transaction bundle while deriving all hierarchical
+/// range conflict metadata from reads and writes.
+pub struct TransactionBundleBuilder {
+    bundle: TransactionBundle,
+    range_scheme: HierarchicalRangeStampScheme,
+    advanced_range_stamps: BTreeSet<RangeStampKey>,
+}
+
+impl TransactionBundleBuilder {
+    pub fn new(
+        transaction_id: impl Into<String>,
+        snapshot_version: CommitVersion,
+        authenticated_principal: impl Into<String>,
+        range_scheme: HierarchicalRangeStampScheme,
+    ) -> Self {
+        Self {
+            bundle: TransactionBundle {
+                schema: TransactionBundle::SCHEMA.to_string(),
+                transaction_id: transaction_id.into(),
+                snapshot_version,
+                authenticated_principal: authenticated_principal.into(),
+                point_observations: Vec::new(),
+                range_observations: Vec::new(),
+                advanced_range_stamps: Vec::new(),
+                writes: Vec::new(),
+                shard_manifests: Vec::new(),
+                outbox_events: Vec::new(),
+                materialisation_jobs: Vec::new(),
+            },
+            range_scheme,
+            advanced_range_stamps: BTreeSet::new(),
+        }
+    }
+
+    pub fn observe_point(
+        &mut self,
+        key: LogicalKey,
+        observed_version: Option<CommitVersion>,
+    ) -> &mut Self {
+        self.bundle.point_observations.push(PointObservation {
+            key,
+            observed_version,
+        });
+        self
+    }
+
+    pub fn observe_range(
+        &mut self,
+        table_id: u16,
+        start_application_key: Vec<u8>,
+        end_application_key: Vec<u8>,
+        observed_range_stamp: Option<CommitVersion>,
+    ) -> Result<&mut Self> {
+        self.observe_scan(
+            table_id,
+            Some(start_application_key),
+            Some(end_application_key),
+            observed_range_stamp,
+        )
+    }
+
+    pub fn observe_scan(
+        &mut self,
+        table_id: u16,
+        start_application_key: Option<Vec<u8>>,
+        end_application_key: Option<Vec<u8>>,
+        observed_range_stamp: Option<CommitVersion>,
+    ) -> Result<&mut Self> {
+        let conflict_key = self.range_scheme.observation_key(
+            table_id,
+            start_application_key.as_deref(),
+            end_application_key.as_deref(),
+        )?;
+        self.bundle.range_observations.push(RangeObservation {
+            table_id,
+            start_application_key,
+            end_application_key,
+            conflict_key,
+            observed_range_stamp,
+        });
+        Ok(self)
+    }
+
+    pub fn put(&mut self, key: LogicalKey, value: Vec<u8>) -> &mut Self {
+        self.advance_write_stamps(&key);
+        self.bundle.writes.push(WriteOperation::Put { key, value });
+        self
+    }
+
+    pub fn delete(&mut self, key: LogicalKey) -> &mut Self {
+        self.advance_write_stamps(&key);
+        self.bundle.writes.push(WriteOperation::Delete { key });
+        self
+    }
+
+    /// Rename is one atomic delete plus put and may cross tables or partitions.
+    pub fn rename(
+        &mut self,
+        old_key: LogicalKey,
+        new_key: LogicalKey,
+        value: Vec<u8>,
+    ) -> &mut Self {
+        self.delete(old_key);
+        self.put(new_key, value);
+        self
+    }
+
+    pub fn add_shard_manifest(&mut self, manifest: ObjectShardManifestReference) -> &mut Self {
+        self.bundle.shard_manifests.push(manifest);
+        self
+    }
+
+    pub fn add_outbox_event(&mut self, event: Vec<u8>) -> &mut Self {
+        self.bundle.outbox_events.push(event);
+        self
+    }
+
+    pub fn add_materialisation_job(&mut self, job: Vec<u8>) -> &mut Self {
+        self.bundle.materialisation_jobs.push(job);
+        self
+    }
+
+    pub fn build(mut self) -> Result<TransactionBundle> {
+        self.bundle.advanced_range_stamps = self.advanced_range_stamps.into_iter().collect();
+        self.bundle.canonicalize()?;
+        Ok(self.bundle)
+    }
+
+    fn advance_write_stamps(&mut self, key: &LogicalKey) {
+        self.advanced_range_stamps
+            .extend(self.range_scheme.write_keys(key));
     }
 }
 
@@ -306,7 +504,7 @@ pub struct CertificationRequest {
     pub object_durability: Vec<ObjectDurabilityEvidence>,
     pub point_observations: Vec<PointObservation>,
     pub range_observations: Vec<RangeObservation>,
-    pub advanced_range_stamps: Vec<RangeConflict>,
+    pub advanced_range_stamps: Vec<RangeStampKey>,
     pub written_keys: Vec<LogicalKey>,
 }
 
@@ -1003,5 +1201,68 @@ mod tests {
         let mut second = first.clone();
         second.writes.reverse();
         assert_eq!(first.identity().unwrap(), second.identity().unwrap());
+    }
+
+    #[test]
+    fn hierarchical_scan_stamp_is_advanced_by_every_overlapping_write() {
+        let scheme = HierarchicalRangeStampScheme::new(8).unwrap();
+        let observed = scheme
+            .observation_key(7, Some(b"orders/a"), Some(b"orders/z"))
+            .unwrap();
+        assert_eq!(observed.key_prefix, b"orders/".to_vec());
+
+        let overlapping = LogicalKey {
+            table_id: 7,
+            application_key: b"orders/m".to_vec(),
+        };
+        assert!(scheme.write_keys(&overlapping).contains(&observed));
+
+        let unrelated = LogicalKey {
+            table_id: 7,
+            application_key: b"profiles/m".to_vec(),
+        };
+        assert!(!scheme.write_keys(&unrelated).contains(&observed));
+        let full_table = scheme.observation_key(7, None, None).unwrap();
+        assert!(full_table.key_prefix.is_empty());
+        assert!(scheme.write_keys(&unrelated).contains(&full_table));
+    }
+
+    #[test]
+    fn builder_advances_delete_and_cross_table_rename_stamps() {
+        let scheme = HierarchicalRangeStampScheme::new(4).unwrap();
+        let old_key = LogicalKey {
+            table_id: 3,
+            application_key: b"old/key".to_vec(),
+        };
+        let new_key = LogicalKey {
+            table_id: 9,
+            application_key: b"new/key".to_vec(),
+        };
+        let mut builder =
+            TransactionBundleBuilder::new("rename", 10, "tenant/1/principal/app", scheme);
+        builder.rename(old_key.clone(), new_key.clone(), b"value".to_vec());
+        let bundle = builder.build().unwrap();
+
+        assert_eq!(bundle.writes.len(), 2);
+        assert!(
+            scheme
+                .write_keys(&old_key)
+                .iter()
+                .all(|stamp| bundle.advanced_range_stamps.contains(stamp))
+        );
+        assert!(
+            scheme
+                .write_keys(&new_key)
+                .iter()
+                .all(|stamp| bundle.advanced_range_stamps.contains(stamp))
+        );
+        assert!(bundle.advanced_range_stamps.contains(&RangeStampKey {
+            table_id: 3,
+            key_prefix: Vec::new(),
+        }));
+        assert!(bundle.advanced_range_stamps.contains(&RangeStampKey {
+            table_id: 9,
+            key_prefix: Vec::new(),
+        }));
     }
 }

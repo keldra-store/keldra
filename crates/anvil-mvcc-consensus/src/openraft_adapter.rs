@@ -1,22 +1,31 @@
 //! The only module permitted to name concrete OpenRaft application types.
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fmt::Debug,
     io::Cursor,
     ops::{Bound, RangeBounds},
+    sync::Arc,
 };
 
+use async_trait::async_trait;
 use openraft::{
     AnyError, BasicNode, Entry, EntryPayload, ErrorSubject, ErrorVerb, LogId, LogState,
     OptionalSend, RaftLogReader, RaftSnapshotBuilder, Snapshot, SnapshotMeta, StorageError,
     StorageIOError, StoredMembership, Vote,
+    error::{InstallSnapshotError, NetworkError, RPCError, RaftError},
+    network::{RPCOption, RaftNetwork, RaftNetworkFactory},
+    raft::{
+        AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
+        InstallSnapshotResponse, VoteRequest, VoteResponse,
+    },
     storage::{LogFlushed, RaftLogStorage, RaftStateMachine},
 };
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CertificationResult, CertificationState, CertifyTransaction, CommitVersion, RaftStorageError,
-    RocksRaftStore,
+    CertificationResult, CertificationState, CertifyTransaction, CommitVersion, Consensus,
+    ConsensusError, NodeId, RaftStorageError, RocksRaftStore,
     storage::{KEY_LAST_PURGED_LOG_ID, KEY_OPENRAFT_STATE},
 };
 
@@ -36,6 +45,128 @@ openraft::declare_raft_types!(
 );
 
 pub(crate) type RaftEntry = Entry<AnvilRaftConfig>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsensusNode {
+    pub address: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConsensusRpcKind {
+    AppendEntries,
+    Vote,
+    InstallSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsensusRpc {
+    pub schema_version: u16,
+    pub kind: ConsensusRpcKind,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum ConsensusRpcError {
+    #[error("peer is unreachable: {0}")]
+    Unreachable(String),
+    #[error("consensus RPC failed: {0}")]
+    Protocol(String),
+}
+
+#[async_trait]
+pub trait ConsensusRpcClient: Send + Sync + 'static {
+    async fn request(&mut self, rpc: ConsensusRpc) -> Result<Vec<u8>, ConsensusRpcError>;
+}
+
+/// Injectable transport boundary. Implementations own connection management;
+/// this crate owns the OpenRaft wire types contained in the opaque payload.
+pub trait ConsensusRpcFactory: Send + Sync + 'static {
+    fn client(&self, target: NodeId, node: &ConsensusNode) -> Box<dyn ConsensusRpcClient>;
+}
+
+#[derive(Clone)]
+struct NetworkFactoryAdapter {
+    inner: Arc<dyn ConsensusRpcFactory>,
+}
+
+struct NetworkAdapter {
+    client: Box<dyn ConsensusRpcClient>,
+}
+
+impl RaftNetworkFactory<AnvilRaftConfig> for NetworkFactoryAdapter {
+    type Network = NetworkAdapter;
+
+    async fn new_client(&mut self, target: u64, node: &BasicNode) -> Self::Network {
+        let descriptor = ConsensusNode {
+            address: node.addr.clone(),
+        };
+        NetworkAdapter {
+            client: self.inner.client(NodeId(target), &descriptor),
+        }
+    }
+}
+
+impl NetworkAdapter {
+    async fn call<Req, Resp, AppError>(
+        &mut self,
+        kind: ConsensusRpcKind,
+        request: &Req,
+    ) -> Result<Resp, RPCError<u64, BasicNode, RaftError<u64, AppError>>>
+    where
+        Req: Serialize,
+        Resp: for<'de> Deserialize<'de>,
+        AppError: std::error::Error,
+    {
+        let payload = bincode::serde::encode_to_vec(request, bincode::config::standard())
+            .map_err(|error| RPCError::Network(NetworkError::new(&error)))?;
+        let response = self
+            .client
+            .request(ConsensusRpc {
+                schema_version: 1,
+                kind,
+                payload,
+            })
+            .await
+            .map_err(|error| match error {
+                ConsensusRpcError::Unreachable(_) => {
+                    RPCError::Unreachable(openraft::error::Unreachable::new(&error))
+                }
+                ConsensusRpcError::Protocol(_) => RPCError::Network(NetworkError::new(&error)),
+            })?;
+        bincode::serde::decode_from_slice(&response, bincode::config::standard())
+            .map(|(value, _)| value)
+            .map_err(|error| RPCError::Network(NetworkError::new(&error)))
+    }
+}
+
+impl RaftNetwork<AnvilRaftConfig> for NetworkAdapter {
+    async fn append_entries(
+        &mut self,
+        rpc: AppendEntriesRequest<AnvilRaftConfig>,
+        _option: RPCOption,
+    ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
+        self.call(ConsensusRpcKind::AppendEntries, &rpc).await
+    }
+
+    async fn install_snapshot(
+        &mut self,
+        rpc: InstallSnapshotRequest<AnvilRaftConfig>,
+        _option: RPCOption,
+    ) -> Result<
+        InstallSnapshotResponse<u64>,
+        RPCError<u64, BasicNode, RaftError<u64, InstallSnapshotError>>,
+    > {
+        self.call(ConsensusRpcKind::InstallSnapshot, &rpc).await
+    }
+
+    async fn vote(
+        &mut self,
+        rpc: VoteRequest<u64>,
+        _option: RPCOption,
+    ) -> Result<VoteResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
+        self.call(ConsensusRpcKind::Vote, &rpc).await
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MachineState {
@@ -75,6 +206,148 @@ pub(crate) fn stores(store: RocksRaftStore) -> (OpenRaftLogStore, OpenRaftStateM
         },
         OpenRaftStateMachine { store },
     )
+}
+
+/// Running consensus service. OpenRaft remains fully contained behind Anvil's
+/// [`Consensus`] and transport interfaces.
+pub struct OpenRaftConsensus {
+    raft: openraft::Raft<AnvilRaftConfig>,
+}
+
+impl OpenRaftConsensus {
+    pub async fn from_db(
+        node_id: NodeId,
+        db: Arc<rocksdb::DB>,
+        group_id: u64,
+        cluster_name: impl Into<String>,
+        network: Arc<dyn ConsensusRpcFactory>,
+    ) -> Result<Self, ConsensusError> {
+        let store = RocksRaftStore::from_db(db, group_id)
+            .map_err(|error| ConsensusError::Storage(error.to_string()))?;
+        Self::new(node_id, store, cluster_name, network).await
+    }
+
+    pub async fn new(
+        node_id: NodeId,
+        store: RocksRaftStore,
+        cluster_name: impl Into<String>,
+        network: Arc<dyn ConsensusRpcFactory>,
+    ) -> Result<Self, ConsensusError> {
+        let config = openraft::Config {
+            cluster_name: cluster_name.into(),
+            ..Default::default()
+        }
+        .validate()
+        .map_err(|error| ConsensusError::Rejected(error.to_string()))?;
+        let (log_store, state_machine) = stores(store);
+        let raft = openraft::Raft::new(
+            node_id.0,
+            Arc::new(config),
+            NetworkFactoryAdapter { inner: network },
+            log_store,
+            state_machine,
+        )
+        .await
+        .map_err(|error| ConsensusError::Storage(error.to_string()))?;
+        Ok(Self { raft })
+    }
+
+    pub async fn initialize(
+        &self,
+        members: BTreeMap<NodeId, ConsensusNode>,
+    ) -> Result<(), ConsensusError> {
+        let members = members
+            .into_iter()
+            .map(|(id, node)| (id.0, BasicNode::new(node.address)))
+            .collect::<BTreeMap<_, _>>();
+        self.raft
+            .initialize(members)
+            .await
+            .map_err(|error| ConsensusError::Unavailable(error.to_string()))
+    }
+
+    pub async fn add_learner(
+        &self,
+        node_id: NodeId,
+        node: ConsensusNode,
+        blocking: bool,
+    ) -> Result<(), ConsensusError> {
+        self.raft
+            .add_learner(node_id.0, BasicNode::new(node.address), blocking)
+            .await
+            .map(|_| ())
+            .map_err(map_raft_error)
+    }
+
+    pub async fn change_membership(
+        &self,
+        voters: BTreeSet<NodeId>,
+        retain_removed_as_learners: bool,
+    ) -> Result<(), ConsensusError> {
+        let voters = voters.into_iter().map(|id| id.0).collect::<BTreeSet<_>>();
+        self.raft
+            .change_membership(voters, retain_removed_as_learners)
+            .await
+            .map(|_| ())
+            .map_err(map_raft_error)
+    }
+
+    pub async fn shutdown(&self) -> Result<(), ConsensusError> {
+        self.raft
+            .shutdown()
+            .await
+            .map_err(|error| ConsensusError::Unavailable(error.to_string()))
+    }
+}
+
+fn map_raft_error<E>(error: openraft::error::RaftError<u64, E>) -> ConsensusError
+where
+    E: std::error::Error + openraft::TryAsRef<openraft::error::ForwardToLeader<u64, BasicNode>>,
+{
+    if error.forward_to_leader::<BasicNode>().is_some() {
+        ConsensusError::ForwardToLeader
+    } else {
+        ConsensusError::Unavailable(error.to_string())
+    }
+}
+
+#[async_trait]
+impl Consensus for OpenRaftConsensus {
+    async fn certify(
+        &self,
+        command: CertifyTransaction,
+    ) -> Result<CertificationResult, ConsensusError> {
+        let response = self
+            .raft
+            .client_write(command)
+            .await
+            .map_err(map_raft_error)?;
+        match response.data {
+            RaftApplyResult::Certification(result) => Ok(result),
+            RaftApplyResult::Rejected(reason) => Err(ConsensusError::Rejected(reason)),
+            RaftApplyResult::Noop => Err(ConsensusError::Rejected(
+                "certification produced a non-application response".into(),
+            )),
+        }
+    }
+
+    async fn linearized_read_barrier(&self) -> Result<CommitVersion, ConsensusError> {
+        self.raft
+            .ensure_linearizable()
+            .await
+            .map(|log_id| CommitVersion(log_id.map_or(0, |id| id.index)))
+            .map_err(map_raft_error)
+    }
+
+    fn observed_commit_version(&self) -> CommitVersion {
+        let metrics = self.raft.metrics();
+        CommitVersion(
+            metrics
+                .borrow()
+                .last_applied
+                .map_or(0, |log_id| log_id.index),
+        )
+    }
 }
 
 fn storage_error(
@@ -364,11 +637,21 @@ impl RaftStateMachine<AnvilRaftConfig> for OpenRaftStateMachine {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use openraft::{CommittedLeaderId, RaftTypeConfig, storage::RaftLogStorage};
     use tempfile::TempDir;
 
     use super::*;
     use crate::{BundleHash, DurabilityLevel, NodeId, NodeIncarnation, TransactionId};
+
+    struct NoRemoteFactory;
+
+    impl ConsensusRpcFactory for NoRemoteFactory {
+        fn client(&self, _target: NodeId, _node: &ConsensusNode) -> Box<dyn ConsensusRpcClient> {
+            panic!("single-node runtime must not create a remote client")
+        }
+    }
 
     #[test]
     fn application_payload_is_the_compact_certification_command() {
@@ -436,5 +719,66 @@ mod tests {
             )]
         ));
         assert_eq!(machine.applied_state().await.unwrap().0, Some(log_id_9));
+    }
+
+    #[tokio::test]
+    async fn single_node_runtime_initializes_certifies_and_linearizes() {
+        let directory = TempDir::new().unwrap();
+        let runtime = OpenRaftConsensus::new(
+            NodeId(1),
+            RocksRaftStore::open(directory.path(), 0).unwrap(),
+            "test-cluster",
+            Arc::new(NoRemoteFactory),
+        )
+        .await
+        .unwrap();
+        runtime
+            .initialize(BTreeMap::from([(
+                NodeId(1),
+                ConsensusNode {
+                    address: "in-process".into(),
+                },
+            )]))
+            .await
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while runtime.raft.metrics().borrow().current_leader != Some(1) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "single node did not elect itself"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let result = runtime.certify(test_command(8)).await.unwrap();
+        let committed = match result {
+            CertificationResult::Committed { commit_version, .. } => commit_version,
+            other => panic!("unexpected result: {other:?}"),
+        };
+        assert_eq!(
+            runtime.linearized_read_barrier().await.unwrap(),
+            runtime.observed_commit_version()
+        );
+        assert!(runtime.observed_commit_version() >= committed);
+        runtime.shutdown().await.unwrap();
+    }
+
+    fn test_command(id: u8) -> CertifyTransaction {
+        CertifyTransaction {
+            transaction_id: TransactionId([id; 16]),
+            snapshot_version: CommitVersion(0),
+            point_observations: vec![],
+            range_observations: vec![],
+            written_point_keys: vec![],
+            advanced_range_stamps: vec![],
+            bundle_hash: BundleHash([id; 32]),
+            bundle_length: 1,
+            durability: DurabilityLevel::Local,
+            durable_holders: vec![NodeIncarnation {
+                node_id: NodeId(1),
+                incarnation: 1,
+            }],
+        }
     }
 }
