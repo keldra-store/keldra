@@ -29,7 +29,7 @@ use crate::typed_field_segment::{
 use crate::vector_segment::{self, VectorSegmentEntry, VectorSegmentWrite};
 use crate::{
     derived_index_proof::{self, DerivedIndexProofWrite},
-    watch_checkpoint::{self, WatchCheckpointUpdate, WatchCheckpointWriteAuthority},
+    watch_checkpoint::{self, WatchCheckpointUpdate},
 };
 use crate::{index_coremeta, index_journal};
 use anyhow::{Context, Result, anyhow};
@@ -302,9 +302,11 @@ async fn build_full_text_index_from_source(
     let index_storage_id =
         index_journal::index_storage_id(index.tenant_id, index.bucket_id, index.id);
     let latest_generation = latest_index_segment_generation(storage, &index_storage_id).await?;
-    let latest_checkpoint_generation =
-        latest_index_checkpoint_generation(storage, &index_storage_id, partition_owner_signing_key)
-            .await?;
+    let latest_checkpoint_generation = latest_index_checkpoint_generation(
+        authority.mvcc()?,
+        &index_storage_id,
+        partition_owner_signing_key,
+    )?;
     let generation = latest_generation
         .max(latest_checkpoint_generation)
         .saturating_add(1)
@@ -602,9 +604,11 @@ async fn build_typed_json_index_from_source(
     let index_storage_id =
         index_journal::index_storage_id(index.tenant_id, index.bucket_id, index.id);
     let latest_generation = latest_index_segment_generation(storage, &index_storage_id).await?;
-    let latest_checkpoint_generation =
-        latest_index_checkpoint_generation(storage, &index_storage_id, partition_owner_signing_key)
-            .await?;
+    let latest_checkpoint_generation = latest_index_checkpoint_generation(
+        authority.mvcc()?,
+        &index_storage_id,
+        partition_owner_signing_key,
+    )?;
     let generation = latest_generation
         .max(latest_checkpoint_generation)
         .saturating_add(1)
@@ -846,9 +850,11 @@ pub(crate) async fn build_metadata_backed_index(
     let index_storage_id =
         index_journal::index_storage_id(index.tenant_id, index.bucket_id, index.id);
     let latest_generation = latest_index_segment_generation(storage, &index_storage_id).await?;
-    let latest_checkpoint_generation =
-        latest_index_checkpoint_generation(storage, &index_storage_id, partition_owner_signing_key)
-            .await?;
+    let latest_checkpoint_generation = latest_index_checkpoint_generation(
+        authority.mvcc()?,
+        &index_storage_id,
+        partition_owner_signing_key,
+    )?;
     let generation = latest_generation
         .max(latest_checkpoint_generation)
         .saturating_add(1)
@@ -1162,9 +1168,11 @@ async fn build_vector_index_with_policy(
     let index_storage_id =
         index_journal::index_storage_id(index.tenant_id, index.bucket_id, index.id);
     let latest_generation = latest_index_segment_generation(storage, &index_storage_id).await?;
-    let latest_checkpoint_generation =
-        latest_index_checkpoint_generation(storage, &index_storage_id, partition_owner_signing_key)
-            .await?;
+    let latest_checkpoint_generation = latest_index_checkpoint_generation(
+        authority.mvcc()?,
+        &index_storage_id,
+        partition_owner_signing_key,
+    )?;
     let generation = latest_generation
         .max(latest_checkpoint_generation)
         .saturating_add(1)
@@ -1699,167 +1707,17 @@ async fn publish_index_build_watch(
         .await
 }
 
-async fn latest_index_checkpoint_generation(
-    storage: &Storage,
+fn latest_index_checkpoint_generation(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     index_storage_id: &str,
     signing_key: &[u8],
 ) -> Result<u64> {
-    Ok(watch_checkpoint::read_watch_checkpoint(
-        storage,
+    Ok(watch_checkpoint::read_watch_checkpoint_mvcc(
+        mvcc,
         "object_metadata",
         index_storage_id,
         signing_key,
-    )
-    .await?
+    )?
     .map(|checkpoint| checkpoint.generation)
     .unwrap_or(0))
 }
-
-async fn acquire_watch_checkpoint_authority(
-    storage: &Storage,
-    update: &WatchCheckpointUpdate,
-    builder_node_id: &str,
-    signing_key: &[u8],
-) -> Result<WatchCheckpointWriteAuthority> {
-    let resource_id = watch_checkpoint::watch_checkpoint_resource_id(
-        &update.watch_stream_id,
-        &update.partition_id,
-        &update.consumer_id,
-    );
-    let now_nanos = chrono::Utc::now()
-        .timestamp_nanos_opt()
-        .ok_or_else(|| anyhow!("timestamp cannot be represented in nanoseconds"))?;
-    let outcome = acquire_ownership(
-        storage,
-        AcquireOwnership {
-            request_id: format!("watch-checkpoint-{resource_id}-{builder_node_id}"),
-            idempotency_key: format!("watch-checkpoint-{resource_id}-{builder_node_id}"),
-            resource: OwnershipResource {
-                resource_kind: OwnershipResourceKind::WatchPartition,
-                resource_id: resource_id.clone(),
-            },
-            owner: OwnershipPrincipal::node(builder_node_id),
-            now_nanos,
-            ttl_nanos: i64::try_from(MAX_OWNERSHIP_LEASE_MS)
-                .unwrap_or(i64::MAX)
-                .saturating_mul(1_000_000),
-        },
-        signing_key,
-    )
-    .await?;
-    Ok(WatchCheckpointWriteAuthority {
-        owner_node_id: builder_node_id.to_string(),
-        fence: outcome.record.fence,
-        resource_id,
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn acquire_index_partition_watch_authority(
-    storage: &Storage,
-    tenant_id: i64,
-    bucket_id: i64,
-    partition_id: &str,
-    payload: &IndexPartitionWatchPayload,
-    builder_node_id: &str,
-    signing_key: &[u8],
-) -> Result<index_partition_watch::IndexPartitionWatchWriteAuthority> {
-    let resource_id = index_partition_watch::index_partition_watch_resource_id(
-        tenant_id,
-        bucket_id,
-        &payload.index_id,
-        partition_id,
-    );
-    let now_nanos = chrono::Utc::now()
-        .timestamp_nanos_opt()
-        .ok_or_else(|| anyhow!("timestamp cannot be represented in nanoseconds"))?;
-    let outcome = acquire_ownership(
-        storage,
-        AcquireOwnership {
-            request_id: format!("index-watch-{resource_id}-{builder_node_id}"),
-            idempotency_key: format!("index-watch-{resource_id}-{builder_node_id}"),
-            resource: OwnershipResource {
-                resource_kind: OwnershipResourceKind::WatchPartition,
-                resource_id: resource_id.clone(),
-            },
-            owner: OwnershipPrincipal::node(builder_node_id),
-            now_nanos,
-            ttl_nanos: i64::try_from(MAX_OWNERSHIP_LEASE_MS)
-                .unwrap_or(i64::MAX)
-                .saturating_mul(1_000_000),
-        },
-        signing_key,
-    )
-    .await?;
-    Ok(index_partition_watch::IndexPartitionWatchWriteAuthority {
-        owner_node_id: builder_node_id.to_string(),
-        fence: outcome.record.fence,
-        resource_id,
-    })
-}
-
-#[derive(Debug, Clone)]
-struct ExtractedVector {
-    chunk_id: u32,
-    source_start: u64,
-    source_len: u32,
-    values: Vec<f32>,
-}
-
-#[derive(Debug, Clone)]
-struct VectorExtractionDiagnostic {
-    code: String,
-    message: String,
-    details: JsonValue,
-}
-
-#[derive(Debug, Clone)]
-struct VectorExtraction {
-    vectors: Vec<ExtractedVector>,
-    diagnostics: Vec<VectorExtractionDiagnostic>,
-}
-
-#[derive(Debug, Deserialize)]
-struct JsonVectorRecord {
-    vector: Option<Vec<f32>>,
-    values: Option<Vec<f32>>,
-    embedding: Option<Vec<f32>>,
-    chunk_id: Option<u32>,
-    source_start: Option<u64>,
-    source_len: Option<u32>,
-}
-
-async fn extract_vectors(
-    extractor: &JsonValue,
-    payload: &[u8],
-    definition: &VectorIndexDefinition,
-    embedding_providers: &EmbeddingProviderRegistry,
-) -> VectorExtraction {
-    let kind = extractor
-        .get("kind")
-        .and_then(JsonValue::as_str)
-        .unwrap_or("object_body_utf8");
-    match kind {
-        "object_body_json_vector" | "object_body_json" | "json_vector" => {
-            extract_json_vectors(extractor, payload, definition)
-        }
-        "object_body_f32_le" | "f32_le" => extract_f32_le_vectors(payload, definition),
-        "object_body_utf8" | "utf8" | "body" => {
-            extract_provider_embedding(extractor, payload, definition, embedding_providers).await
-        }
-        _ => VectorExtraction {
-            vectors: Vec::new(),
-            diagnostics: vec![VectorExtractionDiagnostic {
-                code: "UnsupportedVectorExtractor".to_string(),
-                message: format!("unsupported vector extractor kind `{kind}`"),
-                details: serde_json::json!({ "kind": kind }),
-            }],
-        },
-    }
-}
-
-mod helpers;
-use helpers::*;
-
-#[cfg(test)]
-mod tests;

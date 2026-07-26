@@ -391,3 +391,124 @@ fn local_apply_watermark_rejects_backward_versions_without_changing_visibility()
     );
     assert!(store.read_latest(&older_key).unwrap().is_none());
 }
+
+#[tokio::test]
+async fn successor_epoch_aborts_stale_atomic_publication_and_retry_is_stable() {
+    let (_directory, state) = state().await;
+    let lease_key = feature_key(0x7201, "task-lease");
+    let proof_key = feature_key(0x7202, "derived-proof-head");
+    let checkpoint_key = feature_key(0x7203, "watch-checkpoint");
+    let lease_epoch_one = b"lease-epoch-1".to_vec();
+    let lease_epoch_two = b"lease-epoch-2".to_vec();
+
+    state
+        .mvcc
+        .autocommit_product_mutations(
+            PRINCIPAL,
+            "seed-lease-epoch",
+            vec![ProductMutation::put(
+                lease_key.clone(),
+                lease_epoch_one.clone(),
+            )],
+            DurabilityLevel::Local,
+            NOW,
+        )
+        .await
+        .unwrap();
+
+    let stale = begin(&state, "stale-proof-checkpoint-publication", NOW + 1).await;
+    assert_eq!(
+        state
+            .mvcc
+            .read_transaction_value(&stale.transaction_id, PRINCIPAL, &lease_key)
+            .unwrap(),
+        Some(lease_epoch_one.clone())
+    );
+    state
+        .mvcc
+        .stage_predicate(
+            &stale.transaction_id,
+            PRINCIPAL,
+            lease_key.clone(),
+            crate::mvcc_transaction::PredicateKind::ValueHash(
+                *blake3::hash(&lease_epoch_one).as_bytes(),
+            ),
+            NOW + 1,
+        )
+        .unwrap();
+    state
+        .mvcc
+        .stage_product_mutations(
+            &stale.transaction_id,
+            PRINCIPAL,
+            vec![
+                ProductMutation::put(proof_key.clone(), b"proof".to_vec()),
+                ProductMutation::put(checkpoint_key.clone(), b"checkpoint".to_vec()),
+            ],
+            NOW + 1,
+        )
+        .unwrap();
+
+    state
+        .mvcc
+        .autocommit_product_mutations_with_predicates(
+            PRINCIPAL,
+            "install-successor-lease-epoch",
+            vec![ProductMutation::put(
+                lease_key.clone(),
+                lease_epoch_two.clone(),
+            )],
+            vec![(
+                lease_key.clone(),
+                crate::mvcc_transaction::PredicateKind::ValueHash(
+                    *blake3::hash(&lease_epoch_one).as_bytes(),
+                ),
+            )],
+            DurabilityLevel::Local,
+            NOW + 2,
+        )
+        .await
+        .unwrap();
+
+    // The stale transaction retains its fixed snapshot even after takeover.
+    assert_eq!(
+        state
+            .mvcc
+            .read_transaction_value(&stale.transaction_id, PRINCIPAL, &lease_key)
+            .unwrap(),
+        Some(lease_epoch_one)
+    );
+    let outcome = state
+        .mvcc
+        .open_transactions
+        .commit(
+            state.mvcc.runtime.as_ref(),
+            &stale.transaction_id,
+            PRINCIPAL,
+            NOW + 3,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome.certification,
+        CertificationResult::Aborted { .. }
+    ));
+    assert_eq!(
+        state.mvcc.read_latest_value(&lease_key).unwrap(),
+        Some(lease_epoch_two)
+    );
+    assert_eq!(state.mvcc.read_latest_value(&proof_key).unwrap(), None);
+    assert_eq!(state.mvcc.read_latest_value(&checkpoint_key).unwrap(), None);
+
+    let retry = begin(&state, "stale-proof-checkpoint-publication", NOW + 4).await;
+    assert_eq!(retry.transaction_id, stale.transaction_id);
+    assert_eq!(
+        state
+            .mvcc
+            .open_transactions
+            .status(&retry.transaction_id, PRINCIPAL, NOW + 4)
+            .unwrap()
+            .state,
+        "aborted"
+    );
+}

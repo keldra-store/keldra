@@ -155,13 +155,12 @@ impl Persistence {
             };
         let index_storage_id =
             index_journal::index_storage_id(bucket.tenant_id, bucket.id, index.id);
-        let checkpoint = watch_checkpoint::read_watch_checkpoint(
-            &self.storage,
+        let checkpoint = watch_checkpoint::read_watch_checkpoint_mvcc(
+            self.mvcc()?,
             "object_metadata",
             &index_storage_id,
             &self.partition_owner_signing_key,
-        )
-        .await?;
+        )?;
         let source_manifest_hash =
             if index.kind == "typed_json" && typed_json_source_kind == "append_record" {
                 blake3::hash(
@@ -182,12 +181,11 @@ impl Persistence {
                 )
                 .await?
             };
-        let latest_proof = crate::derived_index_proof::read_latest_derived_index_proof(
-            &self.storage,
+        let latest_proof = crate::derived_index_proof::read_latest_derived_index_proof_mvcc(
+            self.mvcc()?,
             &index_storage_id,
             &self.partition_owner_signing_key,
         )
-        .await
         .ok()
         .flatten();
         let catch_up_plan = crate::derived_index_catchup::plan_derived_index_catch_up(
@@ -335,13 +333,12 @@ impl Persistence {
             return Ok(None);
         }
         let index_storage_id = index_journal::index_storage_id(tenant_id, bucket_id, index.id);
-        if watch_checkpoint::read_watch_checkpoint(
-            &self.storage,
+        if watch_checkpoint::read_watch_checkpoint_mvcc(
+            self.mvcc()?,
             "object_metadata",
             &index_storage_id,
             &self.partition_owner_signing_key,
-        )
-        .await?
+        )?
         .is_some_and(|checkpoint| checkpoint.cursor > source_cursor)
         {
             // A newer build already published this index. Replaying an older
@@ -498,7 +495,7 @@ impl Persistence {
         };
 
         let mut status = index_repair::assess_derived_index(
-            &self.storage,
+            self.mvcc()?,
             &index,
             &index_storage_id,
             source_cursor,

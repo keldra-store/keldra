@@ -42,7 +42,7 @@ pub struct IndexRepairReport {
 }
 
 pub async fn assess_derived_index(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     index: &IndexDefinition,
     index_storage_id: &str,
     source_cursor: u128,
@@ -53,13 +53,11 @@ pub async fn assess_derived_index(
         return Ok(IndexRepairStatus::EmptySource);
     }
 
-    let proof = match derived_index_proof::read_latest_derived_index_proof(
-        storage,
+    let proof = match derived_index_proof::read_latest_derived_index_proof_mvcc(
+        mvcc,
         index_storage_id,
         signing_key,
-    )
-    .await
-    {
+    ) {
         Ok(Some(proof)) => proof,
         Ok(None) => {
             return Ok(IndexRepairStatus::NeedsRepair(
