@@ -1,19 +1,20 @@
 use std::{
     collections::BTreeMap,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use anvil_core::{
+    bundle_replication::{
+        AppendOnlyPreparedBundleStore, BundleTarget, BundleTargetStream, ObjectEvidenceRegistry,
+        StreamingBundleReplicator,
+    },
+    mvcc_consensus_adapter::ConsensusTransactionCertifier,
     mvcc_store::LocalMvccStore,
     mvcc_transaction::{
-        BundleDurabilityEvidence, BundleIdentity, BundleReplicator, CertificationRequest,
-        CertificationResult, DurabilityLevel, DurabilityPolicy, HierarchicalRangeStampScheme,
-        LogicalKey, NodeIncarnation, PreparedBundleStore, ReadConsistency, ReplicationEvidence,
-        TransactionBundleBuilder, TransactionCertifier, TransactionCoordinator,
+        BundleIdentity, CertificationResult, DurabilityLevel, DurabilityPolicy,
+        HierarchicalRangeStampScheme, LogicalKey, NodeIncarnation, TransactionBundleBuilder,
+        TransactionCoordinator,
     },
     replication::{AckStatus, ReplicationAck},
     replication_client::object_shard_transfer_id,
@@ -22,17 +23,23 @@ use anvil_core::{
     },
     streaming_erasure::{EncodedShard, ErasureProfile},
 };
+use anvil_mvcc_consensus::{
+    ConsensusNode, ConsensusRpc, ConsensusRpcClient, ConsensusRpcError, ConsensusRpcFactory,
+    NodeId as RaftNodeId, OpenRaftConsensus, RocksRaftStore,
+};
 use anyhow::Result;
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Phase {
+    BundleBuild,
     StripeEncoding,
     ShardStreaming,
     RemotePersistenceWait,
     RaftCertification,
     LocalMvccApply,
-    DeferredRepair,
+    MvccRead,
     EndToEnd,
 }
 
@@ -89,27 +96,6 @@ const SHAPES: &[Shape] = &[
         concurrency: 1,
     },
     Shape {
-        name: "unrelated_concurrency",
-        logical_keys: 1,
-        tables: 1,
-        payload_bytes: 128,
-        concurrency: 32,
-    },
-    Shape {
-        name: "same_key_conflict",
-        logical_keys: 1,
-        tables: 1,
-        payload_bytes: 128,
-        concurrency: 32,
-    },
-    Shape {
-        name: "overlapping_range_conflict",
-        logical_keys: 10,
-        tables: 1,
-        payload_bytes: 1_280,
-        concurrency: 32,
-    },
-    Shape {
         name: "local_durability",
         logical_keys: 1,
         tables: 1,
@@ -128,48 +114,6 @@ const SHAPES: &[Shape] = &[
         logical_keys: 1,
         tables: 1,
         payload_bytes: 4 * 1024,
-        concurrency: 1,
-    },
-    Shape {
-        name: "group_commit",
-        logical_keys: 1,
-        tables: 1,
-        payload_bytes: 128,
-        concurrency: 64,
-    },
-    Shape {
-        name: "proposal_batching",
-        logical_keys: 1,
-        tables: 1,
-        payload_bytes: 128,
-        concurrency: 128,
-    },
-    Shape {
-        name: "rocksdb_wal_group_commit",
-        logical_keys: 1,
-        tables: 1,
-        payload_bytes: 128,
-        concurrency: 128,
-    },
-    Shape {
-        name: "replication_reconnect_resume",
-        logical_keys: 1,
-        tables: 1,
-        payload_bytes: 8 * 1024 * 1024,
-        concurrency: 1,
-    },
-    Shape {
-        name: "mvcc_read_retained_history",
-        logical_keys: 1,
-        tables: 1,
-        payload_bytes: 128,
-        concurrency: 1,
-    },
-    Shape {
-        name: "mvcc_garbage_collection",
-        logical_keys: 10_000,
-        tables: 4,
-        payload_bytes: 1_280_000,
         concurrency: 1,
     },
 ];
@@ -199,12 +143,13 @@ fn main() {
         let mut timings = PhaseTimings::default();
         runtime.block_on(run_shape(*shape, &mut timings));
         for phase in [
+            Phase::BundleBuild,
             Phase::StripeEncoding,
             Phase::ShardStreaming,
             Phase::RemotePersistenceWait,
             Phase::RaftCertification,
             Phase::LocalMvccApply,
-            Phase::DeferredRepair,
+            Phase::MvccRead,
             Phase::EndToEnd,
         ] {
             println!(
@@ -243,7 +188,7 @@ async fn run_shape(shape: Shape, timings: &mut PhaseTimings) {
         "benchmark-principal",
         HierarchicalRangeStampScheme::new(),
     );
-    timings.measure(Phase::StripeEncoding, || {
+    timings.measure(Phase::BundleBuild, || {
         for ordinal in 0..shape.logical_keys {
             builder.put(
                 LogicalKey {
@@ -255,7 +200,7 @@ async fn run_shape(shape: Shape, timings: &mut PhaseTimings) {
             );
         }
     });
-    let bundle = timings.measure(Phase::StripeEncoding, || {
+    let bundle = timings.measure(Phase::BundleBuild, || {
         let bundle = builder.build().expect("build benchmark transaction");
         bundle.canonical_bytes().expect("encode benchmark bundle");
         bundle
@@ -266,17 +211,44 @@ async fn run_shape(shape: Shape, timings: &mut PhaseTimings) {
         _ => DurabilityLevel::Quorum,
     };
     if durability == DurabilityLevel::Erasure {
-        let shard_started = Instant::now();
-        run_erasure(shape.payload_bytes.max(4 * 1024))
+        let (encoding, streaming) = run_erasure(shape.payload_bytes.max(4 * 1024))
             .await
             .expect("run benchmark distributed ingest");
-        *timings.0.entry(Phase::ShardStreaming).or_default() += shard_started.elapsed();
+        *timings.0.entry(Phase::StripeEncoding).or_default() += encoding;
+        *timings.0.entry(Phase::ShardStreaming).or_default() += streaming;
     }
     let replication_time = Arc::new(Mutex::new(Duration::ZERO));
+    let prepared_directory = tempfile::tempdir().expect("create prepared bundle directory");
+    let prepared = AppendOnlyPreparedBundleStore::open(
+        prepared_directory.path(),
+        "benchmark-cluster",
+        NodeIncarnation {
+            node_id: "node-1".into(),
+            incarnation: 1,
+        },
+        "zone-1",
+    )
+    .expect("open durable prepared bundle store");
+    let target_root = tempfile::tempdir().expect("create replication target root");
+    let targets = vec![
+        bundle_target("node-2", "zone-2"),
+        bundle_target("node-3", "zone-3"),
+    ];
+    let replicator = StreamingBundleReplicator::new(
+        DurableBundleTargets {
+            root: target_root.path().to_path_buf(),
+            elapsed: replication_time.clone(),
+        },
+        targets,
+        ObjectEvidenceRegistry::default(),
+    )
+    .expect("build multi-target bundle replicator");
+    let raft_directory = tempfile::tempdir().expect("create OpenRaft directory");
+    let consensus = openraft_consensus(raft_directory.path()).await;
     let coordinator = TransactionCoordinator::new(
-        MemoryPrepared,
-        MemoryReplicator(replication_time.clone()),
-        MemoryCertifier::default(),
+        prepared,
+        replicator,
+        ConsensusTransactionCertifier::new(consensus.clone()),
         DurabilityPolicy {
             bundle_quorum_holders: 2,
             tolerated_failure_domains: 1,
@@ -309,85 +281,134 @@ async fn run_shape(shape: Shape, timings: &mut PhaseTimings) {
             .apply_certified_bundle(commit_version, &bundle)
             .expect("apply benchmark transaction");
     });
-    timings.measure(Phase::ShardStreaming, || {
+    timings.measure(Phase::MvccRead, || {
         for write in &bundle.writes {
             store
                 .read_at(write.key(), commit_version)
                 .expect("read benchmark MVCC row");
         }
     });
-    timings.measure(Phase::DeferredRepair, || {
-        store
-            .garbage_collect(commit_version)
-            .expect("collect benchmark MVCC history");
-    });
+    consensus
+        .shutdown()
+        .await
+        .expect("shutdown benchmark OpenRaft");
     timings.0.insert(Phase::EndToEnd, end_to_end.elapsed());
 }
 
-struct MemoryPrepared;
-
-#[async_trait]
-impl PreparedBundleStore for MemoryPrepared {
-    async fn persist(&self, _: &BundleIdentity, _: &[u8]) -> Result<BundleDurabilityEvidence> {
-        Ok(bundle_holder("node-1", "zone-1"))
-    }
+struct DurableBundleTargets {
+    root: std::path::PathBuf,
+    elapsed: Arc<Mutex<Duration>>,
 }
 
-struct MemoryReplicator(Arc<Mutex<Duration>>);
-
 #[async_trait]
-impl BundleReplicator for MemoryReplicator {
-    async fn replicate(
+impl BundleTargetStream for DurableBundleTargets {
+    async fn send_bundle(
         &self,
-        _: &BundleIdentity,
-        _: &[u8],
-        _: &[anvil_core::mvcc_transaction::ObjectShardManifestReference],
-        _: DurabilityLevel,
-    ) -> Result<ReplicationEvidence> {
+        target: &BundleTarget,
+        identity: &BundleIdentity,
+        bytes: &[u8],
+    ) -> Result<ReplicationAck> {
         let started = Instant::now();
-        let evidence = ReplicationEvidence {
-            bundle_holders: vec![
-                bundle_holder("node-2", "zone-2"),
-                bundle_holder("node-3", "zone-3"),
-            ],
-            objects: Vec::new(),
-        };
-        *self.0.lock().unwrap() += started.elapsed();
-        Ok(evidence)
-    }
-}
-
-#[derive(Default)]
-struct MemoryCertifier(AtomicU64);
-
-#[async_trait]
-impl TransactionCertifier for MemoryCertifier {
-    async fn observed_commit_version(&self, _: ReadConsistency) -> Result<u64> {
-        Ok(self.0.load(Ordering::Relaxed))
-    }
-
-    async fn certify(&self, _: CertificationRequest) -> Result<CertificationResult> {
-        Ok(CertificationResult::Committed {
-            commit_version: self.0.fetch_add(1, Ordering::Relaxed) + 1,
+        let directory = self.root.join(&target.node.node_id);
+        std::fs::create_dir_all(&directory)?;
+        let path = directory.join(identity.hash.trim_start_matches("sha256:"));
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)?;
+        std::io::Write::write_all(&mut file, bytes)?;
+        file.sync_all()?;
+        *self.elapsed.lock().unwrap() += started.elapsed();
+        let digest: [u8; 32] = Sha256::digest(bytes).into();
+        Ok(ReplicationAck {
+            session_id: Uuid::nil(),
+            acknowledged_sequence: 1,
+            transfer_id: Uuid::new_v4(),
+            persisted_through: bytes.len() as u64,
+            completed_hash: Some(digest),
+            status: AckStatus::Complete,
         })
     }
 }
 
-fn bundle_holder(node: &str, domain: &str) -> BundleDurabilityEvidence {
-    BundleDurabilityEvidence {
+fn bundle_target(node: &str, domain: &str) -> BundleTarget {
+    BundleTarget {
         cluster_id: "benchmark-cluster".into(),
         node: NodeIncarnation {
             node_id: node.into(),
             incarnation: 1,
         },
         failure_domain: domain.into(),
-        complete: true,
-        hash_verified: true,
-        fsynced: true,
     }
 }
 
-struct CompleteShardTarget;
+struct NoRemoteFactory;
+struct NoRemoteClient;
+
+#[async_trait]
+impl ConsensusRpcClient for NoRemoteClient {
+    async fn request(&mut self, _: ConsensusRpc) -> Result<Vec<u8>, ConsensusRpcError> {
+        Err(ConsensusRpcError::Unreachable(
+            "single-node benchmark has no remote peer".into(),
+        ))
+    }
+}
+
+impl ConsensusRpcFactory for NoRemoteFactory {
+    fn client(&self, _: RaftNodeId, _: &ConsensusNode) -> Box<dyn ConsensusRpcClient> {
+        Box::new(NoRemoteClient)
+    }
+}
+
+async fn openraft_consensus(path: &std::path::Path) -> OpenRaftConsensus {
+    let cluster_hash = domain_hash(b"anvil.mvcc.cluster-id.v1", &[&b"benchmark-cluster"[..]]);
+    let consensus = OpenRaftConsensus::new(
+        RaftNodeId(1),
+        RocksRaftStore::open(path, 0).expect("open benchmark OpenRaft store"),
+        cluster_hash,
+        "benchmark-cluster",
+        Arc::new(NoRemoteFactory),
+    )
+    .await
+    .expect("start benchmark OpenRaft");
+    consensus
+        .initialize(BTreeMap::from([(
+            RaftNodeId(1),
+            ConsensusNode {
+                address: "in-process".into(),
+            },
+        )]))
+        .await
+        .expect("initialize benchmark OpenRaft");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if anvil_mvcc_consensus::Consensus::linearized_read_barrier(&consensus)
+            .await
+            .is_ok()
+        {
+            return consensus;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "benchmark OpenRaft did not elect a leader"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn domain_hash(domain: &[u8], fields: &[&[u8]]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update((domain.len() as u64).to_be_bytes());
+    hasher.update(domain);
+    for field in fields {
+        hasher.update((field.len() as u64).to_be_bytes());
+        hasher.update(field);
+    }
+    hasher.finalize().into()
+}
+
+struct CompleteShardTarget(Arc<Mutex<Duration>>);
 
 #[async_trait]
 impl ShardTargetStream for CompleteShardTarget {
@@ -396,7 +417,8 @@ impl ShardTargetStream for CompleteShardTarget {
         _target: &ShardTarget,
         shard: &EncodedShard<'_>,
     ) -> Result<ReplicationAck> {
-        Ok(ReplicationAck {
+        let started = Instant::now();
+        let acknowledged = ReplicationAck {
             session_id: Uuid::nil(),
             acknowledged_sequence: shard.stripe_ordinal + 1,
             transfer_id: object_shard_transfer_id(
@@ -410,11 +432,13 @@ impl ShardTargetStream for CompleteShardTarget {
             persisted_through: shard.payload.len() as u64,
             completed_hash: Some(shard.payload_hash),
             status: AckStatus::Complete,
-        })
+        };
+        *self.0.lock().unwrap() += started.elapsed();
+        Ok(acknowledged)
     }
 }
 
-async fn run_erasure(payload_bytes: usize) -> Result<()> {
+async fn run_erasure(payload_bytes: usize) -> Result<(Duration, Duration)> {
     let targets = (0..4)
         .map(|ordinal| ShardTarget {
             cluster_id: "benchmark-cluster".into(),
@@ -435,8 +459,10 @@ async fn run_erasure(payload_bytes: usize) -> Result<()> {
     };
     let payload = vec![7_u8; payload_bytes];
     let mut reader = payload.as_slice();
+    let streaming = Arc::new(Mutex::new(Duration::ZERO));
+    let started = Instant::now();
     DistributedIngest::encode(
-        &CompleteShardTarget,
+        &CompleteShardTarget(streaming.clone()),
         &plan,
         ShardPlacementPolicy {
             tolerated_failure_domains: 1,
@@ -449,5 +475,7 @@ async fn run_erasure(payload_bytes: usize) -> Result<()> {
         1,
     )
     .await?;
-    Ok(())
+    let total = started.elapsed();
+    let streaming = *streaming.lock().unwrap();
+    Ok((total.saturating_sub(streaming), streaming))
 }

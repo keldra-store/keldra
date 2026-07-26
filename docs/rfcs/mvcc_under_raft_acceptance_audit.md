@@ -60,28 +60,27 @@ so they do not yet measure the behavior their names promise.
 
 ## Section 29 performance matrix
 
-The benchmark harness declares every required shape in `SHAPES`
-([`mvcc_rfc.rs:36`](../../anvil-core/benches/mvcc_rfc.rs#L36)) and emits every
-required phase independently ([`mvcc_rfc.rs:14`](../../anvil-core/benches/mvcc_rfc.rs#L14),
-[`mvcc_rfc.rs:169`](../../anvil-core/benches/mvcc_rfc.rs#L169)). A declared name
-is not treated as a completed benchmark when `run_shape` does not actually
-exercise that behavior.
+The benchmark harness now declares only shapes whose `run_shape` path actually
+exercises the named behavior ([`mvcc_rfc.rs:36`](../../anvil-core/benches/mvcc_rfc.rs#L36)).
+Misleading placeholders were removed and are explicitly recorded as acceptance
+pending below. Retained shapes emit their independently measured phases
+([`mvcc_rfc.rs:14`](../../anvil-core/benches/mvcc_rfc.rs#L14)).
 
 | Section 29 requirement | Harness mapping | Code-only result |
 |---|---|---|
-| Stripe encoding time | `large_streaming_erasure` calls real `DistributedIngest::encode` through `run_erasure` ([`mvcc_rfc.rs:238`](../../anvil-core/benches/mvcc_rfc.rs#L238)). | Partial: real encode runs, but its elapsed time is recorded under `ShardStreaming`, while `StripeEncoding` measures logical bundle construction. |
-| Shard streaming time | Real erasure sink path in `run_erasure`; `ShardStreaming` phase ([`mvcc_rfc.rs:238`](../../anvil-core/benches/mvcc_rfc.rs#L238)). | Partial: encode and streaming are not separated. |
-| Remote persistence wait | `MemoryReplicator` records its call duration ([`mvcc_rfc.rs:291`](../../anvil-core/benches/mvcc_rfc.rs#L291)). | Missing faithful benchmark: no network or remote durable persistence occurs. |
-| Raft certification time | Commit duration is recorded as `RaftCertification` ([`mvcc_rfc.rs:260`](../../anvil-core/benches/mvcc_rfc.rs#L260)). | Missing faithful benchmark: `MemoryCertifier`, not OpenRaft, is used. |
+| Stripe encoding time | `large_streaming_erasure` times real `DistributedIngest::encode` and subtracts time spent inside the target adapter ([`mvcc_rfc.rs:392`](../../anvil-core/benches/mvcc_rfc.rs#L392)). | Implemented as encoder time distinct from target delivery; validation pending. |
+| Shard streaming time | The timed `ShardTargetStream` separately accumulates target-adapter time ([`mvcc_rfc.rs:354`](../../anvil-core/benches/mvcc_rfc.rs#L354)). | Implemented at the placement adapter boundary; a networked shard-stream benchmark remains pending. |
+| Remote persistence wait | Real `StreamingBundleReplicator` sends to two target adapters which write and `sync_all` separate target files ([`mvcc_rfc.rs:220`](../../anvil-core/benches/mvcc_rfc.rs#L220), [`mvcc_rfc.rs:287`](../../anvil-core/benches/mvcc_rfc.rs#L287)). | Implemented for multi-target durable persistence without network transport; validation pending. |
+| Raft certification time | `ConsensusTransactionCertifier<OpenRaftConsensus>` certifies through a real single-node OpenRaft runtime and RocksDB store ([`mvcc_rfc.rs:234`](../../anvil-core/benches/mvcc_rfc.rs#L234), [`mvcc_rfc.rs:332`](../../anvil-core/benches/mvcc_rfc.rs#L332)). | Implemented; validation pending. |
 | Local MVCC application time | Real `LocalMvccStore::apply_certified_bundle` ([`mvcc_rfc.rs:278`](../../anvil-core/benches/mvcc_rfc.rs#L278)). | Implemented; validation pending. |
-| Deferred repair time | `DeferredRepair` currently calls MVCC garbage collection ([`mvcc_rfc.rs:291`](../../anvil-core/benches/mvcc_rfc.rs#L291)). | Missing: this does not execute repair. |
+| Deferred repair time | No runnable shape is emitted. The former misleading GC substitution and `DeferredRepair` phase were removed. | Acceptance pending: requires a benchmark fixture around `ShardRepairRunner`. |
 | Metadata-only, inline object, one key, ten keys, and cross-table/partition transactions | Corresponding `Shape` rows drive real bundle construction and local apply ([`mvcc_rfc.rs:36`](../../anvil-core/benches/mvcc_rfc.rs#L36), [`mvcc_rfc.rs:196`](../../anvil-core/benches/mvcc_rfc.rs#L196)). | Implemented at coordinator/store level; validation pending. Inline payload is a logical row payload, not the public ObjectManager ingest path. |
 | Large streaming-erasure object | `large_streaming_erasure` plus `run_erasure` ([`mvcc_rfc.rs:48`](../../anvil-core/benches/mvcc_rfc.rs#L48), [`mvcc_rfc.rs:238`](../../anvil-core/benches/mvcc_rfc.rs#L238)). | Implemented at erasure/placement level; validation pending. |
-| Unrelated concurrency | `unrelated_concurrency` repeats the same immutable bundle through one coordinator ([`mvcc_rfc.rs:84`](../../anvil-core/benches/mvcc_rfc.rs#L84), [`mvcc_rfc.rs:260`](../../anvil-core/benches/mvcc_rfc.rs#L260)). | Missing faithful benchmark: operations are retries of one transaction, not unrelated transactions. |
-| Same-key conflict | `same_key_conflict` uses the same generic repeated-bundle path ([`mvcc_rfc.rs:91`](../../anvil-core/benches/mvcc_rfc.rs#L91)). | Missing faithful benchmark: it does not create competing transaction IDs/snapshots. |
-| Overlapping-range conflict | `overlapping_range_conflict` uses the same generic path ([`mvcc_rfc.rs:98`](../../anvil-core/benches/mvcc_rfc.rs#L98)). | Missing faithful benchmark: no range observations are constructed. |
+| Unrelated concurrency | The misleading repeated-idempotent-bundle shape was removed. | Acceptance pending: requires distinct transaction IDs and keys. |
+| Same-key conflict | The non-conflicting shape was removed. | Acceptance pending: requires distinct transactions with point observations at one snapshot. |
+| Overlapping-range conflict | The shape without range observations was removed. | Acceptance pending: requires real overlapping range observations and writes. |
 | Local/quorum/erasure comparison | Three durability shapes select distinct durability enums ([`mvcc_rfc.rs:105`](../../anvil-core/benches/mvcc_rfc.rs#L105), [`mvcc_rfc.rs:233`](../../anvil-core/benches/mvcc_rfc.rs#L233)). | Partial: coordinator policy is exercised, but replication/certification are mocked and only erasure performs ingest. |
-| Group-committed certification throughput | `group_commit`, `proposal_batching`, and `rocksdb_wal_group_commit` shapes ([`mvcc_rfc.rs:126`](../../anvil-core/benches/mvcc_rfc.rs#L126)). | Missing faithful benchmark: concurrent calls use `MemoryCertifier`; OpenRaft proposal batching and RocksDB WAL group commit are not measured. |
-| Replication reconnect/resume | `replication_reconnect_resume` is declared ([`mvcc_rfc.rs:147`](../../anvil-core/benches/mvcc_rfc.rs#L147)). | Missing faithful benchmark: `run_shape` never disconnects or resumes a replication stream. |
-| MVCC read with retained history | `mvcc_read_retained_history` is declared and performs one post-apply read ([`mvcc_rfc.rs:154`](../../anvil-core/benches/mvcc_rfc.rs#L154), [`mvcc_rfc.rs:284`](../../anvil-core/benches/mvcc_rfc.rs#L284)). | Missing faithful benchmark: no retained history is seeded. |
-| MVCC garbage collection | `mvcc_garbage_collection` creates many keys then calls GC ([`mvcc_rfc.rs:161`](../../anvil-core/benches/mvcc_rfc.rs#L161), [`mvcc_rfc.rs:291`](../../anvil-core/benches/mvcc_rfc.rs#L291)). | Partial: it measures a GC call but does not seed obsolete multi-version history. |
+| Group-committed certification throughput | Misleading `MemoryCertifier` shapes were removed; ordinary retained shapes now certify through real OpenRaft/RocksDB. | Acceptance pending: a dedicated concurrent OpenRaft proposal/WAL batching workload is still required. |
+| Replication reconnect/resume | The shape that never disconnected was removed. | Acceptance pending: requires a forced persistent-stream disconnect and resume. |
+| MVCC read with retained history | The single-version shape was removed. | Acceptance pending: requires seeded multi-version history. |
+| MVCC garbage collection | The no-history shape was removed. | Acceptance pending: requires seeded obsolete versions and a measured collection. |
