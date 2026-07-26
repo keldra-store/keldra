@@ -433,17 +433,15 @@ impl MvccSubsystem {
                 .initialize(members)
                 .await
                 .context("initialize MVCC Raft membership")?;
-            for _ in 0..100 {
-                if consensus.is_leader() {
-                    break;
+            tokio::time::timeout(Duration::from_secs(15), async {
+                while !consensus.is_leader() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            if !consensus.is_leader() {
-                bail!(
-                    "local node did not become leader while installing initial Raft control state"
-                );
-            }
+            })
+            .await
+            .context(
+                "local node did not become leader while installing initial Raft control state",
+            )?;
             let cluster_hash = cluster_id_hash(&config.mvcc_cluster_id);
             for peer in &peers {
                 consensus

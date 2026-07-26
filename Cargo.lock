@@ -441,6 +441,7 @@ dependencies = [
 name = "anvil-storage-test-utils"
 version = "0.3.0"
 dependencies = [
+ "anvil-mvcc-consensus",
  "anvil-server",
  "anvil-storage-core",
  "anyhow",
@@ -454,7 +455,9 @@ dependencies = [
  "personaldb-protocol",
  "reqwest",
  "serde_json",
+ "tempfile",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tracing",
  "tracing-subscriber",
