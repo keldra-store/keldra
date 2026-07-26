@@ -252,7 +252,7 @@ pub(super) async fn put_record_row<T: GatewayRecordCodec>(
             payload.clone(),
         )],
         vec![(logical_key, predicate)],
-        crate::mvcc_transaction::DurabilityLevel::Local,
+        crate::mvcc_transaction::DurabilityLevel::Quorum,
         u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
     )
     .await?;
@@ -295,13 +295,26 @@ pub(super) async fn put_record_row_in_transaction<T: GatewayRecordCodec>(
         .map(|value| value.generation + 1)
         .unwrap_or(1);
     let payload = encode_gateway_metadata_row(row_kind, row_key, generation, record)?;
+    let predicate = base_payload
+        .as_ref()
+        .map(|bytes| {
+            crate::mvcc_transaction::PredicateKind::ValueHash(*blake3::hash(bytes).as_bytes())
+        })
+        .unwrap_or(crate::mvcc_transaction::PredicateKind::Absent);
     mvcc.stage_product_mutations(
         transaction_id,
         principal,
         vec![crate::mvcc_product::ProductMutation::put(
-            logical_key,
+            logical_key.clone(),
             payload.clone(),
         )],
+        u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+    )?;
+    mvcc.stage_predicate(
+        transaction_id,
+        principal,
+        logical_key,
+        predicate,
         u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
     )?;
     decode_gateway_metadata_row(row_kind, row_key, &payload)
@@ -322,7 +335,21 @@ pub(super) async fn read_record_row_in_transaction<T: GatewayRecordCodec>(
         TABLE_GATEWAY_METADATA_ROW,
         &tuple_key,
     )?;
-    mvcc.read_transaction_value(transaction_id, principal, &logical_key)?
+    let value = mvcc.read_transaction_value(transaction_id, principal, &logical_key)?;
+    let predicate = value
+        .as_ref()
+        .map(|bytes| {
+            crate::mvcc_transaction::PredicateKind::ValueHash(*blake3::hash(bytes).as_bytes())
+        })
+        .unwrap_or(crate::mvcc_transaction::PredicateKind::Absent);
+    mvcc.stage_predicate(
+        transaction_id,
+        principal,
+        logical_key,
+        predicate,
+        u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+    )?;
+    value
         .map(|row| decode_gateway_metadata_row::<T>(row_kind, row_key, &row))
         .transpose()
 }
@@ -378,7 +405,7 @@ pub(super) async fn put_upload_session_start_rows(
                 crate::mvcc_transaction::PredicateKind::Absent,
             ),
         ],
-        crate::mvcc_transaction::DurabilityLevel::Local,
+        crate::mvcc_transaction::DurabilityLevel::Quorum,
         u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
     )
     .await?;

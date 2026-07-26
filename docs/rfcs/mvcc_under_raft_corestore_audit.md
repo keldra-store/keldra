@@ -45,8 +45,8 @@ bundle materialisation, or physical transport used by MVCC.
 
 - `metadata_journal/object_mutation.rs` and `metadata_journal/helpers.rs`:
   legacy physical metadata stream/head and mutation paths remain.
-- `gateway_store.rs`: mutable gateway manifests, routes, and watch-stream state
-  remain mixed with allowed immutable logical-file bytes.
+- Gateway mutable metadata is now MVCC-only. Remaining `CoreStore` calls are
+  immutable blob/upload-part I/O and external security-audit ingestion.
 - `system_realm.rs`: mutable system-realm bootstrap/current rows remain
   physically authoritative.
 - `bucket_journal.rs`: legacy physical test/helper paths remain. Production
@@ -67,3 +67,18 @@ polls the MVCC event index while preserving cursor semantics.
 Static searches after the change show no production caller of the old bucket
 watch stream API. Legacy physical bucket helpers remain isolated to test-only
 coverage and should be deleted when that test group is rewritten for MVCC.
+
+## Gateway follow-up evidence
+
+Gateway repositories, blob locators, tags and manifests, credentials, upload
+sessions, idempotency rows, mounts, and mount routes use MVCC product rows.
+Transaction-scoped gateway reads and writes now stage exact `Absent` or
+`ValueHash` predicates. Non-transactional package-version and registry-ref APIs
+create one internal quorum, linearized MVCC transaction, stage a compact-Raft
+assignment guard, and certify all mutable rows together. Gateway metadata
+autocommits and upload finalisation request quorum durability.
+
+The remaining production `CoreStore` calls in the gateway group are limited to
+immutable registry blob/upload-part bytes and the explicitly external gateway
+security-audit stream. No physical mutable-row fallback or gateway test module
+remains.

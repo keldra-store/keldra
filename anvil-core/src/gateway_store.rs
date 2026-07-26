@@ -1542,7 +1542,7 @@ async fn commit_upload_session_record(
         ),
         mutations,
         predicates,
-        crate::mvcc_transaction::DurabilityLevel::Local,
+        crate::mvcc_transaction::DurabilityLevel::Quorum,
         u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default(),
     )
     .await?;

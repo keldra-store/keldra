@@ -85,6 +85,43 @@ pub async fn put_package_version(
 ) -> Result<GatewayTagUpdateReceipt> {
     serde_json::from_str::<serde_json::Value>(manifest_json)
         .map_err(|err| anyhow!("registry manifest_json is not valid JSON: {err}"))?;
+    if transaction_id.is_none() {
+        let transaction_principal = format!("tenant/{tenant_id}/principal/{principal}");
+        let handle = begin_registry_transaction(
+            mvcc,
+            &transaction_principal,
+            &format!(
+                "package-version:{tenant_id}:{registry_kind}:{namespace}:{package_name}:{version}"
+            ),
+        )
+        .await?;
+        stage_registry_assignment_guard(
+            mvcc,
+            &transaction_principal,
+            &handle.transaction_id,
+            tenant_id,
+            registry_kind,
+            namespace,
+        )
+        .await?;
+        let receipt = Box::pin(put_package_version(
+            storage,
+            mvcc,
+            tenant_id,
+            registry_kind,
+            namespace,
+            package_name,
+            version,
+            manifest_json,
+            blob_digests,
+            principal,
+            expected_generation,
+            Some(&handle.transaction_id),
+        ))
+        .await?;
+        commit_registry_transaction(mvcc, &transaction_principal, &handle.transaction_id).await?;
+        return Ok(receipt);
+    }
     ensure_registry_repository(
         storage,
         mvcc,
@@ -173,6 +210,42 @@ pub async fn put_registry_ref(
     expected_generation: Option<u64>,
     transaction_id: Option<&str>,
 ) -> Result<GatewayTagUpdateReceipt> {
+    if transaction_id.is_none() {
+        let transaction_principal = format!("tenant/{tenant_id}/principal/{principal}");
+        let handle = begin_registry_transaction(
+            mvcc,
+            &transaction_principal,
+            &format!(
+                "registry-ref:{tenant_id}:{registry_kind}:{namespace}:{package_name}:{ref_name}"
+            ),
+        )
+        .await?;
+        stage_registry_assignment_guard(
+            mvcc,
+            &transaction_principal,
+            &handle.transaction_id,
+            tenant_id,
+            registry_kind,
+            namespace,
+        )
+        .await?;
+        let receipt = Box::pin(put_registry_ref(
+            storage,
+            mvcc,
+            tenant_id,
+            registry_kind,
+            namespace,
+            package_name,
+            ref_name,
+            target_version,
+            principal,
+            expected_generation,
+            Some(&handle.transaction_id),
+        ))
+        .await?;
+        commit_registry_transaction(mvcc, &transaction_principal, &handle.transaction_id).await?;
+        return Ok(receipt);
+    }
     let Some((target, _)) = read_gateway_tag_for_transaction(
         storage,
         mvcc,
@@ -708,4 +781,70 @@ fn package_version_from_tag(tag: GatewayTagRecord, generation: u64) -> GatewayPa
         manifest_ref: tag.target_digest,
         generation,
     }
+}
+
+async fn begin_registry_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    principal: &str,
+    logical_idempotency_key: &str,
+) -> Result<crate::mvcc_open_transactions::TransactionHandle> {
+    mvcc.open_transactions
+        .begin(
+            mvcc.runtime.as_ref(),
+            mvcc.cluster_id(),
+            principal,
+            &format!(
+                "gateway-registry:{}:{}",
+                logical_idempotency_key,
+                uuid::Uuid::new_v4()
+            ),
+            std::time::Duration::from_secs(30),
+            crate::mvcc_transaction::DurabilityLevel::Quorum,
+            crate::mvcc_transaction::ReadConsistency::Linearized,
+            u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+        )
+        .await
+}
+
+async fn commit_registry_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    principal: &str,
+    transaction_id: &str,
+) -> Result<()> {
+    let outcome = mvcc
+        .open_transactions
+        .commit(
+            mvcc.runtime.as_ref(),
+            transaction_id,
+            principal,
+            u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+        )
+        .await?;
+    match outcome.certification {
+        crate::mvcc_transaction::CertificationResult::Committed { .. } => Ok(()),
+        crate::mvcc_transaction::CertificationResult::Aborted { reason } => {
+            bail!("gateway registry transaction aborted: {reason:?}")
+        }
+    }
+}
+
+async fn stage_registry_assignment_guard(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    principal: &str,
+    transaction_id: &str,
+    tenant_id: i64,
+    registry_kind: &str,
+    namespace: &str,
+) -> Result<()> {
+    let logical_identity = format!("{tenant_id}:{registry_kind}:{namespace}");
+    let assignment = mvcc
+        .reconcile_work_assignment("gateway-registry", &logical_identity)
+        .await?
+        .ok_or_else(|| anyhow!("this node does not own the gateway registry assignment"))?;
+    mvcc.stage_assignment_guard(
+        transaction_id,
+        principal,
+        &assignment,
+        u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+    )
 }
