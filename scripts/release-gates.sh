@@ -106,6 +106,7 @@ static_gates() {
 }
 
 rust_unit_gates() {
+  run_cargo_test "MVCC-under-Raft executable model" -p anvil-mvcc-raft-model --lib --tests
   # Exercise the public command contract before the long-running core suite so
   # CLI/docs drift fails quickly instead of consuming most of the CI timeout.
   run_cargo_test "public CLI non-Docker integration tests" -p anvil-storage-cli \

@@ -1,0 +1,22 @@
+[package]
+name = "anvil-mvcc-raft-model"
+version.workspace = true
+edition.workspace = true
+readme.workspace = true
+description = "Executable model of Anvil's cluster-local MVCC-under-Raft protocol"
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+default = []
+exhaustive-small = []
+
+[dependencies]
+stateright = "0.31.0"
+
+[dev-dependencies]
+proptest = "1.6"

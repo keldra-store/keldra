@@ -220,6 +220,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "anvil-mvcc-raft-model"
+version = "0.3.0"
+dependencies = [
+ "proptest",
+ "stateright",
+]
+
+[[package]]
 name = "anvil-server"
 version = "0.3.0"
 dependencies = [
