@@ -699,7 +699,7 @@ async fn move_bucket_in_transaction(
     moved.generation = existing.generation.saturating_add(1);
     bucket.region = req.target_region_id.clone();
     bucket_journal::stage_bucket_mutation_in_transaction(
-        &state.storage,
+        state.mvcc.as_ref(),
         &bucket,
         bucket_journal::BucketJournalMutation::Update,
         transaction_id,

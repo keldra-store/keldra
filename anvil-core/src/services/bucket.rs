@@ -425,7 +425,7 @@ impl AppState {
     ) -> Result<(), Status> {
         let principal = crate::object_manager::transaction_principal_from_claims(claims);
         bucket_journal::stage_bucket_mutation_in_transaction(
-            &self.storage,
+            self.mvcc.as_ref(),
             bucket,
             mutation,
             transaction_id,

@@ -52,6 +52,13 @@ pub struct TransactionBinding {
     pub durability: DurabilityLevel,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedLogicalMutation {
+    pub key: LogicalKey,
+    pub observed_version: Option<CommitVersion>,
+    pub value: Option<Vec<u8>>,
+}
+
 #[async_trait]
 pub trait TransactionRuntime: Send + Sync {
     async fn transaction_snapshot(&self, consistency: ReadConsistency) -> Result<CommitVersion>;
@@ -331,6 +338,51 @@ impl OpenTransactionRegistry {
         })
     }
 
+    /// Atomically add a set of point observations and their corresponding
+    /// writes to one open transaction.
+    ///
+    /// A logical key is observed at most once (the first observation wins) and
+    /// has at most one staged write (the latest value wins). This makes retries
+    /// safe and guarantees that a crash cannot leave half of a product
+    /// operation in the durable draft.
+    pub fn stage_logical_mutations(
+        &self,
+        transaction_id: &str,
+        principal: &str,
+        owning_cluster_id: &str,
+        mutations: Vec<StagedLogicalMutation>,
+        now_unix_ms: u64,
+    ) -> Result<()> {
+        self.mutate_for_principal(transaction_id, principal, now_unix_ms, |draft| {
+            ensure_owning_cluster(draft, owning_cluster_id)?;
+            for mutation in mutations {
+                if !draft
+                    .mutations
+                    .points
+                    .iter()
+                    .any(|point| point.key == mutation.key)
+                {
+                    draft.mutations.points.push(PointObservation {
+                        key: mutation.key.clone(),
+                        observed_version: mutation.observed_version,
+                    });
+                }
+                draft
+                    .mutations
+                    .writes
+                    .retain(|write| write.key() != &mutation.key);
+                draft.mutations.writes.push(match mutation.value {
+                    Some(value) => WriteOperation::Put {
+                        key: mutation.key,
+                        value,
+                    },
+                    None => WriteOperation::Delete { key: mutation.key },
+                });
+            }
+            Ok(())
+        })
+    }
+
     pub fn add_event(&self, transaction_id: &str, event: Vec<u8>, now_unix_ms: u64) -> Result<()> {
         self.mutate(transaction_id, now_unix_ms, |draft| {
             draft.mutations.events.push(event);
@@ -487,6 +539,27 @@ impl OpenTransactionRegistry {
     ) -> Result<()> {
         let _guard = self.transition.lock().unwrap();
         let mut draft = self.load(transaction_id)?;
+        if !matches!(draft.state, DraftState::Open) {
+            bail!("transaction is no longer open");
+        }
+        if now_unix_ms >= draft.expires_at_unix_ms {
+            draft.state = DraftState::Expired;
+            self.save(&draft)?;
+            bail!("transaction has expired");
+        }
+        change(&mut draft)?;
+        self.save(&draft)
+    }
+
+    fn mutate_for_principal(
+        &self,
+        transaction_id: &str,
+        principal: &str,
+        now_unix_ms: u64,
+        change: impl FnOnce(&mut Draft) -> Result<()>,
+    ) -> Result<()> {
+        let _guard = self.transition.lock().unwrap();
+        let mut draft = self.load_for_principal(transaction_id, principal)?;
         if !matches!(draft.state, DraftState::Open) {
             bail!("transaction is no longer open");
         }
@@ -751,6 +824,84 @@ mod tests {
         assert_eq!(bundles[0].writes.len(), 2);
         assert_eq!(bundles[0].outbox_events, [b"event".to_vec()]);
         assert_eq!(bundles[0].materialisation_jobs, [b"job".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn one_atomic_stage_spans_product_tables_and_is_retry_safe() {
+        let temp = tempdir().unwrap();
+        let registry = OpenTransactionRegistry::open(temp.path()).unwrap();
+        let runtime = runtime();
+        let handle = registry
+            .begin(
+                &runtime,
+                "cluster",
+                "alice",
+                "cross-feature",
+                Duration::from_secs(30),
+                DurabilityLevel::Quorum,
+                ReadConsistency::Linearized,
+                1_000,
+            )
+            .await
+            .unwrap();
+        let mutations = [0x8804, 0x8810, 0x8842, 0x8860]
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, table_id)| StagedLogicalMutation {
+                key: LogicalKey {
+                    table_id,
+                    application_key: format!("feature/{ordinal}").into_bytes(),
+                },
+                observed_version: (ordinal != 0).then_some(ordinal as u64),
+                value: Some(format!("value/{ordinal}").into_bytes()),
+            })
+            .collect::<Vec<_>>();
+        registry
+            .stage_logical_mutations(
+                &handle.transaction_id,
+                "alice",
+                "cluster",
+                mutations.clone(),
+                1_001,
+            )
+            .unwrap();
+        registry
+            .stage_logical_mutations(
+                &handle.transaction_id,
+                "alice",
+                "cluster",
+                mutations,
+                1_002,
+            )
+            .unwrap();
+        assert!(
+            registry
+                .stage_logical_mutations(
+                    &handle.transaction_id,
+                    "mallory",
+                    "cluster",
+                    Vec::new(),
+                    1_003,
+                )
+                .is_err()
+        );
+
+        registry
+            .commit(&runtime, &handle.transaction_id, "alice", 1_004)
+            .await
+            .unwrap();
+        let bundles = runtime.committed.lock().unwrap();
+        let bundle = &bundles[0];
+        assert_eq!(bundle.point_observations.len(), 4);
+        assert_eq!(bundle.writes.len(), 4);
+        assert_eq!(
+            bundle
+                .writes
+                .iter()
+                .map(|write| write.key().table_id)
+                .collect::<Vec<_>>(),
+            vec![0x8804, 0x8810, 0x8842, 0x8860],
+        );
     }
 
     #[tokio::test]

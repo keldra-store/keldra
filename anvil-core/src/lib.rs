@@ -83,6 +83,7 @@ pub mod mvcc_bootstrap;
 pub mod mvcc_consensus_adapter;
 pub mod mvcc_node_runtime;
 pub mod mvcc_open_transactions;
+pub mod mvcc_product;
 pub mod mvcc_store;
 pub mod mvcc_transaction;
 pub mod native_idempotency;

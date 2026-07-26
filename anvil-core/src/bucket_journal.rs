@@ -236,24 +236,20 @@ pub(crate) async fn append_bucket_mutation_with_permits(
 }
 
 pub(crate) async fn stage_bucket_mutation_in_transaction(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     mutation: BucketJournalMutation,
     transaction_id: &str,
     transaction_principal: &str,
 ) -> Result<()> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let transaction = core_store
-        .read_explicit_transaction_for_principal(transaction_id, transaction_principal)
-        .await?;
     let mutation_id = uuid::Uuid::new_v4().to_string();
     let row_generation = current_unix_nanos();
     let tenant_scope = BucketJournalScope::Tenant(bucket.tenant_id);
     let common_realm_id = tenant_scope.realm_id();
     let common_root_key_hash = tenant_scope.root_key_hash();
-    let mut preconditions = Vec::new();
+    let operation_partition = hex::encode(tenant_scope.partition_id());
     let mut operations = vec![CoreMutationOperation::StreamAppend {
-        partition_id: transaction.scope_partition.clone(),
+        partition_id: operation_partition.clone(),
         stream_id: tenant_scope.stream_id(),
         record_kind: BUCKET_METADATA_RECORD_KIND.to_string(),
         payload: encode_bucket_journal_body(&BucketJournalBody {
@@ -276,41 +272,24 @@ pub(crate) async fn stage_bucket_mutation_in_transaction(
     }];
 
     for scope in [tenant_scope, BucketJournalScope::Global] {
-        preconditions.push(
-            bucket_current_coremeta_precondition(
-                &core_store,
-                scope,
-                bucket,
-                mutation,
-                transaction_id,
-                transaction_principal,
-            )
-            .await?,
-        );
         operations.extend(bucket_current_coremeta_operations_with_root(
             scope,
             bucket,
             mutation,
-            &transaction.scope_partition,
+            &operation_partition,
             transaction_id,
             row_generation,
             common_realm_id.clone(),
             common_root_key_hash.clone(),
         )?);
     }
-    let root_publications =
-        bucket_root_publications(&transaction.root_anchor_key, tenant_scope.root_anchor_key());
-
-    core_store
-        .stage_explicit_transaction_batch(CoreMutationBatch {
-            transaction_id: transaction_id.to_string(),
-            scope_partition: transaction.scope_partition,
-            committed_by_principal: transaction_principal.to_string(),
-            root_publications,
-            preconditions,
-            operations,
-        })
-        .await?;
+    let mutations = crate::mvcc_product::product_mutations_from_operations(operations)?;
+    mvcc.stage_product_mutations(
+        transaction_id,
+        transaction_principal,
+        mutations,
+        u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+    )?;
     tracing::debug!(
         transaction_id,
         mutation_id,
