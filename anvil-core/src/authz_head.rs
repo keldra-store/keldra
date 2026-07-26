@@ -36,6 +36,13 @@ pub(crate) struct AuthzHeadSnapshot {
     expected_payload_hash: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct MvccAuthzHeadSnapshot {
+    pub(crate) head: AuthzHead,
+    pub(crate) key: crate::mvcc_transaction::LogicalKey,
+    pub(crate) predicate: crate::mvcc_transaction::PredicateKind,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum AuthzHeadMutation<'a> {
     TupleBatch {
@@ -109,17 +116,62 @@ pub(crate) async fn read(storage: &Storage, tenant_id: i64) -> Result<AuthzHeadS
     }
 }
 
+pub(crate) fn read_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    tenant_id: i64,
+) -> Result<MvccAuthzHeadSnapshot> {
+    validate_tenant_id(tenant_id)?;
+    let key = crate::mvcc_product::coremeta_logical_key(
+        CF_AUTHZ,
+        TABLE_AUTHZ_HEAD_ROW,
+        &tuple_key(tenant_id)?,
+    )?;
+    let payload = mvcc.read_transaction_value(transaction_id, principal, &key)?;
+    let (head, predicate) = match payload {
+        Some(payload) => (
+            decode(&payload, tenant_id)?,
+            crate::mvcc_transaction::PredicateKind::ValueHash(*blake3::hash(&payload).as_bytes()),
+        ),
+        None => (
+            initial(tenant_id),
+            crate::mvcc_transaction::PredicateKind::Absent,
+        ),
+    };
+    Ok(MvccAuthzHeadSnapshot {
+        head,
+        key,
+        predicate,
+    })
+}
+
 pub(crate) fn advance(
     snapshot: &AuthzHeadSnapshot,
     transaction_id: &str,
     mutation: AuthzHeadMutation<'_>,
 ) -> Result<AuthzHead> {
-    let revision = snapshot
-        .head
+    advance_from(&snapshot.head, transaction_id, mutation)
+}
+
+pub(crate) fn advance_mvcc(
+    snapshot: &MvccAuthzHeadSnapshot,
+    transaction_id: &str,
+    mutation: AuthzHeadMutation<'_>,
+) -> Result<AuthzHead> {
+    advance_from(&snapshot.head, transaction_id, mutation)
+}
+
+fn advance_from(
+    current: &AuthzHead,
+    transaction_id: &str,
+    mutation: AuthzHeadMutation<'_>,
+) -> Result<AuthzHead> {
+    let revision = current
         .committed_revision
         .checked_add(1)
         .context("authorization revision overflow")?;
-    let mut head = snapshot.head.clone();
+    let mut head = current.clone();
     head.committed_revision = revision;
     match mutation {
         AuthzHeadMutation::TupleBatch {
@@ -157,6 +209,20 @@ pub(crate) fn advance(
         bail!("authorization head transaction id must not be empty");
     }
     Ok(head)
+}
+
+pub(crate) fn mvcc_mutation(
+    snapshot: &MvccAuthzHeadSnapshot,
+    head: &AuthzHead,
+    transaction_id: &str,
+) -> Result<crate::mvcc_product::ProductMutation> {
+    if snapshot.head.tenant_id != head.tenant_id {
+        bail!("authorization head mutation changed tenant");
+    }
+    Ok(crate::mvcc_product::ProductMutation::put(
+        snapshot.key.clone(),
+        encode(head, transaction_id)?,
+    ))
 }
 
 pub(crate) fn precondition(snapshot: &AuthzHeadSnapshot) -> Result<CoreMutationPrecondition> {

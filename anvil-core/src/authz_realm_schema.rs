@@ -67,6 +67,13 @@ pub struct BoundAuthzSchemaSnapshot {
     pub binding_precondition: AuthzSchemaBindingPrecondition,
 }
 
+#[derive(Debug, Clone)]
+pub struct MvccBoundAuthzSchemaSnapshot {
+    pub schema: Option<StoredAuthzSchemaRevision>,
+    pub binding_key: crate::mvcc_transaction::LogicalKey,
+    pub binding_predicate: crate::mvcc_transaction::PredicateKind,
+}
+
 #[derive(Clone, PartialEq, Message)]
 struct StoredSchemaRefProto {
     #[prost(string, tag = "1")]
@@ -392,6 +399,58 @@ pub async fn read_bound_schema_snapshot(
             tuple_key,
             expected_payload_hash: Some(core_meta_payload_digest(TABLE_AUTHZ_SCHEMA_ROW, &payload)),
         },
+    })
+}
+
+pub async fn read_bound_schema_snapshot_mvcc(
+    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    tenant_id: i64,
+    realm_id: &str,
+) -> Result<MvccBoundAuthzSchemaSnapshot> {
+    validate_realm_id(realm_id)?;
+    let binding_key = crate::mvcc_product::coremeta_logical_key(
+        CF_AUTHZ,
+        TABLE_AUTHZ_SCHEMA_ROW,
+        &schema_binding_tuple_key(tenant_id, realm_id)?,
+    )?;
+    let Some(payload) = mvcc.read_transaction_value(transaction_id, principal, &binding_key)?
+    else {
+        return Ok(MvccBoundAuthzSchemaSnapshot {
+            schema: None,
+            binding_key,
+            binding_predicate: crate::mvcc_transaction::PredicateKind::Absent,
+        });
+    };
+    let binding =
+        decode_schema_record_row::<StoredAuthzSchemaBinding>(storage, tenant_id, &payload).await?;
+    let revision_key = crate::mvcc_product::coremeta_logical_key(
+        CF_AUTHZ,
+        TABLE_AUTHZ_SCHEMA_ROW,
+        &schema_revision_tuple_key(
+            tenant_id,
+            &binding.schema_ref.schema_id,
+            binding.schema_ref.schema_revision,
+        )?,
+    )?;
+    let schema_payload = mvcc
+        .read_transaction_value(transaction_id, principal, &revision_key)?
+        .ok_or_else(|| anyhow!("bound authorization schema revision not found"))?;
+    let schema =
+        decode_schema_record_row::<StoredAuthzSchemaRevision>(storage, tenant_id, &schema_payload)
+            .await?;
+    validate_stored_schema_revision(&schema)?;
+    if schema.schema_ref != binding.schema_ref {
+        return Err(anyhow!("bound authorization schema reference mismatch"));
+    }
+    Ok(MvccBoundAuthzSchemaSnapshot {
+        schema: Some(schema),
+        binding_key,
+        binding_predicate: crate::mvcc_transaction::PredicateKind::ValueHash(
+            *blake3::hash(&payload).as_bytes(),
+        ),
     })
 }
 
