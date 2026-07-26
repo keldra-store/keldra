@@ -9,7 +9,7 @@ use crate::formats::{Hash32, hash32, writer::WriterFamily};
 use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
 use crate::persistence::{Bucket, BucketMetadataEvent};
 use crate::storage::Storage;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use prost::Message;
 use serde_json::{Value as JsonValue, json};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -640,6 +640,362 @@ struct BucketIdAllocatorSnapshot {
 pub struct CurrentBucketPage {
     pub buckets: Vec<Bucket>,
     pub next_tuple_key: Option<Vec<u8>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct BucketMvccMutationPlan {
+    pub mutations: Vec<crate::mvcc_product::ProductMutation>,
+    pub predicates: Vec<(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )>,
+    pub allocated_bucket_id: i64,
+    pub collection_revision: u64,
+}
+
+impl BucketMvccMutationPlan {
+    pub fn stage(
+        self,
+        mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+        transaction_id: &str,
+        principal: &str,
+        now_unix_ms: u64,
+    ) -> Result<(i64, u64)> {
+        mvcc.stage_product_mutations(transaction_id, principal, self.mutations, now_unix_ms)?;
+        for (key, kind) in self.predicates {
+            mvcc.stage_predicate(transaction_id, principal, key, kind, now_unix_ms)?;
+        }
+        Ok((self.allocated_bucket_id, self.collection_revision))
+    }
+
+    pub async fn autocommit(
+        self,
+        mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+        principal: &str,
+        idempotency_key: &str,
+        durability: crate::mvcc_transaction::DurabilityLevel,
+        now_unix_ms: u64,
+    ) -> Result<(i64, u64)> {
+        let allocated_bucket_id = self.allocated_bucket_id;
+        let collection_revision = self.collection_revision;
+        mvcc.autocommit_product_mutations_with_predicates(
+            principal,
+            idempotency_key,
+            self.mutations,
+            self.predicates,
+            durability,
+            now_unix_ms,
+        )
+        .await?;
+        Ok((allocated_bucket_id, collection_revision))
+    }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct BucketCollectionRevisionValue {
+    schema: String,
+    tenant_id: i64,
+    revision: u64,
+}
+
+const BUCKET_COLLECTION_REVISION_SCHEMA: &str = "anvil.mvcc.bucket.collection-revision.v1";
+
+fn bucket_mvcc_key(table_id: u16, tuple_key: &[u8]) -> Result<crate::mvcc_transaction::LogicalKey> {
+    crate::mvcc_product::coremeta_logical_key(CF_MESH, table_id, tuple_key)
+}
+
+fn bucket_collection_revision_tuple_key(tenant_id: i64) -> Result<Vec<u8>> {
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("bucket-collection-revision"),
+        CoreMetaTuplePart::I64(tenant_id),
+    ])
+}
+
+pub(crate) fn read_current_bucket_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    bucket_name: &str,
+) -> Result<Option<Bucket>> {
+    let key = bucket_mvcc_key(
+        TABLE_BUCKET_CURRENT_BY_NAME_ROW,
+        &tenant_bucket_name_current_tuple_key(tenant_id, bucket_name)?,
+    )?;
+    let Some(payload) = mvcc.read_latest_value(&key)? else {
+        return Ok(None);
+    };
+    let current = decode_bucket_current_row(&payload)?;
+    ensure_bucket_tenant_name_matches(&current.bucket, tenant_id, bucket_name)?;
+    Ok(current.into_active_bucket())
+}
+
+pub(crate) fn read_current_bucket_at_mvcc_snapshot(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    bucket_name: &str,
+    snapshot: u64,
+) -> Result<Option<Bucket>> {
+    let key = bucket_mvcc_key(
+        TABLE_BUCKET_CURRENT_BY_NAME_ROW,
+        &tenant_bucket_name_current_tuple_key(tenant_id, bucket_name)?,
+    )?;
+    let Some(row) = mvcc.runtime.read_at(&key, snapshot)? else {
+        return Ok(None);
+    };
+    let current = decode_bucket_current_row(&row.value)?;
+    ensure_bucket_tenant_name_matches(&current.bucket, tenant_id, bucket_name)?;
+    Ok(current.into_active_bucket())
+}
+
+pub(crate) fn read_current_bucket_by_id_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    bucket_id: i64,
+) -> Result<Option<Bucket>> {
+    let key = bucket_mvcc_key(
+        TABLE_BUCKET_CURRENT_BY_ID_ROW,
+        &global_bucket_id_current_tuple_key(bucket_id)?,
+    )?;
+    let Some(payload) = mvcc.read_latest_value(&key)? else {
+        return Ok(None);
+    };
+    let current = decode_bucket_current_row(&payload)?;
+    if current.bucket.id != bucket_id {
+        bail!("bucket current id row scope mismatch");
+    }
+    Ok(current.into_active_bucket())
+}
+
+pub(crate) fn page_current_buckets_at_mvcc_snapshot(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    snapshot: u64,
+    after_application_key: Option<&[u8]>,
+    page_size: usize,
+) -> Result<CurrentBucketPage> {
+    if !(1..=1_000).contains(&page_size) {
+        bail!("bucket page size must be between 1 and 1000");
+    }
+    let tuple_prefix = tenant_bucket_name_current_tuple_prefix(tenant_id)?;
+    let application_prefix =
+        crate::mvcc_product::coremeta_application_prefix(CF_MESH, &tuple_prefix)?;
+    let mut rows = mvcc.runtime.scan_table_prefix_at(
+        TABLE_BUCKET_CURRENT_BY_NAME_ROW,
+        &application_prefix,
+        snapshot,
+    )?;
+    if let Some(after) = after_application_key {
+        rows.retain(|(key, _)| key.application_key.as_slice() > after);
+    }
+    let has_more = rows.len() > page_size;
+    rows.truncate(page_size);
+    let next_tuple_key = has_more
+        .then(|| rows.last().map(|(key, _)| key.application_key.clone()))
+        .flatten();
+    let mut buckets = Vec::with_capacity(rows.len());
+    for (_, row) in rows {
+        let current = decode_bucket_current_row(&row.value)?;
+        ensure_bucket_scope_matches(BucketJournalScope::Tenant(tenant_id), &current.bucket)?;
+        if current.deleted {
+            bail!("tenant bucket current table contains a deleted row");
+        }
+        buckets.push(current.bucket);
+    }
+    Ok(CurrentBucketPage {
+        buckets,
+        next_tuple_key,
+    })
+}
+
+pub(crate) fn read_bucket_collection_revision_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+) -> Result<u64> {
+    let key = bucket_mvcc_key(
+        TABLE_BUCKET_EVENT_HEAD_ROW,
+        &bucket_collection_revision_tuple_key(tenant_id)?,
+    )?;
+    let Some(payload) = mvcc.read_latest_value(&key)? else {
+        return Ok(0);
+    };
+    let value: BucketCollectionRevisionValue = serde_json::from_slice(&payload)?;
+    if value.schema != BUCKET_COLLECTION_REVISION_SCHEMA || value.tenant_id != tenant_id {
+        bail!("bucket collection revision row scope mismatch");
+    }
+    Ok(value.revision)
+}
+
+pub(crate) fn build_bucket_mvcc_mutation_plan(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    bucket: &Bucket,
+    mutation: BucketJournalMutation,
+) -> Result<BucketMvccMutationPlan> {
+    use crate::mvcc_transaction::PredicateKind;
+
+    let allocator_key = bucket_mvcc_key(
+        TABLE_BUCKET_ID_ALLOCATOR_ROW,
+        &bucket_id_allocator_tuple_key()?,
+    )?;
+    let allocator_payload = mvcc.read_latest_value(&allocator_key)?;
+    let allocator_max = match allocator_payload.as_deref() {
+        Some(payload) => decode_bucket_id_allocator_payload(payload)?,
+        None => 0,
+    };
+    let allocated_bucket_id = if bucket.id > 0 {
+        bucket.id
+    } else {
+        allocator_max
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("bucket id overflow"))?
+    };
+    let collection_revision_key = bucket_mvcc_key(
+        TABLE_BUCKET_EVENT_HEAD_ROW,
+        &bucket_collection_revision_tuple_key(bucket.tenant_id)?,
+    )?;
+    let revision_payload = mvcc.read_latest_value(&collection_revision_key)?;
+    let revision = match revision_payload.as_deref() {
+        Some(payload) => {
+            let value: BucketCollectionRevisionValue = serde_json::from_slice(payload)?;
+            if value.schema != BUCKET_COLLECTION_REVISION_SCHEMA
+                || value.tenant_id != bucket.tenant_id
+            {
+                bail!("bucket collection revision row scope mismatch");
+            }
+            value.revision
+        }
+        None => 0,
+    };
+    let collection_revision = revision
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("bucket collection revision overflow"))?;
+    let mutation_id = uuid::Uuid::new_v4();
+    let mutation_id_string = mutation_id.to_string();
+    let row_generation = collection_revision;
+    let partition_id = hex::encode(BucketJournalScope::Global.partition_id());
+    let mut projected_bucket = bucket.clone();
+    projected_bucket.id = allocated_bucket_id;
+    let body = BucketJournalBody {
+        event: mutation.event_name().to_string(),
+        tenant_id: projected_bucket.tenant_id,
+        bucket_id: projected_bucket.id,
+        bucket_name: projected_bucket.name.clone(),
+        region: projected_bucket.region.clone(),
+        is_public_read: projected_bucket.is_public_read,
+        mutation_id: mutation_id_string.clone(),
+        fence_token: 0,
+        created_at: projected_bucket.created_at.to_rfc3339(),
+        emitted_at: Some(chrono::Utc::now().to_rfc3339()),
+    };
+    let event_payload = encode_bucket_journal_body(&body)?;
+    let mut operations = Vec::new();
+    operations.extend(bucket_current_coremeta_operations(
+        BucketJournalScope::Tenant(projected_bucket.tenant_id),
+        &projected_bucket,
+        mutation,
+        &partition_id,
+        &mutation_id_string,
+        row_generation,
+    )?);
+    operations.extend(bucket_current_coremeta_operations(
+        BucketJournalScope::Global,
+        &projected_bucket,
+        mutation,
+        &partition_id,
+        &mutation_id_string,
+        row_generation,
+    )?);
+    operations.push(bucket_event_head_put(
+        &projected_bucket,
+        &event_payload,
+        collection_revision,
+        &partition_id,
+        &mutation_id_string,
+        row_generation,
+    )?);
+    if mutation == BucketJournalMutation::Create && allocated_bucket_id > allocator_max {
+        operations.push(bucket_id_allocator_put(
+            allocated_bucket_id,
+            &partition_id,
+            &mutation_id_string,
+            row_generation,
+        )?);
+    }
+    operations.push(CoreMutationOperation::CoreMetaPut {
+        partition_id: partition_id.clone(),
+        cf: CF_MESH.to_string(),
+        table_id: TABLE_BUCKET_EVENT_HEAD_ROW,
+        tuple_key: bucket_collection_revision_tuple_key(projected_bucket.tenant_id)?,
+        payload: serde_json::to_vec(&BucketCollectionRevisionValue {
+            schema: BUCKET_COLLECTION_REVISION_SCHEMA.to_string(),
+            tenant_id: projected_bucket.tenant_id,
+            revision: collection_revision,
+        })?,
+    });
+    operations.push(CoreMutationOperation::StreamAppend {
+        partition_id,
+        stream_id: BucketJournalScope::Tenant(projected_bucket.tenant_id).stream_id(),
+        record_kind: BUCKET_METADATA_RECORD_KIND.to_string(),
+        payload: event_payload,
+        idempotency_key: Some(format!("bucket-metadata:{mutation_id_string}")),
+    });
+
+    let mut predicate_keys = std::collections::BTreeSet::new();
+    let mut predicates = Vec::new();
+    for operation in &operations {
+        let (cf, table_id, tuple_key) = match operation {
+            CoreMutationOperation::CoreMetaPut {
+                cf,
+                table_id,
+                tuple_key,
+                ..
+            }
+            | CoreMutationOperation::CoreMetaDelete {
+                cf,
+                table_id,
+                tuple_key,
+                ..
+            } => (cf, *table_id, tuple_key),
+            CoreMutationOperation::StreamAppend { .. } => continue,
+        };
+        let key = crate::mvcc_product::coremeta_logical_key(cf, table_id, tuple_key)?;
+        if !predicate_keys.insert(key.clone()) {
+            continue;
+        }
+        let kind = if mutation == BucketJournalMutation::Create
+            && matches!(
+                table_id,
+                TABLE_BUCKET_CURRENT_BY_NAME_ROW | TABLE_BUCKET_CURRENT_BY_ID_ROW
+            ) {
+            PredicateKind::Absent
+        } else {
+            match mvcc.read_latest_value(&key)? {
+                Some(payload) => PredicateKind::ValueHash(*blake3::hash(&payload).as_bytes()),
+                None if mutation != BucketJournalMutation::Create
+                    && matches!(
+                        table_id,
+                        TABLE_BUCKET_CURRENT_BY_NAME_ROW | TABLE_BUCKET_CURRENT_BY_ID_ROW
+                    ) =>
+                {
+                    PredicateKind::Exists
+                }
+                None => PredicateKind::Absent,
+            }
+        };
+        predicates.push((key, kind));
+    }
+    Ok(BucketMvccMutationPlan {
+        mutations: crate::mvcc_product::product_mutations_from_operations(operations)?,
+        predicates,
+        allocated_bucket_id,
+        collection_revision,
+    })
+}
+
+fn decode_bucket_id_allocator_payload(payload: &[u8]) -> Result<i64> {
+    let row = BucketIdAllocatorRowProto::decode(payload)?;
+    ensure_deterministic_proto(&row, payload, "bucket id allocator row")?;
+    if row.schema != BUCKET_ID_ALLOCATOR_ROW_SCHEMA || row.max_allocated_id < 0 {
+        bail!("bucket id allocator row is invalid");
+    }
+    Ok(row.max_allocated_id)
 }
 
 impl BucketCurrentRow {
