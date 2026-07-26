@@ -4,7 +4,10 @@ use crate::{
     AppState,
     config::Config,
     mvcc_product::ProductMutation,
-    mvcc_transaction::{CertificationResult, DurabilityLevel, LogicalKey, ReadConsistency},
+    mvcc_transaction::{
+        CertificationResult, DurabilityLevel, HierarchicalRangeStampScheme, LogicalKey,
+        ReadConsistency, TransactionBundleBuilder,
+    },
     object_materialisation::{ObjectMaterialisationJob, ObjectMaterialisationOperations},
     personaldb_signing::PersonalDbProtocolKeyring,
 };
@@ -346,4 +349,45 @@ async fn reads_remain_at_the_begin_snapshot_and_foreign_cluster_staging_is_rejec
             .to_string()
             .contains("staged resource belongs to another cluster")
     );
+}
+
+#[test]
+fn local_apply_watermark_rejects_backward_versions_without_changing_visibility() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = crate::mvcc_store::LocalMvccStore::open(directory.path()).unwrap();
+    let newer_key = feature_key(0x7101, "newer");
+    let older_key = feature_key(0x7101, "older");
+    let mut newer = TransactionBundleBuilder::new(
+        "cluster-a",
+        "newer-transaction",
+        0,
+        PRINCIPAL,
+        HierarchicalRangeStampScheme::new(),
+    );
+    newer.put(newer_key.clone(), b"newer".to_vec());
+    store
+        .apply_certified_bundle(7, &newer.build().unwrap())
+        .unwrap();
+
+    let mut older = TransactionBundleBuilder::new(
+        "cluster-a",
+        "older-transaction",
+        0,
+        PRINCIPAL,
+        HierarchicalRangeStampScheme::new(),
+    );
+    older.put(older_key.clone(), b"older".to_vec());
+    assert!(
+        store
+            .apply_certified_bundle(6, &older.build().unwrap())
+            .unwrap_err()
+            .to_string()
+            .contains("below applied version")
+    );
+    assert_eq!(store.applied_version().unwrap(), 7);
+    assert_eq!(
+        store.read_latest(&newer_key).unwrap().unwrap().value,
+        b"newer"
+    );
+    assert!(store.read_latest(&older_key).unwrap().is_none());
 }
