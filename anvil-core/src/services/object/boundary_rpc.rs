@@ -671,22 +671,18 @@ async fn write_boundary_migration_row(
 ) -> Result<(), Status> {
     let payload = crate::core_store::encode_deterministic_proto(row);
     let tuple_key = boundary_migration_tuple_key(boundary_bucket_key, migration_id)?;
-    let op = crate::core_store::CoreMetaBatchOp {
-        cf: crate::core_store::CF_BOUNDARY,
-        table_id: crate::core_store::TABLE_BOUNDARY_MIGRATION_ROW,
-        tuple_key: &tuple_key,
-        common: None,
-        kind: crate::core_store::CoreMetaBatchOpKind::Put(&payload),
-    };
+    let logical_key = boundary_migration_logical_key(&tuple_key)?;
     state
-        .core_store
-        .commit_coremeta_root_groups(
+        .mvcc
+        .autocommit_product_mutations(
+            &format!("boundary-migration:{boundary_bucket_key}"),
             &format!("boundary-migration:{boundary_bucket_key}:{migration_id}"),
-            &[op],
-            &[crate::core_store::CoreMetaRootPublication::new(
-                format!("boundary/{boundary_bucket_key}"),
-                crate::formats::writer::WriterFamily::TypedMetadata,
+            vec![crate::mvcc_product::ProductMutation::put(
+                logical_key,
+                payload,
             )],
+            crate::mvcc_transaction::DurabilityLevel::Local,
+            current_unix_millis_u64(),
         )
         .await
         .map(|_| ())

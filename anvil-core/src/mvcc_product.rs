@@ -4,13 +4,15 @@
 //! deliberately not transaction boundaries. They are retained in the key
 //! encoding only as a schema namespace so two historical tables cannot alias.
 
+use std::time::Duration;
+
 use anyhow::{Result, bail};
 
 use crate::{
     core_store::{CoreMutationOperation, TABLE_STREAM_RECORD_INDEX_ROW},
     mvcc_bootstrap::MvccSubsystem,
     mvcc_open_transactions::StagedLogicalMutation,
-    mvcc_transaction::LogicalKey,
+    mvcc_transaction::{CertificationResult, DurabilityLevel, LogicalKey, ReadConsistency},
 };
 use serde::Serialize;
 
@@ -141,6 +143,69 @@ pub fn product_mutations_from_operations(
 }
 
 impl MvccSubsystem {
+    /// Read the authoritative committed value at the node's latest applied MVCC
+    /// version. Physical CoreStore projections are not consulted.
+    pub fn read_latest_value(&self, key: &LogicalKey) -> Result<Option<Vec<u8>>> {
+        Ok(self.runtime.read_latest(key)?.map(|visible| visible.value))
+    }
+
+    /// Execute an ordinary product mutation as a retry-stable MVCC transaction.
+    ///
+    /// The idempotency key deterministically selects the durable transaction
+    /// draft. Retries of a committing or resolved draft resume certification
+    /// instead of staging a second write.
+    pub async fn autocommit_product_mutations(
+        &self,
+        principal: &str,
+        idempotency_key: &str,
+        mutations: Vec<ProductMutation>,
+        durability: DurabilityLevel,
+        now_unix_ms: u64,
+    ) -> Result<u64> {
+        if mutations.is_empty() {
+            bail!("MVCC autocommit requires at least one mutation");
+        }
+        let handle = self
+            .open_transactions
+            .begin(
+                self.runtime.as_ref(),
+                self.cluster_id(),
+                principal,
+                idempotency_key,
+                Duration::from_secs(30),
+                durability,
+                ReadConsistency::Linearized,
+                now_unix_ms,
+            )
+            .await?;
+        let status =
+            self.open_transactions
+                .status(&handle.transaction_id, principal, now_unix_ms)?;
+        if status.state == "open" {
+            self.stage_product_mutations(
+                &handle.transaction_id,
+                principal,
+                mutations,
+                now_unix_ms,
+            )?;
+        }
+        let outcome = self
+            .open_transactions
+            .commit(
+                self.runtime.as_ref(),
+                &handle.transaction_id,
+                principal,
+                now_unix_ms,
+            )
+            .await?;
+        match outcome.certification {
+            CertificationResult::Committed { commit_version } => Ok(commit_version),
+            CertificationResult::Aborted { reason } => {
+                bail!("MVCC autocommit transaction aborted: {reason:?}")
+            }
+        }
+    }
+
     /// Read through this transaction's own write set, then through its fixed
     /// MVCC snapshot. A staged tombstone is returned as an absent value.
     pub fn read_transaction_value(
