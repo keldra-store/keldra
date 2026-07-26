@@ -34,6 +34,7 @@ struct BundleLocation {
 }
 
 struct PreparedBundleLog {
+    path: std::path::PathBuf,
     file: File,
     index: BTreeMap<String, BundleLocation>,
 }
@@ -49,7 +50,7 @@ impl PreparedBundleLog {
             .open(&path)?;
         let index = recover(&mut file)?;
         file.seek(SeekFrom::End(0))?;
-        Ok(Self { file, index })
+        Ok(Self { path, file, index })
     }
 
     fn persist(&mut self, identity: &BundleIdentity, bytes: &[u8]) -> Result<()> {
@@ -64,25 +65,8 @@ impl PreparedBundleLog {
             verify_identity(identity, &existing)?;
             return Ok(());
         }
-        let hash = parse_sha256(&identity.hash)?;
-        let offset = self.file.seek(SeekFrom::End(0))?;
-        let mut record = Vec::with_capacity(HEADER + bytes.len() + TRAILER);
-        record.extend_from_slice(MAGIC);
-        record.extend_from_slice(&VERSION.to_be_bytes());
-        record.extend_from_slice(&hash);
-        record.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
-        record.extend_from_slice(bytes);
-        let checksum: [u8; 32] = Sha256::digest(&record).into();
-        record.extend_from_slice(&checksum);
-        self.file.write_all(&record)?;
+        append_record(&mut self.file, identity, bytes, &mut self.index)?;
         self.file.sync_data()?;
-        self.index.insert(
-            identity.hash.clone(),
-            BundleLocation {
-                payload_offset: offset + HEADER as u64,
-                payload_length: bytes.len() as u64,
-            },
-        );
         Ok(())
     }
 
@@ -99,6 +83,73 @@ impl PreparedBundleLog {
         verify_identity(identity, &bytes)?;
         Ok(Some(bytes))
     }
+
+    fn compact(&mut self, retained_hashes: &BTreeSet<String>) -> Result<usize> {
+        let removed = self
+            .index
+            .keys()
+            .filter(|hash| !retained_hashes.contains(*hash))
+            .count();
+        if removed == 0 {
+            return Ok(0);
+        }
+
+        let temporary_path = self.path.with_extension("log.compacting");
+        let mut replacement = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&temporary_path)?;
+        let mut replacement_index = BTreeMap::new();
+        for (hash, location) in self.index.clone() {
+            if !retained_hashes.contains(&hash) {
+                continue;
+            }
+            self.file.seek(SeekFrom::Start(location.payload_offset))?;
+            let mut bytes = vec![0; location.payload_length as usize];
+            self.file.read_exact(&mut bytes)?;
+            let identity = BundleIdentity {
+                hash: hash.clone(),
+                length: location.payload_length,
+            };
+            verify_identity(&identity, &bytes)?;
+            append_record(&mut replacement, &identity, &bytes, &mut replacement_index)?;
+        }
+        replacement.sync_all()?;
+        fs::rename(&temporary_path, &self.path)?;
+        self.file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        self.file.seek(SeekFrom::End(0))?;
+        self.index = replacement_index;
+        Ok(removed)
+    }
+}
+
+fn append_record(
+    file: &mut File,
+    identity: &BundleIdentity,
+    bytes: &[u8],
+    index: &mut BTreeMap<String, BundleLocation>,
+) -> Result<()> {
+    let hash = parse_sha256(&identity.hash)?;
+    let offset = file.seek(SeekFrom::End(0))?;
+    let mut record = Vec::with_capacity(HEADER + bytes.len() + TRAILER);
+    record.extend_from_slice(MAGIC);
+    record.extend_from_slice(&VERSION.to_be_bytes());
+    record.extend_from_slice(&hash);
+    record.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+    record.extend_from_slice(bytes);
+    let checksum: [u8; 32] = Sha256::digest(&record).into();
+    record.extend_from_slice(&checksum);
+    file.write_all(&record)?;
+    index.insert(
+        identity.hash.clone(),
+        BundleLocation {
+            payload_offset: offset + HEADER as u64,
+            payload_length: bytes.len() as u64,
+        },
+    );
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -138,6 +189,29 @@ impl AppendOnlyPreparedBundleStore {
             .lock()
             .map_err(|_| anyhow::anyhow!("prepared bundle log lock poisoned"))?
             .read(identity)
+    }
+
+    /// Rewrites the append-only log retaining exactly the bundle identities
+    /// authorised by a cluster-wide GC plan.
+    ///
+    /// This method deliberately accepts no age or watermark: a local node
+    /// cannot prove that an unlisted prepared bundle has expired or that no
+    /// active certification/catch-up attempt still references it.
+    pub fn compact_authorised(&self, retained_identities: &[BundleIdentity]) -> Result<usize> {
+        let mut log = self
+            .log
+            .lock()
+            .map_err(|_| anyhow::anyhow!("prepared bundle log lock poisoned"))?;
+        let mut retained_hashes = BTreeSet::new();
+        for identity in retained_identities {
+            if let Some(location) = log.index.get(&identity.hash)
+                && location.payload_length != identity.length
+            {
+                bail!("authorised prepared bundle identity has the wrong length");
+            }
+            retained_hashes.insert(identity.hash.clone());
+        }
+        log.compact(&retained_hashes)
     }
 }
 
@@ -476,6 +550,44 @@ mod tests {
         .unwrap();
         reopened.persist(&identity, bytes).await.unwrap();
         assert_eq!(path.metadata().unwrap().len(), length);
+    }
+
+    #[tokio::test]
+    async fn authorised_compaction_retains_only_explicitly_pinned_bundles() {
+        let directory = tempfile::tempdir().unwrap();
+        let keep_bytes = b"committed bundle needed by catch-up";
+        let remove_bytes = b"expired uncommitted bundle";
+        let keep = identity(keep_bytes);
+        let remove = identity(remove_bytes);
+        let store = AppendOnlyPreparedBundleStore::open(
+            directory.path(),
+            "cluster-a",
+            node("node-a"),
+            "zone-a",
+        )
+        .unwrap();
+        store.persist(&keep, keep_bytes).await.unwrap();
+        store.persist(&remove, remove_bytes).await.unwrap();
+
+        assert_eq!(
+            store
+                .compact_authorised(std::slice::from_ref(&keep))
+                .unwrap(),
+            1
+        );
+        assert_eq!(store.read(&keep).unwrap().unwrap(), keep_bytes);
+        assert!(store.read(&remove).unwrap().is_none());
+
+        drop(store);
+        let reopened = AppendOnlyPreparedBundleStore::open(
+            directory.path(),
+            "cluster-a",
+            node("node-a"),
+            "zone-a",
+        )
+        .unwrap();
+        assert_eq!(reopened.read(&keep).unwrap().unwrap(), keep_bytes);
+        assert!(reopened.read(&remove).unwrap().is_none());
     }
 
     #[tokio::test]
