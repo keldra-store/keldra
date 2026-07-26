@@ -81,8 +81,7 @@ pub(super) async fn list_buckets(State(state): State<AppState>, req: Request) ->
             page_token: continuation_token.clone(),
         };
         let revision =
-            bucket_journal::current_bucket_collection_revision(&state.storage, claims.tenant_id)
-                .await
+            bucket_journal::current_bucket_collection_revision_mvcc(&state.mvcc, claims.tenant_id)
                 .map_err(|error| tonic::Status::internal(error.to_string()))?;
         let principal_scope = format!("tenant:{}/subject:{}", claims.tenant_id, claims.sub);
         let binding = anvil_core::services::collection_cursor::CollectionCursorBinding {
@@ -100,14 +99,13 @@ pub(super) async fn list_buckets(State(state): State<AppState>, req: Request) ->
         )?;
         let after_tuple_key =
             anvil_core::services::collection_cursor::decode_binary_position(position.as_deref())?;
-        let page = bucket_journal::page_current_buckets(
-            &state.storage,
+        let page = bucket_journal::page_current_buckets_mvcc(
+            &state.mvcc,
             claims.tenant_id,
             &revision,
             after_tuple_key.as_deref(),
             max_buckets as usize,
         )
-        .await
         .map_err(|error| tonic::Status::aborted(error.to_string()))?;
         let next_page_token = page
             .next_tuple_key
@@ -285,7 +283,7 @@ pub(super) async fn get_bucket_versioning_response(
         Err(response) => return response,
     }
 
-    match bucket_journal::read_current_bucket(&state.storage, claims.tenant_id, bucket).await {
+    match bucket_journal::read_current_bucket_mvcc(&state.mvcc, claims.tenant_id, bucket) {
         Ok(Some(_)) => {
             let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  <Status>Enabled</Status>\n</VersioningConfiguration>\n";
             Response::builder()
@@ -326,7 +324,7 @@ pub(super) async fn put_bucket_versioning_response(
         Err(response) => return response,
     }
 
-    match bucket_journal::read_current_bucket(&state.storage, claims.tenant_id, bucket).await {
+    match bucket_journal::read_current_bucket_mvcc(&state.mvcc, claims.tenant_id, bucket) {
         Ok(Some(_)) => {}
         Ok(None) => {
             return s3_error(
@@ -499,8 +497,7 @@ pub(super) async fn head_bucket(
         Err(response) => return response,
     }
 
-    match bucket_journal::read_current_bucket(&state.storage, claims.tenant_id, &bucket_name).await
-    {
+    match bucket_journal::read_current_bucket_mvcc(&state.mvcc, claims.tenant_id, &bucket_name) {
         Ok(Some(bucket)) => {
             if bucket.region != state.region {
                 return s3_remote_bucket_response(
@@ -1049,7 +1046,7 @@ pub(super) async fn get_bucket_location_response(
         Err(response) => return response,
     }
 
-    match bucket_journal::read_current_bucket(&state.storage, claims.tenant_id, bucket).await {
+    match bucket_journal::read_current_bucket_mvcc(&state.mvcc, claims.tenant_id, bucket) {
         Ok(Some(bucket)) => {
             let xml = format!(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<LocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{}</LocationConstraint>\n",

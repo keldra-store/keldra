@@ -9,7 +9,7 @@ use anvil_core::anvil_api::{
 use anvil_core::bucket_journal;
 use anvil_core::mesh_directory::{BucketLocatorStatus, TenantNameStatus};
 use anvil_core::mesh_lifecycle::{LifecycleState, NodeCapability};
-use anvil_core::mvcc_open_transactions::OpenTransactionHandle;
+use anvil_core::mvcc_open_transactions::TransactionHandle;
 use anvil_core::mvcc_transaction::{DurabilityLevel, ReadConsistency};
 use anvil_core::object_links;
 use anvil_core::object_manager::{
@@ -91,7 +91,7 @@ async fn begin_s3_write_transaction(
     operation: &str,
     bucket: &str,
     object_key: &str,
-) -> Result<(OpenTransactionHandle, String), tonic::Status> {
+) -> Result<(TransactionHandle, String), tonic::Status> {
     let principal = anvil_core::object_manager::transaction_principal_from_claims(claims);
     let idempotency_key = format!(
         "s3/{operation}/{bucket}/{object_key}/{}",
@@ -117,7 +117,7 @@ async fn begin_s3_write_transaction(
 
 async fn commit_s3_write_transaction(
     state: &AppState,
-    handle: &OpenTransactionHandle,
+    handle: &TransactionHandle,
     principal: &str,
 ) -> Result<(), tonic::Status> {
     let outcome = state

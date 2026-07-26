@@ -447,7 +447,7 @@ fn bucket_collection_revision_tuple_key(tenant_id: i64) -> Result<Vec<u8>> {
     ])
 }
 
-pub(crate) fn read_current_bucket_mvcc(
+pub fn read_current_bucket_mvcc(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     bucket_name: &str,
@@ -559,14 +559,14 @@ pub(crate) fn read_bucket_collection_revision_mvcc(
     Ok(value.revision)
 }
 
-pub(crate) fn current_bucket_collection_revision_mvcc(
+pub fn current_bucket_collection_revision_mvcc(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
 ) -> Result<String> {
     Ok(read_bucket_collection_revision_mvcc(mvcc, tenant_id)?.to_string())
 }
 
-pub(crate) fn page_current_buckets_mvcc(
+pub fn page_current_buckets_mvcc(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     expected_revision: &str,
