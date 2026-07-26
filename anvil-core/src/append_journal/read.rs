@@ -68,17 +68,19 @@ pub(super) async fn get_active_append_stream_for_optional_transaction(
             &state_stream_id,
             None,
         )?;
-        if let Some(payload) = mvcc.read_transaction_value(transaction_id, principal, &key)? {
-            return decode_active_stream_state(
-                &state_stream_id,
-                tenant_id,
-                bucket_id,
-                stream_key,
-                stream_id,
-                &payload,
-            )
-            .map(Some);
-        }
+        return mvcc
+            .read_transaction_value(transaction_id, principal, &key)?
+            .map(|payload| {
+                decode_active_stream_state(
+                    &state_stream_id,
+                    tenant_id,
+                    bucket_id,
+                    stream_key,
+                    stream_id,
+                    &payload,
+                )
+            })
+            .transpose();
     }
     let core_store = CoreStore::new(storage.clone()).await?;
     let Some(sequence) = latest_visible_sequence(&core_store, &state_stream_id).await? else {
@@ -238,12 +240,9 @@ pub async fn append_stream_has_records(
             &append_record_stream_id(stream)?,
             None,
         )?;
-        if mvcc
+        return Ok(mvcc
             .read_transaction_value(transaction_id, principal, &key)?
-            .is_some()
-        {
-            return Ok(true);
-        }
+            .is_some());
     }
     let core_store = CoreStore::new(storage.clone()).await?;
     Ok(

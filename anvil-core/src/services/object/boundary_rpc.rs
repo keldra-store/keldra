@@ -587,15 +587,7 @@ async fn write_boundary_migration_row_in_transaction(
         .mvcc
         .read_transaction_value(transaction_id, principal, &logical_key)
         .map_err(|error| Status::internal(error.to_string()))?;
-    let visible_in_legacy_projection = state
-        .core_store
-        .read_coremeta_row(
-            crate::core_store::CF_BOUNDARY,
-            crate::core_store::TABLE_BOUNDARY_MIGRATION_ROW,
-            &tuple_key,
-        )
-        .map_err(|error| Status::internal(error.to_string()))?;
-    if visible_in_transaction.is_some() || visible_in_legacy_projection.is_some() {
+    if visible_in_transaction.is_some() {
         return Err(Status::already_exists("BoundaryMigrationAlreadyExists"));
     }
     state
@@ -708,26 +700,15 @@ async fn read_boundary_migration_row(
 ) -> Result<Option<BoundaryMigrationRow>, Status> {
     let tuple_key = boundary_migration_tuple_key(boundary_bucket_key, migration_id)?;
     let logical_key = boundary_migration_logical_key(&tuple_key)?;
-    if let Some(visible) = state
+    let Some(visible) = state
         .mvcc
         .runtime
         .read_latest(&logical_key)
         .map_err(|error| Status::internal(error.to_string()))?
-    {
-        return decode_boundary_migration_row(&visible.value).map(Some);
-    }
-    let Some(bytes) = state
-        .core_store
-        .read_coremeta_row(
-            crate::core_store::CF_BOUNDARY,
-            crate::core_store::TABLE_BOUNDARY_MIGRATION_ROW,
-            &tuple_key,
-        )
-        .map_err(|error| Status::internal(error.to_string()))?
     else {
         return Ok(None);
     };
-    decode_boundary_migration_row(&bytes).map(Some)
+    decode_boundary_migration_row(&visible.value).map(Some)
 }
 
 fn decode_boundary_migration_row(bytes: &[u8]) -> Result<BoundaryMigrationRow, Status> {
