@@ -313,7 +313,7 @@ impl IndexService for AppState {
             .await?;
         let page_size = crate::services::collection_cursor::page_size(req.page.as_ref())?;
         let revision = index_journal::current_index_definition_collection_revision(
-            &self.storage,
+            &self.mvcc,
             claims.tenant_id,
             bucket.id,
         )
@@ -342,7 +342,7 @@ impl IndexService for AppState {
         let after_tuple_key =
             crate::services::collection_cursor::decode_binary_position(position.as_deref())?;
         let page = index_journal::page_current_index_definition_events(
-            &self.storage,
+            &self.mvcc,
             claims.tenant_id,
             bucket.id,
             req.include_disabled,

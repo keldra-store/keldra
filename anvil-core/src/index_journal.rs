@@ -489,16 +489,16 @@ pub async fn read_current_index_definition_events(
 
 #[cfg(any())]
 pub(crate) async fn current_index_definition_collection_revision(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     bucket_id: i64,
 ) -> Result<i64> {
-    current_definitions::collection_revision(storage, tenant_id, bucket_id).await
+    current_definitions::collection_revision_mvcc(mvcc, tenant_id, bucket_id)
 }
 
 #[cfg(any())]
 pub(crate) async fn page_current_index_definition_events(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     bucket_id: i64,
     include_disabled: bool,
@@ -506,16 +506,15 @@ pub(crate) async fn page_current_index_definition_events(
     after_tuple_key: Option<&[u8]>,
     page_size: usize,
 ) -> Result<CurrentIndexDefinitionPage> {
-    let page = current_definitions::page(
-        storage,
+    let page = current_definitions::page_mvcc_window(
+        mvcc,
         tenant_id,
         bucket_id,
         include_disabled,
         expected_revision,
         after_tuple_key,
         page_size,
-    )
-    .await?;
+    )?;
     let mut events = Vec::with_capacity(page.records.len());
     for row in page.records {
         let current = index_current_from_coremeta_row(row)?;

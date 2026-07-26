@@ -1,13 +1,7 @@
-use crate::{
-    core_store::{
-        CF_INDEX_DEFS, CF_INDEX_ROWS, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaRowCommonProto,
-        CoreMetaTuplePart, CoreMetaVisibilityState, CoreMutationBatch, CoreMutationOperation,
-        CoreMutationPrecondition, CoreMutationRootPublication, CoreStore,
-        TABLE_INDEX_DEFINITION_ROW, TABLE_INDEX_ROW, core_meta_record_tuple_key,
-        core_meta_root_key_hash, core_meta_tuple_key, core_mutation_publication_attempt_id,
-        decode_deterministic_proto, encode_deterministic_proto, sha256_hex,
-    },
-    storage::Storage,
+use crate::core_store::{
+    CF_INDEX_ROWS, CoreMetaRowCommonProto, CoreMetaTuplePart, CoreMetaVisibilityState,
+    TABLE_INDEX_ROW, core_meta_root_key_hash, core_meta_tuple_key, decode_deterministic_proto,
+    encode_deterministic_proto, sha256_hex,
 };
 use anyhow::{Result, anyhow, bail};
 use prost::Message;
@@ -458,110 +452,6 @@ fn read_index_segment_point_at(
 
 fn index_segment_logical_key(tuple_key: &[u8]) -> Result<crate::mvcc_transaction::LogicalKey> {
     crate::mvcc_product::coremeta_logical_key(CF_INDEX_ROWS, TABLE_INDEX_ROW, tuple_key)
-}
-
-pub async fn write_index_definition_current_coremeta_record(
-    storage: &Storage,
-    record: &IndexDefinitionCurrentCoreMetaRecord,
-) -> Result<()> {
-    validate_index_definition_current_record(record)?;
-    let tuple_key =
-        index_definition_current_tuple_key(record.tenant_id, record.bucket_id, &record.index_name)?;
-    let payload = encode_index_definition_current_record(record);
-    let store = CoreStore::new(storage.clone()).await?;
-    let op = CoreMetaBatchOp {
-        cf: CF_INDEX_DEFS,
-        table_id: TABLE_INDEX_DEFINITION_ROW,
-        tuple_key: &tuple_key,
-        common: None,
-        kind: CoreMetaBatchOpKind::Put(&payload),
-    };
-    store
-        .commit_coremeta_root_groups(
-            &format!(
-                "index-definition-current:{}:{}:{}",
-                record.tenant_id, record.bucket_id, record.cursor
-            ),
-            &[op],
-            &[crate::core_store::CoreMetaRootPublication::new(
-                index_definition_root_anchor_key(record.tenant_id, record.bucket_id),
-                crate::formats::writer::WriterFamily::TypedMetadata,
-            )],
-        )
-        .await?;
-    Ok(())
-}
-
-pub async fn read_index_definition_current_coremeta_record(
-    storage: &Storage,
-    tenant_id: i64,
-    bucket_id: i64,
-    index_name: &str,
-) -> Result<Option<IndexDefinitionCurrentCoreMetaRecord>> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(payload) = store.read_coremeta_row(
-        CF_INDEX_DEFS,
-        TABLE_INDEX_DEFINITION_ROW,
-        &index_definition_current_tuple_key(tenant_id, bucket_id, index_name)?,
-    )?
-    else {
-        return Ok(None);
-    };
-    let record = decode_index_definition_current_record(&payload)?;
-    validate_index_definition_current_scope(&record, tenant_id, bucket_id, index_name)?;
-    Ok(Some(record))
-}
-
-pub async fn write_index_definition_state_coremeta_record(
-    storage: &Storage,
-    record: &IndexDefinitionStateCoreMetaRecord,
-) -> Result<()> {
-    validate_index_definition_state_record(record)?;
-    let tuple_key = index_definition_state_tuple_key(record.tenant_id, record.bucket_id)?;
-    let payload = encode_index_definition_state_record(record);
-    let store = CoreStore::new(storage.clone()).await?;
-    let op = CoreMetaBatchOp {
-        cf: CF_INDEX_DEFS,
-        table_id: TABLE_INDEX_DEFINITION_ROW,
-        tuple_key: &tuple_key,
-        common: None,
-        kind: CoreMetaBatchOpKind::Put(&payload),
-    };
-    store
-        .commit_coremeta_root_groups(
-            &format!(
-                "index-definition-state:{}:{}:{}",
-                record.tenant_id, record.bucket_id, record.latest_cursor
-            ),
-            &[op],
-            &[crate::core_store::CoreMetaRootPublication::new(
-                index_definition_root_anchor_key(record.tenant_id, record.bucket_id),
-                crate::formats::writer::WriterFamily::TypedMetadata,
-            )],
-        )
-        .await?;
-    Ok(())
-}
-
-pub async fn read_index_definition_state_coremeta_record(
-    storage: &Storage,
-    tenant_id: i64,
-    bucket_id: i64,
-) -> Result<Option<IndexDefinitionStateCoreMetaRecord>> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(payload) = store.read_coremeta_row(
-        CF_INDEX_DEFS,
-        TABLE_INDEX_DEFINITION_ROW,
-        &index_definition_state_tuple_key(tenant_id, bucket_id)?,
-    )?
-    else {
-        return Ok(None);
-    };
-    let record = decode_index_definition_state_record(&payload)?;
-    if record.tenant_id != tenant_id || record.bucket_id != bucket_id {
-        bail!("CoreMeta index definition state row scope mismatch");
-    }
-    Ok(Some(record))
 }
 
 fn encode_index_segment_record(record: &IndexSegmentCoreMetaRecord) -> Vec<u8> {

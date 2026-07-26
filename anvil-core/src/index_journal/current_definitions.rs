@@ -2,13 +2,11 @@ use super::{IndexCurrentState, event_time_unix_nanos};
 use crate::{
     core_store::{
         CF_INDEX_DEFS, CoreMetaRowCommonProto, CoreMetaTuplePart, CoreMetaVisibilityState,
-        CoreMutationOperation, CoreMutationPrecondition, CoreStore, TABLE_INDEX_DEFINITION_ROW,
-        core_meta_committed_row_common, core_meta_payload_digest, core_meta_record_tuple_key,
-        core_meta_root_key_hash, core_meta_tuple_key, decode_deterministic_proto,
-        encode_deterministic_proto,
+        CoreMutationOperation, CoreMutationPrecondition, TABLE_INDEX_DEFINITION_ROW,
+        core_meta_committed_row_common, core_meta_payload_digest, core_meta_root_key_hash,
+        core_meta_tuple_key, decode_deterministic_proto, encode_deterministic_proto,
     },
     persistence::IndexDefinitionEvent,
-    storage::Storage,
 };
 use anyhow::{Result, anyhow, bail};
 use prost::Message;
@@ -356,54 +354,18 @@ pub(super) fn page_mvcc(
         .collect()
 }
 
-pub(super) async fn read_current(
-    storage: &Storage,
-    tenant_id: i64,
-    bucket_id: i64,
-    index_name: &str,
-) -> Result<Option<CurrentDefinitionRecord>> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(payload) = store.read_coremeta_row(
-        CF_INDEX_DEFS,
-        TABLE_INDEX_DEFINITION_ROW,
-        &current_tuple_key(tenant_id, bucket_id, index_name)?,
-    )?
-    else {
-        return Ok(None);
-    };
-    decode_current_record(&payload, tenant_id, bucket_id).map(Some)
-}
-
-pub(super) async fn read_state(
-    storage: &Storage,
-    tenant_id: i64,
-    bucket_id: i64,
-) -> Result<Option<IndexCurrentState>> {
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(payload) = store.read_coremeta_row(
-        CF_INDEX_DEFS,
-        TABLE_INDEX_DEFINITION_ROW,
-        &state_tuple_key(tenant_id, bucket_id)?,
-    )?
-    else {
-        return Ok(None);
-    };
-    decode_state(&payload, tenant_id, bucket_id).map(Some)
-}
-
-pub(super) async fn collection_revision(
-    storage: &Storage,
+pub(super) fn collection_revision_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     bucket_id: i64,
 ) -> Result<i64> {
-    Ok(read_state(storage, tenant_id, bucket_id)
-        .await?
+    Ok(read_state_mvcc(mvcc, tenant_id, bucket_id)?
         .map(|state| state.latest_cursor)
         .unwrap_or_default())
 }
 
-pub(super) async fn page(
-    storage: &Storage,
+pub(super) fn page_mvcc_window(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     bucket_id: i64,
     include_disabled: bool,
@@ -414,11 +376,10 @@ pub(super) async fn page(
     if !(1..=PAGE_SIZE_MAX).contains(&page_size) {
         bail!("index definition page size must be between 1 and {PAGE_SIZE_MAX}");
     }
-    if collection_revision(storage, tenant_id, bucket_id).await? != expected_revision {
+    if collection_revision_mvcc(mvcc, tenant_id, bucket_id)? != expected_revision {
         bail!("index definition collection revision changed");
     }
 
-    let store = CoreStore::new(storage.clone()).await?;
     let prefix = definition_tuple_prefix(
         if include_disabled {
             CURRENT_ROW_KIND
@@ -428,13 +389,26 @@ pub(super) async fn page(
         tenant_id,
         bucket_id,
     )?;
-    let mut rows = store.scan_coremeta_prefix_page(
+    let logical_prefix = crate::mvcc_product::coremeta_logical_key(
         CF_INDEX_DEFS,
         TABLE_INDEX_DEFINITION_ROW,
         &prefix,
-        after_tuple_key,
-        page_size + 1,
     )?;
+    let namespace = crate::mvcc_product::coremeta_application_prefix(CF_INDEX_DEFS, &[])?;
+    let snapshot = mvcc.runtime.applied_version()?;
+    let mut rows = mvcc.runtime.scan_table_prefix_at(
+        TABLE_INDEX_DEFINITION_ROW,
+        &logical_prefix.application_key,
+        snapshot,
+    )?;
+    if let Some(after) = after_tuple_key {
+        rows.retain(|(key, _)| {
+            key.application_key
+                .strip_prefix(&namespace)
+                .is_some_and(|tuple| tuple > after)
+        });
+    }
+    rows.truncate(page_size + 1);
     #[cfg(test)]
     let rows_visited = rows.len();
     let has_more = rows.len() > page_size;
@@ -443,22 +417,19 @@ pub(super) async fn page(
     }
     let next_tuple_key = if has_more {
         Some(
-            core_meta_record_tuple_key(
-                &rows
-                    .last()
-                    .ok_or_else(|| anyhow!("index definition continuation has no last row"))?
-                    .key,
-            )?
-            .to_vec(),
+            rows.last()
+                .and_then(|(key, _)| key.application_key.strip_prefix(&namespace))
+                .ok_or_else(|| anyhow!("index definition continuation has no last row"))?
+                .to_vec(),
         )
     } else {
         None
     };
     let records = rows
         .into_iter()
-        .map(|row| decode_current_record(&row.payload, tenant_id, bucket_id))
+        .map(|(_, row)| decode_current_record(&row.value, tenant_id, bucket_id))
         .collect::<Result<Vec<_>>>()?;
-    if collection_revision(storage, tenant_id, bucket_id).await? != expected_revision {
+    if collection_revision_mvcc(mvcc, tenant_id, bucket_id)? != expected_revision {
         bail!("index definition collection changed during page read");
     }
     Ok(CurrentDefinitionPage {
