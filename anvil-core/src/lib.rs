@@ -91,6 +91,8 @@ pub mod mvcc_open_transactions;
 pub mod mvcc_product;
 pub mod mvcc_shard_repair;
 pub mod mvcc_store;
+#[cfg(test)]
+mod mvcc_three_node_fault_tests;
 pub mod mvcc_transaction;
 pub mod native_idempotency;
 pub mod node_identity;
