@@ -31,6 +31,25 @@ fn validate_stream_page_limit(limit: usize) -> Result<()> {
 }
 
 impl CoreStore {
+    pub(crate) fn encode_boundary_schema_for_mvcc(schema: &CoreBoundarySchema) -> Result<Vec<u8>> {
+        encode_boundary_schema_record(schema)
+    }
+
+    pub(crate) fn decode_boundary_schema_from_mvcc(bytes: &[u8]) -> Result<CoreBoundarySchema> {
+        decode_boundary_schema_record(bytes)
+    }
+
+    pub(crate) fn boundary_schema_generation_tuple_key(
+        bucket: &str,
+        generation: u64,
+    ) -> Result<Vec<u8>> {
+        boundary_schema_coremeta_key(bucket, generation)
+    }
+
+    pub(crate) fn boundary_schema_current_tuple_key(bucket: &str) -> Result<Vec<u8>> {
+        boundary_schema_current_coremeta_key(bucket)
+    }
+
     pub async fn put_boundary_schema(
         &self,
         input: PutBoundarySchema,
@@ -78,69 +97,6 @@ impl CoreStore {
         )];
         self.commit_coremeta_root_groups(&transaction_id, &operations, &publications)
             .await?;
-
-        Ok(BoundarySchemaReceipt {
-            bucket: schema.bucket,
-            generation: schema.generation,
-            row_generation: schema.generation,
-            schema_hash,
-        })
-    }
-
-    pub async fn put_boundary_schema_in_transaction(
-        &self,
-        input: PutBoundarySchema,
-        transaction_id: &str,
-        principal: &str,
-    ) -> Result<BoundarySchemaReceipt> {
-        let _perf_guard = crate::perf::guard(
-            "anvil_core_store_op",
-            &[("operation", "put_boundary_schema_in_transaction")],
-        );
-        validate_logical_id(&input.mutation_id, "boundary schema mutation id")?;
-        validate_logical_id(transaction_id, "boundary schema transaction id")?;
-        validate_logical_id(principal, "boundary schema principal")?;
-        let mut schema = input.schema;
-        if schema.created_at.is_empty() {
-            schema.created_at = now_rfc3339();
-        }
-
-        let (bytes, schema_hash, schema_key, current_key) = {
-            let _schema_guard = self
-                .acquire_named_lock("boundary-schema", &schema.bucket)
-                .await?;
-            let current_schema = self.read_latest_boundary_schema_unlocked(&schema.bucket)?;
-            validate_boundary_schema(&schema, current_schema.as_ref(), input.expected_generation)?;
-            let bytes = encode_boundary_schema_record(&schema)?;
-            let schema_hash = format!("sha256:{}", sha256_hex(&bytes));
-            let schema_key = boundary_schema_coremeta_key(&schema.bucket, schema.generation)?;
-            let current_key = boundary_schema_current_coremeta_key(&schema.bucket)?;
-            (bytes, schema_hash, schema_key, current_key)
-        };
-        self.stage_coremeta_put_in_transaction(
-            transaction_id,
-            principal,
-            CF_BOUNDARY,
-            TABLE_BOUNDARY_SCHEMA_ROW,
-            schema_key,
-            bytes.clone(),
-            None,
-            true,
-            false,
-        )
-        .await?;
-        self.stage_coremeta_put_in_transaction(
-            transaction_id,
-            principal,
-            CF_BOUNDARY,
-            TABLE_BOUNDARY_SCHEMA_CURRENT_ROW,
-            current_key,
-            bytes,
-            None,
-            true,
-            false,
-        )
-        .await?;
 
         Ok(BoundarySchemaReceipt {
             bucket: schema.bucket,

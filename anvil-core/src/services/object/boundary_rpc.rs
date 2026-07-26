@@ -20,11 +20,27 @@ pub(super) async fn put_boundary_schema_rpc(
 
     let boundary_bucket_key =
         crate::core_store::boundary_schema_bucket_key(claims.tenant_id, &bucket.name);
+    let transaction_id = match req.transaction_id.as_deref() {
+        Some(value) if value.trim().is_empty() => {
+            return Err(Status::invalid_argument("transaction_id must not be empty"));
+        }
+        other => other,
+    };
+    let transaction_principal = crate::object_manager::transaction_principal_from_claims(&claims);
     let core_store = &state.core_store;
-    let current_read = core_store.read_boundary_schema(&boundary_bucket_key);
-    let current = current_read
-        .await
-        .map_err(|error| Status::internal(error.to_string()))?;
+    let current = if let Some(transaction_id) = transaction_id {
+        read_boundary_schema_in_transaction(
+            state,
+            &boundary_bucket_key,
+            transaction_id,
+            &transaction_principal,
+        )?
+    } else {
+        core_store
+            .read_boundary_schema(&boundary_bucket_key)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?
+    };
     let generation = match (current.as_ref(), req.expected_generation) {
         (None, None) => 1,
         (None, Some(_)) => {
@@ -56,7 +72,11 @@ pub(super) async fn put_boundary_schema_rpc(
             .into_iter()
             .map(proto_boundary_dimension_to_core)
             .collect::<Result<Vec<_>, _>>()?,
-        created_at: String::new(),
+        created_at: if transaction_id.is_some() {
+            chrono::Utc::now().to_rfc3339()
+        } else {
+            String::new()
+        },
     };
     let mutation_id = if req.mutation_id.trim().is_empty() {
         format!("boundary-schema:{}", uuid::Uuid::new_v4())
@@ -68,22 +88,19 @@ pub(super) async fn put_boundary_schema_rpc(
         expected_generation: req.expected_generation,
         mutation_id,
     };
-    let transaction_id = match req.transaction_id.as_deref() {
-        Some(value) if value.trim().is_empty() => {
-            return Err(Status::invalid_argument("transaction_id must not be empty"));
-        }
-        other => other,
-    };
-    let receipt = if let Some(transaction_id) = transaction_id {
-        let transaction_principal =
-            crate::object_manager::transaction_principal_from_claims(&claims);
-        core_store
-            .put_boundary_schema_in_transaction(put, transaction_id, &transaction_principal)
-            .await
-            .map_err(boundary_status)?
+    let schema_hash = if let Some(transaction_id) = transaction_id {
+        stage_boundary_schema_in_transaction(
+            state,
+            &schema,
+            transaction_id,
+            &transaction_principal,
+        )?
     } else {
         let put_boundary_schema = core_store.put_boundary_schema(put);
-        put_boundary_schema.await.map_err(boundary_status)?
+        put_boundary_schema
+            .await
+            .map_err(boundary_status)?
+            .schema_hash
     };
     let schema = if transaction_id.is_some() {
         schema
@@ -100,9 +117,80 @@ pub(super) async fn put_boundary_schema_rpc(
         schema: Some(core_boundary_schema_to_proto(
             &schema,
             &bucket.name,
-            receipt.schema_hash,
+            schema_hash,
         )),
     }))
+}
+
+fn read_boundary_schema_in_transaction(
+    state: &AppState,
+    boundary_bucket_key: &str,
+    transaction_id: &str,
+    principal: &str,
+) -> Result<Option<crate::core_store::CoreBoundarySchema>, Status> {
+    let tuple_key =
+        crate::core_store::CoreStore::boundary_schema_current_tuple_key(boundary_bucket_key)
+            .map_err(|error| Status::internal(error.to_string()))?;
+    let logical_key = crate::mvcc_product::coremeta_logical_key(
+        crate::core_store::CF_BOUNDARY,
+        crate::core_store::TABLE_BOUNDARY_SCHEMA_CURRENT_ROW,
+        &tuple_key,
+    )
+    .map_err(|error| Status::internal(error.to_string()))?;
+    let Some(bytes) = state
+        .mvcc
+        .read_transaction_value(transaction_id, principal, &logical_key)
+        .map_err(|error| Status::internal(error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    crate::core_store::CoreStore::decode_boundary_schema_from_mvcc(&bytes)
+        .map(Some)
+        .map_err(|error| Status::internal(error.to_string()))
+}
+
+fn stage_boundary_schema_in_transaction(
+    state: &AppState,
+    schema: &crate::core_store::CoreBoundarySchema,
+    transaction_id: &str,
+    principal: &str,
+) -> Result<String, Status> {
+    let bytes = crate::core_store::CoreStore::encode_boundary_schema_for_mvcc(schema)
+        .map_err(|error| Status::internal(error.to_string()))?;
+    let generation_tuple_key = crate::core_store::CoreStore::boundary_schema_generation_tuple_key(
+        &schema.bucket,
+        schema.generation,
+    )
+    .map_err(|error| Status::internal(error.to_string()))?;
+    let current_tuple_key =
+        crate::core_store::CoreStore::boundary_schema_current_tuple_key(&schema.bucket)
+            .map_err(|error| Status::internal(error.to_string()))?;
+    let generation_key = crate::mvcc_product::coremeta_logical_key(
+        crate::core_store::CF_BOUNDARY,
+        crate::core_store::TABLE_BOUNDARY_SCHEMA_ROW,
+        &generation_tuple_key,
+    )
+    .map_err(|error| Status::internal(error.to_string()))?;
+    let current_key = crate::mvcc_product::coremeta_logical_key(
+        crate::core_store::CF_BOUNDARY,
+        crate::core_store::TABLE_BOUNDARY_SCHEMA_CURRENT_ROW,
+        &current_tuple_key,
+    )
+    .map_err(|error| Status::internal(error.to_string()))?;
+    state
+        .mvcc
+        .stage_product_mutations(
+            transaction_id,
+            principal,
+            vec![
+                crate::mvcc_product::ProductMutation::put(generation_key, bytes.clone()),
+                crate::mvcc_product::ProductMutation::put(current_key, bytes.clone()),
+            ],
+            current_unix_millis_u64(),
+        )
+        .map_err(|error| Status::internal(error.to_string()))?;
+    use sha2::Digest;
+    Ok(format!("sha256:{:x}", sha2::Sha256::digest(&bytes)))
 }
 
 pub(super) async fn get_boundary_schema_rpc(
@@ -707,6 +795,43 @@ fn boundary_migration_mode_name(mode: i32) -> Result<&'static str, Status> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boundary_schema_mvcc_rows_are_distinct_and_round_trip() {
+        let schema = crate::core_store::CoreBoundarySchema {
+            schema: crate::core_store::CORE_BOUNDARY_SCHEMA_SCHEMA.to_string(),
+            bucket: "1/releases".to_string(),
+            generation: 2,
+            dimensions: Vec::new(),
+            created_at: "2026-07-26T00:00:00Z".to_string(),
+        };
+        let payload =
+            crate::core_store::CoreStore::encode_boundary_schema_for_mvcc(&schema).unwrap();
+        assert_eq!(
+            crate::core_store::CoreStore::decode_boundary_schema_from_mvcc(&payload).unwrap(),
+            schema
+        );
+
+        let generation_tuple =
+            crate::core_store::CoreStore::boundary_schema_generation_tuple_key(&schema.bucket, 2)
+                .unwrap();
+        let current_tuple =
+            crate::core_store::CoreStore::boundary_schema_current_tuple_key(&schema.bucket)
+                .unwrap();
+        let generation_key = crate::mvcc_product::coremeta_logical_key(
+            crate::core_store::CF_BOUNDARY,
+            crate::core_store::TABLE_BOUNDARY_SCHEMA_ROW,
+            &generation_tuple,
+        )
+        .unwrap();
+        let current_key = crate::mvcc_product::coremeta_logical_key(
+            crate::core_store::CF_BOUNDARY,
+            crate::core_store::TABLE_BOUNDARY_SCHEMA_CURRENT_ROW,
+            &current_tuple,
+        )
+        .unwrap();
+        assert_ne!(generation_key, current_key);
+    }
 
     #[test]
     fn boundary_migration_rows_are_valid_coremeta_payloads() {
