@@ -52,8 +52,9 @@ bundle materialisation, or physical transport used by MVCC.
 - `bucket_journal.rs`: legacy physical test/helper paths remain. Production
   bucket current state already uses MVCC; the production watch event/head path
   was moved to MVCC in the commit accompanying this audit.
-- `append_journal.rs` and `append_journal/read.rs`: physical append journal
-  state requires a dedicated cutover assessment.
+- Append journal heads, state, record indexes, cursors, and reads are now
+  canonical MVCC state. Referenced immutable payload objects remain outside the
+  journal rows.
 
 ## Bucket watch cutover evidence
 
@@ -100,3 +101,20 @@ The following dependencies deliberately remain outside this marker row:
   outside Anvil storage;
 - authz schema and tuple state are canonical MVCC data owned by their existing
   authz transactions.
+
+## Append-journal follow-up evidence
+
+Append stream creation, record publication, and sealing now certify at quorum
+through linearized MVCC transactions with exact predicates and a compact-Raft
+assignment guard. Caller-owned transactions stage the same exact predicates and
+guard. The retired physical partition precondition is no longer evaluated and
+discarded.
+
+Stream record-index values use the canonical MVCC stream-record envelope;
+heads retain the append event payload. Paged reads retain one MVCC snapshot,
+transactional point reads stage conflict predicates, and stream listings verify
+that each scanned head key is the canonical state key for the decoded stream.
+
+No production or disabled/test-only `CoreStore` append-journal helper remains.
+The journal stores only references to immutable payload objects; the referenced
+bytes continue to use the physical object/shard layer.

@@ -52,6 +52,21 @@ pub fn decode_stream_record_value(bytes: &[u8]) -> Result<(String, Vec<u8>)> {
     Ok((value.record_kind, value.payload))
 }
 
+pub fn encode_stream_record_value(
+    stream_id: &str,
+    record_kind: &str,
+    idempotency_key: &str,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    Ok(serde_json::to_vec(&StreamRecordValue {
+        schema: "anvil.mvcc.stream-record.v1",
+        stream_id,
+        record_kind,
+        idempotency_key,
+        payload,
+    })?)
+}
+
 impl ProductMutation {
     pub fn put(key: LogicalKey, value: Vec<u8>) -> Self {
         Self {
@@ -189,13 +204,12 @@ fn logical_mutations_from_operations(
                     &stream_id,
                     Some(stable_stream_ordinal(&idempotency_key)),
                 )?;
-                let value = serde_json::to_vec(&StreamRecordValue {
-                    schema: "anvil.mvcc.stream-record.v1",
-                    stream_id: &stream_id,
-                    record_kind: &record_kind,
-                    idempotency_key: &idempotency_key,
-                    payload: &payload,
-                })?;
+                let value = encode_stream_record_value(
+                    &stream_id,
+                    &record_kind,
+                    &idempotency_key,
+                    &payload,
+                )?;
                 Ok(ProductMutation::put(key, value))
             }
         })

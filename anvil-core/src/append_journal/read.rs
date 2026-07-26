@@ -85,17 +85,31 @@ pub fn list_append_streams_page_mvcc(
             snapshot,
         )?
         .into_iter()
-        .map(|(_, row)| {
+        .map(|(key, row)| {
             let body = decode_append_body(&row.value)?;
-            body.stream
-                .ok_or_else(|| anyhow!("append state event is missing stream"))
+            let stream = body
+                .stream
+                .ok_or_else(|| anyhow!("append state event is missing stream"))?;
+            Ok((key, stream))
         })
         .collect::<Result<Vec<_>>>()?;
-    streams.retain(|stream| {
+    streams.retain(|(key, stream)| {
         stream.tenant_id == tenant_id
             && stream.bucket_id == bucket_id
-            && append_state_stream_id(stream).is_ok()
+            && append_state_stream_id(stream)
+                .and_then(|stream_id| {
+                    crate::mvcc_product::stream_logical_key(
+                        crate::core_store::TABLE_STREAM_HEAD_ROW,
+                        &stream_id,
+                        None,
+                    )
+                })
+                .is_ok_and(|expected| expected == *key)
     });
+    let mut streams = streams
+        .into_iter()
+        .map(|(_, stream)| stream)
+        .collect::<Vec<_>>();
     streams.sort_by_key(|stream| stream.id);
     streams.retain(|stream| u64::try_from(stream.id).is_ok_and(|id| id > after_ordinal));
     let has_more = streams.len() > limit;
@@ -186,8 +200,9 @@ pub(super) async fn get_active_append_stream_for_optional_transaction(
             &state_stream_id,
             None,
         )?;
-        return mvcc
-            .read_transaction_value(transaction_id, principal, &key)?
+        let value = mvcc.read_transaction_value(transaction_id, principal, &key)?;
+        stage_read_predicate(mvcc, transaction_id, principal, key, value.as_deref())?;
+        return value
             .map(|payload| {
                 decode_active_stream_state(
                     &state_stream_id,
@@ -256,9 +271,9 @@ pub fn append_stream_has_records(
             &append_record_stream_id(stream)?,
             None,
         )?;
-        return Ok(mvcc
-            .read_transaction_value(transaction_id, principal, &key)?
-            .is_some());
+        let value = mvcc.read_transaction_value(transaction_id, principal, &key)?;
+        stage_read_predicate(mvcc, transaction_id, principal, key, value.as_deref())?;
+        return Ok(value.is_some());
     }
     let key = crate::mvcc_product::stream_logical_key(
         crate::core_store::TABLE_STREAM_HEAD_ROW,
@@ -324,10 +339,6 @@ fn append_state_stream_id_for_identity(
     ))
 }
 
-fn append_state_stream_prefix(tenant_id: i64, bucket_id: i64) -> String {
-    format!("append_state:tenant:{tenant_id}:bucket:{bucket_id}:")
-}
-
 fn append_stream_identity_hash(stream_key: &str, stream_id: uuid::Uuid) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&(stream_key.len() as u64).to_be_bytes());
@@ -341,4 +352,25 @@ fn ensure_page_size(limit: usize) -> Result<()> {
         bail!("append journal page size must be between 1 and {APPEND_READ_PAGE_MAX_ROWS}");
     }
     Ok(())
+}
+
+fn stage_read_predicate(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    key: crate::mvcc_transaction::LogicalKey,
+    value: Option<&[u8]>,
+) -> Result<()> {
+    let predicate = value
+        .map(|payload| {
+            crate::mvcc_transaction::PredicateKind::ValueHash(*blake3::hash(payload).as_bytes())
+        })
+        .unwrap_or(crate::mvcc_transaction::PredicateKind::Absent);
+    mvcc.stage_predicate(
+        transaction_id,
+        principal,
+        key,
+        predicate,
+        u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+    )
 }

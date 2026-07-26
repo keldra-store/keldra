@@ -2,7 +2,7 @@ use crate::core_store::{
     CoreCompressionDescriptor, CoreObjectEncoding, CoreObjectPlacement, CoreObjectRef,
 };
 use crate::formats::{Hash32, hash32, writer::WriterFamily};
-use crate::partition_fence::{PartitionWritePermit, partition_write_precondition};
+use crate::partition_fence::PartitionWritePermit;
 use crate::persistence::{
     AppendStream, AppendStreamMutation, AppendStreamRecord, AppendStreamRecordMutation,
     MetadataMutationReceipt, SealAppendStreamMutation,
@@ -214,18 +214,16 @@ pub use read::{
 use read::{append_record_cursor_stream_id, append_record_stream_id, append_state_stream_id};
 
 pub(crate) async fn create_append_stream_with_permit_mvcc(
-    storage: &Storage,
+    _storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     bucket_id: i64,
     bucket_name: &str,
     stream_key: &str,
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
+    _partition_owner_signing_key: &[u8],
 ) -> Result<AppendStreamMutation> {
     require_append_metadata_permit(tenant_id, bucket_id, permit)?;
-    let partition_precondition =
-        partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
     let journal_head_key = crate::mvcc_product::stream_logical_key(
         crate::core_store::TABLE_STREAM_HEAD_ROW,
         &append_metadata_stream_id(tenant_id, bucket_id),
@@ -258,33 +256,39 @@ pub(crate) async fn create_append_stream_with_permit_mvcc(
         None,
         permit.fence_token,
     )?;
-    let _ = partition_precondition;
-    mvcc.autocommit_product_mutations(
+    commit_append_mutations(
+        mvcc,
+        tenant_id,
+        bucket_id,
         &append_metadata_partition_principal(tenant_id, bucket_id),
         &format!("append-create:{}", receipt.mutation_id),
         mutations,
-        crate::mvcc_transaction::DurabilityLevel::Local,
-        u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default(),
     )
     .await?;
     Ok(AppendStreamMutation { stream, receipt })
 }
 
 pub(crate) async fn create_append_stream_with_permit_in_transaction(
-    storage: &Storage,
+    _storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     bucket_id: i64,
     bucket_name: &str,
     stream_key: &str,
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
+    _partition_owner_signing_key: &[u8],
     transaction_id: &str,
     transaction_principal: &str,
 ) -> Result<AppendStreamMutation> {
     require_append_metadata_permit(tenant_id, bucket_id, permit)?;
-    let partition_precondition =
-        partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
+    stage_append_assignment_guard(
+        mvcc,
+        tenant_id,
+        bucket_id,
+        transaction_id,
+        transaction_principal,
+    )
+    .await?;
     let journal_head = crate::mvcc_product::stream_logical_key(
         crate::core_store::TABLE_STREAM_HEAD_ROW,
         &append_metadata_stream_id(tenant_id, bucket_id),
@@ -319,12 +323,11 @@ pub(crate) async fn create_append_stream_with_permit_in_transaction(
         transaction_id,
         transaction_principal,
     )?;
-    let _ = partition_precondition;
     Ok(AppendStreamMutation { stream, receipt })
 }
 
 pub(crate) async fn append_stream_record_with_permit_in_partition(
-    storage: &Storage,
+    _storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     bucket_id: i64,
@@ -335,11 +338,9 @@ pub(crate) async fn append_stream_record_with_permit_in_partition(
     user_meta: Option<serde_json::Value>,
     authenticated_principal: &str,
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
+    _partition_owner_signing_key: &[u8],
 ) -> Result<AppendStreamRecordMutation> {
     require_append_metadata_permit(tenant_id, bucket_id, permit)?;
-    let partition_precondition =
-        partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
     let current = get_active_append_stream_mvcc(
         mvcc,
         tenant_id,
@@ -381,20 +382,20 @@ pub(crate) async fn append_stream_record_with_permit_in_partition(
         Some(record.clone()),
         permit.fence_token,
     )?;
-    let _ = partition_precondition;
-    mvcc.autocommit_product_mutations(
+    commit_append_mutations(
+        mvcc,
+        tenant_id,
+        bucket_id,
         authenticated_principal,
         &format!("append-record:{}", receipt.mutation_id),
         mutations,
-        crate::mvcc_transaction::DurabilityLevel::Local,
-        u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default(),
     )
     .await?;
     Ok(AppendStreamRecordMutation { record, receipt })
 }
 
 pub(crate) async fn append_stream_record_with_permit_in_partition_transaction(
-    storage: &Storage,
+    _storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     bucket_id: i64,
@@ -404,13 +405,19 @@ pub(crate) async fn append_stream_record_with_permit_in_partition_transaction(
     content_type: Option<String>,
     user_meta: Option<serde_json::Value>,
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
+    _partition_owner_signing_key: &[u8],
     transaction_id: &str,
     transaction_principal: &str,
 ) -> Result<AppendStreamRecordMutation> {
     require_append_metadata_permit(tenant_id, bucket_id, permit)?;
-    let partition_precondition =
-        partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
+    stage_append_assignment_guard(
+        mvcc,
+        tenant_id,
+        bucket_id,
+        transaction_id,
+        transaction_principal,
+    )
+    .await?;
     let journal_head = crate::mvcc_product::stream_logical_key(
         crate::core_store::TABLE_STREAM_HEAD_ROW,
         &append_metadata_stream_id(tenant_id, bucket_id),
@@ -456,23 +463,20 @@ pub(crate) async fn append_stream_record_with_permit_in_partition_transaction(
         transaction_id,
         transaction_principal,
     )?;
-    let _ = partition_precondition;
     Ok(AppendStreamRecordMutation { record, receipt })
 }
 
 pub(crate) async fn seal_append_stream_with_permit_in_partition(
-    storage: &Storage,
+    _storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     bucket_id: i64,
     stream: &AppendStream,
     segment_hash: &str,
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
+    _partition_owner_signing_key: &[u8],
 ) -> Result<SealAppendStreamMutation> {
     require_append_metadata_permit(tenant_id, bucket_id, permit)?;
-    let partition_precondition =
-        partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
     let mut sealed = get_active_append_stream_mvcc(
         mvcc,
         tenant_id,
@@ -499,13 +503,13 @@ pub(crate) async fn seal_append_stream_with_permit_in_partition(
         permit.fence_token,
     )?;
     let principal = append_metadata_partition_principal(tenant_id, bucket_id);
-    let _ = partition_precondition;
-    mvcc.autocommit_product_mutations(
+    commit_append_mutations(
+        mvcc,
+        tenant_id,
+        bucket_id,
         &principal,
         &format!("append-seal:{}", receipt.mutation_id),
         mutations,
-        crate::mvcc_transaction::DurabilityLevel::Local,
-        u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default(),
     )
     .await?;
     Ok(SealAppendStreamMutation {
@@ -515,20 +519,26 @@ pub(crate) async fn seal_append_stream_with_permit_in_partition(
 }
 
 pub(crate) async fn seal_append_stream_with_permit_in_partition_transaction(
-    storage: &Storage,
+    _storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     bucket_id: i64,
     stream: &AppendStream,
     segment_hash: &str,
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
+    _partition_owner_signing_key: &[u8],
     transaction_id: &str,
     transaction_principal: &str,
 ) -> Result<SealAppendStreamMutation> {
     require_append_metadata_permit(tenant_id, bucket_id, permit)?;
-    let partition_precondition =
-        partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
+    stage_append_assignment_guard(
+        mvcc,
+        tenant_id,
+        bucket_id,
+        transaction_id,
+        transaction_principal,
+    )
+    .await?;
     let mut sealed = stream.clone();
     sealed.sealed_at = Some(Utc::now());
     sealed.segment_hash = Some(segment_hash.to_string());
@@ -543,7 +553,6 @@ pub(crate) async fn seal_append_stream_with_permit_in_partition_transaction(
         transaction_id,
         transaction_principal,
     )?;
-    let _ = (storage, partition_precondition);
     Ok(SealAppendStreamMutation {
         sealed: true,
         receipt: Some(receipt),
@@ -563,13 +572,107 @@ fn stage_append_body_mvcc(
 ) -> Result<MetadataMutationReceipt> {
     let (receipt, mutations) =
         append_body_mvcc_mutations(tenant_id, bucket_id, event, stream, record, fence_token)?;
-    mvcc.stage_product_mutations(
-        transaction_id,
-        transaction_principal,
-        mutations,
-        u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default(),
-    )?;
+    let now = u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default();
+    for mutation in &mutations {
+        let observed =
+            mvcc.read_transaction_value(transaction_id, transaction_principal, &mutation.key)?;
+        mvcc.stage_predicate(
+            transaction_id,
+            transaction_principal,
+            mutation.key.clone(),
+            value_predicate(observed.as_deref()),
+            now,
+        )?;
+    }
+    mvcc.stage_product_mutations(transaction_id, transaction_principal, mutations, now)?;
     Ok(receipt)
+}
+
+async fn commit_append_mutations(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    bucket_id: i64,
+    principal: &str,
+    logical_idempotency_key: &str,
+    mutations: Vec<crate::mvcc_product::ProductMutation>,
+) -> Result<()> {
+    let now = u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default();
+    let handle = mvcc
+        .open_transactions
+        .begin(
+            mvcc.runtime.as_ref(),
+            mvcc.cluster_id(),
+            principal,
+            logical_idempotency_key,
+            std::time::Duration::from_secs(30),
+            crate::mvcc_transaction::DurabilityLevel::Quorum,
+            crate::mvcc_transaction::ReadConsistency::Linearized,
+            now,
+        )
+        .await?;
+    for mutation in &mutations {
+        let observed =
+            mvcc.read_transaction_value(&handle.transaction_id, principal, &mutation.key)?;
+        mvcc.stage_predicate(
+            &handle.transaction_id,
+            principal,
+            mutation.key.clone(),
+            value_predicate(observed.as_deref()),
+            now,
+        )?;
+    }
+    mvcc.stage_product_mutations(&handle.transaction_id, principal, mutations, now)?;
+    stage_append_assignment_guard(
+        mvcc,
+        tenant_id,
+        bucket_id,
+        &handle.transaction_id,
+        principal,
+    )
+    .await?;
+    let outcome = mvcc
+        .open_transactions
+        .commit(
+            mvcc.runtime.as_ref(),
+            &handle.transaction_id,
+            principal,
+            u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default(),
+        )
+        .await?;
+    match outcome.certification {
+        crate::mvcc_transaction::CertificationResult::Committed { .. } => Ok(()),
+        crate::mvcc_transaction::CertificationResult::Aborted { reason } => {
+            Err(anyhow!("append journal transaction aborted: {reason:?}"))
+        }
+    }
+}
+
+async fn stage_append_assignment_guard(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    bucket_id: i64,
+    transaction_id: &str,
+    principal: &str,
+) -> Result<()> {
+    let identity = format!("{tenant_id}:{bucket_id}");
+    let assignment = mvcc
+        .reconcile_work_assignment("append-journal", &identity)
+        .await?
+        .ok_or_else(|| anyhow!("this node does not own the append journal assignment"))?;
+    mvcc.stage_assignment_guard(
+        transaction_id,
+        principal,
+        &assignment,
+        u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default(),
+    )
+}
+
+fn value_predicate(value: Option<&[u8]>) -> crate::mvcc_transaction::PredicateKind {
+    value
+        .map(|payload| {
+            crate::mvcc_transaction::PredicateKind::ValueHash(*blake3::hash(payload).as_bytes())
+        })
+        .unwrap_or(crate::mvcc_transaction::PredicateKind::Absent)
 }
 
 fn append_body_mvcc_mutations(
@@ -599,6 +702,19 @@ fn append_body_mvcc_mutations(
         }
         AppendMutationKind::AppendRecord => append_record_stream_id(&stream)?,
     };
+    let idempotency_key = mutation_id.to_string();
+    let journal_record_value = crate::mvcc_product::encode_stream_record_value(
+        &journal_stream_id,
+        "append_metadata.record",
+        &idempotency_key,
+        &payload,
+    )?;
+    let exact_record_value = crate::mvcc_product::encode_stream_record_value(
+        &exact_stream_id,
+        "append_metadata.record",
+        &idempotency_key,
+        &payload,
+    )?;
     let mut mutations = vec![
         crate::mvcc_product::ProductMutation::put(
             crate::mvcc_product::stream_logical_key(
@@ -614,7 +730,7 @@ fn append_body_mvcc_mutations(
                 &journal_stream_id,
                 Some(stable_append_ordinal(mutation_id)),
             )?,
-            payload.clone(),
+            journal_record_value,
         ),
         crate::mvcc_product::ProductMutation::put(
             crate::mvcc_product::stream_logical_key(
@@ -632,7 +748,7 @@ fn append_body_mvcc_mutations(
                 &exact_stream_id,
                 Some(stable_append_ordinal(mutation_id)),
             )?,
-            payload.clone(),
+            exact_record_value,
         ));
         mutations.push(crate::mvcc_product::ProductMutation::put(
             crate::mvcc_product::stream_logical_key(
