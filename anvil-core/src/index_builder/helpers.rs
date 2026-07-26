@@ -409,33 +409,41 @@ pub(super) async fn build_typed_json_object_rows(
                 continue;
             }
         };
-        let json = match serde_json::from_slice::<JsonValue>(&payload) {
-            Ok(json) => json,
-            Err(error) => {
-                diagnostics.push(IndexBuildDiagnostic {
-                    object_key: object.key.clone(),
-                    version_id: Some(object.version_id),
-                    severity: "error".to_string(),
-                    code: "TypedJsonObjectInvalid".to_string(),
-                    message: error.to_string(),
-                    details: serde_json::json!({ "content_type": object.content_type }),
-                });
-                continue;
-            }
-        };
-        match typed_json_row_from_object(bucket, definition, &object, &json) {
-            Ok(row) => rows.push(row),
+        match typed_json_row_from_frozen_object(bucket, index, definition, &object, &payload) {
+            Ok(None) => {}
+            Ok(Some(row)) => rows.push(row),
             Err(error) => diagnostics.push(IndexBuildDiagnostic {
                 object_key: object.key.clone(),
                 version_id: Some(object.version_id),
                 severity: "error".to_string(),
                 code: "TypedJsonRowExtractionFailed".to_string(),
                 message: error.to_string(),
-                details: serde_json::json!({ "fields": index.build_policy.get("fields") }),
+                details: serde_json::json!({
+                    "content_type": object.content_type,
+                    "fields": index.build_policy.get("fields"),
+                }),
             }),
         }
     }
     Ok((rows, diagnostics, boundary_values))
+}
+
+/// Extract a typed-JSON row exclusively from immutable, transaction-frozen
+/// inputs. This is deliberately separated from source enumeration so MVCC
+/// materialisation never has to re-read an object's mutable "current" row.
+pub(super) fn typed_json_row_from_frozen_object(
+    bucket: &Bucket,
+    index: &IndexDefinition,
+    definition: &TypedJsonBuildDefinition,
+    object: &Object,
+    payload: &[u8],
+) -> Result<Option<TypedFieldSegmentRow>> {
+    if object.deleted_at.is_some() || !selector_matches(&index.selector, object) {
+        return Ok(None);
+    }
+    let json = serde_json::from_slice::<JsonValue>(payload)
+        .context("frozen typed_json object payload is not valid JSON")?;
+    typed_json_row_from_object(bucket, definition, object, &json).map(Some)
 }
 
 pub(super) async fn build_typed_json_append_rows(

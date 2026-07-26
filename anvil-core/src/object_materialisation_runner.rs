@@ -5,9 +5,11 @@ use async_trait::async_trait;
 use tokio::sync::watch;
 
 use crate::{
-    core_store::CoreBoundarySchema, local_object_store::LocalObjectManifest,
+    core_store::CoreBoundarySchema,
+    local_object_store::LocalObjectManifest,
     object_manager::extract_object_boundary_values,
     object_shard_manifest::PhysicalObjectShardManifest,
+    persistence::{Bucket, IndexDefinition, Object},
 };
 use crate::{
     mvcc_bootstrap::MvccSubsystem,
@@ -244,11 +246,9 @@ impl ObjectMaterialisationExecutor for MvccObjectMaterialisationExecutor {
             job.job_id()? == job_id,
             "materialisation job identity mismatch"
         );
-        anyhow::ensure!(
-            !job.requested_operations.maintain_indexes,
-            "MVCC snapshot-aware index materialisation is not available"
-        );
-        let payload = if job.requested_operations.extract_boundaries {
+        let payload = if job.requested_operations.extract_boundaries
+            || job.requested_operations.maintain_indexes
+        {
             self.payload(job).await?
         } else {
             Vec::new()
@@ -269,6 +269,65 @@ impl ObjectMaterialisationExecutor for MvccObjectMaterialisationExecutor {
             }
             _ => Vec::new(),
         };
+        let mut index_outcomes = Vec::new();
+        if job.requested_operations.maintain_indexes {
+            let object: Object = serde_json::from_value(job.frozen_object.clone())?;
+            let bucket = Bucket {
+                id: job.bucket_id,
+                tenant_id: job.tenant_id,
+                name: job.bucket_name.clone(),
+                region: String::new(),
+                created_at: object.created_at,
+                is_public_read: false,
+            };
+            for frozen in &job.frozen_index_definitions {
+                anyhow::ensure!(
+                    frozen.kind == "typed_json",
+                    "MVCC materialisation for index kind `{}` is not available",
+                    frozen.kind
+                );
+                let index = IndexDefinition {
+                    id: frozen.id,
+                    tenant_id: job.tenant_id,
+                    bucket_id: job.bucket_id,
+                    name: frozen.name.clone(),
+                    kind: frozen.kind.clone(),
+                    selector: frozen.selector.clone(),
+                    extractor: frozen.extractor.clone(),
+                    authorization_mode: frozen.authorization_mode.clone(),
+                    build_policy: frozen.build_policy.clone(),
+                    enabled: true,
+                    version: frozen.version,
+                    created_at: object.created_at,
+                    updated_at: object.created_at,
+                };
+                let outcome = crate::index_builder::build_frozen_typed_json_index(
+                    &self.mvcc.materialisation_storage,
+                    &bucket,
+                    &index,
+                    self.mvcc.materialisation_signing_key.as_ref(),
+                    u128::from(job.originating_snapshot_version),
+                    &self.mvcc.peers[0].node_id,
+                    crate::index_builder::IndexBuildAuthority::DirectRepair(
+                        crate::index_builder::DirectRepairIndexBuildAuthority::new(),
+                    ),
+                    crate::index_builder::FrozenTypedJsonIndexSource {
+                        object: object.clone(),
+                        payload: payload.clone(),
+                        boundary_values: boundaries.clone(),
+                        source_manifest_hash: job.source_manifest_hash.clone(),
+                    },
+                )
+                .await?;
+                index_outcomes.push(serde_json::json!({
+                    "index_id": frozen.id,
+                    "index_version": frozen.version,
+                    "kind": frozen.kind,
+                    "generation": outcome.generation,
+                    "segment_hashes": outcome.segment_hashes,
+                }));
+            }
+        }
         self.publisher
             .publish(ObjectMaterialisationResult {
                 schema: ObjectMaterialisationResult::SCHEMA.into(),
@@ -282,6 +341,7 @@ impl ObjectMaterialisationExecutor for MvccObjectMaterialisationExecutor {
                     "requested": job.requested_operations.maintain_indexes,
                     "policy_snapshot": job.index_policy_snapshot,
                     "authz_revision": job.authz_revision,
+                    "outcomes": index_outcomes,
                 }),
                 updated_at_unix_ms: now_unix_ms(),
             })

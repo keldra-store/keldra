@@ -165,6 +165,8 @@ pub struct MvccSubsystem {
     pub object_evidence: ObjectEvidenceRegistry,
     pub shard_candidates: Arc<[ShardTarget]>,
     pub local_objects: LocalObjectStore,
+    pub materialisation_storage: crate::storage::Storage,
+    pub materialisation_signing_key: Arc<[u8]>,
     pub consensus_service: ConsensusTransportService<NodeConnectionAuthorizer>,
     pub replication_service: ReplicationServiceImpl<NodeConnectionAuthorizer>,
     pub peers: Arc<[MvccPeerConfig]>,
@@ -321,6 +323,9 @@ impl MvccSubsystem {
             })
             .collect::<Vec<_>>();
         let local_store = LocalMvccStore::from_db(core_meta_db.clone(), &config.mvcc_cluster_id)?;
+        let materialisation_storage = crate::storage::Storage::new_at(&config.storage_path).await?;
+        let materialisation_signing_key =
+            Arc::<[u8]>::from(hex::decode(&config.anvil_secret_encryption_key)?);
         let runtime = Arc::new(MvccNodeRuntime::new(
             prepared.clone(),
             replicator,
@@ -366,6 +371,8 @@ impl MvccSubsystem {
             object_evidence,
             shard_candidates: shard_candidates.into(),
             local_objects,
+            materialisation_storage,
+            materialisation_signing_key,
             consensus_service,
             replication_service,
             peers: peers.into(),

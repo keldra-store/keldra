@@ -359,6 +359,35 @@ fn typed_json_row_extracts_body_metadata_and_source_id() {
 }
 
 #[test]
+fn frozen_typed_json_extraction_uses_supplied_object_and_payload() {
+    let mut object = object("queue/frozen.json", Some("application/json"));
+    object.user_meta = Some(serde_json::json!({"owner": "frozen-owner"}));
+    let bucket = Bucket {
+        id: 1,
+        tenant_id: 7,
+        name: "jobs".to_string(),
+        region: "local".to_string(),
+        created_at: Utc::now(),
+        is_public_read: false,
+    };
+    let index = index_definition(serde_json::json!({
+        "source_kind": "object_current",
+        "fields": [
+            {"name": "state", "extractor": "/state"},
+            {"name": "owner", "extractor": "object_user_metadata_json_pointer:/owner"}
+        ]
+    }));
+
+    let row = extract_frozen_typed_json_row(&bucket, &index, &object, br#"{"state":"committed"}"#)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(row.values["state"], "committed");
+    assert_eq!(row.values["owner"], "frozen-owner");
+    assert_eq!(row.object_version_id, object.version_id.to_string());
+}
+
+#[test]
 fn typed_json_required_field_missing_fails_extraction() {
     let object = object("queue/item-1.json", Some("application/json"));
     let bucket = Bucket {

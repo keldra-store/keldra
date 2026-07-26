@@ -726,7 +726,7 @@ impl ObjectManager {
                 .collect::<Vec<_>>();
             frozen_index_definitions.sort_by_key(|definition| (definition.id, definition.version));
             let frozen_object = serde_json::to_value(&object)
-                .map(canonical_json)
+                .map(|value| canonical_json(&value))
                 .map_err(|error| Status::internal(error.to_string()))?;
             let source_manifest_hash = {
                 use sha2::Digest as _;
@@ -1358,8 +1358,13 @@ impl ObjectManager {
         let authenticated_principal = transaction_principal_from_claims(claims);
         let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
         let stream = if let Some(transaction_id) = transaction_id {
+            let mvcc = self
+                .mvcc
+                .get()
+                .ok_or_else(|| Status::failed_precondition("MVCC runtime is not installed"))?;
             self.persistence
                 .get_active_append_stream_in_transaction(
+                    mvcc,
                     tenant_id,
                     bucket.id,
                     stream_key,
@@ -1487,8 +1492,13 @@ impl ObjectManager {
             let transaction_principal = transaction_principal.ok_or_else(|| {
                 Status::invalid_argument("transaction principal is required for append stream seal")
             })?;
+            let mvcc = self
+                .mvcc
+                .get()
+                .ok_or_else(|| Status::failed_precondition("MVCC runtime is not installed"))?;
             self.persistence
                 .get_active_append_stream_in_transaction(
+                    mvcc,
                     tenant_id,
                     bucket.id,
                     stream_key,
@@ -1505,9 +1515,16 @@ impl ObjectManager {
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found("Append stream not found"))?;
         let transaction = transaction_id.zip(transaction_principal);
+        let mvcc = transaction_id
+            .map(|_| {
+                self.mvcc
+                    .get()
+                    .ok_or_else(|| Status::failed_precondition("MVCC runtime is not installed"))
+            })
+            .transpose()?;
         let has_records = self
             .persistence
-            .append_stream_has_records(&stream, transaction)
+            .append_stream_has_records(mvcc.map(AsRef::as_ref), &stream, transaction)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         if !has_records {

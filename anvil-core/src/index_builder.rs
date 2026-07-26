@@ -465,6 +465,62 @@ pub(crate) async fn build_typed_json_index(
     builder_node_id: &str,
     authority: IndexBuildAuthority<'_>,
 ) -> Result<IndexBuildOutcome> {
+    build_typed_json_index_from_source(
+        storage,
+        bucket,
+        index,
+        partition_owner_signing_key,
+        source_cursor,
+        builder_node_id,
+        authority,
+        None,
+    )
+    .await
+}
+
+pub(crate) struct FrozenTypedJsonIndexSource {
+    pub object: Object,
+    pub payload: Vec<u8>,
+    pub boundary_values: Vec<CoreBoundaryValue>,
+    pub source_manifest_hash: String,
+}
+
+/// Build and publish a typed-JSON segment from transaction-frozen inputs. The
+/// supplied source-manifest hash is carried into the proof/checkpoint without
+/// re-enumerating mutable object metadata.
+pub(crate) async fn build_frozen_typed_json_index(
+    storage: &Storage,
+    bucket: &Bucket,
+    index: &IndexDefinition,
+    partition_owner_signing_key: &[u8],
+    source_cursor: u128,
+    builder_node_id: &str,
+    authority: IndexBuildAuthority<'_>,
+    source: FrozenTypedJsonIndexSource,
+) -> Result<IndexBuildOutcome> {
+    build_typed_json_index_from_source(
+        storage,
+        bucket,
+        index,
+        partition_owner_signing_key,
+        source_cursor,
+        builder_node_id,
+        authority,
+        Some(source),
+    )
+    .await
+}
+
+async fn build_typed_json_index_from_source(
+    storage: &Storage,
+    bucket: &Bucket,
+    index: &IndexDefinition,
+    partition_owner_signing_key: &[u8],
+    source_cursor: u128,
+    builder_node_id: &str,
+    authority: IndexBuildAuthority<'_>,
+    frozen_source: Option<FrozenTypedJsonIndexSource>,
+) -> Result<IndexBuildOutcome> {
     if index.kind != "typed_json" {
         return Err(anyhow!("index build only supports typed_json indexes"));
     }
@@ -484,26 +540,55 @@ pub(crate) async fn build_typed_json_index(
         .max(u64::try_from(source_cursor).unwrap_or(u64::MAX))
         .max(1);
 
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let (rows, diagnostics, boundary_values) = match definition.source_kind.as_str() {
-        "object_current" => {
-            build_typed_json_object_rows(
-                storage,
-                bucket,
-                index,
-                &definition,
-                &core_store,
-                partition_owner_signing_key,
-                source_cursor,
-            )
-            .await?
-        }
-        "append_record" => {
-            build_typed_json_append_rows(bucket, index, &definition, &core_store, source_cursor)
-                .await?
-        }
-        _ => return Err(anyhow!("unsupported typed_json source kind")),
+    let frozen_source_manifest_hash = frozen_source
+        .as_ref()
+        .map(|source| source.source_manifest_hash.clone());
+    let core_store = if frozen_source.is_none() {
+        Some(CoreStore::new(storage.clone()).await?)
+    } else {
+        None
     };
+    let (rows, diagnostics, boundary_values) =
+        match (definition.source_kind.as_str(), frozen_source) {
+            ("object_current", Some(source)) => {
+                let rows = typed_json_row_from_frozen_object(
+                    bucket,
+                    index,
+                    &definition,
+                    &source.object,
+                    &source.payload,
+                )?
+                .into_iter()
+                .collect();
+                (rows, Vec::new(), source.boundary_values)
+            }
+            ("object_current", None) => {
+                build_typed_json_object_rows(
+                    storage,
+                    bucket,
+                    index,
+                    &definition,
+                    core_store.as_ref().expect("legacy source has a CoreStore"),
+                    partition_owner_signing_key,
+                    source_cursor,
+                )
+                .await?
+            }
+            ("append_record", None) => {
+                build_typed_json_append_rows(
+                    bucket,
+                    index,
+                    &definition,
+                    core_store.as_ref().expect("legacy source has a CoreStore"),
+                    source_cursor,
+                )
+                .await?
+            }
+            ("append_record", Some(_)) => {
+                return Err(anyhow!("frozen typed_json source must be object_current"));
+            }
+            _ => return Err(anyhow!("unsupported typed_json source kind")),
+        };
 
     let field_names = definition
         .fields
@@ -574,14 +659,19 @@ pub(crate) async fn build_typed_json_index(
         .await?;
     let segment_hash = staged_segment.segment_hash.clone();
     let partition_id = hex::encode(hash32(index_storage_id.as_bytes()));
-    let source_manifest_hash = typed_json_source_manifest_hash(
-        storage,
-        bucket,
-        partition_owner_signing_key,
-        source_cursor,
-        &definition.source_kind,
-    )
-    .await?;
+    let source_manifest_hash = match frozen_source_manifest_hash {
+        Some(hash) => hash,
+        None => {
+            typed_json_source_manifest_hash(
+                storage,
+                bucket,
+                partition_owner_signing_key,
+                source_cursor,
+                &definition.source_kind,
+            )
+            .await?
+        }
+    };
     let proof = publish_index_build_proof_and_checkpoint(
         storage,
         bucket,
@@ -635,6 +725,29 @@ pub(crate) async fn build_typed_json_index(
         segment_hashes: vec![segment_hash],
         diagnostics,
     })
+}
+
+/// Extract one typed-JSON row from an immutable MVCC source. Unlike the
+/// legacy index builder this performs no source enumeration and reads no
+/// current object metadata.
+pub(crate) fn extract_frozen_typed_json_row(
+    bucket: &Bucket,
+    index: &IndexDefinition,
+    object: &Object,
+    payload: &[u8],
+) -> Result<Option<TypedFieldSegmentRow>> {
+    if index.kind != "typed_json" || !index.enabled {
+        return Err(anyhow!(
+            "frozen typed_json extraction requires an enabled typed_json index"
+        ));
+    }
+    let definition = parse_typed_json_build_definition(index)?;
+    if definition.source_kind != "object_current" {
+        return Err(anyhow!(
+            "frozen typed_json extraction requires object_current source"
+        ));
+    }
+    typed_json_row_from_frozen_object(bucket, index, &definition, object, payload)
 }
 
 pub(crate) async fn build_metadata_backed_index(
