@@ -198,18 +198,38 @@ fn bucket_event_head_tuple_key(tenant_id: i64, bucket_name: &str) -> Result<Vec<
     ])
 }
 
+fn bucket_event_prefix(tenant_id: i64) -> Result<Vec<u8>> {
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("bucket-event"),
+        CoreMetaTuplePart::I64(tenant_id),
+    ])
+}
+
+fn bucket_event_tuple_key(tenant_id: i64, sequence: u64) -> Result<Vec<u8>> {
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8("bucket-event"),
+        CoreMetaTuplePart::I64(tenant_id),
+        CoreMetaTuplePart::U64(sequence),
+    ])
+}
+
+fn bucket_event_sequence_from_tuple_key(tuple_key: &[u8]) -> Option<i64> {
+    let suffix = tuple_key.get(tuple_key.len().checked_sub(9)?..)?;
+    if suffix.first().copied()? != 0x02 {
+        return None;
+    }
+    let sequence = u64::from_be_bytes(suffix.get(1..)?.try_into().ok()?);
+    i64::try_from(sequence).ok()
+}
+
 pub async fn latest_bucket_metadata_event(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     bucket_name: &str,
 ) -> Result<Option<BucketMetadataEvent>> {
     let tuple_key = bucket_event_head_tuple_key(tenant_id, bucket_name)?;
-    let Some(payload) = CoreStore::new(storage.clone()).await?.read_coremeta_row(
-        CF_MESH,
-        TABLE_BUCKET_EVENT_HEAD_ROW,
-        &tuple_key,
-    )?
-    else {
+    let key = bucket_mvcc_key(TABLE_BUCKET_EVENT_HEAD_ROW, &tuple_key)?;
+    let Some(payload) = mvcc.read_latest_value(&key)? else {
         return Ok(None);
     };
     let row = BucketEventHeadRowProto::decode(payload.as_slice())?;
@@ -244,7 +264,7 @@ pub struct BucketMetadataEventPage {
 }
 
 pub async fn list_bucket_metadata_event_page(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     bucket_name: &str,
     after_cursor: i64,
@@ -253,32 +273,41 @@ pub async fn list_bucket_metadata_event_page(
     if after_cursor < 0 {
         return Err(anyhow!("bucket metadata watch cursor must be non-negative"));
     }
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let page = core_store
-        .read_stream_page(ReadStream {
-            stream_id: BucketJournalScope::Tenant(tenant_id).stream_id(),
-            after_sequence: u64::try_from(after_cursor)?,
-            limit,
-        })
-        .await?;
-    let next_cursor = i64::try_from(page.next_sequence)
-        .map_err(|_| anyhow!("bucket metadata watch cursor exceeds i64"))?;
-    let mut events = Vec::with_capacity(page.records.len());
-    for record in page.records {
-        if record.record_kind != BUCKET_METADATA_RECORD_KIND {
-            continue;
-        }
-        let body = decode_bucket_journal_body(&record.payload)
-            .with_context(|| format!("decode bucket metadata stream record {}", record.cursor))?;
+    let snapshot = mvcc.runtime.applied_version()?;
+    let prefix = bucket_event_prefix(tenant_id)?;
+    let application_prefix = crate::mvcc_product::coremeta_application_prefix(CF_MESH, &prefix)?;
+    let mut rows = mvcc.runtime.scan_table_prefix_at(
+        TABLE_BUCKET_EVENT_HEAD_ROW,
+        &application_prefix,
+        snapshot,
+    )?;
+    rows.retain(|(key, _)| {
+        crate::mvcc_product::coremeta_tuple_from_logical_key(key, CF_MESH)
+            .ok()
+            .and_then(bucket_event_sequence_from_tuple_key)
+            .is_some_and(|sequence| sequence > after_cursor)
+    });
+    rows.truncate(limit.saturating_add(1));
+    let has_more = rows.len() > limit;
+    rows.truncate(limit);
+    let mut next_cursor = after_cursor;
+    let mut events = Vec::with_capacity(rows.len());
+    for (key, row) in rows {
+        let tuple_key = crate::mvcc_product::coremeta_tuple_from_logical_key(&key, CF_MESH)?;
+        let sequence = bucket_event_sequence_from_tuple_key(tuple_key)
+            .ok_or_else(|| anyhow!("bucket metadata event key is malformed"))?;
+        next_cursor = sequence;
+        let body = decode_bucket_journal_body(&row.value)
+            .with_context(|| format!("decode bucket metadata event {sequence}"))?;
         if !bucket_name.is_empty() && body.bucket_name != bucket_name {
             continue;
         }
-        events.push(bucket_event_from_body(record.sequence, body)?);
+        events.push(bucket_event_from_body(u64::try_from(sequence)?, body)?);
     }
     Ok(BucketMetadataEventPage {
         events,
         next_cursor,
-        has_more: page.has_more,
+        has_more,
     })
 }
 
@@ -628,12 +657,12 @@ pub(crate) fn build_bucket_mvcc_mutation_plan(
             revision: collection_revision,
         })?,
     });
-    operations.push(CoreMutationOperation::StreamAppend {
+    operations.push(CoreMutationOperation::CoreMetaPut {
         partition_id,
-        stream_id: BucketJournalScope::Tenant(projected_bucket.tenant_id).stream_id(),
-        record_kind: BUCKET_METADATA_RECORD_KIND.to_string(),
+        cf: CF_MESH.to_string(),
+        table_id: TABLE_BUCKET_EVENT_HEAD_ROW,
+        tuple_key: bucket_event_tuple_key(projected_bucket.tenant_id, collection_revision)?,
         payload: event_payload,
-        idempotency_key: Some(format!("bucket-metadata:{mutation_id_string}")),
     });
 
     let mut predicate_keys = std::collections::BTreeSet::new();
@@ -652,7 +681,9 @@ pub(crate) fn build_bucket_mvcc_mutation_plan(
                 tuple_key,
                 ..
             } => (cf, *table_id, tuple_key),
-            CoreMutationOperation::StreamAppend { .. } => continue,
+            CoreMutationOperation::StreamAppend { .. } => {
+                unreachable!("bucket MVCC plans never contain physical stream appends")
+            }
         };
         let key = crate::mvcc_product::coremeta_logical_key(cf, table_id, tuple_key)?;
         if !predicate_keys.insert(key.clone()) {

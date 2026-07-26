@@ -236,9 +236,7 @@ impl BucketService for AppState {
         .await?;
         let after_cursor = i64::try_from(req.after_cursor)
             .map_err(|_| Status::invalid_argument("after_cursor exceeds supported range"))?;
-        let stream_id = bucket_journal::tenant_bucket_metadata_stream_id(claims.tenant_id);
-        let mut live = self.storage.subscribe_stream(&stream_id);
-        let storage = self.storage.clone();
+        let mvcc = self.mvcc.clone();
         let tenant_id = claims.tenant_id;
         let bucket_name = req.bucket_name;
 
@@ -248,7 +246,7 @@ impl BucketService for AppState {
             loop {
                 loop {
                     let page = match bucket_journal::list_bucket_metadata_event_page(
-                        &storage,
+                        &mvcc,
                         tenant_id,
                         &bucket_name,
                         last_cursor,
@@ -278,10 +276,7 @@ impl BucketService for AppState {
                     }
                 }
 
-                match live.recv().await {
-                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         });
 
@@ -439,7 +434,7 @@ impl AppState {
         deleted: bool,
     ) -> Result<crate::persistence::BucketMetadataEvent, Status> {
         let event =
-            bucket_journal::latest_bucket_metadata_event(&self.storage, tenant_id, &bucket.name)
+            bucket_journal::latest_bucket_metadata_event(&self.mvcc, tenant_id, &bucket.name)
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?
                 .ok_or_else(|| Status::internal("Bucket metadata journal event not found"))?;
