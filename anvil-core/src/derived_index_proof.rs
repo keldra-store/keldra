@@ -8,6 +8,9 @@ use crate::{
         encode_deterministic_proto,
     },
     formats::hash32,
+    mvcc_bootstrap::MvccSubsystem,
+    mvcc_product::{ProductMutation, coremeta_logical_key},
+    mvcc_transaction::PredicateKind,
     storage::Storage,
 };
 use anyhow::{Result, anyhow};
@@ -200,6 +203,85 @@ pub(crate) async fn publish_prepared_derived_index_proof(
     Ok(prepared.sealed.clone())
 }
 
+/// Stages the immutable proof and its movable head in the caller's MVCC
+/// transaction. Both rows are protected by predicates derived from the
+/// transaction's fixed snapshot, so a concurrent successor cannot be
+/// overwritten.
+pub(crate) fn stage_prepared_derived_index_proof(
+    mvcc: &MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    prepared: &PreparedDerivedIndexProof,
+    now_unix_ms: u64,
+) -> Result<DerivedIndexProof> {
+    let proof = &prepared.sealed;
+    let proof_hash = proof
+        .proof_hash
+        .as_deref()
+        .ok_or_else(|| anyhow!("sealed derived index proof is missing proof hash"))?;
+    let versioned = coremeta_logical_key(
+        CF_INDEX_ROWS,
+        TABLE_DERIVED_INDEX_PROOF_ROW,
+        &versioned_proof_tuple_key(&proof.index_id, proof.generation, proof_hash)?,
+    )?;
+    let head = coremeta_logical_key(
+        CF_INDEX_ROWS,
+        TABLE_DERIVED_INDEX_PROOF_ROW,
+        &head_proof_tuple_key(&proof.index_id)?,
+    )?;
+    let versioned_current = mvcc.read_transaction_value(transaction_id, principal, &versioned)?;
+    if let Some(existing) = versioned_current.as_deref()
+        && decode_derived_index_proof_row(existing)? != *proof
+    {
+        return Err(anyhow!(
+            "derived index generation already identifies a different proof"
+        ));
+    }
+    let head_current = mvcc.read_transaction_value(transaction_id, principal, &head)?;
+    if let Some(existing) = head_current.as_deref() {
+        let existing = decode_derived_index_proof_row(existing)?;
+        if existing.generation > proof.generation {
+            return Err(anyhow!("derived index proof head cannot move backwards"));
+        }
+        if existing.generation == proof.generation {
+            if existing != *proof {
+                return Err(anyhow!(
+                    "derived index proof diverges at an existing generation"
+                ));
+            }
+            return Ok(proof.clone());
+        }
+    }
+    let predicate = |current: &Option<Vec<u8>>| match current {
+        Some(payload) => PredicateKind::ValueHash(*blake3::hash(payload).as_bytes()),
+        None => PredicateKind::Absent,
+    };
+    mvcc.stage_product_mutations(
+        transaction_id,
+        principal,
+        vec![
+            ProductMutation::put(versioned.clone(), encode_derived_index_proof_row(proof)?),
+            ProductMutation::put(head.clone(), encode_derived_index_proof_row(proof)?),
+        ],
+        now_unix_ms,
+    )?;
+    mvcc.stage_predicate(
+        transaction_id,
+        principal,
+        versioned,
+        predicate(&versioned_current),
+        now_unix_ms,
+    )?;
+    mvcc.stage_predicate(
+        transaction_id,
+        principal,
+        head,
+        predicate(&head_current),
+        now_unix_ms,
+    )?;
+    Ok(proof.clone())
+}
+
 pub async fn read_latest_derived_index_proof(
     storage: &Storage,
     index_id: &str,
@@ -210,6 +292,27 @@ pub async fn read_latest_derived_index_proof(
     else {
         return Ok(None);
     };
+    proof.verify(signing_key)?;
+    if proof.index_id != index_id {
+        return Err(anyhow!("derived index proof ref scope mismatch"));
+    }
+    Ok(Some(proof))
+}
+
+pub(crate) fn read_latest_derived_index_proof_mvcc(
+    mvcc: &MvccSubsystem,
+    index_id: &str,
+    signing_key: &[u8],
+) -> Result<Option<DerivedIndexProof>> {
+    let key = coremeta_logical_key(
+        CF_INDEX_ROWS,
+        TABLE_DERIVED_INDEX_PROOF_ROW,
+        &head_proof_tuple_key(index_id)?,
+    )?;
+    let Some(payload) = mvcc.read_latest_value(&key)? else {
+        return Ok(None);
+    };
+    let proof = decode_derived_index_proof_row(&payload)?;
     proof.verify(signing_key)?;
     if proof.index_id != index_id {
         return Err(anyhow!("derived index proof ref scope mismatch"));

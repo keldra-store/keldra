@@ -12,20 +12,20 @@ use anyhow::{Result, anyhow};
 use std::future::Future;
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct DirectRepairIndexBuildAuthority {
-    _private: (),
+pub(crate) struct DirectRepairIndexBuildAuthority<'a> {
+    mvcc: &'a crate::mvcc_bootstrap::MvccSubsystem,
 }
 
-impl DirectRepairIndexBuildAuthority {
-    pub(crate) fn new() -> Self {
-        Self { _private: () }
+impl<'a> DirectRepairIndexBuildAuthority<'a> {
+    pub(crate) fn new(mvcc: &'a crate::mvcc_bootstrap::MvccSubsystem) -> Self {
+        Self { mvcc }
     }
 }
 
 #[derive(Clone, Copy)]
 pub(crate) enum IndexBuildAuthority<'a> {
     Task(&'a TaskExecutionGuard),
-    DirectRepair(DirectRepairIndexBuildAuthority),
+    DirectRepair(DirectRepairIndexBuildAuthority<'a>),
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +118,13 @@ impl IndexBuildOwnership {
 }
 
 impl IndexBuildAuthority<'_> {
+    pub(crate) fn mvcc(self) -> Result<&crate::mvcc_bootstrap::MvccSubsystem> {
+        match self {
+            Self::Task(guard) => guard.mvcc(),
+            Self::DirectRepair(authority) => Ok(authority.mvcc),
+        }
+    }
+
     pub(crate) async fn deterministic_payload_actor(self, direct_actor: &str) -> String {
         match self {
             Self::Task(guard) => {

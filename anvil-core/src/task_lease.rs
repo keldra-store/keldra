@@ -678,6 +678,20 @@ pub fn task_lease_mvcc_key(
     )
 }
 
+pub(crate) fn task_lease_mvcc_predicate(
+    lease: &TaskLease,
+) -> Result<(
+    crate::mvcc_transaction::LogicalKey,
+    crate::mvcc_transaction::PredicateKind,
+)> {
+    Ok((
+        task_lease_mvcc_key(lease.owner.tenant_id, &lease.task_id)?,
+        crate::mvcc_transaction::PredicateKind::ValueHash(
+            *blake3::hash(&encode_task_lease_record(lease)?).as_bytes(),
+        ),
+    ))
+}
+
 async fn write_task_lease_mvcc(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     lease: &TaskLease,

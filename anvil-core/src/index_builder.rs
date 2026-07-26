@@ -38,6 +38,7 @@ use prost::Message;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 mod authority;
 use authority::IndexBuildOwnership;
@@ -1433,7 +1434,7 @@ async fn publish_index_build_proof_and_checkpoint(
     builder_node_id: &str,
     signing_key: &[u8],
     authority: IndexBuildAuthority<'_>,
-    ownership: &IndexBuildOwnership,
+    _ownership: &IndexBuildOwnership,
 ) -> Result<derived_index_proof::DerivedIndexProof> {
     let payload_actor = authority.deterministic_payload_actor(builder_node_id).await;
     let publication_digest = deterministic_build_digest(source_manifest_hash, segment_hashes);
@@ -1460,22 +1461,6 @@ async fn publish_index_build_proof_and_checkpoint(
         },
         signing_key,
     )?;
-    let proof_for_publication = &prepared_proof;
-    let proof = authority
-        .publish_with(
-            storage,
-            ownership,
-            signing_key,
-            |preconditions| async move {
-                derived_index_proof::publish_prepared_derived_index_proof(
-                    storage,
-                    proof_for_publication,
-                    &preconditions,
-                )
-                .await
-            },
-        )
-        .await?;
     let checkpoint_update = WatchCheckpointUpdate {
         watch_stream_id: "object_metadata".to_string(),
         partition_family: "object_metadata".to_string(),
@@ -1492,38 +1477,145 @@ async fn publish_index_build_proof_and_checkpoint(
         updated_by_node: builder_node_id.to_string(),
         updated_at_nanos: built_at_nanos,
     };
-    let checkpoint_authority = acquire_watch_checkpoint_authority(
-        storage,
-        &checkpoint_update,
-        builder_node_id,
-        signing_key,
-    )
-    .await?;
-    let prepared_checkpoint = watch_checkpoint::prepare_watch_checkpoint(
-        storage,
-        checkpoint_update,
-        checkpoint_authority,
-        signing_key,
-    )
-    .await?;
-    let checkpoint_for_publication = &prepared_checkpoint;
-    let checkpoint = authority
-        .publish_with(
-            storage,
-            ownership,
+    let mvcc = authority.mvcc()?;
+    let assignment = mvcc
+        .reconcile_work_assignment("index-build", index_storage_id)
+        .await?
+        .ok_or_else(|| anyhow!("index build is assigned to another node"))?;
+    let principal = format!("index-builder:{payload_actor}");
+    let idempotency_key = format!(
+        "index-proof-checkpoint:{}:{}:{}",
+        index_storage_id, generation, publication_digest
+    );
+    let publish = |lease_predicate| {
+        publish_index_build_mvcc_transaction(
+            mvcc,
+            &assignment,
+            &principal,
+            &idempotency_key,
+            &prepared_proof,
+            checkpoint_update.clone(),
             signing_key,
-            |preconditions| async move {
-                watch_checkpoint::publish_prepared_watch_checkpoint(
-                    storage,
-                    checkpoint_for_publication,
-                    &preconditions,
-                )
-                .await
-            },
+            lease_predicate,
         )
-        .await?;
+    };
+    let (proof, checkpoint) = match authority {
+        IndexBuildAuthority::Task(guard) => {
+            guard
+                .publish_mvcc_with(|predicate| publish(Some(predicate)))
+                .await?
+        }
+        IndexBuildAuthority::DirectRepair(_) => publish(None).await?,
+    };
     watch_checkpoint::record_watch_checkpoint_lag(storage, &checkpoint).await?;
     Ok(proof)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_index_build_mvcc_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    assignment: &crate::mvcc_worker_authority::AssignmentGuard,
+    principal: &str,
+    idempotency_key: &str,
+    proof: &derived_index_proof::PreparedDerivedIndexProof,
+    checkpoint_update: WatchCheckpointUpdate,
+    signing_key: &[u8],
+    lease_predicate: Option<(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )>,
+) -> Result<(
+    derived_index_proof::DerivedIndexProof,
+    watch_checkpoint::WatchCheckpoint,
+)> {
+    let now_unix_ms = u64::try_from(chrono::Utc::now().timestamp_millis())
+        .map_err(|_| anyhow!("index publication timestamp predates the Unix epoch"))?;
+    let handle = mvcc
+        .open_transactions
+        .begin(
+            mvcc.runtime.as_ref(),
+            mvcc.cluster_id(),
+            principal,
+            idempotency_key,
+            Duration::from_secs(30),
+            crate::mvcc_transaction::DurabilityLevel::Quorum,
+            crate::mvcc_transaction::ReadConsistency::Linearized,
+            now_unix_ms,
+        )
+        .await?;
+    let status = mvcc
+        .open_transactions
+        .status(&handle.transaction_id, principal, now_unix_ms)?;
+    if status.state == "open" {
+        mvcc.stage_assignment_guard(&handle.transaction_id, principal, assignment, now_unix_ms)?;
+        if let Some((key, predicate)) = lease_predicate {
+            mvcc.stage_predicate(
+                &handle.transaction_id,
+                principal,
+                key,
+                predicate,
+                now_unix_ms,
+            )?;
+        }
+        let proof = derived_index_proof::stage_prepared_derived_index_proof(
+            mvcc,
+            &handle.transaction_id,
+            principal,
+            proof,
+            now_unix_ms,
+        )?;
+        let checkpoint = watch_checkpoint::prepare_mvcc_watch_checkpoint(
+            mvcc,
+            &handle.transaction_id,
+            principal,
+            checkpoint_update,
+            signing_key,
+        )?;
+        let checkpoint = watch_checkpoint::stage_prepared_mvcc_watch_checkpoint(
+            mvcc,
+            &handle.transaction_id,
+            principal,
+            &checkpoint,
+            now_unix_ms,
+        )?;
+        let outcome = mvcc
+            .open_transactions
+            .commit(
+                mvcc.runtime.as_ref(),
+                &handle.transaction_id,
+                principal,
+                now_unix_ms,
+            )
+            .await?;
+        if let crate::mvcc_transaction::CertificationResult::Aborted { reason } =
+            outcome.certification
+        {
+            return Err(anyhow!(
+                "index proof/checkpoint transaction aborted: {reason:?}"
+            ));
+        }
+        return Ok((proof, checkpoint));
+    }
+    if status.state == "committed" {
+        let proof = derived_index_proof::read_latest_derived_index_proof_mvcc(
+            mvcc,
+            &checkpoint_update.consumer_id,
+            signing_key,
+        )?
+        .ok_or_else(|| anyhow!("committed index publication has no proof head"))?;
+        let checkpoint = watch_checkpoint::read_watch_checkpoint_mvcc(
+            mvcc,
+            &checkpoint_update.watch_stream_id,
+            &checkpoint_update.consumer_id,
+            signing_key,
+        )?
+        .ok_or_else(|| anyhow!("committed index publication has no watch checkpoint"))?;
+        return Ok((proof, checkpoint));
+    }
+    Err(anyhow!(
+        "index proof/checkpoint transaction is {}",
+        status.state
+    ))
 }
 
 fn deterministic_build_digest(source_manifest_hash: &str, segment_hashes: &[String]) -> String {

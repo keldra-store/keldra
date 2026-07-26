@@ -52,6 +52,34 @@ pub fn authz_tuple_partition_id(tenant_id: i64) -> Result<u64> {
 }
 
 impl MvccSubsystem {
+    pub async fn reconcile_work_assignment(
+        &self,
+        kind: &str,
+        logical_identity: &str,
+    ) -> Result<Option<AssignmentGuard>> {
+        let partition_id = work_partition_id(kind, logical_identity)?;
+        self.consensus.linearized_read_barrier().await?;
+        let assigned = self
+            .consensus
+            .applied_control_snapshot()?
+            .partitions
+            .iter()
+            .any(|(candidate, _)| *candidate == partition_id);
+        if self.consensus.is_leader() {
+            crate::mvcc_assignment_reconciler::reconcile_partition_assignment(
+                self.cluster_id(),
+                &self.consensus,
+                partition_id,
+            )
+            .await?;
+        } else if !assigned {
+            bail!(
+                "background work partition is not assigned; retry admission through the compact-Raft leader"
+            );
+        }
+        self.claim_assignment(kind, logical_identity)
+    }
+
     /// Ensures the tenant's authorization tuple partition has a current
     /// compact-Raft assignment, then returns its guard only when this node is
     /// the assigned writer. Callers must refuse write admission on `None`.

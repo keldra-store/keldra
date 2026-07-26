@@ -33,6 +33,12 @@ pub(crate) struct TaskPublicationPermit {
 }
 
 impl TaskExecutionGuard {
+    pub(crate) fn mvcc(&self) -> Result<&crate::mvcc_bootstrap::MvccSubsystem> {
+        self.mvcc
+            .as_deref()
+            .ok_or_else(|| anyhow!("task execution guard has no MVCC authority"))
+    }
+
     pub(crate) fn new(storage: Storage, signing_key: Vec<u8>, lease: TaskLease) -> Result<Self> {
         Self::new_inner(storage, None, signing_key, lease)
     }
@@ -154,6 +160,25 @@ impl TaskExecutionGuard {
             lease,
             precondition,
         })
+    }
+
+    /// Retains the exact MVCC lease version while an atomic publication is
+    /// staged and certified.
+    pub(crate) async fn publish_mvcc_with<T, F, Fut>(&self, publication: F) -> Result<T>
+    where
+        F: FnOnce(
+            (
+                crate::mvcc_transaction::LogicalKey,
+                crate::mvcc_transaction::PredicateKind,
+            ),
+        ) -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        let lease = self.lease.clone().lock_owned().await;
+        let predicate = task_lease::task_lease_mvcc_predicate(&lease)?;
+        let result = publication(predicate).await;
+        drop(lease);
+        result
     }
 }
 

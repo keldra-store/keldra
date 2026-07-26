@@ -10,6 +10,9 @@ use crate::{
         encode_deterministic_proto,
     },
     formats::hash32,
+    mvcc_bootstrap::MvccSubsystem,
+    mvcc_product::{ProductMutation, coremeta_logical_key},
+    mvcc_transaction::PredicateKind,
     partition_fence::{
         OWNERSHIP_OWNER_MISMATCH, OwnershipPrincipal, OwnershipResource, OwnershipResourceKind,
         ownership_fence_precondition,
@@ -117,6 +120,13 @@ pub(crate) struct PreparedWatchCheckpoint {
     checkpoint: WatchCheckpoint,
     current_payload: Option<Vec<u8>>,
     ownership_precondition: CoreMutationPrecondition,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedMvccWatchCheckpoint {
+    checkpoint: WatchCheckpoint,
+    key: crate::mvcc_transaction::LogicalKey,
+    current_payload: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -314,6 +324,104 @@ pub(crate) async fn publish_prepared_watch_checkpoint(
     Ok(prepared.checkpoint.clone())
 }
 
+pub(crate) fn prepare_mvcc_watch_checkpoint(
+    mvcc: &MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    update: WatchCheckpointUpdate,
+    signing_key: &[u8],
+) -> Result<PreparedMvccWatchCheckpoint> {
+    validate_update(&update)?;
+    let key = coremeta_logical_key(
+        CF_MATERIALISATION,
+        TABLE_WATCH_CHECKPOINT_ROW,
+        &watch_checkpoint_tuple_key(&update.watch_stream_id, &update.consumer_id)?,
+    )?;
+    let current_payload = mvcc.read_transaction_value(transaction_id, principal, &key)?;
+    let existing = current_payload
+        .as_deref()
+        .map(decode_watch_checkpoint_row)
+        .transpose()?;
+    if let Some(existing) = existing.as_ref() {
+        existing.verify(signing_key)?;
+        if existing.cursor > update.cursor {
+            return Err(anyhow!("watch checkpoint cursor cannot move backwards"));
+        }
+        if existing.source_cursor_high > update.source_cursor_high {
+            return Err(anyhow!(
+                "watch checkpoint source cursor high cannot move backwards"
+            ));
+        }
+        if existing.generation > update.generation {
+            return Err(anyhow!("watch checkpoint generation cannot move backwards"));
+        }
+        if existing.partition_family != update.partition_family
+            || existing.partition_id != update.partition_id
+        {
+            return Err(anyhow!("watch checkpoint stream partition cannot change"));
+        }
+        if existing.cursor == update.cursor
+            && existing.source_manifest_hash != update.source_manifest_hash
+        {
+            return Err(anyhow!(
+                "ControlStreamDivergence: watch checkpoint digest differs for already applied cursor"
+            ));
+        }
+    }
+    let checkpoint = WatchCheckpoint {
+        format_version: 1,
+        watch_stream_id: update.watch_stream_id,
+        partition_family: update.partition_family,
+        partition_id: update.partition_id,
+        consumer_id: update.consumer_id,
+        cursor: update.cursor,
+        source_cursor_high: update.source_cursor_high,
+        lag_record_count_hint: update.lag_record_count_hint,
+        source_manifest_hash: update.source_manifest_hash,
+        generation: update.generation,
+        updated_by_node: update.updated_by_node,
+        updated_at_nanos: update.updated_at_nanos,
+        checkpoint_hash: None,
+        checkpoint_signature: None,
+    }
+    .seal(signing_key)?;
+    Ok(PreparedMvccWatchCheckpoint {
+        checkpoint,
+        key,
+        current_payload,
+    })
+}
+
+pub(crate) fn stage_prepared_mvcc_watch_checkpoint(
+    mvcc: &MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    prepared: &PreparedMvccWatchCheckpoint,
+    now_unix_ms: u64,
+) -> Result<WatchCheckpoint> {
+    mvcc.stage_product_mutations(
+        transaction_id,
+        principal,
+        vec![ProductMutation::put(
+            prepared.key.clone(),
+            encode_watch_checkpoint_row(&prepared.checkpoint)?,
+        )],
+        now_unix_ms,
+    )?;
+    let predicate = match prepared.current_payload.as_ref() {
+        Some(payload) => PredicateKind::ValueHash(*blake3::hash(payload).as_bytes()),
+        None => PredicateKind::Absent,
+    };
+    mvcc.stage_predicate(
+        transaction_id,
+        principal,
+        prepared.key.clone(),
+        predicate,
+        now_unix_ms,
+    )?;
+    Ok(prepared.checkpoint.clone())
+}
+
 pub(crate) async fn record_watch_checkpoint_lag(
     storage: &Storage,
     checkpoint: &WatchCheckpoint,
@@ -347,6 +455,30 @@ pub async fn read_watch_checkpoint(
         return Ok(None);
     };
     let checkpoint = decode_watch_checkpoint_row(&bytes)?;
+    checkpoint.verify(signing_key)?;
+    if checkpoint.watch_stream_id != watch_stream_id || checkpoint.consumer_id != consumer_id {
+        return Err(anyhow!("watch checkpoint path scope mismatch"));
+    }
+    Ok(Some(checkpoint))
+}
+
+pub(crate) fn read_watch_checkpoint_mvcc(
+    mvcc: &MvccSubsystem,
+    watch_stream_id: &str,
+    consumer_id: &str,
+    signing_key: &[u8],
+) -> Result<Option<WatchCheckpoint>> {
+    require_safe_component(watch_stream_id, "watch_stream_id")?;
+    require_safe_component(consumer_id, "consumer_id")?;
+    let key = coremeta_logical_key(
+        CF_MATERIALISATION,
+        TABLE_WATCH_CHECKPOINT_ROW,
+        &watch_checkpoint_tuple_key(watch_stream_id, consumer_id)?,
+    )?;
+    let Some(payload) = mvcc.read_latest_value(&key)? else {
+        return Ok(None);
+    };
+    let checkpoint = decode_watch_checkpoint_row(&payload)?;
     checkpoint.verify(signing_key)?;
     if checkpoint.watch_stream_id != watch_stream_id || checkpoint.consumer_id != consumer_id {
         return Err(anyhow!("watch checkpoint path scope mismatch"));

@@ -396,7 +396,7 @@ impl ObjectMaterialisationExecutor for MvccObjectMaterialisationExecutor {
                     source_manifest_hash: job.source_manifest_hash.clone(),
                 };
                 let authority = crate::index_builder::IndexBuildAuthority::DirectRepair(
-                    crate::index_builder::DirectRepairIndexBuildAuthority::new(),
+                    crate::index_builder::DirectRepairIndexBuildAuthority::new(&self.mvcc),
                 );
                 let outcome = match frozen.kind.as_str() {
                     "typed_json" => {
