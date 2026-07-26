@@ -5,7 +5,6 @@ const GATEWAY_MOUNT_ROUTE_SCHEMA: &str = "anvil.gateway.mount_route.v1";
 const ROUTE_KIND_EXACT_HOST: &str = "exact-host";
 const ROUTE_KIND_VIRTUAL_HOST: &str = "virtual-host";
 const ROUTE_KIND_PATH_STYLE: &str = "path-style";
-const MAX_ROUTE_MATCHES: usize = 2;
 
 #[derive(Clone, PartialEq, Message)]
 struct GatewayMountRouteRowProto {
@@ -34,15 +33,18 @@ struct GatewayMountRoute {
 }
 
 pub async fn put_gateway_mount_record(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     mut record: GatewayMountRecord,
     expected_generation: Option<u64>,
 ) -> Result<u64> {
     let ref_name = gateway_mount_ref_name(&record)?;
     let tuple_key = gateway_metadata_tuple_key(GATEWAY_ROW_MOUNT, &ref_name)?;
-    let store = CoreStore::new(storage.clone()).await?;
-    let current_payload =
-        store.read_coremeta_row(CF_REGISTRY, TABLE_GATEWAY_METADATA_ROW, &tuple_key)?;
+    let main_key = crate::mvcc_product::coremeta_logical_key(
+        CF_REGISTRY,
+        TABLE_GATEWAY_METADATA_ROW,
+        &tuple_key,
+    )?;
+    let current_payload = mvcc.read_latest_value(&main_key)?;
     let current = current_payload
         .as_deref()
         .map(|payload| {
@@ -66,7 +68,6 @@ pub async fn put_gateway_mount_record(
     validate_mount_record_shape(&record)?;
     record.record_hash = hash_record(&record)?;
 
-    let scope_partition = gateway_mount_scope_partition(&ref_name);
     let transaction_id = format!(
         "gateway-mount:{}:{}:{}",
         record.mount_id,
@@ -75,9 +76,12 @@ pub async fn put_gateway_mount_record(
     );
     let main_payload =
         encode_gateway_metadata_row(GATEWAY_ROW_MOUNT, &ref_name, record.generation, &record)?;
-    let previous_payload_hash = current_payload
-        .as_deref()
-        .map(|payload| core_meta_payload_digest(TABLE_GATEWAY_METADATA_ROW, payload));
+    let predicate = current_payload
+        .as_ref()
+        .map(|payload| {
+            crate::mvcc_transaction::PredicateKind::ValueHash(*blake3::hash(payload).as_bytes())
+        })
+        .unwrap_or(crate::mvcc_transaction::PredicateKind::Absent);
 
     let old_routes = current
         .as_ref()
@@ -94,76 +98,56 @@ pub async fn put_gateway_mount_record(
         .map(|route| Ok((mount_route_key(route)?, route)))
         .collect::<Result<BTreeMap<_, _>>>()?;
 
-    let mut operations = Vec::with_capacity(1 + old_keys.len() + new_keys.len());
-    operations.push(CoreMutationOperation::CoreMetaPut {
-        partition_id: scope_partition.clone(),
-        cf: CF_REGISTRY.to_string(),
-        table_id: TABLE_GATEWAY_METADATA_ROW,
-        tuple_key: tuple_key.clone(),
-        payload: main_payload,
-    });
+    let mut mutations = Vec::with_capacity(1 + old_keys.len() + new_keys.len());
+    mutations.push(crate::mvcc_product::ProductMutation::put(
+        main_key.clone(),
+        main_payload,
+    ));
     for key in old_keys.keys().filter(|key| !new_keys.contains_key(*key)) {
-        operations.push(CoreMutationOperation::CoreMetaDelete {
-            partition_id: scope_partition.clone(),
-            cf: CF_REGISTRY.to_string(),
-            table_id: TABLE_GATEWAY_MOUNT_ROUTE_ROW,
-            tuple_key: key.clone(),
-        });
+        mutations.push(crate::mvcc_product::ProductMutation::delete(
+            crate::mvcc_product::coremeta_logical_key(
+                CF_REGISTRY,
+                TABLE_GATEWAY_MOUNT_ROUTE_ROW,
+                key,
+            )?,
+        ));
     }
     for (key, route) in new_keys {
-        operations.push(CoreMutationOperation::CoreMetaPut {
-            partition_id: scope_partition.clone(),
-            cf: CF_REGISTRY.to_string(),
-            table_id: TABLE_GATEWAY_MOUNT_ROUTE_ROW,
-            tuple_key: key,
-            payload: encode_mount_route_row(&record, &ref_name, route)?,
-        });
+        mutations.push(crate::mvcc_product::ProductMutation::put(
+            crate::mvcc_product::coremeta_logical_key(
+                CF_REGISTRY,
+                TABLE_GATEWAY_MOUNT_ROUTE_ROW,
+                &key,
+            )?,
+            encode_mount_route_row(&record, &ref_name, route)?,
+        ));
     }
 
-    store
-        .commit_mutation_batch(CoreMutationBatch {
-            transaction_id,
-            scope_partition: scope_partition.clone(),
-            committed_by_principal: "gateway-mount-registry".to_string(),
-            root_publications: vec![crate::core_store::CoreMutationRootPublication {
-                root_anchor_key: scope_partition,
-                writer_families: vec![
-                    crate::formats::writer::WriterFamily::CoreControl
-                        .as_str()
-                        .to_string(),
-                    crate::formats::writer::WriterFamily::Registry
-                        .as_str()
-                        .to_string(),
-                ],
-                transaction_coordinator: true,
-            }],
-            preconditions: vec![CoreMutationPrecondition::CoreMetaRow {
-                cf: CF_REGISTRY.to_string(),
-                table_id: TABLE_GATEWAY_METADATA_ROW,
-                tuple_key,
-                expected_payload_hash: previous_payload_hash.clone(),
-                require_absent: previous_payload_hash.is_none(),
-                require_present: previous_payload_hash.is_some(),
-            }],
-            operations,
-        })
-        .await?;
+    mvcc.autocommit_product_mutations_with_predicates(
+        "gateway-mount-registry",
+        &transaction_id,
+        mutations,
+        vec![(main_key, predicate)],
+        crate::mvcc_transaction::DurabilityLevel::Local,
+        u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+    )
+    .await?;
     Ok(record.generation)
 }
 
 pub async fn resolve_gateway_mount(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     host: &str,
     path: &str,
 ) -> Result<Option<GatewayMountResolution>> {
     let host = normalize_gateway_host(host)?;
     let path = normalize_gateway_path(path)?;
-    let store = CoreStore::new(storage.clone()).await?;
+    let snapshot = mvcc.runtime.applied_version()?;
 
     for prefix in exact_path_candidates(&path) {
         if let Some(resolution) = resolve_route(
-            storage,
-            &store,
+            mvcc,
+            snapshot,
             ROUTE_KIND_EXACT_HOST,
             GatewayMountMatchKind::ExactHostAlias,
             &host,
@@ -176,8 +160,8 @@ pub async fn resolve_gateway_mount(
     }
 
     if let Some(resolution) = resolve_route(
-        storage,
-        &store,
+        mvcc,
+        snapshot,
         ROUTE_KIND_VIRTUAL_HOST,
         GatewayMountMatchKind::VirtualHostRegional,
         &host,
@@ -192,8 +176,8 @@ pub async fn resolve_gateway_mount(
         return Ok(None);
     };
     resolve_route(
-        storage,
-        &store,
+        mvcc,
+        snapshot,
         ROUTE_KIND_PATH_STYLE,
         GatewayMountMatchKind::PathStyleRegional,
         &host,
@@ -203,20 +187,20 @@ pub async fn resolve_gateway_mount(
 }
 
 async fn resolve_route(
-    storage: &Storage,
-    store: &CoreStore,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    snapshot: u64,
     route_kind: &'static str,
     match_kind: GatewayMountMatchKind,
     host: &str,
     path_prefix: &str,
 ) -> Result<Option<GatewayMountResolution>> {
     let prefix = mount_route_prefix(route_kind, host, path_prefix)?;
-    let rows = store.scan_coremeta_prefix_page(
-        CF_REGISTRY,
+    let application_prefix =
+        crate::mvcc_product::coremeta_application_prefix(CF_REGISTRY, &prefix)?;
+    let rows = mvcc.runtime.scan_table_prefix_at(
         TABLE_GATEWAY_MOUNT_ROUTE_ROW,
-        &prefix,
-        None,
-        MAX_ROUTE_MATCHES,
+        &application_prefix,
+        snapshot,
     )?;
     if rows.is_empty() {
         return Ok(None);
@@ -226,13 +210,18 @@ async fn resolve_route(
             "gateway mount route is ambiguous for kind={route_kind} host={host} path_prefix={path_prefix}"
         );
     }
-    let row = decode_mount_route_row(&rows[0].payload)?;
+    let row = decode_mount_route_row(&rows[0].1.value)?;
     if row.route_kind != route_kind || row.host != host || row.path_prefix != path_prefix {
         bail!("gateway mount route projection scope mismatch");
     }
-    let Some((record, handle)) = read_gateway_mount_record(storage, &row.mount_id).await? else {
+    let ref_name = gateway_mount_ref_name_parts(&row.mount_id)?;
+    let Some(stored) =
+        read_record_row_at::<GatewayMountRecord>(mvcc, GATEWAY_ROW_MOUNT, &ref_name, snapshot)?
+    else {
         bail!("gateway mount route points to a missing mount");
     };
+    let handle = stored.stored_handle();
+    let record = stored.record;
     if handle.generation != row.mount_generation
         || record.generation != row.mount_generation
         || record.state != GatewayMountState::Active
@@ -325,10 +314,6 @@ fn decode_mount_route_row(payload: &[u8]) -> Result<GatewayMountRouteRowProto> {
     validate_gateway_path_prefix(&row.path_prefix)?;
     normalize_gateway_identifier(&row.mount_id, "mount id")?;
     Ok(row)
-}
-
-fn gateway_mount_scope_partition(ref_name: &str) -> String {
-    format!("gateway/{GATEWAY_ROW_MOUNT}/{ref_name}")
 }
 
 fn mount_route_key(route: &GatewayMountRoute) -> Result<Vec<u8>> {

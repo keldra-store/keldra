@@ -1,12 +1,12 @@
 use crate::{
     core_store::{
         AppendStreamRecord, AuthzScopeRef, CF_REGISTRY, CoreLogicalFileWrite, CoreMetaBatchOp,
-        CoreMetaBatchOpKind, CoreMetaRootPublication, CoreMetaTuplePart, CoreMutationBatch,
-        CoreMutationOperation, CoreMutationPrecondition, CoreObjectRef, CorePipelinePolicy,
-        CoreStore, CoreTraceContext, GetBlob, ReadStream, StreamAppendReceipt, StreamRecord,
+        CoreMetaBatchOpKind, CoreMetaRootPublication, CoreMetaTuplePart, CoreObjectRef,
+        CorePipelinePolicy, CoreStore, CoreTraceContext, GetBlob, ReadStream, StreamAppendReceipt,
+        StreamRecord,
         TABLE_GATEWAY_METADATA_ROW, TABLE_GATEWAY_MOUNT_ROUTE_ROW, WriteLogicalFileRequest,
-        core_meta_committed_row_common, core_meta_payload_digest, core_meta_root_key_hash,
-        core_meta_tuple_key, core_object_ref_from_logical_file_write, decode_deterministic_proto,
+        core_meta_committed_row_common, core_meta_root_key_hash, core_meta_tuple_key,
+        core_object_ref_from_logical_file_write, decode_deterministic_proto,
         encode_deterministic_proto,
     },
     formats::{
@@ -1337,13 +1337,14 @@ pub async fn validate_gateway_access_token(
 }
 
 pub async fn read_gateway_mount_record(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     mount_id: &str,
 ) -> Result<Option<(GatewayMountRecord, GatewayStoredHandle)>> {
     let mount_id = normalize_gateway_identifier(mount_id, "mount id")?;
     let ref_name = gateway_mount_ref_name_parts(&mount_id)?;
+    let snapshot = mvcc.runtime.applied_version()?;
     let Some(row) =
-        read_record_row::<GatewayMountRecord>(storage, GATEWAY_ROW_MOUNT, &ref_name).await?
+        read_record_row_at::<GatewayMountRecord>(mvcc, GATEWAY_ROW_MOUNT, &ref_name, snapshot)?
     else {
         return Ok(None);
     };

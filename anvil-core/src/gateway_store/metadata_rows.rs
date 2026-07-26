@@ -200,6 +200,24 @@ pub(super) async fn read_record_row<T: GatewayRecordCodec>(
     )?))
 }
 
+pub(super) fn read_record_row_at<T: GatewayRecordCodec>(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    row_kind: &str,
+    row_key: &str,
+    snapshot: u64,
+) -> Result<Option<GatewayStoredRecord<T>>> {
+    let tuple_key = gateway_metadata_tuple_key(row_kind, row_key)?;
+    let logical_key = crate::mvcc_product::coremeta_logical_key(
+        CF_REGISTRY,
+        TABLE_GATEWAY_METADATA_ROW,
+        &tuple_key,
+    )?;
+    mvcc.runtime
+        .read_at(&logical_key, snapshot)?
+        .map(|row| decode_gateway_metadata_row(row_kind, row_key, &row.value))
+        .transpose()
+}
+
 pub(super) async fn put_record_row<T: GatewayRecordCodec>(
     storage: &Storage,
     row_kind: &str,

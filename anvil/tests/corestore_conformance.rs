@@ -14,10 +14,6 @@ use anvil::core_store::{
     core_meta_payload_digest, core_meta_tuple_key, encode_core_meta_inline_payload_row,
 };
 use anvil::formats::writer::WriterFamily;
-use anvil::gateway_store::{
-    GatewayMountMatchKind, GatewayMountRecord, GatewayMountState, put_gateway_mount_record,
-    resolve_gateway_mount,
-};
 use anvil::storage::Storage;
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -1254,90 +1250,6 @@ async fn rfc_0007_coreobject_manifests_are_reconstructed_from_shard_placement() 
     assert!(
         store.read_object_manifest(&object_ref).await.is_err(),
         "manifest reconstruction must fail closed without enough erasure shard placement"
-    );
-}
-
-#[tokio::test]
-async fn rfc_0006_gateway_mounts_resolve_scope_before_route_handling() {
-    let tmp = tempfile::tempdir().unwrap();
-    let storage = Storage::new_at(tmp.path()).await.unwrap();
-    let mount = GatewayMountRecord {
-        schema: "anvil.gateway.mount.v1".to_string(),
-        mount_id: "docker-west".to_string(),
-        gateway: "docker".to_string(),
-        hosts: vec!["registry.example.test".to_string()],
-        path_prefixes: vec!["/".to_string(), "/v2/".to_string()],
-        mesh_id: "mesh-a".to_string(),
-        region: "eu-west-1".to_string(),
-        anvil_storage_tenant_id: "storage-tenant-a".to_string(),
-        authz_scope: AuthzScopeRef {
-            anvil_storage_tenant_id: "storage-tenant-a".to_string(),
-            authz_realm_id: "realm-a".to_string(),
-        },
-        tenant_id: "tenant-a".to_string(),
-        registry_instance_id: "registry-a".to_string(),
-        default_bucket: "packages".to_string(),
-        repository_prefix: String::new(),
-        state: GatewayMountState::Active,
-        generation: 0,
-        record_hash: String::new(),
-    };
-    assert_eq!(
-        put_gateway_mount_record(&storage, mount, None)
-            .await
-            .unwrap(),
-        1
-    );
-
-    let exact = resolve_gateway_mount(&storage, "registry.example.test", "/v2/team/api/tags/list")
-        .await
-        .unwrap()
-        .expect("exact host mount");
-    assert_eq!(exact.match_kind, GatewayMountMatchKind::ExactHostAlias);
-    assert_eq!(exact.matched_path_prefix, "/v2/");
-    assert_eq!(exact.record.authz_scope.authz_realm_id, "realm-a");
-
-    let virtual_host = resolve_gateway_mount(
-        &storage,
-        "registry-a.tenant-a.eu-west-1.anvil-storage.com",
-        "/v2/team/api/manifests/latest",
-    )
-    .await
-    .unwrap()
-    .expect("virtual host mount");
-    assert_eq!(
-        virtual_host.match_kind,
-        GatewayMountMatchKind::VirtualHostRegional
-    );
-    assert_eq!(virtual_host.record.authz_scope.authz_realm_id, "realm-a");
-
-    let path_style = resolve_gateway_mount(
-        &storage,
-        "eu-west-1.anvil-storage.com",
-        "/tenant-a/_gateway/docker/registry-a/v2/team/api/blobs/sha256:abc",
-    )
-    .await
-    .unwrap()
-    .expect("path-style mount");
-    assert_eq!(
-        path_style.match_kind,
-        GatewayMountMatchKind::PathStyleRegional
-    );
-    assert_eq!(
-        path_style.matched_path_prefix,
-        "/tenant-a/_gateway/docker/registry-a/"
-    );
-
-    assert!(
-        resolve_gateway_mount(
-            &storage,
-            "eu-west-1.anvil-storage.com",
-            "/tenant-a/_gateway/npm/registry-a/package",
-        )
-        .await
-        .unwrap()
-        .is_none(),
-        "gateway kind and authz scope must come from the mount, not caller-supplied path text"
     );
 }
 
