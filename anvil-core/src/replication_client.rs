@@ -877,6 +877,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        mvcc_fault_injection::{FrameAction, FrameFaultPlan},
         replication::AuthenticatedPeer,
         services::replication::{ReplicationConnectionAuthorizer, ReplicationServiceImpl},
     };
@@ -1003,6 +1004,172 @@ mod tests {
         assert_eq!(second.status, AckStatus::Complete);
         assert_eq!(second.completed_hash, first.completed_hash);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn dropped_frame_and_complete_ack_reconnect_at_persisted_watermark() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let directory = tempfile::tempdir().unwrap();
+        let service = ReplicationServiceImpl::open(
+            Authorizer {
+                calls: calls.clone(),
+            },
+            directory.path(),
+        )
+        .unwrap()
+        .with_frame_fault_plan(FrameFaultPlan::new([
+            FrameAction::Drop,
+            FrameAction::Duplicate,
+        ]))
+        .with_dropped_complete_acks(1);
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(
+                    crate::anvil_api::replication_service_server::ReplicationServiceServer::new(
+                        service,
+                    ),
+                )
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+
+        let remote = NodeIncarnation {
+            node_id: "node-b".into(),
+            incarnation: 1,
+        };
+        let manager = TonicReplicationStreamManager::new(
+            "cluster-a",
+            NodeIncarnation {
+                node_id: "node-a".into(),
+                incarnation: 1,
+            },
+            "test-token",
+            [ReplicationPeer {
+                cluster_id: "cluster-a".into(),
+                node: remote.clone(),
+                endpoint: format!("http://{address}"),
+            }],
+            ReplicationStreamOptions {
+                operation_timeout: Duration::from_secs(1),
+                frame_bytes: 64,
+                reconnect_attempts: 3,
+                queue_capacity: 2,
+                heartbeat_interval: Duration::from_secs(1),
+                progress_timeout: Duration::from_millis(50),
+                allow_insecure_transport_for_tests: true,
+            },
+        )
+        .unwrap();
+        let bytes = b"durable-watermark-resume";
+        let identity = bundle_identity(bytes);
+        let target = BundleTarget {
+            cluster_id: "cluster-a".into(),
+            node: remote,
+            failure_domain: "zone-b".into(),
+            voter: true,
+        };
+        let ack = manager
+            .send_bundle(&target, &identity, bytes)
+            .await
+            .unwrap();
+
+        assert_eq!(ack.status, AckStatus::Complete);
+        assert_eq!(
+            manager
+                .read_complete_transfer(
+                    "cluster-a",
+                    &target.node,
+                    ack.transfer_id,
+                    identity.length,
+                    parse_identity_hash(&identity.hash).unwrap(),
+                )
+                .await
+                .unwrap(),
+            bytes
+        );
+        // One reconnect follows the silently dropped frame and another follows
+        // the Complete ACK dropped after durable rename.
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn silent_half_open_expires_progress_and_reconnects() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let directory = tempfile::tempdir().unwrap();
+        let service = ReplicationServiceImpl::open(
+            Authorizer {
+                calls: calls.clone(),
+            },
+            directory.path(),
+        )
+        .unwrap()
+        .with_frame_fault_plan(FrameFaultPlan::new([
+            FrameAction::HalfOpen,
+            FrameAction::Deliver,
+        ]));
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(
+                    crate::anvil_api::replication_service_server::ReplicationServiceServer::new(
+                        service,
+                    ),
+                )
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+
+        let remote = NodeIncarnation {
+            node_id: "node-b".into(),
+            incarnation: 1,
+        };
+        let manager = TonicReplicationStreamManager::new(
+            "cluster-a",
+            NodeIncarnation {
+                node_id: "node-a".into(),
+                incarnation: 1,
+            },
+            "test-token",
+            [ReplicationPeer {
+                cluster_id: "cluster-a".into(),
+                node: remote.clone(),
+                endpoint: format!("http://{address}"),
+            }],
+            ReplicationStreamOptions {
+                operation_timeout: Duration::from_secs(1),
+                frame_bytes: 64,
+                reconnect_attempts: 2,
+                queue_capacity: 2,
+                heartbeat_interval: Duration::from_secs(1),
+                progress_timeout: Duration::from_millis(50),
+                allow_insecure_transport_for_tests: true,
+            },
+        )
+        .unwrap();
+        let bytes = b"half-open-retry";
+        let ack = manager
+            .send_bundle(
+                &BundleTarget {
+                    cluster_id: "cluster-a".into(),
+                    node: remote,
+                    failure_domain: "zone-b".into(),
+                    voter: true,
+                },
+                &bundle_identity(bytes),
+                bytes,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(ack.status, AckStatus::Complete);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
         server.abort();
     }
 

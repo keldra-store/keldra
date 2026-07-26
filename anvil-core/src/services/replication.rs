@@ -1,5 +1,6 @@
 use std::{path::Path, pin::Pin, sync::Arc};
 
+use anyhow::Context as _;
 use async_trait::async_trait;
 use futures_core::Stream;
 use futures_util::StreamExt;
@@ -7,6 +8,9 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, metadata::MetadataMap};
 use uuid::Uuid;
+
+#[cfg(test)]
+use prost::Message as _;
 
 use crate::{
     anvil_api::{
@@ -38,6 +42,10 @@ pub trait ReplicationConnectionAuthorizer: Send + Sync + 'static {
 pub struct ReplicationServiceImpl<A> {
     authorizer: Arc<A>,
     receiver: Arc<std::sync::Mutex<TransferReceiver>>,
+    #[cfg(test)]
+    frame_faults: Option<Arc<std::sync::Mutex<crate::mvcc_fault_injection::FrameFaultPlan>>>,
+    #[cfg(test)]
+    dropped_complete_acks: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl<A> Clone for ReplicationServiceImpl<A> {
@@ -45,6 +53,10 @@ impl<A> Clone for ReplicationServiceImpl<A> {
         Self {
             authorizer: self.authorizer.clone(),
             receiver: self.receiver.clone(),
+            #[cfg(test)]
+            frame_faults: self.frame_faults.clone(),
+            #[cfg(test)]
+            dropped_complete_acks: self.dropped_complete_acks.clone(),
         }
     }
 }
@@ -54,7 +66,94 @@ impl<A: ReplicationConnectionAuthorizer> ReplicationServiceImpl<A> {
         Ok(Self {
             authorizer: Arc::new(authorizer),
             receiver: Arc::new(std::sync::Mutex::new(TransferReceiver::open(directory)?)),
+            #[cfg(test)]
+            frame_faults: None,
+            #[cfg(test)]
+            dropped_complete_acks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
+    }
+
+    #[cfg(test)]
+    pub fn with_frame_fault_plan(
+        mut self,
+        plan: crate::mvcc_fault_injection::FrameFaultPlan,
+    ) -> Self {
+        self.frame_faults = Some(Arc::new(std::sync::Mutex::new(plan)));
+        self
+    }
+
+    /// Drops Complete ACKs after the receiver has durably completed the
+    /// transfer. The stream remains open, modelling a silent half-open socket.
+    #[cfg(test)]
+    pub fn with_dropped_complete_acks(self, count: usize) -> Self {
+        self.dropped_complete_acks
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+
+    #[cfg(test)]
+    fn apply_frame_faults(
+        &self,
+        frame: ReplicationDataFrame,
+    ) -> Result<Vec<ReplicationDataFrame>, Status> {
+        use crate::mvcc_fault_injection::{FaultPoint, hit};
+
+        if hit(FaultPoint::ReplicationFrame).is_err() {
+            return Ok(Vec::new());
+        }
+        let Some(plan) = &self.frame_faults else {
+            return Ok(vec![frame]);
+        };
+        let mut encoded = Vec::new();
+        frame
+            .encode(&mut encoded)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let mut plan = plan.lock().expect("frame fault plan poisoned");
+        let mut delayed = plan.flush_reordered();
+        let mut outputs = match plan.apply(encoded) {
+            Ok(outputs) => outputs,
+            Err(_) => {
+                let _ = hit(FaultPoint::ReplicationHalfOpen);
+                return Ok(Vec::new());
+            }
+        };
+        // Current frames precede previously held frames, making reordering
+        // deterministic so protocol validation can reject gaps or stale data.
+        outputs.append(&mut delayed);
+        outputs
+            .into_iter()
+            .map(|bytes| {
+                ReplicationDataFrame::decode(bytes.as_slice())
+                    .map_err(|error| Status::invalid_argument(error.to_string()))
+            })
+            .collect()
+    }
+
+    #[cfg(not(test))]
+    fn apply_frame_faults(
+        &self,
+        frame: ReplicationDataFrame,
+    ) -> Result<Vec<ReplicationDataFrame>, Status> {
+        Ok(vec![frame])
+    }
+
+    #[cfg(test)]
+    fn should_drop_complete_ack(&self, status: AckStatus) -> bool {
+        use std::sync::atomic::Ordering;
+
+        if status != AckStatus::Complete {
+            return false;
+        }
+        self.dropped_complete_acks
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+    }
+
+    #[cfg(not(test))]
+    fn should_drop_complete_ack(&self, _status: AckStatus) -> bool {
+        false
     }
 
     async fn serve<S>(
@@ -124,15 +223,26 @@ impl<A: ReplicationConnectionAuthorizer> ReplicationServiceImpl<A> {
                     return;
                 }
             };
-            let frame = match request.message {
+            let frames = match request.message {
                 Some(replication_stream_request::Message::Frame(frame)) => {
-                    match decode_frame(frame) {
-                        Ok(frame) => frame,
+                    let frames = match self.apply_frame_faults(frame) {
+                        Ok(frames) => frames,
                         Err(error) => {
                             send_error(&output, error).await;
                             return;
                         }
+                    };
+                    let mut decoded = Vec::with_capacity(frames.len());
+                    for frame in frames {
+                        match decode_frame(frame) {
+                            Ok(frame) => decoded.push(frame),
+                            Err(error) => {
+                                send_error(&output, error).await;
+                                return;
+                            }
+                        }
                     }
+                    decoded
                 }
                 Some(replication_stream_request::Message::Heartbeat(heartbeat)) => {
                     if heartbeat.session_id != session.id().to_string() {
@@ -293,13 +403,26 @@ impl<A: ReplicationConnectionAuthorizer> ReplicationServiceImpl<A> {
                 }
             };
 
+            // A dropped or half-open frame deliberately produces no
+            // application response. The client progress deadline must expire,
+            // discard this session, and resume from the durable watermark.
+            if frames.is_empty() {
+                continue;
+            }
+
             let persist_started_at = std::time::Instant::now();
             let receiver = self.receiver.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let result = receiver
                     .lock()
                     .map_err(|_| anyhow::anyhow!("replication receiver lock poisoned"))
-                    .and_then(|mut receiver| receiver.receive(&mut session, &frame));
+                    .and_then(|mut receiver| {
+                        let mut last_ack = None;
+                        for frame in &frames {
+                            last_ack = Some(receiver.receive(&mut session, frame)?);
+                        }
+                        last_ack.context("frame fault plan emitted no frames")
+                    });
                 (session, result)
             })
             .await;
@@ -340,6 +463,15 @@ impl<A: ReplicationConnectionAuthorizer> ReplicationServiceImpl<A> {
                     return;
                 }
             };
+            if self.should_drop_complete_ack(ack.status) {
+                tracing::debug!(
+                    operation = "replication.persist_ack",
+                    transfer_id = %ack.transfer_id,
+                    persisted_through = ack.persisted_through,
+                    "fault injection dropped Complete ACK after durable persistence"
+                );
+                continue;
+            }
             if output
                 .send(Ok(response(replication_stream_response::Message::Ack(
                     ReplicationApplicationAck {
@@ -450,6 +582,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    use crate::mvcc_fault_injection::{FrameAction, FrameFaultPlan};
 
     struct Authorizer {
         calls: Arc<AtomicUsize>,
@@ -475,6 +608,54 @@ mod tests {
         ReplicationStreamRequest {
             message: Some(message),
         }
+    }
+
+    fn data_frame(sequence: u64) -> ReplicationDataFrame {
+        let payload = vec![sequence as u8];
+        ReplicationDataFrame {
+            session_id: Uuid::new_v4().to_string(),
+            cluster_id: "cluster-a".into(),
+            sequence,
+            partition: "partition-a".into(),
+            transfer_id: Uuid::new_v4().to_string(),
+            kind: ReplicationTransferKind::ObjectShard as i32,
+            offset: sequence - 1,
+            payload_checksum: blake3::hash(&payload).as_bytes().to_vec(),
+            final_hash: blake3::hash(&payload).as_bytes().to_vec(),
+            total_length: 2,
+            payload,
+            finish: false,
+        }
+    }
+
+    #[test]
+    fn operational_frame_hook_reorders_delayed_frames_deterministically() {
+        let service = ReplicationServiceImpl::open(
+            Authorizer {
+                calls: Arc::new(AtomicUsize::new(0)),
+            },
+            tempfile::tempdir().unwrap().path(),
+        )
+        .unwrap()
+        .with_frame_fault_plan(FrameFaultPlan::new([
+            FrameAction::Hold,
+            FrameAction::Deliver,
+        ]));
+
+        assert!(
+            service
+                .apply_frame_faults(data_frame(1))
+                .unwrap()
+                .is_empty()
+        );
+        let reordered = service.apply_frame_faults(data_frame(2)).unwrap();
+        assert_eq!(
+            reordered
+                .iter()
+                .map(|frame| frame.sequence)
+                .collect::<Vec<_>>(),
+            [2, 1]
+        );
     }
 
     #[tokio::test]

@@ -74,6 +74,7 @@ pub struct ConnectionSession {
     peer: NodeIncarnation,
     peer_endpoint: Option<String>,
     last_sequence: u64,
+    last_frame: Option<(Uuid, u64, [u8; 32])>,
 }
 
 impl ConnectionSession {
@@ -88,6 +89,7 @@ impl ConnectionSession {
             peer: peer.incarnation,
             peer_endpoint: peer.endpoint,
             last_sequence: 0,
+            last_frame: None,
         })
     }
 
@@ -114,10 +116,26 @@ impl ConnectionSession {
         if sequence == 0 {
             bail!("replication frame sequence must be non-zero");
         }
-        if sequence <= self.last_sequence {
-            bail!("replication frame sequence is stale or duplicated");
+        // An identical sequence may be retransmitted when its durable ACK was
+        // lost. The receiver verifies the bytes before acknowledging it again.
+        if sequence < self.last_sequence {
+            bail!("replication frame sequence is stale");
         }
         Ok(())
+    }
+
+    fn validate_retransmission(&self, frame: &ReplicationFrame) -> Result<()> {
+        if frame.sequence == self.last_sequence
+            && self.last_frame != Some((frame.transfer_id, frame.offset, frame.payload_checksum))
+        {
+            bail!("replication frame reused a sequence with different bytes");
+        }
+        Ok(())
+    }
+
+    fn record_frame(&mut self, frame: &ReplicationFrame) {
+        self.last_sequence = frame.sequence;
+        self.last_frame = Some((frame.transfer_id, frame.offset, frame.payload_checksum));
     }
 }
 
@@ -300,6 +318,7 @@ impl TransferReceiver {
         frame: &ReplicationFrame,
     ) -> Result<ReplicationAck> {
         session.validate_sequence(frame.session_id, frame.sequence)?;
+        session.validate_retransmission(frame)?;
         if frame.payload_checksum != ReplicationFrame::checksum(&frame.payload) {
             bail!("replication frame payload checksum mismatch");
         }
@@ -325,7 +344,7 @@ impl TransferReceiver {
             if persisted_through != frame.total_length {
                 bail!("completed transfer length differs from immutable metadata");
             }
-            session.last_sequence = frame.sequence;
+            session.record_frame(frame);
             #[cfg(test)]
             crate::mvcc_fault_injection::hit(
                 crate::mvcc_fault_injection::FaultPoint::BeforeCompleteAck,
@@ -367,7 +386,7 @@ impl TransferReceiver {
         }
         file.sync_data()?;
         let persisted_through = file.metadata()?.len();
-        session.last_sequence = frame.sequence;
+        session.record_frame(frame);
 
         let mut ack = ReplicationAck {
             session_id: session.id(),
@@ -576,6 +595,10 @@ mod tests {
         let whole = b"abcdef";
         let first = frame(&session, transfer_id, 1, 0, b"abc", whole, false);
         receiver.receive(&mut session, &first).unwrap();
+        let duplicate = frame(&session, transfer_id, 1, 0, b"abc", whole, false);
+        receiver.receive(&mut session, &duplicate).unwrap();
+        let reused_sequence = frame(&session, transfer_id, 1, 0, b"abd", whole, false);
+        assert!(receiver.receive(&mut session, &reused_sequence).is_err());
 
         let mut retry_session = ConnectionSession::establish("cluster-a", peer).unwrap();
         let retry = frame(&retry_session, transfer_id, 1, 0, b"abc", whole, false);
