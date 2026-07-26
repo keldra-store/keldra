@@ -120,6 +120,64 @@ pub async fn write_personaldb_bytes_as_data_locator(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub async fn write_personaldb_bytes_as_data_locator_mvcc(
+    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    group_id: &str,
+    data_id: &str,
+    data_kind: &str,
+    generation: u64,
+    bytes: Vec<u8>,
+    sqlite_changeset_hash: String,
+    projection_keys: Vec<String>,
+    transaction_id: String,
+    principal: &str,
+) -> Result<PersonalDbDataLocatorCoreMetaRow> {
+    validate_personaldb_scope(tenant_id, group_id)?;
+    let logical_file_id = canonical_logical_file_id(
+        WriterFamily::PersonalDb,
+        generation,
+        data_id,
+        &hash32(&bytes),
+    );
+    let logical = CoreStore::new(storage.clone())
+        .await?
+        .write_logical_file_with_locator(WriteLogicalFileRequest {
+            writer_family: WriterFamily::PersonalDb.as_str().to_string(),
+            generation,
+            logical_file_id,
+            source: bytes,
+            range_hints: Vec::new(),
+            pipeline_policy: Default::default(),
+            trace_context: CoreTraceContext::default(),
+            boundary_values: Vec::new(),
+            mutation_id: transaction_id.clone(),
+            region_id: "local".to_string(),
+        })
+        .await?;
+    let row = PersonalDbDataLocatorCoreMetaRow {
+        tenant_id,
+        group_id: group_id.to_string(),
+        data_id: data_id.to_string(),
+        data_kind: data_kind.to_string(),
+        generation,
+        root_generation: mvcc
+            .runtime
+            .applied_version()?
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("PersonalDB locator generation overflow"))?,
+        sqlite_changeset_hash,
+        payload_locator: logical.locator,
+        projection_keys,
+        transaction_id,
+        created_at_unix_nanos: current_unix_nanos()?,
+    };
+    write_personaldb_data_locator_row_mvcc(mvcc, &row, principal).await?;
+    Ok(row)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn write_personaldb_bytes_as_data_locator_with_preconditions(
     storage: &Storage,
     tenant_id: i64,
