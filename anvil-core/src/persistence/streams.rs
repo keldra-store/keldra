@@ -320,10 +320,11 @@ impl Persistence {
     }
 
     pub async fn latest_object_watch_cursor(&self, tenant_id: i64, bucket_id: i64) -> Result<i64> {
-        i64::try_from(
-            watch_log::latest_object_watch_stream_cursor(&self.storage, tenant_id, bucket_id)
-                .await?,
-        )
+        i64::try_from(watch_log::latest_object_watch_stream_cursor(
+            self.mvcc()?,
+            tenant_id,
+            bucket_id,
+        )?)
         .map_err(|_| anyhow!("object watch cursor exceeds i64"))
     }
 
@@ -336,14 +337,13 @@ impl Persistence {
         limit: usize,
     ) -> Result<watch_log::ObjectWatchEventPage> {
         watch_log::list_object_watch_event_page(
-            &self.storage,
+            self.mvcc()?,
             tenant_id,
             bucket_id,
             prefix,
             after_cursor,
             limit,
         )
-        .await
     }
 
     pub async fn create_append_stream(

@@ -80,12 +80,11 @@ pub(super) async fn object_watch_cursor(
     object: &crate::persistence::Object,
 ) -> Result<u64, Status> {
     let cursor = watch_log::latest_object_watch_cursor(
-        &state.storage,
+        &state.mvcc,
         object.tenant_id,
         object.bucket_id,
         object.version_id,
     )
-    .await
     .map_err(|e| Status::internal(e.to_string()))?
     .ok_or_else(|| Status::internal("Object mutation watch event not found"))?;
     u64::try_from(cursor).map_err(|_| Status::internal("Invalid object watch cursor"))

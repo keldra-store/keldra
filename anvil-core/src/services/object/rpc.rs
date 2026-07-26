@@ -941,25 +941,23 @@ impl ObjectService for AppState {
             .object_manager
             .resolve_prefix_watch_scope(claims, &req.bucket_name, &req.prefix)
             .await?;
-        let stream_id = watch_log::object_watch_stream_id(tenant_id, bucket_id);
-        let mut live = self.storage.subscribe_stream(&stream_id);
-        let storage = self.storage.clone();
+        let mvcc = self.mvcc.clone();
 
         let (tx, rx) = mpsc::channel(32);
         tokio::spawn(async move {
             let mut last_cursor = after_cursor;
+            let mut poll = tokio::time::interval(std::time::Duration::from_millis(100));
+            poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 loop {
                     let page = match watch_log::list_object_watch_event_page(
-                        &storage,
+                        &mvcc,
                         tenant_id,
                         bucket_id,
                         &prefix,
                         last_cursor,
                         256,
-                    )
-                    .await
-                    {
+                    ) {
                         Ok(page) => page,
                         Err(error) => {
                             let _ = tx.send(Err(Status::internal(error.to_string()))).await;
@@ -980,10 +978,7 @@ impl ObjectService for AppState {
                     }
                 }
 
-                match live.recv().await {
-                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                }
+                poll.tick().await;
             }
         });
 

@@ -1795,10 +1795,13 @@ impl ObjectManager {
             is_delete_marker,
             created_at: object.created_at,
         };
-        let receipt =
-            watch_log::committed_object_watch_receipt(&self.storage, bucket, object, &event)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+        let receipt = watch_log::committed_object_watch_receipt(
+            self.installed_mvcc()?,
+            bucket,
+            object,
+            &event,
+        )
+        .map_err(|e| Status::internal(e.to_string()))?;
         i64::try_from(receipt.sequence)
             .map_err(|_| Status::internal("object watch cursor exceeds i64"))?;
         Ok(())

@@ -54,13 +54,12 @@ async fn hydrate_put_batch_watch_cursor(
         let mutation_id = uuid::Uuid::parse_str(&receipt.mutation_id)
             .map_err(|_| Status::internal("Invalid idempotent object mutation"))?;
         let cursor = crate::watch_log::exact_object_watch_cursor(
-            &state.storage,
+            &state.mvcc,
             context.tenant_id,
             context.bucket_id,
             version_id,
             mutation_id,
         )
-        .await
         .map_err(|error| Status::internal(error.to_string()))?
         .ok_or_else(|| Status::internal("Object mutation watch event not found"))?;
         let cursor =

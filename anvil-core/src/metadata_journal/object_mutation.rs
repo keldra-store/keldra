@@ -1,7 +1,7 @@
 use super::*;
 use crate::core_store::{
     CoreMutationBatchAdditions, CoreMutationPrecondition, CoreMutationRootPublication,
-    ObjectMetadataProjectionMutation, core_meta_root_key_hash,
+    ObjectMetadataProjectionMutation,
 };
 use crate::formats::writer::WriterFamily;
 use crate::persistence::ObjectWatchEvent;
@@ -141,21 +141,12 @@ async fn append_object_put_mutations_with_permit_inner(
     let metadata_stream_precondition = core_store
         .stream_head_precondition(&metadata_stream_id)
         .await?;
-    let watch_stream_id = watch_log::object_watch_stream_id(bucket.tenant_id, bucket.id);
-    let watch_stream_precondition = core_store
-        .stream_head_precondition(&watch_stream_id)
-        .await?;
-    let first_watch_sequence = stream_precondition_next_sequence(&watch_stream_precondition)?;
-
-    let mut preconditions = vec![
-        partition_precondition,
-        metadata_stream_precondition,
-        watch_stream_precondition,
-    ];
+    let mut preconditions = vec![partition_precondition, metadata_stream_precondition];
     let mut operations = Vec::with_capacity(objects.len() * 16);
     let mut projection_mutations = Vec::new();
     let mut projection_predicates = Vec::new();
-    for (index, object) in objects.iter().enumerate() {
+    let mut watch_events = Vec::with_capacity(objects.len());
+    for object in objects {
         let loaded = load_object_projection_snapshot(
             mvcc.ok_or_else(|| anyhow!("MVCC staging handle is required"))?,
             bucket,
@@ -169,22 +160,11 @@ async fn append_object_put_mutations_with_permit_inner(
             transaction_id,
         )?);
         projection_predicates.extend(loaded.predicates);
-        let event = object_watch_event(bucket, object, ObjectJournalMutation::Put);
-        let sequence = first_watch_sequence
-            .checked_add(index as u64)
-            .ok_or_else(|| anyhow!("object watch stream sequence overflow"))?;
-        let watch = watch_log::prepare_object_watch_append_at_sequence(
+        watch_events.push(object_watch_event(
             bucket,
             object,
-            &event,
-            &scope_partition,
-            &core_meta_root_key_hash(&scope_partition),
-            Some(loaded.snapshot.projection_generation),
-            transaction_id,
-            sequence,
-            None,
-        )?;
-        preconditions.extend(watch.preconditions);
+            ObjectJournalMutation::Put,
+        ));
         operations.push(CoreMutationOperation::StreamAppend {
             partition_id: scope_partition.clone(),
             stream_id: metadata_stream_id.clone(),
@@ -197,7 +177,6 @@ async fn append_object_put_mutations_with_permit_inner(
             ))?,
             idempotency_key: Some(format!("object-metadata:{}:put", object.mutation_id)),
         });
-        operations.extend(watch.operations);
     }
     preconditions.append(&mut additions.preconditions);
     operations.append(&mut additions.operations);
@@ -238,10 +217,19 @@ async fn append_object_put_mutations_with_permit_inner(
         batch.operations,
         transaction_principal.map(|principal| (transaction_id, principal)),
     )?;
+    let watch_inputs = objects.iter().zip(&watch_events).collect::<Vec<_>>();
+    let watch_plan = watch_log::plan_object_watch_appends(
+        mvcc,
+        bucket,
+        &watch_inputs,
+        transaction_principal.map(|principal| (transaction_id, principal)),
+    )?;
     let mutations = event_plan.mutations;
     let mut predicates = predicates;
     predicates.push(event_plan.head_predicate);
+    predicates.extend(watch_plan.predicates);
     let mut mutations = mutations;
+    mutations.extend(watch_plan.mutations);
     mutations.extend(projection_mutations);
     predicates.extend(projection_predicates);
     if let Some(transaction_principal) = transaction_principal {
@@ -364,19 +352,6 @@ fn coalesce_coremeta_operations_last_write_wins(
         .collect()
 }
 
-fn stream_precondition_next_sequence(precondition: &CoreMutationPrecondition) -> Result<u64> {
-    let CoreMutationPrecondition::StreamHead {
-        expected_last_sequence,
-        ..
-    } = precondition
-    else {
-        bail!("object stream precondition has wrong kind");
-    };
-    expected_last_sequence
-        .checked_add(1)
-        .ok_or_else(|| anyhow!("object stream sequence overflow"))
-}
-
 pub(super) async fn append_object_mutation_inner(
     storage: &Storage,
     mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
@@ -471,23 +446,11 @@ async fn append_object_mutation_inner_once(
         .stream_head_precondition(&metadata_stream_id)
         .await?;
     let event = object_watch_event(bucket, object, mutation);
-    let watch = watch_log::prepare_object_watch_append(
-        core_store,
-        bucket,
-        object,
-        &event,
-        &scope_partition,
-        &core_meta_root_key_hash(&scope_partition),
-        Some(loaded.snapshot.projection_generation),
-        transaction_id,
-    )
-    .await?;
     let object_payload =
         encode_object_version_body(&object_version_body(bucket, object, mutation, fence_token))?;
     let mut preconditions = partition_precondition.into_iter().collect::<Vec<_>>();
     preconditions.push(metadata_stream_precondition);
-    preconditions.extend(watch.preconditions);
-    let mut operations = Vec::with_capacity(3);
+    let mut operations = Vec::with_capacity(1);
     operations.push(CoreMutationOperation::StreamAppend {
         partition_id: scope_partition.clone(),
         stream_id: metadata_stream_id.clone(),
@@ -499,7 +462,6 @@ async fn append_object_mutation_inner_once(
             mutation.event_name()
         )),
     });
-    operations.extend(watch.operations);
     let batch = CoreMutationBatch {
         transaction_id: transaction_id.to_string(),
         scope_partition: scope_partition.clone(),
@@ -522,10 +484,18 @@ async fn append_object_mutation_inner_once(
         batch.operations,
         transaction_principal.map(|principal| (transaction_id, principal)),
     )?;
+    let watch_plan = watch_log::plan_object_watch_appends(
+        mvcc,
+        bucket,
+        &[(object, &event)],
+        transaction_principal.map(|principal| (transaction_id, principal)),
+    )?;
     let mut mutations = event_plan.mutations;
+    mutations.extend(watch_plan.mutations);
     mutations.extend(projection_mutations);
     let mut predicates = predicates;
     predicates.push(event_plan.head_predicate);
+    predicates.extend(watch_plan.predicates);
     predicates.extend(projection_predicates);
     if mvcc_transaction_id.is_some() {
         let transaction_principal = transaction_principal
