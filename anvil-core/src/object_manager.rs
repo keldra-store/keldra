@@ -1427,29 +1427,31 @@ impl ObjectManager {
             .await
             .map_err(core_store_status)?;
         let payload_hash = object_ref.hash.clone();
-        self.core_store
-            .append_stream_authenticated(
-                CoreAppendStreamRecord {
-                    stream_id: core_append_stream_id(tenant_id, bucket.id, stream_id),
-                    partition_id: core_append_stream_partition_id(tenant_id, bucket.id),
-                    record_kind: "append_stream.record".to_string(),
-                    payload: core_stream_payload,
-                    content_type: content_type.clone(),
-                    user_metadata_json: user_metadata
-                        .as_ref()
-                        .map(serde_json::Value::to_string)
-                        .unwrap_or_else(|| "{}".to_string()),
-                    fence: None,
-                    transaction_id: transaction_id.map(ToOwned::to_owned),
-                    idempotency_key: Some(format!(
-                        "append-stream:{tenant_id}:{}:{stream_id}:{}",
-                        bucket.id, stream_payload_mutation_id
-                    )),
-                },
-                &authenticated_principal,
-            )
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        if transaction_id.is_none() {
+            self.core_store
+                .append_stream_authenticated(
+                    CoreAppendStreamRecord {
+                        stream_id: core_append_stream_id(tenant_id, bucket.id, stream_id),
+                        partition_id: core_append_stream_partition_id(tenant_id, bucket.id),
+                        record_kind: "append_stream.record".to_string(),
+                        payload: core_stream_payload,
+                        content_type: content_type.clone(),
+                        user_metadata_json: user_metadata
+                            .as_ref()
+                            .map(serde_json::Value::to_string)
+                            .unwrap_or_else(|| "{}".to_string()),
+                        fence: None,
+                        transaction_id: None,
+                        idempotency_key: Some(format!(
+                            "append-stream:{tenant_id}:{}:{stream_id}:{}",
+                            bucket.id, stream_payload_mutation_id
+                        )),
+                    },
+                    &authenticated_principal,
+                )
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+        }
         let mutation = if let Some(transaction_id) = transaction_id {
             self.persistence
                 .append_stream_record_in_transaction(

@@ -88,6 +88,7 @@ impl ObjectManager {
                 prepared.bucket.id,
                 create_inputs,
                 transaction_id,
+                transaction_principal,
                 visibility.persistence_options(),
             )
             .await

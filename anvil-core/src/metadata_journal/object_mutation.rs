@@ -539,23 +539,7 @@ async fn require_committed_metadata_record(
         .into_iter()
         .find(|record| record.sequence == sequence);
     let Some(record) = record else {
-        let transaction_id = format!(
-            "object-metadata:{}:{}",
-            object.mutation_id,
-            mutation.event_name()
-        );
-        let transaction = core_store.read_transaction(&transaction_id).await?;
-        bail!(
-            "committed object mutation metadata record {stream_id}:{sequence} is not readable; transaction {transaction_id} is {}",
-            transaction
-                .as_ref()
-                .map(|transaction| format!(
-                    "{:?} with {} visible updates",
-                    transaction.state,
-                    transaction.visible_updates.len()
-                ))
-                .unwrap_or_else(|| "missing".to_string())
-        );
+        bail!("committed object mutation metadata record {stream_id}:{sequence} is not readable");
     };
     let actual = metadata_record_from_stream_record(record)?;
     let expected_body = object_version_body(bucket, object, mutation, actual.body.fence_token);

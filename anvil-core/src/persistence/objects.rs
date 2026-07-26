@@ -68,6 +68,7 @@ impl Persistence {
         bucket_id: i64,
         inputs: Vec<ObjectBatchCreateInput>,
         transaction_id: &str,
+        transaction_principal: &str,
         options: ObjectCreateOptions,
     ) -> Result<PreparedObjectBatchCreate> {
         self.prepare_objects_with_storage_class_inner(
@@ -75,6 +76,7 @@ impl Persistence {
             bucket_id,
             inputs,
             Some(transaction_id),
+            Some(transaction_principal),
             options,
         )
         .await
@@ -87,8 +89,10 @@ impl Persistence {
         inputs: Vec<ObjectBatchCreateInput>,
         options: ObjectCreateOptions,
     ) -> Result<PreparedObjectBatchCreate> {
-        self.prepare_objects_with_storage_class_inner(tenant_id, bucket_id, inputs, None, options)
-            .await
+        self.prepare_objects_with_storage_class_inner(
+            tenant_id, bucket_id, inputs, None, None, options,
+        )
+        .await
     }
 
     async fn prepare_objects_with_storage_class_inner(
@@ -97,6 +101,7 @@ impl Persistence {
         bucket_id: i64,
         inputs: Vec<ObjectBatchCreateInput>,
         transaction_id: Option<&str>,
+        transaction_principal: Option<&str>,
         options: ObjectCreateOptions,
     ) -> Result<PreparedObjectBatchCreate> {
         if inputs.is_empty() {
@@ -120,9 +125,24 @@ impl Persistence {
             0
         };
         let core_store = CoreStore::new(self.storage.clone()).await?;
-        let first_object_id = core_store
-            .next_object_metadata_id_in_transaction(&bucket, transaction_id)
-            .await?;
+        let first_object_id = match (transaction_id, transaction_principal) {
+            (Some(transaction_id), Some(transaction_principal)) => {
+                core_store
+                    .next_object_metadata_id_in_mvcc_transaction(
+                        &bucket,
+                        self.mvcc()?,
+                        transaction_id,
+                        transaction_principal,
+                    )
+                    .await?
+            }
+            (None, None) => core_store.next_object_metadata_id(&bucket).await?,
+            _ => {
+                return Err(anyhow!(
+                    "transaction ID and principal must be supplied together"
+                ));
+            }
+        };
         let mut objects = Vec::with_capacity(inputs.len());
         for (index, input) in inputs.into_iter().enumerate() {
             let offset = i64::try_from(index).map_err(|_| anyhow!("object batch exceeds i64"))?;

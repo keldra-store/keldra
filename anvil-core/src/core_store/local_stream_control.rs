@@ -243,72 +243,10 @@ impl CoreStore {
             crate::perf::guard("anvil_core_store_op", &[("operation", "append_stream")]);
         validate_logical_id(&input.stream_id, "stream id")?;
         validate_logical_id(&input.partition_id, "partition id")?;
-        if let Some(transaction_id) = input.transaction_id.clone() {
-            let transaction = self
-                .read_transaction_unlocked(&transaction_id)
-                .await?
-                .ok_or_else(|| anyhow!("TransactionNotFound"))?;
-            let principal = if authenticated_principal.is_empty() {
-                transaction.committed_by_principal.clone()
-            } else {
-                authenticated_principal
-            };
-            if transaction.committed_by_principal != principal {
-                bail!("TransactionPrincipalMismatch");
-            }
-            let mut writer_families = transaction.writer_families.clone();
-            writer_families.push(WriterFamily::Stream.as_str().to_string());
-            writer_families.push(WriterFamily::CoreControl.as_str().to_string());
-            writer_families.sort();
-            writer_families.dedup();
-            let receipt = self
-                .stage_explicit_transaction_batch(CoreMutationBatch {
-                    transaction_id,
-                    scope_partition: transaction.scope_partition,
-                    committed_by_principal: principal,
-                    root_publications: vec![CoreMutationRootPublication {
-                        root_anchor_key: input.partition_id.clone(),
-                        writer_families,
-                        transaction_coordinator: true,
-                    }],
-                    preconditions: input
-                        .fence
-                        .as_ref()
-                        .map(|fence| CoreMutationPrecondition::Fence {
-                            fence_name: fence.fence_name.clone(),
-                            fence_token: fence.fence_token,
-                        })
-                        .into_iter()
-                        .collect(),
-                    operations: vec![CoreMutationOperation::StreamAppend {
-                        partition_id: input.partition_id,
-                        stream_id: input.stream_id.clone(),
-                        record_kind: input.record_kind,
-                        payload: input.payload,
-                        idempotency_key: input.idempotency_key,
-                    }],
-                })
-                .await?;
-            let update = receipt
-                .visible_updates
-                .into_iter()
-                .find_map(|update| match update {
-                    CoreTransactionUpdate::StreamAppend {
-                        stream_id,
-                        visible_sequence,
-                        prepared_record_hash,
-                        ..
-                    } if stream_id == input.stream_id => Some(StreamAppendReceipt {
-                        stream_id,
-                        sequence: visible_sequence,
-                        cursor: format!("{}:{visible_sequence:020}", input.stream_id),
-                        event_hash: prepared_record_hash,
-                        idempotent_replay: false,
-                    }),
-                    _ => None,
-                })
-                .ok_or_else(|| anyhow!("CoreStore staged stream append produced no receipt"))?;
-            return Ok(update);
+        if input.transaction_id.is_some() {
+            bail!(
+                "CoreStore transactional stream staging was removed; stage the append through the MVCC transaction registry"
+            );
         }
         let stream_id = input.stream_id.clone();
         let _stream_guard = self.acquire_named_lock("stream", &input.stream_id).await?;
