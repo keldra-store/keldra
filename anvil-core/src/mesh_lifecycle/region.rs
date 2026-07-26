@@ -77,98 +77,13 @@ async fn create_region_inner(
 }
 
 pub async fn put_region_in_transaction(
-    storage: &Storage,
-    input: CreateRegionDescriptor,
-    target: Option<LifecycleState>,
-    transaction_id: &str,
-    principal: &str,
+    _storage: &Storage,
+    _input: CreateRegionDescriptor,
+    _target: Option<LifecycleState>,
+    _transaction_id: &str,
+    _principal: &str,
 ) -> LifecycleResult<RegionDescriptor> {
-    require_identifier(&input.mesh_id, "mesh id")?;
-    require_identifier(&input.region, "region")?;
-    require_nonempty(&input.virtual_host_suffix, "virtual host suffix")?;
-    if let Some(default_cell) = &input.default_cell {
-        require_identifier(default_cell, "default cell")?;
-    }
-
-    let mut state = read_state_for_transaction(storage, transaction_id, principal).await?;
-    let transaction_timestamp =
-        lifecycle_transaction_timestamp(storage, transaction_id, principal).await?;
-    let existing_generation = state
-        .regions
-        .get(&input.region)
-        .map(|descriptor| descriptor.generation);
-    let existed = existing_generation.is_some();
-    let mut descriptor = if let Some(existing) = state.regions.get(&input.region).cloned() {
-        if !input.public_base_url.is_empty() && existing.public_base_url != input.public_base_url {
-            return Err(LifecycleError::InvalidArgument(format!(
-                "region {} already exists with endpoint {}",
-                existing.region, existing.public_base_url
-            )));
-        }
-        existing
-    } else {
-        require_nonempty(&input.public_base_url, "public base url")?;
-        let now = transaction_timestamp.clone();
-        RegionDescriptor {
-            schema: REGION_DESCRIPTOR_SCHEMA.to_string(),
-            mesh_id: input.mesh_id,
-            region: input.region.clone(),
-            state: LifecycleState::Joining,
-            public_base_url: input.public_base_url,
-            virtual_host_suffix: input.virtual_host_suffix,
-            placement_weight: input.placement_weight,
-            default_cell: input.default_cell,
-            created_at: now.clone(),
-            updated_at: now,
-            generation: 1,
-        }
-    };
-
-    if let Some(target) = target
-        && descriptor.state != target
-    {
-        validate_region_transition(descriptor.state, target).map_err(|_| {
-            LifecycleError::LifecycleTransitionDenied {
-                resource_kind: "region",
-                resource_id: descriptor.region.clone(),
-                from: descriptor.state,
-                to: target,
-            }
-        })?;
-        ensure_region_drain_completion_is_supported(storage, &descriptor.region, target).await?;
-        descriptor.state = target;
-        descriptor.updated_at = transaction_timestamp;
-        descriptor.generation = descriptor.generation.saturating_add(1);
-    }
-
-    if existed && descriptor == state.regions[&input.region] {
-        return Ok(descriptor);
-    }
-
-    state
-        .regions
-        .insert(descriptor.region.clone(), descriptor.clone());
-    let operation = if existed { "upsert" } else { "create" };
-    let expected_generation = existing_generation;
-    let control = topology_mutation::transactional_control_mutation(
-        REGION_DESCRIPTOR_STREAM_FAMILY,
-        descriptor.region.clone(),
-        operation,
-        expected_generation,
-        descriptor.generation,
-        &descriptor.mesh_id,
-        &descriptor,
-        principal,
-    )?;
-    topology_mutation::stage_topology_mutation_in_transaction(
-        storage,
-        record_proto::encode_region_projection_row(&descriptor)?,
-        control,
-        transaction_id,
-        principal,
-    )
-    .await?;
-    Ok(descriptor)
+    Err(topology_transaction_error("region"))
 }
 
 #[cfg(test)]

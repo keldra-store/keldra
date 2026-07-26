@@ -21,6 +21,7 @@ async fn register_cell_inner(
     input: RegisterCellDescriptor,
     authority: Option<LifecycleControlWriteAuthority<'_>>,
 ) -> LifecycleResult<CellDescriptor> {
+    return Err(topology_transaction_error("cell"));
     require_identifier(&input.mesh_id, "mesh id")?;
     require_identifier(&input.region, "region")?;
     require_identifier(&input.cell_id, "cell id")?;

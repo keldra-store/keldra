@@ -121,6 +121,12 @@ pub enum LifecycleError {
     Other(#[from] anyhow::Error),
 }
 
+fn topology_transaction_error(resource_kind: &str) -> LifecycleError {
+    LifecycleError::InvalidArgument(format!(
+        "{resource_kind} is mesh or region control-plane topology and cannot participate in a cluster transaction"
+    ))
+}
+
 pub type LifecycleResult<T> = Result<T, LifecycleError>;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

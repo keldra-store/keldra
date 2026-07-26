@@ -659,29 +659,15 @@ impl Persistence {
 
     pub async fn create_host_alias_descriptor_in_transaction(
         &self,
-        routing_config: &crate::routing::RoutingConfig,
-        input: crate::mesh_lifecycle::CreateHostAliasDescriptor,
-        transaction_id: &str,
-        principal: &str,
+        _routing_config: &crate::routing::RoutingConfig,
+        _input: crate::mesh_lifecycle::CreateHostAliasDescriptor,
+        _transaction_id: &str,
+        _principal: &str,
     ) -> crate::mesh_lifecycle::LifecycleResult<crate::routing::HostAliasDescriptor> {
-        let descriptor = crate::mesh_lifecycle::create_host_alias_in_transaction(
-            &self.storage,
-            routing_config,
-            input,
-            transaction_id,
-            principal,
-        )
-        .await?;
-        mesh_directory::write_host_alias_descriptor_in_transaction(
-            &self.storage,
-            &descriptor,
-            true,
-            transaction_id,
-            principal,
-        )
-        .await
-        .map_err(mesh_directory_lifecycle_error)?;
-        Ok(descriptor)
+        Err(crate::mesh_lifecycle::LifecycleError::InvalidArgument(
+            "host aliases are mesh control-plane topology and cannot participate in a cluster transaction"
+                .to_string(),
+        ))
     }
 
     pub async fn transition_host_alias_descriptor(
@@ -720,31 +706,16 @@ impl Persistence {
 
     pub async fn transition_host_alias_descriptor_in_transaction(
         &self,
-        hostname: &str,
-        expected_generation: u64,
-        target: crate::routing::HostAliasState,
-        transaction_id: &str,
-        principal: &str,
+        _hostname: &str,
+        _expected_generation: u64,
+        _target: crate::routing::HostAliasState,
+        _transaction_id: &str,
+        _principal: &str,
     ) -> crate::mesh_lifecycle::LifecycleResult<crate::routing::HostAliasDescriptor> {
-        let descriptor = crate::mesh_lifecycle::transition_host_alias_in_transaction(
-            &self.storage,
-            hostname,
-            expected_generation,
-            target,
-            transaction_id,
-            principal,
-        )
-        .await?;
-        mesh_directory::write_host_alias_descriptor_in_transaction(
-            &self.storage,
-            &descriptor,
-            false,
-            transaction_id,
-            principal,
-        )
-        .await
-        .map_err(mesh_directory_lifecycle_error)?;
-        Ok(descriptor)
+        Err(crate::mesh_lifecycle::LifecycleError::InvalidArgument(
+            "host aliases are mesh control-plane topology and cannot participate in a cluster transaction"
+                .to_string(),
+        ))
     }
 
     pub async fn get_host_alias_descriptor(

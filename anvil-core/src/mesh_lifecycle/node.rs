@@ -21,6 +21,7 @@ async fn register_node_inner(
     input: RegisterNodeDescriptor,
     authority: Option<LifecycleControlWriteAuthority<'_>>,
 ) -> LifecycleResult<NodeDescriptor> {
+    return Err(topology_transaction_error("node"));
     require_identifier(&input.mesh_id, "mesh id")?;
     require_identifier(&input.node_id, "node id")?;
     require_identifier(&input.region, "region")?;

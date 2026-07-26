@@ -571,86 +571,37 @@ async fn find_node(state: &AppState, node_id: &str) -> Result<Option<NodeDescrip
 }
 
 async fn put_region_in_transaction(
-    state: &AppState,
-    claims: &auth::Claims,
-    req: &PutRegionRequest,
-    transaction_id: &str,
+    _state: &AppState,
+    _claims: &auth::Claims,
+    _req: &PutRegionRequest,
+    _transaction_id: &str,
 ) -> Result<String, Status> {
-    let target = parse_lifecycle_state(req.state.as_str())?;
-    let principal = mesh_transaction_principal(claims);
-    crate::mesh_lifecycle::put_region_in_transaction(
-        &state.storage,
-        CreateRegionDescriptor {
-            mesh_id: state.config.mesh_id.clone(),
-            region: req.region_id.clone(),
-            public_base_url: req.endpoint.clone(),
-            virtual_host_suffix: format!("{}.anvil-storage.com", req.region_id),
-            placement_weight: 1,
-            default_cell: None,
-        },
-        target,
-        transaction_id,
-        &principal,
-    )
-    .await
-    .map_err(mesh_status)?;
-    Ok(req.region_id.clone())
+    Err(topology_transaction_rejected())
 }
 
 async fn put_cell_in_transaction(
-    state: &AppState,
-    claims: &auth::Claims,
-    req: &PutCellRequest,
-    transaction_id: &str,
+    _state: &AppState,
+    _claims: &auth::Claims,
+    _req: &PutCellRequest,
+    _transaction_id: &str,
 ) -> Result<String, Status> {
-    let target = parse_lifecycle_state(req.state.as_str())?;
-    let principal = mesh_transaction_principal(claims);
-    crate::mesh_lifecycle::put_cell_in_transaction(
-        &state.storage,
-        RegisterCellDescriptor {
-            mesh_id: state.config.mesh_id.clone(),
-            region: req.region_id.clone(),
-            cell_id: req.cell_id.clone(),
-            placement_weight: 1,
-            failure_domain: req.failure_domain.clone(),
-        },
-        target,
-        transaction_id,
-        &principal,
-    )
-    .await
-    .map_err(mesh_status)?;
-    Ok(req.cell_id.clone())
+    Err(topology_transaction_rejected())
 }
 
 async fn put_node_in_transaction(
-    state: &AppState,
-    claims: &auth::Claims,
-    req: &PutNodeRequest,
-    capabilities: Vec<CoreNodeCapability>,
-    transaction_id: &str,
+    _state: &AppState,
+    _claims: &auth::Claims,
+    _req: &PutNodeRequest,
+    _capabilities: Vec<CoreNodeCapability>,
+    _transaction_id: &str,
 ) -> Result<String, Status> {
-    let target = parse_lifecycle_state(req.state.as_str())?;
-    let principal = mesh_transaction_principal(claims);
-    crate::mesh_lifecycle::put_node_in_transaction(
-        &state.storage,
-        RegisterNodeDescriptor {
-            mesh_id: state.config.mesh_id.clone(),
-            node_id: req.node_id.clone(),
-            region: req.region_id.clone(),
-            cell_id: req.cell_id.clone(),
-            receipt_signing_public_key: req.receipt_signing_public_key.clone(),
-            public_api_addr: req.advertise_addr.clone(),
-            capabilities,
-            capacity_json: req.capacity_json.clone(),
-        },
-        target,
-        transaction_id,
-        &principal,
+    Err(topology_transaction_rejected())
+}
+
+fn topology_transaction_rejected() -> Status {
+    Status::failed_precondition(
+        "mesh and region topology mutations are control-plane operations and cannot participate in a cluster transaction",
     )
-    .await
-    .map_err(mesh_status)?;
-    Ok(req.node_id.clone())
 }
 
 async fn move_bucket_in_transaction(
@@ -1155,6 +1106,14 @@ mod bootstrap_contract_tests {
                 .code(),
             tonic::Code::InvalidArgument
         );
+    }
+
+    #[test]
+    fn cluster_transaction_cannot_contain_control_plane_topology() {
+        let rejection = topology_transaction_rejected();
+        assert_eq!(rejection.code(), tonic::Code::FailedPrecondition);
+        assert!(rejection.message().contains("control-plane"));
+        assert!(rejection.message().contains("cluster transaction"));
     }
 }
 

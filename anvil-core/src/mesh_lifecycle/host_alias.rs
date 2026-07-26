@@ -89,107 +89,24 @@ pub async fn transition_host_alias(
 }
 
 pub async fn create_host_alias_in_transaction(
-    storage: &Storage,
-    config: &RoutingConfig,
-    input: CreateHostAliasDescriptor,
-    transaction_id: &str,
-    principal: &str,
+    _storage: &Storage,
+    _config: &RoutingConfig,
+    _input: CreateHostAliasDescriptor,
+    _transaction_id: &str,
+    _principal: &str,
 ) -> LifecycleResult<HostAliasDescriptor> {
-    require_identifier(&input.tenant_id, "tenant id")?;
-    require_identifier(&input.bucket_name, "bucket name")?;
-    require_identifier(&input.region, "region")?;
-    let hostname = routing::normalize_alias_hostname(&input.hostname)
-        .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?;
-
-    let mut state = read_state_for_transaction(storage, transaction_id, principal).await?;
-    match state.regions.get(&input.region) {
-        Some(region) if region.state == LifecycleState::Active => {}
-        Some(_) => {
-            return Err(LifecycleError::InvalidArgument(
-                "host alias region must be active".to_string(),
-            ));
-        }
-        None => {
-            return Err(LifecycleError::NotFound {
-                resource_kind: "region",
-                resource_id: input.region,
-            });
-        }
-    }
-    if state.host_aliases.contains_key(&hostname) {
-        return Err(LifecycleError::AlreadyExists {
-            resource_kind: "host alias",
-            resource_id: hostname,
-        });
-    }
-
-    let mut descriptor = HostAliasDescriptor::active(
-        hostname,
-        input.tenant_id,
-        input.bucket_name,
-        input.region,
-        input.prefix,
-        config,
-    )
-    .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?;
-    descriptor.state = HostAliasState::PendingVerification;
-    let out = descriptor.clone();
-    state.host_aliases.insert(out.hostname.clone(), descriptor);
-    stage_lifecycle_projection_row_in_transaction(
-        storage,
-        record_proto::encode_host_alias_projection_row(&out)?,
-        transaction_id,
-        principal,
-    )
-    .await?;
-    Ok(out)
+    Err(topology_transaction_error("host alias"))
 }
 
 pub async fn transition_host_alias_in_transaction(
-    storage: &Storage,
-    hostname: &str,
-    expected_generation: u64,
-    target: HostAliasState,
-    transaction_id: &str,
-    principal: &str,
+    _storage: &Storage,
+    _hostname: &str,
+    _expected_generation: u64,
+    _target: HostAliasState,
+    _transaction_id: &str,
+    _principal: &str,
 ) -> LifecycleResult<HostAliasDescriptor> {
-    let hostname = routing::normalize_alias_hostname(hostname)
-        .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?;
-    let mut state = read_state_for_transaction(storage, transaction_id, principal).await?;
-    let descriptor =
-        state
-            .host_aliases
-            .get_mut(&hostname)
-            .ok_or_else(|| LifecycleError::NotFound {
-                resource_kind: "host alias",
-                resource_id: hostname.clone(),
-            })?;
-    ensure_generation(
-        "host alias",
-        &hostname,
-        descriptor.generation,
-        expected_generation,
-    )?;
-    validate_host_alias_transition(descriptor.state, target).map_err(|_| {
-        LifecycleError::LifecycleTransitionDenied {
-            resource_kind: "host alias",
-            resource_id: hostname.clone(),
-            from: lifecycle_state_for_host_alias(descriptor.state),
-            to: lifecycle_state_for_host_alias(target),
-        }
-    })?;
-    descriptor.state = target;
-    descriptor.updated_at = timestamp_now();
-    descriptor.generation = descriptor.generation.saturating_add(1);
-    let out = descriptor.clone();
-    stage_lifecycle_projection_row_in_transaction(
-        storage,
-        record_proto::encode_host_alias_projection_row(&out)?,
-        transaction_id,
-        principal,
-    )
-    .await?;
-    Ok(out)
+    Err(topology_transaction_error("host alias"))
 }
 
 pub async fn list_host_aliases(
