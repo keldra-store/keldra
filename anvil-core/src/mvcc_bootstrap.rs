@@ -382,6 +382,11 @@ impl MvccSubsystem {
         std::fs::create_dir_all(&paths.base)?;
         let raft_store = RocksRaftStore::from_db(core_meta_db.clone(), config.mvcc_raft_group_id)
             .context("attach MVCC Raft store to CoreMeta RocksDB")?;
+        #[cfg(test)]
+        let raft_store = raft_store.with_log_write_fault_hook(Arc::new(|| {
+            crate::mvcc_fault_injection::hit(crate::mvcc_fault_injection::FaultPoint::RaftLogWrite)
+                .map_err(|error| error.to_string())
+        }));
         let raft_is_empty = raft_store
             .last_log_index()
             .context("inspect MVCC Raft log")?
