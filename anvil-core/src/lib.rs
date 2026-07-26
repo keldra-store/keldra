@@ -718,4 +718,432 @@ mod app_state_tests {
 
         assert!(state.persistence.list_regions().await.unwrap().is_empty());
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+    async fn distributed_mvcc_quorum_certifies_replicates_and_applies_in_order() {
+        use crate::anvil_api::{
+            consensus_transport_server::ConsensusTransportServer,
+            replication_service_server::ReplicationServiceServer,
+        };
+        use crate::mvcc_transaction::{DurabilityLevel, LogicalKey, ReadConsistency};
+        use crate::bundle_replication::BundleTargetStream as _;
+        use anvil_mvcc_consensus::Consensus as _;
+        use sha2::Digest as _;
+        use tokio::net::TcpListener;
+        use tokio_stream::wrappers::TcpListenerStream;
+        use tonic::transport::Server;
+
+        let directories = [
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        ];
+        let listeners = [
+            TcpListener::bind("127.0.0.1:0").await.unwrap(),
+            TcpListener::bind("127.0.0.1:0").await.unwrap(),
+            TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        ];
+        let addresses = listeners
+            .iter()
+            .map(|listener| listener.local_addr().unwrap())
+            .collect::<Vec<_>>();
+        let endpoints = listeners
+            .iter()
+            .map(|listener| format!("http://{}", listener.local_addr().unwrap()))
+            .collect::<Vec<_>>();
+        let peers = endpoints
+            .iter()
+            .enumerate()
+            .map(|(index, endpoint)| {
+                serde_json::json!({
+                    "cluster_id": "distributed-e2e",
+                    "raft_node_id": index + 1,
+                    "node_id": format!("node-{}", index + 1),
+                    "incarnation": 1,
+                    "endpoint": endpoint,
+                    "failure_domain": format!("zone-{}", index + 1),
+                    "voter": true,
+                })
+            })
+            .collect::<Vec<_>>();
+        let peers_json = serde_json::to_string(&peers).unwrap();
+        let mut states = Vec::new();
+        for (index, directory) in directories.iter().enumerate() {
+            let config = Config {
+                jwt_secret: "test-secret".into(),
+                anvil_secret_encryption_key:
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                public_api_addr: "127.0.0.1:0".into(),
+                api_listen_addr: "127.0.0.1:0".into(),
+                region: "distributed".into(),
+                node_id: format!("node-{}", index + 1),
+                bootstrap_system_admin_subject_kind: "app".into(),
+                bootstrap_system_admin_subject_id: "admin-principal".into(),
+                bootstrap_node_ids: vec!["node-1".into(), "node-2".into(), "node-3".into()],
+                storage_path: directory.path().join("storage").to_string_lossy().into_owned(),
+                mvcc_cluster_id: "distributed-e2e".into(),
+                mvcc_raft_node_id: index as u64 + 1,
+                mvcc_node_incarnation: 1,
+                mvcc_failure_domain: format!("zone-{}", index + 1),
+                mvcc_peers_json: peers_json.clone(),
+                mvcc_bootstrap_membership: index == 0,
+                mvcc_bundle_quorum_holders: 2,
+                mvcc_tolerated_failure_domains: 1,
+                mvcc_rpc_timeout_ms: 5_000,
+                ..Config::default()
+            };
+            states.push(
+                AppState::new(
+                    config,
+                    personaldb_signing::PersonalDbProtocolKeyring::disabled(),
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        let mut servers = Vec::new();
+        for (listener, state) in listeners.into_iter().zip(states.iter()) {
+            let consensus = state.mvcc.consensus_service.clone();
+            let replication = state.mvcc.replication_service.clone();
+            servers.push(tokio::spawn(async move {
+                Server::builder()
+                    .add_service(ConsensusTransportServer::new(consensus))
+                    .add_service(ReplicationServiceServer::new(replication))
+                    .serve_with_incoming(TcpListenerStream::new(listener))
+                    .await
+                    .unwrap();
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if states[0].mvcc.consensus.linearized_read_barrier().await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("node one becomes leader");
+
+        let principal = "distributed-e2e-principal";
+        let key = LogicalKey {
+            table_id: 0x7f01,
+            application_key: b"ordered/quorum".to_vec(),
+        };
+        let handle = states[0]
+            .mvcc
+            .open_transactions
+            .begin(
+                states[0].mvcc.runtime.as_ref(),
+                "distributed-e2e",
+                principal,
+                "quorum-write",
+                Duration::from_secs(30),
+                DurabilityLevel::Quorum,
+                ReadConsistency::Linearized,
+                now_ms(),
+            )
+            .await
+            .unwrap();
+        states[0]
+            .mvcc
+            .open_transactions
+            .put(
+                &handle.transaction_id,
+                "distributed-e2e",
+                key.clone(),
+                b"replicated-value".to_vec(),
+                now_ms(),
+            )
+            .unwrap();
+        let outcome = states[0]
+            .mvcc
+            .open_transactions
+            .commit(
+                states[0].mvcc.runtime.as_ref(),
+                &handle.transaction_id,
+                principal,
+                now_ms(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome.certification,
+            mvcc_transaction::CertificationResult::Committed { .. }
+        ));
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if states[1]
+                    .mvcc
+                    .runtime
+                    .local_store()
+                    .read_latest(&key)
+                    .unwrap()
+                    .is_some_and(|row| row.value == b"replicated-value")
+                    && states[2]
+                        .mvcc
+                        .runtime
+                        .local_store()
+                        .read_latest(&key)
+                        .unwrap()
+                        .is_some_and(|row| row.value == b"replicated-value")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("followers apply the certified bundle in order");
+
+        let erasure_key = LogicalKey {
+            table_id: 0x7f01,
+            application_key: b"ordered/erasure".to_vec(),
+        };
+        let erasure_handle = states[0]
+            .mvcc
+            .open_transactions
+            .begin(
+                states[0].mvcc.runtime.as_ref(),
+                "distributed-e2e",
+                principal,
+                "erasure-write",
+                Duration::from_secs(30),
+                DurabilityLevel::Erasure,
+                ReadConsistency::Linearized,
+                now_ms(),
+            )
+            .await
+            .unwrap();
+        let erasure_profile = streaming_erasure::ErasureProfile {
+            data_shards: 1,
+            parity_shards: 1,
+            shard_bytes: 64,
+        };
+        let placement_policy = shard_placement::ShardPlacementPolicy {
+            tolerated_failure_domains: 1,
+        };
+        let object_identity = uuid::Uuid::from_u128(0x4455);
+        let placement = placement_policy
+            .plan(
+                object_identity,
+                1,
+                erasure_profile,
+                &states[0].mvcc.shard_candidates,
+            )
+            .unwrap();
+        let payload = b"erasure transaction payload reconstructed from acknowledged shards";
+        let mut payload_reader = std::io::Cursor::new(payload.as_slice());
+        let ingest = shard_placement::DistributedIngest::encode(
+            &states[0].mvcc.replication_client,
+            &placement,
+            placement_policy,
+            erasure_profile,
+            DurabilityLevel::Erasure,
+            &mut payload_reader,
+            object_identity,
+            None,
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ingest.placements.len(), 2);
+        assert_eq!(ingest.evidence.len(), 2);
+        let manifest = object_shard_manifest::PhysicalObjectShardManifest::from_ingest(
+            "distributed-e2e",
+            object_identity,
+            1,
+            erasure_profile.data_shards,
+            erasure_profile.parity_shards,
+            erasure_profile.shard_bytes,
+            &ingest,
+        )
+        .unwrap();
+        states[0]
+            .mvcc
+            .object_evidence
+            .record_ingest(&ingest)
+            .unwrap();
+        states[0]
+            .mvcc
+            .open_transactions
+            .add_manifest(
+                &erasure_handle.transaction_id,
+                "distributed-e2e",
+                manifest.reference().unwrap(),
+                now_ms(),
+            )
+            .unwrap();
+        states[0]
+            .mvcc
+            .open_transactions
+            .put(
+                &erasure_handle.transaction_id,
+                "distributed-e2e",
+                erasure_key.clone(),
+                b"erasure-certified".to_vec(),
+                now_ms(),
+            )
+            .unwrap();
+        let erasure_outcome = states[0]
+            .mvcc
+            .open_transactions
+            .commit(
+                states[0].mvcc.runtime.as_ref(),
+                &erasure_handle.transaction_id,
+                principal,
+                now_ms(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            erasure_outcome.certification,
+            mvcc_transaction::CertificationResult::Committed { .. }
+        ));
+        servers[2].abort();
+        let _ = (&mut servers[2]).await;
+        let reconstructed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        manifest
+            .read_range_chunks(
+                &states[0].mvcc.replication_client,
+                0,
+                manifest.object_length,
+                {
+                    let reconstructed = reconstructed.clone();
+                    move |chunk| {
+                        let reconstructed = reconstructed.clone();
+                        async move {
+                            reconstructed.lock().unwrap().extend_from_slice(&chunk);
+                            Ok(())
+                        }
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(&*reconstructed.lock().unwrap(), payload);
+        let restarted_listener = TcpListener::bind(addresses[2]).await.unwrap();
+        let consensus = states[2].mvcc.consensus_service.clone();
+        let replication = states[2].mvcc.replication_service.clone();
+        servers[2] = tokio::spawn(async move {
+            Server::builder()
+                .add_service(ConsensusTransportServer::new(consensus))
+                .add_service(ReplicationServiceServer::new(replication))
+                .serve_with_incoming(TcpListenerStream::new(restarted_listener))
+                .await
+                .unwrap();
+        });
+        let reconnect_key = LogicalKey {
+            table_id: 0x7f01,
+            application_key: b"ordered/reconnect".to_vec(),
+        };
+        let reconnect_handle = states[0]
+            .mvcc
+            .open_transactions
+            .begin(
+                states[0].mvcc.runtime.as_ref(),
+                "distributed-e2e",
+                principal,
+                "reconnect-write",
+                Duration::from_secs(30),
+                DurabilityLevel::Quorum,
+                ReadConsistency::Linearized,
+                now_ms(),
+            )
+            .await
+            .unwrap();
+        states[0]
+            .mvcc
+            .open_transactions
+            .put(
+                &reconnect_handle.transaction_id,
+                "distributed-e2e",
+                reconnect_key.clone(),
+                b"after-reconnect".to_vec(),
+                now_ms(),
+            )
+            .unwrap();
+        states[0]
+            .mvcc
+            .open_transactions
+            .commit(
+                states[0].mvcc.runtime.as_ref(),
+                &reconnect_handle.transaction_id,
+                principal,
+                now_ms(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if states[2]
+                    .mvcc
+                    .runtime
+                    .local_store()
+                    .read_latest(&reconnect_key)
+                    .unwrap()
+                    .is_some_and(|row| row.value == b"after-reconnect")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("reconnected follower applies the next certified bundle");
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if states[1]
+                    .mvcc
+                    .runtime
+                    .local_store()
+                    .read_latest(&erasure_key)
+                    .unwrap()
+                    .is_some_and(|row| row.value == b"erasure-certified")
+                    && states[2]
+                        .mvcc
+                        .runtime
+                        .local_store()
+                        .read_latest(&erasure_key)
+                        .unwrap()
+                        .is_some_and(|row| row.value == b"erasure-certified")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("followers apply erasure-certified transaction");
+
+        let foreign_target = bundle_replication::BundleTarget {
+            cluster_id: "foreign-cluster".into(),
+            node: mvcc_transaction::NodeIncarnation {
+                node_id: "node-2".into(),
+                incarnation: 1,
+            },
+            failure_domain: "zone-2".into(),
+        };
+        let foreign_error = states[0]
+            .mvcc
+            .replication_client
+            .send_bundle(
+                &foreign_target,
+                &mvcc_transaction::BundleIdentity {
+                    hash: format!(
+                        "sha256:{}",
+                        hex::encode(sha2::Sha256::digest(b"foreign-bundle"))
+                    ),
+                    length: 14,
+                },
+                b"foreign-bundle",
+            )
+            .await
+            .unwrap_err();
+        assert!(foreign_error.to_string().contains("cross-cluster"));
+
+        for server in servers {
+            server.abort();
+        }
+    }
 }

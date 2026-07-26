@@ -687,7 +687,7 @@ impl OpenTransactionRegistry {
 
 fn is_read_only_bundle(bundle: &TransactionBundle) -> bool {
     bundle.writes.is_empty()
-        && bundle.object_manifests.is_empty()
+        && bundle.shard_manifests.is_empty()
         && bundle.outbox_events.is_empty()
         && bundle.materialisation_jobs.is_empty()
 }
