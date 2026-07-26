@@ -789,5 +789,147 @@ pub fn personaldb_payload_hash(bytes: &[u8]) -> String {
     hex::encode(hash32(bytes))
 }
 
+pub fn read_personaldb_data_locator_row_at_snapshot(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    group_id: &str,
+    data_id: &str,
+    snapshot_version: u64,
+) -> Result<Option<PersonalDbDataLocatorCoreMetaRow>> {
+    let tuple = personaldb_data_locator_tuple_key(tenant_id, group_id, data_id)?;
+    let key = crate::mvcc_product::coremeta_logical_key(
+        CF_PERSONALDB,
+        TABLE_PERSONALDB_DATA_LOCATOR_ROW,
+        &tuple,
+    )?;
+    mvcc.runtime
+        .read_at(&key, snapshot_version)?
+        .map(|row| decode_data_locator_row(&row.value))
+        .transpose()
+}
+
+pub fn read_personaldb_data_locator_row_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    group_id: &str,
+    data_id: &str,
+) -> Result<Option<PersonalDbDataLocatorCoreMetaRow>> {
+    read_personaldb_data_locator_row_at_snapshot(
+        mvcc,
+        tenant_id,
+        group_id,
+        data_id,
+        mvcc.runtime.applied_version()?,
+    )
+}
+
+pub async fn write_personaldb_data_locator_row_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    row: &PersonalDbDataLocatorCoreMetaRow,
+    principal: &str,
+) -> Result<u64> {
+    validate_data_locator_row(row)?;
+    let tuple = personaldb_data_locator_tuple_key(row.tenant_id, &row.group_id, &row.data_id)?;
+    write_personaldb_product_row_mvcc(
+        mvcc,
+        row.tenant_id,
+        &row.group_id,
+        principal,
+        &row.transaction_id,
+        TABLE_PERSONALDB_DATA_LOCATOR_ROW,
+        tuple,
+        encode_data_locator_row(row)?,
+    )
+    .await
+}
+
+pub async fn write_personaldb_group_row_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    row: &PersonalDbGroupCoreMetaRow,
+    principal: &str,
+) -> Result<u64> {
+    validate_group_row(row)?;
+    let tuple = personaldb_group_tuple_key(row.tenant_id, &row.group_id, row.generation)?;
+    write_personaldb_product_row_mvcc(
+        mvcc,
+        row.tenant_id,
+        &row.group_id,
+        principal,
+        &row.transaction_id,
+        TABLE_PERSONALDB_GROUP_ROW,
+        tuple,
+        encode_group_row(row)?,
+    )
+    .await
+}
+
+async fn write_personaldb_product_row_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    group_id: &str,
+    principal: &str,
+    idempotency_key: &str,
+    table_id: u16,
+    tuple_key: Vec<u8>,
+    payload: Vec<u8>,
+) -> Result<u64> {
+    let key = crate::mvcc_product::coremeta_logical_key(CF_PERSONALDB, table_id, &tuple_key)?;
+    let predicate = mvcc
+        .read_latest_value(&key)?
+        .map(|current| {
+            crate::mvcc_transaction::PredicateKind::ValueHash(*blake3::hash(&current).as_bytes())
+        })
+        .unwrap_or(crate::mvcc_transaction::PredicateKind::Absent);
+    let assignment = mvcc
+        .reconcile_work_assignment(
+            "personaldb_group",
+            &personaldb_partition_id(tenant_id, group_id),
+        )
+        .await?
+        .ok_or_else(|| anyhow!("local node does not own PersonalDB group assignment"))?;
+    let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default();
+    let handle = mvcc
+        .open_transactions
+        .begin(
+            mvcc.runtime.as_ref(),
+            mvcc.cluster_id(),
+            principal,
+            idempotency_key,
+            std::time::Duration::from_secs(30),
+            crate::mvcc_transaction::DurabilityLevel::Quorum,
+            crate::mvcc_transaction::ReadConsistency::Linearized,
+            now,
+        )
+        .await?;
+    mvcc.stage_product_mutations(
+        &handle.transaction_id,
+        principal,
+        vec![crate::mvcc_product::ProductMutation::put(
+            key.clone(),
+            payload,
+        )],
+        now,
+    )?;
+    mvcc.stage_predicate(&handle.transaction_id, principal, key, predicate, now)?;
+    mvcc.stage_assignment_guard(&handle.transaction_id, principal, &assignment, now)?;
+    let outcome = mvcc
+        .open_transactions
+        .commit(
+            mvcc.runtime.as_ref(),
+            &handle.transaction_id,
+            principal,
+            now,
+        )
+        .await?;
+    match outcome.certification {
+        crate::mvcc_transaction::CertificationResult::Committed { commit_version } => {
+            Ok(commit_version)
+        }
+        crate::mvcc_transaction::CertificationResult::Aborted { reason } => {
+            bail!("PersonalDB MVCC row transaction aborted: {reason:?}")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;
