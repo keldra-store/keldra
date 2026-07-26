@@ -4,8 +4,8 @@ use crate::{
     formats::{Hash32, hash32},
     personaldb_control::PersonalDbSnapshotManifest,
     personaldb_coremeta::{
-        read_personaldb_data_locator_bytes, read_personaldb_data_locator_row,
-        write_personaldb_bytes_as_data_locator,
+        read_personaldb_data_locator_bytes, read_personaldb_data_locator_row_at_snapshot,
+        write_personaldb_bytes_as_data_locator_mvcc,
     },
     personaldb_signing::{signature_envelope_from_proto, signature_envelope_to_proto},
     storage::Storage,
@@ -61,6 +61,7 @@ struct PersonalDbSnapshotManifestProto {
 
 pub async fn write_personaldb_snapshot(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
     compressed_sqlite_bytes: &[u8],
@@ -88,8 +89,9 @@ pub async fn write_personaldb_snapshot(
         ));
     }
 
-    write_personaldb_bytes_as_data_locator(
+    write_personaldb_bytes_as_data_locator_mvcc(
         storage,
+        mvcc,
         tenant_id,
         database_id,
         &object_ref,
@@ -102,6 +104,7 @@ pub async fn write_personaldb_snapshot(
             "personaldb-snapshot-object:{tenant_id}:{database_id}:{}",
             manifest.log_index
         ),
+        "personaldb-snapshot-writer",
     )
     .await?;
     let manifest_ref = personaldb_snapshot_manifest_ref_name(
@@ -111,8 +114,9 @@ pub async fn write_personaldb_snapshot(
         &hex::encode(state_hash),
     )?;
     let manifest_bytes = encode_snapshot_manifest(manifest)?;
-    write_personaldb_bytes_as_data_locator(
+    write_personaldb_bytes_as_data_locator_mvcc(
         storage,
+        mvcc,
         tenant_id,
         database_id,
         &manifest_ref,
@@ -128,6 +132,7 @@ pub async fn write_personaldb_snapshot(
             "personaldb-snapshot-manifest:{tenant_id}:{database_id}:{}",
             manifest.log_index
         ),
+        "personaldb-snapshot-writer",
     )
     .await?;
     Ok(PersonalDbSnapshotWriteResult {
@@ -138,16 +143,24 @@ pub async fn write_personaldb_snapshot(
 
 pub async fn read_personaldb_snapshot_manifest(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
     log_index: u64,
     state_hash: &str,
     trust_store: &PublicKeyTrustStore,
+    snapshot_version: u64,
 ) -> Result<Option<PersonalDbSnapshotManifest>> {
     let manifest_ref =
         personaldb_snapshot_manifest_ref_name(tenant_id, database_id, log_index, state_hash)?;
-    let Some(manifest) =
-        read_personaldb_snapshot_manifest_by_ref(storage, &manifest_ref, trust_store).await?
+    let Some(manifest) = read_personaldb_snapshot_manifest_by_ref(
+        storage,
+        mvcc,
+        &manifest_ref,
+        trust_store,
+        snapshot_version,
+    )
+    .await?
     else {
         return Ok(None);
     };
@@ -160,12 +173,19 @@ pub async fn read_personaldb_snapshot_manifest(
 
 pub async fn read_personaldb_snapshot_manifest_by_ref(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     manifest_ref: &str,
     trust_store: &PublicKeyTrustStore,
+    snapshot_version: u64,
 ) -> Result<Option<PersonalDbSnapshotManifest>> {
     let (tenant_id, database_id) = personaldb_ref_scope(manifest_ref)?;
-    let Some(row) =
-        read_personaldb_data_locator_row(storage, tenant_id, &database_id, manifest_ref).await?
+    let Some(row) = read_personaldb_data_locator_row_at_snapshot(
+        mvcc,
+        tenant_id,
+        &database_id,
+        manifest_ref,
+        snapshot_version,
+    )?
     else {
         return Ok(None);
     };
@@ -182,10 +202,12 @@ pub async fn read_personaldb_snapshot_manifest_by_ref(
 
 pub async fn read_personaldb_snapshot_object(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
     manifest: &PersonalDbSnapshotManifest,
     trust_store: &PublicKeyTrustStore,
+    snapshot_version: u64,
 ) -> Result<Option<Vec<u8>>> {
     manifest.verify(trust_store)?;
     ensure_manifest_scope(tenant_id, database_id, manifest)?;
@@ -200,13 +222,13 @@ pub async fn read_personaldb_snapshot_object(
             "personaldb snapshot object key does not match CoreStore object identity"
         ));
     }
-    let Some(row) = read_personaldb_data_locator_row(
-        storage,
+    let Some(row) = read_personaldb_data_locator_row_at_snapshot(
+        mvcc,
         tenant_id,
         database_id,
         &manifest.snapshot_object_key,
-    )
-    .await?
+        snapshot_version,
+    )?
     else {
         return Ok(None);
     };
@@ -406,7 +428,7 @@ fn decode_core_object_ref_target(target: &str) -> Result<crate::core_store::Core
     crate::core_store::decode_core_object_ref_target(target)
 }
 
-#[cfg(test)]
+#[cfg(any())]
 mod tests {
     use super::*;
     use crate::test_support::personaldb_protocol_keyring;

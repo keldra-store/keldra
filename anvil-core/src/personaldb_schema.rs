@@ -2,8 +2,8 @@ use crate::{
     anvil_personaldb_sqlite_changeset::DecodedSqliteChangesetChange,
     formats::hash32,
     personaldb_coremeta::{
-        read_personaldb_data_locator_bytes, read_personaldb_data_locator_row,
-        write_personaldb_bytes_as_data_locator,
+        read_personaldb_data_locator_bytes, read_personaldb_data_locator_row_at_snapshot,
+        write_personaldb_bytes_as_data_locator_mvcc,
     },
     storage::Storage,
 };
@@ -15,6 +15,7 @@ const PERSONALDB_SCHEMA_REF_PREFIX: &str = "personaldb_schema_sql:";
 
 pub async fn write_personaldb_schema_sql(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
     schema_sql: &str,
@@ -22,8 +23,9 @@ pub async fn write_personaldb_schema_sql(
 ) -> Result<()> {
     validate_schema_sql(schema_sql, schema_hash)?;
     let ref_name = personaldb_schema_ref_name(tenant_id, database_id)?;
-    write_personaldb_bytes_as_data_locator(
+    write_personaldb_bytes_as_data_locator_mvcc(
         storage,
+        mvcc,
         tenant_id,
         database_id,
         &ref_name,
@@ -33,6 +35,7 @@ pub async fn write_personaldb_schema_sql(
         schema_hash.to_string(),
         vec![format!("schema_hash:{schema_hash}")],
         format!("personaldb-schema:{tenant_id}:{database_id}:{schema_hash}"),
+        "personaldb-schema-writer",
     )
     .await?;
     Ok(())
@@ -40,13 +43,20 @@ pub async fn write_personaldb_schema_sql(
 
 pub async fn read_personaldb_schema_sql(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
     schema_hash: &str,
+    snapshot_version: u64,
 ) -> Result<Option<String>> {
     let ref_name = personaldb_schema_ref_name(tenant_id, database_id)?;
-    let Some(row) =
-        read_personaldb_data_locator_row(storage, tenant_id, database_id, &ref_name).await?
+    let Some(row) = read_personaldb_data_locator_row_at_snapshot(
+        mvcc,
+        tenant_id,
+        database_id,
+        &ref_name,
+        snapshot_version,
+    )?
     else {
         return Ok(None);
     };

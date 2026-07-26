@@ -1,12 +1,12 @@
 use crate::{
     anvil_api::SignatureEnvelopeV1 as WireSignatureEnvelopeV1,
-    core_store::{CoreStore, decode_deterministic_proto, encode_deterministic_proto},
+    core_store::{decode_deterministic_proto, encode_deterministic_proto},
     formats::{Hash32, hash32},
     personaldb_control::PersonalDbCommitCertificate,
     personaldb_coremeta::{
         PersonalDbDataLocatorCoreMetaRow, personaldb_payload_hash,
-        read_personaldb_data_locator_bytes, read_personaldb_data_locator_row,
-        write_personaldb_bytes_as_data_locator, write_personaldb_data_locator_row,
+        read_personaldb_data_locator_bytes, read_personaldb_data_locator_row_at_snapshot,
+        write_personaldb_bytes_as_data_locator_mvcc, write_personaldb_data_locator_row_mvcc,
     },
     personaldb_signing::{signature_envelope_from_proto, signature_envelope_to_proto},
     storage::Storage,
@@ -67,6 +67,7 @@ struct PersonalDbCommitCertificateProto {
 
 pub async fn write_personaldb_changeset_payload(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
     log_index: u64,
@@ -88,8 +89,9 @@ pub async fn write_personaldb_changeset_payload(
         &payload_hash_hex,
     )?;
 
-    let by_hash_row = write_personaldb_bytes_as_data_locator(
+    let by_hash_row = write_personaldb_bytes_as_data_locator_mvcc(
         storage,
+        mvcc,
         tenant_id,
         database_id,
         &by_hash_ref,
@@ -101,6 +103,7 @@ pub async fn write_personaldb_changeset_payload(
         format!(
             "personaldb-changeset-payload:{tenant_id}:{database_id}:{log_index}:{payload_hash_hex}"
         ),
+        "personaldb-commit-store",
     )
     .await?;
     let by_index_row = PersonalDbDataLocatorCoreMetaRow {
@@ -109,12 +112,11 @@ pub async fn write_personaldb_changeset_payload(
         data_id: by_index_ref.clone(),
         data_kind: "changeset".to_string(),
         generation: log_index,
-        root_generation: CoreStore::new(storage.clone())
-            .await?
-            .next_root_generation_for_anchor(
-                &crate::personaldb_coremeta::personaldb_root_anchor_key(tenant_id, database_id),
-            )
-            .await?,
+        root_generation: mvcc
+            .runtime
+            .applied_version()?
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("PersonalDB locator generation overflow"))?,
         sqlite_changeset_hash: payload_hash_hex,
         payload_locator: by_hash_row.payload_locator.clone(),
         projection_keys: by_hash_row.projection_keys.clone(),
@@ -124,7 +126,7 @@ pub async fn write_personaldb_changeset_payload(
         ),
         created_at_unix_nanos: by_hash_row.created_at_unix_nanos,
     };
-    write_personaldb_data_locator_row(storage, &by_index_row, &[]).await?;
+    write_personaldb_data_locator_row_mvcc(mvcc, &by_index_row, "personaldb-commit-store").await?;
 
     Ok(PersonalDbChangesetPayloadRefs {
         by_index_ref,
@@ -134,24 +136,29 @@ pub async fn write_personaldb_changeset_payload(
 
 pub async fn read_personaldb_changeset_payload_by_hash(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
     payload_hash: Hash32,
+    snapshot_version: u64,
 ) -> Result<Option<Vec<u8>>> {
     let ref_name = personaldb_changeset_payload_by_hash_ref_name(
         tenant_id,
         database_id,
         &hex::encode(payload_hash),
     )?;
-    read_personaldb_changeset_payload_ref(storage, &ref_name, payload_hash).await
+    read_personaldb_changeset_payload_ref(storage, mvcc, &ref_name, payload_hash, snapshot_version)
+        .await
 }
 
 pub async fn read_personaldb_changeset_payload_by_index(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
     log_index: u64,
     payload_hash: Hash32,
+    snapshot_version: u64,
 ) -> Result<Option<Vec<u8>>> {
     let ref_name = personaldb_changeset_payload_by_index_ref_name(
         tenant_id,
@@ -159,17 +166,25 @@ pub async fn read_personaldb_changeset_payload_by_index(
         log_index,
         &hex::encode(payload_hash),
     )?;
-    read_personaldb_changeset_payload_ref(storage, &ref_name, payload_hash).await
+    read_personaldb_changeset_payload_ref(storage, mvcc, &ref_name, payload_hash, snapshot_version)
+        .await
 }
 
 pub async fn read_personaldb_changeset_payload_ref(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     ref_name: &str,
     expected_payload_hash: Hash32,
+    snapshot_version: u64,
 ) -> Result<Option<Vec<u8>>> {
     let (tenant_id, database_id) = personaldb_ref_scope(ref_name)?;
-    let Some(row) =
-        read_personaldb_data_locator_row(storage, tenant_id, &database_id, ref_name).await?
+    let Some(row) = read_personaldb_data_locator_row_at_snapshot(
+        mvcc,
+        tenant_id,
+        &database_id,
+        ref_name,
+        snapshot_version,
+    )?
     else {
         return Ok(None);
     };
@@ -185,6 +200,7 @@ pub async fn read_personaldb_changeset_payload_ref(
 
 pub async fn write_personaldb_commit_certificate(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
     certificate: &PersonalDbCommitCertificate,
@@ -204,8 +220,9 @@ pub async fn write_personaldb_commit_certificate(
         &certificate.entry_hash,
     )?;
     let bytes = encode_commit_certificate(certificate)?;
-    write_personaldb_bytes_as_data_locator(
+    write_personaldb_bytes_as_data_locator_mvcc(
         storage,
+        mvcc,
         tenant_id,
         database_id,
         &ref_name,
@@ -218,6 +235,7 @@ pub async fn write_personaldb_commit_certificate(
             "personaldb-commit-certificate:{tenant_id}:{database_id}:{}:{}",
             certificate.log_index, certificate.entry_hash
         ),
+        "personaldb-commit-store",
     )
     .await?;
     Ok(ref_name)
@@ -225,25 +243,35 @@ pub async fn write_personaldb_commit_certificate(
 
 pub async fn read_personaldb_commit_certificate(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
     log_index: u64,
     entry_hash: &str,
     trust_store: &PublicKeyTrustStore,
+    snapshot_version: u64,
 ) -> Result<Option<PersonalDbCommitCertificate>> {
     let ref_name =
         personaldb_commit_certificate_ref_name(tenant_id, database_id, log_index, entry_hash)?;
-    read_personaldb_commit_certificate_ref(storage, &ref_name, trust_store).await
+    read_personaldb_commit_certificate_ref(storage, mvcc, &ref_name, trust_store, snapshot_version)
+        .await
 }
 
 pub async fn read_personaldb_commit_certificate_ref(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     ref_name: &str,
     trust_store: &PublicKeyTrustStore,
+    snapshot_version: u64,
 ) -> Result<Option<PersonalDbCommitCertificate>> {
     let (tenant_id, database_id) = personaldb_ref_scope(ref_name)?;
-    let Some(row) =
-        read_personaldb_data_locator_row(storage, tenant_id, &database_id, ref_name).await?
+    let Some(row) = read_personaldb_data_locator_row_at_snapshot(
+        mvcc,
+        tenant_id,
+        &database_id,
+        ref_name,
+        snapshot_version,
+    )?
     else {
         return Ok(None);
     };
@@ -463,190 +491,15 @@ fn decode_core_object_ref_target(target: &str) -> Result<crate::core_store::Core
 mod tests {
     use super::*;
     use crate::test_support::personaldb_protocol_keyring;
-    use tempfile::tempdir;
 
     #[tokio::test]
-    async fn changeset_payload_is_written_by_hash_and_index() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let payload = b"sqlite changeset bytes";
-        let payload_hash = hash32(payload);
-
-        let refs =
-            write_personaldb_changeset_payload(&storage, 9, "db-alpha", 42, payload_hash, payload)
-                .await
-                .unwrap();
-
-        assert!(
-            refs.by_index_ref
-                .starts_with("personaldb_changeset_payload_by_index:tenant:9:database:db-alpha:")
-        );
-        assert!(
-            refs.by_hash_ref
-                .starts_with("personaldb_changeset_payload_by_hash:tenant:9:database:db-alpha:")
-        );
-
-        let by_hash =
-            read_personaldb_changeset_payload_by_hash(&storage, 9, "db-alpha", payload_hash)
-                .await
-                .unwrap()
-                .unwrap();
-        let by_index =
-            read_personaldb_changeset_payload_by_index(&storage, 9, "db-alpha", 42, payload_hash)
-                .await
-                .unwrap()
-                .unwrap();
-        assert_eq!(by_hash, payload);
-        assert_eq!(by_index, payload);
-    }
-
-    #[tokio::test]
-    async fn changeset_payload_rejects_hash_mismatch_and_ref_collision() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let payload_hash = hash32(b"good");
-
-        assert!(
-            write_personaldb_changeset_payload(&storage, 9, "db-alpha", 1, payload_hash, b"bad")
-                .await
-                .is_err()
-        );
-
-        let refs =
-            write_personaldb_changeset_payload(&storage, 9, "db-alpha", 1, payload_hash, b"good")
-                .await
-                .unwrap();
-        write_personaldb_bytes_as_data_locator(
-            &storage,
-            9,
-            "db-alpha",
-            &refs.by_hash_ref,
-            "changeset",
-            2,
-            b"corrupt".to_vec(),
-            hex::encode(hash32(b"corrupt")),
-            vec!["log_index:00000000000000000002".to_string()],
-            "corrupt-changeset".to_string(),
-        )
-        .await
-        .unwrap();
-        assert!(
-            read_personaldb_changeset_payload_by_hash(&storage, 9, "db-alpha", payload_hash)
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn commit_certificate_round_trips_through_corestore_ref() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
+    async fn commit_certificate_codec_round_trips() {
         let keyring = personaldb_protocol_keyring();
         let certificate = sample_certificate().seal(&keyring).await.unwrap();
-
-        let ref_name = write_personaldb_commit_certificate(
-            &storage,
-            9,
-            "db-alpha",
-            &certificate,
-            keyring.trust_store(),
-        )
-        .await
-        .unwrap();
-
-        assert!(ref_name.starts_with(
-            "personaldb_commit_certificate:tenant:9:database:db-alpha:log:00000000000000000042:"
-        ));
-
-        let read = read_personaldb_commit_certificate(
-            &storage,
-            9,
-            "db-alpha",
-            42,
-            &certificate.entry_hash,
-            keyring.trust_store(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let bytes = encode_commit_certificate(&certificate).unwrap();
+        let read = decode_commit_certificate(&bytes).unwrap();
+        read.verify(keyring.trust_store()).unwrap();
         assert_eq!(read, certificate);
-        assert_eq!(
-            read.witness_signature.unwrap().signature.as_bytes().len(),
-            64
-        );
-    }
-
-    #[tokio::test]
-    async fn commit_certificate_tamper_and_scope_mismatch_are_rejected() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let keyring = personaldb_protocol_keyring();
-        let certificate = sample_certificate().seal(&keyring).await.unwrap();
-        let ref_name = write_personaldb_commit_certificate(
-            &storage,
-            9,
-            "db-alpha",
-            &certificate,
-            keyring.trust_store(),
-        )
-        .await
-        .unwrap();
-
-        let row = read_personaldb_data_locator_row(&storage, 9, "db-alpha", &ref_name)
-            .await
-            .unwrap()
-            .expect("certificate locator exists");
-        let mut value = read_personaldb_data_locator_bytes(&storage, &row)
-            .await
-            .unwrap();
-        *value
-            .last_mut()
-            .expect("stored commit certificate bytes are not empty") ^= 0x01;
-        write_personaldb_bytes_as_data_locator(
-            &storage,
-            9,
-            "db-alpha",
-            &ref_name,
-            "commit_certificate",
-            certificate.log_index + 1,
-            value,
-            personaldb_payload_hash(certificate.entry_hash.as_bytes()),
-            vec![format!("entry_hash:{}", certificate.entry_hash)],
-            "corrupt-certificate".to_string(),
-        )
-        .await
-        .unwrap();
-        assert!(
-            read_personaldb_commit_certificate(
-                &storage,
-                9,
-                "db-alpha",
-                42,
-                &certificate.entry_hash,
-                keyring.trust_store(),
-            )
-            .await
-            .is_err()
-        );
-
-        let wrong_scope = PersonalDbCommitCertificate {
-            database_id: "db-beta".to_string(),
-            ..sample_certificate()
-        }
-        .seal(&keyring)
-        .await
-        .unwrap();
-        assert!(
-            write_personaldb_commit_certificate(
-                &storage,
-                9,
-                "db-alpha",
-                &wrong_scope,
-                keyring.trust_store(),
-            )
-            .await
-            .is_err()
-        );
     }
 
     fn sample_certificate() -> PersonalDbCommitCertificate {

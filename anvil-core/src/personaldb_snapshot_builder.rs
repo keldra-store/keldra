@@ -67,9 +67,11 @@ pub async fn maybe_build_personaldb_snapshot(
     let snapshot_version = mvcc.runtime.applied_version()?;
     let manifest = read_personaldb_group_manifest(
         storage,
+        mvcc,
         request.tenant_id,
         request.database_id,
         protocol_keyring.trust_store(),
+        snapshot_version,
     )
     .await?
     .ok_or_else(|| anyhow!("personaldb group manifest missing"))?;
@@ -104,7 +106,14 @@ pub async fn maybe_build_personaldb_snapshot(
         return Ok(None);
     }
 
-    let records = read_canonical_records(storage, request.database_id, &committed_head).await?;
+    let records = read_canonical_records(
+        storage,
+        mvcc,
+        request.database_id,
+        &committed_head,
+        snapshot_version,
+    )
+    .await?;
     ensure_head_matches_records(&committed_head, &records)?;
     let new_records = records
         .iter()
@@ -113,9 +122,11 @@ pub async fn maybe_build_personaldb_snapshot(
         .collect::<Vec<_>>();
     let payload_bytes = sum_changeset_payload_bytes(
         storage,
+        mvcc,
         request.tenant_id,
         request.database_id,
         &new_records,
+        snapshot_version,
     )
     .await?;
     if (new_records.len() as u64) < request.policy.entry_threshold
@@ -153,10 +164,12 @@ async fn build_snapshot(
     if let Some(snapshot_head) = previous_snapshot {
         restore_snapshot_database_scratch(
             storage,
+            mvcc,
             request,
             protocol_keyring.trust_store(),
             snapshot_head,
             &temp_path,
+            snapshot_version,
         )
         .await?;
     }
@@ -167,9 +180,15 @@ async fn build_snapshot(
             connection.execute_batch(request.schema_sql)?;
         }
         for record in new_records {
-            let changeset =
-                load_changeset_bytes(storage, request.tenant_id, request.database_id, record)
-                    .await?;
+            let changeset = load_changeset_bytes(
+                storage,
+                mvcc,
+                request.tenant_id,
+                request.database_id,
+                record,
+                snapshot_version,
+            )
+            .await?;
             apply_changeset_to_snapshot_builder(&connection, &changeset)?;
         }
         connection.execute_batch("PRAGMA optimize;")?;
@@ -214,6 +233,7 @@ async fn build_snapshot(
 
     write_personaldb_snapshot(
         storage,
+        mvcc,
         request.tenant_id,
         request.database_id,
         &compressed_sqlite_bytes,
@@ -231,15 +251,19 @@ async fn build_snapshot(
 
 async fn restore_snapshot_database_scratch(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     request: PersonalDbSnapshotBuildRequest<'_>,
     trust_store: &PublicKeyTrustStore,
     snapshot_head: &PersonalDbSnapshotsHead,
     target_path: &Path,
+    snapshot_version: u64,
 ) -> Result<()> {
     let manifest = read_personaldb_snapshot_manifest_by_ref(
         storage,
+        mvcc,
         &snapshot_head.latest_snapshot_manifest_ref,
         trust_store,
+        snapshot_version,
     )
     .await?
     .ok_or_else(|| anyhow!("personaldb snapshot manifest missing"))?;
@@ -252,10 +276,12 @@ async fn restore_snapshot_database_scratch(
     }
     let compressed = read_personaldb_snapshot_object(
         storage,
+        mvcc,
         request.tenant_id,
         request.database_id,
         &manifest,
         trust_store,
+        snapshot_version,
     )
     .await?
     .ok_or_else(|| anyhow!("personaldb snapshot object missing"))?;
@@ -307,8 +333,10 @@ async fn publish_snapshots_head(
 
 async fn read_canonical_records(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     database_id: &str,
     committed_head: &PersonalDbCommittedHead,
+    snapshot_version: u64,
 ) -> Result<Vec<PersonalDbLogRecord>> {
     if committed_head.log_index == 0 {
         return Ok(Vec::new());
@@ -317,10 +345,12 @@ async fn read_canonical_records(
         .tenant_id
         .parse::<i64>()
         .context("personaldb committed head tenant id must be numeric")?;
-    let segment_refs = list_personaldb_log_segment_refs(storage, tenant_id, database_id).await?;
+    let segment_refs =
+        list_personaldb_log_segment_refs(mvcc, tenant_id, database_id, snapshot_version).await?;
     let mut records = Vec::new();
     for segment_ref in segment_refs {
-        let segment = read_personaldb_log_segment(storage, &segment_ref).await?;
+        let segment =
+            read_personaldb_log_segment(storage, mvcc, &segment_ref, snapshot_version).await?;
         for record in segment.records {
             if record.log_index <= committed_head.log_index {
                 records.push(record);
@@ -334,15 +364,24 @@ async fn read_canonical_records(
 
 async fn sum_changeset_payload_bytes(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
     records: &[PersonalDbLogRecord],
+    snapshot_version: u64,
 ) -> Result<u64> {
     let mut total = 0u64;
     for record in records {
-        let len = load_changeset_bytes(storage, tenant_id, database_id, record)
-            .await?
-            .len();
+        let len = load_changeset_bytes(
+            storage,
+            mvcc,
+            tenant_id,
+            database_id,
+            record,
+            snapshot_version,
+        )
+        .await?
+        .len();
         total = total
             .checked_add(len as u64)
             .ok_or_else(|| anyhow!("personaldb snapshot payload byte count overflow"))?;
@@ -352,26 +391,32 @@ async fn sum_changeset_payload_bytes(
 
 async fn load_changeset_bytes(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
     record: &PersonalDbLogRecord,
+    snapshot_version: u64,
 ) -> Result<Vec<u8>> {
     if !record.payload_ref.is_empty() {
         let payload_ref = std::str::from_utf8(&record.payload_ref)?;
         return read_personaldb_changeset_payload_ref(
             storage,
+            mvcc,
             payload_ref,
             record.changeset_payload_hash,
+            snapshot_version,
         )
         .await?
         .ok_or_else(|| anyhow!("personaldb changeset payload is missing"));
     }
     read_personaldb_changeset_payload_by_index(
         storage,
+        mvcc,
         tenant_id,
         database_id,
         record.log_index,
         record.changeset_payload_hash,
+        snapshot_version,
     )
     .await?
     .ok_or_else(|| anyhow!("personaldb changeset payload is missing"))

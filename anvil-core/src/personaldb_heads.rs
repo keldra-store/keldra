@@ -1,18 +1,15 @@
 use crate::{
     anvil_api::SignatureEnvelopeV1 as WireSignatureEnvelopeV1,
     core_store::{
-        CF_PERSONALDB, CoreMetaTuplePart, CoreMutationBatch, CoreMutationPrecondition,
-        CoreMutationRootPublication, CoreStore, TABLE_PERSONALDB_GROUP_ROW, core_meta_tuple_key,
+        CF_PERSONALDB, CoreMetaTuplePart, TABLE_PERSONALDB_GROUP_ROW, core_meta_tuple_key,
         decode_deterministic_proto, encode_deterministic_proto,
     },
-    formats::{hash32, writer::WriterFamily},
+    formats::hash32,
     personaldb_control::PersonalDbGroupManifest,
     personaldb_coremeta::{
-        PersonalDbDataLocatorCoreMetaRow, PersonalDbGroupCoreMetaRow,
-        personaldb_data_locator_precondition, personaldb_group_coremeta_put_operation,
-        personaldb_partition_id, personaldb_payload_hash, personaldb_root_anchor_key,
-        read_personaldb_data_locator_bytes, read_personaldb_data_locator_row,
-        write_personaldb_bytes_as_data_locator_with_preconditions,
+        PersonalDbDataLocatorCoreMetaRow, PersonalDbGroupCoreMetaRow, personaldb_payload_hash,
+        read_personaldb_data_locator_bytes, read_personaldb_data_locator_row_at_snapshot,
+        write_personaldb_bytes_as_data_locator_mvcc, write_personaldb_group_row_mvcc,
     },
     personaldb_signing::{
         PersonalDbProtocolKeyring, signature_envelope_from_proto, signature_envelope_to_proto,
@@ -268,6 +265,7 @@ pub fn hash_snapshots_head(head: &PersonalDbSnapshotsHead) -> Result<String> {
 
 pub async fn write_personaldb_group_manifest(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     manifest: &PersonalDbGroupManifest,
     trust_store: &PublicKeyTrustStore,
@@ -281,6 +279,7 @@ pub async fn write_personaldb_group_manifest(
     )?;
     write_head_record(
         storage,
+        mvcc,
         &personaldb_head_data_id(tenant_id, &manifest.database_id, "group_manifest")?,
         manifest,
     )
@@ -289,13 +288,17 @@ pub async fn write_personaldb_group_manifest(
 
 pub async fn read_personaldb_group_manifest(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
     trust_store: &PublicKeyTrustStore,
+    snapshot_version: u64,
 ) -> Result<Option<PersonalDbGroupManifest>> {
     let Some(manifest) = read_head_record::<PersonalDbGroupManifest>(
         storage,
+        mvcc,
         &personaldb_head_data_id(tenant_id, database_id, "group_manifest")?,
+        snapshot_version,
     )
     .await?
     else {
@@ -407,23 +410,16 @@ fn require_corestore_ref(value: &str, field: &'static str, prefix: &str) -> Resu
 
 async fn write_head_record<T: PersonalDbHeadRecordCodec>(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     data_id: &str,
     value: &T,
-) -> Result<()> {
-    write_head_record_with_preconditions(storage, data_id, value, Vec::new()).await
-}
-
-async fn write_head_record_with_preconditions<T: PersonalDbHeadRecordCodec>(
-    storage: &Storage,
-    data_id: &str,
-    value: &T,
-    preconditions: Vec<CoreMutationPrecondition>,
 ) -> Result<()> {
     let (tenant_id, database_id) = personaldb_head_scope(data_id)?;
     let encoded = value.encode_record()?;
     let payload_hash = personaldb_payload_hash(&encoded);
-    let row = write_personaldb_bytes_as_data_locator_with_preconditions(
+    let row = write_personaldb_bytes_as_data_locator_mvcc(
         storage,
+        mvcc,
         tenant_id,
         &database_id,
         data_id,
@@ -433,46 +429,29 @@ async fn write_head_record_with_preconditions<T: PersonalDbHeadRecordCodec>(
         payload_hash,
         vec![format!("kind:{}", value.data_kind())],
         format!("personaldb-head:{}", uuid::Uuid::new_v4().simple()),
-        &preconditions,
+        "system:personaldb",
     )
     .await?;
     if let Some(group_row) = value.group_coremeta_row(tenant_id, &database_id, &row)? {
-        let scope_partition = personaldb_partition_id(tenant_id, &database_id);
-        CoreStore::new(storage.clone())
-            .await?
-            .commit_mutation_batch(CoreMutationBatch {
-                transaction_id: format!(
-                    "personaldb-head-group:{}:{}",
-                    group_row.group_id, group_row.generation
-                ),
-                scope_partition: scope_partition.clone(),
-                committed_by_principal: "system:personaldb".to_string(),
-                root_publications: vec![
-                    CoreMutationRootPublication::new(
-                        scope_partition,
-                        WriterFamily::CoreControl.as_str(),
-                    )
-                    .coordinator(),
-                    CoreMutationRootPublication::new(
-                        personaldb_root_anchor_key(group_row.tenant_id, &group_row.group_id),
-                        WriterFamily::PersonalDb.as_str(),
-                    ),
-                ],
-                preconditions,
-                operations: vec![personaldb_group_coremeta_put_operation(&group_row)?],
-            })
-            .await?;
+        write_personaldb_group_row_mvcc(mvcc, &group_row, "system:personaldb").await?;
     }
     Ok(())
 }
 
 async fn read_head_record<T: PersonalDbHeadRecordCodec>(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     data_id: &str,
+    snapshot_version: u64,
 ) -> Result<Option<T>> {
     let (tenant_id, database_id) = personaldb_head_scope(data_id)?;
-    let Some(row) =
-        read_personaldb_data_locator_row(storage, tenant_id, &database_id, data_id).await?
+    let Some(row) = read_personaldb_data_locator_row_at_snapshot(
+        mvcc,
+        tenant_id,
+        &database_id,
+        data_id,
+        snapshot_version,
+    )?
     else {
         return Ok(None);
     };

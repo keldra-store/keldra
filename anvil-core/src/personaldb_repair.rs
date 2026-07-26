@@ -100,24 +100,33 @@ async fn assess_log_chain(
     database_id: &str,
     trust_store: &PublicKeyTrustStore,
 ) -> Result<PersonalDbLogChainRepairReport> {
-    let manifest =
-        match read_personaldb_group_manifest(storage, tenant_id, database_id, trust_store).await {
-            Ok(Some(manifest)) => manifest,
-            Ok(None) => {
-                return Ok(report_without_head(
-                    tenant_id,
-                    database_id,
-                    PersonalDbLogChainRepairReason::MissingManifest,
-                ));
-            }
-            Err(err) => {
-                return Ok(report_without_head(
-                    tenant_id,
-                    database_id,
-                    PersonalDbLogChainRepairReason::InvalidManifest(err.to_string()),
-                ));
-            }
-        };
+    let snapshot_version = mvcc.runtime.applied_version()?;
+    let manifest = match read_personaldb_group_manifest(
+        storage,
+        mvcc,
+        tenant_id,
+        database_id,
+        trust_store,
+        snapshot_version,
+    )
+    .await
+    {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) => {
+            return Ok(report_without_head(
+                tenant_id,
+                database_id,
+                PersonalDbLogChainRepairReason::MissingManifest,
+            ));
+        }
+        Err(err) => {
+            return Ok(report_without_head(
+                tenant_id,
+                database_id,
+                PersonalDbLogChainRepairReason::InvalidManifest(err.to_string()),
+            ));
+        }
+    };
     let head = match crate::personaldb_proposal_admission::read_personaldb_committed_head_mvcc(
         mvcc,
         tenant_id,
@@ -170,7 +179,16 @@ async fn assess_log_chain(
         });
     }
 
-    let records = match read_records_through_head(storage, tenant_id, database_id, &head).await {
+    let records = match read_records_through_head(
+        storage,
+        mvcc,
+        tenant_id,
+        database_id,
+        &head,
+        snapshot_version,
+    )
+    .await
+    {
         Ok(records) => records,
         Err(reason) => return Ok(report_with_head(tenant_id, database_id, &head, 0, reason)),
     };
@@ -199,7 +217,16 @@ async fn assess_log_chain(
 
     let mut verified_log_index = 0;
     for record in &records {
-        if let Err(reason) = verify_record_payload(storage, tenant_id, database_id, record).await {
+        if let Err(reason) = verify_record_payload(
+            storage,
+            mvcc,
+            tenant_id,
+            database_id,
+            record,
+            snapshot_version,
+        )
+        .await
+        {
             return Ok(report_with_head(
                 tenant_id,
                 database_id,
@@ -208,8 +235,16 @@ async fn assess_log_chain(
                 reason,
             ));
         }
-        if let Err(reason) =
-            verify_record_certificate(storage, tenant_id, database_id, record, trust_store).await
+        if let Err(reason) = verify_record_certificate(
+            storage,
+            mvcc,
+            tenant_id,
+            database_id,
+            record,
+            trust_store,
+            snapshot_version,
+        )
+        .await
         {
             return Ok(report_with_head(
                 tenant_id,
@@ -235,11 +270,13 @@ async fn assess_log_chain(
 
 async fn read_records_through_head(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
     head: &PersonalDbCommittedHead,
+    snapshot_version: u64,
 ) -> std::result::Result<Vec<PersonalDbLogRecord>, PersonalDbLogChainRepairReason> {
-    let segment_refs = list_log_segment_refs(storage, tenant_id, database_id)
+    let segment_refs = list_log_segment_refs(mvcc, tenant_id, database_id, snapshot_version)
         .await
         .map_err(|err| PersonalDbLogChainRepairReason::InvalidLogSegment {
             segment_id: "segment-directory".to_string(),
@@ -254,7 +291,7 @@ async fn read_records_through_head(
     let mut records = Vec::new();
     for segment_ref in segment_refs {
         let segment_id = segment_ref.clone();
-        let segment = read_personaldb_log_segment(storage, &segment_ref)
+        let segment = read_personaldb_log_segment(storage, mvcc, &segment_ref, snapshot_version)
             .await
             .map_err(|err| PersonalDbLogChainRepairReason::InvalidLogSegment {
                 segment_id: segment_id.clone(),
@@ -280,11 +317,12 @@ async fn read_records_through_head(
 }
 
 async fn list_log_segment_refs(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
+    snapshot_version: u64,
 ) -> Result<Vec<String>> {
-    list_personaldb_log_segment_refs(storage, tenant_id, database_id).await
+    list_personaldb_log_segment_refs(mvcc, tenant_id, database_id, snapshot_version).await
 }
 
 fn validate_chain_against_manifest_and_head(
@@ -339,9 +377,11 @@ fn validate_chain_against_manifest_and_head(
 
 async fn verify_record_payload(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
     record: &PersonalDbLogRecord,
+    snapshot_version: u64,
 ) -> std::result::Result<(), PersonalDbLogChainRepairReason> {
     let bytes = if !record.payload_ref.is_empty() {
         let payload_ref = std::str::from_utf8(&record.payload_ref).map_err(|err| {
@@ -352,8 +392,10 @@ async fn verify_record_payload(
         })?;
         match read_personaldb_changeset_payload_ref(
             storage,
+            mvcc,
             payload_ref,
             record.changeset_payload_hash,
+            snapshot_version,
         )
         .await
         {
@@ -373,10 +415,12 @@ async fn verify_record_payload(
     } else {
         match read_personaldb_changeset_payload_by_index(
             storage,
+            mvcc,
             tenant_id,
             database_id,
             record.log_index,
             record.changeset_payload_hash,
+            snapshot_version,
         )
         .await
         {
@@ -406,10 +450,12 @@ async fn verify_record_payload(
 
 async fn verify_record_certificate(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
     record: &PersonalDbLogRecord,
     trust_store: &PublicKeyTrustStore,
+    snapshot_version: u64,
 ) -> std::result::Result<(), PersonalDbLogChainRepairReason> {
     let certificate = if !record.inline_certificate_bytes.is_empty() {
         decode_commit_certificate(&record.inline_certificate_bytes).map_err(|err| {
@@ -425,7 +471,15 @@ async fn verify_record_certificate(
                 message: err.to_string(),
             }
         })?;
-        match read_personaldb_commit_certificate_ref(storage, certificate_ref, trust_store).await {
+        match read_personaldb_commit_certificate_ref(
+            storage,
+            mvcc,
+            certificate_ref,
+            trust_store,
+            snapshot_version,
+        )
+        .await
+        {
             Ok(Some(certificate)) => certificate,
             Ok(None) => {
                 return Err(PersonalDbLogChainRepairReason::MissingCommitCertificate {
@@ -443,11 +497,13 @@ async fn verify_record_certificate(
         let entry_hash = hex::encode(record.entry_hash);
         match read_personaldb_commit_certificate(
             storage,
+            mvcc,
             tenant_id,
             database_id,
             record.log_index,
             &entry_hash,
             trust_store,
+            snapshot_version,
         )
         .await
         {

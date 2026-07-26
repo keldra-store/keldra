@@ -89,9 +89,25 @@ pub async fn personaldb_catch_up(
         .await?);
     };
 
-    let records = read_canonical_records(storage, &request.database_id, &committed_head).await?;
+    let records = read_canonical_records(
+        storage,
+        mvcc,
+        &request.database_id,
+        &committed_head,
+        snapshot_version,
+    )
+    .await?;
     ensure_head_matches_records(&committed_head, &records)?;
-    if !is_replica_position_on_chain(storage, &request, trust_store, &records).await? {
+    if !is_replica_position_on_chain(
+        storage,
+        mvcc,
+        snapshot_version,
+        &request,
+        trust_store,
+        &records,
+    )
+    .await?
+    {
         return Ok(snapshot_required(
             storage,
             mvcc,
@@ -116,10 +132,12 @@ pub async fn personaldb_catch_up(
         entries.push(
             load_catch_up_entry(
                 storage,
+                mvcc,
                 request.tenant_id,
                 &request.database_id,
                 record,
                 trust_store,
+                snapshot_version,
             )
             .await?,
         );
@@ -136,16 +154,20 @@ pub async fn personaldb_catch_up(
 
 async fn read_canonical_records(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     database_id: &str,
     committed_head: &PersonalDbCommittedHead,
+    snapshot_version: u64,
 ) -> Result<Vec<PersonalDbLogRecord>> {
     if committed_head.log_index == 0 {
         return Ok(Vec::new());
     }
-    let segment_refs = list_log_segment_refs(storage, committed_head, database_id).await?;
+    let segment_refs =
+        list_log_segment_refs(mvcc, committed_head, database_id, snapshot_version).await?;
     let mut records = Vec::new();
     for segment_ref in segment_refs {
-        let segment = read_personaldb_log_segment(storage, &segment_ref).await?;
+        let segment =
+            read_personaldb_log_segment(storage, mvcc, &segment_ref, snapshot_version).await?;
         for record in segment.records {
             if record.log_index <= committed_head.log_index {
                 records.push(record);
@@ -158,15 +180,16 @@ async fn read_canonical_records(
 }
 
 async fn list_log_segment_refs(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     committed_head: &PersonalDbCommittedHead,
     database_id: &str,
+    snapshot_version: u64,
 ) -> Result<Vec<String>> {
     let tenant_id = committed_head
         .tenant_id
         .parse::<i64>()
         .context("personaldb committed head tenant id must be numeric")?;
-    list_personaldb_log_segment_refs(storage, tenant_id, database_id).await
+    list_personaldb_log_segment_refs(mvcc, tenant_id, database_id, snapshot_version).await
 }
 
 fn ensure_head_matches_records(
@@ -196,6 +219,8 @@ fn ensure_head_matches_records(
 
 async fn is_replica_position_on_chain(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    snapshot_version: u64,
     request: &PersonalDbCatchUpRequest,
     trust_store: &PublicKeyTrustStore,
     records: &[PersonalDbLogRecord],
@@ -203,9 +228,11 @@ async fn is_replica_position_on_chain(
     if request.have_log_index == 0 {
         let Some(manifest) = read_personaldb_group_manifest(
             storage,
+            mvcc,
             request.tenant_id,
             &request.database_id,
             trust_store,
+            snapshot_version,
         )
         .await?
         else {
@@ -246,14 +273,32 @@ async fn snapshot_required(
 
 async fn load_catch_up_entry(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
     record: PersonalDbLogRecord,
     trust_store: &PublicKeyTrustStore,
+    snapshot_version: u64,
 ) -> Result<PersonalDbCatchUpEntry> {
-    let changeset_bytes = load_changeset_bytes(storage, tenant_id, database_id, &record).await?;
-    let (certificate, certificate_bytes) =
-        load_certificate(storage, tenant_id, database_id, &record, trust_store).await?;
+    let changeset_bytes = load_changeset_bytes(
+        storage,
+        mvcc,
+        tenant_id,
+        database_id,
+        &record,
+        snapshot_version,
+    )
+    .await?;
+    let (certificate, certificate_bytes) = load_certificate(
+        storage,
+        mvcc,
+        tenant_id,
+        database_id,
+        &record,
+        trust_store,
+        snapshot_version,
+    )
+    .await?;
     Ok(PersonalDbCatchUpEntry {
         record,
         changeset_bytes,
@@ -264,26 +309,32 @@ async fn load_catch_up_entry(
 
 async fn load_changeset_bytes(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
     record: &PersonalDbLogRecord,
+    snapshot_version: u64,
 ) -> Result<Vec<u8>> {
     if !record.payload_ref.is_empty() {
         let payload_ref = std::str::from_utf8(&record.payload_ref)?;
         return read_personaldb_changeset_payload_ref(
             storage,
+            mvcc,
             payload_ref,
             record.changeset_payload_hash,
+            snapshot_version,
         )
         .await?
         .ok_or_else(|| anyhow!("personaldb changeset payload is missing"));
     }
     read_personaldb_changeset_payload_by_index(
         storage,
+        mvcc,
         tenant_id,
         database_id,
         record.log_index,
         record.changeset_payload_hash,
+        snapshot_version,
     )
     .await?
     .ok_or_else(|| anyhow!("personaldb changeset payload is missing"))
@@ -291,29 +342,38 @@ async fn load_changeset_bytes(
 
 async fn load_certificate(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
     record: &PersonalDbLogRecord,
     trust_store: &PublicKeyTrustStore,
+    snapshot_version: u64,
 ) -> Result<(PersonalDbCommitCertificate, Vec<u8>)> {
     let certificate_bytes = if !record.inline_certificate_bytes.is_empty() {
         record.inline_certificate_bytes.clone()
     } else if !record.certificate_ref.is_empty() {
         let certificate_ref = std::str::from_utf8(&record.certificate_ref)?;
-        let certificate =
-            read_personaldb_commit_certificate_ref(storage, certificate_ref, trust_store)
-                .await?
-                .ok_or_else(|| anyhow!("personaldb commit certificate is missing"))?;
+        let certificate = read_personaldb_commit_certificate_ref(
+            storage,
+            mvcc,
+            certificate_ref,
+            trust_store,
+            snapshot_version,
+        )
+        .await?
+        .ok_or_else(|| anyhow!("personaldb commit certificate is missing"))?;
         encode_commit_certificate(&certificate)?
     } else {
         let entry_hash = hex::encode(record.entry_hash);
         let certificate = read_personaldb_commit_certificate(
             storage,
+            mvcc,
             tenant_id,
             database_id,
             record.log_index,
             &entry_hash,
             trust_store,
+            snapshot_version,
         )
         .await?
         .ok_or_else(|| anyhow!("personaldb commit certificate is missing"))?;

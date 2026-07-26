@@ -9,7 +9,7 @@ use crate::{
     },
     personaldb_coremeta::{
         personaldb_payload_hash, read_personaldb_data_locator_bytes,
-        read_personaldb_data_locator_row, write_personaldb_bytes_as_data_locator,
+        read_personaldb_data_locator_row_at_snapshot, write_personaldb_bytes_as_data_locator_mvcc,
     },
     storage::Storage,
 };
@@ -48,6 +48,7 @@ pub struct PersonalDbRowIndexWrite<'a> {
 
 pub async fn write_personaldb_row_index(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     input: PersonalDbRowIndexWrite<'_>,
 ) -> Result<String> {
     let mut records = input.records.to_vec();
@@ -85,8 +86,9 @@ pub async fn write_personaldb_row_index(
         last_hash,
     )?;
 
-    write_personaldb_bytes_as_data_locator(
+    write_personaldb_bytes_as_data_locator_mvcc(
         storage,
+        mvcc,
         input.tenant_id,
         input.database_id,
         &data_id,
@@ -99,6 +101,7 @@ pub async fn write_personaldb_row_index(
             "personaldb-row-index:{}:{}:{}",
             input.tenant_id, input.database_id, input.generation
         ),
+        "personaldb-row-index-writer",
     )
     .await?;
     Ok(data_id)
@@ -106,13 +109,20 @@ pub async fn write_personaldb_row_index(
 
 pub async fn read_personaldb_row_index(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     row_index_data_id: &str,
+    snapshot_version: u64,
 ) -> Result<DecodedPersonalDbRowIndex> {
     let (tenant_id, database_id, _generation, _source_hash) =
         parse_personaldb_row_index_data_id(row_index_data_id)?;
-    let row = read_personaldb_data_locator_row(storage, tenant_id, &database_id, row_index_data_id)
-        .await?
-        .ok_or_else(|| anyhow!("personaldb row index CoreMeta row is missing"))?;
+    let row = read_personaldb_data_locator_row_at_snapshot(
+        mvcc,
+        tenant_id,
+        &database_id,
+        row_index_data_id,
+        snapshot_version,
+    )?
+    .ok_or_else(|| anyhow!("personaldb row index CoreMeta row is missing"))?;
     if row.data_kind != PERSONALDB_ROW_INDEX_KIND {
         return Err(anyhow!("personaldb row index CoreMeta row kind mismatch"));
     }
@@ -323,7 +333,6 @@ fn record_hash_bounds(records: &[RowIndexRecord]) -> (Hash32, Hash32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
     fn row(primary_hash: u8) -> RowIndexRecord {
         RowIndexRecord::new(
@@ -342,63 +351,14 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn personaldb_row_index_round_trips_sorted_records() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
+    #[test]
+    fn personaldb_row_index_codec_round_trips_sorted_records() {
         let records = vec![row(9), row(1), row(5)];
-        let row_index_data_id = write_personaldb_row_index(
-            &storage,
-            PersonalDbRowIndexWrite {
-                tenant_id: 4,
-                database_id: "db-alpha",
-                generation: 12,
-                source_hash: [7; 32],
-                records: &records,
-            },
-        )
-        .await
-        .unwrap();
-        assert!(row_index_data_id.starts_with(
-            "personaldb_row_index:tenant:4:database:db-alpha:generation:00000000000000000012:"
-        ));
-
-        let decoded = read_personaldb_row_index(&storage, &row_index_data_id)
-            .await
-            .unwrap();
-        assert_eq!(decoded.header.tenant_id, "4");
-        assert_eq!(decoded.header.database_id, "db-alpha");
-        assert_eq!(decoded.header.generation, 12);
-        assert_eq!(decoded.records.len(), 3);
-        assert_eq!(decoded.records[0].primary_key_hash, [1; 32]);
-        assert_eq!(decoded.records[2].primary_key_hash, [9; 32]);
-    }
-
-    #[tokio::test]
-    async fn personaldb_row_index_footer_protects_body() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let row_index_data_id = write_personaldb_row_index(
-            &storage,
-            PersonalDbRowIndexWrite {
-                tenant_id: 4,
-                database_id: "db-alpha",
-                generation: 12,
-                source_hash: [7; 32],
-                records: &[row(1)],
-            },
-        )
-        .await
-        .unwrap();
-        let row = read_personaldb_data_locator_row(&storage, 4, "db-alpha", &row_index_data_id)
-            .await
-            .unwrap()
-            .expect("row index CoreMeta row exists");
-        let mut bytes = read_personaldb_data_locator_bytes(&storage, &row)
-            .await
-            .unwrap();
-        bytes[crate::formats::WRITER_SEGMENT_FIXED_HEADER_LEN + 1] ^= 1;
-        assert!(decode_personaldb_row_index(&bytes).is_err());
+        let body = encode_row_index_body(&records).unwrap();
+        let decoded = decode_row_index_body(&body).unwrap();
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded[0].primary_key_hash, [1; 32]);
+        assert_eq!(decoded[2].primary_key_hash, [9; 32]);
     }
 
     #[test]

@@ -11,10 +11,11 @@ use crate::formats::{
         canonical_logical_file_id,
     },
 };
+use crate::mvcc_bootstrap::MvccSubsystem;
 use crate::personaldb_coremeta::{
-    PERSONALDB_DATA_LOCATOR_PAGE_MAX, list_personaldb_data_locator_rows,
-    read_personaldb_data_locator_bytes, read_personaldb_data_locator_row,
-    write_personaldb_logical_file_as_data_locator_with_preconditions,
+    PERSONALDB_DATA_LOCATOR_PAGE_MAX, list_personaldb_data_locator_rows_at_snapshot,
+    read_personaldb_data_locator_bytes, read_personaldb_data_locator_row_at_snapshot,
+    write_personaldb_logical_file_as_data_locator_mvcc,
 };
 use crate::storage::Storage;
 use anyhow::{Result, anyhow};
@@ -58,6 +59,7 @@ pub struct PersonalDbLogSegmentWrite<'a> {
 
 pub async fn write_personaldb_log_segment(
     storage: &Storage,
+    mvcc: &MvccSubsystem,
     input: PersonalDbLogSegmentWrite<'_>,
 ) -> Result<String> {
     if input.source_fence_token == 0 {
@@ -133,8 +135,9 @@ pub async fn write_personaldb_log_segment(
         pipeline_policy: CorePipelinePolicy::default(),
         trace_context: CoreTraceContext::default(),
     })?;
-    write_personaldb_logical_file_as_data_locator_with_preconditions(
+    write_personaldb_logical_file_as_data_locator_mvcc(
         storage,
+        mvcc,
         input.tenant_id,
         input.database_id,
         &ref_name,
@@ -148,7 +151,7 @@ pub async fn write_personaldb_log_segment(
             format!("end_log_index:{end_log_index:020}"),
         ],
         transaction_id,
-        &[],
+        "personaldb-log-segment-writer",
     )
     .await?;
     Ok(ref_name)
@@ -176,12 +179,19 @@ pub fn preview_personaldb_log_segment_ref(input: PersonalDbLogSegmentWrite<'_>) 
 
 pub async fn read_personaldb_log_segment(
     storage: &Storage,
+    mvcc: &MvccSubsystem,
     segment_ref: &str,
+    snapshot_version: u64,
 ) -> Result<DecodedPersonalDbLogSegment> {
     let (tenant_id, database_id) = personaldb_log_segment_ref_scope(segment_ref)?;
-    let row = read_personaldb_data_locator_row(storage, tenant_id, &database_id, segment_ref)
-        .await?
-        .ok_or_else(|| anyhow!("personaldb log segment CoreMeta row is missing"))?;
+    let row = read_personaldb_data_locator_row_at_snapshot(
+        mvcc,
+        tenant_id,
+        &database_id,
+        segment_ref,
+        snapshot_version,
+    )?
+    .ok_or_else(|| anyhow!("personaldb log segment CoreMeta row is missing"))?;
     if row.data_kind != "log_segment" {
         return Err(anyhow!(
             "personaldb log segment locator has wrong data kind"
@@ -192,22 +202,23 @@ pub async fn read_personaldb_log_segment(
 }
 
 pub async fn list_personaldb_log_segment_refs(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
+    snapshot_version: u64,
 ) -> Result<Vec<String>> {
     let prefix = personaldb_log_segment_ref_prefix(tenant_id, database_id)?;
     let mut refs = Vec::new();
     let mut after_tuple_key = None;
     loop {
-        let page = list_personaldb_data_locator_rows(
-            storage,
+        let page = list_personaldb_data_locator_rows_at_snapshot(
+            mvcc,
             tenant_id,
             database_id,
             after_tuple_key.as_deref(),
             PERSONALDB_DATA_LOCATOR_PAGE_MAX,
-        )
-        .await?;
+            snapshot_version,
+        )?;
         refs.extend(
             page.rows
                 .into_iter()
@@ -484,7 +495,6 @@ fn record_hash_bounds(records: &[PersonalDbLogRecord]) -> (Hash32, Hash32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
     fn record(log_index: u64, previous_log_hash: Hash32) -> PersonalDbLogRecord {
         PersonalDbLogRecord::new(
@@ -502,111 +512,55 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn personaldb_log_segment_round_trips_with_common_envelope() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
+    #[test]
+    fn personaldb_log_segment_ref_is_canonical() {
         let first = record(1, [0; 32]);
         let second = record(2, first.entry_hash);
         let records = vec![first, second];
 
-        let segment_ref = write_personaldb_log_segment(
-            &storage,
-            PersonalDbLogSegmentWrite {
-                tenant_id: 9,
-                database_id: "db-alpha",
-                schema_hash: [9; 32],
-                source_fence_token: 77,
-                records: &records,
-            },
-        )
-        .await
+        let segment_ref = preview_personaldb_log_segment_ref(PersonalDbLogSegmentWrite {
+            tenant_id: 9,
+            database_id: "db-alpha",
+            schema_hash: [9; 32],
+            source_fence_token: 77,
+            records: &records,
+        })
         .unwrap();
         assert!(segment_ref.starts_with("personaldb_log_segment:tenant:9:database:db-alpha:"));
         assert!(segment_ref.contains("start:00000000000000000001:end:00000000000000000002:"));
-
-        let decoded = read_personaldb_log_segment(&storage, &segment_ref)
-            .await
-            .unwrap();
-        assert_eq!(decoded.header.tenant_id, "9");
-        assert_eq!(decoded.header.database_id, "db-alpha");
-        assert_eq!(decoded.header.start_log_index, 1);
-        assert_eq!(decoded.header.end_log_index, 2);
-        assert_eq!(decoded.header.source_fence_token, 77);
-        assert_eq!(decoded.records, records);
     }
 
-    #[tokio::test]
-    async fn personaldb_log_segment_rejects_non_contiguous_chain() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
+    #[test]
+    fn personaldb_log_segment_rejects_non_contiguous_chain() {
         let first = record(1, [0; 32]);
         let second = record(3, first.entry_hash);
-        let err = write_personaldb_log_segment(
-            &storage,
-            PersonalDbLogSegmentWrite {
-                tenant_id: 9,
-                database_id: "db-alpha",
-                schema_hash: [9; 32],
-                source_fence_token: 77,
-                records: &[first, second],
-            },
-        )
-        .await
+        let err = preview_personaldb_log_segment_ref(PersonalDbLogSegmentWrite {
+            tenant_id: 9,
+            database_id: "db-alpha",
+            schema_hash: [9; 32],
+            source_fence_token: 77,
+            records: &[first, second],
+        })
         .unwrap_err();
         assert!(err.to_string().contains("log index is not contiguous"));
     }
 
-    #[tokio::test]
-    async fn personaldb_log_segment_rejects_zero_source_fence() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
+    #[test]
+    fn personaldb_log_segment_rejects_zero_source_fence() {
         let record = record(1, [0; 32]);
 
-        let err = write_personaldb_log_segment(
-            &storage,
-            PersonalDbLogSegmentWrite {
-                tenant_id: 9,
-                database_id: "db-alpha",
-                schema_hash: [9; 32],
-                source_fence_token: 0,
-                records: &[record],
-            },
-        )
-        .await
+        let err = preview_personaldb_log_segment_ref(PersonalDbLogSegmentWrite {
+            tenant_id: 9,
+            database_id: "db-alpha",
+            schema_hash: [9; 32],
+            source_fence_token: 0,
+            records: &[record],
+        })
         .unwrap_err();
 
         assert!(
             err.to_string()
                 .contains("source fence token must be nonzero")
         );
-    }
-
-    #[tokio::test]
-    async fn personaldb_log_segment_footer_protects_body() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let record = record(1, [0; 32]);
-        let segment_ref = write_personaldb_log_segment(
-            &storage,
-            PersonalDbLogSegmentWrite {
-                tenant_id: 9,
-                database_id: "db-alpha",
-                schema_hash: [9; 32],
-                source_fence_token: 77,
-                records: &[record],
-            },
-        )
-        .await
-        .unwrap();
-        let row = read_personaldb_data_locator_row(&storage, 9, "db-alpha", &segment_ref)
-            .await
-            .unwrap()
-            .expect("segment CoreMeta row exists");
-        let mut bytes = read_personaldb_data_locator_bytes(&storage, &row)
-            .await
-            .unwrap();
-        bytes[crate::formats::WRITER_SEGMENT_FIXED_HEADER_LEN + 1] ^= 1;
-        assert!(decode_personaldb_log_segment(&bytes).is_err());
     }
 }

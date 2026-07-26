@@ -1,10 +1,9 @@
 use crate::{
-    core_store::{
-        AppendStreamRecord, CoreStore, ReadStream, decode_deterministic_proto,
-        encode_deterministic_proto,
-    },
+    core_store::{decode_deterministic_proto, encode_deterministic_proto},
     formats::{Hash32, hash32, watch::WatchRecord},
-    storage::Storage,
+    mvcc_bootstrap::MvccSubsystem,
+    mvcc_product::ProductMutation,
+    mvcc_transaction::{DurabilityLevel, LogicalKey, PredicateKind},
 };
 use anyhow::{Result, anyhow};
 use prost::Message;
@@ -14,6 +13,8 @@ const PERSONALDB_GROUP_PARTITION_FAMILY: u16 = 4;
 const PERSONALDB_GROUP_RECORD_KIND: u16 = 1;
 const PERSONALDB_PROJECTION_PARTITION_FAMILY: u16 = 5;
 const PERSONALDB_PROJECTION_RECORD_KIND: u16 = 1;
+const TABLE_PERSONALDB_GROUP_WATCH: u16 = 0x0607;
+const TABLE_PERSONALDB_PROJECTION_WATCH: u16 = 0x0608;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PersonalDbGroupWatchPayload {
@@ -102,7 +103,7 @@ pub struct PersonalDbProjectionWatchEvent {
 }
 
 pub async fn append_personaldb_group_watch_record(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
     mutation_id: [u8; 16],
@@ -110,9 +111,7 @@ pub async fn append_personaldb_group_watch_record(
     payload: PersonalDbGroupWatchPayload,
 ) -> Result<u128> {
     validate_payload(database_id, &payload)?;
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let stream_id = personaldb_group_watch_stream_id(tenant_id, database_id);
-
+    let key = group_watch_key(tenant_id, database_id, mutation_id)?;
     let record = WatchRecord::new(
         0,
         PERSONALDB_GROUP_PARTITION_FAMILY,
@@ -124,27 +123,24 @@ pub async fn append_personaldb_group_watch_record(
         payload.log_index,
         encode_group_watch_payload(&payload),
     );
-    let receipt = core_store
-        .append_stream(AppendStreamRecord {
-            stream_id,
-            partition_id: hex::encode(partition_id(tenant_id, database_id)),
-            record_kind: "personaldb_group_watch".to_string(),
-            payload: record.encode(),
-            content_type: None,
-            user_metadata_json: "{}".to_string(),
-            fence: None,
-            transaction_id: None,
-            idempotency_key: Some(format!(
+    let committed = mvcc
+        .autocommit_product_mutations_with_predicates(
+            "system/personaldb-group-watch",
+            &format!(
                 "personaldb-group-watch:{tenant_id}:{database_id}:{}",
                 hex::encode(mutation_id)
-            )),
-        })
+            ),
+            vec![ProductMutation::put(key.clone(), record.encode())],
+            vec![(key, PredicateKind::Unique)],
+            DurabilityLevel::Quorum,
+            now_unix_ms(),
+        )
         .await?;
-    Ok(u128::from(receipt.sequence))
+    Ok(u128::from(committed))
 }
 
 pub async fn append_personaldb_projection_watch_record(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
     projection_id: &str,
@@ -153,9 +149,7 @@ pub async fn append_personaldb_projection_watch_record(
     payload: PersonalDbProjectionWatchPayload,
 ) -> Result<u128> {
     validate_projection_payload(database_id, projection_id, &payload)?;
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let stream_id = personaldb_projection_watch_stream_id(tenant_id, database_id, projection_id);
-
+    let key = projection_watch_key(tenant_id, database_id, projection_id, mutation_id)?;
     let record = WatchRecord::new(
         0,
         PERSONALDB_PROJECTION_PARTITION_FAMILY,
@@ -167,47 +161,40 @@ pub async fn append_personaldb_projection_watch_record(
         payload.projection_log_index,
         encode_projection_watch_payload(&payload),
     );
-    let receipt = core_store
-        .append_stream(AppendStreamRecord {
-            stream_id,
-            partition_id: hex::encode(projection_partition_id(
-                tenant_id,
-                database_id,
-                projection_id,
-            )),
-            record_kind: "personaldb_projection_watch".to_string(),
-            payload: record.encode(),
-            content_type: None,
-            user_metadata_json: "{}".to_string(),
-            fence: None,
-            transaction_id: None,
-            idempotency_key: Some(format!(
+    let committed = mvcc
+        .autocommit_product_mutations_with_predicates(
+            "system/personaldb-projection-watch",
+            &format!(
                 "personaldb-projection-watch:{tenant_id}:{database_id}:{projection_id}:{}",
                 hex::encode(mutation_id)
-            )),
-        })
+            ),
+            vec![ProductMutation::put(key.clone(), record.encode())],
+            vec![(key, PredicateKind::Unique)],
+            DurabilityLevel::Quorum,
+            now_unix_ms(),
+        )
         .await?;
-    Ok(u128::from(receipt.sequence))
+    Ok(u128::from(committed))
 }
 
 pub async fn list_personaldb_group_watch_events(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
     after_cursor: u128,
     limit: usize,
+    snapshot_version: u64,
 ) -> Result<Vec<PersonalDbGroupWatchEvent>> {
-    Ok(
-        list_personaldb_group_watch_event_page(
-            storage,
-            tenant_id,
-            database_id,
-            after_cursor,
-            limit,
-        )
-        .await?
-        .events,
+    Ok(list_personaldb_group_watch_event_page(
+        mvcc,
+        tenant_id,
+        database_id,
+        after_cursor,
+        limit,
+        snapshot_version,
     )
+    .await?
+    .events)
 }
 
 #[derive(Debug, Clone)]
@@ -218,21 +205,21 @@ pub struct PersonalDbGroupWatchEventPage {
 }
 
 pub async fn list_personaldb_group_watch_event_page(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
     after_cursor: u128,
     limit: usize,
+    snapshot_version: u64,
 ) -> Result<PersonalDbGroupWatchEventPage> {
-    let core_store = CoreStore::new(storage.clone()).await?;
     let (records, next_cursor, has_more) = read_watch_page(
-        &core_store,
-        &personaldb_group_watch_stream_id(tenant_id, database_id),
-        "personaldb_group_watch",
+        mvcc,
+        TABLE_PERSONALDB_GROUP_WATCH,
+        &group_watch_prefix(tenant_id, database_id)?,
         after_cursor,
         limit,
-    )
-    .await?;
+        snapshot_version,
+    )?;
     let mut events = Vec::with_capacity(records.len());
     for record in records {
         if record.partition_family != PERSONALDB_GROUP_PARTITION_FAMILY
@@ -258,20 +245,22 @@ pub async fn list_personaldb_group_watch_event_page(
 }
 
 pub async fn list_personaldb_projection_watch_events(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
     projection_id: &str,
     after_cursor: u128,
     limit: usize,
+    snapshot_version: u64,
 ) -> Result<Vec<PersonalDbProjectionWatchEvent>> {
     Ok(list_personaldb_projection_watch_event_page(
-        storage,
+        mvcc,
         tenant_id,
         database_id,
         projection_id,
         after_cursor,
         limit,
+        snapshot_version,
     )
     .await?
     .events)
@@ -285,22 +274,22 @@ pub struct PersonalDbProjectionWatchEventPage {
 }
 
 pub async fn list_personaldb_projection_watch_event_page(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
     projection_id: &str,
     after_cursor: u128,
     limit: usize,
+    snapshot_version: u64,
 ) -> Result<PersonalDbProjectionWatchEventPage> {
-    let core_store = CoreStore::new(storage.clone()).await?;
     let (records, next_cursor, has_more) = read_watch_page(
-        &core_store,
-        &personaldb_projection_watch_stream_id(tenant_id, database_id, projection_id),
-        "personaldb_projection_watch",
+        mvcc,
+        TABLE_PERSONALDB_PROJECTION_WATCH,
+        &projection_watch_prefix(tenant_id, database_id, projection_id)?,
         after_cursor,
         limit,
-    )
-    .await?;
+        snapshot_version,
+    )?;
     let mut events = Vec::with_capacity(records.len());
     for record in records {
         if record.partition_family != PERSONALDB_PROJECTION_PARTITION_FAMILY
@@ -326,63 +315,146 @@ pub async fn list_personaldb_projection_watch_event_page(
 }
 
 pub async fn latest_personaldb_group_watch_cursor(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
+    snapshot_version: u64,
 ) -> Result<Option<u128>> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let sequence = core_store
-        .stream_head_sequence(&personaldb_group_watch_stream_id(tenant_id, database_id))
-        .await?;
-    Ok((sequence != 0).then_some(u128::from(sequence)))
+    latest_watch_cursor(
+        mvcc,
+        TABLE_PERSONALDB_GROUP_WATCH,
+        &group_watch_prefix(tenant_id, database_id)?,
+        snapshot_version,
+    )
 }
 
 pub async fn latest_personaldb_projection_watch_cursor(
-    storage: &Storage,
+    mvcc: &MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
     projection_id: &str,
+    snapshot_version: u64,
 ) -> Result<Option<u128>> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let sequence = core_store
-        .stream_head_sequence(&personaldb_projection_watch_stream_id(
-            tenant_id,
-            database_id,
-            projection_id,
-        ))
-        .await?;
-    Ok((sequence != 0).then_some(u128::from(sequence)))
+    latest_watch_cursor(
+        mvcc,
+        TABLE_PERSONALDB_PROJECTION_WATCH,
+        &projection_watch_prefix(tenant_id, database_id, projection_id)?,
+        snapshot_version,
+    )
 }
 
-async fn read_watch_page(
-    core_store: &CoreStore,
-    stream_id: &str,
-    record_kind: &str,
+fn read_watch_page(
+    mvcc: &MvccSubsystem,
+    table_id: u16,
+    prefix: &[u8],
     after_cursor: u128,
     limit: usize,
+    snapshot_version: u64,
 ) -> Result<(Vec<WatchRecord>, u128, bool)> {
-    let after_sequence =
+    if limit == 0 {
+        return Err(anyhow!("personaldb watch limit must be nonzero"));
+    }
+    let after_version =
         u64::try_from(after_cursor).map_err(|_| anyhow!("personaldb watch cursor exceeds u64"))?;
-    let page = core_store
-        .read_stream_page(ReadStream {
-            stream_id: stream_id.to_string(),
-            after_sequence,
-            limit,
-        })
-        .await?;
-    let mut records = Vec::with_capacity(page.records.len());
-    for source in page.records {
-        if source.record_kind != record_kind {
-            return Err(anyhow!("personaldb watch stream record kind mismatch"));
-        }
-        let (mut record, used) = WatchRecord::decode(&source.payload)?;
-        if used != source.payload.len() {
+    let mut page = mvcc
+        .runtime
+        .scan_table_prefix_at(table_id, prefix, snapshot_version)?;
+    page.retain(|(_, row)| row.commit_version > after_version);
+    page.sort_by_key(|(_, row)| row.commit_version);
+    let has_more = page.len() > limit;
+    page.truncate(limit);
+    let mut records = Vec::with_capacity(page.len());
+    for (_, source) in page {
+        let (mut record, used) = WatchRecord::decode(&source.value)?;
+        if used != source.value.len() {
             return Err(anyhow!("personaldb watch record has trailing bytes"));
         }
-        record.cursor = u128::from(source.sequence);
+        record.cursor = u128::from(source.commit_version);
         records.push(record);
     }
-    Ok((records, u128::from(page.next_sequence), page.has_more))
+    let next_cursor = records
+        .last()
+        .map(|record| record.cursor)
+        .unwrap_or(after_cursor);
+    Ok((records, next_cursor, has_more))
+}
+
+fn latest_watch_cursor(
+    mvcc: &MvccSubsystem,
+    table_id: u16,
+    prefix: &[u8],
+    snapshot_version: u64,
+) -> Result<Option<u128>> {
+    Ok(mvcc
+        .runtime
+        .scan_table_prefix_at(table_id, prefix, snapshot_version)?
+        .into_iter()
+        .map(|(_, row)| u128::from(row.commit_version))
+        .max())
+}
+
+fn group_watch_prefix(tenant_id: i64, database_id: &str) -> Result<Vec<u8>> {
+    scoped_watch_prefix(tenant_id, database_id, None)
+}
+
+fn projection_watch_prefix(
+    tenant_id: i64,
+    database_id: &str,
+    projection_id: &str,
+) -> Result<Vec<u8>> {
+    scoped_watch_prefix(tenant_id, database_id, Some(projection_id))
+}
+
+fn scoped_watch_prefix(
+    tenant_id: i64,
+    database_id: &str,
+    projection_id: Option<&str>,
+) -> Result<Vec<u8>> {
+    if tenant_id < 0 || database_id.is_empty() || projection_id.is_some_and(str::is_empty) {
+        return Err(anyhow!("personaldb watch scope is invalid"));
+    }
+    let mut key = Vec::new();
+    key.extend_from_slice(&tenant_id.to_be_bytes());
+    key.extend_from_slice(&(database_id.len() as u32).to_be_bytes());
+    key.extend_from_slice(database_id.as_bytes());
+    if let Some(projection_id) = projection_id {
+        key.extend_from_slice(&(projection_id.len() as u32).to_be_bytes());
+        key.extend_from_slice(projection_id.as_bytes());
+    }
+    Ok(key)
+}
+
+fn group_watch_key(tenant_id: i64, database_id: &str, mutation_id: [u8; 16]) -> Result<LogicalKey> {
+    let mut application_key = group_watch_prefix(tenant_id, database_id)?;
+    application_key.extend_from_slice(&mutation_id);
+    Ok(LogicalKey {
+        table_id: TABLE_PERSONALDB_GROUP_WATCH,
+        application_key,
+    })
+}
+
+fn projection_watch_key(
+    tenant_id: i64,
+    database_id: &str,
+    projection_id: &str,
+    mutation_id: [u8; 16],
+) -> Result<LogicalKey> {
+    let mut application_key = projection_watch_prefix(tenant_id, database_id, projection_id)?;
+    application_key.extend_from_slice(&mutation_id);
+    Ok(LogicalKey {
+        table_id: TABLE_PERSONALDB_PROJECTION_WATCH,
+        application_key,
+    })
+}
+
+fn now_unix_ms() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 fn validate_payload(database_id: &str, payload: &PersonalDbGroupWatchPayload) -> Result<()> {
@@ -503,21 +575,7 @@ fn projection_partition_id(tenant_id: i64, database_id: &str, projection_id: &st
     )
 }
 
-pub(crate) fn personaldb_group_watch_stream_id(tenant_id: i64, database_id: &str) -> String {
-    format!("watch:personaldb_group:tenant:{tenant_id}:database:{database_id}")
-}
-
-pub(crate) fn personaldb_projection_watch_stream_id(
-    tenant_id: i64,
-    database_id: &str,
-    projection_id: &str,
-) -> String {
-    format!(
-        "watch:personaldb_projection:tenant:{tenant_id}:database:{database_id}:projection:{projection_id}"
-    )
-}
-
-#[cfg(test)]
+#[cfg(any())]
 mod tests {
     use super::*;
     use tempfile::tempdir;

@@ -121,6 +121,11 @@ impl PersonalDbService for AppState {
         &self,
         request: Request<CreatePersonalDbGroupRequest>,
     ) -> Result<Response<PersonalDbGroupResponse>, Status> {
+        let snapshot_version = self
+            .mvcc
+            .runtime
+            .applied_version()
+            .map_err(internal_status)?;
         let claims = request_claims(&request)?.clone();
         let req = request.into_inner();
         validate_database_id(&req.database_id)?;
@@ -141,9 +146,11 @@ impl PersonalDbService for AppState {
         let protocol_keyring = self.personaldb_protocol_keyring.as_ref();
         if read_personaldb_group_manifest(
             &self.storage,
+            &self.mvcc,
             claims.tenant_id,
             &req.database_id,
             protocol_keyring.trust_store(),
+            snapshot_version,
         )
         .await
         .map_err(internal_status)?
@@ -179,6 +186,7 @@ impl PersonalDbService for AppState {
         .map_err(internal_status)?;
         write_personaldb_schema_sql(
             &self.storage,
+            &self.mvcc,
             claims.tenant_id,
             &req.database_id,
             &req.schema_sql,
@@ -188,6 +196,7 @@ impl PersonalDbService for AppState {
         .map_err(internal_status)?;
         write_personaldb_group_manifest(
             &self.storage,
+            &self.mvcc,
             claims.tenant_id,
             &manifest,
             protocol_keyring.trust_store(),
@@ -245,6 +254,11 @@ impl PersonalDbService for AppState {
         &self,
         request: Request<GetPersonalDbGroupRequest>,
     ) -> Result<Response<PersonalDbGroupResponse>, Status> {
+        let snapshot_version = self
+            .mvcc
+            .runtime
+            .applied_version()
+            .map_err(internal_status)?;
         let claims = request_claims(&request)?.clone();
         let req = request.into_inner();
         validate_claim_tenant(claims.tenant_id, req.tenant_id)?;
@@ -262,9 +276,11 @@ impl PersonalDbService for AppState {
         }
         let manifest = read_personaldb_group_manifest(
             &self.storage,
+            &self.mvcc,
             claims.tenant_id,
             &req.database_id,
             self.personaldb_protocol_keyring.trust_store(),
+            snapshot_version,
         )
         .await
         .map_err(internal_status)?
@@ -287,6 +303,11 @@ impl PersonalDbService for AppState {
         &self,
         request: Request<CreatePersonalDbProjectionRequest>,
     ) -> Result<Response<PersonalDbProjectionResponse>, Status> {
+        let snapshot_version = self
+            .mvcc
+            .runtime
+            .applied_version()
+            .map_err(internal_status)?;
         let claims = request_claims(&request)?.clone();
         let req = request.into_inner();
         validate_claim_tenant(claims.tenant_id, req.tenant_id)?;
@@ -311,9 +332,11 @@ impl PersonalDbService for AppState {
         .await?;
         read_personaldb_group_manifest(
             &self.storage,
+            &self.mvcc,
             claims.tenant_id,
             &req.database_id,
             self.personaldb_protocol_keyring.trust_store(),
+            snapshot_version,
         )
         .await
         .map_err(internal_status)?
@@ -322,9 +345,11 @@ impl PersonalDbService for AppState {
             validate_database_id(source_database_id)?;
             read_personaldb_group_manifest(
                 &self.storage,
+                &self.mvcc,
                 claims.tenant_id,
                 source_database_id,
                 self.personaldb_protocol_keyring.trust_store(),
+                snapshot_version,
             )
             .await
             .map_err(internal_status)?
@@ -332,9 +357,11 @@ impl PersonalDbService for AppState {
         }
         if read_projection_definition(
             &self.storage,
+            &self.mvcc,
             claims.tenant_id,
             &req.database_id,
             &definition.projection_id,
+            snapshot_version,
         )
         .await
         .map_err(internal_status)?
@@ -350,6 +377,7 @@ impl PersonalDbService for AppState {
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
         write_projection_definition(
             &self.storage,
+            &self.mvcc,
             claims.tenant_id,
             &req.database_id,
             &definition,
@@ -363,6 +391,11 @@ impl PersonalDbService for AppState {
         &self,
         request: Request<GetPersonalDbProjectionRequest>,
     ) -> Result<Response<PersonalDbProjectionResponse>, Status> {
+        let snapshot_version = self
+            .mvcc
+            .runtime
+            .applied_version()
+            .map_err(internal_status)?;
         let claims = request_claims(&request)?.clone();
         let req = request.into_inner();
         validate_claim_tenant(claims.tenant_id, req.tenant_id)?;
@@ -382,9 +415,11 @@ impl PersonalDbService for AppState {
         }
         let definition = read_projection_definition(
             &self.storage,
+            &self.mvcc,
             claims.tenant_id,
             &req.database_id,
             &req.projection_id,
+            snapshot_version,
         )
         .await
         .map_err(internal_status)?
@@ -396,6 +431,11 @@ impl PersonalDbService for AppState {
         &self,
         request: Request<SubmitPersonalDbChangesetRequest>,
     ) -> Result<Response<SubmitPersonalDbChangesetResponse>, Status> {
+        let snapshot_version = self
+            .mvcc
+            .runtime
+            .applied_version()
+            .map_err(internal_status)?;
         let claims = request_claims(&request)?.clone();
         let bearer_token = request_bearer_token(&request)?.to_string();
         let req = request.into_inner();
@@ -411,8 +451,10 @@ impl PersonalDbService for AppState {
         };
         let projection_definitions = list_projection_definitions_for_database(
             &self.storage,
+            &self.mvcc,
             claims.tenant_id,
             &core_request.database_id,
+            snapshot_version,
         )
         .await
         .map_err(internal_status)?;
@@ -496,25 +538,28 @@ impl PersonalDbService for AppState {
             return Err(Status::permission_denied("Permission denied"));
         }
         let after_cursor = join_u128(req.after_cursor_low, req.after_cursor_high);
-        let stream_id = crate::personaldb_watch::personaldb_group_watch_stream_id(
-            claims.tenant_id,
-            &req.database_id,
-        );
-        let mut live = self.storage.subscribe_stream(&stream_id);
-        let storage = self.storage.clone();
+        let mvcc = self.mvcc.clone();
         let tenant_id = claims.tenant_id;
         let database_id = req.database_id;
         let (tx, rx) = mpsc::channel(32);
         tokio::spawn(async move {
             let mut last_cursor = after_cursor;
             loop {
+                let snapshot_version = match mvcc.runtime.applied_version() {
+                    Ok(version) => version,
+                    Err(error) => {
+                        let _ = tx.send(Err(internal_status(error))).await;
+                        return;
+                    }
+                };
                 loop {
                     let page = match list_personaldb_group_watch_event_page(
-                        &storage,
+                        &mvcc,
                         tenant_id,
                         &database_id,
                         last_cursor,
                         256,
+                        snapshot_version,
                     )
                     .await
                     {
@@ -535,10 +580,7 @@ impl PersonalDbService for AppState {
                         break;
                     }
                 }
-                match live.recv().await {
-                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
         });
 
@@ -569,13 +611,7 @@ impl PersonalDbService for AppState {
             return Err(Status::permission_denied("Permission denied"));
         }
         let after_cursor = join_u128(req.after_cursor_low, req.after_cursor_high);
-        let stream_id = crate::personaldb_watch::personaldb_projection_watch_stream_id(
-            claims.tenant_id,
-            &req.database_id,
-            &req.projection_id,
-        );
-        let mut live = self.storage.subscribe_stream(&stream_id);
-        let storage = self.storage.clone();
+        let mvcc = self.mvcc.clone();
         let tenant_id = claims.tenant_id;
         let database_id = req.database_id;
         let projection_id = req.projection_id;
@@ -583,14 +619,22 @@ impl PersonalDbService for AppState {
         tokio::spawn(async move {
             let mut last_cursor = after_cursor;
             loop {
+                let snapshot_version = match mvcc.runtime.applied_version() {
+                    Ok(version) => version,
+                    Err(error) => {
+                        let _ = tx.send(Err(internal_status(error))).await;
+                        return;
+                    }
+                };
                 loop {
                     let page = match list_personaldb_projection_watch_event_page(
-                        &storage,
+                        &mvcc,
                         tenant_id,
                         &database_id,
                         &projection_id,
                         last_cursor,
                         256,
+                        snapshot_version,
                     )
                     .await
                     {
@@ -611,10 +655,7 @@ impl PersonalDbService for AppState {
                         break;
                     }
                 }
-                match live.recv().await {
-                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
         });
 
@@ -784,11 +825,18 @@ impl AppState {
         actor: PersonalDbCommitActor,
         definition: ProjectionDefinition,
     ) -> Result<Response<SubmitPersonalDbChangesetResponse>, Status> {
+        let snapshot_version = self
+            .mvcc
+            .runtime
+            .applied_version()
+            .map_err(internal_status)?;
         let projection_manifest = read_personaldb_group_manifest(
             &self.storage,
+            &self.mvcc,
             actor.tenant_id,
             &definition.database_id,
             self.personaldb_protocol_keyring.trust_store(),
+            snapshot_version,
         )
         .await
         .map_err(internal_status)?
@@ -810,9 +858,11 @@ impl AppState {
         }
         let target_schema_sql = read_personaldb_schema_sql(
             &self.storage,
+            &self.mvcc,
             actor.tenant_id,
             &definition.database_id,
             &projection_manifest.schema_hash,
+            snapshot_version,
         )
         .await
         .map_err(internal_status)?
@@ -820,9 +870,11 @@ impl AppState {
         let source_database_id = single_projection_writeback_source(&definition)?;
         let source_manifest = read_personaldb_group_manifest(
             &self.storage,
+            &self.mvcc,
             actor.tenant_id,
             &source_database_id,
             self.personaldb_protocol_keyring.trust_store(),
+            snapshot_version,
         )
         .await
         .map_err(internal_status)?
@@ -837,9 +889,11 @@ impl AppState {
         .ok_or_else(|| Status::failed_precondition("PersonalDB source head missing"))?;
         let source_schema_sql = read_personaldb_schema_sql(
             &self.storage,
+            &self.mvcc,
             actor.tenant_id,
             &source_database_id,
             &source_manifest.schema_hash,
+            snapshot_version,
         )
         .await
         .map_err(internal_status)?
@@ -908,6 +962,11 @@ impl AppState {
         request: CoreSubmitChangeset,
         actor: PersonalDbCommitActor,
     ) -> Result<CommittedPersonalDbChangeset, Status> {
+        let snapshot_version = self
+            .mvcc
+            .runtime
+            .applied_version()
+            .map_err(internal_status)?;
         validate_claim_tenant(actor.tenant_id, request.tenant_id)?;
         validate_database_id(&request.database_id)?;
         if actor.require_public_commit_authorization
@@ -934,9 +993,11 @@ impl AppState {
         let protocol_keyring = self.personaldb_protocol_keyring.as_ref();
         let manifest = read_personaldb_group_manifest(
             &self.storage,
+            &self.mvcc,
             actor.tenant_id,
             &validated.request.database_id,
             protocol_keyring.trust_store(),
+            snapshot_version,
         )
         .await
         .map_err(internal_status)?
@@ -1009,9 +1070,11 @@ impl AppState {
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
         let schema_sql = read_personaldb_schema_sql(
             &self.storage,
+            &self.mvcc,
             actor.tenant_id,
             &validated.request.database_id,
             &manifest.schema_hash,
+            snapshot_version,
         )
         .await
         .map_err(internal_status)?
@@ -1141,6 +1204,7 @@ impl AppState {
         };
         let payload_paths = write_personaldb_changeset_payload(
             &self.storage,
+            &self.mvcc,
             actor.tenant_id,
             &validated.request.database_id,
             proposed_log_index,
@@ -1296,6 +1360,7 @@ impl AppState {
                     .map_err(internal_status)?;
                 let written_certificate_ref = write_personaldb_commit_certificate(
                     &self.storage,
+                    &self.mvcc,
                     actor.tenant_id,
                     &validated.request.database_id,
                     &certificate,
@@ -1310,6 +1375,7 @@ impl AppState {
                 }
                 let written_segment_ref = write_personaldb_log_segment(
                     &self.storage,
+                    &self.mvcc,
                     PersonalDbLogSegmentWrite {
                         tenant_id: actor.tenant_id,
                         database_id: &validated.request.database_id,
@@ -1333,6 +1399,7 @@ impl AppState {
                     .map_err(internal_status)?;
                 let certificate_ref = write_personaldb_commit_certificate(
                     &self.storage,
+                    &self.mvcc,
                     actor.tenant_id,
                     &validated.request.database_id,
                     &certificate,
@@ -1362,6 +1429,7 @@ impl AppState {
                 );
                 let segment_ref = write_personaldb_log_segment(
                     &self.storage,
+                    &self.mvcc,
                     PersonalDbLogSegmentWrite {
                         tenant_id: actor.tenant_id,
                         database_id: &validated.request.database_id,
@@ -1403,6 +1471,7 @@ impl AppState {
         if !row_index_records.is_empty() {
             write_personaldb_row_index(
                 &self.storage,
+                &self.mvcc,
                 PersonalDbRowIndexWrite {
                     tenant_id: actor.tenant_id,
                     database_id: &validated.request.database_id,
@@ -1471,7 +1540,7 @@ impl AppState {
             .map_err(internal_status)?;
 
         let watch_cursor = append_personaldb_group_watch_record(
-            &self.storage,
+            &self.mvcc,
             actor.tenant_id,
             &validated.request.database_id,
             mutation_id,
@@ -1502,28 +1571,42 @@ impl AppState {
         source_log_hash: &str,
         authz_revision: u64,
     ) -> Result<(), Status> {
+        let snapshot_version = self
+            .mvcc
+            .runtime
+            .applied_version()
+            .map_err(internal_status)?;
         let source_manifest = read_personaldb_group_manifest(
             &self.storage,
+            &self.mvcc,
             tenant_id,
             source_database_id,
             self.personaldb_protocol_keyring.trust_store(),
+            snapshot_version,
         )
         .await
         .map_err(internal_status)?
         .ok_or_else(|| Status::not_found("PersonalDB source group not found"))?;
         let source_schema_sql = read_personaldb_schema_sql(
             &self.storage,
+            &self.mvcc,
             tenant_id,
             source_database_id,
             &source_manifest.schema_hash,
+            snapshot_version,
         )
         .await
         .map_err(internal_status)?
         .ok_or_else(|| Status::failed_precondition("PersonalDB source schema SQL missing"))?;
-        let definitions =
-            list_projection_definitions_for_source(&self.storage, tenant_id, source_database_id)
-                .await
-                .map_err(internal_status)?;
+        let definitions = list_projection_definitions_for_source(
+            &self.storage,
+            &self.mvcc,
+            tenant_id,
+            source_database_id,
+            snapshot_version,
+        )
+        .await
+        .map_err(internal_status)?;
         for definition in definitions {
             self.build_one_personaldb_projection(
                 tenant_id,
@@ -1551,6 +1634,11 @@ impl AppState {
         authz_revision: u64,
         definition: &ProjectionDefinition,
     ) -> Result<(), Status> {
+        let snapshot_version = self
+            .mvcc
+            .runtime
+            .applied_version()
+            .map_err(internal_status)?;
         if definition.target_database_id != definition.database_id {
             return Err(Status::failed_precondition(
                 "PersonalDB projection target database scope mismatch",
@@ -1558,9 +1646,11 @@ impl AppState {
         }
         let target_manifest = read_personaldb_group_manifest(
             &self.storage,
+            &self.mvcc,
             tenant_id,
             &definition.database_id,
             self.personaldb_protocol_keyring.trust_store(),
+            snapshot_version,
         )
         .await
         .map_err(internal_status)?
@@ -1575,9 +1665,11 @@ impl AppState {
         .ok_or_else(|| Status::failed_precondition("PersonalDB projection head missing"))?;
         let target_schema_sql = read_personaldb_schema_sql(
             &self.storage,
+            &self.mvcc,
             tenant_id,
             &definition.database_id,
             &target_manifest.schema_hash,
+            snapshot_version,
         )
         .await
         .map_err(internal_status)?
@@ -1664,7 +1756,7 @@ impl AppState {
         };
         let mutation_id = *uuid::Uuid::new_v4().as_bytes();
         let cursor = append_personaldb_projection_watch_record(
-            &self.storage,
+            &self.mvcc,
             tenant_id,
             &definition.database_id,
             &definition.projection_id,

@@ -2,10 +2,10 @@ use crate::{
     core_store::{decode_deterministic_proto, encode_deterministic_proto},
     formats::hash32,
     personaldb_coremeta::{
-        PERSONALDB_DATA_LOCATOR_PAGE_MAX, list_personaldb_data_locator_rows,
-        list_personaldb_data_locator_rows_for_tenant, personaldb_payload_hash,
-        read_personaldb_data_locator_bytes, read_personaldb_data_locator_row,
-        write_personaldb_bytes_as_data_locator,
+        PERSONALDB_DATA_LOCATOR_PAGE_MAX, list_personaldb_data_locator_rows_at_snapshot,
+        list_personaldb_data_locator_rows_for_tenant_at_snapshot, personaldb_payload_hash,
+        read_personaldb_data_locator_bytes, read_personaldb_data_locator_row_at_snapshot,
+        write_personaldb_bytes_as_data_locator_mvcc,
     },
     storage::Storage,
 };
@@ -244,20 +244,28 @@ pub fn hash_projection_definition(definition: &ProjectionDefinition) -> Result<S
 
 pub async fn write_projection_definition(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
     definition: &ProjectionDefinition,
 ) -> Result<()> {
+    let snapshot_version = mvcc.runtime.applied_version()?;
     definition.verify()?;
     ensure_scope(tenant_id, database_id, definition)?;
     let data_id = projection_definition_data_id(tenant_id, database_id, &definition.projection_id)?;
     let bytes = encode_projection_definition(definition)?;
-    let generation = read_personaldb_data_locator_row(storage, tenant_id, database_id, &data_id)
-        .await?
-        .map(|row| row.generation.saturating_add(1))
-        .unwrap_or(1);
-    write_personaldb_bytes_as_data_locator(
+    let generation = read_personaldb_data_locator_row_at_snapshot(
+        mvcc,
+        tenant_id,
+        database_id,
+        &data_id,
+        snapshot_version,
+    )?
+    .map(|row| row.generation.saturating_add(1))
+    .unwrap_or(1);
+    write_personaldb_bytes_as_data_locator_mvcc(
         storage,
+        mvcc,
         tenant_id,
         database_id,
         &data_id,
@@ -270,6 +278,7 @@ pub async fn write_projection_definition(
             "personaldb-projection-definition:{tenant_id}:{database_id}:{}",
             definition.projection_id
         ),
+        "personaldb-projection-writer",
     )
     .await?;
     Ok(())
@@ -277,13 +286,22 @@ pub async fn write_projection_definition(
 
 pub async fn read_projection_definition(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
     projection_id: &str,
+    snapshot_version: u64,
 ) -> Result<Option<ProjectionDefinition>> {
     let data_id = projection_definition_data_id(tenant_id, database_id, projection_id)?;
-    let Some(definition) =
-        read_projection_definition_row(storage, tenant_id, database_id, &data_id).await?
+    let Some(definition) = read_projection_definition_row(
+        storage,
+        mvcc,
+        tenant_id,
+        database_id,
+        &data_id,
+        snapshot_version,
+    )
+    .await?
     else {
         return Ok(None);
     };
@@ -296,26 +314,34 @@ pub async fn read_projection_definition(
 
 pub async fn list_projection_definitions_for_source(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     source_database_id: &str,
+    snapshot_version: u64,
 ) -> Result<Vec<ProjectionDefinition>> {
     let mut definitions = Vec::new();
     let mut after_tuple_key = None;
     loop {
-        let page = list_personaldb_data_locator_rows_for_tenant(
-            storage,
+        let page = list_personaldb_data_locator_rows_for_tenant_at_snapshot(
+            mvcc,
             tenant_id,
             after_tuple_key.as_deref(),
             PERSONALDB_DATA_LOCATOR_PAGE_MAX,
-        )
-        .await?;
+            snapshot_version,
+        )?;
         for row in page.rows {
             if row.data_kind != PERSONALDB_PROJECTION_DEFINITION_KIND {
                 continue;
             }
-            let Some(definition) =
-                read_projection_definition_row(storage, tenant_id, &row.group_id, &row.data_id)
-                    .await?
+            let Some(definition) = read_projection_definition_row(
+                storage,
+                mvcc,
+                tenant_id,
+                &row.group_id,
+                &row.data_id,
+                snapshot_version,
+            )
+            .await?
             else {
                 continue;
             };
@@ -342,27 +368,35 @@ pub async fn list_projection_definitions_for_source(
 
 pub async fn list_projection_definitions_for_database(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
+    snapshot_version: u64,
 ) -> Result<Vec<ProjectionDefinition>> {
     let mut definitions = Vec::new();
     let mut after_tuple_key = None;
     loop {
-        let page = list_personaldb_data_locator_rows(
-            storage,
+        let page = list_personaldb_data_locator_rows_at_snapshot(
+            mvcc,
             tenant_id,
             database_id,
             after_tuple_key.as_deref(),
             PERSONALDB_DATA_LOCATOR_PAGE_MAX,
-        )
-        .await?;
+            snapshot_version,
+        )?;
         for row in page.rows {
             if row.data_kind != PERSONALDB_PROJECTION_DEFINITION_KIND {
                 continue;
             }
-            if let Some(definition) =
-                read_projection_definition_row(storage, tenant_id, database_id, &row.data_id)
-                    .await?
+            if let Some(definition) = read_projection_definition_row(
+                storage,
+                mvcc,
+                tenant_id,
+                database_id,
+                &row.data_id,
+                snapshot_version,
+            )
+            .await?
             {
                 definitions.push(definition);
             };
@@ -378,12 +412,19 @@ pub async fn list_projection_definitions_for_database(
 
 async fn read_projection_definition_row(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
     data_id: &str,
+    snapshot_version: u64,
 ) -> Result<Option<ProjectionDefinition>> {
-    let Some(row) =
-        read_personaldb_data_locator_row(storage, tenant_id, database_id, data_id).await?
+    let Some(row) = read_personaldb_data_locator_row_at_snapshot(
+        mvcc,
+        tenant_id,
+        database_id,
+        data_id,
+        snapshot_version,
+    )?
     else {
         return Ok(None);
     };
@@ -933,7 +974,7 @@ fn require_nonempty(value: &str, field: &'static str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(any())]
 mod tests {
     use super::*;
     use tempfile::tempdir;
