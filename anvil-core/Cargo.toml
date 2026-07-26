@@ -23,12 +23,10 @@ path = "src/lib.rs"
 name = "mvcc_rfc"
 path = "benches/mvcc_rfc.rs"
 harness = false
-required-features = ["coremeta-perf-gate"]
 
 [features]
 #Declare an enterprise feature, doesn't activate any depdendencies so leave it with an empty array
 enterprise = []
-coremeta-perf-gate = []
 root-publication-test-control = []
 test-in-process-personaldb-signers = []
 gcp = ["dep:prost-types", "tonic/tls-ring"]

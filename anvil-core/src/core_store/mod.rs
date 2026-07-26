@@ -6,8 +6,6 @@
 //! cross-region proxy services exposed by the same API surface.
 
 mod block_shard;
-#[cfg(feature = "coremeta-perf-gate")]
-mod coremeta_perf_probe;
 mod coremeta_quorum;
 mod deterministic_proto;
 mod encoding;
@@ -27,10 +25,6 @@ use std::future::Future;
 
 use anyhow::Result;
 
-#[cfg(feature = "coremeta-perf-gate")]
-pub use coremeta_perf_probe::{
-    CoreMetaCatchUpProbe, CoreMetaFrameProbe, CoreMetaGenerationProbe, CoreMetaInventoryProbe,
-};
 pub use coremeta_quorum::*;
 pub(crate) use deterministic_proto::{
     decode_deterministic_proto, encode_deterministic_proto, protobuf_sha256_hex, sha256_digest,
@@ -113,8 +107,6 @@ pub use meta::{
 pub(crate) use meta::{
     CORE_META_MAX_INLINE_PAYLOAD_BYTES, CORE_META_MAX_VALUE_BYTES, replace_core_meta_row_common,
 };
-#[cfg(feature = "coremeta-perf-gate")]
-pub use meta::{CoreMetaGetProbeEntry, reset_coremeta_get_probe, take_coremeta_get_probe};
 pub use storage_profile::*;
 pub(crate) use transaction_manifest_proto::{
     decode_manifest_locator_proto, encode_manifest_locator_proto,

@@ -12,11 +12,11 @@ This directory contains the local performance stack used to investigate slow rel
 - `scripts/bench-authz-mutations.sh` is a focused diagnostic command, not a
   release gate.
 - `scripts/release-gates.sh` owns the executable release groups. `perf-quick`
-  and `perf-release` are the first counter-backed performance groups that fail
-  directly on measured work and calibrated latency.
-- `anvil-core/benches/coremeta_release_gate/` is the standalone CoreMeta gate;
-  it does not depend on an ignored test or an environment variable to enforce
-  pass/fail.
+  and `perf-release` capture the MVCC-under-Raft benchmark evidence defined by
+  the current architecture.
+- `anvil-core/benches/mvcc_rfc.rs` exercises transaction shapes, durability
+  levels, streaming erasure coding, bundle persistence, Raft certification,
+  local MVCC application, and snapshot reads.
 
 ## Start GreptimeDB and Grafana
 
@@ -55,19 +55,19 @@ The suite records two layers:
 ```sh
 scripts/analyze-perf.py \
   --summary target/anvil/perf/performance-summary.json \
-  --coremeta-report target/anvil/perf/coremeta/quick/report.json \
   --line target/anvil/perf/anvil.line \
   --release-log target/anvil/logs/release-gates.log
 ```
 
 This prints the slowest measured cases, request paths, internal spans, and release-gate slow-test warnings.
 
-## Run the CoreMeta ordered-access gate
+## Capture MVCC-under-Raft performance evidence
 
-The older `performance_tests` suite records broad integration timings but does
-not enforce asymptotic work. The CoreMeta correction therefore has a separate
-benchmark target backed by RocksDB `PerfContext` counters and the deterministic
-`coremeta-release-gate.json` manifest.
+The `mvcc_rfc` harness records the phase boundaries required by
+`docs/rfcs/mvcc_under_raft.md`: stripe encoding, shard streaming, remote
+persistence, Raft certification, local MVCC application, reads, and total
+transaction time. It covers metadata, inline-object, streaming-erasure,
+single-key, ten-key, cross-table, and durability-level transaction shapes.
 
 Run the default pull-request profile with:
 
@@ -81,18 +81,16 @@ Run the larger scheduled/release profile with:
 ./scripts/release-gates.sh perf-release
 ```
 
-The quick profile compares 4,096 and 65,536 row collections. The release profile
-compares 65,536 and 1,048,576 row collections. Both enforce point reads, early
-and deep cursor pages, page-size scaling, a durable single-row calibration, and
-a point-head read followed by one atomic two-row batch. A deep page fails when
-RocksDB work grows with rows before the cursor rather than the requested page.
+The quick profile runs each shape once. The release profile runs five samples by
+default; override that with `ANVIL_MVCC_PERF_ITERATIONS`. Evidence is retained
+under `target/anvil/perf/mvcc/<quick|release>/`: `run.log` contains the phase
+samples and `metadata.txt` records the exact commit and toolchain.
 
-Evidence is retained under
-`target/anvil/perf/coremeta/<quick|release>/`: `report.json` contains raw samples,
-work counters, thresholds, and every gate result; `gate-manifest.json` is the
-exact manifest used; and `run.log` is the benchmark output. The checker rejects
-missing scenarios, missing raw samples, absent complexity gates, non-finite
-metrics, bounded-result mismatches, or any failed gate.
+This harness captures evidence; it does not yet impose hardware-independent
+latency thresholds. Compare like-for-like machines and retain the results with
+release evidence. The remaining RFC-required contention, group-commit,
+reconnect, retained-history, and garbage-collection workloads must be added
+before treating the performance section of the RFC as complete.
 
 ## Capture a macOS Time Profiler trace
 

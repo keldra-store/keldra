@@ -135,60 +135,6 @@ pub(crate) const CORE_META_MAX_SCAN_PAGE_ROWS: usize = 4096;
 static META_DB_CACHE: LazyLock<StdMutex<BTreeMap<PathBuf, Weak<DB>>>> =
     LazyLock::new(|| StdMutex::new(BTreeMap::new()));
 
-#[cfg(feature = "coremeta-perf-gate")]
-static CORE_META_GET_PROBE: LazyLock<StdMutex<BTreeMap<(String, u16), u64>>> =
-    LazyLock::new(|| StdMutex::new(BTreeMap::new()));
-#[cfg(feature = "coremeta-perf-gate")]
-static CORE_META_GET_PROBE_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-#[cfg(feature = "coremeta-perf-gate")]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CoreMetaGetProbeEntry {
-    pub column_family: String,
-    pub table_id: u16,
-    pub calls: u64,
-}
-
-#[cfg(feature = "coremeta-perf-gate")]
-pub fn reset_coremeta_get_probe() {
-    CORE_META_GET_PROBE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clear();
-    CORE_META_GET_PROBE_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
-}
-
-#[cfg(feature = "coremeta-perf-gate")]
-pub fn take_coremeta_get_probe() -> Vec<CoreMetaGetProbeEntry> {
-    CORE_META_GET_PROBE_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
-    let mut counts = CORE_META_GET_PROBE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    std::mem::take(&mut *counts)
-        .into_iter()
-        .map(|((column_family, table_id), calls)| CoreMetaGetProbeEntry {
-            column_family,
-            table_id,
-            calls,
-        })
-        .collect()
-}
-
-#[cfg(feature = "coremeta-perf-gate")]
-fn record_coremeta_get_probe(column_family: &str, table_id: u16) {
-    if !CORE_META_GET_PROBE_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
-        return;
-    }
-    let mut counts = CORE_META_GET_PROBE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let calls = counts
-        .entry((column_family.to_string(), table_id))
-        .or_default();
-    *calls = calls.saturating_add(1);
-}
-
 #[derive(Clone)]
 pub struct CoreMetaStore {
     db: Arc<DB>,
@@ -564,8 +510,6 @@ impl CoreMetaStore {
         let cf = self.cf(cf_name)?;
         let started_at = Instant::now();
         let value = self.db.get_cf(&cf, key)?;
-        #[cfg(feature = "coremeta-perf-gate")]
-        record_coremeta_get_probe(cf_name, table_id);
         let bytes = key_bytes + value.as_ref().map(|value| value.len() as u64).unwrap_or(0);
         crate::perf::record_coremeta_duration(
             "get",
@@ -948,8 +892,6 @@ impl CoreMetaReadSnapshot<'_> {
         let column_family = self.store.cf(cf)?;
         let started_at = Instant::now();
         let value = self.snapshot.get_cf(&column_family, key)?;
-        #[cfg(feature = "coremeta-perf-gate")]
-        record_coremeta_get_probe(cf, table_id);
         let bytes = key_bytes + value.as_ref().map(|value| value.len() as u64).unwrap_or(0);
         crate::perf::record_coremeta_duration(
             "snapshot_get",

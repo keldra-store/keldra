@@ -1,6 +1,6 @@
 # ANVIL-0007: CoreStore Unified Storage Manifest
 
-Status: Draft for implementation
+Status: Superseded by `docs/rfcs/mvcc_under_raft.md`
 Audience: Anvil implementors, operators, storage engineers
 Scope: CoreStore storage architecture, file formats, write/read paths, observability, and performance gates
 
@@ -8723,13 +8723,14 @@ or an explicit written exception.
 
 ### 26.5 CoreMeta Ordered-Access Release Gate
 
-The corrected CoreMeta physical format has a focused release gate in addition to
-the end-to-end baseline. It is implemented by the `coremeta_release_gate`
-benchmark target and is configured only by the checked-in
-`ops/perf/coremeta-release-gate.json` manifest. The benchmark MUST fail its
-process after writing evidence if any correctness, complexity, or latency gate
-fails. A missing report, missing raw samples, missing RocksDB counters, unknown
-manifest schema, or absent required scenario is itself a gate failure.
+This section records the retired ANVIL-0007 CoreMeta performance contract. The
+`coremeta_release_gate` target and `ops/perf/coremeta-release-gate.json` were
+deleted when `mvcc_under_raft.md` replaced physical CoreMeta heads and root
+publication with cluster-scoped MVCC. Current performance evidence is produced
+by `anvil-core/benches/mvcc_rfc.rs` through
+`scripts/run-mvcc-perf-benchmark.sh`; its normative workload inventory is
+section 29 of the replacement RFC. The remainder of this section is historical
+and is not an active implementation or release contract.
 
 The deterministic dataset is `anvil-coremeta-ordered-access-v1` with seed
 `anvil-coremeta-ordered-access-v1-seed-42`. Rows are written to the inline

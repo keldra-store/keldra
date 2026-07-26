@@ -99,7 +99,6 @@ static_gates() {
   run_step "no external database gate" ./scripts/check-no-external-db.sh
   run_step "no public unfenced journal writes gate" ./scripts/check-no-public-unfenced-journal-writes.sh
   run_step "documentation hardening gate" ./scripts/check-docs-hardening.sh
-  run_step "CoreMeta performance evidence checker tests" python3 ./scripts/test-coremeta-perf-report.py
   run_step "release notes gate" ./scripts/test-release-notes.sh
   run_step "fission docs check" fission site check --project-dir documentation --release
   run_step "fission docs build" fission site build --project-dir documentation --release
@@ -363,8 +362,8 @@ docker_mesh_gates() {
 }
 
 performance_quick_gates() {
-  run_step "CoreMeta ordered-access performance gate (quick)" \
-    ./scripts/run-coremeta-perf-gate.sh quick
+  run_step "MVCC-under-Raft performance evidence (quick)" \
+    ./scripts/run-mvcc-perf-benchmark.sh quick
 }
 
 performance_release_gates() {
@@ -374,11 +373,11 @@ performance_release_gates() {
       echo "ANVIL_EXPECTED_GIT_COMMIT must be a full Git object ID" >&2
       return 2
     fi
-    run_step "CoreMeta ordered-access performance gate (release)" \
-      env GITHUB_SHA="${expected_commit}" ./scripts/run-coremeta-perf-gate.sh release
+    run_step "MVCC-under-Raft performance evidence (release)" \
+      env GITHUB_SHA="${expected_commit}" ./scripts/run-mvcc-perf-benchmark.sh release
   else
-    run_step "CoreMeta ordered-access performance gate (release)" \
-      ./scripts/run-coremeta-perf-gate.sh release
+    run_step "MVCC-under-Raft performance evidence (release)" \
+      ./scripts/run-mvcc-perf-benchmark.sh release
   fi
 }
 

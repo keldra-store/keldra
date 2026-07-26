@@ -74,37 +74,24 @@ fn corestore_perf_baseline_release() {
 }
 
 #[test]
-fn coremeta_ordered_access_has_enforced_quick_and_release_profiles() {
-    let manifest_raw = repo_file("ops/perf/coremeta-release-gate.json");
-    let manifest: serde_json::Value = serde_json::from_str(&manifest_raw).unwrap();
-    assert_eq!(
-        manifest.get("schema").and_then(serde_json::Value::as_str),
-        Some("anvil.perf.coremeta_gate_manifest.v1")
-    );
-    for (profile, small_rows, large_rows) in [
-        ("quick", 4_096_u64, 65_536_u64),
-        ("release", 65_536_u64, 1_048_576_u64),
-    ] {
-        let profile = &manifest["profiles"][profile];
-        assert_eq!(profile["small_rows"].as_u64(), Some(small_rows));
-        assert_eq!(profile["large_rows"].as_u64(), Some(large_rows));
-        assert!(profile["page_samples"].as_u64().unwrap() >= 100);
-        assert!(profile["thresholds"]["deep_page_work_growth_ratio"].is_number());
-        assert!(profile["thresholds"]["page_work_per_item"].is_number());
-    }
-
-    let runner = repo_file("anvil-core/benches/coremeta_release_gate/runner.rs");
+fn mvcc_under_raft_performance_harness_reports_required_phase_boundaries() {
+    let runner = repo_file("anvil-core/benches/mvcc_rfc.rs");
     for expected in [
-        "PerfStatsLevel::EnableCount",
-        "point_get_small",
-        "point_get_large",
-        "prefix_page_early_large",
-        "prefix_page_deep_small",
-        "prefix_page_deep_large",
-        "bounded_list_scaled_page_large",
-        "transactional_head_read_and_batch",
-        "deep_page_work_is_table_size_independent",
-        "bounded_list_work_scales_with_page_size",
+        "metadata_only",
+        "small_inline_object",
+        "large_streaming_erasure",
+        "one_logical_key",
+        "ten_logical_keys",
+        "cross_table_partition",
+        "local_durability",
+        "quorum_durability",
+        "erasure_durability",
+        "StripeEncoding",
+        "ShardStreaming",
+        "RemotePersistenceWait",
+        "RaftCertification",
+        "LocalMvccApply",
+        "MvccRead",
     ] {
         assert!(runner.contains(expected), "missing {expected}");
     }
@@ -112,9 +99,7 @@ fn coremeta_ordered_access_has_enforced_quick_and_release_profiles() {
     let release_gates = repo_file("scripts/release-gates.sh");
     assert!(release_gates.contains("perf-quick"));
     assert!(release_gates.contains("perf-release"));
-    let report_checker = repo_file("scripts/check-coremeta-perf-report.py");
-    assert!(report_checker.contains("REQUIRED_COMPLEXITY_GATES"));
-    assert!(report_checker.contains("benchmark reported a failed gate"));
+    assert!(release_gates.contains("run-mvcc-perf-benchmark.sh"));
 }
 
 #[test]
