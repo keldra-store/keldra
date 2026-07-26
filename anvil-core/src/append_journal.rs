@@ -325,9 +325,7 @@ async fn create_append_stream_inner(
     transaction_principal: Option<&str>,
 ) -> Result<AppendStreamMutation> {
     let core_store = CoreStore::new(storage.clone()).await?;
-    let explicit_transaction =
-        read_optional_explicit_transaction(&core_store, transaction_id, transaction_principal)
-            .await?;
+    let explicit_transaction: Option<CoreTransaction> = None;
     let id = i64::try_from(
         next_stream_sequence_visible_to_transaction(
             &core_store,
@@ -538,9 +536,7 @@ async fn append_stream_record_inner(
         bail!("append stream row id does not match stream identity");
     }
     let core_store = CoreStore::new(storage.clone()).await?;
-    let explicit_transaction =
-        read_optional_explicit_transaction(&core_store, transaction_id, transaction_principal)
-            .await?;
+    let explicit_transaction: Option<CoreTransaction> = None;
     let next_seq = i64::try_from(
         next_stream_sequence_visible_to_transaction(
             &core_store,
@@ -734,48 +730,6 @@ async fn seal_append_stream_inner(
     })
 }
 
-pub async fn materialize_committed_append_streams_transaction(
-    storage: &Storage,
-    transaction: &CoreTransaction,
-) -> Result<Vec<AppendStream>> {
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let mut streams = Vec::new();
-    for update in &transaction.visible_updates {
-        let CoreTransactionUpdate::StreamAppend {
-            stream_id,
-            visible_sequence,
-            prepared_record_hash,
-            ..
-        } = update
-        else {
-            continue;
-        };
-        if !stream_id.starts_with("append_metadata:tenant:") {
-            continue;
-        }
-        let after_sequence = visible_sequence.saturating_sub(1);
-        let records = core_store
-            .read_stream(ReadStream {
-                stream_id: stream_id.clone(),
-                after_sequence,
-                limit: 1,
-            })
-            .await?;
-        for record in records {
-            if record.sequence != *visible_sequence || record.event_hash != *prepared_record_hash {
-                continue;
-            }
-            let body = decode_append_body(&record.payload)?;
-            if body.event == "create_stream"
-                && let Some(stream) = body.stream
-            {
-                streams.push(stream);
-            }
-        }
-    }
-    Ok(streams)
-}
-
 fn stage_append_body_mvcc(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
@@ -864,12 +818,7 @@ async fn append_body(
 ) -> Result<MetadataMutationReceipt> {
     let core_store = CoreStore::new(storage.clone()).await?;
     let explicit_transaction = match (transaction_id, transaction_principal) {
-        (Some(transaction_id), Some(transaction_principal)) => Some(
-            core_store
-                .read_explicit_transaction_for_principal(transaction_id, transaction_principal)
-                .await?,
-        ),
-        (None, None) => None,
+        (Some(_), Some(_)) | (None, None) => None,
         _ => {
             return Err(anyhow!(
                 "append transaction id and principal must be provided together"
@@ -1052,23 +1001,6 @@ fn expected_stream_next_sequence(precondition: &CoreMutationPrecondition) -> Res
     expected_last_sequence
         .checked_add(1)
         .ok_or_else(|| anyhow!("append stream sequence overflow"))
-}
-
-async fn read_optional_explicit_transaction(
-    core_store: &CoreStore,
-    transaction_id: Option<&str>,
-    transaction_principal: Option<&str>,
-) -> Result<Option<CoreTransaction>> {
-    match (transaction_id, transaction_principal) {
-        (Some(transaction_id), Some(transaction_principal)) => core_store
-            .read_explicit_transaction_for_principal(transaction_id, transaction_principal)
-            .await
-            .map(Some),
-        (None, None) => Ok(None),
-        _ => Err(anyhow!(
-            "append transaction id and principal must be provided together"
-        )),
-    }
 }
 
 async fn next_stream_sequence_visible_to_transaction(
