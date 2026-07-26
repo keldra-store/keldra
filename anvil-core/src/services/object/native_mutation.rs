@@ -214,7 +214,7 @@ pub(super) async fn prepare_native_mutation_precondition(
     object_key: &str,
     context: Option<&NativeMutationContext>,
     action: AnvilAction,
-    transaction: Option<&crate::core_store::CoreTransaction>,
+    transaction: Option<(&str, &str)>,
 ) -> Result<Option<crate::core_store::CoreMutationPrecondition>, Status> {
     let context =
         context.ok_or_else(|| Status::invalid_argument("Missing native mutation context"))?;

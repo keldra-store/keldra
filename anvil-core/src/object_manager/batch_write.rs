@@ -1,9 +1,5 @@
 use super::*;
-use crate::{
-    core_store::{CoreMutationBatchAdditions, CoreTransactionState},
-    metadata_journal::object_metadata_partition_id,
-    persistence::ObjectBatchCreateInput,
-};
+use crate::{core_store::CoreMutationBatchAdditions, persistence::ObjectBatchCreateInput};
 use futures_util::future::try_join_all;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashSet};
@@ -454,23 +450,13 @@ impl ObjectManager {
         transaction_id: &str,
         transaction_principal: &str,
     ) -> Result<(), Status> {
-        let transaction = self
-            .core_store
-            .read_explicit_transaction_for_principal(transaction_id, transaction_principal)
-            .await
+        let _ = bucket;
+        self.persistence
+            .mvcc()
+            .map_err(transaction_preflight_status)?
+            .open_transactions
+            .binding(transaction_id, transaction_principal)
             .map_err(transaction_preflight_status)?;
-        if transaction.state != CoreTransactionState::Open {
-            return Err(transaction_state_status(transaction.state));
-        }
-
-        let expected_scope = hex::encode(object_metadata_partition_id(bucket.tenant_id, bucket.id));
-        let expected_root_hash = CoreStore::root_key_hash_for_anchor(&expected_scope);
-        if transaction.root_anchor_key != expected_scope
-            || transaction.scope_partition != expected_scope
-            || transaction.root_key_hash != expected_root_hash
-        {
-            return Err(Status::failed_precondition("TransactionScopeMismatch"));
-        }
         Ok(())
     }
 }
@@ -505,9 +491,11 @@ fn payload_digests_are_unique(inputs: &[ResolvedBatchPut]) -> bool {
 
 fn transaction_preflight_status(error: anyhow::Error) -> Status {
     let message = error.to_string();
-    if message.contains("TransactionNotFound") {
+    if message.contains("TransactionNotFound") || message.contains("unknown transaction") {
         Status::not_found("TransactionNotFound")
-    } else if message.contains("TransactionPrincipalMismatch") {
+    } else if message.contains("TransactionPrincipalMismatch")
+        || message.contains("another principal")
+    {
         Status::permission_denied("TransactionPrincipalMismatch")
     } else if message.contains("TransactionScopeMismatch") {
         Status::failed_precondition("TransactionScopeMismatch")
@@ -516,6 +504,8 @@ fn transaction_preflight_status(error: anyhow::Error) -> Status {
         || message.contains("TransactionAlreadyCommitted")
         || message.contains("TransactionNotOpen")
         || message.contains("TransactionNotCommittable")
+        || message.contains("no longer accept staged data")
+        || message.contains("transaction has expired")
     {
         Status::failed_precondition(message)
     } else if message.contains("TransactionConflict") {
@@ -523,14 +513,4 @@ fn transaction_preflight_status(error: anyhow::Error) -> Status {
     } else {
         core_store_status(error)
     }
-}
-
-fn transaction_state_status(state: CoreTransactionState) -> Status {
-    let message = match state {
-        CoreTransactionState::Expired => "TransactionExpired",
-        CoreTransactionState::RolledBack => "TransactionRolledBack",
-        CoreTransactionState::Committed => "TransactionAlreadyCommitted",
-        _ => "TransactionNotOpen",
-    };
-    Status::failed_precondition(message)
 }

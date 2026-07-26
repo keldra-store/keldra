@@ -41,33 +41,66 @@ impl CoreStore {
             &tuple_key,
             explicit_transaction,
         )?;
-        let decoded = payload
-            .as_deref()
-            .map(decode_object_metadata_row)
-            .transpose()?;
-        if let Some(object) = decoded.as_ref() {
-            validate_object_scope(bucket, object)?;
-            if object.key != object_key {
-                bail!("CoreStore object metadata current row key mismatch");
-            }
-        }
-        let object = decoded.filter(|object| object.deleted_at.is_none());
-        let expected_payload_hash = payload
-            .as_ref()
-            .map(|payload| core_meta_payload_digest(TABLE_OBJECT_HEAD_ROW, payload));
-        Ok(ObjectMetadataPreconditionSnapshot {
-            object,
-            precondition: CoreMutationPrecondition::CoreMetaRow {
-                cf: CF_OBJECT_HEADS.to_string(),
-                table_id: TABLE_OBJECT_HEAD_ROW,
-                tuple_key,
-                require_absent: expected_payload_hash.is_none(),
-                require_present: expected_payload_hash.is_some(),
-                expected_payload_hash,
-            },
-        })
+        object_metadata_precondition_snapshot_from_payload(bucket, object_key, tuple_key, payload)
     }
 
+    pub(crate) fn object_metadata_precondition_snapshot_from_payload(
+        &self,
+        bucket: &Bucket,
+        object_key: &str,
+        payload: Option<Vec<u8>>,
+    ) -> Result<ObjectMetadataPreconditionSnapshot> {
+        object_metadata_precondition_snapshot_from_payload(
+            bucket,
+            object_key,
+            object_current_key(bucket, object_key),
+            payload,
+        )
+    }
+
+    pub(crate) fn object_metadata_current_tuple_key(
+        &self,
+        bucket: &Bucket,
+        object_key: &str,
+    ) -> Vec<u8> {
+        object_current_key(bucket, object_key)
+    }
+}
+
+fn object_metadata_precondition_snapshot_from_payload(
+    bucket: &Bucket,
+    object_key: &str,
+    tuple_key: Vec<u8>,
+    payload: Option<Vec<u8>>,
+) -> Result<ObjectMetadataPreconditionSnapshot> {
+    let decoded = payload
+        .as_deref()
+        .map(decode_object_metadata_row)
+        .transpose()?;
+    if let Some(object) = decoded.as_ref() {
+        validate_object_scope(bucket, object)?;
+        if object.key != object_key {
+            bail!("CoreStore object metadata current row key mismatch");
+        }
+    }
+    let object = decoded.filter(|object| object.deleted_at.is_none());
+    let expected_payload_hash = payload
+        .as_ref()
+        .map(|payload| core_meta_payload_digest(TABLE_OBJECT_HEAD_ROW, payload));
+    Ok(ObjectMetadataPreconditionSnapshot {
+        object,
+        precondition: CoreMutationPrecondition::CoreMetaRow {
+            cf: CF_OBJECT_HEADS.to_string(),
+            table_id: TABLE_OBJECT_HEAD_ROW,
+            tuple_key,
+            require_absent: expected_payload_hash.is_none(),
+            require_present: expected_payload_hash.is_some(),
+            expected_payload_hash,
+        },
+    })
+}
+
+impl CoreStore {
     pub(crate) async fn acquire_object_metadata_mutation_lock(
         &self,
         bucket: &Bucket,
@@ -812,6 +845,7 @@ impl CoreStore {
             ObjectDataTarget::ObjectRef { object_ref, .. } => {
                 self.read_object_manifest(object_ref).await?.boundary_values
             }
+            ObjectDataTarget::MvccLocal { .. } | ObjectDataTarget::MvccShards { .. } => Vec::new(),
         };
         if boundary_values.is_empty() {
             return Ok((Vec::new(), Vec::new()));

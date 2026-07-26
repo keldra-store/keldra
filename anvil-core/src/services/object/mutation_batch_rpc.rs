@@ -219,7 +219,10 @@ pub(super) async fn execute_mutation_batch(
     }
     let _operation_guards =
         acquire_mutation_batch_operation_locks(state, claims.tenant_id, &req).await?;
-    let put_only_batch = !write_visibility.requires_payload_boundary_extraction()
+    let put_only_batch = matches!(
+        write_visibility.indexes,
+        object_manager::IndexMaintenanceVisibility::Deferred
+    ) && !write_visibility.requires_payload_boundary_extraction()
         && req.operations.iter().all(|operation| {
             matches!(
                 operation.op.as_ref(),
@@ -234,21 +237,19 @@ pub(super) async fn execute_mutation_batch(
             "ExplicitTransactionRequiredForNonPutMutationBatch",
         ));
     }
-    let precondition_transaction =
-        mutation_precondition_transaction(state, &claims, transaction_id).await?;
-    let mut durable_preconditions = prepare_mutation_batch_native_preconditions(
-        state,
-        &claims,
-        &req,
-        precondition_transaction.as_ref(),
-    )
-    .await?;
+    validate_mutation_precondition_transaction(state, &claims, transaction_id)?;
+    let transaction_principal =
+        transaction_id.map(|_| object_manager::transaction_principal_from_claims(&claims));
+    let precondition_transaction = transaction_id.zip(transaction_principal.as_deref());
+    let mut durable_preconditions =
+        prepare_mutation_batch_native_preconditions(state, &claims, &req, precondition_transaction)
+            .await?;
     durable_preconditions.extend(
         prepare_write_preconditions(
             state,
             &claims,
             req.precondition.as_ref(),
-            precondition_transaction.as_ref(),
+            precondition_transaction,
         )
         .await?,
     );

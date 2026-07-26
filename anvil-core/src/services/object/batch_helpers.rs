@@ -1,5 +1,5 @@
 use super::*;
-use crate::core_store::{CoreMutationPrecondition, CoreTransaction, CoreTransactionState};
+use crate::core_store::CoreMutationPrecondition;
 
 const MAX_MUTATION_BATCH_OPERATIONS: usize = 256;
 
@@ -17,7 +17,7 @@ pub(super) async fn prepare_write_preconditions(
     state: &AppState,
     claims: &auth::Claims,
     precondition: Option<&WritePrecondition>,
-    transaction: Option<&CoreTransaction>,
+    transaction: Option<(&str, &str)>,
 ) -> Result<Vec<CoreMutationPrecondition>, Status> {
     let Some(precondition) = precondition else {
         return Ok(Vec::new());
@@ -107,34 +107,36 @@ pub(super) async fn prepare_write_preconditions(
     Ok(durable_preconditions)
 }
 
-pub(super) async fn mutation_precondition_transaction(
+pub(super) fn validate_mutation_precondition_transaction(
     state: &AppState,
     claims: &auth::Claims,
     transaction_id: Option<&str>,
-) -> Result<Option<CoreTransaction>, Status> {
+) -> Result<(), Status> {
     let Some(transaction_id) = transaction_id else {
-        return Ok(None);
+        return Ok(());
     };
     let principal = crate::object_manager::transaction_principal_from_claims(claims);
-    let transaction = state
-        .core_store
-        .read_explicit_transaction_for_principal(transaction_id, &principal)
-        .await
+    state
+        .mvcc
+        .open_transactions
+        .binding(transaction_id, &principal)
         .map_err(|error| {
-            transaction_core_store_status(&error.to_string())
+            let message = error.to_string();
+            if message.contains("unknown transaction") {
+                return Status::not_found("TransactionNotFound");
+            }
+            if message.contains("another principal") {
+                return Status::permission_denied("TransactionPrincipalMismatch");
+            }
+            if message.contains("no longer accept staged data")
+                || message.contains("transaction has expired")
+            {
+                return Status::failed_precondition("TransactionNotOpen");
+            }
+            transaction_core_store_status(&message)
                 .unwrap_or_else(|| Status::internal(error.to_string()))
         })?;
-    match transaction.state {
-        CoreTransactionState::Open => Ok(Some(transaction)),
-        CoreTransactionState::Expired => Err(Status::failed_precondition("TransactionExpired")),
-        CoreTransactionState::RolledBack | CoreTransactionState::Aborted => {
-            Err(Status::failed_precondition("TransactionRolledBack"))
-        }
-        CoreTransactionState::Committed => {
-            Err(Status::failed_precondition("TransactionAlreadyCommitted"))
-        }
-        _ => Err(Status::failed_precondition("TransactionNotOpen")),
-    }
+    Ok(())
 }
 
 pub(super) fn validate_mutation_batch_operations(req: &MutationBatchRequest) -> Result<(), Status> {
@@ -271,7 +273,7 @@ pub(super) async fn prepare_mutation_batch_native_preconditions(
     state: &AppState,
     claims: &auth::Claims,
     req: &MutationBatchRequest,
-    transaction: Option<&CoreTransaction>,
+    transaction: Option<(&str, &str)>,
 ) -> Result<Vec<CoreMutationPrecondition>, Status> {
     let mut preconditions = Vec::new();
     for operation in &req.operations {

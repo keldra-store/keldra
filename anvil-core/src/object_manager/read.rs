@@ -1197,7 +1197,7 @@ impl ObjectManager {
         bucket_name: &str,
         object_key: &str,
         action: AnvilAction,
-        explicit_transaction: Option<&CoreTransaction>,
+        transaction: Option<(&str, &str)>,
     ) -> Result<ObjectMutationPreconditionSnapshot, Status> {
         // Reuse the public mutation authorization path, then capture the exact
         // metadata row that must remain unchanged until transaction publication.
@@ -1206,17 +1206,30 @@ impl ObjectManager {
         let bucket = self
             .get_tenant_bucket(claims.tenant_id, bucket_name)
             .await?;
-        let transaction = explicit_transaction.filter(|transaction| {
-            transaction.root_anchor_key
-                == hex::encode(crate::metadata_journal::object_metadata_partition_id(
-                    bucket.tenant_id,
-                    bucket.id,
-                ))
-        });
-        let snapshot = self
-            .core_store
-            .object_metadata_precondition_snapshot(&bucket, object_key, transaction)
+        let snapshot = if let Some((transaction_id, principal)) = transaction {
+            let tuple_key = self
+                .core_store
+                .object_metadata_current_tuple_key(&bucket, object_key);
+            let logical_key = crate::mvcc_product::coremeta_logical_key(
+                crate::core_store::CF_OBJECT_HEADS,
+                crate::core_store::TABLE_OBJECT_HEAD_ROW,
+                &tuple_key,
+            )
             .map_err(|error| Status::internal(error.to_string()))?;
+            let payload = self
+                .persistence
+                .mvcc()
+                .map_err(|error| Status::internal(error.to_string()))?
+                .read_transaction_value(transaction_id, principal, &logical_key)
+                .map_err(|error| Status::internal(error.to_string()))?;
+            self.core_store
+                .object_metadata_precondition_snapshot_from_payload(&bucket, object_key, payload)
+                .map_err(|error| Status::internal(error.to_string()))?
+        } else {
+            self.core_store
+                .object_metadata_precondition_snapshot(&bucket, object_key, None)
+                .map_err(|error| Status::internal(error.to_string()))?
+        };
         Ok(ObjectMutationPreconditionSnapshot {
             object: snapshot.object,
             precondition: snapshot.precondition,
