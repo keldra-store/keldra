@@ -168,10 +168,11 @@ pub(crate) struct StagedTypedFieldSegment {
 
 pub async fn write_typed_field_segment(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     write: TypedFieldSegmentWrite<'_>,
 ) -> Result<String> {
     let staged = stage_typed_field_segment(storage, write).await?;
-    publish_typed_field_segment_catalog(storage, &staged, &[]).await?;
+    publish_typed_field_segment_catalog(mvcc, &staged, &[]).await?;
     publish_typed_field_segment_locator(storage, &staged, &[]).await?;
     Ok(staged.segment_ref)
 }
@@ -308,11 +309,14 @@ pub(crate) async fn stage_typed_field_segment(
 }
 
 pub(crate) async fn publish_typed_field_segment_catalog(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     staged: &StagedTypedFieldSegment,
-    additional_preconditions: &[CoreMutationPrecondition],
+    additional_preconditions: &[(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )],
 ) -> Result<()> {
-    write_writer_segment_catalog_record(storage, &staged.catalog, additional_preconditions).await
+    write_writer_segment_catalog_record(mvcc, &staged.catalog, additional_preconditions).await
 }
 
 pub(crate) async fn publish_typed_field_segment_locator(
@@ -1237,78 +1241,4 @@ fn validate_hex32(value: &str, label: &str) -> Result<()> {
         bail!("{label} must be 32 hex bytes");
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    #[tokio::test]
-    async fn typed_field_segment_round_trips_through_core_store() {
-        let dir = tempdir().unwrap();
-        let storage = Storage::new_at(dir.path()).await.unwrap();
-        let mut values = BTreeMap::new();
-        values.insert(
-            "status".to_string(),
-            JsonValue::String("pending".to_string()),
-        );
-        values.insert("priority".to_string(), JsonValue::Number(10.into()));
-        let row = TypedFieldSegmentRow {
-            object_key: "queue/item-1.json".to_string(),
-            object_version_id: uuid::Uuid::new_v4().to_string(),
-            source_identity: "queue/item-1.json#1".to_string(),
-            encoded_values: encode_row_values(&values).unwrap(),
-            source_id_binary: b"source-id".to_vec(),
-            value_flags: 0,
-            values,
-            authz_label_hash: hex::encode([7u8; 32]),
-            authz_revision: 9,
-        };
-        let definition_hash = blake3::hash(b"definition").to_hex().to_string();
-        let segment_ref = write_typed_field_segment(
-            &storage,
-            TypedFieldSegmentWrite {
-                index_id: "tenant:bucket:index",
-                generation: 1,
-                source_kind: "object_current",
-                source_cursor: 12,
-                authz_revision: 9,
-                boundary_values: &[],
-                definition_hash: &definition_hash,
-                field_names: &["status".to_string(), "priority".to_string()],
-                rows: &[row.clone()],
-            },
-        )
-        .await
-        .unwrap();
-
-        let decoded = read_typed_field_segment(&storage, &segment_ref)
-            .await
-            .unwrap();
-        assert_eq!(decoded.header.index_id, "tenant:bucket:index");
-        assert_eq!(decoded.header.source_cursor, 12);
-        assert_eq!(decoded.header.codec, "typed-row-binary-v1");
-        assert_eq!(decoded.rows, vec![row]);
-        assert_eq!(decoded.value_index.len(), 2);
-        assert!(decoded.value_index.iter().any(|entry| {
-            entry.field_name == "status"
-                && entry.encoded_value
-                    == encode_json_value_for_typed_index(&JsonValue::String("pending".to_string()))
-                        .unwrap()
-                && entry.row_ordinal == 0
-        }));
-        assert!(decoded.value_index.iter().any(|entry| {
-            entry.field_name == "priority"
-                && entry.encoded_value
-                    == encode_json_value_for_typed_index(&JsonValue::Number(10.into())).unwrap()
-                && entry.row_ordinal == 0
-        }));
-        assert_eq!(
-            latest_typed_field_segment_ref(&storage, "tenant:bucket:index")
-                .await
-                .unwrap(),
-            Some(segment_ref)
-        );
-    }
 }

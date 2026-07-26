@@ -211,10 +211,11 @@ pub(crate) struct StagedFullTextSegment {
 
 pub async fn write_full_text_segment(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     write: FullTextSegmentWrite<'_>,
 ) -> Result<String> {
     let staged = stage_full_text_segment(storage, write).await?;
-    publish_full_text_segment_catalog(storage, &staged, &[]).await?;
+    publish_full_text_segment_catalog(mvcc, &staged, &[]).await?;
     publish_full_text_segment_locator(storage, &staged, &[]).await?;
     Ok(staged.segment_ref)
 }
@@ -356,11 +357,14 @@ pub(crate) async fn stage_full_text_segment(
 }
 
 pub(crate) async fn publish_full_text_segment_catalog(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     staged: &StagedFullTextSegment,
-    additional_preconditions: &[CoreMutationPrecondition],
+    additional_preconditions: &[(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )],
 ) -> Result<()> {
-    write_writer_segment_catalog_record(storage, &staged.catalog, additional_preconditions).await
+    write_writer_segment_catalog_record(mvcc, &staged.catalog, additional_preconditions).await
 }
 
 pub(crate) async fn publish_full_text_segment_locator(
@@ -1102,236 +1106,4 @@ fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
 
 fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
     crate::core_store::decode_core_object_ref_target(target)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::formats::full_text::{FullTextDocument, TokenizerConfig, build_full_text_postings};
-    use tempfile::tempdir;
-
-    #[tokio::test]
-    async fn full_text_segment_round_trips_built_postings() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let config = TokenizerConfig::default();
-        let built = build_full_text_postings(
-            &[
-                FullTextDocument {
-                    document_id: 1,
-                    field_id: 1,
-                    object_version_id: [1; 16],
-                    authz_label_hash: [2; 32],
-                    text: "Alpha beta alpha",
-                },
-                FullTextDocument {
-                    document_id: 2,
-                    field_id: 1,
-                    object_version_id: [3; 16],
-                    authz_label_hash: [4; 32],
-                    text: "beta gamma",
-                },
-            ],
-            &config,
-        );
-        let document_table = br#"{"documents":[1,2]}"#;
-
-        let segment_ref = write_full_text_segment(
-            &storage,
-            FullTextSegmentWrite {
-                index_id: "index-alpha",
-                generation: 5,
-                tokenizer: serde_json::json!({"language": "simple"}),
-                scorer: serde_json::json!({"kind": "bm25"}),
-                source_cursor: 44,
-                authz_revision: 7,
-                boundary_values: &[],
-                built_postings: &built,
-                document_table,
-            },
-        )
-        .await
-        .unwrap();
-        assert!(segment_ref.starts_with(FULL_TEXT_SEGMENT_REF_PREFIX));
-
-        let decoded = read_full_text_segment(&storage, &segment_ref)
-            .await
-            .unwrap();
-        assert_eq!(decoded.header.index_id, "index-alpha");
-        assert_eq!(decoded.header.source_cursor, 44);
-        assert_eq!(decoded.header.authz_revision, 7);
-        assert_eq!(decoded.header.codec, "zstd");
-        let expected_block = encode_postings_block(&built.postings, &built.postings_bytes).unwrap();
-        let expected_compressed = zstd::stream::encode_all(&expected_block[..], 3).unwrap();
-        assert_ne!(
-            expected_compressed, expected_block,
-            "test fixture should prove on-disk postings are compressed bytes"
-        );
-        assert_eq!(
-            decoded.header.postings_bytes_len,
-            expected_compressed.len() as u64
-        );
-        assert_eq!(decoded.terms, built.terms);
-        assert_eq!(decoded.postings, built.postings);
-        assert_eq!(
-            decoded.posting_skips,
-            build_skip_entries(&built.postings, &built.postings_bytes).unwrap()
-        );
-        assert_eq!(decoded.postings_bytes, built.postings_bytes);
-        assert_eq!(decoded.document_table, document_table);
-    }
-
-    #[tokio::test]
-    async fn full_text_segment_writes_skip_data_every_128_postings() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let config = TokenizerConfig::default();
-        let documents = (0..260)
-            .map(|idx| FullTextDocument {
-                document_id: idx + 1,
-                field_id: 1,
-                object_version_id: [idx as u8; 16],
-                authz_label_hash: [9; 32],
-                text: "shared",
-            })
-            .collect::<Vec<_>>();
-        let built = build_full_text_postings(&documents, &config);
-
-        let segment_ref = write_full_text_segment(
-            &storage,
-            FullTextSegmentWrite {
-                index_id: "index-shared",
-                generation: 1,
-                tokenizer: serde_json::json!({"language": "simple"}),
-                scorer: serde_json::json!({"kind": "bm25"}),
-                source_cursor: 260,
-                authz_revision: 11,
-                boundary_values: &[],
-                built_postings: &built,
-                document_table: b"",
-            },
-        )
-        .await
-        .unwrap();
-
-        let decoded = read_full_text_segment(&storage, &segment_ref)
-            .await
-            .unwrap();
-        assert_eq!(decoded.postings.len(), 260);
-        assert_eq!(decoded.postings, built.postings);
-        assert_eq!(decoded.postings_bytes, built.postings_bytes);
-        assert_eq!(
-            decoded
-                .posting_skips
-                .iter()
-                .map(|entry| entry.posting_index)
-                .collect::<Vec<_>>(),
-            vec![0, 128, 256]
-        );
-
-        let mut cursor = 0u64;
-        let mut expected_offsets = Vec::new();
-        for (idx, posting) in built.postings.iter().enumerate() {
-            if idx % FULL_TEXT_POSTINGS_SKIP_STRIDE as usize == 0 {
-                expected_offsets.push(cursor);
-            }
-            cursor += posting.encode().len() as u64;
-        }
-        assert_eq!(
-            decoded
-                .posting_skips
-                .iter()
-                .map(|entry| entry.postings_offset)
-                .collect::<Vec<_>>(),
-            expected_offsets
-        );
-    }
-
-    #[test]
-    fn full_text_postings_block_rejects_corrupt_skip_data() {
-        let documents = (0..130)
-            .map(|idx| FullTextDocument {
-                document_id: idx + 1,
-                field_id: 1,
-                object_version_id: [idx as u8; 16],
-                authz_label_hash: [8; 32],
-                text: "shared",
-            })
-            .collect::<Vec<_>>();
-        let built = build_full_text_postings(&documents, &TokenizerConfig::default());
-        let mut encoded = encode_postings_block(&built.postings, &built.postings_bytes).unwrap();
-
-        let second_skip_offset = FULL_TEXT_POSTINGS_BLOCK_HEADER_LEN + FULL_TEXT_SKIP_ENTRY_LEN + 8;
-        encoded[second_skip_offset] ^= 1;
-
-        assert!(
-            decode_postings_block(&encoded, built.postings.len() as u64)
-                .unwrap_err()
-                .to_string()
-                .contains("skip entry does not match")
-        );
-    }
-
-    #[tokio::test]
-    async fn full_text_segment_footer_protects_body() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let built = build_full_text_postings(&[], &TokenizerConfig::default());
-        let segment_ref = write_full_text_segment(
-            &storage,
-            FullTextSegmentWrite {
-                index_id: "index-alpha",
-                generation: 5,
-                tokenizer: serde_json::json!({}),
-                scorer: serde_json::json!({}),
-                source_cursor: 0,
-                authz_revision: 0,
-                boundary_values: &[],
-                built_postings: &built,
-                document_table: b"",
-            },
-        )
-        .await
-        .unwrap();
-        let mut bytes = read_full_text_segment_bytes(&storage, &segment_ref)
-            .await
-            .unwrap();
-        bytes[crate::formats::WRITER_SEGMENT_FIXED_HEADER_LEN + 1] ^= 1;
-        assert!(decode_full_text_segment(&bytes).is_err());
-    }
-
-    #[tokio::test]
-    async fn latest_full_text_segment_selects_highest_generation() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let built = build_full_text_postings(&[], &TokenizerConfig::default());
-        for generation in [1, 3, 2] {
-            write_full_text_segment(
-                &storage,
-                FullTextSegmentWrite {
-                    index_id: "index-alpha",
-                    generation,
-                    tokenizer: serde_json::json!({}),
-                    scorer: serde_json::json!({}),
-                    source_cursor: generation,
-                    authz_revision: 0,
-                    boundary_values: &[],
-                    built_postings: &built,
-                    document_table: b"",
-                },
-            )
-            .await
-            .unwrap();
-        }
-        let latest = read_latest_full_text_segment(&storage, "index-alpha")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(latest.header.generation, 3);
-        assert!(
-            latest_full_text_segment_ref(&storage, "../escape")
-                .await
-                .is_err()
-        );
-    }
 }

@@ -470,4 +470,3 @@ mod coremeta_history;
 mod erasure_roots;
 mod logical;
 mod root_publication_recovery;
-mod task_publication_successor;

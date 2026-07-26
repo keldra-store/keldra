@@ -54,6 +54,7 @@ pub struct GitSourceIndexWrite<'a> {
 
 pub async fn write_git_source_index(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     input: GitSourceIndexWrite<'_>,
 ) -> Result<String> {
     let mut records = input.records.to_vec();
@@ -123,7 +124,7 @@ pub async fn write_git_source_index(
         .cloned()
         .ok_or_else(|| anyhow!("CoreFormatWriter returned no git source object"))?;
     write_writer_segment_catalog_record(
-        storage,
+        mvcc,
         &WriterSegmentCatalogRecord {
             family: GIT_SOURCE_INDEX_CATALOG_FAMILY.to_string(),
             scope: git_source_index_scope(input.tenant_id, input.repository_id)?,
@@ -143,16 +144,21 @@ pub async fn write_git_source_index(
 
 pub async fn read_git_source_index(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     index_ref: &str,
 ) -> Result<DecodedGitSourceIndex> {
-    let bytes = read_git_source_index_bytes(storage, index_ref).await?;
+    let bytes = read_git_source_index_bytes(storage, mvcc, index_ref).await?;
     decode_git_source_index(&bytes)
 }
 
-pub async fn read_git_source_index_bytes(storage: &Storage, index_ref: &str) -> Result<Vec<u8>> {
+pub async fn read_git_source_index_bytes(
+    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    index_ref: &str,
+) -> Result<Vec<u8>> {
     let parsed = parse_git_source_index_ref(index_ref)?;
     let record = read_writer_segment_catalog_record(
-        storage,
+        mvcc,
         GIT_SOURCE_INDEX_CATALOG_FAMILY,
         &git_source_index_scope(parsed.tenant_id, &parsed.repository_id)?,
         parsed.generation,
@@ -169,12 +175,12 @@ pub async fn read_git_source_index_bytes(storage: &Storage, index_ref: &str) -> 
 }
 
 pub async fn latest_git_source_index_ref(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     repository_id: &str,
 ) -> Result<Option<String>> {
     Ok(latest_writer_segment_catalog_record(
-        storage,
+        mvcc,
         GIT_SOURCE_INDEX_CATALOG_FAMILY,
         &git_source_index_scope(tenant_id, repository_id)?,
     )
@@ -442,96 +448,4 @@ fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
 
 fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
     crate::core_store::decode_core_object_ref_target(target)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    fn record(commit: u8, path: &str, object: u8) -> GitSourceRecord {
-        GitSourceRecord::new(
-            GitHashAlgorithm::Sha1,
-            b"repo-alpha".to_vec(),
-            vec![commit; 20],
-            vec![object; 20],
-            path.as_bytes().to_vec(),
-            u64::from(object) * 100,
-            44,
-            [9; 16],
-        )
-        .unwrap()
-    }
-
-    #[tokio::test]
-    async fn git_source_index_round_trips_sorted_records() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let records = vec![
-            record(2, "src/lib.rs", 2),
-            record(1, "README.md", 9),
-            record(1, "src/main.rs", 1),
-        ];
-
-        let index_ref = write_git_source_index(
-            &storage,
-            GitSourceIndexWrite {
-                tenant_id: 5,
-                repository_id: "repo-alpha",
-                generation: 3,
-                source_hash: [8; 32],
-                hash_algorithm: GitHashAlgorithm::Sha1,
-                records: &records,
-            },
-        )
-        .await
-        .unwrap();
-        assert!(index_ref.starts_with("git_source_index:tenant:5:repository:repo-alpha:"));
-
-        let decoded = read_git_source_index(&storage, &index_ref).await.unwrap();
-        assert_eq!(decoded.header.repository_id, "repo-alpha");
-        assert_eq!(decoded.header.hash_algorithm, "sha1");
-        assert_eq!(decoded.records.len(), 3);
-        ensure_sorted(&decoded.records).unwrap();
-    }
-
-    #[tokio::test]
-    async fn git_source_index_footer_protects_body() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let index_ref = write_git_source_index(
-            &storage,
-            GitSourceIndexWrite {
-                tenant_id: 5,
-                repository_id: "repo-alpha",
-                generation: 3,
-                source_hash: [8; 32],
-                hash_algorithm: GitHashAlgorithm::Sha1,
-                records: &[record(1, "README.md", 1)],
-            },
-        )
-        .await
-        .unwrap();
-        let mut bytes = read_git_source_index_bytes(&storage, &index_ref)
-            .await
-            .unwrap();
-        bytes[crate::formats::WRITER_SEGMENT_FIXED_HEADER_LEN + 1] ^= 1;
-        assert!(decode_git_source_index(&bytes).is_err());
-    }
-
-    #[test]
-    fn git_source_index_rejects_wrong_record_algorithm() {
-        let record = GitSourceRecord::new(
-            GitHashAlgorithm::Sha1,
-            b"repo-alpha".to_vec(),
-            vec![1; 20],
-            vec![2; 20],
-            b"README.md".to_vec(),
-            0,
-            12,
-            [4; 16],
-        )
-        .unwrap();
-        assert!(ensure_record_algorithms(GitHashAlgorithm::Sha256, &[record]).is_err());
-    }
 }

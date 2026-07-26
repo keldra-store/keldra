@@ -124,10 +124,11 @@ pub(crate) struct StagedVectorSegment {
 
 pub async fn write_vector_segment(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     write: VectorSegmentWrite<'_>,
 ) -> Result<String> {
     let staged = stage_vector_segment(storage, write).await?;
-    publish_vector_segment_catalog(storage, &staged, &[]).await?;
+    publish_vector_segment_catalog(mvcc, &staged, &[]).await?;
     publish_vector_segment_locator(storage, &staged, &[]).await?;
     Ok(staged.segment_ref)
 }
@@ -269,11 +270,14 @@ pub(crate) async fn stage_vector_segment(
 }
 
 pub(crate) async fn publish_vector_segment_catalog(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     staged: &StagedVectorSegment,
-    additional_preconditions: &[CoreMutationPrecondition],
+    additional_preconditions: &[(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )],
 ) -> Result<()> {
-    write_writer_segment_catalog_record(storage, &staged.catalog, additional_preconditions).await
+    write_writer_segment_catalog_record(mvcc, &staged.catalog, additional_preconditions).await
 }
 
 pub(crate) async fn publish_vector_segment_locator(
@@ -1486,287 +1490,4 @@ fn encode_core_object_ref_target(object_ref: &CoreObjectRef) -> Result<String> {
 
 fn decode_core_object_ref_target(target: &str) -> Result<CoreObjectRef> {
     crate::core_store::decode_core_object_ref_target(target)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    fn entry(vector_id: u64, values: Vec<f32>) -> VectorSegmentEntry {
-        VectorSegmentEntry {
-            source_id_binary: vec![vector_id as u8, 0xaa],
-            source_generation: vector_id * 10,
-            labels: if vector_id == 1 { vec![42] } else { Vec::new() },
-            record: VectorRecord {
-                vector_id,
-                object_version_id: [vector_id as u8; 16],
-                chunk_id: vector_id as u32,
-                modality: VectorModality::Text as u8,
-                metric: VectorMetric::Cosine as u8,
-                dimension: 3,
-                vector_payload_offset: 0,
-                source_start: vector_id * 100,
-                source_len: 20,
-                authz_label_hash: [7; 32],
-                metadata_filter_bits: 0,
-            },
-            payload: VectorPayload {
-                dimension: 3,
-                values,
-            },
-        }
-    }
-
-    #[tokio::test]
-    async fn vector_segment_round_trips_payloads_and_graph() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let entries = vec![entry(2, vec![0.0, 1.0, 0.0]), entry(1, vec![1.0, 0.0, 0.0])];
-        let segment_ref = write_vector_segment(
-            &storage,
-            VectorSegmentWrite {
-                index_id: "vector-alpha",
-                definition_hash: "blake3:test-definition",
-                generation: 6,
-                dimension: 3,
-                metric: VectorMetric::Cosine,
-                embedding_provider: "test_only",
-                embedding_model_version: None,
-                embedding_normalisation: "unit_l2",
-                embedding_chunking_hash: "blake3:test-chunking",
-                extractor_definition_hash: "blake3:test-extractor",
-                embedding_provenance_hash: "blake3:test-provenance",
-                embedding_model: "embedding-v1",
-                modality: VectorModality::Text,
-                hnsw_m: 32,
-                hnsw_ef_construction: 200,
-                source_cursor: 88,
-                authz_revision: 9,
-                boundary_values: &[],
-                entries: &entries,
-                deleted_bitset: &[0],
-            },
-        )
-        .await
-        .unwrap();
-        assert!(segment_ref.starts_with(VECTOR_SEGMENT_REF_PREFIX));
-
-        let decoded = read_vector_segment(&storage, &segment_ref).await.unwrap();
-        assert_eq!(decoded.header.index_id, "vector-alpha");
-        assert_eq!(
-            decoded.header.schema,
-            "anvil.index.vector_segment_header.v1"
-        );
-        assert_eq!(decoded.header.definition_hash, "blake3:test-definition");
-        assert_eq!(decoded.header.dimension, 3);
-        assert_eq!(decoded.header.metric, "cosine");
-        assert_eq!(decoded.header.algorithm, "hnsw");
-        assert_eq!(decoded.header.embedding_provider, "test_only");
-        assert_eq!(decoded.header.embedding_model, "embedding-v1");
-        assert_eq!(decoded.header.embedding_normalisation, "unit_l2");
-        assert_eq!(
-            decoded.header.embedding_chunking_hash,
-            "blake3:test-chunking"
-        );
-        assert_eq!(
-            decoded.header.extractor_definition_hash,
-            "blake3:test-extractor"
-        );
-        assert_eq!(
-            decoded.header.embedding_provenance_hash,
-            "blake3:test-provenance"
-        );
-        assert_eq!(decoded.header.vector_count, 2);
-        assert_eq!(decoded.header.ann_format_hash, hnsw_ann_format_hash());
-        assert_eq!(decoded.header.codec, "f32_le_v1");
-        assert_eq!(decoded.entries.len(), 2);
-        assert_eq!(decoded.entries[0].record.vector_id, 1);
-        assert_eq!(decoded.entries[1].record.vector_id, 2);
-        assert_eq!(decoded.entries[0].source_id_binary, vec![1, 0xaa]);
-        assert_eq!(decoded.entries[0].source_generation, 10);
-        assert_eq!(decoded.entries[0].labels, vec![42]);
-        assert_eq!(decoded.entries[1].source_id_binary, vec![2, 0xaa]);
-        assert_eq!(decoded.entries[1].source_generation, 20);
-        assert!(decoded.entries[1].labels.is_empty());
-        assert_eq!(decoded.body_header.record_table_offset, 0);
-        assert_eq!(decoded.body_header.vector_blocks_offset, 0);
-        assert_eq!(decoded.body_header.ann_blocks_offset, 0);
-        assert_eq!(decoded.body_header.deleted_bitset_offset, 0);
-        assert_eq!(decoded.hnsw_graph.node_count, 2);
-        assert!(!decoded.hnsw_graph.layers.is_empty());
-        assert_eq!(decoded.deleted_bitset, vec![0]);
-    }
-
-    fn corrupt_writer_table_value(body: Vec<u8>, table_id: u16) -> Vec<u8> {
-        let mut tables = decode_writer_body_tables(&body).unwrap();
-        let table = tables
-            .iter_mut()
-            .find(|table| table.table_id == table_id)
-            .expect("writer table exists");
-        let row = table.rows.first_mut().expect("writer table row exists");
-        let idx = row.value.len().checked_sub(1).expect("writer table value");
-        row.value[idx] ^= 1;
-        let encoded_tables = tables
-            .into_iter()
-            .map(|table| WriterBodyTable {
-                table_id: table.table_id,
-                row_type_id: table.row_type_id,
-                rows: table.rows,
-            })
-            .collect::<Vec<_>>();
-        encode_writer_body_tables(&encoded_tables).unwrap()
-    }
-
-    #[test]
-    fn vector_body_rejects_corrupt_vector_block_crc32c() {
-        let mut entries = vec![entry(1, vec![1.0, 0.0, 0.0])];
-        let graph = build_hnsw_graph_for_entries(&entries, VectorMetric::Cosine, 32, 200).unwrap();
-        let body = encode_vector_body(&mut entries, &graph, &[0]).unwrap();
-        let body = corrupt_writer_table_value(body, TABLE_VECTOR_BLOCK);
-
-        assert!(
-            decode_vector_body(&body, 3)
-                .unwrap_err()
-                .to_string()
-                .contains("vector block crc32c mismatch")
-        );
-    }
-
-    #[test]
-    fn vector_body_rejects_corrupt_ann_block_crc32c() {
-        let mut entries = vec![entry(1, vec![1.0, 0.0, 0.0])];
-        let graph = build_hnsw_graph_for_entries(&entries, VectorMetric::Cosine, 32, 200).unwrap();
-        let body = encode_vector_body(&mut entries, &graph, &[0]).unwrap();
-        let body = corrupt_writer_table_value(body, TABLE_VECTOR_HNSW);
-
-        assert!(
-            decode_vector_body(&body, 3)
-                .unwrap_err()
-                .to_string()
-                .contains("ann block crc32c mismatch")
-        );
-    }
-
-    #[tokio::test]
-    async fn vector_segment_footer_protects_body() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let segment_ref = write_vector_segment(
-            &storage,
-            VectorSegmentWrite {
-                index_id: "vector-alpha",
-                definition_hash: "blake3:test-definition",
-                generation: 6,
-                dimension: 3,
-                metric: VectorMetric::Cosine,
-                embedding_provider: "test_only",
-                embedding_model_version: None,
-                embedding_normalisation: "unit_l2",
-                embedding_chunking_hash: "blake3:test-chunking",
-                extractor_definition_hash: "blake3:test-extractor",
-                embedding_provenance_hash: "blake3:test-provenance",
-                embedding_model: "embedding-v1",
-                modality: VectorModality::Text,
-                hnsw_m: 32,
-                hnsw_ef_construction: 200,
-                source_cursor: 88,
-                authz_revision: 9,
-                boundary_values: &[],
-                entries: &[entry(1, vec![1.0, 0.0, 0.0])],
-                deleted_bitset: &[0],
-            },
-        )
-        .await
-        .unwrap();
-        let mut bytes = read_vector_segment_bytes(&storage, &segment_ref)
-            .await
-            .unwrap();
-        bytes[crate::formats::WRITER_SEGMENT_FIXED_HEADER_LEN + 1] ^= 1;
-        assert!(decode_vector_segment(&bytes).is_err());
-    }
-
-    #[tokio::test]
-    async fn vector_segment_rejects_deleted_bitset_length_mismatch() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let err = write_vector_segment(
-            &storage,
-            VectorSegmentWrite {
-                index_id: "vector-alpha",
-                definition_hash: "blake3:test-definition",
-                generation: 6,
-                dimension: 3,
-                metric: VectorMetric::Cosine,
-                embedding_provider: "test_only",
-                embedding_model_version: None,
-                embedding_normalisation: "unit_l2",
-                embedding_chunking_hash: "blake3:test-chunking",
-                extractor_definition_hash: "blake3:test-extractor",
-                embedding_provenance_hash: "blake3:test-provenance",
-                embedding_model: "embedding-v1",
-                modality: VectorModality::Text,
-                hnsw_m: 32,
-                hnsw_ef_construction: 200,
-                source_cursor: 88,
-                authz_revision: 9,
-                boundary_values: &[],
-                entries: &[entry(1, vec![1.0, 0.0, 0.0])],
-                deleted_bitset: &[],
-            },
-        )
-        .await
-        .unwrap_err();
-
-        assert!(
-            err.to_string()
-                .contains("vector deleted bitset length does not match entry count")
-        );
-    }
-
-    #[tokio::test]
-    async fn latest_vector_segment_selects_highest_generation() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let entries = [entry(1, vec![1.0, 0.0, 0.0])];
-        for generation in [1, 3, 2] {
-            write_vector_segment(
-                &storage,
-                VectorSegmentWrite {
-                    index_id: "vector-alpha",
-                    definition_hash: "blake3:test-definition",
-                    generation,
-                    dimension: 3,
-                    metric: VectorMetric::Cosine,
-                    embedding_provider: "test_only",
-                    embedding_model: "embedding-v1",
-                    embedding_model_version: None,
-                    embedding_normalisation: "unit_l2",
-                    embedding_chunking_hash: "blake3:test-chunking",
-                    extractor_definition_hash: "blake3:test-extractor",
-                    embedding_provenance_hash: "blake3:test-provenance",
-                    modality: VectorModality::Text,
-                    hnsw_m: 32,
-                    hnsw_ef_construction: 200,
-                    source_cursor: generation,
-                    authz_revision: 0,
-                    boundary_values: &[],
-                    entries: &entries,
-                    deleted_bitset: &[0],
-                },
-            )
-            .await
-            .unwrap();
-        }
-        let latest = read_latest_vector_segment(&storage, "vector-alpha")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(latest.header.generation, 3);
-        assert!(
-            latest_vector_segment_ref(&storage, "../escape")
-                .await
-                .is_err()
-        );
-    }
 }

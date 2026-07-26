@@ -188,37 +188,10 @@ pub(crate) async fn finish_control_stream_append(
         ));
     }
 
-    if std::env::var_os("ANVIL_MESH_SYNC_SEGMENTS").is_some() {
-        crate::mesh_control_segment::write_mesh_control_segment(
-            storage,
-            crate::mesh_control_segment::MeshControlSegmentWrite {
-                mesh_id: &prepared.header.mesh_id,
-                stream_family: &prepared.header.stream_family,
-                partition: &prepared.header.partition,
-                generation: visible_sequence,
-                event_kind: &prepared.header.operation,
-                source_cursor: visible_sequence,
-                placement_epoch: prepared.header.writer_fence,
-                boundary_values: &[],
-                records: &[crate::mesh_control_segment::MeshControlSegmentRecord {
-                    key: prepared.header.record_key.as_bytes().to_vec(),
-                    value: prepared.encoded.clone(),
-                }],
-            },
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "write CoreStore mesh-control segment for {}",
-                prepared.stream_id
-            )
-        })?;
-    } else {
-        crate::emit_test_timing(
-            "mesh_control_stream.append_control_stream_frame deferred_writer_segment",
-            std::time::Duration::ZERO,
-        );
-    }
+    crate::emit_test_timing(
+        "mesh_control_stream.append_control_stream_frame deferred_writer_segment",
+        std::time::Duration::ZERO,
+    );
     Ok(ControlStreamAppend {
         offset: prepared.cursor.byte_offset,
         encoded_len: prepared.encoded.len(),

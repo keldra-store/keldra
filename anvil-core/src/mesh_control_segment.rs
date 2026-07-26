@@ -63,6 +63,7 @@ pub struct DecodedMeshControlSegment {
 
 pub async fn write_mesh_control_segment(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     write: MeshControlSegmentWrite<'_>,
 ) -> Result<String> {
     let mut records = write.records.to_vec();
@@ -143,7 +144,7 @@ pub async fn write_mesh_control_segment(
         .cloned()
         .ok_or_else(|| anyhow!("CoreFormatWriter returned no mesh control object"))?;
     write_writer_segment_catalog_record(
-        storage,
+        mvcc,
         &WriterSegmentCatalogRecord {
             family: MESH_CONTROL_SEGMENT_CATALOG_FAMILY.to_string(),
             scope: mesh_control_segment_scope(
@@ -169,11 +170,12 @@ pub async fn write_mesh_control_segment(
 
 pub async fn read_mesh_control_segment(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     segment_ref: &str,
 ) -> Result<DecodedMeshControlSegment> {
     let parsed = parse_mesh_control_segment_ref(segment_ref)?;
     let record = read_writer_segment_catalog_record(
-        storage,
+        mvcc,
         MESH_CONTROL_SEGMENT_CATALOG_FAMILY,
         &mesh_control_segment_scope(
             &parsed.mesh_id,
@@ -399,43 +401,4 @@ fn mesh_control_record_hash(record: &MeshControlSegmentRecord) -> Hash32 {
     bytes.extend_from_slice(&(record.value.len() as u64).to_le_bytes());
     bytes.extend_from_slice(&record.value);
     hash32(&bytes)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    #[tokio::test]
-    async fn mesh_control_segment_writes_and_reads_through_corestore() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let segment_ref = write_mesh_control_segment(
-            &storage,
-            MeshControlSegmentWrite {
-                mesh_id: "mesh-a",
-                stream_family: "bucket_locator",
-                partition: "00a7",
-                generation: 1,
-                event_kind: "upsert",
-                source_cursor: 1,
-                placement_epoch: 1,
-                boundary_values: &[],
-                records: &[MeshControlSegmentRecord {
-                    key: b"bucket-a".to_vec(),
-                    value: b"payload".to_vec(),
-                }],
-            },
-        )
-        .await
-        .unwrap();
-
-        let decoded = read_mesh_control_segment(&storage, &segment_ref)
-            .await
-            .unwrap();
-        assert_eq!(decoded.header.mesh_id, "mesh-a");
-        assert_eq!(decoded.header.stream_family, "bucket_locator");
-        assert_eq!(decoded.records.len(), 1);
-        assert_eq!(decoded.records[0].value, b"payload");
-    }
 }

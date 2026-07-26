@@ -83,6 +83,7 @@ impl GitSourceService for AppState {
             .await?;
         let index_ref = git_source_index::write_git_source_index(
             &self.storage,
+            &self.mvcc,
             git_source_index::GitSourceIndexWrite {
                 tenant_id: claims.tenant_id,
                 repository_id: &metadata.repository_id,
@@ -354,6 +355,7 @@ impl AppState {
     ) -> Result<git_source_index::DecodedGitSourceIndex, Status> {
         match git_source_query::read_latest_git_source_index(
             &self.storage,
+            &self.mvcc,
             claims.tenant_id,
             repository_id,
         )
@@ -410,6 +412,7 @@ impl AppState {
         .map_err(|err| Status::invalid_argument(err.to_string()))?;
         let index_ref = git_source_index::write_git_source_index(
             &self.storage,
+            &self.mvcc,
             git_source_index::GitSourceIndexWrite {
                 tenant_id: claims.tenant_id,
                 repository_id,
@@ -433,6 +436,7 @@ impl AppState {
         }
         git_source_query::read_latest_git_source_index(
             &self.storage,
+            &self.mvcc,
             claims.tenant_id,
             repository_id,
         )
@@ -446,10 +450,14 @@ impl AppState {
         tenant_id: i64,
         repository_id: &str,
     ) -> Result<u64, Status> {
-        let Some(index) =
-            git_source_query::read_latest_git_source_index(&self.storage, tenant_id, repository_id)
-                .await
-                .map_err(|err| Status::internal(err.to_string()))?
+        let Some(index) = git_source_query::read_latest_git_source_index(
+            &self.storage,
+            &self.mvcc,
+            tenant_id,
+            repository_id,
+        )
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?
         else {
             return Ok(1);
         };

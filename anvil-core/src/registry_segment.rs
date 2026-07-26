@@ -61,6 +61,7 @@ pub struct DecodedRegistrySegment {
 
 pub async fn write_registry_segment(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     write: RegistrySegmentWrite<'_>,
 ) -> Result<String> {
     let mut records = write.records.to_vec();
@@ -143,7 +144,7 @@ pub async fn write_registry_segment(
         .cloned()
         .ok_or_else(|| anyhow!("CoreFormatWriter returned no registry object"))?;
     write_writer_segment_catalog_record(
-        storage,
+        mvcc,
         &WriterSegmentCatalogRecord {
             family: REGISTRY_SEGMENT_CATALOG_FAMILY.to_string(),
             scope: registry_segment_scope(
@@ -168,11 +169,12 @@ pub async fn write_registry_segment(
 
 pub async fn read_registry_segment(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     segment_ref: &str,
 ) -> Result<DecodedRegistrySegment> {
     let parsed = parse_registry_segment_ref(segment_ref)?;
     let record = read_writer_segment_catalog_record(
-        storage,
+        mvcc,
         REGISTRY_SEGMENT_CATALOG_FAMILY,
         &registry_segment_scope(
             &parsed.registry_kind,

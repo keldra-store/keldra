@@ -4,8 +4,8 @@ use super::{
 };
 use crate::core_store::{
     CF_MATERIALISATION, CoreMetaRowCommonProto, CoreMetaTuplePart, CoreMetaVisibilityState,
-    CoreMutationPrecondition, CoreStore, TABLE_WRITER_HEAD_ROW, core_meta_payload_digest,
-    core_meta_tuple_key, decode_deterministic_proto, encode_deterministic_proto,
+    TABLE_WRITER_HEAD_ROW, core_meta_tuple_key, decode_deterministic_proto,
+    encode_deterministic_proto,
 };
 use anyhow::{Result, anyhow, bail};
 use prost::Message;
@@ -15,7 +15,7 @@ const WRITER_HEAD_SCHEMA: &str = "anvil.coremeta.writer_head.v1";
 pub(super) struct WriterHead {
     pub(super) record: WriterSegmentCatalogRecord,
     pub(super) publication_generation: u64,
-    expected_payload_hash: String,
+    pub(super) payload: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -54,31 +54,15 @@ struct WriterHeadProto {
     publication_transaction_id: String,
 }
 
-pub(super) fn read(store: &CoreStore, family: &str, scope: &str) -> Result<Option<WriterHead>> {
-    let Some(payload) = store.read_coremeta_row(
+pub(super) fn logical_key(
+    family: &str,
+    scope: &str,
+) -> Result<crate::mvcc_transaction::LogicalKey> {
+    crate::mvcc_product::coremeta_logical_key(
         CF_MATERIALISATION,
         TABLE_WRITER_HEAD_ROW,
         &tuple_key(family, scope)?,
-    )?
-    else {
-        return Ok(None);
-    };
-    decode(&payload, family, scope).map(Some)
-}
-
-pub(super) fn precondition(
-    family: &str,
-    scope: &str,
-    current: Option<&WriterHead>,
-) -> Result<CoreMutationPrecondition> {
-    Ok(CoreMutationPrecondition::CoreMetaRow {
-        cf: CF_MATERIALISATION.to_string(),
-        table_id: TABLE_WRITER_HEAD_ROW,
-        tuple_key: tuple_key(family, scope)?,
-        expected_payload_hash: current.map(|head| head.expected_payload_hash.clone()),
-        require_absent: current.is_none(),
-        require_present: current.is_some(),
-    })
+    )
 }
 
 pub(super) fn encode(
@@ -130,7 +114,7 @@ pub(super) fn tuple_key(family: &str, scope: &str) -> Result<Vec<u8>> {
     ])
 }
 
-fn decode(bytes: &[u8], family: &str, scope: &str) -> Result<WriterHead> {
+pub(super) fn decode(bytes: &[u8], family: &str, scope: &str) -> Result<WriterHead> {
     let proto = decode_deterministic_proto::<WriterHeadProto>(bytes, "writer head")?;
     if proto.schema != WRITER_HEAD_SCHEMA {
         bail!("writer head schema mismatch");
@@ -175,7 +159,7 @@ fn decode(bytes: &[u8], family: &str, scope: &str) -> Result<WriterHead> {
     Ok(WriterHead {
         record,
         publication_generation: proto.publication_generation,
-        expected_payload_hash: core_meta_payload_digest(TABLE_WRITER_HEAD_ROW, bytes),
+        payload: bytes.to_vec(),
     })
 }
 

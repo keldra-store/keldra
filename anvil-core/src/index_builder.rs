@@ -434,13 +434,13 @@ async fn build_full_text_index_from_source(
     .await?;
     let staged_for_catalog = &staged_segment;
     authority
-        .publish_with(
+        .publish_mvcc_with(
             storage,
             &ownership,
             partition_owner_signing_key,
             |preconditions| async move {
                 full_text_segment::publish_full_text_segment_catalog(
-                    storage,
+                    authority.mvcc()?,
                     staged_for_catalog,
                     &preconditions,
                 )
@@ -709,13 +709,13 @@ async fn build_typed_json_index_from_source(
     .await?;
     let staged_for_catalog = &staged_segment;
     authority
-        .publish_with(
+        .publish_mvcc_with(
             storage,
             &ownership,
             partition_owner_signing_key,
             |preconditions| async move {
                 typed_field_segment::publish_typed_field_segment_catalog(
-                    storage,
+                    authority.mvcc()?,
                     staged_for_catalog,
                     &preconditions,
                 )
@@ -919,13 +919,13 @@ pub(crate) async fn build_metadata_backed_index(
     .await?;
     let staged_for_catalog = &staged_segment;
     authority
-        .publish_with(
+        .publish_mvcc_with(
             storage,
             &ownership,
             partition_owner_signing_key,
             |preconditions| async move {
                 typed_field_segment::publish_typed_field_segment_catalog(
-                    storage,
+                    authority.mvcc()?,
                     staged_for_catalog,
                     &preconditions,
                 )
@@ -1335,13 +1335,13 @@ async fn build_vector_index_with_policy(
     .await?;
     let staged_for_catalog = &staged_segment;
     authority
-        .publish_with(
+        .publish_mvcc_with(
             storage,
             &ownership,
             partition_owner_signing_key,
             |preconditions| async move {
                 vector_segment::publish_vector_segment_catalog(
-                    storage,
+                    authority.mvcc()?,
                     staged_for_catalog,
                     &preconditions,
                 )

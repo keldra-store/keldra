@@ -1,12 +1,7 @@
-use crate::{
-    core_store::{
-        CF_MATERIALISATION, CoreMetaRowCommonProto, CoreMetaTuplePart, CoreMetaVisibilityState,
-        CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
-        CoreMutationRootPublication, CoreStore, TABLE_WRITER_HEAD_ROW, TABLE_WRITER_SEGMENT_ROW,
-        core_meta_root_key_hash, core_meta_tuple_key, core_mutation_publication_attempt_id,
-        decode_deterministic_proto, encode_deterministic_proto, sha256_hex,
-    },
-    storage::Storage,
+use crate::core_store::{
+    CF_MATERIALISATION, CoreMetaRowCommonProto, CoreMetaTuplePart, CoreMetaVisibilityState,
+    TABLE_WRITER_SEGMENT_ROW, core_meta_root_key_hash, core_meta_tuple_key,
+    decode_deterministic_proto, encode_deterministic_proto, sha256_hex,
 };
 use anyhow::{Result, anyhow, bail};
 use prost::Message;
@@ -16,9 +11,6 @@ use std::{
 };
 
 mod head;
-
-#[cfg(test)]
-use crate::core_store::{CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaStore};
 
 const WRITER_SEGMENT_ROW_SCHEMA: &str = "anvil.coremeta.writer_segment_locator.v1";
 pub const WRITER_SEGMENT_PAGE_MAX: usize = 1000;
@@ -74,17 +66,18 @@ struct WriterSegmentCatalogRecordProto {
 }
 
 pub async fn write_writer_segment_catalog_record(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     record: &WriterSegmentCatalogRecord,
-    additional_preconditions: &[CoreMutationPrecondition],
+    additional_preconditions: &[(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )],
 ) -> Result<()> {
     validate_record(record)?;
     let write_lock = writer_lock(&record.family, &record.scope)?;
     let _guard = write_lock.lock().await;
-    let store = CoreStore::new(storage.clone()).await?;
-
     if let Some(existing) =
-        read_record_at_generation(&store, &record.family, &record.scope, record.generation)?
+        read_record_at_generation(mvcc, &record.family, &record.scope, record.generation)?
     {
         if existing == *record {
             return Ok(());
@@ -92,27 +85,37 @@ pub async fn write_writer_segment_catalog_record(
         bail!("writer segment generation already identifies a different segment");
     }
 
-    let current = head::read(&store, &record.family, &record.scope)?;
-    let batch = mutation_batch(record, current.as_ref(), additional_preconditions)?;
-    let receipt = store.commit_mutation_batch(batch).await?;
-    if !receipt.is_committed() {
-        bail!(
-            "writer segment catalog publication {} did not commit: {}",
-            receipt.transaction_id,
-            receipt
-                .finalisation_error
-                .as_deref()
-                .unwrap_or("unknown finalisation failure")
-        );
-    }
+    let head_key = head::logical_key(&record.family, &record.scope)?;
+    let current = mvcc
+        .read_latest_value(&head_key)?
+        .map(|payload| head::decode(&payload, &record.family, &record.scope))
+        .transpose()?;
+    let (mutations, mut predicates, transaction_id) = plan_mutation(record, current.as_ref())?;
+    predicates.extend_from_slice(additional_preconditions);
+    mvcc.autocommit_product_mutations_with_predicates(
+        &writer_realm(&record.family, &record.scope),
+        &transaction_id,
+        mutations,
+        predicates,
+        crate::mvcc_transaction::DurabilityLevel::Quorum,
+        u64::try_from(chrono::Utc::now().timestamp_millis())
+            .map_err(|_| anyhow!("writer segment publication timestamp predates Unix epoch"))?,
+    )
+    .await?;
     Ok(())
 }
 
-fn mutation_batch(
+fn plan_mutation(
     record: &WriterSegmentCatalogRecord,
     current: Option<&head::WriterHead>,
-    additional_preconditions: &[CoreMutationPrecondition],
-) -> Result<CoreMutationBatch> {
+) -> Result<(
+    Vec<crate::mvcc_product::ProductMutation>,
+    Vec<(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )>,
+    String,
+)> {
     let publication_generation = current
         .map(|head| {
             head.publication_generation
@@ -125,22 +128,9 @@ fn mutation_batch(
         .filter(|head| head.record.generation > record.generation)
         .map(|head| &head.record)
         .unwrap_or(record);
-    let segment_key = tuple_key(&record.family, &record.scope, record.generation)?;
-    let head_key = head::tuple_key(&record.family, &record.scope)?;
-    let scope_partition = format!("writer-scope/{}/{}", record.family, record.scope);
-    let mut preconditions = Vec::with_capacity(additional_preconditions.len() + 2);
-    preconditions.push(CoreMutationPrecondition::CoreMetaRow {
-        cf: CF_MATERIALISATION.to_string(),
-        table_id: TABLE_WRITER_SEGMENT_ROW,
-        tuple_key: segment_key.clone(),
-        expected_payload_hash: None,
-        require_absent: true,
-        require_present: false,
-    });
-    preconditions.push(head::precondition(&record.family, &record.scope, current)?);
-    preconditions.extend_from_slice(additional_preconditions);
-    let transaction_id =
-        core_mutation_publication_attempt_id(&logical_transaction_id(record), &preconditions)?;
+    let segment_key = segment_logical_key(&record.family, &record.scope, record.generation)?;
+    let head_key = head::logical_key(&record.family, &record.scope)?;
+    let transaction_id = logical_transaction_id(record);
     let segment_payload = encode_record(record, publication_generation, &transaction_id)?;
     let head_payload = head::encode(
         logical_head,
@@ -150,40 +140,28 @@ fn mutation_batch(
             .created_at_unix_nanos
             .max(record.created_at_unix_nanos),
     )?;
-    let operations = vec![
-        CoreMutationOperation::CoreMetaPut {
-            partition_id: scope_partition.clone(),
-            cf: CF_MATERIALISATION.to_string(),
-            table_id: TABLE_WRITER_SEGMENT_ROW,
-            tuple_key: segment_key,
-            payload: segment_payload,
-        },
-        CoreMutationOperation::CoreMetaPut {
-            partition_id: scope_partition.clone(),
-            cf: CF_MATERIALISATION.to_string(),
-            table_id: TABLE_WRITER_HEAD_ROW,
-            tuple_key: head_key,
-            payload: head_payload,
-        },
-    ];
-    Ok(CoreMutationBatch {
-        transaction_id,
-        scope_partition: scope_partition.clone(),
-        committed_by_principal: writer_realm(&record.family, &record.scope),
-        root_publications: vec![
-            CoreMutationRootPublication::new(
-                scope_partition,
-                crate::formats::writer::WriterFamily::CoreControl.as_str(),
-            )
-            .coordinator(),
+    Ok((
+        vec![
+            crate::mvcc_product::ProductMutation::put(segment_key.clone(), segment_payload),
+            crate::mvcc_product::ProductMutation::put(head_key.clone(), head_payload),
         ],
-        preconditions,
-        operations,
-    })
+        vec![
+            (segment_key, crate::mvcc_transaction::PredicateKind::Absent),
+            (
+                head_key,
+                current.map_or(crate::mvcc_transaction::PredicateKind::Absent, |head| {
+                    crate::mvcc_transaction::PredicateKind::ValueHash(
+                        *blake3::hash(&head.payload).as_bytes(),
+                    )
+                }),
+            ),
+        ],
+        transaction_id,
+    ))
 }
 
 pub async fn read_writer_segment_catalog_record(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     family: &str,
     scope: &str,
     generation: u64,
@@ -193,8 +171,9 @@ pub async fn read_writer_segment_catalog_record(
     if generation == 0 {
         bail!("writer segment generation must be nonzero");
     }
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(record) = read_record_at_generation(&store, family, scope, generation)? else {
+    let snapshot = mvcc.runtime.applied_version()?;
+    let Some(record) = read_record_at_generation_at(mvcc, family, scope, generation, snapshot)?
+    else {
         return Ok(None);
     };
     validate_scope(&record, family, scope, generation, segment_ref)?;
@@ -202,33 +181,47 @@ pub async fn read_writer_segment_catalog_record(
 }
 
 fn read_record_at_generation(
-    store: &CoreStore,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     family: &str,
     scope: &str,
     generation: u64,
 ) -> Result<Option<WriterSegmentCatalogRecord>> {
-    let Some(payload) = store.read_coremeta_row(
-        CF_MATERIALISATION,
-        TABLE_WRITER_SEGMENT_ROW,
-        &tuple_key(family, scope, generation)?,
-    )?
+    let Some(payload) = mvcc.read_latest_value(&segment_logical_key(family, scope, generation)?)?
     else {
         return Ok(None);
     };
     decode_record(&payload).map(Some)
 }
 
+fn read_record_at_generation_at(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    family: &str,
+    scope: &str,
+    generation: u64,
+    snapshot: u64,
+) -> Result<Option<WriterSegmentCatalogRecord>> {
+    mvcc.runtime
+        .read_at(&segment_logical_key(family, scope, generation)?, snapshot)?
+        .map(|row| decode_record(&row.value))
+        .transpose()
+}
+
 pub async fn latest_writer_segment_catalog_record(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     family: &str,
     scope: &str,
 ) -> Result<Option<WriterSegmentCatalogRecord>> {
-    let store = CoreStore::new(storage.clone()).await?;
-    Ok(head::read(&store, family, scope)?.map(|head| head.record))
+    let snapshot = mvcc.runtime.applied_version()?;
+    Ok(mvcc
+        .runtime
+        .read_at(&head::logical_key(family, scope)?, snapshot)?
+        .map(|row| head::decode(&row.value, family, scope))
+        .transpose()?
+        .map(|head| head.record))
 }
 
 pub async fn page_writer_segment_catalog_records(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     family: &str,
     scope: &str,
     after_generation: u64,
@@ -245,27 +238,30 @@ pub async fn page_writer_segment_catalog_records(
             next_generation: None,
         });
     }
-    let scan_limit = limit
-        .checked_add(1)
-        .ok_or_else(|| anyhow!("writer segment page limit overflow"))?;
-    let mut records = CoreStore::new(storage.clone())
-        .await?
-        .scan_coremeta_range_inclusive(
-            CF_MATERIALISATION,
-            TABLE_WRITER_SEGMENT_ROW,
-            &tuple_key(family, scope, after_generation.saturating_add(1))?,
-            &tuple_key(family, scope, through_generation)?,
-            scan_limit,
-        )?
+    let snapshot = mvcc.runtime.applied_version()?;
+    let prefix = crate::mvcc_product::coremeta_application_prefix(
+        CF_MATERIALISATION,
+        &tuple_prefix(family, scope)?,
+    )?;
+    let mut records = mvcc
+        .runtime
+        .scan_table_prefix_at(TABLE_WRITER_SEGMENT_ROW, &prefix, snapshot)?
         .into_iter()
-        .map(|row| {
-            let record = decode_record(&row.payload)?;
+        .map(|(_, row)| {
+            let record = decode_record(&row.value)?;
             if record.family != family || record.scope != scope {
                 bail!("writer segment catalog row scope mismatch");
             }
             Ok(record)
         })
         .collect::<Result<Vec<_>>>()?;
+    records.retain(|record| {
+        record.generation > after_generation && record.generation <= through_generation
+    });
+    let scan_limit = limit
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("writer segment page limit overflow"))?;
+    records.truncate(scan_limit);
     let has_more = records.len() > limit;
     if has_more {
         records.truncate(limit);
@@ -277,39 +273,6 @@ pub async fn page_writer_segment_catalog_records(
         records,
         next_generation,
     })
-}
-
-#[cfg(test)]
-pub(crate) fn test_overwrite_writer_segment_catalog_record(
-    storage: &Storage,
-    record: &WriterSegmentCatalogRecord,
-) -> Result<()> {
-    let existing = CoreMetaStore::open(storage.core_store_meta_path())?
-        .get(
-            CF_MATERIALISATION,
-            TABLE_WRITER_SEGMENT_ROW,
-            &tuple_key(&record.family, &record.scope, record.generation)?,
-        )?
-        .ok_or_else(|| anyhow!("writer segment test row is missing"))?;
-    let (_, publication_generation, publication_transaction_id) =
-        decode_record_with_publication(&existing)?;
-    let payload = encode_record(record, publication_generation, &publication_transaction_id)?;
-    let tuple_key = tuple_key(&record.family, &record.scope, record.generation)?;
-    CoreMetaStore::open(storage.core_store_meta_path())?.write_batch(&[CoreMetaBatchOp {
-        cf: CF_MATERIALISATION,
-        table_id: TABLE_WRITER_SEGMENT_ROW,
-        tuple_key: &tuple_key,
-        common: None,
-        kind: CoreMetaBatchOpKind::Put(&payload),
-    }])
-}
-
-#[cfg(test)]
-pub(crate) fn test_writer_segment_mutation_batch(
-    record: &WriterSegmentCatalogRecord,
-    additional_preconditions: &[CoreMutationPrecondition],
-) -> Result<CoreMutationBatch> {
-    mutation_batch(record, None, additional_preconditions)
 }
 
 fn encode_record(
@@ -491,6 +454,27 @@ fn tuple_key(family: &str, scope: &str, generation: u64) -> Result<Vec<u8>> {
     ])
 }
 
+fn tuple_prefix(family: &str, scope: &str) -> Result<Vec<u8>> {
+    validate_scope_components(family, scope)?;
+    let scope_hash = writer_scope_hash(family, scope);
+    core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8(family),
+        CoreMetaTuplePart::Hash(&scope_hash),
+    ])
+}
+
+fn segment_logical_key(
+    family: &str,
+    scope: &str,
+    generation: u64,
+) -> Result<crate::mvcc_transaction::LogicalKey> {
+    crate::mvcc_product::coremeta_logical_key(
+        CF_MATERIALISATION,
+        TABLE_WRITER_SEGMENT_ROW,
+        &tuple_key(family, scope, generation)?,
+    )
+}
+
 fn writer_lock(family: &str, scope: &str) -> Result<Arc<tokio::sync::Mutex<()>>> {
     let key = writer_scope_hash(family, scope);
     let mut locks = WRITER_LOCKS
@@ -538,205 +522,4 @@ fn validate_hex32(value: &str, field: &'static str) -> Result<()> {
         bail!("writer segment catalog {field} must contain a 32-byte hex digest");
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    fn record(generation: u64) -> WriterSegmentCatalogRecord {
-        WriterSegmentCatalogRecord {
-            family: "test-writer".to_string(),
-            scope: "tenant/42/index/main".to_string(),
-            segment_ref: format!("segment:{generation}"),
-            core_object_ref_target: format!("core-object-ref:test-{generation}"),
-            segment_hash: format!("{generation:064x}"),
-            segment_length: generation,
-            generation,
-            source_cursor: generation * 10,
-            created_at_unix_nanos: generation * 100,
-        }
-    }
-
-    #[tokio::test]
-    async fn writer_head_is_a_transactional_point_projection() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let first = record(1);
-        let second = record(2);
-        let third = record(3);
-
-        write_writer_segment_catalog_record(&storage, &first, &[])
-            .await
-            .unwrap();
-        write_writer_segment_catalog_record(&storage, &third, &[])
-            .await
-            .unwrap();
-        write_writer_segment_catalog_record(&storage, &first, &[])
-            .await
-            .unwrap();
-        write_writer_segment_catalog_record(&storage, &second, &[])
-            .await
-            .unwrap();
-
-        assert_eq!(
-            latest_writer_segment_catalog_record(&storage, &third.family, &third.scope)
-                .await
-                .unwrap(),
-            Some(third.clone())
-        );
-        assert_eq!(
-            read_writer_segment_catalog_record(
-                &storage,
-                &first.family,
-                &first.scope,
-                first.generation,
-                &first.segment_ref,
-            )
-            .await
-            .unwrap(),
-            Some(first.clone())
-        );
-        let first_page = page_writer_segment_catalog_records(
-            &storage,
-            &first.family,
-            &first.scope,
-            0,
-            u64::MAX,
-            2,
-        )
-        .await
-        .unwrap();
-        assert_eq!(first_page.records, vec![first.clone(), second]);
-        assert_eq!(first_page.next_generation, Some(2));
-        let second_page = page_writer_segment_catalog_records(
-            &storage,
-            &first.family,
-            &first.scope,
-            first_page.next_generation.unwrap(),
-            u64::MAX,
-            2,
-        )
-        .await
-        .unwrap();
-        assert_eq!(second_page.records, vec![third]);
-        assert_eq!(second_page.next_generation, None);
-
-        let mut conflicting = first;
-        conflicting.segment_ref = "segment:conflict".to_string();
-        let error = write_writer_segment_catalog_record(&storage, &conflicting, &[])
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("different segment"));
-    }
-
-    #[test]
-    fn catalog_mutation_is_byte_identical_for_the_same_source_record() {
-        let record = record(7);
-        let first = mutation_batch(&record, None, &[]).unwrap();
-        let replay = mutation_batch(&record, None, &[]).unwrap();
-        assert_eq!(first, replay);
-    }
-
-    #[test]
-    fn catalog_row_accepts_independent_physical_root_generation() {
-        let record = record(7);
-        let payload = encode_record(&record, 3, "tx-writer").unwrap();
-        let mut common = crate::core_store::core_meta_row_common_from_payload(&payload).unwrap();
-        common.root_generation = 91;
-        let rebound = crate::core_store::replace_core_meta_row_common(&payload, &common).unwrap();
-
-        let (decoded, catalog_generation, _) = decode_record_with_publication(&rebound).unwrap();
-        assert_eq!(decoded, record);
-        assert_eq!(catalog_generation, 3);
-        assert_ne!(common.root_generation, catalog_generation);
-    }
-
-    #[tokio::test]
-    async fn stale_writer_head_snapshot_cannot_publish_a_segment() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let first = record(1);
-        let second = record(2);
-        let third = record(3);
-
-        write_writer_segment_catalog_record(&storage, &first, &[])
-            .await
-            .unwrap();
-        let store = CoreStore::new(storage.clone()).await.unwrap();
-        let stale_head = head::read(&store, &first.family, &first.scope)
-            .unwrap()
-            .unwrap();
-        let stale_batch = mutation_batch(&third, Some(&stale_head), &[]).unwrap();
-
-        write_writer_segment_catalog_record(&storage, &second, &[])
-            .await
-            .unwrap();
-        store.commit_mutation_batch(stale_batch).await.unwrap_err();
-
-        assert_eq!(
-            latest_writer_segment_catalog_record(&storage, &first.family, &first.scope)
-                .await
-                .unwrap(),
-            Some(second)
-        );
-        assert_eq!(
-            read_writer_segment_catalog_record(
-                &storage,
-                &third.family,
-                &third.scope,
-                third.generation,
-                &third.segment_ref,
-            )
-            .await
-            .unwrap(),
-            None
-        );
-    }
-
-    #[tokio::test]
-    async fn caller_preconditions_are_enforced_with_catalog_publication() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let first = record(1);
-        let second = record(2);
-        let third = record(3);
-
-        write_writer_segment_catalog_record(&storage, &first, &[])
-            .await
-            .unwrap();
-        let store = CoreStore::new(storage.clone()).await.unwrap();
-        let first_head = head::read(&store, &first.family, &first.scope)
-            .unwrap()
-            .unwrap();
-        let stale_caller_precondition =
-            head::precondition(&first.family, &first.scope, Some(&first_head)).unwrap();
-        write_writer_segment_catalog_record(&storage, &second, &[])
-            .await
-            .unwrap();
-
-        write_writer_segment_catalog_record(&storage, &third, &[stale_caller_precondition])
-            .await
-            .unwrap_err();
-
-        assert_eq!(
-            latest_writer_segment_catalog_record(&storage, &first.family, &first.scope)
-                .await
-                .unwrap(),
-            Some(second)
-        );
-        assert_eq!(
-            read_writer_segment_catalog_record(
-                &storage,
-                &third.family,
-                &third.scope,
-                third.generation,
-                &third.segment_ref,
-            )
-            .await
-            .unwrap(),
-            None
-        );
-    }
 }

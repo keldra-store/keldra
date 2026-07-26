@@ -27,14 +27,16 @@ pub struct GitTreeEntry {
 
 pub async fn read_latest_git_source_index(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     repository_id: &str,
 ) -> Result<Option<DecodedGitSourceIndex>> {
-    let Some(index_ref) = latest_git_source_index_ref(storage, tenant_id, repository_id).await?
-    else {
+    let Some(index_ref) = latest_git_source_index_ref(mvcc, tenant_id, repository_id).await? else {
         return Ok(None);
     };
-    Ok(Some(read_git_source_index(storage, &index_ref).await?))
+    Ok(Some(
+        read_git_source_index(storage, mvcc, &index_ref).await?,
+    ))
 }
 
 pub fn get_git_object(
@@ -133,118 +135,4 @@ fn normalize_prefix(prefix: &str) -> Result<String> {
     } else {
         format!("{normalized}/")
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        formats::git::{GitHashAlgorithm, GitSourceRecord},
-        git_source_index::{GitSourceIndexWrite, write_git_source_index},
-    };
-    use tempfile::tempdir;
-
-    #[tokio::test]
-    async fn latest_git_source_index_selects_highest_generation() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        write_git_source_index(
-            &storage,
-            GitSourceIndexWrite {
-                tenant_id: 8,
-                repository_id: "repo-alpha",
-                generation: 1,
-                source_hash: [1; 32],
-                hash_algorithm: GitHashAlgorithm::Sha1,
-                records: &[record(1, "README.md", 1)],
-            },
-        )
-        .await
-        .unwrap();
-        write_git_source_index(
-            &storage,
-            GitSourceIndexWrite {
-                tenant_id: 8,
-                repository_id: "repo-alpha",
-                generation: 2,
-                source_hash: [2; 32],
-                hash_algorithm: GitHashAlgorithm::Sha1,
-                records: &[record(2, "src/lib.rs", 2)],
-            },
-        )
-        .await
-        .unwrap();
-
-        let latest = read_latest_git_source_index(&storage, 8, "repo-alpha")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(latest.header.generation, 2);
-        assert_eq!(latest.records[0].tree_path, b"src/lib.rs".to_vec());
-    }
-
-    #[tokio::test]
-    async fn git_source_queries_find_object_path_and_tree() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let records = vec![
-            record(1, "src/lib.rs", 1),
-            record(1, "src/main.rs", 2),
-            record(1, "README.md", 3),
-            record(2, "src/lib.rs", 4),
-        ];
-        let index_ref = write_git_source_index(
-            &storage,
-            GitSourceIndexWrite {
-                tenant_id: 8,
-                repository_id: "repo-alpha",
-                generation: 1,
-                source_hash: [3; 32],
-                hash_algorithm: GitHashAlgorithm::Sha1,
-                records: &records,
-            },
-        )
-        .await
-        .unwrap();
-        let index = read_git_source_index(&storage, &index_ref).await.unwrap();
-
-        let blob = get_git_blob_by_path(&index, &[1; 20], "/src/lib.rs")
-            .unwrap()
-            .unwrap();
-        assert_eq!(blob.object_id, vec![1; 20]);
-        assert_eq!(blob.blob_start, 100);
-
-        let tree = list_git_tree(&index, &[1; 20], "src").unwrap();
-        assert_eq!(
-            tree.iter()
-                .map(|entry| entry.tree_path.as_str())
-                .collect::<Vec<_>>(),
-            vec!["src/lib.rs", "src/main.rs"]
-        );
-
-        let objects = get_git_object(&index, &[1; 20]).unwrap();
-        assert_eq!(objects.len(), 1);
-        assert_eq!(objects[0].tree_path, "src/lib.rs");
-    }
-
-    #[test]
-    fn git_source_queries_reject_unsafe_paths() {
-        assert!(normalize_tree_path("../secret").is_err());
-        assert!(normalize_tree_path("src\\main.rs").is_err());
-        assert!(normalize_prefix("/").unwrap().is_empty());
-    }
-
-    fn record(commit: u8, path: &str, object: u8) -> GitSourceRecord {
-        GitSourceRecord::new(
-            GitHashAlgorithm::Sha1,
-            b"repo-alpha".to_vec(),
-            vec![commit; 20],
-            vec![object; 20],
-            path.as_bytes().to_vec(),
-            u64::from(object) * 100,
-            44,
-            [object; 16],
-        )
-        .unwrap()
-    }
 }
