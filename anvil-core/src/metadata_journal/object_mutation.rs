@@ -17,7 +17,7 @@ pub(crate) async fn append_object_mutation(
     object: &Object,
     mutation: ObjectJournalMutation,
 ) -> Result<()> {
-    append_object_mutation_inner(storage, bucket, object, mutation, 0, None, None, None).await
+    append_object_mutation_inner(storage, None, bucket, object, mutation, 0, None, None, None).await
 }
 
 pub(crate) async fn append_object_mutation_with_permit(
@@ -30,6 +30,7 @@ pub(crate) async fn append_object_mutation_with_permit(
 ) -> Result<()> {
     append_object_mutation_with_permit_in_transaction(
         storage,
+        None,
         bucket,
         object,
         mutation,
@@ -43,6 +44,7 @@ pub(crate) async fn append_object_mutation_with_permit(
 
 pub(crate) async fn append_object_mutation_with_permit_in_transaction(
     storage: &Storage,
+    mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
     bucket: &Bucket,
     object: &Object,
     mutation: ObjectJournalMutation,
@@ -56,6 +58,7 @@ pub(crate) async fn append_object_mutation_with_permit_in_transaction(
         partition_write_precondition(storage, permit, partition_owner_signing_key).await?;
     append_object_mutation_inner(
         storage,
+        mvcc,
         bucket,
         object,
         mutation,
@@ -69,6 +72,7 @@ pub(crate) async fn append_object_mutation_with_permit_in_transaction(
 
 pub(crate) async fn append_object_put_mutations_with_permit_in_transaction(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     objects: &[Object],
     permit: &PartitionWritePermit,
@@ -79,6 +83,7 @@ pub(crate) async fn append_object_put_mutations_with_permit_in_transaction(
 ) -> Result<()> {
     append_object_put_mutations_with_permit_inner(
         storage,
+        Some(mvcc),
         bucket,
         objects,
         permit,
@@ -101,6 +106,7 @@ pub(crate) async fn commit_object_put_mutations_with_permit(
 ) -> Result<()> {
     append_object_put_mutations_with_permit_inner(
         storage,
+        None,
         bucket,
         objects,
         permit,
@@ -115,6 +121,7 @@ pub(crate) async fn commit_object_put_mutations_with_permit(
 #[allow(clippy::too_many_arguments)]
 async fn append_object_put_mutations_with_permit_inner(
     storage: &Storage,
+    mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
     bucket: &Bucket,
     objects: &[Object],
     permit: &PartitionWritePermit,
@@ -134,36 +141,17 @@ async fn append_object_put_mutations_with_permit_inner(
         .acquire_object_metadata_mutation_lock(bucket)
         .await?;
     let scope_partition = hex::encode(object_metadata_partition_id(bucket.tenant_id, bucket.id));
-    let explicit_transaction = match transaction_principal {
-        Some(transaction_principal) => {
-            let transaction = core_store
-                .read_explicit_transaction_for_principal(transaction_id, transaction_principal)
-                .await?;
-            if transaction.root_anchor_key != scope_partition {
-                bail!("object metadata explicit transaction scope mismatch");
-            }
-            Some(transaction)
-        }
-        None => None,
-    };
-    let committed_by_principal = explicit_transaction
-        .as_ref()
-        .map(|transaction| transaction.committed_by_principal.clone())
+    let committed_by_principal = transaction_principal
+        .map(str::to_owned)
         .unwrap_or_else(|| object_metadata_partition_principal(bucket));
 
     let metadata_stream_id = object_metadata_stream_id(bucket.tenant_id, bucket.id);
     let metadata_stream_precondition = core_store
-        .stream_head_precondition_visible_to_transaction(
-            &metadata_stream_id,
-            explicit_transaction.as_ref(),
-        )
+        .stream_head_precondition_visible_to_transaction(&metadata_stream_id, None)
         .await?;
     let watch_stream_id = watch_log::object_watch_stream_id(bucket.tenant_id, bucket.id);
     let watch_stream_precondition = core_store
-        .stream_head_precondition_visible_to_transaction(
-            &watch_stream_id,
-            explicit_transaction.as_ref(),
-        )
+        .stream_head_precondition_visible_to_transaction(&watch_stream_id, None)
         .await?;
     let first_watch_sequence = stream_precondition_next_sequence(&watch_stream_precondition)?;
 
@@ -181,7 +169,7 @@ async fn append_object_put_mutations_with_permit_inner(
                 ObjectMetadataProjectionMutation::Upsert,
                 &scope_partition,
                 transaction_id,
-                explicit_transaction.as_ref(),
+                None,
             )
             .await?;
         let event = object_watch_event(bucket, object, ObjectJournalMutation::Put);
@@ -246,16 +234,19 @@ async fn append_object_put_mutations_with_permit_inner(
         preconditions,
         operations,
     };
-    let receipt = if explicit_transaction.is_some() {
-        core_store.stage_explicit_transaction_batch(batch).await?
-    } else {
-        core_store.commit_mutation_batch(batch).await?
-    };
-    let expected_state = if explicit_transaction.is_some() {
-        CoreTransactionState::Open
-    } else {
-        CoreTransactionState::Committed
-    };
+    if let Some(transaction_principal) = transaction_principal {
+        let mvcc = mvcc.ok_or_else(|| anyhow!("MVCC staging handle is required"))?;
+        let mutations = crate::mvcc_product::product_mutations_from_operations(batch.operations)?;
+        mvcc.stage_product_mutations(
+            transaction_id,
+            transaction_principal,
+            mutations,
+            u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+        )?;
+        return Ok(());
+    }
+    let receipt = { core_store.commit_mutation_batch(batch).await? };
+    let expected_state = CoreTransactionState::Committed;
     if receipt.state != expected_state {
         bail!(
             "object metadata mutation batch did not reach expected state {expected_state:?}: {}",
@@ -337,6 +328,7 @@ fn stream_precondition_next_sequence(precondition: &CoreMutationPrecondition) ->
 
 pub(super) async fn append_object_mutation_inner(
     storage: &Storage,
+    mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
     bucket: &Bucket,
     object: &Object,
     mutation: ObjectJournalMutation,
@@ -352,6 +344,7 @@ pub(super) async fn append_object_mutation_inner(
     for attempt in 0..MAX_STREAM_HEAD_RETRIES {
         let result = append_object_mutation_inner_once(
             storage,
+            mvcc,
             &core_store,
             bucket,
             object,
@@ -378,6 +371,7 @@ pub(super) async fn append_object_mutation_inner(
 #[allow(clippy::too_many_arguments)]
 async fn append_object_mutation_inner_once(
     storage: &Storage,
+    mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
     core_store: &CoreStore,
     bucket: &Bucket,
     object: &Object,
@@ -394,27 +388,8 @@ async fn append_object_mutation_inner_once(
         mutation.event_name()
     );
     let transaction_id = explicit_transaction_id.unwrap_or(&implicit_transaction_id);
-    let explicit_transaction = match explicit_transaction_id {
-        Some(transaction_id) => {
-            let principal = transaction_principal
-                .ok_or_else(|| anyhow!("object metadata explicit transaction principal missing"))?;
-            Some(
-                core_store
-                    .read_explicit_transaction_for_principal(transaction_id, principal)
-                    .await?,
-            )
-        }
-        None => None,
-    };
-    if explicit_transaction
-        .as_ref()
-        .is_some_and(|transaction| transaction.root_anchor_key != scope_partition)
-    {
-        bail!("object metadata explicit transaction scope mismatch");
-    }
-    let committed_by_principal = explicit_transaction
-        .as_ref()
-        .map(|transaction| transaction.committed_by_principal.clone())
+    let committed_by_principal = transaction_principal
+        .map(str::to_owned)
         .unwrap_or_else(|| object_metadata_partition_principal(bucket));
     let projection_mutation = match mutation {
         ObjectJournalMutation::Put
@@ -429,15 +404,12 @@ async fn append_object_mutation_inner_once(
             projection_mutation,
             &scope_partition,
             transaction_id,
-            explicit_transaction.as_ref(),
+            None,
         )
         .await?;
     let metadata_stream_id = object_metadata_stream_id(bucket.tenant_id, bucket.id);
     let metadata_stream_precondition = core_store
-        .stream_head_precondition_visible_to_transaction(
-            &metadata_stream_id,
-            explicit_transaction.as_ref(),
-        )
+        .stream_head_precondition_visible_to_transaction(&metadata_stream_id, None)
         .await?;
     let event = object_watch_event(bucket, object, mutation);
     let watch = watch_log::prepare_object_watch_append(
@@ -449,7 +421,7 @@ async fn append_object_mutation_inner_once(
         &core_meta_root_key_hash(&scope_partition),
         Some(projection.root_generation),
         transaction_id,
-        explicit_transaction.as_ref(),
+        None,
     )
     .await?;
     let object_payload =
@@ -487,12 +459,16 @@ async fn append_object_mutation_inner_once(
         operations,
     };
     if explicit_transaction_id.is_some() {
-        let receipt = core_store.stage_explicit_transaction_batch(batch).await?;
-        if receipt.state != CoreTransactionState::Open {
-            bail!("object metadata mutation was not staged in its explicit transaction");
-        }
-        require_stream_update(&receipt.visible_updates, &metadata_stream_id)?;
-        require_stream_update(&receipt.visible_updates, &watch.stream_id)?;
+        let transaction_principal = transaction_principal
+            .ok_or_else(|| anyhow!("object metadata explicit transaction principal missing"))?;
+        let mvcc = mvcc.ok_or_else(|| anyhow!("MVCC staging handle is required"))?;
+        let mutations = crate::mvcc_product::product_mutations_from_operations(batch.operations)?;
+        mvcc.stage_product_mutations(
+            transaction_id,
+            transaction_principal,
+            mutations,
+            u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+        )?;
         return Ok(());
     }
     let receipt = match core_store.commit_mutation_batch(batch).await {

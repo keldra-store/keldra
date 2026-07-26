@@ -46,12 +46,6 @@ impl ObjectCreateOptions {
         }
     }
 
-    pub(crate) fn copy() -> Self {
-        Self {
-            journal_mutation: metadata_journal::ObjectJournalMutation::Copy,
-            ..Self::strict()
-        }
-    }
 }
 
 impl Default for ObjectCreateOptions {
@@ -69,34 +63,6 @@ fn deferred_index_policy_snapshot_hash(tenant_id: i64, bucket_id: i64) -> String
 }
 
 impl Persistence {
-    pub(crate) async fn create_objects_with_storage_class_in_transaction(
-        &self,
-        tenant_id: i64,
-        bucket_id: i64,
-        inputs: Vec<ObjectBatchCreateInput>,
-        transaction_id: &str,
-        transaction_principal: &str,
-        options: ObjectCreateOptions,
-        additions: CoreMutationBatchAdditions,
-    ) -> Result<Vec<Object>> {
-        let prepared = self
-            .prepare_objects_with_storage_class_in_transaction(
-                tenant_id,
-                bucket_id,
-                inputs,
-                transaction_id,
-                options,
-            )
-            .await?;
-        self.stage_prepared_objects_in_transaction(
-            prepared,
-            transaction_id,
-            transaction_principal,
-            additions,
-        )
-        .await
-    }
-
     pub(crate) async fn prepare_objects_with_storage_class_in_transaction(
         &self,
         tenant_id: i64,
@@ -245,6 +211,7 @@ impl Persistence {
             .await?;
         metadata_journal::append_object_put_mutations_with_permit_in_transaction(
             &self.storage,
+            self.mvcc()?,
             &prepared.bucket,
             &prepared.objects,
             &permit,
@@ -450,6 +417,7 @@ impl Persistence {
             Box::pin(
                 metadata_journal::append_object_mutation_with_permit_in_transaction(
                     &self.storage,
+                    Some(self.mvcc()?),
                     &bucket,
                     &object,
                     options.journal_mutation,
@@ -695,6 +663,7 @@ impl Persistence {
         if let Some(transaction_id) = request.transaction_id.as_deref() {
             metadata_journal::append_object_mutation_with_permit_in_transaction(
                 &self.storage,
+                Some(self.mvcc()?),
                 &bucket,
                 &object,
                 metadata_journal::ObjectJournalMutation::Put,
@@ -933,6 +902,7 @@ impl Persistence {
         if let Some(transaction_id) = request.transaction_id.as_deref() {
             metadata_journal::append_object_mutation_with_permit_in_transaction(
                 &self.storage,
+                Some(self.mvcc()?),
                 &bucket,
                 &object,
                 metadata_journal::ObjectJournalMutation::DeleteMarker,
@@ -1165,6 +1135,7 @@ impl Persistence {
         if let Some(transaction_id) = transaction_id {
             metadata_journal::append_object_mutation_with_permit_in_transaction(
                 &self.storage,
+                Some(self.mvcc()?),
                 &bucket,
                 &object,
                 metadata_journal::ObjectJournalMutation::DeleteMarker,
@@ -1264,6 +1235,7 @@ impl Persistence {
         if let Some(transaction_id) = transaction_id {
             metadata_journal::append_object_mutation_with_permit_in_transaction(
                 &self.storage,
+                Some(self.mvcc()?),
                 &bucket,
                 &object,
                 metadata_journal::ObjectJournalMutation::DeleteVersion,

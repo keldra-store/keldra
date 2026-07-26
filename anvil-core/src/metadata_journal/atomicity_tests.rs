@@ -208,6 +208,7 @@ async fn failed_mutation_precondition_exposes_none_of_the_object_mutation() {
     let object = sample_object(1, "objects/rejected.bin");
     let rejected = append_object_mutation_inner(
         &storage,
+        None,
         &bucket,
         &object,
         ObjectJournalMutation::Put,
@@ -396,6 +397,7 @@ async fn staged_object_mutation_stays_invisible_across_restart_and_rollback() {
     let transaction = begin_object_transaction(&store, &bucket, transaction_id, principal).await;
     append_object_mutation_inner(
         &storage,
+        None,
         &bucket,
         &object,
         ObjectJournalMutation::Put,
@@ -432,6 +434,7 @@ async fn explicit_commit_after_restart_makes_every_object_projection_visible_tog
     let transaction = begin_object_transaction(&store, &bucket, "object-commit", principal).await;
     append_object_mutation_inner(
         &storage,
+        None,
         &bucket,
         &object,
         ObjectJournalMutation::Put,
@@ -505,6 +508,7 @@ async fn explicit_transaction_commits_multiple_object_mutations_without_projecti
     for object in [&first, &second] {
         append_object_mutation_inner(
             &storage,
+            None,
             &bucket,
             object,
             ObjectJournalMutation::Put,

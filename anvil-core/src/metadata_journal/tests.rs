@@ -313,6 +313,7 @@ async fn object_metadata_corestore_batch_rejects_stale_partition_precondition() 
 
     let rejected = append_object_mutation_inner(
         &storage,
+        None,
         &bucket,
         &sample_object(1, "docs/stale-precondition.txt", false),
         ObjectJournalMutation::Put,

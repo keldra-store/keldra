@@ -1,8 +1,6 @@
 use super::rpc::{native_transaction_id, object_write_visibility, write_state_for_transaction};
 use super::*;
-use crate::core_store::{
-    CoreMutationBatchAdditions, CoreMutationPrecondition, CoreTransactionState,
-};
+use crate::core_store::{CoreMutationBatchAdditions, CoreMutationPrecondition};
 use crate::object_manager;
 
 fn put_mutation_batch_response(
@@ -345,35 +343,6 @@ pub(super) async fn execute_mutation_batch(
         return Ok(Response::new(response));
     }
 
-    if let Some(transaction_id) = transaction_id
-        && !durable_preconditions.is_empty()
-    {
-        // Strict and mixed batches stage operations through their individual
-        // services. Admit the batch guards before those operation stages so
-        // absent-row and compare-and-swap checks observe the transaction's
-        // incoming state rather than its own writes.
-        let receipt = state
-            .core_store
-            .stage_mutation_additions_in_transaction(
-                transaction_id,
-                &object_manager::transaction_principal_from_claims(&claims),
-                CoreMutationBatchAdditions {
-                    preconditions: std::mem::take(&mut durable_preconditions),
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|error| {
-                transaction_core_store_status(&error.to_string())
-                    .unwrap_or_else(|| Status::internal(error.to_string()))
-            })?;
-        if receipt.state != CoreTransactionState::Open {
-            return Err(Status::failed_precondition(
-                "MutationBatchTransactionNotOpen",
-            ));
-        }
-    }
-
     let mut receipts = Vec::with_capacity(req.operations.len());
     let mut max_watch_cursor = 0_u64;
     for operation in req.operations {
@@ -576,8 +545,8 @@ pub(super) async fn execute_mutation_batch(
         mutation_id: context.request_id.clone(),
         write_state: write_state_for_transaction(transaction_id),
     };
-    if let Some(transaction_id) = transaction_id {
-        let mut additions = native_idempotency::prepare_response_in_transaction(
+    if transaction_id.is_some() {
+        native_idempotency::prepare_response_in_transaction(
             &state.storage,
             &state.mvcc,
             &context,
@@ -585,25 +554,6 @@ pub(super) async fn execute_mutation_batch(
             &response,
         )
         .await?;
-        additions.preconditions.extend(durable_preconditions);
-        deduplicate_preconditions(&mut additions.preconditions);
-        let receipt = state
-            .core_store
-            .stage_mutation_additions_in_transaction(
-                transaction_id,
-                &object_manager::transaction_principal_from_claims(&claims),
-                additions,
-            )
-            .await
-            .map_err(|error| {
-                transaction_core_store_status(&error.to_string())
-                    .unwrap_or_else(|| Status::internal(error.to_string()))
-            })?;
-        if receipt.state != CoreTransactionState::Open {
-            return Err(Status::failed_precondition(
-                "MutationBatchTransactionNotOpen",
-            ));
-        }
     } else {
         native_idempotency::store_response(
             &state.storage,
