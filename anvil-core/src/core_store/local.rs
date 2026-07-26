@@ -965,8 +965,11 @@ pub(crate) fn core_mutation_publication_attempt_id(
     Ok(format!("{logical_id}:attempt:{preconditions_hash}"))
 }
 
+#[path = "local_batch_ops.rs"]
 mod local_batch_ops;
+#[path = "local_mutation_commit.rs"]
 mod local_mutation_commit;
+#[path = "local_mutation_validation.rs"]
 mod local_mutation_validation;
 #[path = "local_root_binding.rs"]
 mod local_root_binding;
@@ -989,6 +992,7 @@ mod local_roots;
 mod local_roots_layout;
 #[path = "local_shard_recovery.rs"]
 mod local_shard_recovery;
+#[path = "local_storage_helpers.rs"]
 mod local_storage_helpers;
 #[path = "local_stream_control.rs"]
 mod local_stream_control;
