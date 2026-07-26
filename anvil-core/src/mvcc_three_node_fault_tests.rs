@@ -13,7 +13,9 @@ use crate::{
         replication_service_server::ReplicationServiceServer,
     },
     mvcc_fault_injection::{self, DeterministicFaults, FaultPoint},
-    mvcc_transaction::{DurabilityLevel, LogicalKey, ReadConsistency},
+    mvcc_transaction::{
+        CertificationAbort, CertificationResult, DurabilityLevel, LogicalKey, ReadConsistency,
+    },
     personaldb_signing,
 };
 
@@ -170,6 +172,29 @@ impl ThreeNodeFixture {
     }
 
     async fn write(&self, node: usize, id: &str, key: LogicalKey) {
+        self.write_outcome(node, id, key).await.unwrap();
+    }
+
+    async fn write_outcome(
+        &self,
+        node: usize,
+        id: &str,
+        key: LogicalKey,
+    ) -> anyhow::Result<crate::mvcc_open_transactions::CommitOutcome> {
+        let transaction_id = self.stage_write(node, id, key).await;
+        self.states[node]
+            .mvcc
+            .open_transactions
+            .commit(
+                self.states[node].mvcc.runtime.as_ref(),
+                &transaction_id,
+                "fault-principal",
+                3,
+            )
+            .await
+    }
+
+    async fn stage_write(&self, node: usize, id: &str, key: LogicalKey) -> String {
         let principal = "fault-principal";
         let handle = self.states[node]
             .mvcc
@@ -197,17 +222,7 @@ impl ThreeNodeFixture {
                 2,
             )
             .unwrap();
-        self.states[node]
-            .mvcc
-            .open_transactions
-            .commit(
-                self.states[node].mvcc.runtime.as_ref(),
-                &handle.transaction_id,
-                principal,
-                3,
-            )
-            .await
-            .unwrap();
+        handle.transaction_id
     }
 }
 
@@ -251,4 +266,325 @@ async fn majority_elects_and_commits_after_leader_transport_loss() {
             },
         )
         .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn blind_writes_do_not_conflict_but_observed_writes_do() {
+    let cluster = ThreeNodeFixture::start().await;
+    let principal = "fault-principal";
+    let key = LogicalKey {
+        table_id: 1,
+        application_key: b"blind-write-semantics".to_vec(),
+    };
+    let range_observer = cluster.states[0]
+        .mvcc
+        .open_transactions
+        .begin(
+            cluster.states[0].mvcc.runtime.as_ref(),
+            "fault-e2e",
+            principal,
+            "blind-range-observer",
+            Duration::from_secs(30),
+            DurabilityLevel::Quorum,
+            ReadConsistency::Linearized,
+            1,
+        )
+        .await
+        .unwrap();
+    cluster.states[0]
+        .mvcc
+        .open_transactions
+        .observe_range(
+            &range_observer.transaction_id,
+            "fault-e2e",
+            1,
+            Some(b"blind-write-".to_vec()),
+            Some(b"blind-write-z".to_vec()),
+            None,
+            2,
+        )
+        .unwrap();
+    cluster.states[0]
+        .mvcc
+        .open_transactions
+        .put(
+            &range_observer.transaction_id,
+            "fault-e2e",
+            LogicalKey {
+                table_id: 2,
+                application_key: b"force-certification".to_vec(),
+            },
+            b"value".to_vec(),
+            2,
+        )
+        .unwrap();
+
+    let first = cluster.states[0]
+        .mvcc
+        .open_transactions
+        .begin(
+            cluster.states[0].mvcc.runtime.as_ref(),
+            "fault-e2e",
+            principal,
+            "blind-first",
+            Duration::from_secs(30),
+            DurabilityLevel::Quorum,
+            ReadConsistency::Linearized,
+            1,
+        )
+        .await
+        .unwrap();
+    let second = cluster.states[0]
+        .mvcc
+        .open_transactions
+        .begin(
+            cluster.states[0].mvcc.runtime.as_ref(),
+            "fault-e2e",
+            principal,
+            "blind-second",
+            Duration::from_secs(30),
+            DurabilityLevel::Quorum,
+            ReadConsistency::Linearized,
+            1,
+        )
+        .await
+        .unwrap();
+    for (handle, value) in [
+        (&first, b"first".as_slice()),
+        (&second, b"second".as_slice()),
+    ] {
+        cluster.states[0]
+            .mvcc
+            .open_transactions
+            .put(
+                &handle.transaction_id,
+                "fault-e2e",
+                key.clone(),
+                value.to_vec(),
+                2,
+            )
+            .unwrap();
+    }
+    for handle in [&first, &second] {
+        assert!(matches!(
+            cluster.states[0]
+                .mvcc
+                .open_transactions
+                .commit(
+                    cluster.states[0].mvcc.runtime.as_ref(),
+                    &handle.transaction_id,
+                    principal,
+                    3,
+                )
+                .await
+                .unwrap()
+                .certification,
+            CertificationResult::Committed { .. }
+        ));
+    }
+    assert_eq!(
+        cluster.states[0].mvcc.read_latest_value(&key).unwrap(),
+        Some(b"second".to_vec())
+    );
+    assert!(matches!(
+        cluster.states[0]
+            .mvcc
+            .open_transactions
+            .commit(
+                cluster.states[0].mvcc.runtime.as_ref(),
+                &range_observer.transaction_id,
+                principal,
+                4,
+            )
+            .await
+            .unwrap()
+            .certification,
+        CertificationResult::Aborted {
+            reason: CertificationAbort::RangeConflict { .. }
+        }
+    ));
+
+    let observed_key = LogicalKey {
+        table_id: 1,
+        application_key: b"observed-write-semantics".to_vec(),
+    };
+    let observed_first = cluster.states[0]
+        .mvcc
+        .open_transactions
+        .begin(
+            cluster.states[0].mvcc.runtime.as_ref(),
+            "fault-e2e",
+            principal,
+            "observed-first",
+            Duration::from_secs(30),
+            DurabilityLevel::Quorum,
+            ReadConsistency::Linearized,
+            4,
+        )
+        .await
+        .unwrap();
+    let observed_second = cluster.states[0]
+        .mvcc
+        .open_transactions
+        .begin(
+            cluster.states[0].mvcc.runtime.as_ref(),
+            "fault-e2e",
+            principal,
+            "observed-second",
+            Duration::from_secs(30),
+            DurabilityLevel::Quorum,
+            ReadConsistency::Linearized,
+            4,
+        )
+        .await
+        .unwrap();
+    for (handle, value) in [
+        (&observed_first, b"first".as_slice()),
+        (&observed_second, b"second".as_slice()),
+    ] {
+        cluster.states[0]
+            .mvcc
+            .open_transactions
+            .observe_point(
+                &handle.transaction_id,
+                "fault-e2e",
+                observed_key.clone(),
+                None,
+                5,
+            )
+            .unwrap();
+        cluster.states[0]
+            .mvcc
+            .open_transactions
+            .put(
+                &handle.transaction_id,
+                "fault-e2e",
+                observed_key.clone(),
+                value.to_vec(),
+                5,
+            )
+            .unwrap();
+    }
+    assert!(matches!(
+        cluster.states[0]
+            .mvcc
+            .open_transactions
+            .commit(
+                cluster.states[0].mvcc.runtime.as_ref(),
+                &observed_first.transaction_id,
+                principal,
+                6,
+            )
+            .await
+            .unwrap()
+            .certification,
+        CertificationResult::Committed { .. }
+    ));
+    assert!(matches!(
+        cluster.states[0]
+            .mvcc
+            .open_transactions
+            .commit(
+                cluster.states[0].mvcc.runtime.as_ref(),
+                &observed_second.transaction_id,
+                principal,
+                6,
+            )
+            .await
+            .unwrap()
+            .certification,
+        CertificationResult::Aborted {
+            reason: CertificationAbort::PointConflict { .. }
+        }
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn coordinator_failure_before_proposal_is_retryable_without_a_commit() {
+    let cluster = ThreeNodeFixture::start().await;
+    let key = LogicalKey {
+        table_id: 1,
+        application_key: b"before-proposal".to_vec(),
+    };
+    mvcc_fault_injection::install(
+        DeterministicFaults::default().fail_at(FaultPoint::BeforeProposal, 1),
+    );
+    let transaction_id = cluster.stage_write(0, "before-proposal", key.clone()).await;
+    let first = cluster.states[0]
+        .mvcc
+        .open_transactions
+        .commit(
+            cluster.states[0].mvcc.runtime.as_ref(),
+            &transaction_id,
+            "fault-principal",
+            3,
+        )
+        .await;
+    mvcc_fault_injection::clear();
+    assert!(first.unwrap_err().to_string().contains("BeforeProposal"));
+    assert_eq!(
+        cluster.states[0].mvcc.read_latest_value(&key).unwrap(),
+        None
+    );
+
+    assert!(matches!(
+        cluster.states[0]
+            .mvcc
+            .open_transactions
+            .commit(
+                cluster.states[0].mvcc.runtime.as_ref(),
+                &transaction_id,
+                "fault-principal",
+                4,
+            )
+            .await
+            .unwrap()
+            .certification,
+        CertificationResult::Committed { .. }
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn coordinator_failure_after_proposal_recovers_the_stable_commit() {
+    let cluster = ThreeNodeFixture::start().await;
+    let key = LogicalKey {
+        table_id: 1,
+        application_key: b"after-proposal".to_vec(),
+    };
+    mvcc_fault_injection::install(
+        DeterministicFaults::default().fail_at(FaultPoint::AfterProposal, 1),
+    );
+    let transaction_id = cluster.stage_write(0, "after-proposal", key.clone()).await;
+    let first = cluster.states[0]
+        .mvcc
+        .open_transactions
+        .commit(
+            cluster.states[0].mvcc.runtime.as_ref(),
+            &transaction_id,
+            "fault-principal",
+            3,
+        )
+        .await;
+    mvcc_fault_injection::clear();
+    assert!(first.unwrap_err().to_string().contains("AfterProposal"));
+
+    let recovered = cluster.states[0]
+        .mvcc
+        .open_transactions
+        .commit(
+            cluster.states[0].mvcc.runtime.as_ref(),
+            &transaction_id,
+            "fault-principal",
+            4,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        recovered.certification,
+        CertificationResult::Committed { .. }
+    ));
+    assert_eq!(
+        cluster.states[0].mvcc.read_latest_value(&key).unwrap(),
+        Some(b"after-proposal".to_vec())
+    );
 }
