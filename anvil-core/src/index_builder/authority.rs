@@ -118,7 +118,7 @@ impl IndexBuildOwnership {
 }
 
 impl IndexBuildAuthority<'_> {
-    pub(crate) fn mvcc(self) -> Result<&crate::mvcc_bootstrap::MvccSubsystem> {
+    pub(crate) fn mvcc(&self) -> Result<&crate::mvcc_bootstrap::MvccSubsystem> {
         match self {
             Self::Task(guard) => guard.mvcc(),
             Self::DirectRepair(authority) => Ok(authority.mvcc),

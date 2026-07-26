@@ -260,7 +260,7 @@ pub async fn read_index_diagnostics(
     if let Some(after) = after {
         rows.retain(|(key, _)| {
             key.application_key
-                .strip_prefix(&namespace)
+                .strip_prefix(namespace.as_slice())
                 .is_some_and(|tuple| tuple > after.as_slice())
         });
     }

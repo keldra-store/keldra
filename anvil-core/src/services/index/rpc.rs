@@ -549,9 +549,7 @@ impl IndexService for AppState {
             .await?;
         let after_cursor = i64::try_from(req.after_cursor)
             .map_err(|_| Status::invalid_argument("after_cursor exceeds supported range"))?;
-        let stream_id = index_journal::index_definition_stream_id(claims.tenant_id, bucket.id);
-        let mut live = self.storage.subscribe_stream(&stream_id);
-        let storage = self.storage.clone();
+        let mvcc = std::sync::Arc::clone(&self.mvcc);
         let tenant_id = claims.tenant_id;
         let bucket_id = bucket.id;
 
@@ -560,15 +558,13 @@ impl IndexService for AppState {
             let mut last_cursor = after_cursor;
             loop {
                 loop {
-                    let page = match index_journal::read_index_definition_event_page(
-                        &storage,
+                    let page = match index_journal::read_index_definition_event_page_mvcc(
+                        &mvcc,
                         tenant_id,
                         bucket_id,
                         last_cursor,
                         256,
-                    )
-                    .await
-                    {
+                    ) {
                         Ok(page) => page,
                         Err(error) => {
                             let _ = tx.send(Err(Status::internal(error.to_string()))).await;
@@ -591,10 +587,7 @@ impl IndexService for AppState {
                     }
                 }
 
-                match live.recv().await {
-                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         });
 

@@ -540,8 +540,8 @@ pub(crate) async fn publish_staged_authz_tuple_segment(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     staged: StagedAuthzTupleSegment,
     additional_preconditions: &[(
-        anvil_mvcc_consensus::LogicalKey,
-        anvil_mvcc_consensus::PredicateKind,
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
     )],
 ) -> Result<String> {
     write_writer_segment_catalog_record(mvcc, &staged.catalog_record, additional_preconditions)
@@ -1451,12 +1451,21 @@ fn partition_id(tenant_id: i64) -> Hash32 {
 #[derive(Debug, Clone)]
 pub struct AuthzSegmentCandidateReader {
     storage: Storage,
+    mvcc: std::sync::Arc<crate::mvcc_bootstrap::MvccSubsystem>,
     tenant_id: i64,
 }
 
 impl AuthzSegmentCandidateReader {
-    pub fn new(storage: Storage, tenant_id: i64) -> Self {
-        Self { storage, tenant_id }
+    pub fn new(
+        storage: Storage,
+        mvcc: std::sync::Arc<crate::mvcc_bootstrap::MvccSubsystem>,
+        tenant_id: i64,
+    ) -> Self {
+        Self {
+            storage,
+            mvcc,
+            tenant_id,
+        }
     }
 }
 
@@ -1477,6 +1486,7 @@ impl AuthzCandidateReader for AuthzSegmentCandidateReader {
         loop {
             let page = authz_journal::list_current_authz_objects_page(
                 &self.storage,
+                &self.mvcc,
                 self.tenant_id,
                 &request.object_namespace,
                 &request.relation,
@@ -1540,6 +1550,7 @@ impl AuthzCandidateReader for AuthzSegmentCandidateReader {
         for object_key in object_keys {
             let allowed = authz_journal::resolve_permission_at_revision(
                 &self.storage,
+                &self.mvcc,
                 self.tenant_id,
                 &request.object_namespace,
                 &object_key.canonical_object_id,

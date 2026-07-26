@@ -178,7 +178,7 @@ pub(super) fn read_current_record_at(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn read_current_record_at_runtime(
-    runtime: &crate::mvcc_node_runtime::MvccNodeRuntime,
+    runtime: &crate::mvcc_bootstrap::ProductMvccRuntime,
     snapshot: u64,
     tenant_id: i64,
     namespace: &str,

@@ -5,6 +5,7 @@ use crate::authz_schema_contract::{
 };
 use crate::authz_scope::{DEFAULT_AUTHZ_REALM_ID, split_realm_namespace};
 use crate::authz_segment;
+use crate::core_store::{CF_AUTHZ, CoreMetaTuplePart, core_meta_tuple_key};
 use crate::formats::{Hash32, hash32};
 use crate::partition_fence::PartitionWritePermit;
 use crate::persistence::AuthzTupleRecord;
@@ -728,7 +729,7 @@ pub(crate) fn check_current_authz_tuple(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn check_current_authz_tuple_runtime(
-    runtime: &crate::mvcc_node_runtime::MvccNodeRuntime,
+    runtime: &crate::mvcc_bootstrap::ProductMvccRuntime,
     tenant_id: i64,
     namespace: &str,
     object_id: &str,
@@ -931,7 +932,11 @@ pub async fn list_authz_tuple_log(
     namespace: &str,
     limit: usize,
 ) -> Result<Vec<AuthzTupleRecord>> {
-    Ok(list_authz_tuple_log_page(mvcc, tenant_id, after_revision, namespace, limit)?.records)
+    Ok(
+        list_authz_tuple_log_page(mvcc, tenant_id, after_revision, namespace, limit)
+            .await?
+            .records,
+    )
 }
 
 pub(crate) async fn collect_authz_tuple_log_for_rebuild(
@@ -1299,6 +1304,15 @@ fn encode_authz_tuple_batch_journal_body(
         fence_token,
         mutation_id,
     })
+}
+
+fn decode_authz_tuple_batch_journal_body_fence(bytes: &[u8]) -> Result<u64> {
+    let body = AuthzTupleBatchJournalBodyProto::decode(bytes)?;
+    ensure_deterministic_proto(&body, bytes, "authz tuple batch journal body")?;
+    if body.schema != AUTHZ_TUPLE_BATCH_JOURNAL_BODY_SCHEMA {
+        return Err(anyhow!("authz tuple batch journal body schema mismatch"));
+    }
+    Ok(body.fence_token)
 }
 
 fn decode_authz_tuple_journal_body(bytes: &[u8]) -> Result<AuthzTupleRecord> {

@@ -392,7 +392,7 @@ pub(super) fn page_mvcc_window(
     if let Some(after) = after_tuple_key {
         rows.retain(|(key, _)| {
             key.application_key
-                .strip_prefix(&namespace)
+                .strip_prefix(namespace.as_slice())
                 .is_some_and(|tuple| tuple > after)
         });
     }
@@ -406,7 +406,7 @@ pub(super) fn page_mvcc_window(
     let next_tuple_key = if has_more {
         Some(
             rows.last()
-                .and_then(|(key, _)| key.application_key.strip_prefix(&namespace))
+                .and_then(|(key, _)| key.application_key.strip_prefix(namespace.as_slice()))
                 .ok_or_else(|| anyhow!("index definition continuation has no last row"))?
                 .to_vec(),
         )

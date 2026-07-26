@@ -41,8 +41,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 mod authority;
+mod helpers;
 use authority::IndexBuildOwnership;
 pub(crate) use authority::{DirectRepairIndexBuildAuthority, IndexBuildAuthority};
+use helpers::*;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexBuildOutcome {
@@ -1649,6 +1651,52 @@ fn deterministic_build_digest(source_manifest_hash: &str, segment_hashes: &[Stri
         input.push(0);
     }
     blake3::hash(&input).to_hex().to_string()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn acquire_index_partition_watch_authority(
+    storage: &Storage,
+    tenant_id: i64,
+    bucket_id: i64,
+    partition_id: &str,
+    payload: &IndexPartitionWatchPayload,
+    builder_node_id: &str,
+    signing_key: &[u8],
+) -> Result<index_partition_watch::IndexPartitionWatchWriteAuthority> {
+    let resource_id = index_partition_watch::index_partition_watch_resource_id(
+        tenant_id,
+        bucket_id,
+        &payload.index_id,
+        partition_id,
+    );
+    let resource = OwnershipResource {
+        resource_kind: OwnershipResourceKind::WatchPartition,
+        resource_id: resource_id.clone(),
+    };
+    let now_nanos = chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .ok_or_else(|| anyhow!("index partition watch timestamp overflow"))?;
+    let ttl_nanos = i64::try_from(MAX_OWNERSHIP_LEASE_MS)?
+        .checked_mul(1_000_000)
+        .ok_or_else(|| anyhow!("index partition watch ownership TTL overflow"))?;
+    let acquired = acquire_ownership(
+        storage,
+        AcquireOwnership {
+            request_id: format!("index-watch-acquire-{resource_id}"),
+            idempotency_key: format!("index-watch-owner-{resource_id}"),
+            resource,
+            owner: OwnershipPrincipal::node(builder_node_id),
+            now_nanos,
+            ttl_nanos,
+        },
+        signing_key,
+    )
+    .await?;
+    Ok(index_partition_watch::IndexPartitionWatchWriteAuthority {
+        owner_node_id: builder_node_id.to_string(),
+        fence: acquired.record.fence,
+        resource_id,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

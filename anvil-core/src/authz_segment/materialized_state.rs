@@ -55,9 +55,9 @@ pub(super) async fn schema_descriptor_rows(
                 tenant_id,
                 realm_id,
                 namespace,
-                schema_id: binding.schema_ref.schema_id,
+                schema_id: binding.schema_ref.schema_id.clone(),
                 schema_revision: binding.schema_ref.schema_revision,
-                schema_digest: binding.schema_ref.schema_digest,
+                schema_digest: binding.schema_ref.schema_digest.clone(),
                 binding_generation: binding.binding_generation,
                 authz_revision: binding.authz_revision,
             });

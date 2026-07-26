@@ -401,7 +401,7 @@ pub async fn page_index_segment_coremeta_records(
     if let Some(after) = after_tuple_key {
         rows.retain(|(key, _)| {
             key.application_key
-                .strip_prefix(&namespace)
+                .strip_prefix(namespace.as_slice())
                 .is_some_and(|tuple| tuple > after)
         });
     }
@@ -413,7 +413,7 @@ pub async fn page_index_segment_coremeta_records(
     let next_tuple_key = if has_more {
         Some(
             rows.last()
-                .and_then(|(key, _)| key.application_key.strip_prefix(&namespace))
+                .and_then(|(key, _)| key.application_key.strip_prefix(namespace.as_slice()))
                 .ok_or_else(|| anyhow!("index segment CoreMeta page is empty"))?
                 .to_vec(),
         )
@@ -426,7 +426,8 @@ pub async fn page_index_segment_coremeta_records(
             let record = decode_index_segment_record(&row.value)?;
             let expected_key = index_segment_tuple_key(&record)?;
             if record.index_id != index_id
-                || key.application_key.strip_prefix(&namespace) != Some(expected_key.as_slice())
+                || key.application_key.strip_prefix(namespace.as_slice())
+                    != Some(expected_key.as_slice())
             {
                 bail!("CoreMeta index segment history row scope mismatch");
             }

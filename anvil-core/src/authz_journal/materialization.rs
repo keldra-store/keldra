@@ -1,12 +1,13 @@
 use super::{
-    AUTHZ_TUPLE_JOURNAL_ROW_KIND, decode_authz_tuple_batch_journal_body,
-    decode_authz_tuple_batch_journal_body_fence, latest_authz_revision,
+    AUTHZ_TUPLE_JOURNAL_ROW_KIND, TABLE_AUTHZ_TUPLE_JOURNAL_ROW,
+    decode_authz_tuple_batch_journal_body, decode_authz_tuple_batch_journal_body_fence,
+    latest_authz_revision,
 };
 use crate::{
     authz_head,
     authz_segment::{self, DecodedAuthzSegment},
     authz_userset_index::DEFAULT_DERIVED_USERSET_INDEX_ID,
-    core_store::{CF_AUTHZ, CoreMetaTuplePart, TABLE_AUTHZ_TUPLE_JOURNAL_ROW, core_meta_tuple_key},
+    core_store::{CF_AUTHZ, CoreMetaTuplePart, core_meta_tuple_key},
     persistence::AuthzTupleRecord,
     storage::Storage,
     task_execution_guard::TaskExecutionGuard,
@@ -43,8 +44,8 @@ enum AuthzPublication<'a> {
     Task {
         guard: &'a TaskExecutionGuard,
         source_head_predicate: &'a (
-            anvil_mvcc_consensus::LogicalKey,
-            anvil_mvcc_consensus::PredicateKind,
+            crate::mvcc_transaction::LogicalKey,
+            crate::mvcc_transaction::PredicateKind,
         ),
     },
 }
@@ -176,8 +177,8 @@ impl AuthzMaterializationOutcome {
         source_fence_token: u64,
         guard: &TaskExecutionGuard,
         source_head_predicate: &(
-            anvil_mvcc_consensus::LogicalKey,
-            anvil_mvcc_consensus::PredicateKind,
+            crate::mvcc_transaction::LogicalKey,
+            crate::mvcc_transaction::PredicateKind,
         ),
     ) -> Result<Self> {
         materialize_authz_state_at_revision(
@@ -252,7 +253,7 @@ async fn materialize_authz_state_at_revision_inner(
         .generation
         .checked_add(1)
         .ok_or_else(|| anyhow!("authorization materialization revision overflow"))?;
-    let previous = load_materialized_segment(storage, tenant_id, head.generation).await?;
+    let previous = load_materialized_segment(storage, mvcc, tenant_id, head.generation).await?;
     let IncrementalSourceRead {
         event: next_event,
         cursor_before_event,

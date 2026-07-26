@@ -154,6 +154,7 @@ impl PlannerAuthzCandidateAdapter {
     ) -> anyhow::Result<PlannerAuthzAllowance> {
         let bucket_wide = principal_has_bucket_wide_object_access(
             &self.storage,
+            &self.mvcc,
             &self.claims,
             &self.bucket,
             request.system_revision,
@@ -177,6 +178,7 @@ impl PlannerAuthzCandidateAdapter {
 
         let tenant_reader = crate::authz_segment::AuthzSegmentCandidateReader::new(
             self.storage.clone(),
+            std::sync::Arc::clone(&self.mvcc),
             self.claims.tenant_id,
         );
         let tenant_candidates = tenant_reader.candidate_set(request.clone()).await?;

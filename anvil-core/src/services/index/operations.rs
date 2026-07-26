@@ -1249,6 +1249,7 @@ impl AppState {
                 .collect::<Vec<_>>();
             let Some(segment) = full_text_segment::read_latest_full_text_segment_terms(
                 &self.storage,
+                &self.mvcc,
                 &index_storage_id,
                 &query_terms,
             )
