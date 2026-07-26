@@ -58,6 +58,7 @@ pub struct PersonalDbLogChainRepairReport {
 
 pub async fn repair_personaldb_log_chain(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     database_id: &str,
     lease_fence_token: u64,
@@ -81,8 +82,7 @@ pub async fn repair_personaldb_log_chain(
             &reason,
             lease_fence_token,
         )?;
-        report.finding =
-            Some(write_repair_finding(storage, write, repair_finding_signing_key).await?);
+        report.finding = Some(write_repair_finding(mvcc, write, repair_finding_signing_key).await?);
     }
     Ok(report)
 }
@@ -764,6 +764,7 @@ mod tests {
         let fixture = Fixture::create().await;
         let report = repair_personaldb_log_chain(
             &fixture.storage,
+            &fixture.mvcc,
             7,
             "db-alpha",
             9,
@@ -793,6 +794,7 @@ mod tests {
 
         let report = repair_personaldb_log_chain(
             &fixture.storage,
+            &fixture.mvcc,
             7,
             "db-alpha",
             9,
@@ -826,6 +828,7 @@ mod tests {
 
         let report = repair_personaldb_log_chain(
             &fixture.storage,
+            &fixture.mvcc,
             7,
             "db-alpha",
             9,
@@ -847,6 +850,7 @@ mod tests {
     struct Fixture {
         _temp: TempDir,
         storage: Storage,
+        mvcc: crate::mvcc_bootstrap::MvccSubsystem,
         payload_ref: String,
         certificate_ref: String,
         protocol_keyring: crate::personaldb_signing::PersonalDbProtocolKeyring,
@@ -856,6 +860,17 @@ mod tests {
         async fn create() -> Self {
             let temp = tempdir().unwrap();
             let storage = Storage::new_at(temp.path()).await.unwrap();
+            let config = crate::Config {
+                node_id: "personaldb-repair-test".into(),
+                storage_path: temp.path().to_string_lossy().into_owned(),
+                public_api_addr: "127.0.0.1:0".into(),
+                ..crate::Config::default()
+            };
+            let meta =
+                crate::core_store::CoreMetaStore::open(storage.core_store_meta_path()).unwrap();
+            let mvcc = crate::mvcc_bootstrap::MvccSubsystem::bootstrap(&config, meta.database())
+                .await
+                .unwrap();
             let protocol_keyring = personaldb_protocol_keyring();
             let schema_hash = hash32(b"schema");
             let genesis_hash = hash32(b"genesis");
@@ -996,6 +1011,7 @@ mod tests {
             Self {
                 _temp: temp,
                 storage,
+                mvcc,
                 payload_ref,
                 certificate_ref,
                 protocol_keyring,

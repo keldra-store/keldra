@@ -691,8 +691,7 @@ async fn handle_rebalance_shard(
     let ttl_nanos = task_lease_ttl_nanos(&lease)?;
 
     *lease = check_execution_lease(persistence, core_store, lease).await?;
-    let open_finding_precondition =
-        execution_lease_precondition(persistence, core_store, lease).await?;
+    let open_finding_precondition = crate::task_lease::task_lease_mvcc_predicate(lease)?;
     let open_finding = persistence
         .write_rebalance_shard_finding(
             &payload,
@@ -757,8 +756,7 @@ async fn handle_rebalance_shard(
     let overlays_published = outcome.overlays_published();
     let completed_status = rebalance_shard_completion_status(overlays_published);
     *lease = check_execution_lease(persistence, core_store, lease).await?;
-    let completed_finding_precondition =
-        execution_lease_precondition(persistence, core_store, lease).await?;
+    let completed_finding_precondition = crate::task_lease::task_lease_mvcc_predicate(lease)?;
     let completed_finding = persistence
         .write_rebalance_shard_finding(
             &payload,

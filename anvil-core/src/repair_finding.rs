@@ -1,13 +1,11 @@
 use crate::{
     core_store::{
-        CF_MESH, CoreMetaRowCommonProto, CoreMetaTuplePart, CoreMutationBatch,
-        CoreMutationOperation, CoreMutationPrecondition, CoreMutationRootPublication, CoreStore,
-        TABLE_REPAIR_FINDING_HEAD_ROW, TABLE_REPAIR_FINDING_ID_ROW, TABLE_REPAIR_FINDING_ROW,
-        core_meta_committed_row_common, core_meta_payload_digest, core_meta_root_key_hash,
-        core_meta_tuple_key, decode_deterministic_proto, encode_deterministic_proto,
+        CF_MESH, CoreMetaRowCommonProto, CoreMetaTuplePart, TABLE_REPAIR_FINDING_HEAD_ROW,
+        TABLE_REPAIR_FINDING_ID_ROW, TABLE_REPAIR_FINDING_ROW, core_meta_committed_row_common,
+        core_meta_root_key_hash, core_meta_tuple_key, decode_deterministic_proto,
+        encode_deterministic_proto,
     },
     formats::hash32,
-    storage::Storage,
 };
 use anyhow::{Result, anyhow};
 use base64::Engine;
@@ -317,28 +315,33 @@ pub fn hash_repair_finding(finding: &RepairFinding) -> Result<String> {
 }
 
 pub async fn write_repair_finding(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     finding: RepairFindingWrite,
     signing_key: &[u8],
 ) -> Result<RepairFinding> {
-    write_repair_finding_inner(storage, finding, signing_key, Vec::new()).await
+    write_repair_finding_inner(mvcc, finding, signing_key, Vec::new()).await
 }
 
 pub async fn write_repair_finding_with_lease(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     finding: RepairFindingWrite,
     signing_key: &[u8],
-    lease_precondition: CoreMutationPrecondition,
+    lease_precondition: (
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    ),
 ) -> Result<RepairFinding> {
-    require_temporal_lease_precondition(&lease_precondition)?;
-    write_repair_finding_inner(storage, finding, signing_key, vec![lease_precondition]).await
+    write_repair_finding_inner(mvcc, finding, signing_key, vec![lease_precondition]).await
 }
 
 async fn write_repair_finding_inner(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     finding: RepairFindingWrite,
     signing_key: &[u8],
-    publication_preconditions: Vec<CoreMutationPrecondition>,
+    publication_preconditions: Vec<(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )>,
 ) -> Result<RepairFinding> {
     let repair_started_at = std::time::Instant::now();
     validate_write(&finding)?;
@@ -348,14 +351,12 @@ async fn write_repair_finding_inner(
     let write_lock = repair_finding_write_lock(&finding.scope_kind, &finding.scope_id);
     let _guard = write_lock.lock().await;
     if let Some(existing) = read_repair_finding(
-        storage,
+        mvcc,
         &finding.scope_kind,
         &finding.scope_id,
         &finding.finding_id,
         signing_key,
-    )
-    .await?
-    {
+    )? {
         if finding_matches_write(&existing, &finding) {
             return Ok(existing);
         }
@@ -363,10 +364,15 @@ async fn write_repair_finding_inner(
             "repair finding id already names different immutable content"
         ));
     }
-    let store = CoreStore::new(storage.clone()).await?;
-    let current_head_state =
-        read_repair_finding_head_state(&store, &finding.scope_kind, &finding.scope_id)?;
-    let current_head = current_head_state.as_ref().map(|(_, head)| head);
+    let head_key = repair_finding_mvcc_key(
+        TABLE_REPAIR_FINDING_HEAD_ROW,
+        repair_finding_head_tuple_key(&finding.scope_kind, &finding.scope_id)?,
+    )?;
+    let current_head_payload = mvcc.read_latest_value(&head_key)?;
+    let current_head = current_head_payload
+        .as_deref()
+        .map(|payload| decode_repair_finding_head(payload, &finding.scope_kind, &finding.scope_id))
+        .transpose()?;
     let scope_revision = current_head
         .map(|head| head.revision)
         .unwrap_or_default()
@@ -392,13 +398,11 @@ async fn write_repair_finding_inner(
         finding_signature: None,
     }
     .seal(signing_key)?;
-    write_repair_finding_records(
-        &store,
+    write_repair_finding_records_mvcc(
+        mvcc,
         &sealed,
-        current_head,
-        current_head_state
-            .as_ref()
-            .map(|(payload, _)| payload.as_slice()),
+        current_head.as_ref(),
+        current_head_payload.as_deref(),
         publication_preconditions,
     )
     .await?;
@@ -418,7 +422,7 @@ async fn write_repair_finding_inner(
 }
 
 pub async fn read_repair_finding(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     scope_kind: &str,
     scope_id: &str,
     finding_id: &str,
@@ -427,16 +431,27 @@ pub async fn read_repair_finding(
     require_safe_component(scope_kind, "scope_kind")?;
     require_safe_component(scope_id, "scope_id")?;
     require_safe_component(finding_id, "finding_id")?;
-    let store = CoreStore::new(storage.clone()).await?;
-    let id_key = repair_finding_id_tuple_key(scope_kind, scope_id, finding_id)?;
-    let Some(id_bytes) = store.read_coremeta_row(CF_MESH, TABLE_REPAIR_FINDING_ID_ROW, &id_key)?
+    let id_key = repair_finding_mvcc_key(
+        TABLE_REPAIR_FINDING_ID_ROW,
+        repair_finding_id_tuple_key(scope_kind, scope_id, finding_id)?,
+    )?;
+    let snapshot = mvcc.runtime.applied_version()?;
+    let Some(id_bytes) = mvcc
+        .runtime
+        .read_at(&id_key, snapshot)?
+        .map(|row| row.value)
     else {
         return Ok(None);
     };
     let id_row = decode_repair_finding_id(&id_bytes, scope_kind, scope_id, finding_id)?;
-    let tuple_key = repair_finding_tuple_key(scope_kind, scope_id, id_row.revision)?;
-    let bytes = store
-        .read_coremeta_row(CF_MESH, TABLE_REPAIR_FINDING_ROW, &tuple_key)?
+    let tuple_key = repair_finding_mvcc_key(
+        TABLE_REPAIR_FINDING_ROW,
+        repair_finding_tuple_key(scope_kind, scope_id, id_row.revision)?,
+    )?;
+    let bytes = mvcc
+        .runtime
+        .read_at(&tuple_key, snapshot)?
+        .map(|row| row.value)
         .ok_or_else(|| anyhow!("repair finding id row points to a missing revision"))?;
     let finding = decode_repair_finding(&bytes)?;
     finding.verify(signing_key)?;
@@ -450,18 +465,17 @@ pub async fn read_repair_finding(
 }
 
 pub async fn repair_finding_scope_revision(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     scope_kind: &str,
     scope_id: &str,
 ) -> Result<u64> {
-    let store = CoreStore::new(storage.clone()).await?;
-    Ok(read_repair_finding_head(&store, scope_kind, scope_id)?
+    Ok(read_repair_finding_head_mvcc(mvcc, scope_kind, scope_id)?
         .map(|head| head.revision)
         .unwrap_or_default())
 }
 
 pub async fn page_repair_findings(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     scope_kind: &str,
     scope_id: &str,
     after_revision: u64,
@@ -475,9 +489,9 @@ pub async fn page_repair_findings(
             REPAIR_FINDING_PAGE_MAX + 1
         ));
     }
-    let store = CoreStore::new(storage.clone()).await?;
-    let head_before = read_repair_finding_head(&store, scope_kind, scope_id)?
-        .map(|head| head.revision)
+    let snapshot = mvcc.runtime.applied_version()?;
+    let head_before = read_repair_finding_head_at(mvcc, scope_kind, scope_id, snapshot)?
+        .map(|(_, head)| head.revision)
         .unwrap_or_default();
     if head_before != through_revision {
         return Err(anyhow!("repair finding collection revision changed"));
@@ -487,17 +501,24 @@ pub async fn page_repair_findings(
     }
 
     let start_revision = after_revision + 1;
-    let mut findings = store
-        .scan_coremeta_range_inclusive(
-            CF_MESH,
-            TABLE_REPAIR_FINDING_ROW,
-            &repair_finding_tuple_key(scope_kind, scope_id, start_revision)?,
-            &repair_finding_tuple_key(scope_kind, scope_id, through_revision)?,
-            limit,
-        )?
+    let prefix = crate::mvcc_product::coremeta_application_prefix(
+        CF_MESH,
+        &core_meta_tuple_key(&[
+            CoreMetaTuplePart::Utf8(scope_kind),
+            CoreMetaTuplePart::Utf8(scope_id),
+        ])?,
+    )?;
+    let mut findings = mvcc
+        .runtime
+        .scan_table_prefix_at(TABLE_REPAIR_FINDING_ROW, &prefix, snapshot)?
         .into_iter()
-        .map(|record| decode_repair_finding(&record.payload))
+        .map(|(_, row)| decode_repair_finding(&row.value))
         .collect::<Result<Vec<_>>>()?;
+    findings.retain(|finding| {
+        finding.scope_revision >= start_revision && finding.scope_revision <= through_revision
+    });
+    findings.sort_by_key(|finding| finding.scope_revision);
+    findings.truncate(limit);
     for finding in &findings {
         finding.verify(signing_key)?;
         if finding.scope_kind != scope_kind
@@ -507,16 +528,6 @@ pub async fn page_repair_findings(
         {
             return Err(anyhow!("repair finding page scope mismatch"));
         }
-    }
-    findings.sort_by_key(|finding| finding.scope_revision);
-    if read_repair_finding_head(&store, scope_kind, scope_id)?
-        .map(|head| head.revision)
-        .unwrap_or_default()
-        != through_revision
-    {
-        return Err(anyhow!(
-            "repair finding collection changed during page read"
-        ));
     }
     Ok(findings)
 }
@@ -663,12 +674,15 @@ fn require_safe_component(value: &str, field: &'static str) -> Result<()> {
     Ok(())
 }
 
-async fn write_repair_finding_records(
-    store: &CoreStore,
+async fn write_repair_finding_records_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     finding: &RepairFinding,
     current_head: Option<&RepairFindingHeadProto>,
     current_head_payload: Option<&[u8]>,
-    mut preconditions: Vec<CoreMutationPrecondition>,
+    mut preconditions: Vec<(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )>,
 ) -> Result<()> {
     let finding_key = repair_finding_tuple_key(
         &finding.scope_kind,
@@ -705,117 +719,74 @@ async fn write_repair_finding_records(
             .clone()
             .ok_or_else(|| anyhow!("sealed repair finding is missing hash"))?,
     });
+    let finding_key = repair_finding_mvcc_key(TABLE_REPAIR_FINDING_ROW, finding_key)?;
+    let id_key = repair_finding_mvcc_key(TABLE_REPAIR_FINDING_ID_ROW, id_key)?;
+    let head_key = repair_finding_mvcc_key(TABLE_REPAIR_FINDING_HEAD_ROW, head_key)?;
     preconditions.extend([
-        CoreMutationPrecondition::CoreMetaRow {
-            cf: CF_MESH.to_string(),
-            table_id: TABLE_REPAIR_FINDING_ROW,
-            tuple_key: finding_key.clone(),
-            expected_payload_hash: None,
-            require_absent: true,
-            require_present: false,
-        },
-        CoreMutationPrecondition::CoreMetaRow {
-            cf: CF_MESH.to_string(),
-            table_id: TABLE_REPAIR_FINDING_ID_ROW,
-            tuple_key: id_key.clone(),
-            expected_payload_hash: None,
-            require_absent: true,
-            require_present: false,
-        },
-        CoreMutationPrecondition::CoreMetaRow {
-            cf: CF_MESH.to_string(),
-            table_id: TABLE_REPAIR_FINDING_HEAD_ROW,
-            tuple_key: head_key.clone(),
-            expected_payload_hash: current_head_payload
-                .map(|payload| core_meta_payload_digest(TABLE_REPAIR_FINDING_HEAD_ROW, payload)),
-            require_absent: current_head_payload.is_none(),
-            require_present: current_head_payload.is_some(),
-        },
+        (
+            finding_key.clone(),
+            crate::mvcc_transaction::PredicateKind::Absent,
+        ),
+        (
+            id_key.clone(),
+            crate::mvcc_transaction::PredicateKind::Absent,
+        ),
+        (
+            head_key.clone(),
+            match current_head_payload {
+                Some(payload) => crate::mvcc_transaction::PredicateKind::ValueHash(
+                    *blake3::hash(payload).as_bytes(),
+                ),
+                None => crate::mvcc_transaction::PredicateKind::Absent,
+            },
+        ),
     ]);
-    let root_anchor_key = format!("repair/{}/{}", finding.scope_kind, finding.scope_id);
-    let receipt = store
-        .commit_mutation_batch(CoreMutationBatch {
-            transaction_id: format!(
-                "repair-finding:{}:{}:{}",
-                finding.scope_kind, finding.scope_id, finding.finding_id
-            ),
-            scope_partition: root_anchor_key.clone(),
-            committed_by_principal: "repair-finding".to_string(),
-            root_publications: vec![
-                CoreMutationRootPublication::new(
-                    root_anchor_key.clone(),
-                    crate::formats::writer::WriterFamily::CoreControl
-                        .as_str()
-                        .to_string(),
-                )
-                .coordinator(),
-            ],
-            preconditions,
-            operations: vec![
-                CoreMutationOperation::CoreMetaPut {
-                    partition_id: root_anchor_key.clone(),
-                    cf: CF_MESH.to_string(),
-                    table_id: TABLE_REPAIR_FINDING_ROW,
-                    tuple_key: finding_key,
-                    payload: finding_payload,
-                },
-                CoreMutationOperation::CoreMetaPut {
-                    partition_id: root_anchor_key.clone(),
-                    cf: CF_MESH.to_string(),
-                    table_id: TABLE_REPAIR_FINDING_ID_ROW,
-                    tuple_key: id_key,
-                    payload: id_payload,
-                },
-                CoreMutationOperation::CoreMetaPut {
-                    partition_id: root_anchor_key,
-                    cf: CF_MESH.to_string(),
-                    table_id: TABLE_REPAIR_FINDING_HEAD_ROW,
-                    tuple_key: head_key,
-                    payload: head_payload,
-                },
-            ],
-        })
-        .await?;
-    if !receipt.is_committed() {
-        return Err(anyhow!(
-            "repair finding transaction {} did not commit: {}",
-            receipt.transaction_id,
-            receipt
-                .finalisation_error
-                .unwrap_or_else(|| "unknown finalisation failure".to_string())
-        ));
-    }
+    mvcc.autocommit_product_mutations_with_predicates(
+        "repair-finding",
+        &format!(
+            "repair-finding:{}:{}:{}",
+            finding.scope_kind, finding.scope_id, finding.finding_id
+        ),
+        vec![
+            crate::mvcc_product::ProductMutation::put(finding_key, finding_payload),
+            crate::mvcc_product::ProductMutation::put(id_key, id_payload),
+            crate::mvcc_product::ProductMutation::put(head_key, head_payload),
+        ],
+        preconditions,
+        crate::mvcc_transaction::DurabilityLevel::Quorum,
+        u64::try_from(chrono::Utc::now().timestamp_millis())
+            .map_err(|_| anyhow!("repair finding timestamp predates Unix epoch"))?,
+    )
+    .await?;
     Ok(())
 }
 
-fn require_temporal_lease_precondition(precondition: &CoreMutationPrecondition) -> Result<()> {
-    if !matches!(precondition, CoreMutationPrecondition::CoreMetaLease { .. }) {
-        return Err(anyhow!(
-            "repair finding publication requires an exact temporal CoreMeta lease precondition"
-        ));
-    }
-    Ok(())
-}
-
-fn read_repair_finding_head_state(
-    store: &CoreStore,
+fn read_repair_finding_head_at(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     scope_kind: &str,
     scope_id: &str,
+    snapshot: u64,
 ) -> Result<Option<(Vec<u8>, RepairFindingHeadProto)>> {
-    let key = repair_finding_head_tuple_key(scope_kind, scope_id)?;
-    let Some(bytes) = store.read_coremeta_row(CF_MESH, TABLE_REPAIR_FINDING_HEAD_ROW, &key)? else {
+    let key = repair_finding_mvcc_key(
+        TABLE_REPAIR_FINDING_HEAD_ROW,
+        repair_finding_head_tuple_key(scope_kind, scope_id)?,
+    )?;
+    let Some(row) = mvcc.runtime.read_at(&key, snapshot)? else {
         return Ok(None);
     };
-    let head = decode_repair_finding_head(&bytes, scope_kind, scope_id)?;
-    Ok(Some((bytes, head)))
+    let head = decode_repair_finding_head(&row.value, scope_kind, scope_id)?;
+    Ok(Some((row.value, head)))
 }
 
-fn read_repair_finding_head(
-    store: &CoreStore,
+fn read_repair_finding_head_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     scope_kind: &str,
     scope_id: &str,
 ) -> Result<Option<RepairFindingHeadProto>> {
-    Ok(read_repair_finding_head_state(store, scope_kind, scope_id)?.map(|(_, head)| head))
+    Ok(
+        read_repair_finding_head_at(mvcc, scope_kind, scope_id, mvcc.runtime.applied_version()?)?
+            .map(|(_, head)| head),
+    )
 }
 
 fn decode_repair_finding_head(
@@ -1321,501 +1292,9 @@ fn repair_finding_head_tuple_key(scope_kind: &str, scope_id: &str) -> Result<Vec
     ])
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        core_store::{
-            CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaStore, commit_coremeta_batch_for_storage,
-        },
-        task_lease::{
-            TaskLease, TaskLeaseAcquire, TaskLeaseOwner, acquire_task_lease, renew_task_lease,
-            task_lease_fenced_precondition,
-        },
-    };
-    use tempfile::tempdir;
-
-    const KEY: &[u8] = b"repair finding signing key";
-    const LEASE_KEY: &[u8] = b"repair finding task lease signing key";
-
-    #[tokio::test]
-    async fn repair_findings_write_point_indexes_and_bounded_pages() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        seed_repair_root_generation(&storage).await;
-        let first = write_repair_finding(&storage, finding("finding-001", 10), KEY)
-            .await
-            .unwrap();
-        let second = write_repair_finding(&storage, finding("finding-002", 20), KEY)
-            .await
-            .unwrap();
-        assert_eq!(first.scope_revision, 1);
-        assert_eq!(second.scope_revision, 2);
-        let tuple_key = repair_finding_tuple_key("bucket", "tenant-1-bucket-2", 1).unwrap();
-        let id_key =
-            repair_finding_id_tuple_key("bucket", "tenant-1-bucket-2", "finding-001").unwrap();
-        let head_key = repair_finding_head_tuple_key("bucket", "tenant-1-bucket-2").unwrap();
-        let meta = CoreMetaStore::open(storage.core_store_meta_path()).unwrap();
-        for (expected, expected_generation) in [(&first, 2), (&second, 3)] {
-            let payload = meta
-                .get(
-                    CF_MESH,
-                    TABLE_REPAIR_FINDING_ROW,
-                    &repair_finding_tuple_key(
-                        &expected.scope_kind,
-                        &expected.scope_id,
-                        expected.scope_revision,
-                    )
-                    .unwrap(),
-                )
-                .unwrap()
-                .unwrap();
-            let common = crate::core_store::core_meta_row_common_from_payload(&payload).unwrap();
-            assert_eq!(common.root_generation, expected_generation);
-            assert_ne!(common.root_generation, expected.scope_revision);
-            assert_ne!(
-                common.transaction_id,
-                format!("{}/{}", expected.repair_task_id, expected.finding_id)
-            );
-            let decoded = decode_repair_finding(&payload).unwrap();
-            decoded.verify(KEY).unwrap();
-            assert_eq!(decoded.finding_hash, expected.finding_hash);
-            assert_eq!(decoded.finding_signature, expected.finding_signature);
-        }
-        assert!(
-            meta.get(CF_MESH, TABLE_REPAIR_FINDING_ROW, &tuple_key)
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            meta.get(CF_MESH, TABLE_REPAIR_FINDING_ID_ROW, &id_key)
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            meta.get(CF_MESH, TABLE_REPAIR_FINDING_HEAD_ROW, &head_key)
-                .unwrap()
-                .is_some()
-        );
-        assert_eq!(
-            read_repair_finding(&storage, "bucket", "tenant-1-bucket-2", "finding-001", KEY)
-                .await
-                .unwrap()
-                .unwrap(),
-            first
-        );
-        assert_eq!(
-            page_repair_findings(&storage, "bucket", "tenant-1-bucket-2", 0, 2, 1, KEY)
-                .await
-                .unwrap(),
-            vec![first.clone()]
-        );
-        assert_eq!(
-            page_repair_findings(&storage, "bucket", "tenant-1-bucket-2", 1, 2, 1, KEY)
-                .await
-                .unwrap(),
-            vec![second]
-        );
-        assert!(
-            page_repair_findings(&storage, "bucket", "tenant-1-bucket-2", 2, 2, 1, KEY)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
-    async fn repair_finding_ids_are_immutable_and_idempotent() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let write = finding("finding-001", 10);
-        let first = write_repair_finding(&storage, write.clone(), KEY)
-            .await
-            .unwrap();
-        assert_eq!(
-            write_repair_finding(&storage, write.clone(), KEY)
-                .await
-                .unwrap(),
-            first
-        );
-        assert_eq!(
-            repair_finding_scope_revision(&storage, "bucket", "tenant-1-bucket-2")
-                .await
-                .unwrap(),
-            1
-        );
-
-        let mut conflicting = write;
-        conflicting.message = "different immutable content".to_string();
-        assert!(
-            write_repair_finding(&storage, conflicting, KEY)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("different immutable content")
-        );
-    }
-
-    #[tokio::test]
-    async fn repair_finding_mutation_rejects_a_stale_lease_version() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let (lease, now_nanos) = acquire_finding_lease(&storage, "repair-finding-stale").await;
-        let stale_precondition =
-            task_lease_fenced_precondition(&storage, &lease, now_nanos, LEASE_KEY)
-                .await
-                .unwrap();
-        renew_task_lease(
-            &storage,
-            &lease,
-            now_nanos + 1_000_000,
-            60_000_000_000,
-            LEASE_KEY,
-        )
-        .await
-        .unwrap();
-
-        let error = write_repair_finding_with_lease(
-            &storage,
-            finding("finding-stale-lease", now_nanos),
-            KEY,
-            stale_precondition,
-        )
-        .await
-        .unwrap_err();
-
-        assert!(
-            format!("{error:#}").contains("precondition")
-                || format!("{error:#}").contains("payload hash")
-        );
-        assert!(
-            read_repair_finding(
-                &storage,
-                "bucket",
-                "tenant-1-bucket-2",
-                "finding-stale-lease",
-                KEY,
-            )
-            .await
-            .unwrap()
-            .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn repair_finding_mutation_rejects_an_expired_lease_deadline() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let (lease, now_nanos) = acquire_finding_lease(&storage, "repair-finding-expired").await;
-        let mut expired_precondition =
-            task_lease_fenced_precondition(&storage, &lease, now_nanos, LEASE_KEY)
-                .await
-                .unwrap();
-        let CoreMutationPrecondition::CoreMetaLease {
-            expires_at_unix_nanos,
-            ..
-        } = &mut expired_precondition
-        else {
-            panic!("task lease must produce a temporal CoreMeta lease precondition");
-        };
-        *expires_at_unix_nanos = 1;
-
-        let error = write_repair_finding_with_lease(
-            &storage,
-            finding("finding-expired-lease", now_nanos),
-            KEY,
-            expired_precondition,
-        )
-        .await
-        .unwrap_err();
-
-        assert!(format!("{error:#}").contains("expired"));
-        assert!(
-            read_repair_finding(
-                &storage,
-                "bucket",
-                "tenant-1-bucket-2",
-                "finding-expired-lease",
-                KEY,
-            )
-            .await
-            .unwrap()
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn repair_finding_hash_and_signature_survive_physical_common_rebinding() {
-        let sealed = sealed_finding("finding-001", 10, 11);
-        let encoded = encode_repair_finding(&sealed).unwrap();
-        let mut row = decode_deterministic_proto::<RepairFindingRowProto>(
-            &encoded,
-            "repair finding test row",
-        )
-        .unwrap();
-        let common = row.common.as_mut().unwrap();
-        common.root_generation = 73;
-        common.transaction_id = "corestore-publication-73".to_string();
-        common.created_at_unix_nanos = 999;
-        let rebound = encode_deterministic_proto(&row);
-
-        let decoded = decode_repair_finding(&rebound).unwrap();
-        decoded.verify(KEY).unwrap();
-        assert_eq!(decoded, sealed);
-        assert_ne!(decoded.scope_revision, 73);
-
-        let valid_common = repair_finding_common(&sealed).unwrap();
-        let mut invalid_commons = Vec::new();
-        let mut invalid = valid_common.clone();
-        invalid.realm_id = "repair/wrong/realm".to_string();
-        invalid_commons.push(invalid);
-        let mut invalid = valid_common.clone();
-        invalid.root_key_hash = core_meta_root_key_hash("wrong-repair-root");
-        invalid_commons.push(invalid);
-        let mut invalid = valid_common.clone();
-        invalid.root_generation = 0;
-        invalid_commons.push(invalid);
-        let mut invalid = valid_common;
-        invalid.visibility_state = crate::core_store::CoreMetaVisibilityState::Pending as i32;
-        invalid_commons.push(invalid);
-        for common in invalid_commons {
-            let bytes = encode_repair_finding_with_common(&sealed, common).unwrap();
-            assert!(decode_repair_finding(&bytes).is_err());
-        }
-    }
-
-    #[tokio::test]
-    async fn repair_finding_pages_reject_a_changed_scope_revision() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        write_repair_finding(&storage, finding("finding-001", 10), KEY)
-            .await
-            .unwrap();
-        write_repair_finding(&storage, finding("finding-002", 20), KEY)
-            .await
-            .unwrap();
-        let first_page =
-            page_repair_findings(&storage, "bucket", "tenant-1-bucket-2", 0, 2, 1, KEY)
-                .await
-                .unwrap();
-        assert_eq!(first_page[0].scope_revision, 1);
-
-        write_repair_finding(&storage, finding("finding-003", 30), KEY)
-            .await
-            .unwrap();
-        assert!(
-            page_repair_findings(&storage, "bucket", "tenant-1-bucket-2", 1, 2, 1, KEY)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("revision changed")
-        );
-    }
-
-    #[tokio::test]
-    async fn repair_findings_reject_tamper_and_unsafe_paths() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        write_repair_finding(&storage, finding("finding-001", 10), KEY)
-            .await
-            .unwrap();
-        let tuple_key = repair_finding_tuple_key("bucket", "tenant-1-bucket-2", 1).unwrap();
-        let meta = CoreMetaStore::open(storage.core_store_meta_path()).unwrap();
-        let mut value = meta
-            .get(CF_MESH, TABLE_REPAIR_FINDING_ROW, &tuple_key)
-            .unwrap()
-            .unwrap();
-        *value
-            .last_mut()
-            .expect("stored repair finding bytes are not empty") ^= 0x01;
-        meta.put(CF_MESH, TABLE_REPAIR_FINDING_ROW, &tuple_key, &value)
-            .unwrap();
-        assert!(
-            read_repair_finding(&storage, "bucket", "tenant-1-bucket-2", "finding-001", KEY)
-                .await
-                .is_err()
-        );
-        assert!(
-            read_repair_finding(&storage, "../bucket", "scope", "finding", KEY)
-                .await
-                .is_err()
-        );
-        assert!(
-            read_repair_finding(&storage, "bucket", "scope", "../finding", KEY)
-                .await
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn repair_actions_reject_synthesis_of_committed_state() {
-        assert!(validate_repair_action(RepairActionKind::VerifyOnly).is_ok());
-        assert!(validate_repair_action(RepairActionKind::RebuildDerivedIndex).is_ok());
-        assert!(validate_repair_action(RepairActionKind::RepairManifestFromSegments).is_ok());
-        assert!(validate_repair_action(RepairActionKind::RepairObjectShards).is_ok());
-        assert!(
-            validate_repair_action(RepairActionKind::SynthesizeCommittedObjectVersion).is_err()
-        );
-        assert!(validate_repair_action(RepairActionKind::SynthesizePersonalDbCommit).is_err());
-    }
-
-    #[test]
-    fn shard_repair_proto_roundtrip_is_stable() {
-        let proto = action_to_proto(RepairActionKind::RepairObjectShards);
-        assert_eq!(proto as i32, 7);
-        assert_eq!(
-            action_from_proto(proto as i32).unwrap(),
-            RepairActionKind::RepairObjectShards
-        );
-
-        let status = status_to_proto(RepairFindingStatus::VerifiedHealthy);
-        assert_eq!(status as i32, 7);
-        assert_eq!(
-            status_from_proto(status as i32).unwrap(),
-            RepairFindingStatus::VerifiedHealthy
-        );
-    }
-
-    #[tokio::test]
-    async fn repair_findings_reject_invalid_payloads() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        let mut invalid = finding("finding-001", 10);
-        invalid.subjects.clear();
-        assert!(write_repair_finding(&storage, invalid, KEY).await.is_err());
-        let mut invalid_hash = finding("finding-002", 10);
-        invalid_hash.subjects[0].actual_hash = Some("not-hex".to_string());
-        assert!(
-            write_repair_finding(&storage, invalid_hash, KEY)
-                .await
-                .is_err()
-        );
-        let mut prohibited = finding("finding-003", 10);
-        prohibited.proposed_action = RepairActionKind::SynthesizePersonalDbCommit;
-        assert!(
-            write_repair_finding(&storage, prohibited, KEY)
-                .await
-                .is_err()
-        );
-    }
-
-    fn finding(id: &str, created_at_nanos: i64) -> RepairFindingWrite {
-        RepairFindingWrite {
-            finding_id: id.to_string(),
-            scope_kind: "bucket".to_string(),
-            scope_id: "tenant-1-bucket-2".to_string(),
-            repair_task_id: "repair-task-a".to_string(),
-            lease_fence_token: 7,
-            severity: RepairFindingSeverity::Error,
-            status: RepairFindingStatus::Open,
-            code: "SegmentHashMismatch".to_string(),
-            message: "segment hash does not match manifest entry".to_string(),
-            subjects: vec![RepairSubjectRef {
-                subject_kind: "metadata_segment".to_string(),
-                subject_id: "generation-7".to_string(),
-                generation: Some(7),
-                cursor: Some(42),
-                expected_hash: Some(hex::encode([1; 32])),
-                actual_hash: Some(hex::encode([2; 32])),
-            }],
-            proposed_action: RepairActionKind::RebuildDerivedIndex,
-            evidence: serde_json::json!({"manifest_generation": 7}),
-            created_at_nanos,
-        }
-    }
-
-    fn sealed_finding(id: &str, created_at_nanos: i64, scope_revision: u64) -> RepairFinding {
-        let write = finding(id, created_at_nanos);
-        RepairFinding {
-            format_version: 1,
-            finding_id: write.finding_id,
-            scope_kind: write.scope_kind,
-            scope_id: write.scope_id,
-            repair_task_id: write.repair_task_id,
-            lease_fence_token: write.lease_fence_token,
-            severity: write.severity,
-            status: write.status,
-            code: write.code,
-            message: write.message,
-            subjects: write.subjects,
-            proposed_action: write.proposed_action,
-            evidence: write.evidence,
-            created_at_nanos: write.created_at_nanos,
-            scope_revision,
-            finding_hash: None,
-            finding_signature: None,
-        }
-        .seal(KEY)
-        .unwrap()
-    }
-
-    async fn acquire_finding_lease(storage: &Storage, task_id: &str) -> (TaskLease, i64) {
-        let now_nanos = unix_nanos();
-        let lease = acquire_task_lease(
-            storage,
-            TaskLeaseAcquire {
-                task_id: task_id.to_string(),
-                task_kind: "RebalanceShard".to_string(),
-                partition_family: "object_shard_repair".to_string(),
-                partition_id: hex::encode(hash32(task_id.as_bytes())),
-                owner: TaskLeaseOwner::node("repair-test-node"),
-                source_cursor: 0,
-                now_nanos,
-                ttl_nanos: 60_000_000_000,
-            },
-            LEASE_KEY,
-        )
-        .await
-        .unwrap();
-        (lease, now_nanos)
-    }
-
-    fn unix_nanos() -> i64 {
-        i64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-        )
-        .unwrap()
-    }
-
-    async fn seed_repair_root_generation(storage: &Storage) {
-        let scope_kind = "bucket";
-        let scope_id = "tenant-1-bucket-2";
-        let finding_id = "physical-generation-seed";
-        let tuple_key = repair_finding_id_tuple_key(scope_kind, scope_id, finding_id).unwrap();
-        let payload = encode_deterministic_proto(&RepairFindingIdProto {
-            common: Some(core_meta_committed_row_common(
-                format!("repair/{scope_kind}/{scope_id}"),
-                repair_finding_root_key_hash(scope_kind, scope_id),
-                1,
-                "feature-seed-transaction",
-                0,
-            )),
-            schema: REPAIR_FINDING_ID_SCHEMA.to_string(),
-            scope_kind: scope_kind.to_string(),
-            scope_id: scope_id.to_string(),
-            finding_id: finding_id.to_string(),
-            revision: 999,
-        });
-        let operation = CoreMetaBatchOp {
-            cf: CF_MESH,
-            table_id: TABLE_REPAIR_FINDING_ID_ROW,
-            tuple_key: &tuple_key,
-            common: None,
-            kind: CoreMetaBatchOpKind::Put(&payload),
-        };
-        commit_coremeta_batch_for_storage(
-            storage,
-            "repair-physical-generation-seed",
-            &[operation],
-            &[crate::core_store::CoreMetaRootPublication::new(
-                format!("repair/{scope_kind}/{scope_id}"),
-                crate::formats::writer::WriterFamily::CoreControl,
-            )],
-        )
-        .await
-        .unwrap();
-    }
+fn repair_finding_mvcc_key(
+    table_id: u16,
+    tuple_key: Vec<u8>,
+) -> Result<crate::mvcc_transaction::LogicalKey> {
+    crate::mvcc_product::coremeta_logical_key(CF_MESH, table_id, &tuple_key)
 }

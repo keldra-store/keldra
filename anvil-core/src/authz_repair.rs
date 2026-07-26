@@ -49,6 +49,7 @@ pub struct AuthzDerivedIndexRepairReport {
 
 pub async fn repair_authz_derived_userset_index(
     storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     derived_index_id: &str,
     rebuild: bool,
@@ -82,7 +83,7 @@ pub async fn repair_authz_derived_userset_index(
             finding_status,
             lease_fence_token,
         )?;
-        finding = Some(write_repair_finding(storage, write, signing_key).await?);
+        finding = Some(write_repair_finding(mvcc, write, signing_key).await?);
     }
 
     let processed_revision = rebuilt_index
@@ -304,10 +305,27 @@ mod tests {
 
     const KEY: &[u8] = b"authorization repair signing key";
 
+    async fn test_mvcc(
+        path: &std::path::Path,
+        storage: &Storage,
+    ) -> crate::mvcc_bootstrap::MvccSubsystem {
+        let config = crate::Config {
+            node_id: "authz-repair-test".into(),
+            storage_path: path.to_string_lossy().into_owned(),
+            public_api_addr: "127.0.0.1:0".into(),
+            ..crate::Config::default()
+        };
+        let meta = crate::core_store::CoreMetaStore::open(storage.core_store_meta_path()).unwrap();
+        crate::mvcc_bootstrap::MvccSubsystem::bootstrap(&config, meta.database())
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn authz_repair_rebuilds_missing_derived_userset_index() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
+        let mvcc = test_mvcc(temp.path(), &storage).await;
         bind_repair_test_schema(&storage, 42).await;
         let permit = ready_authz_permit(&storage, 42).await;
         write_tuple(&storage, &permit, "group", "eng", "member", "user", "alice").await;
@@ -326,6 +344,7 @@ mod tests {
 
         let report = repair_authz_derived_userset_index(
             &storage,
+            &mvcc,
             42,
             DEFAULT_DERIVED_USERSET_INDEX_ID,
             true,
@@ -364,6 +383,7 @@ mod tests {
     async fn authz_repair_reports_up_to_date_when_index_matches_tuple_log() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
+        let mvcc = test_mvcc(temp.path(), &storage).await;
         bind_repair_test_schema(&storage, 42).await;
         let permit = ready_authz_permit(&storage, 42).await;
         write_tuple(&storage, &permit, "doc", "alpha", "viewer", "user", "alice").await;
@@ -373,6 +393,7 @@ mod tests {
 
         let report = repair_authz_derived_userset_index(
             &storage,
+            &mvcc,
             42,
             DEFAULT_DERIVED_USERSET_INDEX_ID,
             false,
@@ -393,6 +414,7 @@ mod tests {
     async fn authz_repair_detects_stale_derived_userset_index() {
         let temp = tempdir().unwrap();
         let storage = Storage::new_at(temp.path()).await.unwrap();
+        let mvcc = test_mvcc(temp.path(), &storage).await;
         bind_repair_test_schema(&storage, 42).await;
         let permit = ready_authz_permit(&storage, 42).await;
         let first_tuple =
@@ -405,6 +427,7 @@ mod tests {
 
         let report = repair_authz_derived_userset_index(
             &storage,
+            &mvcc,
             42,
             DEFAULT_DERIVED_USERSET_INDEX_ID,
             false,

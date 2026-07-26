@@ -96,7 +96,10 @@ impl Persistence {
         lease_epoch: u64,
         attempt_started_at_nanos: i64,
         status: repair_finding::RepairFindingStatus,
-        lease_precondition: crate::core_store::CoreMutationPrecondition,
+        lease_precondition: (
+            crate::mvcc_transaction::LogicalKey,
+            crate::mvcc_transaction::PredicateKind,
+        ),
     ) -> Result<repair_finding::RepairFinding> {
         payload.validate()?;
         if lease_fence_token == 0 || lease_epoch == 0 {
@@ -137,7 +140,7 @@ impl Persistence {
         };
 
         repair_finding::write_repair_finding_with_lease(
-            &self.storage,
+            self.mvcc()?,
             repair_finding::RepairFindingWrite {
                 finding_id: rebalance_shard_audit_finding_id(
                     task_id,
