@@ -112,10 +112,25 @@ pub(crate) async fn enqueue_repair_run_with_permit(
         mutation.audit(TaskAuditEvent::Enqueued {
             task: entry.task.clone(),
         });
+        let mut committed_audit_event = audit_event.clone();
+        committed_audit_event.resource_id = format!("repair-run-{task_id}");
+        let mut audit_details: serde_json::Map<String, JsonValue> =
+            serde_json::from_str::<JsonValue>(&committed_audit_event.details_json)
+                .context("decode RepairRun audit details")?
+                .as_object()
+                .cloned()
+                .ok_or_else(|| anyhow!("RepairRun audit details must be a JSON object"))?;
+        audit_details.insert(
+            "repair_task_id".to_string(),
+            JsonValue::String(committed_audit_event.resource_id.clone()),
+        );
+        committed_audit_event.details_json =
+            serde_json::to_string(&JsonValue::Object(audit_details))
+                .context("encode RepairRun audit details")?;
         let transaction_id = mutation.transaction_id().to_string();
         mutation.add_product_plan(crate::admin_audit::admin_audit_mvcc_plan(
-            audit_event,
-            crate::admin_audit::audit_event_revision_generation(audit_event).max(1),
+            &committed_audit_event,
+            crate::admin_audit::audit_event_revision_generation(&committed_audit_event).max(1),
             &transaction_id,
         )?);
         match mutation.commit().await {
