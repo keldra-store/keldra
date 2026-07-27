@@ -75,6 +75,107 @@ async fn public_commit_survives_lost_response_and_coordinator_sigkill() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn public_object_batch_recovers_after_leader_crashes_before_local_batch_write() {
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_anvil-server"));
+    let mut cluster = ProcessMvccCluster::start(binary).await.unwrap();
+    let leader = cluster.wait_for_leader(&[0, 1, 2]).await.unwrap();
+    let bucket_name = format!("process-crash-{}", uuid::Uuid::new_v4().simple());
+    let bucket_id = cluster.create_bucket(leader, &bucket_name).await.unwrap();
+    let transaction = cluster
+        .begin_transaction(leader, MvccReadConsistency::Linearized)
+        .await
+        .unwrap();
+    let keys = ["crash-batch/one.bin", "crash-batch/two.bin"];
+    let staged = cluster
+        .stage_object_puts(
+            leader,
+            &bucket_name,
+            bucket_id,
+            &transaction.transaction_id,
+            &[(keys[0], b"one"), (keys[1], b"two")],
+        )
+        .await
+        .unwrap();
+    assert_eq!(staged.write_state, WriteState::Staged as i32);
+    for key in keys {
+        assert!(!cluster.object_exists(leader, &bucket_name, key).await.unwrap());
+    }
+
+    cluster.arm_hard_crash(leader, "MvccBatchWrite").unwrap();
+    let commit = cluster.commit_transaction(
+        cluster.public_endpoint(leader),
+        transaction.transaction_id.clone(),
+    );
+    let (commit_result, crash_result) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(10), commit),
+        cluster.wait_for_hard_crash(leader, Duration::from_secs(10)),
+    );
+    crash_result.unwrap();
+    assert!(
+        !matches!(commit_result, Ok(Ok(_))),
+        "a process abort before its local RocksDB batch must not return success"
+    );
+
+    let survivors = [0, 1, 2]
+        .into_iter()
+        .filter(|node| *node != leader)
+        .collect::<Vec<_>>();
+    let survivor = cluster.wait_for_leader(&survivors).await.unwrap();
+    let stable = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let Ok(status) = cluster
+                .get_transaction(survivor, &transaction.transaction_id)
+                .await
+            {
+                if status.state == "committed" {
+                    return status;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("surviving quorum resolves the commit to one stable outcome");
+    assert_eq!(stable.state, "committed");
+    let retried = cluster
+        .commit_transaction(
+            cluster.public_endpoint(survivor),
+            transaction.transaction_id.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retried.state, WriteState::Committed as i32);
+    for key in keys {
+        assert!(cluster.object_exists(survivor, &bucket_name, key).await.unwrap());
+    }
+
+    cluster.restart(leader).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let status = cluster
+                .get_transaction(leader, &transaction.transaction_id)
+                .await;
+            let both_visible = matches!(
+                cluster.object_exists(leader, &bucket_name, keys[0]).await,
+                Ok(true)
+            ) && matches!(
+                cluster.object_exists(leader, &bucket_name, keys[1]).await,
+                Ok(true)
+            );
+            if status
+                .is_ok_and(|status| status.state == "committed")
+                && both_visible
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("restarted original disk converges without partial object visibility");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn killed_node_is_replaced_by_higher_incarnation_and_catches_up() {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_anvil-server"));
     let mut cluster = ProcessMvccCluster::start(binary).await.unwrap();

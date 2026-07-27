@@ -14,9 +14,13 @@ use std::{
 
 use anvil::anvil_api::{
     AdminRequestContext, BeginTransactionRequest, BeginTransactionResponse,
-    CommitTransactionRequest, MvccDurability, MvccReadConsistency,
-    ReplaceClusterNodeIncarnationRequest, WriteResponse,
+    CommitTransactionRequest, CreateBucketRequest, GetTransactionRequest, HeadObjectRequest, MutationBatchOperation,
+    MutationBatchPutObject, MutationBatchRequest, MutationBatchResponse, MvccDurability, MvccReadConsistency,
+    NativeMutationContext, ReplaceClusterNodeIncarnationRequest, TransactionStatus, WriteResponse,
     admin_service_client::AdminServiceClient,
+    bucket_service_client::BucketServiceClient,
+    mutation_batch_operation,
+    object_service_client::ObjectServiceClient,
     transaction_service_client::TransactionServiceClient,
 };
 use anvil_core::{auth::JwtManager, system_realm::SYSTEM_STORAGE_TENANT_ID};
@@ -200,6 +204,111 @@ impl ProcessMvccCluster {
             ))
             .await?
             .into_inner())
+    }
+
+    pub async fn get_transaction(
+        &self,
+        node: usize,
+        transaction_id: &str,
+    ) -> anyhow::Result<TransactionStatus> {
+        let mut client = TransactionServiceClient::connect(self.public_endpoint(node)).await?;
+        Ok(client
+            .get_transaction(authorized(
+                GetTransactionRequest {
+                    transaction_id: transaction_id.to_string(),
+                    cluster_id: self.cluster_id.clone(),
+                },
+                &self.admin_token,
+            ))
+            .await?
+            .into_inner())
+    }
+
+    pub async fn create_bucket(&self, node: usize, bucket_name: &str) -> anyhow::Result<i64> {
+        let mut client = BucketServiceClient::connect(self.public_endpoint(node)).await?;
+        Ok(client
+            .create_bucket(authorized(
+                CreateBucketRequest {
+                    bucket_name: bucket_name.to_string(),
+                    region: "process-e2e-region".to_string(),
+                    options: None,
+                },
+                &self.admin_token,
+            ))
+            .await?
+            .into_inner()
+            .bucket_id)
+    }
+
+    pub async fn stage_object_puts(
+        &self,
+        node: usize,
+        bucket_name: &str,
+        bucket_id: i64,
+        transaction_id: &str,
+        objects: &[(&str, &[u8])],
+    ) -> anyhow::Result<MutationBatchResponse> {
+        let mut client = ObjectServiceClient::connect(self.public_endpoint(node)).await?;
+        Ok(client
+            .mutation_batch(authorized(
+                MutationBatchRequest {
+                    bucket_name: bucket_name.to_string(),
+                    mutation_context: Some(NativeMutationContext {
+                        tenant_id: SYSTEM_STORAGE_TENANT_ID,
+                        bucket_id,
+                        principal: ADMIN_PRINCIPAL.to_string(),
+                        request_id: uuid::Uuid::new_v4().to_string(),
+                        precondition: String::new(),
+                        authz_zookie_optional: String::new(),
+                        idempotency_key: uuid::Uuid::new_v4().to_string(),
+                        transaction_id: Some(transaction_id.to_string()),
+                        write_visibility: None,
+                    }),
+                    precondition: None,
+                    operations: objects
+                        .iter()
+                        .map(|(key, payload)| MutationBatchOperation {
+                            op: Some(mutation_batch_operation::Op::PutObject(
+                                MutationBatchPutObject {
+                                    object_key: (*key).to_string(),
+                                    payload: payload.to_vec(),
+                                    content_type: Some("application/octet-stream".to_string()),
+                                    user_metadata_json: "{}".to_string(),
+                                    storage_class: None,
+                                },
+                            )),
+                        })
+                        .collect(),
+                },
+                &self.admin_token,
+            ))
+            .await?
+            .into_inner())
+    }
+
+    pub async fn object_exists(
+        &self,
+        node: usize,
+        bucket_name: &str,
+        object_key: &str,
+    ) -> anyhow::Result<bool> {
+        let mut client = ObjectServiceClient::connect(self.public_endpoint(node)).await?;
+        match client
+            .head_object(authorized(
+                HeadObjectRequest {
+                    bucket_name: bucket_name.to_string(),
+                    object_key: object_key.to_string(),
+                    version_id: None,
+                    ..Default::default()
+                },
+                &self.admin_token,
+            ))
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(status) if status.code() == tonic::Code::NotFound => Ok(false),
+            Err(status) => Err(status.into()),
+        }
     }
 
     /// Send SIGKILL to a node, retaining its directory and address for restart.
