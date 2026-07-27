@@ -303,19 +303,32 @@ impl AdminService for AppState {
             }),
         )?;
         let audit_event_id = audit_event.audit_event_id.clone();
-        crate::access_control::write_delegated_action_tuple_with_admin_audit(
-            &self.storage,
-            &self.persistence,
-            tenant_id,
-            &app.id.to_string(),
-            delegated_action,
-            &req.resource,
-            "add",
-            &principal.principal_id,
-            "admin access grant",
-            &audit_event,
-        )
-        .await?;
+        let policies = vec![(delegated_action, req.resource.clone())];
+        let input_hash = admin_policy_input_hash("add", tenant_id, &app.name, &policies);
+        let transaction =
+            begin_admin_product_transaction(self, &principal, context, "application-policy-grant")
+                .await?;
+        let now = u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default();
+        if transaction.replayed {
+            stage_or_verify_admin_policy_result(self, &transaction, &input_hash, now)?;
+        } else {
+            crate::access_control::stage_delegated_action_tuple_batch_with_admin_audit(
+                &self.storage,
+                &self.persistence,
+                tenant_id,
+                &app.id.to_string(),
+                &policies,
+                "add",
+                &principal.principal_id,
+                "admin access grant",
+                &audit_event,
+                &transaction.transaction_id,
+                &transaction.principal,
+            )
+            .await?;
+            stage_or_verify_admin_policy_result(self, &transaction, &input_hash, now)?;
+            commit_admin_product_transaction(self, &transaction).await?;
+        }
         Ok(Response::new(ApplicationPolicyResponse {
             request_id: context.request_id.clone(),
             tenant_id: tenant_id.to_string(),
@@ -356,19 +369,32 @@ impl AdminService for AppState {
             }),
         )?;
         let audit_event_id = audit_event.audit_event_id.clone();
-        crate::access_control::write_delegated_action_tuple_with_admin_audit(
-            &self.storage,
-            &self.persistence,
-            tenant_id,
-            &app.id.to_string(),
-            delegated_action,
-            &req.resource,
-            "remove",
-            &principal.principal_id,
-            "admin access revoke",
-            &audit_event,
-        )
-        .await?;
+        let policies = vec![(delegated_action, req.resource.clone())];
+        let input_hash = admin_policy_input_hash("remove", tenant_id, &app.name, &policies);
+        let transaction =
+            begin_admin_product_transaction(self, &principal, context, "application-policy-revoke")
+                .await?;
+        let now = u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default();
+        if transaction.replayed {
+            stage_or_verify_admin_policy_result(self, &transaction, &input_hash, now)?;
+        } else {
+            crate::access_control::stage_delegated_action_tuple_batch_with_admin_audit(
+                &self.storage,
+                &self.persistence,
+                tenant_id,
+                &app.id.to_string(),
+                &policies,
+                "remove",
+                &principal.principal_id,
+                "admin access revoke",
+                &audit_event,
+                &transaction.transaction_id,
+                &transaction.principal,
+            )
+            .await?;
+            stage_or_verify_admin_policy_result(self, &transaction, &input_hash, now)?;
+            commit_admin_product_transaction(self, &transaction).await?;
+        }
         Ok(Response::new(ApplicationPolicyResponse {
             request_id: context.request_id.clone(),
             tenant_id: tenant_id.to_string(),

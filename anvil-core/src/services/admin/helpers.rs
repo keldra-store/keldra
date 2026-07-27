@@ -8,6 +8,7 @@ pub(super) struct AdminImplicitTransaction {
 
 const ADMIN_APPLICATION_RESULT_NAMESPACE: &str = "admin.application-mutation.v1";
 const ADMIN_APPLICATION_RESULT_KEY: &str = "result";
+const ADMIN_POLICY_RESULT_NAMESPACE: &str = "admin.application-policy-mutation.v1";
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(super) struct AdminApplicationMutationResult {
@@ -114,6 +115,69 @@ pub(super) fn admin_application_response(
         app_id: result.app_id.to_string(),
         write_state: WriteState::Committed as i32,
     })
+}
+
+pub(super) fn admin_policy_input_hash(
+    operation: &str,
+    tenant_id: i64,
+    app_name: &str,
+    policies: &[(crate::permissions::AnvilAction, String)],
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"anvil.admin.application-policy-mutation.input.v1");
+    for component in [operation, &tenant_id.to_string(), app_name] {
+        hasher.update(&(component.len() as u64).to_be_bytes());
+        hasher.update(component.as_bytes());
+    }
+    for (action, resource) in policies {
+        let action = action.to_string();
+        for component in [&action, resource] {
+            hasher.update(&(component.len() as u64).to_be_bytes());
+            hasher.update(component.as_bytes());
+        }
+    }
+    hex::encode(hasher.finalize().as_bytes())
+}
+
+pub(super) fn stage_or_verify_admin_policy_result(
+    state: &AppState,
+    transaction: &AdminImplicitTransaction,
+    input_hash: &str,
+    now_unix_ms: u64,
+) -> Result<bool, Status> {
+    if let Some(result) = state
+        .mvcc
+        .open_transactions
+        .resolved_idempotency_result(
+            &transaction.transaction_id,
+            &transaction.principal,
+            ADMIN_POLICY_RESULT_NAMESPACE,
+            "result",
+        )
+        .map_err(|error| Status::failed_precondition(error.to_string()))?
+    {
+        if result.payload != input_hash.as_bytes() {
+            return Err(Status::already_exists(
+                "admin policy idempotency key was already used for different input",
+            ));
+        }
+        return Ok(true);
+    }
+    state
+        .mvcc
+        .open_transactions
+        .add_idempotency_result(
+            &transaction.transaction_id,
+            &transaction.principal,
+            crate::mvcc_transaction::IdempotencyResult {
+                namespace: ADMIN_POLICY_RESULT_NAMESPACE.to_string(),
+                key: "result".to_string(),
+                payload: input_hash.as_bytes().to_vec(),
+            },
+            now_unix_ms,
+        )
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    Ok(false)
 }
 
 pub(super) async fn begin_admin_product_transaction(
@@ -1380,18 +1444,39 @@ pub(super) async fn mutate_application_policy_batch(
         }),
     )?;
     let audit_event_id = audit_event.audit_event_id.clone();
-    crate::access_control::write_delegated_action_tuple_batch(
-        &state.storage,
-        &state.persistence,
-        tenant_id,
-        &app.id.to_string(),
-        &parsed,
-        operation,
-        &principal.principal_id,
-        reason,
-        &audit_event,
+    let input_hash = admin_policy_input_hash(operation, tenant_id, &app.name, &parsed);
+    let transaction = begin_admin_product_transaction(
+        state,
+        &principal,
+        context,
+        if operation == "add" {
+            "application-policy-batch-grant"
+        } else {
+            "application-policy-batch-revoke"
+        },
     )
     .await?;
+    let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default();
+    if transaction.replayed {
+        stage_or_verify_admin_policy_result(state, &transaction, &input_hash, now)?;
+    } else {
+        crate::access_control::stage_delegated_action_tuple_batch_with_admin_audit(
+            &state.storage,
+            &state.persistence,
+            tenant_id,
+            &app.id.to_string(),
+            &parsed,
+            operation,
+            &principal.principal_id,
+            reason,
+            &audit_event,
+            &transaction.transaction_id,
+            &transaction.principal,
+        )
+        .await?;
+        stage_or_verify_admin_policy_result(state, &transaction, &input_hash, now)?;
+        commit_admin_product_transaction(state, &transaction).await?;
+    }
     Ok(Response::new(ApplicationPoliciesResponse {
         request_id: context.request_id.clone(),
         tenant_id: tenant_id.to_string(),

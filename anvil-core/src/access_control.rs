@@ -1265,6 +1265,61 @@ pub async fn write_delegated_action_tuple_batch(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+pub async fn stage_delegated_action_tuple_batch_with_admin_audit(
+    storage: &Storage,
+    persistence: &Persistence,
+    tenant_id: i64,
+    grantee_principal_id: &str,
+    policies: &[(AnvilAction, String)],
+    operation: &str,
+    written_by: &str,
+    reason: &str,
+    audit_event: &crate::admin_audit::AdminAuditEvent,
+    transaction_id: &str,
+    transaction_principal: &str,
+) -> Result<(), Status> {
+    if policies.is_empty() {
+        return Err(Status::invalid_argument(
+            "At least one application policy is required",
+        ));
+    }
+    if !matches!(operation, "add" | "remove") {
+        return Err(Status::invalid_argument(
+            "Application policy operation must be add or remove",
+        ));
+    }
+    let mut mutations = Vec::with_capacity(policies.len());
+    for (action, resource) in policies {
+        let relation =
+            delegated_relation_for_action(storage, persistence, tenant_id, action.clone(), resource)
+                .await?;
+        mutations.push(AuthzTupleBatchMutation {
+            namespace: relation.namespace,
+            object_id: relation.object_id,
+            relation: delegated_assignment_relation(action, &relation),
+            subject_kind: APP_SUBJECT_KIND.to_string(),
+            subject_id: grantee_principal_id.to_string(),
+            caveat_hash: String::new(),
+            operation: operation.to_string(),
+            reason: reason.to_string(),
+        });
+    }
+    persistence
+        .stage_authz_tuple_batch_with_admin_audit(
+            SYSTEM_STORAGE_TENANT_ID,
+            mutations,
+            written_by,
+            transaction_id,
+            transaction_principal,
+            None,
+            Some(audit_event),
+        )
+        .await
+        .map_err(authz_tuple_write_status)?;
+    Ok(())
+}
+
 fn delegated_assignment_relation(
     action: &AnvilAction,
     relation: &DelegatedSystemRelation,
