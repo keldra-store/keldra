@@ -777,6 +777,33 @@ mod tests {
     }
 
     #[test]
+    fn rejects_wrong_final_hash_without_advancing_completion_watermark() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut receiver = TransferReceiver::open(directory.path()).unwrap();
+        let peer = AuthenticatedPeer::new("node-b", 1).unwrap();
+        let mut session = ConnectionSession::establish("cluster-a", peer.clone()).unwrap();
+        let transfer_id = Uuid::new_v4();
+        let whole = b"abcdef";
+        let first = frame(&session, transfer_id, 1, 0, b"abc", whole, false);
+        receiver.receive(&mut session, &first).unwrap();
+
+        let mut corrupt_final = frame(&session, transfer_id, 2, 3, b"def", whole, true);
+        corrupt_final.final_hash = [7; 32];
+        assert!(receiver.receive(&mut session, &corrupt_final).is_err());
+        let watermark = receiver.watermark(transfer_id).unwrap().unwrap();
+        assert_eq!(watermark.persisted_through, 3);
+        assert!(!watermark.complete);
+        assert_eq!(watermark.completed_hash, None);
+
+        let mut resumed = ConnectionSession::establish("cluster-a", peer).unwrap();
+        let correct_final = frame(&resumed, transfer_id, 1, 3, b"def", whole, true);
+        let ack = receiver.receive(&mut resumed, &correct_final).unwrap();
+        assert_eq!(ack.status, AckStatus::Complete);
+        assert_eq!(ack.persisted_through, whole.len() as u64);
+        assert_eq!(ack.completed_hash, Some(*blake3::hash(whole).as_bytes()));
+    }
+
+    #[test]
     fn lost_complete_ack_is_recovered_without_rewriting_transfer() {
         let directory = tempfile::tempdir().unwrap();
         let mut receiver = TransferReceiver::open(directory.path()).unwrap();
