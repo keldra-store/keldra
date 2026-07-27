@@ -3082,6 +3082,15 @@ mod tests {
             .unwrap();
         drop(store);
         let store = MvccStore::open(temp.path()).unwrap();
+        assert_eq!(
+            store
+                .find_hf_ingestion_postcommit_by_transaction("hf-ingestion-1")
+                .unwrap()
+                .unwrap()
+                .job
+                .ingestion_id,
+            41
+        );
 
         let expected_partition = crate::mvcc_worker_authority::work_partition_id(
             "hf-ingestion-postcommit",
