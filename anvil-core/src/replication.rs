@@ -162,6 +162,10 @@ pub struct ReplicationFrame {
     pub total_length: u64,
     pub final_hash: [u8; 32],
     pub finish: bool,
+    pub transaction_id: String,
+    pub prepared_snapshot_version: u64,
+    pub prepared_at_unix_ms: u64,
+    pub provisional: bool,
 }
 
 impl ReplicationFrame {
@@ -213,6 +217,10 @@ struct TransferMetadata {
     kind: TransferKind,
     total_length: u64,
     final_hash: [u8; 32],
+    transaction_id: String,
+    prepared_snapshot_version: u64,
+    prepared_at_unix_ms: u64,
+    provisional: bool,
 }
 
 /// Disk-backed receiver for resumable immutable transfers.
@@ -344,6 +352,58 @@ impl TransferReceiver {
         Ok(removed)
     }
 
+    /// Reclaims provisional object shards only after cluster GC proves the
+    /// preparing transaction's snapshot is no longer reachable. Grace expiry
+    /// and absence from every live manifest/job are additional requirements;
+    /// neither can authorise deletion without the consensus-approved
+    /// watermark proof.
+    pub fn retire_orphan_provisional_object_shards(
+        &mut self,
+        gc_watermark: u64,
+        now_unix_ms: u64,
+        grace_ms: u64,
+        protected_transfers: &BTreeSet<Uuid>,
+    ) -> Result<usize> {
+        if grace_ms == 0 {
+            bail!("provisional shard retirement grace must be non-zero");
+        }
+        let candidates = self
+            .metadata
+            .iter()
+            .filter_map(|(transfer_id, metadata)| {
+                let grace_expired = metadata
+                    .prepared_at_unix_ms
+                    .checked_add(grace_ms)
+                    .is_some_and(|deadline| now_unix_ms >= deadline);
+                (metadata.kind == TransferKind::ObjectShard
+                    && metadata.provisional
+                    && !metadata.transaction_id.trim().is_empty()
+                    && metadata.prepared_snapshot_version < gc_watermark
+                    && grace_expired
+                    && !protected_transfers.contains(transfer_id))
+                .then_some(*transfer_id)
+            })
+            .collect::<Vec<_>>();
+        let mut removed = 0;
+        for transfer_id in candidates {
+            for path in [
+                self.partial_path(transfer_id),
+                self.complete_path(transfer_id),
+                self.metadata_path(transfer_id),
+            ] {
+                if path.exists() {
+                    fs::remove_file(path)?;
+                }
+            }
+            self.metadata.remove(&transfer_id);
+            removed += 1;
+        }
+        if removed != 0 {
+            sync_directory(&self.directory)?;
+        }
+        Ok(removed)
+    }
+
     pub fn receive(
         &mut self,
         session: &mut ConnectionSession,
@@ -368,7 +428,18 @@ impl TransferReceiver {
             kind: frame.kind,
             total_length: frame.total_length,
             final_hash: frame.final_hash,
+            transaction_id: frame.transaction_id.clone(),
+            prepared_snapshot_version: frame.prepared_snapshot_version,
+            prepared_at_unix_ms: frame.prepared_at_unix_ms,
+            provisional: frame.provisional,
         };
+        if frame.kind == TransferKind::ObjectShard
+            && frame.provisional
+            && (frame.transaction_id.trim().is_empty()
+                || frame.prepared_at_unix_ms == 0)
+        {
+            bail!("object shard transfer requires durable provisional transaction metadata");
+        }
         self.ensure_metadata(&expected)?;
         let complete_path = self.complete_path(frame.transfer_id);
         if complete_path.exists() {
@@ -574,6 +645,10 @@ mod tests {
             total_length: whole.len() as u64,
             final_hash: *blake3::hash(whole).as_bytes(),
             finish,
+            transaction_id: "tx".into(),
+            prepared_snapshot_version: 1,
+            prepared_at_unix_ms: 1,
+            provisional: true,
         }
     }
 
@@ -615,6 +690,48 @@ mod tests {
         let ack = receiver.receive(&mut resumed_session, &resumed).unwrap();
         assert_eq!(ack.status, AckStatus::Complete);
         assert_eq!(ack.completed_hash, Some(*blake3::hash(whole).as_bytes()));
+    }
+
+    #[test]
+    fn provisional_orphans_require_watermark_grace_and_no_live_reference() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut receiver = TransferReceiver::open(directory.path()).unwrap();
+        let peer = AuthenticatedPeer::new("node-b", 3).unwrap();
+        let mut session = ConnectionSession::establish("cluster-a", peer).unwrap();
+        let whole = b"ab";
+        let orphan = Uuid::new_v4();
+        let protected = Uuid::new_v4();
+        let at_watermark = Uuid::new_v4();
+        let inside_grace = Uuid::new_v4();
+        for (sequence, transfer_id, snapshot, prepared_at) in [
+            (1, orphan, 2, 10),
+            (2, protected, 2, 10),
+            (3, at_watermark, 5, 10),
+            (4, inside_grace, 2, 95),
+        ] {
+            let mut provisional =
+                frame(&session, transfer_id, sequence, 0, b"a", whole, false);
+            provisional.prepared_snapshot_version = snapshot;
+            provisional.prepared_at_unix_ms = prepared_at;
+            receiver.receive(&mut session, &provisional).unwrap();
+        }
+        let protected_set = BTreeSet::from([protected]);
+        assert_eq!(
+            receiver
+                .retire_orphan_provisional_object_shards(5, 100, 10, &protected_set)
+                .unwrap(),
+            1
+        );
+        assert!(receiver.watermark(orphan).unwrap().is_none());
+        assert!(receiver.watermark(protected).unwrap().is_some());
+        assert!(receiver.watermark(at_watermark).unwrap().is_some());
+        assert!(receiver.watermark(inside_grace).unwrap().is_some());
+        assert_eq!(
+            receiver
+                .retire_orphan_provisional_object_shards(5, 100, 10, &protected_set)
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

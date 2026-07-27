@@ -452,6 +452,11 @@ impl ObjectManager {
                 let plan = policy
                     .plan(object_identity, 1, profile, &candidates)
                     .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                let prepared_snapshot_version = mvcc
+                    .open_transactions
+                    .handle(transaction_id)
+                    .map_err(|error| Status::failed_precondition(error.to_string()))?
+                    .snapshot_version;
                 let ingest = DistributedIngest::encode(
                     &mvcc.replication_client,
                     &plan,
@@ -459,6 +464,10 @@ impl ObjectManager {
                     profile,
                     durability,
                     &mut reader,
+                    transaction_id,
+                    prepared_snapshot_version,
+                    now,
+                    true,
                     object_identity,
                     None,
                     1,

@@ -178,6 +178,10 @@ impl<'a, T: ShardTargetStream> DistributedIngest<'a, T> {
         profile: ErasureProfile,
         durability: DurabilityLevel,
         reader: &mut R,
+        transaction_id: &str,
+        prepared_snapshot_version: u64,
+        prepared_at_unix_ms: u64,
+        provisional: bool,
         object_identity: Uuid,
         expected_object_hash: Option<&str>,
         encoding_generation: u64,
@@ -199,7 +203,16 @@ impl<'a, T: ShardTargetStream> DistributedIngest<'a, T> {
             failures: Vec::new(),
         };
         let encoded = encoder
-            .encode(reader, object_identity, encoding_generation, &mut sink)
+            .encode(
+                reader,
+                transaction_id,
+                prepared_snapshot_version,
+                prepared_at_unix_ms,
+                provisional,
+                object_identity,
+                encoding_generation,
+                &mut sink,
+            )
             .await?;
         if let Some(expected_object_hash) = expected_object_hash {
             let expected_hash = parse_sha256(expected_object_hash)?;
@@ -596,6 +609,10 @@ mod tests {
             profile(),
             DurabilityLevel::Quorum,
             &mut Cursor::new(bytes),
+            "tx",
+            1,
+            1,
+            true,
             object_identity,
             Some(&object_hash(bytes)),
             1,
@@ -634,6 +651,10 @@ mod tests {
             profile(),
             DurabilityLevel::Erasure,
             &mut Cursor::new(bytes),
+            "tx",
+            1,
+            1,
+            true,
             object_identity,
             Some(&object_hash(bytes)),
             1,
@@ -664,6 +685,10 @@ mod tests {
             profile(),
             DurabilityLevel::Quorum,
             &mut Cursor::new(bytes),
+            "tx",
+            1,
+            1,
+            true,
             object_identity,
             Some(&object_hash(bytes)),
             1,

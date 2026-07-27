@@ -73,3 +73,52 @@ async fn public_commit_survives_lost_response_and_coordinator_sigkill() {
         .unwrap();
     assert_eq!(follow_up.state, WriteState::Committed as i32);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn killed_node_is_replaced_by_higher_incarnation_and_catches_up() {
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_anvil-server"));
+    let mut cluster = ProcessMvccCluster::start(binary).await.unwrap();
+    let old_leader = cluster.wait_for_leader(&[0, 1, 2]).await.unwrap();
+    let replaced = (0..3).find(|node| *node != old_leader).unwrap();
+    cluster.sigkill(replaced).await.unwrap();
+
+    let survivors = [0, 1, 2]
+        .into_iter()
+        .filter(|node| *node != replaced)
+        .collect::<Vec<_>>();
+    let leader = cluster.wait_for_leader(&survivors).await.unwrap();
+    cluster.spawn_replacement(replaced, 2).await.unwrap();
+    cluster.apply_replacement(leader, replaced, true).await.unwrap();
+    for survivor in survivors.iter().copied().filter(|node| *node != leader) {
+        cluster
+            .apply_replacement(survivor, replaced, false)
+            .await
+            .unwrap();
+    }
+
+    let before = cluster
+        .begin_transaction(leader, MvccReadConsistency::Linearized)
+        .await
+        .unwrap();
+    let committed = cluster
+        .commit_transaction(cluster.public_endpoint(leader), before.transaction_id)
+        .await
+        .unwrap();
+    assert_eq!(committed.state, WriteState::Committed as i32);
+    let replacement = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let Ok(snapshot) = cluster
+                .begin_transaction(replaced, MvccReadConsistency::LocalSnapshot)
+                .await
+            {
+                if snapshot.snapshot_version > before.snapshot_version {
+                    return snapshot;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("higher incarnation catches up and serves its applied snapshot");
+    assert_eq!(replacement.state, "open");
+}

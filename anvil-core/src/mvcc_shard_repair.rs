@@ -787,6 +787,10 @@ impl ShardRepairRunner {
         let encoded = StreamingErasureEncoder::new(profile)?
             .encode(
                 &mut reader,
+                &job.transaction_id,
+                job.originating_snapshot_version,
+                job.requested_at_unix_ms,
+                false,
                 job.source_manifest.object_identity,
                 job.source_manifest.encoding_generation,
                 &mut sink,

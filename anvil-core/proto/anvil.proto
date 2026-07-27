@@ -39,6 +39,7 @@ service AdminService {
   rpc ListCells(ListCellsRequest) returns (ListCellsResponse);
 
   rpc RegisterNode(RegisterNodeRequest) returns (NodeResponse);
+  rpc ReplaceClusterNodeIncarnation(ReplaceClusterNodeIncarnationRequest) returns (AdminMutationResponse);
   rpc GetLocalNodeDescriptor(GetLocalNodeDescriptorRequest) returns (NodeResponse);
   rpc ActivateNode(ActivateNodeRequest) returns (NodeResponse);
   rpc DrainNode(DrainNodeRequest) returns (DrainOperationResponse);
@@ -684,6 +685,21 @@ message RegisterNodeRequest {
   repeated NodeCapability capabilities = 8;
   bytes receipt_signing_public_key = 9;
   string capacity_json = 10;
+}
+
+message ReplaceClusterNodeIncarnationRequest {
+  AdminRequestContext context = 1;
+  string cluster_id = 2;
+  uint64 raft_node_id = 3;
+  string node_id = 4;
+  uint64 incarnation = 5;
+  string failure_domain = 6;
+  string endpoint = 7;
+  // Exactly one call, directed to the current cluster leader, installs the
+  // compact-Raft control record and OpenRaft route. Calls to every other
+  // surviving coordinator set this false and update only their local
+  // replication route after observing that committed control record.
+  bool install_control = 8;
 }
 
 message GetLocalNodeDescriptorRequest {}
@@ -4186,6 +4202,10 @@ message ReplicationDataFrame {
   bytes final_hash = 10;
   bool finish = 11;
   string cluster_id = 12;
+  string transaction_id = 13;
+  uint64 prepared_snapshot_version = 14;
+  uint64 prepared_at_unix_ms = 15;
+  bool provisional = 16;
 }
 
 enum ReplicationAckStatus {

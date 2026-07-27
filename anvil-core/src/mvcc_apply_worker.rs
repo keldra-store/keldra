@@ -240,16 +240,35 @@ impl MvccApplyWorker {
         // restart, and the receiver operation is idempotent.
         if let Some(receiver) = &self.shard_transfers {
             let authorised = self.local.retirable_object_shard_transfers()?;
-            let removed = receiver
+            let protected = self.local.protected_object_shard_transfers()?;
+            let mut receiver = receiver
                 .lock()
-                .map_err(|_| anyhow!("replication receiver lock poisoned"))?
-                .retire_complete_object_shards(&authorised)?;
+                .map_err(|_| anyhow!("replication receiver lock poisoned"))?;
+            let removed = receiver.retire_complete_object_shards(&authorised)?;
+            let orphaned = if let Some(grace_ms) = self.prepared_bundle_gc_grace_ms {
+                receiver.retire_orphan_provisional_object_shards(
+                    gc.0,
+                    unix_time_ms()?,
+                    grace_ms,
+                    &protected,
+                )?
+            } else {
+                0
+            };
             if removed != 0 {
                 tracing::info!(
                     operation = "gc.shard_transfer",
                     removed_transfers = removed,
                     gc_watermark = gc.0,
                     "retired unreferenced physical shard transfers"
+                );
+            }
+            if orphaned != 0 {
+                tracing::info!(
+                    operation = "gc.provisional_shard",
+                    removed_transfers = orphaned,
+                    gc_watermark = gc.0,
+                    "retired orphan provisional shard transfers"
                 );
             }
         }

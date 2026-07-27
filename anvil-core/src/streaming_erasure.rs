@@ -18,6 +18,10 @@ pub struct ErasureProfile {
 
 #[derive(Clone, Debug)]
 pub struct EncodedShard<'a> {
+    pub provisional: bool,
+    pub transaction_id: &'a str,
+    pub prepared_snapshot_version: u64,
+    pub prepared_at_unix_ms: u64,
     pub object_identity: Uuid,
     pub encoding_generation: u64,
     pub stripe_ordinal: u64,
@@ -64,6 +68,10 @@ impl StreamingErasureEncoder {
     pub async fn encode<R: AsyncRead + Unpin + Send, S: ShardSink>(
         &self,
         reader: &mut R,
+        transaction_id: &str,
+        prepared_snapshot_version: u64,
+        prepared_at_unix_ms: u64,
+        provisional: bool,
         object_identity: Uuid,
         encoding_generation: u64,
         sink: &mut S,
@@ -107,6 +115,10 @@ impl StreamingErasureEncoder {
             );
             for (ordinal, payload) in shards.iter().enumerate() {
                 sink.send(EncodedShard {
+                    provisional,
+                    transaction_id,
+                    prepared_snapshot_version,
+                    prepared_at_unix_ms,
                     object_identity,
                     encoding_generation,
                     stripe_ordinal,
@@ -176,7 +188,7 @@ mod tests {
         let mut reader = Cursor::new(input);
         let mut sink = Sink::default();
         let result = encoder
-            .encode(&mut reader, Uuid::new_v4(), 1, &mut sink)
+            .encode(&mut reader, "tx", 1, 1, true, Uuid::new_v4(), 1, &mut sink)
             .await
             .unwrap();
         assert_eq!(result.object_length, 11);

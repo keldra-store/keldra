@@ -60,6 +60,10 @@ pub fn admin_rpc_relation_mapping() -> &'static [(&'static str, SystemAdminRelat
         ("RemoveCell", SystemAdminRelation::ManageRegions),
         ("ListCells", SystemAdminRelation::ManageRegions),
         ("RegisterNode", SystemAdminRelation::ManageNodes),
+        (
+            "ReplaceClusterNodeIncarnation",
+            SystemAdminRelation::ManageNodes,
+        ),
         ("GetLocalNodeDescriptor", SystemAdminRelation::ManageNodes),
         ("ActivateNode", SystemAdminRelation::ManageNodes),
         ("DrainNode", SystemAdminRelation::ManageNodes),

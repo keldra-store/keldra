@@ -1409,6 +1409,70 @@ impl MvccStore {
         Ok(authorised)
     }
 
+    /// Every transfer still reachable from a live manifest or unfinished
+    /// shard job. Orphan provisional retirement subtracts this set after its
+    /// independent GC-watermark and grace proofs.
+    pub fn protected_object_shard_transfers(&self) -> Result<BTreeSet<uuid::Uuid>> {
+        let watermark = self.gc_watermark()?;
+        let mut protected = BTreeSet::new();
+        for (_, row) in self.scan_table_prefix_at(
+            crate::mvcc_shard_repair::SHARD_MANIFEST_CATALOG_TABLE_ID,
+            b"manifest/",
+            watermark,
+        )? {
+            let manifest: crate::object_shard_manifest::PhysicalObjectShardManifest =
+                serde_json::from_slice(&row.value)?;
+            manifest.validate()?;
+            protected.extend(
+                manifest
+                    .placements
+                    .into_iter()
+                    .map(|placement| placement.transfer_id),
+            );
+        }
+        for (_, row) in self.scan_table_prefix_at(
+            crate::mvcc_shard_repair::ShardPlacementOverlay::TABLE_ID,
+            b"",
+            watermark,
+        )? {
+            let overlay: crate::mvcc_shard_repair::ShardPlacementOverlay =
+                serde_json::from_slice(&row.value)?;
+            overlay.replacement_manifest.validate()?;
+            protected.extend(
+                overlay
+                    .replacement_manifest
+                    .placements
+                    .into_iter()
+                    .map(|placement| placement.transfer_id),
+            );
+        }
+        let cf = self.cf(CF_MATERIALISATION)?;
+        let prefix = self.key(b"shard-repair/");
+        for row in self
+            .db
+            .iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward))
+        {
+            let (key, value) = row?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let record: ShardRepairRecord = serde_json::from_slice(&value)?;
+            if record.state == ShardRepairState::Complete {
+                continue;
+            }
+            protected.extend(
+                record
+                    .job
+                    .source_manifest
+                    .placements
+                    .iter()
+                    .chain(record.job.retiring.iter())
+                    .map(|placement| placement.transfer_id),
+            );
+        }
+        Ok(protected)
+    }
+
     fn transition_object_materialisation(
         &self,
         job_id: &str,

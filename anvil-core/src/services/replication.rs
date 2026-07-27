@@ -558,6 +558,10 @@ fn decode_frame(frame: ReplicationDataFrame) -> Result<ReplicationFrame, Status>
         total_length: frame.total_length,
         final_hash,
         finish: frame.finish,
+        transaction_id: frame.transaction_id,
+        prepared_snapshot_version: frame.prepared_snapshot_version,
+        prepared_at_unix_ms: frame.prepared_at_unix_ms,
+        provisional: frame.provisional,
     })
 }
 
@@ -642,6 +646,10 @@ mod tests {
             total_length: 2,
             payload,
             finish: false,
+            transaction_id: "tx".into(),
+            prepared_snapshot_version: 1,
+            prepared_at_unix_ms: 1,
+            provisional: true,
         }
     }
 
@@ -728,6 +736,10 @@ mod tests {
                     total_length: payload.len() as u64,
                     payload,
                     finish: true,
+                    transaction_id: "tx".into(),
+                    prepared_snapshot_version: 1,
+                    prepared_at_unix_ms: 1,
+                    provisional: true,
                 },
             ))))
             .await

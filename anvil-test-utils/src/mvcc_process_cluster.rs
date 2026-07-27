@@ -13,8 +13,9 @@ use std::{
 };
 
 use anvil::anvil_api::{
-    BeginTransactionRequest, BeginTransactionResponse, CommitTransactionRequest, MvccDurability,
-    MvccReadConsistency, WriteResponse,
+    AdminRequestContext, BeginTransactionRequest, BeginTransactionResponse,
+    CommitTransactionRequest, MvccDurability, MvccReadConsistency,
+    ReplaceClusterNodeIncarnationRequest, WriteResponse,
     admin_service_client::AdminServiceClient,
     transaction_service_client::TransactionServiceClient,
 };
@@ -35,6 +36,7 @@ struct ProcessNode {
     api_addr: SocketAddr,
     admin_addr: SocketAddr,
     storage_path: PathBuf,
+    incarnation: u64,
     child: Option<Child>,
 }
 
@@ -82,6 +84,7 @@ impl ProcessMvccCluster {
                 api_addr,
                 admin_addr,
                 storage_path: directory.path().join(format!("node-{}", index + 1)),
+                incarnation: 1,
                 child: None,
             })
             .collect();
@@ -195,6 +198,70 @@ impl ProcessMvccCluster {
         self.wait_for_admin(node).await
     }
 
+    /// Start a clean replacement process with the same logical and Raft node
+    /// IDs, endpoint and failure domain but a strictly newer incarnation.
+    pub async fn spawn_replacement(
+        &mut self,
+        node: usize,
+        incarnation: u64,
+    ) -> anyhow::Result<()> {
+        if self.nodes[node].child.is_some() {
+            bail!("replacement requires the old process to be stopped");
+        }
+        if incarnation <= self.nodes[node].incarnation {
+            bail!("replacement incarnation must advance");
+        }
+        self.nodes[node].incarnation = incarnation;
+        self.nodes[node].storage_path = self
+            ._directory
+            .path()
+            .join(format!("node-{}-incarnation-{incarnation}", node + 1));
+        let mut peers: Vec<serde_json::Value> = serde_json::from_str(&self.peers_json)?;
+        peers[node]["incarnation"] = serde_json::json!(incarnation);
+        self.peers_json = serde_json::to_string(&peers)?;
+        self.spawn_node(node).await?;
+        self.wait_for_admin(node).await
+    }
+
+    /// Apply the authenticated replacement operation to one coordinator.
+    /// The leader call installs control; subsequent survivor calls update each
+    /// coordinator's local replication route after observing that decision.
+    pub async fn apply_replacement(
+        &self,
+        coordinator: usize,
+        replaced_node: usize,
+        install_control: bool,
+    ) -> anyhow::Result<()> {
+        let mut client = AdminServiceClient::connect(format!(
+            "http://{}",
+            self.nodes[coordinator].admin_addr
+        ))
+        .await?;
+        client
+            .replace_cluster_node_incarnation(authorized(
+                ReplaceClusterNodeIncarnationRequest {
+                    context: Some(AdminRequestContext {
+                        request_id: uuid::Uuid::new_v4().to_string(),
+                        idempotency_key: uuid::Uuid::new_v4().to_string(),
+                        audit_reason: "process MVCC incarnation replacement acceptance".into(),
+                        expected_generation: self.nodes[replaced_node]
+                            .incarnation
+                            .saturating_sub(1),
+                    }),
+                    cluster_id: self.cluster_id.clone(),
+                    raft_node_id: replaced_node as u64 + 1,
+                    node_id: format!("{}-node-{}", self.cluster_id, replaced_node + 1),
+                    incarnation: self.nodes[replaced_node].incarnation,
+                    failure_domain: format!("zone-{}", replaced_node + 1),
+                    endpoint: self.public_endpoint(replaced_node),
+                    install_control,
+                },
+                &self.admin_token,
+            ))
+            .await?;
+        Ok(())
+    }
+
     async fn spawn_node(&mut self, node: usize) -> anyhow::Result<()> {
         std::fs::create_dir_all(&self.nodes[node].storage_path)?;
         let child = Command::new(&self.binary)
@@ -206,7 +273,10 @@ impl ProcessMvccCluster {
             .env("REGION", "process-e2e-region")
             .env("NODE_ID", format!("{}-node-{}", self.cluster_id, node + 1))
             .env("MVCC_RAFT_NODE_ID", (node + 1).to_string())
-            .env("MVCC_NODE_INCARNATION", "1")
+            .env(
+                "MVCC_NODE_INCARNATION",
+                self.nodes[node].incarnation.to_string(),
+            )
             .env("MVCC_FAILURE_DOMAIN", format!("zone-{}", node + 1))
             .env("MVCC_PEERS_JSON", &self.peers_json)
             .env("MVCC_BOOTSTRAP_MEMBERSHIP", (node == 0).to_string())

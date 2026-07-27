@@ -1413,6 +1413,98 @@ impl AdminService for AppState {
         }))
     }
 
+    async fn replace_cluster_node_incarnation(
+        &self,
+        request: Request<ReplaceClusterNodeIncarnationRequest>,
+    ) -> Result<Response<AdminMutationResponse>, Status> {
+        let principal = require_admin(&request, self, SystemAdminRelation::ManageNodes).await?;
+        let claims = request
+            .extensions()
+            .get::<auth::Claims>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("Missing authenticated admin principal"))?;
+        let req = request.into_inner();
+        let context = require_mutation_context(req.context.as_ref(), false)?.clone();
+        if req.cluster_id != self.mvcc.cluster_id() {
+            return Err(Status::failed_precondition(
+                "cluster node replacement belongs to another cluster",
+            ));
+        }
+        if req.raft_node_id == 0
+            || req.node_id.trim().is_empty()
+            || req.incarnation == 0
+            || req.failure_domain.trim().is_empty()
+            || req.endpoint.trim().is_empty()
+        {
+            return Err(Status::invalid_argument(
+                "replacement requires non-zero Raft/incarnation IDs, logical node ID, failure domain and endpoint",
+            ));
+        }
+        let authorization = crate::mvcc_control_plane::authorize_node_control(
+            &self.storage,
+            &self.mvcc,
+            &claims,
+            &req.cluster_id,
+        )
+        .await?;
+        let node = crate::mvcc_transaction::NodeIncarnation {
+            node_id: req.node_id.clone(),
+            incarnation: req.incarnation,
+        };
+        if req.install_control {
+            self.mvcc
+                .install_cluster_node(
+                    &authorization,
+                    req.raft_node_id,
+                    node.clone(),
+                    req.failure_domain.clone(),
+                )
+                .await
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            self.mvcc
+                .replace_cluster_endpoint(
+                    &authorization,
+                    req.raft_node_id,
+                    &node,
+                    req.endpoint.clone(),
+                )
+                .await
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        } else {
+            self.mvcc
+                .replace_local_replication_route(&authorization, &node, req.endpoint.clone())
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        }
+        let resource_id = format!(
+            "cluster:{}/node:{}/incarnation:{}",
+            req.cluster_id, req.node_id, req.incarnation
+        );
+        let audit_event_id = record_admin_audit_event(
+            self,
+            &principal,
+            &context,
+            "admin.cluster-node.replace-incarnation",
+            &resource_id,
+            json!({
+                "cluster_id": req.cluster_id,
+                "raft_node_id": req.raft_node_id,
+                "node_id": req.node_id,
+                "incarnation": req.incarnation,
+                "failure_domain": req.failure_domain,
+                "endpoint": req.endpoint,
+                "installed_control": req.install_control,
+            }),
+        )
+        .await?;
+        Ok(Response::new(AdminMutationResponse {
+            request_id: context.request_id,
+            resource_id,
+            generation: req.incarnation,
+            audit_event_id,
+            idempotent_replay: false,
+        }))
+    }
+
     async fn get_local_node_descriptor(
         &self,
         request: Request<GetLocalNodeDescriptorRequest>,

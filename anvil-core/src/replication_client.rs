@@ -262,6 +262,7 @@ impl TonicReplicationStreamManager {
         transfer_id: Uuid,
         bytes: &[u8],
         final_hash: [u8; 32],
+        provisional: Option<(&str, u64, u64)>,
     ) -> Result<ReplicationAck> {
         #[cfg(feature = "test-cluster-transport-faults")]
         {
@@ -663,6 +664,16 @@ impl TonicReplicationStreamManager {
                         final_hash: final_hash.to_vec(),
                         finish,
                         cluster_id: self.cluster_id.to_string(),
+                        transaction_id: provisional
+                            .map(|(transaction_id, _, _)| transaction_id.to_string())
+                            .unwrap_or_default(),
+                        prepared_snapshot_version: provisional
+                            .map(|(_, version, _)| version)
+                            .unwrap_or_default(),
+                        prepared_at_unix_ms: provisional
+                            .map(|(_, _, prepared_at)| prepared_at)
+                            .unwrap_or_default(),
+                        provisional: provisional.is_some(),
                     },
                 )),
             )
@@ -742,6 +753,7 @@ impl BundleTargetStream for TonicReplicationStreamManager {
             transfer_id,
             bytes,
             final_hash,
+            None,
         )
         .await
     }
@@ -802,6 +814,11 @@ impl ShardTargetStream for TonicReplicationStreamManager {
             transfer_id,
             shard.payload,
             shard.payload_hash,
+            shard.provisional.then_some((
+                shard.transaction_id,
+                shard.prepared_snapshot_version,
+                shard.prepared_at_unix_ms,
+            )),
         )
         .await
     }
