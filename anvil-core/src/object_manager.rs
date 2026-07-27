@@ -599,11 +599,7 @@ impl ObjectManager {
     ) -> Result<Option<u64>, Status> {
         let boundary_schema_key =
             crate::core_store::boundary_schema_bucket_key(tenant_id, bucket_name);
-        let schema = self
-            .core_store
-            .read_boundary_schema(&boundary_schema_key)
-            .await
-            .map_err(|error| Status::internal(error.to_string()))?;
+        let schema = self.read_committed_boundary_schema(&boundary_schema_key)?;
         Ok(schema.and_then(|schema| {
             schema
                 .dimensions
@@ -630,11 +626,7 @@ impl ObjectManager {
     ) -> Result<Vec<CoreBoundaryValue>, Status> {
         let boundary_schema_key =
             crate::core_store::boundary_schema_bucket_key(tenant_id, bucket_name);
-        let Some(schema) = self
-            .core_store
-            .read_boundary_schema(&boundary_schema_key)
-            .await
-            .map_err(|error| Status::internal(error.to_string()))?
+        let Some(schema) = self.read_committed_boundary_schema(&boundary_schema_key)?
         else {
             return Ok(Vec::new());
         };
@@ -662,11 +654,7 @@ impl ObjectManager {
     ) -> Result<Vec<CoreBoundaryValue>, Status> {
         let boundary_schema_key =
             crate::core_store::boundary_schema_bucket_key(tenant_id, bucket_name);
-        let Some(schema) = self
-            .core_store
-            .read_boundary_schema(&boundary_schema_key)
-            .await
-            .map_err(|error| Status::internal(error.to_string()))?
+        let Some(schema) = self.read_committed_boundary_schema(&boundary_schema_key)?
         else {
             return Ok(Vec::new());
         };
@@ -692,6 +680,31 @@ impl ObjectManager {
             &[],
         )
         .map_err(|error| Status::invalid_argument(error.to_string()))
+    }
+
+    fn read_committed_boundary_schema(
+        &self,
+        boundary_schema_key: &str,
+    ) -> Result<Option<crate::core_store::CoreBoundarySchema>, Status> {
+        let tuple_key =
+            crate::core_store::CoreStore::boundary_schema_current_tuple_key(boundary_schema_key)
+                .map_err(|error| Status::internal(error.to_string()))?;
+        let logical_key = crate::mvcc_product::coremeta_logical_key(
+            crate::core_store::CF_BOUNDARY,
+            crate::core_store::TABLE_BOUNDARY_SCHEMA_CURRENT_ROW,
+            &tuple_key,
+        )
+        .map_err(|error| Status::internal(error.to_string()))?;
+        let Some(bytes) = self
+            .installed_mvcc()?
+            .read_latest_value(&logical_key)
+            .map_err(|error| Status::internal(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        crate::core_store::CoreStore::decode_boundary_schema_from_mvcc(&bytes)
+            .map(Some)
+            .map_err(|error| Status::internal(error.to_string()))
     }
 
     fn schedule_deferred_object_maintenance(&self, bucket: Bucket, object_key: &str) {
@@ -917,13 +930,10 @@ impl ObjectManager {
             let representation = materialisation_representation;
             let mvcc = self.installed_mvcc()?;
             let boundary_schema = self
-                .core_store
-                .read_boundary_schema(&crate::core_store::boundary_schema_bucket_key(
+                .read_committed_boundary_schema(&crate::core_store::boundary_schema_bucket_key(
                     tenant_id,
                     &bucket.name,
-                ))
-                .await
-                .map_err(|error| Status::internal(error.to_string()))?;
+                ))?;
             let boundary_schema_value = boundary_schema
                 .as_ref()
                 .map(serde_json::to_value)

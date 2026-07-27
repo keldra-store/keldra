@@ -95,11 +95,7 @@ pub(super) async fn put_boundary_schema_rpc(
             ));
         }
         if matches!(status.state, "committed" | "committing") {
-            let schema = state
-                .core_store
-                .read_boundary_schema(&boundary_bucket_key)
-                .await
-                .map_err(|error| Status::internal(error.to_string()))?
+            let schema = read_committed_boundary_schema(state, &boundary_bucket_key, None)?
                 .ok_or_else(|| {
                     Status::failed_precondition(
                         "committed boundary schema outcome is unavailable",
@@ -272,6 +268,45 @@ fn stage_boundary_schema_in_transaction(
     Ok(format!("sha256:{:x}", sha2::Sha256::digest(&bytes)))
 }
 
+fn read_committed_boundary_schema(
+    state: &AppState,
+    boundary_bucket_key: &str,
+    generation: Option<u64>,
+) -> Result<Option<crate::core_store::CoreBoundarySchema>, Status> {
+    let (table_id, tuple_key) = match generation {
+        Some(generation) => (
+            crate::core_store::TABLE_BOUNDARY_SCHEMA_ROW,
+            crate::core_store::CoreStore::boundary_schema_generation_tuple_key(
+                boundary_bucket_key,
+                generation,
+            ),
+        ),
+        None => (
+            crate::core_store::TABLE_BOUNDARY_SCHEMA_CURRENT_ROW,
+            crate::core_store::CoreStore::boundary_schema_current_tuple_key(
+                boundary_bucket_key,
+            ),
+        ),
+    };
+    let tuple_key = tuple_key.map_err(|error| Status::internal(error.to_string()))?;
+    let logical_key = crate::mvcc_product::coremeta_logical_key(
+        crate::core_store::CF_BOUNDARY,
+        table_id,
+        &tuple_key,
+    )
+    .map_err(|error| Status::internal(error.to_string()))?;
+    let Some(bytes) = state
+        .mvcc
+        .read_latest_value(&logical_key)
+        .map_err(|error| Status::internal(error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    crate::core_store::CoreStore::decode_boundary_schema_from_mvcc(&bytes)
+        .map(Some)
+        .map_err(|error| Status::internal(error.to_string()))
+}
+
 pub(super) async fn get_boundary_schema_rpc(
     state: &AppState,
     request: Request<GetBoundarySchemaRequest>,
@@ -291,18 +326,7 @@ pub(super) async fn get_boundary_schema_rpc(
             .ok_or_else(|| Status::not_found("Bucket not found"))?;
     let boundary_bucket_key =
         crate::core_store::boundary_schema_bucket_key(claims.tenant_id, &bucket.name);
-    let schema = if let Some(generation) = req.generation {
-        state
-            .core_store
-            .read_boundary_schema_generation(&boundary_bucket_key, generation)
-            .await
-    } else {
-        state
-            .core_store
-            .read_boundary_schema(&boundary_bucket_key)
-            .await
-    }
-    .map_err(|error| Status::internal(error.to_string()))?
+    let schema = read_committed_boundary_schema(state, &boundary_bucket_key, req.generation)?
     .ok_or_else(|| Status::not_found("Boundary schema not found"))?;
     let schema_hash =
         boundary_schema_hash(&schema).map_err(|error| Status::internal(error.to_string()))?;
@@ -552,11 +576,7 @@ pub(super) async fn start_boundary_migration_rpc(
             .ok_or_else(|| Status::not_found("Bucket not found"))?;
     let boundary_bucket_key =
         crate::core_store::boundary_schema_bucket_key(claims.tenant_id, &bucket.name);
-    let current = state
-        .core_store
-        .read_boundary_schema(&boundary_bucket_key)
-        .await
-        .map_err(|error| Status::internal(error.to_string()))?
+    let current = read_committed_boundary_schema(state, &boundary_bucket_key, None)?
         .ok_or_else(|| Status::failed_precondition("Boundary schema not found"))?;
     if req.from_generation == 0
         || req.to_generation == 0
