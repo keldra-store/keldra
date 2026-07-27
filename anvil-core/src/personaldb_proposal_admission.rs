@@ -16,7 +16,7 @@ use crate::{
     personaldb_commit_store::{decode_commit_certificate, encode_commit_certificate},
     personaldb_control::{PersonalDbCommitCertificate, validate_commit_certificate_unsigned},
     personaldb_coremeta::{
-        personaldb_partition_id, personaldb_realm_id, personaldb_root_anchor_key,
+        PersonalDbWritePlan, personaldb_partition_id, personaldb_realm_id, personaldb_root_anchor_key,
         personaldb_root_key_hash, tenant_id_from_realm,
     },
     personaldb_heads::{
@@ -686,6 +686,38 @@ pub async fn write_personaldb_committed_head_mvcc(
         )],
     )
     .await
+}
+
+pub fn stage_personaldb_committed_head_mvcc(
+    plan: &mut PersonalDbWritePlan,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    database_id: &str,
+    expected: &PersonalDbCommittedHead,
+    next: &PersonalDbCommittedHead,
+    trust_store: &PublicKeyTrustStore,
+) -> Result<()> {
+    expected.verify(trust_store)?;
+    next.verify(trust_store)?;
+    let tuple = committed_head_key(tenant_id, database_id)?;
+    let (payload, current) = read_committed_head_mvcc(mvcc, tenant_id, database_id, trust_store)?
+        .ok_or_else(|| anyhow!("PersonalDB committed head is absent"))?;
+    if current != *expected {
+        bail!("PersonalDB committed head changed before staging");
+    }
+    let key = crate::mvcc_product::coremeta_logical_key(
+        CF_PERSONALDB,
+        TABLE_PERSONALDB_GROUP_ROW,
+        &tuple,
+    )?;
+    plan.stage_put(
+        key,
+        encode_committed_head(next)?,
+        crate::mvcc_transaction::PredicateKind::ValueHash(
+            *blake3::hash(&payload).as_bytes(),
+        ),
+    );
+    Ok(())
 }
 
 pub async fn reserve_personaldb_proposal(

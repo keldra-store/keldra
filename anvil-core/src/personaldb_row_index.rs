@@ -8,7 +8,8 @@ use crate::{
         unix_nanos_from_rfc3339,
     },
     personaldb_coremeta::{
-        personaldb_payload_hash, read_personaldb_data_locator_bytes,
+        PersonalDbWritePlan, personaldb_payload_hash, prepare_personaldb_bytes_as_data_locator,
+        read_personaldb_data_locator_bytes,
         read_personaldb_data_locator_row_at_snapshot, write_personaldb_bytes_as_data_locator_mvcc,
     },
     storage::Storage,
@@ -29,6 +30,66 @@ pub struct PersonalDbRowIndexHeader {
     pub key_order: String,
     pub codec: String,
     pub created_at: String,
+}
+
+pub async fn prepare_and_stage_personaldb_row_index(
+    storage: &Storage,
+    plan: &mut PersonalDbWritePlan,
+    root_generation: u64,
+    input: PersonalDbRowIndexWrite<'_>,
+) -> Result<String> {
+    let mut records = input.records.to_vec();
+    records.sort_by(compare_row_index_records);
+    let body = encode_row_index_body(&records)?;
+    let source_hash_hex = hex::encode(input.source_hash);
+    let data_id = personaldb_row_index_data_id(
+        input.tenant_id,
+        input.database_id,
+        input.generation,
+        &source_hash_hex,
+    )?;
+    let header = PersonalDbRowIndexHeader {
+        tenant_id: input.tenant_id.to_string(),
+        database_id: input.database_id.to_string(),
+        generation: input.generation,
+        source_hash: hex::encode(input.source_hash),
+        key_order: "database_id_table_hash_primary_key_hash".to_string(),
+        codec: "writer-body-table-v1".to_string(),
+        created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+    };
+    let (first_hash, last_hash) = record_hash_bounds(&records);
+    let header_proto = encode_personaldb_row_index_header_proto(&data_id, &header);
+    let range_index =
+        single_body_range_index(body.len(), records.len() as u64, first_hash, last_hash)?;
+    let encoded = encode_writer_segment(
+        FileFamily::PersonalDbRowIndex,
+        0,
+        header_proto,
+        &body,
+        &range_index,
+        records.len() as u64,
+        first_hash,
+        last_hash,
+    )?;
+    let row = prepare_personaldb_bytes_as_data_locator(
+        storage,
+        input.tenant_id,
+        input.database_id,
+        &data_id,
+        PERSONALDB_ROW_INDEX_KIND,
+        input.generation,
+        root_generation,
+        encoded.bytes.clone(),
+        personaldb_payload_hash(&encoded.bytes),
+        vec![source_hash_hex],
+        format!(
+            "personaldb-row-index:{}:{}:{}",
+            input.tenant_id, input.database_id, input.generation
+        ),
+    )
+    .await?;
+    plan.stage_data_locator_row(&row)?;
+    Ok(data_id)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

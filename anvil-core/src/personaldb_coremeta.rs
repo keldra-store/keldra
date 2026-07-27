@@ -386,11 +386,49 @@ pub async fn write_personaldb_logical_file_as_data_locator_mvcc(
     transaction_id: String,
     principal: &str,
 ) -> Result<PersonalDbDataLocatorCoreMetaRow> {
+    let root_generation = mvcc
+        .runtime
+        .applied_version()?
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("PersonalDB locator generation overflow"))?;
+    let row = prepare_personaldb_logical_file_as_data_locator(
+        storage,
+        tenant_id,
+        group_id,
+        data_id,
+        data_kind,
+        request,
+        root_generation,
+        sqlite_changeset_hash,
+        projection_keys,
+        transaction_id,
+    )
+    .await?;
+    write_personaldb_data_locator_row_mvcc(mvcc, &row, principal).await?;
+    Ok(row)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn prepare_personaldb_logical_file_as_data_locator(
+    storage: &Storage,
+    tenant_id: i64,
+    group_id: &str,
+    data_id: &str,
+    data_kind: &str,
+    request: WriteLogicalFileRequest,
+    root_generation: u64,
+    sqlite_changeset_hash: String,
+    projection_keys: Vec<String>,
+    transaction_id: String,
+) -> Result<PersonalDbDataLocatorCoreMetaRow> {
     validate_personaldb_scope(tenant_id, group_id)?;
     require_coremeta_ref_id(data_id, "data_id")?;
     require_safe_component(data_kind, "data_kind")?;
     if request.generation == 0 {
         bail!("PersonalDB data locator generation must be nonzero");
+    }
+    if root_generation == 0 {
+        bail!("PersonalDB locator root generation must be nonzero");
     }
     let generation = request.generation;
     let logical = CoreStore::new(storage.clone())
@@ -403,18 +441,13 @@ pub async fn write_personaldb_logical_file_as_data_locator_mvcc(
         data_id: data_id.to_string(),
         data_kind: data_kind.to_string(),
         generation,
-        root_generation: mvcc
-            .runtime
-            .applied_version()?
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("PersonalDB locator generation overflow"))?,
+        root_generation,
         sqlite_changeset_hash,
         payload_locator: logical.locator,
         projection_keys,
         transaction_id,
         created_at_unix_nanos: current_unix_nanos()?,
     };
-    write_personaldb_data_locator_row_mvcc(mvcc, &row, principal).await?;
     Ok(row)
 }
 
