@@ -824,7 +824,14 @@ impl CoreMetaStore {
                 }
                 scanned = scanned.saturating_add(1);
                 bytes = bytes.saturating_add((key.len() + value.len()) as u64);
-                let table_id = decode_core_meta_table_id(&key)?;
+                // Ignore pre-MVCC version-zero rows left behind by an older
+                // CoreMeta layout. They are not portable rows; retaining them
+                // locally must not make canonical bootstrap export fail.
+                let table_id = match decode_core_meta_table_id(&key) {
+                    Ok(table_id) => table_id,
+                    Err(_error) if key.first() == Some(&0) => continue,
+                    Err(error) => return Err(error),
+                };
                 let (payload, common) = decode_envelope_with_common(cf_name, table_id, &value)?;
                 let canonical_envelope =
                     encode_envelope_with_common(cf_name, table_id, &payload, common.clone())?;

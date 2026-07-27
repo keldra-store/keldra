@@ -60,7 +60,15 @@ impl CoreMetaReadSnapshot<'_> {
                 }
                 scanned = scanned.saturating_add(1);
                 bytes = bytes.saturating_add((key.len() + value.len()) as u64);
-                let table_id = decode_core_meta_table_id(&key)?;
+                // Version-zero keys belong to the pre-MVCC CoreMeta layout.  They
+                // can remain in a node's RocksDB while it is being upgraded, but
+                // are not portable CoreMeta rows and must not prevent scanning
+                // the canonical v1 snapshot.
+                let table_id = match decode_core_meta_table_id(&key) {
+                    Ok(table_id) => table_id,
+                    Err(_error) if key.first() == Some(&0) => continue,
+                    Err(error) => return Err(error),
+                };
                 let (payload, common) = decode_envelope_with_common(cf_name, table_id, &value)?;
                 let value_envelope =
                     encode_envelope_with_common(cf_name, table_id, &payload, common.clone())?;
