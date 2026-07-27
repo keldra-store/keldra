@@ -24,7 +24,7 @@ async fn begin(cluster: &TestCluster, label: &str) -> String {
             tonic::Request::new(BeginTransactionRequest {
                 idempotency_key: format!("{label}-{}", uuid::Uuid::new_v4()),
                 ttl_ms: 30_000,
-                consistency: MvccReadConsistency::Linearized as i32,
+                read_consistency: MvccReadConsistency::Linearized as i32,
                 cluster_id: cluster.states[0].mvcc.cluster_id().to_string(),
                 durability: MvccDurability::Quorum as i32,
             }),

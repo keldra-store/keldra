@@ -1,9 +1,9 @@
 use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::transaction_service_client::TransactionServiceClient;
 use anvil::anvil_api::{
-    BeginTransactionRequest, CommitTransactionRequest, CreateBucketRequest, GetBucketPolicyRequest,
-    ListBucketsRequest, MvccDurability, MvccReadConsistency, PutBucketPolicyRequest, WriteOptions,
-    write_options,
+    BeginTransactionRequest, CommitTransactionRequest, CreateBucketRequest, DeleteBucketRequest,
+    GetBucketPolicyRequest, ListBucketsRequest, MvccDurability, MvccReadConsistency,
+    PutBucketPolicyRequest, WriteOptions, write_options,
 };
 use anvil::system_realm::{SYSTEM_BUCKET_NAMESPACE, SYSTEM_STORAGE_TENANT_ID};
 use anvil_test_utils::{TestCluster, isolated_test_cluster};
@@ -50,6 +50,17 @@ fn transaction_options(transaction_id: &str) -> WriteOptions {
         execution: Some(write_options::Execution::TransactionId(
             transaction_id.to_string(),
         )),
+    }
+}
+
+fn implicit_options(idempotency_key: &str) -> WriteOptions {
+    WriteOptions {
+        idempotency_key: idempotency_key.to_string(),
+        consistency: 0,
+        wait_for_finalization: false,
+        preconditions: Vec::new(),
+        boundary_values: Vec::new(),
+        execution: None,
     }
 }
 
@@ -237,4 +248,70 @@ async fn bucket_name_conflict_aborts_every_bucket_mutation_in_losing_transaction
     assert!(names.contains(&shared));
     assert!(names.contains(&first_only));
     assert!(!names.contains(&second_only));
+}
+
+#[tokio::test]
+async fn implicit_bucket_mutations_reconstruct_committed_outcomes_after_lost_responses() {
+    let cluster = isolated_test_cluster("bucket-implicit-retry", &["test-region-1"]).await;
+    let endpoint = cluster.grpc_addrs[0].clone();
+    let mut buckets = BucketServiceClient::connect(endpoint).await.unwrap();
+    let bucket_name = format!("bucket-retry-{}", uuid::Uuid::new_v4().simple());
+    let create_key = uuid::Uuid::new_v4().to_string();
+    let create = CreateBucketRequest {
+        bucket_name: bucket_name.clone(),
+        region: "test-region-1".to_string(),
+        options: Some(implicit_options(&create_key)),
+    };
+    let first = buckets
+        .create_bucket(authorized(create.clone(), &cluster.token))
+        .await
+        .unwrap()
+        .into_inner();
+    let retry = buckets
+        .create_bucket(authorized(create, &cluster.token))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(retry.bucket_id, first.bucket_id);
+    let changed_input = buckets
+        .create_bucket(authorized(
+            CreateBucketRequest {
+                bucket_name: format!("changed-{}", uuid::Uuid::new_v4().simple()),
+                region: "test-region-1".to_string(),
+                options: Some(implicit_options(&create_key)),
+            },
+            &cluster.token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(changed_input.code(), Code::AlreadyExists);
+
+    let policy_key = uuid::Uuid::new_v4().to_string();
+    let policy = PutBucketPolicyRequest {
+        bucket_name: bucket_name.clone(),
+        policy_json: serde_json::json!({"is_public_read": true}).to_string(),
+        options: Some(implicit_options(&policy_key)),
+    };
+    buckets
+        .put_bucket_policy(authorized(policy.clone(), &cluster.token))
+        .await
+        .unwrap();
+    buckets
+        .put_bucket_policy(authorized(policy, &cluster.token))
+        .await
+        .unwrap();
+
+    let delete_key = uuid::Uuid::new_v4().to_string();
+    let delete = DeleteBucketRequest {
+        bucket_name,
+        options: Some(implicit_options(&delete_key)),
+    };
+    buckets
+        .delete_bucket(authorized(delete.clone(), &cluster.token))
+        .await
+        .unwrap();
+    buckets
+        .delete_bucket(authorized(delete, &cluster.token))
+        .await
+        .unwrap();
 }

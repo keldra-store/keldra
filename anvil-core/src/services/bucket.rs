@@ -16,6 +16,12 @@ fn bucket_transaction_id(options: Option<&WriteOptions>) -> Result<Option<&str>,
     crate::services::transaction_context::write_options_transaction_id(options)
 }
 
+struct ImplicitBucketTransaction {
+    transaction_id: String,
+    principal: String,
+    replayed: bool,
+}
+
 #[tonic::async_trait]
 impl BucketService for AppState {
     type WatchBucketMetadataStream = std::pin::Pin<
@@ -38,13 +44,46 @@ impl BucketService for AppState {
             self.create_bucket_in_transaction(claims, req, transaction_id)
                 .await?
         } else {
-            let bucket = self
-                .bucket_manager
-                .create_bucket(claims, &req.bucket_name, &req.region)
+            let transaction = self
+                .begin_implicit_bucket_transaction(
+                    claims,
+                    req.options.as_ref(),
+                    "bucket-create",
+                )
                 .await?;
-            self.publish_bucket_metadata_event(claims.tenant_id, &bucket, "create", false)
+            if transaction.replayed {
+                crate::access_control::require_action(
+                    &self.storage,
+                    &self.persistence,
+                    claims,
+                    AnvilAction::BucketCreate,
+                    &req.bucket_name,
+                )
                 .await?;
-            bucket
+                let bucket = bucket_journal::read_current_bucket_mvcc(
+                    &self.mvcc,
+                    claims.tenant_id,
+                    &req.bucket_name,
+                )
+                .map_err(|error| Status::internal(error.to_string()))?
+                .filter(|bucket| bucket.region == req.region)
+                .ok_or_else(|| {
+                    Status::already_exists(
+                        "bucket idempotency key was already used for different input",
+                    )
+                })?;
+                bucket
+            } else {
+                let bucket = self
+                    .create_bucket_in_transaction(
+                        claims,
+                        req,
+                        &transaction.transaction_id,
+                    )
+                    .await?;
+                self.commit_implicit_bucket_transaction(&transaction).await?;
+                bucket
+            }
         };
 
         tracing::debug!("[service] EXITING create_bucket");
@@ -67,12 +106,43 @@ impl BucketService for AppState {
             self.delete_bucket_in_transaction(claims, req, transaction_id)
                 .await?;
         } else {
-            let bucket = self
-                .bucket_manager
-                .delete_bucket(claims, &req.bucket_name)
+            let transaction = self
+                .begin_implicit_bucket_transaction(
+                    claims,
+                    req.options.as_ref(),
+                    "bucket-delete",
+                )
                 .await?;
-            self.publish_bucket_metadata_event(claims.tenant_id, &bucket, "delete", true)
+            if transaction.replayed {
+                crate::access_control::require_action(
+                    &self.storage,
+                    &self.persistence,
+                    claims,
+                    AnvilAction::BucketDelete,
+                    &req.bucket_name,
+                )
                 .await?;
+                let event = bucket_journal::latest_bucket_metadata_event(
+                    &self.mvcc,
+                    claims.tenant_id,
+                    &req.bucket_name,
+                )
+                .await
+                .map_err(|error| Status::internal(error.to_string()))?;
+                if !event.is_some_and(|event| event.event_type == "delete") {
+                    return Err(Status::already_exists(
+                        "bucket idempotency key was already used for different input",
+                    ));
+                }
+            } else {
+                self.delete_bucket_in_transaction(
+                    claims,
+                    req,
+                    &transaction.transaction_id,
+                )
+                .await?;
+                self.commit_implicit_bucket_transaction(&transaction).await?;
+            }
         }
 
         Ok(Response::new(DeleteBucketResponse {}))
@@ -197,12 +267,45 @@ impl BucketService for AppState {
             self.put_bucket_policy_in_transaction(claims, req, is_public_read, transaction_id)
                 .await?;
         } else {
-            let bucket = self
-                .bucket_manager
-                .set_bucket_public_access(claims, &req.bucket_name, is_public_read)
+            let transaction = self
+                .begin_implicit_bucket_transaction(
+                    claims,
+                    req.options.as_ref(),
+                    "bucket-policy",
+                )
                 .await?;
-            self.publish_bucket_metadata_event(claims.tenant_id, &bucket, "policy_update", false)
+            if transaction.replayed {
+                crate::access_control::require_action(
+                    &self.storage,
+                    &self.persistence,
+                    claims,
+                    AnvilAction::BucketWrite,
+                    &req.bucket_name,
+                )
                 .await?;
+                let bucket = bucket_journal::read_current_bucket_mvcc(
+                    &self.mvcc,
+                    claims.tenant_id,
+                    &req.bucket_name,
+                )
+                .map_err(|error| Status::internal(error.to_string()))?
+                .filter(|bucket| bucket.is_public_read == is_public_read)
+                .ok_or_else(|| {
+                    Status::already_exists(
+                        "bucket idempotency key was already used for different input",
+                    )
+                })?;
+                let _ = bucket;
+            } else {
+                self.put_bucket_policy_in_transaction(
+                    claims,
+                    req,
+                    is_public_read,
+                    &transaction.transaction_id,
+                )
+                .await?;
+                self.commit_implicit_bucket_transaction(&transaction).await?;
+            }
         }
 
         Ok(Response::new(PutBucketPolicyResponse {}))
@@ -287,6 +390,109 @@ impl BucketService for AppState {
 }
 
 impl AppState {
+    async fn begin_implicit_bucket_transaction(
+        &self,
+        claims: &auth::Claims,
+        options: Option<&WriteOptions>,
+        operation: &str,
+    ) -> Result<ImplicitBucketTransaction, Status> {
+        let principal = crate::object_manager::transaction_principal_from_claims(claims);
+        let supplied_idempotency_key = options
+            .map(|options| options.idempotency_key.trim())
+            .filter(|key| !key.is_empty());
+        let scoped_idempotency_key;
+        let idempotency_key = if let Some(key) = supplied_idempotency_key {
+            scoped_idempotency_key =
+                format!("bucket:{}:{}:{key}", claims.tenant_id, claims.sub);
+            &scoped_idempotency_key
+        } else {
+            scoped_idempotency_key = format!(
+                "bucket:{}:{}:{operation}:{}",
+                claims.tenant_id,
+                claims.sub,
+                uuid::Uuid::new_v4()
+            );
+            &scoped_idempotency_key
+        };
+        let now = u64::try_from(chrono::Utc::now().timestamp_millis())
+            .map_err(|_| Status::internal("bucket mutation timestamp predates Unix epoch"))?;
+        let handle = self
+            .mvcc
+            .open_transactions
+            .begin(
+                self.mvcc.runtime.as_ref(),
+                self.mvcc.cluster_id().to_string(),
+                principal.clone(),
+                idempotency_key,
+                std::time::Duration::from_secs(300),
+                crate::mvcc_transaction::DurabilityLevel::Quorum,
+                crate::mvcc_transaction::ReadConsistency::Linearized,
+                now,
+            )
+            .await
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        let status = self
+            .mvcc
+            .open_transactions
+            .status(&handle.transaction_id, &principal, now)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        if status.state == "committing" {
+            let outcome = self
+                .mvcc
+                .open_transactions
+                .commit(
+                    self.mvcc.runtime.as_ref(),
+                    &handle.transaction_id,
+                    &principal,
+                    now,
+                )
+                .await
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            if let crate::mvcc_transaction::CertificationResult::Aborted { reason } =
+                outcome.certification
+            {
+                return Err(Status::aborted(format!(
+                    "implicit bucket transaction aborted: {reason:?}"
+                )));
+            }
+        } else if status.state == "aborted" {
+            return Err(Status::aborted(
+                "implicit bucket transaction previously aborted",
+            ));
+        }
+        Ok(ImplicitBucketTransaction {
+            transaction_id: handle.transaction_id,
+            principal,
+            replayed: matches!(status.state, "committed" | "committing"),
+        })
+    }
+
+    async fn commit_implicit_bucket_transaction(
+        &self,
+        transaction: &ImplicitBucketTransaction,
+    ) -> Result<(), Status> {
+        let outcome = self
+            .mvcc
+            .open_transactions
+            .commit(
+                self.mvcc.runtime.as_ref(),
+                &transaction.transaction_id,
+                &transaction.principal,
+                u64::try_from(chrono::Utc::now().timestamp_millis())
+                    .map_err(|_| Status::internal("bucket commit predates Unix epoch"))?,
+            )
+            .await
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        match outcome.certification {
+            crate::mvcc_transaction::CertificationResult::Committed { .. } => Ok(()),
+            crate::mvcc_transaction::CertificationResult::Aborted { reason } => {
+                Err(Status::aborted(format!(
+                    "implicit bucket transaction aborted: {reason:?}"
+                )))
+            }
+        }
+    }
+
     async fn create_bucket_in_transaction(
         &self,
         claims: &auth::Claims,
@@ -531,28 +737,6 @@ impl AppState {
             .map_err(|err| Status::failed_precondition(err.to_string()))
     }
 
-    async fn publish_bucket_metadata_event(
-        &self,
-        tenant_id: i64,
-        bucket: &crate::persistence::Bucket,
-        event_type: &str,
-        deleted: bool,
-    ) -> Result<crate::persistence::BucketMetadataEvent, Status> {
-        let event =
-            bucket_journal::latest_bucket_metadata_event(&self.mvcc, tenant_id, &bucket.name)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?
-                .ok_or_else(|| Status::internal("Bucket metadata journal event not found"))?;
-        if event.event_type != event_type {
-            tracing::debug!(
-                expected = event_type,
-                actual = event.event_type,
-                deleted,
-                "bucket metadata journal event type differs from service hint"
-            );
-        }
-        Ok(event)
-    }
 }
 
 fn bucket_metadata_event_response(
