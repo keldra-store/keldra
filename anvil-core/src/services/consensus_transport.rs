@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     pin::Pin,
     sync::{Arc, Mutex},
     time::Duration,
@@ -43,6 +43,7 @@ pub trait ConsensusConnectionAuthorizer: Send + Sync + 'static {
 pub struct ConsensusTransportService<A> {
     runtime: Arc<OpenRaftConsensus>,
     authorizer: Arc<A>,
+    applied_report: Option<(NodeId, u64, LocalGcSafetyReport)>,
 }
 
 impl<A> Clone for ConsensusTransportService<A> {
@@ -50,6 +51,7 @@ impl<A> Clone for ConsensusTransportService<A> {
         Self {
             runtime: self.runtime.clone(),
             authorizer: self.authorizer.clone(),
+            applied_report: self.applied_report.clone(),
         }
     }
 }
@@ -59,7 +61,18 @@ impl<A> ConsensusTransportService<A> {
         Self {
             runtime,
             authorizer: Arc::new(authorizer),
+            applied_report: None,
         }
+    }
+
+    pub fn with_applied_watermark_report(
+        mut self,
+        node_id: NodeId,
+        incarnation: u64,
+        report: LocalGcSafetyReport,
+    ) -> Self {
+        self.applied_report = Some((node_id, incarnation, report));
+        self
     }
 }
 
@@ -95,6 +108,7 @@ impl<A: ConsensusConnectionAuthorizer> ConsensusTransport for ConsensusTransport
 
         let (output, receiver) = mpsc::channel(32);
         let runtime = self.runtime.clone();
+        let applied_report = self.applied_report.clone();
         tokio::spawn(async move {
             if output
                 .send(Ok(ConsensusStreamResponse {
@@ -135,7 +149,19 @@ impl<A: ConsensusConnectionAuthorizer> ConsensusTransport for ConsensusTransport
                         return;
                     }
                 };
-                let reply = dispatch(&runtime, frame).await;
+                let mut reply = dispatch(&runtime, frame).await;
+                if let Some((node_id, incarnation, report)) = &applied_report {
+                    reply.reporting_node_id = node_id.0;
+                    reply.reporting_node_incarnation = *incarnation;
+                    let snapshot = report.snapshot();
+                    reply.mvcc_applied_watermark = snapshot.watermark;
+                    reply.has_active_snapshot_pin = snapshot.oldest_active_snapshot.is_some();
+                    reply.oldest_active_snapshot =
+                        snapshot.oldest_active_snapshot.unwrap_or_default();
+                    reply.has_unfinished_work_pin = snapshot.oldest_unfinished_work.is_some();
+                    reply.oldest_unfinished_work =
+                        snapshot.oldest_unfinished_work.unwrap_or_default();
+                }
                 if output
                     .send(Ok(ConsensusStreamResponse {
                         message: Some(consensus_stream_response::Message::Reply(reply)),
@@ -190,12 +216,80 @@ async fn dispatch(runtime: &OpenRaftConsensus, frame: ConsensusRpcFrame) -> Cons
             request_id: frame.request_id,
             payload,
             error: String::new(),
+            ..Default::default()
         },
         Err(error) => ConsensusRpcReply {
             request_id: frame.request_id,
             payload: Vec::new(),
             error: error.to_string(),
+            ..Default::default()
         },
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AppliedWatermarkReport {
+    pub incarnation: u64,
+    pub watermark: u64,
+    pub oldest_active_snapshot: Option<u64>,
+    pub oldest_unfinished_work: Option<u64>,
+}
+
+#[derive(Clone, Default)]
+pub struct LocalGcSafetyReport {
+    report: Arc<Mutex<AppliedWatermarkReport>>,
+}
+
+impl LocalGcSafetyReport {
+    pub fn update(
+        &self,
+        watermark: u64,
+        oldest_active_snapshot: Option<u64>,
+        oldest_unfinished_work: Option<u64>,
+    ) {
+        *self.report.lock().expect("local GC safety report lock poisoned") =
+            AppliedWatermarkReport {
+                incarnation: 0,
+                watermark,
+                oldest_active_snapshot,
+                oldest_unfinished_work,
+            };
+    }
+
+    pub fn snapshot(&self) -> AppliedWatermarkReport {
+        *self.report.lock().expect("local GC safety report lock poisoned")
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct AppliedWatermarkReports {
+    reports: Arc<Mutex<BTreeMap<NodeId, AppliedWatermarkReport>>>,
+}
+
+impl AppliedWatermarkReports {
+    pub fn record(&self, node_id: NodeId, mut report: AppliedWatermarkReport) {
+        let incarnation = report.incarnation;
+        let watermark = report.watermark;
+        if node_id.0 == 0 || incarnation == 0 {
+            return;
+        }
+        let mut reports = self.reports.lock().expect("applied watermark report lock poisoned");
+        match reports.get(&node_id) {
+            Some(current) if current.incarnation > incarnation => {}
+            Some(current)
+                if current.incarnation == incarnation && current.watermark > watermark => {}
+            _ => {
+                report.incarnation = incarnation;
+                reports.insert(node_id, report);
+            }
+        }
+    }
+
+    pub fn snapshot(&self) -> BTreeMap<NodeId, AppliedWatermarkReport> {
+        self.reports
+            .lock()
+            .expect("applied watermark report lock poisoned")
+            .clone()
     }
 }
 
@@ -207,6 +301,7 @@ pub struct TonicConsensusRpcFactory {
     node_token: Arc<str>,
     request_timeout: Duration,
     channels: Arc<Mutex<HashMap<String, Channel>>>,
+    applied_reports: AppliedWatermarkReports,
 }
 
 impl TonicConsensusRpcFactory {
@@ -224,7 +319,12 @@ impl TonicConsensusRpcFactory {
             node_token: node_token.into(),
             request_timeout,
             channels: Arc::new(Mutex::new(HashMap::new())),
+            applied_reports: AppliedWatermarkReports::default(),
         }
+    }
+
+    pub fn applied_reports(&self) -> AppliedWatermarkReports {
+        self.applied_reports.clone()
     }
 
     fn channel(&self, address: &str) -> Result<Channel, String> {
@@ -251,11 +351,11 @@ impl ConsensusRpcFactory for TonicConsensusRpcFactory {
             cluster_id: self.cluster_id.clone(),
             channel: self.channel(&node.address),
             local_node_id: self.local_node_id,
-            #[cfg(feature = "test-cluster-transport-faults")]
             target_node_id: _target,
             local_incarnation: self.local_incarnation,
             node_token: self.node_token.clone(),
             request_timeout: self.request_timeout,
+            applied_reports: self.applied_reports.clone(),
             next_request_id: 1,
             session: None,
         })
@@ -271,11 +371,11 @@ struct TonicConsensusRpcClient {
     cluster_id: Arc<str>,
     channel: Result<Channel, String>,
     local_node_id: NodeId,
-    #[cfg(feature = "test-cluster-transport-faults")]
     target_node_id: NodeId,
     local_incarnation: u64,
     node_token: Arc<str>,
     request_timeout: Duration,
+    applied_reports: AppliedWatermarkReports,
     next_request_id: u64,
     session: Option<ConnectedSession>,
 }
@@ -385,6 +485,23 @@ impl TonicConsensusRpcClient {
         if !reply.error.is_empty() {
             return Err(ConsensusRpcError::Protocol(reply.error));
         }
+        if reply.reporting_node_id != 0 && reply.reporting_node_id != self.target_node_id.0 {
+            return Err(ConsensusRpcError::Protocol(
+                "consensus peer reported an unexpected node identity".into(),
+            ));
+        }
+        if reply.reporting_node_id != 0 {
+            self.applied_reports.record(self.target_node_id, AppliedWatermarkReport {
+                incarnation: reply.reporting_node_incarnation,
+                watermark: reply.mvcc_applied_watermark,
+                oldest_active_snapshot: reply
+                    .has_active_snapshot_pin
+                    .then_some(reply.oldest_active_snapshot),
+                oldest_unfinished_work: reply
+                    .has_unfinished_work_pin
+                    .then_some(reply.oldest_unfinished_work),
+            });
+        }
         Ok(reply.payload)
     }
 }
@@ -436,6 +553,40 @@ mod tests {
 
     use super::*;
     use crate::anvil_api::consensus_transport_server::ConsensusTransportServer;
+
+    #[test]
+    fn applied_watermark_reports_are_incarnation_fenced_and_monotonic() {
+        let reports = AppliedWatermarkReports::default();
+        let node = NodeId(7);
+        let report = |incarnation, watermark| AppliedWatermarkReport {
+            incarnation,
+            watermark,
+            oldest_active_snapshot: None,
+            oldest_unfinished_work: None,
+        };
+        reports.record(node, report(2, 40));
+        reports.record(node, report(2, 39));
+        reports.record(node, report(1, 100));
+        assert_eq!(
+            reports.snapshot().get(&node),
+            Some(&AppliedWatermarkReport {
+                incarnation: 2,
+                watermark: 40,
+                oldest_active_snapshot: None,
+                oldest_unfinished_work: None,
+            })
+        );
+        reports.record(node, report(3, 4));
+        assert_eq!(
+            reports.snapshot().get(&node),
+            Some(&AppliedWatermarkReport {
+                incarnation: 3,
+                watermark: 4,
+                oldest_active_snapshot: None,
+                oldest_unfinished_work: None,
+            })
+        );
+    }
 
     struct UnusedNetwork;
 

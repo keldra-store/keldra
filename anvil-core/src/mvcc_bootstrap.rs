@@ -27,6 +27,7 @@ use crate::{
     local_object_store::LocalObjectStore,
     mesh_lifecycle::NodeCapability,
     mvcc_apply_worker::{ApplyWorkerState, MvccApplyWorker},
+    mvcc_gc_coordinator::MvccGarbageCollectionCoordinator,
     mvcc_node_runtime::MvccNodeRuntime,
     mvcc_open_transactions::OpenTransactionRegistry,
     mvcc_store::LocalMvccStore,
@@ -40,7 +41,8 @@ use crate::{
     },
     services::{
         consensus_transport::{
-            ConsensusConnectionAuthorizer, ConsensusTransportService, TonicConsensusRpcFactory,
+            ConsensusConnectionAuthorizer, ConsensusTransportService, LocalGcSafetyReport,
+            TonicConsensusRpcFactory,
         },
         replication::{ReplicationConnectionAuthorizer, ReplicationServiceImpl},
     },
@@ -332,6 +334,8 @@ pub struct MvccSubsystem {
     durability_upgrade_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     outbox_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     assignment_reconciler_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    gc_shutdown: tokio::sync::watch::Sender<bool>,
+    gc_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl fmt::Debug for MvccSubsystem {
@@ -346,6 +350,7 @@ impl fmt::Debug for MvccSubsystem {
 impl Drop for MvccSubsystem {
     fn drop(&mut self) {
         let _ = self.apply_shutdown.send(true);
+        let _ = self.gc_shutdown.send(true);
     }
 }
 
@@ -437,6 +442,7 @@ impl MvccSubsystem {
             )?;
         }
         let token = config.mvcc_node_token()?;
+        let applied_watermark_report = LocalGcSafetyReport::default();
         let raft_network = Arc::new(TonicConsensusRpcFactory::new(
             config.mvcc_cluster_id.clone(),
             NodeId(config.mvcc_raft_node_id),
@@ -444,6 +450,7 @@ impl MvccSubsystem {
             token.clone(),
             Duration::from_millis(config.mvcc_rpc_timeout_ms),
         ));
+        let applied_reports = raft_network.applied_reports();
         let consensus = Arc::new(
             OpenRaftConsensus::new(
                 NodeId(config.mvcc_raft_node_id),
@@ -614,8 +621,12 @@ impl MvccSubsystem {
             config.allow_test_only_insecure_mvcc_transport,
             consensus.clone(),
         );
-        let consensus_service =
-            ConsensusTransportService::new(consensus.clone(), authorizer.clone());
+        let consensus_service = ConsensusTransportService::new(consensus.clone(), authorizer.clone())
+            .with_applied_watermark_report(
+                NodeId(config.mvcc_raft_node_id),
+                config.mvcc_node_incarnation,
+                applied_watermark_report.clone(),
+            );
         let replication_service =
             ReplicationServiceImpl::open(authorizer, &paths.replication_inbox)?;
         let remote_nodes = peers
@@ -639,6 +650,18 @@ impl MvccSubsystem {
         let apply_worker_state = worker.state_handle();
         let (apply_shutdown, apply_shutdown_rx) = tokio::sync::watch::channel(false);
         let apply_task = tokio::spawn(worker.run(apply_shutdown_rx));
+        let gc_coordinator = MvccGarbageCollectionCoordinator::new(
+            config.mvcc_cluster_id.clone(),
+            NodeId(config.mvcc_raft_node_id),
+            consensus.clone(),
+            open_transactions.clone(),
+            runtime.local_store().clone(),
+            applied_reports,
+            applied_watermark_report.clone(),
+            Duration::from_secs(1),
+        )?;
+        let (gc_shutdown, gc_shutdown_rx) = tokio::sync::watch::channel(false);
+        let gc_task = tokio::spawn(gc_coordinator.run(gc_shutdown_rx));
 
         Ok(Self {
             consensus,
@@ -665,6 +688,8 @@ impl MvccSubsystem {
             durability_upgrade_task: Mutex::new(None),
             outbox_task: Mutex::new(None),
             assignment_reconciler_task: Mutex::new(None),
+            gc_shutdown,
+            gc_task: Mutex::new(Some(gc_task)),
         })
     }
 
@@ -792,8 +817,13 @@ impl MvccSubsystem {
 
     pub async fn shutdown(&self) {
         let _ = self.apply_shutdown.send(true);
+        let _ = self.gc_shutdown.send(true);
         let task = self.apply_task.lock().ok().and_then(|mut task| task.take());
         if let Some(task) = task {
+            let _ = task.await;
+        }
+        let gc_task = self.gc_task.lock().ok().and_then(|mut task| task.take());
+        if let Some(task) = gc_task {
             let _ = task.await;
         }
         let object_task = self

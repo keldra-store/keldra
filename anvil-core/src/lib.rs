@@ -97,6 +97,7 @@ pub mod mvcc_fault_injection;
 #[cfg(test)]
 mod mvcc_process_crash_acceptance;
 pub mod mvcc_gc;
+pub mod mvcc_gc_coordinator;
 pub mod mvcc_local_durability_upgrade;
 pub mod mvcc_node_runtime;
 #[cfg(test)]

@@ -589,6 +589,14 @@ pub fn record_mvcc_gc(watermark: u64, reclaimed_bytes: u64, duration: Duration) 
     record_histogram_duration_ms("anvil_mvcc_gc_duration_ms", &[("status", "ok")], duration);
 }
 
+pub fn record_gc_coordination(status: &str, duration: Duration) {
+    record_histogram_duration_ms(
+        "anvil_mvcc_gc_coordination_duration_ms",
+        &[("status", status)],
+        duration,
+    );
+}
+
 pub fn record_shard_gc(reclaimed_bytes: u64, duration: Duration) {
     if reclaimed_bytes > 0 {
         record_bytes_counter("anvil_shard_gc_bytes_total", &[], reclaimed_bytes);
