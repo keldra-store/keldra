@@ -239,6 +239,7 @@ async fn seeded_remote_bucket_locator_only(
         MeshControlWriteAuthority {
             permit: &ready.write_permit().unwrap(),
             signing_key: &signing_key,
+            mvcc: None,
         },
     )
     .await

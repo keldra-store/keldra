@@ -69,6 +69,7 @@ async fn write_remote_bucket_locator_for_node0(
         MeshControlWriteAuthority {
             permit: &ready.write_permit().unwrap(),
             signing_key: &signing_key,
+            mvcc: None,
         },
     )
     .await

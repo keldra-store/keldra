@@ -155,10 +155,12 @@ impl Persistence {
         let tenant_name_authority = mesh_directory::MeshControlWriteAuthority {
             permit: &tenant_name_permit,
             signing_key: &self.partition_owner_signing_key,
+            mvcc: Some(self.mvcc()?),
         };
         let tenant_locator_authority = mesh_directory::MeshControlWriteAuthority {
             permit: &tenant_locator_permit,
             signing_key: &self.partition_owner_signing_key,
+            mvcc: Some(self.mvcc()?),
         };
         let reserved = mesh_directory::reserve_tenant_name(
             &self.storage,
@@ -222,6 +224,7 @@ impl Persistence {
             mesh_directory::MeshControlWriteAuthority {
                 permit: &permit,
                 signing_key: &self.partition_owner_signing_key,
+                mvcc: Some(self.mvcc()?),
             },
         )
         .await?;
@@ -584,6 +587,7 @@ impl Persistence {
             mesh_directory::MeshControlWriteAuthority {
                 permit: &permit,
                 signing_key: &self.partition_owner_signing_key,
+                mvcc: Some(self.mvcc()?),
             },
         )
         .await?;

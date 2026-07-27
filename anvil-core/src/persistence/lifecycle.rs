@@ -689,6 +689,7 @@ impl Persistence {
             mesh_directory::MeshControlWriteAuthority {
                 permit: &permit,
                 signing_key: &self.partition_owner_signing_key,
+                mvcc: Some(self.lifecycle_mvcc()?),
             },
         )
         .await
@@ -736,6 +737,7 @@ impl Persistence {
             mesh_directory::MeshControlWriteAuthority {
                 permit: &permit,
                 signing_key: &self.partition_owner_signing_key,
+                mvcc: Some(self.lifecycle_mvcc()?),
             },
         )
         .await

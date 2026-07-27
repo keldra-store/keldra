@@ -107,6 +107,17 @@ struct RoutingRecordSource {
 pub struct MeshControlWriteAuthority<'a> {
     pub permit: &'a PartitionWritePermit,
     pub signing_key: &'a [u8],
+    /// Authoritative production storage. `None` is retained only for legacy
+    /// CoreStore test fixtures.
+    pub mvcc: Option<&'a crate::mvcc_bootstrap::MvccSubsystem>,
+}
+
+const ROUTING_CONTROL_HEAD_KIND: &str = "routing_control_head";
+
+#[derive(Serialize, Deserialize)]
+struct RoutingControlHead {
+    next_sequence: u64,
+    next_byte_offset: u64,
 }
 
 pub fn control_partition_id(stream_family: &str, partition: &str) -> String {
@@ -843,6 +854,7 @@ pub async fn write_host_alias_descriptor(
     descriptor: &routing::HostAliasDescriptor,
     authority: MeshControlWriteAuthority<'_>,
 ) -> MeshDirectoryResult<()> {
+    let committed_in_mvcc = authority.mvcc.is_some();
     let hostname = routing::normalize_alias_hostname(&descriptor.hostname).map_err(|_| {
         MeshDirectoryError::InvalidIdentifier {
             field: "hostname",
@@ -850,7 +862,14 @@ pub async fn write_host_alias_descriptor(
         }
     })?;
     let partition = host_alias_partition(&hostname)?;
-    if let Some(existing) = read_host_alias_descriptor(storage, &hostname).await?
+    let existing = read_typed_routing_descriptor_for_authority(
+        storage,
+        RoutingRecordFamily::HostAlias,
+        &hostname,
+        authority,
+    )
+    .await?;
+    if let Some(existing) = existing
         && existing == *descriptor
     {
         return Ok(());
@@ -871,6 +890,9 @@ pub async fn write_host_alias_descriptor(
         authority,
     )
     .await?;
+    if committed_in_mvcc {
+        return Ok(());
+    }
     write_descriptor(storage, &host_alias_descriptor_key(&hostname)?, descriptor).await
 }
 
@@ -953,29 +975,88 @@ async fn append_control_mutation<T: StoredRoutingRecord>(
             reason: "permit partition id does not match control stream partition".to_string(),
         });
     }
-    let partition_precondition = partition_fence::partition_write_precondition(
-        storage,
-        authority.permit,
-        authority.signing_key,
-    )
-    .await
-    .map_err(|rejection| MeshDirectoryError::ControlFenceRejected {
-        stream_family: stream_family.to_string(),
-        partition: partition.to_string(),
-        code: rejection.code.as_str(),
-        reason: rejection.reason,
-    })?;
+    let (partition_precondition, mvcc_fence) = if let Some(mvcc) = authority.mvcc {
+        let predicate = partition_fence::partition_write_predicate_mvcc(
+            mvcc,
+            authority.permit,
+            authority.signing_key,
+        )
+        .map_err(|rejection| MeshDirectoryError::ControlFenceRejected {
+            stream_family: stream_family.to_string(),
+            partition: partition.to_string(),
+            code: rejection.code.as_str(),
+            reason: rejection.reason,
+        })?;
+        (None, Some(predicate))
+    } else {
+        let precondition = partition_fence::partition_write_precondition(
+            storage,
+            authority.permit,
+            authority.signing_key,
+        )
+        .await
+        .map_err(|rejection| MeshDirectoryError::ControlFenceRejected {
+            stream_family: stream_family.to_string(),
+            partition: partition.to_string(),
+            code: rejection.code.as_str(),
+            reason: rejection.reason,
+        })?;
+        (Some(precondition), None)
+    };
 
-    let cursor =
-        mesh_control_stream::control_stream_append_cursor(storage, stream_family, partition)
-            .await
-            .map_err(|err| MeshDirectoryError::ControlStreamWrite {
-                stream_family: stream_family.to_string(),
-                partition: partition.to_string(),
-                message: format!("{err:#}"),
-            })?;
+    let head_tuple_key = core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8(ROUTING_CONTROL_HEAD_KIND),
+        CoreMetaTuplePart::Utf8(stream_family),
+        CoreMetaTuplePart::Utf8(partition),
+    ])?;
+    let (cursor, current_head) = if let Some(mvcc) = authority.mvcc {
+        let key = crate::mvcc_product::coremeta_logical_key(
+            CF_MESH,
+            TABLE_MESH_PARTITION_ROW,
+            &head_tuple_key,
+        )?;
+        let current = mvcc.read_latest_value(&key)?;
+        let head = current
+            .as_deref()
+            .map(serde_json::from_slice::<RoutingControlHead>)
+            .transpose()
+            .map_err(|error| MeshDirectoryError::Other(error.into()))?
+            .unwrap_or(RoutingControlHead {
+                next_sequence: 1,
+                next_byte_offset: 0,
+            });
+        (
+            mesh_control_stream::ControlStreamAppendCursor {
+                sequence: mesh_control_stream::ControlStreamSequence::new(head.next_sequence)
+                    .map_err(|error| MeshDirectoryError::ControlStreamWrite {
+                        stream_family: stream_family.to_string(),
+                        partition: partition.to_string(),
+                        message: error.to_string(),
+                    })?,
+                byte_offset: head.next_byte_offset,
+            },
+            current,
+        )
+    } else {
+        (
+            mesh_control_stream::control_stream_append_cursor(storage, stream_family, partition)
+                .await
+                .map_err(|err| MeshDirectoryError::ControlStreamWrite {
+                    stream_family: stream_family.to_string(),
+                    partition: partition.to_string(),
+                    message: format!("{err:#}"),
+                })?,
+            None,
+        )
+    };
     let payload_proto = payload.encode_routing_payload_proto()?;
     let digest = ControlRecordDigest::blake3(&payload_proto);
+    let stable_idempotency = idempotency_key.map(str::to_string).unwrap_or_else(|| {
+        format!(
+            "routing:{stream_family}:{partition}:{record_key}:{operation}:{new_generation}:{}",
+            digest
+        )
+    });
     let created_at = Utc::now().to_rfc3339();
     let mesh_id = payload.routing_mesh_id();
     let header_proto =
@@ -991,18 +1072,130 @@ async fn append_control_mutation<T: StoredRoutingRecord>(
             new_generation,
             writer_node_id: authority.permit.owner_node_id.as_str(),
             writer_fence: authority.permit.fence_token,
-            idempotency_key,
+            idempotency_key: Some(&stable_idempotency),
             record_digest: &digest,
             created_at: &created_at,
             byte_offset: cursor.byte_offset,
         });
     let frame = ControlStreamFrame::new(header_proto, payload_proto);
+    if let Some(mvcc) = authority.mvcc {
+        let descriptor_key = routing_record_descriptor_key_for_key(family, record_key)?;
+        let projection_tuple_key = routing_projection_row_key(family, record_key)?;
+        let projection_key = crate::mvcc_product::coremeta_logical_key(
+            CF_MESH,
+            TABLE_MESH_PARTITION_ROW,
+            &projection_tuple_key,
+        )?;
+        let current_projection = mvcc.read_latest_value(&projection_key)?;
+        let projection_payload =
+            record_proto::encode_routing_projection_row(&descriptor_key, payload)?;
+        let encoded_len = u64::try_from(frame.encoded_len().map_err(|error| {
+            MeshDirectoryError::ControlStreamWrite {
+                stream_family: stream_family.to_string(),
+                partition: partition.to_string(),
+                message: error.to_string(),
+            }
+        })?)
+        .map_err(|error| MeshDirectoryError::Other(error.into()))?;
+        let next_sequence = cursor.sequence.get().checked_add(1).ok_or_else(|| {
+            MeshDirectoryError::ControlStreamWrite {
+                stream_family: stream_family.to_string(),
+                partition: partition.to_string(),
+                message: "control stream sequence overflow".to_string(),
+            }
+        })?;
+        let next_byte_offset = cursor.byte_offset.checked_add(encoded_len).ok_or_else(|| {
+            MeshDirectoryError::ControlStreamWrite {
+                stream_family: stream_family.to_string(),
+                partition: partition.to_string(),
+                message: "control stream byte offset overflow".to_string(),
+            }
+        })?;
+        let prepared = mesh_control_stream::prepare_control_stream_append_at_cursor(
+            stream_family,
+            partition,
+            &frame,
+            None,
+            MESH_DIRECTORY_PROJECTION_PARTITION_ID,
+            cursor,
+            None,
+        )
+        .await
+        .map_err(|err| MeshDirectoryError::ControlStreamWrite {
+            stream_family: stream_family.to_string(),
+            partition: partition.to_string(),
+            message: format!("{err:#}"),
+        })?;
+        let mut operations = prepared.operations;
+        operations.push(CoreMutationOperation::CoreMetaPut {
+            partition_id: MESH_DIRECTORY_PROJECTION_PARTITION_ID.to_string(),
+            cf: CF_MESH.to_string(),
+            table_id: TABLE_MESH_PARTITION_ROW,
+            tuple_key: projection_tuple_key,
+            payload: projection_payload,
+        });
+        operations.push(CoreMutationOperation::CoreMetaPut {
+            partition_id: MESH_DIRECTORY_PROJECTION_PARTITION_ID.to_string(),
+            cf: CF_MESH.to_string(),
+            table_id: TABLE_MESH_PARTITION_ROW,
+            tuple_key: head_tuple_key.clone(),
+            payload: serde_json::to_vec(&RoutingControlHead {
+                next_sequence,
+                next_byte_offset,
+            })
+            .map_err(|error| MeshDirectoryError::Other(error.into()))?,
+        });
+        let mut plan =
+            crate::mvcc_product::product_mutations_and_outbox_from_operations(operations)?;
+        plan.predicates.push((
+            projection_key,
+            current_projection
+                .as_ref()
+                .map(|value| {
+                    crate::mvcc_transaction::PredicateKind::ValueHash(
+                        *blake3::hash(value).as_bytes(),
+                    )
+                })
+                .unwrap_or(crate::mvcc_transaction::PredicateKind::Absent),
+        ));
+        let head_key = crate::mvcc_product::coremeta_logical_key(
+            CF_MESH,
+            TABLE_MESH_PARTITION_ROW,
+            &head_tuple_key,
+        )?;
+        plan.predicates.push((
+            head_key,
+            current_head
+                .as_ref()
+                .map(|value| {
+                    crate::mvcc_transaction::PredicateKind::ValueHash(
+                        *blake3::hash(value).as_bytes(),
+                    )
+                })
+                .unwrap_or(crate::mvcc_transaction::PredicateKind::Absent),
+        ));
+        if let Some(predicate) = mvcc_fence {
+            plan.predicates.push(predicate);
+        }
+        mvcc.autocommit_product_mutations_with_predicates_and_outbox(
+            &format!("partition-owner:{}", authority.permit.owner_node_id),
+            &stable_idempotency,
+            plan.mutations,
+            plan.predicates,
+            plan.outbox_events,
+            crate::mvcc_transaction::DurabilityLevel::Quorum,
+            Utc::now().timestamp_millis().max(0) as u64,
+        )
+        .await
+        .map_err(MeshDirectoryError::Other)?;
+        return Ok(());
+    }
     mesh_control_stream::append_control_stream_frame(
         storage,
         stream_family,
         partition,
         &frame,
-        Some(partition_precondition),
+        partition_precondition,
     )
     .await
     .map_err(|err| MeshDirectoryError::ControlStreamWrite {
@@ -1018,6 +1211,7 @@ pub async fn reserve_tenant_name(
     descriptor: &TenantNameDescriptor,
     authority: MeshControlWriteAuthority<'_>,
 ) -> MeshDirectoryResult<TenantNameDescriptor> {
+    let committed_in_mvcc = authority.mvcc.is_some();
     if descriptor.status != TenantNameStatus::Reserved {
         return Err(MeshDirectoryError::InvalidState {
             descriptor_key: descriptor.descriptor_key(),
@@ -1042,7 +1236,14 @@ pub async fn reserve_tenant_name(
         });
     }
 
-    if let Some(existing) = read_tenant_name_descriptor(storage, &descriptor.tenant_name).await? {
+    if let Some(existing) = read_typed_routing_descriptor_for_authority(
+        storage,
+        RoutingRecordFamily::TenantName,
+        descriptor.tenant_name.as_str(),
+        authority,
+    )
+    .await?
+    {
         if existing.tenant_id == descriptor.tenant_id
             && (existing.status == TenantNameStatus::Active
                 || existing.idempotency_key == descriptor.idempotency_key)
@@ -1067,7 +1268,9 @@ pub async fn reserve_tenant_name(
         authority,
     )
     .await?;
-    create_descriptor(storage, &descriptor.descriptor_key(), descriptor).await?;
+    if !committed_in_mvcc {
+        create_descriptor(storage, &descriptor.descriptor_key(), descriptor).await?;
+    }
     Ok(descriptor.clone())
 }
 
@@ -1076,7 +1279,15 @@ pub async fn create_tenant_locator(
     locator: &TenantLocatorDescriptor,
     authority: MeshControlWriteAuthority<'_>,
 ) -> MeshDirectoryResult<TenantLocatorDescriptor> {
-    if let Some(existing) = read_tenant_locator_descriptor(storage, &locator.tenant_id).await? {
+    let committed_in_mvcc = authority.mvcc.is_some();
+    if let Some(existing) = read_typed_routing_descriptor_for_authority(
+        storage,
+        RoutingRecordFamily::TenantLocator,
+        locator.tenant_id.as_str(),
+        authority,
+    )
+    .await?
+    {
         if existing.tenant_id == locator.tenant_id
             && existing.tenant_name == locator.tenant_name
             && existing.home_region == locator.home_region
@@ -1103,7 +1314,9 @@ pub async fn create_tenant_locator(
         authority,
     )
     .await?;
-    create_descriptor(storage, &locator.descriptor_key(), locator).await?;
+    if !committed_in_mvcc {
+        create_descriptor(storage, &locator.descriptor_key(), locator).await?;
+    }
     Ok(locator.clone())
 }
 
@@ -1115,10 +1328,16 @@ pub async fn activate_tenant_name(
     now: impl Into<String>,
     authority: MeshControlWriteAuthority<'_>,
 ) -> MeshDirectoryResult<TenantNameDescriptor> {
+    let committed_in_mvcc = authority.mvcc.is_some();
     let now = now.into();
-    let existing = read_tenant_name_descriptor(storage, tenant_name)
-        .await?
-        .ok_or_else(|| MeshDirectoryError::NotFound(tenant_name.descriptor_key()))?;
+    let existing = read_typed_routing_descriptor_for_authority(
+        storage,
+        RoutingRecordFamily::TenantName,
+        tenant_name.as_str(),
+        authority,
+    )
+    .await?
+    .ok_or_else(|| MeshDirectoryError::NotFound(tenant_name.descriptor_key()))?;
     if existing.tenant_id != *tenant_id {
         return Err(MeshDirectoryError::TenantNameAlreadyExists {
             tenant_name: tenant_name.as_str().to_string(),
@@ -1154,7 +1373,9 @@ pub async fn activate_tenant_name(
         authority,
     )
     .await?;
-    write_descriptor(storage, &active.descriptor_key(), &active).await?;
+    if !committed_in_mvcc {
+        write_descriptor(storage, &active.descriptor_key(), &active).await?;
+    }
     Ok(active)
 }
 
@@ -1165,9 +1386,15 @@ pub async fn tombstone_tenant_name(
     now: impl Into<String>,
     authority: MeshControlWriteAuthority<'_>,
 ) -> MeshDirectoryResult<TenantNameDescriptor> {
-    let existing = read_tenant_name_descriptor(storage, tenant_name)
-        .await?
-        .ok_or_else(|| MeshDirectoryError::NotFound(tenant_name.descriptor_key()))?;
+    let committed_in_mvcc = authority.mvcc.is_some();
+    let existing = read_typed_routing_descriptor_for_authority(
+        storage,
+        RoutingRecordFamily::TenantName,
+        tenant_name.as_str(),
+        authority,
+    )
+    .await?
+    .ok_or_else(|| MeshDirectoryError::NotFound(tenant_name.descriptor_key()))?;
     if existing.generation != expected_generation {
         return Err(MeshDirectoryError::GenerationConflict {
             descriptor_key: existing.descriptor_key(),
@@ -1189,7 +1416,9 @@ pub async fn tombstone_tenant_name(
         authority,
     )
     .await?;
-    write_descriptor(storage, &tombstone.descriptor_key(), &tombstone).await?;
+    if !committed_in_mvcc {
+        write_descriptor(storage, &tombstone.descriptor_key(), &tombstone).await?;
+    }
     Ok(tombstone)
 }
 
@@ -1245,7 +1474,20 @@ pub async fn write_bucket_locator(
     locator: &BucketLocatorDescriptor,
     authority: MeshControlWriteAuthority<'_>,
 ) -> MeshDirectoryResult<()> {
-    if let Some(existing) = read_bucket_locator(storage, &locator.key()).await? {
+    let committed_in_mvcc = authority.mvcc.is_some();
+    let locator_record_key = format!(
+        "{}/{}",
+        locator.tenant_id.as_str(),
+        locator.bucket_name.as_str()
+    );
+    if let Some(existing) = read_typed_routing_descriptor_for_authority(
+        storage,
+        RoutingRecordFamily::BucketLocator,
+        &locator_record_key,
+        authority,
+    )
+    .await?
+    {
         if existing == *locator {
             return Ok(());
         }
@@ -1262,11 +1504,7 @@ pub async fn write_bucket_locator(
         storage,
         RoutingRecordFamily::BucketLocator,
         &locator.partition(),
-        &format!(
-            "{}/{}",
-            locator.tenant_id.as_str(),
-            locator.bucket_name.as_str()
-        ),
+        &locator_record_key,
         "upsert",
         locator
             .generation
@@ -1278,6 +1516,9 @@ pub async fn write_bucket_locator(
         authority,
     )
     .await?;
+    if committed_in_mvcc {
+        return Ok(());
+    }
     write_descriptor(storage, &locator.descriptor_key(), locator).await
 }
 
@@ -1489,6 +1730,35 @@ async fn read_typed_routing_descriptor<T: DecodeRoutingRecord + StoredRoutingRec
     let descriptor_key = routing_record_descriptor_key_for_key(family, record_key)?;
     let Some(payload_proto) =
         read_descriptor_projection_payload_proto(storage, &descriptor_key).await?
+    else {
+        return Ok(None);
+    };
+    let descriptor: T = record_proto::decode_typed_routing_descriptor(&payload_proto)?;
+    if descriptor.routing_record_key() != record_key {
+        return Err(MeshDirectoryError::InvalidIdentifier {
+            field: "routing record protobuf record key",
+            value: format!(
+                "expected {record_key}, got {}",
+                descriptor.routing_record_key()
+            ),
+        });
+    }
+    Ok(Some(descriptor))
+}
+
+async fn read_typed_routing_descriptor_for_authority<
+    T: DecodeRoutingRecord + StoredRoutingRecord,
+>(
+    storage: &Storage,
+    family: RoutingRecordFamily,
+    record_key: &str,
+    authority: MeshControlWriteAuthority<'_>,
+) -> MeshDirectoryResult<Option<T>> {
+    let Some(mvcc) = authority.mvcc else {
+        return read_typed_routing_descriptor(storage, family, record_key).await;
+    };
+    let descriptor_key = routing_record_descriptor_key_for_key(family, record_key)?;
+    let Some(payload_proto) = read_descriptor_projection_payload_proto_mvcc(mvcc, &descriptor_key)?
     else {
         return Ok(None);
     };

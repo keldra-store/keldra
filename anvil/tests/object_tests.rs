@@ -170,6 +170,7 @@ async fn native_object_routes_use_mesh_locator_before_local_bucket_metadata() {
         MeshControlWriteAuthority {
             permit: &ready.write_permit().unwrap(),
             signing_key: &signing_key,
+            mvcc: None,
         },
     )
     .await

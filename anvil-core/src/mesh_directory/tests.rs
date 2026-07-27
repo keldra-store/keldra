@@ -67,6 +67,7 @@ fn authority(permit: &PartitionWritePermit) -> MeshControlWriteAuthority<'_> {
     MeshControlWriteAuthority {
         permit,
         signing_key: TEST_SIGNING_KEY,
+        mvcc: None,
     }
 }
 
