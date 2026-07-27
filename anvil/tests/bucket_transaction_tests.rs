@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::transaction_service_client::TransactionServiceClient;
 use anvil::anvil_api::{
