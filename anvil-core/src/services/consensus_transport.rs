@@ -884,6 +884,21 @@ mod tests {
                 "timed out waiting for node one leadership"
             );
         }
+        for id in 1..=3 {
+            first
+                .install_node(
+                    HASH,
+                    NodeIncarnation {
+                        node_id: NodeId(id),
+                        incarnation: 1,
+                    },
+                    NodeId(id),
+                    format!("zone-{id}"),
+                )
+                .await
+                .unwrap();
+        }
+        first.set_durability_policy(HASH, 1, 2, 1).await.unwrap();
 
         let (left, right) = tokio::join!(
             first.certify(command(1, HASH)),

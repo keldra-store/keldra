@@ -1305,8 +1305,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn replacing_incarnation_removes_stale_replication_ack_route() {
+    #[tokio::test]
+    async fn replacing_incarnation_removes_stale_replication_ack_route() {
         let stale = NodeIncarnation {
             node_id: "node-b".into(),
             incarnation: 1,

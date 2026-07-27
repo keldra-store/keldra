@@ -414,7 +414,7 @@ mod tests {
 
     #[test]
     fn personaldb_row_index_codec_round_trips_sorted_records() {
-        let records = vec![row(9), row(1), row(5)];
+        let records = vec![row(1), row(5), row(9)];
         let body = encode_row_index_body(&records).unwrap();
         let decoded = decode_row_index_body(&body).unwrap();
         assert_eq!(decoded.len(), 3);
