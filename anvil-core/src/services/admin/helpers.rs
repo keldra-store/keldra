@@ -1927,9 +1927,22 @@ pub(super) async fn routing_config_for_region(
         .await
         .map_err(lifecycle_status)?
         .into_iter()
-        .find(|region| region.region == region_name)
-        .ok_or_else(|| Status::not_found("Region not found"))?;
-    let base_domain = base_domain_from_region_suffix(&region.region, &region.virtual_host_suffix)?;
+        .find(|region| region.region == region_name);
+    let base_domain = if let Some(region) = region {
+        base_domain_from_region_suffix(&region.region, &region.virtual_host_suffix)?
+    } else if state.config.region == region_name
+        && state
+            .persistence
+            .list_regions()
+            .await
+            .map_err(|err| Status::internal(err.to_string()))?
+            .iter()
+            .any(|region| region == region_name)
+    {
+        "anvil-storage.com".to_string()
+    } else {
+        return Err(Status::not_found("Region not found"));
+    };
     RoutingConfig::new(base_domain).map_err(|err| Status::invalid_argument(err.to_string()))
 }
 
