@@ -326,7 +326,6 @@ pub(crate) struct BucketMvccMutationPlan {
     pub outbox_events: Vec<crate::mvcc_outbox::StreamOutboxEvent>,
     pub allocated_bucket_id: i64,
     pub collection_revision: u64,
-    assignment_identity: String,
 }
 
 impl BucketMvccMutationPlan {
@@ -355,14 +354,6 @@ impl BucketMvccMutationPlan {
         for (key, kind) in self.predicates {
             mvcc.stage_predicate(transaction_id, principal, key, kind, now_unix_ms)?;
         }
-        stage_bucket_assignment_guard(
-            mvcc,
-            &self.assignment_identity,
-            transaction_id,
-            principal,
-            now_unix_ms,
-        )
-        .await?;
         Ok((self.allocated_bucket_id, self.collection_revision))
     }
 
@@ -409,14 +400,6 @@ impl BucketMvccMutationPlan {
                     now_unix_ms,
                 )?;
             }
-            stage_bucket_assignment_guard(
-                mvcc,
-                &self.assignment_identity,
-                &handle.transaction_id,
-                principal,
-                now_unix_ms,
-            )
-            .await?;
         }
         let outcome = mvcc
             .open_transactions
@@ -434,20 +417,6 @@ impl BucketMvccMutationPlan {
         }
         Ok((allocated_bucket_id, collection_revision))
     }
-}
-
-async fn stage_bucket_assignment_guard(
-    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
-    assignment_identity: &str,
-    transaction_id: &str,
-    principal: &str,
-    now_unix_ms: u64,
-) -> Result<()> {
-    let assignment = mvcc
-        .reconcile_work_assignment("bucket-metadata", assignment_identity)
-        .await?
-        .ok_or_else(|| anyhow!("this node does not own the bucket metadata assignment"))?;
-    mvcc.stage_assignment_guard(transaction_id, principal, &assignment, now_unix_ms)
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -824,7 +793,6 @@ fn build_bucket_mvcc_mutation_plan_with_transaction(
         outbox_events: plan.outbox_events,
         allocated_bucket_id,
         collection_revision,
-        assignment_identity: projected_bucket.tenant_id.to_string(),
     })
 }
 
