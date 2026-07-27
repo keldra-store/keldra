@@ -69,6 +69,8 @@ pub enum ConsensusRpcKind {
     AppendEntries,
     Vote,
     InstallSnapshot,
+    ForwardCertify,
+    ForwardLinearizedRead,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -370,6 +372,7 @@ pub(crate) fn stores(
 pub struct OpenRaftConsensus {
     raft: openraft::Raft<AnvilRaftConfig>,
     store: RocksRaftStore,
+    network: Arc<dyn ConsensusRpcFactory>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -381,6 +384,57 @@ pub struct AppliedControlSnapshot {
 }
 
 impl OpenRaftConsensus {
+    async fn request_current_leader(
+        &self,
+        kind: ConsensusRpcKind,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, ConsensusError> {
+        // Leadership may change between observing metrics and opening the
+        // stream. Retrying from fresh metrics lets any cluster node remain a
+        // transaction coordinator without making followers consensus leaders.
+        let mut last_error = None;
+        for _ in 0..3 {
+            let (leader, node) = {
+                let metrics = self.raft.metrics();
+                let metrics = metrics.borrow();
+                let leader = metrics.current_leader.ok_or_else(|| {
+                    ConsensusError::Unavailable("consensus leader is not yet known".into())
+                })?;
+                let node = metrics
+                    .membership_config
+                    .membership()
+                    .get_node(&leader)
+                    .cloned()
+                    .ok_or_else(|| {
+                        ConsensusError::Unavailable(format!(
+                            "consensus leader {leader} is absent from membership"
+                        ))
+                    })?;
+                (leader, node)
+            };
+            if leader == self.raft.metrics().borrow().id {
+                return Err(ConsensusError::ForwardToLeader);
+            }
+            let descriptor = ConsensusNode { address: node.addr };
+            let mut client = self.network.client(NodeId(leader), &descriptor);
+            match client
+                .request(ConsensusRpc {
+                    schema_version: 1,
+                    kind,
+                    payload: payload.clone(),
+                })
+                .await
+            {
+                Ok(response) => return Ok(response),
+                Err(error) => last_error = Some(error.to_string()),
+            }
+            tokio::task::yield_now().await;
+        }
+        Err(ConsensusError::Unavailable(last_error.unwrap_or_else(
+            || "consensus leader forwarding failed".into(),
+        )))
+    }
+
     pub fn applied_control_snapshot(&self) -> Result<AppliedControlSnapshot, ConsensusError> {
         let state = self
             .store
@@ -468,6 +522,38 @@ impl OpenRaftConsensus {
                 "control command produced an unexpected response".into(),
             )),
         }
+    }
+
+    async fn certify_locally(
+        &self,
+        command: CertifyTransaction,
+    ) -> Result<CertificationResult, ConsensusError> {
+        ConsensusCommand::Certify(command.clone())
+            .validate_section9_boundary()
+            .map_err(|reason| ConsensusError::Rejected(reason.into()))?;
+        let response = self
+            .raft
+            .client_write(ConsensusCommand::Certify(command))
+            .await
+            .map_err(map_raft_error)?;
+        match response.data {
+            RaftApplyResult::Certification(result) => Ok(result),
+            RaftApplyResult::Rejected(reason) => Err(ConsensusError::Rejected(reason)),
+            RaftApplyResult::Control(_) => Err(ConsensusError::Rejected(
+                "certification produced a control response".into(),
+            )),
+            RaftApplyResult::Noop => Err(ConsensusError::Rejected(
+                "certification produced a non-application response".into(),
+            )),
+        }
+    }
+
+    async fn linearized_read_barrier_locally(&self) -> Result<CommitVersion, ConsensusError> {
+        self.raft
+            .ensure_linearizable()
+            .await
+            .map(|log_id| CommitVersion(log_id.map_or(0, |id| id.index)))
+            .map_err(map_raft_error)
     }
 
     pub async fn install_node(
@@ -581,6 +667,21 @@ impl OpenRaftConsensus {
                 let request: InstallSnapshotRequest<AnvilRaftConfig> = decode_rpc(&rpc.payload)?;
                 encode_rpc(&self.raft.install_snapshot(request).await)
             }
+            ConsensusRpcKind::ForwardCertify => {
+                let command: CertifyTransaction = decode_rpc(&rpc.payload)?;
+                let response = self
+                    .certify_locally(command)
+                    .await
+                    .map_err(|error| ConsensusRpcError::Protocol(error.to_string()))?;
+                encode_rpc(&response)
+            }
+            ConsensusRpcKind::ForwardLinearizedRead => {
+                let response = self
+                    .linearized_read_barrier_locally()
+                    .await
+                    .map_err(|error| ConsensusRpcError::Protocol(error.to_string()))?;
+                encode_rpc(&response)
+            }
         }
     }
 
@@ -627,7 +728,9 @@ impl OpenRaftConsensus {
         let raft = openraft::Raft::new(
             node_id.0,
             Arc::new(config),
-            NetworkFactoryAdapter { inner: network },
+            NetworkFactoryAdapter {
+                inner: network.clone(),
+            },
             log_store,
             state_machine,
         )
@@ -636,6 +739,7 @@ impl OpenRaftConsensus {
         Ok(Self {
             raft,
             store: runtime_store,
+            network,
         })
     }
 
@@ -720,32 +824,51 @@ impl Consensus for OpenRaftConsensus {
         &self,
         command: CertifyTransaction,
     ) -> Result<CertificationResult, ConsensusError> {
-        ConsensusCommand::Certify(command.clone())
-            .validate_section9_boundary()
-            .map_err(|reason| ConsensusError::Rejected(reason.into()))?;
-        let response = self
-            .raft
-            .client_write(ConsensusCommand::Certify(command))
-            .await
-            .map_err(map_raft_error)?;
-        match response.data {
-            RaftApplyResult::Certification(result) => Ok(result),
-            RaftApplyResult::Rejected(reason) => Err(ConsensusError::Rejected(reason)),
-            RaftApplyResult::Control(_) => Err(ConsensusError::Rejected(
-                "certification produced a control response".into(),
-            )),
-            RaftApplyResult::Noop => Err(ConsensusError::Rejected(
-                "certification produced a non-application response".into(),
-            )),
+        match self.certify_locally(command.clone()).await {
+            Ok(result) => Ok(result),
+            Err(ConsensusError::ForwardToLeader) => {
+                let payload = encode_rpc(&command)
+                    .map_err(|error| ConsensusError::Unavailable(error.to_string()))?;
+                let response = match self
+                    .request_current_leader(ConsensusRpcKind::ForwardCertify, payload)
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(ConsensusError::ForwardToLeader) => {
+                        return self.certify_locally(command).await;
+                    }
+                    Err(error) => return Err(error),
+                };
+                decode_rpc(&response)
+                    .map_err(|error| ConsensusError::Unavailable(error.to_string()))
+            }
+            Err(error) => Err(error),
         }
     }
 
     async fn linearized_read_barrier(&self) -> Result<CommitVersion, ConsensusError> {
-        self.raft
-            .ensure_linearizable()
-            .await
-            .map(|log_id| CommitVersion(log_id.map_or(0, |id| id.index)))
-            .map_err(map_raft_error)
+        match self.linearized_read_barrier_locally().await {
+            Ok(version) => Ok(version),
+            Err(ConsensusError::ForwardToLeader) => {
+                let response = match self
+                    .request_current_leader(
+                        ConsensusRpcKind::ForwardLinearizedRead,
+                        encode_rpc(&())
+                            .map_err(|error| ConsensusError::Unavailable(error.to_string()))?,
+                    )
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(ConsensusError::ForwardToLeader) => {
+                        return self.linearized_read_barrier_locally().await;
+                    }
+                    Err(error) => return Err(error),
+                };
+                decode_rpc(&response)
+                    .map_err(|error| ConsensusError::Unavailable(error.to_string()))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn observed_commit_version(&self) -> CommitVersion {

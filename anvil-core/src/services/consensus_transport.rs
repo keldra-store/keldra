@@ -199,6 +199,8 @@ async fn dispatch(runtime: &OpenRaftConsensus, frame: ConsensusRpcFrame) -> Cons
         1 => ConsensusRpcKind::AppendEntries,
         2 => ConsensusRpcKind::Vote,
         3 => ConsensusRpcKind::InstallSnapshot,
+        4 => ConsensusRpcKind::ForwardCertify,
+        5 => ConsensusRpcKind::ForwardLinearizedRead,
         other => {
             return ConsensusRpcReply {
                 request_id: frame.request_id,
@@ -468,6 +470,8 @@ impl TonicConsensusRpcClient {
                         ConsensusRpcKind::AppendEntries => 1,
                         ConsensusRpcKind::Vote => 2,
                         ConsensusRpcKind::InstallSnapshot => 3,
+                        ConsensusRpcKind::ForwardCertify => 4,
+                        ConsensusRpcKind::ForwardLinearizedRead => 5,
                     },
                     payload: rpc.payload,
                 })),
@@ -906,6 +910,10 @@ mod tests {
                 && third.observed_commit_version() >= applied
         })
         .await;
+        assert!(
+            second.linearized_read_barrier().await.unwrap() >= applied,
+            "a follower forwards a linearized read barrier to the current leader"
+        );
 
         servers[2].abort();
         let _ = (&mut servers[2]).await;
