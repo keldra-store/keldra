@@ -474,6 +474,8 @@ mod copy_private_watch_stream;
 mod mutation_batch_transactions;
 #[path = "object_tests/native_delete_listing.rs"]
 mod native_delete_listing;
+#[path = "object_tests/native_mvcc_acceptance.rs"]
+mod native_mvcc_acceptance;
 #[path = "object_tests/patch_and_list.rs"]
 mod patch_and_list;
 #[path = "object_tests/planner_listing.rs"]
