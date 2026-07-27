@@ -188,7 +188,7 @@ pub(super) async fn read_descriptor_projection_payload_proto(
     storage: &Storage,
     descriptor_key: &str,
 ) -> MeshDirectoryResult<Option<Vec<u8>>> {
-    let (family, _record_key, row_key) = descriptor_projection_row_key(descriptor_key)?;
+    let (family, record_key, row_key) = descriptor_projection_row_key(descriptor_key)?;
     let store = CoreStore::new(storage.clone()).await?;
     let Some(payload) = store.read_coremeta_row(CF_MESH, TABLE_MESH_PARTITION_ROW, &row_key)?
     else {
@@ -212,7 +212,7 @@ pub(super) async fn delete_descriptor_projection(
     storage: &Storage,
     descriptor_key: &str,
 ) -> MeshDirectoryResult<()> {
-    let (family, record_key, row_key) = descriptor_projection_row_key(descriptor_key)?;
+    let (family, _record_key, row_key) = descriptor_projection_row_key(descriptor_key)?;
     let store = CoreStore::new(storage.clone()).await?;
     let Some(current) = store.read_coremeta_row(CF_MESH, TABLE_MESH_PARTITION_ROW, &row_key)?
     else {
