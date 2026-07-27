@@ -207,7 +207,6 @@ impl Persistence {
             &prepared.bucket,
             &prepared.objects,
             &permit,
-            &self.partition_owner_signing_key,
             transaction_id,
             additions,
         )
@@ -231,7 +230,6 @@ impl Persistence {
             &prepared.bucket,
             &prepared.objects,
             &permit,
-            &self.partition_owner_signing_key,
             transaction_id,
             transaction_principal,
             additions,
@@ -432,7 +430,6 @@ impl Persistence {
                     &object,
                     options.journal_mutation,
                     &permit,
-                    &self.partition_owner_signing_key,
                     Some(transaction_id),
                     transaction_principal,
                 ),
@@ -446,7 +443,6 @@ impl Persistence {
                 &object,
                 options.journal_mutation,
                 &permit,
-                &self.partition_owner_signing_key,
             ))
             .await?;
         }
@@ -661,7 +657,6 @@ impl Persistence {
                 &object,
                 metadata_journal::ObjectJournalMutation::Put,
                 &permit,
-                &self.partition_owner_signing_key,
                 Some(transaction_id),
                 request.transaction_principal.as_deref(),
                 request.audit_event.as_ref(),
@@ -675,7 +670,6 @@ impl Persistence {
                 &object,
                 metadata_journal::ObjectJournalMutation::Put,
                 &permit,
-                &self.partition_owner_signing_key,
                 None,
                 None,
                 request.audit_event.as_ref(),
@@ -876,7 +870,6 @@ impl Persistence {
                 &object,
                 metadata_journal::ObjectJournalMutation::DeleteMarker,
                 &permit,
-                &self.partition_owner_signing_key,
                 Some(transaction_id),
                 request.transaction_principal.as_deref(),
                 request.audit_event.as_ref(),
@@ -890,7 +883,6 @@ impl Persistence {
                 &object,
                 metadata_journal::ObjectJournalMutation::DeleteMarker,
                 &permit,
-                &self.partition_owner_signing_key,
                 None,
                 None,
                 request.audit_event.as_ref(),
@@ -1068,7 +1060,6 @@ impl Persistence {
                 &object,
                 metadata_journal::ObjectJournalMutation::DeleteMarker,
                 &permit,
-                &self.partition_owner_signing_key,
                 Some(transaction_id),
                 transaction_principal,
             )
@@ -1081,7 +1072,6 @@ impl Persistence {
                 &object,
                 metadata_journal::ObjectJournalMutation::DeleteMarker,
                 &permit,
-                &self.partition_owner_signing_key,
             )
             .await?;
             if options.enqueue_index_maintenance {
@@ -1157,7 +1147,6 @@ impl Persistence {
                 &object,
                 metadata_journal::ObjectJournalMutation::DeleteVersion,
                 &permit,
-                &self.partition_owner_signing_key,
                 Some(transaction_id),
                 transaction_principal,
             )
@@ -1170,7 +1159,6 @@ impl Persistence {
                 &object,
                 metadata_journal::ObjectJournalMutation::DeleteVersion,
                 &permit,
-                &self.partition_owner_signing_key,
             )
             .await?;
             if options.enqueue_index_maintenance {

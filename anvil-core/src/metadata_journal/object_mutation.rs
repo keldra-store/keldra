@@ -9,7 +9,6 @@ pub(crate) async fn append_object_mutation_with_permit(
     object: &Object,
     mutation: ObjectJournalMutation,
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
 ) -> Result<()> {
     append_object_mutation_with_permit_in_transaction(
         storage,
@@ -18,7 +17,6 @@ pub(crate) async fn append_object_mutation_with_permit(
         object,
         mutation,
         permit,
-        partition_owner_signing_key,
         None,
         None,
     )
@@ -32,7 +30,6 @@ pub(crate) async fn append_object_mutation_with_permit_in_transaction(
     object: &Object,
     mutation: ObjectJournalMutation,
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
     transaction_id: Option<&str>,
     transaction_principal: Option<&str>,
 ) -> Result<()> {
@@ -43,7 +40,6 @@ pub(crate) async fn append_object_mutation_with_permit_in_transaction(
         object,
         mutation,
         permit,
-        partition_owner_signing_key,
         transaction_id,
         transaction_principal,
         None,
@@ -59,7 +55,6 @@ pub(crate) async fn append_object_mutation_with_permit_in_transaction_and_audit(
     object: &Object,
     mutation: ObjectJournalMutation,
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
     transaction_id: Option<&str>,
     transaction_principal: Option<&str>,
     audit_event: Option<&crate::tenant_audit::TenantAuditEvent>,
@@ -85,7 +80,6 @@ pub(crate) async fn append_object_put_mutations_with_permit_in_transaction(
     bucket: &Bucket,
     objects: &[Object],
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
     transaction_id: &str,
     transaction_principal: &str,
     additions: crate::mvcc_product::ProductMutationPlan,
@@ -96,7 +90,6 @@ pub(crate) async fn append_object_put_mutations_with_permit_in_transaction(
         bucket,
         objects,
         permit,
-        partition_owner_signing_key,
         transaction_id,
         Some(transaction_principal),
         additions,
@@ -110,7 +103,6 @@ pub(crate) async fn commit_object_put_mutations_with_permit(
     bucket: &Bucket,
     objects: &[Object],
     permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
     transaction_id: &str,
     additions: crate::mvcc_product::ProductMutationPlan,
 ) -> Result<()> {
@@ -120,7 +112,6 @@ pub(crate) async fn commit_object_put_mutations_with_permit(
         bucket,
         objects,
         permit,
-        partition_owner_signing_key,
         transaction_id,
         None,
         additions,
@@ -135,7 +126,6 @@ async fn append_object_put_mutations_with_permit_inner(
     bucket: &Bucket,
     objects: &[Object],
     permit: &PartitionWritePermit,
-    _partition_owner_signing_key: &[u8],
     transaction_id: &str,
     transaction_principal: Option<&str>,
     mut additions: crate::mvcc_product::ProductMutationPlan,
@@ -246,6 +236,18 @@ async fn append_object_put_mutations_with_permit_inner(
     )
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod active_path_contract {
+    #[test]
+    fn mvcc_object_mutation_path_has_no_per_transition_signing_dependency() {
+        let source = include_str!("object_mutation.rs");
+        let signing_key_parameter = ["partition_owner_", "signing_key"].concat();
+        let signing_call = ["sign_", "manifest("].concat();
+        assert!(!source.contains(&signing_key_parameter));
+        assert!(!source.contains(&signing_call));
+    }
 }
 
 fn coalesce_coremeta_operations_last_write_wins(
