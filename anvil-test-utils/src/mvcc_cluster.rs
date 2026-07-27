@@ -212,6 +212,27 @@ impl RealMvccCluster {
         Ok(())
     }
 
+    pub fn corrupt_replication_transfer(
+        &self,
+        node: usize,
+        transfer_id: uuid::Uuid,
+    ) -> anyhow::Result<()> {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let path = self.replication_transfer_path(node, transfer_id);
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?;
+        let mut first = [0_u8; 1];
+        file.read_exact(&mut first)?;
+        first[0] ^= 0xff;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&first)?;
+        file.sync_all()?;
+        Ok(())
+    }
+
     /// Blocks both inbound and outbound consensus/replication links while
     /// leaving the node and its public API alive.
     pub fn partition(&self, node: usize) {

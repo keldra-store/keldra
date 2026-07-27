@@ -1,11 +1,14 @@
 #![recursion_limit = "512"]
 
 use anvil::{
+    bundle_replication::BundleTargetStream,
     mvcc_shard_repair::{
         MissingShardTarget, ShardMaintenanceKind, ShardRepairJob, ShardRepairState,
         resolve_manifest_at_snapshot,
     },
-    mvcc_transaction::{CertificationResult, DurabilityLevel, LogicalKey, ReadConsistency},
+    mvcc_transaction::{
+        BundleTarget, CertificationResult, DurabilityLevel, LogicalKey, ReadConsistency,
+    },
     object_shard_manifest::PhysicalObjectShardManifest,
     shard_placement::{DistributedIngest, ShardPlacementPolicy},
     streaming_erasure::ErasureProfile,
@@ -715,6 +718,64 @@ async fn real_cluster_fetches_a_missing_committed_bundle_before_advancing_apply_
             .exists(),
         "replication partition leaves the committed node without its bundle transfer"
     );
+    let bytes = cluster
+        .state(leader)
+        .mvcc
+        .prepared_bundle(&identity)
+        .unwrap()
+        .expect("coordinator retains the canonical committed bundle");
+    let holders = cluster
+        .state(lagging)
+        .mvcc
+        .peers
+        .iter()
+        .filter(|peer| peer.node_id != cluster.state(lagging).mvcc.local_node.node_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(holders.len(), 2);
+    for holder in &holders {
+        let holder_node = cluster.node_index(&holder.node_id).unwrap();
+        if cluster
+            .replication_transfer_path(holder_node, transfer_id)
+            .exists()
+        {
+            continue;
+        }
+        let uploader = [0, 1, 2]
+            .into_iter()
+            .find(|node| *node != lagging && *node != holder_node)
+            .unwrap();
+        cluster
+            .state(uploader)
+            .mvcc
+            .replication_client
+            .send_bundle(
+                &BundleTarget {
+                    cluster_id: cluster.state(uploader).mvcc.cluster_id().to_string(),
+                    node: anvil::mvcc_transaction::NodeIncarnation {
+                        node_id: holder.node_id.clone(),
+                        incarnation: holder.incarnation,
+                    },
+                    failure_domain: holder.failure_domain.clone(),
+                    voter: holder.voter,
+                },
+                &identity,
+                &bytes,
+            )
+            .await
+            .unwrap();
+    }
+    let corrupt_holder = cluster.node_index(&holders[0].node_id).unwrap();
+    let valid_holder = cluster.node_index(&holders[1].node_id).unwrap();
+    cluster
+        .corrupt_replication_transfer(corrupt_holder, transfer_id)
+        .unwrap();
+    assert!(
+        cluster
+            .replication_transfer_path(valid_holder, transfer_id)
+            .is_file(),
+        "a second authenticated holder retains valid immutable bytes"
+    );
 
     tokio::time::timeout(std::time::Duration::from_secs(15), async {
         loop {
@@ -756,7 +817,31 @@ async fn real_cluster_fetches_a_missing_committed_bundle_before_advancing_apply_
         "a missing bundle cannot become partially visible"
     );
 
+    cluster.partition_replication(valid_holder);
     cluster.heal_replication(lagging);
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert!(
+        cluster
+            .state(lagging)
+            .mvcc
+            .runtime
+            .local_store()
+            .decision_watermark()
+            .unwrap()
+            < commit_version,
+        "bytes from the corrupt authenticated holder cannot advance the watermark"
+    );
+    assert!(
+        cluster
+            .state(lagging)
+            .mvcc
+            .runtime
+            .read_at(&key, commit_version)
+            .unwrap()
+            .is_none(),
+        "corrupt holder bytes never become visible"
+    );
+    cluster.heal_replication(valid_holder);
     cluster
         .wait_for_applied_version(lagging, commit_version)
         .await

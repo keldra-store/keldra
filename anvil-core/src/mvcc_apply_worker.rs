@@ -323,8 +323,15 @@ impl MvccApplyWorker {
                 .await
             {
                 Ok(bytes) => {
-                    self.prepared.persist(identity, &bytes).await?;
-                    return Ok(bytes);
+                    match self.prepared.persist(identity, &bytes).await {
+                        Ok(()) => return Ok(bytes),
+                        Err(error) => {
+                            failures.push(format!(
+                                "{}:{} returned bytes outside the committed identity: {error}",
+                                peer.node_id, peer.incarnation
+                            ));
+                        }
+                    }
                 }
                 Err(error) => failures.push(error.to_string()),
             }
