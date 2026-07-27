@@ -248,27 +248,43 @@ impl Persistence {
         &self,
         task: &TaskRecord,
     ) -> Result<task_lease::TaskLease> {
-        let target = self.task_lease_target(task).await?;
-        let now_nanos = current_time_nanos()?;
-        let ttl_nanos = self.task_lease_ttl_nanos()?;
-        task_lease::acquire_task_lease_mvcc(
-            self.mvcc()?,
-            task_lease::TaskLeaseAcquire {
-                task_id: task_lease_id(task.id)?,
-                task_kind: task.task_type.as_str().to_string(),
-                partition_family: target.partition_family,
-                partition_id: target.partition_id,
-                owner: task_lease::TaskLeaseOwner::node_instance(
-                    self.owner_node_id.clone(),
-                    self.task_actor_instance_id.clone(),
-                ),
-                source_cursor: target.source_cursor,
-                now_nanos,
-                ttl_nanos,
-            },
-            &self.partition_owner_signing_key,
-        )
-        .await
+        for attempt in 0..8u8 {
+            // Rebuild the target and lease request on every retry. A stale
+            // predicate cannot succeed if we reuse the plan from the failed
+            // attempt; another worker may have advanced the lease or fence.
+            let target = self.task_lease_target(task).await?;
+            let now_nanos = current_time_nanos()?;
+            let ttl_nanos = self.task_lease_ttl_nanos()?;
+            let result = task_lease::acquire_task_lease_mvcc(
+                self.mvcc()?,
+                task_lease::TaskLeaseAcquire {
+                    task_id: task_lease_id(task.id)?,
+                    task_kind: task.task_type.as_str().to_string(),
+                    partition_family: target.partition_family,
+                    partition_id: target.partition_id,
+                    owner: task_lease::TaskLeaseOwner::node_instance(
+                        self.owner_node_id.clone(),
+                        self.task_actor_instance_id.clone(),
+                    ),
+                    source_cursor: target.source_cursor,
+                    now_nanos,
+                    ttl_nanos,
+                },
+                &self.partition_owner_signing_key,
+            )
+            .await;
+            match result {
+                Ok(lease) => return Ok(lease),
+                Err(error) if attempt < 7 && is_retryable_partition_fence_error(&error) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        10 * u64::from(attempt + 1),
+                    ))
+                    .await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("task execution lease retry loop always returns");
     }
 
     pub async fn checkpoint_task_execution_lease(
