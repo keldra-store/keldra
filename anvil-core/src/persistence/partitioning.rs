@@ -63,7 +63,7 @@ impl Persistence {
         })
     }
 
-    pub(super) async fn core_store(&self) -> Result<CoreStore> {
+    pub(crate) async fn core_store(&self) -> Result<CoreStore> {
         self.core_store
             .get_or_try_init(|| async { CoreStore::new(self.storage.clone()).await })
             .await
