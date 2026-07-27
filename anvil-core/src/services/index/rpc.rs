@@ -77,7 +77,22 @@ impl IndexService for AppState {
                 return Err(Status::internal("invalid create-index mutation outcome"));
             }
         };
-        if transaction_id.is_none() {
+        if let (Some(transaction_id), Some(transaction_principal)) =
+            (transaction_id, transaction_principal.as_deref())
+        {
+            access_control::stage_index_defaults(
+                &self.persistence,
+                &bucket,
+                &index.name,
+                &claims.sub,
+                &claims.sub,
+                "stage creator index owner",
+                transaction_id,
+                transaction_principal,
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        } else {
             access_control::grant_index_defaults(
                 &self.persistence,
                 &bucket,

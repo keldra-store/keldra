@@ -3165,6 +3165,7 @@ message GetPersonalDbGroupRequest {
 message PersonalDbGroupResponse {
     PersonalDbGroupManifestRecord manifest = 1;
     PersonalDbCommittedHeadRecord committed_head = 2;
+    WriteState write_state = 3;
 }
 
 message CreatePersonalDbProjectionRequest {

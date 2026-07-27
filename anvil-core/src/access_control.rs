@@ -1630,6 +1630,50 @@ pub async fn grant_index_defaults(
     Ok(())
 }
 
+pub async fn stage_index_defaults(
+    persistence: &Persistence,
+    bucket: &Bucket,
+    index_name_or_id: &str,
+    principal_id: &str,
+    written_by: &str,
+    reason: &str,
+    transaction_id: &str,
+    transaction_principal: &str,
+) -> Result<()> {
+    persistence
+        .stage_authz_tuple_batch(
+            SYSTEM_STORAGE_TENANT_ID,
+            vec![
+                AuthzTupleBatchMutation {
+                    namespace: system_realm_namespace(SYSTEM_INDEX_NAMESPACE),
+                    object_id: index_object_id(bucket, index_name_or_id),
+                    relation: "parent_bucket".to_string(),
+                    subject_kind: SYSTEM_BUCKET_NAMESPACE.to_string(),
+                    subject_id: bucket_object_id(bucket),
+                    caveat_hash: String::new(),
+                    operation: "add".to_string(),
+                    reason: reason.to_string(),
+                },
+                AuthzTupleBatchMutation {
+                    namespace: system_realm_namespace(SYSTEM_INDEX_NAMESPACE),
+                    object_id: index_object_id(bucket, index_name_or_id),
+                    relation: "owner".to_string(),
+                    subject_kind: APP_SUBJECT_KIND.to_string(),
+                    subject_id: principal_id.to_string(),
+                    caveat_hash: String::new(),
+                    operation: "add".to_string(),
+                    reason: reason.to_string(),
+                },
+            ],
+            written_by,
+            transaction_id,
+            transaction_principal,
+            None,
+        )
+        .await?;
+    Ok(())
+}
+
 pub async fn grant_personaldb_group_defaults(
     persistence: &Persistence,
     tenant_id: i64,

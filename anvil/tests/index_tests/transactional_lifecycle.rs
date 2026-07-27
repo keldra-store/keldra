@@ -98,6 +98,21 @@ async fn explicit_index_transaction_publishes_definition_and_finalises_after_com
         .await
         .unwrap();
     drop(transactions);
+    indexes
+        .update_index(authorized(
+            UpdateIndexRequest {
+                bucket_name: bucket_name.clone(),
+                name: index_name,
+                selector_json: serde_json::json!({"prefix": "committed/"}).to_string(),
+                extractor_json: serde_json::json!({}).to_string(),
+                authorization_mode: "inherit_object".to_string(),
+                build_policy_json: serde_json::json!({}).to_string(),
+                options: None,
+            },
+            &token,
+        ))
+        .await
+        .expect("committed transactional index grants creator ownership");
     let bucket = cluster.states[0]
         .persistence
         .get_bucket_by_name(1, &bucket_name)
