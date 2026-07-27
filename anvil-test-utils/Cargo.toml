@@ -24,7 +24,7 @@ enterprise = ["anvil/enterprise"]
 
 [dependencies]
 anvil = { package = "anvil-server", path = "../anvil", version = "0.3.0" }
-anvil-core = { package = "anvil-storage-core", path = "../anvil-core", version = "0.3.0", features = ["test-in-process-personaldb-signers"] }
+anvil-core = { package = "anvil-storage-core", path = "../anvil-core", version = "0.3.0", features = ["test-in-process-personaldb-signers", "test-cluster-transport-faults"] }
 anvil-mvcc-consensus = { path = "../crates/anvil-mvcc-consensus", version = "0.3.0" }
 anyhow = "1"
 base64 = "0.22"

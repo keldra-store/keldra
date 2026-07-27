@@ -43,6 +43,7 @@ pub mod bucket_journal;
 pub mod bucket_manager;
 pub mod bundle_replication;
 pub mod config;
+#[cfg(feature = "test-cluster-transport-faults")]
 pub mod cluster_transport_fault;
 pub mod control_journal;
 pub mod core_store;

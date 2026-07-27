@@ -199,18 +199,35 @@ impl RealMvccCluster {
         Ok(())
     }
 
-    /// Simulates a bidirectional network partition for this node.
-    pub fn partition(&mut self, node: usize) {
-        if let Some(transport) = self.transports[node].take() {
-            transport.abort();
-        }
-        if let Some(transport) = self.public_transports[node].take() {
-            transport.abort();
-        }
+    /// Blocks both inbound and outbound consensus/replication links while
+    /// leaving the node and its public API alive.
+    pub fn partition(&self, node: usize) {
+        let cluster_id = &self.configs[node].mvcc_cluster_id;
+        anvil_core::cluster_transport_fault::partition_node(
+            cluster_id,
+            format!("raft:{}", self.configs[node].mvcc_raft_node_id),
+        );
+        anvil_core::cluster_transport_fault::partition_node(
+            cluster_id,
+            self.configs[node].node_id.clone(),
+        );
+    }
+
+    pub fn heal(&self, node: usize) {
+        let cluster_id = &self.configs[node].mvcc_cluster_id;
+        anvil_core::cluster_transport_fault::heal_node(
+            cluster_id,
+            &format!("raft:{}", self.configs[node].mvcc_raft_node_id),
+        );
+        anvil_core::cluster_transport_fault::heal_node(
+            cluster_id,
+            &self.configs[node].node_id,
+        );
     }
 
     /// Reopens the node from the same RocksDB directory and network identity.
     pub async fn restart_node(&mut self, node: usize) -> anyhow::Result<()> {
+        self.heal(node);
         if let Some(transport) = self.transports[node].take() {
             transport.abort();
             let _ = transport.await;
@@ -413,6 +430,9 @@ fn spawn_public_api(listener: TcpListener, state: &Arc<AppState>) -> JoinHandle<
 
 impl Drop for RealMvccCluster {
     fn drop(&mut self) {
+        for node in 0..self.configs.len() {
+            self.heal(node);
+        }
         for transport in self.transports.iter_mut().flatten() {
             transport.abort();
         }

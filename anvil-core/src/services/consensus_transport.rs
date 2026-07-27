@@ -251,6 +251,8 @@ impl ConsensusRpcFactory for TonicConsensusRpcFactory {
             cluster_id: self.cluster_id.clone(),
             channel: self.channel(&node.address),
             local_node_id: self.local_node_id,
+            #[cfg(feature = "test-cluster-transport-faults")]
+            target_node_id: _target,
             local_incarnation: self.local_incarnation,
             node_token: self.node_token.clone(),
             request_timeout: self.request_timeout,
@@ -269,6 +271,8 @@ struct TonicConsensusRpcClient {
     cluster_id: Arc<str>,
     channel: Result<Channel, String>,
     local_node_id: NodeId,
+    #[cfg(feature = "test-cluster-transport-faults")]
+    target_node_id: NodeId,
     local_incarnation: u64,
     node_token: Arc<str>,
     request_timeout: Duration,
@@ -388,6 +392,19 @@ impl TonicConsensusRpcClient {
 #[async_trait]
 impl ConsensusRpcClient for TonicConsensusRpcClient {
     async fn request(&mut self, rpc: ConsensusRpc) -> Result<Vec<u8>, ConsensusRpcError> {
+        #[cfg(feature = "test-cluster-transport-faults")]
+        {
+            if !crate::cluster_transport_fault::link_available(
+                &self.cluster_id,
+                &format!("raft:{}", self.local_node_id.0),
+                &format!("raft:{}", self.target_node_id.0),
+            ) {
+                self.session = None;
+                return Err(ConsensusRpcError::Unreachable(
+                    "consensus link is partitioned by fixture".into(),
+                ));
+            }
+        }
         let first =
             tokio::time::timeout(self.request_timeout, self.request_once(rpc.clone())).await;
         match first {

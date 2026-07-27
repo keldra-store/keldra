@@ -29,6 +29,7 @@ harness = false
 enterprise = []
 root-publication-test-control = []
 test-in-process-personaldb-signers = []
+test-cluster-transport-faults = []
 gcp = ["dep:prost-types", "tonic/tls-ring"]
 routeguide = ["dep:async-stream", "dep:tokio-stream", "dep:rand"]
 reflection = ["dep:tonic-reflection"]

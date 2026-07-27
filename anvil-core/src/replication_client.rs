@@ -209,6 +209,16 @@ impl TonicReplicationStreamManager {
         bytes: &[u8],
         final_hash: [u8; 32],
     ) -> Result<ReplicationAck> {
+        #[cfg(feature = "test-cluster-transport-faults")]
+        {
+            if !crate::cluster_transport_fault::link_available(
+                target_cluster_id,
+                &self.local_node.node_id,
+                &target.node_id,
+            ) {
+                bail!("replication link is partitioned by fixture");
+            }
+        }
         let peer = self
             .peers
             .get(&(target_cluster_id.to_string(), target.clone()))
