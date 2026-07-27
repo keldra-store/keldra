@@ -351,7 +351,16 @@ jobs:
             ${{ runner.os }}-cargo-v2-
 
       - name: Prebuild MVCC acceptance binaries
-        run: cargo test --no-run -p anvil-server --test object_tests --test mvcc_cluster_fixture
+        run: |
+          cargo test --no-run -p anvil-server \
+            --test object_tests \
+            --test mvcc_cluster_conflicts \
+            --test mvcc_cluster_fixture \
+            --test mvcc_gc_cluster \
+            --test mvcc_partition_fixture \
+            --test mvcc_process_cluster \
+            --test mvcc_snapshot_stability \
+            --test coremeta_bounded_contracts
 
       - name: Run native object acceptance
         run: |
@@ -361,6 +370,23 @@ jobs:
       - name: Run cluster failure and repair acceptance
         run: |
           cargo test -q -p anvil-server --test mvcc_cluster_fixture \
+            -- --nocapture --test-threads=1
+
+      - name: Run MVCC conflict, partition, and GC acceptance
+        run: |
+          for test_target in \
+            mvcc_cluster_conflicts \
+            mvcc_gc_cluster \
+            mvcc_partition_fixture \
+            mvcc_snapshot_stability \
+            coremeta_bounded_contracts; do
+            cargo test -q -p anvil-server --test "$test_target" \
+              -- --nocapture --test-threads=1
+          done
+
+      - name: Run process crash and restart acceptance
+        run: |
+          cargo test -q -p anvil-server --test mvcc_process_cluster \
             -- --nocapture --test-threads=1
 
   docker-integration:
