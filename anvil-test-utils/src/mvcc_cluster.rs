@@ -340,42 +340,48 @@ impl RealMvccCluster {
         bucket_name: &str,
     ) -> anyhow::Result<PublicActor> {
         let state = self.state(node);
-        state.persistence.create_region("e2e-region").await?;
-        let tenant = state
-            .persistence
-            .create_tenant("e2e-tenant", "e2e-tenant-key")
-            .await?;
+        // These persistence futures are intentionally boxed. In debug builds
+        // several of them retain large MVCC mutation plans; embedding every
+        // future directly in this fixture future made the generated poll frame
+        // large enough to overflow libtest's default thread stack.
+        Box::pin(state.persistence.create_region("e2e-region")).await?;
+        let tenant = Box::pin(
+            state
+                .persistence
+                .create_tenant("e2e-tenant", "e2e-tenant-key"),
+        )
+        .await?;
         let encrypted_secret = state.secret_keyring.encrypt(b"e2e-app-secret")?;
-        let app = state
-            .persistence
-            .create_app(
-                tenant.id,
-                "e2e-app",
-                "e2e-app",
-                &encrypted_secret,
-                None,
-                None,
-            )
-            .await?;
-        anvil_core::access_control::grant_storage_tenant_owner(
+        let app = Box::pin(state.persistence.create_app(
+            tenant.id,
+            "e2e-app",
+            "e2e-app",
+            &encrypted_secret,
+            None,
+            None,
+        ))
+        .await?;
+        Box::pin(anvil_core::access_control::grant_storage_tenant_owner(
             &state.persistence,
             tenant.id,
             &app.id.to_string(),
             "e2e-fixture",
             "grant fixture actor storage ownership",
-        )
+        ))
         .await?;
-        let bucket = state
-            .persistence
-            .create_bucket(tenant.id, bucket_name, "e2e-region")
-            .await?;
-        anvil_core::access_control::grant_bucket_defaults(
+        let bucket = Box::pin(state.persistence.create_bucket(
+            tenant.id,
+            bucket_name,
+            "e2e-region",
+        ))
+        .await?;
+        Box::pin(anvil_core::access_control::grant_bucket_defaults(
             &state.persistence,
             &bucket,
             &app.id.to_string(),
             "e2e-fixture",
             "grant fixture actor bucket ownership",
-        )
+        ))
         .await?;
         let token = state
             .jwt_manager

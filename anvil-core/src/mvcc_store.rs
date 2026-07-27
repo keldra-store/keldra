@@ -161,7 +161,6 @@ pub struct LocalDurabilityViolationRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct UnfinishedWorkPins {
-    pub outbox_versions: BTreeSet<CommitVersion>,
     pub materialisation_snapshots: BTreeSet<CommitVersion>,
     pub repair_snapshots: BTreeSet<CommitVersion>,
     pub transaction_ids: BTreeSet<String>,
@@ -169,9 +168,8 @@ pub struct UnfinishedWorkPins {
 
 impl UnfinishedWorkPins {
     pub fn all(&self) -> BTreeSet<CommitVersion> {
-        self.outbox_versions
+        self.materialisation_snapshots
             .iter()
-            .chain(self.materialisation_snapshots.iter())
             .chain(self.repair_snapshots.iter())
             .copied()
             .collect()
@@ -2233,23 +2231,13 @@ impl MvccStore {
     /// watermark before `AdvanceGcWatermark` is proposed to consensus.
     pub fn unfinished_work_pins(&self) -> Result<UnfinishedWorkPins> {
         let mut pins = UnfinishedWorkPins::default();
-        let outbox_cf = self.cf(CF_OUTBOX)?;
-        let outbox_prefix = self.key(b"event/");
-        for row in self.db.iterator_cf(
-            outbox_cf,
-            IteratorMode::From(&outbox_prefix, Direction::Forward),
-        ) {
-            let (key, value) = row?;
-            if !key.starts_with(&outbox_prefix) {
-                break;
-            }
-            let record: OutboxRecord = serde_json::from_slice(&value)?;
-            if record.state != OutboxState::Delivered {
-                pins.outbox_versions.insert(record.commit_version);
-                pins.transaction_ids.insert(record.transaction_id);
-            }
-        }
-
+        // An outbox row owns a complete, independently durable copy of the
+        // event payload. It does not read transaction history while
+        // delivering, and pending rows are never removed by `garbage_collect`.
+        // Treating it as a version-history pin would also be incorrect in a
+        // cluster: every replica applies the row, but only its Raft-assigned
+        // worker marks a local copy Delivered, so non-owner replicas would pin
+        // the cluster watermark forever.
         let materialisation_cf = self.cf(CF_MATERIALISATION)?;
         let object_prefix = self.key(b"object-job/");
         for row in self.db.iterator_cf(
@@ -4613,7 +4601,7 @@ mod tests {
     }
 
     #[test]
-    fn unfinished_outbox_work_pins_gc_and_delivered_history_is_reclaimed() {
+    fn pending_outbox_survives_gc_without_pinning_mvcc_history() {
         let temp = tempdir().unwrap();
         let store = MvccStore::open(temp.path()).unwrap();
         store
@@ -4639,11 +4627,15 @@ mod tests {
             .apply_certified_bundle(5, &bundle("advance", |_| {}))
             .unwrap();
 
+        let pins = store.unfinished_work_pins().unwrap();
+        assert!(pins.all().is_empty());
+        assert!(pins.transaction_ids.is_empty());
+        store.garbage_collect(5).unwrap();
         assert_eq!(
-            store.unfinished_work_pins().unwrap().outbox_versions,
-            [2_u64].into_iter().collect()
+            store.outbox_records_after(0, 10).unwrap().len(),
+            1,
+            "pending self-contained event payload remains available after MVCC history GC"
         );
-        assert!(store.garbage_collect(5).is_err());
 
         let record = store.claim_outbox("worker", 10, 10).unwrap().unwrap();
         store.complete_outbox(&record, "worker").unwrap();

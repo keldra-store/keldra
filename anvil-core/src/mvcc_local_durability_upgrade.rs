@@ -493,13 +493,19 @@ impl LocalUpgradeConsensus for anvil_mvcc_consensus::OpenRaftConsensus {
             DurabilityLevel::Quorum => anvil_mvcc_consensus::DurabilityLevel::Quorum,
             DurabilityLevel::Erasure => anvil_mvcc_consensus::DurabilityLevel::Erasure,
         };
-        let holders = holders
+        let mut holders = holders
             .into_iter()
             .map(|holder| anvil_mvcc_consensus::NodeIncarnation {
                 node_id: crate::mvcc_bootstrap::consensus_control_node_id(&holder.node_id),
                 incarnation: holder.incarnation,
             })
-            .collect();
+            .collect::<Vec<_>>();
+        // The application-level node IDs were canonical before this mapping,
+        // but their compact-Raft IDs are hashes and therefore have a different
+        // ordering. UpgradeDurability deliberately rejects non-canonical
+        // holder evidence, so canonicalise in the command's identity domain.
+        holders.sort_unstable();
+        holders.dedup();
         self.upgrade_durability(
             cluster_id_hash,
             anvil_mvcc_consensus::CommitVersion(job.commit_version),

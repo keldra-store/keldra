@@ -119,6 +119,20 @@ impl std::fmt::Debug for TonicReplicationStreamManager {
 }
 
 impl TonicReplicationStreamManager {
+    fn require_link_available(&self, cluster_id: &str, target: &NodeIncarnation) -> Result<()> {
+        #[cfg(feature = "test-cluster-transport-faults")]
+        if !crate::cluster_transport_fault::link_available(
+            cluster_id,
+            &self.local_node.node_id,
+            &target.node_id,
+        ) {
+            bail!("replication link is partitioned by fixture");
+        }
+        #[cfg(not(feature = "test-cluster-transport-faults"))]
+        let _ = (cluster_id, target);
+        Ok(())
+    }
+
     pub fn new(
         cluster_id: impl Into<Arc<str>>,
         local_node: NodeIncarnation,
@@ -268,16 +282,7 @@ impl TonicReplicationStreamManager {
         final_hash: [u8; 32],
         provisional: Option<(&str, u64, u64)>,
     ) -> Result<ReplicationAck> {
-        #[cfg(feature = "test-cluster-transport-faults")]
-        {
-            if !crate::cluster_transport_fault::link_available(
-                target_cluster_id,
-                &self.local_node.node_id,
-                &target.node_id,
-            ) {
-                bail!("replication link is partitioned by fixture");
-            }
-        }
+        self.require_link_available(target_cluster_id, target)?;
         if target_cluster_id != &*self.cluster_id {
             bail!("cross-cluster replication cannot provide transaction durability");
         }
@@ -358,6 +363,7 @@ impl TonicReplicationStreamManager {
         if cluster_id != &*self.cluster_id {
             bail!("cross-cluster replication reads require a separate replication boundary");
         }
+        self.require_link_available(cluster_id, target)?;
         let peer = self
             .peers
             .read()
@@ -1306,6 +1312,46 @@ mod tests {
             error
                 .to_string()
                 .contains("cross-cluster replication cannot provide transaction durability")
+        );
+    }
+
+    #[cfg(feature = "test-cluster-transport-faults")]
+    #[tokio::test]
+    async fn partitioned_source_cannot_read_completed_transfer() {
+        let cluster_id = format!("cluster-read-partition-{}", Uuid::new_v4());
+        let local = NodeIncarnation {
+            node_id: "node-a".into(),
+            incarnation: 1,
+        };
+        let remote = NodeIncarnation {
+            node_id: "node-b".into(),
+            incarnation: 1,
+        };
+        let manager = TonicReplicationStreamManager::new(
+            cluster_id.clone(),
+            local.clone(),
+            "test-token",
+            [ReplicationPeer {
+                cluster_id: cluster_id.clone(),
+                node: remote.clone(),
+                endpoint: "http://127.0.0.1:9".into(),
+            }],
+            ReplicationStreamOptions {
+                allow_insecure_transport_for_tests: true,
+                ..ReplicationStreamOptions::default()
+            },
+        )
+        .unwrap();
+
+        crate::cluster_transport_fault::partition_node(&cluster_id, local.node_id.clone());
+        let result = manager
+            .read_complete_transfer(&cluster_id, &remote, Uuid::new_v4(), 1, [0; 32])
+            .await;
+        crate::cluster_transport_fault::heal_node(&cluster_id, &local.node_id);
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "replication link is partitioned by fixture"
         );
     }
 

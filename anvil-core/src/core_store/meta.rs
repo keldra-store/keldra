@@ -824,12 +824,14 @@ impl CoreMetaStore {
                 }
                 scanned = scanned.saturating_add(1);
                 bytes = bytes.saturating_add((key.len() + value.len()) as u64);
-                // Ignore pre-MVCC version-zero rows left behind by an older
-                // CoreMeta layout. They are not portable rows; retaining them
-                // locally must not make canonical bootstrap export fail.
+                // Only v1 keys belong to the current CoreMeta layout. Older
+                // layouts (and unrelated legacy records sharing a column family)
+                // can remain in a node's RocksDB during upgrade, but are not
+                // portable CoreMeta rows and must not prevent scanning the
+                // canonical v1 snapshot.
                 let table_id = match decode_core_meta_table_id(&key) {
                     Ok(table_id) => table_id,
-                    Err(_error) if key.first() == Some(&0) => continue,
+                    Err(_error) if key.first() != Some(&1) => continue,
                     Err(error) => return Err(error),
                 };
                 let (payload, common) = decode_envelope_with_common(cf_name, table_id, &value)?;

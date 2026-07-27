@@ -433,6 +433,37 @@ fn encoded_row_pages_bound_work_and_cross_column_families() {
 }
 
 #[test]
+fn encoded_row_pages_skip_non_v1_legacy_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = CoreMetaStore::open(tmp.path()).unwrap();
+    let tuple_key = core_meta_tuple_key(&[CoreMetaTuplePart::Utf8("encoded-page")]).unwrap();
+    store
+        .put_inline_payload(&tuple_key, b"encoded-page-payload")
+        .unwrap();
+
+    let database = store.database();
+    let mesh = database.cf_handle(CF_MESH).unwrap();
+    database
+        .put_cf(&mesh, b"tenant-name\0legacy-bootstrap", b"legacy-envelope")
+        .unwrap();
+
+    let mut cursor = None;
+    loop {
+        let page = store.scan_encoded_rows_page(cursor.as_ref(), 1).unwrap();
+        assert!(
+            page.rows
+                .iter()
+                .all(|row| row.core_meta_key.first() == Some(&1)),
+            "legacy physical keys must not be exported as CoreMeta rows"
+        );
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+}
+
+#[test]
 fn snapshot_encoded_row_pages_share_one_rocksdb_sequence() {
     let tmp = tempfile::tempdir().unwrap();
     let store = CoreMetaStore::open(tmp.path()).unwrap();
