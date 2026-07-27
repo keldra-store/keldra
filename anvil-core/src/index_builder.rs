@@ -1540,35 +1540,58 @@ async fn publish_index_build_proof_and_checkpoint(
         updated_at_nanos: built_at_nanos,
     };
     let mvcc = authority.mvcc()?;
-    let assignment = mvcc
-        .reconcile_work_assignment("index-build", index_storage_id)
-        .await?
-        .ok_or_else(|| anyhow!("index build is assigned to another node"))?;
     let principal = format!("index-builder:{payload_actor}");
-    let idempotency_key = format!(
-        "index-proof-checkpoint:{}:{}:{}",
-        index_storage_id, generation, publication_digest
-    );
-    let publish = |lease_predicate| {
-        publish_index_build_mvcc_transaction(
-            mvcc,
-            &assignment,
-            &principal,
-            &idempotency_key,
-            &prepared_proof,
-            checkpoint_update.clone(),
-            signing_key,
-            lease_predicate,
-        )
-    };
-    let (proof, checkpoint) = match authority {
-        IndexBuildAuthority::Task(guard) => {
-            guard
-                .publish_mvcc_with(|predicate| publish(Some(predicate)))
-                .await?
+    let mut published = None;
+    for attempt in 0..5u8 {
+        let assignment = mvcc
+            .reconcile_work_assignment("index-build", index_storage_id)
+            .await?
+            .ok_or_else(|| anyhow!("index build is assigned to another node"))?;
+        let idempotency_key = format!(
+            "index-proof-checkpoint:{}:{}:{}:{}",
+            index_storage_id, generation, publication_digest, attempt
+        );
+        let publish = |lease_predicate| {
+            publish_index_build_mvcc_transaction(
+                mvcc,
+                &assignment,
+                &principal,
+                &idempotency_key,
+                &prepared_proof,
+                checkpoint_update.clone(),
+                signing_key,
+                lease_predicate,
+            )
+        };
+        let result = match authority {
+            IndexBuildAuthority::Task(guard) => {
+                guard
+                    .publish_mvcc_with(|predicate| publish(Some(predicate)))
+                    .await
+            }
+            IndexBuildAuthority::DirectRepair(_) => publish(None).await,
+        };
+        match result {
+            Ok(result) => {
+                published = Some(result);
+                break;
+            }
+            Err(error)
+                if attempt < 4
+                    && (error
+                        .to_string()
+                        .contains("assignment predicate violates applied Raft control state")
+                        || error
+                            .to_string()
+                            .contains("background work assignment changed")) =>
+            {
+                tokio::time::sleep(Duration::from_millis(25 * u64::from(attempt + 1))).await;
+            }
+            Err(error) => return Err(error),
         }
-        IndexBuildAuthority::DirectRepair(_) => publish(None).await?,
-    };
+    }
+    let (proof, checkpoint) =
+        published.ok_or_else(|| anyhow!("index publication assignment kept changing"))?;
     watch_checkpoint::record_watch_checkpoint_lag(storage, &checkpoint).await?;
     Ok(proof)
 }
