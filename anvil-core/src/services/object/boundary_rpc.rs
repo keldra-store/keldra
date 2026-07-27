@@ -19,27 +19,122 @@ pub(super) async fn put_boundary_schema_rpc(
 
     let boundary_bucket_key =
         crate::core_store::boundary_schema_bucket_key(claims.tenant_id, &bucket.name);
-    let transaction_id = match req.transaction_id.as_deref() {
+    let requested_dimensions = req
+        .dimensions
+        .clone()
+        .into_iter()
+        .map(proto_boundary_dimension_to_core)
+        .collect::<Result<Vec<_>, _>>()?;
+    let requested_transaction_id = match req.transaction_id.as_deref() {
         Some(value) if value.trim().is_empty() => {
             return Err(Status::invalid_argument("transaction_id must not be empty"));
         }
         other => other,
     };
     let transaction_principal = crate::object_manager::transaction_principal_from_claims(&claims);
-    let core_store = &state.core_store;
-    let current = if let Some(transaction_id) = transaction_id {
-        read_boundary_schema_in_transaction(
-            state,
-            &boundary_bucket_key,
-            transaction_id,
-            &transaction_principal,
-        )?
+    let mutation_id = if req.mutation_id.trim().is_empty() {
+        format!("boundary-schema:{request_id}")
     } else {
-        core_store
-            .read_boundary_schema(&boundary_bucket_key)
-            .await
-            .map_err(|error| Status::internal(error.to_string()))?
+        req.mutation_id.clone()
     };
+    let now = current_unix_millis_u64();
+    let internal_transaction = requested_transaction_id.is_none();
+    let transaction_id = if let Some(transaction_id) = requested_transaction_id {
+        state
+            .mvcc
+            .open_transactions
+            .binding(transaction_id, &transaction_principal)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        transaction_id.to_string()
+    } else {
+        let handle = state
+            .mvcc
+            .open_transactions
+            .begin(
+                state.mvcc.runtime.as_ref(),
+                state.mvcc.cluster_id().to_string(),
+                transaction_principal.clone(),
+                format!(
+                    "boundary-schema:{}:{}",
+                    boundary_bucket_key, mutation_id
+                ),
+                std::time::Duration::from_secs(300),
+                crate::mvcc_transaction::DurabilityLevel::Quorum,
+                crate::mvcc_transaction::ReadConsistency::Linearized,
+                now,
+            )
+            .await
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        let status = state
+            .mvcc
+            .open_transactions
+            .status(&handle.transaction_id, &transaction_principal, now)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        if status.state == "committing" {
+            let outcome = state
+                .mvcc
+                .open_transactions
+                .commit(
+                    state.mvcc.runtime.as_ref(),
+                    &handle.transaction_id,
+                    &transaction_principal,
+                    now,
+                )
+                .await
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            if let crate::mvcc_transaction::CertificationResult::Aborted { reason } =
+                outcome.certification
+            {
+                return Err(Status::aborted(format!(
+                    "implicit boundary schema transaction aborted: {reason:?}"
+                )));
+            }
+        } else if status.state == "aborted" {
+            return Err(Status::aborted(
+                "implicit boundary schema transaction previously aborted",
+            ));
+        }
+        if matches!(status.state, "committed" | "committing") {
+            let schema = state
+                .core_store
+                .read_boundary_schema(&boundary_bucket_key)
+                .await
+                .map_err(|error| Status::internal(error.to_string()))?
+                .ok_or_else(|| {
+                    Status::failed_precondition(
+                        "committed boundary schema outcome is unavailable",
+                    )
+                })?;
+            let expected_result_generation = req
+                .expected_generation
+                .map(|generation| generation.saturating_add(1))
+                .unwrap_or(1);
+            if schema.generation != expected_result_generation
+                || schema.dimensions != requested_dimensions
+            {
+                return Err(Status::already_exists(
+                    "boundary schema mutation_id was already used for different input",
+                ));
+            }
+            let schema_hash = boundary_schema_hash(&schema)
+                .map_err(|error| Status::internal(error.to_string()))?;
+            return Ok(Response::new(BoundarySchemaResponse {
+                request_id,
+                schema: Some(core_boundary_schema_to_proto(
+                    &schema,
+                    &bucket.name,
+                    schema_hash,
+                )),
+            }));
+        }
+        handle.transaction_id
+    };
+    let current = read_boundary_schema_in_transaction(
+        state,
+        &boundary_bucket_key,
+        &transaction_id,
+        &transaction_principal,
+    )?;
     let generation = match (current.as_ref(), req.expected_generation) {
         (None, None) => 1,
         (None, Some(_)) => {
@@ -66,50 +161,35 @@ pub(super) async fn put_boundary_schema_rpc(
         schema: crate::core_store::CORE_BOUNDARY_SCHEMA_SCHEMA.to_string(),
         bucket: boundary_bucket_key.clone(),
         generation,
-        dimensions: req
-            .dimensions
-            .into_iter()
-            .map(proto_boundary_dimension_to_core)
-            .collect::<Result<Vec<_>, _>>()?,
-        created_at: if transaction_id.is_some() {
-            chrono::Utc::now().to_rfc3339()
-        } else {
-            String::new()
-        },
+        dimensions: requested_dimensions,
+        created_at: chrono::Utc::now().to_rfc3339(),
     };
-    let mutation_id = if req.mutation_id.trim().is_empty() {
-        format!("boundary-schema:{}", uuid::Uuid::new_v4())
-    } else {
-        req.mutation_id
-    };
-    let put = crate::core_store::PutBoundarySchema {
-        schema: schema.clone(),
-        expected_generation: req.expected_generation,
-        mutation_id,
-    };
-    let schema_hash = if let Some(transaction_id) = transaction_id {
-        stage_boundary_schema_in_transaction(
-            state,
-            &schema,
-            transaction_id,
-            &transaction_principal,
-        )?
-    } else {
-        let put_boundary_schema = core_store.put_boundary_schema(put);
-        put_boundary_schema
+    let schema_hash = stage_boundary_schema_in_transaction(
+        state,
+        &schema,
+        &transaction_id,
+        &transaction_principal,
+    )?;
+    if internal_transaction {
+        let outcome = state
+            .mvcc
+            .open_transactions
+            .commit(
+                state.mvcc.runtime.as_ref(),
+                &transaction_id,
+                &transaction_principal,
+                current_unix_millis_u64(),
+            )
             .await
-            .map_err(boundary_status)?
-            .schema_hash
-    };
-    let schema = if transaction_id.is_some() {
-        schema
-    } else {
-        let read_boundary_schema = core_store.read_boundary_schema(&boundary_bucket_key);
-        read_boundary_schema
-            .await
-            .map_err(|error| Status::internal(error.to_string()))?
-            .ok_or_else(|| Status::internal("Boundary schema was not visible after write"))?
-    };
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        if let crate::mvcc_transaction::CertificationResult::Aborted { reason } =
+            outcome.certification
+        {
+            return Err(Status::aborted(format!(
+                "implicit boundary schema transaction aborted: {reason:?}"
+            )));
+        }
+    }
 
     Ok(Response::new(BoundarySchemaResponse {
         request_id,
@@ -420,17 +500,6 @@ fn boundary_schema_hash(value: &crate::core_store::CoreBoundarySchema) -> anyhow
         created_at: value.created_at.clone(),
     };
     Ok(crate::core_store::protobuf_sha256_hex(&proto))
-}
-
-fn boundary_status(error: anyhow::Error) -> Status {
-    let message = error.to_string();
-    if message.contains("BoundarySchemaGenerationConflict") {
-        Status::failed_precondition(message)
-    } else if message.contains("BoundarySchemaIncompatibleChange") {
-        Status::failed_precondition(message)
-    } else {
-        Status::invalid_argument(message)
-    }
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
