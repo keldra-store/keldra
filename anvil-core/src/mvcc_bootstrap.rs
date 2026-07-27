@@ -33,7 +33,6 @@ use crate::{
     mvcc_store::LocalMvccStore,
     mvcc_transaction::{
         ClusterOwnershipClaim, ClusterOwnershipResolver, DurabilityPolicy, NodeIncarnation,
-        OwnedResource,
     },
     replication::AuthenticatedPeer,
     replication_client::{
@@ -59,7 +58,6 @@ pub type ProductMvccRuntime = MvccNodeRuntime<
 #[derive(Clone)]
 struct RaftClusterOwnershipResolver {
     cluster_id: String,
-    consensus: Arc<OpenRaftConsensus>,
 }
 
 impl ClusterOwnershipResolver for RaftClusterOwnershipResolver {
@@ -70,22 +68,6 @@ impl ClusterOwnershipResolver for RaftClusterOwnershipResolver {
     ) -> Result<()> {
         if transaction_cluster_id != self.cluster_id || claim.cluster_id() != self.cluster_id {
             bail!("transaction resource belongs to another cluster");
-        }
-        if let OwnedResource::OutboxEvent {
-            destination_partition_id,
-            ..
-        } = claim.resource()
-        {
-            let snapshot = self.consensus.applied_control_snapshot()?;
-            if !snapshot
-                .partitions
-                .iter()
-                .any(|(partition_id, _)| partition_id == destination_partition_id)
-            {
-                bail!(
-                    "outbox destination partition {destination_partition_id} has no applied Raft assignment"
-                );
-            }
         }
         Ok(())
     }
@@ -671,7 +653,6 @@ impl MvccSubsystem {
             local_store.clone(),
             Arc::new(RaftClusterOwnershipResolver {
                 cluster_id: config.mvcc_cluster_id.clone(),
-                consensus: consensus.clone(),
             }),
         )?);
         let initial_assignment_reconciler =
