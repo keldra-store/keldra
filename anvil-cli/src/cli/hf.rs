@@ -90,6 +90,7 @@ pub async fn handle_hf_command(command: &HfCommands, ctx: &Context) -> anyhow::R
                         name: name.clone(),
                         token: token.clone(),
                         note: note.clone().unwrap_or_default(),
+                        options: None,
                     });
                     request.metadata_mut().insert(
                         "authorization",
@@ -127,7 +128,10 @@ pub async fn handle_hf_command(command: &HfCommands, ctx: &Context) -> anyhow::R
                 }
                 HfKeyCommands::Rm { name } => {
                     let mut request =
-                        tonic::Request::new(api::DeleteHfKeyRequest { name: name.clone() });
+                        tonic::Request::new(api::DeleteHfKeyRequest {
+                            name: name.clone(),
+                            options: None,
+                        });
                     request.metadata_mut().insert(
                         "authorization",
                         format!("Bearer {}", token).parse().unwrap(),
@@ -160,6 +164,7 @@ pub async fn handle_hf_command(command: &HfCommands, ctx: &Context) -> anyhow::R
                         include_globs: include.clone(),
                         exclude_globs: exclude.clone(),
                         target_region: target_region.clone(),
+                        options: None,
                     });
                     request.metadata_mut().insert(
                         "authorization",
@@ -171,6 +176,7 @@ pub async fn handle_hf_command(command: &HfCommands, ctx: &Context) -> anyhow::R
                 HfIngestCommands::Status { id } => {
                     let mut request = tonic::Request::new(api::GetHfIngestionStatusRequest {
                         ingestion_id: id.clone(),
+                        options: None,
                     });
                     request.metadata_mut().insert(
                         "authorization",

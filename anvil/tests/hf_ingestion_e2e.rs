@@ -147,6 +147,7 @@ async fn hf_ingestion_config_json() {
                 name: key_name.clone(),
                 token: String::new(),
                 note: String::new(),
+                options: None,
             }),
             &token,
         ))
@@ -170,6 +171,7 @@ async fn hf_ingestion_config_json() {
                 target_prefix: "gpt-oss-20b".into(),
                 include_globs: vec!["config.json".into()],
                 exclude_globs: vec![],
+                options: None,
             }),
             &token,
         ))
@@ -234,6 +236,7 @@ async fn hf_ingestion_config_json() {
                 target_prefix: "gpt-oss-20b".into(),
                 include_globs: vec!["README.md".into()],
                 exclude_globs: vec![],
+                options: None,
             }),
             &token,
         ))

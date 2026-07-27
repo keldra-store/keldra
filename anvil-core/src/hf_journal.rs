@@ -1054,6 +1054,7 @@ async fn stage_body(
         .await?
         .ok_or_else(|| anyhow!("this node does not own the hf metadata assignment"))?;
     let head_key = hf_head_logical_key()?;
+    let committed_head = mvcc.read_latest_value(&head_key)?;
     let observed_head = mvcc.read_transaction_value(transaction_id, principal, &head_key)?;
     let mut head = observed_head
         .as_deref()
@@ -1119,7 +1120,7 @@ async fn stage_body(
         transaction_id,
         principal,
         head_key,
-        value_predicate(observed_head.as_deref()),
+        value_predicate(committed_head.as_deref()),
         now_unix_ms,
     )?;
     mvcc.stage_predicate(

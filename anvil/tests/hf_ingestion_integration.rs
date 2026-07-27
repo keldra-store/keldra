@@ -30,6 +30,7 @@ async fn hf_keys_are_tenant_scoped() {
                     name: key_name.clone(),
                     token: format!("secret-{}", actor.tenant_id),
                     note: note.to_string(),
+                    options: None,
                 }),
                 &actor.token,
             ))
@@ -76,6 +77,7 @@ async fn hf_keys_are_tenant_scoped() {
         .delete_key(authorized(
             tonic::Request::new(anvil::anvil_api::DeleteHfKeyRequest {
                 name: key_name.clone(),
+                options: None,
             }),
             &first.token,
         ))
@@ -131,6 +133,7 @@ async fn hf_ingestion_single_file_integration() {
         name: key_name.clone(),
         token: "".into(),
         note: "".into(),
+        options: None,
     });
     kreq.metadata_mut().insert(
         "authorization",
@@ -154,6 +157,7 @@ async fn hf_ingestion_single_file_integration() {
         target_prefix: "gpt-oss-20b".into(),
         include_globs: vec!["config.json".into()],
         exclude_globs: vec![],
+        options: None,
     });
     sreq.metadata_mut().insert(
         "authorization",
@@ -307,6 +311,7 @@ async fn hf_ingestion_permission_denied() {
         name: key_name.clone(),
         token: "".into(),
         note: "".into(),
+        options: None,
     });
     kreq.metadata_mut().insert(
         "authorization",
@@ -330,6 +335,7 @@ async fn hf_ingestion_permission_denied() {
         target_prefix: "gpt-oss-20b".into(),
         include_globs: vec!["config.json".into()],
         exclude_globs: vec![],
+        options: None,
     });
     // Create a same-tenant app with no HF ingestion grant.
     let limited_actor = cluster
