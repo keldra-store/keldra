@@ -5,6 +5,7 @@ use crate::{
     personaldb_control::PersonalDbCommitCertificate,
     personaldb_coremeta::{
         PersonalDbDataLocatorCoreMetaRow, personaldb_payload_hash,
+        prepare_personaldb_bytes_as_data_locator, PersonalDbWritePlan,
         read_personaldb_data_locator_bytes, read_personaldb_data_locator_row_at_snapshot,
         write_personaldb_bytes_as_data_locator_mvcc, write_personaldb_data_locator_row_mvcc,
     },
@@ -128,6 +129,70 @@ pub async fn write_personaldb_changeset_payload(
     };
     write_personaldb_data_locator_row_mvcc(mvcc, &by_index_row, "personaldb-commit-store").await?;
 
+    Ok(PersonalDbChangesetPayloadRefs {
+        by_index_ref,
+        by_hash_ref,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn prepare_and_stage_personaldb_changeset_payload(
+    storage: &Storage,
+    plan: &mut PersonalDbWritePlan,
+    tenant_id: i64,
+    database_id: &str,
+    log_index: u64,
+    root_generation: u64,
+    expected_payload_hash: Hash32,
+    changeset_bytes: &[u8],
+) -> Result<PersonalDbChangesetPayloadRefs> {
+    let actual_hash = hash32(changeset_bytes);
+    if actual_hash != expected_payload_hash {
+        return Err(anyhow!("personaldb changeset payload hash mismatch"));
+    }
+    let payload_hash_hex = hex::encode(expected_payload_hash);
+    let by_hash_ref =
+        personaldb_changeset_payload_by_hash_ref_name(tenant_id, database_id, &payload_hash_hex)?;
+    let by_index_ref = personaldb_changeset_payload_by_index_ref_name(
+        tenant_id,
+        database_id,
+        log_index,
+        &payload_hash_hex,
+    )?;
+    let by_hash_row = prepare_personaldb_bytes_as_data_locator(
+        storage,
+        tenant_id,
+        database_id,
+        &by_hash_ref,
+        "changeset",
+        log_index,
+        root_generation,
+        changeset_bytes.to_vec(),
+        payload_hash_hex.clone(),
+        vec![format!("log_index:{log_index:020}")],
+        format!(
+            "personaldb-changeset-payload:{tenant_id}:{database_id}:{log_index}:{payload_hash_hex}"
+        ),
+    )
+    .await?;
+    plan.stage_data_locator_row(&by_hash_row)?;
+    let by_index_row = PersonalDbDataLocatorCoreMetaRow {
+        tenant_id,
+        group_id: database_id.to_string(),
+        data_id: by_index_ref.clone(),
+        data_kind: "changeset".to_string(),
+        generation: log_index,
+        root_generation,
+        sqlite_changeset_hash: payload_hash_hex,
+        payload_locator: by_hash_row.payload_locator.clone(),
+        projection_keys: by_hash_row.projection_keys.clone(),
+        transaction_id: format!(
+            "personaldb-changeset-index:{tenant_id}:{database_id}:{log_index}:{}",
+            by_hash_row.sqlite_changeset_hash
+        ),
+        created_at_unix_nanos: by_hash_row.created_at_unix_nanos,
+    };
+    plan.stage_data_locator_row(&by_index_row)?;
     Ok(PersonalDbChangesetPayloadRefs {
         by_index_ref,
         by_hash_ref,

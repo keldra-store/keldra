@@ -4,6 +4,7 @@ use crate::{
     mvcc_bootstrap::MvccSubsystem,
     mvcc_product::ProductMutation,
     mvcc_transaction::{DurabilityLevel, LogicalKey, PredicateKind},
+    personaldb_coremeta::PersonalDbWritePlan,
 };
 use anyhow::{Result, anyhow};
 use prost::Message;
@@ -137,6 +138,31 @@ pub async fn append_personaldb_group_watch_record(
         )
         .await?;
     Ok(u128::from(committed))
+}
+
+pub fn stage_personaldb_group_watch_record(
+    plan: &mut PersonalDbWritePlan,
+    tenant_id: i64,
+    database_id: &str,
+    mutation_id: [u8; 16],
+    authz_revision: u64,
+    payload: PersonalDbGroupWatchPayload,
+) -> Result<()> {
+    validate_payload(database_id, &payload)?;
+    let key = group_watch_key(tenant_id, database_id, mutation_id)?;
+    let record = WatchRecord::new(
+        0,
+        PERSONALDB_GROUP_PARTITION_FAMILY,
+        partition_id(tenant_id, database_id),
+        mutation_id,
+        PERSONALDB_GROUP_RECORD_KIND,
+        authz_revision,
+        0,
+        payload.log_index,
+        encode_group_watch_payload(&payload),
+    );
+    plan.stage_put(key, record.encode(), PredicateKind::Unique);
+    Ok(())
 }
 
 pub async fn append_personaldb_projection_watch_record(

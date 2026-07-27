@@ -19,6 +19,196 @@ use prost::Message;
 
 pub const PERSONALDB_DATA_LOCATOR_PAGE_MAX: usize = 1000;
 
+/// All metadata made visible by one public PersonalDB operation.
+///
+/// Physical logical-file payloads may be written before this plan is committed:
+/// their locators remain unreachable until the corresponding product rows are
+/// staged here.  The plan acquires one assignment guard and receives one MVCC
+/// commit version for the complete product mutation set.
+#[derive(Debug)]
+pub struct PersonalDbWritePlan {
+    tenant_id: i64,
+    group_id: String,
+    principal: String,
+    idempotency_key: String,
+    mutations: Vec<crate::mvcc_product::ProductMutation>,
+    predicates: Vec<(
+        crate::mvcc_transaction::LogicalKey,
+        Option<crate::mvcc_transaction::PredicateKind>,
+    )>,
+}
+
+impl PersonalDbWritePlan {
+    pub fn new(
+        tenant_id: i64,
+        group_id: impl Into<String>,
+        principal: impl Into<String>,
+        idempotency_key: impl Into<String>,
+    ) -> Result<Self> {
+        let group_id = group_id.into();
+        validate_personaldb_scope(tenant_id, &group_id)?;
+        let principal = principal.into();
+        let idempotency_key = idempotency_key.into();
+        if principal.is_empty() || idempotency_key.is_empty() {
+            bail!("PersonalDB write plan principal and idempotency key must be nonempty");
+        }
+        Ok(Self {
+            tenant_id,
+            group_id,
+            principal,
+            idempotency_key,
+            mutations: Vec::new(),
+            predicates: Vec::new(),
+        })
+    }
+
+    pub fn stage_put(
+        &mut self,
+        key: crate::mvcc_transaction::LogicalKey,
+        payload: Vec<u8>,
+        predicate: crate::mvcc_transaction::PredicateKind,
+    ) {
+        self.mutations
+            .push(crate::mvcc_product::ProductMutation::put(key.clone(), payload));
+        self.predicates.push((key, Some(predicate)));
+    }
+
+    pub fn stage_data_locator_row(
+        &mut self,
+        row: &PersonalDbDataLocatorCoreMetaRow,
+    ) -> Result<()> {
+        validate_data_locator_row(row)?;
+        self.require_scope(row.tenant_id, &row.group_id)?;
+        let tuple =
+            personaldb_data_locator_tuple_key(row.tenant_id, &row.group_id, &row.data_id)?;
+        self.stage_coremeta_row(
+            TABLE_PERSONALDB_DATA_LOCATOR_ROW,
+            tuple,
+            encode_data_locator_row(row)?,
+        )
+    }
+
+    pub fn stage_group_row(
+        &mut self,
+        row: &PersonalDbGroupCoreMetaRow,
+    ) -> Result<()> {
+        validate_group_row(row)?;
+        self.require_scope(row.tenant_id, &row.group_id)?;
+        let tuple = personaldb_group_tuple_key(row.tenant_id, &row.group_id, row.generation)?;
+        self.stage_coremeta_row(
+            TABLE_PERSONALDB_GROUP_ROW,
+            tuple,
+            encode_group_row(row)?,
+        )
+    }
+
+    fn stage_coremeta_row(
+        &mut self,
+        table_id: u16,
+        tuple_key: Vec<u8>,
+        payload: Vec<u8>,
+    ) -> Result<()> {
+        let key = crate::mvcc_product::coremeta_logical_key(CF_PERSONALDB, table_id, &tuple_key)?;
+        self.mutations
+            .push(crate::mvcc_product::ProductMutation::put(key.clone(), payload));
+        // Resolve replace semantics at the transaction's fixed snapshot, not
+        // while a potentially long-lived plan is being assembled.
+        self.predicates.push((key, None));
+        Ok(())
+    }
+
+    fn require_scope(&self, tenant_id: i64, group_id: &str) -> Result<()> {
+        if tenant_id != self.tenant_id || group_id != self.group_id {
+            bail!("PersonalDB write plan cannot span group assignments");
+        }
+        Ok(())
+    }
+
+    pub async fn commit(
+        self,
+        mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    ) -> Result<u64> {
+        if self.mutations.is_empty() {
+            bail!("PersonalDB write plan has no product mutations");
+        }
+        let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default();
+        let handle = mvcc
+            .open_transactions
+            .begin(
+                mvcc.runtime.as_ref(),
+                mvcc.cluster_id(),
+                &self.principal,
+                &self.idempotency_key,
+                std::time::Duration::from_secs(30),
+                crate::mvcc_transaction::DurabilityLevel::Quorum,
+                crate::mvcc_transaction::ReadConsistency::Linearized,
+                now,
+            )
+            .await?;
+        let status =
+            mvcc.open_transactions
+                .status(&handle.transaction_id, &self.principal, now)?;
+        if status.state == "open" {
+            let logical_identity =
+                format!("tenant/{}/personaldb/{}", self.tenant_id, self.group_id);
+            let assignment = mvcc
+                .reconcile_work_assignment("personaldb-write", &logical_identity)
+                .await?
+                .ok_or_else(|| anyhow!("local node does not own PersonalDB group assignment"))?;
+            mvcc.stage_product_mutations(
+                &handle.transaction_id,
+                &self.principal,
+                self.mutations,
+                now,
+            )?;
+            for (key, predicate) in self.predicates {
+                let predicate = match predicate {
+                    Some(predicate) => predicate,
+                    None => mvcc
+                        .runtime
+                        .read_at(&key, handle.snapshot_version)?
+                        .map(|current| {
+                            crate::mvcc_transaction::PredicateKind::ValueHash(
+                                *blake3::hash(&current.value).as_bytes(),
+                            )
+                        })
+                        .unwrap_or(crate::mvcc_transaction::PredicateKind::Absent),
+                };
+                mvcc.stage_predicate(
+                    &handle.transaction_id,
+                    &self.principal,
+                    key,
+                    predicate,
+                    now,
+                )?;
+            }
+            mvcc.stage_assignment_guard(
+                &handle.transaction_id,
+                &self.principal,
+                &assignment,
+                now,
+            )?;
+        }
+        let outcome = mvcc
+            .open_transactions
+            .commit(
+                mvcc.runtime.as_ref(),
+                &handle.transaction_id,
+                &self.principal,
+                now,
+            )
+            .await?;
+        match outcome.certification {
+            crate::mvcc_transaction::CertificationResult::Committed { commit_version } => {
+                Ok(commit_version)
+            }
+            crate::mvcc_transaction::CertificationResult::Aborted { reason } => {
+                bail!("PersonalDB MVCC write plan aborted: {reason:?}")
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersonalDbGroupCoreMetaRow {
     pub tenant_id: i64,
@@ -104,7 +294,47 @@ pub async fn write_personaldb_bytes_as_data_locator_mvcc(
     transaction_id: String,
     principal: &str,
 ) -> Result<PersonalDbDataLocatorCoreMetaRow> {
+    let root_generation = mvcc
+        .runtime
+        .applied_version()?
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("PersonalDB locator generation overflow"))?;
+    let row = prepare_personaldb_bytes_as_data_locator(
+        storage,
+        tenant_id,
+        group_id,
+        data_id,
+        data_kind,
+        generation,
+        root_generation,
+        bytes,
+        sqlite_changeset_hash,
+        projection_keys,
+        transaction_id,
+    )
+    .await?;
+    write_personaldb_data_locator_row_mvcc(mvcc, &row, principal).await?;
+    Ok(row)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn prepare_personaldb_bytes_as_data_locator(
+    storage: &Storage,
+    tenant_id: i64,
+    group_id: &str,
+    data_id: &str,
+    data_kind: &str,
+    generation: u64,
+    root_generation: u64,
+    bytes: Vec<u8>,
+    sqlite_changeset_hash: String,
+    projection_keys: Vec<String>,
+    transaction_id: String,
+) -> Result<PersonalDbDataLocatorCoreMetaRow> {
     validate_personaldb_scope(tenant_id, group_id)?;
+    if root_generation == 0 {
+        bail!("PersonalDB locator root generation must be nonzero");
+    }
     let logical_file_id = canonical_logical_file_id(
         WriterFamily::PersonalDb,
         generation,
@@ -132,18 +362,13 @@ pub async fn write_personaldb_bytes_as_data_locator_mvcc(
         data_id: data_id.to_string(),
         data_kind: data_kind.to_string(),
         generation,
-        root_generation: mvcc
-            .runtime
-            .applied_version()?
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("PersonalDB locator generation overflow"))?,
+        root_generation,
         sqlite_changeset_hash,
         payload_locator: logical.locator,
         projection_keys,
         transaction_id,
         created_at_unix_nanos: current_unix_nanos()?,
     };
-    write_personaldb_data_locator_row_mvcc(mvcc, &row, principal).await?;
     Ok(row)
 }
 
@@ -655,62 +880,10 @@ pub(crate) async fn write_personaldb_product_row_mvcc(
     tuple_key: Vec<u8>,
     payload: Vec<u8>,
 ) -> Result<u64> {
-    let key = crate::mvcc_product::coremeta_logical_key(CF_PERSONALDB, table_id, &tuple_key)?;
-    let predicate = mvcc
-        .read_latest_value(&key)?
-        .map(|current| {
-            crate::mvcc_transaction::PredicateKind::ValueHash(*blake3::hash(&current).as_bytes())
-        })
-        .unwrap_or(crate::mvcc_transaction::PredicateKind::Absent);
-    let assignment = mvcc
-        .reconcile_work_assignment(
-            "personaldb_group",
-            &personaldb_partition_id(tenant_id, group_id),
-        )
-        .await?
-        .ok_or_else(|| anyhow!("local node does not own PersonalDB group assignment"))?;
-    let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default();
-    let handle = mvcc
-        .open_transactions
-        .begin(
-            mvcc.runtime.as_ref(),
-            mvcc.cluster_id(),
-            principal,
-            idempotency_key,
-            std::time::Duration::from_secs(30),
-            crate::mvcc_transaction::DurabilityLevel::Quorum,
-            crate::mvcc_transaction::ReadConsistency::Linearized,
-            now,
-        )
-        .await?;
-    mvcc.stage_product_mutations(
-        &handle.transaction_id,
-        principal,
-        vec![crate::mvcc_product::ProductMutation::put(
-            key.clone(),
-            payload,
-        )],
-        now,
-    )?;
-    mvcc.stage_predicate(&handle.transaction_id, principal, key, predicate, now)?;
-    mvcc.stage_assignment_guard(&handle.transaction_id, principal, &assignment, now)?;
-    let outcome = mvcc
-        .open_transactions
-        .commit(
-            mvcc.runtime.as_ref(),
-            &handle.transaction_id,
-            principal,
-            now,
-        )
-        .await?;
-    match outcome.certification {
-        crate::mvcc_transaction::CertificationResult::Committed { commit_version } => {
-            Ok(commit_version)
-        }
-        crate::mvcc_transaction::CertificationResult::Aborted { reason } => {
-            bail!("PersonalDB MVCC row transaction aborted: {reason:?}")
-        }
-    }
+    let mut plan =
+        PersonalDbWritePlan::new(tenant_id, group_id, principal, idempotency_key)?;
+    plan.stage_coremeta_row(table_id, tuple_key, payload)?;
+    plan.commit(mvcc).await
 }
 
 pub fn read_personaldb_group_row_at_snapshot(
