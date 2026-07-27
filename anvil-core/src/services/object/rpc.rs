@@ -22,32 +22,15 @@ async fn begin_implicit_native_transaction(
     claims: &auth::Claims,
     context: Option<&NativeMutationContext>,
     target: &NativeIdempotencyTarget,
-) -> Result<Option<crate::mvcc_open_transactions::TransactionHandle>, Status> {
+) -> Result<Option<super::native_mutation::ImplicitNativeTransaction>, Status> {
     let context =
         context.ok_or_else(|| Status::invalid_argument("Missing native mutation context"))?;
     if context.transaction_id.is_some() {
         return Ok(None);
     }
-    let principal = object_manager::transaction_principal_from_claims(claims);
-    let idempotency_key = super::native_mutation::implicit_native_transaction_key(context, target)?;
-    state
-        .mvcc
-        .open_transactions
-        .begin(
-            state.mvcc.runtime.as_ref(),
-            state.mvcc.cluster_id().to_string(),
-            principal,
-            idempotency_key,
-            std::time::Duration::from_secs(300),
-            super::native_put_rpc::configured_default_durability(
-                &state.config.mvcc_default_durability,
-            )?,
-            crate::mvcc_transaction::ReadConsistency::Linearized,
-            u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
-        )
+    super::native_mutation::begin_implicit_native_transaction(state, context, target, claims)
         .await
         .map(Some)
-        .map_err(|error| Status::failed_precondition(error.to_string()))
 }
 
 async fn commit_implicit_native_response<T: serde::Serialize>(
@@ -56,7 +39,7 @@ async fn commit_implicit_native_response<T: serde::Serialize>(
     context: &NativeMutationContext,
     target: &NativeIdempotencyTarget,
     response: &T,
-    handle: &crate::mvcc_open_transactions::TransactionHandle,
+    handle: &super::native_mutation::ImplicitNativeTransaction,
 ) -> Result<(), Status> {
     let principal = object_manager::transaction_principal_from_claims(claims);
     let plan = crate::native_idempotency::prepare_response_for_implicit_batch(
@@ -1541,6 +1524,23 @@ impl ObjectService for AppState {
             AnvilAction::ObjectWrite,
         )
         .await?;
+        if native_idempotency::response_exists(&self.mvcc, attempt.context()).await? {
+            let (payload_hash, payload_size) =
+                super::native_put_rpc::hash_native_payload(&mut incoming_payload).await?;
+            let target = super::native_put_rpc::native_payload_target(
+                base_target,
+                &payload_hash,
+                payload_size,
+            );
+            let response = native_idempotency::load_response::<UploadPartResponse>(
+                &self.mvcc,
+                attempt.context(),
+                &target,
+            )
+            .await?
+            .ok_or_else(|| Status::data_loss("committed multipart part is missing its response"))?;
+            return Ok(Response::new(response));
+        }
         let implicit_transaction = begin_implicit_native_transaction(
             self,
             &claims,
@@ -1827,11 +1827,11 @@ impl ObjectService for AppState {
                 transaction_principal.as_deref(),
             )
             .await?;
-        let watch_cursor = if requested_transaction_id.is_some() {
-            0
-        } else {
-            object_watch_cursor(self, &object).await?
-        };
+        // Both caller-supplied and implicit native transactions are still open
+        // here. The watch event becomes visible only when this transaction is
+        // applied, so its external cursor cannot be queried or embedded in the
+        // atomically committed idempotency response.
+        let watch_cursor = 0;
         let authz_revision = object_authz_revision(&object)?;
 
         let response = CompleteMultipartResponse {

@@ -31,6 +31,13 @@ pub(crate) async fn execute_native_put(
         AnvilAction::ObjectWrite,
     )
     .await?;
+    if native_idempotency::response_exists(&state.mvcc, attempt.context()).await? {
+        let (payload_hash, payload_size) = hash_native_payload(&mut data_stream).await?;
+        let target = native_payload_target(base_target, &payload_hash, payload_size);
+        return native_idempotency::load_response(&state.mvcc, attempt.context(), &target)
+            .await?
+            .ok_or_else(|| Status::data_loss("committed native put is missing its response"));
+    }
     let transaction_principal = crate::object_manager::transaction_principal_from_claims(&claims);
     let internal_transaction = requested_transaction_id.is_none();
     let internal_transaction_id;
@@ -40,21 +47,13 @@ pub(crate) async fn execute_native_put(
         let context = mutation_context
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("Missing native mutation context"))?;
-        let handle = state
-            .mvcc
-            .open_transactions
-            .begin(
-                state.mvcc.runtime.as_ref(),
-                state.config.mvcc_cluster_id.clone(),
-                transaction_principal.clone(),
-                super::native_mutation::implicit_native_transaction_key(context, &base_target)?,
-                std::time::Duration::from_secs(300),
-                configured_default_durability(&state.config.mvcc_default_durability)?,
-                ReadConsistency::Linearized,
-                current_unix_ms()?,
-            )
-            .await
-            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        let handle = super::native_mutation::begin_implicit_native_transaction(
+            state,
+            context,
+            &base_target,
+            &claims,
+        )
+        .await?;
         internal_transaction_id = handle.transaction_id;
         &internal_transaction_id
     };

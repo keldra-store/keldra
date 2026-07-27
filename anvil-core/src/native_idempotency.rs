@@ -189,16 +189,7 @@ pub async fn load_response<T>(
 where
     T: DeserializeOwned,
 {
-    // A retry may arrive at a follower immediately after another coordinator
-    // committed the mutation.  Establish the cluster read point and wait for
-    // this node to apply through it before consulting the durable response.
-    // This keeps replay local to the contacted node without treating temporary
-    // follower lag as a missing idempotency record and re-proposing the same
-    // deterministic transaction.
-    mvcc.runtime
-        .snapshot(crate::mvcc_transaction::ReadConsistency::Linearized)
-        .await
-        .map_err(|error| Status::unavailable(error.to_string()))?;
+    linearize_response_read(mvcc).await?;
     let Some(record) = read_record(mvcc, context)? else {
         return Ok(None);
     };
@@ -206,6 +197,35 @@ where
     let response = serde_json::from_value(record.response_json)
         .map_err(|e| Status::internal(format!("Invalid native idempotency response: {e}")))?;
     Ok(Some(response))
+}
+
+/// Checks the target-independent identity of a durable native response.
+///
+/// Streaming mutations cannot construct their complete target until they have
+/// consumed and hashed the request body.  This lets a retry discover a
+/// committed response before creating a new local transaction draft; only the
+/// replay case then consumes the body and calls [`load_response`] to validate
+/// the complete target.
+pub(crate) async fn response_exists(
+    mvcc: &MvccSubsystem,
+    context: &NativeMutationContext,
+) -> Result<bool, Status> {
+    linearize_response_read(mvcc).await?;
+    read_record(mvcc, context).map(|record| record.is_some())
+}
+
+async fn linearize_response_read(mvcc: &MvccSubsystem) -> Result<(), Status> {
+    // A retry may arrive at a follower immediately after another coordinator
+    // committed the mutation. Establish the cluster read point and wait for
+    // this node to apply through it before consulting the durable response.
+    // This keeps replay local to the contacted node without treating temporary
+    // follower lag as a missing idempotency record and re-proposing the same
+    // deterministic transaction.
+    mvcc.runtime
+        .snapshot(crate::mvcc_transaction::ReadConsistency::Linearized)
+        .await
+        .map(|_| ())
+        .map_err(|error| Status::unavailable(error.to_string()))
 }
 
 pub async fn store_response<T>(

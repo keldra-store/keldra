@@ -35,7 +35,7 @@ pub(super) async fn begin_implicit_native_transaction(
         .open_transactions
         .begin(
             state.mvcc.runtime.as_ref(),
-            state.config.mvcc_cluster_id.clone(),
+            state.mvcc.cluster_id().to_string(),
             principal.clone(),
             idempotency_key,
             std::time::Duration::from_secs(300),
