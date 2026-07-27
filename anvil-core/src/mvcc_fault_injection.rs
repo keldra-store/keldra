@@ -3,9 +3,7 @@
 //! This module is test-only. Hooks fail exact operation ordinals and never use
 //! sleeps, wall-clock races, or production feature flags.
 
-use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
-};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 

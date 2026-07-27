@@ -132,7 +132,7 @@ pub(super) async fn upload_part(
     key: String,
     upload_id: uuid::Uuid,
     part_number: i32,
-    body_stream: impl Stream<Item = Result<Vec<u8>, tonic::Status>> + Unpin,
+    body_stream: impl Stream<Item = Result<Vec<u8>, tonic::Status>> + Send + Unpin,
 ) -> Response {
     match state
         .object_manager
