@@ -125,7 +125,9 @@ async fn real_cluster_quorum_commit_is_readable_after_node_restart() {
                 object_key: "fixture/smoke".into(),
                 version_id: None,
                 range: None,
-                consistency: anvil::anvil_api::ReadConsistency::Linearized as i32,
+                consistency: Some(anvil::anvil_api::ReadConsistency {
+                    mode: Some(anvil::anvil_api::read_consistency::Mode::Latest(true)),
+                }),
             },
             &actor.token,
         ))
