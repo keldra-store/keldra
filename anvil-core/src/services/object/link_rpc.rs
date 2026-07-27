@@ -1,5 +1,169 @@
 use super::*;
 
+struct ObjectLinkMutationTransaction {
+    id: String,
+    principal: String,
+    internal: bool,
+    replayed: bool,
+}
+
+async fn begin_object_link_mutation(
+    state: &AppState,
+    claims: &auth::Claims,
+    context: &PublicMutationContext,
+) -> Result<ObjectLinkMutationTransaction, Status> {
+    let principal = crate::object_manager::transaction_principal_from_claims(claims);
+    if let Some(transaction_id) = public_context_transaction_id(context)? {
+        state
+            .mvcc
+            .open_transactions
+            .binding(transaction_id, &principal)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        return Ok(ObjectLinkMutationTransaction {
+            id: transaction_id.to_string(),
+            principal,
+            internal: false,
+            replayed: false,
+        });
+    }
+    let now = u64::try_from(chrono::Utc::now().timestamp_millis())
+        .map_err(|_| Status::internal("object-link timestamp predates Unix epoch"))?;
+    let handle = state
+        .mvcc
+        .open_transactions
+        .begin(
+            state.mvcc.runtime.as_ref(),
+            state.mvcc.cluster_id().to_string(),
+            principal.clone(),
+            format!(
+                "object-link:{}:{}:{}",
+                claims.tenant_id, claims.sub, context.idempotency_key
+            ),
+            std::time::Duration::from_secs(300),
+            crate::mvcc_transaction::DurabilityLevel::Quorum,
+            crate::mvcc_transaction::ReadConsistency::Linearized,
+            now,
+        )
+        .await
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    let status = state
+        .mvcc
+        .open_transactions
+        .status(&handle.transaction_id, &principal, now)
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    if status.state == "committing" {
+        let outcome = state
+            .mvcc
+            .open_transactions
+            .commit(
+                state.mvcc.runtime.as_ref(),
+                &handle.transaction_id,
+                &principal,
+                now,
+            )
+            .await
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        if let crate::mvcc_transaction::CertificationResult::Aborted { reason } =
+            outcome.certification
+        {
+            return Err(Status::aborted(format!(
+                "implicit object-link transaction aborted: {reason:?}"
+            )));
+        }
+    } else if status.state == "aborted" {
+        return Err(Status::aborted(
+            "implicit object-link transaction previously aborted",
+        ));
+    }
+    Ok(ObjectLinkMutationTransaction {
+        id: handle.transaction_id,
+        principal,
+        internal: true,
+        replayed: matches!(status.state, "committed" | "committing"),
+    })
+}
+
+async fn commit_object_link_mutation(
+    state: &AppState,
+    transaction: &ObjectLinkMutationTransaction,
+) -> Result<(), Status> {
+    if !transaction.internal {
+        return Ok(());
+    }
+    let outcome = state
+        .mvcc
+        .open_transactions
+        .commit(
+            state.mvcc.runtime.as_ref(),
+            &transaction.id,
+            &transaction.principal,
+            u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+        )
+        .await
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    match outcome.certification {
+        crate::mvcc_transaction::CertificationResult::Committed { .. } => Ok(()),
+        crate::mvcc_transaction::CertificationResult::Aborted { reason } => {
+            Err(Status::aborted(format!(
+                "implicit object-link transaction aborted: {reason:?}"
+            )))
+        }
+    }
+}
+
+fn stage_object_link_finalization(
+    state: &AppState,
+    transaction: &ObjectLinkMutationTransaction,
+    bucket: &crate::persistence::Bucket,
+    link_key: &str,
+    generation: u64,
+    operation: crate::object_link_finalization_job::ObjectLinkFinalizationOperation,
+    target_key: Option<String>,
+    target_version_id: Option<String>,
+    mutation_id: uuid::Uuid,
+) -> Result<(), Status> {
+    let job = crate::object_link_finalization_job::ObjectLinkFinalizationJob {
+        schema: crate::object_link_finalization_job::ObjectLinkFinalizationJob::SCHEMA.into(),
+        cluster_id: state.mvcc.cluster_id().to_string(),
+        transaction_id: transaction.id.clone(),
+        tenant_id: bucket.tenant_id,
+        bucket_id: bucket.id,
+        bucket_name: bucket.name.clone(),
+        link_key: link_key.to_string(),
+        generation,
+        operation,
+        target_key,
+        target_version_id,
+        mutation_id: mutation_id.to_string(),
+        consequences:
+            crate::object_link_finalization_job::ObjectLinkFinalizationConsequences {
+                maintain_indexes: true,
+                compact_metadata: true,
+            },
+    };
+    state
+        .mvcc
+        .open_transactions
+        .add_job(
+            &transaction.id,
+            job.encode()
+                .map_err(|error| Status::internal(error.to_string()))?,
+            u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+        )
+        .map_err(|error| Status::failed_precondition(error.to_string()))
+}
+
+impl AppState {
+    pub async fn run_object_link_finalization_loop(self) {
+        loop {
+            if let Err(error) = self.persistence.run_object_link_finalization_once().await {
+                tracing::warn!(%error, "object-link finalization attempt failed");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+}
+
 pub(super) async fn create_object_link(
     state: &AppState,
     request: Request<CreateObjectLinkRequest>,
@@ -12,9 +176,7 @@ pub(super) async fn create_object_link(
     let req = request.into_inner();
     validate_public_tenant_locator(&claims, &req.tenant_id)?;
     let context = public_link_context(req.context.as_ref(), true)?;
-    let transaction_id = public_context_transaction_id(context)?;
-    let transaction_principal =
-        transaction_id.map(|_| crate::object_manager::transaction_principal_from_claims(&claims));
+    let transaction = begin_object_link_mutation(state, &claims, context).await?;
     require_object_link_scope(
         state,
         &claims,
@@ -34,6 +196,23 @@ pub(super) async fn create_object_link(
         serde_json::json!({ "target_key": req.target_key, "generation": 1 }),
     )?;
     let audit_event_id = audit_event.audit_event_id.clone();
+    if transaction.replayed {
+        let descriptor = state
+            .persistence
+            .get_object_link(bucket.id, &req.link_key)
+            .await
+            .map_err(object_link_status)?
+            .ok_or_else(|| {
+                Status::already_exists(
+                    "object-link idempotency key was already used for different input",
+                )
+            })?;
+        return Ok(Response::new(ObjectLinkResponse {
+            request_id: context.request_id.clone(),
+            link: Some(object_link_descriptor_to_proto(descriptor)),
+            audit_event_id,
+        }));
+    }
     let mutation = state
         .persistence
         .put_object_link(object_links::PutObjectLinkRequest {
@@ -48,12 +227,24 @@ pub(super) async fn create_object_link(
             allow_dangling: req.allow_dangling,
             idempotency_key: context.idempotency_key.clone(),
             created_by: format!("app:{}", claims.sub),
-            transaction_id: transaction_id.map(ToOwned::to_owned),
-            transaction_principal: transaction_principal.clone(),
+            transaction_id: Some(transaction.id.clone()),
+            transaction_principal: Some(transaction.principal.clone()),
             audit_event: Some(audit_event),
         })
         .await
         .map_err(object_link_status)?;
+    stage_object_link_finalization(
+        state,
+        &transaction,
+        &bucket,
+        &mutation.descriptor.link_key,
+        mutation.descriptor.generation,
+        crate::object_link_finalization_job::ObjectLinkFinalizationOperation::Put,
+        Some(mutation.descriptor.target_key.clone()),
+        mutation.descriptor.target_version.clone(),
+        mutation.link.mutation_id,
+    )?;
+    commit_object_link_mutation(state, &transaction).await?;
 
     Ok(Response::new(ObjectLinkResponse {
         request_id: context.request_id.clone(),
@@ -73,9 +264,7 @@ pub(super) async fn update_object_link(
     let req = request.into_inner();
     validate_public_tenant_locator(&claims, &req.tenant_id)?;
     let context = public_link_context(req.context.as_ref(), false)?;
-    let transaction_id = public_context_transaction_id(context)?;
-    let transaction_principal =
-        transaction_id.map(|_| crate::object_manager::transaction_principal_from_claims(&claims));
+    let transaction = begin_object_link_mutation(state, &claims, context).await?;
     require_object_link_scope(
         state,
         &claims,
@@ -95,6 +284,24 @@ pub(super) async fn update_object_link(
         serde_json::json!({ "target_key": req.target_key, "generation": context.expected_generation + 1 }),
     )?;
     let audit_event_id = audit_event.audit_event_id.clone();
+    if transaction.replayed {
+        let descriptor = state
+            .persistence
+            .get_object_link(bucket.id, &req.link_key)
+            .await
+            .map_err(object_link_status)?
+            .filter(|descriptor| descriptor.generation == context.expected_generation + 1)
+            .ok_or_else(|| {
+                Status::already_exists(
+                    "object-link idempotency key was already used for different input",
+                )
+            })?;
+        return Ok(Response::new(ObjectLinkResponse {
+            request_id: context.request_id.clone(),
+            link: Some(object_link_descriptor_to_proto(descriptor)),
+            audit_event_id,
+        }));
+    }
     let mutation = state
         .persistence
         .put_object_link(object_links::PutObjectLinkRequest {
@@ -109,12 +316,24 @@ pub(super) async fn update_object_link(
             allow_dangling: req.allow_dangling,
             idempotency_key: context.idempotency_key.clone(),
             created_by: format!("app:{}", claims.sub),
-            transaction_id: transaction_id.map(ToOwned::to_owned),
-            transaction_principal: transaction_principal.clone(),
+            transaction_id: Some(transaction.id.clone()),
+            transaction_principal: Some(transaction.principal.clone()),
             audit_event: Some(audit_event),
         })
         .await
         .map_err(object_link_status)?;
+    stage_object_link_finalization(
+        state,
+        &transaction,
+        &bucket,
+        &mutation.descriptor.link_key,
+        mutation.descriptor.generation,
+        crate::object_link_finalization_job::ObjectLinkFinalizationOperation::Put,
+        Some(mutation.descriptor.target_key.clone()),
+        mutation.descriptor.target_version.clone(),
+        mutation.link.mutation_id,
+    )?;
+    commit_object_link_mutation(state, &transaction).await?;
 
     Ok(Response::new(ObjectLinkResponse {
         request_id: context.request_id.clone(),
@@ -134,9 +353,7 @@ pub(super) async fn delete_object_link(
     let req = request.into_inner();
     validate_public_tenant_locator(&claims, &req.tenant_id)?;
     let context = public_link_context(req.context.as_ref(), false)?;
-    let transaction_id = public_context_transaction_id(context)?;
-    let transaction_principal =
-        transaction_id.map(|_| crate::object_manager::transaction_principal_from_claims(&claims));
+    let transaction = begin_object_link_mutation(state, &claims, context).await?;
     require_object_link_scope(
         state,
         &claims,
@@ -154,6 +371,15 @@ pub(super) async fn delete_object_link(
         serde_json::json!({ "generation": context.expected_generation + 1 }),
     )?;
     let audit_event_id = audit_event.audit_event_id.clone();
+    if transaction.replayed {
+        return Ok(Response::new(MutationResponse {
+            request_id: context.request_id.clone(),
+            resource_id: req.link_key,
+            generation: context.expected_generation + 1,
+            audit_event_id,
+            idempotent_replay: true,
+        }));
+    }
     let deleted = state
         .persistence
         .delete_object_link(object_links::DeleteObjectLinkRequest {
@@ -162,12 +388,24 @@ pub(super) async fn delete_object_link(
             link_key: req.link_key,
             expected_generation: context.expected_generation,
             idempotency_key: context.idempotency_key.clone(),
-            transaction_id: transaction_id.map(ToOwned::to_owned),
-            transaction_principal: transaction_principal.clone(),
+            transaction_id: Some(transaction.id.clone()),
+            transaction_principal: Some(transaction.principal.clone()),
             audit_event: Some(audit_event),
         })
         .await
         .map_err(object_link_status)?;
+    stage_object_link_finalization(
+        state,
+        &transaction,
+        &bucket,
+        &deleted.link_key,
+        deleted.generation,
+        crate::object_link_finalization_job::ObjectLinkFinalizationOperation::Delete,
+        None,
+        None,
+        deleted.mutation_id,
+    )?;
+    commit_object_link_mutation(state, &transaction).await?;
 
     Ok(Response::new(MutationResponse {
         request_id: context.request_id.clone(),

@@ -62,6 +62,88 @@ fn deferred_index_policy_snapshot_hash(tenant_id: i64, bucket_id: i64) -> String
 }
 
 impl Persistence {
+    pub async fn run_object_link_finalization_once(&self) -> Result<bool> {
+        let worker_id = format!("object-link-finalization/{}", self.owner_node_id());
+        let now = u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default();
+        let Some((job_id, record)) = self
+            .mvcc()?
+            .runtime
+            .local_store()
+            .claim_object_link_finalization_authorized(
+                &worker_id,
+                now,
+                30_000,
+                |record| {
+                    self.mvcc()
+                        .ok()?
+                        .claim_assignment(
+                            "object-link-finalization",
+                            &record.job.target_logical_identity(),
+                        )
+                        .ok()
+                        .flatten()
+                        .map(|guard| guard.lease_owner(&worker_id))
+                },
+            )?
+        else {
+            return Ok(false);
+        };
+        let guard = self
+            .mvcc()?
+            .claim_assignment(
+                "object-link-finalization",
+                &record.job.target_logical_identity(),
+            )?
+            .ok_or_else(|| anyhow!("object-link finalization assignment changed"))?;
+        let lease_owner = guard.lease_owner(&worker_id);
+        let result = async {
+            let bucket = self
+                .get_bucket_by_name(record.job.tenant_id, &record.job.bucket_name)
+                .await?
+                .ok_or_else(|| anyhow!("object-link finalization bucket is unavailable"))?;
+            if bucket.id != record.job.bucket_id {
+                bail!("object-link finalization bucket identity changed");
+            }
+            if record.job.consequences.maintain_indexes {
+                self.enqueue_index_builds_for_object_keys(
+                    &bucket,
+                    [record.job.link_key.as_str()],
+                )
+                .await?;
+            }
+            if record.job.consequences.compact_metadata {
+                self.enqueue_object_metadata_compaction_if_due(&bucket)
+                    .await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                self.mvcc()?.validate_assignment(&guard)?;
+                self.mvcc()?
+                    .runtime
+                    .local_store()
+                    .complete_object_link_finalization(&job_id, &lease_owner)?;
+                Ok(true)
+            }
+            Err(error) => {
+                let delay =
+                    250_u64.saturating_mul(1_u64 << record.attempts.saturating_sub(1).min(10));
+                self.mvcc()?
+                    .runtime
+                    .local_store()
+                    .retry_object_link_finalization(
+                        &job_id,
+                        &lease_owner,
+                        now.saturating_add(delay),
+                        &error.to_string(),
+                    )?;
+                Err(error)
+            }
+        }
+    }
+
     pub(crate) async fn prepare_objects_with_storage_class_in_transaction(
         &self,
         tenant_id: i64,
@@ -900,6 +982,7 @@ impl Persistence {
         Ok(object_links::DeleteObjectLinkResult {
             link_key: request.link_key,
             generation: new_generation,
+            mutation_id,
         })
     }
 

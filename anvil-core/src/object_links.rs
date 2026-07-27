@@ -107,6 +107,7 @@ pub struct DeleteObjectLinkRequest {
 pub struct DeleteObjectLinkResult {
     pub link_key: String,
     pub generation: u64,
+    pub mutation_id: uuid::Uuid,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
