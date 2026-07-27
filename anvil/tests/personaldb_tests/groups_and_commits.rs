@@ -19,6 +19,7 @@ async fn personaldb_group_create_get_and_catch_up_are_native_api_backed() {
                 schema_hash: schema_hash.clone(),
                 genesis_hash: genesis_hash.clone(),
                 schema_sql: PERSONALDB_TEST_SCHEMA_SQL.to_string(),
+                options: None,
             },
             &token,
         ))
@@ -123,6 +124,7 @@ async fn personaldb_submit_commits_and_is_available_to_catch_up_and_watch() {
                 schema_hash: personaldb_test_schema_hash(),
                 genesis_hash: genesis_hash.clone(),
                 schema_sql: PERSONALDB_TEST_SCHEMA_SQL.to_string(),
+                options: None,
             },
             &token,
         ))
@@ -364,6 +366,7 @@ async fn personaldb_create_retry_replays_grants_after_post_commit_failure() {
         schema_hash: personaldb_test_schema_hash(),
         genesis_hash: genesis_hash.clone(),
         schema_sql: PERSONALDB_TEST_SCHEMA_SQL.to_string(),
+        options: None,
     };
 
     let _clear_fault = ClearFault;
@@ -524,6 +527,7 @@ async fn personaldb_row_mutation_can_be_authorized_by_relationship_tuple() {
                 schema_hash: personaldb_test_schema_hash(),
                 genesis_hash: genesis_hash.clone(),
                 schema_sql: PERSONALDB_TEST_SCHEMA_SQL.to_string(),
+                options: None,
             },
             &token,
         ))
@@ -668,6 +672,7 @@ async fn personaldb_submit_builds_snapshot_when_threshold_is_reached() {
                 schema_hash: personaldb_test_schema_hash(),
                 genesis_hash: genesis_hash.clone(),
                 schema_sql: PERSONALDB_TEST_SCHEMA_SQL.to_string(),
+                options: None,
             },
             &token,
         ))

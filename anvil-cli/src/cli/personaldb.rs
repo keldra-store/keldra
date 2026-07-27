@@ -112,6 +112,7 @@ pub async fn handle_personaldb_command(
                 schema_hash: schema_hash.clone(),
                 genesis_hash: genesis_hash.clone(),
                 schema_sql: schema_sql.clone(),
+                options: None,
             });
             add_auth(&mut request, &token);
             print_group(client.create_personal_db_group(request).await?.into_inner());

@@ -211,59 +211,14 @@ impl PersonalDbWritePlan {
             mvcc.open_transactions
                 .status(&handle.transaction_id, &self.principal, now)?;
         if status.state == "open" {
-            let logical_identity =
-                format!("tenant/{}/personaldb/{}", self.tenant_id, self.group_id);
-            let assignment = match self.assignment {
-                Some(assignment) => {
-                    let expected_partition = crate::mvcc_worker_authority::work_partition_id(
-                        "personaldb-write",
-                        &logical_identity,
-                    )?;
-                    if assignment.partition_id != expected_partition {
-                        bail!("PersonalDB write plan assignment scope mismatch");
-                    }
-                    assignment
-                }
-                None => mvcc
-                    .reconcile_work_assignment("personaldb-write", &logical_identity)
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow!("local node does not own PersonalDB group assignment")
-                    })?,
-            };
-            mvcc.stage_product_mutations(
+            let principal = self.principal.clone();
+            self.stage_into_transaction(
+                mvcc,
                 &handle.transaction_id,
-                &self.principal,
-                self.mutations,
+                &principal,
                 now,
-            )?;
-            for (key, predicate) in self.predicates {
-                let predicate = match predicate {
-                    Some(predicate) => predicate,
-                    None => mvcc
-                        .runtime
-                        .read_at(&key, handle.snapshot_version)?
-                        .map(|current| {
-                            crate::mvcc_transaction::PredicateKind::ValueHash(
-                                *blake3::hash(&current.value).as_bytes(),
-                            )
-                        })
-                        .unwrap_or(crate::mvcc_transaction::PredicateKind::Absent),
-                };
-                mvcc.stage_predicate(
-                    &handle.transaction_id,
-                    &self.principal,
-                    key,
-                    predicate,
-                    now,
-                )?;
-            }
-            mvcc.stage_assignment_guard(
-                &handle.transaction_id,
-                &self.principal,
-                &assignment,
-                now,
-            )?;
+            )
+            .await?;
         }
         let outcome = mvcc
             .open_transactions
@@ -282,6 +237,61 @@ impl PersonalDbWritePlan {
                 bail!("PersonalDB MVCC write plan aborted: {reason:?}")
             }
         }
+    }
+
+    pub async fn stage_into_transaction(
+        self,
+        mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+        transaction_id: &str,
+        principal: &str,
+        now_unix_ms: u64,
+    ) -> Result<()> {
+        if self.mutations.is_empty() {
+            bail!("PersonalDB write plan has no product mutations");
+        }
+        if principal != self.principal {
+            bail!("PersonalDB write plan principal does not own caller transaction");
+        }
+        let handle = mvcc.open_transactions.handle(transaction_id)?;
+        if handle.principal != principal {
+            bail!("PersonalDB caller transaction principal mismatch");
+        }
+        let logical_identity =
+            format!("tenant/{}/personaldb/{}", self.tenant_id, self.group_id);
+        let assignment = match self.assignment {
+            Some(assignment) => {
+                let expected_partition = crate::mvcc_worker_authority::work_partition_id(
+                    "personaldb-write",
+                    &logical_identity,
+                )?;
+                if assignment.partition_id != expected_partition {
+                    bail!("PersonalDB write plan assignment scope mismatch");
+                }
+                assignment
+            }
+            None => mvcc
+                .reconcile_work_assignment("personaldb-write", &logical_identity)
+                .await?
+                .ok_or_else(|| anyhow!("local node does not own PersonalDB group assignment"))?,
+        };
+        mvcc.stage_product_mutations(transaction_id, principal, self.mutations, now_unix_ms)?;
+        for (key, predicate) in self.predicates {
+            let predicate = match predicate {
+                Some(predicate) => predicate,
+                None => mvcc
+                    .runtime
+                    .read_at(&key, handle.snapshot_version)?
+                    .map(|current| {
+                        crate::mvcc_transaction::PredicateKind::ValueHash(
+                            *blake3::hash(&current.value).as_bytes(),
+                        )
+                    })
+                    .unwrap_or(crate::mvcc_transaction::PredicateKind::Absent),
+            };
+            mvcc.stage_predicate(transaction_id, principal, key, predicate, now_unix_ms)?;
+        }
+        mvcc.stage_assignment_guard(transaction_id, principal, &assignment, now_unix_ms)?;
+        Ok(())
     }
 }
 

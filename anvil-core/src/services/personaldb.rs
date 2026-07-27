@@ -130,6 +130,14 @@ impl PersonalDbService for AppState {
             .map_err(internal_status)?;
         let claims = request_claims(&request)?.clone();
         let req = request.into_inner();
+        let transaction_id =
+            crate::services::transaction_context::write_options_transaction_id(
+                req.options.as_ref(),
+            )?
+            .map(ToOwned::to_owned);
+        let transaction_principal = transaction_id
+            .as_ref()
+            .map(|_| crate::object_manager::transaction_principal_from_claims(&claims));
         validate_database_id(&req.database_id)?;
         validate_hex32(&req.schema_hash, "schema_hash")?;
         validate_hex32(&req.genesis_hash, "genesis_hash")?;
@@ -150,13 +158,14 @@ impl PersonalDbService for AppState {
             "personaldb-create:{}:{}:{}:{}",
             claims.tenant_id, req.database_id, req.schema_hash, req.genesis_hash
         );
-        if let Some(commit_version) = PersonalDbWritePlan::resolved_commit_version(
-            &self.mvcc,
-            &claims.sub,
-            &create_idempotency_key,
-        )
-        .await
-        .map_err(internal_status)?
+        if transaction_id.is_none()
+            && let Some(commit_version) = PersonalDbWritePlan::resolved_commit_version(
+                &self.mvcc,
+                &claims.sub,
+                &create_idempotency_key,
+            )
+            .await
+            .map_err(internal_status)?
         {
             let manifest = read_personaldb_group_manifest(
                 &self.storage,
@@ -191,6 +200,7 @@ impl PersonalDbService for AppState {
             return Ok(Response::new(PersonalDbGroupResponse {
                 manifest: Some(group_manifest_record(manifest)),
                 committed_head: Some(committed_head_record(committed_head)),
+                write_state: WriteState::Committed as i32,
             }));
         }
         if read_personaldb_group_manifest(
@@ -216,7 +226,7 @@ impl PersonalDbService for AppState {
         let mut write_plan = PersonalDbWritePlan::new(
             claims.tenant_id,
             &req.database_id,
-            &claims.sub,
+            transaction_principal.as_deref().unwrap_or(&claims.sub),
             create_idempotency_key,
         )
         .map_err(internal_status)?
@@ -303,6 +313,69 @@ impl PersonalDbService for AppState {
             protocol_keyring.trust_store(),
         )
         .map_err(internal_status)?;
+        if let Some(transaction_id) = transaction_id.as_deref() {
+            write_plan
+                .stage_into_transaction(
+                    &self.mvcc,
+                    transaction_id,
+                    transaction_principal
+                        .as_deref()
+                        .ok_or_else(|| Status::internal("missing PersonalDB transaction principal"))?,
+                    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+                )
+                .await
+                .map_err(internal_status)?;
+            let object_id = crate::access_control::personaldb_group_object_id(
+                claims.tenant_id,
+                &committed_head.database_id,
+            );
+            self.persistence
+                .stage_authz_tuple_batch(
+                    crate::system_realm::SYSTEM_STORAGE_TENANT_ID,
+                    vec![
+                        crate::persistence::AuthzTupleBatchMutation {
+                            namespace: crate::access_control::system_realm_namespace(
+                                crate::system_realm::SYSTEM_PERSONALDB_GROUP_NAMESPACE,
+                            ),
+                            object_id: object_id.clone(),
+                            relation: "parent_tenant".to_string(),
+                            subject_kind:
+                                crate::system_realm::SYSTEM_STORAGE_TENANT_NAMESPACE.to_string(),
+                            subject_id: crate::access_control::storage_tenant_object_id(
+                                claims.tenant_id,
+                            ),
+                            caveat_hash: String::new(),
+                            operation: "add".to_string(),
+                            reason: "grant creator PersonalDB group owner".to_string(),
+                        },
+                        crate::persistence::AuthzTupleBatchMutation {
+                            namespace: crate::access_control::system_realm_namespace(
+                                crate::system_realm::SYSTEM_PERSONALDB_GROUP_NAMESPACE,
+                            ),
+                            object_id,
+                            relation: "owner".to_string(),
+                            subject_kind: crate::access_control::APP_SUBJECT_KIND.to_string(),
+                            subject_id: claims.sub.clone(),
+                            caveat_hash: String::new(),
+                            operation: "add".to_string(),
+                            reason: "grant creator PersonalDB group owner".to_string(),
+                        },
+                    ],
+                    &claims.sub,
+                    transaction_id,
+                    transaction_principal
+                        .as_deref()
+                        .ok_or_else(|| Status::internal("missing PersonalDB transaction principal"))?,
+                    None,
+                )
+                .await
+                .map_err(internal_status)?;
+            return Ok(Response::new(PersonalDbGroupResponse {
+                manifest: Some(group_manifest_record(manifest)),
+                committed_head: Some(committed_head_record(committed_head)),
+                write_state: WriteState::Staged as i32,
+            }));
+        }
         let commit_version = write_plan.commit(&self.mvcc).await.map_err(internal_status)?;
         crate::mvcc_fault_injection::hit(
             crate::mvcc_fault_injection::FaultPoint::PersonalDbAfterCreateCommit,
@@ -342,6 +415,7 @@ impl PersonalDbService for AppState {
         Ok(Response::new(PersonalDbGroupResponse {
             manifest: Some(group_manifest_record(manifest)),
             committed_head: Some(committed_head_record(committed_head)),
+            write_state: WriteState::Committed as i32,
         }))
     }
 
@@ -391,6 +465,7 @@ impl PersonalDbService for AppState {
         Ok(Response::new(PersonalDbGroupResponse {
             manifest: Some(group_manifest_record(manifest)),
             committed_head: committed_head.map(committed_head_record),
+            write_state: WriteState::Committed as i32,
         }))
     }
 

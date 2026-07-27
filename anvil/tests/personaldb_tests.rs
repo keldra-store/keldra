@@ -1,12 +1,16 @@
 #![recursion_limit = "512"]
 
 use anvil::anvil_api::auth_service_client::AuthServiceClient;
+use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::personal_db_service_client::PersonalDbServiceClient;
+use anvil::anvil_api::transaction_service_client::TransactionServiceClient;
 use anvil::anvil_api::{
+    BeginTransactionRequest, CommitTransactionRequest, CreateBucketRequest,
     CreatePersonalDbGroupRequest, CreatePersonalDbProjectionRequest, GetPersonalDbGroupRequest,
-    GetPersonalDbProjectionRequest, PersonalDbCatchUpRequest, PersonalDbVoterAck,
-    SubmitPersonalDbChangesetRequest, WatchPersonalDbGroupRequest,
-    WatchPersonalDbProjectionRequest, WriteAuthzTupleRequest,
+    GetPersonalDbProjectionRequest, ListBucketsRequest, MvccDurability, MvccReadConsistency,
+    PersonalDbCatchUpRequest, PersonalDbVoterAck, SubmitPersonalDbChangesetRequest,
+    WatchPersonalDbGroupRequest, WatchPersonalDbProjectionRequest, WriteAuthzTupleRequest,
+    WriteOptions, write_options,
 };
 use anvil::anvil_personaldb_sqlite_changeset::iterate_changeset;
 use anvil::authz_scope::DEFAULT_AUTHZ_REALM_ID;
@@ -85,6 +89,8 @@ async fn grant_default_authz_tuple_writer(
 mod groups_and_commits;
 #[path = "personaldb_tests/projections_and_writeback.rs"]
 mod projections_and_writeback;
+#[path = "personaldb_tests/transactional_groups.rs"]
+mod transactional_groups;
 #[path = "personaldb_tests/watch_and_reserved_events.rs"]
 mod watch_and_reserved_events;
 
@@ -135,6 +141,7 @@ async fn create_group_with_schema(
                 schema_hash: schema_hash.to_string(),
                 genesis_hash: genesis_hash.clone(),
                 schema_sql: schema_sql.to_string(),
+                options: None,
             },
             token,
         ))
