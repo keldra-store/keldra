@@ -127,10 +127,25 @@ pub(super) async fn public_routing_config_for_region(
         .await
         .map_err(lifecycle_status)?
         .into_iter()
-        .find(|region| region.region == region_name)
-        .ok_or_else(|| Status::not_found("Region not found"))?;
-    let base_domain =
-        public_base_domain_from_region_suffix(&region.region, &region.virtual_host_suffix)?;
+        .find(|region| region.region == region_name);
+    let base_domain = if let Some(region) = region {
+        public_base_domain_from_region_suffix(&region.region, &region.virtual_host_suffix)?
+    } else if state.config.region == region_name
+        && state
+            .persistence
+            .list_regions()
+            .await
+            .map_err(lifecycle_status)?
+            .iter()
+            .any(|region| region == region_name)
+    {
+        // Standalone nodes bootstrap the legacy region row before the mesh
+        // lifecycle descriptor is installed. Keep public host aliases usable
+        // during that interval with the canonical regional gateway suffix.
+        region_name.to_string()
+    } else {
+        return Err(Status::not_found("Region not found"));
+    };
     RoutingConfig::new(base_domain).map_err(|err| Status::invalid_argument(err.to_string()))
 }
 
