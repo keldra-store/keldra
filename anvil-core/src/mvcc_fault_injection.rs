@@ -281,7 +281,6 @@ mod tests {
             BundleIdentity, HierarchicalRangeStampScheme, LogicalKey, NodeIncarnation,
             PreparedBundleStore, TransactionBundleBuilder,
         },
-        shard_store::{ShardKind, ShardRecord, ShardSegment},
     };
 
     struct ClearInstalledFaults;
@@ -365,29 +364,6 @@ mod tests {
         let error = store.persist(&identity, bytes).await.unwrap_err();
         assert!(error.to_string().contains("PreparedBundleWrite"));
         assert!(store.read(&identity).unwrap().is_none());
-    }
-
-    #[test]
-    fn shard_disk_fault_leaves_no_acknowledgeable_record() {
-        let _clear = ClearInstalledFaults;
-        let directory = tempfile::tempdir().unwrap();
-        let mut segment = ShardSegment::open(directory.path(), 1).unwrap();
-        let before = segment.path().metadata().unwrap().len();
-        let record = ShardRecord {
-            transaction_id: uuid::Uuid::from_u128(1),
-            object_identity: uuid::Uuid::from_u128(2),
-            encoding_generation: 1,
-            prepared_at_unix_ms: 1,
-            stripe_ordinal: 0,
-            shard_ordinal: 0,
-            shard_kind: ShardKind::Data,
-            payload: b"shard".to_vec(),
-        };
-        install(DeterministicFaults::default().fail_at(FaultPoint::ShardWrite, 1));
-
-        let error = segment.append(&record).unwrap_err();
-        assert!(error.to_string().contains("ShardWrite"));
-        assert_eq!(segment.path().metadata().unwrap().len(), before);
     }
 
     #[test]

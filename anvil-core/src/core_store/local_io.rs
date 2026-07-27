@@ -184,7 +184,13 @@ async fn write_file_atomic_with_shard_boundary(
         started_at.elapsed(),
     );
     let started_at = Instant::now();
-    file.write_all(bytes).await?;
+    if let Err(error) = file.write_all(bytes).await {
+        drop(file);
+        let _ = fs::remove_file(&tmp_path).await;
+        return Err(error).with_context(|| {
+            format!("write CoreStore atomic temporary file {}", tmp_path.display())
+        });
+    }
     crate::perf::record_io_duration(
         "core_store",
         "write_all",
@@ -194,10 +200,22 @@ async fn write_file_atomic_with_shard_boundary(
     );
     #[cfg(any(test, debug_assertions))]
     if shard_boundary {
-        crate::mvcc_fault_injection::hit(crate::mvcc_fault_injection::FaultPoint::ShardWrite)?;
+        if let Err(error) =
+            crate::mvcc_fault_injection::hit(crate::mvcc_fault_injection::FaultPoint::ShardWrite)
+        {
+            drop(file);
+            let _ = fs::remove_file(&tmp_path).await;
+            return Err(error.into());
+        }
     }
     let started_at = Instant::now();
-    file.sync_all().await?;
+    if let Err(error) = file.sync_all().await {
+        drop(file);
+        let _ = fs::remove_file(&tmp_path).await;
+        return Err(error).with_context(|| {
+            format!("sync CoreStore atomic temporary file {}", tmp_path.display())
+        });
+    }
     let elapsed = started_at.elapsed();
     crate::perf::record_io_duration(
         "core_store",
@@ -263,6 +281,43 @@ pub(super) async fn sync_parent_dir(path: &PathBuf, operation: &'static str) -> 
     crate::perf::record_io_duration("core_store", operation, &parent, 0, elapsed);
     crate::perf::record_fsync_duration("core_store", "directory", operation, elapsed);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ClearFaults;
+
+    impl Drop for ClearFaults {
+        fn drop(&mut self) {
+            crate::mvcc_fault_injection::clear();
+        }
+    }
+
+    #[tokio::test]
+    async fn shard_disk_fault_never_publishes_or_leaves_a_retry_tail() {
+        let _clear = ClearFaults;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("final.shard");
+        crate::mvcc_fault_injection::install(
+            crate::mvcc_fault_injection::DeterministicFaults::default()
+                .fail_at(crate::mvcc_fault_injection::FaultPoint::ShardWrite, 1),
+        );
+
+        let error = write_shard_file_atomic(&path, b"encoded shard")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("ShardWrite"));
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+
+        crate::mvcc_fault_injection::clear();
+        write_shard_file_atomic(&path, b"encoded shard")
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"encoded shard");
+    }
 }
 
 pub(super) async fn sum_files_with_extension(root: &PathBuf, extensions: &[&str]) -> Result<u64> {
