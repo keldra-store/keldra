@@ -303,7 +303,7 @@ impl PersonalDbService for AppState {
             protocol_keyring.trust_store(),
         )
         .map_err(internal_status)?;
-        write_plan.commit(&self.mvcc).await.map_err(internal_status)?;
+        let commit_version = write_plan.commit(&self.mvcc).await.map_err(internal_status)?;
         access_control::grant_personaldb_group_defaults(
             &self.persistence,
             claims.tenant_id,
@@ -315,6 +315,26 @@ impl PersonalDbService for AppState {
         .await
         .map_err(internal_status)?;
 
+        let manifest = read_personaldb_group_manifest(
+            &self.storage,
+            &self.mvcc,
+            claims.tenant_id,
+            &committed_head.database_id,
+            protocol_keyring.trust_store(),
+            commit_version,
+        )
+        .await
+        .map_err(internal_status)?
+        .ok_or_else(|| Status::internal("Committed PersonalDB manifest is missing"))?;
+        let committed_head = read_personaldb_committed_head_at_snapshot(
+            &self.mvcc,
+            claims.tenant_id,
+            &committed_head.database_id,
+            protocol_keyring.trust_store(),
+            commit_version,
+        )
+        .map_err(internal_status)?
+        .ok_or_else(|| Status::internal("Committed PersonalDB head is missing"))?;
         Ok(Response::new(PersonalDbGroupResponse {
             manifest: Some(group_manifest_record(manifest)),
             committed_head: Some(committed_head_record(committed_head)),
@@ -1039,6 +1059,13 @@ impl AppState {
                     && hex::encode(record.previous_log_hash) == request.base_log_hash
             })
             .ok_or_else(|| Status::internal("Committed PersonalDB retry record is missing"))?;
+        let requested_payload_hash =
+            hex32_status(&request.changeset_payload_hash, "changeset payload hash")?;
+        if record.changeset_payload_hash != requested_payload_hash {
+            return Err(Status::failed_precondition(
+                "PersonalDB idempotency key was already used for a different changeset",
+            ));
+        }
         let certificate_ref = std::str::from_utf8(&record.certificate_ref)
             .map_err(|_| Status::internal("Committed PersonalDB certificate ref is invalid"))?;
         let certificate = read_personaldb_commit_certificate_ref(
@@ -1420,17 +1447,8 @@ impl AppState {
             .await
             .map_err(internal_status)?;
 
-        Ok(CommittedPersonalDbChangeset {
-            log_index: proposed_log_index,
-            log_hash: hex::encode(record.entry_hash),
-            changeset_payload_hash: hex::encode(validated.changeset_payload_hash),
-            verified_envelope_hash: hex::encode(envelope_hash),
-            certificate_hash: hex::encode(certificate_hash),
-            certificate,
-            committed_head,
-            watch_cursor: u128::from(commit_version),
-            authz_revision,
-        })
+        self.reconstruct_personaldb_submit_retry(&validated.request, commit_version)
+            .await
     }
 
     async fn build_personaldb_projections_for_source_commit(

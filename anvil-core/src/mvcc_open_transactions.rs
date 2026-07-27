@@ -642,6 +642,23 @@ impl OpenTransactionRegistry {
         })
     }
 
+    pub fn status_by_idempotency(
+        &self,
+        cluster_id: &str,
+        idempotency_key: &str,
+        principal: &str,
+        now_unix_ms: u64,
+    ) -> Result<Option<TransactionRegistryStatus>> {
+        let Some(draft) = self.find_by_idempotency(cluster_id, idempotency_key)? else {
+            return Ok(None);
+        };
+        if draft.principal != principal {
+            bail!("idempotency key belongs to another principal");
+        }
+        self.status(&draft.transaction_id, principal, now_unix_ms)
+            .map(Some)
+    }
+
     pub fn rollback(
         &self,
         transaction_id: &str,
@@ -1245,6 +1262,19 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[test]
+    fn idempotency_status_lookup_is_read_only() {
+        let temp = tempdir().unwrap();
+        let registry = OpenTransactionRegistry::open(temp.path()).unwrap();
+        assert!(
+            registry
+                .status_by_idempotency("cluster", "missing", "alice", 10)
+                .unwrap()
+                .is_none()
+        );
+        assert!(registry.pinned_snapshots(10).unwrap().is_empty());
     }
 
     #[tokio::test]
