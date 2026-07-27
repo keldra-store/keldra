@@ -30,7 +30,7 @@ pub use bootstrap::{BootstrapMeshLifecycleProjection, install_bootstrap_lifecycl
 pub use cell::*;
 pub use host_alias::{
     create_host_alias, create_host_alias_in_transaction, list_host_aliases, transition_host_alias,
-    transition_host_alias_in_transaction,
+    transition_host_alias_in_transaction, validate_host_alias_transition,
 };
 pub use node::*;
 pub(crate) use portable_snapshot::validate_portable_lifecycle_topology_snapshot;

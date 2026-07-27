@@ -15,7 +15,7 @@ fn runtime_cursor_error(kind: &str) -> crate::mesh_lifecycle::LifecycleError {
 }
 
 impl Persistence {
-    fn lifecycle_mvcc(
+    pub(super) fn lifecycle_mvcc(
         &self,
     ) -> crate::mesh_lifecycle::LifecycleResult<&crate::mvcc_bootstrap::MvccSubsystem> {
         self.mvcc().map_err(|error| {
@@ -567,7 +567,6 @@ impl Persistence {
                 MAX_PARTITION_FENCE_PAGE_SIZE,
                 &self.partition_owner_signing_key,
             )
-            .await
             .map_err(|err| {
                 crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
             })?;

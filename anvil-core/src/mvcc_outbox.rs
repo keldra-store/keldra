@@ -291,7 +291,7 @@ impl MvccOutboxRunner {
         &self,
     ) -> Result<anvil_mvcc_consensus::AppliedControlSnapshot> {
         let target = self.consensus.linearized_read_barrier().await?;
-        tokio::time::timeout(Duration::from_secs(5), async {
+        Ok(tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if self.consensus.observed_commit_version() >= target {
                     return self.consensus.applied_control_snapshot();
@@ -300,7 +300,7 @@ impl MvccOutboxRunner {
             }
         })
         .await
-        .context("local control state did not reach the linearized outbox assignment")?
+        .context("local control state did not reach the linearized outbox assignment")??)
     }
 
     fn retry(

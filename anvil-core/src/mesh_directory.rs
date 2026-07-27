@@ -863,7 +863,7 @@ pub async fn write_host_alias_descriptor(
         }
     })?;
     let partition = host_alias_partition(&hostname)?;
-    let existing = read_typed_routing_descriptor_for_authority(
+    let existing = read_typed_routing_descriptor_for_authority::<routing::HostAliasDescriptor>(
         storage,
         RoutingRecordFamily::HostAlias,
         &hostname,
@@ -1272,7 +1272,7 @@ pub async fn reserve_tenant_name(
         });
     }
 
-    if let Some(existing) = read_typed_routing_descriptor_for_authority(
+    if let Some(existing) = read_typed_routing_descriptor_for_authority::<TenantNameDescriptor>(
         storage,
         RoutingRecordFamily::TenantName,
         descriptor.tenant_name.as_str(),
@@ -1312,7 +1312,7 @@ pub async fn create_tenant_locator(
     locator: &TenantLocatorDescriptor,
     authority: MeshControlWriteAuthority<'_>,
 ) -> MeshDirectoryResult<TenantLocatorDescriptor> {
-    if let Some(existing) = read_typed_routing_descriptor_for_authority(
+    if let Some(existing) = read_typed_routing_descriptor_for_authority::<TenantLocatorDescriptor>(
         storage,
         RoutingRecordFamily::TenantLocator,
         locator.tenant_id.as_str(),
@@ -1358,7 +1358,7 @@ pub async fn activate_tenant_name(
     authority: MeshControlWriteAuthority<'_>,
 ) -> MeshDirectoryResult<TenantNameDescriptor> {
     let now = now.into();
-    let existing = read_typed_routing_descriptor_for_authority(
+    let existing = read_typed_routing_descriptor_for_authority::<TenantNameDescriptor>(
         storage,
         RoutingRecordFamily::TenantName,
         tenant_name.as_str(),
@@ -1411,7 +1411,7 @@ pub async fn tombstone_tenant_name(
     now: impl Into<String>,
     authority: MeshControlWriteAuthority<'_>,
 ) -> MeshDirectoryResult<TenantNameDescriptor> {
-    let existing = read_typed_routing_descriptor_for_authority(
+    let existing = read_typed_routing_descriptor_for_authority::<TenantNameDescriptor>(
         storage,
         RoutingRecordFamily::TenantName,
         tenant_name.as_str(),
@@ -1500,7 +1500,7 @@ pub async fn write_bucket_locator(
         locator.tenant_id.as_str(),
         locator.bucket_name.as_str()
     );
-    if let Some(existing) = read_typed_routing_descriptor_for_authority(
+    if let Some(existing) = read_typed_routing_descriptor_for_authority::<BucketLocatorDescriptor>(
         storage,
         RoutingRecordFamily::BucketLocator,
         &locator_record_key,
