@@ -61,6 +61,9 @@ async fn spawn_admin_cli_node() -> AdminCliNode {
         cell_id: "cell-a".to_string(),
         public_region_base_domain: "eu-west-1.anvil-storage.test".to_string(),
         storage_path: storage_path.to_string_lossy().into_owned(),
+        // This fixture uses ephemeral loopback HTTP listeners; production
+        // nodes must continue to require HTTPS for MVCC peer transport.
+        allow_test_only_insecure_mvcc_transport: true,
         personaldb_snapshot_entry_threshold: 1024,
         personaldb_snapshot_payload_bytes_threshold: 64 * 1024 * 1024,
         ..anvil::config::Config::default()
