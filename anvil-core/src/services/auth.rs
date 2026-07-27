@@ -15,6 +15,7 @@ use crate::{
     system_realm::{SYSTEM_REALM_ID, SYSTEM_STORAGE_TENANT_ID},
 };
 use hmac::{Hmac, Mac};
+use prost::Message;
 use sha2::Sha256;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -259,6 +260,124 @@ fn application_secret_response(
         app_id: result.app_id.to_string(),
         write_state: write_state as i32,
     })
+}
+
+const AUTH_MUTATION_IDEMPOTENCY_NAMESPACE: &str = "auth.public-mutation.v1";
+const AUTH_MUTATION_IMPLICIT_RESULT_KEY: &str = "result";
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct AuthMutationResult {
+    input_hash: String,
+    response: Vec<u8>,
+}
+
+fn auth_mutation_input_hash<M: Message>(
+    operation: &str,
+    claims: &auth::Claims,
+    request: &M,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"anvil.auth.public-mutation.input.v1");
+    for component in [operation, &claims.tenant_id.to_string(), &claims.sub] {
+        hasher.update(&(component.len() as u64).to_be_bytes());
+        hasher.update(component.as_bytes());
+    }
+    hasher.update(&request.encode_to_vec());
+    hex::encode(hasher.finalize().as_bytes())
+}
+
+fn stage_auth_mutation_response<M: Message>(
+    state: &AppState,
+    transaction_id: &str,
+    principal: &str,
+    result_key: &str,
+    input_hash: String,
+    response: &M,
+    now_unix_ms: u64,
+) -> Result<(), Status> {
+    let result = AuthMutationResult {
+        input_hash,
+        response: response.encode_to_vec(),
+    };
+    state
+        .mvcc
+        .open_transactions
+        .add_idempotency_result(
+            transaction_id,
+            principal,
+            crate::mvcc_transaction::IdempotencyResult {
+                namespace: AUTH_MUTATION_IDEMPOTENCY_NAMESPACE.to_string(),
+                key: result_key.to_string(),
+                payload: serde_json::to_vec(&result)
+                    .map_err(|error| Status::internal(error.to_string()))?,
+            },
+            now_unix_ms,
+        )
+        .map_err(|error| Status::failed_precondition(error.to_string()))
+}
+
+fn replay_auth_mutation_response<M: Message + Default>(
+    state: &AppState,
+    transaction: &ImplicitAuthTransaction,
+    expected_input_hash: &str,
+) -> Result<M, Status> {
+    let result = state
+        .mvcc
+        .open_transactions
+        .resolved_idempotency_result(
+            &transaction.transaction_id,
+            &transaction.principal,
+            AUTH_MUTATION_IDEMPOTENCY_NAMESPACE,
+            AUTH_MUTATION_IMPLICIT_RESULT_KEY,
+        )
+        .map_err(|error| Status::failed_precondition(error.to_string()))?
+        .ok_or_else(|| {
+            Status::failed_precondition(
+                "committed authorization transaction is missing its response record",
+            )
+        })?;
+    let result: AuthMutationResult = serde_json::from_slice(&result.payload)
+        .map_err(|error| Status::internal(error.to_string()))?;
+    if result.input_hash != expected_input_hash {
+        return Err(Status::already_exists(
+            "authorization idempotency key was already used for different input",
+        ));
+    }
+    M::decode(result.response.as_slice()).map_err(|error| Status::internal(error.to_string()))
+}
+
+fn stage_tenant_audit_in_transaction(
+    state: &AppState,
+    transaction_id: &str,
+    principal: &str,
+    event: &crate::tenant_audit::TenantAuditEvent,
+    generation: u64,
+    now_unix_ms: u64,
+) -> Result<(), Status> {
+    let plan = crate::tenant_audit::tenant_audit_mvcc_plan(
+        event,
+        generation,
+        transaction_id,
+    )
+    .map_err(|error| Status::internal(error.to_string()))?;
+    state
+        .mvcc
+        .stage_product_mutations(transaction_id, principal, plan.mutations, now_unix_ms)
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    for (key, predicate) in plan.predicates {
+        state
+            .mvcc
+            .stage_predicate(transaction_id, principal, key, predicate, now_unix_ms)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    }
+    for event in plan.outbox_events {
+        state
+            .mvcc
+            .open_transactions
+            .add_stream_event(transaction_id, event, now_unix_ms)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    }
+    Ok(())
 }
 
 async fn public_access_grant_record(
@@ -1248,6 +1367,52 @@ impl AuthService for AppState {
             .transpose()?
             .flatten()
             .map(ToOwned::to_owned);
+        let input_hash = auth_mutation_input_hash("write-authz-tuple", &claims, &req);
+        let implicit = if transaction_id.is_none() {
+            Some(
+                self.begin_implicit_auth_transaction(
+                    &claims,
+                    req.context.as_ref(),
+                    "write-authz-tuple",
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        if let Some(transaction) = implicit.as_ref().filter(|transaction| transaction.replayed) {
+            return replay_auth_mutation_response::<WriteAuthzTupleResponse>(
+                self,
+                transaction,
+                &input_hash,
+            )
+            .map(Response::new);
+        }
+        let effective_transaction_id = transaction_id
+            .as_deref()
+            .or_else(|| {
+                implicit
+                    .as_ref()
+                    .map(|transaction| transaction.transaction_id.as_str())
+            })
+            .ok_or_else(|| Status::internal("authorization transaction was not established"))?;
+        let transaction_principal =
+            crate::object_manager::transaction_principal_from_claims(&claims);
+        let audit_event = crate::services::audit::build_tenant_audit_event(
+            &claims,
+            req.context
+                .as_ref()
+                .map(|context| context.request_id.as_str())
+                .unwrap_or("write-authz-tuple"),
+            format!("authz-tuple:{}:{}", req.namespace, req.object_id),
+            "authz.tuple.write",
+            serde_json::json!({
+                "relation": req.relation,
+                "subject_kind": req.subject_kind,
+                "subject_id": req.subject_id,
+                "operation": req.operation,
+            }),
+        )?;
         let mutation = AuthzTupleMutation {
                 namespace: req.namespace,
                 object_id: req.object_id,
@@ -1259,50 +1424,67 @@ impl AuthService for AppState {
                 reason: req.reason,
                 scope: req.scope,
             };
-        let record = if let Some(transaction_id) = transaction_id.as_deref() {
-            let operation = validate_authz_tuple_mutation(self, &claims, &mutation)
-                .await?
-                .to_string();
-            let scope = resolve_authz_scope(&claims, mutation.scope.as_ref())?;
-            self.persistence
-                .stage_authz_tuple_batch(
-                    claims.tenant_id,
-                    vec![crate::persistence::AuthzTupleBatchMutation {
-                        namespace: encode_realm_namespace(
-                            &scope.authz_realm_id,
-                            &mutation.namespace,
-                        ),
-                        object_id: mutation.object_id,
-                        relation: mutation.relation,
-                        subject_kind: mutation.subject_kind.clone(),
-                        subject_id: encode_userset_subject_realm(
-                            &scope.authz_realm_id,
-                            &mutation.subject_kind,
-                            &mutation.subject_id,
-                        ),
-                        caveat_hash: mutation.caveat_hash,
-                        operation,
-                        reason: mutation.reason,
-                    }],
-                    &claims.sub,
-                    transaction_id,
-                    &crate::object_manager::transaction_principal_from_claims(&claims),
-                    None,
-                )
-                .await
-                .map_err(authz_tuple_write_status)?
-                .into_iter()
-                .next()
-                .ok_or_else(|| Status::internal("staged tuple write returned no record"))?
-        } else {
-            write_authz_tuple_record(self, &claims, mutation).await?
-        };
+        let operation = validate_authz_tuple_mutation(self, &claims, &mutation)
+            .await?
+            .to_string();
+        let scope = resolve_authz_scope(&claims, mutation.scope.as_ref())?;
+        let record = self
+            .persistence
+            .stage_authz_tuple_batch_with_tenant_audit(
+                claims.tenant_id,
+                vec![crate::persistence::AuthzTupleBatchMutation {
+                    namespace: encode_realm_namespace(
+                        &scope.authz_realm_id,
+                        &mutation.namespace,
+                    ),
+                    object_id: mutation.object_id,
+                    relation: mutation.relation,
+                    subject_kind: mutation.subject_kind.clone(),
+                    subject_id: encode_userset_subject_realm(
+                        &scope.authz_realm_id,
+                        &mutation.subject_kind,
+                        &mutation.subject_id,
+                    ),
+                    caveat_hash: mutation.caveat_hash,
+                    operation,
+                    reason: mutation.reason,
+                }],
+                &claims.sub,
+                effective_transaction_id,
+                &transaction_principal,
+                None,
+                Some(&audit_event),
+            )
+            .await
+            .map_err(authz_tuple_write_status)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| Status::internal("staged tuple write returned no record"))?;
 
         let mut response = write_authz_tuple_response(&record)?;
-        if transaction_id.is_some() {
+        if implicit.is_none() {
             response.write_state = WriteState::Staged as i32;
             response.revision = 0;
             response.zookie.clear();
+        } else {
+            response.write_state = WriteState::Committed as i32;
+            let now = u64::try_from(chrono::Utc::now().timestamp_millis())
+                .map_err(|_| Status::internal("authorization mutation predates Unix epoch"))?;
+            stage_auth_mutation_response(
+                self,
+                effective_transaction_id,
+                &transaction_principal,
+                AUTH_MUTATION_IMPLICIT_RESULT_KEY,
+                input_hash,
+                &response,
+                now,
+            )?;
+            self.commit_implicit_auth_transaction(
+                implicit
+                    .as_ref()
+                    .ok_or_else(|| Status::internal("implicit transaction disappeared"))?,
+            )
+            .await?;
         }
         Ok(Response::new(response))
     }
@@ -1324,6 +1506,7 @@ impl AuthService for AppState {
             .transpose()?
             .flatten()
             .map(ToOwned::to_owned);
+        let input_hash = auth_mutation_input_hash("write-authz-tuples", &claims, &req);
         if req.mutations.is_empty() {
             return Err(Status::invalid_argument(
                 "mutations must contain at least one tuple",
@@ -1373,20 +1556,76 @@ impl AuthService for AppState {
             expected_revision,
             schema_binding_precondition: None,
         };
-        if let Some(transaction_id) = transaction_id.as_deref() {
-            let records = self
-                .persistence
-                .stage_authz_tuple_batch(
-                    claims.tenant_id,
-                    mutations,
-                    &claims.sub,
-                    transaction_id,
-                    &crate::object_manager::transaction_principal_from_claims(&claims),
-                    Some(&options),
+        let operation_context = options
+            .operation_id
+            .as_deref()
+            .map(|operation_id| credential_implicit_context(operation_id, operation_id));
+        let implicit_context = req.context.as_ref().or(operation_context.as_ref());
+        let implicit = if transaction_id.is_none() {
+            Some(
+                self.begin_implicit_auth_transaction(
+                    &claims,
+                    implicit_context,
+                    "write-authz-tuples",
                 )
-                .await
-                .map_err(authz_tuple_batch_write_status)?;
-            let mut response = write_authz_tuple_batch_response(&records)?;
+                .await?,
+            )
+        } else {
+            None
+        };
+        if let Some(transaction) = implicit.as_ref().filter(|transaction| transaction.replayed) {
+            return replay_auth_mutation_response::<WriteAuthzTuplesResponse>(
+                self,
+                transaction,
+                &input_hash,
+            )
+            .map_err(|status| {
+                if status.code() == tonic::Code::AlreadyExists {
+                    Status::aborted("AuthzOperationConflict")
+                } else {
+                    status
+                }
+            })
+            .map(Response::new);
+        }
+        let effective_transaction_id = transaction_id
+            .as_deref()
+            .or_else(|| {
+                implicit
+                    .as_ref()
+                    .map(|transaction| transaction.transaction_id.as_str())
+            })
+            .ok_or_else(|| Status::internal("authorization transaction was not established"))?;
+        let transaction_principal =
+            crate::object_manager::transaction_principal_from_claims(&claims);
+        let audit_event = crate::services::audit::build_tenant_audit_event(
+            &claims,
+            req.context
+                .as_ref()
+                .map(|context| context.request_id.as_str())
+                .unwrap_or("write-authz-tuples"),
+            format!("authz-realm:{}", scope.authz_realm_id),
+            "authz.tuples.write",
+            serde_json::json!({
+                "operation_id": options.operation_id,
+                "mutation_count": mutations.len(),
+            }),
+        )?;
+        let records = self
+            .persistence
+            .stage_authz_tuple_batch_with_tenant_audit(
+                claims.tenant_id,
+                mutations,
+                &claims.sub,
+                effective_transaction_id,
+                &transaction_principal,
+                Some(&options),
+                Some(&audit_event),
+            )
+            .await
+            .map_err(authz_tuple_batch_write_status)?;
+        let mut response = write_authz_tuple_batch_response(&records)?;
+        if implicit.is_none() {
             response.write_state = WriteState::Staged as i32;
             response.revision = 0;
             response.zookie.clear();
@@ -1395,32 +1634,30 @@ impl AuthService for AppState {
                 result.revision = 0;
                 result.zookie.clear();
             }
-            return Ok(Response::new(response));
-        }
-        if let Some(replay) = self
-            .persistence
-            .replay_authz_tuple_batch(claims.tenant_id, &mutations, &claims.sub, &options)
-            .await
-            .map_err(authz_tuple_batch_write_status)?
-        {
-            return Ok(Response::new(write_authz_tuple_batch_response(
-                &replay.records,
-            )?));
-        }
-
-        let outcome = self
-            .persistence
-            .write_authz_tuple_batch_conditionally(
-                claims.tenant_id,
-                mutations,
-                &claims.sub,
-                &options,
+        } else {
+            response.write_state = WriteState::Committed as i32;
+            for result in &mut response.results {
+                result.write_state = WriteState::Committed as i32;
+            }
+            let now = u64::try_from(chrono::Utc::now().timestamp_millis())
+                .map_err(|_| Status::internal("authorization mutation predates Unix epoch"))?;
+            stage_auth_mutation_response(
+                self,
+                effective_transaction_id,
+                &transaction_principal,
+                AUTH_MUTATION_IMPLICIT_RESULT_KEY,
+                input_hash,
+                &response,
+                now,
+            )?;
+            self.commit_implicit_auth_transaction(
+                implicit
+                    .as_ref()
+                    .ok_or_else(|| Status::internal("implicit transaction disappeared"))?,
             )
-            .await
-            .map_err(authz_tuple_batch_write_status)?;
-        Ok(Response::new(write_authz_tuple_batch_response(
-            &outcome.records,
-        )?))
+            .await?;
+        }
+        Ok(Response::new(response))
     }
 
     async fn read_authz_tuples(
@@ -1794,6 +2031,7 @@ impl AuthService for AppState {
             .transpose()?
             .flatten()
             .map(ToOwned::to_owned);
+        let input_hash = auth_mutation_input_hash("put-authz-schema", &claims, &req);
         let transaction_principal =
             crate::object_manager::transaction_principal_from_claims(&claims);
         validate_storage_tenant(&claims, &req.anvil_storage_tenant_id)?;
@@ -1816,6 +2054,44 @@ impl AuthService for AppState {
             &format!("schema:{}", req.schema_id),
         )
         .await?;
+        let implicit = if transaction_id.is_none() {
+            Some(
+                self.begin_implicit_auth_transaction(
+                    &claims,
+                    req.context.as_ref(),
+                    "put-authz-schema",
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        if let Some(transaction) = implicit.as_ref().filter(|transaction| transaction.replayed) {
+            return replay_auth_mutation_response::<PutAuthzSchemaResponse>(
+                self,
+                transaction,
+                &input_hash,
+            )
+            .map(Response::new);
+        }
+        let effective_transaction_id = transaction_id
+            .as_deref()
+            .or_else(|| {
+                implicit
+                    .as_ref()
+                    .map(|transaction| transaction.transaction_id.as_str())
+            })
+            .ok_or_else(|| Status::internal("authorization transaction was not established"))?;
+        let audit_event = crate::services::audit::build_tenant_audit_event(
+            &claims,
+            req.context
+                .as_ref()
+                .map(|context| context.request_id.as_str())
+                .unwrap_or("put-authz-schema"),
+            format!("authz-schema:{}", req.schema_id),
+            "authz.schema.put",
+            serde_json::json!({ "namespace_count": req.namespaces.len() }),
+        )?;
         let record = authz_realm_schema::put_schema_revision(
             &self.storage,
             &self.mvcc,
@@ -1824,30 +2100,51 @@ impl AuthService for AppState {
             req.namespaces,
             &claims.sub,
             &req.reason,
-            transaction_id.as_deref().map(|transaction_id| {
-                crate::authz_journal::AuthzTransactionBinding {
-                    transaction_id,
-                    principal: &transaction_principal,
-                }
+            Some(crate::authz_journal::AuthzTransactionBinding {
+                transaction_id: effective_transaction_id,
+                principal: &transaction_principal,
             }),
         )
         .await
         .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let authz_revision = if transaction_id.is_some() {
+        let authz_revision = if implicit.is_none() {
             0
         } else {
             record.authz_revision
         };
-        Ok(Response::new(PutAuthzSchemaResponse {
+        let response = PutAuthzSchemaResponse {
             schema_ref: Some(schema_ref_response(&record.schema_ref)),
             authz_revision,
             zookie: zookie(u64_to_i64(authz_revision)?),
-            write_state: if transaction_id.is_some() {
+            write_state: if implicit.is_none() {
                 WriteState::Staged as i32
             } else {
                 WriteState::Committed as i32
             },
-        }))
+        };
+        let now = u64::try_from(chrono::Utc::now().timestamp_millis())
+            .map_err(|_| Status::internal("authorization mutation predates Unix epoch"))?;
+        stage_tenant_audit_in_transaction(
+            self,
+            effective_transaction_id,
+            &transaction_principal,
+            &audit_event,
+            record.authz_revision,
+            now,
+        )?;
+        if let Some(transaction) = &implicit {
+            stage_auth_mutation_response(
+                self,
+                effective_transaction_id,
+                &transaction_principal,
+                AUTH_MUTATION_IMPLICIT_RESULT_KEY,
+                input_hash,
+                &response,
+                now,
+            )?;
+            self.commit_implicit_auth_transaction(transaction).await?;
+        }
+        Ok(Response::new(response))
     }
 
     async fn bind_authz_schema(
@@ -1867,6 +2164,7 @@ impl AuthService for AppState {
             .transpose()?
             .flatten()
             .map(ToOwned::to_owned);
+        let input_hash = auth_mutation_input_hash("bind-authz-schema", &claims, &req);
         let transaction_principal =
             crate::object_manager::transaction_principal_from_claims(&claims);
         let scope = resolve_authz_scope(&claims, req.scope.as_ref())?;
@@ -1885,42 +2183,46 @@ impl AuthService for AppState {
             "manage_tenant",
         )
         .await?;
-        if let Some(transaction_id) = transaction_id.as_deref() {
-            access_control::stage_authz_realm_defaults(
-                &self.persistence,
-                claims.tenant_id,
-                &scope.authz_realm_id,
-                &claims.sub,
-                &claims.sub,
-                "grant creator authz realm owner",
-                transaction_id,
-                &transaction_principal,
+        let implicit = if transaction_id.is_none() {
+            Some(
+                self.begin_implicit_auth_transaction(
+                    &claims,
+                    req.context.as_ref(),
+                    "bind-authz-schema",
+                )
+                .await?,
             )
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
         } else {
-            access_control::grant_authz_realm_defaults(
-                &self.persistence,
-                claims.tenant_id,
-                &scope.authz_realm_id,
-                &claims.sub,
-                &claims.sub,
-                "grant creator authz realm owner",
+            None
+        };
+        if let Some(transaction) = implicit.as_ref().filter(|transaction| transaction.replayed) {
+            return replay_auth_mutation_response::<BindAuthzSchemaResponse>(
+                self,
+                transaction,
+                &input_hash,
             )
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map(Response::new);
         }
-        if transaction_id.is_none() {
-            access_control::require_system_realm_permission(
-                &self.storage,
-                &self.mvcc,
-                &claims,
-                crate::system_realm::SYSTEM_AUTHZ_REALM_NAMESPACE,
-                &access_control::authz_realm_object_id(claims.tenant_id, &scope.authz_realm_id),
-                "bind_schema",
-            )
-            .await?;
-        }
+        let effective_transaction_id = transaction_id
+            .as_deref()
+            .or_else(|| {
+                implicit
+                    .as_ref()
+                    .map(|transaction| transaction.transaction_id.as_str())
+            })
+            .ok_or_else(|| Status::internal("authorization transaction was not established"))?;
+        access_control::stage_authz_realm_defaults(
+            &self.persistence,
+            claims.tenant_id,
+            &scope.authz_realm_id,
+            &claims.sub,
+            &claims.sub,
+            "grant creator authz realm owner",
+            effective_transaction_id,
+            &transaction_principal,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
         let binding = authz_realm_schema::bind_schema(
             &self.storage,
             &self.mvcc,
@@ -1934,32 +2236,67 @@ impl AuthService for AppState {
             req.expected_binding_generation,
             &claims.sub,
             &req.reason,
-            transaction_id.as_deref().map(|transaction_id| {
-                crate::authz_journal::AuthzTransactionBinding {
-                    transaction_id,
-                    principal: &transaction_principal,
-                }
+            Some(crate::authz_journal::AuthzTransactionBinding {
+                transaction_id: effective_transaction_id,
+                principal: &transaction_principal,
             }),
         )
         .await
         .map_err(|e| Status::failed_precondition(e.to_string()))?;
-        let authz_revision = if transaction_id.is_some() {
+        let authz_revision = if implicit.is_none() {
             0
         } else {
             binding.authz_revision
         };
-        Ok(Response::new(BindAuthzSchemaResponse {
+        let response = BindAuthzSchemaResponse {
             scope: Some(scope),
             schema_ref: Some(schema_ref_response(&binding.schema_ref)),
             binding_generation: binding.binding_generation,
             authz_revision,
             zookie: zookie(u64_to_i64(authz_revision)?),
-            write_state: if transaction_id.is_some() {
+            write_state: if implicit.is_none() {
                 WriteState::Staged as i32
             } else {
                 WriteState::Committed as i32
             },
-        }))
+        };
+        let audit_event = crate::services::audit::build_tenant_audit_event(
+            &claims,
+            req.context
+                .as_ref()
+                .map(|context| context.request_id.as_str())
+                .unwrap_or("bind-authz-schema"),
+            format!("authz-realm:{}", binding.realm_id),
+            "authz.schema.bind",
+            serde_json::json!({
+                "schema_id": binding.schema_ref.schema_id,
+                "schema_revision": binding.schema_ref.schema_revision,
+                "binding_generation": binding.binding_generation,
+            }),
+        )?;
+        let now = u64::try_from(chrono::Utc::now().timestamp_millis())
+            .map_err(|_| Status::internal("authorization mutation predates Unix epoch"))?;
+        stage_tenant_audit_in_transaction(
+            self,
+            effective_transaction_id,
+            &transaction_principal,
+            &audit_event,
+            binding.authz_revision,
+            now,
+        )?;
+        if let Some(transaction) = &implicit {
+            stage_auth_mutation_response(
+                self,
+                effective_transaction_id,
+                &transaction_principal,
+                AUTH_MUTATION_IMPLICIT_RESULT_KEY,
+                input_hash,
+                &response,
+                now,
+            )?;
+            self.commit_implicit_auth_transaction(transaction).await?;
+        }
+        Ok(Response::new(response))
     }
 
     async fn get_authz_schema_binding(
@@ -2014,6 +2351,7 @@ impl AuthService for AppState {
             .transpose()?
             .flatten()
             .map(ToOwned::to_owned);
+        let input_hash = auth_mutation_input_hash("apply-authz-schema", &claims, &req);
         let transaction_principal =
             crate::object_manager::transaction_principal_from_claims(&claims);
         if req.namespaces.is_empty() {
@@ -2035,126 +2373,142 @@ impl AuthService for AppState {
             DEFAULT_AUTHZ_REALM_ID,
         )
         .await?;
-        if let Some(transaction_id) = transaction_id.as_deref() {
-            access_control::stage_authz_realm_defaults(
-                &self.persistence,
-                claims.tenant_id,
-                DEFAULT_AUTHZ_REALM_ID,
-                &claims.sub,
-                &claims.sub,
-                "grant default authz realm owner",
-                transaction_id,
-                &transaction_principal,
-            )
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-            let binding = crate::authz_journal::AuthzTransactionBinding {
-                transaction_id,
-                principal: &transaction_principal,
-            };
-            let record = authz_realm_schema::put_schema_revision(
-                &self.storage,
-                &self.mvcc,
-                claims.tenant_id,
-                DEFAULT_AUTHZ_REALM_ID,
-                req.namespaces,
-                &claims.sub,
-                &req.reason,
-                Some(binding),
-            )
-            .await
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
-            for namespace in &record.namespaces {
-                authz_namespace_watch::stage_authz_namespace_watch_record(
-                    &self.mvcc,
-                    transaction_id,
-                    &transaction_principal,
-                    claims.tenant_id,
-                    mutation_id_from_record_hash(&record.schema_ref.schema_digest),
-                    authz_namespace_watch::AuthzNamespaceWatchPayload {
-                        namespace: namespace.namespace.clone(),
-                        event_type: "schema_changed".to_string(),
-                        authz_revision: record.authz_revision,
-                        schema_hash: namespace.schema_hash.clone(),
-                        invalidates_derived_usersets: true,
-                        emitted_at: record.created_at.clone(),
-                    },
+        let implicit = if transaction_id.is_none() {
+            Some(
+                self.begin_implicit_auth_transaction(
+                    &claims,
+                    req.context.as_ref(),
+                    "apply-authz-schema",
                 )
-                .map_err(|e| Status::internal(e.to_string()))?;
-            }
-            authz_realm_schema::bind_schema(
-                &self.storage,
-                &self.mvcc,
-                claims.tenant_id,
-                DEFAULT_AUTHZ_REALM_ID,
-                record.schema_ref.clone(),
-                None,
-                &claims.sub,
-                &req.reason,
-                Some(binding),
+                .await?,
             )
-            .await
-            .map_err(|e| Status::failed_precondition(e.to_string()))?;
-            return Ok(Response::new(ApplyAuthzSchemaResponse {
-                namespaces: record.namespaces,
-                schema_version: 0,
-                write_state: WriteState::Staged as i32,
-            }));
+        } else {
+            None
+        };
+        if let Some(transaction) = implicit.as_ref().filter(|transaction| transaction.replayed) {
+            return replay_auth_mutation_response::<ApplyAuthzSchemaResponse>(
+                self,
+                transaction,
+                &input_hash,
+            )
+            .map(Response::new);
         }
-
-        access_control::grant_authz_realm_defaults(
+        let effective_transaction_id = transaction_id
+            .as_deref()
+            .or_else(|| {
+                implicit
+                    .as_ref()
+                    .map(|transaction| transaction.transaction_id.as_str())
+            })
+            .ok_or_else(|| Status::internal("authorization transaction was not established"))?;
+        access_control::stage_authz_realm_defaults(
             &self.persistence,
             claims.tenant_id,
             DEFAULT_AUTHZ_REALM_ID,
             &claims.sub,
             &claims.sub,
             "grant default authz realm owner",
+            effective_transaction_id,
+            &transaction_principal,
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
-        let mut records = Vec::with_capacity(req.namespaces.len());
-        let authz_revision = authz_journal::latest_authz_revision(&self.mvcc, claims.tenant_id)
-            .map_err(|e| Status::internal(e.to_string()))
-            .and_then(revision_to_u64)?
-            .max(1);
-        for namespace in req.namespaces {
-            let record = authz_schema::write_authz_namespace_schema(
+        let binding = crate::authz_journal::AuthzTransactionBinding {
+            transaction_id: effective_transaction_id,
+            principal: &transaction_principal,
+        };
+        let record = authz_realm_schema::put_schema_revision(
+            &self.storage,
+            &self.mvcc,
+            claims.tenant_id,
+            DEFAULT_AUTHZ_REALM_ID,
+            req.namespaces,
+            &claims.sub,
+            &req.reason,
+            Some(binding),
+        )
+        .await
+        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        for namespace in &record.namespaces {
+            authz_namespace_watch::stage_authz_namespace_watch_record(
                 &self.mvcc,
+                effective_transaction_id,
+                &transaction_principal,
                 claims.tenant_id,
-                namespace,
-                authz_revision,
-                &claims.sub,
-                &req.reason,
-            )
-            .await
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
-            authz_namespace_watch::append_authz_namespace_watch_record(
-                &self.mvcc,
-                claims.tenant_id,
-                mutation_id_from_record_hash(&record.record_hash),
+                mutation_id_from_record_hash(&record.schema_ref.schema_digest),
                 authz_namespace_watch::AuthzNamespaceWatchPayload {
-                    namespace: record.namespace.clone(),
+                    namespace: namespace.namespace.clone(),
                     event_type: "schema_changed".to_string(),
-                    authz_revision,
-                    schema_hash: record.schema_hash.clone(),
+                    authz_revision: record.authz_revision,
+                    schema_hash: namespace.schema_hash.clone(),
                     invalidates_derived_usersets: true,
-                    emitted_at: record.applied_at.clone(),
+                    emitted_at: record.created_at.clone(),
                 },
             )
-            .await
             .map_err(|e| Status::internal(e.to_string()))?;
-            records.push(record);
         }
-        let schema_version = records
-            .iter()
-            .map(|record| record.schema_version)
-            .max()
-            .unwrap_or(0);
-        Ok(Response::new(ApplyAuthzSchemaResponse {
-            namespaces: records.iter().map(authz_schema::schema_response).collect(),
-            schema_version,
-            write_state: WriteState::Committed as i32,
-        }))
+        authz_realm_schema::bind_schema(
+            &self.storage,
+            &self.mvcc,
+            claims.tenant_id,
+            DEFAULT_AUTHZ_REALM_ID,
+            record.schema_ref.clone(),
+            None,
+            &claims.sub,
+            &req.reason,
+            Some(binding),
+        )
+        .await
+        .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        let response = ApplyAuthzSchemaResponse {
+            namespaces: record.namespaces,
+            schema_version: if implicit.is_some() {
+                record.schema_ref.schema_revision
+            } else {
+                0
+            },
+            write_state: if implicit.is_some() {
+                WriteState::Committed as i32
+            } else {
+                WriteState::Staged as i32
+            },
+        };
+        let audit_event = crate::services::audit::build_tenant_audit_event(
+            &claims,
+            req.context
+                .as_ref()
+                .map(|context| context.request_id.as_str())
+                .unwrap_or("apply-authz-schema"),
+            format!("authz-realm:{DEFAULT_AUTHZ_REALM_ID}"),
+            "authz.schema.apply",
+            serde_json::json!({
+                "schema_revision": record.schema_ref.schema_revision,
+                "namespace_count": response.namespaces.len(),
+            }),
+        )?;
+        let now = u64::try_from(chrono::Utc::now().timestamp_millis())
+            .map_err(|_| Status::internal("authorization mutation predates Unix epoch"))?;
+        stage_tenant_audit_in_transaction(
+            self,
+            effective_transaction_id,
+            &transaction_principal,
+            &audit_event,
+            record.authz_revision,
+            now,
+        )?;
+        if let Some(transaction) = &implicit {
+            stage_auth_mutation_response(
+                self,
+                effective_transaction_id,
+                &transaction_principal,
+                AUTH_MUTATION_IMPLICIT_RESULT_KEY,
+                input_hash,
+                &response,
+                now,
+            )?;
+            self.commit_implicit_auth_transaction(transaction).await?;
+        }
+        Ok(Response::new(response))
     }
 
     async fn get_authz_schema(

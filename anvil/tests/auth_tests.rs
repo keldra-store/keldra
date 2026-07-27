@@ -22,7 +22,7 @@ use anvil::anvil_api::{
     ListObjectsRequest, ListRepairFindingsRequest, NativeMutationContext, ObjectMetadata,
     PageRequest, PutAuthzSchemaRequest, PutObjectRequest, ReadAuthzTuplesRequest,
     ReadHostAliasRequest, ReadObjectLinkRequest, ReadTaskLeaseRequest,
-    RepairAuthzDerivedIndexRequest, RepairIndexRequest, RevokeAccessRequest,
+    PublicMutationContext, RepairAuthzDerivedIndexRequest, RepairIndexRequest, RevokeAccessRequest,
     RotateApplicationCredentialSecretRequest, SetPublicAccessRequest, UpdateObjectLinkRequest,
     VerifyHostAliasRequest, WatchAuthzDerivedLagRequest, WatchAuthzNamespaceRequest,
     WatchAuthzTupleLogRequest, WriteAuthzTupleRequest, WriteAuthzTuplesRequest,

@@ -312,11 +312,18 @@ async fn test_apply_authz_schema_persists_and_emits_namespace_watch() {
         applied_at: String::new(),
     };
 
-    let mut apply = Request::new(ApplyAuthzSchemaRequest {
-            context: None,
-        namespaces: vec![schema],
+    let apply_context = PublicMutationContext {
+        request_id: "apply-schema-idempotent".to_string(),
+        idempotency_key: uuid::Uuid::new_v4().to_string(),
+        expected_generation: 0,
+        transaction_id: None,
+    };
+    let apply_request = || ApplyAuthzSchemaRequest {
+        context: Some(apply_context.clone()),
+        namespaces: vec![schema.clone()],
         reason: "test schema apply".to_string(),
-    });
+    };
+    let mut apply = Request::new(apply_request());
     add_bearer(&mut apply, &actor.token);
     let applied = auth_client
         .apply_authz_schema(apply)
@@ -328,6 +335,30 @@ async fn test_apply_authz_schema_persists_and_emits_namespace_watch() {
     assert_eq!(applied.namespaces[0].namespace, "document");
     assert_eq!(applied.namespaces[0].schema_version, 1);
     assert!(!applied.namespaces[0].schema_hash.is_empty());
+    let mut replay = Request::new(apply_request());
+    add_bearer(&mut replay, &actor.token);
+    assert_eq!(
+        auth_client
+            .apply_authz_schema(replay)
+            .await
+            .unwrap()
+            .into_inner(),
+        applied
+    );
+    let mut changed = Request::new(ApplyAuthzSchemaRequest {
+        context: Some(apply_context),
+        namespaces: vec![schema],
+        reason: "changed idempotent schema input".to_string(),
+    });
+    add_bearer(&mut changed, &actor.token);
+    assert_eq!(
+        auth_client
+            .apply_authz_schema(changed)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::AlreadyExists
+    );
 
     let mut get_one = Request::new(GetAuthzSchemaRequest {
         namespace: "document".to_string(),
