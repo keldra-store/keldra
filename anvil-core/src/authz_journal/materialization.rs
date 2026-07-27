@@ -322,47 +322,28 @@ async fn initialize_authz_materialization(
     source_fence_token: u64,
     publication: AuthzPublication<'_>,
 ) -> Result<AuthzMaterializationOutcome> {
-    let current_revision = u64::try_from(latest_authz_revision(mvcc, tenant_id)?)
-        .context("authorization revision must be nonnegative")?;
-    if target_revision != 1 || current_revision != 1 {
-        bail!(
-            "AuthzMaterializationRepairRequired: no durable materialization head exists for current revision {current_revision}"
-        );
-    }
-    let IncrementalSourceRead {
-        event,
-        cursor_before_event,
-        scanned_cursor,
-        source_rows_visited,
-    } = read_next_source_event(mvcc, tenant_id, 0)?;
-    let (mutations, source_cursor, event_fence_token) = match event {
-        Some(event) if event.revision == 1 => {
-            (event.records, event.source_cursor, event.fence_token)
-        }
-        Some(event) if event.revision > 1 => (Vec::new(), cursor_before_event, 0),
-        Some(event) => bail!(
-            "authorization source starts before the initial materialization revision: {}",
-            event.revision
-        ),
-        None => (Vec::new(), scanned_cursor, 0),
-    };
-    require_available_revision_source(mvcc, tenant_id, 1, &mutations)?;
-    let active = authz_segment::apply_authz_tuple_mutations(tenant_id, &[], &mutations, 1)?;
+    // A node can observe several committed authorization revisions before the
+    // asynchronous materializer gets its first lease.  Rebuilding only
+    // revision one would leave the queue permanently stuck at revision > 1.
+    // Collect and apply the complete source history through the requested
+    // revision, then publish one checkpoint head at that revision.
+    let source = collect_source_records_for_rebuild(mvcc, tenant_id, target_revision)?;
+    let active = active_records_at_revision(source.records, target_revision);
     let staged = authz_segment::stage_authz_tuple_checkpoint_segment(
         storage,
         mvcc,
         tenant_id,
         &active,
         None,
-        1,
-        source_cursor,
-        event_fence_token.max(source_fence_token),
+        target_revision,
+        source.source_cursor,
+        source.latest_fence_token.max(source_fence_token),
     )
     .await?;
-    publish_derived_userset_index(storage, mvcc, tenant_id, 1, publication).await?;
+    publish_derived_userset_index(storage, mvcc, tenant_id, target_revision, publication).await?;
     let segment_ref = publish_staged_segment(mvcc, staged, publication).await?;
-    let segment = load_materialized_segment(storage, mvcc, tenant_id, 1).await?;
-    outcome_from_segment(segment, segment_ref, source_rows_visited)
+    let segment = load_materialized_segment(storage, mvcc, tenant_id, target_revision).await?;
+    outcome_from_segment(segment, segment_ref, source.events_visited)
 }
 
 async fn publish_staged_segment(
