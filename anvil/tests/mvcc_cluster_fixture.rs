@@ -1106,7 +1106,10 @@ async fn real_cluster_reconstructs_a_deleted_shard_and_publishes_repaired_placem
         requested_at_unix_ms: 30,
     };
     let mut pin_job = base_job.clone();
-    pin_job.requested_at_unix_ms = 1_000_000_000_000;
+    // Keep this manual-release job ahead of wall-clock time so the production
+    // repair worker cannot consume it before the deliberate claim race below.
+    const MANUAL_REPAIR_NOW: u64 = 9_000_000_000_000;
+    pin_job.requested_at_unix_ms = MANUAL_REPAIR_NOW;
     pin_job.target_logical_identity = format!("retirement-pin/{object_identity}");
     let (pin_job_id, _) =
         enqueue_repair_job(mvcc, "e2e-retirement-pin", "retirement-pin", pin_job, 30).await;
@@ -1186,7 +1189,7 @@ async fn real_cluster_reconstructs_a_deleted_shard_and_publishes_repaired_placem
     let first = tokio::task::spawn_blocking(move || {
         raced_store.claim_shard_repair_where(
             "e2e-race-worker-a",
-            1_000_000_000_000,
+            MANUAL_REPAIR_NOW,
             1_000,
             move |record| record.job.job_id().ok().as_deref() == Some(race_job_a.as_str()),
         )
@@ -1195,7 +1198,7 @@ async fn real_cluster_reconstructs_a_deleted_shard_and_publishes_repaired_placem
     let second = tokio::task::spawn_blocking(move || {
         raced_store.claim_shard_repair_where(
             "e2e-race-worker-b",
-            1_000_000_000_000,
+            MANUAL_REPAIR_NOW,
             1_000,
             move |record| record.job.job_id().ok().as_deref() == Some(race_job_b.as_str()),
         )
@@ -1219,7 +1222,7 @@ async fn real_cluster_reconstructs_a_deleted_shard_and_publishes_repaired_placem
         let pin_worker = format!("e2e-release-retirement-pin-{node}");
         let store = cluster.state(node).mvcc.runtime.local_store();
         let claimed = store
-            .claim_shard_repair_where(&pin_worker, 1_000_000_000_000, 1_000, |record| {
+            .claim_shard_repair_where(&pin_worker, MANUAL_REPAIR_NOW, 1_000, |record| {
                 record.job.job_id().ok().as_deref() == Some(pin_job_id.as_str())
             })
             .unwrap();
