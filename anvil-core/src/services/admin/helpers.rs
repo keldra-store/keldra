@@ -1,5 +1,98 @@
 use super::*;
 
+pub(super) struct AdminImplicitTransaction {
+    pub transaction_id: String,
+    pub principal: String,
+    pub replayed: bool,
+}
+
+pub(super) async fn begin_admin_product_transaction(
+    state: &AppState,
+    principal: &AdminPrincipal,
+    context: &AdminRequestContext,
+    operation: &str,
+) -> Result<AdminImplicitTransaction, Status> {
+    let transaction_principal = format!(
+        "admin:{}:{}",
+        principal.tenant_id,
+        principal.principal_id.trim()
+    );
+    let idempotency_key = format!(
+        "admin:{operation}:{}:{}:{}",
+        principal.tenant_id,
+        principal.principal_id,
+        context.idempotency_key.trim()
+    );
+    let now = u64::try_from(chrono::Utc::now().timestamp_millis())
+        .map_err(|_| Status::internal("admin mutation timestamp predates Unix epoch"))?;
+    let handle = state
+        .mvcc
+        .open_transactions
+        .begin(
+            state.mvcc.runtime.as_ref(),
+            state.mvcc.cluster_id().to_string(),
+            transaction_principal.clone(),
+            &idempotency_key,
+            std::time::Duration::from_secs(300),
+            crate::mvcc_transaction::DurabilityLevel::Quorum,
+            crate::mvcc_transaction::ReadConsistency::Linearized,
+            now,
+        )
+        .await
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    let status = state
+        .mvcc
+        .open_transactions
+        .status(&handle.transaction_id, &transaction_principal, now)
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    if status.state == "committing" {
+        commit_admin_product_transaction(
+            state,
+            &AdminImplicitTransaction {
+                transaction_id: handle.transaction_id.clone(),
+                principal: transaction_principal.clone(),
+                replayed: true,
+            },
+        )
+        .await?;
+    } else if status.state == "aborted" {
+        return Err(Status::aborted(
+            "admin product transaction previously aborted",
+        ));
+    }
+    Ok(AdminImplicitTransaction {
+        transaction_id: handle.transaction_id,
+        principal: transaction_principal,
+        replayed: matches!(status.state, "committed" | "committing"),
+    })
+}
+
+pub(super) async fn commit_admin_product_transaction(
+    state: &AppState,
+    transaction: &AdminImplicitTransaction,
+) -> Result<(), Status> {
+    let outcome = state
+        .mvcc
+        .open_transactions
+        .commit(
+            state.mvcc.runtime.as_ref(),
+            &transaction.transaction_id,
+            &transaction.principal,
+            u64::try_from(chrono::Utc::now().timestamp_millis())
+                .map_err(|_| Status::internal("admin commit timestamp predates Unix epoch"))?,
+        )
+        .await
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    match outcome.certification {
+        crate::mvcc_transaction::CertificationResult::Committed { .. } => Ok(()),
+        crate::mvcc_transaction::CertificationResult::Aborted { reason } => {
+            Err(Status::aborted(format!(
+                "admin product transaction aborted: {reason:?}"
+            )))
+        }
+    }
+}
+
 pub(super) async fn require_admin<T>(
     request: &Request<T>,
     state: &AppState,

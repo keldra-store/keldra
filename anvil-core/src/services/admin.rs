@@ -558,24 +558,121 @@ impl AdminService for AppState {
             json!({ "resource_kind": "bucket", "tenant_id": tenant_id, "bucket_name": &req.bucket_name, "region": &req.region }),
         )?;
         let audit_event_id = audit_event.audit_event_id.clone();
-        let bucket = self
-            .persistence
-            .create_bucket_with_admin_audit(
+        let transaction =
+            begin_admin_product_transaction(self, &principal, context, "bucket-create").await?;
+        let bucket = if transaction.replayed {
+            self.persistence
+                .get_bucket_by_name(tenant_id, &req.bucket_name)
+                .await
+                .map_err(|err| Status::internal(err.to_string()))?
+                .ok_or_else(|| {
+                    Status::aborted(
+                        "committed admin bucket transaction does not match this request",
+                    )
+                })?
+        } else {
+            if !crate::validation::is_valid_bucket_name(&req.bucket_name) {
+                return Err(Status::invalid_argument("Invalid bucket name"));
+            }
+            mesh_lifecycle::ensure_new_writable_placement(
+                &self.storage,
+                &req.region,
+                &self.config.cell_id,
+                &self.config.node_id,
+            )
+            .await
+            .map_err(|err| Status::failed_precondition(err.to_string()))?;
+            if crate::bucket_journal::read_current_bucket_in_transaction(
+                &self.mvcc,
                 tenant_id,
                 &req.bucket_name,
-                &req.region,
-                Some(&audit_event),
+                &transaction.transaction_id,
+                &transaction.principal,
             )
-            .await?;
-        crate::access_control::grant_bucket_defaults(
-            &self.persistence,
-            &bucket,
-            &principal.principal_id,
-            &principal.principal_id,
-            "admin bucket create",
-        )
-        .await
-        .map_err(|err| Status::internal(err.to_string()))?;
+            .map_err(|err| Status::internal(err.to_string()))?
+            .is_some()
+            {
+                return Err(Status::already_exists(
+                    "A bucket with that name already exists.",
+                ));
+            }
+            let bucket = persistence::Bucket {
+                id: crate::bucket_journal::next_bucket_id_in_transaction(
+                    &self.mvcc,
+                    &transaction.transaction_id,
+                    &transaction.principal,
+                )
+                .map_err(|err| Status::internal(err.to_string()))?,
+                tenant_id,
+                name: req.bucket_name.clone(),
+                region: req.region.clone(),
+                created_at: Utc::now(),
+                is_public_read: false,
+            };
+            let operation_sequence =
+                crate::bucket_journal::stage_bucket_mutation_in_transaction(
+                    &self.mvcc,
+                    &bucket,
+                    crate::bucket_journal::BucketJournalMutation::Create,
+                    &transaction.transaction_id,
+                    &transaction.principal,
+                )
+                .await
+                .map_err(|err| Status::internal(err.to_string()))?;
+            crate::access_control::stage_bucket_defaults(
+                &self.persistence,
+                &bucket,
+                &principal.principal_id,
+                &principal.principal_id,
+                "admin bucket create",
+                &transaction.transaction_id,
+                &transaction.principal,
+            )
+            .await
+            .map_err(|err| Status::internal(err.to_string()))?;
+            let now = u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default();
+            let audit_plan = crate::admin_audit::admin_audit_mvcc_plan(
+                &audit_event,
+                operation_sequence,
+                &transaction.transaction_id,
+            )
+            .map_err(|err| Status::internal(err.to_string()))?;
+            self.mvcc
+                .stage_product_mutations(
+                    &transaction.transaction_id,
+                    &transaction.principal,
+                    audit_plan.mutations,
+                    now,
+                )
+                .map_err(|err| Status::failed_precondition(err.to_string()))?;
+            for event in audit_plan.outbox_events {
+                self.mvcc
+                    .open_transactions
+                    .add_stream_event(&transaction.transaction_id, event, now)
+                    .map_err(|err| Status::failed_precondition(err.to_string()))?;
+            }
+            let job = crate::bucket_locator_finalization_job::BucketLocatorFinalizationJob {
+                schema:
+                    crate::bucket_locator_finalization_job::BucketLocatorFinalizationJob::SCHEMA
+                        .to_string(),
+                cluster_id: self.mvcc.cluster_id().to_string(),
+                transaction_id: transaction.transaction_id.clone(),
+                operation_sequence,
+                operation: crate::bucket_locator_finalization_job::BucketLocatorFinalizationOperation::Publish,
+                frozen_bucket: bucket.clone(),
+            };
+            self.mvcc
+                .open_transactions
+                .add_job(
+                    &transaction.transaction_id,
+                    job.encode()
+                        .map_err(|err| Status::internal(err.to_string()))?,
+                    now,
+                )
+                .map_err(|err| Status::failed_precondition(err.to_string()))?;
+            commit_admin_product_transaction(self, &transaction).await?;
+            bucket
+        };
         Ok(Response::new(BucketAdminResponse {
             request_id: context.request_id.clone(),
             bucket: Some(bucket_to_proto(bucket)),
