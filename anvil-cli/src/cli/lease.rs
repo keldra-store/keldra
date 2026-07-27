@@ -62,6 +62,7 @@ pub async fn handle_lease_command(command: &LeaseCommands, ctx: &Context) -> any
                 source_cursor_low: *source_cursor_low,
                 source_cursor_high: *source_cursor_high,
                 requested_ttl_nanos: *ttl_nanos,
+            options: None,
             });
             add_auth(&mut request, &token);
             print_lease(client.acquire_task_lease(request).await?.into_inner().lease);
@@ -82,6 +83,7 @@ pub async fn handle_lease_command(command: &LeaseCommands, ctx: &Context) -> any
                 expected_lease_epoch: lease.lease_epoch,
                 expected_expires_at_nanos: lease.expires_at_nanos,
                 expected_lease_hash: lease.lease_hash,
+            options: None,
             });
             add_auth(&mut request, &token);
             print_lease(
@@ -108,6 +110,7 @@ pub async fn handle_lease_command(command: &LeaseCommands, ctx: &Context) -> any
                 expected_lease_epoch: lease.lease_epoch,
                 expected_expires_at_nanos: lease.expires_at_nanos,
                 expected_lease_hash: lease.lease_hash,
+            options: None,
             });
             add_auth(&mut request, &token);
             let response = client.commit_task_lease(request).await?.into_inner();
@@ -126,6 +129,7 @@ pub async fn handle_lease_command(command: &LeaseCommands, ctx: &Context) -> any
         LeaseCommands::ForceRelease { task_id } => {
             let mut request = tonic::Request::new(api::ForceReleaseTaskLeaseRequest {
                 task_id: task_id.clone(),
+            options: None,
             });
             add_auth(&mut request, &token);
             let response = client.force_release_task_lease(request).await?.into_inner();

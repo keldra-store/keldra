@@ -3121,6 +3121,7 @@ message AcquireOwnershipRequest {
     string owner_label = 3;
     OwnershipResource resource = 4;
     uint64 requested_lease_ms = 5;
+    WriteOptions options = 6;
 }
 
 message RenewOwnershipRequest {
@@ -3130,6 +3131,7 @@ message RenewOwnershipRequest {
     OwnershipResource resource = 3;
     uint64 current_fence = 4;
     uint64 requested_lease_ms = 5;
+    WriteOptions options = 6;
 }
 
 message TransferOwnershipRequest {
@@ -3146,6 +3148,7 @@ message TransferOwnershipRequest {
     string new_owner_actor_instance_id = 9;
     string new_owner_region = 10;
     string new_owner_cell = 11;
+    WriteOptions options = 12;
 }
 
 message ReleaseOwnershipRequest {
@@ -3157,6 +3160,7 @@ message ReleaseOwnershipRequest {
     OwnershipResource resource = 4;
     uint64 current_fence = 5;
     bool administrative_force = 6;
+    WriteOptions options = 7;
 }
 
 message ForceExpireOwnershipRequest {
@@ -3164,6 +3168,7 @@ message ForceExpireOwnershipRequest {
     string idempotency_key = 2;
     OwnershipResource resource = 3;
     string reason = 4;
+    WriteOptions options = 5;
 }
 
 message OwnershipFenceResponse {
@@ -3181,6 +3186,7 @@ message OwnershipFenceResponse {
     string owner_principal_kind = 12;
     string owner_principal_id = 13;
     string owner_actor_instance_id = 14;
+    WriteState write_state = 15;
 }
 
 enum OwnershipResourceKind {

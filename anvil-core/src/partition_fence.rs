@@ -24,9 +24,9 @@ pub use coremeta::{
     list_ownership_fences_page, list_partition_owners_for_node_page, list_partition_owners_page,
 };
 use coremeta::{
-    is_partition_fence_cas_conflict, ownership_fence_row_key, partition_owner_row_key,
-    read_ownership_fence_state, read_partition_owner_state, write_ownership_fence_state,
-    write_partition_owner_state,
+    is_partition_fence_cas_conflict, ownership_fence_by_node_key, ownership_fence_row_key,
+    partition_owner_row_key, read_ownership_fence_state, read_partition_owner_state,
+    write_ownership_fence_state, write_partition_owner_state,
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -411,6 +411,41 @@ pub struct OwnershipFenceOutcome {
     pub idempotent_replay: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct OwnershipFenceWritePlan {
+    pub outcome: OwnershipFenceOutcome,
+    mutations: Vec<crate::mvcc_product::ProductMutation>,
+    predicates: Vec<(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )>,
+    assignment_identity: String,
+}
+
+impl OwnershipFenceWritePlan {
+    pub async fn stage_into_transaction(
+        self,
+        mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+        transaction_id: &str,
+        principal: &str,
+        now_unix_ms: u64,
+    ) -> Result<()> {
+        let handle = mvcc.open_transactions.handle(transaction_id)?;
+        if handle.principal != principal {
+            bail!("ownership fence caller transaction principal mismatch");
+        }
+        let assignment = mvcc
+            .reconcile_work_assignment("ownership-fence", &self.assignment_identity)
+            .await?
+            .ok_or_else(|| anyhow!("local node does not own the ownership-fence assignment"))?;
+        mvcc.stage_product_mutations(transaction_id, principal, self.mutations, now_unix_ms)?;
+        for (key, predicate) in self.predicates {
+            mvcc.stage_predicate(transaction_id, principal, key, predicate, now_unix_ms)?;
+        }
+        mvcc.stage_assignment_guard(transaction_id, principal, &assignment, now_unix_ms)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcquireOwnership {
     pub request_id: String,
@@ -725,6 +760,362 @@ fn ownership_principal_from_proto(proto: OwnershipPrincipalProto) -> OwnershipPr
         region: proto.region,
         cell: proto.cell,
     }
+}
+
+pub fn plan_acquire_ownership_in_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    request: AcquireOwnership,
+    signing_key: &[u8],
+) -> Result<OwnershipFenceWritePlan> {
+    validate_acquire_ownership(&request)?;
+    let existing = read_ownership_fence_in_transaction(
+        mvcc,
+        transaction_id,
+        principal,
+        request.owner.tenant_id,
+        &request.resource,
+        signing_key,
+    )?;
+    if let Some(existing) = existing.as_ref() {
+        if ownership_idempotency_matches(
+            existing,
+            "acquire",
+            &request.idempotency_key,
+            &request.owner,
+        ) && existing.is_active_unexpired(request.now_nanos)
+        {
+            return ownership_fence_plan(existing.clone(), Some(existing), true);
+        }
+        // Time only admits planning a successor. Certification uses the exact
+        // prior row predicate produced below.
+        if existing.is_active_unexpired(request.now_nanos) {
+            bail!("{OWNERSHIP_HELD}: ownership fence is held by an active principal");
+        }
+    }
+    let record = OwnershipFenceRecord {
+        format_version: existing
+            .as_ref()
+            .map(|record| record.format_version)
+            .unwrap_or(2),
+        resource: request.resource,
+        owner: request.owner.clone(),
+        fence: existing
+            .as_ref()
+            .map(|record| increment_counter(record.fence, "ownership fence token"))
+            .transpose()?
+            .unwrap_or(1),
+        state: OwnershipFenceState::Active,
+        lease_expires_at_nanos: request.now_nanos.saturating_add(request.ttl_nanos),
+        last_heartbeat_at_nanos: request.now_nanos,
+        generation: existing
+            .as_ref()
+            .map(|record| increment_counter(record.generation, "ownership fence generation"))
+            .transpose()?
+            .unwrap_or(1),
+        last_operation: Some("acquire".to_string()),
+        last_idempotency_key: nonempty_idempotency_key(request.idempotency_key),
+        last_actor: Some(request.owner),
+        ownership_hash: None,
+        ownership_signature: None,
+    }
+    .seal(signing_key)?;
+    ownership_fence_plan(record, existing.as_ref(), false)
+}
+
+pub fn plan_renew_ownership_in_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    request: RenewOwnership,
+    signing_key: &[u8],
+) -> Result<OwnershipFenceWritePlan> {
+    validate_renew_ownership(&request)?;
+    let mut record = require_ownership_in_transaction(
+        mvcc,
+        transaction_id,
+        principal,
+        request.owner.tenant_id,
+        &request.resource,
+        signing_key,
+    )?;
+    require_current_owner_and_fence(&record, &request.owner, request.current_fence)?;
+    if !record.is_active_unexpired(request.now_nanos) {
+        bail!("{OWNERSHIP_EXPIRED}: ownership fence is not active");
+    }
+    let expected = record.clone();
+    record.lease_expires_at_nanos = request.now_nanos.saturating_add(request.ttl_nanos);
+    record.last_heartbeat_at_nanos = request.now_nanos;
+    record.generation = increment_counter(record.generation, "ownership fence generation")?;
+    record.last_operation = Some("renew".to_string());
+    record.last_idempotency_key = None;
+    record.last_actor = Some(request.owner);
+    ownership_fence_plan(record.seal(signing_key)?, Some(&expected), false)
+}
+
+pub fn plan_transfer_ownership_in_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    request: TransferOwnership,
+    signing_key: &[u8],
+) -> Result<OwnershipFenceWritePlan> {
+    validate_transfer_ownership(&request)?;
+    if request.new_owner.tenant_id != request.current_owner.tenant_id {
+        bail!("{OWNERSHIP_OWNER_MISMATCH}: transfer target is outside the owner tenant");
+    }
+    let mut record = require_ownership_in_transaction(
+        mvcc,
+        transaction_id,
+        principal,
+        request.current_owner.tenant_id,
+        &request.resource,
+        signing_key,
+    )?;
+    if ownership_idempotency_matches(
+        &record,
+        "transfer",
+        &request.idempotency_key,
+        &request.current_owner,
+    ) {
+        return ownership_fence_plan(record.clone(), Some(&record), true);
+    }
+    require_current_owner_and_fence(&record, &request.current_owner, request.current_fence)?;
+    if !record.is_active_unexpired(request.now_nanos) {
+        bail!("{OWNERSHIP_EXPIRED}: ownership fence is not active");
+    }
+    let expected = record.clone();
+    record.fence = increment_counter(record.fence, "ownership fence token")?;
+    record.generation = increment_counter(record.generation, "ownership fence generation")?;
+    record.owner = request.new_owner;
+    record.state = OwnershipFenceState::Active;
+    record.lease_expires_at_nanos = request.now_nanos.saturating_add(request.ttl_nanos);
+    record.last_heartbeat_at_nanos = request.now_nanos;
+    record.last_operation = Some("transfer".to_string());
+    record.last_idempotency_key = nonempty_idempotency_key(request.idempotency_key);
+    record.last_actor = Some(request.current_owner);
+    ownership_fence_plan(record.seal(signing_key)?, Some(&expected), false)
+}
+
+pub fn plan_release_ownership_in_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    request: ReleaseOwnership,
+    signing_key: &[u8],
+) -> Result<OwnershipFenceWritePlan> {
+    validate_release_ownership(&request)?;
+    let mut record = require_ownership_in_transaction(
+        mvcc,
+        transaction_id,
+        principal,
+        request.owner.tenant_id,
+        &request.resource,
+        signing_key,
+    )?;
+    if ownership_idempotency_matches(
+        &record,
+        "release",
+        &request.idempotency_key,
+        &request.owner,
+    ) {
+        return ownership_fence_plan(record.clone(), Some(&record), true);
+    }
+    if !request.administrative_force {
+        require_current_owner_and_fence(&record, &request.owner, request.current_fence)?;
+    }
+    let expected = record.clone();
+    record.fence = increment_counter(record.fence, "ownership fence token")?;
+    record.generation = increment_counter(record.generation, "ownership fence generation")?;
+    record.state = OwnershipFenceState::Released;
+    record.lease_expires_at_nanos = request.now_nanos;
+    record.last_heartbeat_at_nanos = request.now_nanos;
+    record.last_operation = Some("release".to_string());
+    record.last_idempotency_key = nonempty_idempotency_key(request.idempotency_key);
+    record.last_actor = Some(request.owner);
+    ownership_fence_plan(record.seal(signing_key)?, Some(&expected), false)
+}
+
+pub fn plan_force_expire_ownership_in_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    request: ForceExpireOwnership,
+    signing_key: &[u8],
+) -> Result<OwnershipFenceWritePlan> {
+    validate_force_expire_ownership(&request)?;
+    let mut record = require_ownership_in_transaction(
+        mvcc,
+        transaction_id,
+        principal,
+        request.admin.tenant_id,
+        &request.resource,
+        signing_key,
+    )?;
+    if ownership_idempotency_matches(
+        &record,
+        "force_expire",
+        &request.idempotency_key,
+        &request.admin,
+    ) {
+        return ownership_fence_plan(record.clone(), Some(&record), true);
+    }
+    let expected = record.clone();
+    record.fence = increment_counter(record.fence, "ownership fence token")?;
+    record.generation = increment_counter(record.generation, "ownership fence generation")?;
+    record.state = OwnershipFenceState::Expired;
+    record.lease_expires_at_nanos = request.now_nanos;
+    record.last_heartbeat_at_nanos = request.now_nanos;
+    record.last_operation = Some("force_expire".to_string());
+    record.last_idempotency_key = nonempty_idempotency_key(request.idempotency_key);
+    record.last_actor = Some(request.admin);
+    ownership_fence_plan(record.seal(signing_key)?, Some(&expected), false)
+}
+
+fn require_ownership_in_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    tenant_id: i64,
+    resource: &OwnershipResource,
+    signing_key: &[u8],
+) -> Result<OwnershipFenceRecord> {
+    read_ownership_fence_in_transaction(
+        mvcc,
+        transaction_id,
+        principal,
+        tenant_id,
+        resource,
+        signing_key,
+    )?
+    .ok_or_else(|| anyhow!("{OWNERSHIP_NOT_FOUND}: ownership fence is absent"))
+}
+
+fn read_ownership_fence_in_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    tenant_id: i64,
+    resource: &OwnershipResource,
+    signing_key: &[u8],
+) -> Result<Option<OwnershipFenceRecord>> {
+    let key = ownership_fence_logical_key(tenant_id, resource)?;
+    mvcc.read_transaction_value(transaction_id, principal, &key)?
+        .map(|payload| {
+            let record = decode_ownership_fence_record(&payload)?;
+            record.verify(signing_key)?;
+            Ok(record)
+        })
+        .transpose()
+}
+
+fn ownership_fence_logical_key(
+    tenant_id: i64,
+    resource: &OwnershipResource,
+) -> Result<crate::mvcc_transaction::LogicalKey> {
+    crate::mvcc_product::coremeta_logical_key(
+        CF_LEASES_FENCES,
+        TABLE_OWNERSHIP_FENCE_ROW,
+        &ownership_fence_row_key(tenant_id, resource)?,
+    )
+}
+
+fn ownership_fence_projection_logical_key(
+    record: &OwnershipFenceRecord,
+) -> Result<crate::mvcc_transaction::LogicalKey> {
+    crate::mvcc_product::coremeta_logical_key(
+        CF_LEASES_FENCES,
+        TABLE_OWNERSHIP_FENCE_ROW,
+        &ownership_fence_by_node_key(record)?,
+    )
+}
+
+fn ownership_fence_plan(
+    record: OwnershipFenceRecord,
+    expected: Option<&OwnershipFenceRecord>,
+    idempotent_replay: bool,
+) -> Result<OwnershipFenceWritePlan> {
+    let key = ownership_fence_logical_key(record.owner.tenant_id, &record.resource)?;
+    let payload = encode_ownership_fence_record(&record)?;
+    let main_predicate = expected
+        .map(encode_ownership_fence_record)
+        .transpose()?
+        .map(|payload| {
+            crate::mvcc_transaction::PredicateKind::ValueHash(
+                *blake3::hash(&payload).as_bytes(),
+            )
+        })
+        .unwrap_or(crate::mvcc_transaction::PredicateKind::Absent);
+    let mut mutations = Vec::new();
+    let mut predicates = vec![(key.clone(), main_predicate)];
+    if !idempotent_replay {
+        mutations.push(crate::mvcc_product::ProductMutation::put(
+            key,
+            payload.clone(),
+        ));
+    }
+    let old_projection = expected
+        .filter(|record| record.owner.principal_kind == "node")
+        .map(ownership_fence_projection_logical_key)
+        .transpose()?;
+    let new_projection = (record.owner.principal_kind == "node")
+        .then(|| ownership_fence_projection_logical_key(&record))
+        .transpose()?;
+    if old_projection != new_projection {
+        if let Some(old_key) = old_projection {
+            if !idempotent_replay {
+                mutations.push(crate::mvcc_product::ProductMutation::delete(old_key.clone()));
+            }
+            let old_payload = encode_ownership_fence_record(
+                expected.ok_or_else(|| anyhow!("old ownership projection lacks prior row"))?,
+            )?;
+            predicates.push((
+                old_key,
+                crate::mvcc_transaction::PredicateKind::ValueHash(
+                    *blake3::hash(&old_payload).as_bytes(),
+                ),
+            ));
+        }
+        if let Some(new_key) = new_projection {
+            if !idempotent_replay {
+                mutations.push(crate::mvcc_product::ProductMutation::put(
+                    new_key.clone(),
+                    payload,
+                ));
+            }
+            predicates.push((
+                new_key,
+                crate::mvcc_transaction::PredicateKind::Absent,
+            ));
+        }
+    } else if let Some(projection_key) = new_projection {
+        let projection_predicate = expected
+            .map(encode_ownership_fence_record)
+            .transpose()?
+            .map(|payload| {
+                crate::mvcc_transaction::PredicateKind::ValueHash(
+                    *blake3::hash(&payload).as_bytes(),
+                )
+            })
+            .unwrap_or(crate::mvcc_transaction::PredicateKind::Absent);
+        if !idempotent_replay {
+            mutations.push(crate::mvcc_product::ProductMutation::put(
+                projection_key.clone(),
+                payload,
+            ));
+        }
+        predicates.push((projection_key, projection_predicate));
+    }
+    Ok(OwnershipFenceWritePlan {
+        assignment_identity: ownership_resource_hash(record.owner.tenant_id, &record.resource)?,
+        outcome: OwnershipFenceOutcome {
+            record,
+            idempotent_replay,
+        },
+        mutations,
+        predicates,
+    })
 }
 
 pub async fn acquire_ownership(

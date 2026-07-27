@@ -7,7 +7,8 @@ use anvil::anvil_api::index_service_client::IndexServiceClient;
 use anvil::anvil_api::object_service_client::ObjectServiceClient;
 use anvil::anvil_api::repair_service_client::RepairServiceClient;
 use anvil::anvil_api::{
-    self, AbortMultipartRequest, AcquireTaskLeaseRequest, AppendStreamRecordRequest,
+    self, AbortMultipartRequest, AcquireOwnershipRequest, AcquireTaskLeaseRequest,
+    AppendStreamRecordRequest,
     CompareAndSwapManifestRequest, CompleteMultipartPart, CompleteMultipartRequest,
     ComposeObjectRequest, ComposeObjectSource, CopyObjectRequest, CreateAppendStreamRequest,
     CreateBucketRequest, CreateIndexRequest, CreateObjectLinkRequest, DeleteObjectRequest,
@@ -16,6 +17,7 @@ use anvil::anvil_api::{
     ListObjectVersionsRequest, ListObjectsRequest, MutationBatchOperation,
     MutationBatchPatchJsonObject, MutationBatchPutObject, MutationBatchRequest,
     NativeMutationContext, ObjectLinkResolution, ObjectMetadata, ObjectVersionPrecondition,
+    OwnershipResource, OwnershipResourceKind,
     PatchJsonObjectRequest, PublicMutationContext, PutObjectRequest, ReadAppendStreamRequest,
     ReadObjectLinkRequest, RepairDirectoryIndexRequest,
     SealAppendStreamSegmentRequest, TailAppendStreamRequest, UploadPartMetadata, UploadPartRequest,

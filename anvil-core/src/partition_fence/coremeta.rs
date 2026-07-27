@@ -705,7 +705,7 @@ fn ownership_fence_by_node_prefix(owner_node_id: &str) -> Result<Vec<u8>> {
     ])
 }
 
-fn ownership_fence_by_node_key(record: &OwnershipFenceRecord) -> Result<Vec<u8>> {
+pub(super) fn ownership_fence_by_node_key(record: &OwnershipFenceRecord) -> Result<Vec<u8>> {
     if record.owner.principal_kind != "node" {
         bail!("ownership fence node projection requires a node principal");
     }

@@ -4,7 +4,7 @@ use anvil::anvil_api::transaction_service_client::TransactionServiceClient;
 use anvil::anvil_api::{
     BeginTransactionRequest, BeginTransactionResponse, CommitTransactionRequest,
     GetTransactionRequest, MvccDurability, MvccReadConsistency, ReadConsistency,
-    RollbackTransactionRequest, WriteState,
+    RollbackTransactionRequest, WriteOptions, WriteState, write_options,
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -1372,6 +1372,7 @@ async fn lease_fence_is_revalidated_at_transaction_publication() {
                 source_cursor_low: 0,
                 source_cursor_high: 0,
                 requested_ttl_nanos: 60_000_000_000,
+            options: None,
             },
             &fixture.actor.token,
         ))
@@ -1423,6 +1424,7 @@ async fn lease_fence_is_revalidated_at_transaction_publication() {
                 expected_lease_epoch: lease.lease_epoch,
                 expected_expires_at_nanos: lease.expires_at_nanos,
                 expected_lease_hash: lease.lease_hash,
+            options: None,
             },
             &fixture.actor.token,
         ))
@@ -1438,6 +1440,335 @@ async fn lease_fence_is_revalidated_at_transaction_publication() {
         .expect_err("a changed lease fence must reject object publication");
     assert_eq!(conflict.code(), Code::Aborted);
     assert_object_missing(&fixture, &mut object_client, target_key).await;
+}
+
+#[tokio::test]
+async fn task_lease_and_object_publish_atomically_in_one_transaction() {
+    let fixture = SingleNodeMutationBatchFixture::new("tx-coordination-lease-success").await;
+    let mut transaction_client = fixture.transaction_client().await;
+    let mut coordination_client = fixture.coordination_client().await;
+    let mut object_client = fixture.object_client().await;
+    let transaction = fixture
+        .begin_transaction(
+            &mut transaction_client,
+            "task lease and object",
+            EXPLICIT_TRANSACTION_TTL_MS,
+        )
+        .await;
+    let task_id = unique_test_name("transactional-task-lease");
+    let staged = coordination_client
+        .acquire_task_lease(authorized(
+            AcquireTaskLeaseRequest {
+                task_id: task_id.clone(),
+                task_kind: "transactional_test".to_string(),
+                partition_family: "transactional_test".to_string(),
+                partition_id: hex::encode([9_u8; 32]),
+                owner_label: "transaction-worker".to_string(),
+                source_cursor_low: 0,
+                source_cursor_high: 0,
+                requested_ttl_nanos: 60_000_000_000,
+                options: Some(WriteOptions {
+                    execution: Some(write_options::Execution::TransactionId(
+                        transaction.transaction_id.clone(),
+                    )),
+                    ..Default::default()
+                }),
+            },
+            &fixture.actor.token,
+        ))
+        .await
+        .expect("stage task lease")
+        .into_inner();
+    assert_eq!(staged.write_state, WriteState::Staged as i32);
+
+    let before_commit = coordination_client
+        .read_task_lease(authorized(
+            anvil_api::ReadTaskLeaseRequest {
+                task_id: task_id.clone(),
+            },
+            &fixture.actor.token,
+        ))
+        .await
+        .expect("read staged task lease")
+        .into_inner();
+    assert!(!before_commit.found);
+
+    let object_key = "coordination/atomic-success.json";
+    object_client
+        .mutation_batch(authorized(
+            MutationBatchRequest {
+                bucket_name: fixture.bucket_name.clone(),
+                mutation_context: Some(
+                    fixture.mutation_context("task-lease-object", &transaction.transaction_id),
+                ),
+                precondition: None,
+                operations: vec![small_put(object_key, br#"{"committed":true}"#.to_vec())],
+            },
+            &fixture.actor.token,
+        ))
+        .await
+        .expect("stage object with task lease");
+
+    transaction_client
+        .commit_transaction(authorized(
+            fixture.commit_request(transaction.transaction_id),
+            &fixture.actor.token,
+        ))
+        .await
+        .expect("commit task lease and object");
+    assert!(
+        coordination_client
+            .read_task_lease(authorized(
+                anvil_api::ReadTaskLeaseRequest { task_id },
+                &fixture.actor.token,
+            ))
+            .await
+            .expect("read committed task lease")
+            .into_inner()
+            .found
+    );
+    object_client
+        .head_object(authorized(
+            HeadObjectRequest {
+                bucket_name: fixture.bucket_name.clone(),
+                object_key: object_key.to_string(),
+                version_id: None,
+                consistency: None,
+            },
+            &fixture.actor.token,
+        ))
+        .await
+        .expect("object committed atomically with task lease");
+}
+
+#[tokio::test]
+async fn competing_task_lease_aborts_the_whole_cross_feature_transaction() {
+    let fixture = SingleNodeMutationBatchFixture::new("tx-coordination-lease-conflict").await;
+    let mut transaction_client = fixture.transaction_client().await;
+    let mut coordination_client = fixture.coordination_client().await;
+    let mut object_client = fixture.object_client().await;
+    let transaction = fixture
+        .begin_transaction(
+            &mut transaction_client,
+            "conflicting task lease",
+            EXPLICIT_TRANSACTION_TTL_MS,
+        )
+        .await;
+    let task_id = unique_test_name("transactional-task-lease-conflict");
+    let acquire = |options| AcquireTaskLeaseRequest {
+        task_id: task_id.clone(),
+        task_kind: "transactional_test".to_string(),
+        partition_family: "transactional_test".to_string(),
+        partition_id: hex::encode([10_u8; 32]),
+        owner_label: "transaction-worker".to_string(),
+        source_cursor_low: 0,
+        source_cursor_high: 0,
+        requested_ttl_nanos: 60_000_000_000,
+        options,
+    };
+    coordination_client
+        .acquire_task_lease(authorized(
+            acquire(Some(WriteOptions {
+                execution: Some(write_options::Execution::TransactionId(
+                    transaction.transaction_id.clone(),
+                )),
+                ..Default::default()
+            })),
+            &fixture.actor.token,
+        ))
+        .await
+        .expect("stage lease contender");
+    let object_key = "coordination/atomic-conflict.json";
+    object_client
+        .mutation_batch(authorized(
+            MutationBatchRequest {
+                bucket_name: fixture.bucket_name.clone(),
+                mutation_context: Some(
+                    fixture.mutation_context("task-lease-conflict", &transaction.transaction_id),
+                ),
+                precondition: None,
+                operations: vec![small_put(object_key, br#"{"must_abort":true}"#.to_vec())],
+            },
+            &fixture.actor.token,
+        ))
+        .await
+        .expect("stage object behind lease contender");
+    coordination_client
+        .acquire_task_lease(authorized(acquire(None), &fixture.actor.token))
+        .await
+        .expect("commit competing lease");
+
+    let conflict = transaction_client
+        .commit_transaction(authorized(
+            fixture.commit_request(transaction.transaction_id),
+            &fixture.actor.token,
+        ))
+        .await
+        .expect_err("lease predicate conflict must abort transaction");
+    assert_eq!(conflict.code(), Code::Aborted);
+    assert_object_missing(&fixture, &mut object_client, object_key).await;
+}
+
+#[tokio::test]
+async fn ownership_fence_and_object_publish_atomically_in_one_transaction() {
+    let fixture = SingleNodeMutationBatchFixture::new("tx-coordination-ownership-success").await;
+    let mut transaction_client = fixture.transaction_client().await;
+    let mut coordination_client = fixture.coordination_client().await;
+    let mut object_client = fixture.object_client().await;
+    let transaction = fixture
+        .begin_transaction(
+            &mut transaction_client,
+            "ownership fence and object",
+            EXPLICIT_TRANSACTION_TTL_MS,
+        )
+        .await;
+    let resource_id = unique_test_name("transactional-ownership");
+    let staged = coordination_client
+        .acquire_ownership(authorized(
+            AcquireOwnershipRequest {
+                request_id: unique_test_name("ownership-request"),
+                idempotency_key: unique_test_name("ownership-idempotency"),
+                owner_label: "transaction-owner".to_string(),
+                resource: Some(OwnershipResource {
+                    resource_kind: OwnershipResourceKind::TaskQueue as i32,
+                    resource_id: resource_id.clone(),
+                }),
+                requested_lease_ms: 60_000,
+                options: Some(WriteOptions {
+                    execution: Some(write_options::Execution::TransactionId(
+                        transaction.transaction_id.clone(),
+                    )),
+                    ..Default::default()
+                }),
+            },
+            &fixture.actor.token,
+        ))
+        .await
+        .expect("stage ownership fence")
+        .into_inner();
+    assert_eq!(staged.write_state, WriteState::Staged as i32);
+
+    let object_key = "coordination/ownership-success.json";
+    object_client
+        .mutation_batch(authorized(
+            MutationBatchRequest {
+                bucket_name: fixture.bucket_name.clone(),
+                mutation_context: Some(
+                    fixture.mutation_context("ownership-object", &transaction.transaction_id),
+                ),
+                precondition: None,
+                operations: vec![small_put(object_key, br#"{"owned":true}"#.to_vec())],
+            },
+            &fixture.actor.token,
+        ))
+        .await
+        .expect("stage object with ownership fence");
+    transaction_client
+        .commit_transaction(authorized(
+            fixture.commit_request(transaction.transaction_id),
+            &fixture.actor.token,
+        ))
+        .await
+        .expect("commit ownership fence and object");
+
+    let held = coordination_client
+        .acquire_ownership(authorized(
+            AcquireOwnershipRequest {
+                request_id: unique_test_name("ownership-contender"),
+                idempotency_key: unique_test_name("ownership-contender"),
+                owner_label: "same-authenticated-owner".to_string(),
+                resource: Some(OwnershipResource {
+                    resource_kind: OwnershipResourceKind::TaskQueue as i32,
+                    resource_id,
+                }),
+                requested_lease_ms: 60_000,
+                options: None,
+            },
+            &fixture.actor.token,
+        ))
+        .await
+        .expect_err("committed ownership fence must be authoritative");
+    assert_eq!(held.code(), Code::FailedPrecondition);
+    object_client
+        .head_object(authorized(
+            HeadObjectRequest {
+                bucket_name: fixture.bucket_name.clone(),
+                object_key: object_key.to_string(),
+                version_id: None,
+                consistency: None,
+            },
+            &fixture.actor.token,
+        ))
+        .await
+        .expect("object committed atomically with ownership fence");
+}
+
+#[tokio::test]
+async fn competing_ownership_claim_aborts_the_whole_cross_feature_transaction() {
+    let fixture = SingleNodeMutationBatchFixture::new("tx-coordination-ownership-conflict").await;
+    let mut transaction_client = fixture.transaction_client().await;
+    let mut coordination_client = fixture.coordination_client().await;
+    let mut object_client = fixture.object_client().await;
+    let transaction = fixture
+        .begin_transaction(
+            &mut transaction_client,
+            "conflicting ownership claim",
+            EXPLICIT_TRANSACTION_TTL_MS,
+        )
+        .await;
+    let resource_id = unique_test_name("transactional-ownership-conflict");
+    let acquire = |options| AcquireOwnershipRequest {
+        request_id: unique_test_name("ownership-conflict-request"),
+        idempotency_key: unique_test_name("ownership-conflict-idempotency"),
+        owner_label: "transaction-owner".to_string(),
+        resource: Some(OwnershipResource {
+            resource_kind: OwnershipResourceKind::TaskQueue as i32,
+            resource_id: resource_id.clone(),
+        }),
+        requested_lease_ms: 60_000,
+        options,
+    };
+    coordination_client
+        .acquire_ownership(authorized(
+            acquire(Some(WriteOptions {
+                execution: Some(write_options::Execution::TransactionId(
+                    transaction.transaction_id.clone(),
+                )),
+                ..Default::default()
+            })),
+            &fixture.actor.token,
+        ))
+        .await
+        .expect("stage ownership contender");
+    let object_key = "coordination/ownership-conflict.json";
+    object_client
+        .mutation_batch(authorized(
+            MutationBatchRequest {
+                bucket_name: fixture.bucket_name.clone(),
+                mutation_context: Some(
+                    fixture.mutation_context("ownership-conflict", &transaction.transaction_id),
+                ),
+                precondition: None,
+                operations: vec![small_put(object_key, br#"{"must_abort":true}"#.to_vec())],
+            },
+            &fixture.actor.token,
+        ))
+        .await
+        .expect("stage object behind ownership contender");
+    coordination_client
+        .acquire_ownership(authorized(acquire(None), &fixture.actor.token))
+        .await
+        .expect("commit competing ownership claim");
+
+    let conflict = transaction_client
+        .commit_transaction(authorized(
+            fixture.commit_request(transaction.transaction_id),
+            &fixture.actor.token,
+        ))
+        .await
+        .expect_err("ownership predicate conflict must abort transaction");
+    assert_eq!(conflict.code(), Code::Aborted);
+    assert_object_missing(&fixture, &mut object_client, object_key).await;
 }
 
 #[tokio::test]

@@ -220,6 +220,47 @@ pub struct TaskLeasePage {
     pub snapshot_version: u64,
 }
 
+/// One cluster-local lease transition ready to join either a caller-owned
+/// transaction or the implicit single-operation transaction.
+///
+/// `now_nanos` is deliberately absent from the certified predicates.  Time is
+/// used while planning a successor claim, never as authority in the
+/// deterministic state machine.
+#[derive(Debug, Clone)]
+pub struct TaskLeaseWritePlan {
+    pub lease: TaskLease,
+    mutations: Vec<crate::mvcc_product::ProductMutation>,
+    predicates: Vec<(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )>,
+    assignment_identity: String,
+}
+
+impl TaskLeaseWritePlan {
+    pub async fn stage_into_transaction(
+        self,
+        mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+        transaction_id: &str,
+        principal: &str,
+        now_unix_ms: u64,
+    ) -> Result<()> {
+        let handle = mvcc.open_transactions.handle(transaction_id)?;
+        if handle.principal != principal {
+            bail!("task lease caller transaction principal mismatch");
+        }
+        let assignment = mvcc
+            .reconcile_work_assignment("task-lease", &self.assignment_identity)
+            .await?
+            .ok_or_else(|| anyhow!("local node does not own the task lease assignment"))?;
+        mvcc.stage_product_mutations(transaction_id, principal, self.mutations, now_unix_ms)?;
+        for (key, predicate) in self.predicates {
+            mvcc.stage_predicate(transaction_id, principal, key, predicate, now_unix_ms)?;
+        }
+        mvcc.stage_assignment_guard(transaction_id, principal, &assignment, now_unix_ms)
+    }
+}
+
 pub fn hash_task_lease(lease: &TaskLease) -> Result<String> {
     let mut unsigned = lease.clone();
     unsigned.lease_hash = None;
@@ -393,6 +434,254 @@ pub async fn acquire_task_lease_mvcc(
     Ok(lease)
 }
 
+pub async fn plan_acquire_task_lease_in_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    request: TaskLeaseAcquire,
+    signing_key: &[u8],
+) -> Result<TaskLeaseWritePlan> {
+    validate_acquire_request(&request)?;
+    let existing = read_task_lease_in_transaction(
+        mvcc,
+        transaction_id,
+        principal,
+        request.owner.tenant_id,
+        &request.task_id,
+        signing_key,
+    )?;
+    // Expiry permits planning a successor.  The exact prior-value predicate
+    // below is the authority check which eventually certifies.
+    if let Some(existing) = existing.as_ref()
+        && existing.expires_at_nanos > request.now_nanos
+        && !existing.owner.same_security_owner(&request.owner)
+    {
+        bail!("{LEASE_HELD}: task lease is owned by another active principal");
+    }
+    let fence_token = successor_counter(
+        existing.as_ref().map(|lease| lease.fence_token),
+        "task lease fence token",
+    )?;
+    let lease_epoch = successor_counter(
+        existing.as_ref().map(|lease| lease.lease_epoch),
+        "task lease epoch",
+    )?;
+    let root_generation = successor_counter(
+        existing.as_ref().map(|lease| lease.root_generation),
+        "task lease root generation",
+    )?;
+    let checkpoint_cursor = existing
+        .as_ref()
+        .map(|lease| lease.checkpoint_cursor)
+        .unwrap_or_default()
+        .max(request.source_cursor);
+    let lease = TaskLease {
+        format_version: 3,
+        root_generation,
+        task_id: request.task_id,
+        task_kind: request.task_kind,
+        partition_family: request.partition_family,
+        partition_id: request.partition_id,
+        owner: request.owner,
+        fence_token,
+        source_cursor: request.source_cursor,
+        checkpoint_cursor,
+        lease_epoch,
+        acquired_at_nanos: request.now_nanos,
+        expires_at_nanos: request
+            .now_nanos
+            .checked_add(request.ttl_nanos)
+            .context("task lease expiry overflow")?,
+        updated_at_nanos: request.now_nanos,
+        lease_hash: None,
+        lease_signature: None,
+    }
+    .seal(signing_key)?;
+    task_lease_put_plan(&lease, existing.as_ref())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn plan_checkpoint_task_lease_in_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    authenticated_owner: &TaskLeaseOwner,
+    task_id: &str,
+    fence_token: u64,
+    root_generation: u64,
+    lease_epoch: u64,
+    expires_at_nanos: i64,
+    lease_hash: &str,
+    checkpoint_cursor: u128,
+    now_nanos: i64,
+    signing_key: &[u8],
+) -> Result<TaskLeaseWritePlan> {
+    let mut lease = require_expected_task_lease_in_transaction(
+        mvcc,
+        transaction_id,
+        principal,
+        authenticated_owner,
+        task_id,
+        fence_token,
+        root_generation,
+        lease_epoch,
+        expires_at_nanos,
+        lease_hash,
+        now_nanos,
+        signing_key,
+    )?;
+    if checkpoint_cursor < lease.checkpoint_cursor {
+        bail!("{STALE_FENCE}: task lease checkpoint cannot move backwards");
+    }
+    let expected = lease.clone();
+    if checkpoint_cursor != lease.checkpoint_cursor {
+        lease.root_generation = lease
+            .root_generation
+            .checked_add(1)
+            .context("task lease root generation overflow")?;
+        lease.checkpoint_cursor = checkpoint_cursor;
+        lease.updated_at_nanos = now_nanos;
+        lease = lease.seal(signing_key)?;
+    }
+    task_lease_put_plan(&lease, Some(&expected))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn plan_commit_task_lease_in_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    authenticated_owner: &TaskLeaseOwner,
+    task_id: &str,
+    fence_token: u64,
+    root_generation: u64,
+    lease_epoch: u64,
+    expires_at_nanos: i64,
+    lease_hash: &str,
+    committed_cursor: u128,
+    now_nanos: i64,
+    signing_key: &[u8],
+) -> Result<TaskLeaseWritePlan> {
+    let mut lease = require_expected_task_lease_in_transaction(
+        mvcc,
+        transaction_id,
+        principal,
+        authenticated_owner,
+        task_id,
+        fence_token,
+        root_generation,
+        lease_epoch,
+        expires_at_nanos,
+        lease_hash,
+        now_nanos,
+        signing_key,
+    )?;
+    if committed_cursor < lease.checkpoint_cursor {
+        bail!("{STALE_FENCE}: task lease commit cannot move backwards");
+    }
+    let expected = lease.clone();
+    lease.root_generation = lease
+        .root_generation
+        .checked_add(1)
+        .context("task lease root generation overflow")?;
+    lease.checkpoint_cursor = committed_cursor;
+    lease.updated_at_nanos = now_nanos;
+    let committed = lease.seal(signing_key)?;
+    let mut plan = task_lease_delete_plan(&expected)?;
+    plan.lease = committed;
+    Ok(plan)
+}
+
+pub fn plan_force_release_task_lease_in_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    tenant_id: i64,
+    task_id: &str,
+    signing_key: &[u8],
+) -> Result<Option<TaskLeaseWritePlan>> {
+    read_task_lease_in_transaction(
+        mvcc,
+        transaction_id,
+        principal,
+        tenant_id,
+        task_id,
+        signing_key,
+    )?
+    .as_ref()
+    .map(task_lease_delete_plan)
+    .transpose()
+}
+
+fn successor_counter(current: Option<u64>, label: &str) -> Result<u64> {
+    current
+        .map(|value| value.checked_add(1).context(format!("{label} overflow")))
+        .transpose()
+        .map(|value| value.unwrap_or(1))
+}
+
+fn read_task_lease_in_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    tenant_id: i64,
+    task_id: &str,
+    signing_key: &[u8],
+) -> Result<Option<TaskLease>> {
+    let payload = mvcc.read_transaction_value(
+        transaction_id,
+        principal,
+        &task_lease_mvcc_key(tenant_id, task_id)?,
+    )?;
+    payload
+        .map(|payload| {
+            let lease = decode_task_lease_record(&payload)?;
+            lease.verify(signing_key)?;
+            Ok(lease)
+        })
+        .transpose()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn require_expected_task_lease_in_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    owner: &TaskLeaseOwner,
+    task_id: &str,
+    fence_token: u64,
+    root_generation: u64,
+    lease_epoch: u64,
+    expires_at_nanos: i64,
+    lease_hash: &str,
+    now_nanos: i64,
+    signing_key: &[u8],
+) -> Result<TaskLease> {
+    let lease = read_task_lease_in_transaction(
+        mvcc,
+        transaction_id,
+        principal,
+        owner.tenant_id,
+        task_id,
+        signing_key,
+    )?
+    .ok_or_else(|| anyhow!("{STALE_FENCE}: task lease does not exist"))?;
+    if !lease.owner.same_security_owner(owner) {
+        bail!("{LEASE_OWNER_MISMATCH}: task lease owner mismatch");
+    }
+    lease.require_expected_version(
+        fence_token,
+        root_generation,
+        lease_epoch,
+        expires_at_nanos,
+        lease_hash,
+    )?;
+    if lease.expires_at_nanos <= now_nanos {
+        bail!("{LEASE_EXPIRED}: task lease expired and is eligible for reclaim");
+    }
+    Ok(lease)
+}
+
 pub fn read_task_lease_mvcc(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
@@ -543,6 +832,25 @@ async fn write_task_lease_mvcc(
     lease: &TaskLease,
     expected: Option<&TaskLease>,
 ) -> Result<()> {
+    let plan = task_lease_put_plan(lease, expected)?;
+    let idempotency_key = lease
+        .lease_hash
+        .as_deref()
+        .ok_or_else(|| anyhow!("sealed task lease is missing its hash"))?;
+    commit_task_lease_plan(
+        mvcc,
+        &format!("task-lease:{}", lease.owner.principal_id),
+        idempotency_key,
+        plan,
+        u64::try_from(lease.updated_at_nanos / 1_000_000).unwrap_or_default(),
+    )
+    .await
+}
+
+fn task_lease_put_plan(
+    lease: &TaskLease,
+    expected: Option<&TaskLease>,
+) -> Result<TaskLeaseWritePlan> {
     let key = task_lease_mvcc_key(lease.owner.tenant_id, &lease.task_id)?;
     let owner_key = task_lease_owner_mvcc_key(lease)?;
     let payload = encode_task_lease_record(lease)?;
@@ -582,20 +890,12 @@ async fn write_task_lease_mvcc(
             ),
         ));
     }
-    commit_task_lease_mutations(
-        mvcc,
-        &format!("task-lease:{}", lease.owner.principal_id),
-        lease
-            .lease_hash
-            .as_deref()
-            .ok_or_else(|| anyhow!("sealed task lease is missing its hash"))?,
-        &format!("{}:{}", lease.owner.tenant_id, lease.task_id),
+    Ok(TaskLeaseWritePlan {
+        lease: lease.clone(),
         mutations,
         predicates,
-        u64::try_from(lease.updated_at_nanos / 1_000_000).unwrap_or_default(),
-    )
-    .await?;
-    Ok(())
+        assignment_identity: format!("{}:{}", lease.owner.tenant_id, lease.task_id),
+    })
 }
 
 pub async fn commit_task_lease_mvcc(
@@ -637,43 +937,46 @@ async fn delete_task_lease_mvcc(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     expected: &TaskLease,
 ) -> Result<()> {
-    let key = task_lease_mvcc_key(expected.owner.tenant_id, &expected.task_id)?;
-    let owner_key = task_lease_owner_mvcc_key(expected)?;
-    let predicate = crate::mvcc_transaction::PredicateKind::ValueHash(
-        *blake3::hash(&encode_task_lease_record(expected)?).as_bytes(),
-    );
-    commit_task_lease_mutations(
+    let plan = task_lease_delete_plan(expected)?;
+    commit_task_lease_plan(
         mvcc,
         &format!("task-lease:{}", expected.owner.principal_id),
         &format!(
             "task-lease-release:{}:{}:{}",
             expected.owner.tenant_id, expected.task_id, expected.lease_epoch
         ),
-        &format!("{}:{}", expected.owner.tenant_id, expected.task_id),
-        vec![
-            crate::mvcc_product::ProductMutation::delete(key.clone()),
-            crate::mvcc_product::ProductMutation::delete(owner_key.clone()),
-        ],
-        vec![(key, predicate.clone()), (owner_key, predicate)],
+        plan,
         u64::try_from(expected.updated_at_nanos / 1_000_000).unwrap_or_default(),
     )
     .await
 }
 
-async fn commit_task_lease_mutations(
+fn task_lease_delete_plan(expected: &TaskLease) -> Result<TaskLeaseWritePlan> {
+    let key = task_lease_mvcc_key(expected.owner.tenant_id, &expected.task_id)?;
+    let owner_key = task_lease_owner_mvcc_key(expected)?;
+    let predicate = crate::mvcc_transaction::PredicateKind::ValueHash(
+        *blake3::hash(&encode_task_lease_record(expected)?).as_bytes(),
+    );
+    Ok(TaskLeaseWritePlan {
+        lease: expected.clone(),
+        mutations: vec![
+            crate::mvcc_product::ProductMutation::delete(key.clone()),
+            crate::mvcc_product::ProductMutation::delete(owner_key.clone()),
+        ],
+        predicates: vec![(key, predicate.clone()), (owner_key, predicate)],
+        assignment_identity: format!("{}:{}", expected.owner.tenant_id, expected.task_id),
+    })
+}
+
+async fn commit_task_lease_plan(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     principal: &str,
     idempotency_key: &str,
-    assignment_identity: &str,
-    mutations: Vec<crate::mvcc_product::ProductMutation>,
-    predicates: Vec<(
-        crate::mvcc_transaction::LogicalKey,
-        crate::mvcc_transaction::PredicateKind,
-    )>,
+    plan: TaskLeaseWritePlan,
     now_unix_ms: u64,
 ) -> Result<()> {
     let assignment = mvcc
-        .reconcile_work_assignment("task-lease", assignment_identity)
+        .reconcile_work_assignment("task-lease", &plan.assignment_identity)
         .await?
         .ok_or_else(|| anyhow!("local node does not own the task lease assignment"))?;
     let handle = mvcc
@@ -693,8 +996,13 @@ async fn commit_task_lease_mutations(
         .open_transactions
         .status(&handle.transaction_id, principal, now_unix_ms)?;
     if status.state == "open" {
-        mvcc.stage_product_mutations(&handle.transaction_id, principal, mutations, now_unix_ms)?;
-        for (key, kind) in predicates {
+        mvcc.stage_product_mutations(
+            &handle.transaction_id,
+            principal,
+            plan.mutations,
+            now_unix_ms,
+        )?;
+        for (key, kind) in plan.predicates {
             mvcc.stage_predicate(&handle.transaction_id, principal, key, kind, now_unix_ms)?;
         }
         mvcc.stage_assignment_guard(&handle.transaction_id, principal, &assignment, now_unix_ms)?;
