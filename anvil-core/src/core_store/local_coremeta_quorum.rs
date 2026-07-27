@@ -225,16 +225,9 @@ impl CoreStore {
                 // A control root may coordinate a mutation without owning a
                 // row in that mutation. In that case it is not advanced; use
                 // its current durable generation for the manifest binding.
-                let generation = self
-                        .read_latest_root_anchor(&publication.root_anchor_key)
-                        .await?
-                        .map(|anchor| anchor.root_generation)
-                        .ok_or_else(|| {
-                            anyhow!(
-                                "CoreMeta transaction coordinator root {root_key_hash} has no durable anchor"
-                            )
-                        })?;
-                Some((root_key_hash.clone(), generation))
+                self.read_latest_root_anchor(&publication.root_anchor_key)
+                    .await?
+                    .map(|anchor| (root_key_hash.clone(), anchor.root_generation))
             }
         } else {
             None
