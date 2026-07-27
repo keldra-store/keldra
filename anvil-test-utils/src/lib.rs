@@ -1803,7 +1803,7 @@ impl TestCluster {
         }
 
         let projection = anvil_core::mesh_lifecycle::BootstrapMeshLifecycleProjection {
-            regions,
+            regions: regions.clone(),
             cells,
             nodes,
         };
@@ -1851,6 +1851,29 @@ impl TestCluster {
             projection,
         )
         .unwrap();
+        // The bootstrap snapshot is written directly to CoreStore.  The
+        // public control-plane handlers read the applied MVCC projection, so
+        // make the region descriptors visible there as well before exercising
+        // those handlers.  Without this bridge a freshly seeded test cluster
+        // can create buckets successfully (legacy region row) but reject
+        // host-alias operations with "region not found".
+        for region in &regions {
+            let input = region.clone();
+            let descriptor = match canonical.persistence.create_region_descriptor(input).await {
+                Ok(descriptor) => descriptor,
+                Err(anvil_core::mesh_lifecycle::LifecycleError::AlreadyExists { .. }) => continue,
+                Err(error) => panic!("seed MVCC region descriptor: {error:?}"),
+            };
+            canonical
+                .persistence
+                .transition_region_descriptor(
+                    &descriptor.region,
+                    descriptor.generation,
+                    anvil_core::mesh_lifecycle::LifecycleState::Active,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("activate MVCC region descriptor: {error:?}"));
+        }
         if self.states.len() == 1 {
             install_canonical_coremeta_bootstrap_snapshot(&self.states);
         }
