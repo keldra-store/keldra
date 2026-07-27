@@ -168,6 +168,57 @@ pub(super) async fn write_descriptor_projection<T: StoredRoutingRecord>(
     Ok(())
 }
 
+pub(super) async fn write_descriptor_projection_mvcc<T: StoredRoutingRecord>(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    descriptor_key: &str,
+    descriptor: &T,
+    require_absent: bool,
+) -> MeshDirectoryResult<()> {
+    let family = descriptor.routing_family();
+    let record_key = descriptor.routing_record_key();
+    let expected_descriptor_key = routing_record_descriptor_key_for_key(family, &record_key)?;
+    ensure_descriptor_key_matches(descriptor_key, &expected_descriptor_key)?;
+    let row_key = routing_projection_row_key(family, &record_key)?;
+    let key =
+        crate::mvcc_product::coremeta_logical_key(CF_MESH, TABLE_MESH_PARTITION_ROW, &row_key)?;
+    let current = mvcc.read_latest_value(&key)?;
+    if require_absent && current.is_some() {
+        return Err(MeshDirectoryError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("routing descriptor already exists: {descriptor_key}"),
+        )));
+    }
+    let payload = record_proto::encode_routing_projection_row(descriptor_key, descriptor)?;
+    if current.as_deref() == Some(payload.as_slice()) {
+        return Ok(());
+    }
+    let predicate = current
+        .as_ref()
+        .map(|payload| {
+            crate::mvcc_transaction::PredicateKind::ValueHash(*blake3::hash(payload).as_bytes())
+        })
+        .unwrap_or(crate::mvcc_transaction::PredicateKind::Absent);
+    let transaction_id = format!(
+        "mesh-directory-projection:{}:{}",
+        family.stream_family(),
+        hex::encode(blake3::hash(&payload).as_bytes())
+    );
+    mvcc.autocommit_product_mutations_with_predicates(
+        "mesh-directory",
+        &transaction_id,
+        vec![crate::mvcc_product::ProductMutation::put(
+            key.clone(),
+            payload,
+        )],
+        vec![(key, predicate)],
+        crate::mvcc_transaction::DurabilityLevel::Quorum,
+        chrono::Utc::now().timestamp_millis().max(0) as u64,
+    )
+    .await
+    .map_err(MeshDirectoryError::Other)?;
+    Ok(())
+}
+
 pub(super) async fn read_descriptor_projection_payload(
     storage: &Storage,
     descriptor_key: &str,
@@ -192,6 +243,29 @@ pub(super) async fn read_descriptor_projection_payload_proto(
     let store = CoreStore::new(storage.clone()).await?;
     let Some(payload) = store.read_coremeta_row(CF_MESH, TABLE_MESH_PARTITION_ROW, &row_key)?
     else {
+        return Ok(None);
+    };
+    let row = record_proto::decode_routing_projection_row(&payload)?;
+    if row.descriptor.family != family || row.descriptor.record_key != record_key {
+        return Err(MeshDirectoryError::InvalidIdentifier {
+            field: "mesh directory projection row key",
+            value: format!(
+                "expected {:?}/{record_key}, got {:?}/{}",
+                family, row.descriptor.family, row.descriptor.record_key
+            ),
+        });
+    }
+    Ok(Some(row.payload_proto))
+}
+
+pub(super) fn read_descriptor_projection_payload_proto_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    descriptor_key: &str,
+) -> MeshDirectoryResult<Option<Vec<u8>>> {
+    let (family, record_key, row_key) = descriptor_projection_row_key(descriptor_key)?;
+    let key =
+        crate::mvcc_product::coremeta_logical_key(CF_MESH, TABLE_MESH_PARTITION_ROW, &row_key)?;
+    let Some(payload) = mvcc.read_latest_value(&key)? else {
         return Ok(None);
     };
     let row = record_proto::decode_routing_projection_row(&payload)?;

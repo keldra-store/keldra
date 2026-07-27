@@ -405,8 +405,8 @@ impl Persistence {
                 "latest control stream mutation deletes {stream_family}/{partition}/{record_key}"
             ));
         }
-        mesh_directory::rebuild_routing_record_projection_from_payload(
-            &self.storage,
+        mesh_directory::rebuild_routing_record_projection_from_payload_mvcc(
+            self.mvcc()?,
             family,
             record_key,
             &record.payload_json,

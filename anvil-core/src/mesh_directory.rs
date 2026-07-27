@@ -1588,6 +1588,45 @@ pub async fn rebuild_routing_record_projection_from_payload(
     Ok(descriptor)
 }
 
+pub async fn rebuild_routing_record_projection_from_payload_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    family: RoutingRecordFamily,
+    record_key: &str,
+    payload_json: &[u8],
+) -> MeshDirectoryResult<RoutingRecordDescriptor> {
+    let expected_descriptor_key = routing_record_descriptor_key_for_key(family, record_key)?;
+    let descriptor = match family {
+        RoutingRecordFamily::TenantName => {
+            let descriptor: TenantNameDescriptor = serde_json::from_slice(payload_json)?;
+            ensure_descriptor_key_matches(&descriptor.descriptor_key(), &expected_descriptor_key)?;
+            write_descriptor_mvcc(mvcc, &expected_descriptor_key, &descriptor).await?;
+            routing_record_descriptor_from_record(&descriptor)?
+        }
+        RoutingRecordFamily::TenantLocator => {
+            let descriptor: TenantLocatorDescriptor = serde_json::from_slice(payload_json)?;
+            ensure_descriptor_key_matches(&descriptor.descriptor_key(), &expected_descriptor_key)?;
+            write_descriptor_mvcc(mvcc, &expected_descriptor_key, &descriptor).await?;
+            routing_record_descriptor_from_record(&descriptor)?
+        }
+        RoutingRecordFamily::BucketLocator => {
+            let descriptor: BucketLocatorDescriptor = serde_json::from_slice(payload_json)?;
+            ensure_descriptor_key_matches(&descriptor.descriptor_key(), &expected_descriptor_key)?;
+            write_descriptor_mvcc(mvcc, &expected_descriptor_key, &descriptor).await?;
+            routing_record_descriptor_from_record(&descriptor)?
+        }
+        RoutingRecordFamily::HostAlias => {
+            let descriptor: routing::HostAliasDescriptor = serde_json::from_slice(payload_json)?;
+            ensure_descriptor_key_matches(
+                &host_alias_descriptor_key(&descriptor.hostname)?,
+                &expected_descriptor_key,
+            )?;
+            write_descriptor_mvcc(mvcc, &expected_descriptor_key, &descriptor).await?;
+            routing_record_descriptor_from_record(&descriptor)?
+        }
+    };
+    Ok(descriptor)
+}
+
 async fn rebuild_routing_record_projection_from_proto(
     storage: &Storage,
     family: RoutingRecordFamily,
@@ -1638,6 +1677,14 @@ async fn write_descriptor<T: StoredRoutingRecord>(
 ) -> MeshDirectoryResult<()> {
     write_descriptor_projection(storage, descriptor_key, descriptor, false).await?;
     Ok(())
+}
+
+async fn write_descriptor_mvcc<T: StoredRoutingRecord>(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    descriptor_key: &str,
+    descriptor: &T,
+) -> MeshDirectoryResult<()> {
+    write_descriptor_projection_mvcc(mvcc, descriptor_key, descriptor, false).await
 }
 
 fn bucket_record_key(record_key: &str) -> MeshDirectoryResult<(TenantId, BucketName)> {
