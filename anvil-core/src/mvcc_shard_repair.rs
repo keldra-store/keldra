@@ -428,11 +428,30 @@ impl ShardRebalanceReconciler {
                 .await?;
             checkpoint.after_application_key = None;
         }
-        let rows = self.mvcc.runtime.scan_table_prefix_at(
+        // GC may advance between the checkpoint check above and the scan.
+        // Refresh the checkpoint and retry once instead of turning that
+        // benign race into a failed reconciliation pass.
+        let rows = match self.mvcc.runtime.scan_table_prefix_at(
             SHARD_MANIFEST_CATALOG_TABLE_ID,
             b"manifest/",
             checkpoint.snapshot_version,
-        )?;
+        ) {
+            Ok(rows) => rows,
+            Err(error) if error.to_string().contains("below local GC watermark") => {
+                checkpoint.snapshot_version = self
+                    .mvcc
+                    .runtime
+                    .snapshot(crate::mvcc_transaction::ReadConsistency::Linearized)
+                    .await?;
+                checkpoint.after_application_key = None;
+                self.mvcc.runtime.scan_table_prefix_at(
+                    SHARD_MANIFEST_CATALOG_TABLE_ID,
+                    b"manifest/",
+                    checkpoint.snapshot_version,
+                )?
+            }
+            Err(error) => return Err(error),
+        };
         let page = rows
             .into_iter()
             .filter(|(key, _)| {
