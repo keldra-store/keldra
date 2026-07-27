@@ -32,6 +32,8 @@ pub enum FaultPoint {
     IndexFinalizationAfterExecute,
     PersonalDbPostCommitBeforeEffects,
     PersonalDbPostCommitAfterEffects,
+    GitSourcePostCommitBeforeEffects,
+    GitSourcePostCommitAfterEffects,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

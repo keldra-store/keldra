@@ -1,6 +1,6 @@
 use crate::anvil_api::git_source_service_server::GitSourceService;
 use crate::anvil_api::*;
-use crate::object_manager::ObjectWriteOptions;
+use crate::object_manager::{ObjectLinkReadMode, ObjectReadConsistency, ObjectWriteOptions};
 use crate::{
     AppState, access_control, auth, authz_journal, git_pack, git_source_index, git_source_manifest,
     git_source_query, git_source_watch,
@@ -51,9 +51,58 @@ impl GitSourceService for AppState {
             "git-source/{}/packs/{}.pack",
             metadata.repository_id, source_hash_hex
         );
-        let pack_object = self
-            .object_manager
-            .put_object_with_implicit_quorum_transaction(
+        let requested_transaction_id =
+            crate::services::transaction_context::write_options_transaction_id(
+                metadata.options.as_ref(),
+            )?
+            .map(ToOwned::to_owned);
+        let transaction_principal =
+            crate::object_manager::transaction_principal_from_claims(&claims);
+        let now = current_unix_ms()?;
+        let internal_transaction = requested_transaction_id.is_none();
+        let transaction_id = match requested_transaction_id.as_deref() {
+            Some(transaction_id) => {
+                self.mvcc
+                    .open_transactions
+                    .binding(transaction_id, &transaction_principal)
+                    .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                transaction_id.to_string()
+            }
+            None => {
+                let idempotency_key = metadata
+                    .options
+                    .as_ref()
+                    .map(|options| options.idempotency_key.trim())
+                    .filter(|key| !key.is_empty())
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| {
+                        format!(
+                            "git-pack:{}:{}:{}",
+                            claims.tenant_id, metadata.repository_id, source_hash_hex
+                        )
+                    });
+                self.mvcc
+                    .open_transactions
+                    .begin(
+                        self.mvcc.runtime.as_ref(),
+                        self.mvcc.cluster_id().to_string(),
+                        transaction_principal.clone(),
+                        idempotency_key,
+                        std::time::Duration::from_secs(300),
+                        crate::mvcc_transaction::DurabilityLevel::Quorum,
+                        crate::mvcc_transaction::ReadConsistency::Linearized,
+                        now,
+                    )
+                    .await
+                    .map_err(|error| Status::failed_precondition(error.to_string()))?
+                    .transaction_id
+            }
+        };
+
+        let staged = async {
+            let pack_object = self
+                .object_manager
+                .put_object(
                 &claims,
                 &metadata.bucket_name,
                 &object_key,
@@ -64,43 +113,46 @@ impl GitSourceService for AppState {
                         "object_kind": "git_pack",
                         "repository_id": metadata.repository_id.clone(),
                     })),
+                    transaction_id: Some(transaction_id.clone()),
+                    transaction_principal: Some(transaction_principal.clone()),
                     storage_class_id: None,
                     ..Default::default()
                 },
-                format!(
-                    "git-pack:{}:{}:{}",
-                    claims.tenant_id, metadata.repository_id, source_hash_hex
-                ),
             )
             .await?;
 
-        let parsed = git_pack::build_git_source_index_from_pack(
-            &metadata.repository_id,
-            &pack_bytes,
-            *pack_object.version_id.as_bytes(),
-        )
-        .map_err(|err| Status::invalid_argument(err.to_string()))?;
-        let generation = self
-            .next_git_source_generation(claims.tenant_id, &metadata.repository_id)
-            .await?;
-        let index_ref = git_source_index::write_git_source_index(
-            &self.storage,
-            &self.mvcc,
-            git_source_index::GitSourceIndexWrite {
-                tenant_id: claims.tenant_id,
-                repository_id: &metadata.repository_id,
+            let parsed = git_pack::build_git_source_index_from_pack(
+                &metadata.repository_id,
+                &pack_bytes,
+                *pack_object.version_id.as_bytes(),
+            )
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+            let generation = git_source_manifest::read_git_source_repository_manifest_in_transaction(
+                &self.mvcc,
+                claims.tenant_id,
+                &metadata.repository_id,
+                &transaction_id,
+                &transaction_principal,
+            )
+            .map_err(|err| Status::internal(err.to_string()))?
+            .map(|manifest| {
+                manifest
+                    .generation
+                    .checked_add(1)
+                    .ok_or_else(|| Status::internal("Git source generation overflow"))
+            })
+            .transpose()?
+            .unwrap_or(1);
+            let index_ref = git_source_index::git_source_index_ref_name(
+                claims.tenant_id,
+                &metadata.repository_id,
                 generation,
-                source_hash: parsed.pack_hash,
-                hash_algorithm: parsed.hash_algorithm,
-                records: &parsed.records,
-            },
-        )
-        .await
-        .map_err(|err| Status::internal(format!("{err:#}")))?;
-        let updated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
-        git_source_manifest::write_git_source_repository_manifest(
-            &self.mvcc,
-            &git_source_manifest::GitSourceRepositoryManifest {
+                &source_hash_hex,
+            )
+            .map_err(|err| Status::internal(err.to_string()))?;
+            let updated_at =
+                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+            let manifest = git_source_manifest::GitSourceRepositoryManifest {
                 format_version: 1,
                 tenant_id: claims.tenant_id,
                 repository_id: metadata.repository_id.clone(),
@@ -112,35 +164,82 @@ impl GitSourceService for AppState {
                 record_count: parsed.records.len() as u64,
                 index_path: index_ref.clone(),
                 updated_at: updated_at.clone(),
-            },
-        )
-        .await
-        .map_err(|err| Status::internal(err.to_string()))?;
-        let authz_revision = authz_journal::latest_authz_revision(&self.mvcc, claims.tenant_id)
+            };
+            git_source_manifest::stage_git_source_repository_manifest(
+                &self.mvcc,
+                &manifest,
+                &transaction_id,
+                &transaction_principal,
+                now,
+            )
             .map_err(|err| Status::internal(err.to_string()))?;
-        let authz_revision = u64::try_from(authz_revision)
-            .map_err(|_| Status::internal("Invalid authorization revision"))?;
-        let payload = git_source_watch::GitSourceWatchPayload {
-            repository_id: metadata.repository_id.clone(),
-            event_type: "index_published".to_string(),
-            generation,
-            source_hash: source_hash_hex.clone(),
-            index_path: index_ref.clone(),
-            pack_object_version_id: Some(pack_object.version_id.to_string()),
-            emitted_at: updated_at,
+            let authz_revision =
+                authz_journal::latest_authz_revision(&self.mvcc, claims.tenant_id)
+                    .map_err(|err| Status::internal(err.to_string()))?;
+            let authz_revision = u64::try_from(authz_revision)
+                .map_err(|_| Status::internal("Invalid authorization revision"))?;
+            let job = crate::git_source_postcommit_job::GitSourcePostCommitJob {
+                schema: crate::git_source_postcommit_job::GitSourcePostCommitJob::SCHEMA.into(),
+                cluster_id: self.mvcc.cluster_id().to_string(),
+                transaction_id: transaction_id.clone(),
+                tenant_id: claims.tenant_id,
+                repository_id: metadata.repository_id.clone(),
+                bucket_name: metadata.bucket_name.clone(),
+                object_key: object_key.clone(),
+                pack_object_version_id: pack_object.version_id.to_string(),
+                pack_mutation_id: pack_object.mutation_id.to_string(),
+                source_hash: source_hash_hex.clone(),
+                generation,
+                record_count: parsed.records.len() as u64,
+                index_path: index_ref.clone(),
+                authz_revision,
+                emitted_at: updated_at,
+            };
+            self.mvcc
+                .open_transactions
+                .add_job(
+                    &transaction_id,
+                    job.encode()
+                        .map_err(|error| Status::internal(error.to_string()))?,
+                    now,
+                )
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            Ok::<_, Status>((pack_object, parsed, generation, index_ref))
+        }
+        .await;
+        let (pack_object, parsed, generation, index_ref) = match staged {
+            Ok(staged) => staged,
+            Err(error) => {
+                if internal_transaction {
+                    let _ = self.mvcc.open_transactions.rollback(
+                        &transaction_id,
+                        &transaction_principal,
+                        current_unix_ms().unwrap_or(now),
+                    );
+                }
+                return Err(error);
+            }
         };
-        let watch_cursor = git_source_watch::append_git_source_watch_record(
-            &self.mvcc,
-            claims.tenant_id,
-            &metadata.repository_id,
-            *pack_object.mutation_id.as_bytes(),
-            authz_revision,
-            payload,
-        )
-        .await
-        .map_err(|err| Status::internal(err.to_string()))?;
-
-        let (watch_cursor_low, watch_cursor_high) = split_u128(watch_cursor);
+        if internal_transaction {
+            let outcome = self
+                .mvcc
+                .open_transactions
+                .commit(
+                    self.mvcc.runtime.as_ref(),
+                    &transaction_id,
+                    &transaction_principal,
+                    current_unix_ms()?,
+                )
+                .await
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            if let crate::mvcc_transaction::CertificationResult::Aborted { reason } =
+                outcome.certification
+            {
+                return Err(Status::aborted(format!(
+                    "implicit GitSource transaction aborted: {reason:?}"
+                )));
+            }
+        }
         Ok(Response::new(PutGitPackResponse {
             repository_id: metadata.repository_id,
             bucket_name: metadata.bucket_name,
@@ -151,8 +250,13 @@ impl GitSourceService for AppState {
             source_hash: source_hash_hex,
             index_path: index_ref,
             record_count: parsed.records.len() as u64,
-            watch_cursor_low,
-            watch_cursor_high,
+            watch_cursor_low: 0,
+            watch_cursor_high: 0,
+            write_state: if internal_transaction {
+                WriteState::Committed as i32
+            } else {
+                WriteState::Staged as i32
+            },
         }))
     }
 
@@ -350,6 +454,153 @@ impl GitSourceService for AppState {
 }
 
 impl AppState {
+    pub async fn run_git_source_postcommit_loop(self) {
+        loop {
+            if let Err(error) = self.run_git_source_postcommit_once().await {
+                tracing::warn!(%error, "GitSource postcommit attempt failed");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn run_git_source_postcommit_once(&self) -> anyhow::Result<bool> {
+        let worker_id = format!("git-source-postcommit/{}", self.persistence.owner_node_id());
+        let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default();
+        let Some((job_id, record)) = self
+            .mvcc
+            .runtime
+            .local_store()
+            .claim_git_source_postcommit_authorized(&worker_id, now, 30_000, |record| {
+                self.mvcc
+                    .claim_assignment(
+                        "git-source-postcommit",
+                        &record.job.target_logical_identity(),
+                    )
+                    .ok()
+                    .flatten()
+                    .map(|guard| guard.lease_owner(&worker_id))
+            })?
+        else {
+            return Ok(false);
+        };
+        let guard = self
+            .mvcc
+            .claim_assignment(
+                "git-source-postcommit",
+                &record.job.target_logical_identity(),
+            )?
+            .ok_or_else(|| anyhow::anyhow!("GitSource postcommit assignment changed"))?;
+        let lease_owner = guard.lease_owner(&worker_id);
+        let result = self.execute_git_source_postcommit(&record.job).await;
+        match result {
+            Ok(()) => {
+                self.mvcc.validate_assignment(&guard)?;
+                self.mvcc
+                    .runtime
+                    .local_store()
+                    .complete_git_source_postcommit(&job_id, &lease_owner)?;
+                Ok(true)
+            }
+            Err(error) => {
+                let delay =
+                    250_u64.saturating_mul(1_u64 << record.attempts.saturating_sub(1).min(10));
+                self.mvcc
+                    .runtime
+                    .local_store()
+                    .retry_git_source_postcommit(
+                        &job_id,
+                        &lease_owner,
+                        now.saturating_add(delay),
+                        &error.to_string(),
+                    )?;
+                Err(error)
+            }
+        }
+    }
+
+    async fn execute_git_source_postcommit(
+        &self,
+        job: &crate::git_source_postcommit_job::GitSourcePostCommitJob,
+    ) -> anyhow::Result<()> {
+        crate::mvcc_fault_injection::hit(
+            crate::mvcc_fault_injection::FaultPoint::GitSourcePostCommitBeforeEffects,
+        )?;
+        let version_id = uuid::Uuid::parse_str(&job.pack_object_version_id)?;
+        let object = self
+            .object_manager
+            .get_object_with_link_mode_for_tenant(
+                None,
+                Some(job.tenant_id),
+                job.bucket_name.clone(),
+                job.object_key.clone(),
+                Some(version_id),
+                None,
+                ObjectLinkReadMode::Follow,
+                ObjectReadConsistency::Latest,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        if object.object.version_id != version_id {
+            anyhow::bail!("GitSource postcommit read a different pack object version");
+        }
+        let pack_bytes = collect_object_stream(object.stream)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        if blake3::hash(&pack_bytes).to_hex().to_string() != job.source_hash {
+            anyhow::bail!("GitSource postcommit pack hash does not match committed job");
+        }
+        let parsed = git_pack::build_git_source_index_from_pack(
+            &job.repository_id,
+            &pack_bytes,
+            *version_id.as_bytes(),
+        )?;
+        if parsed.records.len() as u64 != job.record_count
+            || hex::encode(parsed.pack_hash) != job.source_hash
+        {
+            anyhow::bail!("GitSource postcommit parsed index differs from committed job");
+        }
+        let index_ref = git_source_index::write_git_source_index(
+            &self.storage,
+            &self.mvcc,
+            git_source_index::GitSourceIndexWrite {
+                tenant_id: job.tenant_id,
+                repository_id: &job.repository_id,
+                generation: job.generation,
+                source_hash: parsed.pack_hash,
+                hash_algorithm: parsed.hash_algorithm,
+                records: &parsed.records,
+            },
+        )
+        .await?;
+        if index_ref != job.index_path {
+            anyhow::bail!("GitSource postcommit produced a different index ref");
+        }
+        let watch_cursor = git_source_watch::append_git_source_watch_record(
+            &self.mvcc,
+            job.tenant_id,
+            &job.repository_id,
+            *uuid::Uuid::parse_str(&job.pack_mutation_id)?.as_bytes(),
+            job.authz_revision,
+            git_source_watch::GitSourceWatchPayload {
+                repository_id: job.repository_id.clone(),
+                event_type: "index_published".to_string(),
+                generation: job.generation,
+                source_hash: job.source_hash.clone(),
+                index_path: job.index_path.clone(),
+                pack_object_version_id: Some(job.pack_object_version_id.clone()),
+                emitted_at: job.emitted_at.clone(),
+            },
+        )
+        .await?;
+        if watch_cursor == 0 {
+            anyhow::bail!("GitSource postcommit watch publication returned an invalid cursor");
+        }
+        crate::mvcc_fault_injection::hit(
+            crate::mvcc_fault_injection::FaultPoint::GitSourcePostCommitAfterEffects,
+        )?;
+        Ok(())
+    }
+
     async fn latest_git_source_index(
         &self,
         claims: &auth::Claims,
@@ -629,6 +880,13 @@ fn watch_git_source_response(
 
 fn split_u128(value: u128) -> (u64, u64) {
     (value as u64, (value >> 64) as u64)
+}
+
+fn current_unix_ms() -> Result<u64, Status> {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| Status::internal("system clock precedes Unix epoch"))?;
+    u64::try_from(elapsed.as_millis()).map_err(|_| Status::internal("system time exceeds u64"))
 }
 
 fn join_u128(low: u64, high: u64) -> u128 {

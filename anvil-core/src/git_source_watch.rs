@@ -59,6 +59,27 @@ pub async fn append_git_source_watch_record(
     payload: GitSourceWatchPayload,
 ) -> Result<u128> {
     validate_payload(repository_id, &payload)?;
+    let mut after = 0;
+    loop {
+        let page =
+            list_git_source_watch_event_page(mvcc, tenant_id, repository_id, after, 1_000).await?;
+        if let Some(existing) = page
+            .events
+            .iter()
+            .find(|event| event.mutation_id == mutation_id)
+        {
+            if existing.authz_revision != authz_revision || existing.payload != payload {
+                return Err(anyhow!(
+                    "git source watch mutation ID identifies divergent content"
+                ));
+            }
+            return Ok(existing.cursor);
+        }
+        if !page.has_more || page.next_cursor == after {
+            break;
+        }
+        after = page.next_cursor;
+    }
     let head_key = watch_head_key(tenant_id, repository_id)?;
     let head_payload = mvcc.read_latest_value(&head_key)?;
     let current = decode_watch_head(head_payload.as_deref())?;

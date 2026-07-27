@@ -983,6 +983,7 @@ message PutGitPackRequest {
 message GitPackMetadata {
     string repository_id = 1;
     string bucket_name = 2;
+    WriteOptions options = 3;
 }
 
 message PutGitPackResponse {
@@ -997,6 +998,7 @@ message PutGitPackResponse {
     uint64 record_count = 9;
     uint64 watch_cursor_low = 10;
     uint64 watch_cursor_high = 11;
+    WriteState write_state = 12;
 }
 
 message GetGitObjectRequest {

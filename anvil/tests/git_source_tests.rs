@@ -2,14 +2,17 @@
 
 use anvil::anvil_api::git_source_service_client::GitSourceServiceClient;
 use anvil::anvil_api::{
-    GetGitBlobByPathRequest, GetGitObjectRequest, GitPackMetadata, ListGitTreeRequest,
-    PutGitPackRequest, WatchGitSourceRequest, put_git_pack_request,
+    BeginTransactionRequest, CommitTransactionRequest, GetGitBlobByPathRequest,
+    GetGitObjectRequest, GitPackMetadata, ListGitTreeRequest, MvccDurability,
+    MvccReadConsistency, PutGitPackRequest, WatchGitSourceRequest, WriteOptions, WriteState,
+    put_git_pack_request, write_options,
 };
+use anvil::anvil_api::transaction_service_client::TransactionServiceClient;
 use anvil::formats::git::{GitHashAlgorithm, GitSourceRecord};
 use anvil::git_source_index::{GitSourceIndexWrite, write_git_source_index};
 use anvil::git_source_watch::{GitSourceWatchPayload, append_git_source_watch_record};
 use anvil::writer_segment_catalog::read_writer_segment_catalog_record;
-use anvil_test_utils::{shared_default_test_cluster, unique_test_name};
+use anvil_test_utils::{TestCluster, isolated_test_cluster, shared_default_test_cluster, unique_test_name};
 use flate2::{Compression, write::ZlibEncoder};
 use futures_util::StreamExt;
 use sha1::{Digest, Sha1};
@@ -227,6 +230,7 @@ async fn test_put_git_pack_stores_normal_object_builds_index_and_is_s3_readable(
             data: Some(put_git_pack_request::Data::Metadata(GitPackMetadata {
                 repository_id: repository_id.clone(),
                 bucket_name: bucket_name.clone(),
+                options: None,
             })),
         },
         PutGitPackRequest {
@@ -251,12 +255,14 @@ async fn test_put_git_pack_stores_normal_object_builds_index_and_is_s3_readable(
         blake3::hash(&pack).to_hex().to_string()
     );
     assert_eq!(response.record_count, 1);
-    assert_eq!(response.watch_cursor_low, 1);
+    assert_eq!(response.write_state, WriteState::Committed as i32);
+    assert_eq!(response.watch_cursor_low, 0);
     assert_eq!(response.watch_cursor_high, 0);
     assert!(response.index_path.starts_with("git_source_index:"));
     let index_scope = format!("tenant/1/repository/{repository_id}");
-    assert!(
-        read_writer_segment_catalog_record(
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if read_writer_segment_catalog_record(
             &cluster.states[0].mvcc,
             "git_source_index",
             &index_scope,
@@ -266,7 +272,15 @@ async fn test_put_git_pack_stores_normal_object_builds_index_and_is_s3_readable(
         .await
         .unwrap()
         .is_some()
-    );
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "GitSource postcommit index did not materialize"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 
     let blob = client
         .get_git_blob_by_path(authorized(
@@ -310,6 +324,200 @@ fn authorized<T>(message: T, token: &str) -> Request<T> {
         format!("Bearer {token}").parse().expect("valid token"),
     );
     request
+}
+
+async fn begin_git_transaction(
+    cluster: &TestCluster,
+    transactions: &mut TransactionServiceClient<tonic::transport::Channel>,
+    label: &str,
+) -> String {
+    transactions
+        .begin_transaction(authorized(
+            BeginTransactionRequest {
+                idempotency_key: format!("{label}-{}", uuid::Uuid::new_v4()),
+                ttl_ms: 30_000,
+                read_consistency: MvccReadConsistency::Linearized as i32,
+                cluster_id: cluster.states[0].mvcc.cluster_id().to_string(),
+                durability: MvccDurability::Quorum as i32,
+            },
+            &cluster.token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .transaction_id
+}
+
+fn git_transaction_options(transaction_id: &str) -> WriteOptions {
+    WriteOptions {
+        idempotency_key: uuid::Uuid::new_v4().to_string(),
+        consistency: 0,
+        wait_for_finalization: false,
+        preconditions: Vec::new(),
+        boundary_values: Vec::new(),
+        execution: Some(write_options::Execution::TransactionId(
+            transaction_id.to_string(),
+        )),
+    }
+}
+
+async fn stage_git_pack(
+    client: &mut GitSourceServiceClient<tonic::transport::Channel>,
+    token: &str,
+    repository_id: &str,
+    bucket_name: &str,
+    transaction_id: &str,
+    pack: Vec<u8>,
+) -> anvil::anvil_api::PutGitPackResponse {
+    let mut request = Request::new(tokio_stream::iter(vec![
+        PutGitPackRequest {
+            data: Some(put_git_pack_request::Data::Metadata(GitPackMetadata {
+                repository_id: repository_id.to_string(),
+                bucket_name: bucket_name.to_string(),
+                options: Some(git_transaction_options(transaction_id)),
+            })),
+        },
+        PutGitPackRequest {
+            data: Some(put_git_pack_request::Data::Chunk(pack)),
+        },
+    ]));
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {token}").parse().unwrap(),
+    );
+    client.put_git_pack(request).await.unwrap().into_inner()
+}
+
+async fn commit_git_transaction(
+    cluster: &TestCluster,
+    transactions: &mut TransactionServiceClient<tonic::transport::Channel>,
+    transaction_id: String,
+) -> Result<(), tonic::Status> {
+    transactions
+        .commit_transaction(authorized(
+            CommitTransactionRequest {
+                transaction_id,
+                cluster_id: cluster.states[0].mvcc.cluster_id().to_string(),
+            },
+            &cluster.token,
+        ))
+        .await
+        .map(|_| ())
+}
+
+#[tokio::test]
+async fn git_packs_and_manifests_commit_atomically_across_repositories() {
+    let cluster = isolated_test_cluster("git-source-transaction-success", &["test-region-1"]).await;
+    let endpoint = cluster.grpc_addrs[0].clone();
+    let bucket_name = unique_test_name("git-transaction-bucket");
+    cluster.create_bucket(&bucket_name, "test-region-1").await;
+    let mut git = GitSourceServiceClient::connect(endpoint.clone()).await.unwrap();
+    let mut transactions = TransactionServiceClient::connect(endpoint).await.unwrap();
+    let transaction_id =
+        begin_git_transaction(&cluster, &mut transactions, "git-success").await;
+    let first_repo = unique_test_name("git-first");
+    let second_repo = unique_test_name("git-second");
+
+    for repository_id in [&first_repo, &second_repo] {
+        let staged = stage_git_pack(
+            &mut git,
+            &cluster.token,
+            repository_id,
+            &bucket_name,
+            &transaction_id,
+            minimal_git_pack(),
+        )
+        .await;
+        assert_eq!(staged.write_state, WriteState::Staged as i32);
+        assert!(
+            anvil::git_source_manifest::read_git_source_repository_manifest(
+                &cluster.states[0].mvcc,
+                1,
+                repository_id,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    commit_git_transaction(&cluster, &mut transactions, transaction_id)
+        .await
+        .unwrap();
+    for repository_id in [&first_repo, &second_repo] {
+        let manifest = anvil::git_source_manifest::read_git_source_repository_manifest(
+            &cluster.states[0].mvcc,
+            1,
+            repository_id,
+        )
+        .await
+        .unwrap()
+        .expect("committed GitSource manifest");
+        assert_eq!(manifest.generation, 1);
+        assert_eq!(manifest.bucket_name, bucket_name);
+    }
+}
+
+#[tokio::test]
+async fn git_repository_conflict_aborts_every_manifest_and_pack_in_losing_transaction() {
+    let cluster = isolated_test_cluster("git-source-transaction-conflict", &["test-region-1"]).await;
+    let endpoint = cluster.grpc_addrs[0].clone();
+    let bucket_name = unique_test_name("git-conflict-bucket");
+    cluster.create_bucket(&bucket_name, "test-region-1").await;
+    let mut git = GitSourceServiceClient::connect(endpoint.clone()).await.unwrap();
+    let mut transactions = TransactionServiceClient::connect(endpoint).await.unwrap();
+    let first = begin_git_transaction(&cluster, &mut transactions, "git-first").await;
+    let second = begin_git_transaction(&cluster, &mut transactions, "git-second").await;
+    let shared_repo = unique_test_name("git-shared");
+    let losing_repo = unique_test_name("git-losing");
+
+    stage_git_pack(
+        &mut git,
+        &cluster.token,
+        &shared_repo,
+        &bucket_name,
+        &first,
+        minimal_git_pack(),
+    )
+    .await;
+    for repository_id in [&shared_repo, &losing_repo] {
+        stage_git_pack(
+            &mut git,
+            &cluster.token,
+            repository_id,
+            &bucket_name,
+            &second,
+            minimal_git_pack(),
+        )
+        .await;
+    }
+    commit_git_transaction(&cluster, &mut transactions, first)
+        .await
+        .unwrap();
+    let conflict = commit_git_transaction(&cluster, &mut transactions, second)
+        .await
+        .unwrap_err();
+    assert_eq!(conflict.code(), tonic::Code::Aborted);
+    assert!(
+        anvil::git_source_manifest::read_git_source_repository_manifest(
+            &cluster.states[0].mvcc,
+            1,
+            &shared_repo,
+        )
+        .await
+        .unwrap()
+        .is_some()
+    );
+    assert!(
+        anvil::git_source_manifest::read_git_source_repository_manifest(
+            &cluster.states[0].mvcc,
+            1,
+            &losing_repo,
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
 }
 
 #[derive(Debug, Clone, Copy)]
