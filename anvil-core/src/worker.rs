@@ -3,7 +3,8 @@ use crate::core_store::CoreStore;
 use crate::crypto::EncryptionKeyring;
 use crate::object_manager::ObjectManager;
 use crate::partition_fence::{
-    OWNERSHIP_CAS_CONFLICT, OWNERSHIP_HELD, OWNERSHIP_OWNER_MISMATCH, OWNERSHIP_STALE_FENCE,
+    OWNERSHIP_CAS_CONFLICT, OWNERSHIP_HELD, OWNERSHIP_NOT_FOUND, OWNERSHIP_OWNER_MISMATCH,
+    OWNERSHIP_STALE_FENCE,
 };
 use crate::persistence::Object;
 use crate::persistence::Persistence;
@@ -145,6 +146,7 @@ fn is_task_lease_fencing_error(error: &anyhow::Error) -> bool {
             LEASE_EXPIRED,
             LEASE_HELD,
             LEASE_OWNER_MISMATCH,
+            OWNERSHIP_NOT_FOUND,
             STALE_FENCE,
         ],
     )
