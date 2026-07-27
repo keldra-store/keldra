@@ -41,6 +41,15 @@ fn run_child(scenario: &str, crash_at: &str, directory: &Path) {
         !status.success(),
         "child must terminate at the requested hard-crash boundary"
     );
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            status.signal(),
+            Some(6),
+            "child must die from process::abort at the failpoint, not from an assertion or panic"
+        );
+    }
 }
 
 fn bundle_identity(bytes: &[u8]) -> BundleIdentity {
