@@ -418,10 +418,30 @@ impl CoordinationService for AppState {
                 WriteState::Staged,
             )
         } else {
+            let principal = crate::object_manager::transaction_principal_from_claims(&claims);
+            let tenant_id = mutation.owner.tenant_id;
+            let resource = mutation.resource.clone();
+            let idempotency_key = format!("coordination:ownership:acquire:{}", req.request_id);
             (
-                partition_fence::acquire_ownership(&self.storage, mutation, &signing_key)
-                    .await
-                    .map_err(ownership_error_status)?,
+                execute_implicit_ownership_plan(
+                    self,
+                    &principal,
+                    &idempotency_key,
+                    now_nanos,
+                    tenant_id,
+                    &resource,
+                    &signing_key,
+                    |transaction_id| {
+                        partition_fence::plan_acquire_ownership_in_transaction(
+                            self.persistence.mvcc()?,
+                            transaction_id,
+                            &principal,
+                            mutation,
+                            &signing_key,
+                        )
+                    },
+                )
+                .await?,
                 WriteState::Committed,
             )
         };
@@ -489,10 +509,30 @@ impl CoordinationService for AppState {
                 WriteState::Staged,
             )
         } else {
+            let principal = crate::object_manager::transaction_principal_from_claims(&claims);
+            let tenant_id = mutation.owner.tenant_id;
+            let resource = mutation.resource.clone();
+            let idempotency_key = format!("coordination:ownership:renew:{}", req.request_id);
             (
-                partition_fence::renew_ownership(&self.storage, mutation, &signing_key)
-                    .await
-                    .map_err(ownership_error_status)?,
+                execute_implicit_ownership_plan(
+                    self,
+                    &principal,
+                    &idempotency_key,
+                    now_nanos,
+                    tenant_id,
+                    &resource,
+                    &signing_key,
+                    |transaction_id| {
+                        partition_fence::plan_renew_ownership_in_transaction(
+                            self.persistence.mvcc()?,
+                            transaction_id,
+                            &principal,
+                            mutation,
+                            &signing_key,
+                        )
+                    },
+                )
+                .await?,
                 WriteState::Committed,
             )
         };
@@ -573,10 +613,30 @@ impl CoordinationService for AppState {
                 WriteState::Staged,
             )
         } else {
+            let principal = crate::object_manager::transaction_principal_from_claims(&claims);
+            let tenant_id = mutation.current_owner.tenant_id;
+            let resource = mutation.resource.clone();
+            let idempotency_key = format!("coordination:ownership:transfer:{}", req.request_id);
             (
-                partition_fence::transfer_ownership(&self.storage, mutation, &signing_key)
-                    .await
-                    .map_err(ownership_error_status)?,
+                execute_implicit_ownership_plan(
+                    self,
+                    &principal,
+                    &idempotency_key,
+                    now_nanos,
+                    tenant_id,
+                    &resource,
+                    &signing_key,
+                    |transaction_id| {
+                        partition_fence::plan_transfer_ownership_in_transaction(
+                            self.persistence.mvcc()?,
+                            transaction_id,
+                            &principal,
+                            mutation,
+                            &signing_key,
+                        )
+                    },
+                )
+                .await?,
                 WriteState::Committed,
             )
         };
@@ -639,10 +699,30 @@ impl CoordinationService for AppState {
                 WriteState::Staged,
             )
         } else {
+            let principal = crate::object_manager::transaction_principal_from_claims(&claims);
+            let tenant_id = mutation.owner.tenant_id;
+            let resource = mutation.resource.clone();
+            let idempotency_key = format!("coordination:ownership:release:{}", req.request_id);
             (
-                partition_fence::release_ownership(&self.storage, mutation, &signing_key)
-                    .await
-                    .map_err(ownership_error_status)?,
+                execute_implicit_ownership_plan(
+                    self,
+                    &principal,
+                    &idempotency_key,
+                    now_nanos,
+                    tenant_id,
+                    &resource,
+                    &signing_key,
+                    |transaction_id| {
+                        partition_fence::plan_release_ownership_in_transaction(
+                            self.persistence.mvcc()?,
+                            transaction_id,
+                            &principal,
+                            mutation,
+                            &signing_key,
+                        )
+                    },
+                )
+                .await?,
                 WriteState::Committed,
             )
         };
@@ -704,10 +784,31 @@ impl CoordinationService for AppState {
                 WriteState::Staged,
             )
         } else {
+            let principal = crate::object_manager::transaction_principal_from_claims(&claims);
+            let tenant_id = mutation.admin.tenant_id;
+            let resource = mutation.resource.clone();
+            let idempotency_key =
+                format!("coordination:ownership:force-expire:{}", req.request_id);
             (
-                partition_fence::force_expire_ownership(&self.storage, mutation, &signing_key)
-                    .await
-                    .map_err(ownership_error_status)?,
+                execute_implicit_ownership_plan(
+                    self,
+                    &principal,
+                    &idempotency_key,
+                    now_nanos,
+                    tenant_id,
+                    &resource,
+                    &signing_key,
+                    |transaction_id| {
+                        partition_fence::plan_force_expire_ownership_in_transaction(
+                            self.persistence.mvcc()?,
+                            transaction_id,
+                            &principal,
+                            mutation,
+                            &signing_key,
+                        )
+                    },
+                )
+                .await?,
                 WriteState::Committed,
             )
         };
@@ -993,6 +1094,96 @@ async fn stage_ownership_plan(
     .await
     .map_err(ownership_error_status)?;
     Ok(outcome)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_implicit_ownership_plan(
+    state: &AppState,
+    principal: &str,
+    idempotency_key: &str,
+    now_nanos: i64,
+    tenant_id: i64,
+    resource: &partition_fence::OwnershipResource,
+    signing_key: &[u8],
+    planner: impl FnOnce(&str) -> anyhow::Result<partition_fence::OwnershipFenceWritePlan>,
+) -> Result<partition_fence::OwnershipFenceOutcome, Status> {
+    let now_unix_ms = u64::try_from(now_nanos / 1_000_000).unwrap_or_default();
+    let mvcc = state
+        .persistence
+        .mvcc()
+        .map_err(ownership_error_status)?;
+    let handle = mvcc
+        .open_transactions
+        .begin(
+            mvcc.runtime.as_ref(),
+            mvcc.cluster_id(),
+            principal,
+            idempotency_key,
+            std::time::Duration::from_secs(30),
+            crate::mvcc_transaction::DurabilityLevel::Quorum,
+            crate::mvcc_transaction::ReadConsistency::Linearized,
+            now_unix_ms,
+        )
+        .await
+        .map_err(ownership_error_status)?;
+    let status = mvcc
+        .open_transactions
+        .status(&handle.transaction_id, principal, now_unix_ms)
+        .map_err(ownership_error_status)?;
+    let planned_outcome = if status.state == "open" {
+        let plan = planner(&handle.transaction_id).map_err(ownership_error_status)?;
+        let outcome = plan.outcome.clone();
+        plan.stage_into_transaction(
+            mvcc,
+            &handle.transaction_id,
+            principal,
+            now_unix_ms,
+        )
+        .await
+        .map_err(ownership_error_status)?;
+        Some(outcome)
+    } else {
+        None
+    };
+    let outcome = mvcc
+        .open_transactions
+        .commit(
+            mvcc.runtime.as_ref(),
+            &handle.transaction_id,
+            principal,
+            now_unix_ms,
+        )
+        .await
+        .map_err(ownership_error_status)?;
+    if let crate::mvcc_transaction::CertificationResult::Aborted { reason } =
+        outcome.certification
+    {
+        return Err(ownership_error_status(anyhow!(
+            "{0}: ownership fence MVCC transaction aborted: {reason:?}",
+            partition_fence::OWNERSHIP_CAS_CONFLICT
+        )));
+    }
+    if let Some(outcome) = planned_outcome {
+        return Ok(outcome);
+    }
+    let record = partition_fence::read_ownership_fence(
+        &state.storage,
+        tenant_id,
+        resource,
+        signing_key,
+    )
+    .await
+    .map_err(ownership_error_status)?
+    .ok_or_else(|| {
+        ownership_error_status(anyhow!(
+            "{}: resolved ownership transaction has no visible row",
+            partition_fence::OWNERSHIP_NOT_FOUND
+        ))
+    })?;
+    Ok(partition_fence::OwnershipFenceOutcome {
+        record,
+        idempotent_replay: true,
+    })
 }
 
 fn ownership_ttl_nanos(requested_lease_ms: u64) -> Result<i64, Status> {
