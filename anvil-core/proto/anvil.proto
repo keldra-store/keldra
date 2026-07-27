@@ -2580,14 +2580,19 @@ message CreateHfKeyRequest {
   string name = 1;
   string token = 2; // never returned back
   string note = 3;
+  WriteOptions options = 4;
 }
 message CreateHfKeyResponse {
   string name = 1;
   string note = 2;
   string created_at = 3;
+  WriteState write_state = 4;
 }
-message DeleteHfKeyRequest { string name = 1; }
-message DeleteHfKeyResponse {}
+message DeleteHfKeyRequest {
+  string name = 1;
+  WriteOptions options = 2;
+}
+message DeleteHfKeyResponse { WriteState write_state = 1; }
 message ListHfKeysRequest { PageRequest page = 1; }
 message HfKey {
   string name = 1;
@@ -2616,8 +2621,12 @@ message StartHfIngestionRequest {
   repeated string include_globs = 6;
   repeated string exclude_globs = 7;
   string target_region = 8;
+  WriteOptions options = 9;
 }
-message StartHfIngestionResponse { string ingestion_id = 1; }
+message StartHfIngestionResponse {
+  string ingestion_id = 1;
+  WriteState write_state = 2;
+}
 
 message GetHfIngestionStatusRequest { string ingestion_id = 1; }
 message GetHfIngestionStatusResponse {
@@ -2632,8 +2641,11 @@ message GetHfIngestionStatusResponse {
   string finished_at = 9;
 }
 
-message CancelHfIngestionRequest { string ingestion_id = 1; }
-message CancelHfIngestionResponse {}
+message CancelHfIngestionRequest {
+  string ingestion_id = 1;
+  WriteOptions options = 2;
+}
+message CancelHfIngestionResponse { WriteState write_state = 1; }
 
 message GetAccessTokenRequest {
   string client_id = 1;
@@ -3010,6 +3022,7 @@ message AcquireTaskLeaseRequest {
     uint64 source_cursor_low = 6;
     uint64 source_cursor_high = 7;
     int64 requested_ttl_nanos = 8;
+    WriteOptions options = 9;
 }
 
 message CheckpointTaskLeaseRequest {
@@ -3023,6 +3036,7 @@ message CheckpointTaskLeaseRequest {
     uint64 expected_lease_epoch = 7;
     int64 expected_expires_at_nanos = 8;
     string expected_lease_hash = 9;
+    WriteOptions options = 10;
 }
 
 message CommitTaskLeaseRequest {
@@ -3036,6 +3050,7 @@ message CommitTaskLeaseRequest {
     uint64 expected_lease_epoch = 7;
     int64 expected_expires_at_nanos = 8;
     string expected_lease_hash = 9;
+    WriteOptions options = 10;
 }
 
 message ReadTaskLeaseRequest {
@@ -3044,6 +3059,7 @@ message ReadTaskLeaseRequest {
 
 message ForceReleaseTaskLeaseRequest {
     string task_id = 1;
+    WriteOptions options = 2;
 }
 
 message TaskLease {
@@ -3072,6 +3088,7 @@ message TaskLease {
 
 message TaskLeaseResponse {
     TaskLease lease = 1;
+    WriteState write_state = 2;
 }
 
 message ReadTaskLeaseResponse {
@@ -3082,11 +3099,13 @@ message ReadTaskLeaseResponse {
 message CommitTaskLeaseResponse {
     bool committed = 1;
     TaskLease previous_lease = 2;
+    WriteState write_state = 3;
 }
 
 message ForceReleaseTaskLeaseResponse {
     bool released = 1;
     TaskLease previous_lease = 2;
+    WriteState write_state = 3;
 }
 
 message OwnershipResource {
