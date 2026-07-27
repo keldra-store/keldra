@@ -444,7 +444,7 @@ impl ShardRebalanceReconciler {
             })
             .take(REBALANCE_PAGE_SIZE)
             .collect::<Vec<_>>();
-        let principal = format!("shard-rebalance/{}", self.worker_id);
+        let principal = self.worker_id.clone();
         let cursor_hash = blake3::hash(
             checkpoint
                 .after_application_key
@@ -631,7 +631,6 @@ impl ShardRepairRunner {
     }
 
     pub async fn run_once(&self, now: u64) -> Result<bool> {
-        self.mvcc.consensus.linearized_read_barrier().await?;
         let store = self.mvcc.runtime.local_store();
         let Some((job_id, record)) =
             store.claim_shard_repair_authorized(&self.worker_id, now, self.lease_ms, |record| {
@@ -866,7 +865,7 @@ impl ShardRepairRunner {
         mut replacement_manifest: PhysicalObjectShardManifest,
         guard: &crate::mvcc_worker_authority::AssignmentGuard,
     ) -> Result<()> {
-        let principal = format!("shard-repair/{}", self.worker_id);
+        let principal = self.worker_id.clone();
         let handle = self
             .mvcc
             .open_transactions

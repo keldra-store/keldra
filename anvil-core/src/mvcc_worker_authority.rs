@@ -59,7 +59,6 @@ impl MvccSubsystem {
         logical_identity: &str,
     ) -> Result<Option<AssignmentGuard>> {
         let partition_id = work_partition_id(kind, logical_identity)?;
-        self.consensus.linearized_read_barrier().await?;
         let assigned = self
             .consensus
             .applied_control_snapshot()?
@@ -74,9 +73,7 @@ impl MvccSubsystem {
             )
             .await?;
         } else if !assigned {
-            bail!(
-                "background work partition is not assigned; retry admission through the compact-Raft leader"
-            );
+            return Ok(None);
         }
         self.claim_assignment(kind, logical_identity)
     }

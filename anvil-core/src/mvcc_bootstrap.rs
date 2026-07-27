@@ -688,7 +688,7 @@ impl MvccSubsystem {
                 self.clone(),
             ),
         );
-        let worker_id = format!("object-materialisation/{}", self.peers[0].node_id);
+        let worker_id = background_worker_id("object-materialisation", &self.local_node);
         let runner = crate::object_materialisation_runner::ObjectMaterialisationRunner::new(
             self.clone(),
             executor,
@@ -707,7 +707,7 @@ impl MvccSubsystem {
         drop(slot);
         let repair = crate::mvcc_shard_repair::ShardRepairRunner::new(
             self.clone(),
-            format!("shard-repair/{}", self.peers[0].node_id),
+            background_worker_id("shard-repair", &self.local_node),
         )?;
         let repair_task = tokio::spawn(repair.run(self.apply_shutdown.subscribe()));
         let mut repair_slot = self
@@ -721,7 +721,7 @@ impl MvccSubsystem {
         *repair_slot = Some(repair_task);
         let reconciler = crate::mvcc_shard_repair::ShardRebalanceReconciler::new(
             self.clone(),
-            format!("shard-rebalance/{}", self.peers[0].node_id),
+            background_worker_id("shard-rebalance", &self.local_node),
         )?;
         let rebalance_task = tokio::spawn(reconciler.run(self.apply_shutdown.subscribe()));
         let mut rebalance_slot = self
@@ -747,7 +747,7 @@ impl MvccSubsystem {
         );
         let upgrade_task = tokio::spawn(upgrade.run(
             self.runtime.local_store().clone(),
-            format!("local-durability-upgrade/{}", self.local_node.node_id),
+            background_worker_id("local-durability-upgrade", &self.local_node),
             self.apply_shutdown.subscribe(),
         ));
         let mut upgrade_slot = self
@@ -934,6 +934,10 @@ pub(crate) fn cluster_id_hash(cluster_id: &str) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+fn background_worker_id(kind: &str, node: &NodeIncarnation) -> String {
+    format!("{kind}/{}/{}", node.node_id, node.incarnation)
+}
+
 pub(crate) fn consensus_control_node_id(node_id: &str) -> NodeId {
     let mut hasher = Sha256::new();
     let domain = b"anvil.node-id.v1";
@@ -958,6 +962,20 @@ fn normalize_endpoint(endpoint: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_worker_identity_names_the_local_incarnation() {
+        assert_eq!(
+            background_worker_id(
+                "shard-repair",
+                &NodeIncarnation {
+                    node_id: "node-b".to_string(),
+                    incarnation: 7,
+                },
+            ),
+            "shard-repair/node-b/7"
+        );
+    }
 
     #[test]
     fn production_peer_transport_requires_https() {
