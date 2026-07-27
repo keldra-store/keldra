@@ -796,8 +796,6 @@ impl PersonalDbService for AppState {
                 )
                 .await;
         }
-        let source_database_id = core_request.database_id.clone();
-        let source_changeset_bytes = core_request.changeset_bytes.clone();
         let committed = self
             .commit_personaldb_changeset(
                 core_request,
@@ -809,16 +807,6 @@ impl PersonalDbService for AppState {
         if transaction_id.is_some() {
             return Ok(submit_changeset_response(committed, WriteState::Staged));
         }
-        self.build_personaldb_projections_for_source_commit(
-            claims.tenant_id,
-            &source_database_id,
-            &source_changeset_bytes,
-            committed.log_index,
-            &committed.log_hash,
-            committed.authz_revision,
-            &[],
-        )
-        .await?;
         Ok(submit_changeset_response(committed, WriteState::Committed))
     }
 
@@ -1096,16 +1084,6 @@ impl AppState {
                 "certified PersonalDB postcommit head does not match immutable job identity"
             );
         }
-        let envelope: VerifiedMutationEnvelope = serde_json::from_value(job.envelope.clone())?;
-        let actor = PersonalDbCommitActor {
-            tenant_id: job.tenant_id,
-            principal: job.principal.clone(),
-            bearer_token: None,
-            require_public_commit_authorization: false,
-        };
-        materialize_personaldb_row_owner_grants(&self.persistence, &envelope, &actor)
-            .await
-            .map_err(|status| anyhow::anyhow!(status.to_string()))?;
         maybe_build_personaldb_snapshot(
             &self.storage,
             &self.mvcc,
@@ -1249,6 +1227,60 @@ impl AppState {
         definition: ProjectionDefinition,
         caller_transaction: Option<(&str, &str)>,
     ) -> Result<Response<SubmitPersonalDbChangesetResponse>, Status> {
+        if caller_transaction.is_none() {
+            let now = u64::try_from(chrono::Utc::now().timestamp_millis())
+                .map_err(|_| Status::internal("PersonalDB timestamp predates Unix epoch"))?;
+            let handle = self
+                .mvcc
+                .open_transactions
+                .begin(
+                    self.mvcc.runtime.as_ref(),
+                    self.mvcc.cluster_id().to_string(),
+                    actor.principal.clone(),
+                    &format!(
+                        "personaldb-projection-writeback:{}:{}",
+                        request.database_id, request.idempotency_key
+                    ),
+                    std::time::Duration::from_secs(300),
+                    crate::mvcc_transaction::DurabilityLevel::Quorum,
+                    crate::mvcc_transaction::ReadConsistency::Linearized,
+                    now,
+                )
+                .await
+                .map_err(internal_status)?;
+            let mut response = Box::pin(self.commit_personaldb_projection_writeback(
+                request,
+                actor.clone(),
+                definition,
+                Some((&handle.transaction_id, &actor.principal)),
+            ))
+            .await?;
+            let outcome = self
+                .mvcc
+                .open_transactions
+                .commit(
+                    self.mvcc.runtime.as_ref(),
+                    &handle.transaction_id,
+                    &actor.principal,
+                    now,
+                )
+                .await
+                .map_err(internal_status)?;
+            let commit_version = match outcome.certification {
+                crate::mvcc_transaction::CertificationResult::Committed { commit_version } => {
+                    commit_version
+                }
+                crate::mvcc_transaction::CertificationResult::Aborted { reason } => {
+                    return Err(Status::aborted(format!(
+                        "PersonalDB projection writeback aborted: {reason:?}"
+                    )));
+                }
+            };
+            response.get_mut().write_state = WriteState::Committed as i32;
+            response.get_mut().watch_cursor_low = commit_version;
+            response.get_mut().watch_cursor_high = 0;
+            return Ok(response);
+        }
         let snapshot_version = match caller_transaction {
             Some((transaction_id, principal)) => {
                 let handle = self
@@ -1382,8 +1414,6 @@ impl AppState {
             changeset_bytes: writeback.changeset_bytes,
             client_debug_metadata: request.client_debug_metadata,
         };
-        let source_changeset_bytes = source_request.changeset_bytes.clone();
-        let tenant_id = actor.tenant_id;
         if let Some(caller_transaction) = caller_transaction {
             self.commit_personaldb_changeset(
                 target_request,
@@ -1409,20 +1439,9 @@ impl AppState {
                 WriteState::Staged,
             ));
         }
-        let committed = self
-            .commit_personaldb_changeset(source_request, actor, None, &[])
-            .await?;
-        self.build_personaldb_projections_for_source_commit(
-            tenant_id,
-            &source_database_id,
-            &source_changeset_bytes,
-            committed.log_index,
-            &committed.log_hash,
-            committed.authz_revision,
-            &[],
-        )
-        .await?;
-        Ok(submit_changeset_response(committed, WriteState::Committed))
+        Err(Status::internal(
+            "PersonalDB projection writeback reached commit without a transaction",
+        ))
     }
 
     async fn reconstruct_personaldb_submit_retry(
@@ -1499,6 +1518,99 @@ impl AppState {
         caller_transaction: Option<(&str, &str)>,
         excluded_projection_ids: &[String],
     ) -> Result<CommittedPersonalDbChangeset, Status> {
+        if caller_transaction.is_none() {
+            let idempotency_key = format!(
+                "personaldb-submit:{}:{}",
+                request.database_id, request.idempotency_key
+            );
+            let now = u64::try_from(chrono::Utc::now().timestamp_millis())
+                .map_err(|_| Status::internal("PersonalDB timestamp predates Unix epoch"))?;
+            let handle = self
+                .mvcc
+                .open_transactions
+                .begin(
+                    self.mvcc.runtime.as_ref(),
+                    self.mvcc.cluster_id().to_string(),
+                    actor.principal.clone(),
+                    &idempotency_key,
+                    std::time::Duration::from_secs(300),
+                    crate::mvcc_transaction::DurabilityLevel::Quorum,
+                    crate::mvcc_transaction::ReadConsistency::Linearized,
+                    now,
+                )
+                .await
+                .map_err(internal_status)?;
+            let status = self
+                .mvcc
+                .open_transactions
+                .status(&handle.transaction_id, &actor.principal, now)
+                .map_err(internal_status)?;
+            if matches!(status.state, "committed" | "committing") {
+                if status.state == "committing" {
+                    self.mvcc
+                        .open_transactions
+                        .commit(
+                            self.mvcc.runtime.as_ref(),
+                            &handle.transaction_id,
+                            &actor.principal,
+                            now,
+                        )
+                        .await
+                        .map_err(internal_status)?;
+                }
+                let commit_version = PersonalDbWritePlan::resolved_commit_version(
+                    &self.mvcc,
+                    &actor.principal,
+                    &idempotency_key,
+                )
+                .await
+                .map_err(internal_status)?
+                .ok_or_else(|| {
+                    Status::failed_precondition(
+                        "committed PersonalDB transaction is missing its commit result",
+                    )
+                })?;
+                return self
+                    .reconstruct_personaldb_submit_retry(&request, commit_version)
+                    .await;
+            }
+            if status.state == "aborted" {
+                return Err(Status::aborted(
+                    "PersonalDB transaction previously aborted",
+                ));
+            }
+            Box::pin(self.commit_personaldb_changeset(
+                request.clone(),
+                actor.clone(),
+                Some((&handle.transaction_id, &actor.principal)),
+                excluded_projection_ids,
+            ))
+            .await?;
+            let outcome = self
+                .mvcc
+                .open_transactions
+                .commit(
+                    self.mvcc.runtime.as_ref(),
+                    &handle.transaction_id,
+                    &actor.principal,
+                    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+                )
+                .await
+                .map_err(internal_status)?;
+            let commit_version = match outcome.certification {
+                crate::mvcc_transaction::CertificationResult::Committed { commit_version } => {
+                    commit_version
+                }
+                crate::mvcc_transaction::CertificationResult::Aborted { reason } => {
+                    return Err(Status::aborted(format!(
+                        "PersonalDB transaction aborted: {reason:?}"
+                    )));
+                }
+            };
+            return self
+                .reconstruct_personaldb_submit_retry(&request, commit_version)
+                .await;
+        }
         let snapshot_version = match caller_transaction {
             Some((transaction_id, principal)) => {
                 let handle = self
@@ -1885,6 +1997,15 @@ impl AppState {
         )
         .map_err(internal_status)?;
         if let Some((transaction_id, transaction_principal)) = caller_transaction {
+            stage_personaldb_row_owner_grants(
+                &self.persistence,
+                &envelope,
+                &actor,
+                transaction_id,
+                transaction_principal,
+            )
+            .await
+            .map_err(internal_status)?;
             let job = crate::personaldb_postcommit_job::PersonalDbPostCommitJob {
                 schema: crate::personaldb_postcommit_job::PersonalDbPostCommitJob::SCHEMA.into(),
                 cluster_id: self.mvcc.cluster_id().to_string(),
@@ -1930,29 +2051,9 @@ impl AppState {
                 authz_revision,
             });
         }
-        let commit_version = write_plan.commit(&self.mvcc).await.map_err(internal_status)?;
-
-        maybe_build_personaldb_snapshot(
-            &self.storage,
-            &self.mvcc,
-            PersonalDbSnapshotBuildRequest {
-                tenant_id: actor.tenant_id,
-                database_id: &validated.request.database_id,
-                schema_sql: &schema_sql,
-                created_by_node: &actor.principal,
-                policy: configured_personaldb_snapshot_policy(&self.config),
-            },
-            protocol_keyring,
-        )
-        .await
-        .map_err(internal_status)?;
-
-        materialize_personaldb_row_owner_grants(&self.persistence, &envelope, &actor)
-            .await
-            .map_err(internal_status)?;
-
-        self.reconstruct_personaldb_submit_retry(&validated.request, commit_version)
-            .await
+        Err(Status::internal(
+            "PersonalDB changeset reached commit without a caller or internal transaction",
+        ))
     }
 
     async fn build_personaldb_projections_for_source_commit(
@@ -2304,10 +2405,12 @@ async fn authorize_personaldb_row_effects(
     Ok(())
 }
 
-async fn materialize_personaldb_row_owner_grants(
+async fn stage_personaldb_row_owner_grants(
     persistence: &crate::persistence::Persistence,
     envelope: &VerifiedMutationEnvelope,
     actor: &PersonalDbCommitActor,
+    transaction_id: &str,
+    transaction_principal: &str,
 ) -> anyhow::Result<()> {
     let mut mutations = Vec::new();
     for row in &envelope.row_metadata_delta.upserts {
@@ -2339,7 +2442,14 @@ async fn materialize_personaldb_row_owner_grants(
         return Ok(());
     }
     persistence
-        .write_authz_tuple_batch(actor.tenant_id, mutations, &actor.principal)
+        .stage_authz_tuple_batch(
+            actor.tenant_id,
+            mutations,
+            &actor.principal,
+            transaction_id,
+            transaction_principal,
+            None,
+        )
         .await?;
     Ok(())
 }
