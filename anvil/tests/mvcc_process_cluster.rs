@@ -176,6 +176,87 @@ async fn public_object_batch_recovers_after_leader_crashes_before_local_batch_wr
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn public_object_batch_retries_after_crash_before_prepared_bundle_sync() {
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_anvil-server"));
+    let mut cluster = ProcessMvccCluster::start(binary).await.unwrap();
+    let coordinator = cluster.wait_for_leader(&[0, 1, 2]).await.unwrap();
+    let bucket_name = format!("process-prepare-{}", uuid::Uuid::new_v4().simple());
+    let bucket_id = cluster.create_bucket(coordinator, &bucket_name).await.unwrap();
+    let transaction = cluster
+        .begin_transaction(coordinator, MvccReadConsistency::Linearized)
+        .await
+        .unwrap();
+    let keys = ["prepare-crash/one.bin", "prepare-crash/two.bin"];
+    let staged = cluster
+        .stage_object_puts(
+            coordinator,
+            &bucket_name,
+            bucket_id,
+            &transaction.transaction_id,
+            &[(keys[0], b"one"), (keys[1], b"two")],
+        )
+        .await
+        .unwrap();
+    assert_eq!(staged.write_state, WriteState::Staged as i32);
+
+    cluster
+        .arm_hard_crash(coordinator, "PreparedBundleWrite")
+        .unwrap();
+    let commit = cluster.commit_transaction(
+        cluster.public_endpoint(coordinator),
+        transaction.transaction_id.clone(),
+    );
+    let (commit_result, crash_result) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(10), commit),
+        cluster.wait_for_hard_crash(coordinator, Duration::from_secs(10)),
+    );
+    crash_result.unwrap();
+    assert!(
+        !matches!(commit_result, Ok(Ok(_))),
+        "crashing before prepared-bundle sync must not return durability or commit success"
+    );
+
+    let survivors = [0, 1, 2]
+        .into_iter()
+        .filter(|node| *node != coordinator)
+        .collect::<Vec<_>>();
+    let survivor = cluster.wait_for_leader(&survivors).await.unwrap();
+    for key in keys {
+        assert!(
+            !cluster.object_exists(survivor, &bucket_name, key).await.unwrap(),
+            "an unprepared bundle must not have any survivor-visible object"
+        );
+    }
+
+    cluster.restart(coordinator).await.unwrap();
+    let retry = cluster
+        .commit_transaction(
+            cluster.public_endpoint(coordinator),
+            transaction.transaction_id.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retry.state, WriteState::Committed as i32);
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let all_visible = matches!(
+                cluster.object_exists(survivor, &bucket_name, keys[0]).await,
+                Ok(true)
+            ) && matches!(
+                cluster.object_exists(survivor, &bucket_name, keys[1]).await,
+                Ok(true)
+            );
+            if all_visible {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("retried durable bundle converges atomically after same-disk restart");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn killed_node_is_replaced_by_higher_incarnation_and_catches_up() {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_anvil-server"));
     let mut cluster = ProcessMvccCluster::start(binary).await.unwrap();

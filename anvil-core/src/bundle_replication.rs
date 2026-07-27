@@ -55,7 +55,7 @@ impl PreparedBundleLog {
     }
 
     fn persist(&mut self, identity: &BundleIdentity, bytes: &[u8]) -> Result<()> {
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         crate::mvcc_fault_injection::hit(
             crate::mvcc_fault_injection::FaultPoint::PreparedBundleWrite,
         )?;

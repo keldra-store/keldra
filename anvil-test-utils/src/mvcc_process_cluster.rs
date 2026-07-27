@@ -325,7 +325,7 @@ impl ProcessMvccCluster {
     /// Arm a one-shot hard crash in an already-running debug child. The hook
     /// consumes this file before aborting, so same-disk restart can recover.
     pub fn arm_hard_crash(&self, node: usize, fault_point: &str) -> anyhow::Result<()> {
-        const PROCESS_SAFE_POINTS: &[&str] = &["MvccBatchWrite"];
+        const PROCESS_SAFE_POINTS: &[&str] = &["PreparedBundleWrite", "MvccBatchWrite"];
         if !PROCESS_SAFE_POINTS.contains(&fault_point) {
             bail!("fault point is not enabled for process-backed hard crashes");
         }
