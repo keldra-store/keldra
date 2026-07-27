@@ -18,7 +18,9 @@ mod coremeta;
 pub use coremeta::{
     MAX_PARTITION_FENCE_PAGE_SIZE, OwnershipFencePage, OwnershipFencePageCursor,
     PartitionOwnerPage, PartitionOwnerPageCursor, list_active_ownership_fences_for_node_page,
-    list_ownership_fences_page, list_partition_owners_for_node_page, list_partition_owners_page,
+    list_active_ownership_fences_for_node_page_mvcc, list_ownership_fences_page,
+    list_partition_owners_for_node_page, list_partition_owners_for_node_page_mvcc,
+    list_partition_owners_page,
 };
 use coremeta::{
     is_partition_fence_cas_conflict, ownership_fence_by_node_key, ownership_fence_row_key,

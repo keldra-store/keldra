@@ -99,6 +99,25 @@ pub async fn list_partition_owners_for_node_page(
     )
 }
 
+/// Lists one bounded page from the authoritative MVCC node-owned partition projection.
+pub fn list_partition_owners_for_node_page_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    owner_node_id: &str,
+    cursor: Option<&PartitionOwnerPageCursor>,
+    limit: usize,
+    signing_key: &[u8],
+) -> Result<PartitionOwnerPage> {
+    require_nonempty(owner_node_id, "owner node id")?;
+    partition_owner_page_mvcc(
+        mvcc,
+        partition_owner_by_node_prefix(owner_node_id)?,
+        cursor,
+        limit,
+        signing_key,
+        partition_owner_by_node_key,
+    )
+}
+
 /// Lists at most `limit` ownership-fence rows after `cursor`.
 pub async fn list_ownership_fences_page(
     storage: &Storage,
@@ -134,6 +153,30 @@ pub async fn list_active_ownership_fences_for_node_page(
     let store = CoreStore::new(storage.clone()).await?;
     ownership_fence_page(
         &store,
+        ownership_fence_by_node_prefix(owner_node_id)?,
+        cursor,
+        limit,
+        signing_key,
+        ownership_fence_by_node_key,
+        |record| record.is_active_unexpired(now_nanos),
+    )
+}
+
+/// Lists one bounded page from the authoritative MVCC node-owned fence projection.
+pub fn list_active_ownership_fences_for_node_page_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    owner_node_id: &str,
+    now_nanos: i64,
+    cursor: Option<&OwnershipFencePageCursor>,
+    limit: usize,
+    signing_key: &[u8],
+) -> Result<OwnershipFencePage> {
+    require_nonempty(owner_node_id, "owner node id")?;
+    if now_nanos < 0 {
+        return Err(anyhow!("ownership fence timestamp must be nonnegative"));
+    }
+    ownership_fence_page_mvcc(
+        mvcc,
         ownership_fence_by_node_prefix(owner_node_id)?,
         cursor,
         limit,
@@ -340,32 +383,55 @@ pub(super) async fn write_partition_owner_state_mvcc(
         .transpose()?;
     let new_projection_key = partition_owner_by_node_key(owner)?;
 
+    let main_predicate = expected_ref
+        .map(|expected| PredicateKind::ValueHash(*blake3::hash(expected).as_bytes()))
+        .unwrap_or(PredicateKind::Absent);
+    let mut predicates = vec![(main_key.clone(), main_predicate)];
     let mut mutations = vec![crate::mvcc_product::ProductMutation::put(
         main_key.clone(),
         payload.clone(),
     )];
-    if let Some(old_projection_key) = old_projection_key
-        && old_projection_key != new_projection_key
-    {
-        mutations.push(crate::mvcc_product::ProductMutation::delete(
+    let old_projection_logical_key = old_projection_key
+        .as_ref()
+        .map(|tuple_key| {
             crate::mvcc_product::coremeta_logical_key(
                 CF_LEASES_FENCES,
                 TABLE_PARTITION_OWNER_ROW,
-                &old_projection_key,
-            )?,
+                tuple_key,
+            )
+        })
+        .transpose()?;
+    let new_projection_logical_key = crate::mvcc_product::coremeta_logical_key(
+        CF_LEASES_FENCES,
+        TABLE_PARTITION_OWNER_ROW,
+        &new_projection_key,
+    )?;
+    if old_projection_logical_key.as_ref() != Some(&new_projection_logical_key) {
+        if let Some(old_projection_logical_key) = old_projection_logical_key {
+            mutations.push(crate::mvcc_product::ProductMutation::delete(
+                old_projection_logical_key.clone(),
+            ));
+            let expected = expected_ref.ok_or_else(|| {
+                anyhow!("partition-owner old projection lacks its prior payload")
+            })?;
+            predicates.push((
+                old_projection_logical_key,
+                PredicateKind::ValueHash(*blake3::hash(expected).as_bytes()),
+            ));
+        }
+        predicates.push((new_projection_logical_key.clone(), PredicateKind::Absent));
+    } else {
+        predicates.push((
+            new_projection_logical_key.clone(),
+            expected_ref
+                .map(|expected| PredicateKind::ValueHash(*blake3::hash(expected).as_bytes()))
+                .unwrap_or(PredicateKind::Absent),
         ));
     }
     mutations.push(crate::mvcc_product::ProductMutation::put(
-        crate::mvcc_product::coremeta_logical_key(
-            CF_LEASES_FENCES,
-            TABLE_PARTITION_OWNER_ROW,
-            &new_projection_key,
-        )?,
+        new_projection_logical_key,
         payload,
     ));
-    let predicate = expected_ref
-        .map(|expected| PredicateKind::ValueHash(*blake3::hash(expected).as_bytes()))
-        .unwrap_or(PredicateKind::Absent);
     let now_unix_ms = u64::try_from(owner.updated_at_nanos.max(0))
         .unwrap_or(u64::MAX)
         .saturating_div(1_000_000);
@@ -373,7 +439,7 @@ pub(super) async fn write_partition_owner_state_mvcc(
         "partition-fence",
         &partition_owner_transaction_id(owner),
         mutations,
-        vec![(main_key, predicate)],
+        predicates,
         DurabilityLevel::Quorum,
         now_unix_ms,
     )
@@ -736,6 +802,124 @@ fn ownership_fence_page(
         fences,
         next_cursor,
     })
+}
+
+fn partition_owner_page_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    prefix: Vec<u8>,
+    cursor: Option<&PartitionOwnerPageCursor>,
+    limit: usize,
+    signing_key: &[u8],
+    expected_key: impl Fn(&PartitionOwnerState) -> Result<Vec<u8>>,
+) -> Result<PartitionOwnerPage> {
+    let (rows, has_more) = scan_page_mvcc(
+        mvcc,
+        TABLE_PARTITION_OWNER_ROW,
+        &prefix,
+        cursor.map(PartitionOwnerPageCursor::as_str),
+        limit,
+    )?;
+    let next_cursor = has_more
+        .then(|| rows.last())
+        .flatten()
+        .map(|(tuple_key, _)| {
+            PartitionOwnerPageCursor(
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(tuple_key),
+            )
+        });
+    let mut owners = Vec::with_capacity(rows.len());
+    for (tuple_key, payload) in rows {
+        let owner = decode_partition_owner_record(&payload)?;
+        owner.verify(signing_key)?;
+        if tuple_key != expected_key(&owner)? {
+            bail!("partition owner page row key does not match its payload");
+        }
+        owners.push(owner);
+    }
+    Ok(PartitionOwnerPage {
+        owners,
+        next_cursor,
+    })
+}
+
+fn ownership_fence_page_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    prefix: Vec<u8>,
+    cursor: Option<&OwnershipFencePageCursor>,
+    limit: usize,
+    signing_key: &[u8],
+    expected_key: impl Fn(&OwnershipFenceRecord) -> Result<Vec<u8>>,
+    include: impl Fn(&OwnershipFenceRecord) -> bool,
+) -> Result<OwnershipFencePage> {
+    let (rows, has_more) = scan_page_mvcc(
+        mvcc,
+        TABLE_OWNERSHIP_FENCE_ROW,
+        &prefix,
+        cursor.map(OwnershipFencePageCursor::as_str),
+        limit,
+    )?;
+    let next_cursor = has_more
+        .then(|| rows.last())
+        .flatten()
+        .map(|(tuple_key, _)| {
+            OwnershipFencePageCursor(
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(tuple_key),
+            )
+        });
+    let mut fences = Vec::new();
+    for (tuple_key, payload) in rows {
+        let record = decode_ownership_fence_record(&payload)?;
+        record.verify(signing_key)?;
+        if tuple_key != expected_key(&record)? {
+            bail!("ownership fence page row key does not match its payload");
+        }
+        if include(&record) {
+            fences.push(record);
+        }
+    }
+    Ok(OwnershipFencePage {
+        fences,
+        next_cursor,
+    })
+}
+
+fn scan_page_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    table_id: u16,
+    prefix: &[u8],
+    cursor: Option<&str>,
+    limit: usize,
+) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, bool)> {
+    validate_page_limit(limit)?;
+    let after = cursor
+        .map(|cursor| decode_cursor(cursor, prefix))
+        .transpose()?;
+    let application_prefix =
+        crate::mvcc_product::coremeta_application_prefix(CF_LEASES_FENCES, prefix)?;
+    let snapshot = mvcc.runtime.applied_version()?;
+    let mut rows = mvcc
+        .runtime
+        .scan_table_prefix_at(table_id, &application_prefix, snapshot)?
+        .into_iter()
+        .map(|(key, row)| {
+            Ok((
+                crate::mvcc_product::coremeta_tuple_from_logical_key(
+                    &key,
+                    CF_LEASES_FENCES,
+                )?
+                .to_vec(),
+                row.value,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if let Some(after) = after {
+        rows.retain(|(tuple_key, _)| tuple_key > &after);
+    }
+    let has_more = rows.len() > limit;
+    if has_more {
+        rows.truncate(limit);
+    }
+    Ok((rows, has_more))
 }
 
 fn scan_page(
