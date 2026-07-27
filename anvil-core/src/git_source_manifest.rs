@@ -136,6 +136,73 @@ pub async fn read_git_source_repository_manifest(
     Ok(Some(manifest))
 }
 
+pub fn read_git_source_repository_manifest_in_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    repository_id: &str,
+    transaction_id: &str,
+    transaction_principal: &str,
+) -> Result<Option<GitSourceRepositoryManifest>> {
+    let key = crate::mvcc_product::coremeta_logical_key(
+        CF_REGISTRY,
+        TABLE_GIT_SOURCE_MANIFEST_ROW,
+        &manifest_tuple_key(tenant_id, repository_id)?,
+    )?;
+    let Some(payload) =
+        mvcc.read_transaction_value(transaction_id, transaction_principal, &key)?
+    else {
+        return Ok(None);
+    };
+    let manifest = decode_git_source_manifest_row(&payload)?;
+    validate_manifest(&manifest)?;
+    if manifest.tenant_id != tenant_id || manifest.repository_id != repository_id {
+        return Err(anyhow!("git source manifest path scope mismatch"));
+    }
+    Ok(Some(manifest))
+}
+
+pub fn stage_git_source_repository_manifest(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    manifest: &GitSourceRepositoryManifest,
+    transaction_id: &str,
+    transaction_principal: &str,
+    now_unix_ms: u64,
+) -> Result<()> {
+    validate_manifest(manifest)?;
+    let key = crate::mvcc_product::coremeta_logical_key(
+        CF_REGISTRY,
+        TABLE_GIT_SOURCE_MANIFEST_ROW,
+        &manifest_tuple_key(manifest.tenant_id, &manifest.repository_id)?,
+    )?;
+    if let Some(existing) = read_git_source_repository_manifest_in_transaction(
+        mvcc,
+        manifest.tenant_id,
+        &manifest.repository_id,
+        transaction_id,
+        transaction_principal,
+    )? {
+        if existing.generation > manifest.generation {
+            return Err(anyhow!(
+                "git source manifest generation cannot move backwards"
+            ));
+        }
+        if existing.generation == manifest.generation && existing != *manifest {
+            return Err(anyhow!(
+                "git source manifest diverges at an existing generation"
+            ));
+        }
+    }
+    mvcc.stage_product_mutations(
+        transaction_id,
+        transaction_principal,
+        vec![crate::mvcc_product::ProductMutation::put(
+            key,
+            encode_git_source_manifest_row(manifest)?,
+        )],
+        now_unix_ms,
+    )
+}
+
 fn encode_git_source_manifest(manifest: &GitSourceRepositoryManifest) -> Result<Vec<u8>> {
     Ok(encode_deterministic_proto(
         &GitSourceRepositoryManifestProto {

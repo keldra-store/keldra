@@ -408,7 +408,7 @@ fn git_source_index_scope(tenant_id: i64, repository_id: &str) -> Result<String>
     Ok(format!("tenant/{tenant_id}/repository/{repository_id}"))
 }
 
-fn git_source_index_ref_name(
+pub fn git_source_index_ref_name(
     tenant_id: i64,
     repository_id: &str,
     generation: u64,
