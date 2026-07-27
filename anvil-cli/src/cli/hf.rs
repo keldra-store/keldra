@@ -175,7 +175,6 @@ pub async fn handle_hf_command(command: &HfCommands, ctx: &Context) -> anyhow::R
                 HfIngestCommands::Status { id } => {
                     let mut request = tonic::Request::new(api::GetHfIngestionStatusRequest {
                         ingestion_id: id.clone(),
-                        options: None,
                     });
                     request.metadata_mut().insert(
                         "authorization",
