@@ -6,6 +6,30 @@ use anvil::anvil_api::{MvccReadConsistency, WriteState};
 use anvil_test_utils::{
     GrpcLostResponseProxy, mvcc_process_cluster::ProcessMvccCluster,
 };
+use rusqlite::{Connection, session::Session};
+
+const PERSONALDB_PROCESS_SCHEMA: &str = "CREATE TABLE items(
+    id INTEGER PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL,
+    payload BLOB
+);";
+
+fn personaldb_insert_changeset() -> Vec<u8> {
+    let database = Connection::open_in_memory().unwrap();
+    database.execute_batch(PERSONALDB_PROCESS_SCHEMA).unwrap();
+    let mut session = Session::new(&database).unwrap();
+    session.attach::<&str>(None).unwrap();
+    database
+        .execute(
+            "INSERT INTO items (id, name, payload) VALUES (1, 'process-crash', x'010203')",
+            [],
+        )
+        .unwrap();
+    let mut output = Vec::new();
+    session.changeset_strm(&mut output).unwrap();
+    assert!(!output.is_empty());
+    output
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn public_commit_survives_lost_response_and_coordinator_sigkill() {
@@ -213,6 +237,127 @@ async fn committed_index_finalization_survives_two_coordinator_crashes_without_c
     })
     .await
     .expect("same-disk replay completes creator grant and exact-version build");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn committed_personaldb_submit_survives_two_coordinator_crashes_without_client_retry() {
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_anvil-server"));
+    let mut cluster = ProcessMvccCluster::start(binary).await.unwrap();
+    let coordinator = cluster.wait_for_leader(&[0, 1, 2]).await.unwrap();
+    let database_id = format!("personaldb-crash-{}", uuid::Uuid::new_v4().simple());
+    cluster
+        .create_personaldb_group(coordinator, &database_id, PERSONALDB_PROCESS_SCHEMA)
+        .await
+        .unwrap();
+    let genesis_hash = hex::encode(anvil::formats::hash32(
+        format!("genesis:{database_id}").as_bytes(),
+    ));
+    let transaction = cluster
+        .begin_transaction(coordinator, MvccReadConsistency::Linearized)
+        .await
+        .unwrap();
+    let staged = cluster
+        .stage_personaldb_submit(
+            coordinator,
+            &database_id,
+            &genesis_hash,
+            personaldb_insert_changeset(),
+            &transaction.transaction_id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(staged.write_state, WriteState::Staged as i32);
+    assert_eq!(
+        cluster
+            .get_personaldb_group(coordinator, &database_id)
+            .await
+            .unwrap()
+            .committed_head
+            .unwrap()
+            .log_index,
+        0,
+        "the staged PersonalDB head must remain invisible before certification"
+    );
+    assert_eq!(
+        cluster
+            .personaldb_row_owner_tuple_count(coordinator, &database_id, "items", "1")
+            .await
+            .unwrap(),
+        0,
+        "postcommit grants must not escape before certification"
+    );
+
+    cluster
+        .arm_hard_crash(coordinator, "PersonalDbPostCommitBeforeEffects")
+        .unwrap();
+    let committed = cluster
+        .commit_transaction(
+            cluster.public_endpoint(coordinator),
+            transaction.transaction_id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(committed.state, WriteState::Committed as i32);
+    cluster
+        .wait_for_hard_crash(coordinator, Duration::from_secs(45))
+        .await
+        .unwrap();
+
+    let survivors = [0, 1, 2]
+        .into_iter()
+        .filter(|node| *node != coordinator)
+        .collect::<Vec<_>>();
+    let survivor = cluster.wait_for_leader(&survivors).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if cluster
+                .get_personaldb_group(survivor, &database_id)
+                .await
+                .ok()
+                .and_then(|group| group.committed_head)
+                .is_some_and(|head| head.log_index == 1)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the certified PersonalDB head survives the coordinator crash");
+
+    // Replay the immutable job and crash after its idempotent effects but
+    // before durable completion. A second same-disk restart must converge
+    // without the client resubmitting either Submit or Commit.
+    cluster
+        .arm_hard_crash(coordinator, "PersonalDbPostCommitAfterEffects")
+        .unwrap();
+    cluster.restart(coordinator).await.unwrap();
+    cluster
+        .wait_for_hard_crash(coordinator, Duration::from_secs(45))
+        .await
+        .unwrap();
+    cluster.restart(coordinator).await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let head_is_committed = cluster
+                .get_personaldb_group(coordinator, &database_id)
+                .await
+                .ok()
+                .and_then(|group| group.committed_head)
+                .is_some_and(|head| head.log_index == 1);
+            let owner_grants = cluster
+                .personaldb_row_owner_tuple_count(coordinator, &database_id, "items", "1")
+                .await
+                .unwrap_or_default();
+            if head_is_committed && owner_grants == 3 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("same-disk replay completes the exact PersonalDB row-owner grants");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -15,9 +15,11 @@ use std::{
 use anvil::anvil_api::{
     AdminRequestContext, BeginTransactionRequest, BeginTransactionResponse,
     BootstrapMeshTopologyRequest, CommitTransactionRequest, CreateBucketRequest,
-    CheckPermissionRequest, CreateIndexRequest, IndexDefinitionRecord, IndexKind,
+    CheckPermissionRequest, CreateIndexRequest, CreatePersonalDbGroupRequest,
+    GetPersonalDbGroupRequest, IndexDefinitionRecord, IndexKind,
     ListIndexesRequest, QueryIndexRequest, QueryIndexResponse, ReadAuthzTuplesRequest,
-    WriteOptions,
+    PersonalDbGroupResponse, PersonalDbVoterAck, SubmitPersonalDbChangesetRequest,
+    SubmitPersonalDbChangesetResponse, WriteOptions,
     GetLocalNodeDescriptorRequest, GetObjectRequest, GetTransactionRequest, HeadObjectRequest,
     MutationBatchOperation, ReadConsistency,
     MutationBatchPutObject, MutationBatchRequest, MutationBatchResponse, MvccDurability, MvccReadConsistency,
@@ -30,6 +32,7 @@ use anvil::anvil_api::{
     mesh_control_service_client::MeshControlServiceClient,
     mutation_batch_operation,
     object_service_client::ObjectServiceClient,
+    personal_db_service_client::PersonalDbServiceClient,
     transaction_service_client::TransactionServiceClient,
     write_options,
 };
@@ -276,6 +279,145 @@ impl ProcessMvccCluster {
             .await?
             .into_inner()
             .bucket_id)
+    }
+
+    pub async fn create_personaldb_group(
+        &self,
+        node: usize,
+        database_id: &str,
+        schema_sql: &str,
+    ) -> anyhow::Result<PersonalDbGroupResponse> {
+        let mut client = PersonalDbServiceClient::connect(self.public_endpoint(node)).await?;
+        let genesis_hash = hex::encode(anvil::formats::hash32(
+            format!("genesis:{database_id}").as_bytes(),
+        ));
+        Ok(client
+            .create_personal_db_group(authorized(
+                CreatePersonalDbGroupRequest {
+                    database_id: database_id.to_string(),
+                    schema_hash: hex::encode(anvil::formats::hash32(schema_sql.as_bytes())),
+                    genesis_hash,
+                    schema_sql: schema_sql.to_string(),
+                    options: None,
+                },
+                &self.admin_token,
+            ))
+            .await?
+            .into_inner())
+    }
+
+    pub async fn stage_personaldb_submit(
+        &self,
+        node: usize,
+        database_id: &str,
+        genesis_hash: &str,
+        changeset_bytes: Vec<u8>,
+        transaction_id: &str,
+    ) -> anyhow::Result<SubmitPersonalDbChangesetResponse> {
+        let mut client = PersonalDbServiceClient::connect(self.public_endpoint(node)).await?;
+        Ok(client
+            .submit_personal_db_changeset(authorized(
+                SubmitPersonalDbChangesetRequest {
+                    tenant_id: SYSTEM_STORAGE_TENANT_ID,
+                    database_id: database_id.to_string(),
+                    principal: ADMIN_PRINCIPAL.to_string(),
+                    session_token: self.admin_token.clone(),
+                    request_id: format!("process-submit-{database_id}"),
+                    idempotency_key: format!("process-submit-{database_id}"),
+                    base_log_index: 0,
+                    base_log_hash: genesis_hash.to_string(),
+                    client_log_epoch: 1,
+                    membership_epoch: 1,
+                    policy_epoch: 1,
+                    leader_replica_id: ADMIN_PRINCIPAL.to_string(),
+                    voter_acks: vec![PersonalDbVoterAck {
+                        replica_id: ADMIN_PRINCIPAL.to_string(),
+                        log_index: 1,
+                        log_hash: hex::encode(anvil::formats::hash32(&changeset_bytes)),
+                        signature: "process-fixture".to_string(),
+                    }],
+                    changeset_payload_hash: hex::encode(anvil::formats::hash32(&changeset_bytes)),
+                    changeset_bytes,
+                    client_debug_metadata_json: String::new(),
+                    options: Some(WriteOptions {
+                        idempotency_key: format!("process-submit-options-{database_id}"),
+                        consistency: 0,
+                        wait_for_finalization: false,
+                        preconditions: Vec::new(),
+                        boundary_values: Vec::new(),
+                        execution: Some(write_options::Execution::TransactionId(
+                            transaction_id.to_string(),
+                        )),
+                    }),
+                },
+                &self.admin_token,
+            ))
+            .await?
+            .into_inner())
+    }
+
+    pub async fn get_personaldb_group(
+        &self,
+        node: usize,
+        database_id: &str,
+    ) -> anyhow::Result<PersonalDbGroupResponse> {
+        let mut client = PersonalDbServiceClient::connect(self.public_endpoint(node)).await?;
+        Ok(client
+            .get_personal_db_group(authorized(
+                GetPersonalDbGroupRequest {
+                    tenant_id: SYSTEM_STORAGE_TENANT_ID,
+                    database_id: database_id.to_string(),
+                },
+                &self.admin_token,
+            ))
+            .await?
+            .into_inner())
+    }
+
+    pub async fn personaldb_row_owner_tuple_count(
+        &self,
+        node: usize,
+        database_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> anyhow::Result<usize> {
+        let mut client = AuthServiceClient::connect(self.public_endpoint(node)).await?;
+        let namespace = anvil_core::authz_scope::encode_realm_namespace(
+            anvil_core::authz_scope::DEFAULT_AUTHZ_REALM_ID,
+            "personaldb_row",
+        );
+        let object_id = format!(
+            "tenant-{SYSTEM_STORAGE_TENANT_ID}/{database_id}/{resource_type}/{resource_id}"
+        );
+        let mut count = 0;
+        for relation in [
+            "personaldb:insert",
+            "personaldb:update",
+            "personaldb:delete",
+        ] {
+            count += client
+                .read_authz_tuples(authorized(
+                    ReadAuthzTuplesRequest {
+                        namespace: namespace.clone(),
+                        object_id: object_id.clone(),
+                        relation: relation.to_string(),
+                        subject_kind: anvil_core::access_control::APP_SUBJECT_KIND.to_string(),
+                        subject_id: ADMIN_PRINCIPAL.to_string(),
+                        caveat_hash: String::new(),
+                        consistency: "latest".to_string(),
+                        zookie: String::new(),
+                        page_size: 10,
+                        page_token: String::new(),
+                        scope: None,
+                    },
+                    &self.admin_token,
+                ))
+                .await?
+                .into_inner()
+                .tuples
+                .len();
+        }
+        Ok(count)
     }
 
     pub async fn stage_path_index(
