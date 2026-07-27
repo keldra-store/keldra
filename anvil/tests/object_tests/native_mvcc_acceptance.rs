@@ -261,9 +261,11 @@ async fn multipart_and_append_payloads_round_trip_from_mvcc_representations() {
         "multipart-and-append-payloads-round-trip-from-mvcc",
     )
     .await;
-    let endpoint = cluster.grpc_addrs[0].clone();
-    let mut buckets = BucketServiceClient::connect(endpoint.clone()).await.unwrap();
-    let mut objects = ObjectServiceClient::connect(endpoint).await.unwrap();
+    let endpoint_a = cluster.grpc_addrs[0].clone();
+    let endpoint_b = cluster.grpc_addrs[1].clone();
+    let mut buckets = BucketServiceClient::connect(endpoint_a.clone()).await.unwrap();
+    let mut objects = ObjectServiceClient::connect(endpoint_a).await.unwrap();
+    let mut retry_node = ObjectServiceClient::connect(endpoint_b).await.unwrap();
     let bucket_name = unique_test_name("native-mvcc-payloads");
     let bucket_id = buckets
         .create_bucket(authorized(
@@ -292,7 +294,7 @@ async fn multipart_and_append_payloads_round_trip_from_mvcc_representations() {
         .await
         .unwrap()
         .into_inner();
-    let retried_initiate = objects
+    let retried_initiate = retry_node
         .initiate_multipart_upload(authorized(initiate_request, &actor.token))
         .await
         .unwrap()
@@ -316,7 +318,7 @@ async fn multipart_and_append_payloads_round_trip_from_mvcc_representations() {
         .await
         .unwrap();
         let retry = upload_part_with_context(
-            &mut objects,
+            &mut retry_node,
             &actor.token,
             &bucket_name,
             "assembled.bin",
@@ -329,7 +331,7 @@ async fn multipart_and_append_payloads_round_trip_from_mvcc_representations() {
         .unwrap();
         assert_eq!(retry, first);
         let changed = upload_part_with_context(
-            &mut objects,
+            &mut retry_node,
             &actor.token,
             &bucket_name,
             "assembled.bin",

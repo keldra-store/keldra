@@ -40,7 +40,9 @@ async fn begin_implicit_native_transaction(
             principal,
             idempotency_key,
             std::time::Duration::from_secs(300),
-            crate::mvcc_transaction::DurabilityLevel::Quorum,
+            super::native_put_rpc::configured_default_durability(
+                &state.config.mvcc_default_durability,
+            )?,
             crate::mvcc_transaction::ReadConsistency::Linearized,
             u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
         )
@@ -82,6 +84,14 @@ async fn commit_implicit_native_response<T: serde::Serialize>(
             )
             .map_err(|error| Status::failed_precondition(error.to_string()))?;
     }
+    crate::native_idempotency::stage_generic_result(
+        &state.mvcc,
+        &handle.transaction_id,
+        &principal,
+        context,
+        target,
+        response,
+    )?;
     let outcome = state
         .mvcc
         .open_transactions
@@ -1520,43 +1530,32 @@ impl ObjectService for AppState {
         .await?;
         let requested_transaction_id =
             native_transaction_id(metadata.mutation_context.as_ref())?;
-        let incoming_payload = stream.map(|chunk_result| match chunk_result {
+        let mut incoming_payload = stream.map(|chunk_result| match chunk_result {
             Ok(chunk) => match chunk.data {
                 Some(upload_part_request::Data::Chunk(bytes)) => Ok(bytes),
                 _ => Ok(vec![]),
             },
             Err(error) => Err(error),
         });
-        let (scratch_path, payload_size, payload_digest) = self
-            .storage
-            .stream_to_temp_file(incoming_payload)
-            .await
-            .map_err(|error| Status::internal(error.to_string()))?;
-        let scratch = super::native_put_rpc::NativeScratchFile::new(scratch_path);
-        let target =
+        let base_target =
             NativeIdempotencyTarget::new("UploadPart", &metadata.bucket_name, &metadata.object_key)
                 .with_parameters(serde_json::json!({
                     "upload_id": metadata.upload_id.clone(),
-                    "part_number": metadata.part_number,
-                    "payload_hash": format!("sha256:{payload_digest}"),
-                    "payload_size": payload_size
+                    "part_number": metadata.part_number
                 }));
-        let (attempt, replay) = begin_native_mutation::<UploadPartResponse>(
+        let attempt = lock_native_mutation(
             self,
             metadata.mutation_context.as_ref(),
-            &target,
+            &base_target,
             &claims,
             AnvilAction::ObjectWrite,
         )
         .await?;
-        if let Some(response) = replay {
-            return Ok(Response::new(response));
-        }
         let implicit_transaction = begin_implicit_native_transaction(
             self,
             &claims,
             metadata.mutation_context.as_ref(),
-            &target,
+            &base_target,
         )
         .await?;
         let transaction_id = requested_transaction_id.or_else(|| {
@@ -1566,6 +1565,102 @@ impl ObjectService for AppState {
         });
         let transaction_principal = transaction_id
             .map(|_| crate::object_manager::transaction_principal_from_claims(&claims));
+        let transaction_id = transaction_id
+            .ok_or_else(|| Status::failed_precondition("TransactionRequired"))?;
+        let transaction_principal = transaction_principal
+            .as_deref()
+            .ok_or_else(|| Status::failed_precondition("TransactionPrincipalRequired"))?;
+        self.mvcc
+            .runtime
+            .snapshot(crate::mvcc_transaction::ReadConsistency::Linearized)
+            .await
+            .map_err(|error| Status::unavailable(error.to_string()))?;
+        let mut transaction_status = self
+            .mvcc
+            .open_transactions
+            .status(
+                transaction_id,
+                transaction_principal,
+                u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+            )
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        if native_idempotency::generic_result_exists(
+            &self.mvcc,
+            transaction_id,
+            attempt.context(),
+        )? {
+            let (payload_hash, payload_size) =
+                super::native_put_rpc::hash_native_payload(&mut incoming_payload).await?;
+            let target = super::native_put_rpc::native_payload_target(
+                base_target,
+                &payload_hash,
+                payload_size,
+            );
+            let response = native_idempotency::load_generic_response(
+                &self.mvcc,
+                transaction_id,
+                attempt.context(),
+                &target,
+            )?
+            .ok_or_else(|| {
+                Status::data_loss("committed multipart part is missing its result")
+            })?;
+            return Ok(Response::new(response));
+        }
+        if transaction_status.state == "committing" {
+            self.mvcc
+                .open_transactions
+                .commit(
+                    self.mvcc.runtime.as_ref(),
+                    transaction_id,
+                    transaction_principal,
+                    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+                )
+                .await
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            transaction_status = self
+                .mvcc
+                .open_transactions
+                .status(
+                    transaction_id,
+                    transaction_principal,
+                    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+                )
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        }
+        if transaction_status.state == "committed" {
+            let (payload_hash, payload_size) =
+                super::native_put_rpc::hash_native_payload(&mut incoming_payload).await?;
+            let target = super::native_put_rpc::native_payload_target(
+                base_target,
+                &payload_hash,
+                payload_size,
+            );
+            let response = native_idempotency::load_generic_response(
+                &self.mvcc,
+                transaction_id,
+                attempt.context(),
+                &target,
+            )?
+            .or(
+                native_idempotency::load_response::<UploadPartResponse>(
+                    &self.mvcc,
+                    attempt.context(),
+                    &target,
+                )
+                .await?,
+            )
+            .ok_or_else(|| {
+                Status::data_loss("committed multipart part is missing its response")
+            })?;
+            return Ok(Response::new(response));
+        }
+        if transaction_status.state != "open" {
+            return Err(Status::aborted(format!(
+                "multipart part transaction is {}",
+                transaction_status.state
+            )));
+        }
         enforce_native_mutation_precondition(
             self,
             &claims,
@@ -1579,19 +1674,23 @@ impl ObjectService for AppState {
         let part_version_id = metadata.part_number.to_string();
         let upload_id = uuid::Uuid::parse_str(&metadata.upload_id)
             .map_err(|_| Status::invalid_argument("Invalid upload_id"))?;
-        let scratch_file = match tokio::fs::File::open(scratch.path()).await {
-            Ok(file) => file,
-            Err(error) => {
-                return Err(Status::internal(error.to_string()));
-            }
-        };
-        let data_stream = tokio_util::io::ReaderStream::new(scratch_file).map(
-            |result: Result<bytes::Bytes, std::io::Error>| {
-                result
-                    .map(|bytes| bytes.to_vec())
-                    .map_err(|error| Status::internal(error.to_string()))
-            },
-        );
+        use sha2::Digest as _;
+        let payload_identity =
+            std::sync::Arc::new(std::sync::Mutex::new((sha2::Sha256::new(), 0_u64)));
+        let payload_identity_for_stream = payload_identity.clone();
+        let data_stream = incoming_payload.map(move |result| {
+            result.and_then(|bytes| {
+                let mut identity = payload_identity_for_stream
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                identity.0.update(&bytes);
+                identity.1 = identity
+                    .1
+                    .checked_add(bytes.len() as u64)
+                    .ok_or_else(|| Status::invalid_argument("payload size overflow"))?;
+                Ok(bytes)
+            })
+        });
 
         let result = self
             .object_manager
@@ -1602,11 +1701,30 @@ impl ObjectService for AppState {
                 upload_id,
                 metadata.part_number,
                 data_stream,
-                transaction_id,
-                transaction_principal.as_deref(),
+                Some(transaction_id),
+                Some(transaction_principal),
             )
             .await;
         let result = result?;
+        let (payload_hash, payload_size) = {
+            let identity = payload_identity
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                format!("sha256:{}", hex::encode(identity.0.clone().finalize())),
+                identity.1,
+            )
+        };
+        if result.payload_hash != payload_hash {
+            return Err(Status::data_loss(
+                "multipart ingest hash differs from streamed request hash",
+            ));
+        }
+        let target = super::native_put_rpc::native_payload_target(
+            base_target,
+            &payload_hash,
+            payload_size,
+        );
         let authz_revision = latest_authz_revision(self, claims.tenant_id).await?;
 
         let response = UploadPartResponse {

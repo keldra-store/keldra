@@ -6,6 +6,12 @@ pub(super) struct NativeMutationAttempt<'a> {
     _target_guard: OwnedMutexGuard<()>,
 }
 
+impl<'a> NativeMutationAttempt<'a> {
+    pub(super) fn context(&self) -> &'a NativeMutationContext {
+        self.context
+    }
+}
+
 pub(super) struct ImplicitNativeTransaction {
     pub transaction_id: String,
     pub principal: String,
@@ -103,6 +109,14 @@ where
             )
             .map_err(|error| Status::failed_precondition(error.to_string()))?;
     }
+    native_idempotency::stage_generic_result(
+        &state.mvcc,
+        &transaction.transaction_id,
+        &transaction.principal,
+        attempt.context,
+        target,
+        response,
+    )?;
     Ok(())
 }
 
@@ -185,20 +199,29 @@ pub(super) async fn begin_native_mutation<'a, T>(
 where
     T: DeserializeOwned,
 {
+    let attempt = lock_native_mutation(state, context, target, claims, action).await?;
+    let context = attempt.context;
+    let replay = native_idempotency::load_response(&state.mvcc, context, target).await?;
+    Ok((attempt, replay))
+}
+
+pub(super) async fn lock_native_mutation<'a>(
+    state: &AppState,
+    context: Option<&'a NativeMutationContext>,
+    target: &NativeIdempotencyTarget,
+    claims: &auth::Claims,
+    action: AnvilAction,
+) -> Result<NativeMutationAttempt<'a>, Status> {
     let context =
         context.ok_or_else(|| Status::invalid_argument("Missing native mutation context"))?;
     validate_native_mutation_target_authorization(state, claims, target, action).await?;
     let idempotency_guard = acquire_native_mutation_lock(state, context).await?;
     let target_guard = acquire_native_target_lock(state, context, target).await?;
-    let replay = native_idempotency::load_response(&state.mvcc, context, target).await?;
-    Ok((
-        NativeMutationAttempt {
-            context,
-            _idempotency_guard: idempotency_guard,
-            _target_guard: target_guard,
-        },
-        replay,
-    ))
+    Ok(NativeMutationAttempt {
+        context,
+        _idempotency_guard: idempotency_guard,
+        _target_guard: target_guard,
+    })
 }
 
 pub(super) async fn validate_native_mutation_target_authorization(
@@ -235,6 +258,16 @@ pub(super) async fn complete_native_mutation<T>(
 where
     T: Serialize,
 {
+    if let Some(transaction_id) = attempt.context.transaction_id.as_deref() {
+        native_idempotency::stage_generic_result(
+            &state.mvcc,
+            transaction_id,
+            &native_idempotency::native_transaction_principal_from_context(attempt.context),
+            attempt.context,
+            target,
+            response,
+        )?;
+    }
     native_idempotency::store_response(&state.mvcc, attempt.context, target, response).await
 }
 

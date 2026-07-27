@@ -56,6 +56,93 @@ struct NativeIdempotencyRecord {
     record_hash: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NativeGenericResult {
+    target: NativeIdempotencyTarget,
+    response_json: JsonValue,
+}
+
+pub(crate) fn stage_generic_result<T: Serialize>(
+    mvcc: &MvccSubsystem,
+    transaction_id: &str,
+    transaction_principal: &str,
+    context: &NativeMutationContext,
+    target: &NativeIdempotencyTarget,
+    response: &T,
+) -> Result<(), Status> {
+    let payload = serde_json::to_vec(&NativeGenericResult {
+        target: target.clone(),
+        response_json: serde_json::to_value(response)
+            .map_err(|error| Status::internal(error.to_string()))?,
+    })
+    .map_err(|error| Status::internal(error.to_string()))?;
+    mvcc.open_transactions
+        .add_idempotency_result(
+            transaction_id,
+            transaction_principal,
+            crate::mvcc_transaction::IdempotencyResult {
+                namespace: generic_namespace(context),
+                key: context.idempotency_key.clone(),
+                payload,
+            },
+            current_unix_ms(),
+        )
+        .map_err(|error| Status::failed_precondition(error.to_string()))
+}
+
+pub(crate) fn load_generic_response<T: DeserializeOwned>(
+    mvcc: &MvccSubsystem,
+    transaction_id: &str,
+    context: &NativeMutationContext,
+    target: &NativeIdempotencyTarget,
+) -> Result<Option<T>, Status> {
+    let Some(record) = mvcc
+        .runtime
+        .local_store()
+        .committed_idempotency_result(
+            transaction_id,
+            &generic_namespace(context),
+            &context.idempotency_key,
+        )
+        .map_err(|error| Status::internal(error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let result: NativeGenericResult = serde_json::from_slice(&record.result.payload)
+        .map_err(|error| Status::data_loss(error.to_string()))?;
+    if &result.target != target {
+        return Err(Status::failed_precondition(
+            "Native idempotency key already used for different input",
+        ));
+    }
+    serde_json::from_value(result.response_json)
+        .map(Some)
+        .map_err(|error| Status::data_loss(error.to_string()))
+}
+
+pub(crate) fn generic_result_exists(
+    mvcc: &MvccSubsystem,
+    transaction_id: &str,
+    context: &NativeMutationContext,
+) -> Result<bool, Status> {
+    mvcc.runtime
+        .local_store()
+        .committed_idempotency_result(
+            transaction_id,
+            &generic_namespace(context),
+            &context.idempotency_key,
+        )
+        .map(|result| result.is_some())
+        .map_err(|error| Status::internal(error.to_string()))
+}
+
+fn generic_namespace(context: &NativeMutationContext) -> String {
+    format!(
+        "native/{}/{}/{}",
+        context.tenant_id, context.bucket_id, context.principal
+    )
+}
+
 #[derive(Clone, PartialEq, Message)]
 struct NativeIdempotencyTargetProto {
     #[prost(string, tag = "1")]
@@ -367,7 +454,9 @@ fn record_tuple_key(context: &NativeMutationContext) -> Result<Vec<u8>, Status> 
     .map_err(|e| Status::internal(e.to_string()))
 }
 
-fn native_transaction_principal_from_context(context: &NativeMutationContext) -> String {
+pub(crate) fn native_transaction_principal_from_context(
+    context: &NativeMutationContext,
+) -> String {
     format!(
         "tenant/{}/principal/{}",
         context.tenant_id, context.principal
