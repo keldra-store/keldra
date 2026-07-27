@@ -1347,6 +1347,10 @@ impl TestCluster {
             ..anvil_core::config::Config::default()
         };
         configure(&mut config);
+        // This in-process fixture binds ephemeral plaintext loopback peers.
+        // Production configurations retain the secure default and bootstrap
+        // still rejects non-TLS peer endpoints unless this test-only flag is set.
+        config.allow_test_only_insecure_mvcc_transport = true;
         let config = Arc::new(config);
 
         let unique_regions: HashSet<String> = regions.iter().map(|s| s.to_string()).collect();
