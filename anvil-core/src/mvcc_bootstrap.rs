@@ -377,6 +377,68 @@ impl Drop for MvccSubsystem {
 
 impl MvccSubsystem {
     #[cfg(feature = "test-cluster-transport-faults")]
+    pub async fn initialize_configured_test_membership(
+        &self,
+        cluster_id: &str,
+        bundle_quorum_holders: usize,
+        tolerated_failure_domains: usize,
+    ) -> Result<()> {
+        validate_cluster_id(cluster_id)?;
+        if self.peers.iter().any(|peer| peer.cluster_id != cluster_id) {
+            bail!("test MVCC membership contains a peer from another cluster");
+        }
+        let members = self
+            .peers
+            .iter()
+            .filter(|peer| peer.voter)
+            .map(|peer| {
+                (
+                    NodeId(peer.raft_node_id),
+                    ConsensusNode {
+                        address: peer.endpoint.clone(),
+                    },
+                )
+            })
+            .collect();
+        self.consensus
+            .initialize(members)
+            .await
+            .context("initialize configured test MVCC membership")?;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !self.consensus.is_leader() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("test MVCC bootstrap node did not become leader")?;
+        let cluster_hash = cluster_id_hash(cluster_id);
+        for peer in self.peers.iter() {
+            self.consensus
+                .install_node(
+                    cluster_hash,
+                    anvil_mvcc_consensus::NodeIncarnation {
+                        node_id: consensus_control_node_id(&peer.node_id),
+                        incarnation: peer.incarnation,
+                    },
+                    NodeId(peer.raft_node_id),
+                    peer.failure_domain.clone(),
+                )
+                .await
+                .context("install configured test MVCC node")?;
+        }
+        self.consensus
+            .set_durability_policy(
+                cluster_hash,
+                1,
+                u16::try_from(bundle_quorum_holders)?,
+                u16::try_from(tolerated_failure_domains)?,
+            )
+            .await
+            .context("install configured test MVCC durability policy")?;
+        Ok(())
+    }
+
+    #[cfg(feature = "test-cluster-transport-faults")]
     pub fn prepared_bundle(
         &self,
         identity: &crate::mvcc_transaction::BundleIdentity,

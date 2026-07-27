@@ -1235,6 +1235,7 @@ pub struct TestCluster {
     cleanup_path: PathBuf,
     pending_listeners: Vec<tokio::net::TcpListener>,
     pending_admin_listeners: Vec<tokio::net::TcpListener>,
+    mvcc_membership_initialized: bool,
     _cluster_permit: Option<OwnedSemaphorePermit>,
 }
 
@@ -1347,6 +1348,36 @@ impl TestCluster {
             ..anvil_core::config::Config::default()
         };
         configure(&mut config);
+        let mvcc_cluster_id = format!("test-{cluster_id}");
+        let node_ids = (0..regions.len())
+            .map(|node_index| format!("test-{cluster_id}-node-{node_index:03}"))
+            .collect::<Vec<_>>();
+        let mvcc_peers_json = serde_json::to_string(
+            &node_ids
+                .iter()
+                .enumerate()
+                .map(|(node_index, node_id)| {
+                    serde_json::json!({
+                        "cluster_id": mvcc_cluster_id,
+                        "raft_node_id": node_index + 1,
+                        "node_id": node_id,
+                        "incarnation": 1,
+                        "endpoint": grpc_addrs[node_index],
+                        "failure_domain": format!("test-cell-{}", node_index + 1),
+                        "voter": true,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        config.mvcc_cluster_id = mvcc_cluster_id;
+        if regions.len() > 1
+            && config.mvcc_bundle_quorum_holders == 1
+            && config.mvcc_tolerated_failure_domains == 0
+        {
+            config.mvcc_bundle_quorum_holders = 2;
+            config.mvcc_tolerated_failure_domains = 1;
+        }
         // This in-process fixture binds ephemeral plaintext loopback peers.
         // Production configurations retain the secure default and bootstrap
         // still rejects non-TLS peer endpoints unless this test-only flag is set.
@@ -1359,7 +1390,11 @@ impl TestCluster {
         let mut states = Vec::new();
         for (node_index, region_name) in regions.iter().enumerate() {
             let mut node_config = config.deref().clone();
-            node_config.node_id = format!("test-{cluster_id}-node-{node_index:03}");
+            node_config.node_id = node_ids[node_index].clone();
+            node_config.mvcc_raft_node_id = node_index as u64 + 1;
+            node_config.mvcc_failure_domain = format!("test-cell-{}", node_index + 1);
+            node_config.mvcc_peers_json = mvcc_peers_json.clone();
+            node_config.mvcc_bootstrap_membership = regions.len() == 1;
             node_config.region = (*region_name).to_string();
             node_config.cell_id = format!("test-cell-{}", node_index + 1);
             node_config.storage_path = cluster_storage_root
@@ -1446,6 +1481,7 @@ impl TestCluster {
             cleanup_path: cluster_storage_root,
             pending_listeners,
             pending_admin_listeners,
+            mvcc_membership_initialized: regions.len() == 1,
             _cluster_permit: cluster_permit,
         }
     }
@@ -1532,6 +1568,18 @@ impl TestCluster {
                     format!("start_and_converge port_ready nodes={node_count}"),
                     start.elapsed(),
                 );
+                if !self.mvcc_membership_initialized {
+                    self.states[0]
+                        .mvcc
+                        .initialize_configured_test_membership(
+                            &self.config.mvcc_cluster_id,
+                            self.config.mvcc_bundle_quorum_holders,
+                            self.config.mvcc_tolerated_failure_domains,
+                        )
+                        .await
+                        .expect("initialize multi-node test MVCC membership");
+                    self.mvcc_membership_initialized = true;
+                }
                 let http_ready_start = Instant::now();
                 let ready_addrs = self
                     .grpc_addrs
