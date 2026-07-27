@@ -1448,10 +1448,7 @@ mod tests {
     fn production_timing_allows_networked_linearized_read_confirmation() {
         let config = production_raft_config("cluster-a".into());
 
-        assert_eq!(
-            config.heartbeat_interval,
-            ANVIL_RAFT_HEARTBEAT_INTERVAL_MS
-        );
+        assert_eq!(config.heartbeat_interval, ANVIL_RAFT_HEARTBEAT_INTERVAL_MS);
         assert_eq!(
             config.election_timeout_min,
             ANVIL_RAFT_ELECTION_TIMEOUT_MIN_MS
