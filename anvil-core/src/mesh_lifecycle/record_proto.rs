@@ -251,6 +251,7 @@ pub(super) enum LifecycleControlDescriptor {
     Region(RegionDescriptor),
     Cell(CellDescriptor),
     Node(NodeDescriptor),
+    BucketDrainException(BucketDrainExceptionDescriptor),
 }
 
 pub(super) fn encode_lifecycle_state(state: &MeshLifecycleState) -> LifecycleResult<Vec<u8>> {
@@ -633,6 +634,11 @@ pub(super) fn decode_lifecycle_control_payload(
         NODE_DESCRIPTOR_STREAM_FAMILY => Ok(LifecycleControlDescriptor::Node(node_from_proto(
             decode_deterministic(payload_proto, "node control payload")?,
         )?)),
+        BUCKET_DRAIN_EXCEPTION_STREAM_FAMILY => Ok(
+            LifecycleControlDescriptor::BucketDrainException(bucket_drain_exception_from_proto(
+                decode_deterministic(payload_proto, "bucket drain exception control payload")?,
+            )?),
+        ),
         _ => Err(LifecycleError::InvalidArgument(format!(
             "unknown lifecycle control stream family {stream_family}"
         ))),
@@ -660,6 +666,15 @@ pub(crate) fn control_payload_operator_json(
             ensure_control_record_key(expected_record_key, &key)?;
             Ok(serde_json::to_vec(&descriptor)?)
         }
+        LifecycleControlDescriptor::BucketDrainException(descriptor) => {
+            let key = bucket_drain_exception_key(
+                &descriptor.region,
+                &descriptor.tenant_id,
+                &descriptor.bucket_name,
+            );
+            ensure_control_record_key(expected_record_key, &key)?;
+            Ok(serde_json::to_vec(&descriptor)?)
+        }
     }
 }
 
@@ -681,6 +696,15 @@ impl LifecycleControlPayload for NodeDescriptor {
     fn encode_lifecycle_control_payload(&self, stream_family: &str) -> LifecycleResult<Vec<u8>> {
         ensure_stream_family(stream_family, NODE_DESCRIPTOR_STREAM_FAMILY)?;
         Ok(encode_deterministic_proto(&node_to_proto(self)))
+    }
+}
+
+impl LifecycleControlPayload for BucketDrainExceptionDescriptor {
+    fn encode_lifecycle_control_payload(&self, stream_family: &str) -> LifecycleResult<Vec<u8>> {
+        ensure_stream_family(stream_family, BUCKET_DRAIN_EXCEPTION_STREAM_FAMILY)?;
+        Ok(encode_deterministic_proto(
+            &bucket_drain_exception_to_proto(self),
+        ))
     }
 }
 

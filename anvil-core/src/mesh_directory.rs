@@ -907,6 +907,101 @@ pub async fn read_host_alias_descriptor(
     read_typed_routing_descriptor(storage, RoutingRecordFamily::HostAlias, &hostname).await
 }
 
+pub(crate) fn read_host_alias_descriptor_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    hostname: &str,
+) -> MeshDirectoryResult<Option<routing::HostAliasDescriptor>> {
+    let hostname = routing::normalize_alias_hostname(hostname).map_err(|_| {
+        MeshDirectoryError::InvalidIdentifier {
+            field: "hostname",
+            value: hostname.to_string(),
+        }
+    })?;
+    let descriptor_key = host_alias_descriptor_key(&hostname)?;
+    let Some(payload_proto) = read_descriptor_projection_payload_proto_mvcc(mvcc, &descriptor_key)?
+    else {
+        return Ok(None);
+    };
+    let descriptor: routing::HostAliasDescriptor =
+        record_proto::decode_typed_routing_descriptor(&payload_proto)?;
+    if descriptor.routing_record_key() != hostname {
+        return Err(MeshDirectoryError::InvalidIdentifier {
+            field: "host alias record key",
+            value: format!(
+                "expected {hostname}, got {}",
+                descriptor.routing_record_key()
+            ),
+        });
+    }
+    Ok(Some(descriptor))
+}
+
+pub(crate) fn list_host_alias_descriptors_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+) -> MeshDirectoryResult<Vec<routing::HostAliasDescriptor>> {
+    let tuple_prefix = routing_projection_row_prefix(RoutingRecordFamily::HostAlias)?;
+    let application_prefix =
+        crate::mvcc_product::coremeta_application_prefix(CF_MESH, &tuple_prefix)?;
+    let snapshot = mvcc.runtime.applied_version()?;
+    let mut aliases = Vec::new();
+    for (_, row) in mvcc.runtime.scan_table_prefix_at(
+        TABLE_MESH_PARTITION_ROW,
+        &application_prefix,
+        snapshot,
+    )? {
+        let projection = record_proto::decode_routing_projection_row(&row.value)?;
+        if projection.descriptor.family != RoutingRecordFamily::HostAlias {
+            return Err(MeshDirectoryError::InvalidIdentifier {
+                field: "host alias projection family",
+                value: format!("{:?}", projection.descriptor.family),
+            });
+        }
+        let descriptor: routing::HostAliasDescriptor =
+            record_proto::decode_typed_routing_descriptor(&projection.payload_proto)?;
+        if descriptor.routing_record_key() != projection.descriptor.record_key {
+            return Err(MeshDirectoryError::InvalidIdentifier {
+                field: "host alias projection record key",
+                value: format!(
+                    "expected {}, got {}",
+                    projection.descriptor.record_key,
+                    descriptor.routing_record_key()
+                ),
+            });
+        }
+        aliases.push(descriptor);
+    }
+    Ok(aliases)
+}
+
+pub(crate) fn list_bucket_locators_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+) -> MeshDirectoryResult<Vec<BucketLocatorDescriptor>> {
+    let tuple_prefix = routing_projection_row_prefix(RoutingRecordFamily::BucketLocator)?;
+    let application_prefix =
+        crate::mvcc_product::coremeta_application_prefix(CF_MESH, &tuple_prefix)?;
+    let snapshot = mvcc.runtime.applied_version()?;
+    let mut locators = Vec::new();
+    for (_, row) in mvcc.runtime.scan_table_prefix_at(
+        TABLE_MESH_PARTITION_ROW,
+        &application_prefix,
+        snapshot,
+    )? {
+        let projection = record_proto::decode_routing_projection_row(&row.value)?;
+        let descriptor: BucketLocatorDescriptor =
+            record_proto::decode_typed_routing_descriptor(&projection.payload_proto)?;
+        if projection.descriptor.family != RoutingRecordFamily::BucketLocator
+            || descriptor.routing_record_key() != projection.descriptor.record_key
+        {
+            return Err(MeshDirectoryError::InvalidIdentifier {
+                field: "bucket locator projection record key",
+                value: projection.descriptor.record_key,
+            });
+        }
+        locators.push(descriptor);
+    }
+    Ok(locators)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct BucketLocatorDirectory {
     locators: BTreeMap<BucketLocatorKey, BucketLocatorDescriptor>,

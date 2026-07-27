@@ -50,6 +50,7 @@ pub const BUCKET_DRAIN_EXCEPTION_SCHEMA: &str = "anvil.mesh.bucket_drain_excepti
 pub const REGION_DESCRIPTOR_STREAM_FAMILY: &str = "region_descriptor";
 pub const CELL_DESCRIPTOR_STREAM_FAMILY: &str = "cell_descriptor";
 pub const NODE_DESCRIPTOR_STREAM_FAMILY: &str = "node_descriptor";
+pub const BUCKET_DRAIN_EXCEPTION_STREAM_FAMILY: &str = "bucket_drain_exception";
 const CONTROL_MUTATION_SCHEMA: &str = "anvil.mesh.control_mutation.v1";
 const MESH_LIFECYCLE_PROJECTION_PARTITION_ID: &str = "mesh-lifecycle-projection";
 pub(crate) const LIFECYCLE_TOPOLOGY_ROOT_ANCHOR_KEY: &str = "mesh/lifecycle/topology";
@@ -953,6 +954,19 @@ fn apply_lifecycle_control_frame(
             }
             state.nodes.insert(descriptor.node_id.clone(), descriptor);
         }
+        record_proto::LifecycleControlDescriptor::BucketDrainException(descriptor) => {
+            let key = bucket_drain_exception_key(
+                &descriptor.region,
+                &descriptor.tenant_id,
+                &descriptor.bucket_name,
+            );
+            if key != record_key {
+                return Err(LifecycleError::InvalidArgument(format!(
+                    "bucket drain exception key mismatch: expected {record_key}, got {key}"
+                )));
+            }
+            state.bucket_drain_exceptions.insert(key, descriptor);
+        }
     }
     Ok(())
 }
@@ -972,6 +986,9 @@ fn remove_lifecycle_projection(
         NODE_DESCRIPTOR_STREAM_FAMILY => {
             let (_, _, node_id) = parse_node_record_key(record_key)?;
             state.nodes.remove(node_id);
+        }
+        BUCKET_DRAIN_EXCEPTION_STREAM_FAMILY => {
+            state.bucket_drain_exceptions.remove(record_key);
         }
         _ => {
             return Err(LifecycleError::InvalidArgument(format!(
@@ -1020,6 +1037,75 @@ pub async fn upsert_bucket_drain_exception(
         .bucket_drain_exceptions
         .insert(key, descriptor.clone());
     write_state(storage, &state).await?;
+    Ok(descriptor)
+}
+
+pub async fn upsert_bucket_drain_exception_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    input: BucketDrainExceptionInput,
+    permit: &PartitionWritePermit,
+    signing_key: &[u8],
+) -> LifecycleResult<BucketDrainExceptionDescriptor> {
+    require_identifier(&input.tenant_id, "bucket drain exception tenant id")?;
+    require_identifier(&input.bucket_name, "bucket drain exception bucket name")?;
+    require_identifier(&input.region, "bucket drain exception region")?;
+    require_nonempty(&input.reason, "bucket drain exception reason")?;
+    if !input.disposition.allows_drained_exception() {
+        return Err(LifecycleError::InvalidArgument(format!(
+            "bucket drain exception disposition must be remain_proxy_only or read_only_until_removed, got {}",
+            input.disposition.as_str()
+        )));
+    }
+    if let Some(expires_at) = &input.expires_at {
+        require_nonempty(expires_at, "bucket drain exception expires_at")?;
+    }
+
+    let record_key =
+        bucket_drain_exception_key(&input.region, &input.tenant_id, &input.bucket_name);
+    let partition = lifecycle_control_partition(BUCKET_DRAIN_EXCEPTION_STREAM_FAMILY, &record_key);
+    let expected_partition_id =
+        mesh_directory::control_partition_id(BUCKET_DRAIN_EXCEPTION_STREAM_FAMILY, &partition);
+    if permit.partition_family != mesh_directory::CONTROL_PARTITION_FAMILY
+        || permit.partition_id != expected_partition_id
+    {
+        return Err(LifecycleError::InvalidArgument(
+            "invalid bucket drain exception control write permit".to_string(),
+        ));
+    }
+    let state = read_lifecycle_state_projection_mvcc(mvcc)?;
+    let generation = state
+        .bucket_drain_exceptions
+        .get(&record_key)
+        .map_or(1, |existing| existing.generation.saturating_add(1));
+    let descriptor = BucketDrainExceptionDescriptor {
+        schema: BUCKET_DRAIN_EXCEPTION_SCHEMA.to_string(),
+        tenant_id: input.tenant_id,
+        bucket_name: input.bucket_name,
+        region: input.region,
+        disposition: input.disposition,
+        reason: input.reason,
+        expires_at: input.expires_at,
+        generation,
+    };
+    let row = record_proto::encode_bucket_drain_exception_projection_row(&descriptor)?;
+    let mesh_id = topology_activation::canonical_mesh_id(&state)?;
+    let control = topology_mutation::fenced_control_mutation(
+        BUCKET_DRAIN_EXCEPTION_STREAM_FAMILY,
+        record_key,
+        "upsert",
+        generation
+            .checked_sub(1)
+            .filter(|generation| *generation > 0),
+        generation,
+        &mesh_id,
+        &descriptor,
+        LifecycleControlWriteAuthority {
+            permit,
+            signing_key,
+            mvcc,
+        },
+    )?;
+    topology_mutation::commit_auxiliary_control_mutation(row, control).await?;
     Ok(descriptor)
 }
 

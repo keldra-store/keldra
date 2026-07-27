@@ -142,7 +142,13 @@ async fn transition_region_inner(
             }
         })?;
     }
-    ensure_region_drain_completion_is_supported(storage, region, target).await?;
+    ensure_region_drain_completion_is_supported(
+        storage,
+        authority.as_ref().map(|authority| authority.mvcc),
+        region,
+        target,
+    )
+    .await?;
     let descriptor = state
         .regions
         .get_mut(region)

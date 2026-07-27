@@ -485,8 +485,23 @@ impl Persistence {
                 crate::mesh_lifecycle::BucketDrainDisposition::RemainProxyOnly
                 | crate::mesh_lifecycle::BucketDrainDisposition::ReadOnlyUntilRemoved => {
                     status_after = mesh_directory::BucketLocatorStatus::ReadOnly;
-                    crate::mesh_lifecycle::upsert_bucket_drain_exception(
-                        &self.storage,
+                    let exception_record_key = crate::mesh_lifecycle::bucket_drain_exception_key(
+                        region,
+                        &tenant_id,
+                        &bucket_name,
+                    );
+                    let exception_partition = crate::mesh_lifecycle::lifecycle_control_partition(
+                        crate::mesh_lifecycle::BUCKET_DRAIN_EXCEPTION_STREAM_FAMILY,
+                        &exception_record_key,
+                    );
+                    let exception_permit = self
+                        .mesh_control_write_permit_for_stream(
+                            crate::mesh_lifecycle::BUCKET_DRAIN_EXCEPTION_STREAM_FAMILY,
+                            &exception_partition,
+                        )
+                        .await?;
+                    crate::mesh_lifecycle::upsert_bucket_drain_exception_mvcc(
+                        self.mvcc()?,
                         crate::mesh_lifecycle::BucketDrainExceptionInput {
                             tenant_id: tenant_id.clone(),
                             bucket_name: bucket_name.clone(),
@@ -495,6 +510,8 @@ impl Persistence {
                             reason: reason.clone(),
                             expires_at: expires_at.clone(),
                         },
+                        &exception_permit,
+                        &self.partition_owner_signing_key,
                     )
                     .await?;
                     exception_written = true;

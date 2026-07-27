@@ -4,7 +4,7 @@ use super::*;
 const MAX_DRAIN_BLOCKER_DETAILS: usize = 128;
 const ROUTING_PAGE_SIZE: usize = 256;
 
-pub(super) fn lifecycle_state_for_host_alias(state: HostAliasState) -> LifecycleState {
+pub(crate) fn lifecycle_state_for_host_alias(state: HostAliasState) -> LifecycleState {
     match state {
         HostAliasState::PendingVerification => LifecycleState::Joining,
         HostAliasState::Active => LifecycleState::Active,
@@ -208,12 +208,13 @@ pub(super) fn ensure_node_accepts_new_writes_in_state(
 
 pub(super) async fn ensure_region_drain_completion_is_supported(
     storage: &Storage,
+    mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
     region: &str,
     target: LifecycleState,
 ) -> LifecycleResult<()> {
     match target {
         LifecycleState::Drained => {
-            let blockers = bucket_locators_blocking_region_drain(storage, region).await?;
+            let blockers = bucket_locators_blocking_region_drain(storage, mvcc, region).await?;
             if blockers.is_empty() {
                 Ok(())
             } else {
@@ -225,7 +226,8 @@ pub(super) async fn ensure_region_drain_completion_is_supported(
             }
         }
         LifecycleState::DrainedWithExceptions => {
-            let blockers = bucket_locators_without_valid_drain_exception(storage, region).await?;
+            let blockers =
+                bucket_locators_without_valid_drain_exception(storage, mvcc, region).await?;
             if blockers.is_empty() {
                 Ok(())
             } else {
@@ -242,8 +244,28 @@ pub(super) async fn ensure_region_drain_completion_is_supported(
 
 pub(super) async fn bucket_locators_blocking_region_drain(
     storage: &Storage,
+    mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
     region: &str,
 ) -> LifecycleResult<Vec<String>> {
+    if let Some(mvcc) = mvcc {
+        return Ok(mesh_directory::list_bucket_locators_mvcc(mvcc)
+            .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?
+            .into_iter()
+            .filter(|locator| {
+                locator.home_region.as_str() == region
+                    && bucket_locator_blocks_region_drain(locator.status)
+            })
+            .take(MAX_DRAIN_BLOCKER_DETAILS)
+            .map(|locator| {
+                format!(
+                    "{}/{}:{:?}",
+                    locator.tenant_id.as_str(),
+                    locator.bucket_name.as_str(),
+                    locator.status
+                )
+            })
+            .collect());
+    }
     let mut blockers = Vec::new();
     let mut cursor = None;
     loop {
@@ -347,10 +369,26 @@ pub(super) fn bucket_locator_blocks_region_drain(status: BucketLocatorStatus) ->
 
 pub(super) async fn bucket_locators_without_valid_drain_exception(
     storage: &Storage,
+    mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
     region: &str,
 ) -> LifecycleResult<Vec<String>> {
-    let state = read_state(storage).await?;
+    let state = match mvcc {
+        Some(mvcc) => read_lifecycle_state_projection_mvcc(mvcc)?,
+        None => read_state(storage).await?,
+    };
     let mut blockers = Vec::new();
+    if let Some(mvcc) = mvcc {
+        for locator in mesh_directory::list_bucket_locators_mvcc(mvcc)
+            .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?
+        {
+            if let Some(blocker) = bucket_locator_drain_exception_blocker(&state, region, &locator)
+                && push_drain_blocker(&mut blockers, blocker)
+            {
+                break;
+            }
+        }
+        return Ok(blockers);
+    }
     let mut cursor = None;
     loop {
         let page = page_bucket_locators_for_drain(storage, cursor.as_deref()).await?;
@@ -384,11 +422,12 @@ pub fn lifecycle_control_partition(stream_family: &str, record_key: &str) -> Str
     format!("{:02x}{:02x}", bytes[0], bytes[1])
 }
 
-pub fn lifecycle_control_stream_families() -> [&'static str; 3] {
+pub fn lifecycle_control_stream_families() -> [&'static str; 4] {
     [
         REGION_DESCRIPTOR_STREAM_FAMILY,
         CELL_DESCRIPTOR_STREAM_FAMILY,
         NODE_DESCRIPTOR_STREAM_FAMILY,
+        BUCKET_DRAIN_EXCEPTION_STREAM_FAMILY,
     ]
 }
 
@@ -432,7 +471,7 @@ pub(super) fn require_control_record_key(value: &str) -> LifecycleResult<()> {
     Ok(())
 }
 
-pub(super) fn ensure_generation(
+pub(crate) fn ensure_generation(
     resource_kind: &'static str,
     resource_id: &str,
     current: u64,
@@ -644,7 +683,7 @@ pub(super) fn cell_key(region: &str, cell_id: &str) -> LifecycleResult<String> {
     Ok(format!("{region}/{cell_id}"))
 }
 
-pub(super) fn require_identifier(value: &str, field: &str) -> LifecycleResult<()> {
+pub(crate) fn require_identifier(value: &str, field: &str) -> LifecycleResult<()> {
     require_nonempty(value, field)?;
     if value
         .chars()
@@ -689,6 +728,6 @@ pub(crate) fn capacity_json_hash(input: &str) -> LifecycleResult<String> {
     Ok(blake3::hash(&canonical).to_hex().to_string())
 }
 
-pub(super) fn timestamp_now() -> String {
+pub(crate) fn timestamp_now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }

@@ -180,6 +180,168 @@ pub(super) async fn commit_topology_mutation(
     Ok(())
 }
 
+pub(super) async fn commit_auxiliary_control_mutation(
+    row: record_proto::EncodedLifecycleProjectionRow,
+    control: LifecycleControlMutation<'_>,
+) -> LifecycleResult<()> {
+    if row.kind != record_proto::LIFECYCLE_PROJECTION_BUCKET_DRAIN_EXCEPTION_KIND {
+        return Err(LifecycleError::InvalidArgument(format!(
+            "{} is not an auxiliary lifecycle descriptor projection",
+            row.kind
+        )));
+    }
+    let LifecycleControlWriter::Fenced(authority) = &control.writer;
+    let authority = *authority;
+    validate_control_authority(&control, authority)?;
+    let mvcc = authority.mvcc;
+    let fence = partition_fence::partition_write_predicate_mvcc(
+        mvcc,
+        authority.permit,
+        authority.signing_key,
+    )
+    .map_err(|rejection| {
+        LifecycleError::InvalidArgument(format!(
+            "lifecycle control write fence rejected for {}/{}: {}: {}",
+            control.stream_family,
+            control.partition,
+            rejection.code.as_str(),
+            rejection.reason
+        ))
+    })?;
+
+    let table_id = lifecycle_projection_table_id(row.kind)?;
+    let projection_tuple_key = lifecycle_projection_row_key(row.kind, &row.record_key)?;
+    let projection_key =
+        crate::mvcc_product::coremeta_logical_key(CF_MESH, table_id, &projection_tuple_key)
+            .map_err(|error| LifecycleError::InvalidArgument(error.to_string()))?;
+    let current_projection = mvcc
+        .read_latest_value(&projection_key)
+        .map_err(|error| LifecycleError::InvalidArgument(error.to_string()))?;
+    let head_tuple_key = lifecycle_control_head_row_key(control.stream_family, &control.partition)?;
+    let head_key = crate::mvcc_product::coremeta_logical_key(
+        CF_MESH,
+        TABLE_MESH_PARTITION_ROW,
+        &head_tuple_key,
+    )
+    .map_err(|error| LifecycleError::InvalidArgument(error.to_string()))?;
+    let current_head = mvcc
+        .read_latest_value(&head_key)
+        .map_err(|error| LifecycleError::InvalidArgument(error.to_string()))?;
+    let head = current_head
+        .as_deref()
+        .map(serde_json::from_slice::<LifecycleControlHead>)
+        .transpose()
+        .map_err(|error| LifecycleError::InvalidArgument(error.to_string()))?
+        .unwrap_or(LifecycleControlHead {
+            next_sequence: 1,
+            next_byte_offset: 0,
+        });
+    let cursor = ControlStreamAppendCursor {
+        sequence: ControlStreamSequence::new(head.next_sequence)
+            .map_err(|error| LifecycleError::InvalidArgument(error.to_string()))?,
+        byte_offset: head.next_byte_offset,
+    };
+    let identity = topology_mutation_identity(&row, Some(&control));
+    let created_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let digest = ControlRecordDigest::blake3(&control.payload_proto);
+    let frame = ControlStreamFrame::new(
+        crate::mesh_control_stream::encode_control_mutation_header(ControlMutationHeaderInput {
+            schema: CONTROL_MUTATION_SCHEMA,
+            mesh_id: control.mesh_id,
+            stream_family: control.stream_family,
+            partition: &control.partition,
+            sequence: cursor.sequence,
+            record_key: &control.record_key,
+            operation: control.operation,
+            expected_generation: control.expected_generation,
+            new_generation: control.new_generation,
+            writer_node_id: authority.permit.owner_node_id.as_str(),
+            writer_fence: authority.permit.fence_token,
+            idempotency_key: Some(&identity),
+            record_digest: &digest,
+            created_at: &created_at,
+            byte_offset: cursor.byte_offset,
+        }),
+        control.payload_proto,
+    );
+    let encoded_len = u64::try_from(
+        frame
+            .encoded_len()
+            .map_err(|error| LifecycleError::InvalidArgument(error.to_string()))?,
+    )
+    .map_err(|_| LifecycleError::InvalidArgument("control frame is too large".into()))?;
+    let next_sequence = cursor.sequence.get().checked_add(1).ok_or_else(|| {
+        LifecycleError::InvalidArgument("control stream sequence overflow".into())
+    })?;
+    let next_byte_offset = cursor
+        .byte_offset
+        .checked_add(encoded_len)
+        .ok_or_else(|| LifecycleError::InvalidArgument("control stream offset overflow".into()))?;
+    let prepared = crate::mesh_control_stream::prepare_control_stream_append_at_cursor(
+        control.stream_family,
+        &control.partition,
+        &frame,
+        None,
+        LIFECYCLE_TOPOLOGY_ROOT_ANCHOR_KEY,
+        cursor,
+        None,
+    )
+    .await
+    .map_err(|error| LifecycleError::InvalidArgument(error.to_string()))?;
+    let mut operations = prepared.operations;
+    operations.push(CoreMutationOperation::CoreMetaPut {
+        partition_id: LIFECYCLE_TOPOLOGY_ROOT_ANCHOR_KEY.to_string(),
+        cf: CF_MESH.to_string(),
+        table_id,
+        tuple_key: projection_tuple_key,
+        payload: row.payload,
+    });
+    operations.push(CoreMutationOperation::CoreMetaPut {
+        partition_id: LIFECYCLE_TOPOLOGY_ROOT_ANCHOR_KEY.to_string(),
+        cf: CF_MESH.to_string(),
+        table_id: TABLE_MESH_PARTITION_ROW,
+        tuple_key: head_tuple_key,
+        payload: serde_json::to_vec(&LifecycleControlHead {
+            next_sequence,
+            next_byte_offset,
+        })
+        .map_err(|error| LifecycleError::InvalidArgument(error.to_string()))?,
+    });
+    let mut plan = crate::mvcc_product::product_mutations_and_outbox_from_operations(operations)
+        .map_err(|error| LifecycleError::InvalidArgument(error.to_string()))?;
+    plan.predicates.push((
+        projection_key,
+        current_projection
+            .as_ref()
+            .map(|value| {
+                crate::mvcc_transaction::PredicateKind::ValueHash(*blake3::hash(value).as_bytes())
+            })
+            .unwrap_or(crate::mvcc_transaction::PredicateKind::Absent),
+    ));
+    plan.predicates.push((
+        head_key,
+        current_head
+            .as_ref()
+            .map(|value| {
+                crate::mvcc_transaction::PredicateKind::ValueHash(*blake3::hash(value).as_bytes())
+            })
+            .unwrap_or(crate::mvcc_transaction::PredicateKind::Absent),
+    ));
+    plan.predicates.push(fence);
+    mvcc.autocommit_product_mutations_with_predicates_and_outbox(
+        &format!("partition-owner:{}", authority.permit.owner_node_id),
+        &identity,
+        plan.mutations,
+        plan.predicates,
+        plan.outbox_events,
+        crate::mvcc_transaction::DurabilityLevel::Quorum,
+        u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default(),
+    )
+    .await
+    .map_err(|error| LifecycleError::InvalidArgument(error.to_string()))?;
+    Ok(())
+}
+
 async fn prepare_topology_mutation(
     storage: &Storage,
     store: &CoreStore,

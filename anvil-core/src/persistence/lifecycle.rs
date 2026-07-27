@@ -586,9 +586,7 @@ impl Persistence {
                     ),
                     resource: record.resource,
                     admin: admin.clone(),
-                    reason: format!(
-                        "node {node_id} transitioned to non-owning lifecycle state"
-                    ),
+                    reason: format!("node {node_id} transitioned to non-owning lifecycle state"),
                     now_nanos,
                 };
                 let idempotency_key = request.idempotency_key.clone();
@@ -689,8 +687,50 @@ impl Persistence {
         routing_config: &crate::routing::RoutingConfig,
         input: crate::mesh_lifecycle::CreateHostAliasDescriptor,
     ) -> crate::mesh_lifecycle::LifecycleResult<crate::routing::HostAliasDescriptor> {
-        let descriptor =
-            crate::mesh_lifecycle::create_host_alias(&self.storage, routing_config, input).await?;
+        crate::mesh_lifecycle::require_identifier(&input.tenant_id, "tenant id")?;
+        crate::mesh_lifecycle::require_identifier(&input.bucket_name, "bucket name")?;
+        crate::mesh_lifecycle::require_identifier(&input.region, "region")?;
+        let hostname =
+            crate::routing::normalize_alias_hostname(&input.hostname).map_err(|error| {
+                crate::mesh_lifecycle::LifecycleError::InvalidArgument(error.to_string())
+            })?;
+        let state =
+            crate::mesh_lifecycle::read_lifecycle_state_projection_mvcc(self.lifecycle_mvcc()?)?;
+        match state.regions.get(&input.region) {
+            Some(region) if region.state == crate::mesh_lifecycle::LifecycleState::Active => {}
+            Some(_) => {
+                return Err(crate::mesh_lifecycle::LifecycleError::InvalidArgument(
+                    "host alias region must be active".to_string(),
+                ));
+            }
+            None => {
+                return Err(crate::mesh_lifecycle::LifecycleError::NotFound {
+                    resource_kind: "region",
+                    resource_id: input.region,
+                });
+            }
+        }
+        if mesh_directory::read_host_alias_descriptor_mvcc(self.lifecycle_mvcc()?, &hostname)
+            .map_err(mesh_directory_lifecycle_error)?
+            .is_some()
+        {
+            return Err(crate::mesh_lifecycle::LifecycleError::AlreadyExists {
+                resource_kind: "host alias",
+                resource_id: hostname,
+            });
+        }
+        let mut descriptor = crate::routing::HostAliasDescriptor::active(
+            hostname,
+            input.tenant_id,
+            input.bucket_name,
+            input.region,
+            input.prefix,
+            routing_config,
+        )
+        .map_err(|error| {
+            crate::mesh_lifecycle::LifecycleError::InvalidArgument(error.to_string())
+        })?;
+        descriptor.state = crate::routing::HostAliasState::PendingVerification;
         let partition = mesh_directory::host_alias_partition(&descriptor.hostname)
             .map_err(mesh_directory_lifecycle_error)?;
         let permit = self
@@ -732,13 +772,33 @@ impl Persistence {
         expected_generation: u64,
         target: crate::routing::HostAliasState,
     ) -> crate::mesh_lifecycle::LifecycleResult<crate::routing::HostAliasDescriptor> {
-        let descriptor = crate::mesh_lifecycle::transition_host_alias(
-            &self.storage,
-            hostname,
+        let hostname = crate::routing::normalize_alias_hostname(hostname).map_err(|error| {
+            crate::mesh_lifecycle::LifecycleError::InvalidArgument(error.to_string())
+        })?;
+        let mut descriptor =
+            mesh_directory::read_host_alias_descriptor_mvcc(self.lifecycle_mvcc()?, &hostname)
+                .map_err(mesh_directory_lifecycle_error)?
+                .ok_or_else(|| crate::mesh_lifecycle::LifecycleError::NotFound {
+                    resource_kind: "host alias",
+                    resource_id: hostname.clone(),
+                })?;
+        crate::mesh_lifecycle::ensure_generation(
+            "host alias",
+            &hostname,
+            descriptor.generation,
             expected_generation,
-            target,
-        )
-        .await?;
+        )?;
+        crate::mesh_lifecycle::validate_host_alias_transition(descriptor.state, target).map_err(
+            |_| crate::mesh_lifecycle::LifecycleError::LifecycleTransitionDenied {
+                resource_kind: "host alias",
+                resource_id: hostname.clone(),
+                from: crate::mesh_lifecycle::lifecycle_state_for_host_alias(descriptor.state),
+                to: crate::mesh_lifecycle::lifecycle_state_for_host_alias(target),
+            },
+        )?;
+        descriptor.state = target;
+        descriptor.updated_at = crate::mesh_lifecycle::timestamp_now();
+        descriptor.generation = descriptor.generation.saturating_add(1);
         let partition = mesh_directory::host_alias_partition(&descriptor.hostname)
             .map_err(mesh_directory_lifecycle_error)?;
         let permit = self
@@ -779,8 +839,7 @@ impl Persistence {
         &self,
         hostname: &str,
     ) -> crate::mesh_lifecycle::LifecycleResult<Option<crate::routing::HostAliasDescriptor>> {
-        mesh_directory::read_host_alias_descriptor(&self.storage, hostname)
-            .await
+        mesh_directory::read_host_alias_descriptor_mvcc(self.lifecycle_mvcc()?, hostname)
             .map_err(mesh_directory_lifecycle_error)
     }
 
@@ -788,6 +847,17 @@ impl Persistence {
         &self,
         region_filter: Option<&str>,
     ) -> crate::mesh_lifecycle::LifecycleResult<Vec<crate::routing::HostAliasDescriptor>> {
-        crate::mesh_lifecycle::list_host_aliases(&self.storage, region_filter).await
+        if let Some(region) = region_filter.filter(|region| !region.is_empty()) {
+            crate::mesh_lifecycle::require_identifier(region, "region")?;
+        }
+        Ok(
+            mesh_directory::list_host_alias_descriptors_mvcc(self.lifecycle_mvcc()?)
+                .map_err(mesh_directory_lifecycle_error)?
+                .into_iter()
+                .filter(|alias| {
+                    region_filter.is_none_or(|region| region.is_empty() || alias.region == region)
+                })
+                .collect(),
+        )
     }
 }
