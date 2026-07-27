@@ -15,17 +15,23 @@ use std::{
 use anvil::anvil_api::{
     AdminRequestContext, BeginTransactionRequest, BeginTransactionResponse,
     BootstrapMeshTopologyRequest, CommitTransactionRequest, CreateBucketRequest,
+    CheckPermissionRequest, CreateIndexRequest, IndexDefinitionRecord, IndexKind,
+    ListIndexesRequest, QueryIndexRequest, QueryIndexResponse, ReadAuthzTuplesRequest,
+    WriteOptions,
     GetLocalNodeDescriptorRequest, GetObjectRequest, GetTransactionRequest, HeadObjectRequest,
     MutationBatchOperation, ReadConsistency,
     MutationBatchPutObject, MutationBatchRequest, MutationBatchResponse, MvccDurability, MvccReadConsistency,
     NativeMutationContext, PutCellRequest, PutNodeRequest, PutRegionRequest,
     ReplaceClusterNodeIncarnationRequest, TransactionStatus, WriteResponse,
     admin_service_client::AdminServiceClient,
+    auth_service_client::AuthServiceClient,
     bucket_service_client::BucketServiceClient,
+    index_service_client::IndexServiceClient,
     mesh_control_service_client::MeshControlServiceClient,
     mutation_batch_operation,
     object_service_client::ObjectServiceClient,
     transaction_service_client::TransactionServiceClient,
+    write_options,
 };
 use anvil_core::{auth::JwtManager, system_realm::SYSTEM_STORAGE_TENANT_ID};
 use anyhow::{Context, bail};
@@ -272,6 +278,155 @@ impl ProcessMvccCluster {
             .bucket_id)
     }
 
+    pub async fn stage_path_index(
+        &self,
+        node: usize,
+        bucket_name: &str,
+        index_name: &str,
+        transaction_id: &str,
+    ) -> anyhow::Result<IndexDefinitionRecord> {
+        let mut client = IndexServiceClient::connect(self.public_endpoint(node)).await?;
+        Ok(client
+            .create_index(authorized(
+                CreateIndexRequest {
+                    bucket_name: bucket_name.to_string(),
+                    name: index_name.to_string(),
+                    kind: IndexKind::Path as i32,
+                    selector_json: serde_json::json!({"prefix": ""}).to_string(),
+                    extractor_json: "{}".to_string(),
+                    authorization_mode: "inherit_object".to_string(),
+                    build_policy_json: "{}".to_string(),
+                    options: Some(WriteOptions {
+                        idempotency_key: uuid::Uuid::new_v4().to_string(),
+                        consistency: 0,
+                        wait_for_finalization: false,
+                        preconditions: Vec::new(),
+                        boundary_values: Vec::new(),
+                        execution: Some(write_options::Execution::TransactionId(
+                            transaction_id.to_string(),
+                        )),
+                    }),
+                },
+                &self.admin_token,
+            ))
+            .await?
+            .into_inner()
+            .index
+            .context("create index response omitted index")?)
+    }
+
+    pub async fn list_indexes(
+        &self,
+        node: usize,
+        bucket_name: &str,
+    ) -> anyhow::Result<Vec<IndexDefinitionRecord>> {
+        let mut client = IndexServiceClient::connect(self.public_endpoint(node)).await?;
+        Ok(client
+            .list_indexes(authorized(
+                ListIndexesRequest {
+                    bucket_name: bucket_name.to_string(),
+                    include_disabled: true,
+                    page: None,
+                },
+                &self.admin_token,
+            ))
+            .await?
+            .into_inner()
+            .indexes)
+    }
+
+    pub async fn query_path_index(
+        &self,
+        node: usize,
+        bucket_name: &str,
+        index_name: &str,
+    ) -> anyhow::Result<QueryIndexResponse> {
+        let mut client = IndexServiceClient::connect(self.public_endpoint(node)).await?;
+        Ok(client
+            .query_index(authorized(
+                QueryIndexRequest {
+                    bucket_name: bucket_name.to_string(),
+                    index_name: index_name.to_string(),
+                    query_text: String::new(),
+                    query_vector: Vec::new(),
+                    limit: 10,
+                    phrase: false,
+                    path_prefix: String::new(),
+                    metadata_filters_json: String::new(),
+                    typed_predicates_json: String::new(),
+                    typed_order_json: String::new(),
+                    page_token: String::new(),
+                    require_caught_up_to_watch_cursor: String::new(),
+                    lag_timeout_ms: 1_000,
+                    boundary_predicates_json: String::new(),
+                },
+                &self.admin_token,
+            ))
+            .await?
+            .into_inner())
+    }
+
+    pub async fn index_creator_is_owner(
+        &self,
+        node: usize,
+        bucket_id: i64,
+        index_name: &str,
+    ) -> anyhow::Result<bool> {
+        let mut client = AuthServiceClient::connect(self.public_endpoint(node)).await?;
+        Ok(client
+            .check_permission(authorized(
+                CheckPermissionRequest {
+                    namespace: anvil_core::access_control::system_realm_namespace(
+                        anvil_core::system_realm::SYSTEM_INDEX_NAMESPACE,
+                    ),
+                    object_id: format!("{bucket_id}/{index_name}"),
+                    relation: "owner".to_string(),
+                    subject_kind: anvil_core::access_control::APP_SUBJECT_KIND.to_string(),
+                    subject_id: ADMIN_PRINCIPAL.to_string(),
+                    caveat_hash: String::new(),
+                    consistency: "latest".to_string(),
+                    zookie: String::new(),
+                    scope: None,
+                },
+                &self.admin_token,
+            ))
+            .await?
+            .into_inner()
+            .allowed)
+    }
+
+    pub async fn index_creator_owner_tuple_count(
+        &self,
+        node: usize,
+        bucket_id: i64,
+        index_name: &str,
+    ) -> anyhow::Result<usize> {
+        let mut client = AuthServiceClient::connect(self.public_endpoint(node)).await?;
+        Ok(client
+            .read_authz_tuples(authorized(
+                ReadAuthzTuplesRequest {
+                    namespace: anvil_core::access_control::system_realm_namespace(
+                        anvil_core::system_realm::SYSTEM_INDEX_NAMESPACE,
+                    ),
+                    object_id: format!("{bucket_id}/{index_name}"),
+                    relation: "owner".to_string(),
+                    subject_kind: anvil_core::access_control::APP_SUBJECT_KIND.to_string(),
+                    subject_id: ADMIN_PRINCIPAL.to_string(),
+                    caveat_hash: String::new(),
+                    consistency: "latest".to_string(),
+                    zookie: String::new(),
+                    page_size: 100,
+                    page_token: String::new(),
+                    scope: None,
+                },
+                &self.admin_token,
+            ))
+            .await?
+            .into_inner()
+            .tuples
+            .len())
+    }
+
     pub async fn bootstrap_object_placement(&self, coordinator: usize) -> anyhow::Result<()> {
         let mut descriptors = Vec::new();
         for node in 0..self.nodes.len() {
@@ -457,6 +612,8 @@ impl ProcessMvccCluster {
                 "ShardWrite",
                 "MvccBatchWrite",
                 "RaftLogWrite",
+                "IndexFinalizationBeforeExecute",
+                "IndexFinalizationAfterExecute",
             ];
         if !PROCESS_SAFE_POINTS.contains(&fault_point) {
             bail!("fault point is not enabled for process-backed hard crashes");

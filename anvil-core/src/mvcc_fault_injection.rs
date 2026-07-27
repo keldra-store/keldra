@@ -28,6 +28,8 @@ pub enum FaultPoint {
     RepairApply,
     RestartRecovery,
     PersonalDbAfterCreateCommit,
+    IndexFinalizationBeforeExecute,
+    IndexFinalizationAfterExecute,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

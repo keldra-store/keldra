@@ -62,6 +62,9 @@ impl Persistence {
         &self,
         job: &crate::index_finalization_job::IndexFinalizationJob,
     ) -> Result<()> {
+        crate::mvcc_fault_injection::hit(
+            crate::mvcc_fault_injection::FaultPoint::IndexFinalizationBeforeExecute,
+        )?;
         let bucket = self
             .get_bucket_by_name(job.tenant_id, &job.bucket_name)
             .await?
@@ -91,6 +94,9 @@ impl Persistence {
             return Ok(());
         }
         self.enqueue_index_build_for_index(&bucket, &frozen).await?;
+        crate::mvcc_fault_injection::hit(
+            crate::mvcc_fault_injection::FaultPoint::IndexFinalizationAfterExecute,
+        )?;
         Ok(())
     }
 

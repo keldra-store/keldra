@@ -75,6 +75,147 @@ async fn public_commit_survives_lost_response_and_coordinator_sigkill() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn committed_index_finalization_survives_two_coordinator_crashes_without_commit_retry() {
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_anvil-server"));
+    let mut cluster = ProcessMvccCluster::start(binary).await.unwrap();
+    let coordinator = cluster.wait_for_leader(&[0, 1, 2]).await.unwrap();
+    let bucket_name = format!("index-finalization-{}", uuid::Uuid::new_v4().simple());
+    let index_name = "committed-path";
+    let bucket_id = cluster
+        .create_bucket(coordinator, &bucket_name)
+        .await
+        .unwrap();
+    let transaction = cluster
+        .begin_transaction(coordinator, MvccReadConsistency::Linearized)
+        .await
+        .unwrap();
+    let staged = cluster
+        .stage_path_index(
+            coordinator,
+            &bucket_name,
+            index_name,
+            &transaction.transaction_id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(staged.name, index_name);
+    assert!(
+        cluster
+            .list_indexes(coordinator, &bucket_name)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the staged definition must not publish before certification"
+    );
+    assert!(
+        !cluster
+            .index_creator_is_owner(coordinator, bucket_id, index_name)
+            .await
+            .unwrap(),
+        "creator grants must not escape before certification"
+    );
+    assert_eq!(
+        cluster
+            .index_creator_owner_tuple_count(coordinator, bucket_id, index_name)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(
+        cluster
+            .query_path_index(coordinator, &bucket_name, index_name)
+            .await
+            .is_err(),
+        "no derived index build may exist before certification"
+    );
+
+    cluster
+        .arm_hard_crash(coordinator, "IndexFinalizationBeforeExecute")
+        .unwrap();
+    let committed = cluster
+        .commit_transaction(
+            cluster.public_endpoint(coordinator),
+            transaction.transaction_id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(committed.state, WriteState::Committed as i32);
+    cluster
+        .wait_for_hard_crash(coordinator, Duration::from_secs(45))
+        .await
+        .unwrap();
+
+    let survivors = [0, 1, 2]
+        .into_iter()
+        .filter(|node| *node != coordinator)
+        .collect::<Vec<_>>();
+    let survivor = cluster.wait_for_leader(&survivors).await.unwrap();
+    let published = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let Ok(indexes) = cluster.list_indexes(survivor, &bucket_name).await
+                && indexes
+                    .iter()
+                    .any(|index| index.index_id == staged.index_id && index.version == staged.version)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        published.is_ok(),
+        "the certified definition must survive the coordinator crash"
+    );
+
+    // Crash after the replay-safe effects but before marking the durable job
+    // complete. The next same-disk restart must execute the same immutable job
+    // again without duplicating the definition, grant, or build.
+    cluster
+        .arm_hard_crash(coordinator, "IndexFinalizationAfterExecute")
+        .unwrap();
+    cluster.restart(coordinator).await.unwrap();
+    cluster
+        .wait_for_hard_crash(coordinator, Duration::from_secs(45))
+        .await
+        .unwrap();
+    cluster.restart(coordinator).await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let indexes = cluster
+                .list_indexes(coordinator, &bucket_name)
+                .await
+                .unwrap_or_default();
+            let exact = indexes
+                .iter()
+                .filter(|index| {
+                    index.index_id == staged.index_id && index.version == staged.version
+                })
+                .count();
+            let owner = cluster
+                .index_creator_is_owner(coordinator, bucket_id, index_name)
+                .await
+                .unwrap_or(false);
+            let owner_tuple_count = cluster
+                .index_creator_owner_tuple_count(coordinator, bucket_id, index_name)
+                .await
+                .unwrap_or_default();
+            let queryable = cluster
+                .query_path_index(coordinator, &bucket_name, index_name)
+                .await
+                .is_ok();
+            if exact == 1 && owner && owner_tuple_count == 1 && queryable {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("same-disk replay completes creator grant and exact-version build");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn public_object_batch_recovers_after_leader_crashes_before_local_batch_write() {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_anvil-server"));
     let mut cluster = ProcessMvccCluster::start(binary).await.unwrap();
