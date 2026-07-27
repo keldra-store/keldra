@@ -1,4 +1,8 @@
-use crate::personaldb_signing::PersonalDbProtocolKeyring;
+use crate::{
+    config::Config, mvcc_bootstrap::MvccSubsystem, persistence::Persistence,
+    personaldb_signing::PersonalDbProtocolKeyring,
+};
+use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use personaldb_protocol::{
     Ed25519ProtocolSigner, Ed25519PublicKey, KeyGeneration, KeyTrustPolicy, ProtocolSigner,
@@ -13,6 +17,30 @@ const SNAPSHOT_PKCS8_B64: &str = "MC4CAQAwBQYDK2VwBCIEICIiIiIiIiIiIiIiIiIiIiIiIi
 const SNAPSHOT_PUBLIC_B64U: &str = "oJql9HpnWYAv-VX43C0qFKXJnSO-l_hkEn_5ODRVpPA";
 const WITNESS_PKCS8_B64: &str = "MC4CAQAwBQYDK2VwBCIEIDMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMz";
 const WITNESS_PUBLIC_B64U: &str = "F8t5-ytBIPKx7GXkGY1uCLKOgT_rAeSkAIObheGAgM4";
+
+/// Builds the production persistence stack with a real, single-node MVCC
+/// subsystem for unit tests.
+///
+/// `Persistence::new` intentionally remains a synchronous construction step
+/// because production installs the cluster-scoped MVCC runtime during
+/// `AppState` startup. Unit tests that exercise persistence directly must
+/// mirror that second step instead of relying on a legacy non-MVCC write path.
+pub(crate) async fn persistence_with_mvcc(config: &Config) -> Result<Persistence> {
+    let persistence = Persistence::new(config)?;
+    let core_store = persistence
+        .core_store()
+        .await
+        .context("open test persistence CoreStore")?;
+    let mvcc = Arc::new(
+        MvccSubsystem::bootstrap(config, core_store.core_meta_database())
+            .await
+            .context("bootstrap test persistence MVCC subsystem")?,
+    );
+    persistence
+        .install_mvcc(mvcc)
+        .context("install test persistence MVCC subsystem")?;
+    Ok(persistence)
+}
 
 pub(crate) fn personaldb_protocol_keyring() -> PersonalDbProtocolKeyring {
     let signers = [

@@ -1162,7 +1162,7 @@ async fn handle_delete_bucket(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{config::Config, storage::Storage};
+    use crate::{config::Config, storage::Storage, test_support::persistence_with_mvcc};
     use chrono::Utc;
     use tempfile::tempdir;
 
@@ -1220,7 +1220,7 @@ mod tests {
     async fn unleased_running_task_is_recovered_only_after_the_grace_period() {
         let temp = tempdir().unwrap();
         let config = test_config(temp.path());
-        let persistence = Persistence::new(&config).unwrap();
+        let persistence = persistence_with_mvcc(&config).await.unwrap();
 
         persistence
             .enqueue_task(TaskType::DeleteObject, json!({ "object_id": 1 }), 0)
@@ -1264,7 +1264,7 @@ mod tests {
     async fn running_task_is_recovered_only_after_its_lease_expires() {
         let temp = tempdir().unwrap();
         let config = test_config(temp.path());
-        let persistence = Persistence::new(&config).unwrap();
+        let persistence = persistence_with_mvcc(&config).await.unwrap();
 
         persistence
             .enqueue_task(TaskType::DeleteObject, json!({ "object_id": 1 }), 0)
@@ -1308,7 +1308,7 @@ mod tests {
     async fn object_metadata_compaction_task_seals_manifest() {
         let temp = tempdir().unwrap();
         let config = test_config(temp.path());
-        let persistence = Persistence::new(&config).unwrap();
+        let persistence = persistence_with_mvcc(&config).await.unwrap();
 
         persistence.create_region("local").await.unwrap();
         let bucket = persistence

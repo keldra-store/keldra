@@ -241,6 +241,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::persistence::Persistence;
+    use crate::test_support::persistence_with_mvcc;
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -259,7 +260,9 @@ mod tests {
 
     async fn seeded() -> (tempfile::TempDir, Persistence, crate::persistence::Bucket) {
         let temp = tempdir().unwrap();
-        let persistence = Persistence::new(&test_config(temp.path())).unwrap();
+        let persistence = persistence_with_mvcc(&test_config(temp.path()))
+            .await
+            .unwrap();
         persistence.create_region("test-region").await.unwrap();
         let tenant = persistence
             .create_tenant("tenant-a", "unused")

@@ -32,14 +32,19 @@ impl ThreeNodeFixture {
         let directories = (0..3)
             .map(|_| tempfile::tempdir().unwrap())
             .collect::<Vec<_>>();
-        let listeners = [
-            TcpListener::bind("127.0.0.1:0").await.unwrap(),
-            TcpListener::bind("127.0.0.1:0").await.unwrap(),
-            TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        let mut listeners = vec![
+            Some(TcpListener::bind("127.0.0.1:0").await.unwrap()),
+            Some(TcpListener::bind("127.0.0.1:0").await.unwrap()),
+            Some(TcpListener::bind("127.0.0.1:0").await.unwrap()),
         ];
         let endpoints = listeners
             .iter()
-            .map(|listener| format!("http://{}", listener.local_addr().unwrap()))
+            .map(|listener| {
+                format!(
+                    "http://{}",
+                    listener.as_ref().unwrap().local_addr().unwrap()
+                )
+            })
             .collect::<Vec<_>>();
         let peers_json = serde_json::to_string(
             &endpoints
@@ -59,7 +64,6 @@ impl ThreeNodeFixture {
                 .collect::<Vec<_>>(),
         )
         .unwrap();
-        let mut states = Vec::new();
         let mut configs = Vec::new();
         for (index, directory) in directories.iter().enumerate() {
             let config = Config {
@@ -91,29 +95,38 @@ impl ThreeNodeFixture {
                 allow_test_only_insecure_mvcc_transport: true,
                 ..Config::default()
             };
-            configs.push(config.clone());
-            states.push(Arc::new(
+            configs.push(config);
+        }
+
+        // Followers must be listening before the bootstrap member can form a
+        // majority. Constructing node 1 first deadlocks fixture startup:
+        // AppState waits to install the initial Raft control state while nodes
+        // 2 and 3 have not yet been created and cannot answer vote requests.
+        let mut states = vec![None, None, None];
+        let mut servers = (0..3).map(|_| None).collect::<Vec<_>>();
+        for index in [1_usize, 2, 0] {
+            let state = Arc::new(
                 AppState::new(
-                    config,
+                    configs[index].clone(),
                     personaldb_signing::PersonalDbProtocolKeyring::disabled(),
                 )
                 .await
                 .unwrap(),
-            ));
-        }
-        let mut servers = Vec::new();
-        for (listener, state) in listeners.into_iter().zip(&states) {
+            );
             let consensus = state.mvcc.consensus_service.clone();
             let replication = state.mvcc.replication_service.clone();
-            servers.push(Some(tokio::spawn(async move {
+            let listener = listeners[index].take().unwrap();
+            servers[index] = Some(tokio::spawn(async move {
                 Server::builder()
                     .add_service(ConsensusTransportServer::new(consensus))
                     .add_service(ReplicationServiceServer::new(replication))
                     .serve_with_incoming(TcpListenerStream::new(listener))
                     .await
                     .unwrap();
-            })));
+            }));
+            states[index] = Some(state);
         }
+        let states = states.into_iter().map(Option::unwrap).collect::<Vec<_>>();
         let fixture = Self {
             _directories: directories,
             configs,

@@ -1086,7 +1086,10 @@ mod tests {
 
     #[test]
     fn production_peer_transport_requires_https() {
-        let config = Config::default();
+        let config = Config {
+            allow_test_only_insecure_mvcc_transport: false,
+            ..Config::default()
+        };
         let peer = MvccPeerConfig {
             cluster_id: "default".into(),
             raft_node_id: 1,

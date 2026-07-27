@@ -65,7 +65,9 @@ async fn seeded_object_manager(
     let config = test_config(&storage_path);
     let storage = Storage::new_at(&config.storage_path).await.unwrap();
     let core_store = CoreStore::new(storage.clone()).await.unwrap();
-    let persistence = Persistence::new(&config).unwrap();
+    let persistence = crate::test_support::persistence_with_mvcc(&config)
+        .await
+        .unwrap();
     system_realm::ensure_bootstrapped(
         &config,
         &persistence,
@@ -107,6 +109,7 @@ async fn seeded_object_manager(
     )
     .await
     .unwrap();
+    let mvcc = persistence.mvcc_arc().unwrap();
     let manager = ObjectManager::new(
         persistence,
         storage,
@@ -116,6 +119,7 @@ async fn seeded_object_manager(
         hex::decode(&config.anvil_secret_encryption_key).unwrap(),
         Observability::default(),
     );
+    manager.install_mvcc(mvcc).unwrap();
     (temp, manager, bucket, claims)
 }
 
