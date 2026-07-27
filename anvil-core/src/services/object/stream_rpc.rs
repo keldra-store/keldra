@@ -191,7 +191,7 @@ pub(super) async fn append_stream_record_rpc(
         req.mutation_context.as_ref(),
     )
     .await?;
-    let transaction_id = native_transaction_id(req.mutation_context.as_ref())?;
+    let requested_transaction_id = native_transaction_id(req.mutation_context.as_ref())?;
     let target =
         NativeIdempotencyTarget::new("AppendStreamRecord", &req.bucket_name, &req.stream_key)
             .with_parameters(serde_json::json!({
@@ -209,6 +209,26 @@ pub(super) async fn append_stream_record_rpc(
     if let Some(response) = replay {
         return Ok(Response::new(response));
     }
+    let implicit_transaction = if requested_transaction_id.is_none() {
+        Some(
+            begin_implicit_native_transaction(
+                state,
+                req.mutation_context
+                    .as_ref()
+                    .expect("validated native mutation context"),
+                &target,
+                &claims,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let transaction_id = requested_transaction_id.or_else(|| {
+        implicit_transaction
+            .as_ref()
+            .map(|transaction| transaction.transaction_id.as_str())
+    });
     enforce_native_mutation_precondition(
         state,
         &claims,
@@ -245,16 +265,21 @@ pub(super) async fn append_stream_record_rpc(
         mutation_id: record.receipt.mutation_id.to_string(),
         record_hash: record.receipt.record_hash,
         authz_revision,
-        watch_cursor: if transaction_id.is_some() {
+        watch_cursor: if requested_transaction_id.is_some() {
             0
         } else {
             record.receipt.watch_cursor
         },
         content_type: record.content_type.unwrap_or_default(),
         user_metadata_json: json_object_string(record.user_metadata.as_ref()),
-        write_state: write_state_for_transaction(transaction_id),
+        write_state: write_state_for_transaction(requested_transaction_id),
     };
-    complete_native_mutation(state, &attempt, &target, &response).await?;
+    if let Some(transaction) = implicit_transaction.as_ref() {
+        stage_implicit_native_response(state, &attempt, &target, &response, transaction).await?;
+        commit_implicit_native_transaction(state, transaction).await?;
+    } else {
+        complete_native_mutation(state, &attempt, &target, &response).await?;
+    }
     Ok(Response::new(response))
 }
 
@@ -413,7 +438,7 @@ pub(super) async fn seal_append_stream_segment_rpc(
         req.mutation_context.as_ref(),
     )
     .await?;
-    let transaction_id = native_transaction_id(req.mutation_context.as_ref())?;
+    let requested_transaction_id = native_transaction_id(req.mutation_context.as_ref())?;
     let target =
         NativeIdempotencyTarget::new("SealAppendStreamSegment", &req.bucket_name, &req.stream_key)
             .with_parameters(serde_json::json!({ "stream_id": req.stream_id.clone() }));
@@ -428,6 +453,26 @@ pub(super) async fn seal_append_stream_segment_rpc(
     if let Some(response) = replay {
         return Ok(Response::new(response));
     }
+    let implicit_transaction = if requested_transaction_id.is_none() {
+        Some(
+            begin_implicit_native_transaction(
+                state,
+                req.mutation_context
+                    .as_ref()
+                    .expect("validated native mutation context"),
+                &target,
+                &claims,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let transaction_id = requested_transaction_id.or_else(|| {
+        implicit_transaction
+            .as_ref()
+            .map(|transaction| transaction.transaction_id.as_str())
+    });
     enforce_native_mutation_precondition(
         state,
         &claims,
@@ -464,13 +509,18 @@ pub(super) async fn seal_append_stream_segment_rpc(
         payload_hash: sealed.segment_hash,
         record_hash: sealed.receipt.record_hash,
         authz_revision,
-        watch_cursor: if transaction_id.is_some() {
+        watch_cursor: if requested_transaction_id.is_some() {
             0
         } else {
             sealed.receipt.watch_cursor
         },
-        write_state: write_state_for_transaction(transaction_id),
+        write_state: write_state_for_transaction(requested_transaction_id),
     };
-    complete_native_mutation(state, &attempt, &target, &response).await?;
+    if let Some(transaction) = implicit_transaction.as_ref() {
+        stage_implicit_native_response(state, &attempt, &target, &response, transaction).await?;
+        commit_implicit_native_transaction(state, transaction).await?;
+    } else {
+        complete_native_mutation(state, &attempt, &target, &response).await?;
+    }
     Ok(Response::new(response))
 }

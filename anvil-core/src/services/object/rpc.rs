@@ -17,6 +17,93 @@ pub(super) fn native_transaction_id(
     crate::services::transaction_context::native_context_transaction_id(context)
 }
 
+async fn begin_implicit_native_transaction(
+    state: &AppState,
+    claims: &auth::Claims,
+    context: Option<&NativeMutationContext>,
+    operation: &str,
+) -> Result<Option<crate::mvcc_open_transactions::TransactionHandle>, Status> {
+    let context =
+        context.ok_or_else(|| Status::invalid_argument("Missing native mutation context"))?;
+    if context.transaction_id.is_some() {
+        return Ok(None);
+    }
+    let principal = object_manager::transaction_principal_from_claims(claims);
+    state
+        .mvcc
+        .open_transactions
+        .begin(
+            state.mvcc.runtime.as_ref(),
+            state.mvcc.cluster_id().to_string(),
+            principal,
+            format!(
+                "native:{operation}:{}:{}:{}",
+                claims.tenant_id, claims.sub, context.idempotency_key
+            ),
+            std::time::Duration::from_secs(300),
+            crate::mvcc_transaction::DurabilityLevel::Quorum,
+            crate::mvcc_transaction::ReadConsistency::Linearized,
+            u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+        )
+        .await
+        .map(Some)
+        .map_err(|error| Status::failed_precondition(error.to_string()))
+}
+
+async fn commit_implicit_native_response<T: serde::Serialize>(
+    state: &AppState,
+    claims: &auth::Claims,
+    context: &NativeMutationContext,
+    target: &NativeIdempotencyTarget,
+    response: &T,
+    handle: &crate::mvcc_open_transactions::TransactionHandle,
+) -> Result<(), Status> {
+    let principal = object_manager::transaction_principal_from_claims(claims);
+    let plan = crate::native_idempotency::prepare_response_for_implicit_batch(
+        &state.mvcc,
+        context,
+        target,
+        response,
+    )
+    .await?;
+    let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default();
+    state
+        .mvcc
+        .stage_product_mutations(&handle.transaction_id, &principal, plan.mutations, now)
+        .map_err(|error| Status::internal(error.to_string()))?;
+    for (key, predicate) in plan.predicates {
+        state
+            .mvcc
+            .stage_predicate(
+                &handle.transaction_id,
+                &principal,
+                key,
+                predicate,
+                now,
+            )
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    }
+    let outcome = state
+        .mvcc
+        .open_transactions
+        .commit(
+            state.mvcc.runtime.as_ref(),
+            &handle.transaction_id,
+            &principal,
+            now,
+        )
+        .await
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    match outcome.certification {
+        crate::mvcc_transaction::CertificationResult::Committed { .. } => Ok(()),
+        crate::mvcc_transaction::CertificationResult::Aborted { reason } => {
+            Err(Status::aborted(format!(
+                "implicit native transaction aborted: {reason:?}"
+            )))
+        }
+    }
+}
+
 fn native_route_tenant_id(metadata: &tonic::metadata::MetadataMap) -> Result<Option<i64>, Status> {
     let Some(raw) = metadata.get("x-anvil-tenant-id") else {
         return Ok(None);
@@ -189,20 +276,6 @@ impl ObjectService for AppState {
             object_key = %metadata.object_key,
             "received public object request"
         );
-        if let Some(target) = native_put_route_target(self, &claims, &metadata).await? {
-            let response = proxy_native_put(self, &target, &claims, metadata, stream).await?;
-            tracing::info!(
-                operation = "response.send",
-                rpc = "object.put",
-                request_id = %trace_request_id,
-                cluster_id = %self.config.mvcc_cluster_id,
-                session_id = %response.mutation_id,
-                transaction_id = %response.mutation_id,
-                "sending proxied public object response"
-            );
-            return Ok(Response::new(response));
-        }
-
         let data_stream = stream.map(native_put_data_chunk);
         let response = execute_native_put(self, claims, metadata, data_stream).await?;
         tracing::info!(
@@ -225,13 +298,6 @@ impl ObjectService for AppState {
         let claims = request.extensions().get::<auth::Claims>().cloned();
         let req = request.into_inner();
         let consistency = object_read_consistency(req.consistency.as_ref())?;
-
-        if let Some(stream) =
-            proxy_get_object_if_needed(self, claims.as_ref(), route_tenant_id, &req, consistency)
-                .await?
-        {
-            return Ok(Response::new(stream));
-        }
 
         let result = self
             .object_manager
@@ -412,12 +478,6 @@ impl ObjectService for AppState {
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.get_ref();
         let consistency = object_read_consistency(req.consistency.as_ref())?;
-
-        if let Some(response) =
-            proxy_head_object_if_needed(self, claims, request_id.as_ref(), req, consistency).await?
-        {
-            return Ok(Response::new(response));
-        }
 
         let object = self
             .object_manager
@@ -1239,9 +1299,7 @@ impl ObjectService for AppState {
             req.mutation_context.as_ref(),
         )
         .await?;
-        let transaction_id = native_transaction_id(req.mutation_context.as_ref())?;
-        let transaction_principal = transaction_id
-            .map(|_| crate::object_manager::transaction_principal_from_claims(&claims));
+        let requested_transaction_id = native_transaction_id(req.mutation_context.as_ref())?;
         let target = NativeIdempotencyTarget::new(
             "InitiateMultipartUpload",
             &req.bucket_name,
@@ -1258,6 +1316,20 @@ impl ObjectService for AppState {
         if let Some(response) = replay {
             return Ok(Response::new(response));
         }
+        let implicit_transaction = begin_implicit_native_transaction(
+            self,
+            &claims,
+            req.mutation_context.as_ref(),
+            "multipart-initiate",
+        )
+        .await?;
+        let transaction_id = requested_transaction_id.or_else(|| {
+            implicit_transaction
+                .as_ref()
+                .map(|handle| handle.transaction_id.as_str())
+        });
+        let transaction_principal = transaction_id
+            .map(|_| crate::object_manager::transaction_principal_from_claims(&claims));
         enforce_native_mutation_precondition(
             self,
             &claims,
@@ -1287,14 +1359,28 @@ impl ObjectService for AppState {
             payload_hash: result.receipt.payload_hash,
             record_hash: result.receipt.record_hash,
             authz_revision,
-            watch_cursor: if transaction_id.is_some() {
+            watch_cursor: if requested_transaction_id.is_some() {
                 0
             } else {
                 result.receipt.watch_cursor
             },
-            write_state: write_state_for_transaction(transaction_id),
+            write_state: write_state_for_transaction(requested_transaction_id),
         };
-        complete_native_mutation(self, &attempt, &target, &response).await?;
+        if let Some(handle) = implicit_transaction.as_ref() {
+            commit_implicit_native_response(
+                self,
+                &claims,
+                req.mutation_context
+                    .as_ref()
+                    .ok_or_else(|| Status::invalid_argument("Missing native mutation context"))?,
+                &target,
+                &response,
+                handle,
+            )
+            .await?;
+        } else {
+            complete_native_mutation(self, &attempt, &target, &response).await?;
+        }
         Ok(Response::new(response))
     }
 
@@ -1324,9 +1410,8 @@ impl ObjectService for AppState {
             metadata.mutation_context.as_ref(),
         )
         .await?;
-        let transaction_id = native_transaction_id(metadata.mutation_context.as_ref())?;
-        let transaction_principal = transaction_id
-            .map(|_| crate::object_manager::transaction_principal_from_claims(&claims));
+        let requested_transaction_id =
+            native_transaction_id(metadata.mutation_context.as_ref())?;
         let target =
             NativeIdempotencyTarget::new("UploadPart", &metadata.bucket_name, &metadata.object_key)
                 .with_parameters(serde_json::json!({
@@ -1344,6 +1429,20 @@ impl ObjectService for AppState {
         if let Some(response) = replay {
             return Ok(Response::new(response));
         }
+        let implicit_transaction = begin_implicit_native_transaction(
+            self,
+            &claims,
+            metadata.mutation_context.as_ref(),
+            "multipart-upload-part",
+        )
+        .await?;
+        let transaction_id = requested_transaction_id.or_else(|| {
+            implicit_transaction
+                .as_ref()
+                .map(|handle| handle.transaction_id.as_str())
+        });
+        let transaction_principal = transaction_id
+            .map(|_| crate::object_manager::transaction_principal_from_claims(&claims));
         enforce_native_mutation_precondition(
             self,
             &claims,
@@ -1387,14 +1486,28 @@ impl ObjectService for AppState {
             payload_hash: result.payload_hash,
             record_hash: result.receipt.record_hash,
             authz_revision,
-            watch_cursor: if transaction_id.is_some() {
+            watch_cursor: if requested_transaction_id.is_some() {
                 0
             } else {
                 result.receipt.watch_cursor
             },
-            write_state: write_state_for_transaction(transaction_id),
+            write_state: write_state_for_transaction(requested_transaction_id),
         };
-        complete_native_mutation(self, &attempt, &target, &response).await?;
+        if let Some(handle) = implicit_transaction.as_ref() {
+            commit_implicit_native_response(
+                self,
+                &claims,
+                metadata.mutation_context.as_ref().ok_or_else(|| {
+                    Status::invalid_argument("Missing native mutation context")
+                })?,
+                &target,
+                &response,
+                handle,
+            )
+            .await?;
+        } else {
+            complete_native_mutation(self, &attempt, &target, &response).await?;
+        }
         Ok(Response::new(response))
     }
 
@@ -1415,9 +1528,7 @@ impl ObjectService for AppState {
             req.mutation_context.as_ref(),
         )
         .await?;
-        let transaction_id = native_transaction_id(req.mutation_context.as_ref())?;
-        let transaction_principal = transaction_id
-            .map(|_| crate::object_manager::transaction_principal_from_claims(&claims));
+        let requested_transaction_id = native_transaction_id(req.mutation_context.as_ref())?;
         let target_parts = req
             .parts
             .iter()
@@ -1443,6 +1554,20 @@ impl ObjectService for AppState {
         if let Some(response) = replay {
             return Ok(Response::new(response));
         }
+        let implicit_transaction = begin_implicit_native_transaction(
+            self,
+            &claims,
+            req.mutation_context.as_ref(),
+            "multipart-complete",
+        )
+        .await?;
+        let transaction_id = requested_transaction_id.or_else(|| {
+            implicit_transaction
+                .as_ref()
+                .map(|handle| handle.transaction_id.as_str())
+        });
+        let transaction_principal = transaction_id
+            .map(|_| crate::object_manager::transaction_principal_from_claims(&claims));
         enforce_native_mutation_precondition(
             self,
             &claims,
@@ -1456,10 +1581,10 @@ impl ObjectService for AppState {
             .map_err(|_| Status::invalid_argument("Invalid upload_id"))?;
         let parts = req
             .parts
-            .into_iter()
+            .iter()
             .map(|part| crate::object_manager::CompleteMultipartPart {
                 part_number: part.part_number,
-                etag: part.etag,
+                etag: part.etag.clone(),
             })
             .collect();
 
@@ -1475,7 +1600,7 @@ impl ObjectService for AppState {
                 transaction_principal.as_deref(),
             )
             .await?;
-        let watch_cursor = if transaction_id.is_some() {
+        let watch_cursor = if requested_transaction_id.is_some() {
             0
         } else {
             object_watch_cursor(self, &object).await?
@@ -1491,9 +1616,23 @@ impl ObjectService for AppState {
             authz_revision,
             watch_cursor,
             index_policy_snapshot: object.index_policy_snapshot,
-            write_state: write_state_for_transaction(transaction_id),
+            write_state: write_state_for_transaction(requested_transaction_id),
         };
-        complete_native_mutation(self, &attempt, &target, &response).await?;
+        if let Some(handle) = implicit_transaction.as_ref() {
+            commit_implicit_native_response(
+                self,
+                &claims,
+                req.mutation_context
+                    .as_ref()
+                    .ok_or_else(|| Status::invalid_argument("Missing native mutation context"))?,
+                &target,
+                &response,
+                handle,
+            )
+            .await?;
+        } else {
+            complete_native_mutation(self, &attempt, &target, &response).await?;
+        }
         Ok(Response::new(response))
     }
 
@@ -1514,9 +1653,7 @@ impl ObjectService for AppState {
             req.mutation_context.as_ref(),
         )
         .await?;
-        let transaction_id = native_transaction_id(req.mutation_context.as_ref())?;
-        let transaction_principal = transaction_id
-            .map(|_| crate::object_manager::transaction_principal_from_claims(&claims));
+        let requested_transaction_id = native_transaction_id(req.mutation_context.as_ref())?;
         let target =
             NativeIdempotencyTarget::new("AbortMultipartUpload", &req.bucket_name, &req.object_key)
                 .with_parameters(serde_json::json!({ "upload_id": req.upload_id.clone() }));
@@ -1531,6 +1668,20 @@ impl ObjectService for AppState {
         if let Some(response) = replay {
             return Ok(Response::new(response));
         }
+        let implicit_transaction = begin_implicit_native_transaction(
+            self,
+            &claims,
+            req.mutation_context.as_ref(),
+            "multipart-abort",
+        )
+        .await?;
+        let transaction_id = requested_transaction_id.or_else(|| {
+            implicit_transaction
+                .as_ref()
+                .map(|handle| handle.transaction_id.as_str())
+        });
+        let transaction_principal = transaction_id
+            .map(|_| crate::object_manager::transaction_principal_from_claims(&claims));
         enforce_native_mutation_precondition(
             self,
             &claims,
@@ -1562,14 +1713,28 @@ impl ObjectService for AppState {
             payload_hash: result.receipt.payload_hash,
             record_hash: result.receipt.record_hash,
             authz_revision,
-            watch_cursor: if transaction_id.is_some() {
+            watch_cursor: if requested_transaction_id.is_some() {
                 0
             } else {
                 result.receipt.watch_cursor
             },
-            write_state: write_state_for_transaction(transaction_id),
+            write_state: write_state_for_transaction(requested_transaction_id),
         };
-        complete_native_mutation(self, &attempt, &target, &response).await?;
+        if let Some(handle) = implicit_transaction.as_ref() {
+            commit_implicit_native_response(
+                self,
+                &claims,
+                req.mutation_context
+                    .as_ref()
+                    .ok_or_else(|| Status::invalid_argument("Missing native mutation context"))?,
+                &target,
+                &response,
+                handle,
+            )
+            .await?;
+        } else {
+            complete_native_mutation(self, &attempt, &target, &response).await?;
+        }
         Ok(Response::new(response))
     }
 

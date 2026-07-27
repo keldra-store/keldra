@@ -6,6 +6,175 @@ pub(super) struct NativeMutationAttempt<'a> {
     _target_guard: OwnedMutexGuard<()>,
 }
 
+pub(super) struct ImplicitNativeTransaction {
+    pub transaction_id: String,
+    pub principal: String,
+}
+
+pub(super) async fn begin_implicit_native_transaction(
+    state: &AppState,
+    context: &NativeMutationContext,
+    target: &NativeIdempotencyTarget,
+    claims: &auth::Claims,
+) -> Result<ImplicitNativeTransaction, Status> {
+    if context.transaction_id.is_some() {
+        return Err(Status::invalid_argument(
+            "implicit native transaction requires no caller transaction",
+        ));
+    }
+    let principal = crate::object_manager::transaction_principal_from_claims(claims);
+    let idempotency_key = implicit_native_transaction_key(context, target)?;
+    let handle = state
+        .mvcc
+        .open_transactions
+        .begin(
+            state.mvcc.runtime.as_ref(),
+            state.config.mvcc_cluster_id.clone(),
+            principal.clone(),
+            idempotency_key,
+            std::time::Duration::from_secs(300),
+            super::native_put_rpc::configured_default_durability(
+                &state.config.mvcc_default_durability,
+            )?,
+            crate::mvcc_transaction::ReadConsistency::Linearized,
+            native_mutation_unix_ms()?,
+        )
+        .await
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    Ok(ImplicitNativeTransaction {
+        transaction_id: handle.transaction_id,
+        principal,
+    })
+}
+
+fn implicit_native_transaction_key(
+    context: &NativeMutationContext,
+    target: &NativeIdempotencyTarget,
+) -> Result<String, Status> {
+    let target_bytes = serde_json::to_vec(target)
+        .map_err(|error| Status::internal(format!("serialize mutation target: {error}")))?;
+    let mut identity = blake3::Hasher::new();
+    for value in [
+        b"implicit-native-transaction-v1".as_slice(),
+        context.idempotency_key.as_bytes(),
+        target_bytes.as_slice(),
+    ] {
+        identity.update(&(value.len() as u64).to_be_bytes());
+        identity.update(value);
+    }
+    Ok(format!("implicit-native:{}", identity.finalize().to_hex()))
+}
+
+pub(super) async fn stage_implicit_native_response<T>(
+    state: &AppState,
+    attempt: &NativeMutationAttempt<'_>,
+    target: &NativeIdempotencyTarget,
+    response: &T,
+    transaction: &ImplicitNativeTransaction,
+) -> Result<(), Status>
+where
+    T: Serialize,
+{
+    let plan = native_idempotency::prepare_response_for_implicit_batch(
+        &state.mvcc,
+        attempt.context,
+        target,
+        response,
+    )
+    .await?;
+    state
+        .mvcc
+        .stage_product_mutations(
+            &transaction.transaction_id,
+            &transaction.principal,
+            plan.mutations,
+            native_mutation_unix_ms()?,
+        )
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    for (key, predicate) in plan.predicates {
+        state
+            .mvcc
+            .stage_predicate(
+                &transaction.transaction_id,
+                &transaction.principal,
+                key,
+                predicate,
+                native_mutation_unix_ms()?,
+            )
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    }
+    Ok(())
+}
+
+pub(super) async fn commit_implicit_native_transaction(
+    state: &AppState,
+    transaction: &ImplicitNativeTransaction,
+) -> Result<(), Status> {
+    let outcome = state
+        .mvcc
+        .open_transactions
+        .commit(
+            state.mvcc.runtime.as_ref(),
+            &transaction.transaction_id,
+            &transaction.principal,
+            native_mutation_unix_ms()?,
+        )
+        .await
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    if let crate::mvcc_transaction::CertificationResult::Aborted { reason } =
+        outcome.certification
+    {
+        return Err(Status::aborted(format!(
+            "implicit MVCC transaction aborted: {reason:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn native_mutation_unix_ms() -> Result<u64, Status> {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| Status::internal("system clock precedes Unix epoch"))?;
+    u64::try_from(elapsed.as_millis()).map_err(|_| Status::internal("system time exceeds u64"))
+}
+
+#[cfg(test)]
+mod implicit_transaction_tests {
+    use super::*;
+
+    fn context(key: &str) -> NativeMutationContext {
+        NativeMutationContext {
+            tenant_id: 7,
+            bucket_id: 11,
+            principal: "alice".to_string(),
+            request_id: "request".to_string(),
+            precondition: "none".to_string(),
+            idempotency_key: key.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn implicit_transaction_identity_is_stable_and_binds_all_target_parameters() {
+        let first = NativeIdempotencyTarget::new("UploadPart", "bucket", "object")
+            .with_parameters(serde_json::json!({"upload_id":"one","part_number":1}));
+        let changed = NativeIdempotencyTarget::new("UploadPart", "bucket", "object")
+            .with_parameters(serde_json::json!({"upload_id":"one","part_number":2}));
+        assert_eq!(
+            implicit_native_transaction_key(&context("retry"), &first).unwrap(),
+            implicit_native_transaction_key(&context("retry"), &first).unwrap()
+        );
+        assert_ne!(
+            implicit_native_transaction_key(&context("retry"), &first).unwrap(),
+            implicit_native_transaction_key(&context("retry"), &changed).unwrap()
+        );
+        assert_ne!(
+            implicit_native_transaction_key(&context("retry"), &first).unwrap(),
+            implicit_native_transaction_key(&context("other"), &first).unwrap()
+        );
+    }
+}
+
 pub(super) async fn begin_native_mutation<'a, T>(
     state: &AppState,
     context: Option<&'a NativeMutationContext>,

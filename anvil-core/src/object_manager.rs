@@ -2,8 +2,8 @@ use crate::{
     access_control, auth, bucket_journal,
     core_store::{
         AuthzScopeRef, CoreBoundarySchema, CoreBoundarySource, CoreBoundaryValue, CoreByteRange,
-        CoreManifestLocator, CoreObjectRef, CorePrefetchPolicy, CoreStore, GetBlob,
-        WriteLogicalFilePathRequest, WriteLogicalFileRequest,
+        CoreCompressionDescriptor, CoreManifestLocator, CoreObjectEncoding, CoreObjectRef,
+        CorePrefetchPolicy, CoreStore, GetBlob,
         core_object_ref_from_logical_file_write, decode_core_object_ref_target,
         decode_manifest_locator_proto, encode_core_object_ref_target,
         encode_manifest_locator_proto,
@@ -27,6 +27,7 @@ use anyhow::{Context, Result as AnyhowResult, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{Stream, StreamExt, TryStreamExt};
 use serde_json::Value as JsonValue;
+use sha2::Digest as _;
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::pin::Pin;
 use std::sync::{Mutex, OnceLock};
@@ -92,6 +93,8 @@ struct PreparedMvccObjectIngest {
     shard_map: JsonValue,
     boundary_payload: Option<Vec<u8>>,
 }
+
+const MVCC_OBJECT_REF_PREFIX: &str = "anvil-mvcc-target:";
 
 #[derive(Debug, Clone)]
 pub struct AbortMultipartUploadResult {
@@ -328,6 +331,53 @@ impl ObjectManager {
             )));
         }
         Ok(object)
+    }
+
+    async fn begin_internal_transaction(
+        &self,
+        principal: String,
+        idempotency_key: String,
+    ) -> Result<crate::mvcc_open_transactions::TransactionHandle, Status> {
+        let mvcc = self.installed_mvcc()?;
+        mvcc.open_transactions
+            .begin(
+                mvcc.runtime.as_ref(),
+                mvcc.cluster_id().to_string(),
+                principal,
+                idempotency_key,
+                Duration::from_secs(300),
+                crate::mvcc_transaction::DurabilityLevel::Quorum,
+                crate::mvcc_transaction::ReadConsistency::Linearized,
+                Self::current_unix_ms_for_object()?,
+            )
+            .await
+            .map_err(|error| Status::failed_precondition(error.to_string()))
+    }
+
+    async fn commit_internal_transaction(
+        &self,
+        transaction_id: &str,
+        principal: &str,
+    ) -> Result<(), Status> {
+        let mvcc = self.installed_mvcc()?;
+        let outcome = mvcc
+            .open_transactions
+            .commit(
+                mvcc.runtime.as_ref(),
+                transaction_id,
+                principal,
+                Self::current_unix_ms_for_object()?,
+            )
+            .await
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        if let crate::mvcc_transaction::CertificationResult::Aborted { reason } =
+            outcome.certification
+        {
+            return Err(Status::aborted(format!(
+                "implicit MVCC transaction aborted: {reason:?}"
+            )));
+        }
+        Ok(())
     }
 
     /// Consume an object stream directly into its transaction durability
@@ -590,6 +640,109 @@ impl ObjectManager {
                 .map_err(|error| Status::internal(error.to_string()))?,
             boundary_payload,
         })
+    }
+
+    fn mvcc_ingest_object_ref(
+        prepared: &PreparedMvccObjectIngest,
+    ) -> Result<CoreObjectRef, Status> {
+        let representation = serde_json::to_vec(&prepared.shard_map)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        Ok(CoreObjectRef {
+            hash: prepared.object_hash.clone(),
+            logical_size: prepared.object_length,
+            manifest_ref: format!(
+                "{MVCC_OBJECT_REF_PREFIX}{}",
+                URL_SAFE_NO_PAD.encode(representation)
+            ),
+            // Append and multipart journal schemas still expose CoreObjectRef.
+            // The authoritative representation is the MVCC manifest embedded
+            // above; these compatibility fields are never used for reads.
+            encoding: CoreObjectEncoding {
+                block_id: String::new(),
+                profile_id: "mvcc".to_string(),
+                data_shards: 1,
+                parity_shards: 0,
+                minimum_read_shards: 1,
+                minimum_write_ack_shards: 1,
+                stripe_size: prepared.object_length,
+                placement_scope: "cluster".to_string(),
+                repair_priority: "normal".to_string(),
+                stored_hash: prepared.object_hash.clone(),
+                compression: CoreCompressionDescriptor {
+                    algorithm: "none".to_string(),
+                    level: 0,
+                    uncompressed_length: prepared.object_length,
+                    compressed_length: prepared.object_length,
+                    dictionary_id: String::new(),
+                    descriptor_hash: String::new(),
+                },
+                encryption: "none".to_string(),
+            },
+            placements: Vec::new(),
+        })
+    }
+
+    async fn read_mvcc_compatible_object_ref(
+        &self,
+        object_ref: CoreObjectRef,
+    ) -> Result<Vec<u8>, Status> {
+        let Some(encoded) = object_ref.manifest_ref.strip_prefix(MVCC_OBJECT_REF_PREFIX) else {
+            return self
+                .core_store
+                .get_blob(GetBlob { object_ref })
+                .await
+                .map_err(|error| Status::internal(error.to_string()));
+        };
+        let representation = URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|error| Status::data_loss(error.to_string()))?;
+        let representation: JsonValue = serde_json::from_slice(&representation)
+            .map_err(|error| Status::data_loss(error.to_string()))?;
+        let target = object_data_target_from_shard_map(&representation)
+            .map_err(|error| Status::data_loss(error.to_string()))?;
+        let bytes = match target {
+            ObjectDataTarget::MvccLocal(manifest) => self
+                .installed_mvcc()?
+                .local_objects
+                .read_range(&manifest, 0, manifest.object_length)
+                .map_err(|error| Status::data_loss(error.to_string()))?,
+            ObjectDataTarget::MvccShards(manifest) => {
+                let output = std::sync::Arc::new(Mutex::new(Vec::new()));
+                let sink = output.clone();
+                manifest
+                    .read_range_chunks(
+                        &self.installed_mvcc()?.replication_client,
+                        0,
+                        manifest.object_length,
+                        move |chunk| {
+                            let sink = sink.clone();
+                            async move {
+                                sink.lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .extend_from_slice(&chunk);
+                                Ok(())
+                            }
+                        },
+                    )
+                    .await
+                    .map_err(|error| Status::data_loss(error.to_string()))?;
+                std::sync::Arc::try_unwrap(output)
+                    .map_err(|_| Status::internal("MVCC payload reader retained output"))?
+                    .into_inner()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            }
+            ObjectDataTarget::LogicalFile(_) | ObjectDataTarget::ObjectRef(_) => {
+                return Err(Status::data_loss(
+                    "MVCC compatibility reference contains a legacy target",
+                ));
+            }
+        };
+        if object_ref.hash != format!("sha256:{}", hex::encode(sha2::Sha256::digest(&bytes)))
+            || object_ref.logical_size != bytes.len() as u64
+        {
+            return Err(Status::data_loss("MVCC object reference verification failed"));
+        }
+        Ok(bytes)
     }
 
     async fn object_boundary_capture_limit(
@@ -1105,25 +1258,42 @@ impl ObjectManager {
             .await?;
         let tenant_id = claims.tenant_id;
         let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
-
-        let mutation = if let Some(transaction_id) = transaction_id {
-            self.persistence
-                .create_multipart_upload_in_transaction(
-                    tenant_id,
-                    bucket.id,
-                    object_key,
-                    transaction_id,
-                    transaction_principal.ok_or_else(|| {
-                        Status::invalid_argument("transaction principal is required")
-                    })?,
+        let principal = transaction_principal
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| transaction_principal_from_claims(claims));
+        let implicit_transaction = if transaction_id.is_none() {
+            Some(
+                self.begin_internal_transaction(
+                    principal.clone(),
+                    format!(
+                        "multipart-initiate:{tenant_id}:{}:{object_key}:{}",
+                        bucket.id,
+                        uuid::Uuid::new_v4()
+                    ),
                 )
-                .await
+                .await?,
+            )
         } else {
-            self.persistence
-                .create_multipart_upload(tenant_id, bucket.id, object_key)
-                .await
-        }
+            None
+        };
+        let transaction_id = transaction_id
+            .or_else(|| implicit_transaction.as_ref().map(|handle| handle.transaction_id.as_str()))
+            .expect("explicit or implicit transaction");
+        let mutation = self
+            .persistence
+            .create_multipart_upload_in_transaction(
+                tenant_id,
+                bucket.id,
+                object_key,
+                transaction_id,
+                &principal,
+            )
+            .await
         .map_err(|e| Status::internal(e.to_string()))?;
+        if implicit_transaction.is_some() {
+            self.commit_internal_transaction(transaction_id, &principal)
+                .await?;
+        }
         Ok(InitiateMultipartUploadResult {
             upload_id: mutation.upload.upload_id,
             receipt: mutation.receipt,
@@ -1137,7 +1307,7 @@ impl ObjectManager {
         object_key: &str,
         upload_id: uuid::Uuid,
         part_number: i32,
-        data_stream: impl Stream<Item = Result<Vec<u8>, Status>> + Unpin,
+        data_stream: impl Stream<Item = Result<Vec<u8>, Status>> + Unpin + Send,
         transaction_id: Option<&str>,
         transaction_principal: Option<&str>,
     ) -> Result<UploadPartResult, Status> {
@@ -1146,109 +1316,73 @@ impl ObjectManager {
         let tenant_id = claims.tenant_id;
         validate_multipart_part_number(part_number)?;
         let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
-        let upload = if let Some(transaction_id) = transaction_id {
-            self.persistence
-                .get_active_multipart_upload_in_transaction(
-                    tenant_id,
-                    bucket.id,
-                    object_key,
-                    upload_id,
-                    transaction_id,
-                    transaction_principal.ok_or_else(|| {
-                        Status::invalid_argument("transaction principal is required")
-                    })?,
+        let principal = transaction_principal
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| transaction_principal_from_claims(claims));
+        let implicit_transaction = if transaction_id.is_none() {
+            Some(
+                self.begin_internal_transaction(
+                    principal.clone(),
+                    format!(
+                        "multipart-part:{tenant_id}:{}:{upload_id}:{part_number}:{}",
+                        bucket.id,
+                        uuid::Uuid::new_v4()
+                    ),
                 )
-                .await
+                .await?,
+            )
         } else {
-            self.persistence
-                .get_active_multipart_upload(tenant_id, bucket.id, object_key, upload_id)
-                .await
-        }
+            None
+        };
+        let transaction_id = transaction_id
+            .or_else(|| implicit_transaction.as_ref().map(|handle| handle.transaction_id.as_str()))
+            .expect("explicit or implicit transaction");
+        let upload = self
+            .persistence
+            .get_active_multipart_upload_in_transaction(
+                tenant_id,
+                bucket.id,
+                object_key,
+                upload_id,
+                transaction_id,
+                &principal,
+            )
+            .await
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found("Multipart upload not found"))?;
 
-        let (temp_path, bytes, stream_hash) = self
-            .storage
-            .stream_to_temp_file(data_stream)
+        let prepared = self
+            .prepare_mvcc_object_ingest(
+                data_stream,
+                transaction_id,
+                &principal,
+                &bucket.name,
+                &format!("{object_key}/multipart/{upload_id}/part/{part_number}"),
+                None,
+            )
+            .await?;
+        let bytes = i64::try_from(prepared.object_length)
+            .map_err(|_| Status::invalid_argument("Multipart part exceeds supported size"))?;
+        let content_hash = prepared.object_hash.clone();
+        let object_ref = Self::mvcc_ingest_object_ref(&prepared)?;
+
+        let mutation = self
+            .persistence
+            .upsert_multipart_part_in_transaction(
+                upload.id,
+                part_number,
+                object_ref,
+                bytes,
+                &content_hash,
+                transaction_id,
+                &principal,
+            )
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        let bytes_u64 =
-            u64::try_from(bytes).map_err(|_| Status::internal("Negative multipart part size"))?;
-        let storage_class_id = self
-            .core_store
-            .resolve_storage_class_id(None)
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let pipeline_policy = self
-            .core_store
-            .pipeline_policy_for_storage_class(Some(storage_class_id.as_str()))
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let write_result = self
-            .core_store
-            .write_logical_file_path_with_locator(WriteLogicalFilePathRequest {
-                writer_family: WriterFamily::ObjectBlob.as_str().to_string(),
-                generation: 0,
-                logical_file_id: format!(
-                    "tenant:{tenant_id}/bucket:{}/multipart:{upload_id}/part:{part_number}",
-                    bucket.name
-                ),
-                source_path: temp_path.clone(),
-                source_len: bytes_u64,
-                source_hash: format!("sha256:{stream_hash}"),
-                range_hints: Vec::new(),
-                pipeline_policy,
-                trace_context: Default::default(),
-                boundary_values: Vec::new(),
-                mutation_id: uuid::Uuid::new_v4().to_string(),
-                region_id: self.region.clone(),
-            })
-            .await;
-        let io_start = Instant::now();
-        let remove_result = tokio::fs::remove_file(&temp_path).await;
-        crate::perf::record_io_duration(
-            "object_manager",
-            "remove_temp_multipart_part",
-            &temp_path,
-            bytes_u64,
-            io_start.elapsed(),
-        );
-        let write = write_result.map_err(core_store_status)?;
-        if let Err(error) = remove_result {
-            tracing::warn!(
-                path = %temp_path.display(),
-                %error,
-                "failed to remove non-authoritative staged multipart payload"
-            );
-        }
-        let object_ref = core_object_ref_from_logical_file_write(&write);
-        let content_hash = object_ref.hash.clone();
-
-        let mutation = if let Some(transaction_id) = transaction_id {
-            self.persistence
-                .upsert_multipart_part_in_transaction(
-                    upload.id,
-                    part_number,
-                    object_ref,
-                    bytes as i64,
-                    &content_hash,
-                    transaction_id,
-                    transaction_principal.ok_or_else(|| {
-                        Status::invalid_argument("transaction principal is required")
-                    })?,
-                )
-                .await
-        } else {
-            self.persistence
-                .upsert_multipart_part(
-                    upload.id,
-                    part_number,
-                    object_ref,
-                    bytes as i64,
-                    &content_hash,
-                )
-                .await
-        }
         .map_err(|e| Status::internal(e.to_string()))?;
+        if implicit_transaction.is_some() {
+            self.commit_internal_transaction(transaction_id, &principal)
+                .await?;
+        }
         Ok(UploadPartResult {
             etag: mutation.part.etag,
             payload_hash: content_hash,
@@ -1279,39 +1413,40 @@ impl ObjectManager {
         }
 
         let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
-        let upload = if let Some(transaction_id) = transaction_id {
-            self.persistence
-                .get_active_multipart_upload_in_transaction(
-                    tenant_id,
-                    bucket.id,
-                    object_key,
-                    upload_id,
-                    transaction_id,
-                    transaction_principal.ok_or_else(|| {
-                        Status::invalid_argument("transaction principal is required")
-                    })?,
+        let principal = transaction_principal
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| transaction_principal_from_claims(claims));
+        let implicit_transaction = if transaction_id.is_none() {
+            Some(
+                self.begin_internal_transaction(
+                    principal.clone(),
+                    format!("multipart-complete:{tenant_id}:{}:{upload_id}", bucket.id),
                 )
-                .await
+                .await?,
+            )
         } else {
-            self.persistence
-                .get_active_multipart_upload(tenant_id, bucket.id, object_key, upload_id)
-                .await
-        }
+            None
+        };
+        let transaction_id = transaction_id
+            .or_else(|| implicit_transaction.as_ref().map(|handle| handle.transaction_id.as_str()))
+            .expect("explicit or implicit transaction");
+        let upload = self
+            .persistence
+            .get_active_multipart_upload_in_transaction(
+                tenant_id,
+                bucket.id,
+                object_key,
+                upload_id,
+                transaction_id,
+                &principal,
+            )
+            .await
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found("Multipart upload not found"))?;
-        let stored_parts = if let Some(transaction_id) = transaction_id {
-            self.persistence
-                .list_multipart_parts_in_transaction(
-                    upload.id,
-                    transaction_id,
-                    transaction_principal.ok_or_else(|| {
-                        Status::invalid_argument("transaction principal is required")
-                    })?,
-                )
-                .await
-        } else {
-            self.persistence.list_multipart_parts(upload.id).await
-        }
+        let stored_parts = self
+            .persistence
+            .list_multipart_parts_in_transaction(upload.id, transaction_id, &principal)
+            .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
         let mut ordered_part_refs = Vec::with_capacity(parts.len());
@@ -1330,65 +1465,49 @@ impl ObjectManager {
             ordered_part_refs.push(stored.object_ref.clone());
         }
 
-        let core_store = self.core_store.clone();
+        let object_manager = self.clone();
         let (tx, rx) = mpsc::channel(4);
         tokio::spawn(async move {
             for object_ref in ordered_part_refs {
-                let result = core_store
-                    .read_object_ref_chunks(object_ref, None, 1024 * 64, |chunk| {
-                        let tx = tx.clone();
-                        async move {
-                            tx.send(Ok(chunk))
-                                .await
-                                .map_err(|_| anyhow!("multipart completion stream closed"))
+                match object_manager
+                    .read_mvcc_compatible_object_ref(object_ref)
+                    .await
+                {
+                    Ok(bytes) => {
+                        if tx.send(Ok(bytes)).await.is_err() {
+                            return;
                         }
-                    })
-                    .await;
-                if let Err(error) = result {
-                    let _ = tx.send(Err(Status::internal(error.to_string()))).await;
-                    return;
+                    }
+                    Err(error) => {
+                        let _ = tx.send(Err(error)).await;
+                        return;
+                    }
                 }
             }
         });
 
         let options = ObjectWriteOptions {
-            transaction_id: transaction_id.map(ToOwned::to_owned),
-            transaction_principal: transaction_principal.map(ToOwned::to_owned),
+            transaction_id: Some(transaction_id.to_owned()),
+            transaction_principal: Some(principal.clone()),
             visibility: ObjectWriteVisibility::strict(),
             ..Default::default()
         };
         let part_stream = ReceiverStream::new(rx);
-        let object = if transaction_id.is_some() {
-            self.put_object(claims, bucket_name, object_key, part_stream, options)
-                .await?
-        } else {
-            self.put_object_with_implicit_quorum_transaction(
-                claims,
-                bucket_name,
-                object_key,
-                part_stream,
-                options,
-                format!("complete-multipart:{upload_id}"),
-            )
-            .await?
-        };
+        let object = self
+            .put_object(claims, bucket_name, object_key, part_stream, options)
+            .await?;
 
-        let completion = if let Some(transaction_id) = transaction_id {
-            self.persistence
-                .complete_multipart_upload_in_transaction(
-                    upload.id,
-                    transaction_id,
-                    transaction_principal.ok_or_else(|| {
-                        Status::invalid_argument("transaction principal is required")
-                    })?,
-                )
-                .await
-        } else {
-            self.persistence.complete_multipart_upload(upload.id).await
-        }
+        let completion = self
+            .persistence
+            .complete_multipart_upload_in_transaction(upload.id, transaction_id, &principal)
+            .await
         .map_err(|e| Status::internal(e.to_string()))?;
         if !completion.completed {
             return Err(Status::not_found("Multipart upload not found"));
+        }
+        if implicit_transaction.is_some() {
+            self.commit_internal_transaction(transaction_id, &principal)
+                .await?;
         }
 
         Ok(object)
@@ -1407,26 +1526,40 @@ impl ObjectManager {
             .await?;
         let tenant_id = claims.tenant_id;
         let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
-        let mutation = if let Some(transaction_id) = transaction_id {
-            self.persistence
-                .abort_multipart_upload_in_transaction(
-                    tenant_id,
-                    bucket.id,
-                    object_key,
-                    upload_id,
-                    transaction_id,
-                    transaction_principal.ok_or_else(|| {
-                        Status::invalid_argument("transaction principal is required")
-                    })?,
+        let principal = transaction_principal
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| transaction_principal_from_claims(claims));
+        let implicit_transaction = if transaction_id.is_none() {
+            Some(
+                self.begin_internal_transaction(
+                    principal.clone(),
+                    format!("multipart-abort:{tenant_id}:{}:{upload_id}", bucket.id),
                 )
-                .await
+                .await?,
+            )
         } else {
-            self.persistence
-                .abort_multipart_upload(tenant_id, bucket.id, object_key, upload_id)
-                .await
-        }
+            None
+        };
+        let transaction_id = transaction_id
+            .or_else(|| implicit_transaction.as_ref().map(|handle| handle.transaction_id.as_str()))
+            .expect("explicit or implicit transaction");
+        let mutation = self
+            .persistence
+            .abort_multipart_upload_in_transaction(
+                tenant_id,
+                bucket.id,
+                object_key,
+                upload_id,
+                transaction_id,
+                &principal,
+            )
+            .await
         .map_err(|e| Status::internal(e.to_string()))?;
         if let Some(receipt) = mutation.receipt {
+            if implicit_transaction.is_some() {
+                self.commit_internal_transaction(transaction_id, &principal)
+                    .await?;
+            }
             Ok(AbortMultipartUploadResult { upload_id, receipt })
         } else {
             Err(Status::not_found("Multipart upload not found"))
@@ -1541,58 +1674,36 @@ impl ObjectManager {
         .await?;
         let tenant_id = claims.tenant_id;
         let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
-        let mutation = if let Some(transaction_id) = transaction_id {
-            let transaction_principal = transaction_principal.ok_or_else(|| {
-                Status::invalid_argument(
-                    "transaction principal is required for append stream create",
-                )
-            })?;
-            self.persistence
-                .create_append_stream_in_transaction(
-                    tenant_id,
-                    bucket.id,
-                    &bucket.name,
-                    stream_key,
-                    transaction_id,
-                    transaction_principal,
-                )
-                .await
-        } else {
-            self.persistence
-                .create_append_stream(tenant_id, bucket.id, &bucket.name, stream_key)
-                .await
-        }
-        .map_err(|e| Status::internal(e.to_string()))?;
-        if let Some(transaction_id) = transaction_id {
-            let transaction_principal = transaction_principal.ok_or_else(|| {
-                Status::invalid_argument(
-                    "transaction principal is required for append stream create",
-                )
-            })?;
-            access_control::stage_stream_defaults(
-                &self.persistence,
-                &bucket,
+        let transaction_id = transaction_id.ok_or_else(|| {
+            Status::failed_precondition("append stream create requires an MVCC transaction")
+        })?;
+        let transaction_principal = transaction_principal.ok_or_else(|| {
+            Status::invalid_argument("transaction principal is required for append stream create")
+        })?;
+        let mutation = self
+            .persistence
+            .create_append_stream_in_transaction(
+                tenant_id,
+                bucket.id,
+                &bucket.name,
                 stream_key,
-                &claims.sub,
-                &claims.sub,
-                "grant creator stream owner",
                 transaction_id,
                 transaction_principal,
             )
             .await
-            .map_err(core_store_status)?;
-        } else {
-            access_control::grant_stream_defaults(
-                &self.persistence,
-                &bucket,
-                stream_key,
-                &claims.sub,
-                &claims.sub,
-                "grant creator stream owner",
-            )
-                .await
-            .map_err(core_store_status)?;
-        }
+        .map_err(|e| Status::internal(e.to_string()))?;
+        access_control::stage_stream_defaults(
+            &self.persistence,
+            &bucket,
+            stream_key,
+            &claims.sub,
+            &claims.sub,
+            "grant creator stream owner",
+            transaction_id,
+            transaction_principal,
+        )
+        .await
+        .map_err(core_store_status)?;
         Ok(CreateAppendStreamResult {
             stream_id: mutation.stream.stream_id,
             receipt: mutation.receipt,
@@ -1622,80 +1733,56 @@ impl ObjectManager {
         let tenant_id = claims.tenant_id;
         let authenticated_principal = transaction_principal_from_claims(claims);
         let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
-        let stream = if let Some(transaction_id) = transaction_id {
-            let mvcc = self
-                .mvcc
-                .get()
-                .ok_or_else(|| Status::failed_precondition("MVCC runtime is not installed"))?;
-            self.persistence
-                .get_active_append_stream_in_transaction(
-                    mvcc,
-                    tenant_id,
-                    bucket.id,
-                    stream_key,
-                    stream_id,
-                    transaction_id,
-                    &authenticated_principal,
-                )
-                .await
-        } else {
-            self.persistence
-                .get_active_append_stream(tenant_id, bucket.id, stream_key, stream_id)
-                .await
-        }
+        let transaction_id = transaction_id.ok_or_else(|| {
+            Status::failed_precondition("append stream write requires an MVCC transaction")
+        })?;
+        let mvcc = self
+            .mvcc
+            .get()
+            .ok_or_else(|| Status::failed_precondition("MVCC runtime is not installed"))?;
+        let stream = self
+            .persistence
+            .get_active_append_stream_in_transaction(
+                mvcc,
+                tenant_id,
+                bucket.id,
+                stream_key,
+                stream_id,
+                transaction_id,
+                &authenticated_principal,
+            )
+            .await
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found("Append stream not found"))?;
 
-        let payload_size = payload.len() as i64;
-        let stream_payload_mutation_id = uuid::Uuid::new_v4().to_string();
-        let object_ref = self
-            .core_store
-            .write_logical_file_ref(WriteLogicalFileRequest {
-                writer_family: WriterFamily::Stream.as_str().to_string(),
-                generation: 0,
-                logical_file_id: format!(
-                    "tenant:{tenant_id}/bucket:{}/append:{stream_key}/record:{}",
-                    bucket.name, stream_payload_mutation_id
-                ),
-                source: payload,
-                range_hints: Vec::new(),
-                pipeline_policy: Default::default(),
-                trace_context: Default::default(),
-                boundary_values: Vec::new(),
-                region_id: self.region.clone(),
-                mutation_id: stream_payload_mutation_id.clone(),
-            })
+        let prepared = self
+            .prepare_mvcc_object_ingest(
+                futures_util::stream::once(async move { Ok(payload) }),
+                transaction_id,
+                &authenticated_principal,
+                &bucket.name,
+                &format!("{stream_key}/append-record"),
+                None,
+            )
+            .await?;
+        let payload_size = i64::try_from(prepared.object_length)
+            .map_err(|_| Status::invalid_argument("Append payload exceeds supported size"))?;
+        let payload_hash = prepared.object_hash.clone();
+        let object_ref = Self::mvcc_ingest_object_ref(&prepared)?;
+        let mutation = self
+            .persistence
+            .append_stream_record_in_transaction(
+                tenant_id,
+                bucket.id,
+                &stream,
+                object_ref,
+                payload_size,
+                content_type.clone(),
+                user_metadata.clone(),
+                transaction_id,
+                &authenticated_principal,
+            )
             .await
-            .map_err(core_store_status)?;
-        let payload_hash = object_ref.hash.clone();
-        let mutation = if let Some(transaction_id) = transaction_id {
-            self.persistence
-                .append_stream_record_in_transaction(
-                    tenant_id,
-                    bucket.id,
-                    &stream,
-                    object_ref,
-                    payload_size,
-                    content_type.clone(),
-                    user_metadata.clone(),
-                    transaction_id,
-                    &authenticated_principal,
-                )
-                .await
-        } else {
-            self.persistence
-                .append_stream_record(
-                    tenant_id,
-                    bucket.id,
-                    &stream,
-                    object_ref,
-                    payload_size,
-                    content_type.clone(),
-                    user_metadata.clone(),
-                    &authenticated_principal,
-                )
-                .await
-        }
         .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(AppendStreamRecordResult {
@@ -1729,43 +1816,34 @@ impl ObjectManager {
         .await?;
         let tenant_id = claims.tenant_id;
         let bucket = self.get_tenant_bucket(tenant_id, bucket_name).await?;
-        let stream = if let Some(transaction_id) = transaction_id {
-            let transaction_principal = transaction_principal.ok_or_else(|| {
-                Status::invalid_argument("transaction principal is required for append stream seal")
-            })?;
-            let mvcc = self
-                .mvcc
-                .get()
-                .ok_or_else(|| Status::failed_precondition("MVCC runtime is not installed"))?;
-            self.persistence
-                .get_active_append_stream_in_transaction(
-                    mvcc,
-                    tenant_id,
-                    bucket.id,
-                    stream_key,
-                    stream_id,
-                    transaction_id,
-                    transaction_principal,
-                )
-                .await
-        } else {
-            self.persistence
-                .get_active_append_stream(tenant_id, bucket.id, stream_key, stream_id)
-                .await
-        }
+        let transaction_id = transaction_id.ok_or_else(|| {
+            Status::failed_precondition("append stream seal requires an MVCC transaction")
+        })?;
+        let transaction_principal = transaction_principal.ok_or_else(|| {
+            Status::invalid_argument("transaction principal is required for append stream seal")
+        })?;
+        let mvcc = self
+            .mvcc
+            .get()
+            .ok_or_else(|| Status::failed_precondition("MVCC runtime is not installed"))?;
+        let stream = self
+            .persistence
+            .get_active_append_stream_in_transaction(
+                mvcc,
+                tenant_id,
+                bucket.id,
+                stream_key,
+                stream_id,
+                transaction_id,
+                transaction_principal,
+            )
+            .await
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found("Append stream not found"))?;
-        let transaction = transaction_id.zip(transaction_principal);
-        let mvcc = transaction_id
-            .map(|_| {
-                self.mvcc
-                    .get()
-                    .ok_or_else(|| Status::failed_precondition("MVCC runtime is not installed"))
-            })
-            .transpose()?;
+        let transaction = Some((transaction_id, transaction_principal));
         let has_records = self
             .persistence
-            .append_stream_has_records(mvcc.map(AsRef::as_ref), &stream, transaction)
+            .append_stream_has_records(Some(mvcc.as_ref()), &stream, transaction)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         if !has_records {
@@ -1776,28 +1854,20 @@ impl ObjectManager {
 
         let (segment_hash, record_count) = self
             .persistence
-            .append_stream_segment_hash(mvcc.map(AsRef::as_ref), &stream, transaction)
+            .append_stream_segment_hash(Some(mvcc.as_ref()), &stream, transaction)
             .await
             .map_err(|error| Status::internal(error.to_string()))?;
-        let sealed = if let Some(transaction_id) = transaction_id {
-            let transaction_principal = transaction_principal.ok_or_else(|| {
-                Status::invalid_argument("transaction principal is required for append stream seal")
-            })?;
-            self.persistence
-                .seal_append_stream_in_transaction(
-                    tenant_id,
-                    bucket.id,
-                    &stream,
-                    &segment_hash,
-                    transaction_id,
-                    transaction_principal,
-                )
-                .await
-        } else {
-            self.persistence
-                .seal_append_stream(tenant_id, bucket.id, &stream, &segment_hash)
-                .await
-        }
+        let sealed = self
+            .persistence
+            .seal_append_stream_in_transaction(
+                tenant_id,
+                bucket.id,
+                &stream,
+                &segment_hash,
+                transaction_id,
+                transaction_principal,
+            )
+            .await
         .map_err(|e| Status::internal(e.to_string()))?;
         let Some(receipt) = sealed.receipt else {
             return Err(Status::failed_precondition(
@@ -1861,12 +1931,8 @@ impl ObjectManager {
         for record in records {
             let payload = if include_payload {
                 let bytes = self
-                    .core_store
-                    .get_blob(crate::core_store::GetBlob {
-                        object_ref: record.payload_object_ref.clone(),
-                    })
-                    .await
-                    .map_err(|error| Status::internal(error.to_string()))?;
+                    .read_mvcc_compatible_object_ref(record.payload_object_ref.clone())
+                    .await?;
                 if record.payload_object_ref.hash != record.payload_hash
                     || i64::try_from(bytes.len()).ok() != Some(record.payload_size)
                 {
