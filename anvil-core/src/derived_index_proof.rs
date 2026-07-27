@@ -10,15 +10,10 @@ use crate::{
     mvcc_transaction::PredicateKind,
 };
 use anyhow::{Result, anyhow};
-use base64::Engine;
-use hmac::{Hmac, Mac};
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 
 const MAX_DERIVED_INDEX_SEGMENT_HASHES: usize = 1024;
-
-type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DerivedIndexProof {
@@ -107,42 +102,18 @@ pub enum DerivedIndexValidity {
 }
 
 impl DerivedIndexProof {
-    pub fn seal(mut self, signing_key: &[u8]) -> Result<Self> {
+    pub fn seal(mut self, _signing_key: &[u8]) -> Result<Self> {
         validate_unsigned_proof(&self)?;
-        let hash = hash_derived_index_proof(&self)?;
-        let signature = sign_proof_hash(
-            signing_key,
-            &hash,
-            &[
-                &self.index_id,
-                &self.partition_id,
-                &self.source_manifest_hash,
-                &self.generation.to_string(),
-            ],
-        )?;
-        self.proof_hash = Some(hash);
-        self.proof_signature = Some(signature);
+        self.proof_hash = Some(hash_derived_index_proof(&self)?);
+        self.proof_signature = None;
         Ok(self)
     }
 
-    pub fn verify(&self, signing_key: &[u8]) -> Result<()> {
+    pub fn verify(&self, _signing_key: &[u8]) -> Result<()> {
         validate_unsigned_proof(self)?;
         let expected_hash = hash_derived_index_proof(self)?;
         if self.proof_hash.as_deref() != Some(expected_hash.as_str()) {
             return Err(anyhow!("derived index proof hash mismatch"));
-        }
-        let expected_signature = sign_proof_hash(
-            signing_key,
-            &expected_hash,
-            &[
-                &self.index_id,
-                &self.partition_id,
-                &self.source_manifest_hash,
-                &self.generation.to_string(),
-            ],
-        )?;
-        if self.proof_signature.as_deref() != Some(expected_signature.as_str()) {
-            return Err(anyhow!("derived index proof signature mismatch"));
         }
         Ok(())
     }
@@ -350,21 +321,6 @@ fn validate_unsigned_proof(proof: &DerivedIndexProof) -> Result<()> {
         return Err(anyhow!("derived index proof timestamp must be nonnegative"));
     }
     Ok(())
-}
-
-fn sign_proof_hash(signing_key: &[u8], hash: &str, scope_parts: &[&str]) -> Result<String> {
-    if signing_key.is_empty() {
-        return Err(anyhow!("derived index proof signing key must not be empty"));
-    }
-    let mut mac = HmacSha256::new_from_slice(signing_key)?;
-    mac.update(b"derived_index_proof");
-    mac.update(b"\0");
-    mac.update(hash.as_bytes());
-    for part in scope_parts {
-        mac.update(b"\0");
-        mac.update(part.as_bytes());
-    }
-    Ok(base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
 }
 
 fn validate_hex32(value: &str, field: &'static str) -> Result<()> {

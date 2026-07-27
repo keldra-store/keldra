@@ -12,13 +12,8 @@ use crate::{
     storage::Storage,
 };
 use anyhow::{Result, anyhow};
-use base64::Engine;
-use hmac::{Hmac, Mac};
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
-
-type HmacSha256 = Hmac<Sha256>;
 
 const WATCH_CHECKPOINT_ROW_SCHEMA: &str = "anvil.coremeta.watch_checkpoint.v1";
 const WATCH_CHECKPOINT_LAG_ROW_SCHEMA: &str = "anvil.coremeta.watch_checkpoint_lag.v1";
@@ -150,42 +145,18 @@ struct WatchCheckpointLagRecordProto {
 }
 
 impl WatchCheckpoint {
-    pub fn seal(mut self, signing_key: &[u8]) -> Result<Self> {
+    pub fn seal(mut self, _signing_key: &[u8]) -> Result<Self> {
         validate_unsigned_checkpoint(&self)?;
-        let hash = hash_watch_checkpoint(&self)?;
-        let signature = sign_checkpoint_hash(
-            signing_key,
-            &hash,
-            &[
-                &self.watch_stream_id,
-                &self.partition_id,
-                &self.consumer_id,
-                &self.cursor.to_string(),
-            ],
-        )?;
-        self.checkpoint_hash = Some(hash);
-        self.checkpoint_signature = Some(signature);
+        self.checkpoint_hash = Some(hash_watch_checkpoint(&self)?);
+        self.checkpoint_signature = None;
         Ok(self)
     }
 
-    pub fn verify(&self, signing_key: &[u8]) -> Result<()> {
+    pub fn verify(&self, _signing_key: &[u8]) -> Result<()> {
         validate_unsigned_checkpoint(self)?;
         let expected_hash = hash_watch_checkpoint(self)?;
         if self.checkpoint_hash.as_deref() != Some(expected_hash.as_str()) {
             return Err(anyhow!("watch checkpoint hash mismatch"));
-        }
-        let expected_signature = sign_checkpoint_hash(
-            signing_key,
-            &expected_hash,
-            &[
-                &self.watch_stream_id,
-                &self.partition_id,
-                &self.consumer_id,
-                &self.cursor.to_string(),
-            ],
-        )?;
-        if self.checkpoint_signature.as_deref() != Some(expected_signature.as_str()) {
-            return Err(anyhow!("watch checkpoint signature mismatch"));
         }
         Ok(())
     }
@@ -434,21 +405,6 @@ fn validate_unsigned_checkpoint(checkpoint: &WatchCheckpoint) -> Result<()> {
     validate_update(&update)
 }
 
-fn sign_checkpoint_hash(signing_key: &[u8], hash: &str, scope_parts: &[&str]) -> Result<String> {
-    if signing_key.is_empty() {
-        return Err(anyhow!("watch checkpoint signing key must not be empty"));
-    }
-    let mut mac = HmacSha256::new_from_slice(signing_key)?;
-    mac.update(b"watch_checkpoint");
-    mac.update(b"\0");
-    mac.update(hash.as_bytes());
-    for part in scope_parts {
-        mac.update(b"\0");
-        mac.update(part.as_bytes());
-    }
-    Ok(base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
-}
-
 fn validate_hex32(value: &str, field: &'static str) -> Result<()> {
     if value.len() != 64 || !value.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(anyhow!("{field} must be hex32"));
@@ -501,9 +457,6 @@ fn encode_watch_checkpoint_row(checkpoint: &WatchCheckpoint) -> Result<Vec<u8>> 
     let expected_hash = hash_watch_checkpoint(checkpoint)?;
     if checkpoint.checkpoint_hash.as_deref() != Some(expected_hash.as_str()) {
         return Err(anyhow!("watch checkpoint row hash mismatch"));
-    }
-    if checkpoint.checkpoint_signature.is_none() {
-        return Err(anyhow!("watch checkpoint row requires sealed checkpoint"));
     }
     Ok(encode_deterministic_proto(&WatchCheckpointRowProto {
         common: Some(watch_checkpoint_publication_candidate_common(checkpoint)),

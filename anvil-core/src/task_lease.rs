@@ -3,11 +3,8 @@ use crate::{
     formats::hash32,
 };
 use anyhow::{Context, Result, anyhow, bail};
-use base64::Engine;
-use hmac::{Hmac, Mac};
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 
 pub const LEASE_HELD: &str = "LeaseHeld";
 pub const LEASE_EXPIRED: &str = "LeaseExpired";
@@ -19,8 +16,6 @@ const LOCK_RETRY_ATTEMPTS: usize = 200;
 const TASK_LEASE_ROW_PREFIX: &str = "task_lease";
 const TASK_LEASE_OWNER_PREFIX: &str = "task_lease_owner";
 const TASK_LEASE_LIST_PAGE_MAX: usize = 1_000;
-
-type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskLeaseOwner {
@@ -134,46 +129,21 @@ impl TaskLease {
         &self.owner.display_name
     }
 
-    pub fn seal(mut self, signing_key: &[u8]) -> Result<Self> {
+    pub fn seal(mut self, _signing_key: &[u8]) -> Result<Self> {
         validate_unsigned_lease(&self)?;
-        let hash = hash_task_lease(&self)?;
-        let signature = sign_lease_hash(
-            signing_key,
-            &hash,
-            &[
-                &self.task_id,
-                &self.owner.tenant_id.to_string(),
-                &self.owner.principal_kind,
-                &self.owner.principal_id,
-                &self.owner.actor_instance_id,
-                &self.fence_token.to_string(),
-            ],
-        )?;
-        self.lease_hash = Some(hash);
-        self.lease_signature = Some(signature);
+        self.lease_hash = Some(hash_task_lease(&self)?);
+        // Cluster-local lease authority is the certified MVCC row plus its
+        // compact-Raft assignment guard. A second per-record MAC adds no
+        // authority and was removed from the active path.
+        self.lease_signature = None;
         Ok(self)
     }
 
-    pub fn verify(&self, signing_key: &[u8]) -> Result<()> {
+    pub fn verify(&self, _signing_key: &[u8]) -> Result<()> {
         validate_unsigned_lease(self)?;
         let expected_hash = hash_task_lease(self)?;
         if self.lease_hash.as_deref() != Some(expected_hash.as_str()) {
             return Err(anyhow!("task lease hash mismatch"));
-        }
-        let expected_signature = sign_lease_hash(
-            signing_key,
-            &expected_hash,
-            &[
-                &self.task_id,
-                &self.owner.tenant_id.to_string(),
-                &self.owner.principal_kind,
-                &self.owner.principal_id,
-                &self.owner.actor_instance_id,
-                &self.fence_token.to_string(),
-            ],
-        )?;
-        if self.lease_signature.as_deref() != Some(expected_signature.as_str()) {
-            return Err(anyhow!("task lease signature mismatch"));
         }
         Ok(())
     }
@@ -1164,21 +1134,6 @@ fn validate_owner(owner: &TaskLeaseOwner) -> Result<()> {
     require_nonempty(&owner.actor_instance_id, "owner.actor_instance_id")?;
     require_nonempty(&owner.display_name, "owner.display_name")?;
     Ok(())
-}
-
-fn sign_lease_hash(signing_key: &[u8], hash: &str, scope_parts: &[&str]) -> Result<String> {
-    if signing_key.is_empty() {
-        return Err(anyhow!("task lease signing key must not be empty"));
-    }
-    let mut mac = HmacSha256::new_from_slice(signing_key)?;
-    mac.update(b"task_lease");
-    mac.update(b"\0");
-    mac.update(hash.as_bytes());
-    for part in scope_parts {
-        mac.update(b"\0");
-        mac.update(part.as_bytes());
-    }
-    Ok(base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
 }
 
 fn task_lease_owner_prefix(owner_node_id: &str) -> Result<Vec<u8>> {
