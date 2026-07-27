@@ -388,6 +388,75 @@ async fn stage_git_pack(
     client.put_git_pack(request).await.unwrap().into_inner()
 }
 
+async fn put_git_pack_implicitly(
+    client: &mut GitSourceServiceClient<tonic::transport::Channel>,
+    token: &str,
+    repository_id: &str,
+    bucket_name: &str,
+    idempotency_key: &str,
+    pack: Vec<u8>,
+) -> anvil::anvil_api::PutGitPackResponse {
+    let mut request = Request::new(tokio_stream::iter(vec![
+        PutGitPackRequest {
+            data: Some(put_git_pack_request::Data::Metadata(GitPackMetadata {
+                repository_id: repository_id.to_string(),
+                bucket_name: bucket_name.to_string(),
+                options: Some(WriteOptions {
+                    idempotency_key: idempotency_key.to_string(),
+                    consistency: 0,
+                    wait_for_finalization: false,
+                    preconditions: Vec::new(),
+                    boundary_values: Vec::new(),
+                    execution: None,
+                }),
+            })),
+        },
+        PutGitPackRequest {
+            data: Some(put_git_pack_request::Data::Chunk(pack)),
+        },
+    ]));
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {token}").parse().unwrap(),
+    );
+    client.put_git_pack(request).await.unwrap().into_inner()
+}
+
+#[tokio::test]
+async fn implicit_git_pack_retry_reconstructs_the_committed_outcome() {
+    let cluster = isolated_test_cluster("git-source-implicit-retry", &["test-region-1"]).await;
+    let repository_id = unique_test_name("repo-retry");
+    let bucket_name = unique_test_name("git-retry-packs");
+    cluster.create_bucket(&bucket_name, "test-region-1").await;
+    let pack = minimal_git_pack();
+    let idempotency_key = uuid::Uuid::new_v4().to_string();
+    let mut client = GitSourceServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+
+    let first = put_git_pack_implicitly(
+        &mut client,
+        &cluster.token,
+        &repository_id,
+        &bucket_name,
+        &idempotency_key,
+        pack.clone(),
+    )
+    .await;
+    let retry = put_git_pack_implicitly(
+        &mut client,
+        &cluster.token,
+        &repository_id,
+        &bucket_name,
+        &idempotency_key,
+        pack,
+    )
+    .await;
+
+    assert_eq!(retry, first);
+    assert_eq!(retry.write_state, WriteState::Committed as i32);
+}
+
 async fn commit_git_transaction(
     cluster: &TestCluster,
     transactions: &mut TransactionServiceClient<tonic::transport::Channel>,

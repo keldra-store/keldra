@@ -98,6 +98,60 @@ impl GitSourceService for AppState {
                     .transaction_id
             }
         };
+        if internal_transaction {
+            let status = self
+                .mvcc
+                .open_transactions
+                .status(
+                    &transaction_id,
+                    &transaction_principal,
+                    current_unix_ms()?,
+                )
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            if status.state == "committing" {
+                let outcome = self
+                    .mvcc
+                    .open_transactions
+                    .commit(
+                        self.mvcc.runtime.as_ref(),
+                        &transaction_id,
+                        &transaction_principal,
+                        current_unix_ms()?,
+                    )
+                    .await
+                    .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                if let crate::mvcc_transaction::CertificationResult::Aborted { reason } =
+                    outcome.certification
+                {
+                    return Err(Status::aborted(format!(
+                        "implicit GitSource transaction aborted: {reason:?}"
+                    )));
+                }
+                return reconstruct_committed_put_git_pack_response(
+                    self,
+                    claims.tenant_id,
+                    &metadata,
+                    &source_hash_hex,
+                )
+                .await
+                .map(Response::new);
+            }
+            if status.state == "committed" {
+                return reconstruct_committed_put_git_pack_response(
+                    self,
+                    claims.tenant_id,
+                    &metadata,
+                    &source_hash_hex,
+                )
+                .await
+                .map(Response::new);
+            }
+            if status.state == "aborted" {
+                return Err(Status::aborted(
+                    "implicit GitSource transaction previously aborted",
+                ));
+            }
+        }
 
         let staged = async {
             let pack_object = self
@@ -720,6 +774,55 @@ impl AppState {
             .checked_add(1)
             .ok_or_else(|| Status::internal("Git source generation overflow"))
     }
+}
+
+async fn reconstruct_committed_put_git_pack_response(
+    state: &AppState,
+    tenant_id: i64,
+    metadata: &GitPackMetadata,
+    source_hash: &str,
+) -> Result<PutGitPackResponse, Status> {
+    let manifest = git_source_manifest::read_git_source_repository_manifest(
+        &state.mvcc,
+        tenant_id,
+        &metadata.repository_id,
+    )
+    .await
+    .map_err(|error| Status::internal(error.to_string()))?
+    .ok_or_else(|| Status::failed_precondition("committed Git source manifest is unavailable"))?;
+    if manifest.bucket_name != metadata.bucket_name || manifest.source_hash != source_hash {
+        return Err(Status::already_exists(
+            "Git source idempotency key was already used for different input",
+        ));
+    }
+    let bucket = state
+        .persistence
+        .get_bucket_by_name(manifest.tenant_id, &manifest.bucket_name)
+        .await
+        .map_err(|error| Status::internal(error.to_string()))?
+        .ok_or_else(|| Status::failed_precondition("committed Git source bucket is unavailable"))?;
+    let version_id = uuid::Uuid::parse_str(&manifest.pack_object_version_id)
+        .map_err(|error| Status::internal(format!("invalid committed Git pack version: {error}")))?;
+    let object = state
+        .persistence
+        .get_object_version(bucket.id, &manifest.object_key, version_id)
+        .await
+        .map_err(|error| Status::internal(error.to_string()))?
+        .ok_or_else(|| Status::failed_precondition("committed Git pack object is unavailable"))?;
+    Ok(PutGitPackResponse {
+        repository_id: manifest.repository_id,
+        bucket_name: manifest.bucket_name,
+        object_key: manifest.object_key,
+        version_id: manifest.pack_object_version_id,
+        payload_hash: object.content_hash,
+        generation: manifest.generation,
+        source_hash: manifest.source_hash,
+        index_path: manifest.index_path,
+        record_count: manifest.record_count,
+        watch_cursor_low: 0,
+        watch_cursor_high: 0,
+        write_state: WriteState::Committed as i32,
+    })
 }
 
 async fn collect_git_pack_stream(
