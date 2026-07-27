@@ -1,6 +1,7 @@
 use super::*;
 use crate::core_store::{
-    CoreMutationBatch, CoreMutationBatchReceipt, CoreMutationOperation, ReadStream,
+    CoreMutationBatch, CoreMutationBatchReceipt, CoreMutationOperation, CoreMutationPrecondition,
+    ReadStream,
 };
 
 const CONTROL_STREAM_PAGE_MAX_ROWS: usize = 4_096;

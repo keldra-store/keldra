@@ -172,6 +172,36 @@ impl CoreStore {
             }
         }
 
+        // A coordinator is a participating publication root, not merely a
+        // label on the request. Even when the feature mutation has no row
+        // owned by the coordinator root, advance that root with the compact
+        // transaction manifest generated below. This gives every other root a
+        // durable visibility anchor for the transaction and also makes the
+        // first transaction valid when the coordinator has no prior anchor.
+        if let Some(coordinator_root_key_hash) =
+            publications_by_hash
+                .iter()
+                .find_map(|(root_key_hash, publication)| {
+                    publication
+                        .transaction_coordinator
+                        .then(|| root_key_hash.clone())
+                })
+            && !replicated_rows.contains_key(&coordinator_root_key_hash)
+        {
+            let coordinator_generation = generation_bindings
+                .get(&coordinator_root_key_hash)
+                .copied()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "CoreMeta transaction coordinator root {coordinator_root_key_hash} has no generation binding"
+                    )
+                })?;
+            replicated_rows
+                .entry(coordinator_root_key_hash)
+                .or_default()
+                .insert(coordinator_generation, Vec::new());
+        }
+
         if replicated_rows.len() > 1 && coordinator_count != 1 {
             bail!("CoreMeta multi-root mutation must declare exactly one coordinator root");
         }
@@ -222,12 +252,10 @@ impl CoreStore {
                         .0,
                 ))
             } else {
-                // A control root may coordinate a mutation without owning a
-                // row in that mutation. In that case it is not advanced; use
-                // its current durable generation for the manifest binding.
-                self.read_latest_root_anchor(&publication.root_anchor_key)
-                    .await?
-                    .map(|anchor| (root_key_hash.clone(), anchor.root_generation))
+                bail!(
+                    "CoreMeta transaction coordinator root {} was not included in its publication plan",
+                    publication.root_anchor_key
+                )
             }
         } else {
             None
@@ -312,11 +340,10 @@ impl CoreStore {
             });
         }
         while let Some((root_key_hash, publication)) = publications_by_hash.pop_first() {
-            if !publication.transaction_coordinator {
-                bail!(
-                    "CoreMeta logical mutation {transaction_id} declares unused publication root {root_key_hash}"
-                );
-            }
+            bail!(
+                "CoreMeta logical mutation {transaction_id} declares unused publication root {root_key_hash} (coordinator={})",
+                publication.transaction_coordinator
+            );
         }
         self.commit_coremeta_encoded_rows_for_roots(inputs, local_rows)
             .await

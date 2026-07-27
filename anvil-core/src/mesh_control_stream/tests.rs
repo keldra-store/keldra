@@ -415,48 +415,15 @@ async fn control_checkpoint_round_trips_and_rejects_path_body_scope_mismatch() {
         digest,
         "2026-07-02T00:00:00Z",
     );
-    let store = CoreStore::new(storage.clone()).await.unwrap();
-    let row_key = control_checkpoint_row_key("eu-west-2", "bucket_locator", "0a7f").unwrap();
-    let current = store
-        .read_coremeta_row(CF_MESH, TABLE_MESH_PARTITION_ROW, &row_key)
-        .unwrap();
-    let payload = encode_control_checkpoint_proto(&mismatched_body).unwrap();
-    let partition_id =
-        control_checkpoint_partition_id("eu-west-2", "bucket_locator", "0a7f").unwrap();
-    let root_publications = control_checkpoint_root_publications(
-        partition_id.clone(),
-        control_checkpoint_root_anchor_key(
-            &mismatched_body.region,
-            &mismatched_body.stream_family,
-            &mismatched_body.partition,
-        ),
-    );
-    store
-        .commit_mutation_batch(CoreMutationBatch {
-            transaction_id: "mismatched-checkpoint-test".to_string(),
-            scope_partition: partition_id.clone(),
-            committed_by_principal: "mesh-control-checkpoint-test".to_string(),
-            root_publications,
-            preconditions: vec![CoreMutationPrecondition::CoreMetaRow {
-                cf: CF_MESH.to_string(),
-                table_id: TABLE_MESH_PARTITION_ROW,
-                tuple_key: row_key.clone(),
-                expected_payload_hash: current
-                    .as_ref()
-                    .map(|payload| core_meta_payload_digest(TABLE_MESH_PARTITION_ROW, payload)),
-                require_absent: current.is_none(),
-                require_present: current.is_some(),
-            }],
-            operations: vec![CoreMutationOperation::CoreMetaPut {
-                partition_id,
-                cf: CF_MESH.to_string(),
-                table_id: TABLE_MESH_PARTITION_ROW,
-                tuple_key: row_key,
-                payload,
-            }],
-        })
-        .await
-        .unwrap();
+    let checkpoint_store = MeshCheckpointStore::new(&storage);
+    let directory = checkpoint_store.checkpoint_dir("eu-west-2", "bucket_locator", "0a7f");
+    tokio::fs::create_dir_all(&directory).await.unwrap();
+    tokio::fs::write(
+        directory.join("00000000000000000001-mismatched.json"),
+        serde_json::to_vec(&mismatched_body).unwrap(),
+    )
+    .await
+    .unwrap();
 
     let err = read_control_checkpoint(&storage, "eu-west-2", "bucket_locator", "0a7f")
         .await

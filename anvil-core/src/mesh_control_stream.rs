@@ -1,10 +1,4 @@
-use crate::core_store::{
-    CF_MESH, CoreMetaTuplePart, CoreMutationBatch, CoreMutationOperation, CoreMutationPrecondition,
-    CoreMutationRootPublication, CoreStore, TABLE_MESH_PARTITION_ROW,
-    core_meta_committed_row_common, core_meta_payload_digest, core_meta_root_key_hash,
-    core_meta_tuple_key, decode_deterministic_proto, encode_deterministic_proto,
-};
-use crate::formats::writer::WriterFamily;
+use crate::core_store::{CoreStore, decode_deterministic_proto, encode_deterministic_proto};
 use crate::storage::Storage;
 use anyhow::{Context, Result as AnyhowResult, anyhow};
 use prost::Message;
@@ -19,7 +13,6 @@ pub const CONTROL_STREAM_FIXED_HEADER_LEN: usize = 8 + 2 + 4 + 8 + 4 + 4;
 pub const MAX_CONTROL_PROTO_PAYLOAD_LEN: usize = 64 * 1024;
 pub const CONTROL_CHECKPOINT_SCHEMA: &str = "anvil.mesh.control_checkpoint.v1";
 const CONTROL_STREAM_ID_PREFIX: &str = "mesh_control_stream:";
-const CONTROL_CHECKPOINT_ROW_PREFIX: &str = "mesh-control-checkpoint";
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ControlStreamFrameError {
@@ -397,6 +390,9 @@ impl MeshCheckpointStore {
         stream_family: &str,
         partition: &str,
     ) -> AnyhowResult<Option<ControlCheckpointRecord>> {
+        validate_control_stream_scope(region, "control checkpoint region")?;
+        validate_control_stream_scope(stream_family, "control checkpoint stream family")?;
+        validate_control_stream_partition(partition)?;
         let directory = self.checkpoint_dir(region, stream_family, partition);
         let mut entries = match tokio::fs::read_dir(&directory).await {
             Ok(entries) => entries,
@@ -497,28 +493,6 @@ impl ControlCheckpointRecord {
             updated_at: updated_at.into(),
         }
     }
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct ControlCheckpointProto {
-    #[prost(message, optional, tag = "1")]
-    common: Option<crate::core_store::CoreMetaRowCommonProto>,
-    #[prost(string, tag = "2")]
-    schema: String,
-    #[prost(string, tag = "3")]
-    mesh_id: String,
-    #[prost(string, tag = "4")]
-    region: String,
-    #[prost(string, tag = "5")]
-    stream_family: String,
-    #[prost(string, tag = "6")]
-    partition: String,
-    #[prost(uint64, tag = "7")]
-    last_sequence: u64,
-    #[prost(string, tag = "8")]
-    last_digest: String,
-    #[prost(string, tag = "9")]
-    updated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -922,61 +896,13 @@ fn validate_control_checkpoint(checkpoint: &ControlCheckpointRecord) -> AnyhowRe
     if checkpoint.updated_at.trim().is_empty() {
         return Err(anyhow!("control checkpoint updated_at must not be empty"));
     }
-    Ok(())
-}
-
-fn encode_control_checkpoint_proto(checkpoint: &ControlCheckpointRecord) -> AnyhowResult<Vec<u8>> {
-    validate_control_checkpoint(checkpoint)?;
-    Ok(encode_deterministic_proto(&ControlCheckpointProto {
-        common: Some(core_meta_committed_row_common(
-            "mesh",
-            core_meta_root_key_hash(&control_checkpoint_root_anchor_key(
-                &checkpoint.region,
-                &checkpoint.stream_family,
-                &checkpoint.partition,
-            )),
-            checkpoint.last_sequence.get(),
-            format!(
-                "mesh-control-checkpoint:{}:{}:{}:{}",
-                checkpoint.mesh_id,
-                checkpoint.region,
-                checkpoint.stream_family,
-                checkpoint.partition
-            ),
-            0,
-        )),
-        schema: checkpoint.schema.clone(),
-        mesh_id: checkpoint.mesh_id.clone(),
-        region: checkpoint.region.clone(),
-        stream_family: checkpoint.stream_family.clone(),
-        partition: checkpoint.partition.clone(),
-        last_sequence: checkpoint.last_sequence.get(),
-        last_digest: checkpoint.last_digest.to_string(),
-        updated_at: checkpoint.updated_at.clone(),
-    }))
-}
-
-fn decode_control_checkpoint_proto(bytes: &[u8]) -> AnyhowResult<ControlCheckpointRecord> {
-    let proto = decode_deterministic_proto::<ControlCheckpointProto>(
-        bytes,
-        "control checkpoint CoreMeta row",
+    validate_control_stream_scope(&checkpoint.region, "control checkpoint region")?;
+    validate_control_stream_scope(
+        &checkpoint.stream_family,
+        "control checkpoint stream family",
     )?;
-    proto
-        .common
-        .as_ref()
-        .ok_or_else(|| anyhow!("control checkpoint CoreMeta row is missing common metadata"))?;
-    let checkpoint = ControlCheckpointRecord {
-        schema: proto.schema,
-        mesh_id: proto.mesh_id,
-        region: proto.region,
-        stream_family: proto.stream_family,
-        partition: proto.partition,
-        last_sequence: ControlStreamSequence::new(proto.last_sequence)?,
-        last_digest: ControlRecordDigest::new(proto.last_digest)?,
-        updated_at: proto.updated_at,
-    };
-    validate_control_checkpoint(&checkpoint)?;
-    Ok(checkpoint)
+    validate_control_stream_partition(&checkpoint.partition)?;
+    Ok(())
 }
 
 pub fn encode_control_stream_frame(
@@ -1275,64 +1201,6 @@ fn control_stream_id(stream_family: &str, partition: &str) -> AnyhowResult<Strin
 
 fn control_stream_prefix(stream_family: &str) -> String {
     format!("{CONTROL_STREAM_ID_PREFIX}{stream_family}:")
-}
-
-fn control_checkpoint_row_key(
-    region: &str,
-    stream_family: &str,
-    partition: &str,
-) -> AnyhowResult<Vec<u8>> {
-    validate_control_stream_scope(region, "control checkpoint region")?;
-    validate_control_stream_scope(stream_family, "control checkpoint stream family")?;
-    validate_control_stream_partition(partition)?;
-    core_meta_tuple_key(&[
-        CoreMetaTuplePart::Utf8(CONTROL_CHECKPOINT_ROW_PREFIX),
-        CoreMetaTuplePart::Utf8(region),
-        CoreMetaTuplePart::Utf8(stream_family),
-        CoreMetaTuplePart::Utf8(partition),
-    ])
-}
-
-fn control_checkpoint_partition_id(
-    region: &str,
-    stream_family: &str,
-    partition: &str,
-) -> AnyhowResult<String> {
-    validate_control_stream_scope(region, "control checkpoint region")?;
-    validate_control_stream_scope(stream_family, "control checkpoint stream family")?;
-    validate_control_stream_partition(partition)?;
-    Ok(format!(
-        "mesh-control-checkpoint:{region}:{stream_family}:{partition}"
-    ))
-}
-
-fn control_checkpoint_root_anchor_key(
-    region: &str,
-    stream_family: &str,
-    partition: &str,
-) -> String {
-    format!("mesh/control-checkpoint/{region}/{stream_family}/{partition}")
-}
-
-fn control_checkpoint_root_publications(
-    coordinator_root: String,
-    data_root: String,
-) -> Vec<CoreMutationRootPublication> {
-    if coordinator_root == data_root {
-        return vec![CoreMutationRootPublication {
-            root_anchor_key: coordinator_root,
-            writer_families: vec![
-                WriterFamily::CoreControl.as_str().to_string(),
-                WriterFamily::MeshControl.as_str().to_string(),
-            ],
-            transaction_coordinator: true,
-        }];
-    }
-    vec![
-        CoreMutationRootPublication::new(coordinator_root, WriterFamily::CoreControl.as_str())
-            .coordinator(),
-        CoreMutationRootPublication::new(data_root, WriterFamily::MeshControl.as_str()),
-    ]
 }
 
 fn validate_control_stream_scope(value: &str, context: &str) -> AnyhowResult<()> {
