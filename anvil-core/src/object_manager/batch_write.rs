@@ -290,8 +290,6 @@ fn transaction_preflight_status(error: anyhow::Error) -> Status {
         || message.contains("another principal")
     {
         Status::permission_denied("TransactionPrincipalMismatch")
-    } else if message.contains("TransactionScopeMismatch") {
-        Status::failed_precondition("TransactionScopeMismatch")
     } else if message.contains("TransactionExpired")
         || message.contains("TransactionRolledBack")
         || message.contains("TransactionAlreadyCommitted")

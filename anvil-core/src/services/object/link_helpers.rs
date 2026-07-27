@@ -198,8 +198,6 @@ pub(super) fn transaction_core_store_status(message: &str) -> Option<Status> {
         Some(Status::not_found("TransactionNotFound"))
     } else if message.contains("TransactionPrincipalMismatch") {
         Some(Status::permission_denied("TransactionPrincipalMismatch"))
-    } else if message.contains("TransactionScopeMismatch") {
-        Some(Status::failed_precondition("TransactionScopeMismatch"))
     } else if message.contains("TransactionExpired")
         || message.contains("TransactionRolledBack")
         || message.contains("TransactionAlreadyCommitted")

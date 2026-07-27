@@ -804,8 +804,6 @@ fn bucket_core_store_status(error: anyhow::Error) -> Status {
         Status::not_found("TransactionNotFound")
     } else if message.contains("TransactionPrincipalMismatch") {
         Status::permission_denied("TransactionPrincipalMismatch")
-    } else if message.contains("TransactionScopeMismatch") {
-        Status::failed_precondition("TransactionScopeMismatch")
     } else if message.contains("TransactionExpired")
         || message.contains("TransactionRolledBack")
         || message.contains("TransactionAlreadyCommitted")
