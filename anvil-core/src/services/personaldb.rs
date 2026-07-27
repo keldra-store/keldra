@@ -1484,6 +1484,7 @@ impl AppState {
             changeset_bytes: writeback.changeset_bytes,
             client_debug_metadata: request.client_debug_metadata,
         };
+        let result_key = projection_writeback_result_key(&target_request);
         if let Some(caller_transaction) = caller_transaction {
             self.commit_personaldb_changeset(
                 target_request,
@@ -1496,7 +1497,6 @@ impl AppState {
                 "{}/{}",
                 definition.database_id, definition.projection_id
             )];
-            let result_key = projection_writeback_result_key(&target_request);
             let staged_source = self
                 .commit_personaldb_changeset(
                     source_request,
