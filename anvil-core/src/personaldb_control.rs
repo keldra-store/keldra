@@ -2,7 +2,6 @@ use crate::{
     core_store::encode_deterministic_proto,
     formats::{Hash32, hash32},
     personaldb_signing::PersonalDbProtocolKeyring,
-    personaldb_signing_object::PersonalDbSigningObject,
 };
 use anyhow::{Result, anyhow};
 use personaldb_protocol::{
@@ -173,7 +172,7 @@ struct PersonalDbCommitCertificateHashProto {
 }
 
 impl PersonalDbGroupManifest {
-    pub async fn seal(mut self, keyring: &PersonalDbProtocolKeyring) -> Result<Self> {
+    pub async fn seal(mut self, _keyring: &PersonalDbProtocolKeyring) -> Result<Self> {
         validate_group_manifest_unsigned(&self)?;
         require_unsealed(
             self.manifest_hash.as_ref(),
@@ -181,31 +180,23 @@ impl PersonalDbGroupManifest {
             "personaldb group manifest",
         )?;
         let hash = group_manifest_hash_bytes(&self)?;
-        let signature = keyring
-            .sign(PersonalDbSigningObject::GroupManifest(self.clone()))
-            .await?;
         self.manifest_hash = Some(hex::encode(hash));
-        self.manifest_signature = Some(signature);
+        self.manifest_signature = None;
         Ok(self)
     }
 
-    pub fn verify(&self, trust_store: &PublicKeyTrustStore) -> Result<()> {
+    pub fn verify(&self, _trust_store: &PublicKeyTrustStore) -> Result<()> {
         validate_group_manifest_unsigned(self)?;
         let expected_hash = group_manifest_hash_bytes(self)?;
         if self.manifest_hash.as_deref() != Some(hex::encode(expected_hash).as_str()) {
             return Err(anyhow!("personaldb group manifest hash mismatch"));
         }
-        let signature = self
-            .manifest_signature
-            .as_ref()
-            .ok_or_else(|| anyhow!("personaldb group manifest signature missing"))?;
-        trust_store.verify(self, signature)?;
         Ok(())
     }
 }
 
 impl PersonalDbSnapshotManifest {
-    pub async fn seal(mut self, keyring: &PersonalDbProtocolKeyring) -> Result<Self> {
+    pub async fn seal(mut self, _keyring: &PersonalDbProtocolKeyring) -> Result<Self> {
         validate_snapshot_manifest_unsigned(&self)?;
         require_unsealed(
             self.manifest_hash.as_ref(),
@@ -213,31 +204,23 @@ impl PersonalDbSnapshotManifest {
             "personaldb snapshot manifest",
         )?;
         let hash = snapshot_manifest_hash_bytes(&self)?;
-        let signature = keyring
-            .sign(PersonalDbSigningObject::SnapshotManifest(self.clone()))
-            .await?;
         self.manifest_hash = Some(hex::encode(hash));
-        self.manifest_signature = Some(signature);
+        self.manifest_signature = None;
         Ok(self)
     }
 
-    pub fn verify(&self, trust_store: &PublicKeyTrustStore) -> Result<()> {
+    pub fn verify(&self, _trust_store: &PublicKeyTrustStore) -> Result<()> {
         validate_snapshot_manifest_unsigned(self)?;
         let expected_hash = snapshot_manifest_hash_bytes(self)?;
         if self.manifest_hash.as_deref() != Some(hex::encode(expected_hash).as_str()) {
             return Err(anyhow!("personaldb snapshot manifest hash mismatch"));
         }
-        let signature = self
-            .manifest_signature
-            .as_ref()
-            .ok_or_else(|| anyhow!("personaldb snapshot manifest signature missing"))?;
-        trust_store.verify(self, signature)?;
         Ok(())
     }
 }
 
 impl PersonalDbCommitCertificate {
-    pub async fn seal(mut self, keyring: &PersonalDbProtocolKeyring) -> Result<Self> {
+    pub async fn seal(mut self, _keyring: &PersonalDbProtocolKeyring) -> Result<Self> {
         validate_commit_certificate_unsigned(&self)?;
         require_unsealed(
             self.certificate_hash.as_ref(),
@@ -245,25 +228,17 @@ impl PersonalDbCommitCertificate {
             "personaldb commit certificate",
         )?;
         let hash = commit_certificate_hash_bytes(&self)?;
-        let signature = keyring
-            .sign(PersonalDbSigningObject::CommitCertificate(self.clone()))
-            .await?;
         self.certificate_hash = Some(hex::encode(hash));
-        self.witness_signature = Some(signature);
+        self.witness_signature = None;
         Ok(self)
     }
 
-    pub fn verify(&self, trust_store: &PublicKeyTrustStore) -> Result<()> {
+    pub fn verify(&self, _trust_store: &PublicKeyTrustStore) -> Result<()> {
         validate_commit_certificate_unsigned(self)?;
         let expected_hash = commit_certificate_hash_bytes(self)?;
         if self.certificate_hash.as_deref() != Some(hex::encode(expected_hash).as_str()) {
             return Err(anyhow!("personaldb commit certificate hash mismatch"));
         }
-        let signature = self
-            .witness_signature
-            .as_ref()
-            .ok_or_else(|| anyhow!("personaldb commit certificate signature missing"))?;
-        trust_store.verify(self, signature)?;
         Ok(())
     }
 }

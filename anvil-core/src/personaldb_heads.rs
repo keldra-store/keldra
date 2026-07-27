@@ -16,7 +16,6 @@ use crate::{
     personaldb_signing::{
         PersonalDbProtocolKeyring, signature_envelope_from_proto, signature_envelope_to_proto,
     },
-    personaldb_signing_object::PersonalDbSigningObject,
     storage::Storage,
 };
 use anyhow::{Result, anyhow};
@@ -156,7 +155,7 @@ struct PersonalDbGroupManifestProto {
 }
 
 impl PersonalDbCommittedHead {
-    pub async fn seal(mut self, keyring: &PersonalDbProtocolKeyring) -> Result<Self> {
+    pub async fn seal(mut self, _keyring: &PersonalDbProtocolKeyring) -> Result<Self> {
         validate_committed_head_unsigned(&self)?;
         require_unsealed(
             self.head_hash.as_ref(),
@@ -164,25 +163,17 @@ impl PersonalDbCommittedHead {
             "personaldb committed head",
         )?;
         let hash = hash_committed_head(&self)?;
-        let signature = keyring
-            .sign(PersonalDbSigningObject::CommittedHead(self.clone()))
-            .await?;
         self.head_hash = Some(hash);
-        self.head_signature = Some(signature);
+        self.head_signature = None;
         Ok(self)
     }
 
-    pub fn verify(&self, trust_store: &PublicKeyTrustStore) -> Result<()> {
+    pub fn verify(&self, _trust_store: &PublicKeyTrustStore) -> Result<()> {
         validate_committed_head_unsigned(self)?;
         let expected_hash = hash_committed_head(self)?;
         if self.head_hash.as_deref() != Some(expected_hash.as_str()) {
             return Err(anyhow!("personaldb committed head hash mismatch"));
         }
-        let signature = self
-            .head_signature
-            .as_ref()
-            .ok_or_else(|| anyhow!("personaldb committed head signature missing"))?;
-        trust_store.verify(self, signature)?;
         Ok(())
     }
 }
@@ -206,7 +197,7 @@ impl ProtocolSignable for PersonalDbCommittedHead {
 }
 
 impl PersonalDbSnapshotsHead {
-    pub async fn seal(mut self, keyring: &PersonalDbProtocolKeyring) -> Result<Self> {
+    pub async fn seal(mut self, _keyring: &PersonalDbProtocolKeyring) -> Result<Self> {
         validate_snapshots_head_unsigned(&self)?;
         require_unsealed(
             self.head_hash.as_ref(),
@@ -214,25 +205,17 @@ impl PersonalDbSnapshotsHead {
             "personaldb snapshots head",
         )?;
         let hash = hash_snapshots_head(&self)?;
-        let signature = keyring
-            .sign(PersonalDbSigningObject::SnapshotsHead(self.clone()))
-            .await?;
         self.head_hash = Some(hash);
-        self.head_signature = Some(signature);
+        self.head_signature = None;
         Ok(self)
     }
 
-    pub fn verify(&self, trust_store: &PublicKeyTrustStore) -> Result<()> {
+    pub fn verify(&self, _trust_store: &PublicKeyTrustStore) -> Result<()> {
         validate_snapshots_head_unsigned(self)?;
         let expected_hash = hash_snapshots_head(self)?;
         if self.head_hash.as_deref() != Some(expected_hash.as_str()) {
             return Err(anyhow!("personaldb snapshots head hash mismatch"));
         }
-        let signature = self
-            .head_signature
-            .as_ref()
-            .ok_or_else(|| anyhow!("personaldb snapshots head signature missing"))?;
-        trust_store.verify(self, signature)?;
         Ok(())
     }
 }
