@@ -453,6 +453,9 @@ impl OpenRaftConsensus {
         &self,
         command: ConsensusCommand,
     ) -> Result<ControlApplyResult, ConsensusError> {
+        command
+            .validate_section9_boundary()
+            .map_err(|reason| ConsensusError::Rejected(reason.into()))?;
         let response = self
             .raft
             .client_write(command)
@@ -604,9 +607,20 @@ impl OpenRaftConsensus {
         let config = openraft::Config {
             cluster_name: cluster_name.into(),
             ..Default::default()
-        }
-        .validate()
-        .map_err(|error| ConsensusError::Rejected(error.to_string()))?;
+        };
+        Self::new_with_config(node_id, store, cluster_id_hash, config, network).await
+    }
+
+    async fn new_with_config(
+        node_id: NodeId,
+        store: RocksRaftStore,
+        cluster_id_hash: [u8; 32],
+        config: openraft::Config,
+        network: Arc<dyn ConsensusRpcFactory>,
+    ) -> Result<Self, ConsensusError> {
+        let config = config
+            .validate()
+            .map_err(|error| ConsensusError::Rejected(error.to_string()))?;
         let (log_store, state_machine) = stores(store, cluster_id_hash)
             .map_err(|error| ConsensusError::Storage(error.to_string()))?;
         let runtime_store = state_machine.store.clone();
@@ -706,6 +720,9 @@ impl Consensus for OpenRaftConsensus {
         &self,
         command: CertifyTransaction,
     ) -> Result<CertificationResult, ConsensusError> {
+        ConsensusCommand::Certify(command.clone())
+            .validate_section9_boundary()
+            .map_err(|reason| ConsensusError::Rejected(reason.into()))?;
         let response = self
             .raft
             .client_write(ConsensusCommand::Certify(command))
@@ -1848,6 +1865,115 @@ mod tests {
         );
         assert!(runtime.observed_commit_version() >= committed);
         runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn automatic_snapshot_purges_logs_and_restart_keeps_certification_state() {
+        let directory = TempDir::new().unwrap();
+        let store = RocksRaftStore::open(directory.path(), 0).unwrap();
+        let runtime = OpenRaftConsensus::new_with_config(
+            NodeId(1),
+            store.clone(),
+            [1; 32],
+            openraft::Config {
+                cluster_name: "snapshot-purge-test".into(),
+                snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(4),
+                max_in_snapshot_log_to_keep: 1,
+                replication_lag_threshold: 20,
+                purge_batch_size: 1,
+                ..Default::default()
+            },
+            Arc::new(NoRemoteFactory),
+        )
+        .await
+        .unwrap();
+        runtime
+            .initialize(BTreeMap::from([(
+                NodeId(1),
+                ConsensusNode {
+                    address: "in-process".into(),
+                },
+            )]))
+            .await
+            .unwrap();
+        wait_for_single_node_leader(&runtime).await;
+        runtime
+            .install_node(
+                [1; 32],
+                NodeIncarnation {
+                    node_id: NodeId(1),
+                    incarnation: 1,
+                },
+                NodeId(1),
+                "zone-a".into(),
+            )
+            .await
+            .unwrap();
+        runtime
+            .set_durability_policy([1; 32], 1, 1, 0)
+            .await
+            .unwrap();
+
+        let mut retained = None;
+        for id in 20..36 {
+            let result = runtime.certify(test_command(id)).await.unwrap();
+            if id == 25 {
+                retained = Some((id, result));
+            }
+        }
+        let (retained_id, retained_result) = retained.unwrap();
+        let retained_version = match &retained_result {
+            CertificationResult::Committed { commit_version, .. } => *commit_version,
+            other => panic!("unexpected result: {other:?}"),
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if store
+                .last_purged_index()
+                .unwrap()
+                .is_some_and(|purged| purged >= retained_version.0)
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "OpenRaft did not snapshot and purge the covered log"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            store.get_log(0).unwrap().is_none(),
+            "purged entries must be absent from RocksDB"
+        );
+        runtime.shutdown().await.unwrap();
+
+        let restarted = OpenRaftConsensus::new(
+            NodeId(1),
+            store,
+            [1; 32],
+            "snapshot-purge-test",
+            Arc::new(NoRemoteFactory),
+        )
+        .await
+        .unwrap();
+        wait_for_single_node_leader(&restarted).await;
+        assert_eq!(
+            restarted.certify(test_command(retained_id)).await.unwrap(),
+            retained_result,
+            "certification retry state must survive snapshot-backed log purge"
+        );
+        restarted.shutdown().await.unwrap();
+    }
+
+    async fn wait_for_single_node_leader(runtime: &OpenRaftConsensus) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while runtime.raft.metrics().borrow().current_leader != Some(1) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "single node did not elect itself"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     fn test_command(id: u8) -> CertifyTransaction {

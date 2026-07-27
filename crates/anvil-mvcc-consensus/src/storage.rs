@@ -333,6 +333,9 @@ impl RocksRaftStore {
             self.scoped_key(KEY_LAST_PURGED_INDEX),
             through.to_be_bytes(),
         );
+        if self.last_log_index()?.is_some_and(|last| last <= through) {
+            batch.delete_cf(cf_meta, self.scoped_key(KEY_LAST_LOG_INDEX));
+        }
         if let Some(log_id) = log_id {
             batch.put_cf(
                 cf_meta,
@@ -571,6 +574,19 @@ mod tests {
         assert_eq!(store.last_purged_index().unwrap(), Some(1));
         assert!(store.get_log(0).unwrap().is_none());
         assert_eq!(store.get_log(2).unwrap(), Some(vec![2]));
+    }
+
+    #[test]
+    fn purging_through_last_log_clears_stale_last_log_pointer() {
+        let dir = TempDir::new().unwrap();
+        let store = store(dir.path());
+        store
+            .append_logs(&(0..=2).map(|i| (i, vec![i as u8])).collect::<Vec<_>>())
+            .unwrap();
+        store.purge_logs(2).unwrap();
+        assert_eq!(store.last_purged_index().unwrap(), Some(2));
+        assert_eq!(store.last_log_index().unwrap(), None);
+        assert!(store.get_log(2).unwrap().is_none());
     }
 
     #[test]
