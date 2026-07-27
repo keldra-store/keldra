@@ -696,21 +696,82 @@ impl AdminService for AppState {
             json!({ "resource_kind": "bucket", "tenant_id": tenant_id, "bucket_name": &req.bucket_name, "allow_public_read": req.allow_public_read }),
         )?;
         let audit_event_id = audit_event.audit_event_id.clone();
-        self.persistence
-            .set_bucket_public_access_with_admin_audit(
+        let transaction =
+            begin_admin_product_transaction(self, &principal, context, "bucket-public-access")
+                .await?;
+        let bucket = if transaction.replayed {
+            let bucket = self
+                .persistence
+                .get_bucket_by_name(tenant_id, &req.bucket_name)
+                .await
+                .map_err(|err| Status::internal(err.to_string()))?
+                .ok_or_else(|| {
+                    Status::aborted(
+                        "committed admin bucket policy transaction does not match this request",
+                    )
+                })?;
+            if bucket.is_public_read != req.allow_public_read {
+                return Err(Status::aborted(
+                    "committed admin bucket policy transaction has a different outcome",
+                ));
+            }
+            bucket
+        } else {
+            let mut bucket = crate::bucket_journal::read_current_bucket_in_transaction(
+                &self.mvcc,
                 tenant_id,
                 &req.bucket_name,
+                &transaction.transaction_id,
+                &transaction.principal,
+            )
+            .map_err(|err| Status::internal(err.to_string()))?
+            .ok_or_else(|| Status::not_found("Bucket not found"))?;
+            bucket.is_public_read = req.allow_public_read;
+            let operation_sequence =
+                crate::bucket_journal::stage_bucket_mutation_in_transaction(
+                    &self.mvcc,
+                    &bucket,
+                    crate::bucket_journal::BucketJournalMutation::Update,
+                    &transaction.transaction_id,
+                    &transaction.principal,
+                )
+                .await
+                .map_err(|err| Status::internal(err.to_string()))?;
+            crate::access_control::stage_bucket_public_read_tuple(
+                &self.persistence,
+                &bucket,
                 req.allow_public_read,
-                Some(&audit_event),
+                &principal.principal_id,
+                "admin bucket public access update",
+                &transaction.transaction_id,
+                &transaction.principal,
             )
             .await
             .map_err(|err| Status::internal(err.to_string()))?;
-        let bucket = self
-            .persistence
-            .get_bucket_by_name(tenant_id, &req.bucket_name)
-            .await
-            .map_err(|err| Status::internal(err.to_string()))?
-            .ok_or_else(|| Status::not_found("Bucket not found"))?;
+            let now = u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default();
+            let audit_plan = crate::admin_audit::admin_audit_mvcc_plan(
+                &audit_event,
+                operation_sequence,
+                &transaction.transaction_id,
+            )
+            .map_err(|err| Status::internal(err.to_string()))?;
+            self.mvcc
+                .stage_product_mutations(
+                    &transaction.transaction_id,
+                    &transaction.principal,
+                    audit_plan.mutations,
+                    now,
+                )
+                .map_err(|err| Status::failed_precondition(err.to_string()))?;
+            for event in audit_plan.outbox_events {
+                self.mvcc
+                    .open_transactions
+                    .add_stream_event(&transaction.transaction_id, event, now)
+                    .map_err(|err| Status::failed_precondition(err.to_string()))?;
+            }
+            commit_admin_product_transaction(self, &transaction).await?;
+            bucket
+        };
         Ok(Response::new(BucketAdminResponse {
             request_id: context.request_id.clone(),
             bucket: Some(bucket_to_proto(bucket)),
