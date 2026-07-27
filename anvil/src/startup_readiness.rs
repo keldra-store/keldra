@@ -37,11 +37,17 @@ impl PublicReadiness {
     }
 }
 
-pub(crate) fn is_recovery_rpc(path: &str) -> bool {
+pub(crate) fn is_bootstrap_internal_rpc(path: &str) -> bool {
     [
         "/anvil.BlockStoreInternal/",
         "/anvil.AntiEntropyInternal/",
         "/anvil.CrossRegionProxyInternal/",
+        // Consensus must elect a leader before the system realm can become
+        // ready. Both services authenticate their long-lived node session
+        // before accepting frames, so exposing them here does not expose a
+        // public product API during bootstrap.
+        "/anvil.ConsensusTransport/",
+        "/anvil.ReplicationService/",
     ]
     .iter()
     .any(|prefix| path.starts_with(prefix))
@@ -52,7 +58,7 @@ pub(crate) fn is_readiness_probe(path: &str) -> bool {
 }
 
 pub(crate) fn may_bypass_public_readiness(path: &str, cluster_ready: bool) -> bool {
-    is_recovery_rpc(path) || (is_readiness_probe(path) && !cluster_ready)
+    is_bootstrap_internal_rpc(path) || (is_readiness_probe(path) && !cluster_ready)
 }
 
 pub(crate) fn unavailable_response(grpc: bool) -> Response<Body> {
@@ -78,17 +84,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_internal_recovery_services_bypass_public_readiness() {
-        assert!(is_recovery_rpc("/anvil.BlockStoreInternal/GetShard"));
-        assert!(is_recovery_rpc(
+    fn only_internal_bootstrap_services_bypass_public_readiness() {
+        assert!(is_bootstrap_internal_rpc(
+            "/anvil.BlockStoreInternal/GetShard"
+        ));
+        assert!(is_bootstrap_internal_rpc(
             "/anvil.AntiEntropyInternal/ExchangeInventory"
         ));
-        assert!(!is_recovery_rpc("/anvil.RootRegisterInternal/ReadRoot"));
-        assert!(!is_recovery_rpc(
+        assert!(is_bootstrap_internal_rpc(
+            "/anvil.ConsensusTransport/Exchange"
+        ));
+        assert!(is_bootstrap_internal_rpc(
+            "/anvil.ReplicationService/Replicate"
+        ));
+        assert!(!is_bootstrap_internal_rpc(
+            "/anvil.RootRegisterInternal/ReadRoot"
+        ));
+        assert!(!is_bootstrap_internal_rpc(
             "/anvil.CoreMetaReplicationInternal/ExchangeCoreMetaInventory"
         ));
-        assert!(!is_recovery_rpc("/anvil.ObjectService/GetObject"));
-        assert!(!is_recovery_rpc("/anvil.InternalProxyService/ProxyNative"));
+        assert!(!is_bootstrap_internal_rpc("/anvil.ObjectService/GetObject"));
+        assert!(!is_bootstrap_internal_rpc(
+            "/anvil.InternalProxyService/ProxyNative"
+        ));
     }
 
     #[test]
