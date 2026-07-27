@@ -452,7 +452,6 @@ async fn write_diagnostic_ref(mvcc: &MvccSubsystem, diagnostic: &DiagnosticObjec
     )?;
     commit_diagnostic_mutations(
         mvcc,
-        &stream_id,
         &format!(
             "diagnostic:{}:{}:{}:{}:{}",
             diagnostic.scope_kind,
@@ -855,16 +854,11 @@ fn now_unix_ms() -> u64 {
 
 async fn commit_diagnostic_mutations(
     mvcc: &MvccSubsystem,
-    assignment_identity: &str,
     idempotency_key: &str,
     mutations: Vec<ProductMutation>,
     predicates: Vec<(LogicalKey, PredicateKind)>,
 ) -> Result<()> {
     let principal = "diagnostic-store";
-    let assignment = mvcc
-        .reconcile_work_assignment("diagnostic", assignment_identity)
-        .await?
-        .ok_or_else(|| anyhow!("local node does not own the diagnostic assignment"))?;
     let now = now_unix_ms();
     let handle = mvcc
         .open_transactions
@@ -887,7 +881,6 @@ async fn commit_diagnostic_mutations(
         for (key, kind) in predicates {
             mvcc.stage_predicate(&handle.transaction_id, principal, key, kind, now)?;
         }
-        mvcc.stage_assignment_guard(&handle.transaction_id, principal, &assignment, now)?;
     }
     let outcome = mvcc
         .open_transactions

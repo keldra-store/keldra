@@ -1049,10 +1049,6 @@ async fn stage_body(
     mutation_id: uuid::Uuid,
     now_unix_ms: u64,
 ) -> Result<Option<i64>> {
-    let assignment = mvcc
-        .reconcile_work_assignment("hf-metadata", "global")
-        .await?
-        .ok_or_else(|| anyhow!("this node does not own the hf metadata assignment"))?;
     let head_key = hf_head_logical_key()?;
     let committed_head = mvcc.read_latest_value(&head_key)?;
     let observed_head = mvcc.read_transaction_value(transaction_id, principal, &head_key)?;
@@ -1133,7 +1129,6 @@ async fn stage_body(
     for (key, predicate) in plan.predicates {
         mvcc.stage_predicate(transaction_id, principal, key, predicate, now_unix_ms)?;
     }
-    mvcc.stage_assignment_guard(transaction_id, principal, &assignment, now_unix_ms)?;
     Ok(allocated_id)
 }
 

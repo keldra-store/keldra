@@ -645,10 +645,6 @@ async fn commit_model_mutations(
     predicates: Vec<(LogicalKey, PredicateKind)>,
 ) -> Result<()> {
     let principal = model_partition_principal();
-    let assignment = mvcc
-        .reconcile_work_assignment("model-metadata", "global")
-        .await?
-        .ok_or_else(|| anyhow!("local node does not own the model metadata assignment"))?;
     let now = now_unix_ms();
     let handle = mvcc
         .open_transactions
@@ -671,7 +667,6 @@ async fn commit_model_mutations(
         for (key, kind) in predicates {
             mvcc.stage_predicate(&handle.transaction_id, &principal, key, kind, now)?;
         }
-        mvcc.stage_assignment_guard(&handle.transaction_id, &principal, &assignment, now)?;
     }
     let outcome = mvcc
         .open_transactions

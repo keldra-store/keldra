@@ -95,15 +95,6 @@ pub async fn put_package_version(
             ),
         )
         .await?;
-        stage_registry_assignment_guard(
-            mvcc,
-            &transaction_principal,
-            &handle.transaction_id,
-            tenant_id,
-            registry_kind,
-            namespace,
-        )
-        .await?;
         let receipt = Box::pin(put_package_version(
             storage,
             mvcc,
@@ -218,15 +209,6 @@ pub async fn put_registry_ref(
             &format!(
                 "registry-ref:{tenant_id}:{registry_kind}:{namespace}:{package_name}:{ref_name}"
             ),
-        )
-        .await?;
-        stage_registry_assignment_guard(
-            mvcc,
-            &transaction_principal,
-            &handle.transaction_id,
-            tenant_id,
-            registry_kind,
-            namespace,
         )
         .await?;
         let receipt = Box::pin(put_registry_ref(
@@ -825,25 +807,4 @@ async fn commit_registry_transaction(
             bail!("gateway registry transaction aborted: {reason:?}")
         }
     }
-}
-
-async fn stage_registry_assignment_guard(
-    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
-    principal: &str,
-    transaction_id: &str,
-    tenant_id: i64,
-    registry_kind: &str,
-    namespace: &str,
-) -> Result<()> {
-    let logical_identity = format!("{tenant_id}:{registry_kind}:{namespace}");
-    let assignment = mvcc
-        .reconcile_work_assignment("gateway-registry", &logical_identity)
-        .await?
-        .ok_or_else(|| anyhow!("this node does not own the gateway registry assignment"))?;
-    mvcc.stage_assignment_guard(
-        transaction_id,
-        principal,
-        &assignment,
-        u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
-    )
 }

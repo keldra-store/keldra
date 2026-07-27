@@ -133,17 +133,6 @@ pub async fn write_authz_namespace_schema(
     reason: &str,
 ) -> Result<AuthzNamespaceSchemaRecord> {
     validate_namespace_schema(&schema)?;
-    let assignment = if tenant_id == crate::system_realm::SYSTEM_STORAGE_TENANT_ID {
-        None
-    } else {
-        Some(
-            mvcc.reconcile_authz_tuple_assignment(tenant_id)
-                .await?
-                .ok_or_else(|| {
-                    anyhow!("this node is not the assigned authorization schema writer")
-                })?,
-        )
-    };
     let principal = crate::authz_head::transaction_principal(tenant_id);
     let requested_hash = schema_hash(&schema)?;
     let operation_hash = hex::encode(hash32(
@@ -232,14 +221,6 @@ pub async fn write_authz_namespace_schema(
             predicate,
             now_unix_ms,
         )?;
-        if let Some(assignment) = &assignment {
-            mvcc.stage_assignment_guard(
-                &handle.transaction_id,
-                &principal,
-                assignment,
-                now_unix_ms,
-            )?;
-        }
     }
     let outcome = mvcc
         .open_transactions

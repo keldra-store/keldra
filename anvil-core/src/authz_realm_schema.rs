@@ -190,17 +190,6 @@ pub async fn put_schema_revision(
     {
         return Ok(existing);
     }
-    let assignment = if tenant_id == crate::system_realm::SYSTEM_STORAGE_TENANT_ID {
-        None
-    } else {
-        Some(
-            mvcc.reconcile_authz_tuple_assignment(tenant_id)
-                .await?
-                .ok_or_else(|| {
-                    anyhow!("this node is not the assigned authorization schema writer")
-                })?,
-        )
-    };
     let principal = caller_binding
         .map(|binding| binding.principal.to_string())
         .unwrap_or_else(|| authz_head::transaction_principal(tenant_id));
@@ -303,9 +292,6 @@ pub async fn put_schema_revision(
         head_snapshot.predicate,
         now_unix_ms,
     )?;
-    if let Some(assignment) = &assignment {
-        mvcc.stage_assignment_guard(transaction_id, &principal, assignment, now_unix_ms)?;
-    }
     if caller_binding.is_none() {
         commit_schema_transaction(mvcc, transaction_id, &principal).await?;
     }
@@ -382,17 +368,6 @@ pub async fn bind_schema(
         (Some(expected), Some(actual)) if expected == actual => {}
         _ => bail!("schema binding generation conflict"),
     }
-    let assignment = if tenant_id == crate::system_realm::SYSTEM_STORAGE_TENANT_ID {
-        None
-    } else {
-        Some(
-            mvcc.reconcile_authz_tuple_assignment(tenant_id)
-                .await?
-                .ok_or_else(|| {
-                    anyhow!("this node is not the assigned authorization schema writer")
-                })?,
-        )
-    };
     let principal = caller_binding
         .map(|binding| binding.principal.to_string())
         .unwrap_or_else(|| authz_head::transaction_principal(tenant_id));
@@ -490,9 +465,6 @@ pub async fn bind_schema(
         head_snapshot.predicate,
         now_unix_ms,
     )?;
-    if let Some(assignment) = &assignment {
-        mvcc.stage_assignment_guard(transaction_id, &principal, assignment, now_unix_ms)?;
-    }
     if caller_binding.is_none() {
         commit_schema_transaction(mvcc, transaction_id, &principal).await?;
     }
