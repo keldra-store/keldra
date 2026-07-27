@@ -739,7 +739,31 @@ impl CoreStore {
             || manifest.encoding.compression != *compression
             || manifest.boundary_values != finalisation.boundary_values
         {
-            bail!("CoreStore finalised object result does not match its admitted mutation");
+            bail!(
+                "CoreStore finalised object result does not match its admitted mutation: manifest_mutation_id={}, finalisation_mutation_id={}, manifest_logical_file_id={}, expected_logical_file_id={}, manifest_region_id={}, expected_region_id={}, manifest_writer_family={}, expected_writer_family={}, manifest_object_hash={}, expected_object_hash={}, manifest_logical_size={}, expected_logical_size={}, manifest_logical_offset={}, expected_logical_offset={}, manifest_encryption={}, expected_encryption={}, manifest_profile={}, expected_profile={}, manifest_compression={}, expected_compression={}, manifest_boundary_values={:?}, expected_boundary_values={:?}",
+                manifest.mutation_id,
+                finalisation.mutation_id,
+                manifest.logical_file_id,
+                logical_name,
+                manifest.region_id,
+                region_id,
+                manifest.writer_family,
+                finalisation.writer_family,
+                manifest.object_hash,
+                object_hash,
+                manifest.logical_size,
+                object_logical_size,
+                manifest.logical_offset,
+                logical_offset,
+                manifest.encryption_algorithm,
+                encryption,
+                manifest.encoding.profile_id,
+                erasure_profile_id,
+                manifest.encoding.compression,
+                compression,
+                manifest.boundary_values,
+                finalisation.boundary_values,
+            );
         }
         Ok(object_ref.clone())
     }
