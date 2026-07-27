@@ -981,7 +981,7 @@ async fn commit_task_lease_plan(
                 now_unix_ms,
             )?;
         }
-        let outcome = mvcc
+        let outcome = match mvcc
             .open_transactions
             .commit(
                 mvcc.runtime.as_ref(),
@@ -989,7 +989,23 @@ async fn commit_task_lease_plan(
                 principal,
                 now_unix_ms,
             )
-            .await?;
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error)
+                if attempt < 4
+                    && error
+                        .to_string()
+                        .contains("assignment predicate violates applied Raft control state") =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    25 * u64::from(attempt + 1),
+                ))
+                .await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         match outcome.certification {
             crate::mvcc_transaction::CertificationResult::Committed { .. } => return Ok(()),
             crate::mvcc_transaction::CertificationResult::Aborted { reason }
