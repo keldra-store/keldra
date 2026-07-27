@@ -29,6 +29,7 @@ impl Persistence {
         key: &str,
         transaction_id: &str,
         transaction_principal: &str,
+        options: Option<&AuthzTupleBatchWriteOptions>,
     ) -> Result<MultipartUploadMutation> {
         let permit = self
             .multipart_metadata_write_permit(tenant_id, bucket_id)
@@ -801,6 +802,32 @@ impl Persistence {
                 .await;
         }
         Ok(records)
+    }
+
+    pub async fn stage_authz_tuple_batch(
+        &self,
+        tenant_id: i64,
+        mutations: Vec<AuthzTupleBatchMutation>,
+        written_by: &str,
+        transaction_id: &str,
+        transaction_principal: &str,
+    ) -> Result<Vec<AuthzTupleRecord>> {
+        let permit = self.authz_write_permit(tenant_id).await?;
+        let writes = authz_tuple_batch_writes(tenant_id, &mutations, written_by);
+        authz_journal::stage_authz_tuple_batch_with_permit(
+            &self.storage,
+            self.mvcc()?,
+            writes,
+            &permit,
+            None,
+            None,
+            options,
+            authz_journal::AuthzTransactionBinding {
+                transaction_id,
+                principal: transaction_principal,
+            },
+        )
+        .await
     }
 
     pub async fn replay_authz_tuple_batch(

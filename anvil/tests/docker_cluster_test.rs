@@ -56,6 +56,7 @@ async fn docker_cluster_end_to_end() {
     auth_client
         .set_public_access(authenticated_request(
             tonic::Request::new(SetPublicAccessRequest {
+            context: None,
                 bucket: public_bucket.clone(),
                 allow_public_read: true,
             }),

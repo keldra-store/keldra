@@ -297,6 +297,29 @@ impl Persistence {
             .await
     }
 
+    pub async fn stage_bucket_public_access(
+        &self,
+        tenant_id: i64,
+        bucket_name: &str,
+        is_public: bool,
+        transaction_id: &str,
+        transaction_principal: &str,
+    ) -> Result<Bucket> {
+        let mut bucket =
+            bucket_journal::read_current_bucket_mvcc(self.mvcc()?, tenant_id, bucket_name)?
+                .ok_or_else(|| anyhow!("bucket not found"))?;
+        bucket.is_public_read = is_public;
+        bucket_journal::stage_bucket_mutation_in_transaction(
+            self.mvcc()?,
+            &bucket,
+            BucketJournalMutation::Update,
+            transaction_id,
+            transaction_principal,
+        )
+        .await?;
+        Ok(bucket)
+    }
+
     pub async fn set_bucket_public_access_with_admin_audit(
         &self,
         tenant_id: i64,

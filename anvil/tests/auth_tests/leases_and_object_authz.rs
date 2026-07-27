@@ -499,6 +499,7 @@ async fn test_authz_tuple_rejects_invalid_caveat_hash_before_writing() {
         .await
         .unwrap();
     let mut invalid_write = Request::new(WriteAuthzTupleRequest {
+            context: None,
         namespace: "document".to_string(),
         object_id: "alpha".to_string(),
         relation: "viewer".to_string(),

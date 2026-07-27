@@ -82,6 +82,7 @@ async fn test_set_public_access_and_get() {
 
     // Set bucket to public
     let mut public_req = Request::new(SetPublicAccessRequest {
+            context: None,
         bucket: bucket_name.clone(),
         allow_public_read: true,
     });
@@ -165,6 +166,7 @@ async fn test_set_public_access_and_get() {
 
     // Set bucket to private
     let mut private_req = Request::new(SetPublicAccessRequest {
+            context: None,
         bucket: bucket_name.clone(),
         allow_public_read: false,
     });
@@ -341,6 +343,7 @@ async fn test_service_set_public_access() {
     // storage-admin binary is an offline tool and correctly refuses to race an
     // active server's ownership fences.
     let mut set_public_req = tonic::Request::new(SetPublicAccessRequest {
+            context: None,
         bucket: bucket_name.clone(),
         allow_public_read: true,
     });

@@ -76,6 +76,7 @@ async fn bind_persistence_test_authz_schema(persistence: &Persistence, tenant_id
         ],
         "test",
         "bind persistence test schema",
+        None,
     )
     .await
     .unwrap();
@@ -88,6 +89,7 @@ async fn bind_persistence_test_authz_schema(persistence: &Persistence, tenant_id
         None,
         "test",
         "bind persistence test schema",
+        None,
     )
     .await
     .unwrap();

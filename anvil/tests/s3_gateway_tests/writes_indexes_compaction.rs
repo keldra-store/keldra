@@ -231,6 +231,7 @@ async fn test_s3_list_versions_and_get_filter_by_relationship_authorization() {
         .unwrap();
     for key in [allowed_key, visible_nested_key] {
         let mut grant = Request::new(GrantAccessRequest {
+            context: None,
             grantee_app_id: reader_app.clone(),
             resource: format!("{bucket}/{key}"),
             action: "object:read".to_string(),

@@ -183,7 +183,6 @@ impl AuthService for AppState {
         request: Request<GetAccessTokenRequest>,
     ) -> Result<Response<GetAccessTokenResponse>, Status> {
         let req = request.into_inner();
-
         // 1. Verify credentials
         let app_details = self
             .persistence
@@ -422,7 +421,12 @@ impl AuthService for AppState {
             .get::<auth::Claims>()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.get_ref();
-
+        let transaction_id = req
+            .context
+            .as_ref()
+            .map(crate::services::transaction_context::public_context_transaction_id)
+            .transpose()?
+            .flatten();
         validate_public_delegation_resource(claims, &req.resource)?;
         if req.action.trim() == "*"
             || req.action.trim().ends_with(":*")
@@ -461,7 +465,23 @@ impl AuthService for AppState {
             "policy.grant",
             serde_json::json!({ "grantee_app_id": app.id, "action": req.action }),
         )?;
-        access_control::write_delegated_action_tuple(
+        if let Some(transaction_id) = transaction_id {
+            access_control::stage_delegated_action_tuple(
+                &self.storage,
+                &self.persistence,
+                claims.tenant_id,
+                &app.id.to_string(),
+                delegated_action,
+                &req.resource,
+                "add",
+                &claims.sub,
+                "tenant access grant",
+                transaction_id,
+                &crate::object_manager::transaction_principal_from_claims(claims),
+            )
+            .await?;
+        } else {
+            access_control::write_delegated_action_tuple(
             &self.storage,
             &self.persistence,
             claims.tenant_id,
@@ -474,8 +494,15 @@ impl AuthService for AppState {
             &audit_event,
         )
         .await?;
+        }
 
-        Ok(Response::new(GrantAccessResponse {}))
+        Ok(Response::new(GrantAccessResponse {
+            write_state: if transaction_id.is_some() {
+                WriteState::Staged as i32
+            } else {
+                WriteState::Committed as i32
+            },
+        }))
     }
 
     async fn revoke_access(
@@ -487,6 +514,12 @@ impl AuthService for AppState {
             .get::<auth::Claims>()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.get_ref();
+        let transaction_id = req
+            .context
+            .as_ref()
+            .map(crate::services::transaction_context::public_context_transaction_id)
+            .transpose()?
+            .flatten();
 
         validate_public_delegation_resource(claims, &req.resource)?;
         access_control::require_action(
@@ -511,7 +544,23 @@ impl AuthService for AppState {
             "policy.revoke",
             serde_json::json!({ "grantee_app_id": app.id, "action": req.action }),
         )?;
-        access_control::write_delegated_action_tuple(
+        if let Some(transaction_id) = transaction_id {
+            access_control::stage_delegated_action_tuple(
+                &self.storage,
+                &self.persistence,
+                claims.tenant_id,
+                &app.id.to_string(),
+                delegated_action,
+                &req.resource,
+                "remove",
+                &claims.sub,
+                "tenant access revoke",
+                transaction_id,
+                &crate::object_manager::transaction_principal_from_claims(claims),
+            )
+            .await?;
+        } else {
+            access_control::write_delegated_action_tuple(
             &self.storage,
             &self.persistence,
             claims.tenant_id,
@@ -524,8 +573,15 @@ impl AuthService for AppState {
             &audit_event,
         )
         .await?;
+        }
 
-        Ok(Response::new(RevokeAccessResponse {}))
+        Ok(Response::new(RevokeAccessResponse {
+            write_state: if transaction_id.is_some() {
+                WriteState::Staged as i32
+            } else {
+                WriteState::Committed as i32
+            },
+        }))
     }
 
     async fn list_access_grants(
@@ -617,6 +673,14 @@ impl AuthService for AppState {
             .get::<auth::Claims>()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.get_ref();
+        let transaction_id = req
+            .context
+            .as_ref()
+            .map(crate::services::transaction_context::public_context_transaction_id)
+            .transpose()?
+            .flatten();
+        let transaction_principal =
+            crate::object_manager::transaction_principal_from_claims(claims);
 
         access_control::require_action(
             &self.storage,
@@ -627,22 +691,53 @@ impl AuthService for AppState {
         )
         .await?;
 
-        let bucket = self
-            .persistence
-            .set_bucket_public_access(claims.tenant_id, &req.bucket, req.allow_public_read)
+        if let Some(transaction_id) = transaction_id {
+            let bucket = self
+                .persistence
+                .stage_bucket_public_access(
+                    claims.tenant_id,
+                    &req.bucket,
+                    req.allow_public_read,
+                    transaction_id,
+                    &transaction_principal,
+                )
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+            access_control::stage_bucket_public_read_tuple(
+                &self.persistence,
+                &bucket,
+                req.allow_public_read,
+                &claims.sub,
+                "bucket public-read policy update",
+                transaction_id,
+                &transaction_principal,
+            )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        access_control::write_bucket_public_read_tuple(
-            &self.persistence,
-            &bucket,
-            req.allow_public_read,
-            &claims.sub,
-            "bucket public-read policy update",
-        )
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
+        } else {
+            let bucket = self
+                .persistence
+                .set_bucket_public_access(claims.tenant_id, &req.bucket, req.allow_public_read)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+            access_control::write_bucket_public_read_tuple(
+                &self.persistence,
+                &bucket,
+                req.allow_public_read,
+                &claims.sub,
+                "bucket public-read policy update",
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        }
 
-        Ok(Response::new(SetPublicAccessResponse {}))
+        Ok(Response::new(SetPublicAccessResponse {
+            write_state: if transaction_id.is_some() {
+                WriteState::Staged as i32
+            } else {
+                WriteState::Committed as i32
+            },
+        }))
     }
 
     async fn write_authz_tuple(
@@ -655,10 +750,14 @@ impl AuthService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
-        let record = write_authz_tuple_record(
-            self,
-            &claims,
-            AuthzTupleMutation {
+        let transaction_id = req
+            .context
+            .as_ref()
+            .map(crate::services::transaction_context::public_context_transaction_id)
+            .transpose()?
+            .flatten()
+            .map(ToOwned::to_owned);
+        let mutation = AuthzTupleMutation {
                 namespace: req.namespace,
                 object_id: req.object_id,
                 relation: req.relation,
@@ -668,11 +767,53 @@ impl AuthService for AppState {
                 operation: req.operation,
                 reason: req.reason,
                 scope: req.scope,
-            },
-        )
-        .await?;
+            };
+        let record = if let Some(transaction_id) = transaction_id.as_deref() {
+            let operation = validate_authz_tuple_mutation(self, &claims, &mutation)
+                .await?
+                .to_string();
+            let scope = resolve_authz_scope(&claims, mutation.scope.as_ref())?;
+            self.persistence
+                .stage_authz_tuple_batch(
+                    claims.tenant_id,
+                    vec![crate::persistence::AuthzTupleBatchMutation {
+                        namespace: encode_realm_namespace(
+                            &scope.authz_realm_id,
+                            &mutation.namespace,
+                        ),
+                        object_id: mutation.object_id,
+                        relation: mutation.relation,
+                        subject_kind: mutation.subject_kind.clone(),
+                        subject_id: encode_userset_subject_realm(
+                            &scope.authz_realm_id,
+                            &mutation.subject_kind,
+                            &mutation.subject_id,
+                        ),
+                        caveat_hash: mutation.caveat_hash,
+                        operation,
+                        reason: mutation.reason,
+                    }],
+                    &claims.sub,
+                    transaction_id,
+                    &crate::object_manager::transaction_principal_from_claims(&claims),
+                    None,
+                )
+                .await
+                .map_err(authz_tuple_write_status)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| Status::internal("staged tuple write returned no record"))?
+        } else {
+            write_authz_tuple_record(self, &claims, mutation).await?
+        };
 
-        Ok(Response::new(write_authz_tuple_response(&record)?))
+        let mut response = write_authz_tuple_response(&record)?;
+        if transaction_id.is_some() {
+            response.write_state = WriteState::Staged as i32;
+            response.revision = 0;
+            response.zookie.clear();
+        }
+        Ok(Response::new(response))
     }
 
     async fn write_authz_tuples(
@@ -685,6 +826,13 @@ impl AuthService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
+        let transaction_id = req
+            .context
+            .as_ref()
+            .map(crate::services::transaction_context::public_context_transaction_id)
+            .transpose()?
+            .flatten()
+            .map(ToOwned::to_owned);
         if req.mutations.is_empty() {
             return Err(Status::invalid_argument(
                 "mutations must contain at least one tuple",
@@ -734,6 +882,30 @@ impl AuthService for AppState {
             expected_revision,
             schema_binding_precondition: None,
         };
+        if let Some(transaction_id) = transaction_id.as_deref() {
+            let records = self
+                .persistence
+                .stage_authz_tuple_batch(
+                    claims.tenant_id,
+                    mutations,
+                    &claims.sub,
+                    transaction_id,
+                    &crate::object_manager::transaction_principal_from_claims(&claims),
+                    Some(&options),
+                )
+                .await
+                .map_err(authz_tuple_batch_write_status)?;
+            let mut response = write_authz_tuple_batch_response(&records)?;
+            response.write_state = WriteState::Staged as i32;
+            response.revision = 0;
+            response.zookie.clear();
+            for result in &mut response.results {
+                result.write_state = WriteState::Staged as i32;
+                result.revision = 0;
+                result.zookie.clear();
+            }
+            return Ok(Response::new(response));
+        }
         if let Some(replay) = self
             .persistence
             .replay_authz_tuple_batch(claims.tenant_id, &mutations, &claims.sub, &options)
@@ -1124,6 +1296,15 @@ impl AuthService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
+        let transaction_id = req
+            .context
+            .as_ref()
+            .map(crate::services::transaction_context::public_context_transaction_id)
+            .transpose()?
+            .flatten()
+            .map(ToOwned::to_owned);
+        let transaction_principal =
+            crate::object_manager::transaction_principal_from_claims(&claims);
         validate_storage_tenant(&claims, &req.anvil_storage_tenant_id)?;
         validate_tuple_component("schema_id", &req.schema_id)?;
         if req.namespaces.is_empty() {
@@ -1152,14 +1333,29 @@ impl AuthService for AppState {
             req.namespaces,
             &claims.sub,
             &req.reason,
+            transaction_id.as_deref().map(|transaction_id| {
+                crate::authz_journal::AuthzTransactionBinding {
+                    transaction_id,
+                    principal: &transaction_principal,
+                }
+            }),
         )
         .await
         .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let authz_revision = record.authz_revision;
+        let authz_revision = if transaction_id.is_some() {
+            0
+        } else {
+            record.authz_revision
+        };
         Ok(Response::new(PutAuthzSchemaResponse {
             schema_ref: Some(schema_ref_response(&record.schema_ref)),
             authz_revision,
             zookie: zookie(u64_to_i64(authz_revision)?),
+            write_state: if transaction_id.is_some() {
+                WriteState::Staged as i32
+            } else {
+                WriteState::Committed as i32
+            },
         }))
     }
 
@@ -1173,6 +1369,15 @@ impl AuthService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
+        let transaction_id = req
+            .context
+            .as_ref()
+            .map(crate::services::transaction_context::public_context_transaction_id)
+            .transpose()?
+            .flatten()
+            .map(ToOwned::to_owned);
+        let transaction_principal =
+            crate::object_manager::transaction_principal_from_claims(&claims);
         let scope = resolve_authz_scope(&claims, req.scope.as_ref())?;
         let schema_ref = req
             .schema_ref
@@ -1189,25 +1394,42 @@ impl AuthService for AppState {
             "manage_tenant",
         )
         .await?;
-        access_control::grant_authz_realm_defaults(
-            &self.persistence,
-            claims.tenant_id,
-            &scope.authz_realm_id,
-            &claims.sub,
-            &claims.sub,
-            "grant creator authz realm owner",
-        )
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
-        access_control::require_system_realm_permission(
-            &self.storage,
-            &self.mvcc,
-            &claims,
-            crate::system_realm::SYSTEM_AUTHZ_REALM_NAMESPACE,
-            &access_control::authz_realm_object_id(claims.tenant_id, &scope.authz_realm_id),
-            "bind_schema",
-        )
-        .await?;
+        if let Some(transaction_id) = transaction_id.as_deref() {
+            access_control::stage_authz_realm_defaults(
+                &self.persistence,
+                claims.tenant_id,
+                &scope.authz_realm_id,
+                &claims.sub,
+                &claims.sub,
+                "grant creator authz realm owner",
+                transaction_id,
+                &transaction_principal,
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        } else {
+            access_control::grant_authz_realm_defaults(
+                &self.persistence,
+                claims.tenant_id,
+                &scope.authz_realm_id,
+                &claims.sub,
+                &claims.sub,
+                "grant creator authz realm owner",
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        }
+        if transaction_id.is_none() {
+            access_control::require_system_realm_permission(
+                &self.storage,
+                &self.mvcc,
+                &claims,
+                crate::system_realm::SYSTEM_AUTHZ_REALM_NAMESPACE,
+                &access_control::authz_realm_object_id(claims.tenant_id, &scope.authz_realm_id),
+                "bind_schema",
+            )
+            .await?;
+        }
         let binding = authz_realm_schema::bind_schema(
             &self.storage,
             &self.mvcc,
@@ -1221,16 +1443,31 @@ impl AuthService for AppState {
             req.expected_binding_generation,
             &claims.sub,
             &req.reason,
+            transaction_id.as_deref().map(|transaction_id| {
+                crate::authz_journal::AuthzTransactionBinding {
+                    transaction_id,
+                    principal: &transaction_principal,
+                }
+            }),
         )
         .await
         .map_err(|e| Status::failed_precondition(e.to_string()))?;
-        let authz_revision = binding.authz_revision;
+        let authz_revision = if transaction_id.is_some() {
+            0
+        } else {
+            binding.authz_revision
+        };
         Ok(Response::new(BindAuthzSchemaResponse {
             scope: Some(scope),
             schema_ref: Some(schema_ref_response(&binding.schema_ref)),
             binding_generation: binding.binding_generation,
             authz_revision,
             zookie: zookie(u64_to_i64(authz_revision)?),
+            write_state: if transaction_id.is_some() {
+                WriteState::Staged as i32
+            } else {
+                WriteState::Committed as i32
+            },
         }))
     }
 
@@ -1279,6 +1516,15 @@ impl AuthService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
+        let transaction_id = req
+            .context
+            .as_ref()
+            .map(crate::services::transaction_context::public_context_transaction_id)
+            .transpose()?
+            .flatten()
+            .map(ToOwned::to_owned);
+        let transaction_principal =
+            crate::object_manager::transaction_principal_from_claims(&claims);
         if req.namespaces.is_empty() {
             return Err(Status::invalid_argument(
                 "namespaces must contain at least one schema",
@@ -1298,6 +1544,72 @@ impl AuthService for AppState {
             DEFAULT_AUTHZ_REALM_ID,
         )
         .await?;
+        if let Some(transaction_id) = transaction_id.as_deref() {
+            access_control::stage_authz_realm_defaults(
+                &self.persistence,
+                claims.tenant_id,
+                DEFAULT_AUTHZ_REALM_ID,
+                &claims.sub,
+                &claims.sub,
+                "grant default authz realm owner",
+                transaction_id,
+                &transaction_principal,
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+            let binding = crate::authz_journal::AuthzTransactionBinding {
+                transaction_id,
+                principal: &transaction_principal,
+            };
+            let record = authz_realm_schema::put_schema_revision(
+                &self.storage,
+                &self.mvcc,
+                claims.tenant_id,
+                DEFAULT_AUTHZ_REALM_ID,
+                req.namespaces,
+                &claims.sub,
+                &req.reason,
+                Some(binding),
+            )
+            .await
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            for namespace in &record.namespaces {
+                authz_namespace_watch::stage_authz_namespace_watch_record(
+                    &self.mvcc,
+                    transaction_id,
+                    &transaction_principal,
+                    claims.tenant_id,
+                    mutation_id_from_record_hash(&record.schema_ref.schema_digest),
+                    authz_namespace_watch::AuthzNamespaceWatchPayload {
+                        namespace: namespace.namespace.clone(),
+                        event_type: "schema_changed".to_string(),
+                        authz_revision: record.authz_revision,
+                        schema_hash: namespace.schema_hash.clone(),
+                        invalidates_derived_usersets: true,
+                        emitted_at: record.created_at.clone(),
+                    },
+                )
+                .map_err(|e| Status::internal(e.to_string()))?;
+            }
+            authz_realm_schema::bind_schema(
+                &self.storage,
+                &self.mvcc,
+                claims.tenant_id,
+                DEFAULT_AUTHZ_REALM_ID,
+                record.schema_ref.clone(),
+                None,
+                &claims.sub,
+                &req.reason,
+                Some(binding),
+            )
+            .await
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            return Ok(Response::new(ApplyAuthzSchemaResponse {
+                namespaces: record.namespaces,
+                schema_version: 0,
+                write_state: WriteState::Staged as i32,
+            }));
+        }
 
         access_control::grant_authz_realm_defaults(
             &self.persistence,
@@ -1350,6 +1662,7 @@ impl AuthService for AppState {
         Ok(Response::new(ApplyAuthzSchemaResponse {
             namespaces: records.iter().map(authz_schema::schema_response).collect(),
             schema_version,
+            write_state: WriteState::Committed as i32,
         }))
     }
 

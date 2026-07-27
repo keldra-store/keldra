@@ -83,6 +83,44 @@ pub async fn append_authz_namespace_watch_record(
     Ok(u128::from(committed))
 }
 
+pub fn stage_authz_namespace_watch_record(
+    mvcc: &MvccSubsystem,
+    transaction_id: &str,
+    transaction_principal: &str,
+    tenant_id: i64,
+    mutation_id: [u8; 16],
+    payload: AuthzNamespaceWatchPayload,
+) -> Result<()> {
+    validate_payload(&payload)?;
+    let key = watch_key(tenant_id, &payload.namespace, mutation_id)?;
+    let record = WatchRecord::new(
+        0,
+        AUTHZ_NAMESPACE_PARTITION_FAMILY,
+        partition_id(tenant_id, &payload.namespace),
+        mutation_id,
+        AUTHZ_NAMESPACE_RECORD_KIND,
+        payload.authz_revision,
+        0,
+        0,
+        encode_authz_namespace_watch_payload(&payload)?,
+    );
+    let now = now_unix_ms();
+    mvcc.stage_product_mutations(
+        transaction_id,
+        transaction_principal,
+        vec![ProductMutation::put(key.clone(), record.encode())],
+        now,
+    )?;
+    mvcc.stage_predicate(
+        transaction_id,
+        transaction_principal,
+        key,
+        PredicateKind::Unique,
+        now,
+    )?;
+    Ok(())
+}
+
 pub async fn list_authz_namespace_watch_events(
     mvcc: &MvccSubsystem,
     tenant_id: i64,

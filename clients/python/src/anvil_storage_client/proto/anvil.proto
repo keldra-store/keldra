@@ -2588,17 +2588,19 @@ message GrantAccessRequest {
   string grantee_app_id = 1;
   string resource = 2;
   string action = 3;
+  PublicMutationContext context = 4;
 }
 
-message GrantAccessResponse {}
+message GrantAccessResponse { WriteState write_state = 1; }
 
 message RevokeAccessRequest {
   string grantee_app_id = 1;
   string resource = 2;
   string action = 3;
+  PublicMutationContext context = 4;
 }
 
-message RevokeAccessResponse {}
+message RevokeAccessResponse { WriteState write_state = 1; }
 
 message AccessGrantRecord {
   string app_id = 1;
@@ -2620,9 +2622,10 @@ message ListAccessGrantsResponse {
 message SetPublicAccessRequest {
   string bucket = 1;
   bool allow_public_read = 2;
+  PublicMutationContext context = 3;
 }
 
-message SetPublicAccessResponse {}
+message SetPublicAccessResponse { WriteState write_state = 1; }
 
 message AuthzScope {
     string anvil_storage_tenant_id = 1;
@@ -2645,12 +2648,14 @@ message WriteAuthzTupleRequest {
     string operation = 7;
     string reason = 8;
     AuthzScope scope = 9;
+    PublicMutationContext context = 10;
 }
 
 message WriteAuthzTupleResponse {
     uint64 revision = 1;
     string zookie = 2;
     string record_hash = 3;
+    WriteState write_state = 4;
 }
 
 message AuthzTuple {
@@ -2681,12 +2686,14 @@ message WriteAuthzTuplesRequest {
     AuthzScope scope = 2;
     optional string operation_id = 3;
     optional uint64 expected_revision = 4;
+    PublicMutationContext context = 5;
 }
 
 message WriteAuthzTuplesResponse {
     repeated WriteAuthzTupleResponse results = 1;
     uint64 revision = 2;
     string zookie = 3;
+    WriteState write_state = 4;
 }
 
 message ReadAuthzTuplesRequest {
@@ -2833,12 +2840,14 @@ message PutAuthzSchemaRequest {
     string schema_id = 2;
     repeated AuthzNamespaceSchema namespaces = 3;
     string reason = 4;
+    PublicMutationContext context = 5;
 }
 
 message PutAuthzSchemaResponse {
     AuthzSchemaRef schema_ref = 1;
     uint64 authz_revision = 2;
     string zookie = 3;
+    WriteState write_state = 4;
 }
 
 message BindAuthzSchemaRequest {
@@ -2846,6 +2855,7 @@ message BindAuthzSchemaRequest {
     AuthzSchemaRef schema_ref = 2;
     optional uint64 expected_binding_generation = 3;
     string reason = 4;
+    PublicMutationContext context = 5;
 }
 
 message BindAuthzSchemaResponse {
@@ -2854,6 +2864,7 @@ message BindAuthzSchemaResponse {
     uint64 binding_generation = 3;
     uint64 authz_revision = 4;
     string zookie = 5;
+    WriteState write_state = 6;
 }
 
 message GetAuthzSchemaBindingRequest {
@@ -2869,11 +2880,13 @@ message GetAuthzSchemaBindingResponse {
 message ApplyAuthzSchemaRequest {
     repeated AuthzNamespaceSchema namespaces = 1;
     string reason = 2;
+    PublicMutationContext context = 3;
 }
 
 message ApplyAuthzSchemaResponse {
     repeated AuthzNamespaceSchema namespaces = 1;
     uint64 schema_version = 2;
+    WriteState write_state = 3;
 }
 
 message GetAuthzSchemaRequest {
@@ -3141,6 +3154,7 @@ message CreatePersonalDbGroupRequest {
     string schema_hash = 2;
     string genesis_hash = 3;
     string schema_sql = 4;
+    WriteOptions options = 5;
 }
 
 message GetPersonalDbGroupRequest {

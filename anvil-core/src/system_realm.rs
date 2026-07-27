@@ -518,6 +518,7 @@ async fn install_system_schema(storage: &Storage, persistence: &Persistence) -> 
         namespaces.clone(),
         "system-realm-bootstrap",
         "install built-in system realm schema",
+        None,
     )
     .await?;
     match authz_realm_schema::read_schema_binding(
@@ -539,6 +540,7 @@ async fn install_system_schema(storage: &Storage, persistence: &Persistence) -> 
                 Some(binding.binding_generation),
                 "system-realm-bootstrap",
                 "bind built-in system realm schema",
+                None,
             )
             .await?;
         }
@@ -552,6 +554,7 @@ async fn install_system_schema(storage: &Storage, persistence: &Persistence) -> 
                 None,
                 "system-realm-bootstrap",
                 "bind built-in system realm schema",
+                None,
             )
             .await
             {

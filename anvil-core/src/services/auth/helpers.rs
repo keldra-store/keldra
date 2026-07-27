@@ -472,6 +472,7 @@ pub(super) fn write_authz_tuple_response(
         revision: revision_to_u64(record.revision)?,
         zookie: zookie(record.revision),
         record_hash: record.record_hash.clone(),
+        write_state: WriteState::Committed as i32,
     })
 }
 
@@ -490,6 +491,7 @@ pub(super) fn write_authz_tuple_batch_response(
             .collect::<Result<Vec<_>, _>>()?,
         revision: revision_to_u64(revision)?,
         zookie: zookie(revision),
+        write_state: WriteState::Committed as i32,
     })
 }
 

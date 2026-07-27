@@ -129,6 +129,7 @@ async fn set_bucket_public_for_docker_app(actor: &DockerTestStorageActor, bucket
         .await
         .unwrap();
     let mut public_req = tonic::Request::new(SetPublicAccessRequest {
+            context: None,
         bucket: bucket.to_string(),
         allow_public_read: true,
     });

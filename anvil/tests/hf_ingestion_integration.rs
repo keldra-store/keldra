@@ -233,6 +233,7 @@ async fn hf_ingestion_single_file_integration() {
             .await
             .unwrap();
     let mut req = tonic::Request::new(anvil::anvil_api::SetPublicAccessRequest {
+            context: None,
         bucket: bucket_name.clone(),
         allow_public_read: true,
     });

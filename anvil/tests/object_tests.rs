@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 use anvil::anvil_api::bucket_service_client::BucketServiceClient;
+use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::coordination_service_client::CoordinationServiceClient;
 use anvil::anvil_api::index_service_client::IndexServiceClient;
 use anvil::anvil_api::object_service_client::ObjectServiceClient;
@@ -10,7 +11,7 @@ use anvil::anvil_api::{
     CompareAndSwapManifestRequest, CompleteMultipartPart, CompleteMultipartRequest,
     ComposeObjectRequest, ComposeObjectSource, CopyObjectRequest, CreateAppendStreamRequest,
     CreateBucketRequest, CreateIndexRequest, CreateObjectLinkRequest, DeleteObjectRequest,
-    GetObjectRequest,
+    GetObjectRequest, GrantAccessRequest, ListAccessGrantsRequest,
     HeadObjectRequest, IndexKind, InitiateMultipartRequest, LeaseFencePrecondition,
     ListObjectVersionsRequest, ListObjectsRequest, MutationBatchOperation,
     MutationBatchPatchJsonObject, MutationBatchPutObject, MutationBatchRequest,

@@ -83,6 +83,7 @@ pub async fn handle_auth_command(command: &AuthCommands, ctx: &Context) -> anyho
         } => {
             let token = ctx.get_bearer_token().await?;
             let mut request = tonic::Request::new(api::GrantAccessRequest {
+            context: None,
                 grantee_app_id: app.clone(),
                 action: normalise_delegated_action(action, resource)?,
                 resource: resource.clone(),
@@ -101,6 +102,7 @@ pub async fn handle_auth_command(command: &AuthCommands, ctx: &Context) -> anyho
         } => {
             let token = ctx.get_bearer_token().await?;
             let mut request = tonic::Request::new(api::RevokeAccessRequest {
+            context: None,
                 grantee_app_id: app.clone(),
                 action: normalise_delegated_action(action, resource)?,
                 resource: resource.clone(),

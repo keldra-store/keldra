@@ -313,6 +313,7 @@ async fn test_apply_authz_schema_persists_and_emits_namespace_watch() {
     };
 
     let mut apply = Request::new(ApplyAuthzSchemaRequest {
+            context: None,
         namespaces: vec![schema],
         reason: "test schema apply".to_string(),
     });
@@ -402,6 +403,7 @@ async fn test_authz_schema_put_bind_and_realm_scoped_tuples() {
     };
 
     let mut put = Request::new(PutAuthzSchemaRequest {
+            context: None,
         anvil_storage_tenant_id: tenant_id,
         schema_id: "default".to_string(),
         namespaces: vec![schema],
@@ -421,6 +423,7 @@ async fn test_authz_schema_put_bind_and_realm_scoped_tuples() {
 
     for scope in [&scope_a, &scope_b] {
         let mut bind = Request::new(BindAuthzSchemaRequest {
+            context: None,
             scope: Some(scope.clone()),
             schema_ref: Some(schema_ref.clone()),
             expected_binding_generation: None,
@@ -450,6 +453,7 @@ async fn test_authz_schema_put_bind_and_realm_scoped_tuples() {
     );
 
     let mut write = Request::new(WriteAuthzTupleRequest {
+            context: None,
         namespace: "document".to_string(),
         object_id: "alpha".to_string(),
         relation: "viewer".to_string(),
@@ -546,6 +550,7 @@ async fn test_conditional_authz_batch_validates_bound_schema_coordinates() {
         },
     ];
     let mut put = Request::new(PutAuthzSchemaRequest {
+            context: None,
         anvil_storage_tenant_id: actor.tenant_id.to_string(),
         schema_id: "typed".to_string(),
         namespaces: schema,
@@ -559,6 +564,7 @@ async fn test_conditional_authz_batch_validates_bound_schema_coordinates() {
         .into_inner()
         .schema_ref;
     let mut bind = Request::new(BindAuthzSchemaRequest {
+            context: None,
         scope: Some(scope.clone()),
         schema_ref,
         expected_binding_generation: None,
@@ -569,6 +575,7 @@ async fn test_conditional_authz_batch_validates_bound_schema_coordinates() {
 
     let make_request = |mutation: AuthzTupleMutation, operation_id: &str| {
         let mut request = Request::new(WriteAuthzTuplesRequest {
+            context: None,
             mutations: vec![mutation],
             scope: Some(scope.clone()),
             operation_id: Some(operation_id.to_string()),
@@ -682,6 +689,7 @@ async fn test_public_authz_apis_reject_reserved_system_realm_scope() {
     let scope = reserved_system_realm_scope(actor.tenant_id);
 
     let mut write = Request::new(WriteAuthzTupleRequest {
+            context: None,
         namespace: "document".to_string(),
         object_id: "alpha".to_string(),
         relation: "viewer".to_string(),
@@ -696,6 +704,7 @@ async fn test_public_authz_apis_reject_reserved_system_realm_scope() {
     assert_reserved_authz_status(auth_client.write_authz_tuple(write).await);
 
     let mut write_batch = Request::new(WriteAuthzTuplesRequest {
+            context: None,
         mutations: vec![authz_mutation(
             "document", "alpha", "viewer", "user", "alice", "add",
         )],
@@ -767,6 +776,7 @@ async fn test_public_authz_apis_reject_reserved_system_realm_scope() {
     assert_reserved_authz_status(auth_client.list_authz_subjects(list_subjects).await);
 
     let mut bind = Request::new(BindAuthzSchemaRequest {
+            context: None,
         scope: Some(scope.clone()),
         schema_ref: None,
         expected_binding_generation: None,

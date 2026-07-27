@@ -443,6 +443,7 @@ async fn write_authz_tuple(
     auth_client
         .write_authz_tuple(authorized(
             WriteAuthzTupleRequest {
+            context: None,
                 namespace: namespace.to_string(),
                 object_id: object_id.to_string(),
                 relation: relation.to_string(),

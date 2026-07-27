@@ -66,6 +66,12 @@ impl SingleNodeMutationBatchFixture {
             .expect("connect object service")
     }
 
+    async fn auth_client(&self) -> AuthServiceClient<tonic::transport::Channel> {
+        AuthServiceClient::connect(self.actor.grpc_addr.clone())
+            .await
+            .expect("connect auth service")
+    }
+
     async fn transaction_client(&self) -> TransactionServiceClient<tonic::transport::Channel> {
         TransactionServiceClient::connect(self.actor.grpc_addr.clone())
             .await
@@ -411,7 +417,6 @@ async fn mutation_batch_preserves_same_key_put_order() {
             .is_empty(),
         "same-key writes must remain invisible while their transaction is open"
     );
-
     let committed = transaction_client
         .commit_transaction(authorized(
             fixture.commit_request(transaction.transaction_id),
@@ -883,6 +888,7 @@ async fn mixed_public_object_rpcs_publish_on_one_commit() {
     let fixture = SingleNodeMutationBatchFixture::new("tx-mixed-public-rpcs-commit").await;
     let mut transaction_client = fixture.transaction_client().await;
     let mut object_client = fixture.object_client().await;
+    let mut auth_client = fixture.auth_client().await;
     let source_key = "mixed-success/source.json";
     let delete_key = "mixed-success/deleted.json";
     let copy_key = "mixed-success/copied.json";
@@ -910,6 +916,25 @@ async fn mixed_public_object_rpcs_publish_on_one_commit() {
             EXPLICIT_TRANSACTION_TTL_MS,
         )
         .await;
+    let grant = auth_client
+        .grant_access(authorized(
+            GrantAccessRequest {
+                context: Some(PublicMutationContext {
+                    request_id: "mixed-success-auth-grant".to_string(),
+                    idempotency_key: format!("mixed-success-auth-{}", uuid::Uuid::new_v4()),
+                    expected_generation: 0,
+                    transaction_id: Some(transaction.transaction_id.clone()),
+                }),
+                grantee_app_id: fixture.actor.app_id.clone(),
+                resource: fixture.bucket_name.clone(),
+                action: "bucket:read".to_string(),
+            },
+            &fixture.actor.token,
+        ))
+        .await
+        .expect("stage auth grant with mixed object writes")
+        .into_inner();
+    assert_eq!(grant.write_state, WriteState::Staged as i32);
     let copied = object_client
         .copy_object(authorized(
             CopyObjectRequest {
@@ -1006,6 +1031,23 @@ async fn mixed_public_object_rpcs_publish_on_one_commit() {
         .await,
         br#"{"delete":true}"#
     );
+    let grants_before = auth_client
+        .list_access_grants(authorized(
+            ListAccessGrantsRequest {
+                app: fixture.actor.app_id.clone(),
+                page: None,
+            },
+            &fixture.actor.token,
+        ))
+        .await
+        .expect("list grants before mixed commit")
+        .into_inner();
+    assert!(
+        !grants_before.grants.iter().any(|grant| {
+            grant.resource == fixture.bucket_name && grant.action == "bucket:read"
+        }),
+        "staged auth grant leaked before object commit"
+    );
 
     let committed = transaction_client
         .commit_transaction(authorized(
@@ -1052,6 +1094,23 @@ async fn mixed_public_object_rpcs_publish_on_one_commit() {
         ))
         .await
         .expect("mixed link becomes visible only after commit");
+    let grants_after = auth_client
+        .list_access_grants(authorized(
+            ListAccessGrantsRequest {
+                app: fixture.actor.app_id.clone(),
+                page: None,
+            },
+            &fixture.actor.token,
+        ))
+        .await
+        .expect("list grants after mixed commit")
+        .into_inner();
+    assert!(
+        grants_after.grants.iter().any(|grant| {
+            grant.resource == fixture.bucket_name && grant.action == "bucket:read"
+        }),
+        "auth grant did not publish with object mutations"
+    );
 }
 
 #[tokio::test]
@@ -1059,6 +1118,7 @@ async fn object_version_precondition_is_revalidated_at_transaction_publication()
     let fixture = SingleNodeMutationBatchFixture::new("tx-batch-durable-object-precondition").await;
     let mut transaction_client = fixture.transaction_client().await;
     let mut object_client = fixture.object_client().await;
+    let mut auth_client = fixture.auth_client().await;
     let guard_key = "preconditions/guard.json";
     let target_key = "preconditions/target.json";
     let delete_key = "preconditions/mixed-delete.json";
@@ -1114,6 +1174,25 @@ async fn object_version_precondition_is_revalidated_at_transaction_publication()
             EXPLICIT_TRANSACTION_TTL_MS,
         )
         .await;
+    let grant = auth_client
+        .grant_access(authorized(
+            GrantAccessRequest {
+                context: Some(PublicMutationContext {
+                    request_id: "mixed-conflict-auth-grant".to_string(),
+                    idempotency_key: format!("mixed-conflict-auth-{}", uuid::Uuid::new_v4()),
+                    expected_generation: 0,
+                    transaction_id: Some(transaction.transaction_id.clone()),
+                }),
+                grantee_app_id: fixture.actor.app_id.clone(),
+                resource: fixture.bucket_name.clone(),
+                action: "bucket:read".to_string(),
+            },
+            &fixture.actor.token,
+        ))
+        .await
+        .expect("stage auth grant in conflicting transaction")
+        .into_inner();
+    assert_eq!(grant.write_state, WriteState::Staged as i32);
     object_client
         .copy_object(authorized(
             CopyObjectRequest {
@@ -1245,6 +1324,23 @@ async fn object_version_precondition_is_revalidated_at_transaction_publication()
         ))
         .await;
     assert!(aborted_link.is_err(), "aborted link create became visible");
+    let grants_after_abort = auth_client
+        .list_access_grants(authorized(
+            ListAccessGrantsRequest {
+                app: fixture.actor.app_id.clone(),
+                page: None,
+            },
+            &fixture.actor.token,
+        ))
+        .await
+        .expect("list grants after mixed abort")
+        .into_inner();
+    assert!(
+        !grants_after_abort.grants.iter().any(|grant| {
+            grant.resource == fixture.bucket_name && grant.action == "bucket:read"
+        }),
+        "aborted auth grant became visible"
+    );
     assert_eq!(
         get_object_bytes_for_test(
             &mut object_client,

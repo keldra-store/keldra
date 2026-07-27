@@ -340,6 +340,7 @@ async fn performance_docker_end_user_flow() {
             auth_client
                 .write_authz_tuple(authorized(
                     WriteAuthzTupleRequest {
+            context: None,
                         namespace: "document".to_string(),
                         object_id: "latency-object".to_string(),
                         relation: "viewer".to_string(),

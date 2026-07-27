@@ -58,6 +58,7 @@ fn generated_proto_exports_core_service_types() {
         schema_digest: "digest".to_string(),
     };
     let bind = proto::BindAuthzSchemaRequest {
+            context: None,
         scope: Some(scope),
         schema_ref: Some(schema_ref),
         expected_binding_generation: Some(1),
@@ -78,6 +79,7 @@ fn generated_proto_exports_core_service_types() {
     assert_eq!(member.allowed_subjects.len(), 1);
 
     let batch = proto::WriteAuthzTuplesRequest {
+            context: None,
         mutations: vec![proto::AuthzTupleMutation {
             namespace: "document".to_string(),
             object_id: "doc-1".to_string(),

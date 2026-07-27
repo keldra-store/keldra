@@ -115,6 +115,12 @@ pub struct AuthzTupleWrite<'a> {
     pub reason: &'a str,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AuthzTransactionBinding<'a> {
+    pub transaction_id: &'a str,
+    pub principal: &'a str,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AuthzTupleFilter {
     pub realm_id: Option<String>,
@@ -185,6 +191,7 @@ pub(crate) async fn write_authz_tuple_with_permit(
         permit.fence_token,
         None,
         None,
+        None,
     )
     .await?
     .records;
@@ -222,6 +229,39 @@ pub(crate) async fn write_authz_tuple_batch_with_permit(
         permit.fence_token,
         audit_event,
         tenant_audit_event,
+        None,
+    )
+    .await?
+    .records)
+}
+
+pub(crate) async fn stage_authz_tuple_batch_with_permit(
+    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    inputs: Vec<AuthzTupleWrite<'_>>,
+    permit: &PartitionWritePermit,
+    audit_event: Option<&crate::admin_audit::AdminAuditEvent>,
+    tenant_audit_event: Option<&crate::tenant_audit::TenantAuditEvent>,
+    options: Option<&crate::persistence::AuthzTupleBatchWriteOptions>,
+    binding: AuthzTransactionBinding<'_>,
+) -> Result<Vec<AuthzTupleRecord>> {
+    let tenant_id = inputs
+        .first()
+        .ok_or_else(|| anyhow!("authz tuple batch must not be empty"))?
+        .tenant_id;
+    require_authz_permit(tenant_id, permit)?;
+    if inputs.iter().any(|input| input.tenant_id != tenant_id) {
+        return Err(anyhow!("authz tuple batch must target one tenant"));
+    }
+    Ok(write_authz_tuple_batch_mvcc(
+        storage,
+        mvcc,
+        inputs,
+        options,
+        permit.fence_token,
+        audit_event,
+        tenant_audit_event,
+        Some(binding),
     )
     .await?
     .records)
@@ -245,7 +285,7 @@ pub(crate) async fn write_system_authz_tuple_batch(
         validate_optional_caveat_hash(input.caveat_hash)?;
     }
     Ok(
-        write_authz_tuple_batch_mvcc(storage, mvcc, inputs, None, 0, None, None)
+        write_authz_tuple_batch_mvcc(storage, mvcc, inputs, None, 0, None, None, None)
             .await?
             .records,
     )
@@ -289,6 +329,7 @@ pub(crate) async fn write_authz_tuple_batch_conditionally_with_permit(
         permit.fence_token,
         None,
         None,
+        None,
     )
     .await
 }
@@ -305,12 +346,14 @@ async fn write_authz_tuple_batch_mvcc(
     fence_token: u64,
     audit_event: Option<&crate::admin_audit::AdminAuditEvent>,
     tenant_audit_event: Option<&crate::tenant_audit::TenantAuditEvent>,
+    binding: Option<AuthzTransactionBinding<'_>>,
 ) -> Result<crate::persistence::AuthzTupleBatchWriteOutcome> {
     let first = inputs
         .first()
         .ok_or_else(|| anyhow!("authz tuple batch must not be empty"))?;
     let tenant_id = first.tenant_id;
-    if let Some(options) = options
+    if binding.is_none()
+        && let Some(options) = options
         && let Some(replay) = idempotency::replay(mvcc, &inputs, options).await?
     {
         return Ok(replay);
@@ -327,7 +370,10 @@ async fn write_authz_tuple_batch_mvcc(
                 })?,
         )
     };
-    let principal = authz_head::transaction_principal(tenant_id);
+    let implicit_principal = authz_head::transaction_principal(tenant_id);
+    let principal = binding
+        .map(|binding| binding.principal.to_string())
+        .unwrap_or(implicit_principal);
     let idempotency_key = options
         .and_then(|options| options.operation_id.as_deref())
         .map(|operation_id| {
@@ -338,20 +384,32 @@ async fn write_authz_tuple_batch_mvcc(
         })
         .unwrap_or_else(|| format!("authz-tuple:{tenant_id}:{}", uuid::Uuid::new_v4()));
     let now_unix_ms = current_unix_ms();
-    let handle = mvcc
-        .open_transactions
-        .begin(
-            mvcc.runtime.as_ref(),
-            mvcc.cluster_id(),
-            &principal,
-            idempotency_key,
-            Duration::from_secs(30),
-            crate::mvcc_transaction::DurabilityLevel::Quorum,
-            crate::mvcc_transaction::ReadConsistency::Linearized,
-            now_unix_ms,
+    let implicit_handle = if binding.is_none() {
+        Some(
+            mvcc.open_transactions
+                .begin(
+                    mvcc.runtime.as_ref(),
+                    mvcc.cluster_id(),
+                    &principal,
+                    idempotency_key,
+                    Duration::from_secs(30),
+                    crate::mvcc_transaction::DurabilityLevel::Quorum,
+                    crate::mvcc_transaction::ReadConsistency::Linearized,
+                    now_unix_ms,
+                )
+                .await?,
         )
-        .await?;
-    let transaction_id = handle.transaction_id.as_str();
+    } else {
+        None
+    };
+    let transaction_id = binding
+        .map(|binding| binding.transaction_id)
+        .or_else(|| {
+            implicit_handle
+                .as_ref()
+                .map(|handle| handle.transaction_id.as_str())
+        })
+        .expect("authz transaction binding exists");
 
     let realm_id = split_realm_namespace(first.namespace)
         .map(|(realm_id, _)| realm_id)
@@ -507,6 +565,12 @@ async fn write_authz_tuple_batch_mvcc(
     }
     if let Some(assignment) = &assignment {
         mvcc.stage_assignment_guard(transaction_id, &principal, assignment, now_unix_ms)?;
+    }
+    if binding.is_some() {
+        return Ok(crate::persistence::AuthzTupleBatchWriteOutcome {
+            records,
+            replayed: false,
+        });
     }
 
     let outcome = mvcc

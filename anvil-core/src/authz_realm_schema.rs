@@ -173,6 +173,7 @@ pub async fn put_schema_revision(
     mut namespaces: Vec<AuthzNamespaceSchema>,
     written_by: &str,
     reason: &str,
+    caller_binding: Option<crate::authz_journal::AuthzTransactionBinding<'_>>,
 ) -> Result<StoredAuthzSchemaRevision> {
     validate_schema_id(schema_id)?;
     crate::authz_schema_contract::validate_schema_set(&namespaces)?;
@@ -200,12 +201,13 @@ pub async fn put_schema_revision(
                 })?,
         )
     };
-    let principal = authz_head::transaction_principal(tenant_id);
+    let principal = caller_binding
+        .map(|binding| binding.principal.to_string())
+        .unwrap_or_else(|| authz_head::transaction_principal(tenant_id));
     let idempotency_key = format!("authz-schema:{tenant_id}:{schema_id}:{schema_digest}");
     let now_unix_ms = current_unix_ms();
-    let handle = mvcc
-        .open_transactions
-        .begin(
+    let handle = if caller_binding.is_none() {
+        Some(mvcc.open_transactions.begin(
             mvcc.runtime.as_ref(),
             mvcc.cluster_id(),
             &principal,
@@ -214,9 +216,14 @@ pub async fn put_schema_revision(
             crate::mvcc_transaction::DurabilityLevel::Quorum,
             crate::mvcc_transaction::ReadConsistency::Linearized,
             now_unix_ms,
-        )
-        .await?;
-    let transaction_id = handle.transaction_id.as_str();
+        ).await?)
+    } else {
+        None
+    };
+    let transaction_id = caller_binding
+        .map(|binding| binding.transaction_id)
+        .or_else(|| handle.as_ref().map(|handle| handle.transaction_id.as_str()))
+        .expect("schema transaction binding exists");
     let latest_key = schema_latest_tuple_key(tenant_id, schema_id)?;
     let latest = read_proto_row_transaction_mvcc::<StoredAuthzSchemaRevision>(
         storage,
@@ -287,7 +294,9 @@ pub async fn put_schema_revision(
     if let Some(assignment) = &assignment {
         mvcc.stage_assignment_guard(transaction_id, &principal, assignment, now_unix_ms)?;
     }
-    commit_schema_transaction(mvcc, transaction_id, &principal).await?;
+    if caller_binding.is_none() {
+        commit_schema_transaction(mvcc, transaction_id, &principal).await?;
+    }
     Ok(record)
 }
 
@@ -330,6 +339,7 @@ pub async fn bind_schema(
     expected_generation: Option<u64>,
     written_by: &str,
     reason: &str,
+    caller_binding: Option<crate::authz_journal::AuthzTransactionBinding<'_>>,
 ) -> Result<StoredAuthzSchemaBinding> {
     validate_realm_id(realm_id)?;
     let revision_key =
@@ -371,16 +381,17 @@ pub async fn bind_schema(
                 })?,
         )
     };
-    let principal = authz_head::transaction_principal(tenant_id);
+    let principal = caller_binding
+        .map(|binding| binding.principal.to_string())
+        .unwrap_or_else(|| authz_head::transaction_principal(tenant_id));
     let idempotency_key = format!(
         "authz-schema-binding:{tenant_id}:{realm_id}:{}:{}",
         schema_ref.schema_id,
         actual.unwrap_or(0).saturating_add(1)
     );
     let now_unix_ms = current_unix_ms();
-    let handle = mvcc
-        .open_transactions
-        .begin(
+    let handle = if caller_binding.is_none() {
+        Some(mvcc.open_transactions.begin(
             mvcc.runtime.as_ref(),
             mvcc.cluster_id(),
             &principal,
@@ -389,9 +400,14 @@ pub async fn bind_schema(
             crate::mvcc_transaction::DurabilityLevel::Quorum,
             crate::mvcc_transaction::ReadConsistency::Linearized,
             now_unix_ms,
-        )
-        .await?;
-    let transaction_id = handle.transaction_id.as_str();
+        ).await?)
+    } else {
+        None
+    };
+    let transaction_id = caller_binding
+        .map(|binding| binding.transaction_id)
+        .or_else(|| handle.as_ref().map(|handle| handle.transaction_id.as_str()))
+        .expect("schema binding transaction exists");
     let current = read_proto_row_transaction_mvcc::<StoredAuthzSchemaBinding>(
         storage,
         mvcc,
@@ -461,7 +477,9 @@ pub async fn bind_schema(
     if let Some(assignment) = &assignment {
         mvcc.stage_assignment_guard(transaction_id, &principal, assignment, now_unix_ms)?;
     }
-    commit_schema_transaction(mvcc, transaction_id, &principal).await?;
+    if caller_binding.is_none() {
+        commit_schema_transaction(mvcc, transaction_id, &principal).await?;
+    }
     Ok(binding)
 }
 
