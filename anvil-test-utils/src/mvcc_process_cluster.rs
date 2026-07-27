@@ -40,6 +40,13 @@ struct ProcessNode {
     child: Option<Child>,
 }
 
+#[derive(Debug)]
+struct ObsoleteNode {
+    storage_path: PathBuf,
+    peers_json: String,
+    incarnation: u64,
+}
+
 /// Three `anvil-server` children with stable addresses and persistent,
 /// independent storage directories.
 #[derive(Debug)]
@@ -50,6 +57,8 @@ pub struct ProcessMvccCluster {
     peers_json: String,
     admin_token: String,
     nodes: Vec<ProcessNode>,
+    obsolete_nodes: Vec<Option<ObsoleteNode>>,
+    obsolete_children: Vec<Child>,
 }
 
 impl ProcessMvccCluster {
@@ -97,6 +106,8 @@ impl ProcessMvccCluster {
             peers_json,
             admin_token,
             nodes,
+            obsolete_nodes: (0..3).map(|_| None).collect(),
+            obsolete_children: Vec::new(),
         };
 
         // Followers must finish constructing their RPC services before the
@@ -144,8 +155,16 @@ impl ProcessMvccCluster {
         node: usize,
         consistency: MvccReadConsistency,
     ) -> anyhow::Result<BeginTransactionResponse> {
-        let mut client =
-            TransactionServiceClient::connect(self.public_endpoint(node)).await?;
+        self.begin_transaction_at(self.public_endpoint(node), consistency)
+            .await
+    }
+
+    pub async fn begin_transaction_at(
+        &self,
+        endpoint: String,
+        consistency: MvccReadConsistency,
+    ) -> anyhow::Result<BeginTransactionResponse> {
+        let mut client = TransactionServiceClient::connect(endpoint).await?;
         Ok(client
             .begin_transaction(authorized(
                 BeginTransactionRequest {
@@ -211,6 +230,11 @@ impl ProcessMvccCluster {
         if incarnation <= self.nodes[node].incarnation {
             bail!("replacement incarnation must advance");
         }
+        self.obsolete_nodes[node] = Some(ObsoleteNode {
+            storage_path: self.nodes[node].storage_path.clone(),
+            peers_json: self.peers_json.clone(),
+            incarnation: self.nodes[node].incarnation,
+        });
         self.nodes[node].incarnation = incarnation;
         self.nodes[node].storage_path = self
             ._directory
@@ -221,6 +245,48 @@ impl ProcessMvccCluster {
         self.peers_json = serde_json::to_string(&peers)?;
         self.spawn_node(node).await?;
         self.wait_for_admin(node).await
+    }
+
+    /// Relaunch the retired disk on separate listeners. Its authenticated
+    /// streams still present the obsolete incarnation and must be rejected by
+    /// the surviving nodes' applied control fences.
+    pub async fn spawn_obsolete_incarnation(&mut self, node: usize) -> anyhow::Result<String> {
+        let obsolete = self.obsolete_nodes[node]
+            .as_ref()
+            .context("node has no retired incarnation")?;
+        let addresses = reserve_loopback_addresses(2)?;
+        let api_addr = addresses[0];
+        let admin_addr = addresses[1];
+        let child = Command::new(&self.binary)
+            .env("JWT_SECRET", JWT_SECRET)
+            .env("ANVIL_SECRET_ENCRYPTION_KEY", ENCRYPTION_KEY)
+            .env("PUBLIC_API_ADDR", format!("http://{api_addr}"))
+            .env("API_LISTEN_ADDR", api_addr.to_string())
+            .env("ADMIN_LISTEN_ADDR", admin_addr.to_string())
+            .env("REGION", "process-e2e-region")
+            .env("NODE_ID", format!("{}-node-{}", self.cluster_id, node + 1))
+            .env("MVCC_RAFT_NODE_ID", (node + 1).to_string())
+            .env("MVCC_NODE_INCARNATION", obsolete.incarnation.to_string())
+            .env("MVCC_FAILURE_DOMAIN", format!("zone-{}", node + 1))
+            .env("MVCC_PEERS_JSON", &obsolete.peers_json)
+            .env("MVCC_BOOTSTRAP_MEMBERSHIP", "false")
+            .env("MVCC_RAFT_GROUP_ID", "1")
+            .env("MVCC_CLUSTER_ID", &self.cluster_id)
+            .env("MVCC_BUNDLE_QUORUM_HOLDERS", "2")
+            .env("MVCC_TOLERATED_FAILURE_DOMAINS", "1")
+            .env("MVCC_RPC_TIMEOUT_MS", "1000")
+            .env("MVCC_NODE_CONNECTION_TOKEN", "process-e2e-node-token")
+            .env("STORAGE_PATH", &obsolete.storage_path)
+            .env("BOOTSTRAP_SYSTEM_ADMIN_SUBJECT_KIND", "app")
+            .env("BOOTSTRAP_SYSTEM_ADMIN_SUBJECT_ID", ADMIN_PRINCIPAL)
+            .env("ANVIL_TEST_ALLOW_INSECURE_MVCC_TRANSPORT", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()?;
+        self.obsolete_children.push(child);
+        Ok(format!("http://{api_addr}"))
     }
 
     /// Apply the authenticated replacement operation to one coordinator.
@@ -341,6 +407,9 @@ impl Drop for ProcessMvccCluster {
             if let Some(child) = &mut node.child {
                 let _ = child.start_kill();
             }
+        }
+        for child in &mut self.obsolete_children {
+            let _ = child.start_kill();
         }
     }
 }

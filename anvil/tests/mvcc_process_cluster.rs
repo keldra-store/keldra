@@ -121,4 +121,45 @@ async fn killed_node_is_replaced_by_higher_incarnation_and_catches_up() {
     .await
     .expect("higher incarnation catches up and serves its applied snapshot");
     assert_eq!(replacement.state, "open");
+
+    let obsolete_endpoint = cluster.spawn_obsolete_incarnation(replaced).await.unwrap();
+    let obsolete_local = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(snapshot) = cluster
+                .begin_transaction_at(
+                    obsolete_endpoint.clone(),
+                    MvccReadConsistency::LocalSnapshot,
+                )
+                .await
+            {
+                return snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("obsolete process starts from its retired disk");
+    assert!(obsolete_local.snapshot_version <= replacement.snapshot_version);
+    let obsolete_attempt = tokio::time::timeout(
+        Duration::from_secs(5),
+        cluster.begin_transaction_at(
+            obsolete_endpoint,
+            MvccReadConsistency::Linearized,
+        ),
+    )
+    .await;
+    assert!(
+        !matches!(obsolete_attempt, Ok(Ok(_))),
+        "obsolete incarnation must not regain linearized consensus participation"
+    );
+
+    let healthy = cluster
+        .begin_transaction(leader, MvccReadConsistency::Linearized)
+        .await
+        .unwrap();
+    let healthy_commit = cluster
+        .commit_transaction(cluster.public_endpoint(leader), healthy.transaction_id)
+        .await
+        .unwrap();
+    assert_eq!(healthy_commit.state, WriteState::Committed as i32);
 }
