@@ -276,7 +276,10 @@ impl AppState {
         persistence
             .install_mvcc(mvcc.clone())
             .context("install MVCC transaction staging in persistence")?;
-        if !arc_config.region.is_empty() && !arc_config.requires_distributed_coremeta_recovery() {
+        if !arc_config.region.is_empty()
+            && arc_config.mvcc_bootstrap_membership
+            && !arc_config.requires_distributed_coremeta_recovery()
+        {
             // A standalone node owns its local region bootstrap. Distributed
             // regions are installed through the admin topology bootstrap and
             // recovered through CoreMeta; re-creating one on every process
@@ -774,9 +777,32 @@ mod app_state_tests {
             public_api_addr: "127.0.0.1:0".to_string(),
             api_listen_addr: "127.0.0.1:0".to_string(),
             region: "distributed-region".to_string(),
+            node_id: "node-a".to_string(),
             bootstrap_system_admin_subject_kind: "app".to_string(),
             bootstrap_system_admin_subject_id: "admin-principal".to_string(),
-            bootstrap_node_ids: vec!["node-a".to_string(), "node-b".to_string()],
+            mvcc_peers_json: serde_json::to_string(&[
+                serde_json::json!({
+                    "cluster_id": "default",
+                    "raft_node_id": 1,
+                    "node_id": "node-a",
+                    "incarnation": 1,
+                    "endpoint": "http://127.0.0.1:50051",
+                    "failure_domain": "zone-a",
+                    "voter": true,
+                }),
+                serde_json::json!({
+                    "cluster_id": "default",
+                    "raft_node_id": 2,
+                    "node_id": "node-b",
+                    "incarnation": 1,
+                    "endpoint": "http://127.0.0.1:50052",
+                    "failure_domain": "zone-b",
+                    "voter": true,
+                }),
+            ])
+            .unwrap(),
+            mvcc_bootstrap_membership: false,
+            allow_test_only_insecure_mvcc_transport: true,
             storage_path: directory
                 .path()
                 .join("storage")
