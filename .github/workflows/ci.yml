@@ -159,7 +159,11 @@ jobs:
 
   rust-unit:
     name: Rust unit and client tests
-    needs: [build-image, static]
+    # Keep the Rust/integration lanes running even when the optional test-image
+    # packaging lane fails to compile. The image job still reports failure and
+    # remains required for release publication, but decoupling it here lets a
+    # CI run expose the next code/test failures in the same attempt.
+    needs: static
     runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 120
     env:
