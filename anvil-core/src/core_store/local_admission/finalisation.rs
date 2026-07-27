@@ -464,7 +464,19 @@ impl CoreStore {
             publication.root_anchor_key.as_str() == scope_partition.as_str()
                 && publication.transaction_coordinator
         }) {
-            bail!("CoreStore finalisation mutation plan is missing its coordinator root");
+            let publication_summary = publications
+                .iter()
+                .map(|publication| {
+                    format!(
+                        "{} (coordinator={})",
+                        publication.root_anchor_key, publication.transaction_coordinator
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "CoreStore finalisation mutation plan is missing its coordinator root: scope_partition={scope_partition}, publications=[{publication_summary}]"
+            );
         }
         Ok(publications)
     }
