@@ -1659,13 +1659,13 @@ impl TestCluster {
                 .await
                 .unwrap()
         };
-        let app = if let Some(existing) = leader
+        let app_id = if let Some(existing) = leader
             .persistence
             .get_app_by_client_id("test-app")
             .await
             .unwrap()
         {
-            existing
+            existing.id
         } else {
             let encrypted_secret = leader.secret_keyring.encrypt(b"test-secret").unwrap();
             leader
@@ -1680,11 +1680,12 @@ impl TestCluster {
                 )
                 .await
                 .unwrap()
+                .id
         };
         access_control::grant_storage_tenant_owner(
             &leader.persistence,
             tenant.id,
-            &app.id.to_string(),
+            &app_id.to_string(),
             "test-cluster",
             "grant test app ownership of its storage tenant",
         )
@@ -1744,7 +1745,7 @@ impl TestCluster {
         let minted_token = mint_token.then(|| {
             leader
                 .jwt_manager
-                .mint_token(app.id.to_string(), tenant.id)
+                .mint_token(app_id.to_string(), tenant.id)
                 .unwrap()
         });
         if let Some(token) = minted_token {
