@@ -349,6 +349,12 @@ impl TransactionBundle {
                     )?;
                     (job.cluster_id, job.transaction_id)
                 }
+                Some(crate::git_source_postcommit_job::GitSourcePostCommitJob::SCHEMA) => {
+                    let job = crate::git_source_postcommit_job::GitSourcePostCommitJob::decode(
+                        encoded_job,
+                    )?;
+                    (job.cluster_id, job.transaction_id)
+                }
                 _ => {
                     let job =
                         crate::object_materialisation::ObjectMaterialisationJob::decode(encoded_job)?;
