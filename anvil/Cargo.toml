@@ -23,9 +23,15 @@ path = "src/lib.rs"
 name = "anvil-server"
 path = "src/main.rs"
 
+[[test]]
+name = "mvcc_process_cluster"
+path = "tests/mvcc_process_cluster.rs"
+required-features = ["process-hard-crash-test-control"]
+
 [features]
 enterprise = []
 root-publication-test-control = ["anvil-core/root-publication-test-control"]
+process-hard-crash-test-control = ["anvil-core/process-hard-crash-test-control"]
 gcp = ["dep:prost-types", "tonic/tls-ring"]
 routeguide = ["dep:async-stream", "dep:tokio-stream", "dep:rand"]
 reflection = ["dep:tonic-reflection"]

@@ -828,15 +828,18 @@ async fn real_cluster_fetches_a_missing_committed_bundle_before_advancing_apply_
             < commit_version,
         "apply worker must stop at a committed decision whose canonical bundle is unavailable"
     );
+    let unavailable_snapshot = cluster
+        .state(lagging)
+        .mvcc
+        .runtime
+        .read_at(&key, commit_version)
+        .expect_err("a node must not serve a snapshot above its applied watermark");
     assert!(
-        cluster
-            .state(lagging)
-            .mvcc
-            .runtime
-            .read_at(&key, commit_version)
-            .unwrap()
-            .is_none(),
-        "a missing bundle cannot become partially visible"
+        unavailable_snapshot
+            .to_string()
+            .contains("above local readable version"),
+        "a missing bundle must make the committed snapshot unavailable, not partially visible: \
+         {unavailable_snapshot:#}"
     );
 
     cluster.partition_replication(valid_holder);
@@ -853,15 +856,18 @@ async fn real_cluster_fetches_a_missing_committed_bundle_before_advancing_apply_
             < commit_version,
         "bytes from the corrupt authenticated holder cannot advance the watermark"
     );
+    let unavailable_snapshot = cluster
+        .state(lagging)
+        .mvcc
+        .runtime
+        .read_at(&key, commit_version)
+        .expect_err("corrupt holder bytes must not make the committed snapshot readable");
     assert!(
-        cluster
-            .state(lagging)
-            .mvcc
-            .runtime
-            .read_at(&key, commit_version)
-            .unwrap()
-            .is_none(),
-        "corrupt holder bytes never become visible"
+        unavailable_snapshot
+            .to_string()
+            .contains("above local readable version"),
+        "corrupt holder bytes must leave the committed snapshot unavailable: \
+         {unavailable_snapshot:#}"
     );
     cluster.heal_replication(valid_holder);
     cluster
@@ -1245,6 +1251,49 @@ async fn real_cluster_reconstructs_a_deleted_shard_and_publishes_repaired_placem
             );
         }
     }
+
+    // Retirement evidence only becomes authoritative once the overlay is at
+    // or below the cluster GC watermark. Ensure every replica has applied the
+    // overlay, allow its periodic safety report to observe that the repair
+    // pins are gone, then issue a real transaction so the refreshed reports
+    // are ACKed through the persistent Raft streams. This avoids mistaking a
+    // correctly retained post-watermark shard for a failed physical unlink.
+    for node in 0..3 {
+        cluster
+            .wait_for_applied_version(node, overlay_row.commit_version)
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    let gc_barrier = cluster
+        .commit(
+            leader,
+            "e2e-retirement-gc-barrier",
+            LogicalKey {
+                table_id: 65_534,
+                application_key: format!("retirement-gc-barrier/{object_identity}").into_bytes(),
+            },
+            b"applied".to_vec(),
+        )
+        .await
+        .unwrap();
+    let gc_barrier_version = match gc_barrier.certification {
+        CertificationResult::Committed { commit_version } => commit_version,
+        CertificationResult::Aborted { reason } => {
+            panic!("retirement GC barrier transaction aborted: {reason:?}")
+        }
+    };
+    for node in 0..3 {
+        cluster
+            .wait_for_applied_version(node, gc_barrier_version)
+            .await
+            .unwrap();
+    }
+    cluster
+        .wait_for_gc_watermark(retiring_node, overlay_row.commit_version)
+        .await
+        .expect("cluster GC watermark reaches committed retirement evidence");
+
     tokio::time::timeout(std::time::Duration::from_secs(20), async {
         loop {
             if !retiring_path.exists() && !retiring_meta.exists() {

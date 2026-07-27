@@ -360,7 +360,7 @@ jobs:
 
   server-core:
     name: Server core integration tests
-    needs: [release-context, rust-unit]
+    needs: [release-context, build-image, static-and-docs]
     runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 60
     env:
@@ -411,7 +411,7 @@ jobs:
 
   mvcc-e2e:
     name: MVCC under Raft end-to-end acceptance
-    needs: [release-context, server-core]
+    needs: [release-context, build-image, static-and-docs]
     runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 180
     env:

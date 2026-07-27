@@ -28,6 +28,7 @@ harness = false
 #Declare an enterprise feature, doesn't activate any depdendencies so leave it with an empty array
 enterprise = []
 root-publication-test-control = []
+process-hard-crash-test-control = []
 test-in-process-personaldb-signers = []
 test-cluster-transport-faults = []
 gcp = ["dep:prost-types", "tonic/tls-ring"]

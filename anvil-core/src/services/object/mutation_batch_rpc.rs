@@ -181,7 +181,7 @@ pub(super) async fn execute_mutation_batch(
     }
     validate_mutation_batch_operations(&req)?;
     ensure_mutation_batch_operations_supported(&req.operations)?;
-    validate_mutation_batch_authorization(state, &claims, &req).await?;
+    Box::pin(validate_mutation_batch_authorization(state, &claims, &req)).await?;
     let operation_digest = mutation_batch_digest(&req)?;
     let context = req
         .mutation_context
@@ -246,9 +246,13 @@ pub(super) async fn execute_mutation_batch(
     let transaction_principal = effective_transaction_id
         .map(|_| object_manager::transaction_principal_from_claims(&claims));
     let precondition_transaction = effective_transaction_id.zip(transaction_principal.as_deref());
-    let mut mvcc_preconditions =
-        prepare_mutation_batch_native_preconditions(state, &claims, &req, precondition_transaction)
-            .await?;
+    let mut mvcc_preconditions = Box::pin(prepare_mutation_batch_native_preconditions(
+        state,
+        &claims,
+        &req,
+        precondition_transaction,
+    ))
+    .await?;
     let write_preconditions = prepare_write_preconditions(
         state,
         &claims,
@@ -299,9 +303,8 @@ pub(super) async fn execute_mutation_batch(
             .collect::<Result<Vec<_>, Status>>()?;
         let batch_transaction_id = effective_transaction_id
             .expect("put-only batches always have an explicit or implicit transaction");
-        let objects = state
-            .object_manager
-            .put_objects_batch_in_transaction(
+        let objects = Box::pin(
+            state.object_manager.put_objects_batch_in_transaction(
                 &claims,
                 &req.bucket_name,
                 inputs,
@@ -325,8 +328,9 @@ pub(super) async fn execute_mutation_batch(
                         mvcc_preconditions,
                     )
                 },
-            )
-            .await?;
+            ),
+        )
+        .await?;
         if implicit_transaction.is_some() {
             let outcome = state
                 .mvcc
@@ -367,25 +371,23 @@ pub(super) async fn execute_mutation_batch(
         };
         match op {
             mutation_batch_operation::Op::PutObject(op) => {
-                let object = state
-                    .object_manager
-                    .put_object(
-                        &claims,
-                        &req.bucket_name,
-                        &op.object_key,
-                        futures_util::stream::iter(vec![Ok(op.payload)]),
-                        ObjectWriteOptions {
-                            content_type: op.content_type,
-                            user_metadata: parse_user_metadata_json(&op.user_metadata_json)?,
-                            transaction_id: effective_transaction_id.map(ToOwned::to_owned),
-                            transaction_principal: effective_transaction_id.map(|_| {
-                                crate::object_manager::transaction_principal_from_claims(&claims)
-                            }),
-                            storage_class_id: op.storage_class,
-                            visibility: write_visibility,
-                        },
-                    )
-                    .await?;
+                let object = Box::pin(state.object_manager.put_object(
+                    &claims,
+                    &req.bucket_name,
+                    &op.object_key,
+                    futures_util::stream::iter(vec![Ok(op.payload)]),
+                    ObjectWriteOptions {
+                        content_type: op.content_type,
+                        user_metadata: parse_user_metadata_json(&op.user_metadata_json)?,
+                        transaction_id: effective_transaction_id.map(ToOwned::to_owned),
+                        transaction_principal: effective_transaction_id.map(|_| {
+                            crate::object_manager::transaction_principal_from_claims(&claims)
+                        }),
+                        storage_class_id: op.storage_class,
+                        visibility: write_visibility,
+                    },
+                ))
+                .await?;
                 let watch_cursor = if effective_transaction_id.is_some()
                     || !write_visibility.requires_watch_visible()
                 {
@@ -407,17 +409,15 @@ pub(super) async fn execute_mutation_batch(
                 });
             }
             mutation_batch_operation::Op::PatchJsonObject(op) => {
-                let object = state
-                    .object_manager
-                    .patch_json_object(
-                        claims.clone(),
-                        &req.bucket_name,
-                        &op.object_key,
-                        parse_optional_version_id(op.base_version_id.as_deref())?,
-                        &op.merge_patch_json,
-                        effective_transaction_id,
-                    )
-                    .await?;
+                let object = Box::pin(state.object_manager.patch_json_object(
+                    claims.clone(),
+                    &req.bucket_name,
+                    &op.object_key,
+                    parse_optional_version_id(op.base_version_id.as_deref())?,
+                    &op.merge_patch_json,
+                    effective_transaction_id,
+                ))
+                .await?;
                 if effective_transaction_id.is_none() {
                     let watch_cursor = object_watch_cursor(state, &object).await?;
                     max_watch_cursor = max_watch_cursor.max(watch_cursor);
@@ -440,30 +440,26 @@ pub(super) async fn execute_mutation_batch(
                 let deleted = if let Some(version_id) =
                     parse_optional_version_id(op.version_id.as_deref())?
                 {
-                    state
-                        .object_manager
-                        .delete_object_version(
-                            &claims,
-                            &req.bucket_name,
-                            &op.object_key,
-                            version_id,
-                            effective_transaction_id,
-                            transaction_principal.as_deref(),
-                            write_visibility,
-                        )
-                        .await?
+                    Box::pin(state.object_manager.delete_object_version(
+                        &claims,
+                        &req.bucket_name,
+                        &op.object_key,
+                        version_id,
+                        effective_transaction_id,
+                        transaction_principal.as_deref(),
+                        write_visibility,
+                    ))
+                    .await?
                 } else {
-                    state
-                        .object_manager
-                        .delete_object(
-                            &claims,
-                            &req.bucket_name,
-                            &op.object_key,
-                            effective_transaction_id,
-                            transaction_principal.as_deref(),
-                            write_visibility,
-                        )
-                        .await?
+                    Box::pin(state.object_manager.delete_object(
+                        &claims,
+                        &req.bucket_name,
+                        &op.object_key,
+                        effective_transaction_id,
+                        transaction_principal.as_deref(),
+                        write_visibility,
+                    ))
+                    .await?
                 };
                 let watch_cursor = if effective_transaction_id.is_some()
                     || !write_visibility.requires_watch_visible()
@@ -488,19 +484,17 @@ pub(super) async fn execute_mutation_batch(
             mutation_batch_operation::Op::AppendStreamRecord(op) => {
                 let stream_id = uuid::Uuid::parse_str(&op.stream_id)
                     .map_err(|_| Status::invalid_argument("Invalid stream_id"))?;
-                let record = state
-                    .object_manager
-                    .append_stream_record(
-                        &claims,
-                        &req.bucket_name,
-                        &op.stream_key,
-                        stream_id,
-                        op.payload,
-                        op.content_type,
-                        parse_user_metadata_json(&op.user_metadata_json)?,
-                        effective_transaction_id,
-                    )
-                    .await?;
+                let record = Box::pin(state.object_manager.append_stream_record(
+                    &claims,
+                    &req.bucket_name,
+                    &op.stream_key,
+                    stream_id,
+                    op.payload,
+                    op.content_type,
+                    parse_user_metadata_json(&op.user_metadata_json)?,
+                    effective_transaction_id,
+                ))
+                .await?;
                 if effective_transaction_id.is_none() {
                     max_watch_cursor = max_watch_cursor.max(record.receipt.watch_cursor);
                 }
@@ -523,18 +517,16 @@ pub(super) async fn execute_mutation_batch(
             mutation_batch_operation::Op::CompareAndSwapManifest(op) => {
                 let transaction_principal = effective_transaction_id
                     .map(|_| object_manager::transaction_principal_from_claims(&claims));
-                let result = state
-                    .object_manager
-                    .compare_and_swap_manifest(
-                        &claims,
-                        &req.bucket_name,
-                        &op.manifest_key,
-                        op.expected_revision,
-                        &op.manifest_json,
-                        effective_transaction_id,
-                        transaction_principal.as_deref(),
-                    )
-                    .await?;
+                let result = Box::pin(state.object_manager.compare_and_swap_manifest(
+                    &claims,
+                    &req.bucket_name,
+                    &op.manifest_key,
+                    op.expected_revision,
+                    &op.manifest_json,
+                    effective_transaction_id,
+                    transaction_principal.as_deref(),
+                ))
+                .await?;
                 if effective_transaction_id.is_none() {
                     max_watch_cursor = max_watch_cursor.max(result.receipt.watch_cursor);
                 }

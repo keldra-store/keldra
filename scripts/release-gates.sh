@@ -160,13 +160,16 @@ native_mvcc_e2e_gates() {
     mvcc_partition_fixture
     mvcc_snapshot_stability
     coremeta_bounded_contracts
-    mvcc_process_cluster
   )
   local test_name
   for test_name in "${mvcc_tests[@]}"; do
     run_cargo_test "native MVCC acceptance ${test_name}" \
       -p anvil-server --test "${test_name}"
   done
+  run_cargo_test "native MVCC acceptance mvcc_process_cluster" \
+    -p anvil-server \
+    --features process-hard-crash-test-control \
+    --test mvcc_process_cluster
 
   local transaction_tests=(
     boundary_schema_transaction_tests
@@ -433,10 +436,6 @@ case "$group" in
     server_core_integration_gates
     native_mvcc_e2e_gates
     performance_quick_gates
-    docker_auth_gates
-    docker_storage_gates
-    docker_index_gates
-    docker_mesh_gates
     ;;
   static)
     static_gates

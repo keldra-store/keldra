@@ -34,7 +34,13 @@ use anvil::anvil_api::{
     personal_db_service_client::PersonalDbServiceClient, put_git_pack_request,
     transaction_service_client::TransactionServiceClient, write_options,
 };
-use anvil_core::{auth::JwtManager, system_realm::SYSTEM_STORAGE_TENANT_ID};
+use anvil_core::{
+    auth::JwtManager, services::consensus_transport::TonicConsensusRpcFactory,
+    system_realm::SYSTEM_STORAGE_TENANT_ID,
+};
+use anvil_mvcc_consensus::{
+    ConsensusNode, ConsensusRpc, ConsensusRpcFactory as _, ConsensusRpcKind, NodeId,
+};
 use anyhow::{Context, bail};
 use tempfile::TempDir;
 use tokio::process::{Child, Command};
@@ -152,13 +158,54 @@ impl ProcessMvccCluster {
         &self.cluster_id
     }
 
-    /// Find the current leader using the public linearized transaction API.
+    /// Find the current leader through OpenRaft's leader-local linearized read
+    /// barrier.
+    ///
+    /// The public transaction API deliberately forwards linearized reads from
+    /// followers, so a successful `BeginTransaction` only proves that a leader
+    /// is reachable. Sending the existing internal forward-read RPC directly
+    /// to each candidate invokes `linearized_read_barrier_locally` on that
+    /// process and succeeds only on the current leader.
     pub async fn wait_for_leader(&self, candidates: &[usize]) -> anyhow::Result<usize> {
+        let source = candidates
+            .iter()
+            .copied()
+            .find(|&node| {
+                self.nodes
+                    .get(node)
+                    .is_some_and(|candidate| candidate.child.is_some())
+            })
+            .context("leader wait requires at least one live candidate")?;
+        let factory = TonicConsensusRpcFactory::new(
+            self.cluster_id.clone(),
+            NodeId(source as u64 + 1),
+            self.nodes[source].incarnation,
+            "process-e2e-node-token",
+            Duration::from_secs(1),
+        );
+        let probe_payload = bincode::serde::encode_to_vec((), bincode::config::standard())
+            .context("encode process MVCC leader probe")?;
         let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
         loop {
             for &node in candidates {
-                if self
-                    .begin_transaction(node, MvccReadConsistency::Linearized)
+                let Some(candidate) = self.nodes.get(node) else {
+                    bail!("leader candidate index {node} is out of bounds");
+                };
+                if candidate.child.is_none() {
+                    continue;
+                }
+                let mut client = factory.client(
+                    NodeId(node as u64 + 1),
+                    &ConsensusNode {
+                        address: self.public_endpoint(node),
+                    },
+                );
+                if client
+                    .request(ConsensusRpc {
+                        schema_version: 1,
+                        kind: ConsensusRpcKind::ForwardLinearizedRead,
+                        payload: probe_payload.clone(),
+                    })
                     .await
                     .is_ok()
                 {
@@ -961,21 +1008,26 @@ impl ProcessMvccCluster {
         node: usize,
         timeout: Duration,
     ) -> anyhow::Result<()> {
-        tokio::time::timeout(timeout, async {
+        let result = tokio::time::timeout(timeout, async {
             loop {
                 let child = self.nodes[node]
                     .child
                     .as_mut()
                     .context("process MVCC node is not running")?;
-                if child.try_wait()?.is_some() {
+                if let Some(status) = child.try_wait()? {
                     self.nodes[node].child = None;
-                    return Ok::<_, anyhow::Error>(());
+                    return self.verify_expected_hard_crash(node, status);
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
         })
-        .await
-        .context("timed out waiting for process MVCC hard crash")?
+        .await;
+        // A timeout or unexpected exit must not leave a delayed crash armed
+        // against later recovery work.
+        let cleanup = self.disarm_hard_crash(node);
+        let outcome = result.context("timed out waiting for process MVCC hard crash")?;
+        outcome?;
+        cleanup
     }
 
     /// Wait for the compact-Raft-assigned worker to consume a fault armed on
@@ -988,23 +1040,74 @@ impl ProcessMvccCluster {
         if candidates.is_empty() {
             bail!("hard-crash wait requires at least one candidate node");
         }
-        tokio::time::timeout(timeout, async {
+        let result = tokio::time::timeout(timeout, async {
             loop {
+                let mut exited = Vec::new();
                 for &node in candidates {
-                    let exited = self.nodes[node]
-                        .child
-                        .as_mut()
-                        .is_some_and(|child| matches!(child.try_wait(), Ok(Some(_))));
-                    if exited {
-                        self.nodes[node].child = None;
-                        return Ok::<_, anyhow::Error>(node);
+                    let Some(candidate) = self.nodes.get_mut(node) else {
+                        bail!("hard-crash candidate index {node} is out of bounds");
+                    };
+                    if let Some(child) = candidate.child.as_mut() {
+                        if let Some(status) = child.try_wait()? {
+                            exited.push((node, status));
+                        }
                     }
+                }
+                if !exited.is_empty() {
+                    for &(node, _) in &exited {
+                        self.nodes[node].child = None;
+                    }
+                    if exited.len() != 1 {
+                        bail!(
+                            "expected one assigned process MVCC worker to hard crash, but nodes {:?} exited",
+                            exited.iter().map(|(node, _)| *node).collect::<Vec<_>>()
+                        );
+                    }
+                    let (node, status) = exited.pop().expect("one exit was observed");
+                    self.verify_expected_hard_crash(node, status)?;
+                    return Ok::<_, anyhow::Error>(node);
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
         })
-        .await
-        .context("timed out waiting for an assigned process MVCC worker to hard crash")?
+        .await;
+        // Disarm every losing candidate immediately after the assigned worker
+        // aborts. Also disarm on timeout/error so a later unrelated task cannot
+        // consume a stale control file.
+        let mut cleanup = Ok(());
+        for &node in candidates {
+            if let Err(error) = self.disarm_hard_crash(node) {
+                cleanup = Err(error);
+                break;
+            }
+        }
+        let outcome = result
+            .context("timed out waiting for an assigned process MVCC worker to hard crash")?;
+        let node = outcome?;
+        cleanup?;
+        Ok(node)
+    }
+
+    fn verify_expected_hard_crash(
+        &self,
+        node: usize,
+        status: std::process::ExitStatus,
+    ) -> anyhow::Result<()> {
+        if status.success() {
+            bail!("process MVCC node {node} exited successfully instead of aborting");
+        }
+        if self.nodes[node].hard_crash_control_path.exists() {
+            bail!("process MVCC node {node} exited without consuming its armed hard-crash control");
+        }
+        Ok(())
+    }
+
+    fn disarm_hard_crash(&self, node: usize) -> anyhow::Result<()> {
+        match std::fs::remove_file(&self.nodes[node].hard_crash_control_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).context("disarm process MVCC hard crash"),
+        }
     }
 
     pub async fn restart(&mut self, node: usize) -> anyhow::Result<()> {
@@ -1080,6 +1183,7 @@ impl ProcessMvccCluster {
             .env("STORAGE_PATH", &obsolete.storage_path)
             .env("BOOTSTRAP_SYSTEM_ADMIN_SUBJECT_KIND", "app")
             .env("BOOTSTRAP_SYSTEM_ADMIN_SUBJECT_ID", ADMIN_PRINCIPAL)
+            .env("ANVIL_TEST_ENABLE_PROCESS_HARD_CRASH", "1")
             .env("ANVIL_TEST_ALLOW_INSECURE_MVCC_TRANSPORT", "1")
             .env(
                 "ANVIL_MVCC_HARD_CRASH_CONTROL_FILE",
@@ -1166,6 +1270,7 @@ impl ProcessMvccCluster {
                     .collect::<Vec<_>>()
                     .join(","),
             )
+            .env("ANVIL_TEST_ENABLE_PROCESS_HARD_CRASH", "1")
             .env("ANVIL_TEST_ALLOW_INSECURE_MVCC_TRANSPORT", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())

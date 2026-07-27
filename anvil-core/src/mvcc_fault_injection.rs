@@ -118,38 +118,57 @@ pub fn clear() {
 #[cfg(not(test))]
 pub fn clear() {}
 
-#[cfg(test)]
-pub fn hit(point: FaultPoint) -> Result<(), InjectedFault> {
-    #[cfg(debug_assertions)]
+#[cfg(all(feature = "process-hard-crash-test-control", debug_assertions))]
+fn abort_process_if_armed(point: FaultPoint) {
+    if std::env::var("ANVIL_TEST_ENABLE_PROCESS_HARD_CRASH")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        return;
+    }
     if let Some(path) = std::env::var_os("ANVIL_MVCC_HARD_CRASH_CONTROL_FILE") {
         let path = std::path::PathBuf::from(path);
         if std::fs::read_to_string(&path)
             .is_ok_and(|configured| configured.trim() == format!("{point:?}"))
+            // Claim the one-shot control before aborting. If another task
+            // already consumed it, this process must continue normally.
+            && std::fs::remove_file(path).is_ok()
         {
-            // One-shot arming avoids a restarted process crashing again while
-            // recovering the same committed decision from its original disk.
-            let _ = std::fs::remove_file(path);
             std::process::abort();
         }
     }
-    if std::env::var("ANVIL_MVCC_HARD_CRASH_AT").ok().as_deref()
-        == Some(format!("{point:?}").as_str())
-    {
-        std::process::abort();
-    }
-    if let Ok(result) = SCOPED.try_with(|faults| faults.borrow_mut().check(point)) {
-        return result;
-    }
-    let mut installed = INSTALLED.get_or_init(|| Mutex::new(None)).lock().unwrap();
-    match installed.as_mut() {
-        Some(faults) => faults.check(point),
-        None => Ok(()),
-    }
 }
 
-#[cfg(not(test))]
-pub fn hit(_point: FaultPoint) -> Result<(), InjectedFault> {
-    Ok(())
+pub fn hit(point: FaultPoint) -> Result<(), InjectedFault> {
+    // Process-backed acceptance tests run `CARGO_BIN_EXE_anvil-server`, which
+    // is not compiled with `cfg(test)`. Keep this hook behind both an explicit
+    // non-default feature and a child-process environment gate. Release builds
+    // additionally compile it out through `debug_assertions`.
+    #[cfg(all(feature = "process-hard-crash-test-control", debug_assertions))]
+    abort_process_if_armed(point);
+
+    #[cfg(test)]
+    {
+        if std::env::var("ANVIL_MVCC_HARD_CRASH_AT").ok().as_deref()
+            == Some(format!("{point:?}").as_str())
+        {
+            std::process::abort();
+        }
+        if let Ok(result) = SCOPED.try_with(|faults| faults.borrow_mut().check(point)) {
+            return result;
+        }
+        let mut installed = INSTALLED.get_or_init(|| Mutex::new(None)).lock().unwrap();
+        match installed.as_mut() {
+            Some(faults) => faults.check(point),
+            None => Ok(()),
+        }
+    }
+    #[cfg(not(test))]
+    {
+        let _ = point;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

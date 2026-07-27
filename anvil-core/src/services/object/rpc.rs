@@ -1371,7 +1371,10 @@ impl ObjectService for AppState {
         &self,
         request: Request<MutationBatchRequest>,
     ) -> Result<Response<MutationBatchResponse>, Status> {
-        execute_mutation_batch(self, request).await
+        // Keep the generated MutationBatch state machine out of tonic's RPC
+        // dispatch frame. Debug builds otherwise place both large async frames
+        // on a default Tokio worker stack while polling the request.
+        Box::pin(execute_mutation_batch(self, request)).await
     }
 
     async fn initiate_multipart_upload(
