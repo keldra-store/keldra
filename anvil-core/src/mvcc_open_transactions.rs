@@ -333,14 +333,14 @@ impl OpenTransactionRegistry {
     ) -> Result<()> {
         self.mutate(transaction_id, now_unix_ms, |draft| {
             ensure_owning_cluster(draft, owning_cluster_id)?;
-            draft
-                .mutations
-                .predicates
-                .push(crate::mvcc_transaction::ExplicitPredicate {
-                    key,
-                    kind,
-                    observed_version,
-                });
+            let predicate = crate::mvcc_transaction::ExplicitPredicate {
+                key,
+                kind,
+                observed_version,
+            };
+            if !draft.mutations.predicates.contains(&predicate) {
+                draft.mutations.predicates.push(predicate);
+            }
             Ok(())
         })
     }

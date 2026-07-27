@@ -18,10 +18,13 @@ pub struct PersonalDbPostCommitJob {
     pub changeset_bytes: Vec<u8>,
     pub envelope: Value,
     pub committed_head_hash: String,
+    /// Definitions whose target mutations were committed in the originating
+    /// transaction and must not be applied a second time during fanout.
+    pub excluded_projection_ids: Vec<String>,
 }
 
 impl PersonalDbPostCommitJob {
-    pub const SCHEMA: &'static str = "anvil.mvcc.personaldb-postcommit-job.v1";
+    pub const SCHEMA: &'static str = "anvil.mvcc.personaldb-postcommit-job.v2";
 
     pub fn encode(&self) -> Result<Vec<u8>> {
         self.validate()?;
@@ -59,8 +62,18 @@ impl PersonalDbPostCommitJob {
             || self.schema_sql.trim().is_empty()
             || !self.envelope.is_object()
             || self.committed_head_hash.trim().is_empty()
+            || self
+                .excluded_projection_ids
+                .iter()
+                .any(|projection_id| projection_id.trim().is_empty())
         {
             bail!("invalid PersonalDB postcommit job");
+        }
+        let mut canonical = self.excluded_projection_ids.clone();
+        canonical.sort();
+        canonical.dedup();
+        if canonical != self.excluded_projection_ids {
+            bail!("PersonalDB postcommit projection exclusions are not canonical");
         }
         Ok(())
     }
@@ -131,6 +144,7 @@ mod tests {
             changeset_bytes: vec![1, 2, 3],
             envelope: serde_json::json!({"format_version": 1}),
             committed_head_hash: hex::encode([9; 32]),
+            excluded_projection_ids: Vec::new(),
         }
     }
 
@@ -147,5 +161,16 @@ mod tests {
             second.target_logical_identity()
         );
         assert_ne!(first.job_id().unwrap(), second.job_id().unwrap());
+    }
+
+    #[test]
+    fn projection_exclusions_must_be_sorted_and_unique() {
+        let mut value = job(1);
+        value.excluded_projection_ids = vec!["db-b/projection".into(), "db-a/projection".into()];
+        assert!(value.encode().is_err());
+        value.excluded_projection_ids.sort();
+        assert!(value.encode().is_ok());
+        value.excluded_projection_ids.push("db-b/projection".into());
+        assert!(value.encode().is_err());
     }
 }

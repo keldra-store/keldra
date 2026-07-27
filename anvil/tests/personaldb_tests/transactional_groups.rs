@@ -471,3 +471,282 @@ async fn projection_conflict_aborts_an_unrelated_bucket_in_the_losing_transactio
             .all(|bucket| bucket.name != losing_bucket)
     );
 }
+
+#[tokio::test]
+async fn projection_writeback_stages_source_and_target_heads_in_one_transaction() {
+    let cluster = isolated_test_cluster("projection-writeback-transaction", &["test-region-1"]).await;
+    let actor = create_personaldb_test_actor(&cluster, "projection-writeback-transaction").await;
+    let token = actor.token.clone();
+    let cluster_id = cluster.states[0].mvcc.cluster_id().to_string();
+    let mut transactions =
+        TransactionServiceClient::connect(actor.grpc_addr.clone()).await.unwrap();
+    let mut personaldb =
+        PersonalDbServiceClient::connect(actor.grpc_addr.clone()).await.unwrap();
+    let source = format!("writeback-source-{}", uuid::Uuid::new_v4().simple());
+    let target = format!("writeback-target-{}", uuid::Uuid::new_v4().simple());
+    let source_genesis = create_group(&mut personaldb, &token, &source).await;
+    create_group_with_schema(
+        &mut personaldb,
+        &token,
+        &target,
+        PERSONALDB_PROJECTION_TEST_SCHEMA_SQL,
+        &personaldb_projection_test_schema_hash(),
+    )
+    .await;
+    let definition = projection_definition_allowing_name_writeback_for_tenant(
+        actor.tenant_id,
+        &target,
+        &source,
+    );
+    personaldb
+        .create_personal_db_projection(authorized(
+            CreatePersonalDbProjectionRequest {
+                tenant_id: actor.tenant_id,
+                database_id: target.clone(),
+                projection_definition_json: serde_json::to_string(&definition).unwrap(),
+                options: None,
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+    personaldb
+        .submit_personal_db_changeset(authorized(
+            valid_submit_request_for_actor(&actor, &source, &source_genesis),
+            &token,
+        ))
+        .await
+        .unwrap();
+    let target_head = personaldb
+        .get_personal_db_group(authorized(
+            GetPersonalDbGroupRequest {
+                tenant_id: actor.tenant_id,
+                database_id: target.clone(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .committed_head
+        .unwrap();
+    assert_eq!(target_head.log_index, 1);
+    let transaction_id = begin_personaldb_transaction(
+        &mut transactions,
+        &token,
+        &cluster_id,
+        "projection-writeback",
+    )
+    .await;
+    let mut request = submit_request_at_base_for_actor(
+        &actor,
+        &target,
+        target_head.log_index,
+        &target_head.log_hash,
+        sqlite_projection_update_changeset(),
+    );
+    request.options = Some(transaction_options(&transaction_id));
+    let staged = personaldb
+        .submit_personal_db_changeset(authorized(request.clone(), &token))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(staged.write_state, anvil::anvil_api::WriteState::Staged as i32);
+    let retry = personaldb
+        .submit_personal_db_changeset(authorized(request, &token))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(retry.write_state, anvil::anvil_api::WriteState::Staged as i32);
+    for database_id in [&source, &target] {
+        let head = personaldb
+            .get_personal_db_group(authorized(
+                GetPersonalDbGroupRequest {
+                    tenant_id: actor.tenant_id,
+                    database_id: database_id.clone(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .committed_head
+            .unwrap();
+        assert_eq!(head.log_index, 1);
+    }
+
+    transactions
+        .commit_transaction(authorized(
+            CommitTransactionRequest {
+                transaction_id,
+                cluster_id,
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+    for database_id in [&source, &target] {
+        let head = personaldb
+            .get_personal_db_group(authorized(
+                GetPersonalDbGroupRequest {
+                    tenant_id: actor.tenant_id,
+                    database_id: database_id.clone(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .committed_head
+            .unwrap();
+        assert_eq!(head.log_index, 2);
+    }
+}
+
+#[tokio::test]
+async fn projection_writeback_conflict_aborts_both_groups_and_unrelated_writes() {
+    let cluster = isolated_test_cluster("projection-writeback-conflict", &["test-region-1"]).await;
+    let actor = create_personaldb_test_actor(&cluster, "projection-writeback-conflict").await;
+    let token = actor.token.clone();
+    let cluster_id = cluster.states[0].mvcc.cluster_id().to_string();
+    let mut transactions =
+        TransactionServiceClient::connect(actor.grpc_addr.clone()).await.unwrap();
+    let mut buckets = BucketServiceClient::connect(actor.grpc_addr.clone()).await.unwrap();
+    let mut personaldb =
+        PersonalDbServiceClient::connect(actor.grpc_addr.clone()).await.unwrap();
+    let source = format!("writeback-conflict-source-{}", uuid::Uuid::new_v4().simple());
+    let target = format!("writeback-conflict-target-{}", uuid::Uuid::new_v4().simple());
+    let source_genesis = create_group(&mut personaldb, &token, &source).await;
+    create_group_with_schema(
+        &mut personaldb,
+        &token,
+        &target,
+        PERSONALDB_PROJECTION_TEST_SCHEMA_SQL,
+        &personaldb_projection_test_schema_hash(),
+    )
+    .await;
+    let definition = projection_definition_allowing_name_writeback_for_tenant(
+        actor.tenant_id,
+        &target,
+        &source,
+    );
+    personaldb
+        .create_personal_db_projection(authorized(
+            CreatePersonalDbProjectionRequest {
+                tenant_id: actor.tenant_id,
+                database_id: target.clone(),
+                projection_definition_json: serde_json::to_string(&definition).unwrap(),
+                options: None,
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+    personaldb
+        .submit_personal_db_changeset(authorized(
+            valid_submit_request_for_actor(&actor, &source, &source_genesis),
+            &token,
+        ))
+        .await
+        .unwrap();
+    let target_head = personaldb
+        .get_personal_db_group(authorized(
+            GetPersonalDbGroupRequest {
+                tenant_id: actor.tenant_id,
+                database_id: target.clone(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .committed_head
+        .unwrap();
+    let first = begin_personaldb_transaction(
+        &mut transactions,
+        &token,
+        &cluster_id,
+        "writeback-first",
+    )
+    .await;
+    let second = begin_personaldb_transaction(
+        &mut transactions,
+        &token,
+        &cluster_id,
+        "writeback-second",
+    )
+    .await;
+    let losing_bucket = format!("writeback-loser-{}", uuid::Uuid::new_v4().simple());
+    for transaction_id in [&first, &second] {
+        let mut request = submit_request_at_base_for_actor(
+            &actor,
+            &target,
+            target_head.log_index,
+            &target_head.log_hash,
+            sqlite_projection_update_changeset(),
+        );
+        request.options = Some(transaction_options(transaction_id));
+        personaldb
+            .submit_personal_db_changeset(authorized(request, &token))
+            .await
+            .unwrap();
+    }
+    buckets
+        .create_bucket(authorized(
+            CreateBucketRequest {
+                bucket_name: losing_bucket.clone(),
+                region: "test-region-1".to_string(),
+                options: Some(transaction_options(&second)),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+    transactions
+        .commit_transaction(authorized(
+            CommitTransactionRequest {
+                transaction_id: first,
+                cluster_id: cluster_id.clone(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+    let conflict = transactions
+        .commit_transaction(authorized(
+            CommitTransactionRequest {
+                transaction_id: second,
+                cluster_id,
+            },
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(conflict.code(), tonic::Code::Aborted);
+    for database_id in [&source, &target] {
+        let head = personaldb
+            .get_personal_db_group(authorized(
+                GetPersonalDbGroupRequest {
+                    tenant_id: actor.tenant_id,
+                    database_id: database_id.clone(),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .committed_head
+            .unwrap();
+        assert_eq!(head.log_index, 2);
+    }
+    assert!(
+        buckets
+            .list_buckets(authorized(ListBucketsRequest { page: None }, &token))
+            .await
+            .unwrap()
+            .into_inner()
+            .buckets
+            .iter()
+            .all(|bucket| bucket.name != losing_bucket)
+    );
+}

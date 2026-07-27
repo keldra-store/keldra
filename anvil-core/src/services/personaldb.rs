@@ -715,11 +715,6 @@ impl PersonalDbService for AppState {
         &self,
         request: Request<SubmitPersonalDbChangesetRequest>,
     ) -> Result<Response<SubmitPersonalDbChangesetResponse>, Status> {
-        let snapshot_version = self
-            .mvcc
-            .runtime
-            .applied_version()
-            .map_err(internal_status)?;
         let claims = request_claims(&request)?.clone();
         let bearer_token = request_bearer_token(&request)?.to_string();
         let req = request.into_inner();
@@ -731,6 +726,30 @@ impl PersonalDbService for AppState {
         let transaction_principal = transaction_id
             .as_ref()
             .map(|_| crate::object_manager::transaction_principal_from_claims(&claims));
+        let snapshot_version = match transaction_id.as_deref() {
+            Some(transaction_id) => {
+                let handle = self
+                    .mvcc
+                    .open_transactions
+                    .handle(transaction_id)
+                    .map_err(internal_status)?;
+                if handle.principal
+                    != transaction_principal
+                        .as_deref()
+                        .ok_or_else(|| Status::internal("missing transaction principal"))?
+                {
+                    return Err(Status::permission_denied(
+                        "PersonalDB caller transaction principal mismatch",
+                    ));
+                }
+                handle.snapshot_version
+            }
+            None => self
+                .mvcc
+                .runtime
+                .applied_version()
+                .map_err(internal_status)?,
+        };
         validate_claim_tenant(claims.tenant_id, req.tenant_id)?;
         validate_database_id(&req.database_id)?;
         let core_request = core_submit_request(req)?;
@@ -764,13 +783,13 @@ impl PersonalDbService for AppState {
         .await
         .map_err(internal_status)?;
         if !projection_definitions.is_empty() {
-            if transaction_id.is_some() {
-                return Err(Status::failed_precondition(
-                    "explicit PersonalDB submit with projection write-back requires transactional projection support",
-                ));
-            }
             return self
-                .handle_personaldb_projection_writeback(core_request, actor, projection_definitions)
+                .handle_personaldb_projection_writeback(
+                    core_request,
+                    actor,
+                    projection_definitions,
+                    transaction_id.as_deref().zip(transaction_principal.as_deref()),
+                )
                 .await;
         }
         let source_database_id = core_request.database_id.clone();
@@ -780,6 +799,7 @@ impl PersonalDbService for AppState {
                 core_request,
                 actor,
                 transaction_id.as_deref().zip(transaction_principal.as_deref()),
+                &[],
             )
             .await?;
         if transaction_id.is_some() {
@@ -792,6 +812,7 @@ impl PersonalDbService for AppState {
             committed.log_index,
             &committed.log_hash,
             committed.authz_revision,
+            &[],
         )
         .await?;
         Ok(submit_changeset_response(committed, WriteState::Committed))
@@ -1101,6 +1122,7 @@ impl AppState {
             job.log_index,
             &job.log_hash,
             job.authz_revision,
+            &job.excluded_projection_ids,
         )
         .await
         .map_err(|status| anyhow::anyhow!(status.to_string()))?;
@@ -1170,6 +1192,7 @@ impl AppState {
         request: CoreSubmitChangeset,
         actor: PersonalDbCommitActor,
         definitions: Vec<ProjectionDefinition>,
+        caller_transaction: Option<(&str, &str)>,
     ) -> Result<Response<SubmitPersonalDbChangesetResponse>, Status> {
         validate_claim_tenant(actor.tenant_id, request.tenant_id)?;
         validate_database_id(&request.database_id)?;
@@ -1204,8 +1227,13 @@ impl AppState {
                 "projection write-back is denied by projection policy",
             )),
             WriteBackPolicy::AllowMappedColumns { .. } => {
-                self.commit_personaldb_projection_writeback(validated.request, actor, definition)
-                    .await
+                self.commit_personaldb_projection_writeback(
+                    validated.request,
+                    actor,
+                    definition,
+                    caller_transaction,
+                )
+                .await
             }
         }
     }
@@ -1215,12 +1243,29 @@ impl AppState {
         request: CoreSubmitChangeset,
         actor: PersonalDbCommitActor,
         definition: ProjectionDefinition,
+        caller_transaction: Option<(&str, &str)>,
     ) -> Result<Response<SubmitPersonalDbChangesetResponse>, Status> {
-        let snapshot_version = self
-            .mvcc
-            .runtime
-            .applied_version()
-            .map_err(internal_status)?;
+        let snapshot_version = match caller_transaction {
+            Some((transaction_id, principal)) => {
+                let handle = self
+                    .mvcc
+                    .open_transactions
+                    .handle(transaction_id)
+                    .map_err(internal_status)?;
+                if handle.principal != principal {
+                    return Err(Status::permission_denied(
+                        "PersonalDB caller transaction principal mismatch",
+                    ));
+                }
+                handle.snapshot_version
+            }
+            None => self
+                .mvcc
+                .runtime
+                .applied_version()
+                .map_err(internal_status)?,
+        };
+        let target_request = request.clone();
         let projection_manifest = read_personaldb_group_manifest(
             &self.storage,
             &self.mvcc,
@@ -1232,11 +1277,12 @@ impl AppState {
         .await
         .map_err(internal_status)?
         .ok_or_else(|| Status::not_found("PersonalDB projection group not found"))?;
-        let projection_head = read_personaldb_committed_head_mvcc(
+        let projection_head = read_personaldb_committed_head_at_snapshot(
             &self.mvcc,
             actor.tenant_id,
             &definition.database_id,
             self.personaldb_protocol_keyring.trust_store(),
+            snapshot_version,
         )
         .map_err(internal_status)?
         .ok_or_else(|| Status::failed_precondition("PersonalDB projection head missing"))?;
@@ -1270,11 +1316,12 @@ impl AppState {
         .await
         .map_err(internal_status)?
         .ok_or_else(|| Status::not_found("PersonalDB source group not found"))?;
-        let source_head = read_personaldb_committed_head_mvcc(
+        let source_head = read_personaldb_committed_head_at_snapshot(
             &self.mvcc,
             actor.tenant_id,
             &source_database_id,
             self.personaldb_protocol_keyring.trust_store(),
+            snapshot_version,
         )
         .map_err(internal_status)?
         .ok_or_else(|| Status::failed_precondition("PersonalDB source head missing"))?;
@@ -1333,8 +1380,33 @@ impl AppState {
         };
         let source_changeset_bytes = source_request.changeset_bytes.clone();
         let tenant_id = actor.tenant_id;
+        if let Some(caller_transaction) = caller_transaction {
+            self.commit_personaldb_changeset(
+                target_request,
+                actor.clone(),
+                Some(caller_transaction),
+                &[],
+            )
+            .await?;
+            let excluded_projection_ids = vec![format!(
+                "{}/{}",
+                definition.database_id, definition.projection_id
+            )];
+            let staged_source = self
+                .commit_personaldb_changeset(
+                    source_request,
+                    actor,
+                    Some(caller_transaction),
+                    &excluded_projection_ids,
+                )
+                .await?;
+            return Ok(submit_changeset_response(
+                staged_source,
+                WriteState::Staged,
+            ));
+        }
         let committed = self
-            .commit_personaldb_changeset(source_request, actor, None)
+            .commit_personaldb_changeset(source_request, actor, None, &[])
             .await?;
         self.build_personaldb_projections_for_source_commit(
             tenant_id,
@@ -1343,6 +1415,7 @@ impl AppState {
             committed.log_index,
             &committed.log_hash,
             committed.authz_revision,
+            &[],
         )
         .await?;
         Ok(submit_changeset_response(committed, WriteState::Committed))
@@ -1420,12 +1493,28 @@ impl AppState {
         request: CoreSubmitChangeset,
         actor: PersonalDbCommitActor,
         caller_transaction: Option<(&str, &str)>,
+        excluded_projection_ids: &[String],
     ) -> Result<CommittedPersonalDbChangeset, Status> {
-        let snapshot_version = self
-            .mvcc
-            .runtime
-            .applied_version()
-            .map_err(internal_status)?;
+        let snapshot_version = match caller_transaction {
+            Some((transaction_id, principal)) => {
+                let handle = self
+                    .mvcc
+                    .open_transactions
+                    .handle(transaction_id)
+                    .map_err(internal_status)?;
+                if handle.principal != principal {
+                    return Err(Status::permission_denied(
+                        "PersonalDB caller transaction principal mismatch",
+                    ));
+                }
+                handle.snapshot_version
+            }
+            None => self
+                .mvcc
+                .runtime
+                .applied_version()
+                .map_err(internal_status)?,
+        };
         validate_claim_tenant(actor.tenant_id, request.tenant_id)?;
         validate_database_id(&request.database_id)?;
         if actor.require_public_commit_authorization
@@ -1443,6 +1532,31 @@ impl AppState {
 
         let validated = validate_submit_personaldb_changeset(request, default_max_changeset_size())
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        let deterministic_operation_hash = caller_transaction.map(|(transaction_id, _)| {
+            hash32(
+                format!(
+                    "personaldb-transaction-operation:{transaction_id}:{}:{}",
+                    validated.request.database_id, validated.request.idempotency_key
+                )
+                .as_bytes(),
+            )
+        });
+        let operation_timestamp = deterministic_operation_hash
+            .as_ref()
+            .map(|hash| {
+                let offset = u64::from_be_bytes(hash[..8].try_into().expect("eight hash bytes"))
+                    % 3_155_760_000_000_000_000;
+                chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(
+                    1_577_836_800_000_000_000_i64
+                        .saturating_add(i64::try_from(offset).unwrap_or_default()),
+                )
+            })
+            .unwrap_or_else(chrono::Utc::now);
+        let operation_timestamp_rfc3339 =
+            operation_timestamp.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        let mutation_id = deterministic_operation_hash
+            .map(|hash| hash[..16].try_into().expect("sixteen hash bytes"))
+            .unwrap_or_else(|| *uuid::Uuid::new_v4().as_bytes());
         if let Some(bearer_token) = actor.bearer_token.as_deref() {
             bind_personaldb_submit_session(&validated.request, &actor, bearer_token)?;
         }
@@ -1450,22 +1564,35 @@ impl AppState {
             .personaldb_commit_guard(actor.tenant_id, &validated.request.database_id)
             .await;
         let protocol_keyring = self.personaldb_protocol_keyring.as_ref();
-        let manifest = read_personaldb_group_manifest(
-            &self.storage,
+        let manifest = match caller_transaction {
+            Some((transaction_id, principal)) => read_personaldb_group_manifest_in_transaction(
+                &self.storage,
+                &self.mvcc,
+                transaction_id,
+                principal,
+                actor.tenant_id,
+                &validated.request.database_id,
+                protocol_keyring.trust_store(),
+            )
+            .await,
+            None => read_personaldb_group_manifest(
+                &self.storage,
+                &self.mvcc,
+                actor.tenant_id,
+                &validated.request.database_id,
+                protocol_keyring.trust_store(),
+                snapshot_version,
+            )
+            .await,
+        }
+        .map_err(internal_status)?
+        .ok_or_else(|| Status::not_found("PersonalDB group not found"))?;
+        let previous_head = read_personaldb_committed_head_at_snapshot(
             &self.mvcc,
             actor.tenant_id,
             &validated.request.database_id,
             protocol_keyring.trust_store(),
             snapshot_version,
-        )
-        .await
-        .map_err(internal_status)?
-        .ok_or_else(|| Status::not_found("PersonalDB group not found"))?;
-        let previous_head = read_personaldb_committed_head_mvcc(
-            &self.mvcc,
-            actor.tenant_id,
-            &validated.request.database_id,
-            protocol_keyring.trust_store(),
         )
         .map_err(internal_status)?
         .ok_or_else(|| Status::failed_precondition("PersonalDB committed head missing"))?;
@@ -1488,11 +1615,12 @@ impl AppState {
         let assignment = self
             .personaldb_write_assignment(actor.tenant_id, &validated.request.database_id)
             .await?;
-        let current_head_after_fence = read_personaldb_committed_head_mvcc(
+        let current_head_after_fence = read_personaldb_committed_head_at_snapshot(
             &self.mvcc,
             actor.tenant_id,
             &validated.request.database_id,
             protocol_keyring.trust_store(),
+            snapshot_version,
         )
         .map_err(internal_status)?
         .ok_or_else(|| Status::failed_precondition("PersonalDB committed head missing"))?;
@@ -1519,7 +1647,12 @@ impl AppState {
         .ok_or_else(|| Status::failed_precondition("PersonalDB schema SQL missing"))?;
         validate_changeset_tables_registered(&changes, &schema_sql)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
-        let authz_revision = authz_journal::latest_authz_revision(&self.mvcc, actor.tenant_id)
+        let authz_revision =
+            authz_journal::authz_revision_at_snapshot(
+                &self.mvcc,
+                actor.tenant_id,
+                snapshot_version,
+            )
             .map_err(internal_status)
             .and_then(|revision| {
                 u64::try_from(revision)
@@ -1530,7 +1663,6 @@ impl AppState {
             .base_log_index
             .checked_add(1)
             .ok_or_else(|| Status::failed_precondition("PersonalDB log index overflow"))?;
-        let updated_at = chrono::Utc::now();
         let envelope = derive_verified_mutation_envelope(PersonalDbEnvelopeDerivationInput {
             tenant_id: actor.tenant_id,
             database_id: &validated.request.database_id,
@@ -1542,7 +1674,7 @@ impl AppState {
             policy_epoch: manifest.active_policy_epoch,
             authz_revision,
             changes: &changes,
-            updated_at_nanos: updated_at
+            updated_at_nanos: operation_timestamp
                 .timestamp_nanos_opt()
                 .ok_or_else(|| Status::internal("Invalid current timestamp"))?,
         })
@@ -1610,7 +1742,7 @@ impl AppState {
             voter_acks_hash: hex::encode(validated.voter_acks_hash),
             authz_revision,
             witness_node_id: actor.principal.clone(),
-            witnessed_at: now_rfc3339(),
+            witnessed_at: operation_timestamp_rfc3339.clone(),
             certificate_hash: None,
             witness_signature: None,
         };
@@ -1683,7 +1815,7 @@ impl AppState {
             policy_epoch: manifest.active_policy_epoch,
             membership_epoch: manifest.active_membership_epoch,
             schema_hash: manifest.schema_hash.clone(),
-            updated_at: now_rfc3339(),
+            updated_at: operation_timestamp_rfc3339.clone(),
             updated_by_node: actor.principal.clone(),
             head_hash: None,
             head_signature: None,
@@ -1737,9 +1869,8 @@ impl AppState {
             changeset_payload_hash: hex::encode(validated.changeset_payload_hash),
             certificate_hash: hex::encode(certificate_hash),
             committed_head_hash: committed_head.head_hash.clone().unwrap_or_default(),
-            emitted_at: now_rfc3339(),
+            emitted_at: operation_timestamp_rfc3339,
         };
-        let mutation_id = *uuid::Uuid::new_v4().as_bytes();
         stage_personaldb_group_watch_record(
             &mut write_plan,
             actor.tenant_id,
@@ -1764,6 +1895,7 @@ impl AppState {
                 changeset_bytes: validated.request.changeset_bytes.clone(),
                 envelope: serde_json::to_value(&envelope).map_err(internal_status)?,
                 committed_head_hash: committed_head.head_hash.clone().unwrap_or_default(),
+                excluded_projection_ids: excluded_projection_ids.to_vec(),
             };
             write_plan
                 .stage_into_transaction(
@@ -1827,6 +1959,7 @@ impl AppState {
         source_log_index: u64,
         source_log_hash: &str,
         authz_revision: u64,
+        excluded_projection_ids: &[String],
     ) -> Result<(), Status> {
         let snapshot_version = self
             .mvcc
@@ -1865,6 +1998,13 @@ impl AppState {
         .await
         .map_err(internal_status)?;
         for definition in definitions {
+            if excluded_projection_ids.binary_search(&format!(
+                "{}/{}",
+                definition.database_id, definition.projection_id
+            )).is_ok()
+            {
+                continue;
+            }
             self.build_one_personaldb_projection(
                 tenant_id,
                 source_database_id,
@@ -2013,6 +2153,7 @@ impl AppState {
                     require_public_commit_authorization: false,
                 },
                 None,
+                &[],
             )
             .await?
         };
