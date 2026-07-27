@@ -423,13 +423,6 @@ impl ControlTenantMutationPlan {
             mvcc.open_transactions
                 .add_stream_event(transaction_id, event, now_unix_ms)?;
         }
-        let assignment = mvcc
-            .reconcile_work_assignment("control-plane", mvcc.cluster_id())
-            .await?
-            .ok_or_else(|| {
-                anyhow!("this node does not own the cluster control-plane assignment")
-            })?;
-        mvcc.stage_assignment_guard(transaction_id, principal, &assignment, now_unix_ms)?;
         Ok(self.tenant)
     }
 }
@@ -905,13 +898,6 @@ impl ControlAppMutationPlan {
             mvcc.open_transactions
                 .add_stream_event(transaction_id, event, now_unix_ms)?;
         }
-        let assignment = mvcc
-            .reconcile_work_assignment("control-plane", mvcc.cluster_id())
-            .await?
-            .ok_or_else(|| {
-                anyhow!("this node does not own the cluster control-plane assignment")
-            })?;
-        mvcc.stage_assignment_guard(transaction_id, principal, &assignment, now_unix_ms)?;
         Ok(self.app)
     }
 }
@@ -1332,11 +1318,6 @@ async fn append_control_event_mvcc(
         mvcc.open_transactions
             .add_stream_event(&handle.transaction_id, event, now)?;
     }
-    let assignment = mvcc
-        .reconcile_work_assignment("control-plane", mvcc.cluster_id())
-        .await?
-        .ok_or_else(|| anyhow!("this node does not own the cluster control-plane assignment"))?;
-    mvcc.stage_assignment_guard(&handle.transaction_id, &principal, &assignment, now)?;
     let outcome = mvcc
         .open_transactions
         .commit(
