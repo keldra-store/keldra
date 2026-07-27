@@ -55,10 +55,6 @@ impl PreparedBundleLog {
     }
 
     fn persist(&mut self, identity: &BundleIdentity, bytes: &[u8]) -> Result<()> {
-        #[cfg(any(test, debug_assertions))]
-        crate::mvcc_fault_injection::hit(
-            crate::mvcc_fault_injection::FaultPoint::PreparedBundleWrite,
-        )?;
         verify_identity(identity, bytes)?;
         if let Some(location) = self.index.get(&identity.hash).copied() {
             if location.payload_length != identity.length {
@@ -70,14 +66,34 @@ impl PreparedBundleLog {
             verify_identity(identity, &existing)?;
             return Ok(());
         }
-        append_record(
+        let original_len = self.file.metadata()?.len();
+        let append_result = append_record(
             &mut self.file,
             identity,
             bytes,
             unix_time_ms()?,
             &mut self.index,
-        )?;
-        self.file.sync_data()?;
+        )
+        .and_then(|()| {
+            #[cfg(any(test, debug_assertions))]
+            crate::mvcc_fault_injection::hit(
+                crate::mvcc_fault_injection::FaultPoint::PreparedBundleWrite,
+            )?;
+            self.file.sync_data().map_err(Into::into)
+        });
+        if let Err(error) = append_result {
+            self.index.remove(&identity.hash);
+            self.file
+                .set_len(original_len)
+                .context("rollback failed prepared-bundle append")?;
+            self.file
+                .sync_data()
+                .context("sync prepared-bundle append rollback")?;
+            self.file
+                .seek(SeekFrom::End(0))
+                .context("restore prepared-bundle append cursor")?;
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -778,6 +794,55 @@ mod tests {
         assert_eq!(path.metadata().unwrap().len(), valid_length);
         recovered.persist(&identity, bytes).await.unwrap();
         assert_eq!(path.metadata().unwrap().len(), valid_length);
+    }
+
+    #[tokio::test]
+    async fn failed_durable_append_rolls_back_index_and_tail_before_retry() {
+        struct ClearFaults;
+        impl Drop for ClearFaults {
+            fn drop(&mut self) {
+                crate::mvcc_fault_injection::clear();
+            }
+        }
+
+        let _clear = ClearFaults;
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = b"bundle whose append reaches the durability boundary";
+        let identity = identity(bytes);
+        let store = AppendOnlyPreparedBundleStore::open(
+            directory.path(),
+            "cluster-a",
+            node("node-a"),
+            "zone-a",
+        )
+        .unwrap();
+        let path = directory.path().join("prepared-bundles.log");
+        let initial_len = path.metadata().unwrap().len();
+        crate::mvcc_fault_injection::install(
+            crate::mvcc_fault_injection::DeterministicFaults::default()
+                .fail_at(crate::mvcc_fault_injection::FaultPoint::PreparedBundleWrite, 1),
+        );
+
+        let error = store.persist(&identity, bytes).await.unwrap_err();
+        assert!(error.to_string().contains("PreparedBundleWrite"));
+        assert!(store.read(&identity).unwrap().is_none());
+        assert_eq!(path.metadata().unwrap().len(), initial_len);
+
+        crate::mvcc_fault_injection::clear();
+        store.persist(&identity, bytes).await.unwrap();
+        assert_eq!(store.read(&identity).unwrap().as_deref(), Some(bytes.as_slice()));
+        drop(store);
+        let reopened = AppendOnlyPreparedBundleStore::open(
+            directory.path(),
+            "cluster-a",
+            node("node-a"),
+            "zone-a",
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.read(&identity).unwrap().as_deref(),
+            Some(bytes.as_slice())
+        );
     }
 
     struct Transport {
