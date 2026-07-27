@@ -190,6 +190,7 @@ pub async fn handle_hf_command(command: &HfCommands, ctx: &Context) -> anyhow::R
                 HfIngestCommands::Cancel { id } => {
                     let mut request = tonic::Request::new(api::CancelHfIngestionRequest {
                         ingestion_id: id.clone(),
+                        options: None,
                     });
                     request.metadata_mut().insert(
                         "authorization",
