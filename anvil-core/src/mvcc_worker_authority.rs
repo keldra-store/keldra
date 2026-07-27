@@ -72,6 +72,12 @@ impl MvccSubsystem {
                 partition_id,
             )
             .await?;
+            // A newly-created work partition may have just been proposed to
+            // compact Raft. Do not return a guard until that proposal is
+            // reflected in the applied control snapshot; otherwise the
+            // transaction's assignment predicate can be stale by admission
+            // time and be rejected by Raft certification.
+            self.consensus.linearized_read_barrier().await?;
         } else if !assigned {
             return Ok(None);
         }
