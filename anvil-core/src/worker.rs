@@ -122,6 +122,7 @@ fn classify_worker_claim_error(error: &anyhow::Error) -> WorkerClaimError {
             "generation mismatch",
             "stale",
             "CAS conflict",
+            "task queue MVCC conflict",
         ],
     ) {
         return WorkerClaimError::TransientFence;
