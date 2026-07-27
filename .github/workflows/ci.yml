@@ -29,7 +29,10 @@ jobs:
     env:
       ANVIL_DOCKER_PLATFORM: linux/amd64
       ANVIL_IMAGE: anvil:test-amd64-${{ github.run_id }}-${{ github.run_attempt }}
-      ANVIL_USE_NATIVE_CARGO: "1"
+      # The self-hosted builder may be ARM even though the runner label is
+      # x64. Always use the reproducible Zig cross-build path for the amd64
+      # image instead of assuming the host architecture.
+      ANVIL_USE_NATIVE_CARGO: "0"
       ANVIL_BUILD_PROFILE: ci
       ANVIL_INCLUDE_TEST_TOOLS: "1"
       ANVIL_RUNTIME_BASE: ubuntu:24.04
@@ -40,6 +43,19 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+
+      - name: Install cargo-zigbuild
+        run: |
+          if cargo zigbuild --version 2>/dev/null | grep -q 'cargo-zigbuild 0.20.1'; then
+            echo "cargo-zigbuild 0.20.1 is already installed"
+          else
+            cargo install cargo-zigbuild --version 0.20.1 --locked --force
+          fi
 
       - name: Install system build dependencies
         run: |
