@@ -784,6 +784,7 @@ fn plan_control_app_mutation(
             &mutation_id_string,
         )?;
         product.mutations.extend(audit.mutations);
+        product.predicates.extend(audit.predicates);
         product.outbox_events.extend(audit.outbox_events);
     }
     predicates.extend(product.predicates);

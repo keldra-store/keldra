@@ -115,6 +115,152 @@ impl AppState {
     }
 }
 
+const CREDENTIAL_IDEMPOTENCY_NAMESPACE: &str = "auth.application-credential.v1";
+const CREDENTIAL_IMPLICIT_RESULT_KEY: &str = "result";
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct CredentialMutationResult {
+    input_hash: String,
+    operation: String,
+    request_id: String,
+    tenant_id: i64,
+    app_id: i64,
+    app_name: String,
+    client_id: String,
+    encrypted_secret: Vec<u8>,
+    audit_event_id: String,
+}
+
+fn credential_input_hash(
+    operation: &str,
+    claims: &auth::Claims,
+    app_name: &str,
+    request_id: &str,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"anvil.auth.application-credential.input.v1");
+    for component in [
+        operation,
+        &claims.tenant_id.to_string(),
+        &claims.sub,
+        app_name,
+        request_id,
+    ] {
+        hasher.update(&(component.len() as u64).to_be_bytes());
+        hasher.update(component.as_bytes());
+    }
+    hex::encode(hasher.finalize().as_bytes())
+}
+
+fn control_journal_credential_identifier(transaction_id: &str, purpose: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"anvil.auth.application-credential.identifier.v1");
+    hasher.update(transaction_id.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(purpose.as_bytes());
+    hex::encode(&hasher.finalize().as_bytes()[..16])
+}
+
+fn credential_transaction_id(
+    options: Option<&WriteOptions>,
+) -> Result<Option<&str>, Status> {
+    crate::services::transaction_context::write_options_transaction_id(options)
+}
+
+fn credential_implicit_context(
+    request_id: &str,
+    idempotency_key: &str,
+) -> PublicMutationContext {
+    PublicMutationContext {
+        request_id: request_id.to_string(),
+        idempotency_key: idempotency_key.to_string(),
+        expected_generation: 0,
+        transaction_id: None,
+    }
+}
+
+fn stage_credential_result(
+    state: &AppState,
+    transaction_id: &str,
+    principal: &str,
+    result_key: &str,
+    result: &CredentialMutationResult,
+    now_unix_ms: u64,
+) -> Result<(), Status> {
+    state
+        .mvcc
+        .open_transactions
+        .add_idempotency_result(
+            transaction_id,
+            principal,
+            crate::mvcc_transaction::IdempotencyResult {
+                namespace: CREDENTIAL_IDEMPOTENCY_NAMESPACE.to_string(),
+                key: result_key.to_string(),
+                payload: serde_json::to_vec(result)
+                    .map_err(|error| Status::internal(error.to_string()))?,
+            },
+            now_unix_ms,
+        )
+        .map_err(|error| Status::failed_precondition(error.to_string()))
+}
+
+fn replayed_credential_result(
+    state: &AppState,
+    transaction: &ImplicitAuthTransaction,
+    result_key: &str,
+    expected_input_hash: &str,
+) -> Result<CredentialMutationResult, Status> {
+    let result = state
+        .mvcc
+        .open_transactions
+        .resolved_idempotency_result(
+            &transaction.transaction_id,
+            &transaction.principal,
+            CREDENTIAL_IDEMPOTENCY_NAMESPACE,
+            result_key,
+        )
+        .map_err(|error| Status::failed_precondition(error.to_string()))?
+        .ok_or_else(|| {
+            Status::failed_precondition(
+                "committed credential transaction is missing its response record",
+            )
+        })?;
+    let result: CredentialMutationResult = serde_json::from_slice(&result.payload)
+        .map_err(|error| Status::internal(error.to_string()))?;
+    if result.input_hash != expected_input_hash {
+        return Err(Status::already_exists(
+            "credential idempotency key was already used for different input",
+        ));
+    }
+    Ok(result)
+}
+
+fn application_secret_response(
+    state: &AppState,
+    result: CredentialMutationResult,
+    write_state: WriteState,
+) -> Result<ApplicationSecretResponse, Status> {
+    let client_secret = state
+        .secret_keyring
+        .decrypt(&result.encrypted_secret)
+        .map_err(|error| Status::internal(error.to_string()))
+        .and_then(|secret| {
+            String::from_utf8(secret).map_err(|_| {
+                Status::internal("stored application credential secret is not UTF-8")
+            })
+        })?;
+    Ok(ApplicationSecretResponse {
+        request_id: result.request_id,
+        tenant_id: result.tenant_id.to_string(),
+        app_name: result.app_name,
+        client_id: result.client_id,
+        client_secret,
+        audit_event_id: result.audit_event_id,
+        app_id: result.app_id.to_string(),
+        write_state: write_state as i32,
+    })
+}
+
 async fn public_access_grant_record(
     state: &AppState,
     app: &crate::persistence::App,
@@ -326,8 +472,49 @@ impl AuthService for AppState {
         let req = request.into_inner();
         require_app_management_permission(self, &claims, AnvilAction::AppCreate).await?;
         validate_public_app_request(&req.app_name, &req.request_id, &req.idempotency_key)?;
+        let supplied_transaction_id = credential_transaction_id(req.options.as_ref())?;
+        let implicit_context =
+            credential_implicit_context(&req.request_id, &req.idempotency_key);
+        let implicit = if supplied_transaction_id.is_none() {
+            Some(
+                self.begin_implicit_auth_transaction(
+                    &claims,
+                    Some(&implicit_context),
+                    "credential-create",
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let transaction_id = supplied_transaction_id
+            .or_else(|| {
+                implicit
+                    .as_ref()
+                    .map(|transaction| transaction.transaction_id.as_str())
+            })
+            .ok_or_else(|| Status::internal("credential transaction was not established"))?;
+        let principal = crate::object_manager::transaction_principal_from_claims(&claims);
+        let input_hash =
+            credential_input_hash("create", &claims, &req.app_name, &req.request_id);
+        let explicit_result_key;
+        let result_key = if implicit.is_some() {
+            CREDENTIAL_IMPLICIT_RESULT_KEY
+        } else {
+            explicit_result_key = format!("create:{}", req.request_id);
+            &explicit_result_key
+        };
+        if let Some(transaction) = implicit.as_ref().filter(|transaction| transaction.replayed) {
+            let result =
+                replayed_credential_result(self, transaction, result_key, &input_hash)?;
+            return application_secret_response(self, result, WriteState::Committed)
+                .map(Response::new);
+        }
 
-        let client_id = format!("app_{}", uuid::Uuid::new_v4().simple());
+        let client_id = format!(
+            "app_{}",
+            control_journal_credential_identifier(transaction_id, "client")
+        );
         let client_secret = format!("secret_{}", uuid::Uuid::new_v4().simple());
         let encrypted_secret = self
             .secret_keyring
@@ -341,27 +528,48 @@ impl AuthService for AppState {
             serde_json::json!({ "client_id": client_id }),
         )?;
         let audit_event_id = audit_event.audit_event_id.clone();
-        let app = self
-            .persistence
-            .create_app(
+        let now = u64::try_from(chrono::Utc::now().timestamp_millis())
+            .map_err(|_| Status::internal("credential mutation predates Unix epoch"))?;
+        let app = control_journal::plan_create_app_in_transaction(
+            &self.mvcc,
+            transaction_id,
+            &principal,
                 claims.tenant_id,
                 &req.app_name,
                 &client_id,
                 &encrypted_secret,
                 Some(&audit_event),
-                None,
             )
-            .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Response::new(ApplicationSecretResponse {
+        let app = app
+            .stage(&self.mvcc, transaction_id, &principal, now)
+            .await
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        let result = CredentialMutationResult {
+            input_hash,
+            operation: "create".to_string(),
             request_id: req.request_id,
-            tenant_id: claims.tenant_id.to_string(),
+            tenant_id: claims.tenant_id,
+            app_id: app.id,
             app_name: app.name,
-            client_id,
-            client_secret,
+            client_id: app.client_id,
+            encrypted_secret,
             audit_event_id,
-            app_id: app.id.to_string(),
-        }))
+        };
+        stage_credential_result(self, transaction_id, &principal, result_key, &result, now)?;
+        if let Some(transaction) = &implicit {
+            self.commit_implicit_auth_transaction(transaction).await?;
+        }
+        application_secret_response(
+            self,
+            result,
+            if implicit.is_some() {
+                WriteState::Committed
+            } else {
+                WriteState::Staged
+            },
+        )
+        .map(Response::new)
     }
 
     async fn rotate_application_credential_secret(
@@ -376,7 +584,54 @@ impl AuthService for AppState {
         let req = request.into_inner();
         require_app_management_permission(self, &claims, AnvilAction::AppRotateSecret).await?;
         validate_public_app_request(&req.app_name, &req.request_id, &req.idempotency_key)?;
-        let app = app_in_claims_tenant(self, claims.tenant_id, &req.app_name).await?;
+        let supplied_transaction_id = credential_transaction_id(req.options.as_ref())?;
+        let implicit_context =
+            credential_implicit_context(&req.request_id, &req.idempotency_key);
+        let implicit = if supplied_transaction_id.is_none() {
+            Some(
+                self.begin_implicit_auth_transaction(
+                    &claims,
+                    Some(&implicit_context),
+                    "credential-rotate",
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let transaction_id = supplied_transaction_id
+            .or_else(|| {
+                implicit
+                    .as_ref()
+                    .map(|transaction| transaction.transaction_id.as_str())
+            })
+            .ok_or_else(|| Status::internal("credential transaction was not established"))?;
+        let principal = crate::object_manager::transaction_principal_from_claims(&claims);
+        let input_hash =
+            credential_input_hash("rotate", &claims, &req.app_name, &req.request_id);
+        let explicit_result_key;
+        let result_key = if implicit.is_some() {
+            CREDENTIAL_IMPLICIT_RESULT_KEY
+        } else {
+            explicit_result_key = format!("rotate:{}", req.request_id);
+            &explicit_result_key
+        };
+        if let Some(transaction) = implicit.as_ref().filter(|transaction| transaction.replayed) {
+            let result =
+                replayed_credential_result(self, transaction, result_key, &input_hash)?;
+            return application_secret_response(self, result, WriteState::Committed)
+                .map(Response::new);
+        }
+        let details = control_journal::read_app_by_tenant_name_in_transaction(
+            &self.mvcc,
+            transaction_id,
+            &principal,
+            claims.tenant_id,
+            &req.app_name,
+        )
+        .map_err(|error| Status::internal(error.to_string()))?
+        .ok_or_else(|| Status::not_found("Application not found"))?;
+        let app = details.app;
 
         let client_secret = format!("secret_{}", uuid::Uuid::new_v4().simple());
         let encrypted_secret = self
@@ -391,19 +646,45 @@ impl AuthService for AppState {
             serde_json::json!({ "app_id": app.id, "client_id": app.client_id }),
         )?;
         let audit_event_id = audit_event.audit_event_id.clone();
-        self.persistence
-            .update_app_secret(app.id, &encrypted_secret, Some(&audit_event), None)
+        let now = u64::try_from(chrono::Utc::now().timestamp_millis())
+            .map_err(|_| Status::internal("credential mutation predates Unix epoch"))?;
+        let app = control_journal::plan_update_app_secret_in_transaction(
+            &self.mvcc,
+            transaction_id,
+            &principal,
+            app.id,
+            &encrypted_secret,
+            Some(&audit_event),
+        )
+        .map_err(|error| Status::internal(error.to_string()))?
+        .stage(&self.mvcc, transaction_id, &principal, now)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Response::new(ApplicationSecretResponse {
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        let result = CredentialMutationResult {
+            input_hash,
+            operation: "rotate".to_string(),
             request_id: req.request_id,
-            tenant_id: claims.tenant_id.to_string(),
+            tenant_id: claims.tenant_id,
+            app_id: app.id,
             app_name: app.name,
             client_id: app.client_id,
-            client_secret,
+            encrypted_secret,
             audit_event_id,
-            app_id: app.id.to_string(),
-        }))
+        };
+        stage_credential_result(self, transaction_id, &principal, result_key, &result, now)?;
+        if let Some(transaction) = &implicit {
+            self.commit_implicit_auth_transaction(transaction).await?;
+        }
+        application_secret_response(
+            self,
+            result,
+            if implicit.is_some() {
+                WriteState::Committed
+            } else {
+                WriteState::Staged
+            },
+        )
+        .map(Response::new)
     }
 
     async fn delete_application_credential(
@@ -418,7 +699,57 @@ impl AuthService for AppState {
         let req = request.into_inner();
         require_app_management_permission(self, &claims, AnvilAction::AppDelete).await?;
         validate_public_app_request(&req.app_name, &req.request_id, &req.idempotency_key)?;
-        let app = app_in_claims_tenant(self, claims.tenant_id, &req.app_name).await?;
+        let supplied_transaction_id = credential_transaction_id(req.options.as_ref())?;
+        let implicit_context =
+            credential_implicit_context(&req.request_id, &req.idempotency_key);
+        let implicit = if supplied_transaction_id.is_none() {
+            Some(
+                self.begin_implicit_auth_transaction(
+                    &claims,
+                    Some(&implicit_context),
+                    "credential-delete",
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let transaction_id = supplied_transaction_id
+            .or_else(|| {
+                implicit
+                    .as_ref()
+                    .map(|transaction| transaction.transaction_id.as_str())
+            })
+            .ok_or_else(|| Status::internal("credential transaction was not established"))?;
+        let principal = crate::object_manager::transaction_principal_from_claims(&claims);
+        let input_hash =
+            credential_input_hash("delete", &claims, &req.app_name, &req.request_id);
+        let explicit_result_key;
+        let result_key = if implicit.is_some() {
+            CREDENTIAL_IMPLICIT_RESULT_KEY
+        } else {
+            explicit_result_key = format!("delete:{}", req.request_id);
+            &explicit_result_key
+        };
+        if let Some(transaction) = implicit.as_ref().filter(|transaction| transaction.replayed) {
+            let result =
+                replayed_credential_result(self, transaction, result_key, &input_hash)?;
+            return Ok(Response::new(DeleteApplicationCredentialResponse {
+                request_id: result.request_id,
+                app_id: result.app_id.to_string(),
+                write_state: WriteState::Committed as i32,
+            }));
+        }
+        let app = control_journal::read_app_by_tenant_name_in_transaction(
+            &self.mvcc,
+            transaction_id,
+            &principal,
+            claims.tenant_id,
+            &req.app_name,
+        )
+        .map_err(|error| Status::internal(error.to_string()))?
+        .ok_or_else(|| Status::not_found("Application not found"))?
+        .app;
 
         let audit_event = crate::services::audit::build_tenant_audit_event(
             &claims,
@@ -427,13 +758,43 @@ impl AuthService for AppState {
             "app.delete",
             serde_json::json!({ "app_id": app.id }),
         )?;
-        self.persistence
-            .delete_app(app.id, Some(&audit_event), None)
+        let audit_event_id = audit_event.audit_event_id.clone();
+        let now = u64::try_from(chrono::Utc::now().timestamp_millis())
+            .map_err(|_| Status::internal("credential mutation predates Unix epoch"))?;
+        let app = control_journal::plan_delete_app_in_transaction(
+            &self.mvcc,
+            transaction_id,
+            &principal,
+            app.id,
+            Some(&audit_event),
+        )
+        .map_err(|error| Status::internal(error.to_string()))?
+        .stage(&self.mvcc, transaction_id, &principal, now)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        let result = CredentialMutationResult {
+            input_hash,
+            operation: "delete".to_string(),
+            request_id: req.request_id.clone(),
+            tenant_id: claims.tenant_id,
+            app_id: app.id,
+            app_name: app.name,
+            client_id: app.client_id,
+            encrypted_secret: Vec::new(),
+            audit_event_id,
+        };
+        stage_credential_result(self, transaction_id, &principal, result_key, &result, now)?;
+        if let Some(transaction) = &implicit {
+            self.commit_implicit_auth_transaction(transaction).await?;
+        }
         Ok(Response::new(DeleteApplicationCredentialResponse {
             request_id: req.request_id,
             app_id: app.id.to_string(),
+            write_state: if implicit.is_some() {
+                WriteState::Committed as i32
+            } else {
+                WriteState::Staged as i32
+            },
         }))
     }
 
