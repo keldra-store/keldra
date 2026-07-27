@@ -41,26 +41,15 @@ pub async fn start_node_with_admin_listener(
     admin_listener: Option<tokio::net::TcpListener>,
     state: AppState,
 ) -> Result<()> {
-    // Distributed nodes must fail closed before any background mutation can
-    // race the canonical topology/bootstrap import.
-    let distributed_recovery_required = state.config.requires_distributed_coremeta_recovery();
-    let startup_recovery_deferred = state.core_store.startup_recovery_deferred();
-    let public_readiness = startup_readiness::PublicReadiness::new(
-        state.core_store.clone(),
-        !startup_recovery_deferred,
-    );
-    let _coremeta_recovery_task = state
-        .core_store
-        .start_coremeta_distributed_recovery(distributed_recovery_required);
-    if startup_recovery_deferred {
+    // MVCC/OpenRaft bootstrap completed before AppState was returned. Public
+    // traffic remains closed until the cluster-local system realm is visible.
+    let system_realm_ready = state.system_realm_is_bootstrapped()?;
+    let public_readiness = startup_readiness::PublicReadiness::new(system_realm_ready);
+    if !system_realm_ready {
         let startup_state = state.clone();
         let startup_readiness = public_readiness.clone();
         tokio::spawn(async move {
             loop {
-                startup_state
-                    .core_store
-                    .wait_for_coremeta_recovery_ready()
-                    .await;
                 match startup_state.ensure_system_realm_bootstrapped().await {
                     Ok(()) => {
                         startup_readiness.mark_system_realm_ready();
@@ -83,11 +72,6 @@ pub async fn start_node_with_admin_listener(
             // metadata view. Background maintenance must not race either one.
             worker_readiness.wait_until_ready().await;
             // Queue scanning must share the worker capability and cancellation scope.
-            let shard_recovery_store = worker_state.core_store.clone();
-            let shard_recovery = async move {
-                shard_recovery_store.run_distributed_shard_recovery().await;
-                std::future::pending::<()>().await;
-            };
             let worker = anvil_core::worker::run(
                 worker_state.persistence.clone(),
                 worker_state.core_store.clone(),
@@ -109,7 +93,6 @@ pub async fn start_node_with_admin_listener(
                 _ = personaldb_postcommit => unreachable!("PersonalDB postcommit worker completed"),
                 _ = git_source_postcommit => unreachable!("GitSource postcommit worker completed"),
                 _ = hf_ingestion_postcommit => unreachable!("HF ingestion postcommit worker completed"),
-                _ = shard_recovery => unreachable!("shard recovery supervisor completed"),
             }
         });
     }
@@ -166,7 +149,7 @@ pub async fn start_node_with_admin_listener(
             if !public_readiness.public_api_ready()
                 && !startup_readiness::may_bypass_public_readiness(
                     &path,
-                    public_readiness.coremeta_ready(),
+                    public_readiness.cluster_ready(),
                 )
             {
                 return Ok(startup_readiness::unavailable_response(

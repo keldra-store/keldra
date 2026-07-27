@@ -198,18 +198,15 @@ pub async fn run(
     keyring: Arc<EncryptionKeyring>,
     concurrency: usize,
 ) -> Result<()> {
-    core_store.wait_for_coremeta_recovery_ready().await;
     while let Err(error) = recover_interrupted_tasks(&persistence).await {
         warn!(%error, "Failed to recover interrupted background tasks; retrying");
         tokio::time::sleep(CLAIM_FATAL_DELAY).await;
-        core_store.wait_for_coremeta_recovery_ready().await;
     }
     let mut next_recovery = tokio::time::Instant::now() + INTERRUPTED_TASK_RECOVERY_INTERVAL;
     let task_notify = persistence.task_notify();
     let mut claim_backoff = WorkerClaimBackoff::default();
     let task_slots = Arc::new(Semaphore::new(concurrency.max(1)));
     loop {
-        core_store.wait_for_coremeta_recovery_ready().await;
         if let Err(error) = persistence.run_index_finalization_once().await {
             warn!(%error, "Committed index finalization attempt failed");
         }

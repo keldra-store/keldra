@@ -1,4 +1,3 @@
-use anvil_core::core_store::CoreStore;
 use axum::body::Body;
 use axum::http::{Response, StatusCode, header};
 use std::sync::Arc;
@@ -10,14 +9,12 @@ const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 #[derive(Clone)]
 pub(crate) struct PublicReadiness {
     system_realm_ready: Arc<AtomicBool>,
-    core_store: CoreStore,
 }
 
 impl PublicReadiness {
-    pub(crate) fn new(core_store: CoreStore, system_realm_ready: bool) -> Self {
+    pub(crate) fn new(system_realm_ready: bool) -> Self {
         Self {
             system_realm_ready: Arc::new(AtomicBool::new(system_realm_ready)),
-            core_store,
         }
     }
 
@@ -26,11 +23,11 @@ impl PublicReadiness {
     }
 
     pub(crate) fn public_api_ready(&self) -> bool {
-        self.system_realm_ready.load(Ordering::Acquire) && self.core_store.coremeta_recovery_ready()
+        self.system_realm_ready.load(Ordering::Acquire)
     }
 
-    pub(crate) fn coremeta_ready(&self) -> bool {
-        self.core_store.coremeta_recovery_ready()
+    pub(crate) fn cluster_ready(&self) -> bool {
+        true
     }
 
     pub(crate) async fn wait_until_ready(&self) {
@@ -54,8 +51,8 @@ pub(crate) fn is_readiness_probe(path: &str) -> bool {
     path == "/ready"
 }
 
-pub(crate) fn may_bypass_public_readiness(path: &str, coremeta_ready: bool) -> bool {
-    is_recovery_rpc(path) || (is_readiness_probe(path) && !coremeta_ready)
+pub(crate) fn may_bypass_public_readiness(path: &str, cluster_ready: bool) -> bool {
+    is_recovery_rpc(path) || (is_readiness_probe(path) && !cluster_ready)
 }
 
 pub(crate) fn unavailable_response(grpc: bool) -> Response<Body> {
@@ -64,14 +61,14 @@ pub(crate) fn unavailable_response(grpc: bool) -> Response<Body> {
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/grpc")
             .header("grpc-status", "14")
-            .header("grpc-message", "CoreMeta recovery is not ready")
+            .header("grpc-message", "Anvil startup is not ready")
             .body(Body::empty())
             .expect("static gRPC recovery response is valid")
     } else {
         Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
             .header(header::RETRY_AFTER, "1")
-            .body(Body::from("CoreMeta recovery is not ready"))
+            .body(Body::from("Anvil startup is not ready"))
             .expect("static HTTP recovery response is valid")
     }
 }

@@ -237,11 +237,10 @@ impl AppState {
                 internal_bearer_token: (!arc_config.corestore_internal_bearer_token.is_empty())
                     .then(|| arc_config.corestore_internal_bearer_token.clone()),
             },
-            if arc_config.requires_distributed_coremeta_recovery() {
-                core_store::CoreStoreStartupRecovery::Distributed
-            } else {
-                core_store::CoreStoreStartupRecovery::Immediate
-            },
+            // The replacement architecture performs cluster recovery through
+            // MVCC/OpenRaft. Legacy root/CoreMeta publication recovery is not
+            // a startup authority and carries no migration obligation.
+            core_store::CoreStoreStartupRecovery::Immediate,
         )
         .await?;
         let mvcc = Arc::new(
@@ -304,8 +303,7 @@ impl AppState {
         object_manager
             .install_mvcc(mvcc.clone())
             .context("install MVCC object runtime")?;
-        if !core_store.startup_recovery_deferred() {
-            if mvcc.peers.len() == 1 {
+        if mvcc.peers.len() == 1 {
                 system_realm::ensure_bootstrapped(
                     &arc_config,
                     &persistence,
@@ -314,7 +312,7 @@ impl AppState {
                 )
                 .await
                 .context("bootstrap system realm")?;
-            } else {
+        } else {
                 // A multi-node AppState must return before the initial quorum
                 // can exist. Raft also chooses the bootstrap work owner, which
                 // need not be the membership bootstrap node. Every node
@@ -353,7 +351,6 @@ impl AppState {
                         }
                     }
                 });
-            }
         }
         mvcc.start_background_work(core_store.clone(), observability.clone())
             .context("start MVCC background workers")?;
