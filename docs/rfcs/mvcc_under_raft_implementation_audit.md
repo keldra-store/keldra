@@ -26,7 +26,7 @@ Status meanings:
 | Streaming erasure directly to final nodes | Implemented, unvalidated | Bounded encoding is at [`streaming_erasure.rs:64`](../../anvil-core/src/streaming_erasure.rs#L64); placement/ACK policy is at [`shard_placement.rs:174`](../../anvil-core/src/shard_placement.rs#L174). |
 | Durable repair/rebalance state machine | Implemented, unvalidated | Jobs, claims and retry transitions exist in [`mvcc_shard_repair.rs`](../../anvil-core/src/mvcc_shard_repair.rs) and `LocalMvccStore`. |
 | Local-durability automatic upgrade | Implemented internally, unvalidated | Local writes create an upgrade job at [`object_manager.rs:395`](../../anvil-core/src/object_manager.rs#L395); the worker is wired at [`mvcc_bootstrap.rs:700`](../../anvil-core/src/mvcc_bootstrap.rs#L700). |
-| Public explicit durability upgrade/status API | **Missing** | No stable public operation was found for a client to request promotion of an existing local object or query the upgrade state. Internal job types are not a public contract. |
+| Public explicit durability upgrade/status API | Implemented, unvalidated | `ObjectService.PromoteObjectDurability` and `ObjectService.GetObjectDurabilityPromotion` are part of the public proto ([`anvil.proto:1415`](../../anvil-core/proto/anvil.proto#L1415), request/response messages at [`anvil.proto:1638`](../../anvil-core/proto/anvil.proto#L1638)). The RPC validates object write/read authorization, accepts an optional object version, returns the stable promotion ID and durable state, and is exercised from a real three-node fixture ([`services/object/rpc.rs:514`](../../anvil-core/src/services/object/rpc.rs#L514), [`mvcc_cluster_fixture.rs:247`](../../anvil/tests/mvcc_cluster_fixture.rs#L247)). |
 | GC safety and observability | Partial | MVCC GC, pins and metrics exist, but current HEAD is unrun and realistic lagging-node/process-restart validation is incomplete. |
 | Stable trace operation vocabulary | Partial | Core transaction, replication, consensus, ingest and repair spans exist. Public `request.receive`/`response.send` coverage is not consistently standardised. |
 | Section 28 fault suite | Partial | Deterministic in-process faults and real-stream frame/ACK faults exist. Real process kills at every durability boundary and complete multi-node topology faults do not. |
@@ -52,8 +52,8 @@ source-supported claim to validated acceptance.
 
 ## Required work before end-to-end testing can be called meaningful
 
-1. Finish source work for any API needed by the test, especially the decision
-   on explicit public local-to-quorum/erasure promotion.
+1. Compile and execute the public durability-promotion API test on current
+   HEAD, including authorization failures and an explicit version selection.
 2. Compile once near the end, fix integration errors, then run focused suites.
 3. Add a repeatable cluster fixture using real gRPC replication and real
    OpenRaft peers.

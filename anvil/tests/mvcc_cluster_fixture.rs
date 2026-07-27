@@ -296,6 +296,36 @@ async fn public_local_object_returns_locally_then_promotes_and_survives_holder_l
         "pending" | "running" | "complete"
     ));
 
+    let invalid_target = objects
+        .promote_object_durability(authorized(
+            anvil::anvil_api::PromoteObjectDurabilityRequest {
+                bucket_name: actor.bucket_name.clone(),
+                object_key: object_key.clone(),
+                version_id: None,
+                target_durability: anvil::anvil_api::MvccDurability::Local as i32,
+                idempotency_key: "invalid-local-target".into(),
+            },
+            &actor.token,
+        ))
+        .await
+        .expect_err("promotion cannot weaken a local object to local durability");
+    assert_eq!(invalid_target.code(), tonic::Code::InvalidArgument);
+
+    let missing_key = objects
+        .promote_object_durability(authorized(
+            anvil::anvil_api::PromoteObjectDurabilityRequest {
+                bucket_name: actor.bucket_name.clone(),
+                object_key: object_key.clone(),
+                version_id: None,
+                target_durability: anvil::anvil_api::MvccDurability::Erasure as i32,
+                idempotency_key: String::new(),
+            },
+            &actor.token,
+        ))
+        .await
+        .expect_err("promotion requests require a client idempotency key");
+    assert_eq!(missing_key.code(), tonic::Code::InvalidArgument);
+
     let explicit = objects
         .promote_object_durability(authorized(
             anvil::anvil_api::PromoteObjectDurabilityRequest {
@@ -1147,6 +1177,38 @@ async fn real_cluster_reconstructs_a_deleted_shard_and_publishes_repaired_placem
     .await
     .expect("repair pin replicated to every cluster node");
 
+    // Two workers racing on the same local durable record must be serialized
+    // by the claim transition.  Exactly one obtains the lease; the loser sees
+    // the running lease and must not execute the repair concurrently.
+    let raced_store = cluster.state(0).mvcc.runtime.local_store().clone();
+    let race_job_a = pin_job_id.clone();
+    let race_job_b = pin_job_id.clone();
+    let first = tokio::task::spawn_blocking(move || {
+        raced_store
+            .claim_shard_repair_where("e2e-race-worker-a", 1_000_000_000_000, 1_000, move |record| {
+                record.job.job_id().ok().as_deref() == Some(race_job_a.as_str())
+            })
+    });
+    let raced_store = cluster.state(0).mvcc.runtime.local_store().clone();
+    let second = tokio::task::spawn_blocking(move || {
+        raced_store
+            .claim_shard_repair_where("e2e-race-worker-b", 1_000_000_000_000, 1_000, move |record| {
+                record.job.job_id().ok().as_deref() == Some(race_job_b.as_str())
+            })
+    });
+    let (first, second) = tokio::join!(first, second);
+    let first = first.unwrap().unwrap();
+    let second = second.unwrap().unwrap();
+    assert_eq!(usize::from(first.is_some()) + usize::from(second.is_some()), 1);
+    let winner = first.or(second).expect("one racing worker claims the repair");
+    cluster
+        .state(0)
+        .mvcc
+        .runtime
+        .local_store()
+        .complete_shard_repair(&pin_job_id, &winner.1.lease_owner.clone().unwrap())
+        .unwrap();
+
     for node in 0..3 {
         let pin_worker = format!("e2e-release-retirement-pin-{node}");
         let store = cluster.state(node).mvcc.runtime.local_store();
@@ -1155,11 +1217,23 @@ async fn real_cluster_reconstructs_a_deleted_shard_and_publishes_repaired_placem
                 record.job.job_id().ok().as_deref() == Some(pin_job_id.as_str())
             })
             .unwrap()
-            .expect("future repair pin becomes claimable");
-        assert_eq!(claimed.0, pin_job_id);
-        store
-            .complete_shard_repair(&pin_job_id, &pin_worker)
-            .unwrap();
+            ;
+        if let Some((job_id, record)) = claimed {
+            assert_eq!(job_id, pin_job_id);
+            store
+                .complete_shard_repair(&pin_job_id, &pin_worker)
+                .unwrap();
+        } else {
+            assert_eq!(
+                store
+                    .shard_repair_record(&pin_job_id)
+                    .unwrap()
+                    .expect("replicated repair pin")
+                    .state,
+                ShardRepairState::Complete,
+                "a competing worker may only observe a completed repair"
+            );
+        }
     }
     tokio::time::timeout(std::time::Duration::from_secs(20), async {
         loop {
