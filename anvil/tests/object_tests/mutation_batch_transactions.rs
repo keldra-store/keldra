@@ -3,8 +3,8 @@ use super::*;
 use anvil::anvil_api::transaction_service_client::TransactionServiceClient;
 use anvil::anvil_api::{
     BeginTransactionRequest, BeginTransactionResponse, CommitTransactionRequest,
-    GetTransactionRequest, MvccDurability, MvccReadConsistency, ReadConsistency,
-    RollbackTransactionRequest, WriteOptions, WriteState, write_options,
+    GetTransactionRequest, MutationBatchDeleteObject, MvccDurability, MvccReadConsistency,
+    ReadConsistency, RollbackTransactionRequest, WriteOptions, WriteState, write_options,
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -728,7 +728,18 @@ async fn implicit_mixed_batch_commits_once_atomically() {
         .expect("implicit mixed batch must commit as one transaction")
         .into_inner();
     assert_eq!(response.write_state, WriteState::Committed as i32);
-    assert_eq!(response.receipts.len(), 3);
+    assert_eq!(
+        response
+            .operation_receipts
+            .iter()
+            .map(|receipt| (receipt.operation.as_str(), receipt.object_key.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("patch_json_object", patch_key),
+            ("delete_object", delete_key),
+            ("put_object", put_key),
+        ]
+    );
     assert_eq!(
         get_object_bytes_for_test(
             &mut object_client,
