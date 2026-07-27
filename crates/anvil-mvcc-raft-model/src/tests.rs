@@ -328,6 +328,27 @@ fn duplicate_repair_worker_execution_is_idempotent() {
 }
 
 #[test]
+fn repair_after_incarnation_replacement_refreshes_the_holder_receipt_once() {
+    let id = TransactionId(1);
+    let mut state = begin(MvccRaftState::default(), id);
+    state = apply(state, Action::Write(id, A, RANGE));
+    state = persist(state, id, &[NodeId(0), NodeId(1)]);
+    state = propose_and_commit(state, id, Durability::Quorum);
+
+    state = apply(state, Action::ReplaceNode(NodeId(1)));
+    assert_eq!(state.valid_holder_count(id), Some(1));
+    state = apply(state, Action::Repair(id, NodeId(1)));
+    state = apply(state, Action::Repair(id, NodeId(1)));
+
+    assert_eq!(
+        state.transactions[&id].bundle_holders[&NodeId(1)],
+        state.nodes[&NodeId(1)].incarnation
+    );
+    assert_eq!(state.repair_runs.len(), 1);
+    assert!(state.bundle_available(id));
+}
+
+#[test]
 fn garbage_collection_is_pinned_by_active_snapshot() {
     let id = TransactionId(1);
     let mut state = MvccRaftState::default();
@@ -348,6 +369,27 @@ fn garbage_collection_is_pinned_by_lagging_replica() {
     state = apply(state, Action::GarbageCollect(1));
     assert_eq!(state.nodes[&NodeId(2)].applied, 0);
     assert_eq!(state.gc_watermark, 0);
+}
+
+#[test]
+fn garbage_collection_advances_only_after_snapshot_and_replica_pins_release() {
+    let id = TransactionId(1);
+    let mut state = begin(MvccRaftState::default(), id);
+    state = apply(state, Action::Write(id, A, RANGE));
+    state = persist(state, id, &[NodeId(0)]);
+    state = propose_and_commit(state, id, Durability::Local);
+    assert!(!state.active_snapshots.contains_key(&id));
+
+    // Certification released the transaction snapshot, but every replica still
+    // pins version zero until it applies the committed prefix.
+    state = apply(state, Action::GarbageCollect(1));
+    assert_eq!(state.gc_watermark, 0);
+    for node in 0..NODE_COUNT {
+        state = apply(state, Action::ApplyCommitted(NodeId(node)));
+    }
+    state = apply(state, Action::GarbageCollect(1));
+    assert_eq!(state.gc_watermark, 1);
+    assert!(state.gc_respects_readers());
 }
 
 #[test]
