@@ -142,7 +142,7 @@ pub(super) async fn public_routing_config_for_region(
         // Standalone nodes bootstrap the legacy region row before the mesh
         // lifecycle descriptor is installed. Keep public host aliases usable
         // during that interval with the canonical regional gateway suffix.
-        region_name.to_string()
+        "anvil-storage.com".to_string()
     } else {
         return Err(Status::not_found("Region not found"));
     };
