@@ -990,7 +990,16 @@ impl RaftStateMachine<AnvilRaftConfig> for OpenRaftStateMachine {
         for entry in entries {
             let log_id = entry.log_id;
             let mut committed_bundle = None;
-            let response = match entry.payload {
+            let boundary_rejection = match &entry.payload {
+                EntryPayload::Normal(command) => {
+                    command.validate_section9_boundary().err().map(str::to_string)
+                }
+                EntryPayload::Blank | EntryPayload::Membership(_) => None,
+            };
+            let response = if let Some(reason) = boundary_rejection {
+                RaftApplyResult::Rejected(reason)
+            } else {
+                match entry.payload {
                 EntryPayload::Blank => RaftApplyResult::Noop,
                 EntryPayload::Membership(membership) => {
                     state.membership = StoredMembership::new(Some(log_id), membership);
@@ -1170,6 +1179,7 @@ impl RaftStateMachine<AnvilRaftConfig> for OpenRaftStateMachine {
                             Err(error) => RaftApplyResult::Rejected(error),
                         }
                     }
+                }
                 }
             };
             state
