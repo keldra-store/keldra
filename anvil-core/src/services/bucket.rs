@@ -312,16 +312,27 @@ impl AppState {
         )
         .await
         .map_err(|err| Status::failed_precondition(err.to_string()))?;
-        if bucket_journal::read_current_bucket_mvcc(&self.mvcc, claims.tenant_id, &req.bucket_name)
-            .map_err(|err| Status::internal(err.to_string()))?
-            .is_some()
+        let principal = crate::object_manager::transaction_principal_from_claims(claims);
+        if bucket_journal::read_current_bucket_in_transaction(
+            &self.mvcc,
+            claims.tenant_id,
+            &req.bucket_name,
+            transaction_id,
+            &principal,
+        )
+        .map_err(|err| Status::internal(err.to_string()))?
+        .is_some()
         {
             return Err(Status::already_exists(
                 "A bucket with that name already exists.",
             ));
         }
         let bucket = crate::persistence::Bucket {
-            id: bucket_journal::next_bucket_id_mvcc(&self.mvcc)
+            id: bucket_journal::next_bucket_id_in_transaction(
+                &self.mvcc,
+                transaction_id,
+                &principal,
+            )
                 .map_err(|err| Status::internal(err.to_string()))?,
             tenant_id: claims.tenant_id,
             name: req.bucket_name.clone(),
@@ -336,6 +347,17 @@ impl AppState {
             transaction_id,
         )
         .await?;
+        crate::access_control::stage_bucket_defaults(
+            &self.persistence,
+            &bucket,
+            &claims.sub,
+            &claims.sub,
+            "grant creator bucket owner",
+            transaction_id,
+            &principal,
+        )
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?;
         Ok(bucket)
     }
 
@@ -353,19 +375,31 @@ impl AppState {
             &req.bucket_name,
         )
         .await?;
-        let bucket = bucket_journal::read_current_bucket_mvcc(
+        let principal = crate::object_manager::transaction_principal_from_claims(claims);
+        let bucket = bucket_journal::read_current_bucket_in_transaction(
             &self.mvcc,
             claims.tenant_id,
             &req.bucket_name,
+            transaction_id,
+            &principal,
         )
         .map_err(|err| Status::internal(err.to_string()))?
         .ok_or_else(|| Status::not_found("Bucket not found"))?;
-        if self
-            .persistence
-            .bucket_has_retained_objects_or_uploads(bucket.id)
-            .await
-            .map_err(|err| Status::internal(err.to_string()))?
-        {
+        let has_objects = crate::metadata_journal::has_object_versions_in_transaction(
+            &self.mvcc,
+            &bucket,
+            transaction_id,
+            &principal,
+        )
+        .map_err(|err| Status::internal(err.to_string()))?;
+        let has_uploads = crate::multipart_journal::has_active_multipart_upload_in_transaction(
+            &self.mvcc,
+            bucket.id,
+            transaction_id,
+            &principal,
+        )
+        .map_err(|err| Status::internal(err.to_string()))?;
+        if has_objects || has_uploads {
             return Err(Status::failed_precondition("Bucket not empty"));
         }
         self.stage_bucket_metadata_transaction(
@@ -393,10 +427,13 @@ impl AppState {
             &req.bucket_name,
         )
         .await?;
-        let mut bucket = bucket_journal::read_current_bucket_mvcc(
+        let principal = crate::object_manager::transaction_principal_from_claims(claims);
+        let mut bucket = bucket_journal::read_current_bucket_in_transaction(
             &self.mvcc,
             claims.tenant_id,
             &req.bucket_name,
+            transaction_id,
+            &principal,
         )
         .map_err(|err| Status::internal(err.to_string()))?
         .ok_or_else(|| Status::not_found("Bucket not found"))?;
@@ -408,6 +445,17 @@ impl AppState {
             transaction_id,
         )
         .await?;
+        crate::access_control::stage_bucket_public_read_tuple(
+            &self.persistence,
+            &bucket,
+            is_public_read,
+            &claims.sub,
+            "bucket public-read policy update",
+            transaction_id,
+            &principal,
+        )
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?;
         Ok(bucket)
     }
 

@@ -1536,6 +1536,50 @@ pub async fn grant_bucket_defaults(
     Ok(())
 }
 
+pub async fn stage_bucket_defaults(
+    persistence: &Persistence,
+    bucket: &Bucket,
+    principal_id: &str,
+    written_by: &str,
+    reason: &str,
+    transaction_id: &str,
+    transaction_principal: &str,
+) -> Result<()> {
+    let bucket_id = bucket_object_id(bucket);
+    persistence
+        .stage_authz_tuple_batch(
+            SYSTEM_STORAGE_TENANT_ID,
+            vec![
+                AuthzTupleBatchMutation {
+                    namespace: system_realm_namespace(SYSTEM_BUCKET_NAMESPACE),
+                    object_id: bucket_id.clone(),
+                    relation: "parent_tenant".to_string(),
+                    subject_kind: SYSTEM_STORAGE_TENANT_NAMESPACE.to_string(),
+                    subject_id: storage_tenant_object_id(bucket.tenant_id),
+                    caveat_hash: String::new(),
+                    operation: "add".to_string(),
+                    reason: reason.to_string(),
+                },
+                AuthzTupleBatchMutation {
+                    namespace: system_realm_namespace(SYSTEM_BUCKET_NAMESPACE),
+                    object_id: bucket_id,
+                    relation: "owner".to_string(),
+                    subject_kind: APP_SUBJECT_KIND.to_string(),
+                    subject_id: principal_id.to_string(),
+                    caveat_hash: String::new(),
+                    operation: "add".to_string(),
+                    reason: reason.to_string(),
+                },
+            ],
+            written_by,
+            transaction_id,
+            transaction_principal,
+            None,
+        )
+        .await?;
+    Ok(())
+}
+
 pub async fn write_bucket_public_read_tuple(
     persistence: &Persistence,
     bucket: &Bucket,

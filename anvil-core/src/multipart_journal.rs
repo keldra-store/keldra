@@ -433,6 +433,25 @@ pub async fn has_active_multipart_upload(
     Ok(active_count_value(&payload, bucket_id)? > 0)
 }
 
+pub(crate) fn has_active_multipart_upload_in_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    bucket_id: i64,
+    transaction_id: &str,
+    transaction_principal: &str,
+) -> Result<bool> {
+    let logical_key = crate::mvcc_product::coremeta_logical_key(
+        CF_OBJECT_HEADS,
+        TABLE_MULTIPART_UPLOAD_CURRENT_ROW,
+        &multipart_active_count_key(bucket_id)?,
+    )?;
+    let Some(payload) =
+        mvcc.read_transaction_value(transaction_id, transaction_principal, &logical_key)?
+    else {
+        return Ok(false);
+    };
+    Ok(active_count_value(&payload, bucket_id)? > 0)
+}
+
 pub(crate) async fn upsert_multipart_part_with_permit(
     _storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,

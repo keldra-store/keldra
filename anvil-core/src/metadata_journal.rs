@@ -1472,6 +1472,51 @@ pub fn read_object_versions_at_mvcc_snapshot(
         .collect())
 }
 
+pub(crate) fn has_object_versions_in_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    bucket: &Bucket,
+    transaction_id: &str,
+    transaction_principal: &str,
+) -> Result<bool> {
+    use crate::mvcc_transaction::WriteOperation;
+
+    let snapshot = mvcc.open_transactions.handle(transaction_id)?.snapshot_version;
+    let tuple_prefix = crate::core_store::object_version_page_bucket_prefix(bucket);
+    let application_prefix = crate::mvcc_product::coremeta_application_prefix(
+        crate::core_store::CF_OBJECT_VERSIONS,
+        &tuple_prefix,
+    )?;
+    let mut rows = mvcc
+        .runtime
+        .scan_table_prefix_at(
+            crate::core_store::TABLE_OBJECT_VERSION_META_ROW,
+            &application_prefix,
+            snapshot,
+        )?
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect::<std::collections::BTreeSet<_>>();
+    for write in mvcc
+        .open_transactions
+        .staged_writes(transaction_id, transaction_principal)?
+    {
+        if write.key().table_id != crate::core_store::TABLE_OBJECT_VERSION_META_ROW
+            || !write.key().application_key.starts_with(&application_prefix)
+        {
+            continue;
+        }
+        match write {
+            WriteOperation::Put { key, .. } => {
+                rows.insert(key);
+            }
+            WriteOperation::Delete { key } => {
+                rows.remove(&key);
+            }
+        }
+    }
+    Ok(!rows.is_empty())
+}
+
 pub fn list_object_versions_mvcc(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,

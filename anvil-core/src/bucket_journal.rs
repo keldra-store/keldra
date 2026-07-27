@@ -118,7 +118,12 @@ pub(crate) async fn stage_bucket_mutation_in_transaction(
     transaction_id: &str,
     transaction_principal: &str,
 ) -> Result<()> {
-    build_bucket_mvcc_mutation_plan(mvcc, bucket, mutation)?
+    build_bucket_mvcc_mutation_plan_with_transaction(
+        mvcc,
+        bucket,
+        mutation,
+        Some((transaction_id, transaction_principal)),
+    )?
         .stage(
             mvcc,
             transaction_id,
@@ -135,6 +140,24 @@ pub fn next_bucket_id_mvcc(mvcc: &crate::mvcc_bootstrap::MvccSubsystem) -> Resul
         &bucket_id_allocator_tuple_key()?,
     )?;
     mvcc.read_latest_value(&key)?
+        .as_deref()
+        .map(decode_bucket_id_allocator_payload)
+        .transpose()?
+        .unwrap_or_default()
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("bucket id overflow"))
+}
+
+pub(crate) fn next_bucket_id_in_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    transaction_principal: &str,
+) -> Result<i64> {
+    let key = bucket_mvcc_key(
+        TABLE_BUCKET_ID_ALLOCATOR_ROW,
+        &bucket_id_allocator_tuple_key()?,
+    )?;
+    mvcc.read_transaction_value(transaction_id, transaction_principal, &key)?
         .as_deref()
         .map(decode_bucket_id_allocator_payload)
         .transpose()?
@@ -464,6 +487,27 @@ pub fn read_current_bucket_mvcc(
     Ok(current.into_active_bucket())
 }
 
+pub(crate) fn read_current_bucket_in_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    bucket_name: &str,
+    transaction_id: &str,
+    transaction_principal: &str,
+) -> Result<Option<Bucket>> {
+    let key = bucket_mvcc_key(
+        TABLE_BUCKET_CURRENT_BY_NAME_ROW,
+        &tenant_bucket_name_current_tuple_key(tenant_id, bucket_name)?,
+    )?;
+    let Some(payload) =
+        mvcc.read_transaction_value(transaction_id, transaction_principal, &key)?
+    else {
+        return Ok(None);
+    };
+    let current = decode_bucket_current_row(&payload)?;
+    ensure_bucket_tenant_name_matches(&current.bucket, tenant_id, bucket_name)?;
+    Ok(current.into_active_bucket())
+}
+
 pub(crate) fn read_current_bucket_at_mvcc_snapshot(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
@@ -595,13 +639,27 @@ pub(crate) fn build_bucket_mvcc_mutation_plan(
     bucket: &Bucket,
     mutation: BucketJournalMutation,
 ) -> Result<BucketMvccMutationPlan> {
+    build_bucket_mvcc_mutation_plan_with_transaction(mvcc, bucket, mutation, None)
+}
+
+fn build_bucket_mvcc_mutation_plan_with_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    bucket: &Bucket,
+    mutation: BucketJournalMutation,
+    transaction: Option<(&str, &str)>,
+) -> Result<BucketMvccMutationPlan> {
     use crate::mvcc_transaction::PredicateKind;
 
     let allocator_key = bucket_mvcc_key(
         TABLE_BUCKET_ID_ALLOCATOR_ROW,
         &bucket_id_allocator_tuple_key()?,
     )?;
-    let allocator_payload = mvcc.read_latest_value(&allocator_key)?;
+    let allocator_payload = match transaction {
+        Some((transaction_id, principal)) => {
+            mvcc.read_transaction_value(transaction_id, principal, &allocator_key)?
+        }
+        None => mvcc.read_latest_value(&allocator_key)?,
+    };
     let allocator_max = match allocator_payload.as_deref() {
         Some(payload) => decode_bucket_id_allocator_payload(payload)?,
         None => 0,
@@ -617,7 +675,12 @@ pub(crate) fn build_bucket_mvcc_mutation_plan(
         TABLE_BUCKET_EVENT_HEAD_ROW,
         &bucket_collection_revision_tuple_key(bucket.tenant_id)?,
     )?;
-    let revision_payload = mvcc.read_latest_value(&collection_revision_key)?;
+    let revision_payload = match transaction {
+        Some((transaction_id, principal)) => {
+            mvcc.read_transaction_value(transaction_id, principal, &collection_revision_key)?
+        }
+        None => mvcc.read_latest_value(&collection_revision_key)?,
+    };
     let revision = match revision_payload.as_deref() {
         Some(payload) => {
             let value: BucketCollectionRevisionValue = serde_json::from_slice(payload)?;
@@ -715,6 +778,18 @@ pub(crate) fn build_bucket_mvcc_mutation_plan(
         if !predicate_keys.insert(key.clone()) {
             continue;
         }
+        if let Some((transaction_id, principal)) = transaction
+            && mvcc
+                .open_transactions
+                .staged_value(transaction_id, principal, &key)?
+                .is_some()
+        {
+            // The first write to this key already captured its snapshot
+            // observation and any stronger explicit predicate. A later bucket
+            // operation in the same transaction must validate against that
+            // transaction overlay without replacing the original observation.
+            continue;
+        }
         let kind = if mutation == BucketJournalMutation::Create
             && matches!(
                 table_id,
@@ -722,7 +797,13 @@ pub(crate) fn build_bucket_mvcc_mutation_plan(
             ) {
             PredicateKind::Absent
         } else {
-            match mvcc.read_latest_value(&key)? {
+            let visible = match transaction {
+                Some((transaction_id, principal)) => {
+                    mvcc.read_transaction_value(transaction_id, principal, &key)?
+                }
+                None => mvcc.read_latest_value(&key)?,
+            };
+            match visible {
                 Some(payload) => PredicateKind::ValueHash(*blake3::hash(&payload).as_bytes()),
                 None if mutation != BucketJournalMutation::Create
                     && matches!(
