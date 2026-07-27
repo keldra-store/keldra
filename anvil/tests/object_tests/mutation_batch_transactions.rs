@@ -652,59 +652,92 @@ async fn implicit_mutation_batch_supports_non_inline_payloads_atomically() {
 }
 
 #[tokio::test]
-async fn implicit_non_put_batches_require_an_explicit_object_transaction() {
-    let fixture = SingleNodeMutationBatchFixture::new("implicit-batch-requires-transaction").await;
+async fn implicit_mixed_batch_commits_once_atomically() {
+    let fixture = SingleNodeMutationBatchFixture::new("implicit-mixed-batch").await;
     let mut object_client = fixture.object_client().await;
-    let object_key = "implicit-policy/item.json";
+    let patch_key = "implicit-mixed/patched.json";
+    let delete_key = "implicit-mixed/deleted.json";
+    let put_key = "implicit-mixed/created.json";
     put_object_for_test(
         &mut object_client,
         &fixture.actor.token,
         &fixture.bucket_name,
-        object_key,
+        patch_key,
         br#"{"state":"original"}"#,
-        native_mutation_context(&fixture.actor, fixture.bucket_id, "implicit-policy-seed"),
+        native_mutation_context(&fixture.actor, fixture.bucket_id, "implicit-mixed-patch-seed"),
     )
     .await
-    .expect("seed object for implicit patch policy");
+    .expect("seed object for implicit patch");
+    put_object_for_test(
+        &mut object_client,
+        &fixture.actor.token,
+        &fixture.bucket_name,
+        delete_key,
+        br#"{"state":"present"}"#,
+        native_mutation_context(&fixture.actor, fixture.bucket_id, "implicit-mixed-delete-seed"),
+    )
+    .await
+    .expect("seed object for implicit delete");
     let mut context =
-        native_mutation_context(&fixture.actor, fixture.bucket_id, "implicit-patch-policy");
+        native_mutation_context(&fixture.actor, fixture.bucket_id, "implicit-mixed-commit");
     context.write_visibility = None;
 
-    let error = object_client
+    let response = object_client
         .mutation_batch(authorized(
             MutationBatchRequest {
                 bucket_name: fixture.bucket_name.clone(),
                 mutation_context: Some(context),
                 precondition: None,
-                operations: vec![MutationBatchOperation {
-                    op: Some(anvil_api::mutation_batch_operation::Op::PatchJsonObject(
-                        MutationBatchPatchJsonObject {
-                            object_key: object_key.to_string(),
-                            base_version_id: None,
-                            merge_patch_json: r#"{"state":"changed"}"#.to_string(),
-                        },
-                    )),
-                }],
+                operations: vec![
+                    MutationBatchOperation {
+                        op: Some(anvil_api::mutation_batch_operation::Op::PatchJsonObject(
+                            MutationBatchPatchJsonObject {
+                                object_key: patch_key.to_string(),
+                                base_version_id: None,
+                                merge_patch_json: r#"{"state":"changed"}"#.to_string(),
+                            },
+                        )),
+                    },
+                    MutationBatchOperation {
+                        op: Some(anvil_api::mutation_batch_operation::Op::DeleteObject(
+                            MutationBatchDeleteObject {
+                                object_key: delete_key.to_string(),
+                                version_id: None,
+                            },
+                        )),
+                    },
+                    small_put(put_key, br#"{"state":"created"}"#.to_vec()),
+                ],
             },
             &fixture.actor.token,
         ))
         .await
-        .expect_err("implicit non-put batch must not execute sequentially");
-    assert_eq!(error.code(), Code::FailedPrecondition);
-    assert_eq!(
-        error.message(),
-        "ExplicitTransactionRequiredForNonPutMutationBatch"
-    );
+        .expect("implicit mixed batch must commit as one transaction")
+        .into_inner();
+    assert_eq!(response.write_state, WriteState::Committed as i32);
+    assert_eq!(response.receipts.len(), 3);
     assert_eq!(
         get_object_bytes_for_test(
             &mut object_client,
             &fixture.actor.token,
             &fixture.bucket_name,
-            object_key,
+            patch_key,
             None,
         )
         .await,
-        br#"{"state":"original"}"#
+        br#"{"state":"changed"}"#
+    );
+    assert_object_missing(&fixture, &mut object_client, delete_key).await;
+    assert_eq!(
+        get_object_bytes_for_test(
+            &mut object_client,
+            &fixture.actor.token,
+            &fixture.bucket_name,
+            put_key,
+            None,
+        )
+        .await,
+        br#"{"state":"created"}"#
     );
 }
 
@@ -852,6 +885,7 @@ async fn object_version_precondition_is_revalidated_at_transaction_publication()
     let mut object_client = fixture.object_client().await;
     let guard_key = "preconditions/guard.json";
     let target_key = "preconditions/target.json";
+    let delete_key = "preconditions/mixed-delete.json";
     let original_guard = put_object_for_test(
         &mut object_client,
         &fixture.actor.token,
@@ -866,6 +900,20 @@ async fn object_version_precondition_is_revalidated_at_transaction_publication()
     )
     .await
     .expect("create object used as the transaction guard");
+    put_object_for_test(
+        &mut object_client,
+        &fixture.actor.token,
+        &fixture.bucket_name,
+        delete_key,
+        br#"{"must":"survive-abort"}"#,
+        native_mutation_context(
+            &fixture.actor,
+            fixture.bucket_id,
+            "durable-precondition-delete-seed",
+        ),
+    )
+    .await
+    .expect("create object deleted by the mixed transaction");
     let transaction = fixture
         .begin_transaction(
             &mut transaction_client,
@@ -892,7 +940,17 @@ async fn object_version_precondition_is_revalidated_at_transaction_publication()
                         }],
                         lease_fence: None,
                     }),
-                    operations: vec![small_put(target_key, br#"{"accepted":true}"#.to_vec())],
+                    operations: vec![
+                        small_put(target_key, br#"{"accepted":true}"#.to_vec()),
+                        MutationBatchOperation {
+                            op: Some(anvil_api::mutation_batch_operation::Op::DeleteObject(
+                                MutationBatchDeleteObject {
+                                    object_key: delete_key.to_string(),
+                                    version_id: None,
+                                },
+                            )),
+                        },
+                    ],
                 },
                 &fixture.actor.token,
             ))
@@ -925,6 +983,17 @@ async fn object_version_precondition_is_revalidated_at_transaction_publication()
         .expect_err("a guard changed on another writer must reject publication");
     assert_eq!(conflict.code(), Code::Aborted);
     assert_object_missing(&fixture, &mut object_client, target_key).await;
+    assert_eq!(
+        get_object_bytes_for_test(
+            &mut object_client,
+            &fixture.actor.token,
+            &fixture.bucket_name,
+            delete_key,
+            None,
+        )
+        .await,
+        br#"{"must":"survive-abort"}"#
+    );
 }
 
 #[tokio::test]

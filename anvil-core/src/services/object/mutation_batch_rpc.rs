@@ -120,19 +120,6 @@ fn mutation_batch_now_unix_ms() -> Result<u64, Status> {
     u64::try_from(elapsed.as_millis()).map_err(|_| Status::internal("system time exceeds u64"))
 }
 
-fn is_object_data_operation(operation: &MutationBatchOperation) -> bool {
-    matches!(
-        operation.op.as_ref(),
-        Some(
-            mutation_batch_operation::Op::PutObject(_)
-                | mutation_batch_operation::Op::DeleteObject(_)
-                | mutation_batch_operation::Op::CompareAndSwapManifest(_)
-                | mutation_batch_operation::Op::PatchJsonObject(_)
-                | mutation_batch_operation::Op::AppendStreamRecord(_)
-        )
-    )
-}
-
 fn deduplicate_preconditions(
     preconditions: &mut Vec<(
         crate::mvcc_transaction::LogicalKey,
@@ -227,7 +214,7 @@ pub(super) async fn execute_mutation_batch(
                 Some(mutation_batch_operation::Op::PutObject(_))
             )
         });
-    let implicit_transaction = if transaction_id.is_none() && put_only_batch {
+    let implicit_transaction = if transaction_id.is_none() {
         Some(
             state
                 .mvcc
@@ -255,14 +242,6 @@ pub(super) async fn execute_mutation_batch(
             .as_ref()
             .map(|handle| handle.transaction_id.as_str())
     });
-    if transaction_id.is_none()
-        && !put_only_batch
-        && req.operations.iter().any(is_object_data_operation)
-    {
-        return Err(Status::failed_precondition(
-            "ExplicitTransactionRequiredForNonPutMutationBatch",
-        ));
-    }
     validate_mutation_precondition_transaction(state, &claims, effective_transaction_id)?;
     let transaction_principal = effective_transaction_id
         .map(|_| object_manager::transaction_principal_from_claims(&claims));
@@ -398,8 +377,8 @@ pub(super) async fn execute_mutation_batch(
                         ObjectWriteOptions {
                             content_type: op.content_type,
                             user_metadata: parse_user_metadata_json(&op.user_metadata_json)?,
-                            transaction_id: transaction_id.map(ToOwned::to_owned),
-                            transaction_principal: transaction_id.map(|_| {
+                            transaction_id: effective_transaction_id.map(ToOwned::to_owned),
+                            transaction_principal: effective_transaction_id.map(|_| {
                                 crate::object_manager::transaction_principal_from_claims(&claims)
                             }),
                             storage_class_id: op.storage_class,
@@ -408,7 +387,9 @@ pub(super) async fn execute_mutation_batch(
                     )
                     .await?;
                 let watch_cursor =
-                    if transaction_id.is_some() || !write_visibility.requires_watch_visible() {
+                    if effective_transaction_id.is_some()
+                        || !write_visibility.requires_watch_visible()
+                    {
                         0
                     } else {
                         object_watch_cursor(state, &object).await?
@@ -435,10 +416,10 @@ pub(super) async fn execute_mutation_batch(
                         &op.object_key,
                         parse_optional_version_id(op.base_version_id.as_deref())?,
                         &op.merge_patch_json,
-                        transaction_id,
+                        effective_transaction_id,
                     )
                     .await?;
-                if transaction_id.is_none() {
+                if effective_transaction_id.is_none() {
                     let watch_cursor = object_watch_cursor(state, &object).await?;
                     max_watch_cursor = max_watch_cursor.max(watch_cursor);
                 }
@@ -455,7 +436,7 @@ pub(super) async fn execute_mutation_batch(
                 });
             }
             mutation_batch_operation::Op::DeleteObject(op) => {
-                let transaction_principal = transaction_id
+                let transaction_principal = effective_transaction_id
                     .map(|_| crate::object_manager::transaction_principal_from_claims(&claims));
                 let deleted = if let Some(version_id) =
                     parse_optional_version_id(op.version_id.as_deref())?
@@ -467,7 +448,7 @@ pub(super) async fn execute_mutation_batch(
                             &req.bucket_name,
                             &op.object_key,
                             version_id,
-                            transaction_id,
+                            effective_transaction_id,
                             transaction_principal.as_deref(),
                             write_visibility,
                         )
@@ -479,14 +460,16 @@ pub(super) async fn execute_mutation_batch(
                             &claims,
                             &req.bucket_name,
                             &op.object_key,
-                            transaction_id,
+                            effective_transaction_id,
                             transaction_principal.as_deref(),
                             write_visibility,
                         )
                         .await?
                 };
                 let watch_cursor =
-                    if transaction_id.is_some() || !write_visibility.requires_watch_visible() {
+                    if effective_transaction_id.is_some()
+                        || !write_visibility.requires_watch_visible()
+                    {
                         0
                     } else {
                         object_watch_cursor(state, &deleted).await?
@@ -517,10 +500,10 @@ pub(super) async fn execute_mutation_batch(
                         op.payload,
                         op.content_type,
                         parse_user_metadata_json(&op.user_metadata_json)?,
-                        transaction_id,
+                        effective_transaction_id,
                     )
                     .await?;
-                if transaction_id.is_none() {
+                if effective_transaction_id.is_none() {
                     max_watch_cursor = max_watch_cursor.max(record.receipt.watch_cursor);
                 }
                 receipts.push(MutationBatchOperationReceipt {
@@ -540,7 +523,7 @@ pub(super) async fn execute_mutation_batch(
                 unreachable!("coordination-plane operations are rejected before batch execution")
             }
             mutation_batch_operation::Op::CompareAndSwapManifest(op) => {
-                let transaction_principal = transaction_id
+                let transaction_principal = effective_transaction_id
                     .map(|_| object_manager::transaction_principal_from_claims(&claims));
                 let result = state
                     .object_manager
@@ -550,11 +533,11 @@ pub(super) async fn execute_mutation_batch(
                         &op.manifest_key,
                         op.expected_revision,
                         &op.manifest_json,
-                        transaction_id,
+                        effective_transaction_id,
                         transaction_principal.as_deref(),
                     )
                     .await?;
-                if transaction_id.is_none() {
+                if effective_transaction_id.is_none() {
                     max_watch_cursor = max_watch_cursor.max(result.receipt.watch_cursor);
                 }
                 receipts.push(MutationBatchOperationReceipt {
@@ -588,7 +571,31 @@ pub(super) async fn execute_mutation_batch(
         )
         .await?;
     } else {
-        native_idempotency::store_response(&state.mvcc, &context, &target, &response).await?;
+        native_idempotency::prepare_response_for_implicit_batch(
+            &state.mvcc,
+            &context,
+            &target,
+            &response,
+        )
+        .await?;
+        let outcome = state
+            .mvcc
+            .open_transactions
+            .commit(
+                state.mvcc.runtime.as_ref(),
+                effective_transaction_id.expect("implicit batch transaction exists"),
+                transaction_principal
+                    .as_deref()
+                    .expect("implicit batch transaction has a principal"),
+                mutation_batch_now_unix_ms()?,
+            )
+            .await
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        if let CertificationResult::Aborted { reason } = outcome.certification {
+            return Err(Status::aborted(format!(
+                "implicit MVCC transaction aborted: {reason:?}"
+            )));
+        }
     }
     Ok(Response::new(response))
 }
