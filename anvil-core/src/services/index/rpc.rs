@@ -4,6 +4,130 @@ fn index_write_transaction_id(options: Option<&WriteOptions>) -> Result<Option<&
     crate::services::transaction_context::write_options_transaction_id(options)
 }
 
+struct IndexMutationTransaction {
+    id: String,
+    principal: String,
+    internal: bool,
+    replayed: bool,
+}
+
+async fn begin_index_mutation(
+    state: &AppState,
+    claims: &auth::Claims,
+    options: Option<&WriteOptions>,
+    operation: &str,
+) -> Result<IndexMutationTransaction, Status> {
+    let principal = crate::object_manager::transaction_principal_from_claims(claims);
+    if let Some(transaction_id) = index_write_transaction_id(options)? {
+        state
+            .mvcc
+            .open_transactions
+            .binding(transaction_id, &principal)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        return Ok(IndexMutationTransaction {
+            id: transaction_id.to_string(),
+            principal,
+            internal: false,
+            replayed: false,
+        });
+    }
+    let supplied = options
+        .map(|options| options.idempotency_key.trim())
+        .filter(|key| !key.is_empty());
+    let idempotency_key = supplied.map_or_else(
+        || {
+            format!(
+                "index:{}:{}:{operation}:{}",
+                claims.tenant_id,
+                claims.sub,
+                uuid::Uuid::new_v4()
+            )
+        },
+        |key| format!("index:{}:{}:{key}", claims.tenant_id, claims.sub),
+    );
+    let now = u64::try_from(chrono::Utc::now().timestamp_millis())
+        .map_err(|_| Status::internal("index mutation timestamp predates Unix epoch"))?;
+    let handle = state
+        .mvcc
+        .open_transactions
+        .begin(
+            state.mvcc.runtime.as_ref(),
+            state.mvcc.cluster_id().to_string(),
+            principal.clone(),
+            idempotency_key,
+            std::time::Duration::from_secs(300),
+            crate::mvcc_transaction::DurabilityLevel::Quorum,
+            crate::mvcc_transaction::ReadConsistency::Linearized,
+            now,
+        )
+        .await
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    let status = state
+        .mvcc
+        .open_transactions
+        .status(&handle.transaction_id, &principal, now)
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    if status.state == "committing" {
+        let outcome = state
+            .mvcc
+            .open_transactions
+            .commit(
+                state.mvcc.runtime.as_ref(),
+                &handle.transaction_id,
+                &principal,
+                now,
+            )
+            .await
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        if let crate::mvcc_transaction::CertificationResult::Aborted { reason } =
+            outcome.certification
+        {
+            return Err(Status::aborted(format!(
+                "implicit index transaction aborted: {reason:?}"
+            )));
+        }
+    } else if status.state == "aborted" {
+        return Err(Status::aborted(
+            "implicit index transaction previously aborted",
+        ));
+    }
+    Ok(IndexMutationTransaction {
+        id: handle.transaction_id,
+        principal,
+        internal: true,
+        replayed: matches!(status.state, "committed" | "committing"),
+    })
+}
+
+async fn commit_index_mutation(
+    state: &AppState,
+    transaction: &IndexMutationTransaction,
+) -> Result<(), Status> {
+    if !transaction.internal {
+        return Ok(());
+    }
+    let outcome = state
+        .mvcc
+        .open_transactions
+        .commit(
+            state.mvcc.runtime.as_ref(),
+            &transaction.id,
+            &transaction.principal,
+            u64::try_from(chrono::Utc::now().timestamp_millis())
+                .map_err(|_| Status::internal("index commit predates Unix epoch"))?,
+        )
+        .await
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    match outcome.certification {
+        crate::mvcc_transaction::CertificationResult::Committed { .. } => Ok(()),
+        crate::mvcc_transaction::CertificationResult::Aborted { reason } => {
+            Err(Status::aborted(format!(
+                "implicit index transaction aborted: {reason:?}"
+            )))
+        }
+    }
+}
+
 #[tonic::async_trait]
 impl IndexService for AppState {
     type WatchIndexDefinitionStream = std::pin::Pin<
@@ -42,9 +166,30 @@ impl IndexService for AppState {
         let build_policy = parse_json_field("build_policy_json", &req.build_policy_json)?;
         validate_authorization_mode(&req.authorization_mode)?;
         validate_index_definition_shape(kind, &build_policy, &extractor, &self.config)?;
-        let transaction_id = index_write_transaction_id(req.options.as_ref())?;
-        let transaction_principal = transaction_id
-            .map(|_| crate::object_manager::transaction_principal_from_claims(&claims));
+        let transaction =
+            begin_index_mutation(self, &claims, req.options.as_ref(), "create").await?;
+        if transaction.replayed {
+            let index = self
+                .persistence
+                .get_index_definition(claims.tenant_id, bucket.id, &req.name)
+                .await
+                .map_err(|error| Status::internal(error.to_string()))?
+                .filter(|index| {
+                    index.kind == kind.to_string()
+                        && index.selector == selector
+                        && index.extractor == extractor
+                        && index.authorization_mode == req.authorization_mode
+                        && index.build_policy == build_policy
+                })
+                .ok_or_else(|| {
+                    Status::already_exists(
+                        "index idempotency key was already used for different input",
+                    )
+                })?;
+            return Ok(Response::new(IndexDefinitionResponse {
+                index: Some(index_record(&bucket.name, index)?),
+            }));
+        }
 
         let mutation = crate::persistence::IndexDefinitionMutation::Create {
             name: req.name,
@@ -59,8 +204,8 @@ impl IndexService for AppState {
             .apply_index_definition_mutation(
                 &bucket,
                 &mutation,
-                transaction_id,
-                transaction_principal.as_deref(),
+                Some(&transaction.id),
+                Some(&transaction.principal),
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?
@@ -77,37 +222,19 @@ impl IndexService for AppState {
                 return Err(Status::internal("invalid create-index mutation outcome"));
             }
         };
-        if let (Some(transaction_id), Some(transaction_principal)) =
-            (transaction_id, transaction_principal.as_deref())
-        {
-            access_control::stage_index_defaults(
-                &self.persistence,
-                &bucket,
-                &index.name,
-                &claims.sub,
-                &claims.sub,
-                "stage creator index owner",
-                transaction_id,
-                transaction_principal,
-            )
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        } else {
-            access_control::grant_index_defaults(
-                &self.persistence,
-                &bucket,
-                &index.name,
-                &claims.sub,
-                &claims.sub,
-                "grant creator index owner",
-            )
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-            self.persistence
-                .enqueue_index_build_for_index(&bucket, &index)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
-        }
+        access_control::stage_index_defaults(
+            &self.persistence,
+            &bucket,
+            &index.name,
+            &claims.sub,
+            &claims.sub,
+            "stage creator index owner",
+            &transaction.id,
+            &transaction.principal,
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+        commit_index_mutation(self, &transaction).await?;
 
         Ok(Response::new(IndexDefinitionResponse {
             index: Some(index_record(&bucket.name, index)?),
@@ -141,9 +268,8 @@ impl IndexService for AppState {
         let extractor = parse_json_field("extractor_json", &req.extractor_json)?;
         let build_policy = parse_json_field("build_policy_json", &req.build_policy_json)?;
         validate_authorization_mode(&req.authorization_mode)?;
-        let transaction_id = index_write_transaction_id(req.options.as_ref())?;
-        let transaction_principal = transaction_id
-            .map(|_| crate::object_manager::transaction_principal_from_claims(&claims));
+        let transaction =
+            begin_index_mutation(self, &claims, req.options.as_ref(), "update").await?;
         let existing = self
             .persistence
             .get_index_definition(claims.tenant_id, bucket.id, &req.name)
@@ -151,6 +277,27 @@ impl IndexService for AppState {
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Index definition not found"))?;
         validate_index_definition_shape(&existing.kind, &build_policy, &extractor, &self.config)?;
+        if transaction.replayed {
+            let index = self
+                .persistence
+                .get_index_definition(claims.tenant_id, bucket.id, &req.name)
+                .await
+                .map_err(|error| Status::internal(error.to_string()))?
+                .filter(|index| {
+                    index.selector == selector
+                        && index.extractor == extractor
+                        && index.authorization_mode == req.authorization_mode
+                        && index.build_policy == build_policy
+                })
+                .ok_or_else(|| {
+                    Status::already_exists(
+                        "index idempotency key was already used for different input",
+                    )
+                })?;
+            return Ok(Response::new(IndexDefinitionResponse {
+                index: Some(index_record(&bucket.name, index)?),
+            }));
+        }
 
         let mutation = crate::persistence::IndexDefinitionMutation::Update {
             name: req.name,
@@ -165,8 +312,8 @@ impl IndexService for AppState {
             .apply_index_definition_mutation(
                 &bucket,
                 &mutation,
-                transaction_id,
-                transaction_principal.as_deref(),
+                Some(&transaction.id),
+                Some(&transaction.principal),
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?
@@ -185,12 +332,7 @@ impl IndexService for AppState {
                 return Err(Status::internal("invalid update-index mutation outcome"));
             }
         };
-        if transaction_id.is_none() {
-            self.persistence
-                .enqueue_index_build_for_index(&bucket, &index)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
-        }
+        commit_index_mutation(self, &transaction).await?;
 
         Ok(Response::new(IndexDefinitionResponse {
             index: Some(index_record(&bucket.name, index)?),
@@ -220,17 +362,32 @@ impl IndexService for AppState {
         let bucket = self
             .get_index_bucket(claims.tenant_id, &req.bucket_name)
             .await?;
-        let transaction_id = index_write_transaction_id(req.options.as_ref())?;
-        let transaction_principal = transaction_id
-            .map(|_| crate::object_manager::transaction_principal_from_claims(&claims));
+        let transaction =
+            begin_index_mutation(self, &claims, req.options.as_ref(), "disable").await?;
+        if transaction.replayed {
+            let index = self
+                .persistence
+                .get_index_definition(claims.tenant_id, bucket.id, &req.name)
+                .await
+                .map_err(|error| Status::internal(error.to_string()))?
+                .filter(|index| !index.enabled)
+                .ok_or_else(|| {
+                    Status::already_exists(
+                        "index idempotency key was already used for different input",
+                    )
+                })?;
+            return Ok(Response::new(IndexDefinitionResponse {
+                index: Some(index_record(&bucket.name, index)?),
+            }));
+        }
         let mutation = crate::persistence::IndexDefinitionMutation::Disable { name: req.name };
         let index = match self
             .persistence
             .apply_index_definition_mutation(
                 &bucket,
                 &mutation,
-                transaction_id,
-                transaction_principal.as_deref(),
+                Some(&transaction.id),
+                Some(&transaction.principal),
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?
@@ -247,6 +404,7 @@ impl IndexService for AppState {
                 return Err(Status::internal("invalid disable-index mutation outcome"));
             }
         };
+        commit_index_mutation(self, &transaction).await?;
 
         Ok(Response::new(IndexDefinitionResponse {
             index: Some(index_record(&bucket.name, index)?),
@@ -276,17 +434,30 @@ impl IndexService for AppState {
         let bucket = self
             .get_index_bucket(claims.tenant_id, &req.bucket_name)
             .await?;
-        let transaction_id = index_write_transaction_id(req.options.as_ref())?;
-        let transaction_principal = transaction_id
-            .map(|_| crate::object_manager::transaction_principal_from_claims(&claims));
+        let transaction =
+            begin_index_mutation(self, &claims, req.options.as_ref(), "drop").await?;
+        if transaction.replayed {
+            if self
+                .persistence
+                .get_index_definition(claims.tenant_id, bucket.id, &req.name)
+                .await
+                .map_err(|error| Status::internal(error.to_string()))?
+                .is_some()
+            {
+                return Err(Status::already_exists(
+                    "index idempotency key was already used for different input",
+                ));
+            }
+            return Ok(Response::new(DropIndexResponse {}));
+        }
         let mutation = crate::persistence::IndexDefinitionMutation::Drop { name: req.name };
         match self
             .persistence
             .apply_index_definition_mutation(
                 &bucket,
                 &mutation,
-                transaction_id,
-                transaction_principal.as_deref(),
+                Some(&transaction.id),
+                Some(&transaction.principal),
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?
@@ -302,6 +473,7 @@ impl IndexService for AppState {
                 return Err(Status::internal("invalid drop-index mutation outcome"));
             }
         }
+        commit_index_mutation(self, &transaction).await?;
         Ok(Response::new(DropIndexResponse {}))
     }
 

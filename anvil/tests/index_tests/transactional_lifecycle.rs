@@ -53,6 +53,23 @@ fn transactional_index_request(
     }
 }
 
+fn implicit_index_request(
+    bucket_name: &str,
+    index_name: &str,
+    idempotency_key: &str,
+) -> CreateIndexRequest {
+    let mut request = transactional_index_request(bucket_name, index_name, String::new());
+    request.options = Some(WriteOptions {
+        idempotency_key: idempotency_key.to_string(),
+        consistency: 0,
+        wait_for_finalization: false,
+        preconditions: Vec::new(),
+        boundary_values: Vec::new(),
+        execution: None,
+    });
+    request
+}
+
 #[tokio::test]
 async fn explicit_index_transaction_publishes_definition_and_finalises_after_commit() {
     let cluster = shared_default_test_cluster().await;
@@ -189,4 +206,126 @@ async fn conflicting_explicit_index_transactions_publish_only_one_definition() {
         .await
         .unwrap_err();
     assert_eq!(conflict.code(), Code::Aborted);
+}
+
+#[tokio::test]
+async fn implicit_index_retry_reconstructs_the_committed_definition() {
+    let cluster = shared_default_test_cluster().await;
+    let endpoint = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let mut buckets = BucketServiceClient::connect(endpoint.clone()).await.unwrap();
+    let mut indexes = IndexServiceClient::connect(endpoint).await.unwrap();
+    let bucket_name = unique_test_name("implicit-index-bucket");
+    buckets
+        .create_bucket(authorized(
+            CreateBucketRequest {
+                bucket_name: bucket_name.clone(),
+                region: "test-region-1".to_string(),
+                options: None,
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+    let index_name = unique_test_name("implicit-index");
+    let idempotency_key = unique_test_name("implicit-index-key");
+    let request = implicit_index_request(&bucket_name, &index_name, &idempotency_key);
+    let first = indexes
+        .create_index(authorized(request.clone(), &token))
+        .await
+        .unwrap()
+        .into_inner();
+    let retry = indexes
+        .create_index(authorized(request, &token))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(retry, first);
+
+    let changed = indexes
+        .create_index(authorized(
+            implicit_index_request(
+                &bucket_name,
+                &unique_test_name("changed-index"),
+                &idempotency_key,
+            ),
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(changed.code(), Code::AlreadyExists);
+
+    let update_key = unique_test_name("implicit-index-update");
+    let update = UpdateIndexRequest {
+        bucket_name: bucket_name.clone(),
+        name: index_name.clone(),
+        selector_json: serde_json::json!({"prefix": "updated/"}).to_string(),
+        extractor_json: serde_json::json!({}).to_string(),
+        authorization_mode: "inherit_object".to_string(),
+        build_policy_json: serde_json::json!({}).to_string(),
+        options: Some(WriteOptions {
+            idempotency_key: update_key,
+            consistency: 0,
+            wait_for_finalization: false,
+            preconditions: Vec::new(),
+            boundary_values: Vec::new(),
+            execution: None,
+        }),
+    };
+    let first_update = indexes
+        .update_index(authorized(update.clone(), &token))
+        .await
+        .unwrap()
+        .into_inner();
+    let retry_update = indexes
+        .update_index(authorized(update, &token))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(retry_update, first_update);
+
+    let disable = DisableIndexRequest {
+        bucket_name: bucket_name.clone(),
+        name: index_name.clone(),
+        options: Some(WriteOptions {
+            idempotency_key: unique_test_name("implicit-index-disable"),
+            consistency: 0,
+            wait_for_finalization: false,
+            preconditions: Vec::new(),
+            boundary_values: Vec::new(),
+            execution: None,
+        }),
+    };
+    let first_disable = indexes
+        .disable_index(authorized(disable.clone(), &token))
+        .await
+        .unwrap()
+        .into_inner();
+    let retry_disable = indexes
+        .disable_index(authorized(disable, &token))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(retry_disable, first_disable);
+
+    let drop_request = DropIndexRequest {
+        bucket_name,
+        name: index_name,
+        options: Some(WriteOptions {
+            idempotency_key: unique_test_name("implicit-index-drop"),
+            consistency: 0,
+            wait_for_finalization: false,
+            preconditions: Vec::new(),
+            boundary_values: Vec::new(),
+            execution: None,
+        }),
+    };
+    indexes
+        .drop_index(authorized(drop_request.clone(), &token))
+        .await
+        .unwrap();
+    indexes
+        .drop_index(authorized(drop_request, &token))
+        .await
+        .unwrap();
 }
