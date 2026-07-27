@@ -1705,18 +1705,6 @@ async fn latest_routing_record_from_control_stream(
     )))
 }
 
-async fn read_projected_routing_record_descriptor(
-    storage: &Storage,
-    family: RoutingRecordFamily,
-    record_key: &str,
-) -> MeshDirectoryResult<Option<RoutingRecordDescriptor>> {
-    Ok(
-        read_projected_routing_record_source(storage, family, record_key)
-            .await?
-            .map(|source| source.descriptor),
-    )
-}
-
 async fn read_projected_routing_record_source(
     storage: &Storage,
     family: RoutingRecordFamily,
@@ -1792,89 +1780,6 @@ async fn read_typed_routing_descriptor_for_authority<
         });
     }
     Ok(Some(descriptor))
-}
-
-fn routing_record_descriptor_from_payload(
-    family: RoutingRecordFamily,
-    record_key: &str,
-    payload_json: Vec<u8>,
-) -> MeshDirectoryResult<RoutingRecordDescriptor> {
-    match family {
-        RoutingRecordFamily::TenantName => {
-            let descriptor: TenantNameDescriptor = serde_json::from_slice(&payload_json)?;
-            descriptor_from_operator_record(record_key, &descriptor)
-        }
-        RoutingRecordFamily::TenantLocator => {
-            let descriptor: TenantLocatorDescriptor = serde_json::from_slice(&payload_json)?;
-            descriptor_from_operator_record(record_key, &descriptor)
-        }
-        RoutingRecordFamily::BucketLocator => {
-            let descriptor: BucketLocatorDescriptor = serde_json::from_slice(&payload_json)?;
-            descriptor_from_operator_record(record_key, &descriptor)
-        }
-        RoutingRecordFamily::HostAlias => {
-            let descriptor: routing::HostAliasDescriptor = serde_json::from_slice(&payload_json)?;
-            descriptor_from_operator_record(record_key, &descriptor)
-        }
-    }
-}
-
-fn descriptor_from_operator_record<T>(
-    expected_record_key: &str,
-    record: &T,
-) -> MeshDirectoryResult<RoutingRecordDescriptor>
-where
-    T: StoredRoutingRecord,
-{
-    if record.routing_record_key() != expected_record_key {
-        return Err(MeshDirectoryError::InvalidIdentifier {
-            field: "routing record payload record key",
-            value: format!(
-                "expected {expected_record_key}, got {}",
-                record.routing_record_key()
-            ),
-        });
-    }
-    routing_record_descriptor_from_record(record)
-}
-
-pub async fn rebuild_routing_record_projection_from_payload(
-    storage: &Storage,
-    family: RoutingRecordFamily,
-    record_key: &str,
-    payload_json: &[u8],
-) -> MeshDirectoryResult<RoutingRecordDescriptor> {
-    let expected_descriptor_key = routing_record_descriptor_key_for_key(family, record_key)?;
-    let descriptor = match family {
-        RoutingRecordFamily::TenantName => {
-            let descriptor: TenantNameDescriptor = serde_json::from_slice(payload_json)?;
-            ensure_descriptor_key_matches(&descriptor.descriptor_key(), &expected_descriptor_key)?;
-            write_descriptor(storage, &expected_descriptor_key, &descriptor).await?;
-            routing_record_descriptor_from_record(&descriptor)?
-        }
-        RoutingRecordFamily::TenantLocator => {
-            let descriptor: TenantLocatorDescriptor = serde_json::from_slice(payload_json)?;
-            ensure_descriptor_key_matches(&descriptor.descriptor_key(), &expected_descriptor_key)?;
-            write_descriptor(storage, &expected_descriptor_key, &descriptor).await?;
-            routing_record_descriptor_from_record(&descriptor)?
-        }
-        RoutingRecordFamily::BucketLocator => {
-            let descriptor: BucketLocatorDescriptor = serde_json::from_slice(payload_json)?;
-            ensure_descriptor_key_matches(&descriptor.descriptor_key(), &expected_descriptor_key)?;
-            write_descriptor(storage, &expected_descriptor_key, &descriptor).await?;
-            routing_record_descriptor_from_record(&descriptor)?
-        }
-        RoutingRecordFamily::HostAlias => {
-            let descriptor: routing::HostAliasDescriptor = serde_json::from_slice(payload_json)?;
-            ensure_descriptor_key_matches(
-                &host_alias_descriptor_key(&descriptor.hostname)?,
-                &expected_descriptor_key,
-            )?;
-            write_descriptor(storage, &expected_descriptor_key, &descriptor).await?;
-            routing_record_descriptor_from_record(&descriptor)?
-        }
-    };
-    Ok(descriptor)
 }
 
 pub async fn rebuild_routing_record_projection_from_payload_mvcc(
@@ -1999,15 +1904,6 @@ fn ensure_descriptor_key_matches(actual: &str, expected: &str) -> MeshDirectoryR
             value: format!("expected {expected}, got {actual}"),
         })
     }
-}
-
-async fn create_descriptor<T: StoredRoutingRecord>(
-    storage: &Storage,
-    descriptor_key: &str,
-    descriptor: &T,
-) -> MeshDirectoryResult<()> {
-    write_descriptor_projection(storage, descriptor_key, descriptor, true).await?;
-    Ok(())
 }
 
 #[cfg(test)]

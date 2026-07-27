@@ -411,9 +411,8 @@ pub(super) async fn write_partition_owner_state_mvcc(
             mutations.push(crate::mvcc_product::ProductMutation::delete(
                 old_projection_logical_key.clone(),
             ));
-            let expected = expected_ref.ok_or_else(|| {
-                anyhow!("partition-owner old projection lacks its prior payload")
-            })?;
+            let expected = expected_ref
+                .ok_or_else(|| anyhow!("partition-owner old projection lacks its prior payload"))?;
             predicates.push((
                 old_projection_logical_key,
                 PredicateKind::ValueHash(*blake3::hash(expected).as_bytes()),
@@ -903,11 +902,8 @@ fn scan_page_mvcc(
         .into_iter()
         .map(|(key, row)| {
             Ok((
-                crate::mvcc_product::coremeta_tuple_from_logical_key(
-                    &key,
-                    CF_LEASES_FENCES,
-                )?
-                .to_vec(),
+                crate::mvcc_product::coremeta_tuple_from_logical_key(&key, CF_LEASES_FENCES)?
+                    .to_vec(),
                 row.value,
             ))
         })
