@@ -1,6 +1,6 @@
 use super::*;
 use crate::core_store::CoreMutationBatchReceipt;
-use crate::mesh_control_stream::PreparedControlStreamAppend;
+use crate::mesh_control_stream::{ControlStreamAppendCursor, PreparedControlStreamAppend};
 
 pub(super) struct LifecycleControlMutation<'a> {
     stream_family: &'a str,
