@@ -709,7 +709,7 @@ impl CoreStore {
         }
         let CorePendingMutationTarget::ObjectPut {
             logical_name,
-            region_id,
+            region_id: _,
             erasure_profile_id,
             encryption,
             object_hash,
@@ -729,7 +729,7 @@ impl CoreStore {
         let manifest = self.read_object_manifest(&object_ref).await?;
         if manifest.mutation_id != finalisation.mutation_id
             || manifest.logical_file_id != *logical_name
-            || manifest.region_id != *region_id
+            || manifest.region_id != self.node_identity.region_id
             || manifest.writer_family != finalisation.writer_family
             || manifest.object_hash != *object_hash
             || manifest.logical_size != *object_logical_size
@@ -746,7 +746,7 @@ impl CoreStore {
                 manifest.logical_file_id,
                 logical_name,
                 manifest.region_id,
-                region_id,
+                self.node_identity.region_id,
                 manifest.writer_family,
                 finalisation.writer_family,
                 manifest.object_hash,
