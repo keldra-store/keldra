@@ -150,6 +150,7 @@ struct DraftMutations {
 pub struct OpenTransactionRegistry {
     db: Arc<DB>,
     transition: Mutex<()>,
+    snapshot_gc_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl OpenTransactionRegistry {
@@ -172,6 +173,7 @@ impl OpenTransactionRegistry {
                 )?,
             ),
             transition: Mutex::new(()),
+            snapshot_gc_gate: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -184,7 +186,20 @@ impl OpenTransactionRegistry {
         Ok(Self {
             db,
             transition: Mutex::new(()),
+            snapshot_gc_gate: Arc::new(tokio::sync::Mutex::new(())),
         })
+    }
+
+    /// Serializes selection and durable publication of a new snapshot with
+    /// local application of a cluster garbage-collection watermark.
+    ///
+    /// Cluster reports let the leader avoid proposing a watermark that crosses
+    /// a remote pin, but a report can become stale while `begin` is selecting
+    /// its snapshot. The node that owns the durable transaction registry is the
+    /// final safety boundary: either the draft is published first and local GC
+    /// observes its pin, or GC completes before a new snapshot is selected.
+    pub(crate) fn snapshot_gc_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.snapshot_gc_gate.clone()
     }
 
     /// Returns every snapshot still pinned by a live or committing durable
@@ -222,6 +237,8 @@ impl OpenTransactionRegistry {
         consistency: ReadConsistency,
         now_unix_ms: u64,
     ) -> Result<TransactionHandle> {
+        let snapshot_gc_gate = self.snapshot_gc_gate.clone();
+        let _snapshot_gc_guard = snapshot_gc_gate.lock().await;
         let cluster_id = cluster_id.into();
         let principal = principal.into();
         let idempotency_key = idempotency_key.into();

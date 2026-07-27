@@ -1538,6 +1538,14 @@ A version below the GC watermark may be deleted only when it is not needed by:
 - audit retention;
 - an unfinished repair or rebalance job.
 
+Replica reports are a planning optimisation, not the final deletion authority.
+Each node must serialize transaction snapshot selection and durable publication
+of its active-snapshot pin with local application of the GC watermark. If a
+consensus-approved watermark would cross a durable local pin, that node defers
+physical collection until the transaction resolves or its durable lease
+expires. This local check closes the race in which a transaction begins after
+the node's last safety report but before the leader's watermark proposal.
+
 ### 22.4 Conflict-State GC
 
 Point-conflict entries may be removed only when the corresponding logical key

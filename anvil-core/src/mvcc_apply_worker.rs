@@ -12,6 +12,7 @@ use tokio::sync::{Mutex, watch};
 
 use crate::{
     bundle_replication::AppendOnlyPreparedBundleStore,
+    mvcc_open_transactions::OpenTransactionRegistry,
     mvcc_store::{LocalDurabilityViolationRecord, LocalMvccStore},
     mvcc_transaction::NodeIncarnation,
     mvcc_transaction::{BundleIdentity, PreparedBundleStore, TransactionBundle},
@@ -36,6 +37,7 @@ pub struct MvccApplyWorker {
     state: Arc<Mutex<ApplyWorkerState>>,
     prepared_bundle_gc_grace_ms: Option<u64>,
     shard_transfers: Option<Arc<std::sync::Mutex<crate::replication::TransferReceiver>>>,
+    open_transactions: Option<Arc<OpenTransactionRegistry>>,
 }
 
 pub trait DecisionSource: Send + Sync {
@@ -96,7 +98,16 @@ impl MvccApplyWorker {
             state: Arc::new(Mutex::new(ApplyWorkerState::Stopped)),
             prepared_bundle_gc_grace_ms: None,
             shard_transfers: None,
+            open_transactions: None,
         }
+    }
+
+    pub fn with_open_transactions(
+        mut self,
+        open_transactions: Arc<OpenTransactionRegistry>,
+    ) -> Self {
+        self.open_transactions = Some(open_transactions);
+        self
     }
 
     pub fn with_prepared_bundle_gc_grace(mut self, grace_ms: u64) -> Result<Self> {
@@ -214,11 +225,35 @@ impl MvccApplyWorker {
             crate::perf::record_mvcc_state(watermark.0, observed_commit.0, 0);
             applied += 1;
         }
-        let advanced_gc = self.local.gc_watermark()? < gc.0;
-        if advanced_gc {
-            self.local
-                .garbage_collect(gc.0)
-                .context("apply consensus-approved MVCC GC watermark locally")?;
+        let should_advance_gc = self.local.gc_watermark()? < gc.0;
+        let mut advanced_gc = false;
+        if should_advance_gc {
+            if let Some(open_transactions) = &self.open_transactions {
+                let gate = open_transactions.snapshot_gc_gate();
+                let _gc_guard = gate.lock().await;
+                let oldest_pin = open_transactions
+                    .active_snapshot_pins(unix_time_ms()?)?
+                    .into_iter()
+                    .next();
+                if oldest_pin.is_none_or(|pin| pin >= gc.0) {
+                    self.local
+                        .garbage_collect(gc.0)
+                        .context("apply consensus-approved MVCC GC watermark locally")?;
+                    advanced_gc = true;
+                } else {
+                    tracing::debug!(
+                        operation = "gc.apply",
+                        proposed_watermark = gc.0,
+                        oldest_active_snapshot = oldest_pin,
+                        "deferring local MVCC garbage collection behind durable snapshot pin"
+                    );
+                }
+            } else {
+                self.local
+                    .garbage_collect(gc.0)
+                    .context("apply consensus-approved MVCC GC watermark locally")?;
+                advanced_gc = true;
+            }
         }
         if advanced_gc && let Some(grace_ms) = self.prepared_bundle_gc_grace_ms {
             let reachable_bundles = self
@@ -440,7 +475,12 @@ mod tests {
     use crate::{
         anvil_api::{ReplicationSessionOpen, replication_service_server::ReplicationServiceServer},
         bundle_replication::{BundleTarget, BundleTargetStream},
-        mvcc_transaction::{HierarchicalRangeStampScheme, LogicalKey, TransactionBundleBuilder},
+        mvcc_node_runtime::CommitOutcome,
+        mvcc_open_transactions::TransactionRuntime,
+        mvcc_transaction::{
+            CertificationResult, DurabilityLevel, HierarchicalRangeStampScheme, LogicalKey,
+            ReadConsistency, TransactionBundleBuilder,
+        },
         replication::AuthenticatedPeer,
         replication_client::{ReplicationPeer, ReplicationStreamOptions},
         services::replication::{ReplicationConnectionAuthorizer, ReplicationServiceImpl},
@@ -464,6 +504,31 @@ mod tests {
         decisions: StdMutex<Vec<AppliedDecision>>,
         gc: CommitVersion,
         violations: Vec<LocalDurabilityViolation>,
+    }
+
+    struct SnapshotRuntime(CommitVersion);
+
+    #[async_trait]
+    impl TransactionRuntime for SnapshotRuntime {
+        async fn transaction_snapshot(&self, _: ReadConsistency) -> Result<u64> {
+            Ok(self.0.0)
+        }
+
+        async fn commit_transaction_bundle(
+            &self,
+            _: TransactionBundle,
+            _: DurabilityLevel,
+        ) -> Result<CommitOutcome> {
+            unreachable!()
+        }
+
+        fn apply_transaction_decision(
+            &self,
+            _: TransactionBundle,
+            _: CertificationResult,
+        ) -> Result<CommitOutcome> {
+            unreachable!()
+        }
     }
 
     impl DecisionSource for Source {
@@ -555,6 +620,56 @@ mod tests {
                 durable_holders: Vec::new(),
             }),
         }
+    }
+
+    #[tokio::test]
+    async fn durable_snapshot_pin_defers_local_consensus_gc_until_resolution() {
+        let prepared_directory = tempdir().unwrap();
+        let local_directory = tempdir().unwrap();
+        let registry_directory = tempdir().unwrap();
+        let prepared = AppendOnlyPreparedBundleStore::open(
+            prepared_directory.path(),
+            "cluster",
+            NodeIncarnation {
+                node_id: "node-a".into(),
+                incarnation: 1,
+            },
+            "zone-a",
+        )
+        .unwrap();
+        let local = LocalMvccStore::open(local_directory.path()).unwrap();
+        local.advance_decision_watermark(8).unwrap();
+        let registry = Arc::new(OpenTransactionRegistry::open(registry_directory.path()).unwrap());
+        let now = unix_time_ms().unwrap();
+        let transaction = registry
+            .begin(
+                &SnapshotRuntime(CommitVersion(7)),
+                "cluster",
+                "principal",
+                "pin-before-gc",
+                Duration::from_secs(30),
+                DurabilityLevel::Quorum,
+                ReadConsistency::Linearized,
+                now,
+            )
+            .await
+            .unwrap();
+        let source = Arc::new(Source {
+            decisions: StdMutex::new(Vec::new()),
+            gc: CommitVersion(8),
+            violations: vec![],
+        });
+        let running =
+            worker(source, prepared, local.clone()).with_open_transactions(registry.clone());
+
+        assert_eq!(running.apply_available().await.unwrap(), 0);
+        assert_eq!(local.gc_watermark().unwrap(), 0);
+
+        registry
+            .rollback(&transaction.transaction_id, "principal", now + 1)
+            .unwrap();
+        assert_eq!(running.apply_available().await.unwrap(), 0);
+        assert_eq!(local.gc_watermark().unwrap(), 8);
     }
 
     #[tokio::test]
