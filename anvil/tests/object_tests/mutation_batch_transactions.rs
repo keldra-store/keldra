@@ -879,6 +879,182 @@ async fn twenty_put_explicit_batch_finishes_before_ttl_and_commits_atomically() 
 }
 
 #[tokio::test]
+async fn mixed_public_object_rpcs_publish_on_one_commit() {
+    let fixture = SingleNodeMutationBatchFixture::new("tx-mixed-public-rpcs-commit").await;
+    let mut transaction_client = fixture.transaction_client().await;
+    let mut object_client = fixture.object_client().await;
+    let source_key = "mixed-success/source.json";
+    let delete_key = "mixed-success/deleted.json";
+    let copy_key = "mixed-success/copied.json";
+    let put_key = "mixed-success/created.json";
+    let link_key = "mixed-success/link";
+    for (key, payload, tag) in [
+        (source_key, br#"{"source":true}"#.as_slice(), "mixed-source"),
+        (delete_key, br#"{"delete":true}"#.as_slice(), "mixed-delete"),
+    ] {
+        put_object_for_test(
+            &mut object_client,
+            &fixture.actor.token,
+            &fixture.bucket_name,
+            key,
+            payload,
+            native_mutation_context(&fixture.actor, fixture.bucket_id, tag),
+        )
+        .await
+        .expect("seed mixed transaction object");
+    }
+    let transaction = fixture
+        .begin_transaction(
+            &mut transaction_client,
+            "mixed public object RPC commit",
+            EXPLICIT_TRANSACTION_TTL_MS,
+        )
+        .await;
+    let copied = object_client
+        .copy_object(authorized(
+            CopyObjectRequest {
+                source_bucket_name: fixture.bucket_name.clone(),
+                source_object_key: source_key.to_string(),
+                source_version_id: None,
+                destination_bucket_name: fixture.bucket_name.clone(),
+                destination_object_key: copy_key.to_string(),
+                mutation_context: Some(
+                    fixture.mutation_context("mixed-success-copy", &transaction.transaction_id),
+                ),
+            },
+            &fixture.actor.token,
+        ))
+        .await
+        .expect("stage mixed copy")
+        .into_inner();
+    assert_eq!(copied.write_state, WriteState::Staged as i32);
+    assert_eq!(copied.watch_cursor, 0);
+    object_client
+        .create_object_link(authorized(
+            CreateObjectLinkRequest {
+                context: Some(PublicMutationContext {
+                    request_id: "mixed-success-link".to_string(),
+                    idempotency_key: format!("mixed-success-link-{}", uuid::Uuid::new_v4()),
+                    expected_generation: 0,
+                    transaction_id: Some(transaction.transaction_id.clone()),
+                }),
+                tenant_id: String::new(),
+                bucket_name: fixture.bucket_name.clone(),
+                link_key: link_key.to_string(),
+                target_key: source_key.to_string(),
+                target_version: String::new(),
+                resolution: ObjectLinkResolution::Follow as i32,
+                allow_dangling: false,
+            },
+            &fixture.actor.token,
+        ))
+        .await
+        .expect("stage mixed link");
+    let staged = object_client
+        .mutation_batch(authorized(
+            MutationBatchRequest {
+                bucket_name: fixture.bucket_name.clone(),
+                mutation_context: Some(
+                    fixture.mutation_context("mixed-success-batch", &transaction.transaction_id),
+                ),
+                precondition: None,
+                operations: vec![
+                    small_put(put_key, br#"{"created":true}"#.to_vec()),
+                    MutationBatchOperation {
+                        op: Some(anvil_api::mutation_batch_operation::Op::DeleteObject(
+                            MutationBatchDeleteObject {
+                                object_key: delete_key.to_string(),
+                                version_id: None,
+                            },
+                        )),
+                    },
+                ],
+            },
+            &fixture.actor.token,
+        ))
+        .await
+        .expect("stage mixed put and delete")
+        .into_inner();
+    assert_eq!(staged.write_state, WriteState::Staged as i32);
+    assert_eq!(staged.watch_cursor, 0);
+    assert_object_missing(&fixture, &mut object_client, copy_key).await;
+    assert_object_missing(&fixture, &mut object_client, put_key).await;
+    assert!(
+        object_client
+            .read_object_link(authorized(
+                ReadObjectLinkRequest {
+                    request_id: "read-hidden-mixed-link".to_string(),
+                    tenant_id: String::new(),
+                    bucket_name: fixture.bucket_name.clone(),
+                    link_key: link_key.to_string(),
+                    consistency: None,
+                },
+                &fixture.actor.token,
+            ))
+            .await
+            .is_err(),
+        "staged mixed link leaked before commit"
+    );
+    assert_eq!(
+        get_object_bytes_for_test(
+            &mut object_client,
+            &fixture.actor.token,
+            &fixture.bucket_name,
+            delete_key,
+            None,
+        )
+        .await,
+        br#"{"delete":true}"#
+    );
+
+    let committed = transaction_client
+        .commit_transaction(authorized(
+            fixture.commit_request(transaction.transaction_id),
+            &fixture.actor.token,
+        ))
+        .await
+        .expect("commit mixed public RPC transaction")
+        .into_inner();
+    assert_eq!(committed.state, WriteState::Committed as i32);
+    assert_eq!(
+        get_object_bytes_for_test(
+            &mut object_client,
+            &fixture.actor.token,
+            &fixture.bucket_name,
+            copy_key,
+            None,
+        )
+        .await,
+        br#"{"source":true}"#
+    );
+    assert_eq!(
+        get_object_bytes_for_test(
+            &mut object_client,
+            &fixture.actor.token,
+            &fixture.bucket_name,
+            put_key,
+            None,
+        )
+        .await,
+        br#"{"created":true}"#
+    );
+    assert_object_missing(&fixture, &mut object_client, delete_key).await;
+    object_client
+        .read_object_link(authorized(
+            ReadObjectLinkRequest {
+                request_id: "read-committed-mixed-link".to_string(),
+                tenant_id: String::new(),
+                bucket_name: fixture.bucket_name.clone(),
+                link_key: link_key.to_string(),
+                consistency: None,
+            },
+            &fixture.actor.token,
+        ))
+        .await
+        .expect("mixed link becomes visible only after commit");
+}
+
+#[tokio::test]
 async fn object_version_precondition_is_revalidated_at_transaction_publication() {
     let fixture = SingleNodeMutationBatchFixture::new("tx-batch-durable-object-precondition").await;
     let mut transaction_client = fixture.transaction_client().await;
