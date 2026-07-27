@@ -37,6 +37,7 @@ struct ProcessNode {
     admin_addr: SocketAddr,
     storage_path: PathBuf,
     incarnation: u64,
+    hard_crash_control_path: PathBuf,
     child: Option<Child>,
 }
 
@@ -94,6 +95,9 @@ impl ProcessMvccCluster {
                 admin_addr,
                 storage_path: directory.path().join(format!("node-{}", index + 1)),
                 incarnation: 1,
+                hard_crash_control_path: directory
+                    .path()
+                    .join(format!("node-{}-hard-crash", index + 1)),
                 child: None,
             })
             .collect();
@@ -209,6 +213,39 @@ impl ProcessMvccCluster {
         Ok(())
     }
 
+    /// Arm a one-shot hard crash in an already-running debug child. The hook
+    /// consumes this file before aborting, so same-disk restart can recover.
+    pub fn arm_hard_crash(&self, node: usize, fault_point: &str) -> anyhow::Result<()> {
+        const PROCESS_SAFE_POINTS: &[&str] = &["MvccBatchWrite"];
+        if !PROCESS_SAFE_POINTS.contains(&fault_point) {
+            bail!("fault point is not enabled for process-backed hard crashes");
+        }
+        std::fs::write(&self.nodes[node].hard_crash_control_path, fault_point)
+            .context("arm process MVCC hard crash")
+    }
+
+    pub async fn wait_for_hard_crash(
+        &mut self,
+        node: usize,
+        timeout: Duration,
+    ) -> anyhow::Result<()> {
+        tokio::time::timeout(timeout, async {
+            loop {
+                let child = self.nodes[node]
+                    .child
+                    .as_mut()
+                    .context("process MVCC node is not running")?;
+                if child.try_wait()?.is_some() {
+                    self.nodes[node].child = None;
+                    return Ok::<_, anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .context("timed out waiting for process MVCC hard crash")?
+    }
+
     pub async fn restart(&mut self, node: usize) -> anyhow::Result<()> {
         if self.nodes[node].child.is_some() {
             bail!("cannot restart a running process MVCC node");
@@ -280,6 +317,10 @@ impl ProcessMvccCluster {
             .env("BOOTSTRAP_SYSTEM_ADMIN_SUBJECT_KIND", "app")
             .env("BOOTSTRAP_SYSTEM_ADMIN_SUBJECT_ID", ADMIN_PRINCIPAL)
             .env("ANVIL_TEST_ALLOW_INSECURE_MVCC_TRANSPORT", "1")
+            .env(
+                "ANVIL_MVCC_HARD_CRASH_CONTROL_FILE",
+                &self.nodes[node].hard_crash_control_path,
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

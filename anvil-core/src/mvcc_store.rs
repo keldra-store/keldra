@@ -425,7 +425,7 @@ impl MvccStore {
                 position.to_be_bytes(),
             );
         }
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         crate::mvcc_fault_injection::hit(crate::mvcc_fault_injection::FaultPoint::MvccBatchWrite)?;
         self.db.write_opt(batch, &durable_write_options())?;
         Ok(ApplyOutcome::Applied)

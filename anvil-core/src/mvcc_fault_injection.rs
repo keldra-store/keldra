@@ -85,6 +85,18 @@ pub fn clear() {
 }
 
 pub fn hit(point: FaultPoint) -> Result<(), InjectedFault> {
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var_os("ANVIL_MVCC_HARD_CRASH_CONTROL_FILE") {
+        let path = std::path::PathBuf::from(path);
+        if std::fs::read_to_string(&path)
+            .is_ok_and(|configured| configured.trim() == format!("{point:?}"))
+        {
+            // One-shot arming avoids a restarted process crashing again while
+            // recovering the same committed decision from its original disk.
+            let _ = std::fs::remove_file(path);
+            std::process::abort();
+        }
+    }
     if std::env::var("ANVIL_MVCC_HARD_CRASH_AT")
         .ok()
         .as_deref()
