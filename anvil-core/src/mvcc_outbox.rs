@@ -14,7 +14,7 @@ use crate::{
         MVCC_OUTBOX_BACKLOG, MVCC_OUTBOX_FAILURES, MVCC_OUTBOX_OLDEST_AGE_MS, Observability,
     },
 };
-use anvil_mvcc_consensus::{NodeId, OpenRaftConsensus};
+use anvil_mvcc_consensus::{Consensus, NodeId, OpenRaftConsensus};
 
 const OUTBOX_SCHEMA: &str = "anvil.mvcc.outbox.stream.v1";
 
@@ -189,10 +189,7 @@ impl MvccOutboxRunner {
     pub async fn run_once(&self) -> Result<bool> {
         let now = unix_ms();
         self.publish_metrics(now)?;
-        if !self.consensus.is_leader() {
-            return Ok(false);
-        }
-        let snapshot = self.consensus.applied_control_snapshot()?;
+        let snapshot = self.linearized_control_snapshot().await?;
         let record =
             self.store
                 .claim_outbox_where(&self.worker_id, now, self.lease_ms, |record| {
@@ -210,8 +207,7 @@ impl MvccOutboxRunner {
             return Ok(false);
         };
         let event = StreamOutboxEvent::decode(&record.payload)?;
-        let guard = self
-            .assignment_guard(event.partition_id)?
+        let guard = Self::assignment_guard(&snapshot, &self.local_node, event.partition_id)
             .context("outbox assignment changed after claim")?;
         let lease_owner = guard.lease_owner(&self.worker_id);
         let record = self
@@ -243,10 +239,10 @@ impl MvccOutboxRunner {
             );
         }
 
-        // Leadership and assignment may change while CoreStore durably appends.
-        // In that case leave the lease to expire. The new owner will replay the
+        // Assignment may change while CoreStore durably appends. In that case
+        // leave the lease to expire. The new owner will replay the
         // deterministic downstream idempotency key and receive the same ACK.
-        if !self.consensus.is_leader() || !self.still_assigned(&guard)? {
+        if !self.still_assigned(&guard).await? {
             return Ok(false);
         }
         let completed_at = unix_ms();
@@ -257,38 +253,54 @@ impl MvccOutboxRunner {
     }
 
     fn assignment_guard(
-        &self,
+        snapshot: &anvil_mvcc_consensus::AppliedControlSnapshot,
+        local_node: &anvil_mvcc_consensus::NodeIncarnation,
         partition_id: u64,
-    ) -> Result<Option<crate::mvcc_worker_authority::AssignmentGuard>> {
-        let snapshot = self.consensus.applied_control_snapshot()?;
-        Ok(snapshot
+    ) -> Option<crate::mvcc_worker_authority::AssignmentGuard> {
+        snapshot
             .partitions
             .iter()
-            .find(|(id, assignment)| *id == partition_id && assignment.owner == self.local_node)
+            .find(|(id, assignment)| *id == partition_id && assignment.owner == *local_node)
             .map(
                 |(_, assignment)| crate::mvcc_worker_authority::AssignmentGuard {
                     partition_id,
                     assignment_epoch: assignment.epoch,
                     topology_epoch: snapshot.topology_epoch,
                     owner: NodeIncarnation {
-                        node_id: self.local_node.node_id.0.to_string(),
-                        incarnation: self.local_node.incarnation,
+                        node_id: local_node.node_id.0.to_string(),
+                        incarnation: local_node.incarnation,
                     },
                 },
-            ))
+            )
     }
 
-    fn still_assigned(
+    async fn still_assigned(
         &self,
         guard: &crate::mvcc_worker_authority::AssignmentGuard,
     ) -> Result<bool> {
-        let snapshot = self.consensus.applied_control_snapshot()?;
+        let snapshot = self.linearized_control_snapshot().await?;
         Ok(snapshot.topology_epoch == guard.topology_epoch
             && snapshot.partitions.iter().any(|(id, assignment)| {
                 *id == guard.partition_id
                     && assignment.epoch == guard.assignment_epoch
                     && assignment.owner == self.local_node
             }))
+    }
+
+    async fn linearized_control_snapshot(
+        &self,
+    ) -> Result<anvil_mvcc_consensus::AppliedControlSnapshot> {
+        let target = self.consensus.linearized_read_barrier().await?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if self.consensus.observed_commit_version() >= target {
+                    return self.consensus.applied_control_snapshot();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("local control state did not reach the linearized outbox assignment")?
     }
 
     fn retry(
