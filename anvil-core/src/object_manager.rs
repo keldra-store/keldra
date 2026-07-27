@@ -1553,7 +1553,25 @@ impl ObjectManager {
                 .await
         }
         .map_err(|e| Status::internal(e.to_string()))?;
-        if transaction_id.is_none() {
+        if let Some(transaction_id) = transaction_id {
+            let transaction_principal = transaction_principal.ok_or_else(|| {
+                Status::invalid_argument(
+                    "transaction principal is required for append stream create",
+                )
+            })?;
+            access_control::stage_stream_defaults(
+                &self.persistence,
+                &bucket,
+                stream_key,
+                &claims.sub,
+                &claims.sub,
+                "grant creator stream owner",
+                transaction_id,
+                transaction_principal,
+            )
+            .await
+            .map_err(core_store_status)?;
+        } else {
             access_control::grant_stream_defaults(
                 &self.persistence,
                 &bucket,
@@ -1562,7 +1580,7 @@ impl ObjectManager {
                 &claims.sub,
                 "grant creator stream owner",
             )
-            .await
+                .await
             .map_err(core_store_status)?;
         }
         Ok(CreateAppendStreamResult {
