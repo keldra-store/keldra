@@ -740,7 +740,7 @@ impl CoreStore {
             || manifest.boundary_values != finalisation.boundary_values
         {
             bail!(
-                "CoreStore finalised object result does not match its admitted mutation: manifest_mutation_id={}, finalisation_mutation_id={}, manifest_logical_file_id={}, expected_logical_file_id={}, manifest_region_id={}, expected_region_id={}, manifest_writer_family={}, expected_writer_family={}, manifest_object_hash={}, expected_object_hash={}, manifest_logical_size={}, expected_logical_size={}, manifest_logical_offset={}, expected_logical_offset={}, manifest_encryption={}, expected_encryption={}, manifest_profile={}, expected_profile={}, manifest_compression={}, expected_compression={}, manifest_boundary_values={:?}, expected_boundary_values={:?}",
+                "CoreStore finalised object result does not match its admitted mutation: manifest_mutation_id={}, finalisation_mutation_id={}, manifest_logical_file_id={}, expected_logical_file_id={}, manifest_region_id={}, expected_region_id={}, manifest_writer_family={}, expected_writer_family={}, manifest_object_hash={}, expected_object_hash={}, manifest_logical_size={}, expected_logical_size={}, manifest_logical_offset={}, expected_logical_offset={}, manifest_encryption={}, expected_encryption={}, manifest_profile={}, expected_profile={}, manifest_compression={:?}, expected_compression={:?}, manifest_boundary_values={:?}, expected_boundary_values={:?}",
                 manifest.mutation_id,
                 finalisation.mutation_id,
                 manifest.logical_file_id,
