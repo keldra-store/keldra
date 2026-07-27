@@ -618,6 +618,140 @@ async fn real_cluster_elects_a_new_leader_and_catches_up_crashed_leader() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn real_cluster_fetches_a_missing_committed_bundle_before_advancing_apply_watermark() {
+    use anvil_mvcc_consensus::Consensus as _;
+
+    let cluster = RealMvccCluster::start().await.unwrap();
+    let leader = cluster.wait_for_any_leader(&[0, 1, 2]).await.unwrap();
+    let lagging = [0, 1, 2]
+        .into_iter()
+        .find(|node| *node != leader)
+        .unwrap();
+    cluster.partition_replication(lagging);
+
+    let key = LogicalKey {
+        table_id: 2,
+        application_key: b"fixture/missing-prepared-bundle".to_vec(),
+    };
+    let outcome = cluster
+        .commit(
+            leader,
+            "fixture-missing-prepared-bundle",
+            key.clone(),
+            b"fetched-from-authenticated-holder".to_vec(),
+        )
+        .await
+        .unwrap();
+    let commit_version = match outcome.certification {
+        CertificationResult::Committed { commit_version } => commit_version,
+        CertificationResult::Aborted { reason } => {
+            panic!("missing-bundle transaction aborted: {reason:?}")
+        }
+    };
+    let committed = cluster
+        .state(lagging)
+        .mvcc
+        .consensus
+        .applied_decisions_after(anvil_mvcc_consensus::CommitVersion(
+            commit_version.saturating_sub(1),
+        ))
+        .unwrap()
+        .into_iter()
+        .find(|decision| decision.position.0 == commit_version)
+        .and_then(|decision| decision.committed_bundle)
+        .expect("Raft decision names the immutable prepared bundle identity");
+    let identity = anvil::mvcc_transaction::BundleIdentity {
+        hash: format!("sha256:{}", hex::encode(committed.bundle_hash.0)),
+        length: committed.bundle_length,
+    };
+    let transfer_id = anvil::replication_client::bundle_transfer_id(&identity).unwrap();
+    assert!(
+        !cluster
+            .replication_transfer_path(lagging, transfer_id)
+            .exists(),
+        "replication partition leaves the committed node without its bundle transfer"
+    );
+
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            if cluster
+                .state(lagging)
+                .mvcc
+                .consensus
+                .observed_commit_version()
+                .0
+                >= commit_version
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("lagging node observes the compact committed decision over Raft");
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert!(
+        cluster
+            .state(lagging)
+            .mvcc
+            .runtime
+            .local_store()
+            .decision_watermark()
+            .unwrap()
+            < commit_version,
+        "apply worker must stop at a committed decision whose canonical bundle is unavailable"
+    );
+    assert!(
+        cluster
+            .state(lagging)
+            .mvcc
+            .runtime
+            .read_at(&key, commit_version)
+            .unwrap()
+            .is_none(),
+        "a missing bundle cannot become partially visible"
+    );
+
+    cluster.heal_replication(lagging);
+    cluster
+        .wait_for_applied_version(lagging, commit_version)
+        .await
+        .unwrap();
+    assert_eq!(
+        cluster
+            .state(lagging)
+            .mvcc
+            .runtime
+            .local_store()
+            .decision_watermark()
+            .unwrap(),
+        commit_version,
+        "verified bundle application and watermark advancement are one local atomic batch"
+    );
+    let row = cluster
+        .state(lagging)
+        .mvcc
+        .runtime
+        .read_at(&key, commit_version)
+        .unwrap()
+        .expect("authenticated peer recovery makes the committed row visible");
+    assert_eq!(row.value, b"fetched-from-authenticated-holder");
+
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert_eq!(
+        cluster
+            .state(lagging)
+            .mvcc
+            .runtime
+            .local_store()
+            .decision_watermark()
+            .unwrap(),
+        commit_version,
+        "the recovered decision is not re-applied after its watermark advances"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn real_cluster_reconstructs_a_deleted_shard_and_publishes_repaired_placement() {
     let cluster = RealMvccCluster::start().await.unwrap();
     let leader = cluster.wait_for_any_leader(&[0, 1, 2]).await.unwrap();

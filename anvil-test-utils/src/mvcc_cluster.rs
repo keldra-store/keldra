@@ -226,6 +226,23 @@ impl RealMvccCluster {
         );
     }
 
+    /// Blocks only replication traffic for a node, leaving its Raft transport
+    /// connected so tests can observe a committed decision ahead of its local
+    /// bundle/application watermark.
+    pub fn partition_replication(&self, node: usize) {
+        anvil_core::cluster_transport_fault::partition_node(
+            &self.configs[node].mvcc_cluster_id,
+            self.configs[node].node_id.clone(),
+        );
+    }
+
+    pub fn heal_replication(&self, node: usize) {
+        anvil_core::cluster_transport_fault::heal_node(
+            &self.configs[node].mvcc_cluster_id,
+            &self.configs[node].node_id,
+        );
+    }
+
     /// Reopens the node from the same RocksDB directory and network identity.
     pub async fn restart_node(&mut self, node: usize) -> anyhow::Result<()> {
         self.heal(node);
