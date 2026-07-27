@@ -2,6 +2,7 @@ use crate::{
     anvil_personaldb_sqlite_changeset::DecodedSqliteChangesetChange,
     formats::hash32,
     personaldb_coremeta::{
+        PersonalDbWritePlan, prepare_personaldb_bytes_as_data_locator,
         read_personaldb_data_locator_bytes, read_personaldb_data_locator_row_at_snapshot,
         write_personaldb_bytes_as_data_locator_mvcc,
     },
@@ -39,6 +40,34 @@ pub async fn write_personaldb_schema_sql(
     )
     .await?;
     Ok(())
+}
+
+pub async fn prepare_and_stage_personaldb_schema_sql(
+    storage: &Storage,
+    plan: &mut PersonalDbWritePlan,
+    tenant_id: i64,
+    database_id: &str,
+    root_generation: u64,
+    schema_sql: &str,
+    schema_hash: &str,
+) -> Result<()> {
+    validate_schema_sql(schema_sql, schema_hash)?;
+    let ref_name = personaldb_schema_ref_name(tenant_id, database_id)?;
+    let row = prepare_personaldb_bytes_as_data_locator(
+        storage,
+        tenant_id,
+        database_id,
+        &ref_name,
+        "schema_sql",
+        1,
+        root_generation,
+        schema_sql.as_bytes().to_vec(),
+        schema_hash.to_string(),
+        vec![format!("schema_hash:{schema_hash}")],
+        format!("personaldb-schema:{tenant_id}:{database_id}:{schema_hash}"),
+    )
+    .await?;
+    plan.stage_data_locator_row(&row)
 }
 
 pub async fn read_personaldb_schema_sql(

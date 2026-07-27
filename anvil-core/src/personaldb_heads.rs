@@ -7,7 +7,8 @@ use crate::{
     formats::hash32,
     personaldb_control::PersonalDbGroupManifest,
     personaldb_coremeta::{
-        PersonalDbDataLocatorCoreMetaRow, PersonalDbGroupCoreMetaRow, personaldb_payload_hash,
+        PersonalDbDataLocatorCoreMetaRow, PersonalDbGroupCoreMetaRow, PersonalDbWritePlan,
+        personaldb_payload_hash, prepare_personaldb_bytes_as_data_locator,
         read_personaldb_data_locator_bytes, read_personaldb_data_locator_row_at_snapshot,
         write_personaldb_bytes_as_data_locator_mvcc, write_personaldb_group_row_mvcc,
     },
@@ -263,6 +264,27 @@ pub fn hash_snapshots_head(head: &PersonalDbSnapshotsHead) -> Result<String> {
     Ok(hex::encode(snapshots_head_payload_hash(head)))
 }
 
+pub async fn prepare_and_stage_personaldb_committed_head(
+    storage: &Storage,
+    plan: &mut PersonalDbWritePlan,
+    tenant_id: i64,
+    database_id: &str,
+    root_generation: u64,
+    head: &PersonalDbCommittedHead,
+    trust_store: &PublicKeyTrustStore,
+) -> Result<()> {
+    head.verify(trust_store)?;
+    ensure_head_scope(tenant_id, database_id, &head.tenant_id, &head.database_id)?;
+    prepare_and_stage_head_record(
+        storage,
+        plan,
+        &personaldb_head_data_id(tenant_id, database_id, "committed_head")?,
+        root_generation,
+        head,
+    )
+    .await
+}
+
 pub async fn write_personaldb_group_manifest(
     storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
@@ -281,6 +303,31 @@ pub async fn write_personaldb_group_manifest(
         storage,
         mvcc,
         &personaldb_head_data_id(tenant_id, &manifest.database_id, "group_manifest")?,
+        manifest,
+    )
+    .await
+}
+
+pub async fn prepare_and_stage_personaldb_group_manifest(
+    storage: &Storage,
+    plan: &mut PersonalDbWritePlan,
+    tenant_id: i64,
+    root_generation: u64,
+    manifest: &PersonalDbGroupManifest,
+    trust_store: &PublicKeyTrustStore,
+) -> Result<()> {
+    manifest.verify(trust_store)?;
+    ensure_head_scope(
+        tenant_id,
+        &manifest.database_id,
+        &manifest.tenant_id,
+        &manifest.database_id,
+    )?;
+    prepare_and_stage_head_record(
+        storage,
+        plan,
+        &personaldb_head_data_id(tenant_id, &manifest.database_id, "group_manifest")?,
+        root_generation,
         manifest,
     )
     .await
@@ -434,6 +481,36 @@ async fn write_head_record<T: PersonalDbHeadRecordCodec>(
     .await?;
     if let Some(group_row) = value.group_coremeta_row(tenant_id, &database_id, &row)? {
         write_personaldb_group_row_mvcc(mvcc, &group_row, "system:personaldb").await?;
+    }
+    Ok(())
+}
+
+async fn prepare_and_stage_head_record<T: PersonalDbHeadRecordCodec>(
+    storage: &Storage,
+    plan: &mut PersonalDbWritePlan,
+    data_id: &str,
+    root_generation: u64,
+    value: &T,
+) -> Result<()> {
+    let (tenant_id, database_id) = personaldb_head_scope(data_id)?;
+    let encoded = value.encode_record()?;
+    let row = prepare_personaldb_bytes_as_data_locator(
+        storage,
+        tenant_id,
+        &database_id,
+        data_id,
+        value.data_kind(),
+        value.writer_generation().max(1),
+        root_generation,
+        encoded.clone(),
+        personaldb_payload_hash(&encoded),
+        vec![format!("kind:{}", value.data_kind())],
+        format!("personaldb-head:{data_id}"),
+    )
+    .await?;
+    plan.stage_data_locator_row(&row)?;
+    if let Some(group_row) = value.group_coremeta_row(tenant_id, &database_id, &row)? {
+        plan.stage_group_row(&group_row)?;
     }
     Ok(())
 }

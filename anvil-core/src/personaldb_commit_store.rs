@@ -306,6 +306,50 @@ pub async fn write_personaldb_commit_certificate(
     Ok(ref_name)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub async fn prepare_and_stage_personaldb_commit_certificate(
+    storage: &Storage,
+    plan: &mut PersonalDbWritePlan,
+    tenant_id: i64,
+    database_id: &str,
+    root_generation: u64,
+    certificate: &PersonalDbCommitCertificate,
+    trust_store: &PublicKeyTrustStore,
+) -> Result<String> {
+    certificate.verify(trust_store)?;
+    ensure_scope(
+        tenant_id,
+        database_id,
+        &certificate.tenant_id,
+        &certificate.database_id,
+    )?;
+    let ref_name = personaldb_commit_certificate_ref_name(
+        tenant_id,
+        database_id,
+        certificate.log_index,
+        &certificate.entry_hash,
+    )?;
+    let row = prepare_personaldb_bytes_as_data_locator(
+        storage,
+        tenant_id,
+        database_id,
+        &ref_name,
+        "commit_certificate",
+        certificate.log_index,
+        root_generation,
+        encode_commit_certificate(certificate)?,
+        personaldb_payload_hash(certificate.entry_hash.as_bytes()),
+        vec![format!("entry_hash:{}", certificate.entry_hash)],
+        format!(
+            "personaldb-commit-certificate:{tenant_id}:{database_id}:{}:{}",
+            certificate.log_index, certificate.entry_hash
+        ),
+    )
+    .await?;
+    plan.stage_data_locator_row(&row)?;
+    Ok(ref_name)
+}
+
 pub async fn read_personaldb_commit_certificate(
     storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
