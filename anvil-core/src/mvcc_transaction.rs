@@ -323,8 +323,33 @@ impl TransactionBundle {
         self.materialisation_jobs.sort();
         ensure_unique(self.materialisation_jobs.iter(), "materialisation job")?;
         for encoded_job in &self.materialisation_jobs {
-            let job = crate::object_materialisation::ObjectMaterialisationJob::decode(encoded_job)?;
-            if job.cluster_id != self.cluster_id || job.transaction_id != self.transaction_id {
+            let schema = serde_json::from_slice::<serde_json::Value>(encoded_job)?
+                .get("schema")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            let (cluster_id, transaction_id) = match schema.as_deref() {
+                Some(crate::mvcc_shard_repair::ShardRepairJob::SCHEMA) => {
+                    let job = crate::mvcc_shard_repair::ShardRepairJob::decode(encoded_job)?;
+                    (job.cluster_id, job.transaction_id)
+                }
+                Some(crate::mvcc_local_durability_upgrade::LocalDurabilityUpgradeJob::SCHEMA) => {
+                    let job: crate::mvcc_local_durability_upgrade::LocalDurabilityUpgradeJob =
+                        serde_json::from_slice(encoded_job)?;
+                    job.validate()?;
+                    (job.cluster_id, job.transaction_id)
+                }
+                Some(crate::index_finalization_job::IndexFinalizationJob::SCHEMA) => {
+                    let job =
+                        crate::index_finalization_job::IndexFinalizationJob::decode(encoded_job)?;
+                    (job.cluster_id, job.transaction_id)
+                }
+                _ => {
+                    let job =
+                        crate::object_materialisation::ObjectMaterialisationJob::decode(encoded_job)?;
+                    (job.cluster_id, job.transaction_id)
+                }
+            };
+            if cluster_id != self.cluster_id || transaction_id != self.transaction_id {
                 bail!("materialisation job belongs to another transaction or cluster");
             }
         }

@@ -20,6 +20,9 @@ use crate::mvcc_local_durability_upgrade::{
     LocalDurabilityUpgradeJob, LocalDurabilityUpgradeRecord, LocalDurabilityUpgradeState,
 };
 use crate::mvcc_shard_repair::{ShardRepairJob, ShardRepairRecord, ShardRepairState};
+use crate::index_finalization_job::{
+    IndexFinalizationJob, IndexFinalizationRecord, IndexFinalizationState,
+};
 use crate::mvcc_transaction::{CommitVersion, LogicalKey, TransactionBundle, WriteOperation};
 use crate::object_materialisation::ObjectMaterialisationState;
 use crate::object_materialisation::{ObjectMaterialisationJob, ObjectMaterialisationRecord};
@@ -133,6 +136,7 @@ impl MvccStore {
             (b"object-job/".as_slice(), "object-materialisation"),
             (b"shard-repair/".as_slice(), "shard-repair"),
             (b"local-upgrade/".as_slice(), "local-durability-upgrade"),
+            (b"index-finalization/".as_slice(), "index-finalization"),
         ] {
             let prefix = self.key(prefix_suffix);
             for row in self.db.iterator_cf(
@@ -155,6 +159,12 @@ impl MvccStore {
                         continue;
                     }
                     record.job.target_logical_identity
+                } else if kind == "index-finalization" {
+                    let record: IndexFinalizationRecord = serde_json::from_slice(&value)?;
+                    if record.state == IndexFinalizationState::Complete {
+                        continue;
+                    }
+                    record.job.target_logical_identity()
                 } else {
                     let record: LocalDurabilityUpgradeRecord = serde_json::from_slice(&value)?;
                     if record.state == LocalDurabilityUpgradeState::Complete {
@@ -373,6 +383,23 @@ impl MvccStore {
                     && existing.as_slice() != record.as_slice()
                 {
                     bail!("local durability upgrade job identity collision");
+                }
+                batch.put_cf(materialisation_cf, key, record);
+                continue;
+            }
+            if schema.as_deref() == Some(IndexFinalizationJob::SCHEMA) {
+                let job = IndexFinalizationJob::decode(encoded_job)?;
+                if job.cluster_id != self.cluster_id || job.transaction_id != bundle.transaction_id
+                {
+                    bail!("index finalization job belongs to another transaction or cluster");
+                }
+                let key = self.key(format!("index-finalization/{}", job.job_id()?).as_bytes());
+                let record =
+                    serde_json::to_vec(&IndexFinalizationRecord::pending(job, commit_version))?;
+                if let Some(existing) = self.db.get_cf(materialisation_cf, &key)?
+                    && existing.as_slice() != record.as_slice()
+                {
+                    bail!("index finalization job identity collision");
                 }
                 batch.put_cf(materialisation_cf, key, record);
                 continue;
@@ -1111,6 +1138,114 @@ impl MvccStore {
         self.claim_shard_repair_where(worker_id, now_unix_ms, lease_ms, |_| true)
     }
 
+    pub fn claim_index_finalization(
+        &self,
+        worker_id: &str,
+        now_unix_ms: u64,
+        lease_ms: u64,
+    ) -> Result<Option<(String, IndexFinalizationRecord)>> {
+        self.claim_index_finalization_where(worker_id, now_unix_ms, lease_ms, |_| true)
+    }
+
+    fn claim_index_finalization_where(
+        &self,
+        worker_id: &str,
+        now_unix_ms: u64,
+        lease_ms: u64,
+        eligible: impl Fn(&IndexFinalizationRecord) -> bool,
+    ) -> Result<Option<(String, IndexFinalizationRecord)>> {
+        if worker_id.trim().is_empty() || lease_ms == 0 {
+            bail!("index finalization worker and lease must be non-empty");
+        }
+        let _transition = self.materialisation_transition.lock().unwrap();
+        let cf = self.cf(CF_MATERIALISATION)?;
+        let prefix = self.key(b"index-finalization/");
+        for row in self
+            .db
+            .iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward))
+        {
+            let (key, value) = row?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let mut record: IndexFinalizationRecord = serde_json::from_slice(&value)?;
+            if !record.claimable(now_unix_ms) || !eligible(&record) {
+                continue;
+            }
+            record.state = IndexFinalizationState::Running;
+            record.attempts = record.attempts.saturating_add(1);
+            record.lease_owner = Some(worker_id.to_string());
+            record.lease_expires_unix_ms = Some(
+                now_unix_ms
+                    .checked_add(lease_ms)
+                    .context("index finalization lease expiry overflow")?,
+            );
+            self.db.put_cf_opt(
+                cf,
+                &key,
+                serde_json::to_vec(&record)?,
+                &durable_write_options(),
+            )?;
+            let id = String::from_utf8(self.unscoped(&key)?.to_vec())?
+                .strip_prefix("index-finalization/")
+                .context("invalid index finalization key")?
+                .to_string();
+            return Ok(Some((id, record)));
+        }
+        Ok(None)
+    }
+
+    pub fn claim_index_finalization_authorized(
+        &self,
+        worker_id: &str,
+        now_unix_ms: u64,
+        lease_ms: u64,
+        eligible: impl Fn(&IndexFinalizationRecord) -> Option<String>,
+    ) -> Result<Option<(String, IndexFinalizationRecord)>> {
+        self.claim_index_finalization_where(worker_id, now_unix_ms, lease_ms, |record| {
+            eligible(record).is_some()
+        })
+        .and_then(|claimed| {
+            let Some((job_id, mut record)) = claimed else {
+                return Ok(None);
+            };
+            let owner = eligible(&record).context("index assignment changed at claim")?;
+            self.transition_index_finalization(&job_id, worker_id, |current| {
+                current.lease_owner = Some(owner.clone());
+                Ok(())
+            })?;
+            record.lease_owner = Some(owner);
+            Ok(Some((job_id, record)))
+        })
+    }
+
+    pub fn retry_index_finalization(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        next_attempt_unix_ms: u64,
+        error: &str,
+    ) -> Result<()> {
+        self.transition_index_finalization(job_id, worker_id, |record| {
+            record.state = IndexFinalizationState::Pending;
+            record.next_attempt_unix_ms = next_attempt_unix_ms;
+            record.lease_owner = None;
+            record.lease_expires_unix_ms = None;
+            record.last_error = Some(error.to_string());
+            Ok(())
+        })
+    }
+
+    pub fn complete_index_finalization(&self, job_id: &str, worker_id: &str) -> Result<()> {
+        self.transition_index_finalization(job_id, worker_id, |record| {
+            record.state = IndexFinalizationState::Complete;
+            record.lease_owner = None;
+            record.lease_expires_unix_ms = None;
+            record.last_error = None;
+            Ok(())
+        })
+    }
+
     pub fn claim_shard_repair_where(
         &self,
         worker_id: &str,
@@ -1332,6 +1467,21 @@ impl MvccStore {
                 pins.transaction_ids.insert(record.job.transaction_id);
             }
         }
+        let index_prefix = self.key(b"index-finalization/");
+        for row in self.db.iterator_cf(
+            materialisation_cf,
+            IteratorMode::From(&index_prefix, Direction::Forward),
+        ) {
+            let (key, value) = row?;
+            if !key.starts_with(&index_prefix) {
+                break;
+            }
+            let record: IndexFinalizationRecord = serde_json::from_slice(&value)?;
+            if record.state != IndexFinalizationState::Complete {
+                pins.materialisation_snapshots.insert(record.commit_version);
+                pins.transaction_ids.insert(record.job.transaction_id);
+            }
+        }
         Ok(pins)
     }
 
@@ -1531,6 +1681,35 @@ impl MvccStore {
         Ok(())
     }
 
+    fn transition_index_finalization(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        update: impl FnOnce(&mut IndexFinalizationRecord) -> Result<()>,
+    ) -> Result<()> {
+        let _transition = self.materialisation_transition.lock().unwrap();
+        let cf = self.cf(CF_MATERIALISATION)?;
+        let key = self.key(format!("index-finalization/{job_id}").as_bytes());
+        let bytes = self
+            .db
+            .get_cf(cf, &key)?
+            .context("index finalization job not found")?;
+        let mut record: IndexFinalizationRecord = serde_json::from_slice(&bytes)?;
+        if record.state != IndexFinalizationState::Running
+            || record.lease_owner.as_deref() != Some(worker_id)
+        {
+            bail!("index finalization job is not leased by this worker");
+        }
+        update(&mut record)?;
+        self.db.put_cf_opt(
+            cf,
+            key,
+            serde_json::to_vec(&record)?,
+            &durable_write_options(),
+        )?;
+        Ok(())
+    }
+
     fn transition_local_durability_upgrade(
         &self,
         job_id: &str,
@@ -1674,6 +1853,14 @@ impl MvccStore {
             &mut deleted,
             &mut deleted_bytes,
         )?;
+        self.collect_completed_jobs(
+            materialisation_cf,
+            b"index-finalization/",
+            safe_watermark,
+            &mut batch,
+            &mut deleted,
+            &mut deleted_bytes,
+        )?;
         batch.put_cf(
             meta_cf,
             self.key(GC_WATERMARK_KEY),
@@ -1717,10 +1904,14 @@ impl MvccStore {
                 let record: ShardRepairRecord = serde_json::from_slice(&value)?;
                 record.state == ShardRepairState::Complete
                     && record.job.originating_snapshot_version < safe_watermark
-            } else {
+            } else if suffix == b"local-upgrade/" {
                 let record: LocalDurabilityUpgradeRecord = serde_json::from_slice(&value)?;
                 record.state == LocalDurabilityUpgradeState::Complete
                     && record.job.commit_version < safe_watermark
+            } else {
+                let record: IndexFinalizationRecord = serde_json::from_slice(&value)?;
+                record.state == IndexFinalizationState::Complete
+                    && record.commit_version < safe_watermark
             };
             if completed_below_watermark {
                 batch.delete_cf(cf, &key);
