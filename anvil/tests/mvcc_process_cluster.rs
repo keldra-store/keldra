@@ -257,6 +257,85 @@ async fn public_object_batch_retries_after_crash_before_prepared_bundle_sync() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn public_object_batch_retries_after_crash_before_raft_wal_append() {
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_anvil-server"));
+    let mut cluster = ProcessMvccCluster::start(binary).await.unwrap();
+    let coordinator = cluster.wait_for_leader(&[0, 1, 2]).await.unwrap();
+    let bucket_name = format!("process-raft-wal-{}", uuid::Uuid::new_v4().simple());
+    let bucket_id = cluster.create_bucket(coordinator, &bucket_name).await.unwrap();
+    let transaction = cluster
+        .begin_transaction(coordinator, MvccReadConsistency::Linearized)
+        .await
+        .unwrap();
+    let keys = ["raft-wal-crash/one.bin", "raft-wal-crash/two.bin"];
+    let staged = cluster
+        .stage_object_puts(
+            coordinator,
+            &bucket_name,
+            bucket_id,
+            &transaction.transaction_id,
+            &[(keys[0], b"one"), (keys[1], b"two")],
+        )
+        .await
+        .unwrap();
+    assert_eq!(staged.write_state, WriteState::Staged as i32);
+
+    cluster.arm_hard_crash(coordinator, "RaftLogWrite").unwrap();
+    let commit = cluster.commit_transaction(
+        cluster.public_endpoint(coordinator),
+        transaction.transaction_id.clone(),
+    );
+    let (commit_result, crash_result) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(10), commit),
+        cluster.wait_for_hard_crash(coordinator, Duration::from_secs(10)),
+    );
+    crash_result.unwrap();
+    assert!(
+        !matches!(commit_result, Ok(Ok(_))),
+        "crashing before the local Raft WAL append must not return commit success"
+    );
+
+    let survivors = [0, 1, 2]
+        .into_iter()
+        .filter(|node| *node != coordinator)
+        .collect::<Vec<_>>();
+    let survivor = cluster.wait_for_leader(&survivors).await.unwrap();
+    for key in keys {
+        assert!(
+            !cluster.object_exists(survivor, &bucket_name, key).await.unwrap(),
+            "a proposal absent from the leader WAL must not leak partial visibility"
+        );
+    }
+
+    cluster.restart(coordinator).await.unwrap();
+    let retry = cluster
+        .commit_transaction(
+            cluster.public_endpoint(coordinator),
+            transaction.transaction_id.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retry.state, WriteState::Committed as i32);
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let all_visible = matches!(
+                cluster.object_exists(survivor, &bucket_name, keys[0]).await,
+                Ok(true)
+            ) && matches!(
+                cluster.object_exists(survivor, &bucket_name, keys[1]).await,
+                Ok(true)
+            );
+            if all_visible {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("retried transaction converges atomically after Raft WAL crash recovery");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn killed_node_is_replaced_by_higher_incarnation_and_catches_up() {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_anvil-server"));
     let mut cluster = ProcessMvccCluster::start(binary).await.unwrap();
