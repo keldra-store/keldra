@@ -15,9 +15,8 @@ use std::{
     sync::Arc,
 };
 
-const SUPPORTED_PERSONALDB_SIGNER_PURPOSES: [SignaturePurpose; 4] = [
+const SUPPORTED_PERSONALDB_SIGNER_PURPOSES: [SignaturePurpose; 3] = [
     SignaturePurpose::GroupControl,
-    SignaturePurpose::ProposalAdmission,
     SignaturePurpose::Snapshot,
     SignaturePurpose::Witness,
 ];

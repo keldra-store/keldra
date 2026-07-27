@@ -91,11 +91,6 @@ pub fn personaldb_test_protocol_keyring()
             SignaturePurpose::GroupControl,
         ),
         signer(
-            "MC4CAQAwBQYDK2VwBCIEIDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8",
-            "VSb3QpQXEbO8UwukT_b22rDwq3Gvgy9Bp_47n9rtnGA",
-            SignaturePurpose::ProposalAdmission,
-        ),
-        signer(
             "MC4CAQAwBQYDK2VwBCIEICIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIi",
             "oJql9HpnWYAv-VX43C0qFKXJnSO-l_hkEn_5ODRVpPA",
             SignaturePurpose::Snapshot,

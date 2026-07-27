@@ -62,7 +62,6 @@ pub enum PersonalDbSigningKeyCommands {
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum PersonalDbSigningPurposeArg {
     GroupControl,
-    ProposalAdmission,
     Witness,
     Snapshot,
 }
@@ -71,7 +70,6 @@ impl PersonalDbSigningPurposeArg {
     fn to_protocol(self) -> SignaturePurpose {
         match self {
             Self::GroupControl => SignaturePurpose::GroupControl,
-            Self::ProposalAdmission => SignaturePurpose::ProposalAdmission,
             Self::Witness => SignaturePurpose::Witness,
             Self::Snapshot => SignaturePurpose::Snapshot,
         }

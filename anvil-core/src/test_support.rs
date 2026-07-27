@@ -9,9 +9,6 @@ use std::sync::Arc;
 const GROUP_CONTROL_PKCS8_B64: &str =
     "MC4CAQAwBQYDK2VwBCIEIBERERERERERERERERERERERERERERERERERERERERER";
 const GROUP_CONTROL_PUBLIC_B64U: &str = "0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc";
-const PROPOSAL_ADMISSION_PKCS8_B64: &str =
-    "MC4CAQAwBQYDK2VwBCIEIDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8";
-const PROPOSAL_ADMISSION_PUBLIC_B64U: &str = "VSb3QpQXEbO8UwukT_b22rDwq3Gvgy9Bp_47n9rtnGA";
 const SNAPSHOT_PKCS8_B64: &str = "MC4CAQAwBQYDK2VwBCIEICIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIi";
 const SNAPSHOT_PUBLIC_B64U: &str = "oJql9HpnWYAv-VX43C0qFKXJnSO-l_hkEn_5ODRVpPA";
 const WITNESS_PKCS8_B64: &str = "MC4CAQAwBQYDK2VwBCIEIDMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMz";
@@ -23,11 +20,6 @@ pub(crate) fn personaldb_protocol_keyring() -> PersonalDbProtocolKeyring {
             GROUP_CONTROL_PKCS8_B64,
             GROUP_CONTROL_PUBLIC_B64U,
             SignaturePurpose::GroupControl,
-        ),
-        signer(
-            PROPOSAL_ADMISSION_PKCS8_B64,
-            PROPOSAL_ADMISSION_PUBLIC_B64U,
-            SignaturePurpose::ProposalAdmission,
         ),
         signer(
             SNAPSHOT_PKCS8_B64,
