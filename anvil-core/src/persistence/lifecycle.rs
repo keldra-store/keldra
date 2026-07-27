@@ -288,16 +288,15 @@ impl Persistence {
         target: crate::mesh_lifecycle::LifecycleState,
         drain: Option<crate::mesh_lifecycle::NodeDrainDescriptor>,
     ) -> crate::mesh_lifecycle::LifecycleResult<crate::mesh_lifecycle::NodeDescriptor> {
-        let node = crate::mesh_lifecycle::read_lifecycle_state_projection_mvcc(
-            self.lifecycle_mvcc()?,
-        )?
-        .nodes
-        .into_values()
-        .find(|node| node.node_id == node_id)
-            .ok_or_else(|| crate::mesh_lifecycle::LifecycleError::NotFound {
-                resource_kind: "node",
-                resource_id: node_id.to_string(),
-            })?;
+        let node =
+            crate::mesh_lifecycle::read_lifecycle_state_projection_mvcc(self.lifecycle_mvcc()?)?
+                .nodes
+                .into_values()
+                .find(|node| node.node_id == node_id)
+                .ok_or_else(|| crate::mesh_lifecycle::LifecycleError::NotFound {
+                    resource_kind: "node",
+                    resource_id: node_id.to_string(),
+                })?;
         if node.generation != expected_generation {
             return Err(crate::mesh_lifecycle::LifecycleError::GenerationConflict {
                 resource_kind: "node",
