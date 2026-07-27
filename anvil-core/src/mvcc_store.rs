@@ -120,6 +120,7 @@ pub struct MvccStore {
     db: Arc<DB>,
     cluster_id: String,
     scope: Vec<u8>,
+    decision_transition: Arc<Mutex<()>>,
     materialisation_transition: Arc<Mutex<()>>,
     outbox_transition: Arc<Mutex<()>>,
 }
@@ -270,6 +271,7 @@ impl MvccStore {
             db,
             cluster_id: cluster_id.to_string(),
             scope,
+            decision_transition: Arc::new(Mutex::new(())),
             materialisation_transition: Arc::new(Mutex::new(())),
             outbox_transition: Arc::new(Mutex::new(())),
         })
@@ -303,6 +305,7 @@ impl MvccStore {
         bundle: &TransactionBundle,
         decision_position: Option<CommitVersion>,
     ) -> Result<ApplyOutcome> {
+        let _decision_transition = self.decision_transition.lock().unwrap();
         if bundle.cluster_id != self.cluster_id {
             bail!("transaction bundle belongs to another cluster");
         }
@@ -312,7 +315,7 @@ impl MvccStore {
         if let Some(existing) = self.db.get_cf(applied_cf, &applied_key)? {
             if existing.as_slice() == identity.as_bytes() {
                 if let Some(position) = decision_position {
-                    self.advance_decision_watermark(position)?;
+                    self.advance_decision_watermark_unlocked(position)?;
                 }
                 return Ok(ApplyOutcome::Replayed);
             }
@@ -778,9 +781,14 @@ impl MvccStore {
     }
 
     pub fn advance_decision_watermark(&self, position: CommitVersion) -> Result<()> {
+        let _decision_transition = self.decision_transition.lock().unwrap();
+        self.advance_decision_watermark_unlocked(position)
+    }
+
+    fn advance_decision_watermark_unlocked(&self, position: CommitVersion) -> Result<()> {
         let current = self.decision_watermark()?;
-        if position < current {
-            bail!("MVCC decision watermark cannot move backwards");
+        if position <= current {
+            return Ok(());
         }
         self.db.put_cf_opt(
             self.cf(CF_META)?,
@@ -2438,6 +2446,33 @@ mod tests {
                 .to_string()
                 .contains("snapshot 2 is above local readable version 1")
         );
+    }
+
+    #[test]
+    fn stale_worker_replay_cannot_regress_or_fail_the_decision_watermark() {
+        let temp = tempdir().unwrap();
+        let store = MvccStore::open(temp.path()).unwrap();
+        let committed = bundle("simultaneous-workers", |builder| {
+            builder.put(key(1, b"row"), b"value".to_vec());
+        });
+        assert_eq!(
+            store
+                .apply_certified_bundle_and_advance(1, &committed, 1)
+                .unwrap(),
+            ApplyOutcome::Applied
+        );
+
+        // Model the interleaving where another worker has already applied a
+        // later non-data decision before this worker replays decision one.
+        store.advance_decision_watermark(2).unwrap();
+        assert_eq!(
+            store
+                .apply_certified_bundle_and_advance(1, &committed, 1)
+                .unwrap(),
+            ApplyOutcome::Replayed
+        );
+        assert_eq!(store.decision_watermark().unwrap(), 2);
+        assert_eq!(store.applied_version().unwrap(), 1);
     }
 
     #[test]
