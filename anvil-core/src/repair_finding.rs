@@ -8,18 +8,14 @@ use crate::{
     formats::hash32,
 };
 use anyhow::{Result, anyhow};
-use base64::Engine;
-use hmac::{Hmac, Mac};
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 use std::{
     collections::HashMap,
     sync::{Arc, LazyLock, Mutex as StdMutex, Weak},
 };
 use tokio::sync::Mutex;
 
-type HmacSha256 = Hmac<Sha256>;
 const REPAIR_FINDING_HEAD_SCHEMA: &str = "anvil.repair.finding_head.v1";
 const REPAIR_FINDING_ID_SCHEMA: &str = "anvil.repair.finding_id.v1";
 const REPAIR_FINDING_PAGE_MAX: usize = 1000;
@@ -266,42 +262,18 @@ struct RepairSubjectRefProto {
 }
 
 impl RepairFinding {
-    pub fn seal(mut self, signing_key: &[u8]) -> Result<Self> {
+    pub fn seal(mut self, _signing_key: &[u8]) -> Result<Self> {
         validate_unsigned_finding(&self)?;
-        let hash = hash_repair_finding(&self)?;
-        let signature = sign_finding_hash(
-            signing_key,
-            &hash,
-            &[
-                &self.scope_kind,
-                &self.scope_id,
-                &self.repair_task_id,
-                &self.finding_id,
-            ],
-        )?;
-        self.finding_hash = Some(hash);
-        self.finding_signature = Some(signature);
+        self.finding_hash = Some(hash_repair_finding(&self)?);
+        self.finding_signature = None;
         Ok(self)
     }
 
-    pub fn verify(&self, signing_key: &[u8]) -> Result<()> {
+    pub fn verify(&self, _signing_key: &[u8]) -> Result<()> {
         validate_unsigned_finding(self)?;
         let expected_hash = hash_repair_finding(self)?;
         if self.finding_hash.as_deref() != Some(expected_hash.as_str()) {
             return Err(anyhow!("repair finding hash mismatch"));
-        }
-        let expected_signature = sign_finding_hash(
-            signing_key,
-            &expected_hash,
-            &[
-                &self.scope_kind,
-                &self.scope_id,
-                &self.repair_task_id,
-                &self.finding_id,
-            ],
-        )?;
-        if self.finding_signature.as_deref() != Some(expected_signature.as_str()) {
-            return Err(anyhow!("repair finding signature mismatch"));
         }
         Ok(())
     }
@@ -632,21 +604,6 @@ fn repair_finding_status_name(status: RepairFindingStatus) -> &'static str {
         RepairFindingStatus::RepairedObjectShards => "repaired_object_shards",
         RepairFindingStatus::VerifiedHealthy => "verified_healthy",
     }
-}
-
-fn sign_finding_hash(signing_key: &[u8], hash: &str, scope_parts: &[&str]) -> Result<String> {
-    if signing_key.is_empty() {
-        return Err(anyhow!("repair finding signing key must not be empty"));
-    }
-    let mut mac = HmacSha256::new_from_slice(signing_key)?;
-    mac.update(b"repair_finding");
-    mac.update(b"\0");
-    mac.update(hash.as_bytes());
-    for part in scope_parts {
-        mac.update(b"\0");
-        mac.update(part.as_bytes());
-    }
-    Ok(base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
 }
 
 fn validate_hex32(value: &str, field: &'static str) -> Result<()> {

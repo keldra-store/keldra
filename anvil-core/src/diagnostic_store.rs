@@ -13,13 +13,9 @@ use crate::{
     mvcc_transaction::{LogicalKey, PredicateKind},
 };
 use anyhow::{Result, anyhow};
-use base64::Engine;
-use hmac::{Hmac, Mac};
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 
-type HmacSha256 = Hmac<Sha256>;
 pub const DIAGNOSTIC_OBJECT_PAGE_MAX: usize = 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,42 +181,18 @@ struct DiagnosticObjectRefProto {
 }
 
 impl DiagnosticObject {
-    pub fn seal(mut self, signing_key: &[u8]) -> Result<Self> {
+    pub fn seal(mut self, _signing_key: &[u8]) -> Result<Self> {
         validate_unsigned_diagnostic(&self)?;
-        let hash = hash_diagnostic_object(&self)?;
-        let signature = sign_diagnostic_hash(
-            signing_key,
-            &hash,
-            &[
-                &self.scope_kind,
-                &self.scope_id,
-                &self.source,
-                &self.diagnostic_id,
-            ],
-        )?;
-        self.diagnostic_hash = Some(hash);
-        self.diagnostic_signature = Some(signature);
+        self.diagnostic_hash = Some(hash_diagnostic_object(&self)?);
+        self.diagnostic_signature = None;
         Ok(self)
     }
 
-    pub fn verify(&self, signing_key: &[u8]) -> Result<()> {
+    pub fn verify(&self, _signing_key: &[u8]) -> Result<()> {
         validate_unsigned_diagnostic(self)?;
         let expected_hash = hash_diagnostic_object(self)?;
         if self.diagnostic_hash.as_deref() != Some(expected_hash.as_str()) {
             return Err(anyhow!("diagnostic object hash mismatch"));
-        }
-        let expected_signature = sign_diagnostic_hash(
-            signing_key,
-            &expected_hash,
-            &[
-                &self.scope_kind,
-                &self.scope_id,
-                &self.source,
-                &self.diagnostic_id,
-            ],
-        )?;
-        if self.diagnostic_signature.as_deref() != Some(expected_signature.as_str()) {
-            return Err(anyhow!("diagnostic object signature mismatch"));
         }
         Ok(())
     }
@@ -779,21 +751,6 @@ fn severity_rank(severity: DiagnosticSeverity) -> u8 {
         DiagnosticSeverity::Warning => 1,
         DiagnosticSeverity::Error => 2,
     }
-}
-
-fn sign_diagnostic_hash(signing_key: &[u8], hash: &str, scope_parts: &[&str]) -> Result<String> {
-    if signing_key.is_empty() {
-        return Err(anyhow!("diagnostic object signing key must not be empty"));
-    }
-    let mut mac = HmacSha256::new_from_slice(signing_key)?;
-    mac.update(b"diagnostic_object");
-    mac.update(b"\0");
-    mac.update(hash.as_bytes());
-    for part in scope_parts {
-        mac.update(b"\0");
-        mac.update(part.as_bytes());
-    }
-    Ok(base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
 }
 
 fn validate_optional_hash(value: &str, field: &'static str) -> Result<()> {

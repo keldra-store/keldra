@@ -9,11 +9,8 @@ use crate::{
     storage::Storage,
 };
 use anyhow::{Result, anyhow, bail};
-use base64::Engine;
-use hmac::{Hmac, Mac};
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 use std::fmt;
 
 mod coremeta;
@@ -28,8 +25,6 @@ use coremeta::{
     partition_owner_row_key, read_ownership_fence_state, read_partition_owner_state,
     write_ownership_fence_state, write_partition_owner_state,
 };
-
-type HmacSha256 = Hmac<Sha256>;
 
 pub const OWNERSHIP_HELD: &str = "OwnershipHeld";
 pub const OWNERSHIP_EXPIRED: &str = "OwnershipExpired";
@@ -238,48 +233,18 @@ pub struct OwnershipFenceRecord {
 }
 
 impl OwnershipFenceRecord {
-    pub fn seal(mut self, signing_key: &[u8]) -> Result<Self> {
+    pub fn seal(mut self, _signing_key: &[u8]) -> Result<Self> {
         validate_unsigned_ownership_fence(&self)?;
-        let hash = hash_ownership_fence(&self)?;
-        let signature = sign_ownership_hash(
-            signing_key,
-            &hash,
-            &[
-                &self.owner.tenant_id.to_string(),
-                self.resource.resource_kind.as_str(),
-                &self.resource.resource_id,
-                &self.owner.principal_kind,
-                &self.owner.principal_id,
-                &self.owner.actor_instance_id,
-                &self.fence.to_string(),
-            ],
-        )?;
-        self.ownership_hash = Some(hash);
-        self.ownership_signature = Some(signature);
+        self.ownership_hash = Some(hash_ownership_fence(&self)?);
+        self.ownership_signature = None;
         Ok(self)
     }
 
-    pub fn verify(&self, signing_key: &[u8]) -> Result<()> {
+    pub fn verify(&self, _signing_key: &[u8]) -> Result<()> {
         validate_unsigned_ownership_fence(self)?;
         let expected_hash = hash_ownership_fence(self)?;
         if self.ownership_hash.as_deref() != Some(expected_hash.as_str()) {
             return Err(anyhow!("ownership fence hash mismatch"));
-        }
-        let expected_signature = sign_ownership_hash(
-            signing_key,
-            &expected_hash,
-            &[
-                &self.owner.tenant_id.to_string(),
-                self.resource.resource_kind.as_str(),
-                &self.resource.resource_id,
-                &self.owner.principal_kind,
-                &self.owner.principal_id,
-                &self.owner.actor_instance_id,
-                &self.fence.to_string(),
-            ],
-        )?;
-        if self.ownership_signature.as_deref() != Some(expected_signature.as_str()) {
-            return Err(anyhow!("ownership fence signature mismatch"));
         }
         Ok(())
     }
@@ -500,42 +465,18 @@ pub struct ForceExpireOwnership {
 }
 
 impl PartitionOwnerState {
-    pub fn seal(mut self, signing_key: &[u8]) -> Result<Self> {
+    pub fn seal(mut self, _signing_key: &[u8]) -> Result<Self> {
         validate_unsigned_owner(&self)?;
-        let hash = hash_partition_owner(&self)?;
-        let signature = sign_owner_hash(
-            signing_key,
-            &hash,
-            &[
-                &self.partition_family,
-                &self.partition_id,
-                &self.owner_node_id,
-                &self.fence_token.to_string(),
-            ],
-        )?;
-        self.owner_hash = Some(hash);
-        self.owner_signature = Some(signature);
+        self.owner_hash = Some(hash_partition_owner(&self)?);
+        self.owner_signature = None;
         Ok(self)
     }
 
-    pub fn verify(&self, signing_key: &[u8]) -> Result<()> {
+    pub fn verify(&self, _signing_key: &[u8]) -> Result<()> {
         validate_unsigned_owner(self)?;
         let expected_hash = hash_partition_owner(self)?;
         if self.owner_hash.as_deref() != Some(expected_hash.as_str()) {
             return Err(anyhow!("partition owner hash mismatch"));
-        }
-        let expected_signature = sign_owner_hash(
-            signing_key,
-            &expected_hash,
-            &[
-                &self.partition_family,
-                &self.partition_id,
-                &self.owner_node_id,
-                &self.fence_token.to_string(),
-            ],
-        )?;
-        if self.owner_signature.as_deref() != Some(expected_signature.as_str()) {
-            return Err(anyhow!("partition owner signature mismatch"));
         }
         Ok(())
     }
@@ -2165,36 +2106,6 @@ fn increment_counter(value: u64, label: &'static str) -> Result<u64> {
     value
         .checked_add(1)
         .ok_or_else(|| anyhow!("{label} overflow"))
-}
-
-fn sign_owner_hash(signing_key: &[u8], hash: &str, scope_parts: &[&str]) -> Result<String> {
-    if signing_key.is_empty() {
-        return Err(anyhow!("partition owner signing key must not be empty"));
-    }
-    let mut mac = HmacSha256::new_from_slice(signing_key)?;
-    mac.update(b"partition_owner");
-    mac.update(b"\0");
-    mac.update(hash.as_bytes());
-    for part in scope_parts {
-        mac.update(b"\0");
-        mac.update(part.as_bytes());
-    }
-    Ok(base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
-}
-
-fn sign_ownership_hash(signing_key: &[u8], hash: &str, scope_parts: &[&str]) -> Result<String> {
-    if signing_key.is_empty() {
-        return Err(anyhow!("ownership fence signing key must not be empty"));
-    }
-    let mut mac = HmacSha256::new_from_slice(signing_key)?;
-    mac.update(b"ownership_fence");
-    mac.update(b"\0");
-    mac.update(hash.as_bytes());
-    for part in scope_parts {
-        mac.update(b"\0");
-        mac.update(part.as_bytes());
-    }
-    Ok(base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
 }
 
 fn validate_hex32(value: &str, field: &'static str) -> Result<()> {
