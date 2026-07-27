@@ -603,31 +603,130 @@ pub(super) async fn start_boundary_migration_rpc(
         last_error_code: String::new(),
         last_error_message: String::new(),
     };
-    let transaction_id = crate::services::transaction_context::native_context_transaction_id(
+    let requested_transaction_id =
+        crate::services::transaction_context::native_context_transaction_id(
         req.mutation_context.as_ref(),
     )?;
-    if let Some(transaction_id) = transaction_id {
-        let transaction_principal =
-            crate::object_manager::transaction_principal_from_claims(&claims);
-        write_boundary_migration_row_in_transaction(
-            state,
-            &boundary_bucket_key,
-            &migration_id,
-            &row,
-            transaction_id,
-            &transaction_principal,
-        )
-        .await?;
+    let transaction_principal =
+        crate::object_manager::transaction_principal_from_claims(&claims);
+    let internal_transaction = requested_transaction_id.is_none();
+    let transaction_id = if let Some(transaction_id) = requested_transaction_id {
+        state
+            .mvcc
+            .open_transactions
+            .binding(transaction_id, &transaction_principal)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        transaction_id.to_string()
     } else {
-        write_boundary_migration_row(state, &boundary_bucket_key, &migration_id, &row).await?;
+        let now = current_unix_millis_u64();
+        let handle = state
+            .mvcc
+            .open_transactions
+            .begin(
+                state.mvcc.runtime.as_ref(),
+                state.mvcc.cluster_id().to_string(),
+                transaction_principal.clone(),
+                format!(
+                    "boundary-migration:{}:{}",
+                    claims.tenant_id, mutation_id
+                ),
+                std::time::Duration::from_secs(300),
+                crate::mvcc_transaction::DurabilityLevel::Quorum,
+                crate::mvcc_transaction::ReadConsistency::Linearized,
+                now,
+            )
+            .await
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        let status = state
+            .mvcc
+            .open_transactions
+            .status(&handle.transaction_id, &transaction_principal, now)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        if matches!(status.state, "committed" | "committing") {
+            if status.state == "committing" {
+                let outcome = state
+                    .mvcc
+                    .open_transactions
+                    .commit(
+                        state.mvcc.runtime.as_ref(),
+                        &handle.transaction_id,
+                        &transaction_principal,
+                        now,
+                    )
+                    .await
+                    .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                if let crate::mvcc_transaction::CertificationResult::Aborted { reason } =
+                    outcome.certification
+                {
+                    return Err(Status::aborted(format!(
+                        "implicit boundary migration transaction aborted: {reason:?}"
+                    )));
+                }
+            }
+            let existing =
+                read_boundary_migration_row(state, &boundary_bucket_key, &migration_id)
+                    .await?
+                    .filter(|existing| existing == &row)
+                    .ok_or_else(|| {
+                        Status::already_exists(
+                            "boundary migration idempotency key was used for different input",
+                        )
+                    })?;
+            let _ = existing;
+            return Ok(Response::new(WriteResponse {
+                request_id,
+                mutation_id,
+                state: WriteState::Finalised as i32,
+                root_generation: None,
+                transaction_manifest_ref: None,
+                idempotency_outcome: "replayed".to_string(),
+                retry_after_hint: None,
+                finalisation_error: None,
+            }));
+        }
+        if status.state == "aborted" {
+            return Err(Status::aborted(
+                "implicit boundary migration transaction previously aborted",
+            ));
+        }
+        handle.transaction_id
+    };
+    write_boundary_migration_row_in_transaction(
+        state,
+        &boundary_bucket_key,
+        &migration_id,
+        &row,
+        &transaction_id,
+        &transaction_principal,
+    )
+    .await?;
+    if internal_transaction {
+        let outcome = state
+            .mvcc
+            .open_transactions
+            .commit(
+                state.mvcc.runtime.as_ref(),
+                &transaction_id,
+                &transaction_principal,
+                current_unix_millis_u64(),
+            )
+            .await
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        if let crate::mvcc_transaction::CertificationResult::Aborted { reason } =
+            outcome.certification
+        {
+            return Err(Status::aborted(format!(
+                "implicit boundary migration transaction aborted: {reason:?}"
+            )));
+        }
     }
     Ok(Response::new(WriteResponse {
         request_id,
         mutation_id,
-        state: if transaction_id.is_some() {
-            WriteState::Staged as i32
-        } else {
+        state: if internal_transaction {
             WriteState::Finalised as i32
+        } else {
+            WriteState::Staged as i32
         },
         root_generation: None,
         transaction_manifest_ref: None,
@@ -725,32 +824,6 @@ fn current_unix_millis_u64() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(0)
-}
-
-async fn write_boundary_migration_row(
-    state: &AppState,
-    boundary_bucket_key: &str,
-    migration_id: &str,
-    row: &BoundaryMigrationRow,
-) -> Result<(), Status> {
-    let payload = crate::core_store::encode_deterministic_proto(row);
-    let tuple_key = boundary_migration_tuple_key(boundary_bucket_key, migration_id)?;
-    let logical_key = boundary_migration_logical_key(&tuple_key)?;
-    state
-        .mvcc
-        .autocommit_product_mutations(
-            &format!("boundary-migration:{boundary_bucket_key}"),
-            &format!("boundary-migration:{boundary_bucket_key}:{migration_id}"),
-            vec![crate::mvcc_product::ProductMutation::put(
-                logical_key,
-                payload,
-            )],
-            crate::mvcc_transaction::DurabilityLevel::Quorum,
-            current_unix_millis_u64(),
-        )
-        .await
-        .map(|_| ())
-        .map_err(|error| Status::internal(error.to_string()))
 }
 
 async fn read_boundary_migration_row(
