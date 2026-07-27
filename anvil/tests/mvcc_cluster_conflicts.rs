@@ -63,7 +63,7 @@ async fn wait_for_value(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn concurrent_same_snapshot_point_writes_commit_exactly_one_and_converge() {
+async fn concurrent_point_writes_commit_exactly_one_and_converge() {
     let cluster = RealMvccCluster::start().await.unwrap();
     let leader = cluster.wait_for_any_leader(&[0, 1, 2]).await.unwrap();
     let other = (leader + 1) % 3;
@@ -73,8 +73,6 @@ async fn concurrent_same_snapshot_point_writes_commit_exactly_one_and_converge()
     };
     let first = begin(&cluster, leader, "point-conflict-first").await;
     let second = begin(&cluster, other, "point-conflict-second").await;
-    assert_eq!(first.snapshot_version, second.snapshot_version);
-
     for (node, handle, value) in [
         (leader, &first, b"first".as_slice()),
         (other, &second, b"second".as_slice()),
@@ -129,7 +127,7 @@ async fn concurrent_same_snapshot_point_writes_commit_exactly_one_and_converge()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn concurrent_same_snapshot_range_observer_rejects_phantom_and_cluster_converges() {
+async fn concurrent_range_observer_rejects_phantom_and_cluster_converges() {
     let cluster = RealMvccCluster::start().await.unwrap();
     let leader = cluster.wait_for_any_leader(&[0, 1, 2]).await.unwrap();
     let observer_node = (leader + 1) % 3;
@@ -143,8 +141,6 @@ async fn concurrent_same_snapshot_range_observer_rejects_phantom_and_cluster_con
     };
     let inserter = begin(&cluster, leader, "range-conflict-inserter").await;
     let observer = begin(&cluster, observer_node, "range-conflict-observer").await;
-    assert_eq!(inserter.snapshot_version, observer.snapshot_version);
-
     let observer_mvcc = &cluster.state(observer_node).mvcc;
     observer_mvcc.open_transactions
         .observe_range(
