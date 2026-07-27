@@ -11,10 +11,6 @@ use anvil::anvil_api::{
 use anvil::anvil_personaldb_sqlite_changeset::iterate_changeset;
 use anvil::authz_scope::DEFAULT_AUTHZ_REALM_ID;
 use anvil::formats::hash32;
-use anvil::partition_fence::{
-    AcquireOwnership, MAX_OWNERSHIP_LEASE_MS, OwnershipPrincipal, OwnershipResource,
-    OwnershipResourceKind, acquire_ownership, read_ownership_fence, read_partition_owner,
-};
 use anvil::personaldb_envelope::{
     PersonalDbEnvelopeDerivationInput, derive_verified_mutation_envelope,
 };
@@ -145,12 +141,6 @@ async fn create_group_with_schema(
         .await
         .unwrap();
     genesis_hash
-}
-
-fn personaldb_group_partition_id_for_test(tenant_id: i64, database_id: &str) -> String {
-    hex::encode(hash32(
-        format!("personaldb_group\0{tenant_id}\0{database_id}").as_bytes(),
-    ))
 }
 
 fn projection_definition(

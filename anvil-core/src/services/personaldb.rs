@@ -7,7 +7,6 @@ use crate::{
     authz_scope::{DEFAULT_AUTHZ_REALM_ID, encode_realm_namespace},
     error_codes::AnvilErrorCode,
     formats::{Hash32, hash32, personaldb::PersonalDbLogRecord as CorePersonalDbLogRecord},
-    partition_fence::PartitionWritePermit,
     permissions::AnvilAction,
     personaldb_catchup::{
         PersonalDbCatchUpRequest as CoreCatchUpRequest,
@@ -208,8 +207,8 @@ impl PersonalDbService for AppState {
         {
             return Err(Status::already_exists("PersonalDB group already exists"));
         }
-        let _write_permit = self
-            .personaldb_assignment_write_permit(claims.tenant_id, &req.database_id)
+        let assignment = self
+            .personaldb_write_assignment(claims.tenant_id, &req.database_id)
             .await?;
         let root_generation = snapshot_version
             .checked_add(1)
@@ -220,7 +219,8 @@ impl PersonalDbService for AppState {
             &claims.sub,
             create_idempotency_key,
         )
-        .map_err(internal_status)?;
+        .map_err(internal_status)?
+        .with_assignment_guard(assignment);
 
         let now = now_rfc3339();
         let manifest = PersonalDbGroupManifest {
@@ -809,23 +809,11 @@ impl AppState {
         lock.lock_owned().await
     }
 
-    async fn acquire_personaldb_group_write_permit(
+    async fn personaldb_write_assignment(
         &self,
         tenant_id: i64,
         database_id: &str,
-        _recovered_through_sequence: u64,
-        recovered_manifest_hash: &str,
-    ) -> Result<PartitionWritePermit, Status> {
-        validate_hex32(recovered_manifest_hash, "recovered_manifest_hash")?;
-        self.personaldb_assignment_write_permit(tenant_id, database_id)
-            .await
-    }
-
-    async fn personaldb_assignment_write_permit(
-        &self,
-        tenant_id: i64,
-        database_id: &str,
-    ) -> Result<PartitionWritePermit, Status> {
+    ) -> Result<crate::mvcc_worker_authority::AssignmentGuard, Status> {
         let logical_identity = format!("tenant/{tenant_id}/personaldb/{database_id}");
         let guard = self
             .mvcc
@@ -837,12 +825,7 @@ impl AppState {
                     "PersonalDB write is assigned to another cluster node",
                 )
             })?;
-        Ok(PartitionWritePermit {
-            partition_family: "personaldb-write".to_string(),
-            partition_id: guard.partition_id.to_string(),
-            owner_node_id: guard.owner.node_id,
-            fence_token: guard.assignment_epoch,
-        })
+        Ok(guard)
     }
 
     async fn handle_personaldb_projection_writeback(
@@ -1164,13 +1147,8 @@ impl AppState {
                 "PersonalDB submit epochs or schema do not match the active group",
             ));
         }
-        let write_permit = self
-            .acquire_personaldb_group_write_permit(
-                actor.tenant_id,
-                &validated.request.database_id,
-                previous_head.log_index,
-                &previous_head.log_hash,
-            )
+        let assignment = self
+            .personaldb_write_assignment(actor.tenant_id, &validated.request.database_id)
             .await?;
         let current_head_after_fence = read_personaldb_committed_head_mvcc(
             &self.mvcc,
@@ -1247,7 +1225,8 @@ impl AppState {
                 validated.request.database_id, validated.request.idempotency_key
             ),
         )
-        .map_err(internal_status)?;
+        .map_err(internal_status)?
+        .with_assignment_guard(assignment.clone());
         let payload_paths = prepare_and_stage_personaldb_changeset_payload(
             &self.storage,
             &mut write_plan,
@@ -1347,7 +1326,7 @@ impl AppState {
                 tenant_id: actor.tenant_id,
                 database_id: &validated.request.database_id,
                 schema_hash,
-                source_fence_token: write_permit.fence_token,
+                source_fence_token: assignment.assignment_epoch,
                 records: std::slice::from_ref(&record),
             },
         )

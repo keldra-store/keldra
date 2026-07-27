@@ -31,6 +31,7 @@ pub struct PersonalDbWritePlan {
     group_id: String,
     principal: String,
     idempotency_key: String,
+    assignment: Option<crate::mvcc_worker_authority::AssignmentGuard>,
     mutations: Vec<crate::mvcc_product::ProductMutation>,
     predicates: Vec<(
         crate::mvcc_transaction::LogicalKey,
@@ -109,9 +110,18 @@ impl PersonalDbWritePlan {
             group_id,
             principal,
             idempotency_key,
+            assignment: None,
             mutations: Vec::new(),
             predicates: Vec::new(),
         })
+    }
+
+    pub fn with_assignment_guard(
+        mut self,
+        assignment: crate::mvcc_worker_authority::AssignmentGuard,
+    ) -> Self {
+        self.assignment = Some(assignment);
+        self
     }
 
     pub fn stage_put(
@@ -203,10 +213,24 @@ impl PersonalDbWritePlan {
         if status.state == "open" {
             let logical_identity =
                 format!("tenant/{}/personaldb/{}", self.tenant_id, self.group_id);
-            let assignment = mvcc
-                .reconcile_work_assignment("personaldb-write", &logical_identity)
-                .await?
-                .ok_or_else(|| anyhow!("local node does not own PersonalDB group assignment"))?;
+            let assignment = match self.assignment {
+                Some(assignment) => {
+                    let expected_partition = crate::mvcc_worker_authority::work_partition_id(
+                        "personaldb-write",
+                        &logical_identity,
+                    )?;
+                    if assignment.partition_id != expected_partition {
+                        bail!("PersonalDB write plan assignment scope mismatch");
+                    }
+                    assignment
+                }
+                None => mvcc
+                    .reconcile_work_assignment("personaldb-write", &logical_identity)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow!("local node does not own PersonalDB group assignment")
+                    })?,
+            };
             mvcc.stage_product_mutations(
                 &handle.transaction_id,
                 &self.principal,

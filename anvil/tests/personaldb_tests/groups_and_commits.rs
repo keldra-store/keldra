@@ -107,78 +107,6 @@ async fn personaldb_group_create_get_and_catch_up_are_native_api_backed() {
 }
 
 #[tokio::test]
-// Internal-only: seeds and reads ownership fences through cluster storage and
-// the local secret key, which are not exposed by public/admin APIs.
-async fn personaldb_group_creation_requires_current_rfc_ownership_fence() {
-    let cluster = shared_default_test_cluster().await;
-
-    let grpc_addr = cluster.grpc_addrs[0].clone();
-    let token = cluster.token.clone();
-    let mut client = PersonalDbServiceClient::connect(grpc_addr).await.unwrap();
-    let database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
-    let conflicting_owner_id = unique_test_name("other-node-personaldb-owner");
-    let resource = OwnershipResource {
-        resource_kind: OwnershipResourceKind::PersonalDbGroup,
-        resource_id: format!("tenant/1/personaldb/{database_id}"),
-    };
-    let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap();
-
-    acquire_ownership(
-        &cluster.states[0].storage,
-        AcquireOwnership {
-            request_id: format!("{conflicting_owner_id}-request"),
-            idempotency_key: format!("{conflicting_owner_id}-idempotency"),
-            resource: resource.clone(),
-            owner: OwnershipPrincipal {
-                tenant_id: 0,
-                principal_kind: "node".to_string(),
-                principal_id: conflicting_owner_id.clone(),
-                actor_instance_id: conflicting_owner_id.clone(),
-                display_name: conflicting_owner_id.clone(),
-                region: "test-region-1".to_string(),
-                cell: "default".to_string(),
-            },
-            now_nanos,
-            ttl_nanos: i64::try_from(MAX_OWNERSHIP_LEASE_MS)
-                .unwrap()
-                .saturating_mul(1_000_000),
-        },
-        &hex::decode(&cluster.states[0].config.anvil_secret_encryption_key).unwrap(),
-    )
-    .await
-    .unwrap();
-
-    let err = client
-        .create_personal_db_group(authorized(
-            CreatePersonalDbGroupRequest {
-                database_id: database_id.clone(),
-                schema_hash: personaldb_test_schema_hash(),
-                genesis_hash: hex::encode(hash32(format!("genesis:{database_id}").as_bytes())),
-                schema_sql: PERSONALDB_TEST_SCHEMA_SQL.to_string(),
-            },
-            &token,
-        ))
-        .await
-        .unwrap_err();
-    assert_eq!(err.code(), Code::FailedPrecondition);
-    assert!(
-        err.message().contains("OwnershipHeld"),
-        "unexpected error: {err}"
-    );
-
-    let fence = read_ownership_fence(
-        &cluster.states[0].storage,
-        0,
-        &resource,
-        &hex::decode(&cluster.states[0].config.anvil_secret_encryption_key).unwrap(),
-    )
-    .await
-    .unwrap()
-    .expect("conflicting owner fence remains durable");
-    assert_eq!(fence.owner.principal_id, conflicting_owner_id);
-}
-
-#[tokio::test]
 // Internal-only: mints custom JWTs and reads the row index from local storage.
 async fn personaldb_submit_commits_and_is_available_to_catch_up_and_watch() {
     let cluster = shared_default_test_cluster().await;
@@ -572,48 +500,6 @@ async fn personaldb_concurrent_same_base_submits_publish_one_witness_commit() {
         caught_up.entries[0].log_record.as_ref().unwrap().entry_hash,
         successes[0].log_hash
     );
-}
-
-#[tokio::test]
-async fn personaldb_group_commit_uses_partition_owner_signing_key() {
-    let cluster = shared_default_test_cluster().await;
-
-    let token = cluster.token.clone();
-    let database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
-    let mut client = PersonalDbServiceClient::connect(cluster.grpc_addrs[0].clone())
-        .await
-        .unwrap();
-
-    let genesis_hash = create_group(&mut client, &token, &database_id).await;
-    let first = client
-        .submit_personal_db_changeset(authorized(
-            submit_request(
-                &database_id,
-                &genesis_hash,
-                &token,
-                sqlite_insert_changeset_with_item(1, "alpha", &[1_u8, 2, 3]),
-            ),
-            &token,
-        ))
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(first.log_index, 1);
-
-    let partition_id = personaldb_group_partition_id_for_test(1, &database_id);
-    let partition_owner_signing_key =
-        hex::decode(&cluster.states[0].config.anvil_secret_encryption_key).unwrap();
-    let owner = read_partition_owner(
-        &cluster.states[0].storage,
-        "personaldb_group",
-        &partition_id,
-        &partition_owner_signing_key,
-    )
-    .await
-    .unwrap()
-    .expect("PersonalDB commit writes a partition-owner row");
-    assert_eq!(owner.owner_node_id, cluster.states[0].config.node_id);
-    assert!(owner.fence_token > 0);
 }
 
 #[tokio::test]
