@@ -21,6 +21,18 @@ enum LifecycleControlWriter<'a> {
 struct PreparedTopologyMutation {
     batch: CoreMutationBatch,
     control_append: Option<PreparedControlStreamAppend>,
+    mvcc_predicates: Vec<(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )>,
+}
+
+const LIFECYCLE_CONTROL_HEAD_KIND: &str = "lifecycle_control_head";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LifecycleControlHead {
+    next_sequence: u64,
+    next_byte_offset: u64,
 }
 
 pub(super) async fn read_topology_mutation_state(
@@ -122,7 +134,7 @@ pub(super) async fn commit_topology_mutation(
                 .map_err(|error| LifecycleError::InvalidArgument(error.to_string()))?;
             let kind = if require_absent {
                 crate::mvcc_transaction::PredicateKind::Absent
-            } else if expected_payload_hash.is_some() {
+            } else if let Some(expected_payload_hash) = expected_payload_hash {
                 let value = mvcc
                     .read_latest_value(&key)
                     .map_err(|error| LifecycleError::InvalidArgument(error.to_string()))?
@@ -131,6 +143,11 @@ pub(super) async fn commit_topology_mutation(
                             "topology CAS row disappeared before MVCC staging".to_string(),
                         )
                     })?;
+                if core_meta_payload_digest(table_id, &value) != expected_payload_hash {
+                    return Err(LifecycleError::InvalidArgument(
+                        "topology CAS row changed before MVCC staging".to_string(),
+                    ));
+                }
                 crate::mvcc_transaction::PredicateKind::ValueHash(*blake3::hash(&value).as_bytes())
             } else if require_present {
                 crate::mvcc_transaction::PredicateKind::Exists
@@ -139,6 +156,7 @@ pub(super) async fn commit_topology_mutation(
             };
             plan.predicates.push((key, kind));
         }
+        plan.predicates.extend(prepared.mvcc_predicates);
         mvcc.autocommit_product_mutations_with_predicates_and_outbox(
             &prepared.batch.committed_by_principal,
             &prepared.batch.transaction_id,
@@ -279,6 +297,7 @@ async fn prepare_topology_mutation(
 
     let mut preconditions = Vec::new();
     let mut operations = Vec::new();
+    let mut mvcc_predicates = Vec::new();
     for row in rows {
         let table_id = lifecycle_projection_table_id(row.kind)?;
         let tuple_key = lifecycle_projection_row_key(row.kind, &row.record_key)?;
@@ -315,36 +334,105 @@ async fn prepare_topology_mutation(
         {
             LifecycleControlWriter::Fenced(authority) => {
                 validate_control_authority(&control, authority)?;
-                let partition_precondition = partition_fence::partition_write_precondition(
-                    storage,
-                    authority.permit,
-                    authority.signing_key,
-                )
-                .await
-                .map_err(|rejection| {
-                    LifecycleError::InvalidArgument(format!(
-                        "lifecycle control write fence rejected for {}/{}: {}: {}",
-                        control.stream_family,
-                        control.partition,
-                        rejection.code.as_str(),
-                        rejection.reason
-                    ))
-                })?;
-                (
-                    Some(partition_precondition),
-                    authority.permit.owner_node_id.as_str(),
-                    authority.permit.fence_token,
-                    format!("partition-owner:{}", authority.permit.owner_node_id),
-                )
+                if let Some(mvcc) = mvcc {
+                    let predicate = partition_fence::partition_write_predicate_mvcc(
+                        mvcc,
+                        authority.permit,
+                        authority.signing_key,
+                    )
+                    .map_err(|rejection| {
+                        LifecycleError::InvalidArgument(format!(
+                            "lifecycle control write fence rejected for {}/{}: {}: {}",
+                            control.stream_family,
+                            control.partition,
+                            rejection.code.as_str(),
+                            rejection.reason
+                        ))
+                    })?;
+                    mvcc_predicates.push(predicate);
+                    (
+                        None,
+                        authority.permit.owner_node_id.as_str(),
+                        authority.permit.fence_token,
+                        format!("partition-owner:{}", authority.permit.owner_node_id),
+                    )
+                } else {
+                    let partition_precondition = partition_fence::partition_write_precondition(
+                        storage,
+                        authority.permit,
+                        authority.signing_key,
+                    )
+                    .await
+                    .map_err(|rejection| {
+                        LifecycleError::InvalidArgument(format!(
+                            "lifecycle control write fence rejected for {}/{}: {}: {}",
+                            control.stream_family,
+                            control.partition,
+                            rejection.code.as_str(),
+                            rejection.reason
+                        ))
+                    })?;
+                    (
+                        Some(partition_precondition),
+                        authority.permit.owner_node_id.as_str(),
+                        authority.permit.fence_token,
+                        format!("partition-owner:{}", authority.permit.owner_node_id),
+                    )
+                }
             }
         };
-        let cursor = crate::mesh_control_stream::control_stream_append_cursor(
-            storage,
-            control.stream_family,
-            &control.partition,
-        )
-        .await
-        .map_err(|error| LifecycleError::InvalidArgument(error.to_string()))?;
+        let (cursor, control_head) = match mvcc {
+            Some(mvcc) => {
+                let tuple_key =
+                    lifecycle_control_head_row_key(control.stream_family, &control.partition)?;
+                let key = crate::mvcc_product::coremeta_logical_key(
+                    CF_MESH,
+                    TABLE_MESH_PARTITION_ROW,
+                    &tuple_key,
+                )
+                .map_err(|error| LifecycleError::InvalidArgument(error.to_string()))?;
+                let current = mvcc
+                    .read_latest_value(&key)
+                    .map_err(|error| LifecycleError::InvalidArgument(error.to_string()))?;
+                let head = current
+                    .as_deref()
+                    .map(serde_json::from_slice::<LifecycleControlHead>)
+                    .transpose()
+                    .map_err(|error| LifecycleError::InvalidArgument(error.to_string()))?
+                    .unwrap_or(LifecycleControlHead {
+                        next_sequence: 1,
+                        next_byte_offset: 0,
+                    });
+                preconditions.push(CoreMutationPrecondition::CoreMetaRow {
+                    cf: CF_MESH.to_string(),
+                    table_id: TABLE_MESH_PARTITION_ROW,
+                    tuple_key: tuple_key.clone(),
+                    expected_payload_hash: current
+                        .as_ref()
+                        .map(|payload| core_meta_payload_digest(TABLE_MESH_PARTITION_ROW, payload)),
+                    require_absent: current.is_none(),
+                    require_present: current.is_some(),
+                });
+                (
+                    ControlStreamAppendCursor {
+                        sequence: ControlStreamSequence::new(head.next_sequence)
+                            .map_err(|error| LifecycleError::InvalidArgument(error.to_string()))?,
+                        byte_offset: head.next_byte_offset,
+                    },
+                    Some(tuple_key),
+                )
+            }
+            None => (
+                crate::mesh_control_stream::control_stream_append_cursor(
+                    storage,
+                    control.stream_family,
+                    &control.partition,
+                )
+                .await
+                .map_err(|error| LifecycleError::InvalidArgument(error.to_string()))?,
+                None,
+            ),
+        };
         let digest = ControlRecordDigest::blake3(&control.payload_proto);
         let frame = ControlStreamFrame::new(
             crate::mesh_control_stream::encode_control_mutation_header(
@@ -368,15 +456,54 @@ async fn prepare_topology_mutation(
             ),
             control.payload_proto,
         );
-        let prepared = crate::mesh_control_stream::prepare_control_stream_append(
-            storage,
-            control.stream_family,
-            &control.partition,
-            &frame,
-            partition_precondition,
-            LIFECYCLE_TOPOLOGY_ROOT_ANCHOR_KEY,
-        )
-        .await
+        if let Some(tuple_key) = control_head {
+            let encoded_len = u64::try_from(
+                frame
+                    .encoded_len()
+                    .map_err(|error| LifecycleError::InvalidArgument(error.to_string()))?,
+            )
+            .map_err(|_| LifecycleError::InvalidArgument("control frame is too large".into()))?;
+            let next_sequence = cursor.sequence.get().checked_add(1).ok_or_else(|| {
+                LifecycleError::InvalidArgument("control stream sequence overflow".into())
+            })?;
+            let next_byte_offset =
+                cursor.byte_offset.checked_add(encoded_len).ok_or_else(|| {
+                    LifecycleError::InvalidArgument("control stream byte offset overflow".into())
+                })?;
+            operations.push(CoreMutationOperation::CoreMetaPut {
+                partition_id: LIFECYCLE_TOPOLOGY_ROOT_ANCHOR_KEY.to_string(),
+                cf: CF_MESH.to_string(),
+                table_id: TABLE_MESH_PARTITION_ROW,
+                tuple_key,
+                payload: serde_json::to_vec(&LifecycleControlHead {
+                    next_sequence,
+                    next_byte_offset,
+                })
+                .map_err(|error| LifecycleError::InvalidArgument(error.to_string()))?,
+            });
+        }
+        let prepared = if mvcc.is_some() {
+            crate::mesh_control_stream::prepare_control_stream_append_at_cursor(
+                control.stream_family,
+                &control.partition,
+                &frame,
+                partition_precondition,
+                LIFECYCLE_TOPOLOGY_ROOT_ANCHOR_KEY,
+                cursor,
+                None,
+            )
+            .await
+        } else {
+            crate::mesh_control_stream::prepare_control_stream_append(
+                storage,
+                control.stream_family,
+                &control.partition,
+                &frame,
+                partition_precondition,
+                LIFECYCLE_TOPOLOGY_ROOT_ANCHOR_KEY,
+            )
+            .await
+        }
         .map_err(|error| LifecycleError::InvalidArgument(error.to_string()))?;
         preconditions.extend(prepared.preconditions.iter().cloned());
         operations.extend(prepared.operations.iter().cloned());
@@ -402,7 +529,19 @@ async fn prepare_topology_mutation(
             operations,
         },
         control_append,
+        mvcc_predicates,
     })
+}
+
+fn lifecycle_control_head_row_key(
+    stream_family: &str,
+    partition: &str,
+) -> LifecycleResult<Vec<u8>> {
+    Ok(core_meta_tuple_key(&[
+        CoreMetaTuplePart::Utf8(LIFECYCLE_CONTROL_HEAD_KIND),
+        CoreMetaTuplePart::Utf8(stream_family),
+        CoreMetaTuplePart::Utf8(partition),
+    ])?)
 }
 
 fn topology_mutation_created_at(

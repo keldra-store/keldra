@@ -352,7 +352,7 @@ pub use store::{
 };
 pub(crate) use store::{
     PreparedControlStreamAppend, append_control_stream_frame, finish_control_stream_append,
-    prepare_control_stream_append,
+    prepare_control_stream_append, prepare_control_stream_append_at_cursor,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

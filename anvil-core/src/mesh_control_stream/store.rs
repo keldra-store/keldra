@@ -84,6 +84,29 @@ pub(crate) async fn prepare_control_stream_append(
     precondition: Option<CoreMutationPrecondition>,
     operation_partition: &str,
 ) -> AnyhowResult<PreparedControlStreamAppend> {
+    let store = CoreStore::new(storage.clone()).await?;
+    let cursor = control_stream_append_cursor_with_store(&store, stream_family, partition).await?;
+    prepare_control_stream_append_at_cursor(
+        stream_family,
+        partition,
+        frame,
+        precondition,
+        operation_partition,
+        cursor,
+        Some(&store),
+    )
+    .await
+}
+
+pub(crate) async fn prepare_control_stream_append_at_cursor(
+    stream_family: &str,
+    partition: &str,
+    frame: &ControlStreamFrame,
+    precondition: Option<CoreMutationPrecondition>,
+    operation_partition: &str,
+    cursor: ControlStreamAppendCursor,
+    physical_store: Option<&CoreStore>,
+) -> AnyhowResult<PreparedControlStreamAppend> {
     let stream_id = control_stream_id(stream_family, partition)?;
     let metadata = frame.metadata()?;
     let header = decode_control_mutation_header(&frame.header_proto)?;
@@ -98,8 +121,6 @@ pub(crate) async fn prepare_control_stream_append(
         return Err(anyhow!("control stream record key must not be empty"));
     }
 
-    let store = CoreStore::new(storage.clone()).await?;
-    let cursor = control_stream_append_cursor_with_store(&store, stream_family, partition).await?;
     if metadata.sequence != cursor.sequence || header.byte_offset != cursor.byte_offset {
         return Err(anyhow!(
             "control stream append cursor changed: frame declares sequence {} offset {}, current sequence {} offset {}",
@@ -113,8 +134,10 @@ pub(crate) async fn prepare_control_stream_append(
     let encoded = frame.encode()?;
     let record_stream_id = control_record_stream_id(stream_family, partition, &header.record_key)?;
     let mut preconditions: Vec<_> = precondition.into_iter().collect();
-    preconditions.push(store.stream_head_precondition(&stream_id).await?);
-    preconditions.push(store.stream_head_precondition(&record_stream_id).await?);
+    if let Some(store) = physical_store {
+        preconditions.push(store.stream_head_precondition(&stream_id).await?);
+        preconditions.push(store.stream_head_precondition(&record_stream_id).await?);
+    }
     let idempotency_key = header.idempotency_key.as_deref();
     let idempotency_scope = idempotency_key.map(|key| {
         format!(
