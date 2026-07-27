@@ -20,12 +20,12 @@ use anvil::anvil_api::{
     GetTransactionRequest, GitBlobLocation, GitPackMetadata, HeadObjectRequest,
     IndexDefinitionRecord, IndexKind, ListIndexesRequest, ListRoutingRecordsRequest,
     MutationBatchOperation, MutationBatchPutObject, MutationBatchRequest, MutationBatchResponse,
-    MvccDurability, MvccReadConsistency, NativeMutationContext, PersonalDbGroupResponse,
-    PersonalDbVoterAck, PutCellRequest, PutGitPackRequest, PutGitPackResponse, PutNodeRequest,
-    PutRegionRequest, QueryIndexRequest, QueryIndexResponse, ReadAuthzTuplesRequest,
-    ReadConsistency, ReplaceClusterNodeIncarnationRequest, RoutingRecordFamily,
-    SubmitPersonalDbChangesetRequest, SubmitPersonalDbChangesetResponse, TransactionStatus,
-    WatchGitSourceRequest, WatchGitSourceResponse, WriteOptions, WriteResponse,
+    MvccDurability, MvccReadConsistency, NativeMutationContext, NodeCapability,
+    PersonalDbGroupResponse, PersonalDbVoterAck, PutCellRequest, PutGitPackRequest,
+    PutGitPackResponse, PutNodeRequest, PutRegionRequest, QueryIndexRequest, QueryIndexResponse,
+    ReadAuthzTuplesRequest, ReadConsistency, ReplaceClusterNodeIncarnationRequest,
+    RoutingRecordFamily, SubmitPersonalDbChangesetRequest, SubmitPersonalDbChangesetResponse,
+    TransactionStatus, WatchGitSourceRequest, WatchGitSourceResponse, WriteOptions, WriteResponse,
     admin_service_client::AdminServiceClient, auth_service_client::AuthServiceClient,
     bucket_service_client::BucketServiceClient, git_source_service_client::GitSourceServiceClient,
     index_service_client::IndexServiceClient,
@@ -132,11 +132,15 @@ impl ProcessMvccCluster {
         // bootstrap voter attempts to install the initial membership.
         for node in [1_usize, 2] {
             cluster.spawn_node(node).await?;
-            cluster.wait_for_admin(node).await?;
+            cluster.wait_for_admin_transport(node).await?;
         }
         cluster.spawn_node(0).await?;
-        cluster.wait_for_admin(0).await?;
-        cluster.wait_for_leader(&[0, 1, 2]).await?;
+        cluster.wait_for_admin_transport(0).await?;
+        let coordinator = cluster.wait_for_leader(&[0, 1, 2]).await?;
+        for node in 0..3 {
+            cluster.wait_for_admin(node).await?;
+        }
+        cluster.bootstrap_cluster_topology(coordinator).await?;
         Ok(cluster)
     }
 
@@ -710,7 +714,7 @@ impl ProcessMvccCluster {
             .len())
     }
 
-    pub async fn bootstrap_object_placement(&self, coordinator: usize) -> anyhow::Result<()> {
+    async fn bootstrap_cluster_topology(&self, coordinator: usize) -> anyhow::Result<()> {
         let mut descriptors = Vec::new();
         for node in 0..self.nodes.len() {
             let mut admin =
@@ -739,35 +743,63 @@ impl ProcessMvccCluster {
             })
             .collect();
         let nodes = descriptors
-            .into_iter()
-            .map(|node| PutNodeRequest {
-                node_id: node.node_id,
-                region_id: node.region,
-                cell_id: node.cell_id,
-                advertise_addr: node.public_api_addr,
-                state: "active".to_string(),
-                capacity_json: "{}".to_string(),
-                options: None,
-                receipt_signing_public_key: node.receipt_signing_public_key,
-                capabilities: vec!["object".to_string()],
-            })
-            .collect();
-        let mut mesh = MeshControlServiceClient::connect(self.public_endpoint(coordinator)).await?;
-        mesh.bootstrap_mesh_topology(authorized(
-            BootstrapMeshTopologyRequest {
-                regions: vec![PutRegionRequest {
-                    region_id: "process-e2e-region".to_string(),
-                    endpoint: self.public_endpoint(coordinator),
+            .iter()
+            .map(|node| {
+                Ok(PutNodeRequest {
+                    node_id: node.node_id.clone(),
+                    region_id: node.region.clone(),
+                    cell_id: node.cell_id.clone(),
+                    advertise_addr: node.public_api_addr.clone(),
                     state: "active".to_string(),
+                    capacity_json: "{}".to_string(),
                     options: None,
-                }],
-                cells,
-                nodes,
-                canonical_coremeta_rows: Vec::new(),
-            },
-            &self.admin_token,
+                    receipt_signing_public_key: node.receipt_signing_public_key.clone(),
+                    capabilities: node
+                        .capabilities
+                        .iter()
+                        .copied()
+                        .map(bootstrap_capability_name)
+                        .collect::<anyhow::Result<Vec<_>>>()?,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let topology = BootstrapMeshTopologyRequest {
+            regions: vec![PutRegionRequest {
+                region_id: "process-e2e-region".to_string(),
+                endpoint: self.public_endpoint(coordinator),
+                state: "active".to_string(),
+                options: None,
+            }],
+            cells,
+            nodes,
+            canonical_coremeta_rows: Vec::new(),
+        };
+        let mut seed = MeshControlServiceClient::connect(format!(
+            "http://{}",
+            self.nodes[coordinator].admin_addr
         ))
         .await?;
+        let seeded = seed
+            .bootstrap_mesh_topology(authorized(topology.clone(), &self.admin_token))
+            .await?
+            .into_inner();
+        if seeded.canonical_coremeta_rows.is_empty() {
+            bail!("process topology bootstrap omitted its canonical CoreMeta snapshot");
+        }
+        for node in 0..self.nodes.len() {
+            if node == coordinator {
+                continue;
+            }
+            let mut join = topology.clone();
+            join.canonical_coremeta_rows = seeded.canonical_coremeta_rows.clone();
+            let mut mesh = MeshControlServiceClient::connect(format!(
+                "http://{}",
+                self.nodes[node].admin_addr
+            ))
+            .await?;
+            mesh.bootstrap_mesh_topology(authorized(join, &self.admin_token))
+                .await?;
+        }
         Ok(())
     }
 
@@ -789,7 +821,7 @@ impl ProcessMvccCluster {
                         bucket_id,
                         principal: ADMIN_PRINCIPAL.to_string(),
                         request_id: uuid::Uuid::new_v4().to_string(),
-                        precondition: String::new(),
+                        precondition: "none".to_string(),
                         authz_zookie_optional: String::new(),
                         idempotency_key: uuid::Uuid::new_v4().to_string(),
                         transaction_id: Some(transaction_id.to_string()),
@@ -911,6 +943,19 @@ impl ProcessMvccCluster {
             .context("arm process MVCC hard crash")
     }
 
+    /// Arm the same worker fault on every live node.
+    ///
+    /// Background work is placed by compact-Raft partition assignment, not by
+    /// request coordination. Process acceptance tests which exercise a worker
+    /// crash therefore cannot assume that the transaction coordinator will
+    /// execute the committed job.
+    pub fn arm_hard_crash_on_all(&self, fault_point: &str) -> anyhow::Result<()> {
+        for node in 0..self.nodes.len() {
+            self.arm_hard_crash(node, fault_point)?;
+        }
+        Ok(())
+    }
+
     pub async fn wait_for_hard_crash(
         &mut self,
         node: usize,
@@ -931,6 +976,35 @@ impl ProcessMvccCluster {
         })
         .await
         .context("timed out waiting for process MVCC hard crash")?
+    }
+
+    /// Wait for the compact-Raft-assigned worker to consume a fault armed on
+    /// multiple candidates, returning the process which actually executed it.
+    pub async fn wait_for_any_hard_crash(
+        &mut self,
+        candidates: &[usize],
+        timeout: Duration,
+    ) -> anyhow::Result<usize> {
+        if candidates.is_empty() {
+            bail!("hard-crash wait requires at least one candidate node");
+        }
+        tokio::time::timeout(timeout, async {
+            loop {
+                for &node in candidates {
+                    let exited = self.nodes[node]
+                        .child
+                        .as_mut()
+                        .is_some_and(|child| matches!(child.try_wait(), Ok(Some(_))));
+                    if exited {
+                        self.nodes[node].child = None;
+                        return Ok::<_, anyhow::Error>(node);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .context("timed out waiting for an assigned process MVCC worker to hard crash")?
     }
 
     pub async fn restart(&mut self, node: usize) -> anyhow::Result<()> {
@@ -964,7 +1038,13 @@ impl ProcessMvccCluster {
         peers[node]["incarnation"] = serde_json::json!(incarnation);
         self.peers_json = serde_json::to_string(&peers)?;
         self.spawn_node(node).await?;
-        self.wait_for_admin(node).await
+        // This is a clean disk whose newer incarnation has not yet been
+        // installed by ReplaceClusterNodeIncarnation. Requiring an
+        // authenticated admin response here creates a cycle: the replacement
+        // cannot apply the system realm until the surviving quorum admits it,
+        // while the caller cannot submit that admission until this method
+        // returns. Transport readiness is the correct pre-admission boundary.
+        self.wait_for_admin_transport(node).await
     }
 
     /// Relaunch the retired disk on separate listeners. Its authenticated
@@ -1123,6 +1203,58 @@ impl ProcessMvccCluster {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
+
+    async fn wait_for_admin_transport(&mut self, node: usize) -> anyhow::Result<()> {
+        let endpoint = format!("http://{}", self.nodes[node].admin_addr);
+        let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+        loop {
+            if self.nodes[node]
+                .child
+                .as_mut()
+                .is_some_and(|child| matches!(child.try_wait(), Ok(Some(_))))
+            {
+                bail!("process MVCC node {node} exited during startup");
+            }
+            if let Ok(mut client) = AdminServiceClient::connect(endpoint.clone()).await {
+                // The system realm is committed through this cluster's Raft
+                // group, so an authenticated admin authorization check cannot
+                // succeed before the bootstrap voter is running. An
+                // unauthenticated response proves that the admin gRPC router
+                // and its interceptor are serving without weakening
+                // production authorization.
+                match client
+                    .get_local_node_descriptor(Request::new(GetLocalNodeDescriptorRequest {}))
+                    .await
+                {
+                    Ok(_) => return Ok(()),
+                    Err(status) if status.code() == tonic::Code::Unauthenticated => return Ok(()),
+                    Err(_) => {}
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!("process MVCC node {node} admin transport did not become ready");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+fn bootstrap_capability_name(value: i32) -> anyhow::Result<String> {
+    let Ok(capability) = NodeCapability::try_from(value) else {
+        bail!("local node descriptor advertised unknown capability {value}");
+    };
+    let name = match capability {
+        NodeCapability::Object => "object",
+        NodeCapability::Index => "index",
+        NodeCapability::Personaldb => "personaldb",
+        NodeCapability::Metadata => "metadata",
+        NodeCapability::Gateway => "gateway",
+        NodeCapability::Admin => "admin",
+        NodeCapability::Unspecified => {
+            bail!("local node descriptor advertised an unspecified capability")
+        }
+    };
+    Ok(name.to_string())
 }
 
 impl Drop for ProcessMvccCluster {

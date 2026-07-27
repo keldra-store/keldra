@@ -179,6 +179,7 @@ jobs:
     # remains required for release publication, but decoupling it here lets a
     # CI run expose the next code/test failures in the same attempt.
     needs: static
+    if: ${{ !cancelled() }}
     runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 120
     env:
@@ -224,7 +225,11 @@ jobs:
 
   coremeta-performance:
     name: CoreMeta ordered-access performance gate
-    needs: rust-unit
+    # Performance is deliberately last while the replacement architecture is
+    # being brought to functional E2E readiness. Still run it after functional
+    # failures so one CI attempt produces complete diagnostic evidence.
+    needs: [rust-unit, server-core, mvcc-e2e]
+    if: ${{ !cancelled() }}
     runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 60
     env:
@@ -276,7 +281,11 @@ jobs:
 
   server-core:
     name: Server core integration tests
-    needs: rust-unit
+    # Functional lanes are independent after static validation. A unit failure
+    # must not hide server-integration or native-cluster failures in the same
+    # CI attempt.
+    needs: static
+    if: ${{ !cancelled() }}
     runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 60
     env:
@@ -324,7 +333,11 @@ jobs:
 
   mvcc-e2e:
     name: MVCC under Raft end-to-end acceptance
-    needs: server-core
+    # Run native cluster acceptance independently of the shorter Rust and
+    # server-core lanes so failures there do not suppress the evidence we need
+    # to reach E2E QA.
+    needs: static
+    if: ${{ !cancelled() }}
     runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 180
     env:

@@ -9,6 +9,10 @@ use anvil_core::{
         consensus_transport_server::ConsensusTransportServer,
         replication_service_server::ReplicationServiceServer,
     },
+    mesh_lifecycle::{
+        BootstrapMeshLifecycleProjection, CreateRegionDescriptor, LifecycleState, NodeCapability,
+        RegisterCellDescriptor, RegisterNodeDescriptor, install_bootstrap_lifecycle_projection,
+    },
     mvcc_node_runtime::CommitOutcome,
     mvcc_transaction::{DurabilityLevel, LogicalKey, ReadConsistency},
     personaldb_signing::PersonalDbProtocolKeyring,
@@ -94,6 +98,7 @@ impl RealMvccCluster {
                 bootstrap_system_admin_subject_id: "e2e-admin".into(),
                 node_id: format!("{cluster_id}-node-{}", index + 1),
                 region: "e2e-region".into(),
+                public_api_addr: public_endpoints[index].clone(),
                 storage_path: directory
                     .path()
                     .join("storage")
@@ -156,6 +161,7 @@ impl RealMvccCluster {
         };
         cluster.wait_for_any_leader(&[0, 1, 2]).await?;
         cluster.wait_for_system_realm().await?;
+        cluster.bootstrap_active_topology().await?;
         Ok(cluster)
     }
 
@@ -363,6 +369,14 @@ impl RealMvccCluster {
             .persistence
             .create_bucket(tenant.id, bucket_name, "e2e-region")
             .await?;
+        anvil_core::access_control::grant_bucket_defaults(
+            &state.persistence,
+            &bucket,
+            &app.id.to_string(),
+            "e2e-fixture",
+            "grant fixture actor bucket ownership",
+        )
+        .await?;
         let token = state
             .jwt_manager
             .mint_token(app.id.to_string(), tenant.id)?;
@@ -435,6 +449,152 @@ impl RealMvccCluster {
         .map_err(|_| anyhow::anyhow!("system realm did not become visible on every cluster node"))?
     }
 
+    async fn bootstrap_active_topology(&self) -> anyhow::Result<()> {
+        let coordinator = self.wait_for_any_leader(&[0, 1, 2]).await?;
+        let state = self.state(coordinator);
+        let region_id = self.configs[coordinator].region.clone();
+        let cell_id = self.configs[coordinator].cell_id.clone();
+        let mesh_id = self.configs[coordinator].mesh_id.clone();
+
+        let node_keys = self
+            .states
+            .iter()
+            .flatten()
+            .map(|state| {
+                (
+                    state.config.node_id.clone(),
+                    state.core_store.local_receipt_signing_public_key(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let region_input = CreateRegionDescriptor {
+            mesh_id: mesh_id.clone(),
+            region: region_id.clone(),
+            public_base_url: self.public_endpoints[coordinator].clone(),
+            virtual_host_suffix: format!("{region_id}.test.invalid"),
+            placement_weight: 100,
+            default_cell: Some(cell_id.clone()),
+        };
+        let cell_input = RegisterCellDescriptor {
+            mesh_id: mesh_id.clone(),
+            region: region_id.clone(),
+            cell_id: cell_id.clone(),
+            placement_weight: 100,
+            failure_domain: cell_id.clone(),
+        };
+        let node_inputs = self
+            .configs
+            .iter()
+            .enumerate()
+            .map(|(index, config)| RegisterNodeDescriptor {
+                mesh_id: mesh_id.clone(),
+                node_id: config.node_id.clone(),
+                region: region_id.clone(),
+                cell_id: cell_id.clone(),
+                receipt_signing_public_key: node_keys[index].1.clone(),
+                public_api_addr: config.public_api_addr.clone(),
+                capabilities: vec![
+                    NodeCapability::Object,
+                    NodeCapability::Index,
+                    NodeCapability::PersonalDb,
+                    NodeCapability::Metadata,
+                    NodeCapability::Gateway,
+                    NodeCapability::Admin,
+                ],
+                capacity_json: "{}".to_string(),
+            })
+            .collect::<Vec<_>>();
+        let physical_projection = BootstrapMeshLifecycleProjection {
+            regions: vec![region_input.clone()],
+            cells: vec![cell_input.clone()],
+            nodes: node_inputs.clone(),
+        };
+        for target in self.states.iter().flatten() {
+            for (node_id, key) in &node_keys {
+                target
+                    .core_store
+                    .register_node_receipt_signing_public_key(node_id, key)?;
+            }
+            install_bootstrap_lifecycle_projection(
+                &target.storage,
+                &target.core_store,
+                physical_projection.clone(),
+            )?;
+        }
+
+        let mut region = state
+            .persistence
+            .create_region_descriptor(region_input)
+            .await?;
+        let mut cell = state
+            .persistence
+            .register_cell_descriptor(cell_input)
+            .await?;
+        cell = state
+            .persistence
+            .transition_cell_descriptor(
+                &region_id,
+                &cell_id,
+                cell.generation,
+                LifecycleState::Active,
+            )
+            .await?;
+
+        region = state
+            .persistence
+            .transition_region_descriptor(&region_id, region.generation, LifecycleState::Active)
+            .await?;
+
+        for input in node_inputs {
+            let mut node = state.persistence.register_node_descriptor(input).await?;
+            node = state
+                .persistence
+                .transition_node_descriptor(
+                    &node.node_id,
+                    node.generation,
+                    LifecycleState::Active,
+                    None,
+                )
+                .await?;
+            debug_assert_eq!(node.state, LifecycleState::Active);
+        }
+        debug_assert_eq!(region.state, LifecycleState::Active);
+        debug_assert_eq!(cell.state, LifecycleState::Active);
+
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let mut converged = true;
+                for node in 0..self.states.len() {
+                    let persistence = &self.state(node).persistence;
+                    let regions = persistence.list_region_descriptors().await?;
+                    let cells = persistence.list_cell_descriptors(Some(&region_id)).await?;
+                    let nodes = persistence
+                        .list_node_descriptors(Some(&region_id), Some(&cell_id))
+                        .await?;
+                    converged &= regions.iter().any(|region| {
+                        region.region == region_id && region.state == LifecycleState::Active
+                    });
+                    converged &= cells.iter().any(|cell| {
+                        cell.cell_id == cell_id && cell.state == LifecycleState::Active
+                    });
+                    converged &= self.configs.iter().all(|config| {
+                        nodes.iter().any(|node| {
+                            node.node_id == config.node_id && node.state == LifecycleState::Active
+                        })
+                    });
+                }
+                if converged {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("mesh topology did not become visible on every cluster node")
+        })?
+    }
+
     pub async fn commit(
         &self,
         node: usize,
@@ -498,10 +658,9 @@ fn spawn_public_api(listener: TcpListener, state: &Arc<AppState>) -> JoinHandle<
         anvil_core::middleware::auth_interceptor(request, &auth_state)
     });
     let routes = anvil_core::services::create_grpc_router(app_state, interceptor);
+    let app = anvil_core::services::create_axum_router(routes);
     tokio::spawn(async move {
-        Server::builder()
-            .add_routes(routes)
-            .serve_with_incoming(TcpListenerStream::new(listener))
+        axum::serve(listener, app.into_make_service())
             .await
             .expect("real MVCC fixture public API");
     })

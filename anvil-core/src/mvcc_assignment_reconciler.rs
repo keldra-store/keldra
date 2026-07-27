@@ -100,7 +100,7 @@ impl BackgroundAssignmentReconciler {
     }
 }
 
-async fn reconcile_partition_owner(
+pub(crate) async fn reconcile_partition_owner(
     cluster_id: &str,
     consensus: &OpenRaftConsensus,
     partition_id: u64,

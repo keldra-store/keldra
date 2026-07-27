@@ -153,7 +153,7 @@ async fn public_commit_survives_lost_response_and_coordinator_sigkill() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn committed_index_finalization_survives_two_coordinator_crashes_without_commit_retry() {
+async fn committed_index_finalization_survives_two_worker_crashes_without_commit_retry() {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_anvil-server"));
     let mut cluster = ProcessMvccCluster::start(binary).await.unwrap();
     let coordinator = cluster.wait_for_leader(&[0, 1, 2]).await.unwrap();
@@ -208,7 +208,7 @@ async fn committed_index_finalization_survives_two_coordinator_crashes_without_c
     );
 
     cluster
-        .arm_hard_crash(coordinator, "IndexFinalizationBeforeExecute")
+        .arm_hard_crash_on_all("IndexFinalizationBeforeExecute")
         .unwrap();
     let committed = cluster
         .commit_transaction(
@@ -218,14 +218,14 @@ async fn committed_index_finalization_survives_two_coordinator_crashes_without_c
         .await
         .unwrap();
     assert_eq!(committed.state, WriteState::Committed as i32);
-    cluster
-        .wait_for_hard_crash(coordinator, Duration::from_secs(45))
+    let worker = cluster
+        .wait_for_any_hard_crash(&[0, 1, 2], Duration::from_secs(45))
         .await
         .unwrap();
 
     let survivors = [0, 1, 2]
         .into_iter()
-        .filter(|node| *node != coordinator)
+        .filter(|node| *node != worker)
         .collect::<Vec<_>>();
     let survivor = cluster.wait_for_leader(&survivors).await.unwrap();
     let published = tokio::time::timeout(Duration::from_secs(20), async {
@@ -250,19 +250,19 @@ async fn committed_index_finalization_survives_two_coordinator_crashes_without_c
     // complete. The next same-disk restart must execute the same immutable job
     // again without duplicating the definition, grant, or build.
     cluster
-        .arm_hard_crash(coordinator, "IndexFinalizationAfterExecute")
+        .arm_hard_crash(worker, "IndexFinalizationAfterExecute")
         .unwrap();
-    cluster.restart(coordinator).await.unwrap();
+    cluster.restart(worker).await.unwrap();
     cluster
-        .wait_for_hard_crash(coordinator, Duration::from_secs(45))
+        .wait_for_hard_crash(worker, Duration::from_secs(45))
         .await
         .unwrap();
-    cluster.restart(coordinator).await.unwrap();
+    cluster.restart(worker).await.unwrap();
 
     tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             let indexes = cluster
-                .list_indexes(coordinator, &bucket_name)
+                .list_indexes(worker, &bucket_name)
                 .await
                 .unwrap_or_default();
             let exact = indexes
@@ -272,15 +272,15 @@ async fn committed_index_finalization_survives_two_coordinator_crashes_without_c
                 })
                 .count();
             let owner = cluster
-                .index_creator_is_owner(coordinator, bucket_id, index_name)
+                .index_creator_is_owner(worker, bucket_id, index_name)
                 .await
                 .unwrap_or(false);
             let owner_tuple_count = cluster
-                .index_creator_owner_tuple_count(coordinator, bucket_id, index_name)
+                .index_creator_owner_tuple_count(worker, bucket_id, index_name)
                 .await
                 .unwrap_or_default();
             let queryable = cluster
-                .query_path_index(coordinator, &bucket_name, index_name)
+                .query_path_index(worker, &bucket_name, index_name)
                 .await
                 .is_ok();
             if exact == 1 && owner && owner_tuple_count == 1 && queryable {
@@ -294,7 +294,7 @@ async fn committed_index_finalization_survives_two_coordinator_crashes_without_c
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn committed_personaldb_submit_survives_two_coordinator_crashes_without_client_retry() {
+async fn committed_personaldb_submit_survives_two_worker_crashes_without_client_retry() {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_anvil-server"));
     let mut cluster = ProcessMvccCluster::start(binary).await.unwrap();
     let coordinator = cluster.wait_for_leader(&[0, 1, 2]).await.unwrap();
@@ -342,7 +342,7 @@ async fn committed_personaldb_submit_survives_two_coordinator_crashes_without_cl
     );
 
     cluster
-        .arm_hard_crash(coordinator, "PersonalDbPostCommitBeforeEffects")
+        .arm_hard_crash_on_all("PersonalDbPostCommitBeforeEffects")
         .unwrap();
     let committed = cluster
         .commit_transaction(
@@ -352,14 +352,14 @@ async fn committed_personaldb_submit_survives_two_coordinator_crashes_without_cl
         .await
         .unwrap();
     assert_eq!(committed.state, WriteState::Committed as i32);
-    cluster
-        .wait_for_hard_crash(coordinator, Duration::from_secs(45))
+    let worker = cluster
+        .wait_for_any_hard_crash(&[0, 1, 2], Duration::from_secs(45))
         .await
         .unwrap();
 
     let survivors = [0, 1, 2]
         .into_iter()
-        .filter(|node| *node != coordinator)
+        .filter(|node| *node != worker)
         .collect::<Vec<_>>();
     let survivor = cluster.wait_for_leader(&survivors).await.unwrap();
     tokio::time::timeout(Duration::from_secs(20), async {
@@ -383,25 +383,25 @@ async fn committed_personaldb_submit_survives_two_coordinator_crashes_without_cl
     // before durable completion. A second same-disk restart must converge
     // without the client resubmitting either Submit or Commit.
     cluster
-        .arm_hard_crash(coordinator, "PersonalDbPostCommitAfterEffects")
+        .arm_hard_crash(worker, "PersonalDbPostCommitAfterEffects")
         .unwrap();
-    cluster.restart(coordinator).await.unwrap();
+    cluster.restart(worker).await.unwrap();
     cluster
-        .wait_for_hard_crash(coordinator, Duration::from_secs(45))
+        .wait_for_hard_crash(worker, Duration::from_secs(45))
         .await
         .unwrap();
-    cluster.restart(coordinator).await.unwrap();
+    cluster.restart(worker).await.unwrap();
 
     tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             let head_is_committed = cluster
-                .get_personaldb_group(coordinator, &database_id)
+                .get_personaldb_group(worker, &database_id)
                 .await
                 .ok()
                 .and_then(|group| group.committed_head)
                 .is_some_and(|head| head.log_index == 1);
             let owner_grants = cluster
-                .personaldb_row_owner_tuple_count(coordinator, &database_id, "items", "1")
+                .personaldb_row_owner_tuple_count(worker, &database_id, "items", "1")
                 .await
                 .unwrap_or_default();
             if head_is_committed && owner_grants == 3 {
@@ -415,7 +415,7 @@ async fn committed_personaldb_submit_survives_two_coordinator_crashes_without_cl
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn committed_bucket_locator_survives_two_coordinator_crashes_without_client_retry() {
+async fn committed_bucket_locator_survives_two_worker_crashes_without_client_retry() {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_anvil-server"));
     let mut cluster = ProcessMvccCluster::start(binary).await.unwrap();
     let coordinator = cluster.wait_for_leader(&[0, 1, 2]).await.unwrap();
@@ -438,7 +438,7 @@ async fn committed_bucket_locator_survives_two_coordinator_crashes_without_clien
     );
 
     cluster
-        .arm_hard_crash(coordinator, "BucketLocatorFinalizationBeforeEffects")
+        .arm_hard_crash_on_all("BucketLocatorFinalizationBeforeEffects")
         .unwrap();
     let committed = cluster
         .commit_transaction(
@@ -448,25 +448,25 @@ async fn committed_bucket_locator_survives_two_coordinator_crashes_without_clien
         .await
         .unwrap();
     assert_eq!(committed.state, WriteState::Committed as i32);
-    cluster
-        .wait_for_hard_crash(coordinator, Duration::from_secs(45))
+    let worker = cluster
+        .wait_for_any_hard_crash(&[0, 1, 2], Duration::from_secs(45))
         .await
         .unwrap();
 
     cluster
-        .arm_hard_crash(coordinator, "BucketLocatorFinalizationAfterEffects")
+        .arm_hard_crash(worker, "BucketLocatorFinalizationAfterEffects")
         .unwrap();
-    cluster.restart(coordinator).await.unwrap();
+    cluster.restart(worker).await.unwrap();
     cluster
-        .wait_for_hard_crash(coordinator, Duration::from_secs(45))
+        .wait_for_hard_crash(worker, Duration::from_secs(45))
         .await
         .unwrap();
-    cluster.restart(coordinator).await.unwrap();
+    cluster.restart(worker).await.unwrap();
 
     tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             if cluster
-                .bucket_locator_record_count(coordinator, &bucket_name)
+                .bucket_locator_record_count(worker, &bucket_name)
                 .await
                 .unwrap_or_default()
                 == 1
@@ -481,15 +481,10 @@ async fn committed_bucket_locator_survives_two_coordinator_crashes_without_clien
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn committed_git_pack_survives_two_postcommit_crashes_without_client_retry_or_duplicate_watch()
- {
+async fn committed_git_pack_survives_two_worker_crashes_without_client_retry_or_duplicate_watch() {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_anvil-server"));
     let mut cluster = ProcessMvccCluster::start(binary).await.unwrap();
     let coordinator = cluster.wait_for_leader(&[0, 1, 2]).await.unwrap();
-    cluster
-        .bootstrap_object_placement(coordinator)
-        .await
-        .unwrap();
     let bucket_name = format!("git-crash-{}", uuid::Uuid::new_v4().simple());
     cluster
         .create_bucket(coordinator, &bucket_name)
@@ -521,7 +516,7 @@ async fn committed_git_pack_survives_two_postcommit_crashes_without_client_retry
     );
 
     cluster
-        .arm_hard_crash(coordinator, "GitSourcePostCommitBeforeEffects")
+        .arm_hard_crash_on_all("GitSourcePostCommitBeforeEffects")
         .unwrap();
     let committed = cluster
         .commit_transaction(
@@ -531,14 +526,14 @@ async fn committed_git_pack_survives_two_postcommit_crashes_without_client_retry
         .await
         .unwrap();
     assert_eq!(committed.state, WriteState::Committed as i32);
-    cluster
-        .wait_for_hard_crash(coordinator, Duration::from_secs(45))
+    let worker = cluster
+        .wait_for_any_hard_crash(&[0, 1, 2], Duration::from_secs(45))
         .await
         .unwrap();
 
     let survivors = [0, 1, 2]
         .into_iter()
-        .filter(|node| *node != coordinator)
+        .filter(|node| *node != worker)
         .collect::<Vec<_>>();
     let survivor = cluster.wait_for_leader(&survivors).await.unwrap();
     tokio::time::timeout(Duration::from_secs(20), async {
@@ -557,19 +552,19 @@ async fn committed_git_pack_survives_two_postcommit_crashes_without_client_retry
     .expect("certified Git pack object survives the coordinator crash");
 
     cluster
-        .arm_hard_crash(coordinator, "GitSourcePostCommitAfterEffects")
+        .arm_hard_crash(worker, "GitSourcePostCommitAfterEffects")
         .unwrap();
-    cluster.restart(coordinator).await.unwrap();
+    cluster.restart(worker).await.unwrap();
     cluster
-        .wait_for_hard_crash(coordinator, Duration::from_secs(45))
+        .wait_for_hard_crash(worker, Duration::from_secs(45))
         .await
         .unwrap();
-    cluster.restart(coordinator).await.unwrap();
+    cluster.restart(worker).await.unwrap();
 
     tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             let events = cluster
-                .git_source_watch_events(coordinator, &repository_id, Duration::from_millis(250))
+                .git_source_watch_events(worker, &repository_id, Duration::from_millis(250))
                 .await
                 .unwrap_or_default();
             if events.len() == 1
@@ -584,12 +579,12 @@ async fn committed_git_pack_survives_two_postcommit_crashes_without_client_retry
     .await
     .expect("same-disk replay materializes exactly one GitSource watch event");
     let blob = cluster
-        .get_git_blob_by_path(coordinator, &repository_id, &commit_id, "README.md")
+        .get_git_blob_by_path(worker, &repository_id, &commit_id, "README.md")
         .await
         .expect("same-disk replay materializes the GitSource index");
     assert_eq!(blob.pack_object_version_id, staged.version_id);
     let events = cluster
-        .git_source_watch_events(coordinator, &repository_id, Duration::from_millis(750))
+        .git_source_watch_events(worker, &repository_id, Duration::from_millis(750))
         .await
         .unwrap();
     assert_eq!(
@@ -884,10 +879,6 @@ async fn public_erasure_object_retries_after_remote_shard_crash_before_sync() {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_anvil-server"));
     let mut cluster = ProcessMvccCluster::start(binary).await.unwrap();
     let coordinator = cluster.wait_for_leader(&[0, 1, 2]).await.unwrap();
-    cluster
-        .bootstrap_object_placement(coordinator)
-        .await
-        .unwrap();
     let shard_target = (0..3).find(|node| *node != coordinator).unwrap();
     let bucket_name = format!("process-shard-{}", uuid::Uuid::new_v4().simple());
     let bucket_id = cluster

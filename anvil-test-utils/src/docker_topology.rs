@@ -146,13 +146,6 @@ async fn prepare_docker_topology(
         .await
         .expect("Docker seed BootstrapMeshTopology")
         .into_inner();
-    if seed.already_initialised {
-        assert!(
-            deferred_ordinal.is_none(),
-            "cannot defer a peer after Docker topology is already initialised"
-        );
-        return None;
-    }
     assert!(
         !seed.canonical_coremeta_rows.is_empty(),
         "Docker seed topology bootstrap must return a canonical CoreMeta snapshot"
@@ -170,15 +163,10 @@ async fn prepare_docker_topology(
         let mut client = connect_docker_mesh_control(admin_addr).await;
         let mut request = tonic::Request::new(join);
         add_docker_admin_bearer(&mut request, admin_token);
-        let response = client
+        client
             .bootstrap_mesh_topology(request)
             .await
-            .expect("Docker joining BootstrapMeshTopology")
-            .into_inner();
-        assert!(
-            !response.already_initialised,
-            "fresh Docker joining node unexpectedly had an existing mesh topology"
-        );
+            .expect("Docker joining BootstrapMeshTopology");
     }
     deferred_request
 }

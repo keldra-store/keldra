@@ -27,6 +27,10 @@ mod region;
 mod topology_activation;
 mod topology_mutation;
 pub use bootstrap::{BootstrapMeshLifecycleProjection, install_bootstrap_lifecycle_projection};
+pub(crate) use bootstrap::{
+    await_authoritative_bootstrap_lifecycle_projection, existing_bootstrap_lifecycle_projection,
+    install_authoritative_bootstrap_lifecycle_projection,
+};
 pub use cell::*;
 pub use host_alias::{
     create_host_alias, create_host_alias_in_transaction, list_host_aliases, transition_host_alias,

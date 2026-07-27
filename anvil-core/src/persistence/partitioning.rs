@@ -1018,6 +1018,16 @@ impl Persistence {
         }
     }
 
+    pub(super) async fn task_queue_producer_permit(
+        &self,
+    ) -> Result<task_journal::TaskQueueProducerPermit> {
+        self.ensure_owner_node_can_acquire_new_partition("task_queue")
+            .await?;
+        Ok(task_journal::TaskQueueProducerPermit::for_node(
+            self.mvcc()?.local_node.node_id.clone(),
+        ))
+    }
+
     pub(super) async fn task_queue_write_permit(&self) -> Result<PartitionWritePermit> {
         let partition_id = hex::encode(task_journal::task_queue_partition_id());
         self.global_write_permit("task_queue", partition_id).await

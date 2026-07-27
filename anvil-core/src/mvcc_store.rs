@@ -34,7 +34,8 @@ use crate::mvcc_local_durability_upgrade::{
 };
 use crate::mvcc_shard_repair::{ShardRepairJob, ShardRepairRecord, ShardRepairState};
 use crate::mvcc_transaction::{
-    CommitVersion, IdempotencyResult, LogicalKey, TransactionBundle, WriteOperation,
+    CommitVersion, IdempotencyResult, LogicalKey, NodeIncarnation, TransactionBundle,
+    WriteOperation,
 };
 use crate::object_link_finalization_job::{
     ObjectLinkFinalizationJob, ObjectLinkFinalizationRecord, ObjectLinkFinalizationState,
@@ -330,17 +331,7 @@ impl MvccStore {
             if record.state == LocalDurabilityUpgradeState::Complete {
                 continue;
             }
-            let mut holders = record
-                .job
-                .objects
-                .iter()
-                .map(|object| object.local_manifest.node.clone());
-            let holder = holders
-                .next()
-                .context("local durability upgrade has no local holder")?;
-            if holders.any(|candidate| candidate != holder) {
-                bail!("one local durability upgrade spans multiple holder incarnations");
-            }
+            let holder = record.job.local_holder()?;
             let partition_id = crate::mvcc_worker_authority::work_partition_id(
                 "local-durability-upgrade",
                 &format!("transaction/{}", record.job.transaction_id),
@@ -2278,6 +2269,7 @@ impl MvccStore {
         }
 
         let repair_prefix = self.key(b"shard-repair/");
+        let repair_snapshot = self.readable_version()?;
         for row in self.db.iterator_cf(
             materialisation_cf,
             IteratorMode::From(&repair_prefix, Direction::Forward),
@@ -2288,6 +2280,15 @@ impl MvccStore {
             }
             let record: ShardRepairRecord = serde_json::from_slice(&value)?;
             if record.state != ShardRepairState::Complete {
+                // The repair journal is local and only the Raft-assigned
+                // worker transitions its copy to Complete.  A committed,
+                // locally applied placement overlay is the cluster-wide
+                // completion fact for every other replica: keeping their
+                // Pending copies as GC pins would prevent the overlay itself
+                // from ever becoming eligible for physical retirement.
+                if self.shard_repair_published_at(&record, repair_snapshot)? {
+                    continue;
+                }
                 pins.repair_snapshots
                     .insert(record.job.originating_snapshot_version);
                 pins.transaction_ids.insert(record.job.transaction_id);
@@ -2402,38 +2403,124 @@ impl MvccStore {
         Ok(pins)
     }
 
+    fn shard_repair_published_at(
+        &self,
+        record: &ShardRepairRecord,
+        snapshot_version: CommitVersion,
+    ) -> Result<bool> {
+        let key = LogicalKey {
+            table_id: crate::mvcc_shard_repair::ShardPlacementOverlay::TABLE_ID,
+            application_key: record.job.target_logical_identity.as_bytes().to_vec(),
+        };
+        let Some(row) = self.read_at(&key, snapshot_version)? else {
+            return Ok(false);
+        };
+        let overlay: crate::mvcc_shard_repair::ShardPlacementOverlay =
+            serde_json::from_slice(&row.value)?;
+        self.validate_shard_placement_overlay(&key, &overlay)?;
+        let source = &record.job.source_manifest;
+        let replacement = &overlay.replacement_manifest;
+        if overlay.cluster_id != record.job.cluster_id
+            || overlay.target_logical_identity != record.job.target_logical_identity
+            || overlay.source_manifest_hash != record.job.source_manifest_hash
+            || replacement.cluster_id != source.cluster_id
+            || replacement.object_identity != source.object_identity
+            || replacement.object_hash != source.object_hash
+            || replacement.object_length != source.object_length
+            || replacement.encoding_generation != source.encoding_generation
+            || replacement.data_shards != source.data_shards
+            || replacement.parity_shards != source.parity_shards
+            || replacement.shard_bytes != source.shard_bytes
+            || replacement.stripe_count != source.stripe_count
+        {
+            return Ok(false);
+        }
+        let every_replacement_is_live = record.job.missing.iter().all(|missing| {
+            overlay
+                .replacement_manifest
+                .placements
+                .iter()
+                .any(|placement| {
+                    placement.stripe_ordinal == missing.stripe_ordinal
+                        && placement.shard_ordinal == missing.shard_ordinal
+                        && placement.node_id == missing.target.node.node_id
+                        && placement.node_incarnation == missing.target.node.incarnation
+                        && placement.failure_domain == missing.target.failure_domain
+                })
+        });
+        let every_old_placement_is_retired = record.job.retiring.iter().all(|retiring| {
+            overlay
+                .retired_after_commit
+                .iter()
+                .any(|retired| retired == retiring)
+                && !overlay
+                    .replacement_manifest
+                    .placements
+                    .iter()
+                    .any(|placement| {
+                        placement.stripe_ordinal == retiring.stripe_ordinal
+                            && placement.shard_ordinal == retiring.shard_ordinal
+                            && placement.node_id == retiring.node_id
+                            && placement.node_incarnation == retiring.node_incarnation
+                            && placement.failure_domain == retiring.failure_domain
+                    })
+        });
+        Ok(every_replacement_is_live && every_old_placement_is_retired)
+    }
+
+    fn validate_shard_placement_overlay(
+        &self,
+        key: &LogicalKey,
+        overlay: &crate::mvcc_shard_repair::ShardPlacementOverlay,
+    ) -> Result<()> {
+        overlay.replacement_manifest.validate()?;
+        if overlay.schema != crate::mvcc_shard_repair::ShardPlacementOverlay::SCHEMA
+            || overlay.cluster_id != self.cluster_id
+            || overlay.target_logical_identity.as_bytes() != key.application_key.as_slice()
+            || overlay.replacement_manifest.cluster_id != overlay.cluster_id
+            || overlay.source_manifest_hash.len() != 64
+            || !overlay
+                .source_manifest_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            bail!("invalid stored shard placement overlay");
+        }
+        Ok(())
+    }
+
     /// Returns object-shard transfers whose retirement is authorised by a
     /// placement overlay already below the locally applied cluster GC
     /// watermark. Incomplete repair jobs pin their source and retiring
     /// placements, so a retry never loses bytes it may still need.
-    pub fn retirable_object_shard_transfers(&self) -> Result<BTreeSet<uuid::Uuid>> {
+    pub fn retirable_object_shard_transfers(
+        &self,
+        local_node: &NodeIncarnation,
+    ) -> Result<BTreeSet<uuid::Uuid>> {
         let watermark = self.gc_watermark()?;
         let mut authorised = BTreeSet::new();
         let mut replacement_live = BTreeSet::new();
-        let mut published_repairs = BTreeSet::new();
-        for (_, row) in self.scan_table_prefix_at(
+        for (key, row) in self.scan_table_prefix_at(
             crate::mvcc_shard_repair::ShardPlacementOverlay::TABLE_ID,
             b"",
             watermark,
         )? {
             let overlay: crate::mvcc_shard_repair::ShardPlacementOverlay =
                 serde_json::from_slice(&row.value)?;
-            overlay.replacement_manifest.validate()?;
-            published_repairs.insert((
-                overlay.target_logical_identity.clone(),
-                overlay.source_manifest_hash.clone(),
-            ));
+            self.validate_shard_placement_overlay(&key, &overlay)?;
             replacement_live.extend(
                 overlay
                     .replacement_manifest
                     .placements
                     .iter()
+                    .filter(|placement| placement_is_local(placement, local_node))
                     .map(|placement| placement.transfer_id),
             );
             authorised.extend(
                 overlay
                     .retired_after_commit
                     .into_iter()
+                    .filter(|placement| placement_is_local(placement, local_node))
                     .map(|placement| placement.transfer_id),
             );
         }
@@ -2452,10 +2539,7 @@ impl MvccStore {
             if record.state == ShardRepairState::Complete {
                 continue;
             }
-            if published_repairs.contains(&(
-                record.job.target_logical_identity.clone(),
-                record.job.source_manifest_hash.clone(),
-            )) {
+            if self.shard_repair_published_at(&record, watermark)? {
                 continue;
             }
             for placement in record
@@ -2464,6 +2548,7 @@ impl MvccStore {
                 .placements
                 .iter()
                 .chain(record.job.retiring.iter())
+                .filter(|placement| placement_is_local(placement, local_node))
             {
                 authorised.remove(&placement.transfer_id);
             }
@@ -2479,7 +2564,10 @@ impl MvccStore {
     /// Every transfer still reachable from a live manifest or unfinished
     /// shard job. Orphan provisional retirement subtracts this set after its
     /// independent GC-watermark and grace proofs.
-    pub fn protected_object_shard_transfers(&self) -> Result<BTreeSet<uuid::Uuid>> {
+    pub fn protected_object_shard_transfers(
+        &self,
+        local_node: &NodeIncarnation,
+    ) -> Result<BTreeSet<uuid::Uuid>> {
         let watermark = self.gc_watermark()?;
         let mut protected = BTreeSet::new();
         for (_, row) in self.scan_table_prefix_at(
@@ -2494,22 +2582,24 @@ impl MvccStore {
                 manifest
                     .placements
                     .into_iter()
+                    .filter(|placement| placement_is_local(placement, local_node))
                     .map(|placement| placement.transfer_id),
             );
         }
-        for (_, row) in self.scan_table_prefix_at(
+        for (key, row) in self.scan_table_prefix_at(
             crate::mvcc_shard_repair::ShardPlacementOverlay::TABLE_ID,
             b"",
             watermark,
         )? {
             let overlay: crate::mvcc_shard_repair::ShardPlacementOverlay =
                 serde_json::from_slice(&row.value)?;
-            overlay.replacement_manifest.validate()?;
+            self.validate_shard_placement_overlay(&key, &overlay)?;
             protected.extend(
                 overlay
                     .replacement_manifest
                     .placements
                     .into_iter()
+                    .filter(|placement| placement_is_local(placement, local_node))
                     .map(|placement| placement.transfer_id),
             );
         }
@@ -2527,6 +2617,9 @@ impl MvccStore {
             if record.state == ShardRepairState::Complete {
                 continue;
             }
+            if self.shard_repair_published_at(&record, watermark)? {
+                continue;
+            }
             protected.extend(
                 record
                     .job
@@ -2534,6 +2627,7 @@ impl MvccStore {
                     .placements
                     .iter()
                     .chain(record.job.retiring.iter())
+                    .filter(|placement| placement_is_local(placement, local_node))
                     .map(|placement| placement.transfer_id),
             );
         }
@@ -3012,7 +3106,8 @@ impl MvccStore {
                     && record.job.originating_snapshot_version < safe_watermark
             } else if suffix == b"shard-repair/" {
                 let record: ShardRepairRecord = serde_json::from_slice(&value)?;
-                record.state == ShardRepairState::Complete
+                (record.state == ShardRepairState::Complete
+                    || self.shard_repair_published_at(&record, safe_watermark)?)
                     && record.job.originating_snapshot_version < safe_watermark
             } else if suffix == b"local-upgrade/" {
                 let record: LocalDurabilityUpgradeRecord = serde_json::from_slice(&value)?;
@@ -3103,6 +3198,13 @@ fn current_unix_ms() -> u64 {
             .as_millis(),
     )
     .unwrap_or(u64::MAX)
+}
+
+fn placement_is_local(
+    placement: &crate::object_shard_manifest::PhysicalShardPlacement,
+    local_node: &NodeIncarnation,
+) -> bool {
+    placement.node_id == local_node.node_id && placement.node_incarnation == local_node.incarnation
 }
 
 fn encode_logical_key(key: &LogicalKey) -> Result<Vec<u8>> {
@@ -4348,6 +4450,166 @@ mod tests {
         );
         assert_eq!(store.read_at(&row, 6).unwrap(), None);
         assert_eq!(store.read_latest(&row).unwrap(), None);
+    }
+
+    #[test]
+    fn published_repair_releases_replica_pin_and_retires_only_the_old_target() {
+        use crate::{
+            mvcc_shard_repair::{MissingShardTarget, ShardMaintenanceKind, ShardPlacementOverlay},
+            object_shard_manifest::{
+                OBJECT_SHARD_MANIFEST_SCHEMA, PhysicalObjectShardManifest, PhysicalShardPlacement,
+            },
+            shard_placement::ShardTarget,
+        };
+
+        let temp = tempdir().unwrap();
+        let store = MvccStore::open(temp.path()).unwrap();
+        let object_identity = uuid::Uuid::from_u128(1);
+        let transfer_id = uuid::Uuid::from_u128(2);
+        let payload_hash = [7; 32];
+        let old_placement = PhysicalShardPlacement {
+            stripe_ordinal: 0,
+            shard_ordinal: 0,
+            payload_length: 4,
+            payload_hash,
+            transfer_id,
+            node_id: "node-old".into(),
+            node_incarnation: 1,
+            failure_domain: "rack-old".into(),
+        };
+        let parity_placement = PhysicalShardPlacement {
+            stripe_ordinal: 0,
+            shard_ordinal: 1,
+            payload_length: 4,
+            payload_hash: [8; 32],
+            transfer_id: uuid::Uuid::from_u128(3),
+            node_id: "node-parity".into(),
+            node_incarnation: 1,
+            failure_domain: "rack-parity".into(),
+        };
+        let source = PhysicalObjectShardManifest {
+            schema_version: OBJECT_SHARD_MANIFEST_SCHEMA,
+            cluster_id: "cluster".into(),
+            object_identity,
+            object_hash: format!("sha256:{}", hex::encode([9; 32])),
+            object_length: 4,
+            encoding_generation: 1,
+            data_shards: 1,
+            parity_shards: 1,
+            shard_bytes: 4,
+            stripe_count: 1,
+            placements: vec![old_placement.clone(), parity_placement.clone()],
+        };
+        let new_placement = PhysicalShardPlacement {
+            node_id: "node-new".into(),
+            node_incarnation: 1,
+            failure_domain: "rack-new".into(),
+            ..old_placement.clone()
+        };
+        let target_logical_identity = format!("cluster/cluster/object/{}", source.object_hash);
+        let source_manifest_hash =
+            hex::encode(blake3::hash(&source.canonical_bytes().unwrap()).as_bytes());
+        let job = ShardRepairJob {
+            schema: ShardRepairJob::SCHEMA.into(),
+            cluster_id: "cluster".into(),
+            transaction_id: "repair".into(),
+            kind: ShardMaintenanceKind::Rebalance,
+            target_logical_identity: target_logical_identity.clone(),
+            source_manifest: source.clone(),
+            source_manifest_hash: source_manifest_hash.clone(),
+            missing: vec![MissingShardTarget {
+                stripe_ordinal: 0,
+                shard_ordinal: 0,
+                target: ShardTarget {
+                    cluster_id: "cluster".into(),
+                    node: NodeIncarnation {
+                        node_id: "node-new".into(),
+                        incarnation: 1,
+                    },
+                    failure_domain: "rack-new".into(),
+                },
+            }],
+            retiring: vec![old_placement.clone()],
+            originating_snapshot_version: 1,
+            requested_at_unix_ms: 10,
+        };
+        let job_id = job.job_id().unwrap();
+        store
+            .apply_certified_bundle(
+                2,
+                &bundle("repair", |builder| {
+                    builder.add_materialisation_job(job.canonical_bytes().unwrap());
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            store.unfinished_work_pins().unwrap().repair_snapshots,
+            BTreeSet::from([1])
+        );
+
+        let replacement = PhysicalObjectShardManifest {
+            placements: vec![new_placement, parity_placement],
+            ..source
+        };
+        let overlay_key = LogicalKey {
+            table_id: ShardPlacementOverlay::TABLE_ID,
+            application_key: target_logical_identity.into_bytes(),
+        };
+        let overlay = ShardPlacementOverlay {
+            schema: ShardPlacementOverlay::SCHEMA.into(),
+            cluster_id: "cluster".into(),
+            target_logical_identity: String::from_utf8(overlay_key.application_key.clone())
+                .unwrap(),
+            source_manifest_hash,
+            replacement_manifest: replacement,
+            retired_after_commit: vec![old_placement],
+        };
+        store
+            .apply_certified_bundle(
+                3,
+                &bundle("publish-repair", |builder| {
+                    builder.put(overlay_key, serde_json::to_vec(&overlay).unwrap());
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.shard_repair_record(&job_id).unwrap().unwrap().state,
+            ShardRepairState::Pending,
+            "only the assigned worker completes its replica-local journal row"
+        );
+        assert!(
+            store.unfinished_work_pins().unwrap().all().is_empty(),
+            "the committed overlay is the cluster-wide completion fact"
+        );
+        store.garbage_collect(3).unwrap();
+        assert!(store.shard_repair_record(&job_id).unwrap().is_none());
+
+        let old_node = NodeIncarnation {
+            node_id: "node-old".into(),
+            incarnation: 1,
+        };
+        let new_node = NodeIncarnation {
+            node_id: "node-new".into(),
+            incarnation: 1,
+        };
+        assert_eq!(
+            store.retirable_object_shard_transfers(&old_node).unwrap(),
+            BTreeSet::from([transfer_id])
+        );
+        assert!(
+            store
+                .retirable_object_shard_transfers(&new_node)
+                .unwrap()
+                .is_empty(),
+            "the same deterministic transfer ID remains live on its replacement node"
+        );
+        assert!(
+            store
+                .protected_object_shard_transfers(&new_node)
+                .unwrap()
+                .contains(&transfer_id)
+        );
     }
 
     #[test]

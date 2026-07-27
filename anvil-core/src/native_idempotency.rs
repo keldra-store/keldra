@@ -629,7 +629,7 @@ mod tests {
             bucket_id: 42,
             principal: "user:alice".to_string(),
             request_id: "req-1".to_string(),
-            precondition: String::new(),
+            precondition: "none".to_string(),
             authz_zookie_optional: String::new(),
             idempotency_key: "idem-1".to_string(),
             transaction_id: None,

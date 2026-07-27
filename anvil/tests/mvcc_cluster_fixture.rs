@@ -22,19 +22,28 @@ async fn bootstrap_actor_on_every_node(
         .bootstrap_public_actor(0, bucket_name)
         .await
         .unwrap();
-    for node in 1..3 {
+    let committed_version = anvil_mvcc_consensus::Consensus::observed_commit_version(
+        cluster.state(0).mvcc.consensus.as_ref(),
+    )
+    .0;
+    for node in 0..3 {
+        cluster
+            .wait_for_applied_version(node, committed_version)
+            .await
+            .unwrap();
         let state = cluster.state(node);
-        state.persistence.create_region("e2e-region").await.unwrap();
         let tenant = state
             .persistence
-            .create_tenant("e2e-tenant", "e2e-tenant-key")
+            .get_tenant_by_name("e2e-tenant")
             .await
-            .unwrap();
+            .unwrap()
+            .expect("fixture tenant is visible on every replica");
         let bucket = state
             .persistence
-            .create_bucket(tenant.id, bucket_name, "e2e-region")
+            .get_bucket_by_name(tenant.id, bucket_name)
             .await
-            .unwrap();
+            .unwrap()
+            .expect("fixture bucket is visible on every replica");
         assert_eq!(tenant.id, actor.tenant_id);
         assert_eq!(bucket.id, actor.bucket_id);
     }
@@ -86,7 +95,7 @@ async fn public_object_transaction(
                     bucket_id: actor.bucket_id,
                     principal: actor.principal.clone(),
                     request_id: format!("{id}-write"),
-                    precondition: String::new(),
+                    precondition: "none".to_string(),
                     authz_zookie_optional: String::new(),
                     idempotency_key: format!("{id}-write"),
                     transaction_id: Some(transaction.transaction_id.clone()),
@@ -569,7 +578,7 @@ async fn real_cluster_quorum_commit_is_readable_after_node_restart() {
                     bucket_id: actor.bucket_id,
                     principal: actor.principal.clone(),
                     request_id: "fixture-public-write".into(),
-                    precondition: String::new(),
+                    precondition: "none".to_string(),
                     authz_zookie_optional: String::new(),
                     idempotency_key: "fixture-public-write".into(),
                     transaction_id: Some(transaction.transaction_id.clone()),
@@ -715,18 +724,28 @@ async fn real_cluster_fetches_a_missing_committed_bundle_before_advancing_apply_
             panic!("missing-bundle transaction aborted: {reason:?}")
         }
     };
-    let committed = cluster
-        .state(lagging)
-        .mvcc
-        .consensus
-        .applied_decisions_after(anvil_mvcc_consensus::CommitVersion(
-            commit_version.saturating_sub(1),
-        ))
-        .unwrap()
-        .into_iter()
-        .find(|decision| decision.position.0 == commit_version)
-        .and_then(|decision| decision.committed_bundle)
-        .expect("Raft decision names the immutable prepared bundle identity");
+    let committed = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            if let Some(decision) = cluster
+                .state(lagging)
+                .mvcc
+                .consensus
+                .applied_decisions_after(anvil_mvcc_consensus::CommitVersion(
+                    commit_version.saturating_sub(1),
+                ))
+                .unwrap()
+                .into_iter()
+                .find(|decision| decision.position.0 == commit_version)
+            {
+                return decision
+                    .committed_bundle
+                    .expect("applied Raft decision names the immutable prepared bundle identity");
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("lagging node applies the compact committed decision over Raft");
     let identity = anvil::mvcc_transaction::BundleIdentity {
         hash: format!("sha256:{}", hex::encode(committed.bundle_hash.0)),
         length: committed.bundle_length,
@@ -797,23 +816,6 @@ async fn real_cluster_fetches_a_missing_committed_bundle_before_advancing_apply_
         "a second authenticated holder retains valid immutable bytes"
     );
 
-    tokio::time::timeout(std::time::Duration::from_secs(15), async {
-        loop {
-            if cluster
-                .state(lagging)
-                .mvcc
-                .consensus
-                .observed_commit_version()
-                .0
-                >= commit_version
-            {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("lagging node observes the compact committed decision over Raft");
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     assert!(
         cluster

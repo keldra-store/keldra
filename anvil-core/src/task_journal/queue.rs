@@ -1,4 +1,5 @@
 use super::{
+    TaskQueueProducerPermit,
     model::{
         LiveDedupeHead, PendingProjection, RunningProjection, TaskAllocator, TaskAuditEvent,
         TaskEntry, TaskGroupHead, TaskGroupIdentity, TaskOrder, TaskQueueRow, allocator_key,
@@ -26,20 +27,12 @@ pub(crate) async fn enqueue_task_with_permit(
     task_type: TaskType,
     payload: JsonValue,
     priority: i32,
-    permit: &PartitionWritePermit,
-    _partition_owner_signing_key: &[u8],
+    permit: &TaskQueueProducerPermit,
 ) -> Result<()> {
-    require_task_queue_permit(mvcc, permit)?;
-    enqueue_generic(
-        mvcc,
-        task_type,
-        payload,
-        priority,
-        false,
-        permit.fence_token,
-    )
-    .await
-    .map(|_| ())
+    require_task_queue_producer_permit(mvcc, permit)?;
+    enqueue_generic(mvcc, task_type, payload, priority, false)
+        .await
+        .map(|_| ())
 }
 
 pub(crate) async fn enqueue_task_if_absent_with_permit(
@@ -47,21 +40,20 @@ pub(crate) async fn enqueue_task_if_absent_with_permit(
     task_type: TaskType,
     payload: JsonValue,
     priority: i32,
-    permit: &PartitionWritePermit,
-    _partition_owner_signing_key: &[u8],
+    permit: &TaskQueueProducerPermit,
 ) -> Result<bool> {
-    require_task_queue_permit(mvcc, permit)?;
-    enqueue_generic(mvcc, task_type, payload, priority, true, permit.fence_token).await
+    require_task_queue_producer_permit(mvcc, permit)?;
+    enqueue_generic(mvcc, task_type, payload, priority, true).await
 }
 
 pub(crate) async fn enqueue_repair_run_with_permit(
     mvcc: &MvccSubsystem,
     payload: &crate::tasks::RepairRunTaskPayload,
     priority: i32,
-    permit: &PartitionWritePermit,
+    permit: &TaskQueueProducerPermit,
     audit_event: &crate::admin_audit::AdminAuditEvent,
 ) -> Result<TaskRecord> {
-    require_task_queue_permit(mvcc, permit)?;
+    require_task_queue_producer_permit(mvcc, permit)?;
     payload.validate()?;
     if audit_event.audit_event_id != payload.audit_event_id
         || audit_event.request_id != payload.request_id
@@ -75,7 +67,7 @@ pub(crate) async fn enqueue_repair_run_with_permit(
         &serde_json::json!({ "audit_event_id": payload.audit_event_id }),
     )?;
     for attempt in 0..max_queue_cas_attempts() {
-        let mut mutation = TaskMutation::new(mvcc, permit.fence_token)?;
+        let mut mutation = TaskMutation::producer(mvcc)?;
         if let Some(existing) = live_dedupe_task(&mut mutation, &dedupe_hash)? {
             if existing.task.payload != payload_json {
                 bail!("RepairRun idempotency identity was reused with a different payload");
@@ -150,26 +142,16 @@ pub(crate) async fn enqueue_index_build_task_with_permit(
     mvcc: &MvccSubsystem,
     payload: JsonValue,
     priority: i32,
-    permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
+    permit: &TaskQueueProducerPermit,
 ) -> Result<bool> {
-    enqueue_grouped_with_permit(
-        mvcc,
-        TaskType::IndexBuild,
-        payload,
-        priority,
-        permit,
-        partition_owner_signing_key,
-    )
-    .await
+    enqueue_grouped_with_permit(mvcc, TaskType::IndexBuild, payload, priority, permit).await
 }
 
 pub(crate) async fn enqueue_authz_materialization_task_with_permit(
     mvcc: &MvccSubsystem,
     payload: JsonValue,
     priority: i32,
-    permit: &PartitionWritePermit,
-    partition_owner_signing_key: &[u8],
+    permit: &TaskQueueProducerPermit,
 ) -> Result<bool> {
     enqueue_grouped_with_permit(
         mvcc,
@@ -177,7 +159,6 @@ pub(crate) async fn enqueue_authz_materialization_task_with_permit(
         payload,
         priority,
         permit,
-        partition_owner_signing_key,
     )
     .await
 }
@@ -187,11 +168,10 @@ async fn enqueue_grouped_with_permit(
     task_type: TaskType,
     payload: JsonValue,
     priority: i32,
-    permit: &PartitionWritePermit,
-    _partition_owner_signing_key: &[u8],
+    permit: &TaskQueueProducerPermit,
 ) -> Result<bool> {
-    require_task_queue_permit(mvcc, permit)?;
-    enqueue_grouped(mvcc, task_type, payload, priority, permit.fence_token).await
+    require_task_queue_producer_permit(mvcc, permit)?;
+    enqueue_grouped(mvcc, task_type, payload, priority).await
 }
 
 async fn enqueue_generic(
@@ -200,13 +180,12 @@ async fn enqueue_generic(
     payload: JsonValue,
     priority: i32,
     deduplicate: bool,
-    fence_token: u64,
 ) -> Result<bool> {
     let dedupe_hash = deduplicate
         .then(|| task_identity_hash(task_type, &payload))
         .transpose()?;
     for attempt in 0..max_queue_cas_attempts() {
-        let mut mutation = TaskMutation::new(mvcc, fence_token)?;
+        let mut mutation = TaskMutation::producer(mvcc)?;
         if let Some(hash) = dedupe_hash.as_ref()
             && live_dedupe_task(&mut mutation, hash)?.is_some()
         {
@@ -262,12 +241,11 @@ async fn enqueue_grouped(
     task_type: TaskType,
     payload: JsonValue,
     priority: i32,
-    fence_token: u64,
 ) -> Result<bool> {
     let group = task_group_identity(task_type, &payload)?
         .ok_or_else(|| anyhow!("grouped task type has no group identity"))?;
     for attempt in 0..max_queue_cas_attempts() {
-        let mut mutation = TaskMutation::new(mvcc, fence_token)?;
+        let mut mutation = TaskMutation::producer(mvcc)?;
         let mut head = read_group_head(&mut mutation, &group)?.unwrap_or(TaskGroupHead {
             kind: group.kind.clone(),
             group_hash: group.hash.clone(),
@@ -373,7 +351,7 @@ async fn claim_pending_tasks_inner(
             let Some(candidate) = QueueStore::open(mvcc)?.first_due_task(Utc::now())? else {
                 return Ok(claimed);
             };
-            let mut mutation = TaskMutation::new(mvcc, fence_token)?;
+            let mut mutation = TaskMutation::assigned_worker(mvcc, fence_token)?;
             let Some(mut entry) = mutation.read_task(candidate.task.id)? else {
                 continue;
             };
@@ -487,7 +465,7 @@ async fn update_task_status_inner(
     expected_running_attempts: Option<i32>,
 ) -> Result<()> {
     for attempt in 0..max_queue_cas_attempts() {
-        let mut mutation = TaskMutation::new(mvcc, fence_token)?;
+        let mut mutation = TaskMutation::assigned_worker(mvcc, fence_token)?;
         if let Some(predicate) = additional_predicate.clone() {
             mutation.add_predicate(predicate);
         }
@@ -565,7 +543,7 @@ async fn fail_task_inner(
     expected_running_attempts: Option<i32>,
 ) -> Result<()> {
     for attempt in 0..max_queue_cas_attempts() {
-        let mut mutation = TaskMutation::new(mvcc, fence_token)?;
+        let mut mutation = TaskMutation::assigned_worker(mvcc, fence_token)?;
         if let Some(predicate) = additional_predicate.clone() {
             mutation.add_predicate(predicate);
         }
@@ -905,6 +883,16 @@ fn require_task_queue_permit(mvcc: &MvccSubsystem, permit: &PartitionWritePermit
         || permit.owner_node_id != mvcc.local_node.node_id
     {
         bail!("task queue write permit targets a different partition");
+    }
+    Ok(())
+}
+
+fn require_task_queue_producer_permit(
+    mvcc: &MvccSubsystem,
+    permit: &TaskQueueProducerPermit,
+) -> Result<()> {
+    if permit.producer_node_id() != mvcc.local_node.node_id {
+        bail!("task queue producer permit belongs to a different node");
     }
     Ok(())
 }

@@ -10,6 +10,7 @@ use super::repair::RepairKindArg;
 use super::*;
 use anvil::anvil_api as api;
 use anvil::anvil_api::admin_service_client::AdminServiceClient;
+use anvil::anvil_api::mesh_control_service_client::MeshControlServiceClient;
 use anvil_test_utils::personaldb_test_protocol_keyring;
 use base64::Engine;
 use clap::Parser;
@@ -121,6 +122,59 @@ fn admin_token(node: &AdminCliNode) -> String {
         .jwt_manager
         .mint_token("cli-admin-principal".to_string(), 0)
         .unwrap()
+}
+
+async fn bootstrap_admin_cli_topology(node: &AdminCliNode, token: &str) {
+    let config = &node.state.config;
+    let mut client = MeshControlServiceClient::connect(node.admin_url.clone())
+        .await
+        .unwrap();
+    client
+        .bootstrap_mesh_topology(
+            with_auth(
+                api::BootstrapMeshTopologyRequest {
+                    regions: vec![api::PutRegionRequest {
+                        region_id: config.region.clone(),
+                        endpoint: config.public_api_addr.clone(),
+                        state: "active".to_string(),
+                        options: None,
+                    }],
+                    cells: vec![api::PutCellRequest {
+                        region_id: config.region.clone(),
+                        cell_id: config.cell_id.clone(),
+                        failure_domain: config.cell_id.clone(),
+                        state: "active".to_string(),
+                        options: None,
+                    }],
+                    nodes: vec![api::PutNodeRequest {
+                        node_id: config.node_id.clone(),
+                        region_id: config.region.clone(),
+                        cell_id: config.cell_id.clone(),
+                        advertise_addr: config.public_api_addr.clone(),
+                        state: "active".to_string(),
+                        capacity_json: "{}".to_string(),
+                        options: None,
+                        receipt_signing_public_key: node
+                            .state
+                            .core_store
+                            .local_receipt_signing_public_key(),
+                        capabilities: vec![
+                            "object".to_string(),
+                            "index".to_string(),
+                            "personaldb".to_string(),
+                            "metadata".to_string(),
+                            "gateway".to_string(),
+                            "admin".to_string(),
+                        ],
+                    }],
+                    canonical_coremeta_rows: Vec::new(),
+                },
+                token,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
 }
 
 async fn write_activation_checkpoint_from_existing_streams(
@@ -862,6 +916,7 @@ async fn admin_repair_diagnostics_and_audit_handlers_return_structured_responses
     let mut client = AdminServiceClient::connect(node.admin_url.clone())
         .await
         .unwrap();
+    bootstrap_admin_cli_topology(&node, &token).await;
 
     client
         .create_tenant(

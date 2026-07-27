@@ -19,16 +19,9 @@ impl Persistence {
         payload: JsonValue,
         priority: i32,
     ) -> Result<()> {
-        let permit = self.task_queue_write_permit().await?;
-        task_journal::enqueue_task_with_permit(
-            self.mvcc()?,
-            task_type,
-            payload,
-            priority,
-            &permit,
-            &self.partition_owner_signing_key,
-        )
-        .await?;
+        let permit = self.task_queue_producer_permit().await?;
+        task_journal::enqueue_task_with_permit(self.mvcc()?, task_type, payload, priority, &permit)
+            .await?;
         self.notify_task_enqueued();
         Ok(())
     }
@@ -39,14 +32,13 @@ impl Persistence {
         payload: JsonValue,
         priority: i32,
     ) -> Result<bool> {
-        let permit = self.task_queue_write_permit().await?;
+        let permit = self.task_queue_producer_permit().await?;
         let enqueued = task_journal::enqueue_task_if_absent_with_permit(
             self.mvcc()?,
             task_type,
             payload,
             priority,
             &permit,
-            &self.partition_owner_signing_key,
         )
         .await?;
         if enqueued {
@@ -62,7 +54,7 @@ impl Persistence {
         audit_event: &crate::admin_audit::AdminAuditEvent,
     ) -> Result<TaskRecord> {
         payload.validate()?;
-        let permit = self.task_queue_write_permit().await?;
+        let permit = self.task_queue_producer_permit().await?;
         let task = task_journal::enqueue_repair_run_with_permit(
             self.mvcc()?,
             payload,
@@ -96,7 +88,7 @@ impl Persistence {
     ) -> Result<bool> {
         let mut last_error = None;
         for _ in 0..5 {
-            let permit = match self.task_queue_write_permit().await {
+            let permit = match self.task_queue_producer_permit().await {
                 Ok(permit) => permit,
                 Err(error) if is_retryable_partition_fence_error(&error) => {
                     last_error = Some(error);
@@ -110,7 +102,6 @@ impl Persistence {
                 payload.clone(),
                 priority,
                 &permit,
-                &self.partition_owner_signing_key,
             )
             .await
             {
@@ -141,7 +132,7 @@ impl Persistence {
         });
         let mut last_error = None;
         for _ in 0..5 {
-            let permit = match self.task_queue_write_permit().await {
+            let permit = match self.task_queue_producer_permit().await {
                 Ok(permit) => permit,
                 Err(error) if is_retryable_partition_fence_error(&error) => {
                     last_error = Some(error);
@@ -155,7 +146,6 @@ impl Persistence {
                 payload.clone(),
                 30,
                 &permit,
-                &self.partition_owner_signing_key,
             )
             .await
             {

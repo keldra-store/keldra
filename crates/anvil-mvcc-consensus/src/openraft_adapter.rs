@@ -537,6 +537,18 @@ impl OpenRaftConsensus {
         metrics.current_leader == Some(metrics.id)
     }
 
+    /// Whether this runtime can still accept Raft RPCs.
+    ///
+    /// A transport session may outlive the server accept loop during an
+    /// in-process restart. Exposing the authoritative OpenRaft running state
+    /// lets that stale session terminate instead of continuing to dispatch to
+    /// a stopped runtime.
+    pub fn is_running(&self) -> bool {
+        let metrics = self.raft.metrics();
+        let running = metrics.borrow().running_state.is_ok();
+        running
+    }
+
     pub fn applied_decisions_after(
         &self,
         position: CommitVersion,

@@ -34,17 +34,6 @@ impl MeshControlService for AppState {
                 "bootstrap topology requires regions, cells, and nodes",
             ));
         }
-        if mesh_topology_exists(self).await? {
-            return Ok(Response::new(BootstrapMeshTopologyResponse {
-                write: Some(mesh_write_response(
-                    request_id,
-                    "mesh-topology-already-initialised".to_string(),
-                    None,
-                )),
-                canonical_coremeta_rows: Vec::new(),
-                already_initialised: true,
-            }));
-        }
 
         let regions = req
             .regions
@@ -86,47 +75,110 @@ impl MeshControlService for AppState {
                 })
             })
             .collect::<Result<Vec<_>, Status>>()?;
-        let canonical_coremeta_rows = if req.canonical_coremeta_rows.is_empty() {
-            for node in &nodes {
-                self.core_store
-                    .register_node_receipt_signing_public_key(
-                        &node.node_id,
-                        &node.receipt_signing_public_key,
-                    )
-                    .map_err(mesh_status)?;
-            }
-            crate::mesh_lifecycle::install_bootstrap_lifecycle_projection(
-                &self.storage,
-                &self.core_store,
-                BootstrapMeshLifecycleProjection {
-                    regions: regions.clone(),
-                    cells: cells.clone(),
-                    nodes: nodes.clone(),
-                },
-            )
-            .map_err(mesh_status)?;
-            let exported_rows = self
-                .core_store
-                .export_portable_coremeta_bootstrap_rows(MAX_BOOTSTRAP_COREMETA_ROWS)
+        let topology = BootstrapMeshLifecycleProjection {
+            regions: regions.clone(),
+            cells: cells.clone(),
+            nodes: nodes.clone(),
+        };
+        let local_node = nodes
+            .iter()
+            .find(|node| node.node_id == self.config.node_id)
+            .ok_or_else(|| {
+                Status::failed_precondition(
+                    "bootstrap topology must contain the receiving node descriptor",
+                )
+            })?;
+        if local_node.receipt_signing_public_key
+            != self.core_store.local_receipt_signing_public_key()
+        {
+            return Err(Status::failed_precondition(
+                "bootstrap topology receipt key does not match the receiving node identity",
+            ));
+        }
+        let imports_canonical_snapshot = !req.canonical_coremeta_rows.is_empty();
+        let (physical_state, canonical_coremeta_rows, local_already_initialised) =
+            if !imports_canonical_snapshot {
+                for node in &nodes {
+                    self.core_store
+                        .register_node_receipt_signing_public_key(
+                            &node.node_id,
+                            &node.receipt_signing_public_key,
+                        )
+                        .map_err(mesh_status)?;
+                }
+                let physical_state = crate::mesh_lifecycle::install_bootstrap_lifecycle_projection(
+                    &self.storage,
+                    &self.core_store,
+                    topology.clone(),
+                )
                 .map_err(mesh_status)?;
-            encode_bootstrap_snapshot_rows(exported_rows)
+                let exported_rows = self
+                    .core_store
+                    .export_portable_coremeta_bootstrap_rows(MAX_BOOTSTRAP_COREMETA_ROWS)
+                    .map_err(mesh_status)?;
+                (
+                    physical_state,
+                    encode_bootstrap_snapshot_rows(exported_rows),
+                    false,
+                )
+            } else {
+                let rows = decode_bootstrap_snapshot_rows(req.canonical_coremeta_rows)?;
+                let existing = crate::mesh_lifecycle::existing_bootstrap_lifecycle_projection(
+                    &self.core_store,
+                    &topology,
+                )
+                .map_err(mesh_status)?;
+                let local_already_initialised = existing.is_some();
+                let physical_state = match existing {
+                    Some(existing) => existing,
+                    None => {
+                        self.core_store
+                            .install_portable_coremeta_bootstrap_rows(&rows)
+                            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+                        crate::mesh_lifecycle::install_bootstrap_lifecycle_projection(
+                            &self.storage,
+                            &self.core_store,
+                            topology,
+                        )
+                        .map_err(mesh_status)?
+                    }
+                };
+                (physical_state, Vec::new(), local_already_initialised)
+            };
+        let already_initialised = if imports_canonical_snapshot {
+            crate::mesh_lifecycle::await_authoritative_bootstrap_lifecycle_projection(
+                &self.mvcc,
+                &physical_state,
+            )
+            .await
+            .map_err(mesh_status)?;
+            local_already_initialised
         } else {
-            let rows = decode_bootstrap_snapshot_rows(req.canonical_coremeta_rows)?;
-            self.core_store
-                .install_portable_coremeta_bootstrap_rows(&rows)
-                .map_err(|error| Status::invalid_argument(error.to_string()))?;
-            Vec::new()
+            crate::mesh_lifecycle::install_authoritative_bootstrap_lifecycle_projection(
+                &self.mvcc,
+                &physical_state,
+            )
+            .await
+            .map_err(mesh_status)?
         };
         ensure_bootstrap_topology_matches(self, &regions, &cells, &nodes).await?;
 
         Ok(Response::new(BootstrapMeshTopologyResponse {
             write: Some(mesh_write_response(
                 request_id,
-                "mesh-topology-bootstrap".to_string(),
+                if already_initialised {
+                    "mesh-topology-already-initialised".to_string()
+                } else {
+                    "mesh-topology-bootstrap".to_string()
+                },
                 None,
             )),
-            canonical_coremeta_rows,
-            already_initialised: false,
+            canonical_coremeta_rows: if imports_canonical_snapshot {
+                Vec::new()
+            } else {
+                canonical_coremeta_rows
+            },
+            already_initialised,
         }))
     }
 
@@ -814,27 +866,6 @@ fn parse_node_capabilities(values: &[String]) -> Result<Vec<CoreNodeCapability>,
             ))),
         })
         .collect()
-}
-
-async fn mesh_topology_exists(state: &AppState) -> Result<bool, Status> {
-    Ok(!state
-        .persistence
-        .list_region_descriptors()
-        .await
-        .map_err(mesh_status)?
-        .is_empty()
-        || !state
-            .persistence
-            .list_cell_descriptors(None)
-            .await
-            .map_err(mesh_status)?
-            .is_empty()
-        || !state
-            .persistence
-            .list_node_descriptors(None, None)
-            .await
-            .map_err(mesh_status)?
-            .is_empty())
 }
 
 fn encode_bootstrap_snapshot_rows(

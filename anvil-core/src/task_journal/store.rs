@@ -61,6 +61,32 @@ pub(super) struct QueueStore<'a> {
     snapshot_version: u64,
 }
 
+/// Authority required by a task-queue mutation.
+///
+/// Enqueue is an ordinary MVCC product write: any transaction coordinator may
+/// publish a new durable task while the queue row, allocator, projection, and
+/// audit predicates serialize concurrent producers. Worker transitions are
+/// different. Claiming or changing an existing task publishes background-work
+/// progress and must remain fenced by the exact compact-Raft assignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskMutationAuthority {
+    Producer,
+    AssignedWorker { audit_fence_token: u64 },
+}
+
+impl TaskMutationAuthority {
+    fn audit_fence_token(self) -> u64 {
+        match self {
+            // Producers are admitted as ordinary MVCC writers and do not hold
+            // a task-queue ownership fence. Zero makes that explicit in the
+            // existing audit wire field rather than recording a synthetic
+            // authority token.
+            Self::Producer => 0,
+            Self::AssignedWorker { audit_fence_token } => audit_fence_token,
+        }
+    }
+}
+
 impl<'a> QueueStore<'a> {
     pub fn open(mvcc: &'a MvccSubsystem) -> Result<Self> {
         Ok(Self {
@@ -204,7 +230,7 @@ impl<'a> QueueStore<'a> {
 pub(super) struct TaskMutation<'a> {
     store: QueueStore<'a>,
     transaction_id: String,
-    fence_token: u64,
+    authority: TaskMutationAuthority,
     additional_predicates: Vec<(LogicalKey, PredicateKind)>,
     initial: BTreeMap<Vec<u8>, RowSnapshot>,
     desired: BTreeMap<Vec<u8>, Option<TaskQueueRow>>,
@@ -214,11 +240,24 @@ pub(super) struct TaskMutation<'a> {
 }
 
 impl<'a> TaskMutation<'a> {
-    pub fn new(mvcc: &'a MvccSubsystem, fence_token: u64) -> Result<Self> {
+    pub fn producer(mvcc: &'a MvccSubsystem) -> Result<Self> {
+        Self::new(mvcc, TaskMutationAuthority::Producer)
+    }
+
+    pub fn assigned_worker(mvcc: &'a MvccSubsystem, fence_token: u64) -> Result<Self> {
+        Self::new(
+            mvcc,
+            TaskMutationAuthority::AssignedWorker {
+                audit_fence_token: fence_token,
+            },
+        )
+    }
+
+    fn new(mvcc: &'a MvccSubsystem, authority: TaskMutationAuthority) -> Result<Self> {
         Ok(Self {
             store: QueueStore::open(mvcc)?,
             transaction_id: format!("task-queue:{}", uuid::Uuid::new_v4()),
-            fence_token,
+            authority,
             additional_predicates: Vec::new(),
             initial: BTreeMap::new(),
             desired: BTreeMap::new(),
@@ -324,6 +363,7 @@ impl<'a> TaskMutation<'a> {
             mutations,
             predicates,
             self.outbox_events,
+            self.authority,
         )
         .await
     }
@@ -355,7 +395,11 @@ impl<'a> TaskMutation<'a> {
                 });
         predicates.push((head_key.clone(), predicate_for(observed.as_deref())));
         for (ordinal, audit) in self.audit.iter().enumerate() {
-            let payload = encode_task_audit(audit, self.fence_token, &self.transaction_id)?;
+            let payload = encode_task_audit(
+                audit,
+                self.authority.audit_fence_token(),
+                &self.transaction_id,
+            )?;
             head.last_sequence = head
                 .last_sequence
                 .checked_add(1)
@@ -405,12 +449,17 @@ async fn commit_task_mutation(
     mutations: Vec<ProductMutation>,
     predicates: Vec<(LogicalKey, PredicateKind)>,
     outbox_events: Vec<crate::mvcc_outbox::StreamOutboxEvent>,
+    authority: TaskMutationAuthority,
 ) -> Result<()> {
     let principal = task_queue_partition_principal();
-    let assignment = mvcc
-        .reconcile_work_assignment("task-queue", "global")
-        .await?
-        .ok_or_else(|| anyhow!("local node does not own the task queue assignment"))?;
+    let assignment = match authority {
+        TaskMutationAuthority::Producer => None,
+        TaskMutationAuthority::AssignedWorker { .. } => Some(
+            mvcc.reconcile_work_assignment("task-queue", "global")
+                .await?
+                .ok_or_else(|| anyhow!("local node does not own the task queue assignment"))?,
+        ),
+    };
     let now = now_unix_ms();
     let handle = mvcc
         .open_transactions
@@ -437,7 +486,9 @@ async fn commit_task_mutation(
             mvcc.open_transactions
                 .add_stream_event(&handle.transaction_id, event, now)?;
         }
-        mvcc.stage_assignment_guard(&handle.transaction_id, &principal, &assignment, now)?;
+        if let Some(assignment) = assignment.as_ref() {
+            mvcc.stage_assignment_guard(&handle.transaction_id, &principal, assignment, now)?;
+        }
     }
     let outcome = mvcc
         .open_transactions

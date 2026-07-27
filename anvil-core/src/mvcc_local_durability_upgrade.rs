@@ -125,6 +125,20 @@ impl LocalDurabilityUpgradeJob {
         intent.bundle = None;
         Ok(hex::encode(Sha256::digest(intent.canonical_bytes()?)))
     }
+
+    pub(crate) fn local_holder(&self) -> Result<NodeIncarnation> {
+        let mut holders = self
+            .objects
+            .iter()
+            .map(|object| object.local_manifest.node.clone());
+        let holder = holders
+            .next()
+            .context("local durability upgrade has no local holder")?;
+        if holders.any(|candidate| candidate != holder) {
+            bail!("one local durability upgrade spans multiple holder incarnations");
+        }
+        Ok(holder)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -217,9 +231,10 @@ impl LocalUpgradePlacementProvider for Arc<crate::mvcc_bootstrap::MvccSubsystem>
         &self,
         job: &LocalDurabilityUpgradeJob,
     ) -> Result<crate::mvcc_worker_authority::AssignmentGuard> {
-        self.reconcile_work_assignment(
+        self.reconcile_pinned_work_assignment(
             "local-durability-upgrade",
             &format!("transaction/{}", job.transaction_id),
+            &job.local_holder()?,
         )
         .await?
         .context("local durability upgrade is assigned to another node")
@@ -312,7 +327,11 @@ impl LocalUpgradeManifestPublisher for Arc<crate::mvcc_bootstrap::MvccSubsystem>
         let now = unix_time_ms()?;
         let logical_identity = format!("transaction/{}", job.transaction_id);
         let guard = self
-            .reconcile_work_assignment("local-durability-upgrade", &logical_identity)
+            .reconcile_pinned_work_assignment(
+                "local-durability-upgrade",
+                &logical_identity,
+                &job.local_holder()?,
+            )
             .await?
             .context("local durability upgrade is assigned to another node")?;
         let handle = self
@@ -385,7 +404,11 @@ impl LocalUpgradeManifestPublisher for Arc<crate::mvcc_bootstrap::MvccSubsystem>
         let now = unix_time_ms()?;
         let logical_identity = format!("transaction/{}", job.transaction_id);
         let guard = self
-            .reconcile_work_assignment("local-durability-upgrade", &logical_identity)
+            .reconcile_pinned_work_assignment(
+                "local-durability-upgrade",
+                &logical_identity,
+                &job.local_holder()?,
+            )
             .await?
             .context("local durability upgrade is assigned to another node")?;
         let handle = self

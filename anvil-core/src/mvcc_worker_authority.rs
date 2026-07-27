@@ -80,6 +80,46 @@ impl MvccSubsystem {
         self.claim_assignment(kind, logical_identity)
     }
 
+    /// Reconciles work whose executor is physically pinned to one node.
+    ///
+    /// Unlike ordinary background work, a local-durability promotion cannot
+    /// move to the rendezvous owner because only `owner` has the authoritative
+    /// source bytes. Every foreground phase must preserve the same owner that
+    /// the background reconciler installs.
+    pub async fn reconcile_pinned_work_assignment(
+        &self,
+        kind: &str,
+        logical_identity: &str,
+        owner: &NodeIncarnation,
+    ) -> Result<Option<AssignmentGuard>> {
+        if owner.node_id.trim().is_empty() || owner.incarnation == 0 {
+            bail!("pinned background work owner must be a valid node incarnation");
+        }
+        let partition_id = work_partition_id(kind, logical_identity)?;
+        let assigned = self
+            .consensus
+            .applied_control_snapshot()?
+            .partitions
+            .iter()
+            .any(|(candidate, _)| *candidate == partition_id);
+        if self.consensus.is_leader() {
+            crate::mvcc_assignment_reconciler::reconcile_partition_owner(
+                self.cluster_id(),
+                &self.consensus,
+                partition_id,
+                anvil_mvcc_consensus::NodeIncarnation {
+                    node_id: crate::mvcc_bootstrap::consensus_control_node_id(&owner.node_id),
+                    incarnation: owner.incarnation,
+                },
+            )
+            .await?;
+            self.consensus.linearized_read_barrier().await?;
+        } else if !assigned {
+            return Ok(None);
+        }
+        self.claim_assignment(kind, logical_identity)
+    }
+
     /// Ensures the tenant's authorization tuple partition has a current
     /// compact-Raft assignment, then returns its guard only when this node is
     /// the assigned writer. Callers must refuse write admission on `None`.

@@ -276,8 +276,9 @@ impl MvccApplyWorker {
         // a crash after MVCC GC but before physical unlink must converge on
         // restart, and the receiver operation is idempotent.
         if let Some(receiver) = &self.shard_transfers {
-            let authorised = self.local.retirable_object_shard_transfers()?;
-            let protected = self.local.protected_object_shard_transfers()?;
+            let local_node = self.replication.local_node();
+            let authorised = self.local.retirable_object_shard_transfers(local_node)?;
+            let protected = self.local.protected_object_shard_transfers(local_node)?;
             let mut receiver = receiver
                 .lock()
                 .map_err(|_| anyhow!("replication receiver lock poisoned"))?;

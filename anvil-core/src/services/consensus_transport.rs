@@ -160,6 +160,20 @@ impl<A: ConsensusConnectionAuthorizer> ConsensusTransport for ConsensusTransport
                         return;
                     }
                 };
+                if !runtime.is_running() {
+                    // Tonic owns accepted HTTP/2 connections independently of
+                    // the server accept-loop future. During an in-process
+                    // restart, aborting that future therefore does not
+                    // necessarily drop an already-authenticated stream. Close
+                    // it explicitly before it can keep dispatching to the old
+                    // stopped OpenRaft handle.
+                    let _ = output
+                        .send(Err(Status::unavailable(
+                            "consensus runtime stopped; reconnect required",
+                        )))
+                        .await;
+                    return;
+                }
                 if let Err(error) =
                     authorizer.authorize_incarnation(session_node_id, session_incarnation)
                 {
@@ -362,21 +376,27 @@ impl TonicConsensusRpcFactory {
         if let Some(channel) = channels.get(address) {
             return Ok(channel.clone());
         }
-        let channel = Endpoint::from_shared(address.to_string())
-            .map_err(|error| error.to_string())?
-            .connect_timeout(self.request_timeout)
-            .timeout(self.request_timeout)
-            .connect_lazy();
+        let channel = consensus_channel(address, self.request_timeout)?;
         channels.insert(address.to_string(), channel.clone());
         Ok(channel)
     }
+}
+
+fn consensus_channel(address: &str, request_timeout: Duration) -> Result<Channel, String> {
+    Ok(Endpoint::from_shared(address.to_string())
+        .map_err(|error| error.to_string())?
+        .connect_timeout(request_timeout)
+        .timeout(request_timeout)
+        .connect_lazy())
 }
 
 impl ConsensusRpcFactory for TonicConsensusRpcFactory {
     fn client(&self, _target: NodeId, node: &ConsensusNode) -> Box<dyn ConsensusRpcClient> {
         Box::new(TonicConsensusRpcClient {
             cluster_id: self.cluster_id.clone(),
+            address: node.address.clone(),
             channel: self.channel(&node.address),
+            channels: self.channels.clone(),
             local_node_id: self.local_node_id,
             target_node_id: _target,
             local_incarnation: self.local_incarnation,
@@ -396,7 +416,9 @@ struct ConnectedSession {
 
 struct TonicConsensusRpcClient {
     cluster_id: Arc<str>,
+    address: String,
     channel: Result<Channel, String>,
+    channels: Arc<Mutex<HashMap<String, Channel>>>,
     local_node_id: NodeId,
     target_node_id: NodeId,
     local_incarnation: u64,
@@ -408,6 +430,16 @@ struct TonicConsensusRpcClient {
 }
 
 impl TonicConsensusRpcClient {
+    fn reset_connection(&mut self) {
+        self.session = None;
+        self.channel = consensus_channel(&self.address, self.request_timeout);
+        if let Ok(channel) = &self.channel
+            && let Ok(mut channels) = self.channels.lock()
+        {
+            channels.insert(self.address.clone(), channel.clone());
+        }
+    }
+
     async fn connect(&self) -> Result<ConnectedSession, ConsensusRpcError> {
         let channel = self
             .channel
@@ -560,10 +592,25 @@ impl ConsensusRpcClient for TonicConsensusRpcClient {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(ConsensusRpcError::Protocol(error))) => Err(ConsensusRpcError::Protocol(error)),
             Ok(Err(ConsensusRpcError::Unreachable(_))) | Err(_) => {
-                self.session = None;
-                tokio::time::timeout(self.request_timeout, self.request_once(rpc))
-                    .await
-                    .map_err(|_| ConsensusRpcError::Unreachable("consensus RPC timed out".into()))?
+                // A tonic Channel can retain the HTTP/2 connection accepted by
+                // an old server task even after its listener has been
+                // replaced. Rebuild the channel as well as the logical stream
+                // so a retry reaches the restarted node at the same address.
+                self.reset_connection();
+                match tokio::time::timeout(self.request_timeout, self.request_once(rpc)).await {
+                    Ok(Ok(response)) => Ok(response),
+                    Ok(Err(error @ ConsensusRpcError::Protocol(_))) => Err(error),
+                    Ok(Err(error @ ConsensusRpcError::Unreachable(_))) => {
+                        self.reset_connection();
+                        Err(error)
+                    }
+                    Err(_) => {
+                        self.reset_connection();
+                        Err(ConsensusRpcError::Unreachable(
+                            "consensus RPC timed out".into(),
+                        ))
+                    }
+                }
             }
         }
     }
@@ -821,6 +868,110 @@ mod tests {
         assert_eq!(authorization_calls.load(Ordering::SeqCst), 1);
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn reconnects_to_restarted_service_instead_of_reusing_stopped_runtime_stream() {
+        let original_directory = tempfile::tempdir().unwrap();
+        let original = Arc::new(
+            OpenRaftConsensus::new(
+                NodeId(1),
+                RocksRaftStore::open(original_directory.path(), 1).unwrap(),
+                [1; 32],
+                "transport-restart-test",
+                Arc::new(UnusedNetwork),
+            )
+            .await
+            .unwrap(),
+        );
+        let original_authorizations = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let original_server = tokio::spawn(
+            Server::builder()
+                .add_service(ConsensusTransportServer::new(
+                    ConsensusTransportService::new(
+                        original.clone(),
+                        CountingAuthorizer {
+                            calls: original_authorizations.clone(),
+                        },
+                    ),
+                ))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let factory = TonicConsensusRpcFactory::new(
+            "transport-restart-test",
+            NodeId(2),
+            1,
+            "test-node-token",
+            Duration::from_secs(5),
+        );
+        let mut client = factory.client(
+            NodeId(1),
+            &ConsensusNode {
+                address: format!("http://{address}"),
+            },
+        );
+        let invalid_rpc = ConsensusRpc {
+            schema_version: 99,
+            kind: ConsensusRpcKind::Vote,
+            payload: Vec::new(),
+        };
+
+        assert!(matches!(
+            client.request(invalid_rpc.clone()).await,
+            Err(ConsensusRpcError::Protocol(_))
+        ));
+        assert_eq!(original_authorizations.load(Ordering::SeqCst), 1);
+
+        original.shutdown().await.unwrap();
+        original_server.abort();
+        let _ = original_server.await;
+
+        let replacement_directory = tempfile::tempdir().unwrap();
+        let replacement = Arc::new(
+            OpenRaftConsensus::new(
+                NodeId(1),
+                RocksRaftStore::open(replacement_directory.path(), 1).unwrap(),
+                [1; 32],
+                "transport-restart-test",
+                Arc::new(UnusedNetwork),
+            )
+            .await
+            .unwrap(),
+        );
+        let replacement_authorizations = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind(address).await.unwrap();
+        let replacement_server = tokio::spawn(
+            Server::builder()
+                .add_service(ConsensusTransportServer::new(
+                    ConsensusTransportService::new(
+                        replacement.clone(),
+                        CountingAuthorizer {
+                            calls: replacement_authorizations.clone(),
+                        },
+                    ),
+                ))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+
+        assert!(matches!(
+            client.request(invalid_rpc).await,
+            Err(ConsensusRpcError::Protocol(_))
+        ));
+        assert_eq!(
+            original_authorizations.load(Ordering::SeqCst),
+            1,
+            "the stopped runtime must not authorize another stream"
+        );
+        assert_eq!(
+            replacement_authorizations.load(Ordering::SeqCst),
+            1,
+            "the existing client must reconnect to the replacement service"
+        );
+
+        replacement.shutdown().await.unwrap();
+        replacement_server.abort();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

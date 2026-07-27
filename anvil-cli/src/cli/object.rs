@@ -477,7 +477,7 @@ async fn handle_object_boundary_command(
                     bucket_id: 0,
                     principal: String::new(),
                     request_id: String::new(),
-                    precondition: String::new(),
+                    precondition: "none".to_string(),
                     authz_zookie_optional: String::new(),
                     idempotency_key: format!("boundary-migration-{}", uuid::Uuid::new_v4()),
                     transaction_id: transaction_id.clone(),

@@ -282,6 +282,166 @@ impl Drop for ThreeNodeFixture {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn non_owner_producer_enqueues_but_worker_mutations_remain_assignment_fenced() {
+    let mut cluster = ThreeNodeFixture::start().await;
+    let task_queue_partition =
+        crate::mvcc_worker_authority::work_partition_id("task-queue", "global").unwrap();
+    let _ = cluster.states[0]
+        .mvcc
+        .reconcile_work_assignment("task-queue", "global")
+        .await
+        .unwrap();
+    cluster.states[0]
+        .mvcc
+        .consensus
+        .linearized_read_barrier()
+        .await
+        .unwrap();
+    let assigned_owner = cluster.states[0]
+        .mvcc
+        .consensus
+        .applied_control_snapshot()
+        .unwrap()
+        .partitions
+        .into_iter()
+        .find(|(partition_id, _)| *partition_id == task_queue_partition)
+        .expect("task queue assignment is installed")
+        .1
+        .owner;
+    let assigned_owner_index = cluster
+        .states
+        .iter()
+        .position(|state| {
+            crate::mvcc_bootstrap::consensus_control_node_id(&state.config.node_id)
+                == assigned_owner.node_id
+                && state.config.mvcc_node_incarnation == assigned_owner.incarnation
+        })
+        .expect("task queue assignment names a fixture node");
+
+    // Node zero is the initial leader. If rendezvous placement also selected it
+    // as the task worker, elect one of the surviving voters as coordinator.
+    // The stopped node remains installed, so the exact task-queue assignment
+    // continues to name it and cannot accidentally move to the producer.
+    let producer = if assigned_owner_index == 0 {
+        cluster.stop_transport(0);
+        cluster.states[0].mvcc.consensus.shutdown().await.unwrap();
+        cluster.wait_for_any_leader(&[1, 2]).await
+    } else {
+        0
+    };
+    assert_ne!(producer, assigned_owner_index);
+    cluster.states[producer]
+        .mvcc
+        .consensus
+        .linearized_read_barrier()
+        .await
+        .unwrap();
+    let producer_snapshot = cluster.states[producer]
+        .mvcc
+        .consensus
+        .applied_control_snapshot()
+        .unwrap();
+    let current_owner = producer_snapshot
+        .partitions
+        .iter()
+        .find(|(partition_id, _)| *partition_id == task_queue_partition)
+        .expect("producer observes the task queue assignment")
+        .1
+        .owner;
+    assert_eq!(current_owner, assigned_owner);
+    assert_ne!(
+        current_owner.node_id,
+        crate::mvcc_bootstrap::consensus_control_node_id(&cluster.states[producer].config.node_id)
+    );
+
+    let legacy_partition_id = hex::encode(crate::task_journal::task_queue_partition_id());
+    let legacy_owner_before = crate::partition_fence::read_partition_owner_mvcc(
+        &cluster.states[producer].mvcc,
+        "task_queue",
+        &legacy_partition_id,
+        cluster.states[producer]
+            .persistence
+            .partition_owner_signing_key(),
+    )
+    .unwrap();
+    let marker = format!("non-owner-producer-{producer}");
+    cluster.states[producer]
+        .persistence
+        .enqueue_task(
+            crate::tasks::TaskType::DeleteBucket,
+            serde_json::json!({
+                "bucket_id": 7,
+                "regression_marker": marker,
+            }),
+            100,
+        )
+        .await
+        .expect("ordinary producer enqueue does not require the task worker assignment");
+    let legacy_owner_after = crate::partition_fence::read_partition_owner_mvcc(
+        &cluster.states[producer].mvcc,
+        "task_queue",
+        &legacy_partition_id,
+        cluster.states[producer]
+            .persistence
+            .partition_owner_signing_key(),
+    )
+    .unwrap();
+    assert_eq!(
+        legacy_owner_after, legacy_owner_before,
+        "producer enqueue must not acquire or transfer legacy task-queue partition ownership"
+    );
+    let task = cluster.states[producer]
+        .persistence
+        .list_tasks_page(None, 1_000)
+        .await
+        .unwrap()
+        .tasks
+        .into_iter()
+        .find(|task| task.payload["regression_marker"].as_str() == Some(marker.as_str()))
+        .expect("non-owner producer task is atomically visible");
+    assert_eq!(task.status, crate::tasks::TaskStatus::Pending);
+
+    let claim_error = cluster.states[producer]
+        .persistence
+        .claim_pending_tasks(1)
+        .await
+        .expect_err("non-owner must not claim task-queue work");
+    assert!(
+        format!("{claim_error:#}").contains("local node does not own the task queue assignment"),
+        "unexpected claim failure: {claim_error:#}"
+    );
+
+    let update_error = cluster.states[producer]
+        .persistence
+        .update_task_status(task.id, crate::tasks::TaskStatus::Completed)
+        .await
+        .expect_err("non-owner must not publish task status");
+    assert!(
+        format!("{update_error:#}").contains("local node does not own the task queue assignment"),
+        "unexpected status failure: {update_error:#}"
+    );
+    let failure_error = cluster.states[producer]
+        .persistence
+        .fail_task(task.id, "must remain fenced")
+        .await
+        .expect_err("non-owner must not publish task failure");
+    assert!(
+        format!("{failure_error:#}").contains("local node does not own the task queue assignment"),
+        "unexpected failure transition error: {failure_error:#}"
+    );
+    let unchanged = cluster.states[producer]
+        .persistence
+        .list_tasks_page(None, 1_000)
+        .await
+        .unwrap()
+        .tasks
+        .into_iter()
+        .find(|candidate| candidate.id == task.id)
+        .expect("rejected worker update retains the producer task");
+    assert_eq!(unchanged.status, crate::tasks::TaskStatus::Pending);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn quorum_commit_survives_one_minority_transport_loss() {
     let mut cluster = ThreeNodeFixture::start().await;
     cluster.inject_transport_loss(2, FaultPoint::MinorityNodeLoss);

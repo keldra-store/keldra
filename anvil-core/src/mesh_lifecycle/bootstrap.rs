@@ -18,18 +18,151 @@ pub fn install_bootstrap_lifecycle_projection(
     store: &CoreStore,
     input: BootstrapMeshLifecycleProjection,
 ) -> LifecycleResult<MeshLifecycleState> {
-    let existing = read_lifecycle_state_projection_with_core_store(store)?;
-    if !existing.regions.is_empty() || !existing.cells.is_empty() || !existing.nodes.is_empty() {
-        portable_snapshot::validate_complete_topology_state(
-            &existing,
-            existing.canonical_topology_activation.as_ref(),
-        )?;
-        ensure_bootstrap_input_matches(&existing, &input)?;
+    if let Some(existing) = existing_bootstrap_lifecycle_projection(store, &input)? {
         return Ok(existing);
     }
     let state = bootstrap_lifecycle_state(input)?;
     install_bootstrap_lifecycle_projection_state(storage, store, &state)?;
     Ok(state)
+}
+
+/// Return an already-installed complete local bootstrap projection without
+/// rewriting any other portable CoreMeta state.
+///
+/// Canonical join retries must use this check before importing their snapshot:
+/// reapplying an old portable snapshot after normal writes could otherwise
+/// remove rows that were committed after bootstrap.
+pub(crate) fn existing_bootstrap_lifecycle_projection(
+    store: &CoreStore,
+    input: &BootstrapMeshLifecycleProjection,
+) -> LifecycleResult<Option<MeshLifecycleState>> {
+    let existing = read_lifecycle_state_projection_with_core_store(store)?;
+    if existing == MeshLifecycleState::default() {
+        return Ok(None);
+    }
+    portable_snapshot::validate_complete_topology_state(
+        &existing,
+        existing.canonical_topology_activation.as_ref(),
+    )?;
+    ensure_bootstrap_input_matches(&existing, input)?;
+    Ok(Some(existing))
+}
+
+/// Install the complete bootstrap topology as one authoritative MVCC commit.
+///
+/// The caller installs (or imports) the local physical bootstrap projection
+/// first and passes that exact decoded state here. Reusing the physical state
+/// keeps timestamps and canonical activation evidence byte-for-byte identical
+/// across the local projection and the cluster-wide MVCC projection.
+pub(crate) async fn install_authoritative_bootstrap_lifecycle_projection(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    state: &MeshLifecycleState,
+) -> LifecycleResult<bool> {
+    portable_snapshot::validate_complete_topology_state(state, None)?;
+
+    let existing = read_lifecycle_state_projection_mvcc(mvcc)?;
+    if existing != MeshLifecycleState::default() {
+        portable_snapshot::validate_complete_topology_state(&existing, None)?;
+        if existing != *state {
+            return Err(LifecycleError::InvalidArgument(
+                "bootstrap topology differs from the authoritative MVCC topology".to_string(),
+            ));
+        }
+        return Ok(true);
+    }
+
+    let plan = authoritative_bootstrap_plan(state)?;
+    mvcc.autocommit_product_mutations_with_predicates(
+        "mesh/bootstrap",
+        &plan.idempotency_key,
+        plan.mutations,
+        plan.predicates,
+        crate::mvcc_transaction::DurabilityLevel::Quorum,
+        u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default(),
+    )
+    .await
+    .map_err(|error| LifecycleError::InvalidArgument(error.to_string()))?;
+
+    let committed = read_lifecycle_state_projection_mvcc(mvcc)?;
+    if committed != *state {
+        return Err(LifecycleError::InvalidArgument(
+            "authoritative MVCC bootstrap commit did not publish the complete topology".to_string(),
+        ));
+    }
+    Ok(false)
+}
+
+/// Wait for a canonical joiner's cluster-shared MVCC topology to become
+/// locally visible and verify that it matches the imported physical snapshot.
+///
+/// A join request must never originate a second authoritative topology write:
+/// the seed request has already committed it through the cluster's Raft group.
+pub(crate) async fn await_authoritative_bootstrap_lifecycle_projection(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    state: &MeshLifecycleState,
+) -> LifecycleResult<()> {
+    portable_snapshot::validate_complete_topology_state(state, None)?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let existing = read_lifecycle_state_projection_mvcc(mvcc)?;
+        if existing != MeshLifecycleState::default() {
+            portable_snapshot::validate_complete_topology_state(&existing, None)?;
+            if existing != *state {
+                return Err(LifecycleError::InvalidArgument(
+                    "bootstrap topology differs from the authoritative MVCC topology".to_string(),
+                ));
+            }
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(LifecycleError::InvalidArgument(
+                "canonical bootstrap snapshot arrived before the authoritative MVCC topology"
+                    .to_string(),
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+struct AuthoritativeBootstrapPlan {
+    idempotency_key: String,
+    mutations: Vec<crate::mvcc_product::ProductMutation>,
+    predicates: Vec<(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )>,
+}
+
+fn authoritative_bootstrap_plan(
+    state: &MeshLifecycleState,
+) -> LifecycleResult<AuthoritativeBootstrapPlan> {
+    portable_snapshot::validate_complete_topology_state(state, None)?;
+    let rows = encode_lifecycle_projection_rows(state)?;
+    let mut identity = blake3::Hasher::new();
+    identity.update(b"anvil.mesh.authoritative-lifecycle-bootstrap.v1");
+    let mut mutations = Vec::with_capacity(rows.len());
+    let mut predicates = Vec::with_capacity(rows.len());
+
+    for row in rows {
+        let table_id = lifecycle_projection_table_id(row.kind)?;
+        let tuple_key = lifecycle_projection_row_key(row.kind, &row.record_key)?;
+        identity.update(&table_id.to_be_bytes());
+        identity.update(&(tuple_key.len() as u64).to_be_bytes());
+        identity.update(&tuple_key);
+        identity.update(&(row.payload.len() as u64).to_be_bytes());
+        identity.update(&row.payload);
+
+        let key = crate::mvcc_product::coremeta_logical_key(CF_MESH, table_id, &tuple_key)
+            .map_err(|error| LifecycleError::InvalidArgument(error.to_string()))?;
+        predicates.push((key.clone(), crate::mvcc_transaction::PredicateKind::Absent));
+        mutations.push(crate::mvcc_product::ProductMutation::put(key, row.payload));
+    }
+
+    Ok(AuthoritativeBootstrapPlan {
+        idempotency_key: format!("mesh-lifecycle-bootstrap:{}", identity.finalize().to_hex()),
+        mutations,
+        predicates,
+    })
 }
 
 fn ensure_bootstrap_input_matches(
@@ -315,4 +448,72 @@ fn install_bootstrap_lifecycle_projection_state(
     }
     CoreMetaStore::open(storage.core_store_meta_path())?.write_local_committed_batch(&ops)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod authoritative_bootstrap_tests {
+    use super::*;
+
+    fn bootstrap_input() -> BootstrapMeshLifecycleProjection {
+        BootstrapMeshLifecycleProjection {
+            regions: vec![CreateRegionDescriptor {
+                mesh_id: "mesh-a".to_string(),
+                region: "region-a".to_string(),
+                public_base_url: "https://region-a.invalid".to_string(),
+                virtual_host_suffix: "region-a.invalid".to_string(),
+                placement_weight: 100,
+                default_cell: Some("cell-a".to_string()),
+            }],
+            cells: vec![RegisterCellDescriptor {
+                mesh_id: "mesh-a".to_string(),
+                region: "region-a".to_string(),
+                cell_id: "cell-a".to_string(),
+                placement_weight: 100,
+                failure_domain: "rack-a".to_string(),
+            }],
+            nodes: vec![RegisterNodeDescriptor {
+                mesh_id: "mesh-a".to_string(),
+                node_id: "node-a".to_string(),
+                region: "region-a".to_string(),
+                cell_id: "cell-a".to_string(),
+                receipt_signing_public_key: crate::node_signing::NodeSigningKeypair::generate()
+                    .unwrap()
+                    .public_key_bytes()
+                    .to_vec(),
+                public_api_addr: "http://127.0.0.1:50051".to_string(),
+                capabilities: vec![NodeCapability::Metadata, NodeCapability::Object],
+                capacity_json: "{}".to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn authoritative_bootstrap_is_one_absence_guarded_plan() {
+        let state = bootstrap_lifecycle_state(bootstrap_input()).unwrap();
+        let expected_row_count = encode_lifecycle_projection_rows(&state).unwrap().len();
+        let first = authoritative_bootstrap_plan(&state).unwrap();
+        let repeated = authoritative_bootstrap_plan(&state).unwrap();
+
+        assert_eq!(first.mutations.len(), expected_row_count);
+        assert_eq!(first.predicates.len(), expected_row_count);
+        assert_eq!(first.idempotency_key, repeated.idempotency_key);
+        assert!(
+            first
+                .predicates
+                .iter()
+                .all(|(_, predicate)| *predicate == crate::mvcc_transaction::PredicateKind::Absent)
+        );
+        assert_eq!(
+            first
+                .mutations
+                .iter()
+                .map(|mutation| &mutation.key)
+                .collect::<BTreeSet<_>>(),
+            first
+                .predicates
+                .iter()
+                .map(|(key, _)| key)
+                .collect::<BTreeSet<_>>()
+        );
+    }
 }

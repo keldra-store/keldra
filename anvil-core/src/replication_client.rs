@@ -176,6 +176,10 @@ impl TonicReplicationStreamManager {
         })
     }
 
+    pub fn local_node(&self) -> &NodeIncarnation {
+        &self.local_node
+    }
+
     /// Replaces the transport endpoint for one configured peer incarnation.
     ///
     /// The peer mutex serializes this topology transition with transfers. Any
