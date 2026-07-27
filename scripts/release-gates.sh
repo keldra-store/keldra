@@ -117,7 +117,11 @@ rust_unit_gates() {
   run_cargo_test "Rust client package tests" -p anvil-storage --lib --tests
   run_cargo_test "test utils package tests" -p anvil-storage-test-utils --lib
   run_cargo_test "documentation package tests" -p anvil-documentation --lib --bins
-  run_cargo_test "core library tests" -p anvil-storage-core --lib --bins
+  # Core tests include process-global deterministic fault injection and several
+  # in-process Raft clusters. Running them concurrently can leak an armed fault
+  # into an unrelated test or make leader-election deadlines compete for the
+  # same runner. Keep this gate exhaustive but serial.
+  ANVIL_RUST_TEST_THREADS=1 run_cargo_test "core library tests" -p anvil-storage-core --lib --bins
   run_cargo_test "server library and binary tests" -p anvil-server --lib --bins
 }
 
