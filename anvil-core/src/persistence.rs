@@ -567,12 +567,19 @@ fn is_retryable_partition_fence_error(error: &anyhow::Error) -> bool {
     if crate::core_store::is_retryable_mutation_conflict(error) {
         return true;
     }
-    let message = error.to_string();
+    // Preserve the full anyhow chain here.  MVCC predicate failures are
+    // commonly wrapped by transaction certification (for example,
+    // `consensus certification failed`), so looking only at the outer
+    // context misclassifies a transient queue/lease race as fatal.
+    let message = format!("{error:#}");
     message.contains("generation mismatch")
         || message.contains("target mismatch")
         || message.contains("must be absent")
         || message.contains("must be present")
         || message.contains("CAS lock was not acquired")
+        || message.contains("MVCC transaction predicate is false")
+        || message.contains("assignment predicate violates applied Raft control state")
+        || message.contains("task queue MVCC conflict")
         || message.contains("stale")
 }
 
