@@ -886,6 +886,9 @@ async fn object_version_precondition_is_revalidated_at_transaction_publication()
     let guard_key = "preconditions/guard.json";
     let target_key = "preconditions/target.json";
     let delete_key = "preconditions/mixed-delete.json";
+    let source_key = "preconditions/copy-source.json";
+    let copy_key = "preconditions/copied.json";
+    let link_key = "preconditions/staged-link";
     let original_guard = put_object_for_test(
         &mut object_client,
         &fixture.actor.token,
@@ -914,6 +917,20 @@ async fn object_version_precondition_is_revalidated_at_transaction_publication()
     )
     .await
     .expect("create object deleted by the mixed transaction");
+    put_object_for_test(
+        &mut object_client,
+        &fixture.actor.token,
+        &fixture.bucket_name,
+        source_key,
+        br#"{"source":"copy"}"#,
+        native_mutation_context(
+            &fixture.actor,
+            fixture.bucket_id,
+            "durable-precondition-copy-seed",
+        ),
+    )
+    .await
+    .expect("create copy source");
     let transaction = fixture
         .begin_transaction(
             &mut transaction_client,
@@ -921,6 +938,61 @@ async fn object_version_precondition_is_revalidated_at_transaction_publication()
             EXPLICIT_TRANSACTION_TTL_MS,
         )
         .await;
+    object_client
+        .copy_object(authorized(
+            CopyObjectRequest {
+                source_bucket_name: fixture.bucket_name.clone(),
+                source_object_key: source_key.to_string(),
+                source_version_id: None,
+                destination_bucket_name: fixture.bucket_name.clone(),
+                destination_object_key: copy_key.to_string(),
+                mutation_context: Some(fixture.mutation_context(
+                    "durable-precondition-copy",
+                    &transaction.transaction_id,
+                )),
+            },
+            &fixture.actor.token,
+        ))
+        .await
+        .expect("stage copy in the mixed transaction");
+    object_client
+        .create_object_link(authorized(
+            CreateObjectLinkRequest {
+                context: Some(PublicMutationContext {
+                    request_id: "durable-precondition-link".to_string(),
+                    idempotency_key: format!(
+                        "durable-precondition-link-{}",
+                        uuid::Uuid::new_v4()
+                    ),
+                    expected_generation: 0,
+                    transaction_id: Some(transaction.transaction_id.clone()),
+                }),
+                tenant_id: String::new(),
+                bucket_name: fixture.bucket_name.clone(),
+                link_key: link_key.to_string(),
+                target_key: source_key.to_string(),
+                target_version: String::new(),
+                resolution: ObjectLinkResolution::Follow as i32,
+                allow_dangling: false,
+            },
+            &fixture.actor.token,
+        ))
+        .await
+        .expect("stage link create in the mixed transaction");
+    assert_object_missing(&fixture, &mut object_client, copy_key).await;
+    let hidden_link = object_client
+        .read_object_link(authorized(
+            ReadObjectLinkRequest {
+                request_id: "read-staged-link".to_string(),
+                tenant_id: String::new(),
+                bucket_name: fixture.bucket_name.clone(),
+                link_key: link_key.to_string(),
+                consistency: None,
+            },
+            &fixture.actor.token,
+        ))
+        .await;
+    assert!(hidden_link.is_err(), "staged link leaked before commit");
 
     let staged =
         object_client
@@ -983,6 +1055,20 @@ async fn object_version_precondition_is_revalidated_at_transaction_publication()
         .expect_err("a guard changed on another writer must reject publication");
     assert_eq!(conflict.code(), Code::Aborted);
     assert_object_missing(&fixture, &mut object_client, target_key).await;
+    assert_object_missing(&fixture, &mut object_client, copy_key).await;
+    let aborted_link = object_client
+        .read_object_link(authorized(
+            ReadObjectLinkRequest {
+                request_id: "read-aborted-link".to_string(),
+                tenant_id: String::new(),
+                bucket_name: fixture.bucket_name.clone(),
+                link_key: link_key.to_string(),
+                consistency: None,
+            },
+            &fixture.actor.token,
+        ))
+        .await;
+    assert!(aborted_link.is_err(), "aborted link create became visible");
     assert_eq!(
         get_object_bytes_for_test(
             &mut object_client,
