@@ -170,7 +170,9 @@ impl MvccApplyWorker {
                     bail!("unrecoverable MVCC bundle belongs to another cluster");
                 }
                 let identity = bundle_identity(committed.bundle_hash, committed.bundle_length);
-                let bytes = self.fetch_bundle(&identity).await?;
+                let bytes = self
+                    .fetch_bundle(&identity, &committed.durable_holders)
+                    .await?;
                 let mut bundle: TransactionBundle = serde_json::from_slice(&bytes)
                     .context("unrecoverable MVCC: decode canonical transaction bundle")?;
                 bundle
@@ -303,14 +305,25 @@ impl MvccApplyWorker {
         Ok(())
     }
 
-    async fn fetch_bundle(&self, identity: &BundleIdentity) -> Result<Vec<u8>> {
+    async fn fetch_bundle(
+        &self,
+        identity: &BundleIdentity,
+        durable_holders: &[anvil_mvcc_consensus::NodeIncarnation],
+    ) -> Result<Vec<u8>> {
         if let Some(bytes) = self.prepared.read(identity)? {
             return Ok(bytes);
         }
         let transfer_id = bundle_transfer_id(identity)?;
         let expected_hash = parse_hash(&identity.hash)?;
         let mut failures = Vec::new();
-        for peer in self.peers.iter() {
+        let peers = durable_peer_candidates(&self.peers, durable_holders);
+        if peers.is_empty() {
+            bail!(
+                "canonical bundle {} is not locally available and no committed durable holder is reachable",
+                identity.hash
+            );
+        }
+        for peer in peers {
             match self
                 .replication
                 .read_complete_transfer(
@@ -342,6 +355,22 @@ impl MvccApplyWorker {
             failures.join("; ")
         ))
     }
+}
+
+fn durable_peer_candidates<'a>(
+    peers: &'a [NodeIncarnation],
+    durable_holders: &[anvil_mvcc_consensus::NodeIncarnation],
+) -> Vec<&'a NodeIncarnation> {
+    peers
+        .iter()
+        .filter(|peer| {
+            durable_holders.iter().any(|holder| {
+                holder.node_id
+                    == crate::mvcc_bootstrap::consensus_control_node_id(&peer.node_id)
+                    && holder.incarnation == peer.incarnation
+            })
+        })
+        .collect()
 }
 
 fn unix_time_ms() -> Result<u64> {
@@ -618,8 +647,17 @@ mod tests {
         )
         .unwrap();
         let local = LocalMvccStore::open(local_directory.path()).unwrap();
+        let mut decision = committed(&bundle, 1);
+        decision
+            .committed_bundle
+            .as_mut()
+            .unwrap()
+            .durable_holders = vec![anvil_mvcc_consensus::NodeIncarnation {
+            node_id: crate::mvcc_bootstrap::consensus_control_node_id(&remote.node_id),
+            incarnation: remote.incarnation,
+        }];
         let source = Arc::new(Source {
-            decisions: StdMutex::new(vec![committed(&bundle, 1)]),
+            decisions: StdMutex::new(vec![decision]),
             gc: CommitVersion(0),
             violations: vec![],
         });
@@ -662,6 +700,34 @@ mod tests {
         );
         assert_eq!(prepared.read(&identity).unwrap(), Some(bytes));
         server.abort();
+    }
+
+    #[test]
+    fn recovery_contacts_only_exact_incarnation_committed_holders() {
+        let holder = NodeIncarnation {
+            node_id: "holder".into(),
+            incarnation: 3,
+        };
+        let stale_holder = NodeIncarnation {
+            node_id: "holder".into(),
+            incarnation: 2,
+        };
+        let non_holder = NodeIncarnation {
+            node_id: "other".into(),
+            incarnation: 3,
+        };
+        let durable = [anvil_mvcc_consensus::NodeIncarnation {
+            node_id: crate::mvcc_bootstrap::consensus_control_node_id(&holder.node_id),
+            incarnation: holder.incarnation,
+        }];
+
+        assert_eq!(
+            durable_peer_candidates(
+                &[stale_holder, non_holder, holder.clone()],
+                &durable,
+            ),
+            vec![&holder]
+        );
     }
 
     #[tokio::test]
