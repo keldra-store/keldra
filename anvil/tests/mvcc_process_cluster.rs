@@ -416,6 +416,78 @@ async fn committed_personaldb_submit_survives_two_coordinator_crashes_without_cl
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn committed_bucket_locator_survives_two_coordinator_crashes_without_client_retry() {
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_anvil-server"));
+    let mut cluster = ProcessMvccCluster::start(binary).await.unwrap();
+    let coordinator = cluster.wait_for_leader(&[0, 1, 2]).await.unwrap();
+    let bucket_name = format!("bucket-locator-crash-{}", uuid::Uuid::new_v4().simple());
+    let transaction = cluster
+        .begin_transaction(coordinator, MvccReadConsistency::Linearized)
+        .await
+        .unwrap();
+    cluster
+        .stage_bucket_create(coordinator, &bucket_name, &transaction.transaction_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        cluster
+            .bucket_locator_record_count(coordinator, &bucket_name)
+            .await
+            .unwrap(),
+        0,
+        "a staged bucket must not publish its mesh locator"
+    );
+
+    cluster
+        .arm_hard_crash(
+            coordinator,
+            "BucketLocatorFinalizationBeforeEffects",
+        )
+        .unwrap();
+    let committed = cluster
+        .commit_transaction(
+            cluster.public_endpoint(coordinator),
+            transaction.transaction_id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(committed.state, WriteState::Committed as i32);
+    cluster
+        .wait_for_hard_crash(coordinator, Duration::from_secs(45))
+        .await
+        .unwrap();
+
+    cluster
+        .arm_hard_crash(
+            coordinator,
+            "BucketLocatorFinalizationAfterEffects",
+        )
+        .unwrap();
+    cluster.restart(coordinator).await.unwrap();
+    cluster
+        .wait_for_hard_crash(coordinator, Duration::from_secs(45))
+        .await
+        .unwrap();
+    cluster.restart(coordinator).await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            if cluster
+                .bucket_locator_record_count(coordinator, &bucket_name)
+                .await
+                .unwrap_or_default()
+                == 1
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("same-disk replay publishes exactly one bucket locator");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn committed_git_pack_survives_two_postcommit_crashes_without_client_retry_or_duplicate_watch()
 {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_anvil-server"));

@@ -117,8 +117,8 @@ pub(crate) async fn stage_bucket_mutation_in_transaction(
     mutation: BucketJournalMutation,
     transaction_id: &str,
     transaction_principal: &str,
-) -> Result<()> {
-    build_bucket_mvcc_mutation_plan_with_transaction(
+) -> Result<u64> {
+    let (_, collection_revision) = build_bucket_mvcc_mutation_plan_with_transaction(
         mvcc,
         bucket,
         mutation,
@@ -131,7 +131,7 @@ pub(crate) async fn stage_bucket_mutation_in_transaction(
             u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
         )
         .await?;
-    Ok(())
+    Ok(collection_revision)
 }
 
 pub fn next_bucket_id_mvcc(mvcc: &crate::mvcc_bootstrap::MvccSubsystem) -> Result<i64> {

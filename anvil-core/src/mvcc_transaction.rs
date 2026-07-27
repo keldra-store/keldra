@@ -355,6 +355,14 @@ impl TransactionBundle {
                     )?;
                     (job.cluster_id, job.transaction_id)
                 }
+                Some(
+                    crate::bucket_locator_finalization_job::BucketLocatorFinalizationJob::SCHEMA,
+                ) => {
+                    let job = crate::bucket_locator_finalization_job::BucketLocatorFinalizationJob::decode(
+                        encoded_job,
+                    )?;
+                    (job.cluster_id, job.transaction_id)
+                }
                 _ => {
                     let job =
                         crate::object_materialisation::ObjectMaterialisationJob::decode(encoded_job)?;

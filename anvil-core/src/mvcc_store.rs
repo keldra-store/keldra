@@ -26,6 +26,10 @@ use crate::index_finalization_job::{
 use crate::git_source_postcommit_job::{
     GitSourcePostCommitJob, GitSourcePostCommitRecord, GitSourcePostCommitState,
 };
+use crate::bucket_locator_finalization_job::{
+    BucketLocatorFinalizationJob, BucketLocatorFinalizationRecord,
+    BucketLocatorFinalizationState,
+};
 use crate::mvcc_transaction::{CommitVersion, LogicalKey, TransactionBundle, WriteOperation};
 use crate::object_materialisation::ObjectMaterialisationState;
 use crate::object_materialisation::{ObjectMaterialisationJob, ObjectMaterialisationRecord};
@@ -146,6 +150,10 @@ impl MvccStore {
             (b"index-finalization/".as_slice(), "index-finalization"),
             (b"personaldb-postcommit/".as_slice(), "personaldb-postcommit"),
             (b"git-source-postcommit/".as_slice(), "git-source-postcommit"),
+            (
+                b"bucket-locator-finalization/".as_slice(),
+                "bucket-locator-finalization",
+            ),
         ] {
             let prefix = self.key(prefix_suffix);
             for row in self.db.iterator_cf(
@@ -183,6 +191,13 @@ impl MvccStore {
                 } else if kind == "git-source-postcommit" {
                     let record: GitSourcePostCommitRecord = serde_json::from_slice(&value)?;
                     if record.state == GitSourcePostCommitState::Complete {
+                        continue;
+                    }
+                    record.job.target_logical_identity()
+                } else if kind == "bucket-locator-finalization" {
+                    let record: BucketLocatorFinalizationRecord =
+                        serde_json::from_slice(&value)?;
+                    if record.state == BucketLocatorFinalizationState::Complete {
                         continue;
                     }
                     record.job.target_logical_identity()
@@ -459,6 +474,27 @@ impl MvccStore {
                     && existing.as_slice() != record.as_slice()
                 {
                     bail!("GitSource postcommit job identity collision");
+                }
+                batch.put_cf(materialisation_cf, key, record);
+                continue;
+            }
+            if schema.as_deref() == Some(BucketLocatorFinalizationJob::SCHEMA) {
+                let job = BucketLocatorFinalizationJob::decode(encoded_job)?;
+                if job.cluster_id != self.cluster_id || job.transaction_id != bundle.transaction_id
+                {
+                    bail!("bucket locator finalization job belongs to another transaction or cluster");
+                }
+                let key = self.key(
+                    format!("bucket-locator-finalization/{}", job.job_id()?).as_bytes(),
+                );
+                let record = serde_json::to_vec(&BucketLocatorFinalizationRecord::pending(
+                    job,
+                    commit_version,
+                ))?;
+                if let Some(existing) = self.db.get_cf(materialisation_cf, &key)?
+                    && existing.as_slice() != record.as_slice()
+                {
+                    bail!("bucket locator finalization job identity collision");
                 }
                 batch.put_cf(materialisation_cf, key, record);
                 continue;
@@ -1507,6 +1543,110 @@ impl MvccStore {
         })
     }
 
+    pub fn claim_bucket_locator_finalization_authorized(
+        &self,
+        worker_id: &str,
+        now_unix_ms: u64,
+        lease_ms: u64,
+        eligible: impl Fn(&BucketLocatorFinalizationRecord) -> Option<String>,
+    ) -> Result<Option<(String, BucketLocatorFinalizationRecord)>> {
+        if worker_id.trim().is_empty() || lease_ms == 0 {
+            bail!("bucket locator finalization worker and lease must be non-empty");
+        }
+        let _transition = self.materialisation_transition.lock().unwrap();
+        let cf = self.cf(CF_MATERIALISATION)?;
+        let prefix = self.key(b"bucket-locator-finalization/");
+        let mut incomplete = Vec::new();
+        for row in self
+            .db
+            .iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward))
+        {
+            let (key, value) = row?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let record: BucketLocatorFinalizationRecord = serde_json::from_slice(&value)?;
+            if record.state != BucketLocatorFinalizationState::Complete {
+                incomplete.push((key, record));
+            }
+        }
+        let candidate = incomplete
+            .iter()
+            .filter_map(|(key, record)| eligible(record).map(|owner| (key, record, owner)))
+            .filter(|(_, candidate, _)| {
+                !incomplete.iter().any(|(_, other)| {
+                    other.job.target_logical_identity()
+                        == candidate.job.target_logical_identity()
+                        && (other.commit_version, other.job.operation_sequence)
+                            < (
+                                candidate.commit_version,
+                                candidate.job.operation_sequence,
+                            )
+                })
+            })
+            .min_by_key(|(_, record, _)| {
+                (record.commit_version, record.job.operation_sequence)
+            });
+        let Some((key, record, owner)) = candidate else {
+            return Ok(None);
+        };
+        let key = key.clone();
+        let mut record = record.clone();
+        if !record.claimable(now_unix_ms) {
+            return Ok(None);
+        }
+        record.state = BucketLocatorFinalizationState::Running;
+        record.attempts = record.attempts.saturating_add(1);
+        record.lease_owner = Some(owner);
+        record.lease_expires_unix_ms = Some(
+            now_unix_ms
+                .checked_add(lease_ms)
+                .context("bucket locator finalization lease overflow")?,
+        );
+        self.db.put_cf_opt(
+            cf,
+            &key,
+            serde_json::to_vec(&record)?,
+            &durable_write_options(),
+        )?;
+        let id = String::from_utf8(self.unscoped(&key)?.to_vec())?
+            .strip_prefix("bucket-locator-finalization/")
+            .context("invalid bucket locator finalization key")?
+            .to_string();
+        Ok(Some((id, record)))
+    }
+
+    pub fn retry_bucket_locator_finalization(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        next_attempt_unix_ms: u64,
+        error: &str,
+    ) -> Result<()> {
+        self.transition_bucket_locator_finalization(job_id, worker_id, |record| {
+            record.state = BucketLocatorFinalizationState::Pending;
+            record.next_attempt_unix_ms = next_attempt_unix_ms;
+            record.lease_owner = None;
+            record.lease_expires_unix_ms = None;
+            record.last_error = Some(error.to_string());
+            Ok(())
+        })
+    }
+
+    pub fn complete_bucket_locator_finalization(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+    ) -> Result<()> {
+        self.transition_bucket_locator_finalization(job_id, worker_id, |record| {
+            record.state = BucketLocatorFinalizationState::Complete;
+            record.lease_owner = None;
+            record.lease_expires_unix_ms = None;
+            record.last_error = None;
+            Ok(())
+        })
+    }
+
     pub fn claim_shard_repair_where(
         &self,
         worker_id: &str,
@@ -1769,6 +1909,21 @@ impl MvccStore {
             }
             let record: GitSourcePostCommitRecord = serde_json::from_slice(&value)?;
             if record.state != GitSourcePostCommitState::Complete {
+                pins.materialisation_snapshots.insert(record.commit_version);
+                pins.transaction_ids.insert(record.job.transaction_id);
+            }
+        }
+        let bucket_locator_prefix = self.key(b"bucket-locator-finalization/");
+        for row in self.db.iterator_cf(
+            materialisation_cf,
+            IteratorMode::From(&bucket_locator_prefix, Direction::Forward),
+        ) {
+            let (key, value) = row?;
+            if !key.starts_with(&bucket_locator_prefix) {
+                break;
+            }
+            let record: BucketLocatorFinalizationRecord = serde_json::from_slice(&value)?;
+            if record.state != BucketLocatorFinalizationState::Complete {
                 pins.materialisation_snapshots.insert(record.commit_version);
                 pins.transaction_ids.insert(record.job.transaction_id);
             }
@@ -2059,6 +2214,35 @@ impl MvccStore {
         Ok(())
     }
 
+    fn transition_bucket_locator_finalization(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        update: impl FnOnce(&mut BucketLocatorFinalizationRecord) -> Result<()>,
+    ) -> Result<()> {
+        let _transition = self.materialisation_transition.lock().unwrap();
+        let cf = self.cf(CF_MATERIALISATION)?;
+        let key = self.key(format!("bucket-locator-finalization/{job_id}").as_bytes());
+        let bytes = self
+            .db
+            .get_cf(cf, &key)?
+            .context("bucket locator finalization job not found")?;
+        let mut record: BucketLocatorFinalizationRecord = serde_json::from_slice(&bytes)?;
+        if record.state != BucketLocatorFinalizationState::Running
+            || record.lease_owner.as_deref() != Some(worker_id)
+        {
+            bail!("bucket locator finalization job is not leased by this worker");
+        }
+        update(&mut record)?;
+        self.db.put_cf_opt(
+            cf,
+            key,
+            serde_json::to_vec(&record)?,
+            &durable_write_options(),
+        )?;
+        Ok(())
+    }
+
     fn transition_local_durability_upgrade(
         &self,
         job_id: &str,
@@ -2226,6 +2410,14 @@ impl MvccStore {
             &mut deleted,
             &mut deleted_bytes,
         )?;
+        self.collect_completed_jobs(
+            materialisation_cf,
+            b"bucket-locator-finalization/",
+            safe_watermark,
+            &mut batch,
+            &mut deleted,
+            &mut deleted_bytes,
+        )?;
         batch.put_cf(
             meta_cf,
             self.key(GC_WATERMARK_KEY),
@@ -2284,6 +2476,10 @@ impl MvccStore {
             } else if suffix == b"git-source-postcommit/" {
                 let record: GitSourcePostCommitRecord = serde_json::from_slice(&value)?;
                 record.state == GitSourcePostCommitState::Complete
+                    && record.commit_version < safe_watermark
+            } else if suffix == b"bucket-locator-finalization/" {
+                let record: BucketLocatorFinalizationRecord = serde_json::from_slice(&value)?;
+                record.state == BucketLocatorFinalizationState::Complete
                     && record.commit_version < safe_watermark
             } else {
                 bail!("unknown completed materialisation job family");
@@ -2485,6 +2681,30 @@ mod tests {
         }
     }
 
+    fn bucket_locator_job(
+        transaction_id: &str,
+        operation_sequence: u64,
+        operation: crate::bucket_locator_finalization_job::BucketLocatorFinalizationOperation,
+    ) -> BucketLocatorFinalizationJob {
+        use chrono::TimeZone;
+
+        BucketLocatorFinalizationJob {
+            schema: BucketLocatorFinalizationJob::SCHEMA.into(),
+            cluster_id: "cluster".into(),
+            transaction_id: transaction_id.into(),
+            operation_sequence,
+            operation,
+            frozen_bucket: crate::persistence::Bucket {
+                id: 17,
+                tenant_id: 1,
+                name: "bucket-a".into(),
+                region: "region-a".into(),
+                created_at: chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+                is_public_read: false,
+            },
+        }
+    }
+
     #[test]
     fn snapshot_reads_select_the_newest_visible_immutable_version() {
         let temp = tempdir().unwrap();
@@ -2606,6 +2826,114 @@ mod tests {
         assert!(
             store
                 .claim_git_source_postcommit_authorized("worker", 30, 5, |_| {
+                    Some("assignment-owner".into())
+                })
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn bucket_locator_jobs_are_durable_ordered_retryable_and_gc_pinned() {
+        use crate::bucket_locator_finalization_job::BucketLocatorFinalizationOperation;
+
+        let temp = tempdir().unwrap();
+        let store = MvccStore::open(temp.path()).unwrap();
+        for (commit_version, transaction_id, operation) in [
+            (2, "bucket-create", BucketLocatorFinalizationOperation::Publish),
+            (3, "bucket-delete", BucketLocatorFinalizationOperation::Delete),
+        ] {
+            store
+                .apply_certified_bundle(
+                    commit_version,
+                    &bundle(transaction_id, |builder| {
+                        builder.add_materialisation_job(
+                            bucket_locator_job(transaction_id, commit_version, operation)
+                                .encode()
+                                .unwrap(),
+                        );
+                    }),
+                )
+                .unwrap();
+        }
+        store
+            .apply_certified_bundle(5, &bundle("advance", |_| {}))
+            .unwrap();
+
+        let expected_partition = crate::mvcc_worker_authority::work_partition_id(
+            "bucket-locator-finalization",
+            "tenant/1/bucket/17/locator",
+        )
+        .unwrap();
+        assert!(
+            store
+                .required_background_work_partitions()
+                .unwrap()
+                .contains(&expected_partition)
+        );
+        assert_eq!(
+            store
+                .unfinished_work_pins()
+                .unwrap()
+                .materialisation_snapshots,
+            [2_u64, 3].into_iter().collect()
+        );
+        assert!(store.garbage_collect(5).is_err());
+
+        let (create_id, create) = store
+            .claim_bucket_locator_finalization_authorized("worker", 10, 5, |_| {
+                Some("assignment-owner".into())
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            create.job.operation,
+            BucketLocatorFinalizationOperation::Publish
+        );
+        store
+            .retry_bucket_locator_finalization(
+                &create_id,
+                "assignment-owner",
+                20,
+                "retry",
+            )
+            .unwrap();
+        assert!(
+            store
+                .claim_bucket_locator_finalization_authorized("worker", 19, 5, |_| {
+                    Some("assignment-owner".into())
+                })
+                .unwrap()
+                .is_none()
+        );
+        let (create_id, _) = store
+            .claim_bucket_locator_finalization_authorized("worker", 20, 5, |_| {
+                Some("assignment-owner".into())
+            })
+            .unwrap()
+            .unwrap();
+        store
+            .complete_bucket_locator_finalization(&create_id, "assignment-owner")
+            .unwrap();
+
+        let (delete_id, delete) = store
+            .claim_bucket_locator_finalization_authorized("worker", 20, 5, |_| {
+                Some("assignment-owner".into())
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            delete.job.operation,
+            BucketLocatorFinalizationOperation::Delete
+        );
+        store
+            .complete_bucket_locator_finalization(&delete_id, "assignment-owner")
+            .unwrap();
+        assert!(store.unfinished_work_pins().unwrap().all().is_empty());
+        store.garbage_collect(5).unwrap();
+        assert!(
+            store
+                .claim_bucket_locator_finalization_authorized("worker", 30, 5, |_| {
                     Some("assignment-owner".into())
                 })
                 .unwrap()

@@ -179,6 +179,26 @@ async fn bucket_create_and_policy_use_one_transaction_overlay_and_publish_defaul
             && record.relation == "reader"
             && record.operation == "add"
     }));
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if cluster.states[0]
+                .persistence
+                .get_mesh_bucket_locator(1, &bucket_name)
+                .await
+                .unwrap()
+                .is_some_and(|locator| {
+                    locator.bucket_id.as_str() == bucket_id.to_string()
+                        && locator.status
+                            == anvil::mesh_directory::BucketLocatorStatus::Active
+                })
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("committed bucket locator finalization completes");
 }
 
 #[tokio::test]

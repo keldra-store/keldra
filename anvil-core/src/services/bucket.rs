@@ -340,7 +340,7 @@ impl AppState {
             created_at: chrono::Utc::now(),
             is_public_read: false,
         };
-        self.stage_bucket_metadata_transaction(
+        let operation_sequence = self.stage_bucket_metadata_transaction(
             claims,
             &bucket,
             BucketJournalMutation::Create,
@@ -358,6 +358,13 @@ impl AppState {
         )
         .await
         .map_err(|err| Status::internal(err.to_string()))?;
+        self.stage_bucket_locator_finalization(
+            transaction_id,
+            &principal,
+            &bucket,
+            operation_sequence,
+            crate::bucket_locator_finalization_job::BucketLocatorFinalizationOperation::Publish,
+        )?;
         Ok(bucket)
     }
 
@@ -402,13 +409,20 @@ impl AppState {
         if has_objects || has_uploads {
             return Err(Status::failed_precondition("Bucket not empty"));
         }
-        self.stage_bucket_metadata_transaction(
+        let operation_sequence = self.stage_bucket_metadata_transaction(
             claims,
             &bucket,
             BucketJournalMutation::Delete,
             transaction_id,
         )
         .await?;
+        self.stage_bucket_locator_finalization(
+            transaction_id,
+            &principal,
+            &bucket,
+            operation_sequence,
+            crate::bucket_locator_finalization_job::BucketLocatorFinalizationOperation::Delete,
+        )?;
         Ok(bucket)
     }
 
@@ -465,7 +479,7 @@ impl AppState {
         bucket: &crate::persistence::Bucket,
         mutation: BucketJournalMutation,
         transaction_id: &str,
-    ) -> Result<(), Status> {
+    ) -> Result<u64, Status> {
         let principal = crate::object_manager::transaction_principal_from_claims(claims);
         bucket_journal::stage_bucket_mutation_in_transaction(
             self.mvcc.as_ref(),
@@ -476,6 +490,45 @@ impl AppState {
         )
         .await
         .map_err(bucket_core_store_status)
+    }
+
+    fn stage_bucket_locator_finalization(
+        &self,
+        transaction_id: &str,
+        principal: &str,
+        bucket: &crate::persistence::Bucket,
+        operation_sequence: u64,
+        operation: crate::bucket_locator_finalization_job::BucketLocatorFinalizationOperation,
+    ) -> Result<(), Status> {
+        let handle = self
+            .mvcc
+            .open_transactions
+            .handle(transaction_id)
+            .map_err(|err| Status::failed_precondition(err.to_string()))?;
+        if handle.principal != principal {
+            return Err(Status::permission_denied(
+                "bucket locator caller transaction principal mismatch",
+            ));
+        }
+        let job = crate::bucket_locator_finalization_job::BucketLocatorFinalizationJob {
+            schema:
+                crate::bucket_locator_finalization_job::BucketLocatorFinalizationJob::SCHEMA
+                    .to_string(),
+            cluster_id: self.mvcc.cluster_id().to_string(),
+            transaction_id: transaction_id.to_string(),
+            operation_sequence,
+            operation,
+            frozen_bucket: bucket.clone(),
+        };
+        self.mvcc
+            .open_transactions
+            .add_job(
+                transaction_id,
+                job.encode()
+                    .map_err(|err| Status::internal(err.to_string()))?,
+                u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+            )
+            .map_err(|err| Status::failed_precondition(err.to_string()))
     }
 
     async fn publish_bucket_metadata_event(

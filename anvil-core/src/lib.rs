@@ -40,6 +40,7 @@ pub mod authz_scope;
 pub mod authz_segment;
 pub mod authz_userset_index;
 pub mod bucket_journal;
+pub mod bucket_locator_finalization_job;
 pub mod bucket_manager;
 pub mod bundle_replication;
 pub mod config;

@@ -34,6 +34,8 @@ pub enum FaultPoint {
     PersonalDbPostCommitAfterEffects,
     GitSourcePostCommitBeforeEffects,
     GitSourcePostCommitAfterEffects,
+    BucketLocatorFinalizationBeforeEffects,
+    BucketLocatorFinalizationAfterEffects,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

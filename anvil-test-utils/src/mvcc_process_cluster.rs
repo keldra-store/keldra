@@ -19,7 +19,8 @@ use anvil::anvil_api::{
     GetPersonalDbGroupRequest, IndexDefinitionRecord, IndexKind,
     GetGitBlobByPathRequest, GitBlobLocation, GitPackMetadata, PutGitPackRequest,
     PutGitPackResponse, WatchGitSourceRequest, WatchGitSourceResponse,
-    ListIndexesRequest, QueryIndexRequest, QueryIndexResponse, ReadAuthzTuplesRequest,
+    ListIndexesRequest, ListRoutingRecordsRequest, QueryIndexRequest, QueryIndexResponse,
+    ReadAuthzTuplesRequest, RoutingRecordFamily,
     PersonalDbGroupResponse, PersonalDbVoterAck, SubmitPersonalDbChangesetRequest,
     SubmitPersonalDbChangesetResponse, WriteOptions,
     GetLocalNodeDescriptorRequest, GetObjectRequest, GetTransactionRequest, HeadObjectRequest,
@@ -283,6 +284,62 @@ impl ProcessMvccCluster {
             .await?
             .into_inner()
             .bucket_id)
+    }
+
+    pub async fn stage_bucket_create(
+        &self,
+        node: usize,
+        bucket_name: &str,
+        transaction_id: &str,
+    ) -> anyhow::Result<i64> {
+        let mut client = BucketServiceClient::connect(self.public_endpoint(node)).await?;
+        Ok(client
+            .create_bucket(authorized(
+                CreateBucketRequest {
+                    bucket_name: bucket_name.to_string(),
+                    region: "process-e2e-region".to_string(),
+                    options: Some(WriteOptions {
+                        idempotency_key: format!("process-bucket-{bucket_name}"),
+                        consistency: 0,
+                        wait_for_finalization: false,
+                        preconditions: Vec::new(),
+                        boundary_values: Vec::new(),
+                        execution: Some(write_options::Execution::TransactionId(
+                            transaction_id.to_string(),
+                        )),
+                    }),
+                },
+                &self.admin_token,
+            ))
+            .await?
+            .into_inner()
+            .bucket_id)
+    }
+
+    pub async fn bucket_locator_record_count(
+        &self,
+        node: usize,
+        bucket_name: &str,
+    ) -> anyhow::Result<usize> {
+        let mut client = AdminServiceClient::connect(format!(
+            "http://{}",
+            self.nodes[node].admin_addr
+        ))
+        .await?;
+        Ok(client
+            .list_routing_records(authorized(
+                ListRoutingRecordsRequest {
+                    family: RoutingRecordFamily::BucketLocator as i32,
+                    page: None,
+                },
+                &self.admin_token,
+            ))
+            .await?
+            .into_inner()
+            .records
+            .into_iter()
+            .filter(|record| record.record_key.ends_with(&format!("/{bucket_name}")))
+            .count())
     }
 
     pub async fn create_personaldb_group(
@@ -859,6 +916,8 @@ impl ProcessMvccCluster {
                 "PersonalDbPostCommitAfterEffects",
                 "GitSourcePostCommitBeforeEffects",
                 "GitSourcePostCommitAfterEffects",
+                "BucketLocatorFinalizationBeforeEffects",
+                "BucketLocatorFinalizationAfterEffects",
             ];
         if !PROCESS_SAFE_POINTS.contains(&fault_point) {
             bail!("fault point is not enabled for process-backed hard crashes");
