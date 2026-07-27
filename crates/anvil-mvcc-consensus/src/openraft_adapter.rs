@@ -2097,6 +2097,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unrelated_partition_topology_change_preserves_assignment_predicate() {
+        let directory = TempDir::new().unwrap();
+        let store = RocksRaftStore::open(directory.path(), 0).unwrap();
+        let (_, mut machine) = stores(store.clone(), [1; 32]).unwrap();
+        let owner = NodeIncarnation {
+            node_id: NodeId(1),
+            incarnation: 1,
+        };
+        machine
+            .apply([
+                Entry {
+                    log_id: LogId::new(CommittedLeaderId::new(1, 1), 1),
+                    payload: EntryPayload::Normal(ConsensusCommand::InstallNode {
+                        cluster_id_hash: [1; 32],
+                        node: owner,
+                        raft_node_id: NodeId(1),
+                        failure_domain: "zone-a".into(),
+                    }),
+                },
+                Entry {
+                    log_id: LogId::new(CommittedLeaderId::new(1, 1), 2),
+                    payload: EntryPayload::Normal(ConsensusCommand::SetDurabilityPolicy {
+                        cluster_id_hash: [1; 32],
+                        generation: 1,
+                        bundle_quorum_holders: 1,
+                        tolerated_failure_domains: 0,
+                    }),
+                },
+                Entry {
+                    log_id: LogId::new(CommittedLeaderId::new(1, 1), 3),
+                    payload: EntryPayload::Normal(ConsensusCommand::AssignPartition {
+                        cluster_id_hash: [1; 32],
+                        partition_id: 7,
+                        owner,
+                        epoch: 1,
+                    }),
+                },
+                Entry {
+                    log_id: LogId::new(CommittedLeaderId::new(1, 1), 4),
+                    payload: EntryPayload::Normal(ConsensusCommand::AssignPartition {
+                        cluster_id_hash: [1; 32],
+                        partition_id: 8,
+                        owner,
+                        epoch: 1,
+                    }),
+                },
+            ])
+            .await
+            .unwrap();
+        let before: MachineState = store.read_state_value(KEY_OPENRAFT_STATE).unwrap().unwrap();
+        assert_eq!(before.control.topology_epoch(), 4);
+        assert_eq!(
+            before.control.partition(7),
+            Some(&crate::PartitionAssignment { owner, epoch: 1 })
+        );
+
+        let result = machine
+            .apply([Entry {
+                log_id: LogId::new(CommittedLeaderId::new(1, 1), 5),
+                payload: EntryPayload::Normal(ConsensusCommand::Certify(CertifyTransaction {
+                    cluster_id_hash: [1; 32],
+                    transaction_id: TransactionId([11; 16]),
+                    snapshot_version: CommitVersion(0),
+                    point_observations: vec![],
+                    range_observations: vec![],
+                    predicates: vec![],
+                    assignment_predicates: vec![crate::AssignmentPredicate {
+                        partition_id: 7,
+                        owner,
+                        assignment_epoch: 1,
+                        topology_epoch: 3,
+                    }],
+                    written_point_keys: vec![],
+                    written_points: vec![],
+                    advanced_range_stamps: vec![],
+                    bundle_hash: BundleHash([11; 32]),
+                    bundle_length: 1,
+                    durability: DurabilityLevel::Local,
+                    durable_holders: vec![owner],
+                })),
+            }])
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            result.as_slice(),
+            [RaftApplyResult::Certification(
+                CertificationResult::Committed {
+                    commit_version: CommitVersion(5),
+                    ..
+                }
+            )]
+        ));
+    }
+
+    #[tokio::test]
     async fn stale_assignment_predicate_is_a_stable_abort_not_a_rejected_raft_entry() {
         let directory = TempDir::new().unwrap();
         let store = RocksRaftStore::open(directory.path(), 0).unwrap();
