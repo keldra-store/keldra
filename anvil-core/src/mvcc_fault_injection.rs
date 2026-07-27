@@ -27,6 +27,7 @@ pub enum FaultPoint {
     LaggingFollowerGc,
     RepairApply,
     RestartRecovery,
+    PersonalDbAfterCreateCommit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -261,6 +262,11 @@ pub const RFC_FAULT_MATRIX: &[FaultScenario] = &[
         point: FaultPoint::RestartRecovery,
         invariant: ExpectedInvariant::RecoverOrRejectTail,
     },
+    FaultScenario {
+        name: "personaldb_after_create_commit",
+        point: FaultPoint::PersonalDbAfterCreateCommit,
+        invariant: ExpectedInvariant::IdempotentReplay,
+    },
 ];
 
 #[cfg(test)]
@@ -328,7 +334,7 @@ mod tests {
             .map(|scenario| scenario.point)
             .collect::<BTreeSet<_>>();
         assert_eq!(names.len(), RFC_FAULT_MATRIX.len());
-        assert_eq!(points.len(), 17);
+        assert_eq!(points.len(), 18);
     }
 
     #[tokio::test]

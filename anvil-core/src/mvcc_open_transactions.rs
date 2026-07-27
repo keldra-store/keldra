@@ -889,9 +889,13 @@ fn durable_write_options() -> WriteOptions {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use tempfile::tempdir;
+    use tokio::sync::Notify;
 
     use super::*;
     use crate::mvcc_store::ApplyOutcome;
@@ -940,6 +944,48 @@ mod tests {
         Runtime {
             snapshot: 9,
             committed: Mutex::new(Vec::new()),
+        }
+    }
+
+    struct GatedRuntime {
+        calls: AtomicUsize,
+        first_started: Notify,
+        release_first: Notify,
+    }
+
+    #[async_trait]
+    impl TransactionRuntime for GatedRuntime {
+        async fn transaction_snapshot(
+            &self,
+            _consistency: ReadConsistency,
+        ) -> Result<CommitVersion> {
+            Ok(9)
+        }
+
+        async fn commit_transaction_bundle(
+            &self,
+            _bundle: TransactionBundle,
+            _durability: DurabilityLevel,
+        ) -> Result<CommitOutcome> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.first_started.notify_one();
+                self.release_first.notified().await;
+            }
+            Ok(CommitOutcome {
+                certification: CertificationResult::Committed { commit_version: 12 },
+                local_apply: Some(ApplyOutcome::Applied),
+            })
+        }
+
+        fn apply_transaction_decision(
+            &self,
+            _bundle: TransactionBundle,
+            result: CertificationResult,
+        ) -> Result<CommitOutcome> {
+            Ok(CommitOutcome {
+                certification: result,
+                local_apply: Some(ApplyOutcome::Replayed),
+            })
         }
     }
 
@@ -1275,6 +1321,70 @@ mod tests {
                 .is_none()
         );
         assert!(registry.pinned_snapshots(10).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn committing_idempotency_retry_resumes_to_the_same_outcome() {
+        let temp = tempdir().unwrap();
+        let registry = Arc::new(OpenTransactionRegistry::open(temp.path()).unwrap());
+        let runtime = Arc::new(GatedRuntime {
+            calls: AtomicUsize::new(0),
+            first_started: Notify::new(),
+            release_first: Notify::new(),
+        });
+        let handle = registry
+            .begin(
+                runtime.as_ref(),
+                "cluster",
+                "alice",
+                "resume",
+                Duration::from_secs(30),
+                DurabilityLevel::Local,
+                ReadConsistency::LocalSnapshot,
+                10,
+            )
+            .await
+            .unwrap();
+        registry
+            .put(
+                &handle.transaction_id,
+                "cluster",
+                LogicalKey {
+                    table_id: 7,
+                    application_key: b"row".to_vec(),
+                },
+                b"value".to_vec(),
+                11,
+            )
+            .unwrap();
+
+        let first_registry = registry.clone();
+        let first_runtime = runtime.clone();
+        let transaction_id = handle.transaction_id.clone();
+        let first = tokio::spawn(async move {
+            first_registry
+                .commit(first_runtime.as_ref(), &transaction_id, "alice", 12)
+                .await
+                .unwrap()
+        });
+        runtime.first_started.notified().await;
+        let status = registry
+            .status_by_idempotency("cluster", "resume", "alice", 12)
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.state, "committing");
+
+        let retry = registry
+            .commit(runtime.as_ref(), &handle.transaction_id, "alice", 12)
+            .await
+            .unwrap();
+        runtime.release_first.notify_one();
+        let first = first.await.unwrap();
+        assert_eq!(retry.certification, first.certification);
+        assert_eq!(
+            retry.certification,
+            CertificationResult::Committed { commit_version: 12 }
+        );
     }
 
     #[tokio::test]

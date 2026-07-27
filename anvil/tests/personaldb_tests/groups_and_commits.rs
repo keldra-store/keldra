@@ -371,6 +371,106 @@ async fn personaldb_submit_commits_and_is_available_to_catch_up_and_watch() {
 }
 
 #[tokio::test]
+async fn personaldb_lost_submit_response_retry_survives_later_head_advances() {
+    let cluster = shared_default_test_cluster().await;
+    let token = cluster.token.clone();
+    let mut client = PersonalDbServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
+    let genesis_hash = create_group(&mut client, &token, &database_id).await;
+
+    let original_request = submit_request(
+        &database_id,
+        &genesis_hash,
+        &token,
+        sqlite_insert_changeset_with_item(1, "alpha", &[1, 2, 3]),
+    );
+    let original = client
+        .submit_personal_db_changeset(authorized(original_request.clone(), &token))
+        .await
+        .unwrap()
+        .into_inner();
+    let later = client
+        .submit_personal_db_changeset(authorized(
+            submit_request_at_base(
+                &database_id,
+                original.log_index,
+                &original.log_hash,
+                &token,
+                sqlite_item_update_changeset(),
+            ),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(later.log_index, 2);
+
+    let retried = client
+        .submit_personal_db_changeset(authorized(original_request, &token))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(retried, original);
+}
+
+#[tokio::test]
+async fn personaldb_create_retry_replays_grants_after_post_commit_failure() {
+    struct ClearFault;
+    impl Drop for ClearFault {
+        fn drop(&mut self) {
+            anvil::mvcc_fault_injection::clear();
+        }
+    }
+
+    let cluster = shared_default_test_cluster().await;
+    let token = cluster.token.clone();
+    let mut client = PersonalDbServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
+    let genesis_hash = hex::encode(hash32(format!("genesis:{database_id}").as_bytes()));
+    let request = CreatePersonalDbGroupRequest {
+        database_id: database_id.clone(),
+        schema_hash: personaldb_test_schema_hash(),
+        genesis_hash: genesis_hash.clone(),
+        schema_sql: PERSONALDB_TEST_SCHEMA_SQL.to_string(),
+    };
+
+    let _clear_fault = ClearFault;
+    anvil::mvcc_fault_injection::install(
+        anvil::mvcc_fault_injection::DeterministicFaults::default().fail_at(
+            anvil::mvcc_fault_injection::FaultPoint::PersonalDbAfterCreateCommit,
+            1,
+        ),
+    );
+    let lost_response = client
+        .create_personal_db_group(authorized(request.clone(), &token))
+        .await
+        .unwrap_err();
+    assert_eq!(lost_response.code(), Code::Internal);
+    anvil::mvcc_fault_injection::clear();
+
+    let replayed = client
+        .create_personal_db_group(authorized(request, &token))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(replayed.committed_head.unwrap().log_index, 0);
+
+    let committed = client
+        .submit_personal_db_changeset(authorized(
+            valid_submit_request(&database_id, &genesis_hash, &token),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(committed.log_index, 1);
+}
+
+#[tokio::test]
 async fn personaldb_concurrent_same_base_submits_publish_one_witness_commit() {
     let cluster = shared_docker_test_cluster().await;
     let actor = create_personaldb_test_actor(&cluster, "personaldb-concurrent").await;

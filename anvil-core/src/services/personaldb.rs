@@ -304,6 +304,10 @@ impl PersonalDbService for AppState {
         )
         .map_err(internal_status)?;
         let commit_version = write_plan.commit(&self.mvcc).await.map_err(internal_status)?;
+        crate::mvcc_fault_injection::hit(
+            crate::mvcc_fault_injection::FaultPoint::PersonalDbAfterCreateCommit,
+        )
+        .map_err(internal_status)?;
         access_control::grant_personaldb_group_defaults(
             &self.persistence,
             claims.tenant_id,

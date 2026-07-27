@@ -1090,6 +1090,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn assignment_epoch_replacement_aborts_all_staged_personaldb_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("coremeta");
+        let coremeta = crate::core_store::CoreMetaStore::open(&db_path).unwrap();
+        let subsystem = MvccSubsystem::bootstrap(&config(directory.path()), coremeta.database())
+            .await
+            .unwrap();
+        let identity = "tenant/1/personaldb/assignment-race";
+        let guard = subsystem
+            .reconcile_work_assignment("personaldb-write", identity)
+            .await
+            .unwrap()
+            .unwrap();
+        let now = 10;
+        let handle = subsystem
+            .open_transactions
+            .begin(
+                subsystem.runtime.as_ref(),
+                subsystem.cluster_id(),
+                "alice",
+                "assignment-race",
+                std::time::Duration::from_secs(30),
+                crate::mvcc_transaction::DurabilityLevel::Quorum,
+                crate::mvcc_transaction::ReadConsistency::Linearized,
+                now,
+            )
+            .await
+            .unwrap();
+        let head_key = crate::mvcc_transaction::LogicalKey {
+            table_id: crate::core_store::TABLE_PERSONALDB_GROUP_ROW,
+            application_key: b"head".to_vec(),
+        };
+        let watch_key = crate::mvcc_transaction::LogicalKey {
+            table_id: 0x0607,
+            application_key: b"watch".to_vec(),
+        };
+        subsystem
+            .stage_product_mutations(
+                &handle.transaction_id,
+                "alice",
+                vec![
+                    crate::mvcc_product::ProductMutation::put(
+                        head_key.clone(),
+                        b"head-value".to_vec(),
+                    ),
+                    crate::mvcc_product::ProductMutation::put(
+                        watch_key.clone(),
+                        b"watch-value".to_vec(),
+                    ),
+                ],
+                now,
+            )
+            .unwrap();
+        for key in [head_key.clone(), watch_key.clone()] {
+            subsystem
+                .stage_predicate(
+                    &handle.transaction_id,
+                    "alice",
+                    key,
+                    crate::mvcc_transaction::PredicateKind::Absent,
+                    now,
+                )
+                .unwrap();
+        }
+        subsystem
+            .stage_assignment_guard(&handle.transaction_id, "alice", &guard, now)
+            .unwrap();
+        subsystem
+            .consensus
+            .assign_partition(
+                cluster_id_hash(subsystem.cluster_id()),
+                guard.partition_id,
+                anvil_mvcc_consensus::NodeIncarnation {
+                    node_id: consensus_control_node_id(&subsystem.local_node.node_id),
+                    incarnation: subsystem.local_node.incarnation,
+                },
+                guard.assignment_epoch + 1,
+            )
+            .await
+            .unwrap();
+
+        let outcome = subsystem
+            .open_transactions
+            .commit(
+                subsystem.runtime.as_ref(),
+                &handle.transaction_id,
+                "alice",
+                now,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome.certification,
+            crate::mvcc_transaction::CertificationResult::Aborted { .. }
+        ));
+        assert!(
+            subsystem
+                .runtime
+                .local_store()
+                .read_latest(&head_key)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            subsystem
+                .runtime
+                .local_store()
+                .read_latest(&watch_key)
+                .unwrap()
+                .is_none()
+        );
+        subsystem.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn restart_recovery_fault_fails_before_runtime_reopens_and_is_retryable() {
         let directory = tempfile::tempdir().unwrap();
         let db_path = directory.path().join("coremeta");
