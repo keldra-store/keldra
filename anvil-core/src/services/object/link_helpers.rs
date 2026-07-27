@@ -135,7 +135,7 @@ pub(super) async fn public_routing_config_for_region(
             .persistence
             .list_regions()
             .await
-            .map_err(lifecycle_status)?
+            .map_err(|err| Status::internal(err.to_string()))?
             .iter()
             .any(|region| region == region_name)
     {
