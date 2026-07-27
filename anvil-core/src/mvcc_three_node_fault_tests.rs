@@ -21,6 +21,8 @@ use crate::{
 
 struct ThreeNodeFixture {
     _directories: Vec<TempDir>,
+    configs: Vec<Config>,
+    endpoints: Vec<String>,
     states: Vec<Arc<AppState>>,
     servers: Vec<Option<JoinHandle<()>>>,
 }
@@ -58,6 +60,7 @@ impl ThreeNodeFixture {
         )
         .unwrap();
         let mut states = Vec::new();
+        let mut configs = Vec::new();
         for (index, directory) in directories.iter().enumerate() {
             let config = Config {
                 jwt_secret: "fault-secret".into(),
@@ -88,6 +91,7 @@ impl ThreeNodeFixture {
                 allow_test_only_insecure_mvcc_transport: true,
                 ..Config::default()
             };
+            configs.push(config.clone());
             states.push(Arc::new(
                 AppState::new(
                     config,
@@ -112,6 +116,8 @@ impl ThreeNodeFixture {
         }
         let fixture = Self {
             _directories: directories,
+            configs,
+            endpoints,
             states,
             servers,
         };
@@ -161,6 +167,35 @@ impl ThreeNodeFixture {
 
     fn stop_transport(&mut self, node: usize) {
         self.servers[node].take().unwrap().abort();
+    }
+
+    async fn restart_node(&mut self, node: usize) {
+        self.stop_transport(node);
+        self.states[node].mvcc.shutdown().await;
+        self.states[node].mvcc.consensus.shutdown().await.unwrap();
+        let state = Arc::new(
+            AppState::new(
+                self.configs[node].clone(),
+                personaldb_signing::PersonalDbProtocolKeyring::disabled(),
+            )
+            .await
+            .unwrap(),
+        );
+        let listener =
+            TcpListener::bind(self.endpoints[node].trim_start_matches("http://"))
+                .await
+                .unwrap();
+        let consensus = state.mvcc.consensus_service.clone();
+        let replication = state.mvcc.replication_service.clone();
+        self.servers[node] = Some(tokio::spawn(async move {
+            Server::builder()
+                .add_service(ConsensusTransportServer::new(consensus))
+                .add_service(ReplicationServiceServer::new(replication))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        }));
+        self.states[node] = state;
     }
 
     fn inject_transport_loss(&mut self, node: usize, point: FaultPoint) {
@@ -535,7 +570,7 @@ async fn blind_writes_do_not_conflict_but_observed_writes_do() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn coordinator_failure_before_proposal_is_retryable_without_a_commit() {
-    let cluster = ThreeNodeFixture::start().await;
+    let mut cluster = ThreeNodeFixture::start().await;
     let key = LogicalKey {
         table_id: 1,
         application_key: b"before-proposal".to_vec(),
@@ -543,6 +578,10 @@ async fn coordinator_failure_before_proposal_is_retryable_without_a_commit() {
     mvcc_fault_injection::install(
         DeterministicFaults::default().fail_at(FaultPoint::BeforeProposal, 1),
     );
+    let version_before = cluster.states[0]
+        .mvcc
+        .consensus
+        .observed_commit_version();
     let transaction_id = cluster.stage_write(0, "before-proposal", key.clone()).await;
     let first = cluster.states[0]
         .mvcc
@@ -560,27 +599,65 @@ async fn coordinator_failure_before_proposal_is_retryable_without_a_commit() {
         cluster.states[0].mvcc.read_latest_value(&key).unwrap(),
         None
     );
-
-    assert!(matches!(
+    assert_eq!(
+        cluster.states[0]
+            .mvcc
+            .consensus
+            .observed_commit_version(),
+        version_before,
+        "failure before proposal must not create a commit"
+    );
+    assert_eq!(
         cluster.states[0]
             .mvcc
             .open_transactions
-            .commit(
-                cluster.states[0].mvcc.runtime.as_ref(),
-                &transaction_id,
-                "fault-principal",
-                4,
-            )
-            .await
+            .status(&transaction_id, "fault-principal", 3)
             .unwrap()
-            .certification,
-        CertificationResult::Committed { .. }
-    ));
+            .state,
+        "committing"
+    );
+
+    cluster.restart_node(0).await;
+    cluster.wait_for_any_leader(&[0, 1, 2]).await;
+    let recovered = cluster.states[0]
+        .mvcc
+        .open_transactions
+        .commit(
+            cluster.states[0].mvcc.runtime.as_ref(),
+            &transaction_id,
+            "fault-principal",
+            4,
+        )
+        .await
+        .unwrap();
+    let CertificationResult::Committed { commit_version } =
+        recovered.certification
+    else {
+        panic!("retry after pre-proposal crash did not commit");
+    };
+    for node in 0..3 {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if cluster.states[node].mvcc.read_latest_value(&key).unwrap()
+                    == Some(b"before-proposal".to_vec())
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            cluster.states[node].mvcc.runtime.applied_version().unwrap()
+                >= commit_version
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn coordinator_failure_after_proposal_recovers_the_stable_commit() {
-    let cluster = ThreeNodeFixture::start().await;
+    let mut cluster = ThreeNodeFixture::start().await;
     let key = LogicalKey {
         table_id: 1,
         application_key: b"after-proposal".to_vec(),
@@ -601,7 +678,22 @@ async fn coordinator_failure_after_proposal_recovers_the_stable_commit() {
         .await;
     mvcc_fault_injection::clear();
     assert!(first.unwrap_err().to_string().contains("AfterProposal"));
+    assert_eq!(
+        cluster.states[0]
+            .mvcc
+            .open_transactions
+            .status(&transaction_id, "fault-principal", 3)
+            .unwrap()
+            .state,
+        "committing"
+    );
+    let committed_before_response = cluster.states[0]
+        .mvcc
+        .consensus
+        .observed_commit_version();
 
+    cluster.restart_node(0).await;
+    cluster.wait_for_any_leader(&[0, 1, 2]).await;
     let recovered = cluster.states[0]
         .mvcc
         .open_transactions
@@ -613,12 +705,50 @@ async fn coordinator_failure_after_proposal_recovers_the_stable_commit() {
         )
         .await
         .unwrap();
-    assert!(matches!(
-        recovered.certification,
-        CertificationResult::Committed { .. }
-    ));
+    let commit_version = match &recovered.certification {
+        CertificationResult::Committed { commit_version } => *commit_version,
+        CertificationResult::Aborted { reason } => {
+            panic!("indeterminate proposal resolved as abort: {reason:?}")
+        }
+    };
+    assert_eq!(commit_version, committed_before_response.0);
+    let replay = cluster.states[0]
+        .mvcc
+        .open_transactions
+        .commit(
+            cluster.states[0].mvcc.runtime.as_ref(),
+            &transaction_id,
+            "fault-principal",
+            5,
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.certification, recovered.certification);
+    assert_eq!(
+        cluster.states[0]
+            .mvcc
+            .consensus
+            .observed_commit_version()
+            .0,
+        commit_version,
+        "resolved retry must not allocate a second commit version"
+    );
     assert_eq!(
         cluster.states[0].mvcc.read_latest_value(&key).unwrap(),
         Some(b"after-proposal".to_vec())
     );
+    for node in 0..3 {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if cluster.states[node].mvcc.read_latest_value(&key).unwrap()
+                    == Some(b"after-proposal".to_vec())
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
 }
