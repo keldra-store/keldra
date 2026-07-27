@@ -1,5 +1,44 @@
 use super::*;
 
+async fn create_transactional_personaldb_actor(
+    cluster: &TestCluster,
+    label: &str,
+) -> TestStorageActor {
+    create_storage_test_actor(cluster, label).await
+}
+
+fn valid_submit_request_for_transactional_actor(
+    actor: &TestStorageActor,
+    database_id: &str,
+    genesis_hash: &str,
+) -> SubmitPersonalDbChangesetRequest {
+    submit_request_at_base_for_transactional_actor(
+        actor,
+        database_id,
+        0,
+        genesis_hash,
+        sqlite_insert_changeset(),
+    )
+}
+
+fn submit_request_at_base_for_transactional_actor(
+    actor: &TestStorageActor,
+    database_id: &str,
+    base_log_index: u64,
+    base_log_hash: &str,
+    changeset_bytes: Vec<u8>,
+) -> SubmitPersonalDbChangesetRequest {
+    submit_request_at_base_for_tenant_and_principal(
+        actor.tenant_id,
+        database_id,
+        base_log_index,
+        base_log_hash,
+        &actor.app_id,
+        &actor.token,
+        changeset_bytes,
+    )
+}
+
 async fn begin_personaldb_transaction(
     client: &mut TransactionServiceClient<tonic::transport::Channel>,
     token: &str,
@@ -501,7 +540,8 @@ async fn projection_conflict_aborts_an_unrelated_bucket_in_the_losing_transactio
 async fn projection_writeback_stages_source_and_target_heads_in_one_transaction() {
     let cluster =
         isolated_test_cluster("projection-writeback-transaction", &["test-region-1"]).await;
-    let actor = create_personaldb_test_actor(&cluster, "projection-writeback-transaction").await;
+    let actor =
+        create_transactional_personaldb_actor(&cluster, "projection-writeback-transaction").await;
     let token = actor.token.clone();
     let cluster_id = cluster.states[0].mvcc.cluster_id().to_string();
     let mut transactions = TransactionServiceClient::connect(actor.grpc_addr.clone())
@@ -537,7 +577,7 @@ async fn projection_writeback_stages_source_and_target_heads_in_one_transaction(
         .unwrap();
     personaldb
         .submit_personal_db_changeset(authorized(
-            valid_submit_request_for_actor(&actor, &source, &source_genesis),
+            valid_submit_request_for_transactional_actor(&actor, &source, &source_genesis),
             &token,
         ))
         .await
@@ -563,7 +603,7 @@ async fn projection_writeback_stages_source_and_target_heads_in_one_transaction(
         "projection-writeback",
     )
     .await;
-    let mut request = submit_request_at_base_for_actor(
+    let mut request = submit_request_at_base_for_transactional_actor(
         &actor,
         &target,
         target_head.log_index,
@@ -637,7 +677,8 @@ async fn projection_writeback_stages_source_and_target_heads_in_one_transaction(
 #[tokio::test]
 async fn projection_writeback_conflict_aborts_both_groups_and_unrelated_writes() {
     let cluster = isolated_test_cluster("projection-writeback-conflict", &["test-region-1"]).await;
-    let actor = create_personaldb_test_actor(&cluster, "projection-writeback-conflict").await;
+    let actor =
+        create_transactional_personaldb_actor(&cluster, "projection-writeback-conflict").await;
     let token = actor.token.clone();
     let cluster_id = cluster.states[0].mvcc.cluster_id().to_string();
     let mut transactions = TransactionServiceClient::connect(actor.grpc_addr.clone())
@@ -682,7 +723,7 @@ async fn projection_writeback_conflict_aborts_both_groups_and_unrelated_writes()
         .unwrap();
     personaldb
         .submit_personal_db_changeset(authorized(
-            valid_submit_request_for_actor(&actor, &source, &source_genesis),
+            valid_submit_request_for_transactional_actor(&actor, &source, &source_genesis),
             &token,
         ))
         .await
@@ -708,7 +749,7 @@ async fn projection_writeback_conflict_aborts_both_groups_and_unrelated_writes()
             .await;
     let losing_bucket = format!("writeback-loser-{}", uuid::Uuid::new_v4().simple());
     for transaction_id in [&first, &second] {
-        let mut request = submit_request_at_base_for_actor(
+        let mut request = submit_request_at_base_for_transactional_actor(
             &actor,
             &target,
             target_head.log_index,
