@@ -386,7 +386,7 @@ impl ObjectService for AppState {
             req.mutation_context.as_ref(),
         )
         .await?;
-        let transaction_id = native_transaction_id(req.mutation_context.as_ref())?;
+        let requested_transaction_id = native_transaction_id(req.mutation_context.as_ref())?;
         let write_visibility = object_write_visibility(req.mutation_context.as_ref())?;
         let target =
             NativeIdempotencyTarget::new("DeleteObject", &req.bucket_name, &req.object_key)
@@ -404,6 +404,18 @@ impl ObjectService for AppState {
         if let Some(response) = replay {
             return Ok(Response::new(response));
         }
+        let implicit_transaction = begin_implicit_native_transaction(
+            self,
+            &claims,
+            req.mutation_context.as_ref(),
+            "delete-object",
+        )
+        .await?;
+        let transaction_id = requested_transaction_id.or_else(|| {
+            implicit_transaction
+                .as_ref()
+                .map(|handle| handle.transaction_id.as_str())
+        });
         enforce_native_mutation_precondition(
             self,
             claims,
@@ -441,12 +453,7 @@ impl ObjectService for AppState {
                     )
                     .await?
             };
-        let watch_cursor = if transaction_id.is_some() || !write_visibility.requires_watch_visible()
-        {
-            0
-        } else {
-            object_watch_cursor(self, &deleted).await?
-        };
+        let watch_cursor = 0;
 
         let response = DeleteObjectResponse {
             version_id: deleted.version_id.to_string(),
@@ -458,9 +465,23 @@ impl ObjectService for AppState {
             index_policy_snapshot: deleted.index_policy_snapshot,
             watch_cursor,
             delete_marker: deleted.deleted_at.is_some(),
-            write_state: write_state_for_transaction(transaction_id),
+            write_state: write_state_for_transaction(requested_transaction_id),
         };
-        complete_native_mutation(self, &attempt, &target, &response).await?;
+        if let Some(handle) = implicit_transaction.as_ref() {
+            commit_implicit_native_response(
+                self,
+                claims,
+                req.mutation_context
+                    .as_ref()
+                    .ok_or_else(|| Status::invalid_argument("Missing native mutation context"))?,
+                &target,
+                &response,
+                handle,
+            )
+            .await?;
+        } else {
+            complete_native_mutation(self, &attempt, &target, &response).await?;
+        }
         Ok(Response::new(response))
     }
 
@@ -817,7 +838,7 @@ impl ObjectService for AppState {
             req.mutation_context.as_ref(),
         )
         .await?;
-        let transaction_id = native_transaction_id(req.mutation_context.as_ref())?;
+        let requested_transaction_id = native_transaction_id(req.mutation_context.as_ref())?;
         let target = NativeIdempotencyTarget::new(
             "CopyObject",
             &req.destination_bucket_name,
@@ -839,6 +860,18 @@ impl ObjectService for AppState {
         if let Some(response) = replay {
             return Ok(Response::new(response));
         }
+        let implicit_transaction = begin_implicit_native_transaction(
+            self,
+            &claims,
+            req.mutation_context.as_ref(),
+            "copy-object",
+        )
+        .await?;
+        let transaction_id = requested_transaction_id.or_else(|| {
+            implicit_transaction
+                .as_ref()
+                .map(|handle| handle.transaction_id.as_str())
+        });
         enforce_native_mutation_precondition(
             self,
             &claims,
@@ -861,11 +894,7 @@ impl ObjectService for AppState {
                 transaction_id,
             )
             .await?;
-        let watch_cursor = if transaction_id.is_some() {
-            0
-        } else {
-            object_watch_cursor(self, &object).await?
-        };
+        let watch_cursor = 0;
         let authz_revision = object_authz_revision(&object)?;
 
         let response = CopyObjectResponse {
@@ -878,9 +907,23 @@ impl ObjectService for AppState {
             authz_revision,
             watch_cursor,
             index_policy_snapshot: object.index_policy_snapshot,
-            write_state: write_state_for_transaction(transaction_id),
+            write_state: write_state_for_transaction(requested_transaction_id),
         };
-        complete_native_mutation(self, &attempt, &target, &response).await?;
+        if let Some(handle) = implicit_transaction.as_ref() {
+            commit_implicit_native_response(
+                self,
+                &claims,
+                req.mutation_context
+                    .as_ref()
+                    .ok_or_else(|| Status::invalid_argument("Missing native mutation context"))?,
+                &target,
+                &response,
+                handle,
+            )
+            .await?;
+        } else {
+            complete_native_mutation(self, &attempt, &target, &response).await?;
+        }
         Ok(Response::new(response))
     }
 
@@ -901,7 +944,7 @@ impl ObjectService for AppState {
             req.mutation_context.as_ref(),
         )
         .await?;
-        let transaction_id = native_transaction_id(req.mutation_context.as_ref())?;
+        let requested_transaction_id = native_transaction_id(req.mutation_context.as_ref())?;
         let target_sources = req
             .sources
             .iter()
@@ -930,6 +973,18 @@ impl ObjectService for AppState {
         if let Some(response) = replay {
             return Ok(Response::new(response));
         }
+        let implicit_transaction = begin_implicit_native_transaction(
+            self,
+            &claims,
+            req.mutation_context.as_ref(),
+            "compose-object",
+        )
+        .await?;
+        let transaction_id = requested_transaction_id.or_else(|| {
+            implicit_transaction
+                .as_ref()
+                .map(|handle| handle.transaction_id.as_str())
+        });
         enforce_native_mutation_precondition(
             self,
             &claims,
@@ -941,10 +996,10 @@ impl ObjectService for AppState {
         .await?;
 
         let mut sources = Vec::with_capacity(req.sources.len());
-        for source in req.sources {
+        for source in &req.sources {
             sources.push(crate::object_manager::ComposeSource {
-                bucket_name: source.bucket_name,
-                object_key: source.object_key,
+                bucket_name: source.bucket_name.clone(),
+                object_key: source.object_key.clone(),
                 version_id: parse_optional_version_id(source.version_id.as_deref())?,
             });
         }
@@ -959,11 +1014,7 @@ impl ObjectService for AppState {
                 transaction_id,
             )
             .await?;
-        let watch_cursor = if transaction_id.is_some() {
-            0
-        } else {
-            object_watch_cursor(self, &object).await?
-        };
+        let watch_cursor = 0;
         let authz_revision = object_authz_revision(&object)?;
 
         let response = ComposeObjectResponse {
@@ -976,9 +1027,23 @@ impl ObjectService for AppState {
             authz_revision,
             watch_cursor,
             index_policy_snapshot: object.index_policy_snapshot,
-            write_state: write_state_for_transaction(transaction_id),
+            write_state: write_state_for_transaction(requested_transaction_id),
         };
-        complete_native_mutation(self, &attempt, &target, &response).await?;
+        if let Some(handle) = implicit_transaction.as_ref() {
+            commit_implicit_native_response(
+                self,
+                &claims,
+                req.mutation_context
+                    .as_ref()
+                    .ok_or_else(|| Status::invalid_argument("Missing native mutation context"))?,
+                &target,
+                &response,
+                handle,
+            )
+            .await?;
+        } else {
+            complete_native_mutation(self, &attempt, &target, &response).await?;
+        }
         Ok(Response::new(response))
     }
 
@@ -999,7 +1064,7 @@ impl ObjectService for AppState {
             req.mutation_context.as_ref(),
         )
         .await?;
-        let transaction_id = native_transaction_id(req.mutation_context.as_ref())?;
+        let requested_transaction_id = native_transaction_id(req.mutation_context.as_ref())?;
         let target = NativeIdempotencyTarget::new(
             "PatchJsonObject",
             &req.bucket_name,
@@ -1020,6 +1085,18 @@ impl ObjectService for AppState {
         if let Some(response) = replay {
             return Ok(Response::new(response));
         }
+        let implicit_transaction = begin_implicit_native_transaction(
+            self,
+            &claims,
+            req.mutation_context.as_ref(),
+            "patch-json-object",
+        )
+        .await?;
+        let transaction_id = requested_transaction_id.or_else(|| {
+            implicit_transaction
+                .as_ref()
+                .map(|handle| handle.transaction_id.as_str())
+        });
         enforce_native_mutation_precondition(
             self,
             &claims,
@@ -1042,11 +1119,7 @@ impl ObjectService for AppState {
                 transaction_id,
             )
             .await?;
-        let watch_cursor = if transaction_id.is_some() {
-            0
-        } else {
-            object_watch_cursor(self, &object).await?
-        };
+        let watch_cursor = 0;
         let authz_revision = object_authz_revision(&object)?;
 
         let response = PatchJsonObjectResponse {
@@ -1059,9 +1132,23 @@ impl ObjectService for AppState {
             authz_revision,
             watch_cursor,
             index_policy_snapshot: object.index_policy_snapshot,
-            write_state: write_state_for_transaction(transaction_id),
+            write_state: write_state_for_transaction(requested_transaction_id),
         };
-        complete_native_mutation(self, &attempt, &target, &response).await?;
+        if let Some(handle) = implicit_transaction.as_ref() {
+            commit_implicit_native_response(
+                self,
+                &claims,
+                req.mutation_context
+                    .as_ref()
+                    .ok_or_else(|| Status::invalid_argument("Missing native mutation context"))?,
+                &target,
+                &response,
+                handle,
+            )
+            .await?;
+        } else {
+            complete_native_mutation(self, &attempt, &target, &response).await?;
+        }
         Ok(Response::new(response))
     }
 
@@ -1082,7 +1169,7 @@ impl ObjectService for AppState {
             req.mutation_context.as_ref(),
         )
         .await?;
-        let transaction_id = native_transaction_id(req.mutation_context.as_ref())?;
+        let requested_transaction_id = native_transaction_id(req.mutation_context.as_ref())?;
         let target = NativeIdempotencyTarget::new(
             "CompareAndSwapManifest",
             &req.bucket_name,
@@ -1103,6 +1190,18 @@ impl ObjectService for AppState {
         if let Some(response) = replay {
             return Ok(Response::new(response));
         }
+        let implicit_transaction = begin_implicit_native_transaction(
+            self,
+            &claims,
+            req.mutation_context.as_ref(),
+            "manifest-cas",
+        )
+        .await?;
+        let transaction_id = requested_transaction_id.or_else(|| {
+            implicit_transaction
+                .as_ref()
+                .map(|handle| handle.transaction_id.as_str())
+        });
         enforce_native_mutation_precondition(
             self,
             &claims,
@@ -1137,14 +1236,24 @@ impl ObjectService for AppState {
             payload_hash: result.manifest_hash,
             record_hash: result.receipt.record_hash,
             authz_revision,
-            watch_cursor: if transaction_id.is_some() {
-                0
-            } else {
-                result.receipt.watch_cursor
-            },
-            write_state: write_state_for_transaction(transaction_id),
+            watch_cursor: 0,
+            write_state: write_state_for_transaction(requested_transaction_id),
         };
-        complete_native_mutation(self, &attempt, &target, &response).await?;
+        if let Some(handle) = implicit_transaction.as_ref() {
+            commit_implicit_native_response(
+                self,
+                &claims,
+                req.mutation_context
+                    .as_ref()
+                    .ok_or_else(|| Status::invalid_argument("Missing native mutation context"))?,
+                &target,
+                &response,
+                handle,
+            )
+            .await?;
+        } else {
+            complete_native_mutation(self, &attempt, &target, &response).await?;
+        }
         Ok(Response::new(response))
     }
 

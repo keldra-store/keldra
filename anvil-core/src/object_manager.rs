@@ -1981,36 +1981,26 @@ impl ObjectManager {
             .map_err(|e| Status::internal(format!("Failed to encode manifest JSON: {}", e)))?;
         let manifest_hash = blake3::hash(&manifest_bytes).to_hex().to_string();
 
-        let result = if let Some(transaction_id) = transaction_id {
-            let transaction_principal = transaction_principal.ok_or_else(|| {
-                Status::invalid_argument("transaction principal is required for manifest CAS")
-            })?;
-            self.persistence
-                .compare_and_swap_manifest_in_transaction(
-                    tenant_id,
-                    bucket.id,
-                    &bucket.name,
-                    manifest_key,
-                    expected_revision,
-                    manifest,
-                    &manifest_hash,
-                    transaction_id,
-                    transaction_principal,
-                )
-                .await
-        } else {
-            self.persistence
-                .compare_and_swap_manifest(
-                    tenant_id,
-                    bucket.id,
-                    &bucket.name,
-                    manifest_key,
-                    expected_revision,
-                    manifest,
-                    &manifest_hash,
-                )
-                .await
-        }
+        let transaction_id = transaction_id.ok_or_else(|| {
+            Status::failed_precondition("manifest CAS requires an MVCC transaction")
+        })?;
+        let transaction_principal = transaction_principal.ok_or_else(|| {
+            Status::invalid_argument("transaction principal is required for manifest CAS")
+        })?;
+        let result = self
+            .persistence
+            .compare_and_swap_manifest_in_transaction(
+                tenant_id,
+                bucket.id,
+                &bucket.name,
+                manifest_key,
+                expected_revision,
+                manifest,
+                &manifest_hash,
+                transaction_id,
+                transaction_principal,
+            )
+            .await
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::failed_precondition("Manifest revision mismatch"))?;
 

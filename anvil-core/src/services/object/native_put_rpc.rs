@@ -1,6 +1,6 @@
 use super::rpc::{native_transaction_id, object_write_visibility, write_state_for_transaction};
 use super::*;
-use crate::mvcc_transaction::{CertificationResult, DurabilityLevel, ReadConsistency};
+use crate::mvcc_transaction::{DurabilityLevel, ReadConsistency};
 
 pub(crate) async fn execute_native_put(
     state: &AppState,
@@ -88,30 +88,6 @@ pub(crate) async fn execute_native_put(
             },
         )
         .await?;
-    if internal_transaction {
-        let outcome = state
-            .mvcc
-            .open_transactions
-            .commit(
-                state.mvcc.runtime.as_ref(),
-                transaction_id,
-                &transaction_principal,
-                current_unix_ms()?,
-            )
-            .await
-            .map_err(|error| Status::failed_precondition(error.to_string()))?;
-        if let CertificationResult::Aborted { reason } = outcome.certification {
-            return Err(Status::aborted(format!(
-                "implicit MVCC transaction aborted: {reason:?}"
-            )));
-        }
-    }
-    let watch_cursor =
-        if requested_transaction_id.is_some() || !write_visibility.requires_watch_visible() {
-            0
-        } else {
-            object_watch_cursor(state, &object).await?
-        };
     let response = PutObjectResponse {
         etag: object.etag,
         version_id: object.version_id.to_string(),
@@ -121,10 +97,28 @@ pub(crate) async fn execute_native_put(
         authz_revision: u64::try_from(object.authz_revision)
             .map_err(|_| Status::internal("Invalid authz revision"))?,
         index_policy_snapshot: object.index_policy_snapshot,
-        watch_cursor,
+        // Publication is part of applying this transaction. Its external
+        // cursor is intentionally not guessed before the atomic commit.
+        watch_cursor: 0,
         write_state: write_state_for_transaction(requested_transaction_id),
     };
-    complete_native_mutation(state, &attempt, &target, &response).await?;
+    if internal_transaction {
+        let transaction = super::native_mutation::ImplicitNativeTransaction {
+            transaction_id: transaction_id.to_owned(),
+            principal: transaction_principal,
+        };
+        super::native_mutation::stage_implicit_native_response(
+            state,
+            &attempt,
+            &target,
+            &response,
+            &transaction,
+        )
+        .await?;
+        super::native_mutation::commit_implicit_native_transaction(state, &transaction).await?;
+    } else {
+        complete_native_mutation(state, &attempt, &target, &response).await?;
+    }
     Ok(response)
 }
 
