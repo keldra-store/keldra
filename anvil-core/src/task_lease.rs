@@ -994,8 +994,7 @@ async fn commit_task_lease_plan(
             crate::mvcc_transaction::CertificationResult::Committed { .. } => return Ok(()),
             crate::mvcc_transaction::CertificationResult::Aborted { reason }
                 if attempt < 4
-                    && reason
-                        .to_string()
+                    && format!("{reason:?}")
                         .contains("assignment predicate violates applied Raft control state") =>
             {
                 tokio::time::sleep(std::time::Duration::from_millis(
