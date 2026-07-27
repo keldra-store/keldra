@@ -233,6 +233,7 @@ version = "0.3.0"
 dependencies = [
  "aes-gcm",
  "ahash 0.8.12",
+ "anvil-mvcc-consensus",
  "anvil-storage",
  "anvil-storage-core",
  "anvil-storage-test-utils",
