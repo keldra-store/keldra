@@ -213,6 +213,9 @@ pub async fn run(
         if let Err(error) = persistence.run_bucket_locator_finalization_once().await {
             warn!(%error, "Committed bucket locator finalization attempt failed");
         }
+        if let Err(error) = persistence.run_tenant_locator_finalization_once().await {
+            warn!(%error, "Committed tenant locator finalization attempt failed");
+        }
         if tokio::time::Instant::now() >= next_recovery {
             if let Err(error) = recover_interrupted_tasks(&persistence).await {
                 warn!(%error, "Failed to recover expired background tasks");

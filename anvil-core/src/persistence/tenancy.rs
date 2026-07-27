@@ -64,7 +64,7 @@ impl Persistence {
             admin_audit_event,
         )
         .await?;
-        self.write_mesh_tenant_locators(&tenant, idempotency_key)
+        self.write_mesh_tenant_locators(&tenant, idempotency_key, &self.region)
             .await?;
         Ok(tenant)
     }

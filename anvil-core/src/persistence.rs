@@ -615,6 +615,7 @@ fn canonical_json_bytes(value: &JsonValue) -> Vec<u8> {
 
 mod helpers;
 mod bucket_locator_finalization;
+mod tenant_locator_finalization;
 mod index_definition_lifecycle;
 mod indexes;
 mod lifecycle;

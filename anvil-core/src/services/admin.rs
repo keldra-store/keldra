@@ -103,14 +103,30 @@ impl AdminService for AppState {
                 .await
                 .map_err(|err| Status::failed_precondition(err.to_string()))?,
             };
+            let locator_job =
+                crate::tenant_locator_finalization_job::TenantLocatorFinalizationJob {
+                    cluster_id: self.mvcc.cluster_id().to_string(),
+                    transaction_id: transaction.transaction_id.clone(),
+                    tenant: tenant.clone(),
+                    idempotency_key: context.idempotency_key.trim().to_string(),
+                    home_region: home_region.clone(),
+                };
+            self.mvcc
+                .stage_product_mutations(
+                    &transaction.transaction_id,
+                    &transaction.principal,
+                    vec![
+                        locator_job
+                            .mutation()
+                            .map_err(|err| Status::internal(err.to_string()))?,
+                    ],
+                    now,
+                )
+                .map_err(|err| Status::failed_precondition(err.to_string()))?;
             stage_or_verify_admin_tenant_result(self, &transaction, &input_hash, now)?;
             commit_admin_product_transaction(self, &transaction).await?;
             tenant
         };
-        self.persistence
-            .write_mesh_tenant_locators(&tenant, context.idempotency_key.trim())
-            .await
-            .map_err(|err| Status::failed_precondition(err.to_string()))?;
         Ok(Response::new(TenantAdminResponse {
             request_id: context.request_id.clone(),
             tenant: Some(TenantAdminDescriptor {

@@ -117,13 +117,14 @@ impl Persistence {
         &self,
         tenant: &Tenant,
         idempotency_key: &str,
+        home_region: &str,
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         let reservation_expires_at = (Utc::now() + Duration::minutes(5)).to_rfc3339();
         let mesh_id = mesh_directory::MeshId::new(self.mesh_id.clone())?;
         let tenant_id = mesh_directory::TenantId::new(tenant.id.to_string())?;
         let tenant_name = mesh_directory::TenantName::canonicalize(&tenant.name)?;
-        let home_region = mesh_directory::RegionName::new(self.region.clone())?;
+        let home_region = mesh_directory::RegionName::new(home_region.to_string())?;
         let reserved_name = mesh_directory::TenantNameDescriptor::reserved(
             mesh_id.clone(),
             tenant_name.clone(),

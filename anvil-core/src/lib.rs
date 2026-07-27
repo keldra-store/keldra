@@ -168,6 +168,7 @@ pub mod streaming_erasure;
 pub mod system_realm;
 pub(crate) mod task_execution_guard;
 pub mod task_journal;
+pub mod tenant_locator_finalization_job;
 pub mod task_lease;
 pub mod tasks;
 pub mod tenant_audit;
