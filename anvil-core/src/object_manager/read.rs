@@ -106,7 +106,7 @@ impl ObjectManager {
 
         let mut object = match version_id {
             Some(version_id) => {
-                let object = if let Some(snapshot) = consistency.root_generation() {
+                let object = if let Some(snapshot) = consistency.commit_version() {
                     crate::metadata_journal::read_object_version_at_mvcc_snapshot(
                         self.installed_mvcc()?,
                         &bucket,
@@ -130,7 +130,7 @@ impl ObjectManager {
                 object
             }
             None => {
-                let object = if let Some(snapshot) = consistency.root_generation() {
+                let object = if let Some(snapshot) = consistency.commit_version() {
                     crate::metadata_journal::read_current_object_at_mvcc_snapshot(
                         self.installed_mvcc()?,
                         &bucket,
@@ -556,7 +556,7 @@ impl ObjectManager {
 
         let mut object = match version_id {
             Some(version_id) => {
-                let object = if let Some(snapshot) = consistency.root_generation() {
+                let object = if let Some(snapshot) = consistency.commit_version() {
                     crate::metadata_journal::read_object_version_at_mvcc_snapshot(
                         self.installed_mvcc()?,
                         &bucket,
@@ -580,7 +580,7 @@ impl ObjectManager {
                 object
             }
             None => {
-                let object = if let Some(snapshot) = consistency.root_generation() {
+                let object = if let Some(snapshot) = consistency.commit_version() {
                     crate::metadata_journal::read_current_object_at_mvcc_snapshot(
                         self.installed_mvcc()?,
                         &bucket,
@@ -666,7 +666,7 @@ impl ObjectManager {
 
         let object = match version_id {
             Some(version_id) => {
-                let object = if let Some(snapshot) = consistency.root_generation() {
+                let object = if let Some(snapshot) = consistency.commit_version() {
                     crate::metadata_journal::read_object_version_at_mvcc_snapshot(
                         self.installed_mvcc()?,
                         &bucket,
@@ -687,7 +687,7 @@ impl ObjectManager {
                     .ok_or_else(|| Status::not_found("Object link not found"))?
             }
             None => {
-                let object = if let Some(snapshot) = consistency.root_generation() {
+                let object = if let Some(snapshot) = consistency.commit_version() {
                     crate::metadata_journal::read_current_object_at_mvcc_snapshot(
                         self.installed_mvcc()?,
                         &bucket,
@@ -801,7 +801,7 @@ impl ObjectManager {
         let result_limit = object_list_result_limit(limit, MAX_OBJECT_LIST_RESULTS);
         let candidate_budget = if bucket_wide_read
             && delimiter.is_empty()
-            && consistency.root_generation().is_none()
+            && consistency.commit_version().is_none()
         {
             result_limit
         } else {
@@ -817,7 +817,7 @@ impl ObjectManager {
                 break;
             }
             let source_page_limit = remaining;
-            let snapshot = match consistency.root_generation() {
+            let snapshot = match consistency.commit_version() {
                 Some(snapshot) => snapshot,
                 None => self
                     .installed_mvcc()?
@@ -884,7 +884,7 @@ impl ObjectManager {
         }
 
         let root_generation =
-            source_generation.unwrap_or_else(|| consistency.root_generation().unwrap_or_default());
+            source_generation.unwrap_or_else(|| consistency.commit_version().unwrap_or_default());
         let docs = object_listing_docs(bucket, objects, "object-list-current");
         let planner_limit = u32::try_from(result_limit)
             .map_err(|_| Status::internal("Object listing limit exceeds u32"))?;
@@ -998,7 +998,7 @@ impl ObjectManager {
             .await?;
         let result_limit = object_list_result_limit(limit, MAX_OBJECT_VERSION_RESULTS);
         let plan_limit = result_limit.saturating_add(1);
-        let candidate_budget = if bucket_wide_read && consistency.root_generation().is_none() {
+        let candidate_budget = if bucket_wide_read && consistency.commit_version().is_none() {
             plan_limit
         } else {
             object_listing_candidate_budget(plan_limit)
@@ -1012,7 +1012,7 @@ impl ObjectManager {
             if remaining == 0 {
                 break;
             }
-            let snapshot = match consistency.root_generation() {
+            let snapshot = match consistency.commit_version() {
                 Some(snapshot) => snapshot,
                 None => self
                     .installed_mvcc()?
@@ -1071,7 +1071,7 @@ impl ObjectManager {
             }
         }
         let root_generation =
-            source_generation.unwrap_or_else(|| consistency.root_generation().unwrap_or_default());
+            source_generation.unwrap_or_else(|| consistency.commit_version().unwrap_or_default());
         let docs = object_version_listing_docs(&bucket, versions, "object-list-versions");
         let planner_limit = u32::try_from(plan_limit)
             .map_err(|_| Status::internal("Object version listing limit exceeds u32"))?;
@@ -1645,7 +1645,7 @@ impl ObjectManager {
             .await?;
 
             let target = match link.target_version {
-                Some(version_id) => match consistency.root_generation() {
+                Some(version_id) => match consistency.commit_version() {
                     Some(snapshot) => {
                         crate::metadata_journal::read_object_version_at_mvcc_snapshot(
                             self.installed_mvcc()?,
@@ -1662,7 +1662,7 @@ impl ObjectManager {
                         version_id,
                     ),
                 },
-                None => match consistency.root_generation() {
+                None => match consistency.commit_version() {
                     Some(snapshot) => {
                         crate::metadata_journal::read_current_object_at_mvcc_snapshot(
                             self.installed_mvcc()?,

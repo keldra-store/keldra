@@ -447,9 +447,9 @@ fn version_header(version_id: Option<&str>) -> Vec<ProxyHeader> {
 fn add_consistency_headers(headers: &mut Vec<ProxyHeader>, consistency: ObjectReadConsistency) {
     match consistency {
         ObjectReadConsistency::Latest => {}
-        ObjectReadConsistency::AtRootGeneration(generation) => headers.push(proxy_header(
-            "x-anvil-consistency-root-generation",
-            generation.to_string(),
+        ObjectReadConsistency::AtCommitVersion(version) => headers.push(proxy_header(
+            "x-anvil-consistency-commit-version",
+            version.to_string(),
         )),
         ObjectReadConsistency::AtAuthzRevision(revision) => headers.push(proxy_header(
             "x-anvil-consistency-authz-revision",

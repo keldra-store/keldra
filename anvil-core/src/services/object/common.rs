@@ -62,8 +62,8 @@ pub(super) fn object_read_consistency(
         crate::anvil_api::read_consistency::Mode::Latest(_) => {
             Ok(crate::object_manager::ObjectReadConsistency::Latest)
         }
-        crate::anvil_api::read_consistency::Mode::AtRootGeneration(generation) => {
-            Ok(crate::object_manager::ObjectReadConsistency::AtRootGeneration(*generation))
+        crate::anvil_api::read_consistency::Mode::AtCommitVersion(version) => {
+            Ok(crate::object_manager::ObjectReadConsistency::AtCommitVersion(*version))
         }
         crate::anvil_api::read_consistency::Mode::AtAuthzRevision(revision) => {
             let revision = revision

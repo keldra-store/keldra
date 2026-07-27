@@ -91,7 +91,7 @@ pub mod proto {
         StartBoundaryMigrationRequest, StartHfIngestionRequest, StartHfIngestionResponse,
         StorageClassDescriptor, StorageClassResponse, SubmitPersonalDbChangesetRequest,
         SubmitPersonalDbChangesetResponse, TailAppendStreamRequest, TailAppendStreamResponse,
-        TaskLease, TaskLeaseResponse, TenantScope, TensorIndexRow, TransactionScope,
+        TaskLease, TaskLeaseResponse, TenantScope, TensorIndexRow,
         TransactionStatus, UpdateIndexRequest, UpdateObjectLinkRequest, UploadPartMetadata,
         UploadPartRequest, UploadPartResponse, VerifyHostAliasRequest, WatchAuthzDerivedLagRequest,
         WatchAuthzDerivedLagResponse, WatchAuthzNamespaceRequest, WatchAuthzNamespaceResponse,

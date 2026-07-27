@@ -111,14 +111,14 @@ static DEFERRED_OBJECT_MAINTENANCE: OnceLock<Mutex<HashMap<(i64, i64), HashSet<S
 pub enum ObjectReadConsistency {
     #[default]
     Latest,
-    AtRootGeneration(u64),
+    AtCommitVersion(u64),
     AtAuthzRevision(i64),
 }
 
 impl ObjectReadConsistency {
-    pub fn root_generation(self) -> Option<u64> {
+    pub fn commit_version(self) -> Option<u64> {
         match self {
-            Self::AtRootGeneration(generation) => Some(generation),
+            Self::AtCommitVersion(version) => Some(version),
             Self::Latest | Self::AtAuthzRevision(_) => None,
         }
     }
@@ -126,7 +126,7 @@ impl ObjectReadConsistency {
     pub fn authz_revision(self) -> Option<i64> {
         match self {
             Self::AtAuthzRevision(revision) => Some(revision),
-            Self::Latest | Self::AtRootGeneration(_) => None,
+            Self::Latest | Self::AtCommitVersion(_) => None,
         }
     }
 }
@@ -1815,7 +1815,7 @@ impl ObjectManager {
             .ok_or_else(|| Status::not_found("Append stream not found"))?;
         let limit = if limit == 0 { 100 } else { limit.min(1000) } as usize;
         let snapshot = match consistency {
-            ObjectReadConsistency::AtRootGeneration(generation) => generation,
+            ObjectReadConsistency::AtCommitVersion(version) => version,
             ObjectReadConsistency::Latest | ObjectReadConsistency::AtAuthzRevision(_) => self
                 .persistence
                 .mvcc()

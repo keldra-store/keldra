@@ -2052,14 +2052,9 @@ message WriteOptions {
 message ReadConsistency {
     oneof mode {
         bool latest = 1;
-        uint64 at_root_generation = 2;
+        uint64 at_commit_version = 2;
         string at_authz_revision = 3;
     }
-}
-
-message TransactionScope {
-    string root_anchor_key = 1;
-    string root_key_hash = 2;
 }
 
 message BoundaryValue {

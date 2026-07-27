@@ -588,11 +588,11 @@ fn parse_proxy_read_range(
 }
 
 fn parse_proxy_read_consistency(headers: &[ProxyHeader]) -> Result<ObjectReadConsistency, Status> {
-    let root_generation = proxy_header_u64(headers, "x-anvil-consistency-root-generation")?;
+    let commit_version = proxy_header_u64(headers, "x-anvil-consistency-commit-version")?;
     let authz_revision = proxy_header_i64(headers, "x-anvil-consistency-authz-revision")?;
-    match (root_generation, authz_revision) {
+    match (commit_version, authz_revision) {
         (None, None) => Ok(ObjectReadConsistency::Latest),
-        (Some(generation), None) => Ok(ObjectReadConsistency::AtRootGeneration(generation)),
+        (Some(version), None) => Ok(ObjectReadConsistency::AtCommitVersion(version)),
         (None, Some(revision)) => Ok(ObjectReadConsistency::AtAuthzRevision(revision)),
         (Some(_), Some(_)) => Err(Status::invalid_argument(
             "proxy read consistency modes are mutually exclusive",
@@ -769,7 +769,7 @@ mod tests {
         let headers = vec![
             proxy_header("x-anvil-range-start", b"10"),
             proxy_header("x-anvil-range-end-exclusive", b"20"),
-            proxy_header("x-anvil-consistency-root-generation", b"7"),
+            proxy_header("x-anvil-consistency-commit-version", b"7"),
         ];
         assert_eq!(
             parse_proxy_read_range(&headers).unwrap(),
@@ -780,14 +780,14 @@ mod tests {
         );
         assert_eq!(
             parse_proxy_read_consistency(&headers).unwrap(),
-            ObjectReadConsistency::AtRootGeneration(7)
+            ObjectReadConsistency::AtCommitVersion(7)
         );
     }
 
     #[test]
     fn proxy_read_rejects_ambiguous_consistency() {
         let headers = vec![
-            proxy_header("x-anvil-consistency-root-generation", b"7"),
+            proxy_header("x-anvil-consistency-commit-version", b"7"),
             proxy_header("x-anvil-consistency-authz-revision", b"9"),
         ];
         assert_eq!(
