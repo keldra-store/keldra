@@ -504,6 +504,7 @@ pub(super) fn single_projection_writeback_source(
 
 pub(super) fn submit_changeset_response(
     committed: CommittedPersonalDbChangeset,
+    write_state: WriteState,
 ) -> Response<SubmitPersonalDbChangesetResponse> {
     let (watch_cursor_low, watch_cursor_high) = split_u128(committed.watch_cursor);
     Response::new(SubmitPersonalDbChangesetResponse {
@@ -516,14 +517,17 @@ pub(super) fn submit_changeset_response(
         committed_head: Some(committed_head_record(committed.committed_head)),
         watch_cursor_low,
         watch_cursor_high,
+        write_state: write_state as i32,
     })
 }
 
 pub(super) fn projection_response(
     definition: ProjectionDefinition,
+    write_state: WriteState,
 ) -> Result<PersonalDbProjectionResponse, Status> {
     Ok(PersonalDbProjectionResponse {
         projection_definition_json: serde_json::to_string(&definition).map_err(internal_status)?,
+        write_state: write_state as i32,
     })
 }
 

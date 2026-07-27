@@ -2,9 +2,12 @@ use crate::{
     core_store::{decode_deterministic_proto, encode_deterministic_proto},
     formats::hash32,
     personaldb_coremeta::{
-        PERSONALDB_DATA_LOCATOR_PAGE_MAX, list_personaldb_data_locator_rows_at_snapshot,
+        PERSONALDB_DATA_LOCATOR_PAGE_MAX, PersonalDbWritePlan,
+        list_personaldb_data_locator_rows_at_snapshot,
         list_personaldb_data_locator_rows_for_tenant_at_snapshot, personaldb_payload_hash,
-        read_personaldb_data_locator_bytes, read_personaldb_data_locator_row_at_snapshot,
+        prepare_personaldb_bytes_as_data_locator, read_personaldb_data_locator_bytes,
+        read_personaldb_data_locator_row_at_snapshot,
+        read_personaldb_data_locator_row_in_transaction,
         write_personaldb_bytes_as_data_locator_mvcc,
     },
     storage::Storage,
@@ -284,6 +287,43 @@ pub async fn write_projection_definition(
     Ok(())
 }
 
+/// Prepare the immutable payload and stage its authoritative locator in the
+/// supplied transaction. Until certification the landed bytes are unreachable;
+/// an abort can therefore leave only normal orphan-GC input, never a partially
+/// visible projection definition.
+pub async fn prepare_and_stage_projection_definition(
+    storage: &Storage,
+    plan: &mut PersonalDbWritePlan,
+    tenant_id: i64,
+    database_id: &str,
+    root_generation: u64,
+    definition: &ProjectionDefinition,
+) -> Result<()> {
+    definition.verify()?;
+    ensure_scope(tenant_id, database_id, definition)?;
+    let data_id =
+        projection_definition_data_id(tenant_id, database_id, &definition.projection_id)?;
+    let bytes = encode_projection_definition(definition)?;
+    let row = prepare_personaldb_bytes_as_data_locator(
+        storage,
+        tenant_id,
+        database_id,
+        &data_id,
+        PERSONALDB_PROJECTION_DEFINITION_KIND,
+        1,
+        root_generation,
+        bytes.clone(),
+        personaldb_payload_hash(&bytes),
+        definition.source_database_ids.clone(),
+        format!(
+            "personaldb-projection-definition:{tenant_id}:{database_id}:{}",
+            definition.projection_id
+        ),
+    )
+    .await?;
+    plan.stage_data_locator_row(&row)
+}
+
 pub async fn read_projection_definition(
     storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
@@ -305,6 +345,40 @@ pub async fn read_projection_definition(
     else {
         return Ok(None);
     };
+    ensure_scope(tenant_id, database_id, &definition)?;
+    if definition.projection_id != projection_id {
+        return Err(anyhow!("projection definition data scope mismatch"));
+    }
+    Ok(Some(definition))
+}
+
+pub async fn read_projection_definition_in_transaction(
+    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    tenant_id: i64,
+    database_id: &str,
+    projection_id: &str,
+) -> Result<Option<ProjectionDefinition>> {
+    let data_id = projection_definition_data_id(tenant_id, database_id, projection_id)?;
+    let Some(row) = read_personaldb_data_locator_row_in_transaction(
+        mvcc,
+        transaction_id,
+        principal,
+        tenant_id,
+        database_id,
+        &data_id,
+    )?
+    else {
+        return Ok(None);
+    };
+    if row.data_kind != PERSONALDB_PROJECTION_DEFINITION_KIND {
+        return Err(anyhow!("projection definition CoreMeta row kind mismatch"));
+    }
+    let bytes = read_personaldb_data_locator_bytes(storage, &row).await?;
+    let definition = decode_projection_definition(&bytes)?;
+    definition.verify()?;
     ensure_scope(tenant_id, database_id, &definition)?;
     if definition.projection_id != projection_id {
         return Err(anyhow!("projection definition data scope mismatch"));

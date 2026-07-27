@@ -343,6 +343,12 @@ impl TransactionBundle {
                         crate::index_finalization_job::IndexFinalizationJob::decode(encoded_job)?;
                     (job.cluster_id, job.transaction_id)
                 }
+                Some(crate::personaldb_postcommit_job::PersonalDbPostCommitJob::SCHEMA) => {
+                    let job = crate::personaldb_postcommit_job::PersonalDbPostCommitJob::decode(
+                        encoded_job,
+                    )?;
+                    (job.cluster_id, job.transaction_id)
+                }
                 _ => {
                     let job =
                         crate::object_materialisation::ObjectMaterialisationJob::decode(encoded_job)?;

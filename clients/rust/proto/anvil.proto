@@ -3172,6 +3172,7 @@ message CreatePersonalDbProjectionRequest {
     int64 tenant_id = 1;
     string database_id = 2;
     string projection_definition_json = 3;
+    WriteOptions options = 4;
 }
 
 message GetPersonalDbProjectionRequest {
@@ -3182,6 +3183,7 @@ message GetPersonalDbProjectionRequest {
 
 message PersonalDbProjectionResponse {
     string projection_definition_json = 1;
+    WriteState write_state = 2;
 }
 
 enum HashAlgorithmV1 {
@@ -3275,6 +3277,7 @@ message SubmitPersonalDbChangesetRequest {
     string changeset_payload_hash = 14;
     bytes changeset_bytes = 15;
     string client_debug_metadata_json = 16;
+    WriteOptions options = 17;
 }
 
 message SubmitPersonalDbChangesetResponse {
@@ -3287,6 +3290,7 @@ message SubmitPersonalDbChangesetResponse {
     PersonalDbCommittedHeadRecord committed_head = 7;
     uint64 watch_cursor_low = 8;
     uint64 watch_cursor_high = 9;
+    WriteState write_state = 10;
 }
 
 message PersonalDbCommitCertificateRecord {

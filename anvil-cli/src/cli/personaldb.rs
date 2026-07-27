@@ -138,6 +138,7 @@ pub async fn handle_personaldb_command(
                 tenant_id: claims.tenant_id,
                 database_id: database_id.clone(),
                 projection_definition_json: projection_definition_json.clone(),
+                options: None,
             });
             add_auth(&mut request, &token);
             println!(
@@ -192,6 +193,7 @@ pub async fn handle_personaldb_command(
                 changeset_payload_hash: blake3::hash(&payload).to_hex().to_string(),
                 changeset_bytes: payload,
                 client_debug_metadata_json: String::new(),
+                options: None,
             });
             add_auth(&mut request, &token);
             let response = client

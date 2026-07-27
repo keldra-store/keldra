@@ -10,6 +10,7 @@ use crate::{
         PersonalDbDataLocatorCoreMetaRow, PersonalDbGroupCoreMetaRow, PersonalDbWritePlan,
         personaldb_payload_hash, prepare_personaldb_bytes_as_data_locator,
         read_personaldb_data_locator_bytes, read_personaldb_data_locator_row_at_snapshot,
+        read_personaldb_data_locator_row_in_transaction,
         write_personaldb_bytes_as_data_locator_mvcc, write_personaldb_group_row_mvcc,
     },
     personaldb_signing::{
@@ -351,6 +352,42 @@ pub async fn read_personaldb_group_manifest(
     else {
         return Ok(None);
     };
+    manifest.verify(trust_store)?;
+    ensure_head_scope(
+        tenant_id,
+        database_id,
+        &manifest.tenant_id,
+        &manifest.database_id,
+    )?;
+    Ok(Some(manifest))
+}
+
+pub async fn read_personaldb_group_manifest_in_transaction(
+    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    tenant_id: i64,
+    database_id: &str,
+    trust_store: &PublicKeyTrustStore,
+) -> Result<Option<PersonalDbGroupManifest>> {
+    let data_id = personaldb_head_data_id(tenant_id, database_id, "group_manifest")?;
+    let Some(row) = read_personaldb_data_locator_row_in_transaction(
+        mvcc,
+        transaction_id,
+        principal,
+        tenant_id,
+        database_id,
+        &data_id,
+    )?
+    else {
+        return Ok(None);
+    };
+    if row.data_kind != PersonalDbGroupManifest::data_kind_static() {
+        return Err(anyhow!("personaldb CoreMeta row has wrong record kind"));
+    }
+    let bytes = read_personaldb_data_locator_bytes(storage, &row).await?;
+    let manifest = PersonalDbGroupManifest::decode_record(&bytes)?;
     manifest.verify(trust_store)?;
     ensure_head_scope(
         tenant_id,

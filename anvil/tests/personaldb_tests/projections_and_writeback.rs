@@ -29,6 +29,7 @@ async fn personaldb_projection_definition_create_get_and_watch_are_native_api_ba
                 tenant_id: 1,
                 database_id: projection_database_id.clone(),
                 projection_definition_json: serde_json::to_string(&definition).unwrap(),
+                options: None,
             },
             &token,
         ))
@@ -150,6 +151,7 @@ async fn personaldb_source_commit_builds_projection_group_and_watch_event() {
                 tenant_id: actor.tenant_id,
                 database_id: projection_database_id.clone(),
                 projection_definition_json: serde_json::to_string(&definition).unwrap(),
+                options: None,
             },
             &token,
         ))
@@ -275,6 +277,7 @@ async fn personaldb_projection_resource_relation_filter_uses_authz_index() {
                 tenant_id: actor.tenant_id,
                 database_id: projection_database_id.clone(),
                 projection_definition_json: serde_json::to_string(&definition).unwrap(),
+                options: None,
             },
             &token,
         ))
@@ -366,6 +369,7 @@ async fn personaldb_projection_group_submit_rejects_direct_writeback_when_policy
                 tenant_id: actor.tenant_id,
                 database_id: projection_database_id.clone(),
                 projection_definition_json: serde_json::to_string(&definition).unwrap(),
+                options: None,
             },
             &token,
         ))
@@ -468,6 +472,7 @@ async fn personaldb_projection_writeback_updates_source_and_rebuilds_projection_
                 tenant_id: actor.tenant_id,
                 database_id: projection_database_id.clone(),
                 projection_definition_json: serde_json::to_string(&definition).unwrap(),
+                options: None,
             },
             &token,
         ))
@@ -627,6 +632,7 @@ async fn personaldb_projection_writeback_insert_and_delete_round_trip_through_so
                 tenant_id: actor.tenant_id,
                 database_id: projection_database_id.clone(),
                 projection_definition_json: serde_json::to_string(&definition).unwrap(),
+                options: None,
             },
             &token,
         ))
@@ -787,6 +793,7 @@ async fn personaldb_projection_writeback_rejects_protected_column_mutation() {
                 tenant_id: actor.tenant_id,
                 database_id: projection_database_id.clone(),
                 projection_definition_json: serde_json::to_string(&definition).unwrap(),
+                options: None,
             },
             &token,
         ))
@@ -898,6 +905,7 @@ async fn personaldb_projection_writeback_rejects_ambiguous_source_binding() {
                 tenant_id: actor.tenant_id,
                 database_id: projection_database_id.clone(),
                 projection_definition_json: serde_json::to_string(&definition).unwrap(),
+                options: None,
             },
             &token,
         ))

@@ -96,12 +96,14 @@ pub async fn start_node_with_admin_listener(
                 worker_state.secret_keyring.clone(),
                 worker_state.config.background_worker_concurrency,
             );
+            let personaldb_postcommit = worker_state.clone().run_personaldb_postcommit_loop();
             tokio::select! {
                 result = worker => {
                     if let Err(error) = result {
                         error!("Worker process failed: {}", error);
                     }
                 }
+                _ = personaldb_postcommit => unreachable!("PersonalDB postcommit worker completed"),
                 _ = shard_recovery => unreachable!("shard recovery supervisor completed"),
             }
         });

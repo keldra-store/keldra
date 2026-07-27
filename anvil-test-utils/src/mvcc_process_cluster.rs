@@ -614,6 +614,8 @@ impl ProcessMvccCluster {
                 "RaftLogWrite",
                 "IndexFinalizationBeforeExecute",
                 "IndexFinalizationAfterExecute",
+                "PersonalDbPostCommitBeforeEffects",
+                "PersonalDbPostCommitAfterEffects",
             ];
         if !PROCESS_SAFE_POINTS.contains(&fault_point) {
             bail!("fault point is not enabled for process-backed hard crashes");

@@ -26,6 +26,9 @@ use crate::index_finalization_job::{
 use crate::mvcc_transaction::{CommitVersion, LogicalKey, TransactionBundle, WriteOperation};
 use crate::object_materialisation::ObjectMaterialisationState;
 use crate::object_materialisation::{ObjectMaterialisationJob, ObjectMaterialisationRecord};
+use crate::personaldb_postcommit_job::{
+    PersonalDbPostCommitJob, PersonalDbPostCommitRecord, PersonalDbPostCommitState,
+};
 
 pub const MVCC_COLUMN_FAMILIES: [&str; 6] = [
     "mvcc_versions",
@@ -138,6 +141,7 @@ impl MvccStore {
             (b"shard-repair/".as_slice(), "shard-repair"),
             (b"local-upgrade/".as_slice(), "local-durability-upgrade"),
             (b"index-finalization/".as_slice(), "index-finalization"),
+            (b"personaldb-postcommit/".as_slice(), "personaldb-postcommit"),
         ] {
             let prefix = self.key(prefix_suffix);
             for row in self.db.iterator_cf(
@@ -163,6 +167,12 @@ impl MvccStore {
                 } else if kind == "index-finalization" {
                     let record: IndexFinalizationRecord = serde_json::from_slice(&value)?;
                     if record.state == IndexFinalizationState::Complete {
+                        continue;
+                    }
+                    record.job.target_logical_identity()
+                } else if kind == "personaldb-postcommit" {
+                    let record: PersonalDbPostCommitRecord = serde_json::from_slice(&value)?;
+                    if record.state == PersonalDbPostCommitState::Complete {
                         continue;
                     }
                     record.job.target_logical_identity()
@@ -403,6 +413,25 @@ impl MvccStore {
                     && existing.as_slice() != record.as_slice()
                 {
                     bail!("index finalization job identity collision");
+                }
+                batch.put_cf(materialisation_cf, key, record);
+                continue;
+            }
+            if schema.as_deref() == Some(PersonalDbPostCommitJob::SCHEMA) {
+                let job = PersonalDbPostCommitJob::decode(encoded_job)?;
+                if job.cluster_id != self.cluster_id || job.transaction_id != bundle.transaction_id
+                {
+                    bail!("PersonalDB postcommit job belongs to another transaction or cluster");
+                }
+                let key = self.key(format!("personaldb-postcommit/{}", job.job_id()?).as_bytes());
+                let record = serde_json::to_vec(&PersonalDbPostCommitRecord::pending(
+                    job,
+                    commit_version,
+                ))?;
+                if let Some(existing) = self.db.get_cf(materialisation_cf, &key)?
+                    && existing.as_slice() != record.as_slice()
+                {
+                    bail!("PersonalDB postcommit job identity collision");
                 }
                 batch.put_cf(materialisation_cf, key, record);
                 continue;
@@ -1254,6 +1283,101 @@ impl MvccStore {
         })
     }
 
+    pub fn claim_personaldb_postcommit_authorized(
+        &self,
+        worker_id: &str,
+        now: u64,
+        lease_ms: u64,
+        eligible: impl Fn(&PersonalDbPostCommitRecord) -> Option<String>,
+    ) -> Result<Option<(String, PersonalDbPostCommitRecord)>> {
+        if worker_id.trim().is_empty() || lease_ms == 0 {
+            bail!("PersonalDB postcommit worker and lease must be non-empty");
+        }
+        let _transition = self.materialisation_transition.lock().unwrap();
+        let cf = self.cf(CF_MATERIALISATION)?;
+        let prefix = self.key(b"personaldb-postcommit/");
+        let mut incomplete = Vec::new();
+        for row in self
+            .db
+            .iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward))
+        {
+            let (key, value) = row?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let record: PersonalDbPostCommitRecord = serde_json::from_slice(&value)?;
+            if record.state == PersonalDbPostCommitState::Complete {
+                continue;
+            }
+            incomplete.push((key, record));
+        }
+        let candidate = incomplete
+            .iter()
+            .filter_map(|(key, record)| eligible(record).map(|owner| (key, record, owner)))
+            .filter(|(_, candidate, _)| {
+                !incomplete.iter().any(|(_, other)| {
+                    other.job.tenant_id == candidate.job.tenant_id
+                        && other.job.database_id == candidate.job.database_id
+                        && other.job.log_index < candidate.job.log_index
+                })
+            })
+            .min_by_key(|(_, record, _)| {
+                (record.job.tenant_id, record.job.database_id.as_str(), record.job.log_index)
+            });
+        let Some((key, record, owner)) = candidate else {
+            return Ok(None);
+        };
+        let key = key.clone();
+        let mut record = record.clone();
+        if !record.claimable(now) {
+            // Never overtake an earlier running/backed-off source commit.
+            return Ok(None);
+        }
+        record.state = PersonalDbPostCommitState::Running;
+        record.attempts = record.attempts.saturating_add(1);
+        record.lease_owner = Some(owner);
+        record.lease_expires_unix_ms =
+            Some(now.checked_add(lease_ms).context("PersonalDB job lease overflow")?);
+        self.db.put_cf_opt(
+            cf,
+            &key,
+            serde_json::to_vec(&record)?,
+            &durable_write_options(),
+        )?;
+        let id = String::from_utf8(self.unscoped(&key)?.to_vec())?
+            .strip_prefix("personaldb-postcommit/")
+            .context("invalid PersonalDB postcommit key")?
+            .to_string();
+        Ok(Some((id, record)))
+    }
+
+    pub fn retry_personaldb_postcommit(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        next_attempt: u64,
+        error: &str,
+    ) -> Result<()> {
+        self.transition_personaldb_postcommit(job_id, worker_id, |record| {
+            record.state = PersonalDbPostCommitState::Pending;
+            record.next_attempt_unix_ms = next_attempt;
+            record.lease_owner = None;
+            record.lease_expires_unix_ms = None;
+            record.last_error = Some(error.to_string());
+            Ok(())
+        })
+    }
+
+    pub fn complete_personaldb_postcommit(&self, job_id: &str, worker_id: &str) -> Result<()> {
+        self.transition_personaldb_postcommit(job_id, worker_id, |record| {
+            record.state = PersonalDbPostCommitState::Complete;
+            record.lease_owner = None;
+            record.lease_expires_unix_ms = None;
+            record.last_error = None;
+            Ok(())
+        })
+    }
+
     pub fn claim_shard_repair_where(
         &self,
         worker_id: &str,
@@ -1490,6 +1614,21 @@ impl MvccStore {
                 pins.transaction_ids.insert(record.job.transaction_id);
             }
         }
+        let personaldb_prefix = self.key(b"personaldb-postcommit/");
+        for row in self.db.iterator_cf(
+            materialisation_cf,
+            IteratorMode::From(&personaldb_prefix, Direction::Forward),
+        ) {
+            let (key, value) = row?;
+            if !key.starts_with(&personaldb_prefix) {
+                break;
+            }
+            let record: PersonalDbPostCommitRecord = serde_json::from_slice(&value)?;
+            if record.state != PersonalDbPostCommitState::Complete {
+                pins.materialisation_snapshots.insert(record.commit_version);
+                pins.transaction_ids.insert(record.job.transaction_id);
+            }
+        }
         Ok(pins)
     }
 
@@ -1718,6 +1857,35 @@ impl MvccStore {
         Ok(())
     }
 
+    fn transition_personaldb_postcommit(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        update: impl FnOnce(&mut PersonalDbPostCommitRecord) -> Result<()>,
+    ) -> Result<()> {
+        let _transition = self.materialisation_transition.lock().unwrap();
+        let cf = self.cf(CF_MATERIALISATION)?;
+        let key = self.key(format!("personaldb-postcommit/{job_id}").as_bytes());
+        let bytes = self
+            .db
+            .get_cf(cf, &key)?
+            .context("PersonalDB postcommit job not found")?;
+        let mut record: PersonalDbPostCommitRecord = serde_json::from_slice(&bytes)?;
+        if record.state != PersonalDbPostCommitState::Running
+            || record.lease_owner.as_deref() != Some(worker_id)
+        {
+            bail!("PersonalDB postcommit job is not leased by this worker");
+        }
+        update(&mut record)?;
+        self.db.put_cf_opt(
+            cf,
+            key,
+            serde_json::to_vec(&record)?,
+            &durable_write_options(),
+        )?;
+        Ok(())
+    }
+
     fn transition_local_durability_upgrade(
         &self,
         job_id: &str,
@@ -1869,6 +2037,14 @@ impl MvccStore {
             &mut deleted,
             &mut deleted_bytes,
         )?;
+        self.collect_completed_jobs(
+            materialisation_cf,
+            b"personaldb-postcommit/",
+            safe_watermark,
+            &mut batch,
+            &mut deleted,
+            &mut deleted_bytes,
+        )?;
         batch.put_cf(
             meta_cf,
             self.key(GC_WATERMARK_KEY),
@@ -1916,9 +2092,13 @@ impl MvccStore {
                 let record: LocalDurabilityUpgradeRecord = serde_json::from_slice(&value)?;
                 record.state == LocalDurabilityUpgradeState::Complete
                     && record.job.commit_version < safe_watermark
-            } else {
+            } else if suffix == b"index-finalization/" {
                 let record: IndexFinalizationRecord = serde_json::from_slice(&value)?;
                 record.state == IndexFinalizationState::Complete
+                    && record.commit_version < safe_watermark
+            } else {
+                let record: PersonalDbPostCommitRecord = serde_json::from_slice(&value)?;
+                record.state == PersonalDbPostCommitState::Complete
                     && record.commit_version < safe_watermark
             };
             if completed_below_watermark {

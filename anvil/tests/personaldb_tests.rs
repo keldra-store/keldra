@@ -387,6 +387,7 @@ fn submit_request_at_base_for_tenant_and_principal(
         changeset_payload_hash: hex::encode(hash32(&changeset_bytes)),
         changeset_bytes,
         client_debug_metadata_json: String::new(),
+        options: None,
     }
 }
 

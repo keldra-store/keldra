@@ -30,6 +30,8 @@ pub enum FaultPoint {
     PersonalDbAfterCreateCommit,
     IndexFinalizationBeforeExecute,
     IndexFinalizationAfterExecute,
+    PersonalDbPostCommitBeforeEffects,
+    PersonalDbPostCommitAfterEffects,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

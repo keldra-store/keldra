@@ -838,6 +838,25 @@ pub fn read_personaldb_data_locator_row_at_snapshot(
         .transpose()
 }
 
+pub fn read_personaldb_data_locator_row_in_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    tenant_id: i64,
+    group_id: &str,
+    data_id: &str,
+) -> Result<Option<PersonalDbDataLocatorCoreMetaRow>> {
+    let tuple = personaldb_data_locator_tuple_key(tenant_id, group_id, data_id)?;
+    let key = crate::mvcc_product::coremeta_logical_key(
+        CF_PERSONALDB,
+        TABLE_PERSONALDB_DATA_LOCATOR_ROW,
+        &tuple,
+    )?;
+    mvcc.read_transaction_value(transaction_id, principal, &key)?
+        .map(|value| decode_data_locator_row(&value))
+        .transpose()
+}
+
 pub fn list_personaldb_data_locator_rows_at_snapshot(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
