@@ -13,9 +13,11 @@ use crate::formats::{
 };
 use crate::mvcc_bootstrap::MvccSubsystem;
 use crate::personaldb_coremeta::{
-    PERSONALDB_DATA_LOCATOR_PAGE_MAX, list_personaldb_data_locator_rows_at_snapshot,
+    PERSONALDB_DATA_LOCATOR_PAGE_MAX, PersonalDbDataLocatorCoreMetaRow, PersonalDbWritePlan,
+    list_personaldb_data_locator_rows_at_snapshot,
+    prepare_personaldb_logical_file_as_data_locator,
     read_personaldb_data_locator_bytes, read_personaldb_data_locator_row_at_snapshot,
-    write_personaldb_logical_file_as_data_locator_mvcc,
+    write_personaldb_data_locator_row_mvcc,
 };
 use crate::storage::Storage;
 use anyhow::{Result, anyhow};
@@ -62,6 +64,34 @@ pub async fn write_personaldb_log_segment(
     mvcc: &MvccSubsystem,
     input: PersonalDbLogSegmentWrite<'_>,
 ) -> Result<String> {
+    let root_generation = mvcc
+        .runtime
+        .applied_version()?
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("PersonalDB locator generation overflow"))?;
+    let (ref_name, row) =
+        prepare_personaldb_log_segment_row(storage, root_generation, input).await?;
+    write_personaldb_data_locator_row_mvcc(mvcc, &row, "personaldb-log-segment-writer").await?;
+    Ok(ref_name)
+}
+
+pub async fn prepare_and_stage_personaldb_log_segment(
+    storage: &Storage,
+    plan: &mut PersonalDbWritePlan,
+    root_generation: u64,
+    input: PersonalDbLogSegmentWrite<'_>,
+) -> Result<String> {
+    let (ref_name, row) =
+        prepare_personaldb_log_segment_row(storage, root_generation, input).await?;
+    plan.stage_data_locator_row(&row)?;
+    Ok(ref_name)
+}
+
+async fn prepare_personaldb_log_segment_row(
+    storage: &Storage,
+    root_generation: u64,
+    input: PersonalDbLogSegmentWrite<'_>,
+) -> Result<(String, PersonalDbDataLocatorCoreMetaRow)> {
     if input.source_fence_token == 0 {
         return Err(anyhow!(
             "personaldb log segment source fence token must be nonzero"
@@ -135,9 +165,8 @@ pub async fn write_personaldb_log_segment(
         pipeline_policy: CorePipelinePolicy::default(),
         trace_context: CoreTraceContext::default(),
     })?;
-    write_personaldb_logical_file_as_data_locator_mvcc(
+    let row = prepare_personaldb_logical_file_as_data_locator(
         storage,
-        mvcc,
         input.tenant_id,
         input.database_id,
         &ref_name,
@@ -145,16 +174,16 @@ pub async fn write_personaldb_log_segment(
         built_segment
             .logical_file
             .into_write_logical_file_request()?,
+        root_generation,
         hex::encode(segment_hash),
         vec![
             format!("start_log_index:{start_log_index:020}"),
             format!("end_log_index:{end_log_index:020}"),
         ],
         transaction_id,
-        "personaldb-log-segment-writer",
     )
     .await?;
-    Ok(ref_name)
+    Ok((ref_name, row))
 }
 
 pub fn preview_personaldb_log_segment_ref(input: PersonalDbLogSegmentWrite<'_>) -> Result<String> {
