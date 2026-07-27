@@ -2,8 +2,10 @@ use crate::{
     core_store::CoreMutationPrecondition,
     partition_fence::{
         AcquireOwnership, MAX_OWNERSHIP_LEASE_MS, OwnershipPrincipal, OwnershipResource,
-        OwnershipResourceKind, RenewOwnership, acquire_ownership, ownership_fence_precondition,
-        read_ownership_fence, renew_ownership,
+        OwnershipResourceKind, RenewOwnership, commit_implicit_ownership_plan,
+        ownership_fence_precondition, ownership_fence_predicate_mvcc,
+        plan_acquire_ownership_in_transaction, plan_renew_ownership_in_transaction,
+        read_ownership_fence_mvcc,
     },
     storage::Storage,
     task_execution_guard::TaskExecutionGuard,
@@ -37,7 +39,7 @@ pub(crate) struct IndexBuildOwnership {
 
 impl IndexBuildOwnership {
     pub(crate) async fn acquire(
-        storage: &Storage,
+        mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
         tenant_id: i64,
         bucket_id: i64,
         index_storage_id: &str,
@@ -57,37 +59,68 @@ impl IndexBuildOwnership {
             .checked_mul(1_000_000)
             .ok_or_else(|| anyhow!("index build ownership TTL overflow"))?;
 
+        let transaction_principal = format!("node:{builder_node_id}");
         let record = if let Some(record) =
-            read_ownership_fence(storage, owner.tenant_id, &resource, signing_key).await?
+            read_ownership_fence_mvcc(mvcc, owner.tenant_id, &resource, signing_key)?
             && record.owner.same_security_owner(&owner)
             && record.is_active_unexpired(now_nanos)
         {
-            renew_ownership(
-                storage,
-                RenewOwnership {
-                    request_id: format!("index-build-renew-{}", resource.resource_id),
-                    resource: resource.clone(),
-                    owner: owner.clone(),
-                    current_fence: record.fence,
-                    now_nanos,
-                    ttl_nanos,
-                },
+            let request = RenewOwnership {
+                request_id: format!("index-build-renew-{}", resource.resource_id),
+                resource: resource.clone(),
+                owner: owner.clone(),
+                current_fence: record.fence,
+                now_nanos,
+                ttl_nanos,
+            };
+            let idempotency_key = request.request_id.clone();
+            commit_implicit_ownership_plan(
+                mvcc,
+                &transaction_principal,
+                &idempotency_key,
+                now_nanos,
+                owner.tenant_id,
+                &resource,
                 signing_key,
+                |transaction_id| {
+                    plan_renew_ownership_in_transaction(
+                        mvcc,
+                        transaction_id,
+                        &transaction_principal,
+                        request,
+                        signing_key,
+                    )
+                },
             )
             .await?
             .record
         } else {
-            acquire_ownership(
-                storage,
-                AcquireOwnership {
-                    request_id: format!("index-build-acquire-{}", resource.resource_id),
-                    idempotency_key: format!("index-build-owner-{}", resource.resource_id),
-                    resource: resource.clone(),
-                    owner: owner.clone(),
-                    now_nanos,
-                    ttl_nanos,
-                },
+            let request = AcquireOwnership {
+                request_id: format!("index-build-acquire-{}", resource.resource_id),
+                idempotency_key: format!("index-build-owner-{}", resource.resource_id),
+                resource: resource.clone(),
+                owner: owner.clone(),
+                now_nanos,
+                ttl_nanos,
+            };
+            let idempotency_key = request.idempotency_key.clone();
+            commit_implicit_ownership_plan(
+                mvcc,
+                &transaction_principal,
+                &idempotency_key,
+                now_nanos,
+                owner.tenant_id,
+                &resource,
                 signing_key,
+                |transaction_id| {
+                    plan_acquire_ownership_in_transaction(
+                        mvcc,
+                        transaction_id,
+                        &transaction_principal,
+                        request,
+                        signing_key,
+                    )
+                },
             )
             .await?
             .record
@@ -114,6 +147,25 @@ impl IndexBuildOwnership {
             signing_key,
         )
         .await
+    }
+
+    fn mvcc_precondition(
+        &self,
+        mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+        signing_key: &[u8],
+    ) -> Result<(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )> {
+        ownership_fence_predicate_mvcc(
+            mvcc,
+            self.owner.tenant_id,
+            &self.resource,
+            &self.owner,
+            self.fence,
+            current_time_nanos()?,
+            signing_key,
+        )
     }
 }
 
@@ -165,7 +217,7 @@ impl IndexBuildAuthority<'_> {
     /// execution, publishes with the exact MVCC task-lease predicate.
     pub(crate) async fn publish_mvcc_with<T, F, Fut>(
         self,
-        storage: &Storage,
+        _storage: &Storage,
         ownership: &IndexBuildOwnership,
         signing_key: &[u8],
         publication: F,
@@ -179,14 +231,16 @@ impl IndexBuildAuthority<'_> {
         ) -> Fut,
         Fut: Future<Output = Result<T>>,
     {
-        let _ = ownership.precondition(storage, signing_key).await?;
+        let ownership_predicate = ownership.mvcc_precondition(self.mvcc()?, signing_key)?;
         match self {
             Self::Task(guard) => {
                 guard
-                    .publish_mvcc_with(|predicate| publication(vec![predicate]))
+                    .publish_mvcc_with(|predicate| {
+                        publication(vec![ownership_predicate, predicate])
+                    })
                     .await
             }
-            Self::DirectRepair(_) => publication(Vec::new()).await,
+            Self::DirectRepair(_) => publication(vec![ownership_predicate]).await,
         }
     }
 }

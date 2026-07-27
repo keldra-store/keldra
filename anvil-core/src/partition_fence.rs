@@ -22,9 +22,9 @@ pub use coremeta::{
 };
 use coremeta::{
     is_partition_fence_cas_conflict, ownership_fence_by_node_key, ownership_fence_row_key,
-    partition_owner_row_key, read_ownership_fence_state, read_partition_owner_state,
-    read_partition_owner_state_mvcc, write_ownership_fence_state, write_partition_owner_state,
-    write_partition_owner_state_mvcc,
+    partition_owner_row_key, read_ownership_fence_state, read_ownership_fence_state_mvcc,
+    read_partition_owner_state, read_partition_owner_state_mvcc, write_ownership_fence_state,
+    write_partition_owner_state, write_partition_owner_state_mvcc,
 };
 
 pub const OWNERSHIP_HELD: &str = "OwnershipHeld";
@@ -407,6 +407,68 @@ impl OwnershipFenceWritePlan {
         }
         mvcc.stage_assignment_guard(transaction_id, principal, &assignment, now_unix_ms)
     }
+}
+
+pub(crate) async fn commit_implicit_ownership_plan(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    principal: &str,
+    idempotency_key: &str,
+    now_nanos: i64,
+    tenant_id: i64,
+    resource: &OwnershipResource,
+    signing_key: &[u8],
+    planner: impl FnOnce(&str) -> Result<OwnershipFenceWritePlan>,
+) -> Result<OwnershipFenceOutcome> {
+    let now_unix_ms = u64::try_from(now_nanos / 1_000_000).unwrap_or_default();
+    let handle = mvcc
+        .open_transactions
+        .begin(
+            mvcc.runtime.as_ref(),
+            mvcc.cluster_id(),
+            principal,
+            idempotency_key,
+            std::time::Duration::from_secs(30),
+            crate::mvcc_transaction::DurabilityLevel::Quorum,
+            crate::mvcc_transaction::ReadConsistency::Linearized,
+            now_unix_ms,
+        )
+        .await?;
+    let status = mvcc
+        .open_transactions
+        .status(&handle.transaction_id, principal, now_unix_ms)?;
+    let planned_outcome = if status.state == "open" {
+        let plan = planner(&handle.transaction_id)?;
+        let outcome = plan.outcome.clone();
+        plan.stage_into_transaction(mvcc, &handle.transaction_id, principal, now_unix_ms)
+            .await?;
+        Some(outcome)
+    } else {
+        None
+    };
+    let outcome = mvcc
+        .open_transactions
+        .commit(
+            mvcc.runtime.as_ref(),
+            &handle.transaction_id,
+            principal,
+            now_unix_ms,
+        )
+        .await?;
+    if let crate::mvcc_transaction::CertificationResult::Aborted { reason } = outcome.certification
+    {
+        bail!("{OWNERSHIP_CAS_CONFLICT}: ownership fence MVCC transaction aborted: {reason:?}");
+    }
+    if let Some(outcome) = planned_outcome {
+        return Ok(outcome);
+    }
+    let record =
+        read_ownership_fence_mvcc(mvcc, tenant_id, resource, signing_key)?.ok_or_else(|| {
+            anyhow!("{OWNERSHIP_NOT_FOUND}: resolved ownership transaction has no row")
+        })?;
+    Ok(OwnershipFenceOutcome {
+        record,
+        idempotent_replay: true,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1382,6 +1444,53 @@ pub async fn read_ownership_fence(
     )
 }
 
+pub fn read_ownership_fence_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    resource: &OwnershipResource,
+    signing_key: &[u8],
+) -> Result<Option<OwnershipFenceRecord>> {
+    Ok(
+        read_ownership_fence_state_mvcc(mvcc, tenant_id, resource, signing_key)?
+            .map(|(_, record)| record),
+    )
+}
+
+pub fn ownership_fence_predicate_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    resource: &OwnershipResource,
+    expected_owner: &OwnershipPrincipal,
+    expected_fence: u64,
+    now_nanos: i64,
+    signing_key: &[u8],
+) -> Result<(
+    crate::mvcc_transaction::LogicalKey,
+    crate::mvcc_transaction::PredicateKind,
+)> {
+    if now_nanos < 0 {
+        bail!("ownership fence validation timestamp must be nonnegative");
+    }
+    let Some((payload, record)) =
+        read_ownership_fence_state_mvcc(mvcc, tenant_id, resource, signing_key)?
+    else {
+        bail!("{OWNERSHIP_NOT_FOUND}: ownership fence is absent");
+    };
+    if !record.is_active_unexpired(now_nanos) {
+        bail!("{OWNERSHIP_EXPIRED}: ownership fence is not active");
+    }
+    if !record.owner.same_security_owner(expected_owner) {
+        bail!("{OWNERSHIP_OWNER_MISMATCH}: ownership fence owner mismatch");
+    }
+    if record.fence != expected_fence {
+        bail!("{OWNERSHIP_STALE_FENCE}: ownership fence token mismatch");
+    }
+    Ok((
+        ownership_fence_logical_key(tenant_id, resource)?,
+        crate::mvcc_transaction::PredicateKind::ValueHash(*blake3::hash(&payload).as_bytes()),
+    ))
+}
+
 /// Returns an exact CoreMeta CAS fence for an active ownership lease.
 ///
 /// Callers include this precondition in the same mutation batch as the
@@ -1951,6 +2060,56 @@ pub async fn partition_write_precondition(
         require_absent: false,
         require_present: true,
     })
+}
+
+pub fn partition_write_predicate_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    permit: &PartitionWritePermit,
+    signing_key: &[u8],
+) -> Result<
+    (
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    ),
+    FenceRejection,
+> {
+    let state = read_partition_owner_state_mvcc(
+        mvcc,
+        &permit.partition_family,
+        &permit.partition_id,
+        signing_key,
+    )
+    .map_err(|_| FenceRejection {
+        code: AnvilErrorCode::PartitionNotOwned,
+        reason: "partition owner state cannot be read",
+    })?;
+    let Some((payload, owner)) = state else {
+        return Err(FenceRejection {
+            code: AnvilErrorCode::PartitionNotOwned,
+            reason: "partition owner state is absent",
+        });
+    };
+    validate_write_permit_for_state(&owner, permit, true)?;
+    let row_key =
+        partition_owner_row_key(&permit.partition_family, &permit.partition_id).map_err(|_| {
+            FenceRejection {
+                code: AnvilErrorCode::PartitionNotOwned,
+                reason: "partition owner row cannot be addressed",
+            }
+        })?;
+    let key = crate::mvcc_product::coremeta_logical_key(
+        CF_LEASES_FENCES,
+        TABLE_PARTITION_OWNER_ROW,
+        &row_key,
+    )
+    .map_err(|_| FenceRejection {
+        code: AnvilErrorCode::PartitionNotOwned,
+        reason: "partition owner row cannot be addressed",
+    })?;
+    Ok((
+        key,
+        crate::mvcc_transaction::PredicateKind::ValueHash(*blake3::hash(&payload).as_bytes()),
+    ))
 }
 
 pub fn validate_write_permit_for_state(

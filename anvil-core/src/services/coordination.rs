@@ -1144,16 +1144,14 @@ async fn execute_implicit_ownership_plan(
     if let Some(outcome) = planned_outcome {
         return Ok(outcome);
     }
-    let record =
-        partition_fence::read_ownership_fence(&state.storage, tenant_id, resource, signing_key)
-            .await
-            .map_err(ownership_error_status)?
-            .ok_or_else(|| {
-                ownership_error_status(anyhow!(
-                    "{}: resolved ownership transaction has no visible row",
-                    partition_fence::OWNERSHIP_NOT_FOUND
-                ))
-            })?;
+    let record = partition_fence::read_ownership_fence_mvcc(mvcc, tenant_id, resource, signing_key)
+        .map_err(ownership_error_status)?
+        .ok_or_else(|| {
+            ownership_error_status(anyhow!(
+                "{}: resolved ownership transaction has no visible row",
+                partition_fence::OWNERSHIP_NOT_FOUND
+            ))
+        })?;
     Ok(partition_fence::OwnershipFenceOutcome {
         record,
         idempotent_replay: true,

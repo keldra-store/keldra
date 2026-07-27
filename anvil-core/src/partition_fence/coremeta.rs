@@ -170,6 +170,29 @@ pub(super) async fn read_ownership_fence_state(
     Ok(Some((bytes, record)))
 }
 
+pub(super) fn read_ownership_fence_state_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    resource: &OwnershipResource,
+    signing_key: &[u8],
+) -> Result<Option<(Vec<u8>, OwnershipFenceRecord)>> {
+    let row_key = ownership_fence_row_key(tenant_id, resource)?;
+    let key = crate::mvcc_product::coremeta_logical_key(
+        CF_LEASES_FENCES,
+        TABLE_OWNERSHIP_FENCE_ROW,
+        &row_key,
+    )?;
+    let Some(bytes) = mvcc.read_latest_value(&key)? else {
+        return Ok(None);
+    };
+    let record = decode_ownership_fence_record(&bytes)?;
+    record.verify(signing_key)?;
+    if record.owner.tenant_id != tenant_id || record.resource != *resource {
+        return Err(anyhow!("ownership fence row scope mismatch"));
+    }
+    Ok(Some((bytes, record)))
+}
+
 pub(super) async fn write_ownership_fence_state(
     storage: &Storage,
     record: &OwnershipFenceRecord,

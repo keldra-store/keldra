@@ -6,7 +6,7 @@ use crate::{
     formats::{Hash32, hash32, watch::WatchRecord},
     partition_fence::{
         OWNERSHIP_OWNER_MISMATCH, OwnershipPrincipal, OwnershipResource, OwnershipResourceKind,
-        ownership_fence_precondition,
+        ownership_fence_predicate_mvcc,
     },
     storage::Storage,
 };
@@ -80,6 +80,10 @@ pub(crate) struct PreparedIndexPartitionWatch {
     head_key: crate::mvcc_transaction::LogicalKey,
     head_payload: Option<Vec<u8>>,
     next_sequence: u64,
+    authority_predicate: (
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    ),
 }
 
 pub async fn append_index_partition_watch_record(
@@ -116,7 +120,7 @@ pub async fn append_index_partition_watch_record(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn prepare_index_partition_watch_record(
-    storage: &Storage,
+    _storage: &Storage,
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     bucket_id: i64,
@@ -128,16 +132,15 @@ pub(crate) async fn prepare_index_partition_watch_record(
     signing_key: &[u8],
 ) -> Result<PreparedIndexPartitionWatch> {
     validate_payload(partition_id, &payload)?;
-    validate_write_authority(
-        storage,
+    let authority_predicate = validate_write_authority(
+        mvcc,
         tenant_id,
         bucket_id,
         partition_id,
         &payload,
         &authority,
         signing_key,
-    )
-    .await?;
+    )?;
     let head_key = watch_head_key(tenant_id, bucket_id, &payload.index_id, partition_id)?;
     let head_payload = mvcc.read_latest_value(&head_key)?;
     let next_sequence = decode_watch_head(head_payload.as_deref())?
@@ -169,6 +172,7 @@ pub(crate) async fn prepare_index_partition_watch_record(
         head_key,
         head_payload,
         next_sequence,
+        authority_predicate,
     })
 }
 
@@ -188,6 +192,7 @@ pub(crate) async fn publish_prepared_index_partition_watch(
         prepared.next_sequence,
     )?;
     let mut predicates = additional_preconditions.to_vec();
+    predicates.push(prepared.authority_predicate);
     predicates.extend([
         (
             event_key.clone(),
@@ -338,15 +343,18 @@ pub async fn list_index_partition_watch_event_page(
     })
 }
 
-async fn validate_write_authority(
-    storage: &Storage,
+fn validate_write_authority(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     bucket_id: i64,
     partition_id: &str,
     payload: &IndexPartitionWatchPayload,
     authority: &IndexPartitionWatchWriteAuthority,
     signing_key: &[u8],
-) -> Result<()> {
+) -> Result<(
+    crate::mvcc_transaction::LogicalKey,
+    crate::mvcc_transaction::PredicateKind,
+)> {
     if authority.fence == 0 {
         return Err(anyhow!("index partition watch write fence must be nonzero"));
     }
@@ -364,8 +372,8 @@ async fn validate_write_authority(
     let now_nanos = chrono::Utc::now()
         .timestamp_nanos_opt()
         .ok_or_else(|| anyhow!("index partition watch timestamp overflow"))?;
-    let _ = ownership_fence_precondition(
-        storage,
+    ownership_fence_predicate_mvcc(
+        mvcc,
         0,
         &resource,
         &OwnershipPrincipal::node(authority.owner_node_id.clone()),
@@ -373,8 +381,6 @@ async fn validate_write_authority(
         now_nanos,
         signing_key,
     )
-    .await?;
-    Ok(())
 }
 
 pub async fn latest_index_partition_watch_cursor(

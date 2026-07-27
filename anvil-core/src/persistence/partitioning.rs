@@ -877,59 +877,89 @@ impl Persistence {
             .ok_or_else(|| anyhow!("ownership timestamp overflow"))?;
         let ttl_nanos = i64::try_from(MAX_OWNERSHIP_LEASE_MS)?.saturating_mul(1_000_000);
 
-        if let Some(record) = read_ownership_fence(
-            &self.storage,
+        let mvcc = self.mvcc()?;
+        let transaction_principal = format!("node:{}", self.owner_node_id);
+        if let Some(record) = read_ownership_fence_mvcc(
+            mvcc,
             owner.tenant_id,
             &resource,
             &self.partition_owner_signing_key,
-        )
-        .await?
-        {
+        )? {
             if record.owner == owner && record.is_active_unexpired(now_nanos) {
                 let remaining_nanos = record.lease_expires_at_nanos.saturating_sub(now_nanos);
                 if remaining_nanos > ttl_nanos / 3 {
                     return Ok(());
                 }
-                renew_ownership(
-                    &self.storage,
-                    RenewOwnership {
-                        request_id: format!(
-                            "owned-write-renew-{}-{}",
-                            resource.resource_kind.as_str(),
-                            resource.resource_id
-                        ),
-                        resource: resource.clone(),
-                        owner: owner.clone(),
-                        current_fence: record.fence,
-                        now_nanos,
-                        ttl_nanos,
-                    },
+                let request = RenewOwnership {
+                    request_id: format!(
+                        "owned-write-renew-{}-{}",
+                        resource.resource_kind.as_str(),
+                        resource.resource_id
+                    ),
+                    resource: resource.clone(),
+                    owner: owner.clone(),
+                    current_fence: record.fence,
+                    now_nanos,
+                    ttl_nanos,
+                };
+                let idempotency_key = request.request_id.clone();
+                commit_implicit_ownership_plan(
+                    mvcc,
+                    &transaction_principal,
+                    &idempotency_key,
+                    now_nanos,
+                    owner.tenant_id,
+                    &resource,
                     &self.partition_owner_signing_key,
+                    |transaction_id| {
+                        plan_renew_ownership_in_transaction(
+                            mvcc,
+                            transaction_id,
+                            &transaction_principal,
+                            request,
+                            &self.partition_owner_signing_key,
+                        )
+                    },
                 )
                 .await?;
                 return Ok(());
             }
         }
 
-        acquire_ownership(
-            &self.storage,
-            AcquireOwnership {
-                request_id: format!(
-                    "owned-write-acquire-{}-{}",
-                    resource.resource_kind.as_str(),
-                    resource.resource_id
-                ),
-                idempotency_key: format!(
-                    "owned-write-owner-{}-{}",
-                    resource.resource_kind.as_str(),
-                    resource.resource_id
-                ),
-                resource,
-                owner,
-                now_nanos,
-                ttl_nanos,
-            },
+        let request = AcquireOwnership {
+            request_id: format!(
+                "owned-write-acquire-{}-{}",
+                resource.resource_kind.as_str(),
+                resource.resource_id
+            ),
+            idempotency_key: format!(
+                "owned-write-owner-{}-{}",
+                resource.resource_kind.as_str(),
+                resource.resource_id
+            ),
+            resource: resource.clone(),
+            owner: owner.clone(),
+            now_nanos,
+            ttl_nanos,
+        };
+        let idempotency_key = request.idempotency_key.clone();
+        commit_implicit_ownership_plan(
+            mvcc,
+            &transaction_principal,
+            &idempotency_key,
+            now_nanos,
+            owner.tenant_id,
+            &resource,
             &self.partition_owner_signing_key,
+            |transaction_id| {
+                plan_acquire_ownership_in_transaction(
+                    mvcc,
+                    transaction_id,
+                    &transaction_principal,
+                    request,
+                    &self.partition_owner_signing_key,
+                )
+            },
         )
         .await?;
         Ok(())

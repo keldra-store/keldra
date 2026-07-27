@@ -467,7 +467,7 @@ async fn build_full_text_index_from_source(
     )
     .await?;
     let ownership = IndexBuildOwnership::acquire(
-        storage,
+        authority.mvcc()?,
         index.tenant_id,
         index.bucket_id,
         &index_storage_id,
@@ -744,7 +744,7 @@ async fn build_typed_json_index_from_source(
     )
     .await?;
     let ownership = IndexBuildOwnership::acquire(
-        storage,
+        authority.mvcc()?,
         index.tenant_id,
         index.bucket_id,
         &index_storage_id,
@@ -955,7 +955,7 @@ pub(crate) async fn build_metadata_backed_index(
     )
     .await?;
     let ownership = IndexBuildOwnership::acquire(
-        storage,
+        authority.mvcc()?,
         index.tenant_id,
         index.bucket_id,
         &index_storage_id,
@@ -1372,7 +1372,7 @@ async fn build_vector_index_with_policy(
     )
     .await?;
     let ownership = IndexBuildOwnership::acquire(
-        storage,
+        authority.mvcc()?,
         index.tenant_id,
         index.bucket_id,
         &index_storage_id,
