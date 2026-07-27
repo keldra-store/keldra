@@ -34,7 +34,6 @@ use crate::anvil_api::{
     bucket_service_server::BucketServiceServer,
     consensus_transport_server::ConsensusTransportServer,
     coordination_service_server::CoordinationServiceServer,
-    core_meta_replication_internal_server::CoreMetaReplicationInternalServer,
     cross_region_proxy_internal_server::CrossRegionProxyInternalServer,
     git_source_service_server::GitSourceServiceServer,
     hf_ingestion_service_server::HfIngestionServiceServer,
@@ -46,7 +45,6 @@ use crate::anvil_api::{
     personal_db_service_server::PersonalDbServiceServer,
     registry_service_server::RegistryServiceServer, repair_service_server::RepairServiceServer,
     replication_service_server::ReplicationServiceServer,
-    root_register_internal_server::RootRegisterInternalServer,
     stream_service_server::StreamServiceServer,
     transaction_service_server::TransactionServiceServer,
 };
@@ -133,14 +131,6 @@ pub fn create_grpc_router(state: AppState, auth_interceptor: AuthInterceptorFn) 
         auth_closure.clone(),
     ))
     .add_service(BlockStoreInternalServer::with_interceptor(
-        state.clone(),
-        auth_closure.clone(),
-    ))
-    .add_service(CoreMetaReplicationInternalServer::with_interceptor(
-        state.clone(),
-        auth_closure.clone(),
-    ))
-    .add_service(RootRegisterInternalServer::with_interceptor(
         state.clone(),
         auth_closure.clone(),
     ))
