@@ -942,53 +942,73 @@ async fn commit_task_lease_plan(
     plan: TaskLeaseWritePlan,
     now_unix_ms: u64,
 ) -> Result<()> {
-    let assignment = mvcc
-        .reconcile_work_assignment("task-lease", &plan.assignment_identity)
-        .await?
-        .ok_or_else(|| anyhow!("local node does not own the task lease assignment"))?;
-    let handle = mvcc
-        .open_transactions
-        .begin(
-            mvcc.runtime.as_ref(),
-            mvcc.cluster_id(),
-            principal,
-            idempotency_key,
-            std::time::Duration::from_secs(30),
-            crate::mvcc_transaction::DurabilityLevel::Quorum,
-            crate::mvcc_transaction::ReadConsistency::Linearized,
-            now_unix_ms,
-        )
-        .await?;
-    let status = mvcc
-        .open_transactions
-        .status(&handle.transaction_id, principal, now_unix_ms)?;
-    if status.state == "open" {
-        mvcc.stage_product_mutations(
-            &handle.transaction_id,
-            principal,
-            plan.mutations,
-            now_unix_ms,
-        )?;
-        for (key, kind) in plan.predicates {
-            mvcc.stage_predicate(&handle.transaction_id, principal, key, kind, now_unix_ms)?;
+    for attempt in 0..5u8 {
+        let assignment = mvcc
+            .reconcile_work_assignment("task-lease", &plan.assignment_identity)
+            .await?
+            .ok_or_else(|| anyhow!("local node does not own the task lease assignment"))?;
+        let attempt_key = format!("{idempotency_key}:{attempt}");
+        let handle = mvcc
+            .open_transactions
+            .begin(
+                mvcc.runtime.as_ref(),
+                mvcc.cluster_id(),
+                principal,
+                &attempt_key,
+                std::time::Duration::from_secs(30),
+                crate::mvcc_transaction::DurabilityLevel::Quorum,
+                crate::mvcc_transaction::ReadConsistency::Linearized,
+                now_unix_ms,
+            )
+            .await?;
+        let status =
+            mvcc.open_transactions
+                .status(&handle.transaction_id, principal, now_unix_ms)?;
+        if status.state == "open" {
+            mvcc.stage_product_mutations(
+                &handle.transaction_id,
+                principal,
+                plan.mutations.clone(),
+                now_unix_ms,
+            )?;
+            for (key, kind) in plan.predicates.clone() {
+                mvcc.stage_predicate(&handle.transaction_id, principal, key, kind, now_unix_ms)?;
+            }
+            mvcc.stage_assignment_guard(
+                &handle.transaction_id,
+                principal,
+                &assignment,
+                now_unix_ms,
+            )?;
         }
-        mvcc.stage_assignment_guard(&handle.transaction_id, principal, &assignment, now_unix_ms)?;
-    }
-    let outcome = mvcc
-        .open_transactions
-        .commit(
-            mvcc.runtime.as_ref(),
-            &handle.transaction_id,
-            principal,
-            now_unix_ms,
-        )
-        .await?;
-    match outcome.certification {
-        crate::mvcc_transaction::CertificationResult::Committed { .. } => Ok(()),
-        crate::mvcc_transaction::CertificationResult::Aborted { reason } => {
-            bail!("{LEASE_CAS_CONFLICT}: task lease MVCC transaction aborted: {reason:?}")
+        let outcome = mvcc
+            .open_transactions
+            .commit(
+                mvcc.runtime.as_ref(),
+                &handle.transaction_id,
+                principal,
+                now_unix_ms,
+            )
+            .await?;
+        match outcome.certification {
+            crate::mvcc_transaction::CertificationResult::Committed { .. } => return Ok(()),
+            crate::mvcc_transaction::CertificationResult::Aborted { reason }
+                if attempt < 4
+                    && reason
+                        .to_string()
+                        .contains("assignment predicate violates applied Raft control state") =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    25 * u64::from(attempt + 1),
+                ))
+                .await;
+            }
+            crate::mvcc_transaction::CertificationResult::Aborted { reason } => {
+                bail!("{LEASE_CAS_CONFLICT}: task lease MVCC transaction aborted: {reason:?}")
+            }
         }
     }
+    bail!("{LEASE_CAS_CONFLICT}: task lease assignment kept changing")
 }
 
 fn task_lease_owner_mvcc_key(lease: &TaskLease) -> Result<crate::mvcc_transaction::LogicalKey> {
