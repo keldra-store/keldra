@@ -34,7 +34,7 @@ pub(super) async fn create_append_stream_rpc(
         req.mutation_context.as_ref(),
     )
     .await?;
-    let transaction_id = native_transaction_id(req.mutation_context.as_ref())?;
+    let requested_transaction_id = native_transaction_id(req.mutation_context.as_ref())?;
     let target =
         NativeIdempotencyTarget::new("CreateAppendStream", &req.bucket_name, &req.stream_key);
     let (attempt, replay) = begin_native_mutation::<CreateAppendStreamResponse>(
@@ -48,6 +48,40 @@ pub(super) async fn create_append_stream_rpc(
     if let Some(response) = replay {
         return Ok(Response::new(response));
     }
+    let transaction_principal = object_manager::transaction_principal_from_claims(&claims);
+    let implicit_transaction = if requested_transaction_id.is_none() {
+        let context = req
+            .mutation_context
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("Missing native mutation context"))?;
+        Some(
+            state
+                .mvcc
+                .open_transactions
+                .begin(
+                    state.mvcc.runtime.as_ref(),
+                    state.mvcc.cluster_id().to_string(),
+                    transaction_principal.clone(),
+                    format!(
+                        "append-stream-create:{}:{}:{}",
+                        claims.tenant_id, claims.sub, context.idempotency_key
+                    ),
+                    std::time::Duration::from_secs(300),
+                    crate::mvcc_transaction::DurabilityLevel::Quorum,
+                    crate::mvcc_transaction::ReadConsistency::Linearized,
+                    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+                )
+                .await
+                .map_err(|error| Status::failed_precondition(error.to_string()))?,
+        )
+    } else {
+        None
+    };
+    let transaction_id = requested_transaction_id.or_else(|| {
+        implicit_transaction
+            .as_ref()
+            .map(|handle| handle.transaction_id.as_str())
+    });
     enforce_native_mutation_precondition(
         state,
         &claims,
@@ -57,8 +91,6 @@ pub(super) async fn create_append_stream_rpc(
         AnvilAction::StreamCreate,
     )
     .await?;
-    let transaction_principal =
-        transaction_id.map(|_| object_manager::transaction_principal_from_claims(&claims));
     let result = state
         .object_manager
         .create_append_stream(
@@ -66,7 +98,7 @@ pub(super) async fn create_append_stream_rpc(
             &req.bucket_name,
             &req.stream_key,
             transaction_id,
-            transaction_principal.as_deref(),
+            transaction_id.map(|_| transaction_principal.as_str()),
         )
         .await?;
     let authz_revision = latest_authz_revision(state, claims.tenant_id).await?;
@@ -78,14 +110,67 @@ pub(super) async fn create_append_stream_rpc(
         payload_hash: result.receipt.payload_hash,
         record_hash: result.receipt.record_hash,
         authz_revision,
-        watch_cursor: if transaction_id.is_some() {
+        watch_cursor: if requested_transaction_id.is_some() {
             0
         } else {
             result.receipt.watch_cursor
         },
-        write_state: write_state_for_transaction(transaction_id),
+        write_state: write_state_for_transaction(requested_transaction_id),
     };
-    complete_native_mutation(state, &attempt, &target, &response).await?;
+    if let Some(handle) = implicit_transaction.as_ref() {
+        let implicit_context = req
+            .mutation_context
+            .clone()
+            .ok_or_else(|| Status::invalid_argument("Missing native mutation context"))?;
+        let idempotency_plan = crate::native_idempotency::prepare_response_for_implicit_batch(
+            &state.mvcc,
+            &implicit_context,
+            &target,
+            &response,
+        )
+        .await?;
+        state
+            .mvcc
+            .stage_product_mutations(
+                &handle.transaction_id,
+                &transaction_principal,
+                idempotency_plan.mutations,
+                u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+            )
+            .map_err(|error| Status::internal(error.to_string()))?;
+        for (key, predicate) in idempotency_plan.predicates {
+            state
+                .mvcc
+                .stage_predicate(
+                    &handle.transaction_id,
+                    &transaction_principal,
+                    key,
+                    predicate,
+                    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+                )
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        }
+        let outcome = state
+            .mvcc
+            .open_transactions
+            .commit(
+                state.mvcc.runtime.as_ref(),
+                &handle.transaction_id,
+                &transaction_principal,
+                u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+            )
+            .await
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        if let crate::mvcc_transaction::CertificationResult::Aborted { reason } =
+            outcome.certification
+        {
+            return Err(Status::aborted(format!(
+                "append stream create transaction aborted: {reason:?}"
+            )));
+        }
+    } else {
+        complete_native_mutation(state, &attempt, &target, &response).await?;
+    }
     Ok(Response::new(response))
 }
 
