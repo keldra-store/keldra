@@ -244,6 +244,14 @@ pub async fn put_schema_revision(
         .committed_revision
         .checked_add(1)
         .ok_or_else(|| anyhow!("authorization revision overflow"))?;
+    let created_at = chrono::Utc::now().to_rfc3339();
+    for namespace in &mut namespaces {
+        let schema_hash = schema_digest(&[namespace.clone()])?;
+        namespace.schema_hash = schema_hash;
+        namespace.schema_version = next_revision;
+        namespace.authz_revision = authz_revision;
+        namespace.applied_at = created_at.clone();
+    }
     let record = StoredAuthzSchemaRevision {
         schema_ref: StoredSchemaRef {
             schema_id: schema_id.to_string(),
@@ -254,7 +262,7 @@ pub async fn put_schema_revision(
         authz_revision,
         written_by: written_by.to_string(),
         reason: reason.to_string(),
-        created_at: chrono::Utc::now().to_rfc3339(),
+        created_at,
     };
     let revision_key = schema_revision_tuple_key(tenant_id, schema_id, next_revision)?;
     let head = authz_head::advance_mvcc(
@@ -1043,6 +1051,15 @@ fn rule_from_proto(proto: AuthzRelationRuleProto) -> crate::anvil_api::AuthzRela
 fn schema_digest(namespaces: &[AuthzNamespaceSchema]) -> Result<String> {
     let mut namespaces = namespaces.to_vec();
     crate::authz_schema_contract::canonicalize_schema_set(&mut namespaces);
+    for namespace in &mut namespaces {
+        // Publication metadata is assigned by the authoritative MVCC schema
+        // revision. It must not change the identity of otherwise identical
+        // schema input or retries would allocate a fresh revision.
+        namespace.schema_hash.clear();
+        namespace.schema_version = 0;
+        namespace.authz_revision = 0;
+        namespace.applied_at.clear();
+    }
     let bytes = encode_deterministic_proto(&AuthzNamespaceSetProto {
         namespaces: namespaces.iter().map(namespace_to_proto).collect(),
     });
@@ -1143,5 +1160,32 @@ fn validate_storage_tenant(tenant_id: i64) -> Result<()> {
         ))
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_identity_excludes_mvcc_publication_metadata() {
+        let input = AuthzNamespaceSchema {
+            namespace: "document".to_string(),
+            relations: Vec::new(),
+            schema_json: "{}".to_string(),
+            schema_hash: String::new(),
+            schema_version: 0,
+            authz_revision: 0,
+            applied_at: String::new(),
+        };
+        let mut published = input.clone();
+        published.schema_hash = "derived-hash".to_string();
+        published.schema_version = 9;
+        published.authz_revision = 14;
+        published.applied_at = "2026-07-27T00:00:00Z".to_string();
+        assert_eq!(
+            schema_digest(&[input]).unwrap(),
+            schema_digest(&[published]).unwrap()
+        );
     }
 }

@@ -2,7 +2,7 @@ use crate::anvil_api::auth_service_server::AuthService;
 use crate::anvil_api::*;
 use crate::{
     AppState, access_control, auth, authz_derived_lag_watch, authz_journal, authz_namespace_watch,
-    authz_realm_schema, authz_schema,
+    authz_realm_schema,
     authz_scope::{
         DEFAULT_AUTHZ_REALM_ID, decode_realm_namespace, decode_userset_subject_realm,
         encode_optional_realm_namespace, encode_realm_namespace, encode_userset_subject_realm,
@@ -2559,37 +2559,43 @@ impl AuthService for AppState {
             DEFAULT_AUTHZ_REALM_ID,
         )
         .await?;
-        let records = if req.namespace.is_empty() {
-            let page = authz_schema::page_authz_namespace_schemas(
-                &self.mvcc,
-                claims.tenant_id,
-                None,
-                authz_schema::AUTHZ_NAMESPACE_SCHEMA_PAGE_MAX,
-            )
-            .await
-            .map_err(|error| Status::internal(error.to_string()))?;
-            if page.next_tuple_key.is_some() {
-                return Err(Status::resource_exhausted(format!(
-                    "authorization schema contains more than {} namespaces; request one namespace",
-                    authz_schema::AUTHZ_NAMESPACE_SCHEMA_PAGE_MAX
-                )));
-            }
-            page.records
+        let binding = authz_realm_schema::read_schema_binding(
+            &self.storage,
+            &self.mvcc,
+            claims.tenant_id,
+            DEFAULT_AUTHZ_REALM_ID,
+        )
+        .await
+        .map_err(|error| Status::internal(error.to_string()))?
+        .ok_or_else(|| Status::not_found("default authorization schema is not bound"))?;
+        let schema = authz_realm_schema::read_schema_revision(
+            &self.storage,
+            &self.mvcc,
+            claims.tenant_id,
+            &binding.schema_ref.schema_id,
+            Some(binding.schema_ref.schema_revision),
+        )
+        .await
+        .map_err(|error| Status::internal(error.to_string()))?
+        .ok_or_else(|| Status::not_found("bound authorization schema revision not found"))?;
+        if schema.schema_ref != binding.schema_ref {
+            return Err(Status::data_loss(
+                "bound authorization schema reference does not match its revision",
+            ));
+        }
+        let namespaces = if req.namespace.is_empty() {
+            schema.namespaces
         } else {
-            authz_schema::read_authz_namespace_schema(&self.mvcc, claims.tenant_id, &req.namespace)
-                .await
-                .map(|record| record.into_iter().collect())
-                .map_err(|error| Status::internal(error.to_string()))?
+            schema
+                .namespaces
+                .into_iter()
+                .filter(|record| record.namespace == req.namespace)
+                .collect()
         };
-        let schema_version = records
-            .iter()
-            .map(|record| record.schema_version)
-            .max()
-            .unwrap_or(0);
         Ok(Response::new(GetAuthzSchemaResponse {
-            namespaces: records.iter().map(authz_schema::schema_response).collect(),
-            schema_version,
-            schema_ref: None,
+            namespaces,
+            schema_version: binding.schema_ref.schema_revision,
+            schema_ref: Some(schema_ref_response(&binding.schema_ref)),
         }))
     }
 

@@ -377,6 +377,11 @@ async fn test_apply_authz_schema_persists_and_emits_namespace_watch() {
         fetched.namespaces[0].schema_hash,
         applied.namespaces[0].schema_hash
     );
+    let fetched_ref = fetched
+        .schema_ref
+        .expect("default schema reads return the authoritative MVCC binding");
+    assert_eq!(fetched_ref.schema_revision, applied.schema_version);
+    assert!(!fetched_ref.schema_digest.is_empty());
 
     let mut watch_req = Request::new(WatchAuthzNamespaceRequest {
         namespace: "document".to_string(),
