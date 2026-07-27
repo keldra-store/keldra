@@ -636,11 +636,11 @@ async fn public_object_batch_recovers_after_leader_crashes_before_local_batch_wr
         cluster.public_endpoint(leader),
         transaction.transaction_id.clone(),
     );
-    let (commit_result, crash_result) = tokio::join!(
-        tokio::time::timeout(Duration::from_secs(10), commit),
-        cluster.wait_for_hard_crash(leader, Duration::from_secs(10)),
-    );
-    crash_result.unwrap();
+    let commit_result = tokio::time::timeout(Duration::from_secs(10), commit).await;
+    cluster
+        .wait_for_hard_crash(leader, Duration::from_secs(10))
+        .await
+        .unwrap();
     assert!(
         !matches!(commit_result, Ok(Ok(_))),
         "a process abort before its local RocksDB batch must not return success"
@@ -741,11 +741,11 @@ async fn public_object_batch_retries_after_crash_before_prepared_bundle_sync() {
         cluster.public_endpoint(coordinator),
         transaction.transaction_id.clone(),
     );
-    let (commit_result, crash_result) = tokio::join!(
-        tokio::time::timeout(Duration::from_secs(10), commit),
-        cluster.wait_for_hard_crash(coordinator, Duration::from_secs(10)),
-    );
-    crash_result.unwrap();
+    let commit_result = tokio::time::timeout(Duration::from_secs(10), commit).await;
+    cluster
+        .wait_for_hard_crash(coordinator, Duration::from_secs(10))
+        .await
+        .unwrap();
     assert!(
         !matches!(commit_result, Ok(Ok(_))),
         "crashing before prepared-bundle sync must not return durability or commit success"
@@ -826,11 +826,11 @@ async fn public_object_batch_retries_after_crash_before_raft_wal_append() {
         cluster.public_endpoint(coordinator),
         transaction.transaction_id.clone(),
     );
-    let (commit_result, crash_result) = tokio::join!(
-        tokio::time::timeout(Duration::from_secs(10), commit),
-        cluster.wait_for_hard_crash(coordinator, Duration::from_secs(10)),
-    );
-    crash_result.unwrap();
+    let commit_result = tokio::time::timeout(Duration::from_secs(10), commit).await;
+    cluster
+        .wait_for_hard_crash(coordinator, Duration::from_secs(10))
+        .await
+        .unwrap();
     assert!(
         !matches!(commit_result, Ok(Ok(_))),
         "crashing before the local Raft WAL append must not return commit success"
@@ -906,18 +906,19 @@ async fn public_erasure_object_retries_after_remote_shard_crash_before_sync() {
     let payload = vec![0x73_u8; 384 * 1024];
 
     cluster.arm_hard_crash(shard_target, "ShardWrite").unwrap();
+    let staged_objects = [(object_key, payload.as_slice())];
     let stage = cluster.stage_object_puts(
         coordinator,
         &bucket_name,
         bucket_id,
         &transaction.transaction_id,
-        &[(object_key, payload.as_slice())],
+        &staged_objects,
     );
-    let (stage_result, crash_result) = tokio::join!(
-        tokio::time::timeout(Duration::from_secs(10), stage),
-        cluster.wait_for_hard_crash(shard_target, Duration::from_secs(10)),
-    );
-    crash_result.unwrap();
+    let stage_result = tokio::time::timeout(Duration::from_secs(10), stage).await;
+    cluster
+        .wait_for_hard_crash(shard_target, Duration::from_secs(10))
+        .await
+        .unwrap();
     assert!(
         !matches!(stage_result, Ok(Ok(_))),
         "a shard target abort before sync must not produce a durable staging ACK"
