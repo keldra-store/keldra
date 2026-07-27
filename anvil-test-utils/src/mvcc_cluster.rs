@@ -140,6 +140,33 @@ impl RealMvccCluster {
         &self.endpoints[node]
     }
 
+    pub fn node_index(&self, node_id: &str) -> Option<usize> {
+        self.configs
+            .iter()
+            .position(|config| config.node_id == node_id)
+    }
+
+    pub fn replication_transfer_path(
+        &self,
+        node: usize,
+        transfer_id: uuid::Uuid,
+    ) -> std::path::PathBuf {
+        std::path::Path::new(&self.configs[node].storage_path)
+            .join("mvcc")
+            .join(&self.configs[node].mvcc_cluster_id)
+            .join("replication-inbox")
+            .join(format!("{transfer_id}.complete"))
+    }
+
+    pub fn remove_replication_transfer(
+        &self,
+        node: usize,
+        transfer_id: uuid::Uuid,
+    ) -> anyhow::Result<()> {
+        std::fs::remove_file(self.replication_transfer_path(node, transfer_id))?;
+        Ok(())
+    }
+
     /// Simulates a bidirectional network partition for this node.
     pub fn partition(&mut self, node: usize) {
         if let Some(transport) = self.transports[node].take() {
