@@ -1357,6 +1357,7 @@ impl ObjectManager {
                 object_key,
                 transaction_id,
                 &principal,
+                None,
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;

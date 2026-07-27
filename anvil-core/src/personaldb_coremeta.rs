@@ -237,6 +237,10 @@ impl PersonalDbWritePlan {
             bail!("PersonalDB write plan principal does not own caller transaction");
         }
         mvcc.open_transactions.binding(transaction_id, principal)?;
+        let snapshot_version = mvcc
+            .open_transactions
+            .handle(transaction_id)?
+            .snapshot_version;
         let logical_identity = format!("tenant/{}/personaldb/{}", self.tenant_id, self.group_id);
         let assignment = match self.assignment {
             Some(assignment) => {
@@ -260,7 +264,7 @@ impl PersonalDbWritePlan {
                 Some(predicate) => predicate,
                 None => mvcc
                     .runtime
-                    .read_at(&key, handle.snapshot_version)?
+                    .read_at(&key, snapshot_version)?
                     .map(|current| {
                         crate::mvcc_transaction::PredicateKind::ValueHash(
                             *blake3::hash(&current.value).as_bytes(),
