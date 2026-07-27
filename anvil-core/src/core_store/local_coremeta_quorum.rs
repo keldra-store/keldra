@@ -311,10 +311,12 @@ impl CoreStore {
                 publication: Some(prepared_publication),
             });
         }
-        if let Some((root_key_hash, _)) = publications_by_hash.pop_first() {
-            bail!(
-                "CoreMeta logical mutation {transaction_id} declares unused publication root {root_key_hash}"
-            );
+        while let Some((root_key_hash, publication)) = publications_by_hash.pop_first() {
+            if !publication.transaction_coordinator {
+                bail!(
+                    "CoreMeta logical mutation {transaction_id} declares unused publication root {root_key_hash}"
+                );
+            }
         }
         self.commit_coremeta_encoded_rows_for_roots(inputs, local_rows)
             .await
