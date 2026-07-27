@@ -13,12 +13,395 @@ use anvil::{
 use anvil_test_utils::mvcc_cluster::RealMvccCluster;
 use tonic::Request;
 
+async fn bootstrap_actor_on_every_node(
+    cluster: &RealMvccCluster,
+    bucket_name: &str,
+) -> anvil_test_utils::mvcc_cluster::PublicActor {
+    let actor = cluster
+        .bootstrap_public_actor(0, bucket_name)
+        .await
+        .unwrap();
+    for node in 1..3 {
+        let state = cluster.state(node);
+        state
+            .persistence
+            .create_region("e2e-region")
+            .await
+            .unwrap();
+        let tenant = state
+            .persistence
+            .create_tenant("e2e-tenant", "e2e-tenant-key")
+            .await
+            .unwrap();
+        let bucket = state
+            .persistence
+            .create_bucket(tenant.id, bucket_name, "e2e-region")
+            .await
+            .unwrap();
+        assert_eq!(tenant.id, actor.tenant_id);
+        assert_eq!(bucket.id, actor.bucket_id);
+    }
+    actor
+}
+
+async fn public_object_transaction(
+    cluster: &RealMvccCluster,
+    node: usize,
+    actor: &anvil_test_utils::mvcc_cluster::PublicActor,
+    id: &str,
+    object_key: &str,
+    payload: &[u8],
+    durability: anvil::anvil_api::MvccDurability,
+) -> anvil::anvil_api::WriteResponse {
+    let endpoint = cluster.public_endpoint(node).to_string();
+    let cluster_id = cluster.state(node).mvcc.cluster_id().to_string();
+    let mut transactions =
+        anvil::anvil_api::transaction_service_client::TransactionServiceClient::connect(
+            endpoint.clone(),
+        )
+        .await
+        .unwrap();
+    let transaction = transactions
+        .begin_transaction(authorized(
+            anvil::anvil_api::BeginTransactionRequest {
+                idempotency_key: format!("{id}-begin"),
+                ttl_ms: 30_000,
+                read_consistency: anvil::anvil_api::MvccReadConsistency::Linearized as i32,
+                cluster_id: cluster_id.clone(),
+                durability: durability as i32,
+            },
+            &actor.token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(transaction.durability, durability as i32);
+    let mut objects =
+        anvil::anvil_api::object_service_client::ObjectServiceClient::connect(endpoint)
+            .await
+            .unwrap();
+    let staged = objects
+        .mutation_batch(authorized(
+            anvil::anvil_api::MutationBatchRequest {
+                bucket_name: actor.bucket_name.clone(),
+                mutation_context: Some(anvil::anvil_api::NativeMutationContext {
+                    tenant_id: actor.tenant_id,
+                    bucket_id: actor.bucket_id,
+                    principal: actor.principal.clone(),
+                    request_id: format!("{id}-write"),
+                    precondition: String::new(),
+                    authz_zookie_optional: String::new(),
+                    idempotency_key: format!("{id}-write"),
+                    transaction_id: Some(transaction.transaction_id.clone()),
+                    write_visibility: None,
+                }),
+                precondition: None,
+                operations: vec![anvil::anvil_api::MutationBatchOperation {
+                    op: Some(anvil::anvil_api::mutation_batch_operation::Op::PutObject(
+                        anvil::anvil_api::MutationBatchPutObject {
+                            object_key: object_key.to_string(),
+                            payload: payload.to_vec(),
+                            content_type: Some("application/octet-stream".into()),
+                            user_metadata_json: "{}".into(),
+                            storage_class: None,
+                        },
+                    )),
+                }],
+            },
+            &actor.token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(staged.write_state, anvil::anvil_api::WriteState::Staged as i32);
+    transactions
+        .commit_transaction(authorized(
+            anvil::anvil_api::CommitTransactionRequest {
+                transaction_id: transaction.transaction_id,
+                cluster_id,
+            },
+            &actor.token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+}
+
+async fn read_public_object(
+    cluster: &RealMvccCluster,
+    node: usize,
+    actor: &anvil_test_utils::mvcc_cluster::PublicActor,
+    object_key: &str,
+) -> Result<Vec<u8>, tonic::Status> {
+    let mut objects =
+        anvil::anvil_api::object_service_client::ObjectServiceClient::connect(
+            cluster.public_endpoint(node).to_string(),
+        )
+        .await
+        .unwrap();
+    let mut response = objects
+        .get_object(authorized(
+            anvil::anvil_api::GetObjectRequest {
+                bucket_name: actor.bucket_name.clone(),
+                object_key: object_key.to_string(),
+                version_id: None,
+                range: None,
+                consistency: Some(anvil::anvil_api::ReadConsistency {
+                    mode: Some(anvil::anvil_api::read_consistency::Mode::Latest(true)),
+                }),
+            },
+            &actor.token,
+        ))
+        .await?
+        .into_inner();
+    let mut bytes = Vec::new();
+    while let Some(frame) = response.message().await? {
+        if let Some(anvil::anvil_api::get_object_response::Data::Chunk(chunk)) = frame.data {
+            bytes.extend(chunk);
+        }
+    }
+    Ok(bytes)
+}
+
+async fn wait_for_public_object(
+    cluster: &RealMvccCluster,
+    node: usize,
+    actor: &anvil_test_utils::mvcc_cluster::PublicActor,
+    object_key: &str,
+    expected: &[u8],
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            if read_public_object(cluster, node, actor, object_key)
+                .await
+                .is_ok_and(|bytes| bytes == expected)
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("object becomes readable from surviving node");
+}
+
 fn authorized<T>(message: T, token: &str) -> Request<T> {
     let mut request = Request::new(message);
     request
         .metadata_mut()
         .insert("authorization", format!("Bearer {token}").parse().unwrap());
     request
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn public_local_object_returns_locally_then_promotes_and_survives_holder_loss() {
+    let mut cluster = RealMvccCluster::start().await.unwrap();
+    let coordinator = cluster.wait_for_any_leader(&[0, 1, 2]).await.unwrap();
+    let actor = bootstrap_actor_on_every_node(&cluster, "local-durability-e2e").await;
+    let payload = vec![0x51_u8; 384 * 1024];
+
+    // Upgrade work must execute where the local representation exists. Select
+    // a real committed transaction whose compact-Raft assignment names the
+    // coordinator; non-selected attempts remain valid independent local
+    // objects and exercise the same admission path.
+    let mut selected = None;
+    for attempt in 0..24 {
+        let key = format!("durability/local-{attempt}");
+        let response = public_object_transaction(
+            &cluster,
+            coordinator,
+            &actor,
+            &format!("local-durability-{attempt}"),
+            &key,
+            &payload,
+            anvil::anvil_api::MvccDurability::Local,
+        )
+        .await;
+        assert_eq!(response.state, anvil::anvil_api::WriteState::Committed as i32);
+        assert_eq!(
+            read_public_object(&cluster, coordinator, &actor, &key)
+                .await
+                .unwrap(),
+            payload,
+            "local durability returns with a readable local representation"
+        );
+        let logical_identity = format!("transaction/{}", response.mutation_id);
+        if cluster
+            .state(coordinator)
+            .mvcc
+            .reconcile_work_assignment("local-durability-upgrade", &logical_identity)
+            .await
+            .unwrap()
+            .is_some()
+        {
+            selected = Some((key, response.mutation_id));
+            break;
+        }
+    }
+    let (object_key, _transaction_id) =
+        selected.expect("find a local upgrade assigned to its representation holder");
+    let endpoint = cluster.public_endpoint(coordinator).to_string();
+    let mut objects =
+        anvil::anvil_api::object_service_client::ObjectServiceClient::connect(endpoint)
+            .await
+            .unwrap();
+    let automatic = objects
+        .get_object_durability_promotion(authorized(
+            anvil::anvil_api::GetObjectDurabilityPromotionRequest {
+                bucket_name: actor.bucket_name.clone(),
+                object_key: object_key.clone(),
+                version_id: None,
+            },
+            &actor.token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!automatic.promotion_id.is_empty());
+    assert_eq!(
+        automatic.target_durability,
+        anvil::anvil_api::MvccDurability::Erasure as i32
+    );
+    assert!(matches!(
+        automatic.state.as_str(),
+        "pending" | "running" | "complete"
+    ));
+
+    let explicit = objects
+        .promote_object_durability(authorized(
+            anvil::anvil_api::PromoteObjectDurabilityRequest {
+                bucket_name: actor.bucket_name.clone(),
+                object_key: object_key.clone(),
+                version_id: None,
+                target_durability: anvil::anvil_api::MvccDurability::Erasure as i32,
+                idempotency_key: "explicit-local-promotion".into(),
+            },
+            &actor.token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(explicit.promotion_id, automatic.promotion_id);
+
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let status = objects
+                .get_object_durability_promotion(authorized(
+                    anvil::anvil_api::GetObjectDurabilityPromotionRequest {
+                        bucket_name: actor.bucket_name.clone(),
+                        object_key: object_key.clone(),
+                        version_id: None,
+                    },
+                    &actor.token,
+                ))
+                .await
+                .unwrap()
+                .into_inner();
+            if status.state == "complete" {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("automatic/explicit local durability promotion completes");
+
+    cluster.partition(coordinator);
+    cluster
+        .state(coordinator)
+        .mvcc
+        .consensus
+        .shutdown()
+        .await
+        .unwrap();
+    let survivors = [0, 1, 2]
+        .into_iter()
+        .filter(|node| *node != coordinator)
+        .collect::<Vec<_>>();
+    let survivor = cluster.wait_for_any_leader(&survivors).await.unwrap();
+    wait_for_public_object(&cluster, survivor, &actor, &object_key, &payload).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn public_quorum_object_is_readable_after_one_node_loss() {
+    let mut cluster = RealMvccCluster::start().await.unwrap();
+    let coordinator = cluster.wait_for_any_leader(&[0, 1, 2]).await.unwrap();
+    let actor = bootstrap_actor_on_every_node(&cluster, "quorum-durability-e2e").await;
+    let payload = vec![0x62_u8; 384 * 1024];
+    let response = public_object_transaction(
+        &cluster,
+        coordinator,
+        &actor,
+        "quorum-durability",
+        "durability/quorum",
+        &payload,
+        anvil::anvil_api::MvccDurability::Quorum,
+    )
+    .await;
+    assert_eq!(response.state, anvil::anvil_api::WriteState::Committed as i32);
+
+    cluster.partition(coordinator);
+    cluster
+        .state(coordinator)
+        .mvcc
+        .consensus
+        .shutdown()
+        .await
+        .unwrap();
+    let survivors = [0, 1, 2]
+        .into_iter()
+        .filter(|node| *node != coordinator)
+        .collect::<Vec<_>>();
+    let survivor = cluster.wait_for_any_leader(&survivors).await.unwrap();
+    wait_for_public_object(
+        &cluster,
+        survivor,
+        &actor,
+        "durability/quorum",
+        &payload,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn public_erasure_object_is_readable_after_one_node_loss() {
+    let mut cluster = RealMvccCluster::start().await.unwrap();
+    let coordinator = cluster.wait_for_any_leader(&[0, 1, 2]).await.unwrap();
+    let actor = bootstrap_actor_on_every_node(&cluster, "erasure-durability-e2e").await;
+    let payload = vec![0x73_u8; 384 * 1024];
+    let response = public_object_transaction(
+        &cluster,
+        coordinator,
+        &actor,
+        "erasure-durability",
+        "durability/erasure",
+        &payload,
+        anvil::anvil_api::MvccDurability::Erasure,
+    )
+    .await;
+    assert_eq!(response.state, anvil::anvil_api::WriteState::Committed as i32);
+
+    cluster.partition(coordinator);
+    cluster
+        .state(coordinator)
+        .mvcc
+        .consensus
+        .shutdown()
+        .await
+        .unwrap();
+    let survivors = [0, 1, 2]
+        .into_iter()
+        .filter(|node| *node != coordinator)
+        .collect::<Vec<_>>();
+    let survivor = cluster.wait_for_any_leader(&survivors).await.unwrap();
+    wait_for_public_object(
+        &cluster,
+        survivor,
+        &actor,
+        "durability/erasure",
+        &payload,
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
