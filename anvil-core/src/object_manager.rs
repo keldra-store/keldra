@@ -1832,7 +1832,7 @@ impl ObjectManager {
 
         let prepared = self
             .prepare_mvcc_object_ingest(
-                futures_util::stream::once(async move { Ok(payload) }),
+                futures_util::stream::iter(std::iter::once(Ok(payload))),
                 transaction_id,
                 &authenticated_principal,
                 &bucket.name,

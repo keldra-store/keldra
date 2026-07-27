@@ -885,7 +885,7 @@ impl ObjectService for AppState {
         let object = self
             .object_manager
             .copy_object(
-                claims,
+                claims.clone(),
                 &req.source_bucket_name,
                 &req.source_object_key,
                 parse_optional_version_id(req.source_version_id.as_deref())?,
@@ -1007,7 +1007,7 @@ impl ObjectService for AppState {
         let object = self
             .object_manager
             .compose_object(
-                claims,
+                claims.clone(),
                 sources,
                 &req.destination_bucket_name,
                 &req.destination_object_key,
@@ -1111,7 +1111,7 @@ impl ObjectService for AppState {
         let object = self
             .object_manager
             .patch_json_object(
-                claims,
+                claims.clone(),
                 &req.bucket_name,
                 &req.object_key,
                 parse_optional_version_id(req.base_version_id.as_deref())?,

@@ -321,6 +321,7 @@ impl TonicReplicationStreamManager {
                     transfer_id,
                     bytes,
                     final_hash,
+                    provisional,
                 )
                 .await;
             match result {
@@ -579,6 +580,7 @@ impl TonicReplicationStreamManager {
         transfer_id: Uuid,
         bytes: &[u8],
         final_hash: [u8; 32],
+        provisional: Option<(&str, u64, u64)>,
     ) -> Result<ReplicationAck> {
         send_timeout(
             self.options.operation_timeout,
