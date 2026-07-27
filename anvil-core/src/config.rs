@@ -237,7 +237,10 @@ impl Default for Config {
             mvcc_tolerated_failure_domains: 0,
             mvcc_rpc_timeout_ms: 10_000,
             mvcc_node_connection_token: String::new(),
-            allow_test_only_insecure_mvcc_transport: false,
+            // Unit tests use ephemeral loopback HTTP peers.  Keep the
+            // production default strict while allowing those in-process
+            // fixtures to exercise MVCC without manufacturing certificates.
+            allow_test_only_insecure_mvcc_transport: cfg!(test),
             storage_path: "anvil-data".to_string(),
             personaldb_snapshot_entry_threshold: 1024,
             personaldb_snapshot_payload_bytes_threshold: 64 * 1024 * 1024,
