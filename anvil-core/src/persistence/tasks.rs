@@ -858,6 +858,34 @@ impl Persistence {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn hf_stage_create_key(
+        &self,
+        tenant_id: i64,
+        name: &str,
+        token_encrypted: &[u8],
+        note: Option<&str>,
+        transaction_id: &str,
+        principal: &str,
+        now_unix_ms: u64,
+    ) -> Result<()> {
+        let permit = self.hf_write_permit().await?;
+        hf_journal::stage_create_key_with_permit(
+            &self.storage,
+            self.mvcc()?,
+            tenant_id,
+            name,
+            token_encrypted,
+            note,
+            transaction_id,
+            principal,
+            now_unix_ms,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
+    }
+
     pub async fn hf_delete_key(&self, tenant_id: i64, name: &str) -> Result<u64> {
         let permit = self.hf_write_permit().await?;
         hf_journal::delete_key_with_permit(
@@ -865,6 +893,29 @@ impl Persistence {
             self.mvcc()?,
             tenant_id,
             name,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
+    }
+
+    pub async fn hf_stage_delete_key(
+        &self,
+        tenant_id: i64,
+        name: &str,
+        transaction_id: &str,
+        principal: &str,
+        now_unix_ms: u64,
+    ) -> Result<u64> {
+        let permit = self.hf_write_permit().await?;
+        hf_journal::stage_delete_key_with_permit(
+            &self.storage,
+            self.mvcc()?,
+            tenant_id,
+            name,
+            transaction_id,
+            principal,
+            now_unix_ms,
             &permit,
             &self.partition_owner_signing_key,
         )
@@ -951,6 +1002,46 @@ impl Persistence {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn hf_stage_create_ingestion(
+        &self,
+        key_id: i64,
+        tenant_id: i64,
+        requester_app_id: i64,
+        repo: &str,
+        revision: Option<&str>,
+        target_bucket: &str,
+        target_region: &str,
+        target_prefix: Option<&str>,
+        include_globs: &[String],
+        exclude_globs: &[String],
+        transaction_id: &str,
+        principal: &str,
+        now_unix_ms: u64,
+    ) -> Result<i64> {
+        let permit = self.hf_write_permit().await?;
+        hf_journal::stage_create_ingestion_with_permit(
+            &self.storage,
+            self.mvcc()?,
+            key_id,
+            tenant_id,
+            requester_app_id,
+            repo,
+            revision,
+            target_bucket,
+            target_region,
+            target_prefix,
+            include_globs,
+            exclude_globs,
+            transaction_id,
+            principal,
+            now_unix_ms,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
+    }
+
     pub async fn hf_get_ingestion_job(&self, id: i64) -> Result<Option<HfIngestionJob>> {
         hf_journal::get_ingestion_job(self.mvcc()?, id).await
     }
@@ -980,6 +1071,27 @@ impl Persistence {
             &self.storage,
             self.mvcc()?,
             id,
+            &permit,
+            &self.partition_owner_signing_key,
+        )
+        .await
+    }
+
+    pub async fn hf_stage_cancel_ingestion(
+        &self,
+        id: i64,
+        transaction_id: &str,
+        principal: &str,
+        now_unix_ms: u64,
+    ) -> Result<u64> {
+        let permit = self.hf_write_permit().await?;
+        hf_journal::stage_cancel_ingestion_with_permit(
+            &self.storage,
+            self.mvcc()?,
+            id,
+            transaction_id,
+            principal,
+            now_unix_ms,
             &permit,
             &self.partition_owner_signing_key,
         )

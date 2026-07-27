@@ -247,6 +247,47 @@ pub(crate) async fn create_key_with_permit(
     create_key_inner(storage, mvcc, tenant_id, name, token_encrypted, note, guard).await
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn stage_create_key_with_permit(
+    storage: &Storage,
+    mvcc: &MvccSubsystem,
+    tenant_id: i64,
+    name: &str,
+    token_encrypted: &[u8],
+    note: Option<&str>,
+    transaction_id: &str,
+    principal: &str,
+    now_unix_ms: u64,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<()> {
+    let guard = hf_write_guard(storage, permit, partition_owner_signing_key).await?;
+    let now = Utc::now();
+    stage_body(
+        mvcc,
+        transaction_id,
+        principal,
+        HfMutationKind::KeyUpsert,
+        Some(HfKey {
+            id: 0,
+            tenant_id,
+            name: name.to_string(),
+            token_encrypted: token_encrypted.to_vec(),
+            note: note.map(ToOwned::to_owned),
+            created_at: now,
+            updated_at: now,
+        }),
+        None,
+        None,
+        None,
+        guard,
+        uuid::Uuid::new_v4(),
+        now_unix_ms,
+    )
+    .await
+    .map(|_| ())
+}
+
 async fn create_key_inner(
     _storage: &Storage,
     mvcc: &MvccSubsystem,
@@ -293,6 +334,41 @@ pub(crate) async fn delete_key_with_permit(
 ) -> Result<u64> {
     let guard = hf_write_guard(storage, permit, partition_owner_signing_key).await?;
     delete_key_inner(storage, mvcc, tenant_id, name, guard).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn stage_delete_key_with_permit(
+    storage: &Storage,
+    mvcc: &MvccSubsystem,
+    tenant_id: i64,
+    name: &str,
+    transaction_id: &str,
+    principal: &str,
+    now_unix_ms: u64,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<u64> {
+    let guard = hf_write_guard(storage, permit, partition_owner_signing_key).await?;
+    let Some(key) =
+        projection::get_key_by_name(mvcc, mvcc.runtime.applied_version()?, tenant_id, name)?
+    else {
+        return Ok(0);
+    };
+    stage_body(
+        mvcc,
+        transaction_id,
+        principal,
+        HfMutationKind::KeyDelete,
+        None,
+        Some((tenant_id, key.id, name.to_string())),
+        None,
+        None,
+        guard,
+        uuid::Uuid::new_v4(),
+        now_unix_ms,
+    )
+    .await?;
+    Ok(1)
 }
 
 async fn delete_key_inner(
@@ -441,6 +517,61 @@ pub(crate) async fn create_ingestion_with_permit(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) async fn stage_create_ingestion_with_permit(
+    storage: &Storage,
+    mvcc: &MvccSubsystem,
+    key_id: i64,
+    tenant_id: i64,
+    requester_app_id: i64,
+    repo: &str,
+    revision: Option<&str>,
+    target_bucket: &str,
+    target_region: &str,
+    target_prefix: Option<&str>,
+    include_globs: &[String],
+    exclude_globs: &[String],
+    transaction_id: &str,
+    principal: &str,
+    now_unix_ms: u64,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<i64> {
+    let guard = hf_write_guard(storage, permit, partition_owner_signing_key).await?;
+    stage_body(
+        mvcc,
+        transaction_id,
+        principal,
+        HfMutationKind::IngestionUpsert,
+        None,
+        None,
+        Some(HfIngestion {
+            id: 0,
+            key_id,
+            tenant_id,
+            requester_app_id,
+            repo: repo.to_string(),
+            revision: revision.unwrap_or("main").to_string(),
+            target_bucket: target_bucket.to_string(),
+            target_region: target_region.to_string(),
+            target_prefix: target_prefix.unwrap_or_default().to_string(),
+            include_globs: include_globs.to_vec(),
+            exclude_globs: exclude_globs.to_vec(),
+            state: crate::tasks::HFIngestionState::Queued,
+            error: None,
+            created_at: Utc::now(),
+            started_at: None,
+            finished_at: None,
+        }),
+        None,
+        guard,
+        uuid::Uuid::new_v4(),
+        now_unix_ms,
+    )
+    .await?
+    .ok_or_else(|| anyhow!("hf ingestion creation did not allocate an id"))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn create_ingestion_inner(
     _storage: &Storage,
     mvcc: &MvccSubsystem,
@@ -566,6 +697,47 @@ pub(crate) async fn cancel_ingestion_with_permit(
 ) -> Result<u64> {
     let guard = hf_write_guard(storage, permit, partition_owner_signing_key).await?;
     cancel_ingestion_inner(storage, mvcc, id, guard).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn stage_cancel_ingestion_with_permit(
+    storage: &Storage,
+    mvcc: &MvccSubsystem,
+    id: i64,
+    transaction_id: &str,
+    principal: &str,
+    now_unix_ms: u64,
+    permit: &PartitionWritePermit,
+    partition_owner_signing_key: &[u8],
+) -> Result<u64> {
+    let guard = hf_write_guard(storage, permit, partition_owner_signing_key).await?;
+    let Some(mut job) = projection::get_ingestion(mvcc, mvcc.runtime.applied_version()?, id)?
+    else {
+        return Ok(0);
+    };
+    if !matches!(
+        job.state,
+        crate::tasks::HFIngestionState::Queued | crate::tasks::HFIngestionState::Running
+    ) {
+        return Ok(0);
+    }
+    job.state = crate::tasks::HFIngestionState::Canceled;
+    job.finished_at = Some(Utc::now());
+    stage_body(
+        mvcc,
+        transaction_id,
+        principal,
+        HfMutationKind::IngestionUpsert,
+        None,
+        None,
+        Some(job),
+        None,
+        guard,
+        uuid::Uuid::new_v4(),
+        now_unix_ms,
+    )
+    .await?;
+    Ok(1)
 }
 
 async fn cancel_ingestion_inner(
@@ -810,10 +982,6 @@ async fn append_body(
         .unwrap_or_else(|| event.as_str().to_string());
     let principal = hf_partition_principal();
     let now_unix_ms = current_unix_ms();
-    let assignment = mvcc
-        .reconcile_work_assignment("hf-metadata", "global")
-        .await?
-        .ok_or_else(|| anyhow!("this node does not own the hf metadata assignment"))?;
     let handle = mvcc
         .open_transactions
         .begin(
@@ -828,8 +996,57 @@ async fn append_body(
         )
         .await?;
     let transaction_id = handle.transaction_id.as_str();
+    let allocated_id = stage_body(
+        mvcc,
+        transaction_id,
+        &principal,
+        event,
+        key,
+        key_delete,
+        ingestion,
+        item,
+        guard,
+        mutation_id,
+        now_unix_ms,
+    )
+    .await?;
+    let outcome = mvcc
+        .open_transactions
+        .commit(
+            mvcc.runtime.as_ref(),
+            transaction_id,
+            &principal,
+            current_unix_ms(),
+        )
+        .await?;
+    match outcome.certification {
+        crate::mvcc_transaction::CertificationResult::Committed { .. } => Ok(allocated_id),
+        crate::mvcc_transaction::CertificationResult::Aborted { reason } => {
+            Err(anyhow!("hf metadata transaction aborted: {reason:?}"))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stage_body(
+    mvcc: &MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    event: HfMutationKind,
+    key: Option<HfKey>,
+    key_delete: Option<(i64, i64, String)>,
+    ingestion: Option<HfIngestion>,
+    item: Option<HfIngestionItem>,
+    guard: HfWriteGuard,
+    mutation_id: uuid::Uuid,
+    now_unix_ms: u64,
+) -> Result<Option<i64>> {
+    let assignment = mvcc
+        .reconcile_work_assignment("hf-metadata", "global")
+        .await?
+        .ok_or_else(|| anyhow!("this node does not own the hf metadata assignment"))?;
     let head_key = hf_head_logical_key()?;
-    let observed_head = mvcc.read_transaction_value(transaction_id, &principal, &head_key)?;
+    let observed_head = mvcc.read_transaction_value(transaction_id, principal, &head_key)?;
     let mut head = observed_head
         .as_deref()
         .map(decode_hf_head)
@@ -882,47 +1099,33 @@ async fn append_body(
     })?;
     head.last_sequence = sequence;
     head.last_event_hash = event_hash.to_vec();
-    let mut plan = projection::projection_plan(mvcc, transaction_id, &principal, &body)?;
+    let mut plan = projection::projection_plan(mvcc, transaction_id, principal, &body)?;
     plan.mutations.push(ProductMutation::put(
         head_key.clone(),
         encode_deterministic_proto(&head)?,
     ));
     plan.mutations
         .push(ProductMutation::put(event_key.clone(), event_payload));
-    mvcc.stage_product_mutations(transaction_id, &principal, plan.mutations, now_unix_ms)?;
+    mvcc.stage_product_mutations(transaction_id, principal, plan.mutations, now_unix_ms)?;
     mvcc.stage_predicate(
         transaction_id,
-        &principal,
+        principal,
         head_key,
         value_predicate(observed_head.as_deref()),
         now_unix_ms,
     )?;
     mvcc.stage_predicate(
         transaction_id,
-        &principal,
+        principal,
         event_key,
         PredicateKind::Absent,
         now_unix_ms,
     )?;
     for (key, predicate) in plan.predicates {
-        mvcc.stage_predicate(transaction_id, &principal, key, predicate, now_unix_ms)?;
+        mvcc.stage_predicate(transaction_id, principal, key, predicate, now_unix_ms)?;
     }
-    mvcc.stage_assignment_guard(transaction_id, &principal, &assignment, now_unix_ms)?;
-    let outcome = mvcc
-        .open_transactions
-        .commit(
-            mvcc.runtime.as_ref(),
-            transaction_id,
-            &principal,
-            current_unix_ms(),
-        )
-        .await?;
-    match outcome.certification {
-        crate::mvcc_transaction::CertificationResult::Committed { .. } => Ok(allocated_id),
-        crate::mvcc_transaction::CertificationResult::Aborted { reason } => {
-            Err(anyhow!("hf metadata transaction aborted: {reason:?}"))
-        }
-    }
+    mvcc.stage_assignment_guard(transaction_id, principal, &assignment, now_unix_ms)?;
+    Ok(allocated_id)
 }
 
 fn hf_body_from_parts(
