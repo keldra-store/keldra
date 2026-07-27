@@ -1184,23 +1184,29 @@ async fn real_cluster_reconstructs_a_deleted_shard_and_publishes_repaired_placem
     let race_job_a = pin_job_id.clone();
     let race_job_b = pin_job_id.clone();
     let first = tokio::task::spawn_blocking(move || {
-        raced_store
-            .claim_shard_repair_where("e2e-race-worker-a", 1_000_000_000_000, 1_000, move |record| {
-                record.job.job_id().ok().as_deref() == Some(race_job_a.as_str())
-            })
+        raced_store.claim_shard_repair_where(
+            "e2e-race-worker-a",
+            1_000_000_000_000,
+            1_000,
+            move |record| record.job.job_id().ok().as_deref() == Some(race_job_a.as_str()),
+        )
     });
     let raced_store = cluster.state(0).mvcc.runtime.local_store().clone();
     let second = tokio::task::spawn_blocking(move || {
-        raced_store
-            .claim_shard_repair_where("e2e-race-worker-b", 1_000_000_000_000, 1_000, move |record| {
-                record.job.job_id().ok().as_deref() == Some(race_job_b.as_str())
-            })
+        raced_store.claim_shard_repair_where(
+            "e2e-race-worker-b",
+            1_000_000_000_000,
+            1_000,
+            move |record| record.job.job_id().ok().as_deref() == Some(race_job_b.as_str()),
+        )
     });
     let (first, second) = tokio::join!(first, second);
     let first = first.unwrap().unwrap();
     let second = second.unwrap().unwrap();
-    assert_eq!(usize::from(first.is_some()) + usize::from(second.is_some()), 1);
-    let winner = first.or(second).expect("one racing worker claims the repair");
+    assert_eq!(first.is_some() as usize + second.is_some() as usize, 1);
+    let winner = first
+        .or(second)
+        .expect("one racing worker claims the repair");
     cluster
         .state(0)
         .mvcc
@@ -1216,8 +1222,7 @@ async fn real_cluster_reconstructs_a_deleted_shard_and_publishes_repaired_placem
             .claim_shard_repair_where(&pin_worker, 1_000_000_000_000, 1_000, |record| {
                 record.job.job_id().ok().as_deref() == Some(pin_job_id.as_str())
             })
-            .unwrap()
-            ;
+            .unwrap();
         if let Some((job_id, record)) = claimed {
             assert_eq!(job_id, pin_job_id);
             store

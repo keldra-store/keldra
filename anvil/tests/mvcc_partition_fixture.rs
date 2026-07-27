@@ -61,3 +61,65 @@ async fn bidirectional_partition_elects_rejects_minority_then_heals_and_converge
         .expect("healed minority catches up");
     assert_eq!(row.value, b"majority-value");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn isolated_follower_cannot_ack_or_apply_until_replication_heals() {
+    let cluster = RealMvccCluster::start().await.unwrap();
+    let leader = cluster.wait_for_any_leader(&[0, 1, 2]).await.unwrap();
+    let follower = [0, 1, 2].into_iter().find(|node| *node != leader).unwrap();
+    let healthy_peer = [0, 1, 2]
+        .into_iter()
+        .find(|node| *node != leader && *node != follower)
+        .unwrap();
+
+    // Keep the follower process alive but cut both consensus and bundle
+    // streams. The remaining two voters must still certify the transaction.
+    cluster.partition(follower);
+    let key = LogicalKey {
+        table_id: 9,
+        application_key: b"fixture/follower-isolation".to_vec(),
+    };
+    let outcome = cluster
+        .commit(
+            leader,
+            "follower-isolation-write",
+            key.clone(),
+            b"majority-acknowledged".to_vec(),
+        )
+        .await
+        .unwrap();
+    let commit_version = match outcome.certification {
+        CertificationResult::Committed { commit_version } => commit_version,
+        CertificationResult::Aborted { reason } => {
+            panic!("majority transaction aborted during follower isolation: {reason:?}")
+        }
+    };
+    cluster
+        .wait_for_applied_version(healthy_peer, commit_version)
+        .await
+        .unwrap();
+    assert!(
+        cluster
+            .state(follower)
+            .mvcc
+            .runtime
+            .read_at(&key, commit_version)
+            .unwrap()
+            .is_none(),
+        "isolated follower must not apply a decision without its bundle"
+    );
+
+    cluster.heal(follower);
+    cluster
+        .wait_for_applied_version(follower, commit_version)
+        .await
+        .unwrap();
+    let row = cluster
+        .state(follower)
+        .mvcc
+        .runtime
+        .read_at(&key, commit_version)
+        .unwrap()
+        .expect("healed follower catches up the committed bundle");
+    assert_eq!(row.value, b"majority-acknowledged");
+}
