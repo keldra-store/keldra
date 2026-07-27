@@ -143,7 +143,7 @@ async fn explicit_index_transaction_publishes_definition_and_finalises_after_com
         INDEX_EVENTUAL_CONSISTENCY_TIMEOUT,
         1,
         bucket.id,
-        &[index.id],
+        &[index.index_id as i64],
     )
     .await;
 }
