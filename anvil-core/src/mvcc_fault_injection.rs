@@ -85,6 +85,13 @@ pub fn clear() {
 }
 
 pub fn hit(point: FaultPoint) -> Result<(), InjectedFault> {
+    if std::env::var("ANVIL_MVCC_HARD_CRASH_AT")
+        .ok()
+        .as_deref()
+        == Some(format!("{point:?}").as_str())
+    {
+        std::process::abort();
+    }
     let mut installed = INSTALLED.get_or_init(|| Mutex::new(None)).lock().unwrap();
     match installed.as_mut() {
         Some(faults) => faults.check(point),

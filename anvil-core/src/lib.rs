@@ -43,6 +43,7 @@ pub mod bucket_journal;
 pub mod bucket_manager;
 pub mod bundle_replication;
 pub mod config;
+pub mod cluster_transport_fault;
 pub mod control_journal;
 pub mod core_store;
 pub mod crypto;
@@ -92,6 +93,8 @@ mod mvcc_crash_restart_acceptance;
 mod mvcc_cross_feature_tests;
 #[cfg(test)]
 pub mod mvcc_fault_injection;
+#[cfg(test)]
+mod mvcc_process_crash_acceptance;
 pub mod mvcc_gc;
 pub mod mvcc_local_durability_upgrade;
 pub mod mvcc_node_runtime;
