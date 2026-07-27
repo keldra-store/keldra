@@ -630,9 +630,17 @@ impl MvccStore {
             self.cf(CF_MATERIALISATION)?,
             self.idempotency_result_key(transaction_id, namespace, key),
         )?;
-        bytes
-            .map(|bytes| serde_json::from_slice(&bytes).map_err(Into::into))
-            .transpose()
+        let record = bytes
+            .map(|bytes| serde_json::from_slice::<CommittedIdempotencyResult>(&bytes))
+            .transpose()?;
+        if let Some(record) = &record
+            && (record.transaction_id != transaction_id
+                || record.result.namespace != namespace
+                || record.result.key != key)
+        {
+            bail!("committed idempotency result key does not match its record");
+        }
+        Ok(record)
     }
 
     pub fn outbox_records_after(
