@@ -322,7 +322,7 @@ impl CoreStore {
         } else {
             record_corestore_trace_event("byte_pipeline.dedupe", "miss");
             let block_write_started_at = Instant::now();
-            write_file_atomic(&shard_path, &shard_file).await?;
+            write_shard_file_atomic(&shard_path, &shard_file).await?;
             record_block_write_duration(
                 &input.placement.node_id,
                 &input.placement.region_id,

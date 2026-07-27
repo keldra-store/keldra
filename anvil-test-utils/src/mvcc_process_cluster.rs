@@ -14,11 +14,15 @@ use std::{
 
 use anvil::anvil_api::{
     AdminRequestContext, BeginTransactionRequest, BeginTransactionResponse,
-    CommitTransactionRequest, CreateBucketRequest, GetTransactionRequest, HeadObjectRequest, MutationBatchOperation,
+    BootstrapMeshTopologyRequest, CommitTransactionRequest, CreateBucketRequest,
+    GetLocalNodeDescriptorRequest, GetObjectRequest, GetTransactionRequest, HeadObjectRequest,
+    MutationBatchOperation, ReadConsistency,
     MutationBatchPutObject, MutationBatchRequest, MutationBatchResponse, MvccDurability, MvccReadConsistency,
-    NativeMutationContext, ReplaceClusterNodeIncarnationRequest, TransactionStatus, WriteResponse,
+    NativeMutationContext, PutCellRequest, PutNodeRequest, PutRegionRequest,
+    ReplaceClusterNodeIncarnationRequest, TransactionStatus, WriteResponse,
     admin_service_client::AdminServiceClient,
     bucket_service_client::BucketServiceClient,
+    mesh_control_service_client::MeshControlServiceClient,
     mutation_batch_operation,
     object_service_client::ObjectServiceClient,
     transaction_service_client::TransactionServiceClient,
@@ -163,14 +167,42 @@ impl ProcessMvccCluster {
         node: usize,
         consistency: MvccReadConsistency,
     ) -> anyhow::Result<BeginTransactionResponse> {
-        self.begin_transaction_at(self.public_endpoint(node), consistency)
+        self.begin_transaction_with_durability(node, consistency, MvccDurability::Quorum)
             .await
+    }
+
+    pub async fn begin_transaction_with_durability(
+        &self,
+        node: usize,
+        consistency: MvccReadConsistency,
+        durability: MvccDurability,
+    ) -> anyhow::Result<BeginTransactionResponse> {
+        self.begin_transaction_at_with_durability(
+            self.public_endpoint(node),
+            consistency,
+            durability,
+        )
+        .await
     }
 
     pub async fn begin_transaction_at(
         &self,
         endpoint: String,
         consistency: MvccReadConsistency,
+    ) -> anyhow::Result<BeginTransactionResponse> {
+        self.begin_transaction_at_with_durability(
+            endpoint,
+            consistency,
+            MvccDurability::Quorum,
+        )
+        .await
+    }
+
+    async fn begin_transaction_at_with_durability(
+        &self,
+        endpoint: String,
+        consistency: MvccReadConsistency,
+        durability: MvccDurability,
     ) -> anyhow::Result<BeginTransactionResponse> {
         let mut client = TransactionServiceClient::connect(endpoint).await?;
         Ok(client
@@ -180,7 +212,7 @@ impl ProcessMvccCluster {
                     ttl_ms: 30_000,
                     read_consistency: consistency as i32,
                     cluster_id: self.cluster_id.clone(),
-                    durability: MvccDurability::Quorum as i32,
+                    durability: durability as i32,
                 },
                 &self.admin_token,
             ))
@@ -238,6 +270,69 @@ impl ProcessMvccCluster {
             .await?
             .into_inner()
             .bucket_id)
+    }
+
+    pub async fn bootstrap_object_placement(&self, coordinator: usize) -> anyhow::Result<()> {
+        let mut descriptors = Vec::new();
+        for node in 0..self.nodes.len() {
+            let mut admin = AdminServiceClient::connect(format!(
+                "http://{}",
+                self.nodes[node].admin_addr
+            ))
+            .await?;
+            descriptors.push(
+                admin
+                    .get_local_node_descriptor(authorized(
+                        GetLocalNodeDescriptorRequest {},
+                        &self.admin_token,
+                    ))
+                    .await?
+                    .into_inner()
+                    .node
+                    .context("local node descriptor response omitted node")?,
+            );
+        }
+        let cells = descriptors
+            .iter()
+            .map(|node| PutCellRequest {
+                region_id: node.region.clone(),
+                cell_id: node.cell_id.clone(),
+                failure_domain: node.cell_id.clone(),
+                state: "active".to_string(),
+                options: None,
+            })
+            .collect();
+        let nodes = descriptors
+            .into_iter()
+            .map(|node| PutNodeRequest {
+                node_id: node.node_id,
+                region_id: node.region,
+                cell_id: node.cell_id,
+                advertise_addr: node.public_api_addr,
+                state: "active".to_string(),
+                capacity_json: "{}".to_string(),
+                options: None,
+                receipt_signing_public_key: node.receipt_signing_public_key,
+                capabilities: vec!["object".to_string()],
+            })
+            .collect();
+        let mut mesh = MeshControlServiceClient::connect(self.public_endpoint(coordinator)).await?;
+        mesh.bootstrap_mesh_topology(authorized(
+            BootstrapMeshTopologyRequest {
+                regions: vec![PutRegionRequest {
+                    region_id: "process-e2e-region".to_string(),
+                    endpoint: self.public_endpoint(coordinator),
+                    state: "active".to_string(),
+                    options: None,
+                }],
+                cells,
+                nodes,
+                canonical_coremeta_rows: Vec::new(),
+            },
+            &self.admin_token,
+        ))
+        .await?;
+        Ok(())
     }
 
     pub async fn stage_object_puts(
@@ -311,6 +406,37 @@ impl ProcessMvccCluster {
         }
     }
 
+    pub async fn read_object(
+        &self,
+        node: usize,
+        bucket_name: &str,
+        object_key: &str,
+    ) -> anyhow::Result<Vec<u8>> {
+        let mut client = ObjectServiceClient::connect(self.public_endpoint(node)).await?;
+        let mut stream = client
+            .get_object(authorized(
+                GetObjectRequest {
+                    bucket_name: bucket_name.to_string(),
+                    object_key: object_key.to_string(),
+                    version_id: None,
+                    range: None,
+                    consistency: Some(ReadConsistency {
+                        mode: Some(anvil::anvil_api::read_consistency::Mode::Latest(true)),
+                    }),
+                },
+                &self.admin_token,
+            ))
+            .await?
+            .into_inner();
+        let mut bytes = Vec::new();
+        while let Some(frame) = stream.message().await? {
+            if let Some(anvil::anvil_api::get_object_response::Data::Chunk(chunk)) = frame.data {
+                bytes.extend(chunk);
+            }
+        }
+        Ok(bytes)
+    }
+
     /// Send SIGKILL to a node, retaining its directory and address for restart.
     pub async fn sigkill(&mut self, node: usize) -> anyhow::Result<()> {
         let mut child = self.nodes[node]
@@ -326,7 +452,12 @@ impl ProcessMvccCluster {
     /// consumes this file before aborting, so same-disk restart can recover.
     pub fn arm_hard_crash(&self, node: usize, fault_point: &str) -> anyhow::Result<()> {
         const PROCESS_SAFE_POINTS: &[&str] =
-            &["PreparedBundleWrite", "MvccBatchWrite", "RaftLogWrite"];
+            &[
+                "PreparedBundleWrite",
+                "ShardWrite",
+                "MvccBatchWrite",
+                "RaftLogWrite",
+            ];
         if !PROCESS_SAFE_POINTS.contains(&fault_point) {
             bail!("fault point is not enabled for process-backed hard crashes");
         }
@@ -411,6 +542,7 @@ impl ProcessMvccCluster {
             .env("API_LISTEN_ADDR", api_addr.to_string())
             .env("ADMIN_LISTEN_ADDR", admin_addr.to_string())
             .env("REGION", "process-e2e-region")
+            .env("CELL_ID", format!("zone-{}", node + 1))
             .env("NODE_ID", format!("{}-node-{}", self.cluster_id, node + 1))
             .env("MVCC_RAFT_NODE_ID", (node + 1).to_string())
             .env("MVCC_NODE_INCARNATION", obsolete.incarnation.to_string())
@@ -488,6 +620,7 @@ impl ProcessMvccCluster {
             .env("API_LISTEN_ADDR", self.nodes[node].api_addr.to_string())
             .env("ADMIN_LISTEN_ADDR", self.nodes[node].admin_addr.to_string())
             .env("REGION", "process-e2e-region")
+            .env("CELL_ID", format!("zone-{}", node + 1))
             .env("NODE_ID", format!("{}-node-{}", self.cluster_id, node + 1))
             .env("MVCC_RAFT_NODE_ID", (node + 1).to_string())
             .env(

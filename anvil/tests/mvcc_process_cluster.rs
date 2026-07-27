@@ -336,6 +336,88 @@ async fn public_object_batch_retries_after_crash_before_raft_wal_append() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn public_erasure_object_retries_after_remote_shard_crash_before_sync() {
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_anvil-server"));
+    let mut cluster = ProcessMvccCluster::start(binary).await.unwrap();
+    let coordinator = cluster.wait_for_leader(&[0, 1, 2]).await.unwrap();
+    cluster.bootstrap_object_placement(coordinator).await.unwrap();
+    let shard_target = (0..3).find(|node| *node != coordinator).unwrap();
+    let bucket_name = format!("process-shard-{}", uuid::Uuid::new_v4().simple());
+    let bucket_id = cluster.create_bucket(coordinator, &bucket_name).await.unwrap();
+    let transaction = cluster
+        .begin_transaction_with_durability(
+            coordinator,
+            MvccReadConsistency::Linearized,
+            anvil::anvil_api::MvccDurability::Erasure,
+        )
+        .await
+        .unwrap();
+    let object_key = "shard-crash/reconstruct.bin";
+    let payload = vec![0x73_u8; 384 * 1024];
+
+    cluster.arm_hard_crash(shard_target, "ShardWrite").unwrap();
+    let stage = cluster.stage_object_puts(
+        coordinator,
+        &bucket_name,
+        bucket_id,
+        &transaction.transaction_id,
+        &[(object_key, payload.as_slice())],
+    );
+    let (stage_result, crash_result) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(10), stage),
+        cluster.wait_for_hard_crash(shard_target, Duration::from_secs(10)),
+    );
+    crash_result.unwrap();
+    assert!(
+        !matches!(stage_result, Ok(Ok(_))),
+        "a shard target abort before sync must not produce a durable staging ACK"
+    );
+    assert!(
+        !cluster
+            .object_exists(coordinator, &bucket_name, object_key)
+            .await
+            .unwrap(),
+        "failed erasure ingest must not become visible or commit"
+    );
+
+    cluster.restart(shard_target).await.unwrap();
+    let staged = cluster
+        .stage_object_puts(
+            coordinator,
+            &bucket_name,
+            bucket_id,
+            &transaction.transaction_id,
+            &[(object_key, payload.as_slice())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(staged.write_state, WriteState::Staged as i32);
+    let committed = cluster
+        .commit_transaction(
+            cluster.public_endpoint(coordinator),
+            transaction.transaction_id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(committed.state, WriteState::Committed as i32);
+
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if cluster
+                .read_object(coordinator, &bucket_name, object_key)
+                .await
+                .is_ok_and(|bytes| bytes == payload)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("retried erasure object reconstructs exactly after shard target restart");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn killed_node_is_replaced_by_higher_incarnation_and_catches_up() {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_anvil-server"));
     let mut cluster = ProcessMvccCluster::start(binary).await.unwrap();

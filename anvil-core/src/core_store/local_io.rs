@@ -146,6 +146,18 @@ pub(super) fn record_block_read_duration(
 }
 
 pub(crate) async fn write_file_atomic(path: &PathBuf, bytes: &[u8]) -> Result<()> {
+    write_file_atomic_with_shard_boundary(path, bytes, false).await
+}
+
+pub(crate) async fn write_shard_file_atomic(path: &PathBuf, bytes: &[u8]) -> Result<()> {
+    write_file_atomic_with_shard_boundary(path, bytes, true).await
+}
+
+async fn write_file_atomic_with_shard_boundary(
+    path: &PathBuf,
+    bytes: &[u8],
+    shard_boundary: bool,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         let started_at = Instant::now();
         fs::create_dir_all(parent).await?;
@@ -180,6 +192,10 @@ pub(crate) async fn write_file_atomic(path: &PathBuf, bytes: &[u8]) -> Result<()
         bytes.len() as u64,
         started_at.elapsed(),
     );
+    #[cfg(any(test, debug_assertions))]
+    if shard_boundary {
+        crate::mvcc_fault_injection::hit(crate::mvcc_fault_injection::FaultPoint::ShardWrite)?;
+    }
     let started_at = Instant::now();
     file.sync_all().await?;
     let elapsed = started_at.elapsed();

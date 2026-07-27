@@ -115,7 +115,7 @@ impl CoreStore {
                     self.build_internal_shard_receipt(&request, &placement, unix_timestamp_nanos())
                 }
                 InternalShardEpochDecision::Apply { .. } => {
-                    write_file_atomic(&shard_path, &shard_file).await?;
+                    write_shard_file_atomic(&shard_path, &shard_file).await?;
                     self.build_internal_shard_receipt(&request, &placement, unix_timestamp_nanos())
                 }
             };
@@ -168,7 +168,7 @@ impl CoreStore {
                 let record_bytes = encode_block_shard_repair_record(&record)?;
                 write_file_atomic(&repair_head_path, &record_bytes).await?;
                 write_file_atomic(&repair_operation_path, &record_bytes).await?;
-                write_file_atomic(&shard_path, &shard_file).await?;
+                write_shard_file_atomic(&shard_path, &shard_file).await?;
                 Ok(record.receipt)
             }
             InternalShardRepairDecision::Apply { expected } => {
@@ -195,7 +195,7 @@ impl CoreStore {
                 // publishing the shard so a retry can finish an interrupted rename.
                 write_file_atomic(&repair_head_path, &record_bytes).await?;
                 write_file_atomic(&repair_operation_path, &record_bytes).await?;
-                write_file_atomic(&shard_path, &shard_file).await?;
+                write_shard_file_atomic(&shard_path, &shard_file).await?;
                 Ok(receipt)
             }
         }

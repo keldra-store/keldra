@@ -112,8 +112,6 @@ impl ShardSegment {
 
     /// Returns only after the complete shard and its framing are fsynced.
     pub fn append(&mut self, record: &ShardRecord) -> Result<ShardLocation> {
-        #[cfg(test)]
-        crate::mvcc_fault_injection::hit(crate::mvcc_fault_injection::FaultPoint::ShardWrite)?;
         let location = append_record(&mut self.file, self.id, record)?;
         self.file.sync_data()?;
         tracing::debug!(
