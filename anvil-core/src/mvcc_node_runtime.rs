@@ -70,15 +70,27 @@ where
     }
 
     pub async fn snapshot(&self, consistency: ReadConsistency) -> Result<u64> {
-        if consistency == ReadConsistency::LocalSnapshot {
-            return self.local.readable_version();
-        }
-        let target = self.coordinator.snapshot(consistency).await?;
+        // A consensus snapshot can race local GC application: the ordered
+        // target may already be below the local store's watermark by the
+        // time the caller starts reading.  Returning that stale version
+        // would make every subsequent read fail closed.  Use the local GC
+        // watermark as a floor and wait until that floor is readable.
+        let target = if consistency == ReadConsistency::LocalSnapshot {
+            0
+        } else {
+            self.coordinator.snapshot(consistency).await?
+        };
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let readable = self.local.readable_version()?;
-            if readable >= target {
-                return Ok(target);
+            let gc_watermark = self.local.gc_watermark()?;
+            let required = target.max(gc_watermark);
+            if readable >= required {
+                return Ok(if consistency == ReadConsistency::LocalSnapshot {
+                    readable
+                } else {
+                    required
+                });
             }
             if tokio::time::Instant::now() >= deadline {
                 bail!(

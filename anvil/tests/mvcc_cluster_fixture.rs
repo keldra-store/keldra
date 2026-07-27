@@ -1123,6 +1123,30 @@ async fn real_cluster_reconstructs_a_deleted_shard_and_publishes_repaired_placem
         "incomplete repair state pins the retired physical shard"
     );
 
+    // Quorum commit only guarantees the enqueue is durable on a quorum;
+    // replicas apply the materialisation record asynchronously.  Wait for
+    // every node to observe the pin before exercising the local claim path.
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            if (0..3).all(|node| {
+                cluster
+                    .state(node)
+                    .mvcc
+                    .runtime
+                    .local_store()
+                    .shard_repair_record(&pin_job_id)
+                    .ok()
+                    .flatten()
+                    .is_some()
+            }) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("repair pin replicated to every cluster node");
+
     for node in 0..3 {
         let pin_worker = format!("e2e-release-retirement-pin-{node}");
         let store = cluster.state(node).mvcc.runtime.local_store();
