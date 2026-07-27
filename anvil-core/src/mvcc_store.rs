@@ -26,6 +26,9 @@ use crate::index_finalization_job::{
 use crate::git_source_postcommit_job::{
     GitSourcePostCommitJob, GitSourcePostCommitRecord, GitSourcePostCommitState,
 };
+use crate::hf_ingestion_postcommit_job::{
+    HfIngestionPostCommitJob, HfIngestionPostCommitRecord, HfIngestionPostCommitState,
+};
 use crate::bucket_locator_finalization_job::{
     BucketLocatorFinalizationJob, BucketLocatorFinalizationRecord,
     BucketLocatorFinalizationState,
@@ -151,6 +154,10 @@ impl MvccStore {
             (b"personaldb-postcommit/".as_slice(), "personaldb-postcommit"),
             (b"git-source-postcommit/".as_slice(), "git-source-postcommit"),
             (
+                b"hf-ingestion-postcommit/".as_slice(),
+                "hf-ingestion-postcommit",
+            ),
+            (
                 b"bucket-locator-finalization/".as_slice(),
                 "bucket-locator-finalization",
             ),
@@ -191,6 +198,12 @@ impl MvccStore {
                 } else if kind == "git-source-postcommit" {
                     let record: GitSourcePostCommitRecord = serde_json::from_slice(&value)?;
                     if record.state == GitSourcePostCommitState::Complete {
+                        continue;
+                    }
+                    record.job.target_logical_identity()
+                } else if kind == "hf-ingestion-postcommit" {
+                    let record: HfIngestionPostCommitRecord = serde_json::from_slice(&value)?;
+                    if record.state == HfIngestionPostCommitState::Complete {
                         continue;
                     }
                     record.job.target_logical_identity()
@@ -474,6 +487,28 @@ impl MvccStore {
                     && existing.as_slice() != record.as_slice()
                 {
                     bail!("GitSource postcommit job identity collision");
+                }
+                batch.put_cf(materialisation_cf, key, record);
+                continue;
+            }
+            if schema.as_deref() == Some(HfIngestionPostCommitJob::SCHEMA) {
+                let job = HfIngestionPostCommitJob::decode(encoded_job)?;
+                if job.cluster_id != self.cluster_id || job.transaction_id != bundle.transaction_id
+                {
+                    bail!(
+                        "Hugging Face ingestion postcommit job belongs to another transaction or cluster"
+                    );
+                }
+                let key =
+                    self.key(format!("hf-ingestion-postcommit/{}", job.job_id()?).as_bytes());
+                let record = serde_json::to_vec(&HfIngestionPostCommitRecord::pending(
+                    job,
+                    commit_version,
+                ))?;
+                if let Some(existing) = self.db.get_cf(materialisation_cf, &key)?
+                    && existing.as_slice() != record.as_slice()
+                {
+                    bail!("Hugging Face ingestion postcommit job identity collision");
                 }
                 batch.put_cf(materialisation_cf, key, record);
                 continue;
@@ -1543,6 +1578,103 @@ impl MvccStore {
         })
     }
 
+    pub fn claim_hf_ingestion_postcommit_authorized(
+        &self,
+        worker_id: &str,
+        now_unix_ms: u64,
+        lease_ms: u64,
+        eligible: impl Fn(&HfIngestionPostCommitRecord) -> Option<String>,
+    ) -> Result<Option<(String, HfIngestionPostCommitRecord)>> {
+        if worker_id.trim().is_empty() || lease_ms == 0 {
+            bail!("Hugging Face ingestion postcommit worker and lease must be non-empty");
+        }
+        let _transition = self.materialisation_transition.lock().unwrap();
+        let cf = self.cf(CF_MATERIALISATION)?;
+        let prefix = self.key(b"hf-ingestion-postcommit/");
+        let mut candidates = Vec::new();
+        for row in self
+            .db
+            .iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward))
+        {
+            let (key, value) = row?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let record: HfIngestionPostCommitRecord = serde_json::from_slice(&value)?;
+            if record.state != HfIngestionPostCommitState::Complete {
+                candidates.push((key, record));
+            }
+        }
+        let candidate = candidates
+            .iter()
+            .filter_map(|(key, record)| eligible(record).map(|owner| (key, record, owner)))
+            .filter(|(_, candidate, _)| {
+                !candidates.iter().any(|(_, other)| {
+                    other.job.tenant_id == candidate.job.tenant_id
+                        && other.job.ingestion_id < candidate.job.ingestion_id
+                })
+            })
+            .min_by_key(|(_, record, _)| (record.job.tenant_id, record.job.ingestion_id));
+        let Some((key, record, owner)) = candidate else {
+            return Ok(None);
+        };
+        let key = key.clone();
+        let mut record = record.clone();
+        if !record.claimable(now_unix_ms) {
+            return Ok(None);
+        }
+        record.state = HfIngestionPostCommitState::Running;
+        record.attempts = record.attempts.saturating_add(1);
+        record.lease_owner = Some(owner);
+        record.lease_expires_unix_ms = Some(
+            now_unix_ms
+                .checked_add(lease_ms)
+                .context("Hugging Face ingestion job lease overflow")?,
+        );
+        self.db.put_cf_opt(
+            cf,
+            &key,
+            serde_json::to_vec(&record)?,
+            &durable_write_options(),
+        )?;
+        let id = String::from_utf8(self.unscoped(&key)?.to_vec())?
+            .strip_prefix("hf-ingestion-postcommit/")
+            .context("invalid Hugging Face ingestion postcommit key")?
+            .to_string();
+        Ok(Some((id, record)))
+    }
+
+    pub fn retry_hf_ingestion_postcommit(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        next_attempt_unix_ms: u64,
+        error: &str,
+    ) -> Result<()> {
+        self.transition_hf_ingestion_postcommit(job_id, worker_id, |record| {
+            record.state = HfIngestionPostCommitState::Pending;
+            record.next_attempt_unix_ms = next_attempt_unix_ms;
+            record.lease_owner = None;
+            record.lease_expires_unix_ms = None;
+            record.last_error = Some(error.to_string());
+            Ok(())
+        })
+    }
+
+    pub fn complete_hf_ingestion_postcommit(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+    ) -> Result<()> {
+        self.transition_hf_ingestion_postcommit(job_id, worker_id, |record| {
+            record.state = HfIngestionPostCommitState::Complete;
+            record.lease_owner = None;
+            record.lease_expires_unix_ms = None;
+            record.last_error = None;
+            Ok(())
+        })
+    }
+
     pub fn claim_bucket_locator_finalization_authorized(
         &self,
         worker_id: &str,
@@ -1913,6 +2045,21 @@ impl MvccStore {
                 pins.transaction_ids.insert(record.job.transaction_id);
             }
         }
+        let hf_ingestion_prefix = self.key(b"hf-ingestion-postcommit/");
+        for row in self.db.iterator_cf(
+            materialisation_cf,
+            IteratorMode::From(&hf_ingestion_prefix, Direction::Forward),
+        ) {
+            let (key, value) = row?;
+            if !key.starts_with(&hf_ingestion_prefix) {
+                break;
+            }
+            let record: HfIngestionPostCommitRecord = serde_json::from_slice(&value)?;
+            if record.state != HfIngestionPostCommitState::Complete {
+                pins.materialisation_snapshots.insert(record.commit_version);
+                pins.transaction_ids.insert(record.job.transaction_id);
+            }
+        }
         let bucket_locator_prefix = self.key(b"bucket-locator-finalization/");
         for row in self.db.iterator_cf(
             materialisation_cf,
@@ -2214,6 +2361,35 @@ impl MvccStore {
         Ok(())
     }
 
+    fn transition_hf_ingestion_postcommit(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        update: impl FnOnce(&mut HfIngestionPostCommitRecord) -> Result<()>,
+    ) -> Result<()> {
+        let _transition = self.materialisation_transition.lock().unwrap();
+        let cf = self.cf(CF_MATERIALISATION)?;
+        let key = self.key(format!("hf-ingestion-postcommit/{job_id}").as_bytes());
+        let bytes = self
+            .db
+            .get_cf(cf, &key)?
+            .context("Hugging Face ingestion postcommit job not found")?;
+        let mut record: HfIngestionPostCommitRecord = serde_json::from_slice(&bytes)?;
+        if record.state != HfIngestionPostCommitState::Running
+            || record.lease_owner.as_deref() != Some(worker_id)
+        {
+            bail!("Hugging Face ingestion postcommit job is not leased by this worker");
+        }
+        update(&mut record)?;
+        self.db.put_cf_opt(
+            cf,
+            key,
+            serde_json::to_vec(&record)?,
+            &durable_write_options(),
+        )?;
+        Ok(())
+    }
+
     fn transition_bucket_locator_finalization(
         &self,
         job_id: &str,
@@ -2412,6 +2588,14 @@ impl MvccStore {
         )?;
         self.collect_completed_jobs(
             materialisation_cf,
+            b"hf-ingestion-postcommit/",
+            safe_watermark,
+            &mut batch,
+            &mut deleted,
+            &mut deleted_bytes,
+        )?;
+        self.collect_completed_jobs(
+            materialisation_cf,
             b"bucket-locator-finalization/",
             safe_watermark,
             &mut batch,
@@ -2476,6 +2660,10 @@ impl MvccStore {
             } else if suffix == b"git-source-postcommit/" {
                 let record: GitSourcePostCommitRecord = serde_json::from_slice(&value)?;
                 record.state == GitSourcePostCommitState::Complete
+                    && record.commit_version < safe_watermark
+            } else if suffix == b"hf-ingestion-postcommit/" {
+                let record: HfIngestionPostCommitRecord = serde_json::from_slice(&value)?;
+                record.state == HfIngestionPostCommitState::Complete
                     && record.commit_version < safe_watermark
             } else if suffix == b"bucket-locator-finalization/" {
                 let record: BucketLocatorFinalizationRecord = serde_json::from_slice(&value)?;
@@ -2681,6 +2869,20 @@ mod tests {
         }
     }
 
+    fn hf_ingestion_job(
+        transaction_id: &str,
+        ingestion_id: i64,
+    ) -> HfIngestionPostCommitJob {
+        HfIngestionPostCommitJob {
+            schema: HfIngestionPostCommitJob::SCHEMA.into(),
+            cluster_id: "cluster".into(),
+            transaction_id: transaction_id.into(),
+            ingestion_id,
+            tenant_id: 1,
+            priority: 100,
+        }
+    }
+
     fn bucket_locator_job(
         transaction_id: &str,
         operation_sequence: u64,
@@ -2826,6 +3028,107 @@ mod tests {
         assert!(
             store
                 .claim_git_source_postcommit_authorized("worker", 30, 5, |_| {
+                    Some("assignment-owner".into())
+                })
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn hf_ingestion_postcommit_jobs_are_durable_ordered_retryable_and_gc_pinned() {
+        let temp = tempdir().unwrap();
+        let store = MvccStore::open(temp.path()).unwrap();
+        for (commit_version, transaction_id, ingestion_id) in
+            [(2, "hf-ingestion-1", 41), (3, "hf-ingestion-2", 42)]
+        {
+            store
+                .apply_certified_bundle(
+                    commit_version,
+                    &bundle(transaction_id, |builder| {
+                        builder.add_materialisation_job(
+                            hf_ingestion_job(transaction_id, ingestion_id)
+                                .encode()
+                                .unwrap(),
+                        );
+                    }),
+                )
+                .unwrap();
+        }
+        store
+            .apply_certified_bundle(5, &bundle("advance-hf", |_| {}))
+            .unwrap();
+
+        let expected_partition = crate::mvcc_worker_authority::work_partition_id(
+            "hf-ingestion-postcommit",
+            "tenant/1/hf-ingestion/41",
+        )
+        .unwrap();
+        assert!(
+            store
+                .required_background_work_partitions()
+                .unwrap()
+                .contains(&expected_partition)
+        );
+        assert_eq!(
+            store
+                .unfinished_work_pins()
+                .unwrap()
+                .materialisation_snapshots,
+            [2_u64, 3].into_iter().collect()
+        );
+        assert!(store.garbage_collect(5).is_err());
+
+        let (first_id, first) = store
+            .claim_hf_ingestion_postcommit_authorized("worker", 10, 5, |_| {
+                Some("assignment-owner".into())
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.job.ingestion_id, 41);
+        assert_eq!(first.lease_owner.as_deref(), Some("assignment-owner"));
+        assert!(
+            store
+                .complete_hf_ingestion_postcommit(&first_id, "worker")
+                .is_err()
+        );
+        store
+            .retry_hf_ingestion_postcommit(&first_id, "assignment-owner", 20, "retry")
+            .unwrap();
+        assert!(
+            store
+                .claim_hf_ingestion_postcommit_authorized("worker", 19, 5, |_| {
+                    Some("assignment-owner".into())
+                })
+                .unwrap()
+                .is_none()
+        );
+        let (first_id, first) = store
+            .claim_hf_ingestion_postcommit_authorized("worker", 20, 5, |_| {
+                Some("assignment-owner".into())
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.job.ingestion_id, 41);
+        store
+            .complete_hf_ingestion_postcommit(&first_id, "assignment-owner")
+            .unwrap();
+
+        let (second_id, second) = store
+            .claim_hf_ingestion_postcommit_authorized("worker", 20, 5, |_| {
+                Some("assignment-owner".into())
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.job.ingestion_id, 42);
+        store
+            .complete_hf_ingestion_postcommit(&second_id, "assignment-owner")
+            .unwrap();
+        assert!(store.unfinished_work_pins().unwrap().all().is_empty());
+        store.garbage_collect(5).unwrap();
+        assert!(
+            store
+                .claim_hf_ingestion_postcommit_authorized("worker", 30, 5, |_| {
                     Some("assignment-owner".into())
                 })
                 .unwrap()

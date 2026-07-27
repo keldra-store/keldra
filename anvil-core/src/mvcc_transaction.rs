@@ -355,6 +355,13 @@ impl TransactionBundle {
                     )?;
                     (job.cluster_id, job.transaction_id)
                 }
+                Some(crate::hf_ingestion_postcommit_job::HfIngestionPostCommitJob::SCHEMA) => {
+                    let job =
+                        crate::hf_ingestion_postcommit_job::HfIngestionPostCommitJob::decode(
+                            encoded_job,
+                        )?;
+                    (job.cluster_id, job.transaction_id)
+                }
                 Some(
                     crate::bucket_locator_finalization_job::BucketLocatorFinalizationJob::SCHEMA,
                 ) => {

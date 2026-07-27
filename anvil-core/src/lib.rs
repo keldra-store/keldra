@@ -63,6 +63,7 @@ pub mod full_text_segment;
 pub mod gateway_store;
 pub mod git_pack;
 pub mod git_source_postcommit_job;
+pub mod hf_ingestion_postcommit_job;
 pub mod git_source_index;
 pub mod git_source_manifest;
 pub mod git_source_query;
