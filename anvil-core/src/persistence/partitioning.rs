@@ -645,9 +645,11 @@ impl Persistence {
     }
 
     async fn choose_bucket_home_cell(&self, target_region: &str) -> Result<Option<String>> {
-        let mut cells = crate::mesh_lifecycle::list_cells(&self.storage, Some(target_region))
-            .await?
+        let mut cells = crate::mesh_lifecycle::read_lifecycle_state_projection_mvcc(self.mvcc()?)?
+            .cells
             .into_iter()
+            .map(|(_, cell)| cell)
+            .filter(|cell| cell.region == target_region)
             .filter(|cell| cell.state == crate::mesh_lifecycle::LifecycleState::Active)
             .collect::<Vec<_>>();
         cells.sort_by(|left, right| {
@@ -833,15 +835,11 @@ impl Persistence {
         ) {
             return Ok(());
         }
-        let core_store = self.core_store().await?;
-        let nodes = crate::mesh_lifecycle::list_nodes_with_core_store(
-            &self.storage,
-            &core_store,
-            None,
-            None,
-        )
-        .await
-        .map_err(|err| anyhow!(err.to_string()))?;
+        let nodes =
+            crate::mesh_lifecycle::read_lifecycle_state_projection_mvcc(self.lifecycle_mvcc()?)?
+                .nodes
+                .into_values()
+                .collect::<Vec<_>>();
         if nodes.is_empty() {
             return Ok(());
         }
