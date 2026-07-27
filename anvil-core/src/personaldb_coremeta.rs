@@ -199,8 +199,8 @@ impl PersonalDbWritePlan {
         let status = mvcc
             .open_transactions
             .status(&handle.transaction_id, &self.principal, now)?;
+        let principal = self.principal.clone();
         if status.state == "open" {
-            let principal = self.principal.clone();
             self.stage_into_transaction(mvcc, &handle.transaction_id, &principal, now)
                 .await?;
         }
@@ -209,7 +209,7 @@ impl PersonalDbWritePlan {
             .commit(
                 mvcc.runtime.as_ref(),
                 &handle.transaction_id,
-                &self.principal,
+                &principal,
                 now,
             )
             .await?;
@@ -236,10 +236,7 @@ impl PersonalDbWritePlan {
         if principal != self.principal {
             bail!("PersonalDB write plan principal does not own caller transaction");
         }
-        let handle = mvcc.open_transactions.handle(transaction_id)?;
-        if handle.principal != principal {
-            bail!("PersonalDB caller transaction principal mismatch");
-        }
+        mvcc.open_transactions.binding(transaction_id, principal)?;
         let logical_identity = format!("tenant/{}/personaldb/{}", self.tenant_id, self.group_id);
         let assignment = match self.assignment {
             Some(assignment) => {

@@ -215,10 +215,7 @@ impl TaskLeaseWritePlan {
         principal: &str,
         now_unix_ms: u64,
     ) -> Result<()> {
-        let handle = mvcc.open_transactions.handle(transaction_id)?;
-        if handle.principal != principal {
-            bail!("task lease caller transaction principal mismatch");
-        }
+        mvcc.open_transactions.binding(transaction_id, principal)?;
         let assignment = mvcc
             .reconcile_work_assignment("task-lease", &self.assignment_identity)
             .await?

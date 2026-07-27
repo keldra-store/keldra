@@ -688,16 +688,10 @@ impl AppState {
         operation_sequence: u64,
         operation: crate::bucket_locator_finalization_job::BucketLocatorFinalizationOperation,
     ) -> Result<(), Status> {
-        let handle = self
-            .mvcc
+        self.mvcc
             .open_transactions
-            .handle(transaction_id)
+            .binding(transaction_id, principal)
             .map_err(|err| Status::failed_precondition(err.to_string()))?;
-        if handle.principal != principal {
-            return Err(Status::permission_denied(
-                "bucket locator caller transaction principal mismatch",
-            ));
-        }
         let job = crate::bucket_locator_finalization_job::BucketLocatorFinalizationJob {
             schema: crate::bucket_locator_finalization_job::BucketLocatorFinalizationJob::SCHEMA
                 .to_string(),

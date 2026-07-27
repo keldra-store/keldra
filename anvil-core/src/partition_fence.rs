@@ -395,10 +395,7 @@ impl OwnershipFenceWritePlan {
         principal: &str,
         now_unix_ms: u64,
     ) -> Result<()> {
-        let handle = mvcc.open_transactions.handle(transaction_id)?;
-        if handle.principal != principal {
-            bail!("ownership fence caller transaction principal mismatch");
-        }
+        mvcc.open_transactions.binding(transaction_id, principal)?;
         let assignment = mvcc
             .reconcile_work_assignment("ownership-fence", &self.assignment_identity)
             .await?

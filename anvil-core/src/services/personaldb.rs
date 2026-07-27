@@ -493,20 +493,18 @@ impl PersonalDbService for AppState {
             .map(|_| crate::object_manager::transaction_principal_from_claims(&claims));
         let snapshot_version = match transaction_id.as_deref() {
             Some(transaction_id) => {
+                let principal = transaction_principal
+                    .as_deref()
+                    .ok_or_else(|| Status::internal("missing transaction principal"))?;
+                self.mvcc
+                    .open_transactions
+                    .binding(transaction_id, principal)
+                    .map_err(internal_status)?;
                 let handle = self
                     .mvcc
                     .open_transactions
                     .handle(transaction_id)
                     .map_err(internal_status)?;
-                if handle.principal
-                    != transaction_principal
-                        .as_deref()
-                        .ok_or_else(|| Status::internal("missing transaction principal"))?
-                {
-                    return Err(Status::permission_denied(
-                        "PersonalDB caller transaction principal mismatch",
-                    ));
-                }
                 handle.snapshot_version
             }
             None => self
@@ -748,20 +746,18 @@ impl PersonalDbService for AppState {
             .map(|_| crate::object_manager::transaction_principal_from_claims(&claims));
         let snapshot_version = match transaction_id.as_deref() {
             Some(transaction_id) => {
+                let principal = transaction_principal
+                    .as_deref()
+                    .ok_or_else(|| Status::internal("missing transaction principal"))?;
+                self.mvcc
+                    .open_transactions
+                    .binding(transaction_id, principal)
+                    .map_err(internal_status)?;
                 let handle = self
                     .mvcc
                     .open_transactions
                     .handle(transaction_id)
                     .map_err(internal_status)?;
-                if handle.principal
-                    != transaction_principal
-                        .as_deref()
-                        .ok_or_else(|| Status::internal("missing transaction principal"))?
-                {
-                    return Err(Status::permission_denied(
-                        "PersonalDB caller transaction principal mismatch",
-                    ));
-                }
                 handle.snapshot_version
             }
             None => self
@@ -1358,16 +1354,15 @@ impl AppState {
         }
         let snapshot_version = match caller_transaction {
             Some((transaction_id, principal)) => {
+                self.mvcc
+                    .open_transactions
+                    .binding(transaction_id, principal)
+                    .map_err(internal_status)?;
                 let handle = self
                     .mvcc
                     .open_transactions
                     .handle(transaction_id)
                     .map_err(internal_status)?;
-                if handle.principal != principal {
-                    return Err(Status::permission_denied(
-                        "PersonalDB caller transaction principal mismatch",
-                    ));
-                }
                 handle.snapshot_version
             }
             None => self
@@ -1698,16 +1693,15 @@ impl AppState {
         }
         let snapshot_version = match caller_transaction {
             Some((transaction_id, principal)) => {
+                self.mvcc
+                    .open_transactions
+                    .binding(transaction_id, principal)
+                    .map_err(internal_status)?;
                 let handle = self
                     .mvcc
                     .open_transactions
                     .handle(transaction_id)
                     .map_err(internal_status)?;
-                if handle.principal != principal {
-                    return Err(Status::permission_denied(
-                        "PersonalDB caller transaction principal mismatch",
-                    ));
-                }
                 handle.snapshot_version
             }
             None => self
