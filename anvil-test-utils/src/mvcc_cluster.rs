@@ -108,6 +108,7 @@ impl RealMvccCluster {
                 mvcc_bundle_quorum_holders: 2,
                 mvcc_tolerated_failure_domains: 1,
                 mvcc_rpc_timeout_ms: 1_000,
+                mvcc_prepared_bundle_gc_grace_ms: 1,
                 allow_test_only_insecure_mvcc_transport: true,
                 bootstrap_node_ids: (1..=3)
                     .map(|node| format!("{cluster_id}-node-{node}"))
@@ -331,6 +332,44 @@ impl RealMvccCluster {
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 if self.state(node).mvcc.runtime.applied_version()? >= version {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?
+    }
+
+    pub async fn wait_for_readable_version(&self, node: usize, version: u64) -> anyhow::Result<()> {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if self
+                    .state(node)
+                    .mvcc
+                    .runtime
+                    .local_store()
+                    .readable_version()?
+                    >= version
+                {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?
+    }
+
+    pub async fn wait_for_gc_watermark(&self, node: usize, version: u64) -> anyhow::Result<()> {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if self
+                    .state(node)
+                    .mvcc
+                    .runtime
+                    .local_store()
+                    .gc_watermark()?
+                    >= version
+                {
                     return Ok::<_, anyhow::Error>(());
                 }
                 tokio::task::yield_now().await;

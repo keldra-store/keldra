@@ -350,6 +350,14 @@ impl Drop for MvccSubsystem {
 }
 
 impl MvccSubsystem {
+    #[cfg(feature = "test-cluster-transport-faults")]
+    pub fn prepared_bundle(
+        &self,
+        identity: &crate::mvcc_transaction::BundleIdentity,
+    ) -> Result<Option<Vec<u8>>> {
+        self.prepared_bundles.read(identity)
+    }
+
     /// Durable operator-visible records for committed `local` writes whose
     /// sole holder incarnation has been removed from cluster control state.
     pub fn local_durability_violations(

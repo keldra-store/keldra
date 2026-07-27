@@ -132,6 +132,7 @@ tonic-prost-build = { version = "0.14.2" }
 [dev-dependencies]
 anvil-storage = { path = "../clients/rust", version = "0.3.0" }
 anvil-test-utils = { package = "anvil-storage-test-utils", path = "../anvil-test-utils", version = "0.3.0" }
+anvil-mvcc-consensus = { path = "../crates/anvil-mvcc-consensus", version = "0.3.0" }
 personaldb-protocol = "=0.1.0"
 aws-config = "1.1.7"
 aws-sdk-s3 = "1.18.0"
