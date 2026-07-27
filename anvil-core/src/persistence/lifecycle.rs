@@ -388,14 +388,13 @@ impl Persistence {
         let mut blockers = Vec::new();
         let mut partition_cursor = None;
         loop {
-            let page = list_partition_owners_for_node_page(
-                &self.storage,
+            let page = list_partition_owners_for_node_page_mvcc(
+                self.mvcc()?,
                 node_id,
                 partition_cursor.as_ref(),
                 MAX_PARTITION_FENCE_PAGE_SIZE,
                 &self.partition_owner_signing_key,
             )
-            .await
             .map_err(|err| {
                 crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
             })?;
@@ -425,15 +424,14 @@ impl Persistence {
 
         let mut ownership_cursor = None;
         loop {
-            let page = list_active_ownership_fences_for_node_page(
-                &self.storage,
+            let page = list_active_ownership_fences_for_node_page_mvcc(
+                self.mvcc()?,
                 node_id,
                 now_nanos,
                 ownership_cursor.as_ref(),
                 MAX_PARTITION_FENCE_PAGE_SIZE,
                 &self.partition_owner_signing_key,
             )
-            .await
             .map_err(|err| {
                 crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
             })?;
@@ -513,20 +511,20 @@ impl Persistence {
         })?;
         let mut partition_cursor = None;
         loop {
-            let page = list_partition_owners_for_node_page(
-                &self.storage,
+            let page = list_partition_owners_for_node_page_mvcc(
+                self.mvcc()?,
                 node_id,
                 partition_cursor.as_ref(),
                 MAX_PARTITION_FENCE_PAGE_SIZE,
                 &self.partition_owner_signing_key,
             )
-            .await
             .map_err(|err| {
                 crate::mesh_lifecycle::LifecycleError::InvalidArgument(err.to_string())
             })?;
             for owner in page.owners {
-                force_expire_partition_owner_for_node(
+                force_expire_partition_owner_for_node_mvcc(
                     &self.storage,
+                    self.mvcc()?,
                     &owner.partition_family,
                     &owner.partition_id,
                     node_id,
@@ -561,8 +559,8 @@ impl Persistence {
         };
         let mut ownership_cursor = None;
         loop {
-            let page = list_active_ownership_fences_for_node_page(
-                &self.storage,
+            let page = list_active_ownership_fences_for_node_page_mvcc(
+                self.mvcc()?,
                 node_id,
                 now_nanos,
                 ownership_cursor.as_ref(),
@@ -576,26 +574,44 @@ impl Persistence {
             for record in page.fences {
                 let mut admin = admin.clone();
                 admin.tenant_id = record.owner.tenant_id;
-                force_expire_ownership(
-                    &self.storage,
-                    ForceExpireOwnership {
-                        request_id: format!(
-                            "node-force-expire-{}-{}",
-                            node_id,
-                            record.resource.resource_id.replace('/', "-")
-                        ),
-                        idempotency_key: format!(
-                            "node-force-expire-{}-{}-{}",
-                            node_id, record.resource.resource_id, record.fence
-                        ),
-                        resource: record.resource,
-                        admin: admin.clone(),
-                        reason: format!(
-                            "node {node_id} transitioned to non-owning lifecycle state"
-                        ),
-                        now_nanos,
-                    },
+                let request = ForceExpireOwnership {
+                    request_id: format!(
+                        "node-force-expire-{}-{}",
+                        node_id,
+                        record.resource.resource_id.replace('/', "-")
+                    ),
+                    idempotency_key: format!(
+                        "node-force-expire-{}-{}-{}",
+                        node_id, record.resource.resource_id, record.fence
+                    ),
+                    resource: record.resource,
+                    admin: admin.clone(),
+                    reason: format!(
+                        "node {node_id} transitioned to non-owning lifecycle state"
+                    ),
+                    now_nanos,
+                };
+                let idempotency_key = request.idempotency_key.clone();
+                let tenant_id = request.admin.tenant_id;
+                let resource = request.resource.clone();
+                let principal = format!("node:{}", self.owner_node_id);
+                commit_implicit_ownership_plan(
+                    self.mvcc()?,
+                    &principal,
+                    &idempotency_key,
+                    now_nanos,
+                    tenant_id,
+                    &resource,
                     &self.partition_owner_signing_key,
+                    |transaction_id| {
+                        plan_force_expire_ownership_in_transaction(
+                            self.mvcc()?,
+                            transaction_id,
+                            &principal,
+                            request,
+                            &self.partition_owner_signing_key,
+                        )
+                    },
                 )
                 .await
                 .map_err(|err| {
