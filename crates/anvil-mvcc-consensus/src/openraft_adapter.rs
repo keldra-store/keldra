@@ -428,7 +428,6 @@ impl OpenRaftConsensus {
                 Ok(response) => return Ok(response),
                 Err(error) => last_error = Some(error.to_string()),
             }
-            tokio::task::yield_now().await;
         }
         Err(ConsensusError::Unavailable(last_error.unwrap_or_else(
             || "consensus leader forwarding failed".into(),
