@@ -301,8 +301,7 @@ pub async fn prepare_and_stage_projection_definition(
 ) -> Result<()> {
     definition.verify()?;
     ensure_scope(tenant_id, database_id, definition)?;
-    let data_id =
-        projection_definition_data_id(tenant_id, database_id, &definition.projection_id)?;
+    let data_id = projection_definition_data_id(tenant_id, database_id, &definition.projection_id)?;
     let bytes = encode_projection_definition(definition)?;
     let row = prepare_personaldb_bytes_as_data_locator(
         storage,

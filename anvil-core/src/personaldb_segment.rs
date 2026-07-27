@@ -14,8 +14,7 @@ use crate::formats::{
 use crate::mvcc_bootstrap::MvccSubsystem;
 use crate::personaldb_coremeta::{
     PERSONALDB_DATA_LOCATOR_PAGE_MAX, PersonalDbDataLocatorCoreMetaRow, PersonalDbWritePlan,
-    list_personaldb_data_locator_rows_at_snapshot,
-    prepare_personaldb_logical_file_as_data_locator,
+    list_personaldb_data_locator_rows_at_snapshot, prepare_personaldb_logical_file_as_data_locator,
     read_personaldb_data_locator_bytes, read_personaldb_data_locator_row_at_snapshot,
     write_personaldb_data_locator_row_mvcc,
 };

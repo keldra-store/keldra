@@ -292,10 +292,7 @@ pub fn resolve_promoted_manifest(
         .transpose()
 }
 
-pub fn promotion_complete(
-    store: &crate::mvcc_store::LocalMvccStore,
-    job_id: &str,
-) -> Result<bool> {
+pub fn promotion_complete(store: &crate::mvcc_store::LocalMvccStore, job_id: &str) -> Result<bool> {
     let key = crate::mvcc_transaction::LogicalKey {
         table_id: LOCAL_UPGRADE_STATUS_TABLE_ID,
         application_key: format!("promotion/{job_id}").into_bytes(),

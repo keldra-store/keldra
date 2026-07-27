@@ -127,11 +127,10 @@ pub async fn handle_hf_command(command: &HfCommands, ctx: &Context) -> anyhow::R
                     }
                 }
                 HfKeyCommands::Rm { name } => {
-                    let mut request =
-                        tonic::Request::new(api::DeleteHfKeyRequest {
-                            name: name.clone(),
-                            options: None,
-                        });
+                    let mut request = tonic::Request::new(api::DeleteHfKeyRequest {
+                        name: name.clone(),
+                        options: None,
+                    });
                     request.metadata_mut().insert(
                         "authorization",
                         format!("Bearer {}", token).parse().unwrap(),

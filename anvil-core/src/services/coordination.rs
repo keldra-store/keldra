@@ -18,11 +18,10 @@ impl CoordinationService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
-        let transaction_id =
-            crate::services::transaction_context::write_options_transaction_id(
-                req.options.as_ref(),
-            )?
-            .map(str::to_string);
+        let transaction_id = crate::services::transaction_context::write_options_transaction_id(
+            req.options.as_ref(),
+        )?
+        .map(str::to_string);
         validate_task_lease_id(&req.task_id)?;
         let resource = task_lease_resource(&req.task_id);
         access_control::require_action(
@@ -39,15 +38,15 @@ impl CoordinationService for AppState {
             capped_public_ttl_nanos(req.requested_ttl_nanos, self.config.task_lease_ttl_secs)?;
         let owner = lease_owner_from_claims(&claims, &req.owner_label);
         let acquire = task_lease::TaskLeaseAcquire {
-                task_id: req.task_id,
-                task_kind: req.task_kind,
-                partition_family: req.partition_family,
-                partition_id: req.partition_id,
-                owner,
-                source_cursor: join_u128(req.source_cursor_low, req.source_cursor_high),
-                now_nanos,
-                ttl_nanos,
-            };
+            task_id: req.task_id,
+            task_kind: req.task_kind,
+            partition_family: req.partition_family,
+            partition_id: req.partition_id,
+            owner,
+            source_cursor: join_u128(req.source_cursor_low, req.source_cursor_high),
+            now_nanos,
+            ttl_nanos,
+        };
         let (lease, write_state) = if let Some(transaction_id) = transaction_id.as_deref() {
             let principal = crate::object_manager::transaction_principal_from_claims(&claims);
             let plan = task_lease::plan_acquire_task_lease_in_transaction(
@@ -95,11 +94,10 @@ impl CoordinationService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
-        let transaction_id =
-            crate::services::transaction_context::write_options_transaction_id(
-                req.options.as_ref(),
-            )?
-            .map(str::to_string);
+        let transaction_id = crate::services::transaction_context::write_options_transaction_id(
+            req.options.as_ref(),
+        )?
+        .map(str::to_string);
         validate_task_lease_id(&req.task_id)?;
         let resource = task_lease_resource(&req.task_id);
         access_control::require_action(
@@ -183,11 +181,10 @@ impl CoordinationService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
-        let transaction_id =
-            crate::services::transaction_context::write_options_transaction_id(
-                req.options.as_ref(),
-            )?
-            .map(str::to_string);
+        let transaction_id = crate::services::transaction_context::write_options_transaction_id(
+            req.options.as_ref(),
+        )?
+        .map(str::to_string);
         validate_task_lease_id(&req.task_id)?;
         let resource = task_lease_resource(&req.task_id);
         access_control::require_action(
@@ -305,11 +302,10 @@ impl CoordinationService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
-        let transaction_id =
-            crate::services::transaction_context::write_options_transaction_id(
-                req.options.as_ref(),
-            )?
-            .map(str::to_string);
+        let transaction_id = crate::services::transaction_context::write_options_transaction_id(
+            req.options.as_ref(),
+        )?
+        .map(str::to_string);
         validate_task_lease_id(&req.task_id)?;
         let resource = task_lease_resource(&req.task_id);
         access_control::require_action(
@@ -372,11 +368,10 @@ impl CoordinationService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
-        let transaction_id =
-            crate::services::transaction_context::write_options_transaction_id(
-                req.options.as_ref(),
-            )?
-            .map(str::to_string);
+        let transaction_id = crate::services::transaction_context::write_options_transaction_id(
+            req.options.as_ref(),
+        )?
+        .map(str::to_string);
         let resource = ownership_resource_from_proto(req.resource)?;
         ensure_ownership_authorized(
             self,
@@ -396,13 +391,13 @@ impl CoordinationService for AppState {
             &self.config.cell_id,
         )?;
         let mutation = partition_fence::AcquireOwnership {
-                request_id: req.request_id.clone(),
-                idempotency_key: req.idempotency_key,
-                resource,
-                owner,
-                now_nanos,
-                ttl_nanos,
-            };
+            request_id: req.request_id.clone(),
+            idempotency_key: req.idempotency_key,
+            resource,
+            owner,
+            now_nanos,
+            ttl_nanos,
+        };
         let (outcome, write_state) = if let Some(transaction_id) = transaction_id.as_deref() {
             let principal = crate::object_manager::transaction_principal_from_claims(&claims);
             let plan = partition_fence::plan_acquire_ownership_in_transaction(
@@ -463,11 +458,10 @@ impl CoordinationService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
-        let transaction_id =
-            crate::services::transaction_context::write_options_transaction_id(
-                req.options.as_ref(),
-            )?
-            .map(str::to_string);
+        let transaction_id = crate::services::transaction_context::write_options_transaction_id(
+            req.options.as_ref(),
+        )?
+        .map(str::to_string);
         let resource = ownership_resource_from_proto(req.resource)?;
         ensure_ownership_authorized(
             self,
@@ -487,13 +481,13 @@ impl CoordinationService for AppState {
             &self.config.cell_id,
         )?;
         let mutation = partition_fence::RenewOwnership {
-                request_id: req.request_id.clone(),
-                resource,
-                owner,
-                current_fence: req.current_fence,
-                now_nanos,
-                ttl_nanos,
-            };
+            request_id: req.request_id.clone(),
+            resource,
+            owner,
+            current_fence: req.current_fence,
+            now_nanos,
+            ttl_nanos,
+        };
         let (outcome, write_state) = if let Some(transaction_id) = transaction_id.as_deref() {
             let principal = crate::object_manager::transaction_principal_from_claims(&claims);
             let plan = partition_fence::plan_renew_ownership_in_transaction(
@@ -554,11 +548,10 @@ impl CoordinationService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
-        let transaction_id =
-            crate::services::transaction_context::write_options_transaction_id(
-                req.options.as_ref(),
-            )?
-            .map(str::to_string);
+        let transaction_id = crate::services::transaction_context::write_options_transaction_id(
+            req.options.as_ref(),
+        )?
+        .map(str::to_string);
         let resource = ownership_resource_from_proto(req.resource)?;
         ensure_ownership_authorized(
             self,
@@ -589,15 +582,15 @@ impl CoordinationService for AppState {
             &self.config.cell_id,
         )?;
         let mutation = partition_fence::TransferOwnership {
-                request_id: req.request_id.clone(),
-                idempotency_key: req.idempotency_key,
-                resource,
-                current_owner: owner,
-                new_owner,
-                current_fence: req.current_fence,
-                now_nanos,
-                ttl_nanos,
-            };
+            request_id: req.request_id.clone(),
+            idempotency_key: req.idempotency_key,
+            resource,
+            current_owner: owner,
+            new_owner,
+            current_fence: req.current_fence,
+            now_nanos,
+            ttl_nanos,
+        };
         let (outcome, write_state) = if let Some(transaction_id) = transaction_id.as_deref() {
             let principal = crate::object_manager::transaction_principal_from_claims(&claims);
             let plan = partition_fence::plan_transfer_ownership_in_transaction(
@@ -658,11 +651,10 @@ impl CoordinationService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
-        let transaction_id =
-            crate::services::transaction_context::write_options_transaction_id(
-                req.options.as_ref(),
-            )?
-            .map(str::to_string);
+        let transaction_id = crate::services::transaction_context::write_options_transaction_id(
+            req.options.as_ref(),
+        )?
+        .map(str::to_string);
         let resource = ownership_resource_from_proto(req.resource)?;
         let action = ownership_release_action(req.administrative_force);
         ensure_ownership_authorized(self, &claims, &resource, action).await?;
@@ -676,14 +668,14 @@ impl CoordinationService for AppState {
             &self.config.cell_id,
         )?;
         let mutation = partition_fence::ReleaseOwnership {
-                request_id: req.request_id.clone(),
-                idempotency_key: req.idempotency_key,
-                resource,
-                owner,
-                current_fence: req.current_fence,
-                administrative_force: req.administrative_force,
-                now_nanos,
-            };
+            request_id: req.request_id.clone(),
+            idempotency_key: req.idempotency_key,
+            resource,
+            owner,
+            current_fence: req.current_fence,
+            administrative_force: req.administrative_force,
+            now_nanos,
+        };
         let (outcome, write_state) = if let Some(transaction_id) = transaction_id.as_deref() {
             let principal = crate::object_manager::transaction_principal_from_claims(&claims);
             let plan = partition_fence::plan_release_ownership_in_transaction(
@@ -744,11 +736,10 @@ impl CoordinationService for AppState {
             .cloned()
             .ok_or_else(|| Status::unauthenticated("Missing claims"))?;
         let req = request.into_inner();
-        let transaction_id =
-            crate::services::transaction_context::write_options_transaction_id(
-                req.options.as_ref(),
-            )?
-            .map(str::to_string);
+        let transaction_id = crate::services::transaction_context::write_options_transaction_id(
+            req.options.as_ref(),
+        )?
+        .map(str::to_string);
         let resource = ownership_resource_from_proto(req.resource)?;
         ensure_ownership_authorized(
             self,
@@ -762,13 +753,13 @@ impl CoordinationService for AppState {
         let signing_key = ownership_signing_key(self)?;
         let admin = ownership_owner_from_claims(&claims, "", &self.region, &self.config.cell_id)?;
         let mutation = partition_fence::ForceExpireOwnership {
-                request_id: req.request_id.clone(),
-                idempotency_key: req.idempotency_key,
-                resource,
-                admin,
-                reason: req.reason,
-                now_nanos,
-            };
+            request_id: req.request_id.clone(),
+            idempotency_key: req.idempotency_key,
+            resource,
+            admin,
+            reason: req.reason,
+            now_nanos,
+        };
         let (outcome, write_state) = if let Some(transaction_id) = transaction_id.as_deref() {
             let principal = crate::object_manager::transaction_principal_from_claims(&claims);
             let plan = partition_fence::plan_force_expire_ownership_in_transaction(
@@ -787,8 +778,7 @@ impl CoordinationService for AppState {
             let principal = crate::object_manager::transaction_principal_from_claims(&claims);
             let tenant_id = mutation.admin.tenant_id;
             let resource = mutation.resource.clone();
-            let idempotency_key =
-                format!("coordination:ownership:force-expire:{}", req.request_id);
+            let idempotency_key = format!("coordination:ownership:force-expire:{}", req.request_id);
             (
                 execute_implicit_ownership_plan(
                     self,
@@ -1083,10 +1073,7 @@ async fn stage_ownership_plan(
 ) -> Result<partition_fence::OwnershipFenceOutcome, Status> {
     let outcome = plan.outcome.clone();
     plan.stage_into_transaction(
-        state
-            .persistence
-            .mvcc()
-            .map_err(ownership_error_status)?,
+        state.persistence.mvcc().map_err(ownership_error_status)?,
         transaction_id,
         principal,
         u64::try_from(now_nanos / 1_000_000).unwrap_or_default(),
@@ -1108,10 +1095,7 @@ async fn execute_implicit_ownership_plan(
     planner: impl FnOnce(&str) -> anyhow::Result<partition_fence::OwnershipFenceWritePlan>,
 ) -> Result<partition_fence::OwnershipFenceOutcome, Status> {
     let now_unix_ms = u64::try_from(now_nanos / 1_000_000).unwrap_or_default();
-    let mvcc = state
-        .persistence
-        .mvcc()
-        .map_err(ownership_error_status)?;
+    let mvcc = state.persistence.mvcc().map_err(ownership_error_status)?;
     let handle = mvcc
         .open_transactions
         .begin(
@@ -1133,14 +1117,9 @@ async fn execute_implicit_ownership_plan(
     let planned_outcome = if status.state == "open" {
         let plan = planner(&handle.transaction_id).map_err(ownership_error_status)?;
         let outcome = plan.outcome.clone();
-        plan.stage_into_transaction(
-            mvcc,
-            &handle.transaction_id,
-            principal,
-            now_unix_ms,
-        )
-        .await
-        .map_err(ownership_error_status)?;
+        plan.stage_into_transaction(mvcc, &handle.transaction_id, principal, now_unix_ms)
+            .await
+            .map_err(ownership_error_status)?;
         Some(outcome)
     } else {
         None
@@ -1155,8 +1134,7 @@ async fn execute_implicit_ownership_plan(
         )
         .await
         .map_err(ownership_error_status)?;
-    if let crate::mvcc_transaction::CertificationResult::Aborted { reason } =
-        outcome.certification
+    if let crate::mvcc_transaction::CertificationResult::Aborted { reason } = outcome.certification
     {
         return Err(ownership_error_status(anyhow!(
             "{0}: ownership fence MVCC transaction aborted: {reason:?}",
@@ -1166,20 +1144,16 @@ async fn execute_implicit_ownership_plan(
     if let Some(outcome) = planned_outcome {
         return Ok(outcome);
     }
-    let record = partition_fence::read_ownership_fence(
-        &state.storage,
-        tenant_id,
-        resource,
-        signing_key,
-    )
-    .await
-    .map_err(ownership_error_status)?
-    .ok_or_else(|| {
-        ownership_error_status(anyhow!(
-            "{}: resolved ownership transaction has no visible row",
-            partition_fence::OWNERSHIP_NOT_FOUND
-        ))
-    })?;
+    let record =
+        partition_fence::read_ownership_fence(&state.storage, tenant_id, resource, signing_key)
+            .await
+            .map_err(ownership_error_status)?
+            .ok_or_else(|| {
+                ownership_error_status(anyhow!(
+                    "{}: resolved ownership transaction has no visible row",
+                    partition_fence::OWNERSHIP_NOT_FOUND
+                ))
+            })?;
     Ok(partition_fence::OwnershipFenceOutcome {
         record,
         idempotent_replay: true,

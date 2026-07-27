@@ -31,12 +31,7 @@ pub(super) fn admin_application_input_hash(
 ) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"anvil.admin.application-mutation.input.v1");
-    for component in [
-        operation,
-        &tenant_id.to_string(),
-        app_name,
-        request_id,
-    ] {
+    for component in [operation, &tenant_id.to_string(), app_name, request_id] {
         hasher.update(&(component.len() as u64).to_be_bytes());
         hasher.update(component.as_bytes());
     }
@@ -311,11 +306,9 @@ pub(super) async fn commit_admin_product_transaction(
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
     match outcome.certification {
         crate::mvcc_transaction::CertificationResult::Committed { .. } => Ok(()),
-        crate::mvcc_transaction::CertificationResult::Aborted { reason } => {
-            Err(Status::aborted(format!(
-                "admin product transaction aborted: {reason:?}"
-            )))
-        }
+        crate::mvcc_transaction::CertificationResult::Aborted { reason } => Err(Status::aborted(
+            format!("admin product transaction aborted: {reason:?}"),
+        )),
     }
 }
 

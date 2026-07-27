@@ -386,14 +386,13 @@ pub(super) async fn execute_mutation_batch(
                         },
                     )
                     .await?;
-                let watch_cursor =
-                    if effective_transaction_id.is_some()
-                        || !write_visibility.requires_watch_visible()
-                    {
-                        0
-                    } else {
-                        object_watch_cursor(state, &object).await?
-                    };
+                let watch_cursor = if effective_transaction_id.is_some()
+                    || !write_visibility.requires_watch_visible()
+                {
+                    0
+                } else {
+                    object_watch_cursor(state, &object).await?
+                };
                 max_watch_cursor = max_watch_cursor.max(watch_cursor);
                 receipts.push(MutationBatchOperationReceipt {
                     operation: "put_object".to_string(),
@@ -466,14 +465,13 @@ pub(super) async fn execute_mutation_batch(
                         )
                         .await?
                 };
-                let watch_cursor =
-                    if effective_transaction_id.is_some()
-                        || !write_visibility.requires_watch_visible()
-                    {
-                        0
-                    } else {
-                        object_watch_cursor(state, &deleted).await?
-                    };
+                let watch_cursor = if effective_transaction_id.is_some()
+                    || !write_visibility.requires_watch_visible()
+                {
+                    0
+                } else {
+                    object_watch_cursor(state, &deleted).await?
+                };
                 max_watch_cursor = max_watch_cursor.max(watch_cursor);
                 receipts.push(MutationBatchOperationReceipt {
                     operation: "delete_object".to_string(),

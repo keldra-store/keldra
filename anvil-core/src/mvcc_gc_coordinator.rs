@@ -99,14 +99,12 @@ impl MvccGarbageCollectionCoordinator {
                 report.incarnation = *incarnation;
                 report
             } else {
-                let report = reports
-                    .get(raft_node_id)
-                    .with_context(|| {
-                        format!(
-                            "node {} has not reported MVCC apply progress",
-                            raft_node_id.0
-                        )
-                    })?;
+                let report = reports.get(raft_node_id).with_context(|| {
+                    format!(
+                        "node {} has not reported MVCC apply progress",
+                        raft_node_id.0
+                    )
+                })?;
                 if report.incarnation != *incarnation {
                     bail!(
                         "node {} reported incarnation {}, installed incarnation is {}",

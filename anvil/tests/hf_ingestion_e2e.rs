@@ -126,7 +126,7 @@ async fn hf_ingestion_config_json() {
     auth_client
         .set_public_access(authorized(
             tonic::Request::new(anvil::anvil_api::SetPublicAccessRequest {
-            context: None,
+                context: None,
                 bucket: bucket_name.clone(),
                 allow_public_read: true,
             }),

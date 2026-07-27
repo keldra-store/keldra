@@ -14,32 +14,25 @@ use std::{
 
 use anvil::anvil_api::{
     AdminRequestContext, BeginTransactionRequest, BeginTransactionResponse,
-    BootstrapMeshTopologyRequest, CommitTransactionRequest, CreateBucketRequest,
-    CheckPermissionRequest, CreateIndexRequest, CreatePersonalDbGroupRequest,
-    GetPersonalDbGroupRequest, IndexDefinitionRecord, IndexKind,
-    GetGitBlobByPathRequest, GitBlobLocation, GitPackMetadata, PutGitPackRequest,
-    PutGitPackResponse, WatchGitSourceRequest, WatchGitSourceResponse,
-    ListIndexesRequest, ListRoutingRecordsRequest, QueryIndexRequest, QueryIndexResponse,
-    ReadAuthzTuplesRequest, RoutingRecordFamily,
-    PersonalDbGroupResponse, PersonalDbVoterAck, SubmitPersonalDbChangesetRequest,
-    SubmitPersonalDbChangesetResponse, WriteOptions,
-    GetLocalNodeDescriptorRequest, GetObjectRequest, GetTransactionRequest, HeadObjectRequest,
-    MutationBatchOperation, ReadConsistency,
-    MutationBatchPutObject, MutationBatchRequest, MutationBatchResponse, MvccDurability, MvccReadConsistency,
-    NativeMutationContext, PutCellRequest, PutNodeRequest, PutRegionRequest,
-    ReplaceClusterNodeIncarnationRequest, TransactionStatus, WriteResponse,
-    admin_service_client::AdminServiceClient,
-    auth_service_client::AuthServiceClient,
-    bucket_service_client::BucketServiceClient,
+    BootstrapMeshTopologyRequest, CheckPermissionRequest, CommitTransactionRequest,
+    CreateBucketRequest, CreateIndexRequest, CreatePersonalDbGroupRequest, GetGitBlobByPathRequest,
+    GetLocalNodeDescriptorRequest, GetObjectRequest, GetPersonalDbGroupRequest,
+    GetTransactionRequest, GitBlobLocation, GitPackMetadata, HeadObjectRequest,
+    IndexDefinitionRecord, IndexKind, ListIndexesRequest, ListRoutingRecordsRequest,
+    MutationBatchOperation, MutationBatchPutObject, MutationBatchRequest, MutationBatchResponse,
+    MvccDurability, MvccReadConsistency, NativeMutationContext, PersonalDbGroupResponse,
+    PersonalDbVoterAck, PutCellRequest, PutGitPackRequest, PutGitPackResponse, PutNodeRequest,
+    PutRegionRequest, QueryIndexRequest, QueryIndexResponse, ReadAuthzTuplesRequest,
+    ReadConsistency, ReplaceClusterNodeIncarnationRequest, RoutingRecordFamily,
+    SubmitPersonalDbChangesetRequest, SubmitPersonalDbChangesetResponse, TransactionStatus,
+    WatchGitSourceRequest, WatchGitSourceResponse, WriteOptions, WriteResponse,
+    admin_service_client::AdminServiceClient, auth_service_client::AuthServiceClient,
+    bucket_service_client::BucketServiceClient, git_source_service_client::GitSourceServiceClient,
     index_service_client::IndexServiceClient,
-    git_source_service_client::GitSourceServiceClient,
-    mesh_control_service_client::MeshControlServiceClient,
-    mutation_batch_operation,
+    mesh_control_service_client::MeshControlServiceClient, mutation_batch_operation,
     object_service_client::ObjectServiceClient,
-    personal_db_service_client::PersonalDbServiceClient,
-    put_git_pack_request,
-    transaction_service_client::TransactionServiceClient,
-    write_options,
+    personal_db_service_client::PersonalDbServiceClient, put_git_pack_request,
+    transaction_service_client::TransactionServiceClient, write_options,
 };
 use anvil_core::{auth::JwtManager, system_realm::SYSTEM_STORAGE_TENANT_ID};
 use anyhow::{Context, bail};
@@ -48,8 +41,7 @@ use tokio::process::{Child, Command};
 use tonic::Request;
 
 const JWT_SECRET: &str = "process-mvcc-fixture-secret";
-const ENCRYPTION_KEY: &str =
-    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const ENCRYPTION_KEY: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const ADMIN_PRINCIPAL: &str = "process-mvcc-admin";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -204,12 +196,8 @@ impl ProcessMvccCluster {
         endpoint: String,
         consistency: MvccReadConsistency,
     ) -> anyhow::Result<BeginTransactionResponse> {
-        self.begin_transaction_at_with_durability(
-            endpoint,
-            consistency,
-            MvccDurability::Quorum,
-        )
-        .await
+        self.begin_transaction_at_with_durability(endpoint, consistency, MvccDurability::Quorum)
+            .await
     }
 
     async fn begin_transaction_at_with_durability(
@@ -321,11 +309,8 @@ impl ProcessMvccCluster {
         node: usize,
         bucket_name: &str,
     ) -> anyhow::Result<usize> {
-        let mut client = AdminServiceClient::connect(format!(
-            "http://{}",
-            self.nodes[node].admin_addr
-        ))
-        .await?;
+        let mut client =
+            AdminServiceClient::connect(format!("http://{}", self.nodes[node].admin_addr)).await?;
         Ok(client
             .list_routing_records(authorized(
                 ListRoutingRecordsRequest {
@@ -728,11 +713,9 @@ impl ProcessMvccCluster {
     pub async fn bootstrap_object_placement(&self, coordinator: usize) -> anyhow::Result<()> {
         let mut descriptors = Vec::new();
         for node in 0..self.nodes.len() {
-            let mut admin = AdminServiceClient::connect(format!(
-                "http://{}",
-                self.nodes[node].admin_addr
-            ))
-            .await?;
+            let mut admin =
+                AdminServiceClient::connect(format!("http://{}", self.nodes[node].admin_addr))
+                    .await?;
             descriptors.push(
                 admin
                     .get_local_node_descriptor(authorized(
@@ -897,28 +880,30 @@ impl ProcessMvccCluster {
             .take()
             .context("process MVCC node is not running")?;
         child.start_kill().context("SIGKILL process MVCC node")?;
-        child.wait().await.context("reap killed process MVCC node")?;
+        child
+            .wait()
+            .await
+            .context("reap killed process MVCC node")?;
         Ok(())
     }
 
     /// Arm a one-shot hard crash in an already-running debug child. The hook
     /// consumes this file before aborting, so same-disk restart can recover.
     pub fn arm_hard_crash(&self, node: usize, fault_point: &str) -> anyhow::Result<()> {
-        const PROCESS_SAFE_POINTS: &[&str] =
-            &[
-                "PreparedBundleWrite",
-                "ShardWrite",
-                "MvccBatchWrite",
-                "RaftLogWrite",
-                "IndexFinalizationBeforeExecute",
-                "IndexFinalizationAfterExecute",
-                "PersonalDbPostCommitBeforeEffects",
-                "PersonalDbPostCommitAfterEffects",
-                "GitSourcePostCommitBeforeEffects",
-                "GitSourcePostCommitAfterEffects",
-                "BucketLocatorFinalizationBeforeEffects",
-                "BucketLocatorFinalizationAfterEffects",
-            ];
+        const PROCESS_SAFE_POINTS: &[&str] = &[
+            "PreparedBundleWrite",
+            "ShardWrite",
+            "MvccBatchWrite",
+            "RaftLogWrite",
+            "IndexFinalizationBeforeExecute",
+            "IndexFinalizationAfterExecute",
+            "PersonalDbPostCommitBeforeEffects",
+            "PersonalDbPostCommitAfterEffects",
+            "GitSourcePostCommitBeforeEffects",
+            "GitSourcePostCommitAfterEffects",
+            "BucketLocatorFinalizationBeforeEffects",
+            "BucketLocatorFinalizationAfterEffects",
+        ];
         if !PROCESS_SAFE_POINTS.contains(&fault_point) {
             bail!("fault point is not enabled for process-backed hard crashes");
         }
@@ -958,11 +943,7 @@ impl ProcessMvccCluster {
 
     /// Start a clean replacement process with the same logical and Raft node
     /// IDs, endpoint and failure domain but a strictly newer incarnation.
-    pub async fn spawn_replacement(
-        &mut self,
-        node: usize,
-        incarnation: u64,
-    ) -> anyhow::Result<()> {
+    pub async fn spawn_replacement(&mut self, node: usize, incarnation: u64) -> anyhow::Result<()> {
         if self.nodes[node].child.is_some() {
             bail!("replacement requires the old process to be stopped");
         }
@@ -1042,11 +1023,9 @@ impl ProcessMvccCluster {
         replaced_node: usize,
         install_control: bool,
     ) -> anyhow::Result<()> {
-        let mut client = AdminServiceClient::connect(format!(
-            "http://{}",
-            self.nodes[coordinator].admin_addr
-        ))
-        .await?;
+        let mut client =
+            AdminServiceClient::connect(format!("http://{}", self.nodes[coordinator].admin_addr))
+                .await?;
         client
             .replace_cluster_node_incarnation(authorized(
                 ReplaceClusterNodeIncarnationRequest {

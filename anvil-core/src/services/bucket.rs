@@ -45,11 +45,7 @@ impl BucketService for AppState {
                 .await?
         } else {
             let transaction = self
-                .begin_implicit_bucket_transaction(
-                    claims,
-                    req.options.as_ref(),
-                    "bucket-create",
-                )
+                .begin_implicit_bucket_transaction(claims, req.options.as_ref(), "bucket-create")
                 .await?;
             if transaction.replayed {
                 crate::access_control::require_action(
@@ -75,13 +71,10 @@ impl BucketService for AppState {
                 bucket
             } else {
                 let bucket = self
-                    .create_bucket_in_transaction(
-                        claims,
-                        req,
-                        &transaction.transaction_id,
-                    )
+                    .create_bucket_in_transaction(claims, req, &transaction.transaction_id)
                     .await?;
-                self.commit_implicit_bucket_transaction(&transaction).await?;
+                self.commit_implicit_bucket_transaction(&transaction)
+                    .await?;
                 bucket
             }
         };
@@ -107,11 +100,7 @@ impl BucketService for AppState {
                 .await?;
         } else {
             let transaction = self
-                .begin_implicit_bucket_transaction(
-                    claims,
-                    req.options.as_ref(),
-                    "bucket-delete",
-                )
+                .begin_implicit_bucket_transaction(claims, req.options.as_ref(), "bucket-delete")
                 .await?;
             if transaction.replayed {
                 crate::access_control::require_action(
@@ -135,13 +124,10 @@ impl BucketService for AppState {
                     ));
                 }
             } else {
-                self.delete_bucket_in_transaction(
-                    claims,
-                    req,
-                    &transaction.transaction_id,
-                )
-                .await?;
-                self.commit_implicit_bucket_transaction(&transaction).await?;
+                self.delete_bucket_in_transaction(claims, req, &transaction.transaction_id)
+                    .await?;
+                self.commit_implicit_bucket_transaction(&transaction)
+                    .await?;
             }
         }
 
@@ -268,11 +254,7 @@ impl BucketService for AppState {
                 .await?;
         } else {
             let transaction = self
-                .begin_implicit_bucket_transaction(
-                    claims,
-                    req.options.as_ref(),
-                    "bucket-policy",
-                )
+                .begin_implicit_bucket_transaction(claims, req.options.as_ref(), "bucket-policy")
                 .await?;
             if transaction.replayed {
                 crate::access_control::require_action(
@@ -304,7 +286,8 @@ impl BucketService for AppState {
                     &transaction.transaction_id,
                 )
                 .await?;
-                self.commit_implicit_bucket_transaction(&transaction).await?;
+                self.commit_implicit_bucket_transaction(&transaction)
+                    .await?;
             }
         }
 
@@ -402,8 +385,7 @@ impl AppState {
             .filter(|key| !key.is_empty());
         let scoped_idempotency_key;
         let idempotency_key = if let Some(key) = supplied_idempotency_key {
-            scoped_idempotency_key =
-                format!("bucket:{}:{}:{key}", claims.tenant_id, claims.sub);
+            scoped_idempotency_key = format!("bucket:{}:{}:{key}", claims.tenant_id, claims.sub);
             &scoped_idempotency_key
         } else {
             scoped_idempotency_key = format!(
@@ -485,11 +467,9 @@ impl AppState {
             .map_err(|error| Status::failed_precondition(error.to_string()))?;
         match outcome.certification {
             crate::mvcc_transaction::CertificationResult::Committed { .. } => Ok(()),
-            crate::mvcc_transaction::CertificationResult::Aborted { reason } => {
-                Err(Status::aborted(format!(
-                    "implicit bucket transaction aborted: {reason:?}"
-                )))
-            }
+            crate::mvcc_transaction::CertificationResult::Aborted { reason } => Err(
+                Status::aborted(format!("implicit bucket transaction aborted: {reason:?}")),
+            ),
         }
     }
 
@@ -539,20 +519,21 @@ impl AppState {
                 transaction_id,
                 &principal,
             )
-                .map_err(|err| Status::internal(err.to_string()))?,
+            .map_err(|err| Status::internal(err.to_string()))?,
             tenant_id: claims.tenant_id,
             name: req.bucket_name.clone(),
             region: req.region.clone(),
             created_at: chrono::Utc::now(),
             is_public_read: false,
         };
-        let operation_sequence = self.stage_bucket_metadata_transaction(
-            claims,
-            &bucket,
-            BucketJournalMutation::Create,
-            transaction_id,
-        )
-        .await?;
+        let operation_sequence = self
+            .stage_bucket_metadata_transaction(
+                claims,
+                &bucket,
+                BucketJournalMutation::Create,
+                transaction_id,
+            )
+            .await?;
         crate::access_control::stage_bucket_defaults(
             &self.persistence,
             &bucket,
@@ -615,13 +596,14 @@ impl AppState {
         if has_objects || has_uploads {
             return Err(Status::failed_precondition("Bucket not empty"));
         }
-        let operation_sequence = self.stage_bucket_metadata_transaction(
-            claims,
-            &bucket,
-            BucketJournalMutation::Delete,
-            transaction_id,
-        )
-        .await?;
+        let operation_sequence = self
+            .stage_bucket_metadata_transaction(
+                claims,
+                &bucket,
+                BucketJournalMutation::Delete,
+                transaction_id,
+            )
+            .await?;
         self.stage_bucket_locator_finalization(
             transaction_id,
             &principal,
@@ -717,9 +699,8 @@ impl AppState {
             ));
         }
         let job = crate::bucket_locator_finalization_job::BucketLocatorFinalizationJob {
-            schema:
-                crate::bucket_locator_finalization_job::BucketLocatorFinalizationJob::SCHEMA
-                    .to_string(),
+            schema: crate::bucket_locator_finalization_job::BucketLocatorFinalizationJob::SCHEMA
+                .to_string(),
             cluster_id: self.mvcc.cluster_id().to_string(),
             transaction_id: transaction_id.to_string(),
             operation_sequence,
@@ -736,7 +717,6 @@ impl AppState {
             )
             .map_err(|err| Status::failed_precondition(err.to_string()))
     }
-
 }
 
 fn bucket_metadata_event_response(

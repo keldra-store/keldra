@@ -335,17 +335,15 @@ impl MvccApplyWorker {
                 )
                 .await
             {
-                Ok(bytes) => {
-                    match self.prepared.persist(identity, &bytes).await {
-                        Ok(()) => return Ok(bytes),
-                        Err(error) => {
-                            failures.push(format!(
-                                "{}:{} returned bytes outside the committed identity: {error}",
-                                peer.node_id, peer.incarnation
-                            ));
-                        }
+                Ok(bytes) => match self.prepared.persist(identity, &bytes).await {
+                    Ok(()) => return Ok(bytes),
+                    Err(error) => {
+                        failures.push(format!(
+                            "{}:{} returned bytes outside the committed identity: {error}",
+                            peer.node_id, peer.incarnation
+                        ));
                     }
-                }
+                },
                 Err(error) => failures.push(error.to_string()),
             }
         }
@@ -365,8 +363,7 @@ fn durable_peer_candidates<'a>(
         .iter()
         .filter(|peer| {
             durable_holders.iter().any(|holder| {
-                holder.node_id
-                    == crate::mvcc_bootstrap::consensus_control_node_id(&peer.node_id)
+                holder.node_id == crate::mvcc_bootstrap::consensus_control_node_id(&peer.node_id)
                     && holder.incarnation == peer.incarnation
             })
         })
@@ -648,14 +645,11 @@ mod tests {
         .unwrap();
         let local = LocalMvccStore::open(local_directory.path()).unwrap();
         let mut decision = committed(&bundle, 1);
-        decision
-            .committed_bundle
-            .as_mut()
-            .unwrap()
-            .durable_holders = vec![anvil_mvcc_consensus::NodeIncarnation {
-            node_id: crate::mvcc_bootstrap::consensus_control_node_id(&remote.node_id),
-            incarnation: remote.incarnation,
-        }];
+        decision.committed_bundle.as_mut().unwrap().durable_holders =
+            vec![anvil_mvcc_consensus::NodeIncarnation {
+                node_id: crate::mvcc_bootstrap::consensus_control_node_id(&remote.node_id),
+                incarnation: remote.incarnation,
+            }];
         let source = Arc::new(Source {
             decisions: StdMutex::new(vec![decision]),
             gc: CommitVersion(0),
@@ -722,10 +716,7 @@ mod tests {
         }];
 
         assert_eq!(
-            durable_peer_candidates(
-                &[stale_holder, non_holder, holder.clone()],
-                &durable,
-            ),
+            durable_peer_candidates(&[stale_holder, non_holder, holder.clone()], &durable,),
             vec![&holder]
         );
     }

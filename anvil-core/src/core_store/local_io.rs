@@ -188,7 +188,10 @@ async fn write_file_atomic_with_shard_boundary(
         drop(file);
         let _ = fs::remove_file(&tmp_path).await;
         return Err(error).with_context(|| {
-            format!("write CoreStore atomic temporary file {}", tmp_path.display())
+            format!(
+                "write CoreStore atomic temporary file {}",
+                tmp_path.display()
+            )
         });
     }
     crate::perf::record_io_duration(
@@ -213,7 +216,10 @@ async fn write_file_atomic_with_shard_boundary(
         drop(file);
         let _ = fs::remove_file(&tmp_path).await;
         return Err(error).with_context(|| {
-            format!("sync CoreStore atomic temporary file {}", tmp_path.display())
+            format!(
+                "sync CoreStore atomic temporary file {}",
+                tmp_path.display()
+            )
         });
     }
     let elapsed = started_at.elapsed();

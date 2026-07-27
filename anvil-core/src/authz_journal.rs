@@ -704,10 +704,8 @@ pub fn authz_revision_at_snapshot(
     tenant_id: i64,
     snapshot_version: u64,
 ) -> Result<i64> {
-    i64::try_from(
-        authz_head::read_at_mvcc(mvcc, tenant_id, snapshot_version)?.committed_revision,
-    )
-    .context("authorization revision exceeds i64")
+    i64::try_from(authz_head::read_at_mvcc(mvcc, tenant_id, snapshot_version)?.committed_revision)
+        .context("authorization revision exceeds i64")
 }
 
 pub(crate) fn latest_authz_tuple_revision(

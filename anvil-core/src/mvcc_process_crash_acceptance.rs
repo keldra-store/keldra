@@ -10,9 +10,7 @@ use tonic::{Status, metadata::MetadataMap};
 
 use crate::{
     anvil_api::replication_service_server::ReplicationServiceServer,
-    bundle_replication::{
-        AppendOnlyPreparedBundleStore, BundleTarget, BundleTargetStream,
-    },
+    bundle_replication::{AppendOnlyPreparedBundleStore, BundleTarget, BundleTargetStream},
     mvcc_store::LocalMvccStore,
     mvcc_transaction::{
         BundleIdentity, HierarchicalRangeStampScheme, LogicalKey, NodeIncarnation,
@@ -22,14 +20,11 @@ use crate::{
     replication_client::{
         ReplicationPeer, ReplicationStreamOptions, TonicReplicationStreamManager,
     },
-    services::replication::{
-        ReplicationConnectionAuthorizer, ReplicationServiceImpl,
-    },
+    services::replication::{ReplicationConnectionAuthorizer, ReplicationServiceImpl},
     shard_store::{ShardKind, ShardRecord, ShardSegment},
 };
 
-const CHILD_TEST: &str =
-    "mvcc_process_crash_acceptance::mvcc_os_crash_child";
+const CHILD_TEST: &str = "mvcc_process_crash_acceptance::mvcc_os_crash_child";
 fn child_path() -> std::path::PathBuf {
     std::env::var_os("ANVIL_MVCC_CRASH_DIRECTORY")
         .map(Into::into)
@@ -66,12 +61,7 @@ fn unused_loopback_endpoint() -> String {
     endpoint
 }
 
-fn run_tonic_child(
-    scenario: &str,
-    crash_at: &str,
-    directory: &Path,
-    endpoint: &str,
-) {
+fn run_tonic_child(scenario: &str, crash_at: &str, directory: &Path, endpoint: &str) {
     let status = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", CHILD_TEST, "--nocapture"])
         .env("ANVIL_MVCC_CRASH_SCENARIO", scenario)
@@ -98,12 +88,8 @@ impl ReplicationConnectionAuthorizer for CrashReplicationAuthorizer {
         _metadata: &MetadataMap,
         open: &crate::anvil_api::ReplicationSessionOpen,
     ) -> Result<AuthenticatedPeer, Status> {
-        AuthenticatedPeer::new_bound(
-            open.node_id.clone(),
-            open.node_incarnation,
-            "crash-client",
-        )
-        .map_err(|error| Status::permission_denied(error.to_string()))
+        AuthenticatedPeer::new_bound(open.node_id.clone(), open.node_incarnation, "crash-client")
+            .map_err(|error| Status::permission_denied(error.to_string()))
     }
 }
 
@@ -150,13 +136,10 @@ async fn replication_manager(endpoint: String) -> TonicReplicationStreamManager 
 }
 
 async fn serve_and_send(directory: &Path, endpoint: &str) -> crate::replication::ReplicationAck {
-    let listener = tokio::net::TcpListener::bind(
-        endpoint.trim_start_matches("http://"),
-    )
-    .await
-    .unwrap();
-    let service =
-        ReplicationServiceImpl::open(CrashReplicationAuthorizer, directory).unwrap();
+    let listener = tokio::net::TcpListener::bind(endpoint.trim_start_matches("http://"))
+        .await
+        .unwrap();
+    let service = ReplicationServiceImpl::open(CrashReplicationAuthorizer, directory).unwrap();
     let server = tokio::spawn(
         tonic::transport::Server::builder()
             .add_service(ReplicationServiceServer::new(service))
@@ -164,7 +147,10 @@ async fn serve_and_send(directory: &Path, endpoint: &str) -> crate::replication:
     );
     let (identity, bytes, target) = crash_bundle();
     let manager = replication_manager(endpoint.to_string()).await;
-    let ack = manager.send_bundle(&target, &identity, &bytes).await.unwrap();
+    let ack = manager
+        .send_bundle(&target, &identity, &bytes)
+        .await
+        .unwrap();
     server.abort();
     ack
 }
@@ -235,7 +221,9 @@ fn mvcc_os_crash_child() {
                     )
                     .map_err(|error| error.to_string())
                 }));
-            store.append_logs(&[(0, b"must-not-commit".to_vec())]).unwrap();
+            store
+                .append_logs(&[(0, b"must-not-commit".to_vec())])
+                .unwrap();
         }
         "mvcc_batch" => {
             let key = LogicalKey {
@@ -256,8 +244,7 @@ fn mvcc_os_crash_child() {
                 .unwrap();
         }
         "complete_ack_tonic_before" | "complete_ack_tonic_after" => {
-            let endpoint =
-                std::env::var("ANVIL_MVCC_CRASH_ENDPOINT").unwrap();
+            let endpoint = std::env::var("ANVIL_MVCC_CRASH_ENDPOINT").unwrap();
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -272,11 +259,7 @@ fn mvcc_os_crash_child() {
 #[test]
 fn prepared_bundle_crash_reopens_without_false_durability() {
     let directory = tempfile::tempdir().unwrap();
-    run_child(
-        "prepared_bundle",
-        "PreparedBundleWrite",
-        directory.path(),
-    );
+    run_child("prepared_bundle", "PreparedBundleWrite", directory.path());
     let bytes = b"hard-crash-prepared-bundle";
     let identity = bundle_identity(bytes);
     let reopened = AppendOnlyPreparedBundleStore::open(
@@ -336,18 +319,10 @@ async fn assert_tonic_ack_crash_resumes(crash_at: &str, scenario: &str) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tonic_crash_before_complete_ack_restarts_and_resumes_idempotently() {
-    assert_tonic_ack_crash_resumes(
-        "BeforeCompleteAck",
-        "complete_ack_tonic_before",
-    )
-    .await;
+    assert_tonic_ack_crash_resumes("BeforeCompleteAck", "complete_ack_tonic_before").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tonic_crash_after_complete_ack_restarts_and_resumes_idempotently() {
-    assert_tonic_ack_crash_resumes(
-        "AfterCompleteAck",
-        "complete_ack_tonic_after",
-    )
-    .await;
+    assert_tonic_ack_crash_resumes("AfterCompleteAck", "complete_ack_tonic_after").await;
 }

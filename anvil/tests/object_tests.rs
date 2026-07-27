@@ -1,25 +1,23 @@
 #![recursion_limit = "256"]
 
-use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::auth_service_client::AuthServiceClient;
+use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::coordination_service_client::CoordinationServiceClient;
 use anvil::anvil_api::index_service_client::IndexServiceClient;
 use anvil::anvil_api::object_service_client::ObjectServiceClient;
 use anvil::anvil_api::repair_service_client::RepairServiceClient;
 use anvil::anvil_api::{
     self, AbortMultipartRequest, AcquireOwnershipRequest, AcquireTaskLeaseRequest,
-    AppendStreamRecordRequest,
-    CompareAndSwapManifestRequest, CompleteMultipartPart, CompleteMultipartRequest,
-    ComposeObjectRequest, ComposeObjectSource, CopyObjectRequest, CreateAppendStreamRequest,
-    CreateBucketRequest, CreateIndexRequest, CreateObjectLinkRequest, DeleteObjectRequest,
-    GetObjectRequest, GrantAccessRequest, ListAccessGrantsRequest,
-    HeadObjectRequest, IndexKind, InitiateMultipartRequest, LeaseFencePrecondition,
+    AppendStreamRecordRequest, CompareAndSwapManifestRequest, CompleteMultipartPart,
+    CompleteMultipartRequest, ComposeObjectRequest, ComposeObjectSource, CopyObjectRequest,
+    CreateAppendStreamRequest, CreateBucketRequest, CreateIndexRequest, CreateObjectLinkRequest,
+    DeleteObjectRequest, GetObjectRequest, GrantAccessRequest, HeadObjectRequest, IndexKind,
+    InitiateMultipartRequest, LeaseFencePrecondition, ListAccessGrantsRequest,
     ListObjectVersionsRequest, ListObjectsRequest, MutationBatchOperation,
     MutationBatchPatchJsonObject, MutationBatchPutObject, MutationBatchRequest,
     NativeMutationContext, ObjectLinkResolution, ObjectMetadata, ObjectVersionPrecondition,
-    OwnershipResource, OwnershipResourceKind,
-    PatchJsonObjectRequest, PublicMutationContext, PutObjectRequest, ReadAppendStreamRequest,
-    ReadObjectLinkRequest, RepairDirectoryIndexRequest,
+    OwnershipResource, OwnershipResourceKind, PatchJsonObjectRequest, PublicMutationContext,
+    PutObjectRequest, ReadAppendStreamRequest, ReadObjectLinkRequest, RepairDirectoryIndexRequest,
     SealAppendStreamSegmentRequest, TailAppendStreamRequest, UploadPartMetadata, UploadPartRequest,
     WatchPrefixRequest, WritePrecondition, WriteVisibilityOptions,
 };

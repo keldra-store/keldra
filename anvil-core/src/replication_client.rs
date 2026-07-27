@@ -1333,11 +1333,7 @@ mod tests {
         .unwrap();
 
         manager
-            .replace_peer_incarnation(
-                "cluster-a",
-                &replacement,
-                "http://127.0.0.1:10",
-            )
+            .replace_peer_incarnation("cluster-a", &replacement, "http://127.0.0.1:10")
             .unwrap();
         let peers = manager
             .peers

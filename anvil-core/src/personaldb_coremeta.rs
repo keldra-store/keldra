@@ -46,22 +46,19 @@ impl PersonalDbWritePlan {
         idempotency_key: &str,
     ) -> Result<Option<u64>> {
         let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default();
-        let Some(status) = mvcc
-            .open_transactions
-            .status_by_idempotency(
-                mvcc.cluster_id(),
-                idempotency_key,
-                principal,
-                now,
-            )
-            ?
+        let Some(status) = mvcc.open_transactions.status_by_idempotency(
+            mvcc.cluster_id(),
+            idempotency_key,
+            principal,
+            now,
+        )?
         else {
             return Ok(None);
         };
         match status.result {
-            Some(crate::mvcc_transaction::CertificationResult::Committed {
-                commit_version,
-            }) => Ok(Some(commit_version)),
+            Some(crate::mvcc_transaction::CertificationResult::Committed { commit_version }) => {
+                Ok(Some(commit_version))
+            }
             Some(crate::mvcc_transaction::CertificationResult::Aborted { reason }) => {
                 bail!("PersonalDB MVCC write plan previously aborted: {reason:?}")
             }
@@ -77,9 +74,9 @@ impl PersonalDbWritePlan {
                     )
                     .await?;
                 match outcome.certification {
-                    crate::mvcc_transaction::CertificationResult::Committed {
-                        commit_version,
-                    } => Ok(Some(commit_version)),
+                    crate::mvcc_transaction::CertificationResult::Committed { commit_version } => {
+                        Ok(Some(commit_version))
+                    }
                     crate::mvcc_transaction::CertificationResult::Aborted { reason } => {
                         bail!("PersonalDB MVCC write plan aborted while resuming: {reason:?}")
                     }
@@ -131,18 +128,17 @@ impl PersonalDbWritePlan {
         predicate: crate::mvcc_transaction::PredicateKind,
     ) {
         self.mutations
-            .push(crate::mvcc_product::ProductMutation::put(key.clone(), payload));
+            .push(crate::mvcc_product::ProductMutation::put(
+                key.clone(),
+                payload,
+            ));
         self.predicates.push((key, Some(predicate)));
     }
 
-    pub fn stage_data_locator_row(
-        &mut self,
-        row: &PersonalDbDataLocatorCoreMetaRow,
-    ) -> Result<()> {
+    pub fn stage_data_locator_row(&mut self, row: &PersonalDbDataLocatorCoreMetaRow) -> Result<()> {
         validate_data_locator_row(row)?;
         self.require_scope(row.tenant_id, &row.group_id)?;
-        let tuple =
-            personaldb_data_locator_tuple_key(row.tenant_id, &row.group_id, &row.data_id)?;
+        let tuple = personaldb_data_locator_tuple_key(row.tenant_id, &row.group_id, &row.data_id)?;
         self.stage_coremeta_row(
             TABLE_PERSONALDB_DATA_LOCATOR_ROW,
             tuple,
@@ -150,18 +146,11 @@ impl PersonalDbWritePlan {
         )
     }
 
-    pub fn stage_group_row(
-        &mut self,
-        row: &PersonalDbGroupCoreMetaRow,
-    ) -> Result<()> {
+    pub fn stage_group_row(&mut self, row: &PersonalDbGroupCoreMetaRow) -> Result<()> {
         validate_group_row(row)?;
         self.require_scope(row.tenant_id, &row.group_id)?;
         let tuple = personaldb_group_tuple_key(row.tenant_id, &row.group_id, row.generation)?;
-        self.stage_coremeta_row(
-            TABLE_PERSONALDB_GROUP_ROW,
-            tuple,
-            encode_group_row(row)?,
-        )
+        self.stage_coremeta_row(TABLE_PERSONALDB_GROUP_ROW, tuple, encode_group_row(row)?)
     }
 
     fn stage_coremeta_row(
@@ -172,7 +161,10 @@ impl PersonalDbWritePlan {
     ) -> Result<()> {
         let key = crate::mvcc_product::coremeta_logical_key(CF_PERSONALDB, table_id, &tuple_key)?;
         self.mutations
-            .push(crate::mvcc_product::ProductMutation::put(key.clone(), payload));
+            .push(crate::mvcc_product::ProductMutation::put(
+                key.clone(),
+                payload,
+            ));
         // Resolve replace semantics at the transaction's fixed snapshot, not
         // while a potentially long-lived plan is being assembled.
         self.predicates.push((key, None));
@@ -186,10 +178,7 @@ impl PersonalDbWritePlan {
         Ok(())
     }
 
-    pub async fn commit(
-        self,
-        mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
-    ) -> Result<u64> {
+    pub async fn commit(self, mvcc: &crate::mvcc_bootstrap::MvccSubsystem) -> Result<u64> {
         if self.mutations.is_empty() {
             bail!("PersonalDB write plan has no product mutations");
         }
@@ -207,18 +196,13 @@ impl PersonalDbWritePlan {
                 now,
             )
             .await?;
-        let status =
-            mvcc.open_transactions
-                .status(&handle.transaction_id, &self.principal, now)?;
+        let status = mvcc
+            .open_transactions
+            .status(&handle.transaction_id, &self.principal, now)?;
         if status.state == "open" {
             let principal = self.principal.clone();
-            self.stage_into_transaction(
-                mvcc,
-                &handle.transaction_id,
-                &principal,
-                now,
-            )
-            .await?;
+            self.stage_into_transaction(mvcc, &handle.transaction_id, &principal, now)
+                .await?;
         }
         let outcome = mvcc
             .open_transactions
@@ -256,8 +240,7 @@ impl PersonalDbWritePlan {
         if handle.principal != principal {
             bail!("PersonalDB caller transaction principal mismatch");
         }
-        let logical_identity =
-            format!("tenant/{}/personaldb/{}", self.tenant_id, self.group_id);
+        let logical_identity = format!("tenant/{}/personaldb/{}", self.tenant_id, self.group_id);
         let assignment = match self.assignment {
             Some(assignment) => {
                 let expected_partition = crate::mvcc_worker_authority::work_partition_id(
@@ -1018,8 +1001,7 @@ pub(crate) async fn write_personaldb_product_row_mvcc(
     tuple_key: Vec<u8>,
     payload: Vec<u8>,
 ) -> Result<u64> {
-    let mut plan =
-        PersonalDbWritePlan::new(tenant_id, group_id, principal, idempotency_key)?;
+    let mut plan = PersonalDbWritePlan::new(tenant_id, group_id, principal, idempotency_key)?;
     plan.stage_coremeta_row(table_id, tuple_key, payload)?;
     plan.commit(mvcc).await
 }

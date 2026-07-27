@@ -443,7 +443,7 @@ async fn write_authz_tuple(
     auth_client
         .write_authz_tuple(authorized(
             WriteAuthzTupleRequest {
-            context: None,
+                context: None,
                 namespace: namespace.to_string(),
                 object_id: object_id.to_string(),
                 relation: relation.to_string(),
@@ -558,10 +558,10 @@ mod build_repair;
 mod list_indexes;
 #[path = "index_tests/query_spec.rs"]
 mod query_spec;
-#[path = "index_tests/typed_lifecycle.rs"]
-mod typed_lifecycle;
 #[path = "index_tests/transactional_lifecycle.rs"]
 mod transactional_lifecycle;
+#[path = "index_tests/typed_lifecycle.rs"]
+mod typed_lifecycle;
 #[path = "index_tests/validation_diagnostics.rs"]
 mod validation_diagnostics;
 #[path = "index_tests/vector_hybrid.rs"]

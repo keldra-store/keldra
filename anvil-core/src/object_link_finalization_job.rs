@@ -79,7 +79,9 @@ impl ObjectLinkFinalizationJob {
                 .map_err(|_| anyhow::anyhow!("object-link target version ID is invalid"))?;
         }
         match self.operation {
-            ObjectLinkFinalizationOperation::Put if self.target_key.as_deref().is_none_or(str::is_empty) => {
+            ObjectLinkFinalizationOperation::Put
+                if self.target_key.as_deref().is_none_or(str::is_empty) =>
+            {
                 bail!("object-link put finalization requires a target key");
             }
             ObjectLinkFinalizationOperation::Delete

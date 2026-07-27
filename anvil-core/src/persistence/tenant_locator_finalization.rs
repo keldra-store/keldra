@@ -32,16 +32,15 @@ impl Persistence {
         let guard = mvcc
             .claim_assignment("control-plane", mvcc.cluster_id())?
             .ok_or_else(|| anyhow!("tenant locator finalization is not assigned to this node"))?;
-        self.write_mesh_tenant_locators(
-            &job.tenant,
-            &job.idempotency_key,
-            &job.home_region,
-        )
-        .await?;
+        self.write_mesh_tenant_locators(&job.tenant, &job.idempotency_key, &job.home_region)
+            .await?;
         mvcc.validate_assignment(&guard)?;
         mvcc.autocommit_product_mutations(
             &format!("tenant-locator-finalization/{}", self.owner_node_id()),
-            &format!("tenant-locator-finalization-complete:{}", job.transaction_id),
+            &format!(
+                "tenant-locator-finalization-complete:{}",
+                job.transaction_id
+            ),
             vec![ProductMutation { key, value: None }],
             DurabilityLevel::Quorum,
             u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),

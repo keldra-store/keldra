@@ -1291,9 +1291,14 @@ pub async fn stage_delegated_action_tuple_batch_with_admin_audit(
     }
     let mut mutations = Vec::with_capacity(policies.len());
     for (action, resource) in policies {
-        let relation =
-            delegated_relation_for_action(storage, persistence, tenant_id, action.clone(), resource)
-                .await?;
+        let relation = delegated_relation_for_action(
+            storage,
+            persistence,
+            tenant_id,
+            action.clone(),
+            resource,
+        )
+        .await?;
         mutations.push(AuthzTupleBatchMutation {
             namespace: relation.namespace,
             object_id: relation.object_id,

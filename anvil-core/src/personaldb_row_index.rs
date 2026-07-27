@@ -9,8 +9,8 @@ use crate::{
     },
     personaldb_coremeta::{
         PersonalDbWritePlan, personaldb_payload_hash, prepare_personaldb_bytes_as_data_locator,
-        read_personaldb_data_locator_bytes,
-        read_personaldb_data_locator_row_at_snapshot, write_personaldb_bytes_as_data_locator_mvcc,
+        read_personaldb_data_locator_bytes, read_personaldb_data_locator_row_at_snapshot,
+        write_personaldb_bytes_as_data_locator_mvcc,
     },
     storage::Storage,
 };

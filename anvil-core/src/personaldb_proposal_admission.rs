@@ -9,9 +9,7 @@ use crate::{
         CF_PERSONALDB, CoreMetaTuplePart, TABLE_PERSONALDB_GROUP_ROW, core_meta_tuple_key,
     },
     personaldb_coremeta::{PersonalDbWritePlan, personaldb_realm_id},
-    personaldb_heads::{
-        PersonalDbCommittedHead, decode_committed_head, encode_committed_head,
-    },
+    personaldb_heads::{PersonalDbCommittedHead, decode_committed_head, encode_committed_head},
 };
 use anyhow::{Result, anyhow, bail};
 use personaldb_protocol::PublicKeyTrustStore;

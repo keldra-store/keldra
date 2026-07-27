@@ -82,10 +82,8 @@ pub async fn start_node_with_admin_listener(
             );
             let personaldb_postcommit = worker_state.clone().run_personaldb_postcommit_loop();
             let git_source_postcommit = worker_state.clone().run_git_source_postcommit_loop();
-            let hf_ingestion_postcommit =
-                worker_state.clone().run_hf_ingestion_postcommit_loop();
-            let object_link_finalization =
-                worker_state.clone().run_object_link_finalization_loop();
+            let hf_ingestion_postcommit = worker_state.clone().run_hf_ingestion_postcommit_loop();
+            let object_link_finalization = worker_state.clone().run_object_link_finalization_loop();
             tokio::select! {
                 result = worker => {
                     if let Err(error) = result {

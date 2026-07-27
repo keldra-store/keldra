@@ -3,11 +3,9 @@
 use std::{io::Write, path::PathBuf, time::Duration};
 
 use anvil::anvil_api::{MvccReadConsistency, WriteState};
-use anvil_test_utils::{
-    GrpcLostResponseProxy, mvcc_process_cluster::ProcessMvccCluster,
-};
-use rusqlite::{Connection, session::Session};
+use anvil_test_utils::{GrpcLostResponseProxy, mvcc_process_cluster::ProcessMvccCluster};
 use flate2::{Compression, write::ZlibEncoder};
+use rusqlite::{Connection, session::Session};
 use sha1::{Digest, Sha1};
 
 const PERSONALDB_PROCESS_SCHEMA: &str = "CREATE TABLE items(
@@ -97,15 +95,16 @@ async fn public_commit_survives_lost_response_and_coordinator_sigkill() {
         .unwrap();
 
     let mut proxy = GrpcLostResponseProxy::start(&cluster.public_endpoint(coordinator)).await;
-    let commit = cluster.commit_transaction(
-        proxy.endpoint().to_string(),
-        transaction.transaction_id,
-    );
+    let commit =
+        cluster.commit_transaction(proxy.endpoint().to_string(), transaction.transaction_id);
     let (commit_result, dropped) = tokio::join!(
         commit,
         proxy.wait_until_response_dropped(Duration::from_secs(10))
     );
-    assert!(commit_result.is_err(), "the commit acknowledgement must be lost");
+    assert!(
+        commit_result.is_err(),
+        "the commit acknowledgement must be lost"
+    );
     dropped.unwrap();
 
     // The proxy only drops after the server has produced its unary response,
@@ -232,9 +231,9 @@ async fn committed_index_finalization_survives_two_coordinator_crashes_without_c
     let published = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             if let Ok(indexes) = cluster.list_indexes(survivor, &bucket_name).await
-                && indexes
-                    .iter()
-                    .any(|index| index.index_id == staged.index_id && index.version == staged.version)
+                && indexes.iter().any(|index| {
+                    index.index_id == staged.index_id && index.version == staged.version
+                })
             {
                 return;
             }
@@ -439,10 +438,7 @@ async fn committed_bucket_locator_survives_two_coordinator_crashes_without_clien
     );
 
     cluster
-        .arm_hard_crash(
-            coordinator,
-            "BucketLocatorFinalizationBeforeEffects",
-        )
+        .arm_hard_crash(coordinator, "BucketLocatorFinalizationBeforeEffects")
         .unwrap();
     let committed = cluster
         .commit_transaction(
@@ -458,10 +454,7 @@ async fn committed_bucket_locator_survives_two_coordinator_crashes_without_clien
         .unwrap();
 
     cluster
-        .arm_hard_crash(
-            coordinator,
-            "BucketLocatorFinalizationAfterEffects",
-        )
+        .arm_hard_crash(coordinator, "BucketLocatorFinalizationAfterEffects")
         .unwrap();
     cluster.restart(coordinator).await.unwrap();
     cluster
@@ -489,11 +482,14 @@ async fn committed_bucket_locator_survives_two_coordinator_crashes_without_clien
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn committed_git_pack_survives_two_postcommit_crashes_without_client_retry_or_duplicate_watch()
-{
+ {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_anvil-server"));
     let mut cluster = ProcessMvccCluster::start(binary).await.unwrap();
     let coordinator = cluster.wait_for_leader(&[0, 1, 2]).await.unwrap();
-    cluster.bootstrap_object_placement(coordinator).await.unwrap();
+    cluster
+        .bootstrap_object_placement(coordinator)
+        .await
+        .unwrap();
     let bucket_name = format!("git-crash-{}", uuid::Uuid::new_v4().simple());
     cluster
         .create_bucket(coordinator, &bucket_name)
@@ -573,11 +569,7 @@ async fn committed_git_pack_survives_two_postcommit_crashes_without_client_retry
     tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             let events = cluster
-                .git_source_watch_events(
-                    coordinator,
-                    &repository_id,
-                    Duration::from_millis(250),
-                )
+                .git_source_watch_events(coordinator, &repository_id, Duration::from_millis(250))
                 .await
                 .unwrap_or_default();
             if events.len() == 1
@@ -597,11 +589,7 @@ async fn committed_git_pack_survives_two_postcommit_crashes_without_client_retry
         .expect("same-disk replay materializes the GitSource index");
     assert_eq!(blob.pack_object_version_id, staged.version_id);
     let events = cluster
-        .git_source_watch_events(
-            coordinator,
-            &repository_id,
-            Duration::from_millis(750),
-        )
+        .git_source_watch_events(coordinator, &repository_id, Duration::from_millis(750))
         .await
         .unwrap();
     assert_eq!(
@@ -635,7 +623,12 @@ async fn public_object_batch_recovers_after_leader_crashes_before_local_batch_wr
         .unwrap();
     assert_eq!(staged.write_state, WriteState::Staged as i32);
     for key in keys {
-        assert!(!cluster.object_exists(leader, &bucket_name, key).await.unwrap());
+        assert!(
+            !cluster
+                .object_exists(leader, &bucket_name, key)
+                .await
+                .unwrap()
+        );
     }
 
     cluster.arm_hard_crash(leader, "MvccBatchWrite").unwrap();
@@ -683,7 +676,12 @@ async fn public_object_batch_recovers_after_leader_crashes_before_local_batch_wr
         .unwrap();
     assert_eq!(retried.state, WriteState::Committed as i32);
     for key in keys {
-        assert!(cluster.object_exists(survivor, &bucket_name, key).await.unwrap());
+        assert!(
+            cluster
+                .object_exists(survivor, &bucket_name, key)
+                .await
+                .unwrap()
+        );
     }
 
     cluster.restart(leader).await.unwrap();
@@ -699,10 +697,7 @@ async fn public_object_batch_recovers_after_leader_crashes_before_local_batch_wr
                 cluster.object_exists(leader, &bucket_name, keys[1]).await,
                 Ok(true)
             );
-            if status
-                .is_ok_and(|status| status.state == "committed")
-                && both_visible
-            {
+            if status.is_ok_and(|status| status.state == "committed") && both_visible {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -718,7 +713,10 @@ async fn public_object_batch_retries_after_crash_before_prepared_bundle_sync() {
     let mut cluster = ProcessMvccCluster::start(binary).await.unwrap();
     let coordinator = cluster.wait_for_leader(&[0, 1, 2]).await.unwrap();
     let bucket_name = format!("process-prepare-{}", uuid::Uuid::new_v4().simple());
-    let bucket_id = cluster.create_bucket(coordinator, &bucket_name).await.unwrap();
+    let bucket_id = cluster
+        .create_bucket(coordinator, &bucket_name)
+        .await
+        .unwrap();
     let transaction = cluster
         .begin_transaction(coordinator, MvccReadConsistency::Linearized)
         .await
@@ -760,7 +758,10 @@ async fn public_object_batch_retries_after_crash_before_prepared_bundle_sync() {
     let survivor = cluster.wait_for_leader(&survivors).await.unwrap();
     for key in keys {
         assert!(
-            !cluster.object_exists(survivor, &bucket_name, key).await.unwrap(),
+            !cluster
+                .object_exists(survivor, &bucket_name, key)
+                .await
+                .unwrap(),
             "an unprepared bundle must not have any survivor-visible object"
         );
     }
@@ -799,7 +800,10 @@ async fn public_object_batch_retries_after_crash_before_raft_wal_append() {
     let mut cluster = ProcessMvccCluster::start(binary).await.unwrap();
     let coordinator = cluster.wait_for_leader(&[0, 1, 2]).await.unwrap();
     let bucket_name = format!("process-raft-wal-{}", uuid::Uuid::new_v4().simple());
-    let bucket_id = cluster.create_bucket(coordinator, &bucket_name).await.unwrap();
+    let bucket_id = cluster
+        .create_bucket(coordinator, &bucket_name)
+        .await
+        .unwrap();
     let transaction = cluster
         .begin_transaction(coordinator, MvccReadConsistency::Linearized)
         .await
@@ -839,7 +843,10 @@ async fn public_object_batch_retries_after_crash_before_raft_wal_append() {
     let survivor = cluster.wait_for_leader(&survivors).await.unwrap();
     for key in keys {
         assert!(
-            !cluster.object_exists(survivor, &bucket_name, key).await.unwrap(),
+            !cluster
+                .object_exists(survivor, &bucket_name, key)
+                .await
+                .unwrap(),
             "a proposal absent from the leader WAL must not leak partial visibility"
         );
     }
@@ -877,10 +884,16 @@ async fn public_erasure_object_retries_after_remote_shard_crash_before_sync() {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_anvil-server"));
     let mut cluster = ProcessMvccCluster::start(binary).await.unwrap();
     let coordinator = cluster.wait_for_leader(&[0, 1, 2]).await.unwrap();
-    cluster.bootstrap_object_placement(coordinator).await.unwrap();
+    cluster
+        .bootstrap_object_placement(coordinator)
+        .await
+        .unwrap();
     let shard_target = (0..3).find(|node| *node != coordinator).unwrap();
     let bucket_name = format!("process-shard-{}", uuid::Uuid::new_v4().simple());
-    let bucket_id = cluster.create_bucket(coordinator, &bucket_name).await.unwrap();
+    let bucket_id = cluster
+        .create_bucket(coordinator, &bucket_name)
+        .await
+        .unwrap();
     let transaction = cluster
         .begin_transaction_with_durability(
             coordinator,
@@ -968,7 +981,10 @@ async fn killed_node_is_replaced_by_higher_incarnation_and_catches_up() {
         .collect::<Vec<_>>();
     let leader = cluster.wait_for_leader(&survivors).await.unwrap();
     cluster.spawn_replacement(replaced, 2).await.unwrap();
-    cluster.apply_replacement(leader, replaced, true).await.unwrap();
+    cluster
+        .apply_replacement(leader, replaced, true)
+        .await
+        .unwrap();
     for survivor in survivors.iter().copied().filter(|node| *node != leader) {
         cluster
             .apply_replacement(survivor, replaced, false)
@@ -1022,10 +1038,7 @@ async fn killed_node_is_replaced_by_higher_incarnation_and_catches_up() {
     assert!(obsolete_local.snapshot_version <= replacement.snapshot_version);
     let obsolete_attempt = tokio::time::timeout(
         Duration::from_secs(5),
-        cluster.begin_transaction_at(
-            obsolete_endpoint,
-            MvccReadConsistency::Linearized,
-        ),
+        cluster.begin_transaction_at(obsolete_endpoint, MvccReadConsistency::Linearized),
     )
     .await;
     assert!(

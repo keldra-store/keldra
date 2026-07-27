@@ -1,11 +1,11 @@
 #![recursion_limit = "256"]
 
+use anvil::anvil_api::object_service_client::ObjectServiceClient;
+use anvil::anvil_api::transaction_service_client::TransactionServiceClient;
 use anvil::anvil_api::{
     BeginTransactionRequest, CommitTransactionRequest, MvccDurability, MvccReadConsistency,
     PutBoundarySchemaRequest,
 };
-use anvil::anvil_api::object_service_client::ObjectServiceClient;
-use anvil::anvil_api::transaction_service_client::TransactionServiceClient;
 use anvil_test_utils::{TestCluster, isolated_test_cluster, unique_test_name};
 
 fn authorized<T>(mut request: tonic::Request<T>, token: &str) -> tonic::Request<T> {
@@ -61,8 +61,7 @@ async fn put(
 
 #[tokio::test]
 async fn implicit_boundary_schema_retry_reconstructs_the_committed_schema() {
-    let cluster =
-        isolated_test_cluster("boundary-schema-lost-response", &["test-region-1"]).await;
+    let cluster = isolated_test_cluster("boundary-schema-lost-response", &["test-region-1"]).await;
     let bucket_name = unique_test_name("boundary-retry");
     cluster.create_bucket(&bucket_name, "test-region-1").await;
     let mutation_id = uuid::Uuid::new_v4().to_string();
@@ -70,22 +69,8 @@ async fn implicit_boundary_schema_retry_reconstructs_the_committed_schema() {
         .await
         .unwrap();
 
-    let first = put(
-        &cluster,
-        &mut objects,
-        &bucket_name,
-        &mutation_id,
-        None,
-    )
-    .await;
-    let retry = put(
-        &cluster,
-        &mut objects,
-        &bucket_name,
-        &mutation_id,
-        None,
-    )
-    .await;
+    let first = put(&cluster, &mut objects, &bucket_name, &mutation_id, None).await;
+    let retry = put(&cluster, &mut objects, &bucket_name, &mutation_id, None).await;
     assert_eq!(retry.schema, first.schema);
     assert_eq!(retry.schema.unwrap().generation, 1);
 }

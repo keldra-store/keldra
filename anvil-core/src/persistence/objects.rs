@@ -69,22 +69,17 @@ impl Persistence {
             .mvcc()?
             .runtime
             .local_store()
-            .claim_object_link_finalization_authorized(
-                &worker_id,
-                now,
-                30_000,
-                |record| {
-                    self.mvcc()
-                        .ok()?
-                        .claim_assignment(
-                            "object-link-finalization",
-                            &record.job.target_logical_identity(),
-                        )
-                        .ok()
-                        .flatten()
-                        .map(|guard| guard.lease_owner(&worker_id))
-                },
-            )?
+            .claim_object_link_finalization_authorized(&worker_id, now, 30_000, |record| {
+                self.mvcc()
+                    .ok()?
+                    .claim_assignment(
+                        "object-link-finalization",
+                        &record.job.target_logical_identity(),
+                    )
+                    .ok()
+                    .flatten()
+                    .map(|guard| guard.lease_owner(&worker_id))
+            })?
         else {
             return Ok(false);
         };
@@ -105,11 +100,8 @@ impl Persistence {
                 bail!("object-link finalization bucket identity changed");
             }
             if record.job.consequences.maintain_indexes {
-                self.enqueue_index_builds_for_object_keys(
-                    &bucket,
-                    [record.job.link_key.as_str()],
-                )
-                .await?;
+                self.enqueue_index_builds_for_object_keys(&bucket, [record.job.link_key.as_str()])
+                    .await?;
             }
             if record.job.consequences.compact_metadata {
                 self.enqueue_object_metadata_compaction_if_due(&bucket)

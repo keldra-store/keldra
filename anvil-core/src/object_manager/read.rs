@@ -799,14 +799,12 @@ impl ObjectManager {
             .bucket_relation_allowed(claims, bucket, "get_object", Some(authz_revision))
             .await?;
         let result_limit = object_list_result_limit(limit, MAX_OBJECT_LIST_RESULTS);
-        let candidate_budget = if bucket_wide_read
-            && delimiter.is_empty()
-            && consistency.commit_version().is_none()
-        {
-            result_limit
-        } else {
-            object_listing_candidate_budget(result_limit)
-        };
+        let candidate_budget =
+            if bucket_wide_read && delimiter.is_empty() && consistency.commit_version().is_none() {
+                result_limit
+            } else {
+                object_listing_candidate_budget(result_limit)
+            };
         let mut objects = Vec::with_capacity(result_limit);
         let mut cursor = None;
         let mut candidates_visited = 0_usize;

@@ -44,10 +44,7 @@ impl PersonalDbPostCommitJob {
     }
 
     pub fn target_logical_identity(&self) -> String {
-        format!(
-            "tenant/{}/personaldb/{}",
-            self.tenant_id, self.database_id
-        )
+        format!("tenant/{}/personaldb/{}", self.tenant_id, self.database_id)
     }
 
     fn validate(&self) -> Result<()> {
@@ -117,9 +114,9 @@ impl PersonalDbPostCommitRecord {
     pub fn claimable(&self, now: u64) -> bool {
         match self.state {
             PersonalDbPostCommitState::Pending => self.next_attempt_unix_ms <= now,
-            PersonalDbPostCommitState::Running => {
-                self.lease_expires_unix_ms.is_some_and(|expiry| expiry <= now)
-            }
+            PersonalDbPostCommitState::Running => self
+                .lease_expires_unix_ms
+                .is_some_and(|expiry| expiry <= now),
             PersonalDbPostCommitState::Complete => false,
         }
     }

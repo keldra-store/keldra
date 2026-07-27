@@ -103,11 +103,9 @@ async fn commit_object_link_mutation(
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
     match outcome.certification {
         crate::mvcc_transaction::CertificationResult::Committed { .. } => Ok(()),
-        crate::mvcc_transaction::CertificationResult::Aborted { reason } => {
-            Err(Status::aborted(format!(
-                "implicit object-link transaction aborted: {reason:?}"
-            )))
-        }
+        crate::mvcc_transaction::CertificationResult::Aborted { reason } => Err(Status::aborted(
+            format!("implicit object-link transaction aborted: {reason:?}"),
+        )),
     }
 }
 
@@ -135,11 +133,10 @@ fn stage_object_link_finalization(
         target_key,
         target_version_id,
         mutation_id: mutation_id.to_string(),
-        consequences:
-            crate::object_link_finalization_job::ObjectLinkFinalizationConsequences {
-                maintain_indexes: true,
-                compact_metadata: true,
-            },
+        consequences: crate::object_link_finalization_job::ObjectLinkFinalizationConsequences {
+            maintain_indexes: true,
+            compact_metadata: true,
+        },
     };
     state
         .mvcc

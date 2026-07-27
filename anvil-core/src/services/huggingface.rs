@@ -45,13 +45,9 @@ impl api::hugging_face_key_service_server::HuggingFaceKeyService for AppState {
         )
         .await?;
         if transaction.replayed {
-            let key = crate::hf_journal::get_key_record(
-                &self.mvcc,
-                claims.tenant_id,
-                &req.name,
-            )
-            .map_err(|error| Status::internal(error.to_string()))?
-            .ok_or_else(|| Status::failed_precondition("committed HF key is unavailable"))?;
+            let key = crate::hf_journal::get_key_record(&self.mvcc, claims.tenant_id, &req.name)
+                .map_err(|error| Status::internal(error.to_string()))?
+                .ok_or_else(|| Status::failed_precondition("committed HF key is unavailable"))?;
             return Ok(Response::new(api::CreateHfKeyResponse {
                 name: key.name,
                 note: key.note.unwrap_or_default(),
@@ -288,9 +284,7 @@ impl api::hf_ingestion_service_server::HfIngestionService for AppState {
                 .find_hf_ingestion_postcommit_by_transaction(&transaction.id)
                 .map_err(|error| Status::internal(error.to_string()))?
                 .ok_or_else(|| {
-                    Status::failed_precondition(
-                        "committed HF ingestion outcome is unavailable",
-                    )
+                    Status::failed_precondition("committed HF ingestion outcome is unavailable")
                 })?;
             return Ok(Response::new(api::StartHfIngestionResponse {
                 ingestion_id: record.job.ingestion_id.to_string(),
@@ -581,8 +575,7 @@ async fn begin_hf_mutation(
     let idempotency_key = if let Some(key) = supplied_idempotency_key {
         key
     } else {
-        generated_idempotency_key =
-            format!("{default_idempotency_key}:{}", uuid::Uuid::new_v4());
+        generated_idempotency_key = format!("{default_idempotency_key}:{}", uuid::Uuid::new_v4());
         &generated_idempotency_key
     };
     let handle = state

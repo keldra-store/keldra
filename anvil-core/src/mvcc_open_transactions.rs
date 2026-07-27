@@ -490,14 +490,9 @@ impl OpenTransactionRegistry {
         now_unix_ms: u64,
     ) -> Result<()> {
         self.mutate_for_principal(transaction_id, principal, now_unix_ms, |draft| {
-            if let Some(existing) = draft
-                .mutations
-                .idempotency_results
-                .iter()
-                .find(|existing| {
-                    existing.namespace == result.namespace && existing.key == result.key
-                })
-            {
+            if let Some(existing) = draft.mutations.idempotency_results.iter().find(|existing| {
+                existing.namespace == result.namespace && existing.key == result.key
+            }) {
                 if existing != &result {
                     bail!("idempotency result identity was reused with a different payload");
                 }

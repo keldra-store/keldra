@@ -642,12 +642,13 @@ impl MvccSubsystem {
             config.allow_test_only_insecure_mvcc_transport,
             consensus.clone(),
         );
-        let consensus_service = ConsensusTransportService::new(consensus.clone(), authorizer.clone())
-            .with_applied_watermark_report(
-                NodeId(config.mvcc_raft_node_id),
-                config.mvcc_node_incarnation,
-                applied_watermark_report.clone(),
-            );
+        let consensus_service =
+            ConsensusTransportService::new(consensus.clone(), authorizer.clone())
+                .with_applied_watermark_report(
+                    NodeId(config.mvcc_raft_node_id),
+                    config.mvcc_node_incarnation,
+                    applied_watermark_report.clone(),
+                );
         let replication_service =
             ReplicationServiceImpl::open(authorizer, &paths.replication_inbox)?;
         let remote_nodes = peers

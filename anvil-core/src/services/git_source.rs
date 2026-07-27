@@ -102,11 +102,7 @@ impl GitSourceService for AppState {
             let status = self
                 .mvcc
                 .open_transactions
-                .status(
-                    &transaction_id,
-                    &transaction_principal,
-                    current_unix_ms()?,
-                )
+                .status(&transaction_id, &transaction_principal, current_unix_ms()?)
                 .map_err(|error| Status::failed_precondition(error.to_string()))?;
             if status.state == "committing" {
                 let outcome = self
@@ -157,23 +153,23 @@ impl GitSourceService for AppState {
             let pack_object = self
                 .object_manager
                 .put_object(
-                &claims,
-                &metadata.bucket_name,
-                &object_key,
-                tokio_stream::iter(vec![Ok(pack_bytes.clone())]),
-                ObjectWriteOptions {
-                    content_type: Some("application/x-git-packed-objects".to_string()),
-                    user_metadata: Some(json!({
-                        "object_kind": "git_pack",
-                        "repository_id": metadata.repository_id.clone(),
-                    })),
-                    transaction_id: Some(transaction_id.clone()),
-                    transaction_principal: Some(transaction_principal.clone()),
-                    storage_class_id: None,
-                    ..Default::default()
-                },
-            )
-            .await?;
+                    &claims,
+                    &metadata.bucket_name,
+                    &object_key,
+                    tokio_stream::iter(vec![Ok(pack_bytes.clone())]),
+                    ObjectWriteOptions {
+                        content_type: Some("application/x-git-packed-objects".to_string()),
+                        user_metadata: Some(json!({
+                            "object_kind": "git_pack",
+                            "repository_id": metadata.repository_id.clone(),
+                        })),
+                        transaction_id: Some(transaction_id.clone()),
+                        transaction_principal: Some(transaction_principal.clone()),
+                        storage_class_id: None,
+                        ..Default::default()
+                    },
+                )
+                .await?;
 
             let parsed = git_pack::build_git_source_index_from_pack(
                 &metadata.repository_id,
@@ -181,22 +177,23 @@ impl GitSourceService for AppState {
                 *pack_object.version_id.as_bytes(),
             )
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
-            let generation = git_source_manifest::read_git_source_repository_manifest_in_transaction(
-                &self.mvcc,
-                claims.tenant_id,
-                &metadata.repository_id,
-                &transaction_id,
-                &transaction_principal,
-            )
-            .map_err(|err| Status::internal(err.to_string()))?
-            .map(|manifest| {
-                manifest
-                    .generation
-                    .checked_add(1)
-                    .ok_or_else(|| Status::internal("Git source generation overflow"))
-            })
-            .transpose()?
-            .unwrap_or(1);
+            let generation =
+                git_source_manifest::read_git_source_repository_manifest_in_transaction(
+                    &self.mvcc,
+                    claims.tenant_id,
+                    &metadata.repository_id,
+                    &transaction_id,
+                    &transaction_principal,
+                )
+                .map_err(|err| Status::internal(err.to_string()))?
+                .map(|manifest| {
+                    manifest
+                        .generation
+                        .checked_add(1)
+                        .ok_or_else(|| Status::internal("Git source generation overflow"))
+                })
+                .transpose()?
+                .unwrap_or(1);
             let index_ref = git_source_index::git_source_index_ref_name(
                 claims.tenant_id,
                 &metadata.repository_id,
@@ -204,8 +201,7 @@ impl GitSourceService for AppState {
                 &source_hash_hex,
             )
             .map_err(|err| Status::internal(err.to_string()))?;
-            let updated_at =
-                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+            let updated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
             let manifest = git_source_manifest::GitSourceRepositoryManifest {
                 format_version: 1,
                 tenant_id: claims.tenant_id,
@@ -227,9 +223,8 @@ impl GitSourceService for AppState {
                 now,
             )
             .map_err(|err| Status::internal(err.to_string()))?;
-            let authz_revision =
-                authz_journal::latest_authz_revision(&self.mvcc, claims.tenant_id)
-                    .map_err(|err| Status::internal(err.to_string()))?;
+            let authz_revision = authz_journal::latest_authz_revision(&self.mvcc, claims.tenant_id)
+                .map_err(|err| Status::internal(err.to_string()))?;
             let authz_revision = u64::try_from(authz_revision)
                 .map_err(|_| Status::internal("Invalid authorization revision"))?;
             let job = crate::git_source_postcommit_job::GitSourcePostCommitJob {
@@ -801,8 +796,9 @@ async fn reconstruct_committed_put_git_pack_response(
         .await
         .map_err(|error| Status::internal(error.to_string()))?
         .ok_or_else(|| Status::failed_precondition("committed Git source bucket is unavailable"))?;
-    let version_id = uuid::Uuid::parse_str(&manifest.pack_object_version_id)
-        .map_err(|error| Status::internal(format!("invalid committed Git pack version: {error}")))?;
+    let version_id = uuid::Uuid::parse_str(&manifest.pack_object_version_id).map_err(|error| {
+        Status::internal(format!("invalid committed Git pack version: {error}"))
+    })?;
     let object = state
         .persistence
         .get_object_version(bucket.id, &manifest.object_key, version_id)

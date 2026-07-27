@@ -221,9 +221,7 @@ impl AdminService for AppState {
                 &encrypted_secret,
                 None,
             )
-            .and_then(|plan| {
-                plan.with_admin_audit(&audit_event, &transaction.transaction_id)
-            })
+            .and_then(|plan| plan.with_admin_audit(&audit_event, &transaction.transaction_id))
             .map_err(|err| Status::internal(err.to_string()))?
             .stage(
                 &self.mvcc,
@@ -317,8 +315,8 @@ impl AdminService for AppState {
             &transaction.principal,
             now,
         )
-            .await
-            .map_err(|err| Status::failed_precondition(err.to_string()))?;
+        .await
+        .map_err(|err| Status::failed_precondition(err.to_string()))?;
         let result = prior_result.unwrap_or(AdminApplicationMutationResult {
             input_hash,
             request_id: context.request_id.clone(),
@@ -798,16 +796,15 @@ impl AdminService for AppState {
                 created_at: Utc::now(),
                 is_public_read: false,
             };
-            let operation_sequence =
-                crate::bucket_journal::stage_bucket_mutation_in_transaction(
-                    &self.mvcc,
-                    &bucket,
-                    crate::bucket_journal::BucketJournalMutation::Create,
-                    &transaction.transaction_id,
-                    &transaction.principal,
-                )
-                .await
-                .map_err(|err| Status::internal(err.to_string()))?;
+            let operation_sequence = crate::bucket_journal::stage_bucket_mutation_in_transaction(
+                &self.mvcc,
+                &bucket,
+                crate::bucket_journal::BucketJournalMutation::Create,
+                &transaction.transaction_id,
+                &transaction.principal,
+            )
+            .await
+            .map_err(|err| Status::internal(err.to_string()))?;
             crate::access_control::stage_bucket_defaults(
                 &self.persistence,
                 &bucket,
@@ -916,16 +913,15 @@ impl AdminService for AppState {
             .map_err(|err| Status::internal(err.to_string()))?
             .ok_or_else(|| Status::not_found("Bucket not found"))?;
             bucket.is_public_read = req.allow_public_read;
-            let operation_sequence =
-                crate::bucket_journal::stage_bucket_mutation_in_transaction(
-                    &self.mvcc,
-                    &bucket,
-                    crate::bucket_journal::BucketJournalMutation::Update,
-                    &transaction.transaction_id,
-                    &transaction.principal,
-                )
-                .await
-                .map_err(|err| Status::internal(err.to_string()))?;
+            let operation_sequence = crate::bucket_journal::stage_bucket_mutation_in_transaction(
+                &self.mvcc,
+                &bucket,
+                crate::bucket_journal::BucketJournalMutation::Update,
+                &transaction.transaction_id,
+                &transaction.principal,
+            )
+            .await
+            .map_err(|err| Status::internal(err.to_string()))?;
             crate::access_control::stage_bucket_public_read_tuple(
                 &self.persistence,
                 &bucket,

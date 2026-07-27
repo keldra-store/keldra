@@ -135,8 +135,7 @@ pub(super) async fn commit_implicit_native_transaction(
         )
         .await
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
-    if let crate::mvcc_transaction::CertificationResult::Aborted { reason } =
-        outcome.certification
+    if let crate::mvcc_transaction::CertificationResult::Aborted { reason } = outcome.certification
     {
         return Err(Status::aborted(format!(
             "implicit MVCC transaction aborted: {reason:?}"

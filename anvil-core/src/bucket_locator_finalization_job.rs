@@ -101,9 +101,7 @@ impl BucketLocatorFinalizationRecord {
 
     pub fn claimable(&self, now_unix_ms: u64) -> bool {
         match self.state {
-            BucketLocatorFinalizationState::Pending => {
-                self.next_attempt_unix_ms <= now_unix_ms
-            }
+            BucketLocatorFinalizationState::Pending => self.next_attempt_unix_ms <= now_unix_ms,
             BucketLocatorFinalizationState::Running => self
                 .lease_expires_unix_ms
                 .is_some_and(|expiry| expiry <= now_unix_ms),
@@ -141,8 +139,7 @@ mod tests {
         let publish = job(BucketLocatorFinalizationOperation::Publish);
         let delete = job(BucketLocatorFinalizationOperation::Delete);
 
-        let decoded =
-            BucketLocatorFinalizationJob::decode(&publish.encode().unwrap()).unwrap();
+        let decoded = BucketLocatorFinalizationJob::decode(&publish.encode().unwrap()).unwrap();
         assert_eq!(decoded.encode().unwrap(), publish.encode().unwrap());
         assert_ne!(publish.job_id().unwrap(), delete.job_id().unwrap());
         assert_eq!(

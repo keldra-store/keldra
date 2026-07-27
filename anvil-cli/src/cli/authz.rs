@@ -125,7 +125,7 @@ pub async fn handle_authz_command(command: &AuthzCommands, ctx: &Context) -> any
                 },
         } => {
             let mut request = tonic::Request::new(api::PutAuthzSchemaRequest {
-            context: None,
+                context: None,
                 anvil_storage_tenant_id: tenant_id,
                 schema_id: schema_id.clone(),
                 namespaces: vec![api::AuthzNamespaceSchema {
@@ -159,7 +159,7 @@ pub async fn handle_authz_command(command: &AuthzCommands, ctx: &Context) -> any
                 },
         } => {
             let mut request = tonic::Request::new(api::BindAuthzSchemaRequest {
-            context: None,
+                context: None,
                 scope: Some(scope(&tenant_id, realm_id)),
                 schema_ref: Some(api::AuthzSchemaRef {
                     schema_id: schema_id.clone(),
@@ -230,7 +230,7 @@ pub async fn handle_authz_command(command: &AuthzCommands, ctx: &Context) -> any
                 },
         } => {
             let mut request = tonic::Request::new(api::WriteAuthzTupleRequest {
-            context: None,
+                context: None,
                 namespace: namespace.clone(),
                 object_id: object_id.clone(),
                 relation: relation.clone(),

@@ -36,7 +36,10 @@ fn transaction_options(transaction_id: &str) -> WriteOptions {
     }
 }
 
-fn transactional_group_request(database_id: &str, transaction_id: &str) -> CreatePersonalDbGroupRequest {
+fn transactional_group_request(
+    database_id: &str,
+    transaction_id: &str,
+) -> CreatePersonalDbGroupRequest {
     CreatePersonalDbGroupRequest {
         database_id: database_id.to_string(),
         schema_hash: personaldb_test_schema_hash(),
@@ -52,8 +55,12 @@ async fn bucket_and_personaldb_group_commit_atomically_in_one_public_transaction
     let endpoint = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
     let cluster_id = cluster.states[0].mvcc.cluster_id().to_string();
-    let mut transactions = TransactionServiceClient::connect(endpoint.clone()).await.unwrap();
-    let mut buckets = BucketServiceClient::connect(endpoint.clone()).await.unwrap();
+    let mut transactions = TransactionServiceClient::connect(endpoint.clone())
+        .await
+        .unwrap();
+    let mut buckets = BucketServiceClient::connect(endpoint.clone())
+        .await
+        .unwrap();
     let mut personaldb = PersonalDbServiceClient::connect(endpoint).await.unwrap();
     let transaction_id =
         begin_personaldb_transaction(&mut transactions, &token, &cluster_id, "mixed-success").await;
@@ -79,13 +86,13 @@ async fn bucket_and_personaldb_group_commit_atomically_in_one_public_transaction
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(staged.write_state, anvil::anvil_api::WriteState::Staged as i32);
+    assert_eq!(
+        staged.write_state,
+        anvil::anvil_api::WriteState::Staged as i32
+    );
     assert!(
         buckets
-            .list_buckets(authorized(
-                ListBucketsRequest { page: None },
-                &token,
-            ))
+            .list_buckets(authorized(ListBucketsRequest { page: None }, &token,))
             .await
             .unwrap()
             .into_inner()
@@ -106,10 +113,7 @@ async fn bucket_and_personaldb_group_commit_atomically_in_one_public_transaction
         .unwrap();
     assert!(
         buckets
-            .list_buckets(authorized(
-                ListBucketsRequest { page: None },
-                &token,
-            ))
+            .list_buckets(authorized(ListBucketsRequest { page: None }, &token,))
             .await
             .unwrap()
             .into_inner()
@@ -135,8 +139,12 @@ async fn personaldb_conflict_aborts_the_other_transactions_bucket_write() {
     let endpoint = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
     let cluster_id = cluster.states[0].mvcc.cluster_id().to_string();
-    let mut transactions = TransactionServiceClient::connect(endpoint.clone()).await.unwrap();
-    let mut buckets = BucketServiceClient::connect(endpoint.clone()).await.unwrap();
+    let mut transactions = TransactionServiceClient::connect(endpoint.clone())
+        .await
+        .unwrap();
+    let mut buckets = BucketServiceClient::connect(endpoint.clone())
+        .await
+        .unwrap();
     let mut personaldb = PersonalDbServiceClient::connect(endpoint).await.unwrap();
     let first =
         begin_personaldb_transaction(&mut transactions, &token, &cluster_id, "mixed-first").await;
@@ -207,8 +215,12 @@ async fn bucket_and_personaldb_submit_commit_atomically_and_conflict_as_one_bund
     let endpoint = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
     let cluster_id = cluster.states[0].mvcc.cluster_id().to_string();
-    let mut transactions = TransactionServiceClient::connect(endpoint.clone()).await.unwrap();
-    let mut buckets = BucketServiceClient::connect(endpoint.clone()).await.unwrap();
+    let mut transactions = TransactionServiceClient::connect(endpoint.clone())
+        .await
+        .unwrap();
+    let mut buckets = BucketServiceClient::connect(endpoint.clone())
+        .await
+        .unwrap();
     let mut personaldb = PersonalDbServiceClient::connect(endpoint).await.unwrap();
     let database_id = format!("db-submit-{}", uuid::Uuid::new_v4().simple());
     let genesis_hash = create_group(&mut personaldb, &token, &database_id).await;
@@ -238,7 +250,10 @@ async fn bucket_and_personaldb_submit_commit_atomically_and_conflict_as_one_bund
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(staged.write_state, anvil::anvil_api::WriteState::Staged as i32);
+        assert_eq!(
+            staged.write_state,
+            anvil::anvil_api::WriteState::Staged as i32
+        );
     }
     transactions
         .commit_transaction(authorized(
@@ -324,11 +339,14 @@ fn transactional_projection_request(
 
 #[tokio::test]
 async fn personaldb_projection_definition_is_invisible_until_transaction_commit() {
-    let cluster = isolated_test_cluster("personaldb-projection-transaction", &["test-region-1"]).await;
+    let cluster =
+        isolated_test_cluster("personaldb-projection-transaction", &["test-region-1"]).await;
     let endpoint = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
     let cluster_id = cluster.states[0].mvcc.cluster_id().to_string();
-    let mut transactions = TransactionServiceClient::connect(endpoint.clone()).await.unwrap();
+    let mut transactions = TransactionServiceClient::connect(endpoint.clone())
+        .await
+        .unwrap();
     let mut personaldb = PersonalDbServiceClient::connect(endpoint).await.unwrap();
     let source = format!("projection-atomic-source-{}", uuid::Uuid::new_v4().simple());
     let target = format!("projection-atomic-target-{}", uuid::Uuid::new_v4().simple());
@@ -363,7 +381,10 @@ async fn personaldb_projection_definition_is_invisible_until_transaction_commit(
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(staged.write_state, anvil::anvil_api::WriteState::Staged as i32);
+    assert_eq!(
+        staged.write_state,
+        anvil::anvil_api::WriteState::Staged as i32
+    );
     let invisible = personaldb
         .get_personal_db_projection(authorized(
             GetPersonalDbProjectionRequest {
@@ -406,8 +427,12 @@ async fn projection_conflict_aborts_an_unrelated_bucket_in_the_losing_transactio
     let endpoint = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
     let cluster_id = cluster.states[0].mvcc.cluster_id().to_string();
-    let mut transactions = TransactionServiceClient::connect(endpoint.clone()).await.unwrap();
-    let mut buckets = BucketServiceClient::connect(endpoint.clone()).await.unwrap();
+    let mut transactions = TransactionServiceClient::connect(endpoint.clone())
+        .await
+        .unwrap();
+    let mut buckets = BucketServiceClient::connect(endpoint.clone())
+        .await
+        .unwrap();
     let mut personaldb = PersonalDbServiceClient::connect(endpoint).await.unwrap();
     let (source, target) =
         create_projection_groups(&mut personaldb, &token, "projection-conflict").await;
@@ -474,14 +499,17 @@ async fn projection_conflict_aborts_an_unrelated_bucket_in_the_losing_transactio
 
 #[tokio::test]
 async fn projection_writeback_stages_source_and_target_heads_in_one_transaction() {
-    let cluster = isolated_test_cluster("projection-writeback-transaction", &["test-region-1"]).await;
+    let cluster =
+        isolated_test_cluster("projection-writeback-transaction", &["test-region-1"]).await;
     let actor = create_personaldb_test_actor(&cluster, "projection-writeback-transaction").await;
     let token = actor.token.clone();
     let cluster_id = cluster.states[0].mvcc.cluster_id().to_string();
-    let mut transactions =
-        TransactionServiceClient::connect(actor.grpc_addr.clone()).await.unwrap();
-    let mut personaldb =
-        PersonalDbServiceClient::connect(actor.grpc_addr.clone()).await.unwrap();
+    let mut transactions = TransactionServiceClient::connect(actor.grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut personaldb = PersonalDbServiceClient::connect(actor.grpc_addr.clone())
+        .await
+        .unwrap();
     let source = format!("writeback-source-{}", uuid::Uuid::new_v4().simple());
     let target = format!("writeback-target-{}", uuid::Uuid::new_v4().simple());
     let source_genesis = create_group(&mut personaldb, &token, &source).await;
@@ -493,11 +521,8 @@ async fn projection_writeback_stages_source_and_target_heads_in_one_transaction(
         &personaldb_projection_test_schema_hash(),
     )
     .await;
-    let definition = projection_definition_allowing_name_writeback_for_tenant(
-        actor.tenant_id,
-        &target,
-        &source,
-    );
+    let definition =
+        projection_definition_allowing_name_writeback_for_tenant(actor.tenant_id, &target, &source);
     personaldb
         .create_personal_db_projection(authorized(
             CreatePersonalDbProjectionRequest {
@@ -551,13 +576,19 @@ async fn projection_writeback_stages_source_and_target_heads_in_one_transaction(
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(staged.write_state, anvil::anvil_api::WriteState::Staged as i32);
+    assert_eq!(
+        staged.write_state,
+        anvil::anvil_api::WriteState::Staged as i32
+    );
     let retry = personaldb
         .submit_personal_db_changeset(authorized(request, &token))
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(retry.write_state, anvil::anvil_api::WriteState::Staged as i32);
+    assert_eq!(
+        retry.write_state,
+        anvil::anvil_api::WriteState::Staged as i32
+    );
     for database_id in [&source, &target] {
         let head = personaldb
             .get_personal_db_group(authorized(
@@ -609,13 +640,23 @@ async fn projection_writeback_conflict_aborts_both_groups_and_unrelated_writes()
     let actor = create_personaldb_test_actor(&cluster, "projection-writeback-conflict").await;
     let token = actor.token.clone();
     let cluster_id = cluster.states[0].mvcc.cluster_id().to_string();
-    let mut transactions =
-        TransactionServiceClient::connect(actor.grpc_addr.clone()).await.unwrap();
-    let mut buckets = BucketServiceClient::connect(actor.grpc_addr.clone()).await.unwrap();
-    let mut personaldb =
-        PersonalDbServiceClient::connect(actor.grpc_addr.clone()).await.unwrap();
-    let source = format!("writeback-conflict-source-{}", uuid::Uuid::new_v4().simple());
-    let target = format!("writeback-conflict-target-{}", uuid::Uuid::new_v4().simple());
+    let mut transactions = TransactionServiceClient::connect(actor.grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut buckets = BucketServiceClient::connect(actor.grpc_addr.clone())
+        .await
+        .unwrap();
+    let mut personaldb = PersonalDbServiceClient::connect(actor.grpc_addr.clone())
+        .await
+        .unwrap();
+    let source = format!(
+        "writeback-conflict-source-{}",
+        uuid::Uuid::new_v4().simple()
+    );
+    let target = format!(
+        "writeback-conflict-target-{}",
+        uuid::Uuid::new_v4().simple()
+    );
     let source_genesis = create_group(&mut personaldb, &token, &source).await;
     create_group_with_schema(
         &mut personaldb,
@@ -625,11 +666,8 @@ async fn projection_writeback_conflict_aborts_both_groups_and_unrelated_writes()
         &personaldb_projection_test_schema_hash(),
     )
     .await;
-    let definition = projection_definition_allowing_name_writeback_for_tenant(
-        actor.tenant_id,
-        &target,
-        &source,
-    );
+    let definition =
+        projection_definition_allowing_name_writeback_for_tenant(actor.tenant_id, &target, &source);
     personaldb
         .create_personal_db_projection(authorized(
             CreatePersonalDbProjectionRequest {
@@ -662,20 +700,12 @@ async fn projection_writeback_conflict_aborts_both_groups_and_unrelated_writes()
         .into_inner()
         .committed_head
         .unwrap();
-    let first = begin_personaldb_transaction(
-        &mut transactions,
-        &token,
-        &cluster_id,
-        "writeback-first",
-    )
-    .await;
-    let second = begin_personaldb_transaction(
-        &mut transactions,
-        &token,
-        &cluster_id,
-        "writeback-second",
-    )
-    .await;
+    let first =
+        begin_personaldb_transaction(&mut transactions, &token, &cluster_id, "writeback-first")
+            .await;
+    let second =
+        begin_personaldb_transaction(&mut transactions, &token, &cluster_id, "writeback-second")
+            .await;
     let losing_bucket = format!("writeback-loser-{}", uuid::Uuid::new_v4().simple());
     for transaction_id in [&first, &second] {
         let mut request = submit_request_at_base_for_actor(

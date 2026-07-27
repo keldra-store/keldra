@@ -54,7 +54,7 @@ async fn test_grant_and_revoke_access() {
 
     // 2. Grant access
     let mut grant_req = Request::new(GrantAccessRequest {
-            context: None,
+        context: None,
         grantee_app_id: grantee.app_name.clone(),
         resource: resource.clone(),
         action: "bucket:read".to_string(),
@@ -80,7 +80,7 @@ async fn test_grant_and_revoke_access() {
 
     // 4. Revoke access
     let mut revoke_req = Request::new(RevokeAccessRequest {
-            context: None,
+        context: None,
         grantee_app_id: grantee.app_name,
         resource: resource.clone(),
         action: "bucket:read".to_string(),
@@ -122,7 +122,7 @@ async fn test_authz_tuple_write_check_and_watch() {
         .unwrap();
 
     let mut write_add = Request::new(WriteAuthzTupleRequest {
-            context: None,
+        context: None,
         namespace: "document".to_string(),
         object_id: "alpha".to_string(),
         relation: "viewer".to_string(),
@@ -224,7 +224,7 @@ async fn test_authz_tuple_write_check_and_watch() {
     assert_eq!(exact_add.revision, add.revision);
 
     let mut write_remove = Request::new(WriteAuthzTupleRequest {
-            context: None,
+        context: None,
         namespace: "document".to_string(),
         object_id: "alpha".to_string(),
         relation: "viewer".to_string(),
@@ -388,7 +388,7 @@ async fn test_authz_batch_read_and_list_operations() {
         .unwrap();
 
     let mut write = Request::new(WriteAuthzTuplesRequest {
-            context: None,
+        context: None,
         mutations: vec![
             authz_mutation("document", "alpha", "viewer", "user", "alice", "add"),
             authz_mutation("document", "beta", "viewer", "user", "alice", "add"),
@@ -531,7 +531,7 @@ async fn test_authz_batch_watch_and_current_pagination_rejects_stale_revision() 
         .await
         .unwrap();
     let mut first_batch = Request::new(WriteAuthzTuplesRequest {
-            context: None,
+        context: None,
         mutations: vec![
             authz_mutation("document", "alpha", "viewer", "user", "alice", "add"),
             authz_mutation("document", "beta", "viewer", "user", "bob", "add"),
@@ -605,7 +605,7 @@ async fn test_authz_batch_watch_and_current_pagination_rejects_stale_revision() 
     assert!(!first_page.next_page_token.is_empty());
 
     let mut second_batch = Request::new(WriteAuthzTuplesRequest {
-            context: None,
+        context: None,
         mutations: vec![authz_mutation(
             "document", "delta", "viewer", "user", "dana", "add",
         )],
@@ -679,7 +679,7 @@ async fn test_authz_tuple_batch_failure_is_atomic() {
         .unwrap();
 
     let mut invalid_batch = Request::new(WriteAuthzTuplesRequest {
-            context: None,
+        context: None,
         mutations: vec![
             authz_mutation("document", "alpha", "viewer", "user", "alice", "add"),
             AuthzTupleMutation {
@@ -714,7 +714,7 @@ async fn test_authz_tuple_batch_failure_is_atomic() {
     );
 
     let mut unsafe_component_batch = Request::new(WriteAuthzTuplesRequest {
-            context: None,
+        context: None,
         mutations: vec![
             authz_mutation("document", "alpha", "viewer", "user", "alice", "add"),
             authz_mutation("bad/slash", "beta", "viewer", "user", "alice", "add"),
@@ -749,7 +749,7 @@ async fn test_authz_tuple_batch_failure_is_atomic() {
         bind_default_authz_schema(&cluster.grpc_addrs[0], tenant_id, &token).await;
 
     let mut valid_batch = Request::new(WriteAuthzTuplesRequest {
-            context: None,
+        context: None,
         mutations: vec![
             authz_mutation("document", "alpha", "viewer", "user", "alice", "add"),
             authz_mutation("document", "beta", "viewer", "user", "alice", "add"),
@@ -787,7 +787,7 @@ async fn test_conditional_authz_batch_idempotency_and_revision_conflicts() {
     ];
 
     let mut baseline_request = Request::new(WriteAuthzTuplesRequest {
-            context: None,
+        context: None,
         mutations: vec![authz_mutation(
             "document",
             "baseline",
@@ -808,7 +808,7 @@ async fn test_conditional_authz_batch_idempotency_and_revision_conflicts() {
         .into_inner();
 
     let mut first_request = Request::new(WriteAuthzTuplesRequest {
-            context: None,
+        context: None,
         mutations: mutations.clone(),
         scope: None,
         operation_id: Some("grant-initial-access".to_string()),
@@ -823,7 +823,7 @@ async fn test_conditional_authz_batch_idempotency_and_revision_conflicts() {
     assert_eq!(first.revision, baseline.revision + 1);
 
     let mut advance_request = Request::new(WriteAuthzTuplesRequest {
-            context: None,
+        context: None,
         mutations: vec![authz_mutation(
             "document", "gamma", "viewer", "user", "carol", "add",
         )],
@@ -840,7 +840,7 @@ async fn test_conditional_authz_batch_idempotency_and_revision_conflicts() {
     assert_eq!(advanced.revision, first.revision + 1);
 
     let mut retry_request = Request::new(WriteAuthzTuplesRequest {
-            context: None,
+        context: None,
         mutations: mutations.clone(),
         scope: None,
         operation_id: Some("grant-initial-access".to_string()),
@@ -860,7 +860,7 @@ async fn test_conditional_authz_batch_idempotency_and_revision_conflicts() {
     let mut changed_mutations = mutations;
     changed_mutations[0].object_id = "changed".to_string();
     let mut changed_request = Request::new(WriteAuthzTuplesRequest {
-            context: None,
+        context: None,
         mutations: changed_mutations,
         scope: None,
         operation_id: Some("grant-initial-access".to_string()),
@@ -875,7 +875,7 @@ async fn test_conditional_authz_batch_idempotency_and_revision_conflicts() {
     assert_eq!(changed.message(), "AuthzOperationConflict");
 
     let mut stale_request = Request::new(WriteAuthzTuplesRequest {
-            context: None,
+        context: None,
         mutations: vec![authz_mutation(
             "document", "delta", "viewer", "user", "dana", "add",
         )],
@@ -892,7 +892,7 @@ async fn test_conditional_authz_batch_idempotency_and_revision_conflicts() {
     assert!(stale.message().contains("AuthzRevisionConflict"));
 
     let mut oversized_id_request = Request::new(WriteAuthzTuplesRequest {
-            context: None,
+        context: None,
         mutations: vec![authz_mutation(
             "document", "epsilon", "viewer", "user", "erin", "add",
         )],
@@ -920,7 +920,7 @@ async fn test_authz_accepts_arbitrary_safe_subject_kind() {
         .unwrap();
 
     let mut write = Request::new(WriteAuthzTuplesRequest {
-            context: None,
+        context: None,
         mutations: vec![authz_mutation(
             "document", "doc-1", "viewer", "folder", "folder-1", "add",
         )],

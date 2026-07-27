@@ -365,10 +365,9 @@ impl TransactionBundle {
                     (job.cluster_id, job.transaction_id)
                 }
                 Some(crate::hf_ingestion_postcommit_job::HfIngestionPostCommitJob::SCHEMA) => {
-                    let job =
-                        crate::hf_ingestion_postcommit_job::HfIngestionPostCommitJob::decode(
-                            encoded_job,
-                        )?;
+                    let job = crate::hf_ingestion_postcommit_job::HfIngestionPostCommitJob::decode(
+                        encoded_job,
+                    )?;
                     (job.cluster_id, job.transaction_id)
                 }
                 Some(
@@ -380,8 +379,9 @@ impl TransactionBundle {
                     (job.cluster_id, job.transaction_id)
                 }
                 _ => {
-                    let job =
-                        crate::object_materialisation::ObjectMaterialisationJob::decode(encoded_job)?;
+                    let job = crate::object_materialisation::ObjectMaterialisationJob::decode(
+                        encoded_job,
+                    )?;
                     (job.cluster_id, job.transaction_id)
                 }
             };

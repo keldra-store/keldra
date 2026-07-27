@@ -669,7 +669,11 @@ async fn implicit_mixed_batch_commits_once_atomically() {
         &fixture.bucket_name,
         patch_key,
         br#"{"state":"original"}"#,
-        native_mutation_context(&fixture.actor, fixture.bucket_id, "implicit-mixed-patch-seed"),
+        native_mutation_context(
+            &fixture.actor,
+            fixture.bucket_id,
+            "implicit-mixed-patch-seed",
+        ),
     )
     .await
     .expect("seed object for implicit patch");
@@ -679,7 +683,11 @@ async fn implicit_mixed_batch_commits_once_atomically() {
         &fixture.bucket_name,
         delete_key,
         br#"{"state":"present"}"#,
-        native_mutation_context(&fixture.actor, fixture.bucket_id, "implicit-mixed-delete-seed"),
+        native_mutation_context(
+            &fixture.actor,
+            fixture.bucket_id,
+            "implicit-mixed-delete-seed",
+        ),
     )
     .await
     .expect("seed object for implicit delete");
@@ -1201,10 +1209,10 @@ async fn object_version_precondition_is_revalidated_at_transaction_publication()
                 source_version_id: None,
                 destination_bucket_name: fixture.bucket_name.clone(),
                 destination_object_key: copy_key.to_string(),
-                mutation_context: Some(fixture.mutation_context(
-                    "durable-precondition-copy",
-                    &transaction.transaction_id,
-                )),
+                mutation_context: Some(
+                    fixture
+                        .mutation_context("durable-precondition-copy", &transaction.transaction_id),
+                ),
             },
             &fixture.actor.token,
         ))
@@ -1215,10 +1223,7 @@ async fn object_version_precondition_is_revalidated_at_transaction_publication()
             CreateObjectLinkRequest {
                 context: Some(PublicMutationContext {
                     request_id: "durable-precondition-link".to_string(),
-                    idempotency_key: format!(
-                        "durable-precondition-link-{}",
-                        uuid::Uuid::new_v4()
-                    ),
+                    idempotency_key: format!("durable-precondition-link-{}", uuid::Uuid::new_v4()),
                     expected_generation: 0,
                     transaction_id: Some(transaction.transaction_id.clone()),
                 }),
@@ -1372,7 +1377,7 @@ async fn lease_fence_is_revalidated_at_transaction_publication() {
                 source_cursor_low: 0,
                 source_cursor_high: 0,
                 requested_ttl_nanos: 60_000_000_000,
-            options: None,
+                options: None,
             },
             &fixture.actor.token,
         ))
@@ -1424,7 +1429,7 @@ async fn lease_fence_is_revalidated_at_transaction_publication() {
                 expected_lease_epoch: lease.lease_epoch,
                 expected_expires_at_nanos: lease.expires_at_nanos,
                 expected_lease_hash: lease.lease_hash,
-            options: None,
+                options: None,
             },
             &fixture.actor.token,
         ))

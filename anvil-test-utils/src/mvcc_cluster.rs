@@ -253,10 +253,7 @@ impl RealMvccCluster {
             cluster_id,
             &format!("raft:{}", self.configs[node].mvcc_raft_node_id),
         );
-        anvil_core::cluster_transport_fault::heal_node(
-            cluster_id,
-            &self.configs[node].node_id,
-        );
+        anvil_core::cluster_transport_fault::heal_node(cluster_id, &self.configs[node].node_id);
     }
 
     /// Blocks only replication traffic for a node, leaving its Raft transport
@@ -412,14 +409,7 @@ impl RealMvccCluster {
     pub async fn wait_for_gc_watermark(&self, node: usize, version: u64) -> anyhow::Result<()> {
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                if self
-                    .state(node)
-                    .mvcc
-                    .runtime
-                    .local_store()
-                    .gc_watermark()?
-                    >= version
-                {
+                if self.state(node).mvcc.runtime.local_store().gc_watermark()? >= version {
                     return Ok::<_, anyhow::Error>(());
                 }
                 tokio::task::yield_now().await;

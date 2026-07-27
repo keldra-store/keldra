@@ -247,9 +247,7 @@ impl MvccSubsystem {
                     )
                     .await
                     .with_context(|| {
-                        format!(
-                            "move partition {partition_id} to replacement node incarnation"
-                        )
+                        format!("move partition {partition_id} to replacement node incarnation")
                     })?;
             }
         }
@@ -408,15 +406,12 @@ impl MvccSubsystem {
         endpoint: String,
     ) -> Result<()> {
         authorization.require(self.cluster_id(), ClusterControlPermission::Nodes)?;
-        let installed = self
-            .consensus
-            .applied_control_snapshot()?
-            .nodes
-            .iter()
-            .any(|(node_id, _raft_node_id, incarnation, _failure_domain)| {
+        let installed = self.consensus.applied_control_snapshot()?.nodes.iter().any(
+            |(node_id, _raft_node_id, incarnation, _failure_domain)| {
                 *node_id == consensus_control_node_id(&node.node_id)
                     && *incarnation == node.incarnation
-            });
+            },
+        );
         if !installed {
             bail!("replacement incarnation is not committed in local Raft control state");
         }

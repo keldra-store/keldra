@@ -6,9 +6,7 @@ use anvil::{
         BundleIdentity, CertificationResult, DurabilityLevel, LogicalKey, ReadConsistency,
     },
 };
-use anvil_mvcc_consensus::{
-    CommitVersion, GarbageCollectionPins, NodeId, NodeIncarnation,
-};
+use anvil_mvcc_consensus::{CommitVersion, GarbageCollectionPins, NodeId, NodeIncarnation};
 use anvil_test_utils::mvcc_cluster::RealMvccCluster;
 use sha2::{Digest, Sha256};
 
@@ -61,12 +59,7 @@ async fn advance_gc(
     now_unix_ms: u64,
 ) -> u64 {
     let state = cluster.state(leader);
-    let current = state
-        .mvcc
-        .runtime
-        .local_store()
-        .gc_watermark()
-        .unwrap();
+    let current = state.mvcc.runtime.local_store().gc_watermark().unwrap();
     let head = state.mvcc.runtime.applied_version().unwrap();
     let proposal = plan_garbage_collection(
         &state.mvcc.open_transactions,
@@ -91,10 +84,7 @@ async fn advance_gc(
 async fn real_cluster_gc_respects_snapshot_and_lagging_replica_then_reclaims_after_catchup() {
     let cluster = RealMvccCluster::start().await.unwrap();
     let leader = cluster.wait_for_any_leader(&[0, 1, 2]).await.unwrap();
-    let lagging = [0, 1, 2]
-        .into_iter()
-        .find(|node| *node != leader)
-        .unwrap();
+    let lagging = [0, 1, 2].into_iter().find(|node| *node != leader).unwrap();
     let key = LogicalKey {
         table_id: 17,
         application_key: b"gc/retained-history".to_vec(),

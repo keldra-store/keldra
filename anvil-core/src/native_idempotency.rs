@@ -454,9 +454,7 @@ fn record_tuple_key(context: &NativeMutationContext) -> Result<Vec<u8>, Status> 
     .map_err(|e| Status::internal(e.to_string()))
 }
 
-pub(crate) fn native_transaction_principal_from_context(
-    context: &NativeMutationContext,
-) -> String {
+pub(crate) fn native_transaction_principal_from_context(context: &NativeMutationContext) -> String {
     format!(
         "tenant/{}/principal/{}",
         context.tenant_id, context.principal

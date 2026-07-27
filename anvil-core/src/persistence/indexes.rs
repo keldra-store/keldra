@@ -12,10 +12,7 @@ impl Persistence {
             .claim_index_finalization_authorized(&worker_id, now, 30_000, |record| {
                 self.mvcc()
                     .ok()?
-                    .claim_assignment(
-                        "index-finalization",
-                        &record.job.target_logical_identity(),
-                    )
+                    .claim_assignment("index-finalization", &record.job.target_logical_identity())
                     .ok()
                     .flatten()
                     .map(|guard| guard.lease_owner(&worker_id))
@@ -25,10 +22,7 @@ impl Persistence {
         };
         let guard = self
             .mvcc()?
-            .claim_assignment(
-                "index-finalization",
-                &record.job.target_logical_identity(),
-            )?
+            .claim_assignment("index-finalization", &record.job.target_logical_identity())?
             .ok_or_else(|| anyhow!("index finalization assignment changed after claim"))?;
         let lease_owner = guard.lease_owner(&worker_id);
         let result = self.execute_index_finalization(&record.job).await;
@@ -81,16 +75,13 @@ impl Persistence {
             .await?;
         }
         let frozen: IndexDefinition = serde_json::from_value(job.frozen_definition.clone())?;
-        let Some(current) =
-            self.get_index_definition(job.tenant_id, job.bucket_id, &job.index_name)
-                .await?
+        let Some(current) = self
+            .get_index_definition(job.tenant_id, job.bucket_id, &job.index_name)
+            .await?
         else {
             return Ok(());
         };
-        if current.id != job.index_id
-            || current.version != job.index_version
-            || current != frozen
-        {
+        if current.id != job.index_id || current.version != job.index_version || current != frozen {
             return Ok(());
         }
         self.enqueue_index_build_for_index(&bucket, &frozen).await?;

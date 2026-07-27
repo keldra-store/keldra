@@ -19,17 +19,11 @@ async fn put_with_context(
     payload: &[u8],
     context: NativeMutationContext,
 ) -> Result<anvil_api::PutObjectResponse, Status> {
-    let chunks = put_object_chunks(
-        bucket_name,
-        object_key,
-        payload,
-        Some(context),
-    );
+    let chunks = put_object_chunks(bucket_name, object_key, payload, Some(context));
     let mut request = Request::new(tokio_stream::iter(chunks));
-    request.metadata_mut().insert(
-        "authorization",
-        format!("Bearer {token}").parse().unwrap(),
-    );
+    request
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
     client
         .put_object(request)
         .await
@@ -65,10 +59,9 @@ async fn upload_part_with_context(
         },
     ];
     let mut request = Request::new(tokio_stream::iter(chunks));
-    request.metadata_mut().insert(
-        "authorization",
-        format!("Bearer {token}").parse().unwrap(),
-    );
+    request
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
     client
         .upload_part(request)
         .await
@@ -90,7 +83,9 @@ async fn implicit_native_retries_reconstruct_results_and_reject_changed_inputs_a
     .await;
     let endpoint_a = cluster.grpc_addrs[0].clone();
     let endpoint_b = cluster.grpc_addrs[1].clone();
-    let mut buckets = BucketServiceClient::connect(endpoint_a.clone()).await.unwrap();
+    let mut buckets = BucketServiceClient::connect(endpoint_a.clone())
+        .await
+        .unwrap();
     let mut first_node = ObjectServiceClient::connect(endpoint_a).await.unwrap();
     let mut second_node = ObjectServiceClient::connect(endpoint_b).await.unwrap();
     let bucket_name = unique_test_name("native-mvcc-retry");
@@ -144,7 +139,10 @@ async fn implicit_native_retries_reconstruct_results_and_reject_changed_inputs_a
     .await
     .unwrap_err();
     assert!(
-        matches!(changed_put.code(), Code::AlreadyExists | Code::FailedPrecondition),
+        matches!(
+            changed_put.code(),
+            Code::AlreadyExists | Code::FailedPrecondition
+        ),
         "changed-input reuse must be rejected, got {changed_put:?}"
     );
 
@@ -183,20 +181,17 @@ async fn implicit_native_retries_reconstruct_results_and_reject_changed_inputs_a
         ))
         .await
         .unwrap_err();
-    assert!(
-        matches!(changed_cas.code(), Code::AlreadyExists | Code::FailedPrecondition)
-    );
+    assert!(matches!(
+        changed_cas.code(),
+        Code::AlreadyExists | Code::FailedPrecondition
+    ));
 
     let create_stream = first_node
         .create_append_stream(authorized(
             CreateAppendStreamRequest {
                 bucket_name: bucket_name.clone(),
                 stream_key: "events".to_string(),
-                mutation_context: Some(native_mutation_context(
-                    &actor,
-                    bucket_id,
-                    "create-stream",
-                )),
+                mutation_context: Some(native_mutation_context(&actor, bucket_id, "create-stream")),
             },
             &actor.token,
         ))
@@ -243,9 +238,10 @@ async fn implicit_native_retries_reconstruct_results_and_reject_changed_inputs_a
         ))
         .await
         .unwrap_err();
-    assert!(
-        matches!(changed_append.code(), Code::AlreadyExists | Code::FailedPrecondition)
-    );
+    assert!(matches!(
+        changed_append.code(),
+        Code::AlreadyExists | Code::FailedPrecondition
+    ));
 }
 
 #[tokio::test]
@@ -263,7 +259,9 @@ async fn multipart_and_append_payloads_round_trip_from_mvcc_representations() {
     .await;
     let endpoint_a = cluster.grpc_addrs[0].clone();
     let endpoint_b = cluster.grpc_addrs[1].clone();
-    let mut buckets = BucketServiceClient::connect(endpoint_a.clone()).await.unwrap();
+    let mut buckets = BucketServiceClient::connect(endpoint_a.clone())
+        .await
+        .unwrap();
     let mut objects = ObjectServiceClient::connect(endpoint_a).await.unwrap();
     let mut retry_node = ObjectServiceClient::connect(endpoint_b).await.unwrap();
     let bucket_name = unique_test_name("native-mvcc-payloads");
@@ -401,10 +399,7 @@ async fn multipart_and_append_payloads_round_trip_from_mvcc_representations() {
                 bucket_name: bucket_name.clone(),
                 object_key: "assembled.bin".to_string(),
                 upload_id: first_initiate.upload_id,
-                parts: completed
-                    .into_iter()
-                    .rev()
-                    .collect(),
+                parts: completed.into_iter().rev().collect(),
                 mutation_context: Some(complete_context),
             },
             &actor.token,
@@ -430,11 +425,7 @@ async fn multipart_and_append_payloads_round_trip_from_mvcc_representations() {
             CreateAppendStreamRequest {
                 bucket_name: bucket_name.clone(),
                 stream_key: "mvcc-events".to_string(),
-                mutation_context: Some(native_mutation_context(
-                    &actor,
-                    bucket_id,
-                    "mvcc-stream",
-                )),
+                mutation_context: Some(native_mutation_context(&actor, bucket_id, "mvcc-stream")),
             },
             &actor.token,
         ))
@@ -448,11 +439,7 @@ async fn multipart_and_append_payloads_round_trip_from_mvcc_representations() {
                 stream_key: "mvcc-events".to_string(),
                 stream_id: stream.stream_id.clone(),
                 payload: b"sharded append payload".to_vec(),
-                mutation_context: Some(native_mutation_context(
-                    &actor,
-                    bucket_id,
-                    "mvcc-append",
-                )),
+                mutation_context: Some(native_mutation_context(&actor, bucket_id, "mvcc-append")),
                 content_type: None,
                 user_metadata_json: String::new(),
                 precondition: None,

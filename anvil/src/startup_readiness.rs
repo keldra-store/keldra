@@ -80,7 +80,9 @@ mod tests {
     #[test]
     fn only_internal_recovery_services_bypass_public_readiness() {
         assert!(is_recovery_rpc("/anvil.BlockStoreInternal/GetShard"));
-        assert!(is_recovery_rpc("/anvil.AntiEntropyInternal/ExchangeInventory"));
+        assert!(is_recovery_rpc(
+            "/anvil.AntiEntropyInternal/ExchangeInventory"
+        ));
         assert!(!is_recovery_rpc("/anvil.RootRegisterInternal/ReadRoot"));
         assert!(!is_recovery_rpc(
             "/anvil.CoreMetaReplicationInternal/ExchangeCoreMetaInventory"

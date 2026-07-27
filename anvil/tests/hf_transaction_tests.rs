@@ -1,11 +1,11 @@
 #![recursion_limit = "256"]
 
+use anvil::anvil_api::hugging_face_key_service_client::HuggingFaceKeyServiceClient;
+use anvil::anvil_api::transaction_service_client::TransactionServiceClient;
 use anvil::anvil_api::{
     BeginTransactionRequest, CommitTransactionRequest, CreateHfKeyRequest, MvccDurability,
     MvccReadConsistency, WriteOptions, WriteState, write_options,
 };
-use anvil::anvil_api::hugging_face_key_service_client::HuggingFaceKeyServiceClient;
-use anvil::anvil_api::transaction_service_client::TransactionServiceClient;
 use anvil_test_utils::{TestCluster, isolated_test_cluster, unique_test_name};
 
 fn authorized<T>(mut request: tonic::Request<T>, token: &str) -> tonic::Request<T> {
@@ -43,9 +43,7 @@ fn options(transaction_id: Option<&str>, idempotency_key: &str) -> WriteOptions 
         wait_for_finalization: false,
         preconditions: Vec::new(),
         boundary_values: Vec::new(),
-        execution: transaction_id.map(|id| {
-            write_options::Execution::TransactionId(id.to_string())
-        }),
+        execution: transaction_id.map(|id| write_options::Execution::TransactionId(id.to_string())),
     }
 }
 
@@ -80,9 +78,14 @@ async fn hf_key_writes_stage_and_conflicting_transactions_abort() {
         .await
         .unwrap();
     assert_eq!(
-        create_key(&cluster, &mut keys, &key_name, options(Some(&first), "first"))
-            .await
-            .write_state,
+        create_key(
+            &cluster,
+            &mut keys,
+            &key_name,
+            options(Some(&first), "first")
+        )
+        .await
+        .write_state,
         WriteState::Staged as i32
     );
     assert_eq!(

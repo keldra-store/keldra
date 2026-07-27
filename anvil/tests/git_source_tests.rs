@@ -1,18 +1,20 @@
 #![recursion_limit = "256"]
 
 use anvil::anvil_api::git_source_service_client::GitSourceServiceClient;
+use anvil::anvil_api::transaction_service_client::TransactionServiceClient;
 use anvil::anvil_api::{
     BeginTransactionRequest, CommitTransactionRequest, GetGitBlobByPathRequest,
-    GetGitObjectRequest, GitPackMetadata, ListGitTreeRequest, MvccDurability,
-    MvccReadConsistency, PutGitPackRequest, WatchGitSourceRequest, WriteOptions, WriteState,
-    put_git_pack_request, write_options,
+    GetGitObjectRequest, GitPackMetadata, ListGitTreeRequest, MvccDurability, MvccReadConsistency,
+    PutGitPackRequest, WatchGitSourceRequest, WriteOptions, WriteState, put_git_pack_request,
+    write_options,
 };
-use anvil::anvil_api::transaction_service_client::TransactionServiceClient;
 use anvil::formats::git::{GitHashAlgorithm, GitSourceRecord};
 use anvil::git_source_index::{GitSourceIndexWrite, write_git_source_index};
 use anvil::git_source_watch::{GitSourceWatchPayload, append_git_source_watch_record};
 use anvil::writer_segment_catalog::read_writer_segment_catalog_record;
-use anvil_test_utils::{TestCluster, isolated_test_cluster, shared_default_test_cluster, unique_test_name};
+use anvil_test_utils::{
+    TestCluster, isolated_test_cluster, shared_default_test_cluster, unique_test_name,
+};
 use flate2::{Compression, write::ZlibEncoder};
 use futures_util::StreamExt;
 use sha1::{Digest, Sha1};
@@ -381,10 +383,9 @@ async fn stage_git_pack(
             data: Some(put_git_pack_request::Data::Chunk(pack)),
         },
     ]));
-    request.metadata_mut().insert(
-        "authorization",
-        format!("Bearer {token}").parse().unwrap(),
-    );
+    request
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
     client.put_git_pack(request).await.unwrap().into_inner()
 }
 
@@ -415,10 +416,9 @@ async fn put_git_pack_implicitly(
             data: Some(put_git_pack_request::Data::Chunk(pack)),
         },
     ]));
-    request.metadata_mut().insert(
-        "authorization",
-        format!("Bearer {token}").parse().unwrap(),
-    );
+    request
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
     client.put_git_pack(request).await.unwrap().into_inner()
 }
 
@@ -480,10 +480,11 @@ async fn git_packs_and_manifests_commit_atomically_across_repositories() {
     let endpoint = cluster.grpc_addrs[0].clone();
     let bucket_name = unique_test_name("git-transaction-bucket");
     cluster.create_bucket(&bucket_name, "test-region-1").await;
-    let mut git = GitSourceServiceClient::connect(endpoint.clone()).await.unwrap();
+    let mut git = GitSourceServiceClient::connect(endpoint.clone())
+        .await
+        .unwrap();
     let mut transactions = TransactionServiceClient::connect(endpoint).await.unwrap();
-    let transaction_id =
-        begin_git_transaction(&cluster, &mut transactions, "git-success").await;
+    let transaction_id = begin_git_transaction(&cluster, &mut transactions, "git-success").await;
     let first_repo = unique_test_name("git-first");
     let second_repo = unique_test_name("git-second");
 
@@ -529,11 +530,14 @@ async fn git_packs_and_manifests_commit_atomically_across_repositories() {
 
 #[tokio::test]
 async fn git_repository_conflict_aborts_every_manifest_and_pack_in_losing_transaction() {
-    let cluster = isolated_test_cluster("git-source-transaction-conflict", &["test-region-1"]).await;
+    let cluster =
+        isolated_test_cluster("git-source-transaction-conflict", &["test-region-1"]).await;
     let endpoint = cluster.grpc_addrs[0].clone();
     let bucket_name = unique_test_name("git-conflict-bucket");
     cluster.create_bucket(&bucket_name, "test-region-1").await;
-    let mut git = GitSourceServiceClient::connect(endpoint.clone()).await.unwrap();
+    let mut git = GitSourceServiceClient::connect(endpoint.clone())
+        .await
+        .unwrap();
     let mut transactions = TransactionServiceClient::connect(endpoint).await.unwrap();
     let first = begin_git_transaction(&cluster, &mut transactions, "git-first").await;
     let second = begin_git_transaction(&cluster, &mut transactions, "git-second").await;

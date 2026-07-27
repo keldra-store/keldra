@@ -1349,8 +1349,7 @@ fn table_spec(table_id: u16) -> Result<CoreMetaTableSpec> {
             cf: CF_AUTHZ,
             max_payload_bytes: CORE_META_MAX_VALUE_BYTES,
         },
-        TABLE_PERSONALDB_GROUP_ROW
-        | TABLE_PERSONALDB_DATA_LOCATOR_ROW => CoreMetaTableSpec {
+        TABLE_PERSONALDB_GROUP_ROW | TABLE_PERSONALDB_DATA_LOCATOR_ROW => CoreMetaTableSpec {
             cf: CF_PERSONALDB,
             max_payload_bytes: CORE_META_MAX_VALUE_BYTES,
         },

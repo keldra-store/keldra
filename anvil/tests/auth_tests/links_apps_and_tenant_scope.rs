@@ -501,7 +501,7 @@ async fn tenant_can_create_and_rotate_own_app_secret() {
     assert!(!created.client_secret.is_empty());
 
     let mut grant = Request::new(GrantAccessRequest {
-            context: None,
+        context: None,
         grantee_app_id: app_name.clone(),
         resource: "buckets".to_string(),
         action: "bucket:list".to_string(),
@@ -617,7 +617,7 @@ async fn tenant_can_delegate_narrower_policy_capability() {
         .await
         .unwrap();
     let mut grant = Request::new(GrantAccessRequest {
-            context: None,
+        context: None,
         grantee_app_id: grantee_app.clone(),
         resource: "buckets".to_string(),
         action: "bucket:list".to_string(),

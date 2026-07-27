@@ -819,8 +819,10 @@ mod tests {
         let path = directory.path().join("prepared-bundles.log");
         let initial_len = path.metadata().unwrap().len();
         crate::mvcc_fault_injection::install(
-            crate::mvcc_fault_injection::DeterministicFaults::default()
-                .fail_at(crate::mvcc_fault_injection::FaultPoint::PreparedBundleWrite, 1),
+            crate::mvcc_fault_injection::DeterministicFaults::default().fail_at(
+                crate::mvcc_fault_injection::FaultPoint::PreparedBundleWrite,
+                1,
+            ),
         );
 
         let error = store.persist(&identity, bytes).await.unwrap_err();
@@ -830,7 +832,10 @@ mod tests {
 
         crate::mvcc_fault_injection::clear();
         store.persist(&identity, bytes).await.unwrap();
-        assert_eq!(store.read(&identity).unwrap().as_deref(), Some(bytes.as_slice()));
+        assert_eq!(
+            store.read(&identity).unwrap().as_deref(),
+            Some(bytes.as_slice())
+        );
         drop(store);
         let reopened = AppendOnlyPreparedBundleStore::open(
             directory.path(),

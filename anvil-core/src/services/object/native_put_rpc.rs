@@ -7,10 +7,7 @@ pub(crate) async fn execute_native_put(
     state: &AppState,
     claims: auth::Claims,
     metadata: ObjectMetadata,
-    mut data_stream: impl futures_core::Stream<Item = Result<Vec<u8>, Status>>
-    + Unpin
-    + Send
-    + 'static,
+    mut data_stream: impl futures_core::Stream<Item = Result<Vec<u8>, Status>> + Unpin + Send + 'static,
 ) -> Result<PutObjectResponse, Status> {
     let ObjectMetadata {
         bucket_name,
@@ -73,11 +70,7 @@ pub(crate) async fn execute_native_put(
         .open_transactions
         .status(transaction_id, &transaction_principal, current_unix_ms()?)
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
-    if native_idempotency::generic_result_exists(
-        &state.mvcc,
-        transaction_id,
-        attempt.context(),
-    )? {
+    if native_idempotency::generic_result_exists(&state.mvcc, transaction_id, attempt.context())? {
         let (payload_hash, payload_size) = hash_native_payload(&mut data_stream).await?;
         let target = native_payload_target(base_target, &payload_hash, payload_size);
         return native_idempotency::load_generic_response(
@@ -115,10 +108,7 @@ pub(crate) async fn execute_native_put(
             attempt.context(),
             &target,
         )?
-        .or(
-            native_idempotency::load_response(&state.mvcc, attempt.context(), &target)
-                .await?,
-        )
+        .or(native_idempotency::load_response(&state.mvcc, attempt.context(), &target).await?)
         .ok_or_else(|| Status::data_loss("committed native put is missing its response"));
     }
     if status.state != "open" {
@@ -157,8 +147,7 @@ pub(crate) async fn execute_native_put(
     let target = native_payload_target(
         base_target,
         &object.content_hash,
-        u64::try_from(object.size)
-            .map_err(|_| Status::internal("object size is negative"))?,
+        u64::try_from(object.size).map_err(|_| Status::internal("object size is negative"))?,
     );
     let response = PutObjectResponse {
         etag: object.etag,

@@ -1,9 +1,9 @@
 use super::*;
+use anvil::anvil_api::transaction_service_client::TransactionServiceClient;
 use anvil::anvil_api::{
     BeginTransactionRequest, CommitTransactionRequest, MvccDurability, MvccReadConsistency,
     WriteOptions, write_options,
 };
-use anvil::anvil_api::transaction_service_client::TransactionServiceClient;
 use tonic::Code;
 
 async fn begin_index_transaction(
@@ -76,7 +76,9 @@ async fn explicit_index_transaction_publishes_definition_and_finalises_after_com
     let endpoint = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
     let cluster_id = cluster.states[0].mvcc.cluster_id().to_string();
-    let mut buckets = BucketServiceClient::connect(endpoint.clone()).await.unwrap();
+    let mut buckets = BucketServiceClient::connect(endpoint.clone())
+        .await
+        .unwrap();
     let mut indexes = IndexServiceClient::connect(endpoint.clone()).await.unwrap();
     let mut transactions = TransactionServiceClient::connect(endpoint).await.unwrap();
     let bucket_name = unique_test_name("transactional-index-bucket");
@@ -152,7 +154,9 @@ async fn conflicting_explicit_index_transactions_publish_only_one_definition() {
     let endpoint = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
     let cluster_id = cluster.states[0].mvcc.cluster_id().to_string();
-    let mut buckets = BucketServiceClient::connect(endpoint.clone()).await.unwrap();
+    let mut buckets = BucketServiceClient::connect(endpoint.clone())
+        .await
+        .unwrap();
     let mut indexes = IndexServiceClient::connect(endpoint.clone()).await.unwrap();
     let mut transactions = TransactionServiceClient::connect(endpoint).await.unwrap();
     let bucket_name = unique_test_name("conflicting-index-bucket");
@@ -167,7 +171,8 @@ async fn conflicting_explicit_index_transactions_publish_only_one_definition() {
         ))
         .await
         .unwrap();
-    let first = begin_index_transaction(&mut transactions, &token, &cluster_id, "index-first").await;
+    let first =
+        begin_index_transaction(&mut transactions, &token, &cluster_id, "index-first").await;
     let second =
         begin_index_transaction(&mut transactions, &token, &cluster_id, "index-second").await;
     let index_name = unique_test_name("conflicting-index");
@@ -213,7 +218,9 @@ async fn implicit_index_retry_reconstructs_the_committed_definition() {
     let cluster = shared_default_test_cluster().await;
     let endpoint = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
-    let mut buckets = BucketServiceClient::connect(endpoint.clone()).await.unwrap();
+    let mut buckets = BucketServiceClient::connect(endpoint.clone())
+        .await
+        .unwrap();
     let mut indexes = IndexServiceClient::connect(endpoint).await.unwrap();
     let bucket_name = unique_test_name("implicit-index-bucket");
     buckets

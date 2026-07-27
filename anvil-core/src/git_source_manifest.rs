@@ -148,8 +148,7 @@ pub fn read_git_source_repository_manifest_in_transaction(
         TABLE_GIT_SOURCE_MANIFEST_ROW,
         &manifest_tuple_key(tenant_id, repository_id)?,
     )?;
-    let Some(payload) =
-        mvcc.read_transaction_value(transaction_id, transaction_principal, &key)?
+    let Some(payload) = mvcc.read_transaction_value(transaction_id, transaction_principal, &key)?
     else {
         return Ok(None);
     };

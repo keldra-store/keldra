@@ -391,8 +391,7 @@ async fn stage_registry_namespace_defaults(
     transaction: &RegistryMutationTransaction,
 ) -> anyhow::Result<()> {
     let namespace = registry_namespace_resource(registry_kind, namespace);
-    let object_id =
-        access_control::registry_namespace_object_id(claims.tenant_id, &namespace);
+    let object_id = access_control::registry_namespace_object_id(claims.tenant_id, &namespace);
     state
         .persistence
         .stage_authz_tuple_batch(
@@ -404,10 +403,8 @@ async fn stage_registry_namespace_defaults(
                     ),
                     object_id: object_id.clone(),
                     relation: "parent_tenant".to_string(),
-                    subject_kind:
-                        crate::system_realm::SYSTEM_STORAGE_TENANT_NAMESPACE.to_string(),
-                    subject_id:
-                        access_control::storage_tenant_object_id(claims.tenant_id),
+                    subject_kind: crate::system_realm::SYSTEM_STORAGE_TENANT_NAMESPACE.to_string(),
+                    subject_id: access_control::storage_tenant_object_id(claims.tenant_id),
                     caveat_hash: String::new(),
                     operation: "add".to_string(),
                     reason: "stage registry namespace owner".to_string(),
@@ -455,11 +452,9 @@ async fn commit_registry_mutation(
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
     match outcome.certification {
         crate::mvcc_transaction::CertificationResult::Committed { .. } => Ok(()),
-        crate::mvcc_transaction::CertificationResult::Aborted { reason } => {
-            Err(Status::aborted(format!(
-                "implicit registry transaction aborted: {reason:?}"
-            )))
-        }
+        crate::mvcc_transaction::CertificationResult::Aborted { reason } => Err(Status::aborted(
+            format!("implicit registry transaction aborted: {reason:?}"),
+        )),
     }
 }
 

@@ -43,9 +43,9 @@ pub mod bucket_journal;
 pub mod bucket_locator_finalization_job;
 pub mod bucket_manager;
 pub mod bundle_replication;
-pub mod config;
 #[cfg(feature = "test-cluster-transport-faults")]
 pub mod cluster_transport_fault;
+pub mod config;
 pub mod control_journal;
 pub mod core_store;
 pub mod crypto;
@@ -62,16 +62,17 @@ pub mod formats;
 pub mod full_text_segment;
 pub mod gateway_store;
 pub mod git_pack;
-pub mod git_source_postcommit_job;
-pub mod hf_ingestion_postcommit_job;
 pub mod git_source_index;
 pub mod git_source_manifest;
+pub mod git_source_postcommit_job;
 pub mod git_source_query;
 pub mod git_source_watch;
+pub mod hf_ingestion_postcommit_job;
 pub mod hf_journal;
 pub mod index_builder;
 pub mod index_coremeta;
 pub mod index_diagnostic_journal;
+pub mod index_finalization_job;
 pub mod index_journal;
 pub mod index_partition_watch;
 pub mod index_repair;
@@ -97,8 +98,6 @@ mod mvcc_crash_restart_acceptance;
 mod mvcc_cross_feature_tests;
 #[cfg(test)]
 pub mod mvcc_fault_injection;
-#[cfg(test)]
-mod mvcc_process_crash_acceptance;
 pub mod mvcc_gc;
 pub mod mvcc_gc_coordinator;
 pub mod mvcc_local_durability_upgrade;
@@ -107,7 +106,11 @@ pub mod mvcc_node_runtime;
 mod mvcc_observability_contract;
 pub mod mvcc_open_transactions;
 pub mod mvcc_outbox;
+#[cfg(test)]
+mod mvcc_process_crash_acceptance;
 pub mod mvcc_product;
+#[cfg(test)]
+mod mvcc_service_acceptance;
 pub mod mvcc_shard_repair;
 pub mod mvcc_store;
 #[cfg(test)]
@@ -117,12 +120,11 @@ pub mod mvcc_worker_authority;
 pub mod native_idempotency;
 pub mod node_identity;
 pub mod node_signing;
+pub mod object_link_finalization_job;
 pub mod object_links;
 pub mod object_manager;
-pub mod object_link_finalization_job;
 pub mod object_materialisation;
 pub mod object_materialisation_runner;
-pub mod index_finalization_job;
 pub mod object_shard_manifest;
 pub mod observability;
 pub mod partition_fence;
@@ -136,8 +138,8 @@ pub mod personaldb_control;
 pub mod personaldb_coremeta;
 pub mod personaldb_envelope;
 pub mod personaldb_heads;
-pub mod personaldb_projection;
 pub mod personaldb_postcommit_job;
+pub mod personaldb_projection;
 pub mod personaldb_projection_builder;
 pub mod personaldb_projection_writeback;
 pub mod personaldb_proposal_admission;
@@ -168,12 +170,10 @@ pub mod streaming_erasure;
 pub mod system_realm;
 pub(crate) mod task_execution_guard;
 pub mod task_journal;
-pub mod tenant_locator_finalization_job;
-#[cfg(test)]
-mod mvcc_service_acceptance;
 pub mod task_lease;
 pub mod tasks;
 pub mod tenant_audit;
+pub mod tenant_locator_finalization_job;
 pub mod typed_field_segment;
 pub mod validation;
 pub mod vector_hnsw;
@@ -307,53 +307,53 @@ impl AppState {
             .install_mvcc(mvcc.clone())
             .context("install MVCC object runtime")?;
         if mvcc.peers.len() == 1 {
-                system_realm::ensure_bootstrapped(
-                    &arc_config,
-                    &persistence,
-                    &storage,
-                    secret_keyring.as_ref(),
-                )
-                .await
-                .context("bootstrap system realm")?;
+            system_realm::ensure_bootstrapped(
+                &arc_config,
+                &persistence,
+                &storage,
+                secret_keyring.as_ref(),
+            )
+            .await
+            .context("bootstrap system realm")?;
         } else {
-                // A multi-node AppState must return before the initial quorum
-                // can exist. Raft also chooses the bootstrap work owner, which
-                // need not be the membership bootstrap node. Every node
-                // therefore retries the idempotent operation; only the
-                // assignment owner can commit it and all others stop once its
-                // marker is applied locally.
-                let bootstrap_config = arc_config.clone();
-                let bootstrap_persistence = persistence.clone();
-                let bootstrap_storage = storage.clone();
-                let bootstrap_keyring = secret_keyring.clone();
-                tokio::spawn(async move {
-                    loop {
-                        if !bootstrap_persistence
-                            .mvcc()
-                            .is_ok_and(|mvcc| mvcc.consensus.is_leader())
-                        {
+            // A multi-node AppState must return before the initial quorum
+            // can exist. Raft also chooses the bootstrap work owner, which
+            // need not be the membership bootstrap node. Every node
+            // therefore retries the idempotent operation; only the
+            // assignment owner can commit it and all others stop once its
+            // marker is applied locally.
+            let bootstrap_config = arc_config.clone();
+            let bootstrap_persistence = persistence.clone();
+            let bootstrap_storage = storage.clone();
+            let bootstrap_keyring = secret_keyring.clone();
+            tokio::spawn(async move {
+                loop {
+                    if !bootstrap_persistence
+                        .mvcc()
+                        .is_ok_and(|mvcc| mvcc.consensus.is_leader())
+                    {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        continue;
+                    }
+                    match system_realm::ensure_bootstrapped(
+                        &bootstrap_config,
+                        &bootstrap_persistence,
+                        &bootstrap_storage,
+                        bootstrap_keyring.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(()) => return,
+                        Err(error) => {
+                            tracing::debug!(
+                                error = %format!("{error:#}"),
+                                "system realm bootstrap is waiting for its Raft assignment"
+                            );
                             tokio::time::sleep(Duration::from_millis(250)).await;
-                            continue;
-                        }
-                        match system_realm::ensure_bootstrapped(
-                            &bootstrap_config,
-                            &bootstrap_persistence,
-                            &bootstrap_storage,
-                            bootstrap_keyring.as_ref(),
-                        )
-                        .await
-                        {
-                            Ok(()) => return,
-                            Err(error) => {
-                                tracing::debug!(
-                                    error = %format!("{error:#}"),
-                                    "system realm bootstrap is waiting for its Raft assignment"
-                                );
-                                tokio::time::sleep(Duration::from_millis(250)).await;
-                            }
                         }
                     }
-                });
+                }
+            });
         }
         mvcc.start_background_work(core_store.clone(), observability.clone())
             .context("start MVCC background workers")?;

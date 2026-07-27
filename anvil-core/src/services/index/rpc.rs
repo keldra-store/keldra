@@ -120,11 +120,9 @@ async fn commit_index_mutation(
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
     match outcome.certification {
         crate::mvcc_transaction::CertificationResult::Committed { .. } => Ok(()),
-        crate::mvcc_transaction::CertificationResult::Aborted { reason } => {
-            Err(Status::aborted(format!(
-                "implicit index transaction aborted: {reason:?}"
-            )))
-        }
+        crate::mvcc_transaction::CertificationResult::Aborted { reason } => Err(Status::aborted(
+            format!("implicit index transaction aborted: {reason:?}"),
+        )),
     }
 }
 
@@ -434,8 +432,7 @@ impl IndexService for AppState {
         let bucket = self
             .get_index_bucket(claims.tenant_id, &req.bucket_name)
             .await?;
-        let transaction =
-            begin_index_mutation(self, &claims, req.options.as_ref(), "drop").await?;
+        let transaction = begin_index_mutation(self, &claims, req.options.as_ref(), "drop").await?;
         if transaction.replayed {
             if self
                 .persistence

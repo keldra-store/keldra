@@ -17,12 +17,8 @@ use rocksdb::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::mvcc_local_durability_upgrade::{
-    LocalDurabilityUpgradeJob, LocalDurabilityUpgradeRecord, LocalDurabilityUpgradeState,
-};
-use crate::mvcc_shard_repair::{ShardRepairJob, ShardRepairRecord, ShardRepairState};
-use crate::index_finalization_job::{
-    IndexFinalizationJob, IndexFinalizationRecord, IndexFinalizationState,
+use crate::bucket_locator_finalization_job::{
+    BucketLocatorFinalizationJob, BucketLocatorFinalizationRecord, BucketLocatorFinalizationState,
 };
 use crate::git_source_postcommit_job::{
     GitSourcePostCommitJob, GitSourcePostCommitRecord, GitSourcePostCommitState,
@@ -30,15 +26,18 @@ use crate::git_source_postcommit_job::{
 use crate::hf_ingestion_postcommit_job::{
     HfIngestionPostCommitJob, HfIngestionPostCommitRecord, HfIngestionPostCommitState,
 };
-use crate::object_link_finalization_job::{
-    ObjectLinkFinalizationJob, ObjectLinkFinalizationRecord, ObjectLinkFinalizationState,
+use crate::index_finalization_job::{
+    IndexFinalizationJob, IndexFinalizationRecord, IndexFinalizationState,
 };
-use crate::bucket_locator_finalization_job::{
-    BucketLocatorFinalizationJob, BucketLocatorFinalizationRecord,
-    BucketLocatorFinalizationState,
+use crate::mvcc_local_durability_upgrade::{
+    LocalDurabilityUpgradeJob, LocalDurabilityUpgradeRecord, LocalDurabilityUpgradeState,
 };
+use crate::mvcc_shard_repair::{ShardRepairJob, ShardRepairRecord, ShardRepairState};
 use crate::mvcc_transaction::{
     CommitVersion, IdempotencyResult, LogicalKey, TransactionBundle, WriteOperation,
+};
+use crate::object_link_finalization_job::{
+    ObjectLinkFinalizationJob, ObjectLinkFinalizationRecord, ObjectLinkFinalizationState,
 };
 use crate::object_materialisation::ObjectMaterialisationState;
 use crate::object_materialisation::{ObjectMaterialisationJob, ObjectMaterialisationRecord};
@@ -164,8 +163,14 @@ impl MvccStore {
             (b"shard-repair/".as_slice(), "shard-repair"),
             (b"local-upgrade/".as_slice(), "local-durability-upgrade"),
             (b"index-finalization/".as_slice(), "index-finalization"),
-            (b"personaldb-postcommit/".as_slice(), "personaldb-postcommit"),
-            (b"git-source-postcommit/".as_slice(), "git-source-postcommit"),
+            (
+                b"personaldb-postcommit/".as_slice(),
+                "personaldb-postcommit",
+            ),
+            (
+                b"git-source-postcommit/".as_slice(),
+                "git-source-postcommit",
+            ),
             (
                 b"hf-ingestion-postcommit/".as_slice(),
                 "hf-ingestion-postcommit",
@@ -225,15 +230,13 @@ impl MvccStore {
                     }
                     record.job.target_logical_identity()
                 } else if kind == "bucket-locator-finalization" {
-                    let record: BucketLocatorFinalizationRecord =
-                        serde_json::from_slice(&value)?;
+                    let record: BucketLocatorFinalizationRecord = serde_json::from_slice(&value)?;
                     if record.state == BucketLocatorFinalizationState::Complete {
                         continue;
                     }
                     record.job.target_logical_identity()
                 } else if kind == "object-link-finalization" {
-                    let record: ObjectLinkFinalizationRecord =
-                        serde_json::from_slice(&value)?;
+                    let record: ObjectLinkFinalizationRecord = serde_json::from_slice(&value)?;
                     if record.state == ObjectLinkFinalizationState::Complete {
                         continue;
                     }
@@ -486,10 +489,8 @@ impl MvccStore {
                     bail!("PersonalDB postcommit job belongs to another transaction or cluster");
                 }
                 let key = self.key(format!("personaldb-postcommit/{}", job.job_id()?).as_bytes());
-                let record = serde_json::to_vec(&PersonalDbPostCommitRecord::pending(
-                    job,
-                    commit_version,
-                ))?;
+                let record =
+                    serde_json::to_vec(&PersonalDbPostCommitRecord::pending(job, commit_version))?;
                 if let Some(existing) = self.db.get_cf(materialisation_cf, &key)?
                     && existing.as_slice() != record.as_slice()
                 {
@@ -523,12 +524,9 @@ impl MvccStore {
                         "Hugging Face ingestion postcommit job belongs to another transaction or cluster"
                     );
                 }
-                let key =
-                    self.key(format!("hf-ingestion-postcommit/{}", job.job_id()?).as_bytes());
-                let record = serde_json::to_vec(&HfIngestionPostCommitRecord::pending(
-                    job,
-                    commit_version,
-                ))?;
+                let key = self.key(format!("hf-ingestion-postcommit/{}", job.job_id()?).as_bytes());
+                let record =
+                    serde_json::to_vec(&HfIngestionPostCommitRecord::pending(job, commit_version))?;
                 if let Some(existing) = self.db.get_cf(materialisation_cf, &key)?
                     && existing.as_slice() != record.as_slice()
                 {
@@ -541,9 +539,7 @@ impl MvccStore {
                 let job = ObjectLinkFinalizationJob::decode(encoded_job)?;
                 if job.cluster_id != self.cluster_id || job.transaction_id != bundle.transaction_id
                 {
-                    bail!(
-                        "object-link finalization job belongs to another transaction or cluster"
-                    );
+                    bail!("object-link finalization job belongs to another transaction or cluster");
                 }
                 let key =
                     self.key(format!("object-link-finalization/{}", job.job_id()?).as_bytes());
@@ -563,11 +559,12 @@ impl MvccStore {
                 let job = BucketLocatorFinalizationJob::decode(encoded_job)?;
                 if job.cluster_id != self.cluster_id || job.transaction_id != bundle.transaction_id
                 {
-                    bail!("bucket locator finalization job belongs to another transaction or cluster");
+                    bail!(
+                        "bucket locator finalization job belongs to another transaction or cluster"
+                    );
                 }
-                let key = self.key(
-                    format!("bucket-locator-finalization/{}", job.job_id()?).as_bytes(),
-                );
+                let key =
+                    self.key(format!("bucket-locator-finalization/{}", job.job_id()?).as_bytes());
                 let record = serde_json::to_vec(&BucketLocatorFinalizationRecord::pending(
                     job,
                     commit_version,
@@ -616,11 +613,8 @@ impl MvccStore {
             );
         }
         for result in &bundle.idempotency_results {
-            let key = self.idempotency_result_key(
-                &bundle.transaction_id,
-                &result.namespace,
-                &result.key,
-            );
+            let key =
+                self.idempotency_result_key(&bundle.transaction_id, &result.namespace, &result.key);
             let record = CommittedIdempotencyResult {
                 transaction_id: bundle.transaction_id.clone(),
                 commit_version,
@@ -659,7 +653,8 @@ impl MvccStore {
         namespace: &str,
         key: &str,
     ) -> Result<Option<CommittedIdempotencyResult>> {
-        if transaction_id.trim().is_empty() || namespace.trim().is_empty() || key.trim().is_empty() {
+        if transaction_id.trim().is_empty() || namespace.trim().is_empty() || key.trim().is_empty()
+        {
             bail!("committed idempotency result identity must be non-empty");
         }
         let bytes = self.db.get_cf(
@@ -1178,12 +1173,7 @@ impl MvccStore {
         now_unix_ms: u64,
         lease_ms: u64,
     ) -> Result<Option<(String, LocalDurabilityUpgradeRecord)>> {
-        self.claim_local_durability_upgrade_where(
-            worker_id,
-            now_unix_ms,
-            lease_ms,
-            |_| true,
-        )
+        self.claim_local_durability_upgrade_where(worker_id, now_unix_ms, lease_ms, |_| true)
     }
 
     pub fn claim_local_durability_upgrade_where(
@@ -1511,7 +1501,11 @@ impl MvccStore {
                 })
             })
             .min_by_key(|(_, record, _)| {
-                (record.job.tenant_id, record.job.database_id.as_str(), record.job.log_index)
+                (
+                    record.job.tenant_id,
+                    record.job.database_id.as_str(),
+                    record.job.log_index,
+                )
             });
         let Some((key, record, owner)) = candidate else {
             return Ok(None);
@@ -1525,8 +1519,10 @@ impl MvccStore {
         record.state = PersonalDbPostCommitState::Running;
         record.attempts = record.attempts.saturating_add(1);
         record.lease_owner = Some(owner);
-        record.lease_expires_unix_ms =
-            Some(now.checked_add(lease_ms).context("PersonalDB job lease overflow")?);
+        record.lease_expires_unix_ms = Some(
+            now.checked_add(lease_ms)
+                .context("PersonalDB job lease overflow")?,
+        );
         self.db.put_cf_opt(
             cf,
             &key,
@@ -1774,11 +1770,7 @@ impl MvccStore {
         })
     }
 
-    pub fn complete_hf_ingestion_postcommit(
-        &self,
-        job_id: &str,
-        worker_id: &str,
-    ) -> Result<()> {
+    pub fn complete_hf_ingestion_postcommit(&self, job_id: &str, worker_id: &str) -> Result<()> {
         self.transition_hf_ingestion_postcommit(job_id, worker_id, |record| {
             record.state = HfIngestionPostCommitState::Complete;
             record.lease_owner = None;
@@ -1880,11 +1872,7 @@ impl MvccStore {
         })
     }
 
-    pub fn complete_object_link_finalization(
-        &self,
-        job_id: &str,
-        worker_id: &str,
-    ) -> Result<()> {
+    pub fn complete_object_link_finalization(&self, job_id: &str, worker_id: &str) -> Result<()> {
         self.transition_object_link_finalization(job_id, worker_id, |record| {
             record.state = ObjectLinkFinalizationState::Complete;
             record.lease_owner = None;
@@ -1926,18 +1914,12 @@ impl MvccStore {
             .filter_map(|(key, record)| eligible(record).map(|owner| (key, record, owner)))
             .filter(|(_, candidate, _)| {
                 !incomplete.iter().any(|(_, other)| {
-                    other.job.target_logical_identity()
-                        == candidate.job.target_logical_identity()
+                    other.job.target_logical_identity() == candidate.job.target_logical_identity()
                         && (other.commit_version, other.job.operation_sequence)
-                            < (
-                                candidate.commit_version,
-                                candidate.job.operation_sequence,
-                            )
+                            < (candidate.commit_version, candidate.job.operation_sequence)
                 })
             })
-            .min_by_key(|(_, record, _)| {
-                (record.commit_version, record.job.operation_sequence)
-            });
+            .min_by_key(|(_, record, _)| (record.commit_version, record.job.operation_sequence));
         let Some((key, record, owner)) = candidate else {
             return Ok(None);
         };
@@ -2989,12 +2971,7 @@ impl MvccStore {
         key
     }
 
-    fn idempotency_result_key(
-        &self,
-        transaction_id: &str,
-        namespace: &str,
-        key: &str,
-    ) -> Vec<u8> {
+    fn idempotency_result_key(&self, transaction_id: &str, namespace: &str, key: &str) -> Vec<u8> {
         let mut hash = Sha256::new();
         hash.update(b"anvil.mvcc.idempotency-result.v1");
         for component in [transaction_id, namespace, key] {
@@ -3170,10 +3147,7 @@ mod tests {
         }
     }
 
-    fn hf_ingestion_job(
-        transaction_id: &str,
-        ingestion_id: i64,
-    ) -> HfIngestionPostCommitJob {
+    fn hf_ingestion_job(transaction_id: &str, ingestion_id: i64) -> HfIngestionPostCommitJob {
         HfIngestionPostCommitJob {
             schema: HfIngestionPostCommitJob::SCHEMA.into(),
             cluster_id: "cluster".into(),
@@ -3184,10 +3158,7 @@ mod tests {
         }
     }
 
-    fn object_link_job(
-        transaction_id: &str,
-        generation: u64,
-    ) -> ObjectLinkFinalizationJob {
+    fn object_link_job(transaction_id: &str, generation: u64) -> ObjectLinkFinalizationJob {
         ObjectLinkFinalizationJob {
             schema: ObjectLinkFinalizationJob::SCHEMA.into(),
             cluster_id: "cluster".into(),
@@ -3199,15 +3170,12 @@ mod tests {
             generation,
             operation: crate::object_link_finalization_job::ObjectLinkFinalizationOperation::Put,
             target_key: Some(format!("objects/{generation}")),
-            target_version_id: Some(
-                uuid::Uuid::from_u128(100 + generation as u128).to_string(),
-            ),
+            target_version_id: Some(uuid::Uuid::from_u128(100 + generation as u128).to_string()),
             mutation_id: uuid::Uuid::from_u128(200 + generation as u128).to_string(),
-            consequences:
-                crate::object_link_finalization_job::ObjectLinkFinalizationConsequences {
-                    maintain_indexes: true,
-                    compact_metadata: true,
-                },
+            consequences: crate::object_link_finalization_job::ObjectLinkFinalizationConsequences {
+                maintain_indexes: true,
+                compact_metadata: true,
+            },
         }
     }
 
@@ -3274,9 +3242,7 @@ mod tests {
                     commit_version,
                     &bundle(transaction_id, |builder| {
                         builder.add_materialisation_job(
-                            git_source_job(transaction_id, generation)
-                                .encode()
-                                .unwrap(),
+                            git_source_job(transaction_id, generation).encode().unwrap(),
                         );
                     }),
                 )
@@ -3368,9 +3334,7 @@ mod tests {
         let temp = tempdir().unwrap();
         {
             let store = MvccStore::open(temp.path()).unwrap();
-            for (version, transaction_id, generation) in
-                [(2, "link-1", 1), (3, "link-2", 2)]
-            {
+            for (version, transaction_id, generation) in [(2, "link-1", 1), (3, "link-2", 2)] {
                 store
                     .apply_certified_bundle(
                         version,
@@ -3586,8 +3550,16 @@ mod tests {
         let temp = tempdir().unwrap();
         let store = MvccStore::open(temp.path()).unwrap();
         for (commit_version, transaction_id, operation) in [
-            (2, "bucket-create", BucketLocatorFinalizationOperation::Publish),
-            (3, "bucket-delete", BucketLocatorFinalizationOperation::Delete),
+            (
+                2,
+                "bucket-create",
+                BucketLocatorFinalizationOperation::Publish,
+            ),
+            (
+                3,
+                "bucket-delete",
+                BucketLocatorFinalizationOperation::Delete,
+            ),
         ] {
             store
                 .apply_certified_bundle(
@@ -3637,12 +3609,7 @@ mod tests {
             BucketLocatorFinalizationOperation::Publish
         );
         store
-            .retry_bucket_locator_finalization(
-                &create_id,
-                "assignment-owner",
-                20,
-                "retry",
-            )
+            .retry_bucket_locator_finalization(&create_id, "assignment-owner", 20, "retry")
             .unwrap();
         assert!(
             store
@@ -4086,11 +4053,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             store
-                .committed_idempotency_result(
-                    transaction_id,
-                    &result.namespace,
-                    &result.key,
-                )
+                .committed_idempotency_result(transaction_id, &result.namespace, &result.key,)
                 .unwrap()
                 .unwrap()
                 .result,
@@ -4103,11 +4066,7 @@ mod tests {
         store.garbage_collect(2).unwrap();
         assert!(
             store
-                .committed_idempotency_result(
-                    transaction_id,
-                    "bucket.create",
-                    "request-1",
-                )
+                .committed_idempotency_result(transaction_id, "bucket.create", "request-1",)
                 .unwrap()
                 .is_none()
         );

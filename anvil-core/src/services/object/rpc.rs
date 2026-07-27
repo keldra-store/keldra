@@ -29,8 +29,7 @@ async fn begin_implicit_native_transaction(
         return Ok(None);
     }
     let principal = object_manager::transaction_principal_from_claims(claims);
-    let idempotency_key =
-        super::native_mutation::implicit_native_transaction_key(context, target)?;
+    let idempotency_key = super::native_mutation::implicit_native_transaction_key(context, target)?;
     state
         .mvcc
         .open_transactions
@@ -75,13 +74,7 @@ async fn commit_implicit_native_response<T: serde::Serialize>(
     for (key, predicate) in plan.predicates {
         state
             .mvcc
-            .stage_predicate(
-                &handle.transaction_id,
-                &principal,
-                key,
-                predicate,
-                now,
-            )
+            .stage_predicate(&handle.transaction_id, &principal, key, predicate, now)
             .map_err(|error| Status::failed_precondition(error.to_string()))?;
     }
     crate::native_idempotency::stage_generic_result(
@@ -105,11 +98,9 @@ async fn commit_implicit_native_response<T: serde::Serialize>(
         .map_err(|error| Status::failed_precondition(error.to_string()))?;
     match outcome.certification {
         crate::mvcc_transaction::CertificationResult::Committed { .. } => Ok(()),
-        crate::mvcc_transaction::CertificationResult::Aborted { reason } => {
-            Err(Status::aborted(format!(
-                "implicit native transaction aborted: {reason:?}"
-            )))
-        }
+        crate::mvcc_transaction::CertificationResult::Aborted { reason } => Err(Status::aborted(
+            format!("implicit native transaction aborted: {reason:?}"),
+        )),
     }
 }
 
@@ -1528,8 +1519,7 @@ impl ObjectService for AppState {
             metadata.mutation_context.as_ref(),
         )
         .await?;
-        let requested_transaction_id =
-            native_transaction_id(metadata.mutation_context.as_ref())?;
+        let requested_transaction_id = native_transaction_id(metadata.mutation_context.as_ref())?;
         let mut incoming_payload = stream.map(|chunk_result| match chunk_result {
             Ok(chunk) => match chunk.data {
                 Some(upload_part_request::Data::Chunk(bytes)) => Ok(bytes),
@@ -1565,8 +1555,8 @@ impl ObjectService for AppState {
         });
         let transaction_principal = transaction_id
             .map(|_| crate::object_manager::transaction_principal_from_claims(&claims));
-        let transaction_id = transaction_id
-            .ok_or_else(|| Status::failed_precondition("TransactionRequired"))?;
+        let transaction_id =
+            transaction_id.ok_or_else(|| Status::failed_precondition("TransactionRequired"))?;
         let transaction_principal = transaction_principal
             .as_deref()
             .ok_or_else(|| Status::failed_precondition("TransactionPrincipalRequired"))?;
@@ -1584,11 +1574,8 @@ impl ObjectService for AppState {
                 u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
             )
             .map_err(|error| Status::failed_precondition(error.to_string()))?;
-        if native_idempotency::generic_result_exists(
-            &self.mvcc,
-            transaction_id,
-            attempt.context(),
-        )? {
+        if native_idempotency::generic_result_exists(&self.mvcc, transaction_id, attempt.context())?
+        {
             let (payload_hash, payload_size) =
                 super::native_put_rpc::hash_native_payload(&mut incoming_payload).await?;
             let target = super::native_put_rpc::native_payload_target(
@@ -1602,9 +1589,7 @@ impl ObjectService for AppState {
                 attempt.context(),
                 &target,
             )?
-            .ok_or_else(|| {
-                Status::data_loss("committed multipart part is missing its result")
-            })?;
+            .ok_or_else(|| Status::data_loss("committed multipart part is missing its result"))?;
             return Ok(Response::new(response));
         }
         if transaction_status.state == "committing" {
@@ -1642,17 +1627,13 @@ impl ObjectService for AppState {
                 attempt.context(),
                 &target,
             )?
-            .or(
-                native_idempotency::load_response::<UploadPartResponse>(
-                    &self.mvcc,
-                    attempt.context(),
-                    &target,
-                )
-                .await?,
+            .or(native_idempotency::load_response::<UploadPartResponse>(
+                &self.mvcc,
+                attempt.context(),
+                &target,
             )
-            .ok_or_else(|| {
-                Status::data_loss("committed multipart part is missing its response")
-            })?;
+            .await?)
+            .ok_or_else(|| Status::data_loss("committed multipart part is missing its response"))?;
             return Ok(Response::new(response));
         }
         if transaction_status.state != "open" {
@@ -1720,11 +1701,8 @@ impl ObjectService for AppState {
                 "multipart ingest hash differs from streamed request hash",
             ));
         }
-        let target = super::native_put_rpc::native_payload_target(
-            base_target,
-            &payload_hash,
-            payload_size,
-        );
+        let target =
+            super::native_put_rpc::native_payload_target(base_target, &payload_hash, payload_size);
         let authz_revision = latest_authz_revision(self, claims.tenant_id).await?;
 
         let response = UploadPartResponse {
@@ -1745,9 +1723,10 @@ impl ObjectService for AppState {
             commit_implicit_native_response(
                 self,
                 &claims,
-                metadata.mutation_context.as_ref().ok_or_else(|| {
-                    Status::invalid_argument("Missing native mutation context")
-                })?,
+                metadata
+                    .mutation_context
+                    .as_ref()
+                    .ok_or_else(|| Status::invalid_argument("Missing native mutation context"))?,
                 &target,
                 &response,
                 handle,

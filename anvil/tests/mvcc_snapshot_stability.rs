@@ -15,7 +15,12 @@ async fn open_transaction_keeps_one_snapshot_across_a_concurrent_commit() {
     };
 
     let initial = cluster
-        .commit(leader, "snapshot-stability-initial", key.clone(), b"old".to_vec())
+        .commit(
+            leader,
+            "snapshot-stability-initial",
+            key.clone(),
+            b"old".to_vec(),
+        )
         .await
         .unwrap();
     let initial_version = match initial.certification {
@@ -50,7 +55,12 @@ async fn open_transaction_keeps_one_snapshot_across_a_concurrent_commit() {
     );
 
     let update = cluster
-        .commit(leader, "snapshot-stability-update", key.clone(), b"new".to_vec())
+        .commit(
+            leader,
+            "snapshot-stability-update",
+            key.clone(),
+            b"new".to_vec(),
+        )
         .await
         .unwrap();
     let update_version = match update.certification {

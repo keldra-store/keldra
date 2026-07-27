@@ -855,12 +855,7 @@ pub fn plan_release_ownership_in_transaction(
         &request.resource,
         signing_key,
     )?;
-    if ownership_idempotency_matches(
-        &record,
-        "release",
-        &request.idempotency_key,
-        &request.owner,
-    ) {
+    if ownership_idempotency_matches(&record, "release", &request.idempotency_key, &request.owner) {
         return ownership_fence_plan(record.clone(), Some(&record), true);
     }
     if !request.administrative_force {
@@ -983,9 +978,7 @@ fn ownership_fence_plan(
         .map(encode_ownership_fence_record)
         .transpose()?
         .map(|payload| {
-            crate::mvcc_transaction::PredicateKind::ValueHash(
-                *blake3::hash(&payload).as_bytes(),
-            )
+            crate::mvcc_transaction::PredicateKind::ValueHash(*blake3::hash(&payload).as_bytes())
         })
         .unwrap_or(crate::mvcc_transaction::PredicateKind::Absent);
     let mut mutations = Vec::new();
@@ -1006,7 +999,9 @@ fn ownership_fence_plan(
     if old_projection != new_projection {
         if let Some(old_key) = old_projection {
             if !idempotent_replay {
-                mutations.push(crate::mvcc_product::ProductMutation::delete(old_key.clone()));
+                mutations.push(crate::mvcc_product::ProductMutation::delete(
+                    old_key.clone(),
+                ));
             }
             let old_payload = encode_ownership_fence_record(
                 expected.ok_or_else(|| anyhow!("old ownership projection lacks prior row"))?,
@@ -1025,10 +1020,7 @@ fn ownership_fence_plan(
                     payload,
                 ));
             }
-            predicates.push((
-                new_key,
-                crate::mvcc_transaction::PredicateKind::Absent,
-            ));
+            predicates.push((new_key, crate::mvcc_transaction::PredicateKind::Absent));
         }
     } else if let Some(projection_key) = new_projection {
         let projection_predicate = expected

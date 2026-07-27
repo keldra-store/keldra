@@ -991,124 +991,127 @@ impl RaftStateMachine<AnvilRaftConfig> for OpenRaftStateMachine {
             let log_id = entry.log_id;
             let mut committed_bundle = None;
             let boundary_rejection = match &entry.payload {
-                EntryPayload::Normal(command) => {
-                    command.validate_section9_boundary().err().map(str::to_string)
-                }
+                EntryPayload::Normal(command) => command
+                    .validate_section9_boundary()
+                    .err()
+                    .map(str::to_string),
                 EntryPayload::Blank | EntryPayload::Membership(_) => None,
             };
             let response = if let Some(reason) = boundary_rejection {
                 RaftApplyResult::Rejected(reason)
             } else {
                 match entry.payload {
-                EntryPayload::Blank => RaftApplyResult::Noop,
-                EntryPayload::Membership(membership) => {
-                    state.membership = StoredMembership::new(Some(log_id), membership);
-                    RaftApplyResult::Noop
-                }
-                EntryPayload::Normal(ConsensusCommand::Certify(command)) => {
-                    let policy = state.control.durability_policy();
-                    let required_holders = match command.durability {
-                        crate::DurabilityLevel::Local => 1,
-                        crate::DurabilityLevel::Quorum | crate::DurabilityLevel::Erasure => {
-                            usize::from(policy.bundle_quorum_holders)
-                        }
-                    };
-                    let current_holders = command
-                        .durable_holders
-                        .iter()
-                        .filter(|holder| {
-                            state.control.node_incarnation(holder.node_id)
-                                == Some(holder.incarnation)
-                        })
-                        .collect::<Vec<_>>();
-                    let holder_raft_ids = current_holders
-                        .iter()
-                        .filter_map(|holder| state.control.raft_node_id(holder.node_id))
-                        .map(|node_id| node_id.0)
-                        .collect::<BTreeSet<_>>();
-                    let voter_safe = matches!(command.durability, crate::DurabilityLevel::Local)
-                        || holders_intersect_every_election_quorum(
-                            &state.membership,
-                            &holder_raft_ids,
-                        );
-                    let assignments_current =
-                        command.assignment_predicates.iter().all(|predicate| {
-                            state.control.topology_epoch() == predicate.topology_epoch
-                                && state.control.partition(predicate.partition_id).is_some_and(
-                                    |current| {
-                                        current.epoch == predicate.assignment_epoch
-                                            && current.owner == predicate.owner
-                                    },
-                                )
-                        });
-                    if policy.generation == 0
-                        || required_holders == 0
-                        || current_holders.len() < required_holders
-                        || !voter_safe
-                    {
-                        RaftApplyResult::Rejected(
-                            "durability evidence violates applied Raft control state".into(),
-                        )
-                    } else if !assignments_current {
-                        RaftApplyResult::Rejected(
-                            "assignment predicate violates applied Raft control state".into(),
-                        )
-                    } else {
-                        let result = state
-                            .certification
-                            .apply(CommitVersion(log_id.index), &command);
-                        match result {
-                            Ok(result) => {
-                                if matches!(result, CertificationResult::Committed { .. }) {
-                                    committed_bundle = Some(CommittedBundleDecision {
-                                        cluster_id_hash: command.cluster_id_hash,
-                                        bundle_hash: command.bundle_hash,
-                                        bundle_length: command.bundle_length,
-                                        durability: command.durability,
-                                        durable_holders: command.durable_holders.clone(),
-                                    });
-                                }
-                                RaftApplyResult::Certification(result)
+                    EntryPayload::Blank => RaftApplyResult::Noop,
+                    EntryPayload::Membership(membership) => {
+                        state.membership = StoredMembership::new(Some(log_id), membership);
+                        RaftApplyResult::Noop
+                    }
+                    EntryPayload::Normal(ConsensusCommand::Certify(command)) => {
+                        let policy = state.control.durability_policy();
+                        let required_holders = match command.durability {
+                            crate::DurabilityLevel::Local => 1,
+                            crate::DurabilityLevel::Quorum | crate::DurabilityLevel::Erasure => {
+                                usize::from(policy.bundle_quorum_holders)
                             }
-                            Err(error) => RaftApplyResult::Rejected(error.to_string()),
+                        };
+                        let current_holders = command
+                            .durable_holders
+                            .iter()
+                            .filter(|holder| {
+                                state.control.node_incarnation(holder.node_id)
+                                    == Some(holder.incarnation)
+                            })
+                            .collect::<Vec<_>>();
+                        let holder_raft_ids = current_holders
+                            .iter()
+                            .filter_map(|holder| state.control.raft_node_id(holder.node_id))
+                            .map(|node_id| node_id.0)
+                            .collect::<BTreeSet<_>>();
+                        let voter_safe =
+                            matches!(command.durability, crate::DurabilityLevel::Local)
+                                || holders_intersect_every_election_quorum(
+                                    &state.membership,
+                                    &holder_raft_ids,
+                                );
+                        let assignments_current =
+                            command.assignment_predicates.iter().all(|predicate| {
+                                state.control.topology_epoch() == predicate.topology_epoch
+                                    && state.control.partition(predicate.partition_id).is_some_and(
+                                        |current| {
+                                            current.epoch == predicate.assignment_epoch
+                                                && current.owner == predicate.owner
+                                        },
+                                    )
+                            });
+                        if policy.generation == 0
+                            || required_holders == 0
+                            || current_holders.len() < required_holders
+                            || !voter_safe
+                        {
+                            RaftApplyResult::Rejected(
+                                "durability evidence violates applied Raft control state".into(),
+                            )
+                        } else if !assignments_current {
+                            RaftApplyResult::Rejected(
+                                "assignment predicate violates applied Raft control state".into(),
+                            )
+                        } else {
+                            let result = state
+                                .certification
+                                .apply(CommitVersion(log_id.index), &command);
+                            match result {
+                                Ok(result) => {
+                                    if matches!(result, CertificationResult::Committed { .. }) {
+                                        committed_bundle = Some(CommittedBundleDecision {
+                                            cluster_id_hash: command.cluster_id_hash,
+                                            bundle_hash: command.bundle_hash,
+                                            bundle_length: command.bundle_length,
+                                            durability: command.durability,
+                                            durable_holders: command.durable_holders.clone(),
+                                        });
+                                    }
+                                    RaftApplyResult::Certification(result)
+                                }
+                                Err(error) => RaftApplyResult::Rejected(error.to_string()),
+                            }
                         }
                     }
-                }
-                EntryPayload::Normal(ConsensusCommand::UpgradeDurability {
-                    cluster_id_hash,
-                    commit_version,
-                    bundle_hash,
-                    durability,
-                    durable_holders,
-                }) => {
-                    let policy = state.control.durability_policy();
-                    let live_holders = durable_holders
-                        .iter()
-                        .filter(|holder| {
-                            state.control.node_incarnation(holder.node_id)
-                                == Some(holder.incarnation)
-                        })
-                        .copied()
-                        .collect::<BTreeSet<_>>();
-                    let canonical_holders =
-                        durable_holders.iter().copied().collect::<BTreeSet<_>>();
-                    let holders_are_canonical =
-                        canonical_holders.iter().copied().collect::<Vec<_>>() == durable_holders;
-                    let holder_raft_ids = live_holders
-                        .iter()
-                        .filter_map(|holder| state.control.raft_node_id(holder.node_id))
-                        .map(|node_id| node_id.0)
-                        .collect::<BTreeSet<_>>();
-                    let required_holders = usize::from(policy.bundle_quorum_holders);
-                    let valid_level = matches!(
+                    EntryPayload::Normal(ConsensusCommand::UpgradeDurability {
+                        cluster_id_hash,
+                        commit_version,
+                        bundle_hash,
                         durability,
-                        crate::DurabilityLevel::Quorum | crate::DurabilityLevel::Erasure
-                    );
-                    let target = state
-                        .decisions
-                        .get_mut(&commit_version)
-                        .and_then(Option::as_mut);
-                    match target {
+                        durable_holders,
+                    }) => {
+                        let policy = state.control.durability_policy();
+                        let live_holders = durable_holders
+                            .iter()
+                            .filter(|holder| {
+                                state.control.node_incarnation(holder.node_id)
+                                    == Some(holder.incarnation)
+                            })
+                            .copied()
+                            .collect::<BTreeSet<_>>();
+                        let canonical_holders =
+                            durable_holders.iter().copied().collect::<BTreeSet<_>>();
+                        let holders_are_canonical =
+                            canonical_holders.iter().copied().collect::<Vec<_>>()
+                                == durable_holders;
+                        let holder_raft_ids = live_holders
+                            .iter()
+                            .filter_map(|holder| state.control.raft_node_id(holder.node_id))
+                            .map(|node_id| node_id.0)
+                            .collect::<BTreeSet<_>>();
+                        let required_holders = usize::from(policy.bundle_quorum_holders);
+                        let valid_level = matches!(
+                            durability,
+                            crate::DurabilityLevel::Quorum | crate::DurabilityLevel::Erasure
+                        );
+                        let target = state
+                            .decisions
+                            .get_mut(&commit_version)
+                            .and_then(Option::as_mut);
+                        match target {
                         Some(decision)
                             if cluster_id_hash == self.cluster_id_hash
                                 && decision.bundle_hash == bundle_hash
@@ -1136,50 +1139,59 @@ impl RaftStateMachine<AnvilRaftConfig> for OpenRaftStateMachine {
                                 .into(),
                         ),
                     }
-                }
-                EntryPayload::Normal(command) => {
-                    if matches!(
-                        &command,
-                        ConsensusCommand::AdvanceGcWatermark { watermark, .. }
-                            if *watermark > CommitVersion(log_id.index)
-                    ) {
-                        RaftApplyResult::Rejected(
+                    }
+                    EntryPayload::Normal(command) => {
+                        if matches!(
+                            &command,
+                            ConsensusCommand::AdvanceGcWatermark { watermark, .. }
+                                if *watermark > CommitVersion(log_id.index)
+                        ) {
+                            RaftApplyResult::Rejected(
                             "GC safety watermark cannot exceed its committed consensus position"
                                 .into(),
                         )
-                    } else {
-                        let replaced_incarnation = match &command {
-                            ConsensusCommand::InstallNode { node, .. } => state
-                                .control
-                                .node_incarnation(node.node_id)
-                                .filter(|current| *current != node.incarnation)
-                                .map(|incarnation| NodeIncarnation {
-                                    node_id: node.node_id,
-                                    incarnation,
-                                }),
-                            _ => None,
-                        };
-                        match state.control.apply(&command) {
-                            Ok(result) => {
-                                if let ControlApplyResult::NodeRemoved(removed) = &result {
-                                    record_lost_local_holder(&mut state, *removed, log_id.index);
+                        } else {
+                            let replaced_incarnation = match &command {
+                                ConsensusCommand::InstallNode { node, .. } => state
+                                    .control
+                                    .node_incarnation(node.node_id)
+                                    .filter(|current| *current != node.incarnation)
+                                    .map(|incarnation| NodeIncarnation {
+                                        node_id: node.node_id,
+                                        incarnation,
+                                    }),
+                                _ => None,
+                            };
+                            match state.control.apply(&command) {
+                                Ok(result) => {
+                                    if let ControlApplyResult::NodeRemoved(removed) = &result {
+                                        record_lost_local_holder(
+                                            &mut state,
+                                            *removed,
+                                            log_id.index,
+                                        );
+                                    }
+                                    if let Some(replaced) = replaced_incarnation {
+                                        record_lost_local_holder(
+                                            &mut state,
+                                            replaced,
+                                            log_id.index,
+                                        );
+                                    }
+                                    if let ControlApplyResult::GcWatermarkAdvanced(watermark) =
+                                        &result
+                                    {
+                                        state.certification.garbage_collect_results(*watermark);
+                                        state
+                                            .decisions
+                                            .retain(|position, _| *position >= *watermark);
+                                    }
+                                    RaftApplyResult::Control(result)
                                 }
-                                if let Some(replaced) = replaced_incarnation {
-                                    record_lost_local_holder(&mut state, replaced, log_id.index);
-                                }
-                                if let ControlApplyResult::GcWatermarkAdvanced(watermark) = &result
-                                {
-                                    state.certification.garbage_collect_results(*watermark);
-                                    state
-                                        .decisions
-                                        .retain(|position, _| *position >= *watermark);
-                                }
-                                RaftApplyResult::Control(result)
+                                Err(error) => RaftApplyResult::Rejected(error),
                             }
-                            Err(error) => RaftApplyResult::Rejected(error),
                         }
                     }
-                }
                 }
             };
             state

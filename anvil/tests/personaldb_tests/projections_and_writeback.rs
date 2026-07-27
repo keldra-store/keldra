@@ -287,7 +287,7 @@ async fn personaldb_projection_resource_relation_filter_uses_authz_index() {
     auth_client
         .write_authz_tuple(authorized(
             WriteAuthzTupleRequest {
-            context: None,
+                context: None,
                 namespace: "personaldb_row".to_string(),
                 object_id: format!("tenant-{}/{source_database_id}/items/1", actor.tenant_id),
                 relation: "viewer".to_string(),

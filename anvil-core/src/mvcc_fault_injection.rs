@@ -106,9 +106,7 @@ pub fn hit(point: FaultPoint) -> Result<(), InjectedFault> {
             std::process::abort();
         }
     }
-    if std::env::var("ANVIL_MVCC_HARD_CRASH_AT")
-        .ok()
-        .as_deref()
+    if std::env::var("ANVIL_MVCC_HARD_CRASH_AT").ok().as_deref()
         == Some(format!("{point:?}").as_str())
     {
         std::process::abort();

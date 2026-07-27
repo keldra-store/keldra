@@ -332,11 +332,10 @@ impl AppState {
         .map_err(|error| Status::internal(error.to_string()))?;
         let raw_generation_hash = authoritative_boundary_generation_hash(
             &bucket_key,
-            self
-            .mvcc
-            .read_latest_value(&logical_key)
-            .map_err(|error| Status::internal(error.to_string()))?
-            .as_deref(),
+            self.mvcc
+                .read_latest_value(&logical_key)
+                .map_err(|error| Status::internal(error.to_string()))?
+                .as_deref(),
         )?;
         Ok(stable_prefixed_json_hash(&serde_json::json!({
             "schema": "anvil.query.boundary_schema_generation_hash.v1",
@@ -2036,15 +2035,12 @@ mod authoritative_read_tests {
         };
         let payload =
             crate::core_store::CoreStore::encode_boundary_schema_for_mvcc(&schema).unwrap();
-        let hash =
-            authoritative_boundary_generation_hash(&schema.bucket, Some(&payload)).unwrap();
+        let hash = authoritative_boundary_generation_hash(&schema.bucket, Some(&payload)).unwrap();
         assert!(hash.starts_with("generation:12:sha256:"));
         assert_eq!(
             authoritative_boundary_generation_hash(&schema.bucket, None).unwrap(),
             "none:0"
         );
-        assert!(
-            authoritative_boundary_generation_hash("8/releases", Some(&payload)).is_err()
-        );
+        assert!(authoritative_boundary_generation_hash("8/releases", Some(&payload)).is_err());
     }
 }

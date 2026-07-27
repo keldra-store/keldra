@@ -605,7 +605,7 @@ async fn personaldb_row_mutation_can_be_authorized_by_relationship_tuple() {
     auth_client
         .write_authz_tuple(authorized(
             WriteAuthzTupleRequest {
-            context: None,
+                context: None,
                 namespace: "personaldb_row".to_string(),
                 object_id: resource,
                 relation: permission,

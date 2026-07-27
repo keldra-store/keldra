@@ -349,13 +349,8 @@ pub(crate) async fn stage_delete_key_with_permit(
     partition_owner_signing_key: &[u8],
 ) -> Result<u64> {
     let guard = hf_write_guard(storage, permit, partition_owner_signing_key).await?;
-    let Some(key) = projection::get_key_by_name_transaction(
-        mvcc,
-        transaction_id,
-        principal,
-        tenant_id,
-        name,
-    )?
+    let Some(key) =
+        projection::get_key_by_name_transaction(mvcc, transaction_id, principal, tenant_id, name)?
     else {
         return Ok(0);
     };
@@ -724,8 +719,7 @@ pub(crate) async fn stage_cancel_ingestion_with_permit(
     partition_owner_signing_key: &[u8],
 ) -> Result<u64> {
     let guard = hf_write_guard(storage, permit, partition_owner_signing_key).await?;
-    let Some(mut job) =
-        projection::get_ingestion_transaction(mvcc, transaction_id, principal, id)?
+    let Some(mut job) = projection::get_ingestion_transaction(mvcc, transaction_id, principal, id)?
     else {
         return Ok(0);
     };

@@ -20,9 +20,9 @@ use anvil::anvil_api::{
     ListAuthzObjectsRequest, ListAuthzSubjectsRequest, ListBucketsRequest, ListHostAliasesRequest,
     ListIndexDiagnosticsRequest, ListObjectLinksRequest, ListObjectVersionsRequest,
     ListObjectsRequest, ListRepairFindingsRequest, NativeMutationContext, ObjectMetadata,
-    PageRequest, PutAuthzSchemaRequest, PutObjectRequest, ReadAuthzTuplesRequest,
-    ReadHostAliasRequest, ReadObjectLinkRequest, ReadTaskLeaseRequest,
-    PublicMutationContext, RepairAuthzDerivedIndexRequest, RepairIndexRequest, RevokeAccessRequest,
+    PageRequest, PublicMutationContext, PutAuthzSchemaRequest, PutObjectRequest,
+    ReadAuthzTuplesRequest, ReadHostAliasRequest, ReadObjectLinkRequest, ReadTaskLeaseRequest,
+    RepairAuthzDerivedIndexRequest, RepairIndexRequest, RevokeAccessRequest,
     RotateApplicationCredentialSecretRequest, SetPublicAccessRequest, UpdateObjectLinkRequest,
     VerifyHostAliasRequest, WatchAuthzDerivedLagRequest, WatchAuthzNamespaceRequest,
     WatchAuthzTupleLogRequest, WriteAuthzTupleRequest, WriteAuthzTuplesRequest,
@@ -197,7 +197,7 @@ async fn bind_default_authz_schema(grpc_addr: &str, tenant_id: i64, token: &str)
         .await
         .unwrap();
     let mut put = Request::new(PutAuthzSchemaRequest {
-            context: None,
+        context: None,
         anvil_storage_tenant_id: tenant_id.to_string(),
         schema_id: "default".to_string(),
         namespaces: test_default_authz_schema(),
@@ -213,7 +213,7 @@ async fn bind_default_authz_schema(grpc_addr: &str, tenant_id: i64, token: &str)
         .expect("put default Docker test schema returns a schema reference");
 
     let mut bind = Request::new(BindAuthzSchemaRequest {
-            context: None,
+        context: None,
         scope: Some(AuthzScope {
             anvil_storage_tenant_id: tenant_id.to_string(),
             authz_realm_id: "default".to_string(),
@@ -378,9 +378,8 @@ fn write_authz_tuple_request(
     subject_id: &str,
     operation: &str,
 ) -> WriteAuthzTupleRequest {
-            context: None,
     WriteAuthzTupleRequest {
-            context: None,
+        context: None,
         namespace: namespace.to_string(),
         object_id: object_id.to_string(),
         relation: relation.to_string(),

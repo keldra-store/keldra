@@ -1480,7 +1480,10 @@ pub(crate) fn has_object_versions_in_transaction(
 ) -> Result<bool> {
     use crate::mvcc_transaction::WriteOperation;
 
-    let snapshot = mvcc.open_transactions.handle(transaction_id)?.snapshot_version;
+    let snapshot = mvcc
+        .open_transactions
+        .handle(transaction_id)?
+        .snapshot_version;
     let tuple_prefix = crate::core_store::object_version_page_bucket_prefix(bucket);
     let application_prefix = crate::mvcc_product::coremeta_application_prefix(
         crate::core_store::CF_OBJECT_VERSIONS,

@@ -11,22 +11,17 @@ impl Persistence {
             .mvcc()?
             .runtime
             .local_store()
-            .claim_bucket_locator_finalization_authorized(
-                &worker_id,
-                now,
-                30_000,
-                |record| {
-                    self.mvcc()
-                        .ok()?
-                        .claim_assignment(
-                            "bucket-locator-finalization",
-                            &record.job.target_logical_identity(),
-                        )
-                        .ok()
-                        .flatten()
-                        .map(|guard| guard.lease_owner(&worker_id))
-                },
-            )?
+            .claim_bucket_locator_finalization_authorized(&worker_id, now, 30_000, |record| {
+                self.mvcc()
+                    .ok()?
+                    .claim_assignment(
+                        "bucket-locator-finalization",
+                        &record.job.target_logical_identity(),
+                    )
+                    .ok()
+                    .flatten()
+                    .map(|guard| guard.lease_owner(&worker_id))
+            })?
         else {
             return Ok(false);
         };

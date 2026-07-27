@@ -551,12 +551,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 store.scan_logs(8, 12).unwrap(),
-                vec![
-                    (8, vec![8]),
-                    (9, vec![9]),
-                    (10, vec![10]),
-                    (11, vec![11]),
-                ]
+                vec![(8, vec![8]), (9, vec![9]), (10, vec![10]), (11, vec![11]),]
             );
         }
         let store = store(dir.path());
@@ -792,9 +787,6 @@ mod tests {
             store.install_consensus_snapshot(b"not-a-certification-snapshot"),
             Err(RaftStorageError::Codec(_))
         ));
-        assert_eq!(
-            store.load_consensus_state().unwrap().unwrap().state,
-            state
-        );
+        assert_eq!(store.load_consensus_state().unwrap().unwrap().state, state);
     }
 }

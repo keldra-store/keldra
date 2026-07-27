@@ -26,11 +26,7 @@ async fn bootstrap_actor_on_every_node(
         .unwrap();
     for node in 1..3 {
         let state = cluster.state(node);
-        state
-            .persistence
-            .create_region("e2e-region")
-            .await
-            .unwrap();
+        state.persistence.create_region("e2e-region").await.unwrap();
         let tenant = state
             .persistence
             .create_tenant("e2e-tenant", "e2e-tenant-key")
@@ -116,7 +112,10 @@ async fn public_object_transaction(
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(staged.write_state, anvil::anvil_api::WriteState::Staged as i32);
+    assert_eq!(
+        staged.write_state,
+        anvil::anvil_api::WriteState::Staged as i32
+    );
     transactions
         .commit_transaction(authorized(
             anvil::anvil_api::CommitTransactionRequest {
@@ -136,12 +135,11 @@ async fn read_public_object(
     actor: &anvil_test_utils::mvcc_cluster::PublicActor,
     object_key: &str,
 ) -> Result<Vec<u8>, tonic::Status> {
-    let mut objects =
-        anvil::anvil_api::object_service_client::ObjectServiceClient::connect(
-            cluster.public_endpoint(node).to_string(),
-        )
-        .await
-        .unwrap();
+    let mut objects = anvil::anvil_api::object_service_client::ObjectServiceClient::connect(
+        cluster.public_endpoint(node).to_string(),
+    )
+    .await
+    .unwrap();
     let mut response = objects
         .get_object(authorized(
             anvil::anvil_api::GetObjectRequest {
@@ -221,7 +219,11 @@ async fn enqueue_repair_job(
     job.originating_snapshot_version = handle.snapshot_version;
     let job_id = job.job_id().unwrap();
     mvcc.open_transactions
-        .add_job(&handle.transaction_id, job.canonical_bytes().unwrap(), now + 1)
+        .add_job(
+            &handle.transaction_id,
+            job.canonical_bytes().unwrap(),
+            now + 1,
+        )
         .unwrap();
     let committed = mvcc
         .open_transactions
@@ -258,7 +260,10 @@ async fn public_local_object_returns_locally_then_promotes_and_survives_holder_l
         anvil::anvil_api::MvccDurability::Local,
     )
     .await;
-    assert_eq!(response.state, anvil::anvil_api::WriteState::Committed as i32);
+    assert_eq!(
+        response.state,
+        anvil::anvil_api::WriteState::Committed as i32
+    );
     assert_eq!(
         read_public_object(&cluster, coordinator, &actor, &object_key)
             .await
@@ -310,33 +315,31 @@ async fn public_local_object_returns_locally_then_promotes_and_survives_holder_l
     assert_eq!(explicit.promotion_id, automatic.promotion_id);
 
     let status_node = (coordinator + 1) % 3;
-    let mut remote_status =
-        anvil::anvil_api::object_service_client::ObjectServiceClient::connect(
-            cluster.public_endpoint(status_node).to_string(),
-        )
-        .await
-        .unwrap();
-    let initial_remote_status =
-        tokio::time::timeout(std::time::Duration::from_secs(20), async {
-            loop {
-                if let Ok(response) = remote_status
-                    .get_object_durability_promotion(authorized(
-                        anvil::anvil_api::GetObjectDurabilityPromotionRequest {
-                            bucket_name: actor.bucket_name.clone(),
-                            object_key: object_key.clone(),
-                            version_id: None,
-                        },
-                        &actor.token,
-                    ))
-                    .await
-                {
-                    return response.into_inner();
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    let mut remote_status = anvil::anvil_api::object_service_client::ObjectServiceClient::connect(
+        cluster.public_endpoint(status_node).to_string(),
+    )
+    .await
+    .unwrap();
+    let initial_remote_status = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            if let Ok(response) = remote_status
+                .get_object_durability_promotion(authorized(
+                    anvil::anvil_api::GetObjectDurabilityPromotionRequest {
+                        bucket_name: actor.bucket_name.clone(),
+                        object_key: object_key.clone(),
+                        version_id: None,
+                    },
+                    &actor.token,
+                ))
+                .await
+            {
+                return response.into_inner();
             }
-        })
-        .await
-        .expect("non-holder can query promotion status from replicated MVCC state");
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("non-holder can query promotion status from replicated MVCC state");
     assert!(
         matches!(
             initial_remote_status.state.as_str(),
@@ -423,7 +426,10 @@ async fn public_quorum_object_is_readable_after_one_node_loss() {
         anvil::anvil_api::MvccDurability::Quorum,
     )
     .await;
-    assert_eq!(response.state, anvil::anvil_api::WriteState::Committed as i32);
+    assert_eq!(
+        response.state,
+        anvil::anvil_api::WriteState::Committed as i32
+    );
 
     cluster.partition(coordinator);
     cluster
@@ -438,14 +444,7 @@ async fn public_quorum_object_is_readable_after_one_node_loss() {
         .filter(|node| *node != coordinator)
         .collect::<Vec<_>>();
     let survivor = cluster.wait_for_any_leader(&survivors).await.unwrap();
-    wait_for_public_object(
-        &cluster,
-        survivor,
-        &actor,
-        "durability/quorum",
-        &payload,
-    )
-    .await;
+    wait_for_public_object(&cluster, survivor, &actor, "durability/quorum", &payload).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
@@ -464,7 +463,10 @@ async fn public_erasure_object_is_readable_after_one_node_loss() {
         anvil::anvil_api::MvccDurability::Erasure,
     )
     .await;
-    assert_eq!(response.state, anvil::anvil_api::WriteState::Committed as i32);
+    assert_eq!(
+        response.state,
+        anvil::anvil_api::WriteState::Committed as i32
+    );
 
     cluster.partition(coordinator);
     cluster
@@ -479,14 +481,7 @@ async fn public_erasure_object_is_readable_after_one_node_loss() {
         .filter(|node| *node != coordinator)
         .collect::<Vec<_>>();
     let survivor = cluster.wait_for_any_leader(&survivors).await.unwrap();
-    wait_for_public_object(
-        &cluster,
-        survivor,
-        &actor,
-        "durability/erasure",
-        &payload,
-    )
-    .await;
+    wait_for_public_object(&cluster, survivor, &actor, "durability/erasure", &payload).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
@@ -670,10 +665,7 @@ async fn real_cluster_fetches_a_missing_committed_bundle_before_advancing_apply_
 
     let cluster = RealMvccCluster::start().await.unwrap();
     let leader = cluster.wait_for_any_leader(&[0, 1, 2]).await.unwrap();
-    let lagging = [0, 1, 2]
-        .into_iter()
-        .find(|node| *node != leader)
-        .unwrap();
+    let lagging = [0, 1, 2].into_iter().find(|node| *node != leader).unwrap();
     cluster.partition_replication(lagging);
 
     let key = LogicalKey {
@@ -1048,8 +1040,7 @@ async fn real_cluster_reconstructs_a_deleted_shard_and_publishes_repaired_placem
         .unwrap()
         .clone();
     let retiring_node = cluster.node_index(&retiring.node_id).unwrap();
-    let retiring_path =
-        cluster.replication_transfer_path(retiring_node, retiring.transfer_id);
+    let retiring_path = cluster.replication_transfer_path(retiring_node, retiring.transfer_id);
     let retiring_meta =
         cluster.replication_transfer_metadata_path(retiring_node, retiring.transfer_id);
     assert!(retiring_path.is_file() && retiring_meta.is_file());
@@ -1086,8 +1077,7 @@ async fn real_cluster_reconstructs_a_deleted_shard_and_publishes_repaired_placem
     pin_job.requested_at_unix_ms = 1_000_000_000_000;
     pin_job.target_logical_identity = format!("retirement-pin/{object_identity}");
     let (pin_job_id, _) =
-        enqueue_repair_job(mvcc, "e2e-retirement-pin", "retirement-pin", pin_job, 30)
-            .await;
+        enqueue_repair_job(mvcc, "e2e-retirement-pin", "retirement-pin", pin_job, 30).await;
     let (rebalance_job_id, _) = enqueue_repair_job(
         mvcc,
         "e2e-retirement-rebalance",
@@ -1135,12 +1125,9 @@ async fn real_cluster_reconstructs_a_deleted_shard_and_publishes_repaired_placem
         let pin_worker = format!("e2e-release-retirement-pin-{node}");
         let store = cluster.state(node).mvcc.runtime.local_store();
         let claimed = store
-            .claim_shard_repair_where(
-                &pin_worker,
-                1_000_000_000_000,
-                1_000,
-                |record| record.job.job_id().ok().as_deref() == Some(pin_job_id.as_str()),
-            )
+            .claim_shard_repair_where(&pin_worker, 1_000_000_000_000, 1_000, |record| {
+                record.job.job_id().ok().as_deref() == Some(pin_job_id.as_str())
+            })
             .unwrap()
             .expect("future repair pin becomes claimable");
         assert_eq!(claimed.0, pin_job_id);

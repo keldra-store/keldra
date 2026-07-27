@@ -181,10 +181,9 @@ impl ThreeNodeFixture {
             .await
             .unwrap(),
         );
-        let listener =
-            TcpListener::bind(self.endpoints[node].trim_start_matches("http://"))
-                .await
-                .unwrap();
+        let listener = TcpListener::bind(self.endpoints[node].trim_start_matches("http://"))
+            .await
+            .unwrap();
         let consensus = state.mvcc.consensus_service.clone();
         let replication = state.mvcc.replication_service.clone();
         self.servers[node] = Some(tokio::spawn(async move {
@@ -578,10 +577,7 @@ async fn coordinator_failure_before_proposal_is_retryable_without_a_commit() {
     mvcc_fault_injection::install(
         DeterministicFaults::default().fail_at(FaultPoint::BeforeProposal, 1),
     );
-    let version_before = cluster.states[0]
-        .mvcc
-        .consensus
-        .observed_commit_version();
+    let version_before = cluster.states[0].mvcc.consensus.observed_commit_version();
     let transaction_id = cluster.stage_write(0, "before-proposal", key.clone()).await;
     let first = cluster.states[0]
         .mvcc
@@ -600,10 +596,7 @@ async fn coordinator_failure_before_proposal_is_retryable_without_a_commit() {
         None
     );
     assert_eq!(
-        cluster.states[0]
-            .mvcc
-            .consensus
-            .observed_commit_version(),
+        cluster.states[0].mvcc.consensus.observed_commit_version(),
         version_before,
         "failure before proposal must not create a commit"
     );
@@ -630,9 +623,7 @@ async fn coordinator_failure_before_proposal_is_retryable_without_a_commit() {
         )
         .await
         .unwrap();
-    let CertificationResult::Committed { commit_version } =
-        recovered.certification
-    else {
+    let CertificationResult::Committed { commit_version } = recovered.certification else {
         panic!("retry after pre-proposal crash did not commit");
     };
     for node in 0..3 {
@@ -648,10 +639,7 @@ async fn coordinator_failure_before_proposal_is_retryable_without_a_commit() {
         })
         .await
         .unwrap();
-        assert!(
-            cluster.states[node].mvcc.runtime.applied_version().unwrap()
-                >= commit_version
-        );
+        assert!(cluster.states[node].mvcc.runtime.applied_version().unwrap() >= commit_version);
     }
 }
 
@@ -687,10 +675,7 @@ async fn coordinator_failure_after_proposal_recovers_the_stable_commit() {
             .state,
         "committing"
     );
-    let committed_before_response = cluster.states[0]
-        .mvcc
-        .consensus
-        .observed_commit_version();
+    let committed_before_response = cluster.states[0].mvcc.consensus.observed_commit_version();
 
     cluster.restart_node(0).await;
     cluster.wait_for_any_leader(&[0, 1, 2]).await;
@@ -725,11 +710,7 @@ async fn coordinator_failure_after_proposal_recovers_the_stable_commit() {
         .unwrap();
     assert_eq!(replay.certification, recovered.certification);
     assert_eq!(
-        cluster.states[0]
-            .mvcc
-            .consensus
-            .observed_commit_version()
-            .0,
+        cluster.states[0].mvcc.consensus.observed_commit_version().0,
         commit_version,
         "resolved retry must not allocate a second commit version"
     );

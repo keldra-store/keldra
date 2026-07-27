@@ -472,9 +472,7 @@ mod section9_boundary_tests {
                 bincode::serde::encode_to_vec(&command, bincode::config::standard()).unwrap();
             for marker in forbidden {
                 assert!(
-                    !encoded
-                        .windows(marker.len())
-                        .any(|window| window == marker),
+                    !encoded.windows(marker.len()).any(|window| window == marker),
                     "forbidden Section 9 body reached serialized Raft command"
                 );
             }

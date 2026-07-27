@@ -20,7 +20,7 @@ async fn test_coordination_task_lease_grpc_flow() {
         source_cursor_low: 10,
         source_cursor_high: 0,
         requested_ttl_nanos: 60_000_000_000,
-    options: None,
+        options: None,
     });
     add_bearer(&mut acquire, &token);
     let acquired = coordination_client
@@ -49,7 +49,7 @@ async fn test_coordination_task_lease_grpc_flow() {
         expected_lease_epoch: acquired.lease_epoch,
         expected_expires_at_nanos: acquired.expires_at_nanos,
         expected_lease_hash: acquired.lease_hash.clone(),
-    options: None,
+        options: None,
     });
     add_bearer(&mut checkpoint, &token);
     let checkpointed = coordination_client
@@ -83,7 +83,7 @@ async fn test_coordination_task_lease_grpc_flow() {
         expected_lease_epoch: checkpointed.lease_epoch,
         expected_expires_at_nanos: checkpointed.expires_at_nanos,
         expected_lease_hash: checkpointed.lease_hash.clone(),
-    options: None,
+        options: None,
     });
     add_bearer(&mut commit, &token);
     let committed = coordination_client
@@ -216,7 +216,7 @@ async fn test_coordination_task_lease_security_invariants() {
         source_cursor_low: 7,
         source_cursor_high: 0,
         requested_ttl_nanos: 600_000_000_000,
-    options: None,
+        options: None,
     });
     add_bearer(&mut acquire, &token_a);
     let first = client
@@ -239,7 +239,7 @@ async fn test_coordination_task_lease_security_invariants() {
         expected_lease_epoch: first.lease_epoch,
         expected_expires_at_nanos: first.expires_at_nanos,
         expected_lease_hash: first.lease_hash.clone(),
-    options: None,
+        options: None,
     });
     add_bearer(&mut wrong_owner_checkpoint, &token_b);
     let err = client
@@ -258,7 +258,7 @@ async fn test_coordination_task_lease_security_invariants() {
         source_cursor_low: 8,
         source_cursor_high: 0,
         requested_ttl_nanos: 1_000_000_000,
-    options: None,
+        options: None,
     });
     add_bearer(&mut same_label_acquire, &token_b);
     let err = client
@@ -270,7 +270,7 @@ async fn test_coordination_task_lease_security_invariants() {
 
     let mut unauthorized_release = Request::new(ForceReleaseTaskLeaseRequest {
         task_id: task_id.to_string(),
-    options: None,
+        options: None,
     });
     add_bearer(&mut unauthorized_release, &token_a);
     let err = client
@@ -281,7 +281,7 @@ async fn test_coordination_task_lease_security_invariants() {
 
     let mut force_release = Request::new(ForceReleaseTaskLeaseRequest {
         task_id: task_id.to_string(),
-    options: None,
+        options: None,
     });
     add_bearer(&mut force_release, &admin_token);
     let release = client
@@ -318,7 +318,7 @@ async fn test_coordination_task_lease_security_invariants() {
         source_cursor_low: 1,
         source_cursor_high: 0,
         requested_ttl_nanos: 1,
-    options: None,
+        options: None,
     });
     add_bearer(&mut short_acquire, &token_a);
     let stale_first = client
@@ -339,7 +339,7 @@ async fn test_coordination_task_lease_security_invariants() {
         source_cursor_low: 2,
         source_cursor_high: 0,
         requested_ttl_nanos: 1_000_000_000,
-    options: None,
+        options: None,
     });
     add_bearer(&mut renewed, &token_a);
     let stale_second = client
@@ -360,7 +360,7 @@ async fn test_coordination_task_lease_security_invariants() {
         expected_lease_epoch: stale_first.lease_epoch,
         expected_expires_at_nanos: stale_first.expires_at_nanos,
         expected_lease_hash: stale_first.lease_hash.clone(),
-    options: None,
+        options: None,
     });
     add_bearer(&mut stale_checkpoint, &token_a);
     let err = client
@@ -379,7 +379,7 @@ async fn test_coordination_task_lease_security_invariants() {
         expected_lease_epoch: stale_first.lease_epoch,
         expected_expires_at_nanos: stale_first.expires_at_nanos,
         expected_lease_hash: stale_first.lease_hash.clone(),
-    options: None,
+        options: None,
     });
     add_bearer(&mut stale_commit, &token_a);
     let err = client.commit_task_lease(stale_commit).await.unwrap_err();
@@ -396,7 +396,7 @@ async fn test_coordination_task_lease_security_invariants() {
         source_cursor_low: 1,
         source_cursor_high: 0,
         requested_ttl_nanos: 1_000_000_000,
-    options: None,
+        options: None,
     });
     add_bearer(&mut tenant_b_acquire, &token_tenant_b);
     let tenant_b_lease = client
@@ -421,7 +421,7 @@ async fn test_coordination_task_lease_security_invariants() {
         expected_lease_epoch: tenant_b_lease.lease_epoch,
         expected_expires_at_nanos: tenant_b_lease.expires_at_nanos,
         expected_lease_hash: tenant_b_lease.lease_hash.clone(),
-    options: None,
+        options: None,
     });
     add_bearer(&mut tenant_a_checkpoint, &token_a);
     assert!(
@@ -466,7 +466,7 @@ async fn test_coordination_task_lease_security_invariants() {
         source_cursor_low: 1,
         source_cursor_high: 0,
         requested_ttl_nanos: 1_000_000_000,
-    options: None,
+        options: None,
     });
     add_bearer(&mut acquire_one, &token_a);
     let mut acquire_two = Request::new(AcquireTaskLeaseRequest {
@@ -478,7 +478,7 @@ async fn test_coordination_task_lease_security_invariants() {
         source_cursor_low: 1,
         source_cursor_high: 0,
         requested_ttl_nanos: 1_000_000_000,
-    options: None,
+        options: None,
     });
     add_bearer(&mut acquire_two, &token_b);
 
@@ -515,7 +515,7 @@ async fn test_authz_tuple_rejects_invalid_caveat_hash_before_writing() {
         .await
         .unwrap();
     let mut invalid_write = Request::new(WriteAuthzTupleRequest {
-            context: None,
+        context: None,
         namespace: "document".to_string(),
         object_id: "alpha".to_string(),
         relation: "viewer".to_string(),

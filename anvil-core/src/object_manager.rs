@@ -3,10 +3,9 @@ use crate::{
     core_store::{
         AuthzScopeRef, CoreBoundarySchema, CoreBoundarySource, CoreBoundaryValue, CoreByteRange,
         CoreCompressionDescriptor, CoreManifestLocator, CoreObjectEncoding, CoreObjectRef,
-        CorePrefetchPolicy, CoreStore, GetBlob,
-        core_object_ref_from_logical_file_write, decode_core_object_ref_target,
-        decode_manifest_locator_proto, encode_core_object_ref_target,
-        encode_manifest_locator_proto,
+        CorePrefetchPolicy, CoreStore, GetBlob, core_object_ref_from_logical_file_write,
+        decode_core_object_ref_target, decode_manifest_locator_proto,
+        encode_core_object_ref_target, encode_manifest_locator_proto,
     },
     error_codes::AnvilErrorCode,
     formats::writer::WriterFamily,
@@ -740,7 +739,9 @@ impl ObjectManager {
         if object_ref.hash != format!("sha256:{}", hex::encode(sha2::Sha256::digest(&bytes)))
             || object_ref.logical_size != bytes.len() as u64
         {
-            return Err(Status::data_loss("MVCC object reference verification failed"));
+            return Err(Status::data_loss(
+                "MVCC object reference verification failed",
+            ));
         }
         Ok(bytes)
     }
@@ -783,7 +784,9 @@ impl ObjectManager {
                 let mut chunks = tokio_util::io::ReaderStream::with_capacity(file, 256 * 1024);
                 while let Some(chunk) = chunks.next().await {
                     output
-                        .send(Ok(chunk.map_err(|error| Status::data_loss(error.to_string()))?.to_vec()))
+                        .send(Ok(chunk
+                            .map_err(|error| Status::data_loss(error.to_string()))?
+                            .to_vec()))
                         .await
                         .map_err(|_| Status::cancelled("multipart completion stream closed"))?;
                 }
@@ -846,8 +849,7 @@ impl ObjectManager {
     ) -> Result<Vec<CoreBoundaryValue>, Status> {
         let boundary_schema_key =
             crate::core_store::boundary_schema_bucket_key(tenant_id, bucket_name);
-        let Some(schema) = self.read_committed_boundary_schema(&boundary_schema_key)?
-        else {
+        let Some(schema) = self.read_committed_boundary_schema(&boundary_schema_key)? else {
             return Ok(Vec::new());
         };
         extract_object_boundary_values(
@@ -874,8 +876,7 @@ impl ObjectManager {
     ) -> Result<Vec<CoreBoundaryValue>, Status> {
         let boundary_schema_key =
             crate::core_store::boundary_schema_bucket_key(tenant_id, bucket_name);
-        let Some(schema) = self.read_committed_boundary_schema(&boundary_schema_key)?
-        else {
+        let Some(schema) = self.read_committed_boundary_schema(&boundary_schema_key)? else {
             return Ok(Vec::new());
         };
         if schema.dimensions.iter().any(|dimension| {
@@ -1149,11 +1150,9 @@ impl ObjectManager {
             let principal = transaction_principal.as_str();
             let representation = materialisation_representation;
             let mvcc = self.installed_mvcc()?;
-            let boundary_schema = self
-                .read_committed_boundary_schema(&crate::core_store::boundary_schema_bucket_key(
-                    tenant_id,
-                    &bucket.name,
-                ))?;
+            let boundary_schema = self.read_committed_boundary_schema(
+                &crate::core_store::boundary_schema_bucket_key(tenant_id, &bucket.name),
+            )?;
             let boundary_schema_value = boundary_schema
                 .as_ref()
                 .map(serde_json::to_value)
@@ -1344,7 +1343,11 @@ impl ObjectManager {
             None
         };
         let transaction_id = transaction_id
-            .or_else(|| implicit_transaction.as_ref().map(|handle| handle.transaction_id.as_str()))
+            .or_else(|| {
+                implicit_transaction
+                    .as_ref()
+                    .map(|handle| handle.transaction_id.as_str())
+            })
             .expect("explicit or implicit transaction");
         let mutation = self
             .persistence
@@ -1356,7 +1359,7 @@ impl ObjectManager {
                 &principal,
             )
             .await
-        .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| Status::internal(e.to_string()))?;
         if implicit_transaction.is_some() {
             self.commit_internal_transaction(transaction_id, &principal)
                 .await?;
@@ -1402,7 +1405,11 @@ impl ObjectManager {
             None
         };
         let transaction_id = transaction_id
-            .or_else(|| implicit_transaction.as_ref().map(|handle| handle.transaction_id.as_str()))
+            .or_else(|| {
+                implicit_transaction
+                    .as_ref()
+                    .map(|handle| handle.transaction_id.as_str())
+            })
             .expect("explicit or implicit transaction");
         let upload = self
             .persistence
@@ -1415,8 +1422,8 @@ impl ObjectManager {
                 &principal,
             )
             .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found("Multipart upload not found"))?;
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Multipart upload not found"))?;
 
         let prepared = self
             .prepare_mvcc_object_ingest(
@@ -1445,7 +1452,7 @@ impl ObjectManager {
                 &principal,
             )
             .await
-        .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| Status::internal(e.to_string()))?;
         if implicit_transaction.is_some() {
             self.commit_internal_transaction(transaction_id, &principal)
                 .await?;
@@ -1495,7 +1502,11 @@ impl ObjectManager {
             None
         };
         let transaction_id = transaction_id
-            .or_else(|| implicit_transaction.as_ref().map(|handle| handle.transaction_id.as_str()))
+            .or_else(|| {
+                implicit_transaction
+                    .as_ref()
+                    .map(|handle| handle.transaction_id.as_str())
+            })
             .expect("explicit or implicit transaction");
         let upload = self
             .persistence
@@ -1508,13 +1519,13 @@ impl ObjectManager {
                 &principal,
             )
             .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found("Multipart upload not found"))?;
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Multipart upload not found"))?;
         let stored_parts = self
             .persistence
             .list_multipart_parts_in_transaction(upload.id, transaction_id, &principal)
             .await
-        .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| Status::internal(e.to_string()))?;
 
         let mut ordered_part_refs = Vec::with_capacity(parts.len());
         for expected in parts {
@@ -1561,7 +1572,7 @@ impl ObjectManager {
             .persistence
             .complete_multipart_upload_in_transaction(upload.id, transaction_id, &principal)
             .await
-        .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| Status::internal(e.to_string()))?;
         if !completion.completed {
             return Err(Status::not_found("Multipart upload not found"));
         }
@@ -1601,7 +1612,11 @@ impl ObjectManager {
             None
         };
         let transaction_id = transaction_id
-            .or_else(|| implicit_transaction.as_ref().map(|handle| handle.transaction_id.as_str()))
+            .or_else(|| {
+                implicit_transaction
+                    .as_ref()
+                    .map(|handle| handle.transaction_id.as_str())
+            })
             .expect("explicit or implicit transaction");
         let mutation = self
             .persistence
@@ -1614,7 +1629,7 @@ impl ObjectManager {
                 &principal,
             )
             .await
-        .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| Status::internal(e.to_string()))?;
         if let Some(receipt) = mutation.receipt {
             if implicit_transaction.is_some() {
                 self.commit_internal_transaction(transaction_id, &principal)
@@ -1751,7 +1766,7 @@ impl ObjectManager {
                 transaction_principal,
             )
             .await
-        .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| Status::internal(e.to_string()))?;
         access_control::stage_stream_defaults(
             &self.persistence,
             &bucket,
@@ -1812,8 +1827,8 @@ impl ObjectManager {
                 &authenticated_principal,
             )
             .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found("Append stream not found"))?;
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Append stream not found"))?;
 
         let prepared = self
             .prepare_mvcc_object_ingest(
@@ -1843,7 +1858,7 @@ impl ObjectManager {
                 &authenticated_principal,
             )
             .await
-        .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(AppendStreamRecordResult {
             record_sequence: u64::try_from(mutation.record.record_sequence)
@@ -1898,8 +1913,8 @@ impl ObjectManager {
                 transaction_principal,
             )
             .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found("Append stream not found"))?;
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Append stream not found"))?;
         let transaction = Some((transaction_id, transaction_principal));
         let has_records = self
             .persistence
@@ -1928,7 +1943,7 @@ impl ObjectManager {
                 transaction_principal,
             )
             .await
-        .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| Status::internal(e.to_string()))?;
         let Some(receipt) = sealed.receipt else {
             return Err(Status::failed_precondition(
                 "Append stream is already sealed",
@@ -2061,8 +2076,8 @@ impl ObjectManager {
                 transaction_principal,
             )
             .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::failed_precondition("Manifest revision mismatch"))?;
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::failed_precondition("Manifest revision mismatch"))?;
 
         Ok(ManifestCasResult {
             revision: u64::try_from(result.revision)

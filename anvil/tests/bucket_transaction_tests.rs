@@ -106,12 +106,13 @@ async fn commit(
 async fn bucket_create_and_policy_use_one_transaction_overlay_and_publish_default_grants() {
     let cluster = isolated_test_cluster("bucket-transaction-overlay", &["test-region-1"]).await;
     let endpoint = cluster.grpc_addrs[0].clone();
-    let mut transactions = TransactionServiceClient::connect(endpoint.clone()).await.unwrap();
+    let mut transactions = TransactionServiceClient::connect(endpoint.clone())
+        .await
+        .unwrap();
     let mut buckets = BucketServiceClient::connect(endpoint).await.unwrap();
     let transaction_id = begin_transaction(&cluster, &mut transactions, "bucket-overlay").await;
     let bucket_name = format!("bucket-overlay-{}", uuid::Uuid::new_v4().simple());
-    let bucket_id =
-        stage_bucket(&mut buckets, &cluster.token, &transaction_id, &bucket_name).await;
+    let bucket_id = stage_bucket(&mut buckets, &cluster.token, &transaction_id, &bucket_name).await;
 
     // This update must resolve the bucket staged above through the caller's
     // overlay. Reading only committed state would return NOT_FOUND here.
@@ -128,7 +129,10 @@ async fn bucket_create_and_policy_use_one_transaction_overlay_and_publish_defaul
         .unwrap();
     assert!(
         buckets
-            .list_buckets(authorized(ListBucketsRequest { page: None }, &cluster.token))
+            .list_buckets(authorized(
+                ListBucketsRequest { page: None },
+                &cluster.token
+            ))
             .await
             .unwrap()
             .into_inner()
@@ -152,8 +156,7 @@ async fn bucket_create_and_policy_use_one_transaction_overlay_and_publish_defaul
         .unwrap()
         .into_inner();
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&policy.policy_json).unwrap()
-            ["is_public_read"],
+        serde_json::from_str::<serde_json::Value>(&policy.policy_json).unwrap()["is_public_read"],
         true
     );
 
@@ -199,8 +202,7 @@ async fn bucket_create_and_policy_use_one_transaction_overlay_and_publish_defaul
                 .unwrap()
                 .is_some_and(|locator| {
                     locator.bucket_id.as_str() == bucket_id.to_string()
-                        && locator.status
-                            == anvil::mesh_directory::BucketLocatorStatus::Active
+                        && locator.status == anvil::mesh_directory::BucketLocatorStatus::Active
                 })
             {
                 return;
@@ -216,7 +218,9 @@ async fn bucket_create_and_policy_use_one_transaction_overlay_and_publish_defaul
 async fn bucket_name_conflict_aborts_every_bucket_mutation_in_losing_transaction() {
     let cluster = isolated_test_cluster("bucket-transaction-conflict", &["test-region-1"]).await;
     let endpoint = cluster.grpc_addrs[0].clone();
-    let mut transactions = TransactionServiceClient::connect(endpoint.clone()).await.unwrap();
+    let mut transactions = TransactionServiceClient::connect(endpoint.clone())
+        .await
+        .unwrap();
     let mut buckets = BucketServiceClient::connect(endpoint).await.unwrap();
     let first = begin_transaction(&cluster, &mut transactions, "bucket-first").await;
     let second = begin_transaction(&cluster, &mut transactions, "bucket-second").await;
@@ -237,7 +241,10 @@ async fn bucket_name_conflict_aborts_every_bucket_mutation_in_losing_transaction
     assert_eq!(conflict.code(), Code::Aborted);
 
     let names = buckets
-        .list_buckets(authorized(ListBucketsRequest { page: None }, &cluster.token))
+        .list_buckets(authorized(
+            ListBucketsRequest { page: None },
+            &cluster.token,
+        ))
         .await
         .unwrap()
         .into_inner()

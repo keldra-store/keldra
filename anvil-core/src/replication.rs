@@ -435,8 +435,7 @@ impl TransferReceiver {
         };
         if frame.kind == TransferKind::ObjectShard
             && frame.provisional
-            && (frame.transaction_id.trim().is_empty()
-                || frame.prepared_at_unix_ms == 0)
+            && (frame.transaction_id.trim().is_empty() || frame.prepared_at_unix_ms == 0)
         {
             bail!("object shard transfer requires durable provisional transaction metadata");
         }
@@ -709,8 +708,7 @@ mod tests {
             (3, at_watermark, 5, 10),
             (4, inside_grace, 2, 95),
         ] {
-            let mut provisional =
-                frame(&session, transfer_id, sequence, 0, b"a", whole, false);
+            let mut provisional = frame(&session, transfer_id, sequence, 0, b"a", whole, false);
             provisional.prepared_snapshot_version = snapshot;
             provisional.prepared_at_unix_ms = prepared_at;
             receiver.receive(&mut session, &provisional).unwrap();
@@ -839,21 +837,21 @@ mod tests {
 
         let authorised = BTreeSet::from([retired, inflight, bundle]);
         assert_eq!(
-            receiver
-                .retire_complete_object_shards(&authorised)
-                .unwrap(),
+            receiver.retire_complete_object_shards(&authorised).unwrap(),
             1
         );
         assert!(receiver.watermark(retired).unwrap().is_none());
         assert_eq!(
-            receiver.watermark(inflight).unwrap().unwrap().persisted_through,
+            receiver
+                .watermark(inflight)
+                .unwrap()
+                .unwrap()
+                .persisted_through,
             2
         );
         assert!(receiver.watermark(bundle).unwrap().unwrap().complete);
         assert_eq!(
-            receiver
-                .retire_complete_object_shards(&authorised)
-                .unwrap(),
+            receiver.retire_complete_object_shards(&authorised).unwrap(),
             0
         );
     }

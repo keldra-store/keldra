@@ -207,16 +207,20 @@ pub async fn put_schema_revision(
     let idempotency_key = format!("authz-schema:{tenant_id}:{schema_id}:{schema_digest}");
     let now_unix_ms = current_unix_ms();
     let handle = if caller_binding.is_none() {
-        Some(mvcc.open_transactions.begin(
-            mvcc.runtime.as_ref(),
-            mvcc.cluster_id(),
-            &principal,
-            idempotency_key,
-            std::time::Duration::from_secs(30),
-            crate::mvcc_transaction::DurabilityLevel::Quorum,
-            crate::mvcc_transaction::ReadConsistency::Linearized,
-            now_unix_ms,
-        ).await?)
+        Some(
+            mvcc.open_transactions
+                .begin(
+                    mvcc.runtime.as_ref(),
+                    mvcc.cluster_id(),
+                    &principal,
+                    idempotency_key,
+                    std::time::Duration::from_secs(30),
+                    crate::mvcc_transaction::DurabilityLevel::Quorum,
+                    crate::mvcc_transaction::ReadConsistency::Linearized,
+                    now_unix_ms,
+                )
+                .await?,
+        )
     } else {
         None
     };
@@ -399,16 +403,20 @@ pub async fn bind_schema(
     );
     let now_unix_ms = current_unix_ms();
     let handle = if caller_binding.is_none() {
-        Some(mvcc.open_transactions.begin(
-            mvcc.runtime.as_ref(),
-            mvcc.cluster_id(),
-            &principal,
-            idempotency_key,
-            std::time::Duration::from_secs(30),
-            crate::mvcc_transaction::DurabilityLevel::Quorum,
-            crate::mvcc_transaction::ReadConsistency::Linearized,
-            now_unix_ms,
-        ).await?)
+        Some(
+            mvcc.open_transactions
+                .begin(
+                    mvcc.runtime.as_ref(),
+                    mvcc.cluster_id(),
+                    &principal,
+                    idempotency_key,
+                    std::time::Duration::from_secs(30),
+                    crate::mvcc_transaction::DurabilityLevel::Quorum,
+                    crate::mvcc_transaction::ReadConsistency::Linearized,
+                    now_unix_ms,
+                )
+                .await?,
+        )
     } else {
         None
     };

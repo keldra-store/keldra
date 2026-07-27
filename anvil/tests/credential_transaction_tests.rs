@@ -2,9 +2,8 @@ use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::transaction_service_client::TransactionServiceClient;
 use anvil::anvil_api::{
     BeginTransactionRequest, CommitTransactionRequest, CreateApplicationCredentialRequest,
-    DeleteApplicationCredentialRequest, GetAccessTokenRequest, MvccDurability,
-    MvccReadConsistency, RotateApplicationCredentialSecretRequest, WriteOptions, WriteState,
-    write_options,
+    DeleteApplicationCredentialRequest, GetAccessTokenRequest, MvccDurability, MvccReadConsistency,
+    RotateApplicationCredentialSecretRequest, WriteOptions, WriteState, write_options,
 };
 use anvil_test_utils::{TestCluster, isolated_test_cluster};
 use tonic::{Code, Request};
@@ -57,10 +56,11 @@ fn transaction_options(transaction_id: &str) -> WriteOptions {
 async fn credential_create_is_invisible_until_its_caller_transaction_commits() {
     let cluster = isolated_test_cluster("credential-transaction", &["test-region-1"]).await;
     let endpoint = cluster.grpc_addrs[0].clone();
-    let mut transactions = TransactionServiceClient::connect(endpoint.clone()).await.unwrap();
+    let mut transactions = TransactionServiceClient::connect(endpoint.clone())
+        .await
+        .unwrap();
     let mut auth = AuthServiceClient::connect(endpoint).await.unwrap();
-    let transaction_id =
-        begin_transaction(&cluster, &mut transactions, "credential-create").await;
+    let transaction_id = begin_transaction(&cluster, &mut transactions, "credential-create").await;
     let app_name = format!("credential-tx-{}", uuid::Uuid::new_v4().simple());
 
     let staged = auth

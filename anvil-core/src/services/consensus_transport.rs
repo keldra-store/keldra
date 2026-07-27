@@ -264,17 +264,22 @@ impl LocalGcSafetyReport {
         oldest_active_snapshot: Option<u64>,
         oldest_unfinished_work: Option<u64>,
     ) {
-        *self.report.lock().expect("local GC safety report lock poisoned") =
-            AppliedWatermarkReport {
-                incarnation: 0,
-                watermark,
-                oldest_active_snapshot,
-                oldest_unfinished_work,
-            };
+        *self
+            .report
+            .lock()
+            .expect("local GC safety report lock poisoned") = AppliedWatermarkReport {
+            incarnation: 0,
+            watermark,
+            oldest_active_snapshot,
+            oldest_unfinished_work,
+        };
     }
 
     pub fn snapshot(&self) -> AppliedWatermarkReport {
-        *self.report.lock().expect("local GC safety report lock poisoned")
+        *self
+            .report
+            .lock()
+            .expect("local GC safety report lock poisoned")
     }
 }
 
@@ -290,7 +295,10 @@ impl AppliedWatermarkReports {
         if node_id.0 == 0 || incarnation == 0 {
             return;
         }
-        let mut reports = self.reports.lock().expect("applied watermark report lock poisoned");
+        let mut reports = self
+            .reports
+            .lock()
+            .expect("applied watermark report lock poisoned");
         match reports.get(&node_id) {
             Some(current) if current.incarnation > incarnation => {}
             Some(current)
@@ -508,16 +516,19 @@ impl TonicConsensusRpcClient {
             ));
         }
         if reply.reporting_node_id != 0 {
-            self.applied_reports.record(self.target_node_id, AppliedWatermarkReport {
-                incarnation: reply.reporting_node_incarnation,
-                watermark: reply.mvcc_applied_watermark,
-                oldest_active_snapshot: reply
-                    .has_active_snapshot_pin
-                    .then_some(reply.oldest_active_snapshot),
-                oldest_unfinished_work: reply
-                    .has_unfinished_work_pin
-                    .then_some(reply.oldest_unfinished_work),
-            });
+            self.applied_reports.record(
+                self.target_node_id,
+                AppliedWatermarkReport {
+                    incarnation: reply.reporting_node_incarnation,
+                    watermark: reply.mvcc_applied_watermark,
+                    oldest_active_snapshot: reply
+                        .has_active_snapshot_pin
+                        .then_some(reply.oldest_active_snapshot),
+                    oldest_unfinished_work: reply
+                        .has_unfinished_work_pin
+                        .then_some(reply.oldest_unfinished_work),
+                },
+            );
         }
         Ok(reply.payload)
     }

@@ -1640,7 +1640,7 @@ async fn test_query_inherit_object_full_text_filters_results_by_object_read_scop
     auth_client
         .write_authz_tuple(authorized(
             WriteAuthzTupleRequest {
-            context: None,
+                context: None,
                 namespace: "object".to_string(),
                 object_id: format!("{bucket_name}/docs/denied.txt"),
                 relation: "reader".to_string(),

@@ -124,13 +124,13 @@ pub(crate) async fn stage_bucket_mutation_in_transaction(
         mutation,
         Some((transaction_id, transaction_principal)),
     )?
-        .stage(
-            mvcc,
-            transaction_id,
-            transaction_principal,
-            u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
-        )
-        .await?;
+    .stage(
+        mvcc,
+        transaction_id,
+        transaction_principal,
+        u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+    )
+    .await?;
     Ok(collection_revision)
 }
 
@@ -498,8 +498,7 @@ pub(crate) fn read_current_bucket_in_transaction(
         TABLE_BUCKET_CURRENT_BY_NAME_ROW,
         &tenant_bucket_name_current_tuple_key(tenant_id, bucket_name)?,
     )?;
-    let Some(payload) =
-        mvcc.read_transaction_value(transaction_id, transaction_principal, &key)?
+    let Some(payload) = mvcc.read_transaction_value(transaction_id, transaction_principal, &key)?
     else {
         return Ok(None);
     };

@@ -54,10 +54,7 @@ pub(super) async fn put_boundary_schema_rpc(
                 state.mvcc.runtime.as_ref(),
                 state.mvcc.cluster_id().to_string(),
                 transaction_principal.clone(),
-                format!(
-                    "boundary-schema:{}:{}",
-                    boundary_bucket_key, mutation_id
-                ),
+                format!("boundary-schema:{}:{}", boundary_bucket_key, mutation_id),
                 std::time::Duration::from_secs(300),
                 crate::mvcc_transaction::DurabilityLevel::Quorum,
                 crate::mvcc_transaction::ReadConsistency::Linearized,
@@ -97,9 +94,7 @@ pub(super) async fn put_boundary_schema_rpc(
         if matches!(status.state, "committed" | "committing") {
             let schema = read_committed_boundary_schema(state, &boundary_bucket_key, None)?
                 .ok_or_else(|| {
-                    Status::failed_precondition(
-                        "committed boundary schema outcome is unavailable",
-                    )
+                    Status::failed_precondition("committed boundary schema outcome is unavailable")
                 })?;
             let expected_result_generation = req
                 .expected_generation
@@ -283,9 +278,7 @@ fn read_committed_boundary_schema(
         ),
         None => (
             crate::core_store::TABLE_BOUNDARY_SCHEMA_CURRENT_ROW,
-            crate::core_store::CoreStore::boundary_schema_current_tuple_key(
-                boundary_bucket_key,
-            ),
+            crate::core_store::CoreStore::boundary_schema_current_tuple_key(boundary_bucket_key),
         ),
     };
     let tuple_key = tuple_key.map_err(|error| Status::internal(error.to_string()))?;
@@ -327,7 +320,7 @@ pub(super) async fn get_boundary_schema_rpc(
     let boundary_bucket_key =
         crate::core_store::boundary_schema_bucket_key(claims.tenant_id, &bucket.name);
     let schema = read_committed_boundary_schema(state, &boundary_bucket_key, req.generation)?
-    .ok_or_else(|| Status::not_found("Boundary schema not found"))?;
+        .ok_or_else(|| Status::not_found("Boundary schema not found"))?;
     let schema_hash =
         boundary_schema_hash(&schema).map_err(|error| Status::internal(error.to_string()))?;
 
@@ -625,10 +618,9 @@ pub(super) async fn start_boundary_migration_rpc(
     };
     let requested_transaction_id =
         crate::services::transaction_context::native_context_transaction_id(
-        req.mutation_context.as_ref(),
-    )?;
-    let transaction_principal =
-        crate::object_manager::transaction_principal_from_claims(&claims);
+            req.mutation_context.as_ref(),
+        )?;
+    let transaction_principal = crate::object_manager::transaction_principal_from_claims(&claims);
     let internal_transaction = requested_transaction_id.is_none();
     let transaction_id = if let Some(transaction_id) = requested_transaction_id {
         state
@@ -646,10 +638,7 @@ pub(super) async fn start_boundary_migration_rpc(
                 state.mvcc.runtime.as_ref(),
                 state.mvcc.cluster_id().to_string(),
                 transaction_principal.clone(),
-                format!(
-                    "boundary-migration:{}:{}",
-                    claims.tenant_id, mutation_id
-                ),
+                format!("boundary-migration:{}:{}", claims.tenant_id, mutation_id),
                 std::time::Duration::from_secs(300),
                 crate::mvcc_transaction::DurabilityLevel::Quorum,
                 crate::mvcc_transaction::ReadConsistency::Linearized,
@@ -683,15 +672,14 @@ pub(super) async fn start_boundary_migration_rpc(
                     )));
                 }
             }
-            let existing =
-                read_boundary_migration_row(state, &boundary_bucket_key, &migration_id)
-                    .await?
-                    .filter(|existing| existing == &row)
-                    .ok_or_else(|| {
-                        Status::already_exists(
-                            "boundary migration idempotency key was used for different input",
-                        )
-                    })?;
+            let existing = read_boundary_migration_row(state, &boundary_bucket_key, &migration_id)
+                .await?
+                .filter(|existing| existing == &row)
+                .ok_or_else(|| {
+                    Status::already_exists(
+                        "boundary migration idempotency key was used for different input",
+                    )
+                })?;
             let _ = existing;
             return Ok(Response::new(WriteResponse {
                 request_id,

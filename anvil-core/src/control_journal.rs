@@ -402,7 +402,9 @@ impl ControlTenantMutationPlan {
         let assignment = mvcc
             .reconcile_work_assignment("control-plane", mvcc.cluster_id())
             .await?
-            .ok_or_else(|| anyhow!("this node does not own the cluster control-plane assignment"))?;
+            .ok_or_else(|| {
+                anyhow!("this node does not own the cluster control-plane assignment")
+            })?;
         mvcc.stage_assignment_guard(transaction_id, principal, &assignment, now_unix_ms)?;
         Ok(self.tenant)
     }
@@ -870,12 +872,7 @@ impl ControlAppMutationPlan {
         principal: &str,
         now_unix_ms: u64,
     ) -> Result<App> {
-        mvcc.stage_product_mutations(
-            transaction_id,
-            principal,
-            self.mutations,
-            now_unix_ms,
-        )?;
+        mvcc.stage_product_mutations(transaction_id, principal, self.mutations, now_unix_ms)?;
         for (key, predicate) in self.predicates {
             mvcc.stage_predicate(transaction_id, principal, key, predicate, now_unix_ms)?;
         }
@@ -886,7 +883,9 @@ impl ControlAppMutationPlan {
         let assignment = mvcc
             .reconcile_work_assignment("control-plane", mvcc.cluster_id())
             .await?
-            .ok_or_else(|| anyhow!("this node does not own the cluster control-plane assignment"))?;
+            .ok_or_else(|| {
+                anyhow!("this node does not own the cluster control-plane assignment")
+            })?;
         mvcc.stage_assignment_guard(transaction_id, principal, &assignment, now_unix_ms)?;
         Ok(self.app)
     }
