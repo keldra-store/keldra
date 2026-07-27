@@ -1,13 +1,7 @@
-use crate::{
-    core_store::{
-        CF_OBSERVABILITY, CoreMetaTuplePart, CoreMutationBatch, CoreMutationOperation,
-        CoreMutationPrecondition, CoreMutationRootPublication, CoreStore,
-        TABLE_OBSERVABILITY_CURSOR_ROW, core_meta_committed_row_common, core_meta_record_tuple_key,
-        core_meta_root_key_hash, core_meta_tuple_key, decode_deterministic_proto,
-        encode_deterministic_proto,
-    },
-    formats::writer::WriterFamily,
-    storage::Storage,
+use crate::core_store::{
+    CF_OBSERVABILITY, CoreMetaTuplePart, CoreMutationOperation, TABLE_OBSERVABILITY_CURSOR_ROW,
+    core_meta_committed_row_common, core_meta_root_key_hash, core_meta_tuple_key,
+    decode_deterministic_proto, encode_deterministic_proto,
 };
 use anyhow::{Result, anyhow};
 use prost::Message;
@@ -74,55 +68,6 @@ pub struct TenantAuditEventPage {
     pub events: Vec<TenantAuditEvent>,
     pub next_cursor: Option<Vec<u8>>,
     pub revision: String,
-}
-
-/// Direct idempotent ingestion for external mesh/topology control events.
-/// Cluster product consequences must use `tenant_audit_mvcc_plan` atomically.
-pub async fn append_tenant_audit_event(storage: &Storage, event: &TenantAuditEvent) -> Result<()> {
-    require_direct_tenant_audit_action(event)?;
-    let core_store = CoreStore::new(storage.clone()).await?;
-    let stream_id = tenant_audit_stream_id(event.tenant_id);
-    let stream_precondition = core_store.stream_head_precondition(&stream_id).await?;
-    let root_generation = next_stream_generation(&stream_precondition)?;
-    let transaction_id = format!("tenant-audit:{}:{}", event.tenant_id, event.audit_event_id);
-    let projection_root_anchor_key = tenant_audit_projection_root_anchor_key(&stream_id);
-    let projection =
-        encode_tenant_audit_projection(event, &stream_id, root_generation, &transaction_id);
-    let partition_id = format!("tenant:{}", event.tenant_id);
-    let mut operations = vec![CoreMutationOperation::StreamAppend {
-        partition_id: partition_id.clone(),
-        stream_id,
-        record_kind: "tenant_audit_event".to_string(),
-        payload: encode_tenant_audit_event(event),
-        idempotency_key: Some(event.audit_event_id.clone()),
-    }];
-    for tuple_key in tenant_audit_projection_keys(event)? {
-        operations.push(CoreMutationOperation::CoreMetaPut {
-            partition_id: partition_id.clone(),
-            cf: CF_OBSERVABILITY.to_string(),
-            table_id: TABLE_OBSERVABILITY_CURSOR_ROW,
-            tuple_key,
-            payload: projection.clone(),
-        });
-    }
-    core_store
-        .commit_mutation_batch(CoreMutationBatch {
-            transaction_id,
-            scope_partition: partition_id.clone(),
-            committed_by_principal: format!("tenant:{}:audit", event.tenant_id),
-            root_publications: vec![
-                CoreMutationRootPublication::new(partition_id, WriterFamily::CoreControl.as_str())
-                    .coordinator(),
-                CoreMutationRootPublication::new(
-                    projection_root_anchor_key,
-                    WriterFamily::Stream.as_str(),
-                ),
-            ],
-            preconditions: vec![stream_precondition],
-            operations,
-        })
-        .await?;
-    Ok(())
 }
 
 pub async fn append_tenant_audit_event_mvcc(
@@ -203,70 +148,6 @@ pub(crate) fn tenant_audit_mvcc_plan(
         });
     }
     crate::mvcc_product::product_mutations_and_outbox_from_operations(operations)
-}
-
-pub async fn list_tenant_audit_event_page(
-    storage: &Storage,
-    tenant_id: i64,
-    filter: TenantAuditEventFilter<'_>,
-) -> Result<TenantAuditEventPage> {
-    list_tenant_audit_event_page_after(storage, tenant_id, filter, None, TENANT_AUDIT_PAGE_MAX)
-        .await
-}
-
-pub async fn list_tenant_audit_event_page_after(
-    storage: &Storage,
-    tenant_id: i64,
-    filter: TenantAuditEventFilter<'_>,
-    after_cursor: Option<&[u8]>,
-    limit: usize,
-) -> Result<TenantAuditEventPage> {
-    if !(1..=TENANT_AUDIT_PAGE_MAX).contains(&limit) {
-        return Err(anyhow!(
-            "tenant audit page size must be between 1 and {TENANT_AUDIT_PAGE_MAX}"
-        ));
-    }
-    let prefix = tenant_audit_projection_prefix(tenant_id, &filter)?;
-    let store = CoreStore::new(storage.clone()).await?;
-    let mut rows = store.scan_coremeta_prefix_page(
-        CF_OBSERVABILITY,
-        TABLE_OBSERVABILITY_CURSOR_ROW,
-        &prefix,
-        after_cursor,
-        limit + 1,
-    )?;
-    let has_more = rows.len() > limit;
-    if has_more {
-        rows.truncate(limit);
-    }
-    let next_cursor = if has_more {
-        Some(
-            core_meta_record_tuple_key(
-                &rows
-                    .last()
-                    .ok_or_else(|| anyhow!("tenant audit continuation has no row"))?
-                    .key,
-            )?
-            .to_vec(),
-        )
-    } else {
-        None
-    };
-    let events = rows
-        .into_iter()
-        .map(|row| decode_tenant_audit_projection(&row.payload))
-        .collect::<Result<Vec<_>>>()?;
-    if events
-        .iter()
-        .any(|event| event.tenant_id != tenant_id || !matches_filter(event, &filter))
-    {
-        return Err(anyhow!("tenant audit projection scope mismatch"));
-    }
-    Ok(TenantAuditEventPage {
-        events,
-        next_cursor,
-        revision: tenant_audit_collection_revision(storage, tenant_id).await?,
-    })
 }
 
 pub fn list_tenant_audit_event_page_after_mvcc(
@@ -350,14 +231,6 @@ pub fn tenant_audit_collection_revision_mvcc(
     Ok(hex::encode(hasher.finalize().as_bytes()))
 }
 
-pub async fn tenant_audit_collection_revision(storage: &Storage, tenant_id: i64) -> Result<String> {
-    Ok(CoreStore::new(storage.clone())
-        .await?
-        .stream_head_sequence(&tenant_audit_stream_id(tenant_id))
-        .await?
-        .to_string())
-}
-
 pub fn audit_event_position(event: &TenantAuditEvent) -> String {
     format!("{}:{}", event.created_at, event.audit_event_id)
 }
@@ -400,19 +273,6 @@ pub fn collection_revision<'a>(events: impl IntoIterator<Item = &'a TenantAuditE
 
 fn tenant_audit_stream_id(tenant_id: i64) -> String {
     format!("tenant_audit:{tenant_id}")
-}
-
-fn next_stream_generation(precondition: &CoreMutationPrecondition) -> Result<u64> {
-    let CoreMutationPrecondition::StreamHead {
-        expected_last_sequence,
-        ..
-    } = precondition
-    else {
-        return Err(anyhow!("tenant audit stream precondition has wrong kind"));
-    };
-    expected_last_sequence
-        .checked_add(1)
-        .ok_or_else(|| anyhow!("tenant audit stream sequence overflow"))
 }
 
 fn tenant_audit_projection_keys(event: &TenantAuditEvent) -> Result<Vec<Vec<u8>>> {
@@ -568,7 +428,6 @@ fn matches_filter(event: &TenantAuditEvent, filter: &TenantAuditEventFilter<'_>)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
     fn event(id: &str, tenant_id: i64, principal: &str) -> TenantAuditEvent {
         TenantAuditEvent {
@@ -582,49 +441,6 @@ mod tests {
             created_at: format!("2026-07-02T20:00:{id}Z"),
             details_json: "{}".to_string(),
         }
-    }
-
-    #[tokio::test]
-    async fn tenant_audit_pages_are_bounded_and_scope_unrelated_history() {
-        let temp = tempdir().unwrap();
-        let storage = Storage::new_at(temp.path()).await.unwrap();
-        for index in 0..48 {
-            append_tenant_audit_event(&storage, &event(&format!("{index:02}"), 11, "unrelated"))
-                .await
-                .unwrap();
-        }
-        for index in 50..53 {
-            append_tenant_audit_event(&storage, &event(&format!("{index:02}"), 11, "target"))
-                .await
-                .unwrap();
-        }
-        for index in 0..32 {
-            append_tenant_audit_event(&storage, &event(&format!("{index:02}"), 12, "target"))
-                .await
-                .unwrap();
-        }
-
-        let filter = TenantAuditEventFilter {
-            principal_id: Some("target"),
-            resource_id: Some("host_alias:docs.example.com"),
-            action: Some("host_alias.create"),
-        };
-        let first = list_tenant_audit_event_page_after(&storage, 11, filter.clone(), None, 2)
-            .await
-            .unwrap();
-        assert_eq!(first.events.len(), 2);
-        let second = list_tenant_audit_event_page_after(
-            &storage,
-            11,
-            filter,
-            first.next_cursor.as_deref(),
-            2,
-        )
-        .await
-        .unwrap();
-        assert_eq!(second.events.len(), 1);
-        assert!(second.next_cursor.is_none());
-        assert!(second.events.iter().all(|event| event.tenant_id == 11));
     }
 
     #[test]
