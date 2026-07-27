@@ -59,6 +59,31 @@ openraft::declare_raft_types!(
 
 pub(crate) type RaftEntry = Entry<AnvilRaftConfig>;
 
+// OpenRaft 0.9.24 uses `heartbeat_interval` as both the cadence for leader
+// heartbeats and the complete timeout for the quorum probe performed by
+// `ensure_linearizable()`. Its 50 ms default is appropriate for an in-memory
+// example, but is not a viable failure detector for Anvil's authenticated,
+// multiplexed gRPC streams: a short scheduler or RocksDB stall can consume the
+// entire allowance while every peer remains healthy.
+//
+// Keep the interval comfortably below the election window (Raft §5.2) while
+// allowing a linearized read probe to survive ordinary process contention.
+// These values do not weaken a read barrier: OpenRaft still requires a
+// confirmation from a voter quorum in the current term before returning.
+const ANVIL_RAFT_HEARTBEAT_INTERVAL_MS: u64 = 500;
+const ANVIL_RAFT_ELECTION_TIMEOUT_MIN_MS: u64 = 1_500;
+const ANVIL_RAFT_ELECTION_TIMEOUT_MAX_MS: u64 = 3_000;
+
+fn production_raft_config(cluster_name: String) -> openraft::Config {
+    openraft::Config {
+        cluster_name,
+        heartbeat_interval: ANVIL_RAFT_HEARTBEAT_INTERVAL_MS,
+        election_timeout_min: ANVIL_RAFT_ELECTION_TIMEOUT_MIN_MS,
+        election_timeout_max: ANVIL_RAFT_ELECTION_TIMEOUT_MAX_MS,
+        ..Default::default()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsensusNode {
     pub address: String,
@@ -704,10 +729,7 @@ impl OpenRaftConsensus {
         cluster_name: impl Into<String>,
         network: Arc<dyn ConsensusRpcFactory>,
     ) -> Result<Self, ConsensusError> {
-        let config = openraft::Config {
-            cluster_name: cluster_name.into(),
-            ..Default::default()
-        };
+        let config = production_raft_config(cluster_name.into());
         Self::new_with_config(node_id, store, cluster_id_hash, config, network).await
     }
 
@@ -1420,6 +1442,26 @@ mod tests {
         fn assert_response_type<C: RaftTypeConfig<R = RaftApplyResult>>() {}
         assert_data_type::<AnvilRaftConfig>();
         assert_response_type::<AnvilRaftConfig>();
+    }
+
+    #[test]
+    fn production_timing_allows_networked_linearized_read_confirmation() {
+        let config = production_raft_config("cluster-a".into());
+
+        assert_eq!(
+            config.heartbeat_interval,
+            ANVIL_RAFT_HEARTBEAT_INTERVAL_MS
+        );
+        assert_eq!(
+            config.election_timeout_min,
+            ANVIL_RAFT_ELECTION_TIMEOUT_MIN_MS
+        );
+        assert_eq!(
+            config.election_timeout_max,
+            ANVIL_RAFT_ELECTION_TIMEOUT_MAX_MS
+        );
+        assert!(config.election_timeout_min >= config.heartbeat_interval * 3);
+        config.validate().expect("production Raft timing is valid");
     }
 
     #[test]
