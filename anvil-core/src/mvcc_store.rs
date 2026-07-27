@@ -15,6 +15,7 @@ use rocksdb::{
     WriteOptions,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::mvcc_local_durability_upgrade::{
     LocalDurabilityUpgradeJob, LocalDurabilityUpgradeRecord, LocalDurabilityUpgradeState,
@@ -33,7 +34,9 @@ use crate::bucket_locator_finalization_job::{
     BucketLocatorFinalizationJob, BucketLocatorFinalizationRecord,
     BucketLocatorFinalizationState,
 };
-use crate::mvcc_transaction::{CommitVersion, LogicalKey, TransactionBundle, WriteOperation};
+use crate::mvcc_transaction::{
+    CommitVersion, IdempotencyResult, LogicalKey, TransactionBundle, WriteOperation,
+};
 use crate::object_materialisation::ObjectMaterialisationState;
 use crate::object_materialisation::{ObjectMaterialisationJob, ObjectMaterialisationRecord};
 use crate::personaldb_postcommit_job::{
@@ -65,6 +68,13 @@ const TOMBSTONE: u8 = 0;
 pub struct VisibleRow {
     pub commit_version: CommitVersion,
     pub value: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommittedIdempotencyResult {
+    pub transaction_id: String,
+    pub commit_version: CommitVersion,
+    pub result: IdempotencyResult,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -569,6 +579,25 @@ impl MvccStore {
                 serde_json::to_vec(&record)?,
             );
         }
+        for result in &bundle.idempotency_results {
+            let key = self.idempotency_result_key(
+                &bundle.transaction_id,
+                &result.namespace,
+                &result.key,
+            );
+            let record = CommittedIdempotencyResult {
+                transaction_id: bundle.transaction_id.clone(),
+                commit_version,
+                result: result.clone(),
+            };
+            let encoded = serde_json::to_vec(&record)?;
+            if let Some(existing) = self.db.get_cf(materialisation_cf, &key)?
+                && existing.as_slice() != encoded.as_slice()
+            {
+                bail!("committed idempotency result identity collision");
+            }
+            batch.put_cf(materialisation_cf, key, encoded);
+        }
         batch.put_cf(applied_cf, applied_key, identity.as_bytes());
         batch.put_cf(
             meta_cf,
@@ -586,6 +615,24 @@ impl MvccStore {
         crate::mvcc_fault_injection::hit(crate::mvcc_fault_injection::FaultPoint::MvccBatchWrite)?;
         self.db.write_opt(batch, &durable_write_options())?;
         Ok(ApplyOutcome::Applied)
+    }
+
+    pub fn committed_idempotency_result(
+        &self,
+        transaction_id: &str,
+        namespace: &str,
+        key: &str,
+    ) -> Result<Option<CommittedIdempotencyResult>> {
+        if transaction_id.trim().is_empty() || namespace.trim().is_empty() || key.trim().is_empty() {
+            bail!("committed idempotency result identity must be non-empty");
+        }
+        let bytes = self.db.get_cf(
+            self.cf(CF_MATERIALISATION)?,
+            self.idempotency_result_key(transaction_id, namespace, key),
+        )?;
+        bytes
+            .map(|bytes| serde_json::from_slice(&bytes).map_err(Into::into))
+            .transpose()
     }
 
     pub fn outbox_records_after(
@@ -2624,6 +2671,14 @@ impl MvccStore {
             &mut deleted,
             &mut deleted_bytes,
         )?;
+        self.collect_completed_jobs(
+            materialisation_cf,
+            b"idempotency-result/",
+            safe_watermark,
+            &mut batch,
+            &mut deleted,
+            &mut deleted_bytes,
+        )?;
         batch.put_cf(
             meta_cf,
             self.key(GC_WATERMARK_KEY),
@@ -2691,6 +2746,9 @@ impl MvccStore {
                 let record: BucketLocatorFinalizationRecord = serde_json::from_slice(&value)?;
                 record.state == BucketLocatorFinalizationState::Complete
                     && record.commit_version < safe_watermark
+            } else if suffix == b"idempotency-result/" {
+                let record: CommittedIdempotencyResult = serde_json::from_slice(&value)?;
+                record.commit_version < safe_watermark
             } else {
                 bail!("unknown completed materialisation job family");
             };
@@ -2723,6 +2781,21 @@ impl MvccStore {
         key.extend_from_slice(&self.scope);
         key.extend_from_slice(suffix);
         key
+    }
+
+    fn idempotency_result_key(
+        &self,
+        transaction_id: &str,
+        namespace: &str,
+        key: &str,
+    ) -> Vec<u8> {
+        let mut hash = Sha256::new();
+        hash.update(b"anvil.mvcc.idempotency-result.v1");
+        for component in [transaction_id, namespace, key] {
+            hash.update((component.len() as u64).to_be_bytes());
+            hash.update(component.as_bytes());
+        }
+        self.key(format!("idempotency-result/{:x}", hash.finalize()).as_bytes())
     }
 
     fn unscoped<'a>(&self, key: &'a [u8]) -> Result<&'a [u8]> {
@@ -3654,6 +3727,53 @@ mod tests {
         });
         assert!(store.apply_certified_bundle(4, &other).is_err());
         assert_eq!(store.applied_version().unwrap(), 4);
+    }
+
+    #[test]
+    fn committed_idempotency_results_apply_atomically_and_follow_gc_watermark() {
+        let temp = tempdir().unwrap();
+        let store = MvccStore::open(temp.path()).unwrap();
+        let transaction_id = "result-transaction";
+        let result = crate::mvcc_transaction::IdempotencyResult {
+            namespace: "bucket.create".into(),
+            key: "request-1".into(),
+            payload: b"response".to_vec(),
+        };
+        store
+            .apply_certified_bundle(
+                1,
+                &bundle(transaction_id, |builder| {
+                    builder.add_idempotency_result(result.clone());
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .committed_idempotency_result(
+                    transaction_id,
+                    &result.namespace,
+                    &result.key,
+                )
+                .unwrap()
+                .unwrap()
+                .result,
+            result
+        );
+
+        store
+            .apply_certified_bundle(2, &bundle("advance-result-watermark", |_| {}))
+            .unwrap();
+        store.garbage_collect(2).unwrap();
+        assert!(
+            store
+                .committed_idempotency_result(
+                    transaction_id,
+                    "bucket.create",
+                    "request-1",
+                )
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

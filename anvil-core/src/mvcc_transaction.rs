@@ -190,7 +190,16 @@ pub struct TransactionBundle {
     pub shard_manifests: Vec<ObjectShardManifestReference>,
     pub outbox_events: Vec<Vec<u8>>,
     pub materialisation_jobs: Vec<Vec<u8>>,
+    #[serde(default)]
+    pub idempotency_results: Vec<IdempotencyResult>,
     pub ownership_claims: Vec<ClusterOwnershipClaim>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct IdempotencyResult {
+    pub namespace: String,
+    pub key: String,
+    pub payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -385,6 +394,21 @@ impl TransactionBundle {
         for encoded_event in &self.outbox_events {
             crate::mvcc_outbox::StreamOutboxEvent::decode(encoded_event)?;
         }
+        self.idempotency_results.sort();
+        ensure_unique_by(
+            self.idempotency_results.iter(),
+            |result| (&result.namespace, &result.key),
+            "idempotency result",
+        )?;
+        if self.idempotency_results.iter().any(|result| {
+            result.namespace.trim().is_empty()
+                || result.key.trim().is_empty()
+                || result.namespace.len() > 128
+                || result.key.len() > 512
+                || result.payload.len() > 1024 * 1024
+        }) {
+            bail!("idempotency result has invalid identity or payload size");
+        }
         self.ownership_claims.sort();
         ensure_unique(self.ownership_claims.iter(), "ownership claim")?;
         if self.ownership_claims != expected_ownership_claims(self)? {
@@ -502,6 +526,7 @@ impl TransactionBundleBuilder {
                 shard_manifests: Vec::new(),
                 outbox_events: Vec::new(),
                 materialisation_jobs: Vec::new(),
+                idempotency_results: Vec::new(),
                 ownership_claims: Vec::new(),
             },
             range_scheme,
@@ -629,6 +654,11 @@ impl TransactionBundleBuilder {
     pub fn add_materialisation_job(&mut self, job: Vec<u8>) -> &mut Self {
         self.claim(payload_resource(&job, false));
         self.bundle.materialisation_jobs.push(job);
+        self
+    }
+
+    pub fn add_idempotency_result(&mut self, result: IdempotencyResult) -> &mut Self {
+        self.bundle.idempotency_results.push(result);
         self
     }
 
@@ -885,6 +915,12 @@ impl TransactionResourceLimits {
             })
             .chain(bundle.outbox_events.iter().map(Vec::len))
             .chain(bundle.materialisation_jobs.iter().map(Vec::len))
+            .chain(
+                bundle
+                    .idempotency_results
+                    .iter()
+                    .map(|result| result.payload.len()),
+            )
             .try_fold(0usize, |total, length| total.checked_add(length))
             .context("transaction raw payload byte count overflow")?;
         for manifest in &bundle.shard_manifests {
@@ -1535,6 +1571,44 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("range observation limit")
+        );
+    }
+
+    #[test]
+    fn idempotency_results_are_canonical_and_identity_unique() {
+        let mut first = TransactionBundleBuilder::new(
+            "cluster",
+            "idempotency",
+            0,
+            "principal",
+            HierarchicalRangeStampScheme::new(),
+        );
+        first
+            .add_idempotency_result(IdempotencyResult {
+                namespace: "service.method".into(),
+                key: "b".into(),
+                payload: b"second".to_vec(),
+            })
+            .add_idempotency_result(IdempotencyResult {
+                namespace: "service.method".into(),
+                key: "a".into(),
+                payload: b"first".to_vec(),
+            });
+        let canonical = first.build().unwrap();
+        assert_eq!(canonical.idempotency_results[0].key, "a");
+
+        let mut duplicate = canonical.clone();
+        duplicate.idempotency_results.push(IdempotencyResult {
+            namespace: "service.method".into(),
+            key: "a".into(),
+            payload: b"different".to_vec(),
+        });
+        assert!(
+            duplicate
+                .canonicalize()
+                .unwrap_err()
+                .to_string()
+                .contains("idempotency result")
         );
     }
 

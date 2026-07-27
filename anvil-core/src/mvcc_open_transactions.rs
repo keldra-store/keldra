@@ -143,6 +143,8 @@ struct DraftMutations {
     manifests: Vec<ObjectShardManifestReference>,
     events: Vec<Vec<u8>>,
     jobs: Vec<Vec<u8>>,
+    #[serde(default)]
+    idempotency_results: Vec<crate::mvcc_transaction::IdempotencyResult>,
 }
 
 pub struct OpenTransactionRegistry {
@@ -480,6 +482,50 @@ impl OpenTransactionRegistry {
         })
     }
 
+    pub fn add_idempotency_result(
+        &self,
+        transaction_id: &str,
+        principal: &str,
+        result: crate::mvcc_transaction::IdempotencyResult,
+        now_unix_ms: u64,
+    ) -> Result<()> {
+        self.mutate_for_principal(transaction_id, principal, now_unix_ms, |draft| {
+            if let Some(existing) = draft
+                .mutations
+                .idempotency_results
+                .iter()
+                .find(|existing| {
+                    existing.namespace == result.namespace && existing.key == result.key
+                })
+            {
+                if existing != &result {
+                    bail!("idempotency result identity was reused with a different payload");
+                }
+                return Ok(());
+            }
+            draft.mutations.idempotency_results.push(result);
+            Ok(())
+        })
+    }
+
+    pub fn resolved_idempotency_result(
+        &self,
+        transaction_id: &str,
+        principal: &str,
+        namespace: &str,
+        key: &str,
+    ) -> Result<Option<crate::mvcc_transaction::IdempotencyResult>> {
+        let draft = self.load_for_principal(transaction_id, principal)?;
+        if !matches!(draft.state, DraftState::Resolved { .. }) {
+            return Ok(None);
+        }
+        Ok(draft
+            .mutations
+            .idempotency_results
+            .into_iter()
+            .find(|result| result.namespace == namespace && result.key == key))
+    }
+
     pub async fn commit(
         &self,
         runtime: &impl TransactionRuntime,
@@ -790,6 +836,7 @@ fn is_read_only_bundle(bundle: &TransactionBundle) -> bool {
         && bundle.shard_manifests.is_empty()
         && bundle.outbox_events.is_empty()
         && bundle.materialisation_jobs.is_empty()
+        && bundle.idempotency_results.is_empty()
 }
 
 fn build_bundle(draft: &Draft) -> Result<TransactionBundle> {
@@ -839,6 +886,9 @@ fn build_bundle(draft: &Draft) -> Result<TransactionBundle> {
     }
     for job in &draft.mutations.jobs {
         builder.add_materialisation_job(job.clone());
+    }
+    for result in &draft.mutations.idempotency_results {
+        builder.add_idempotency_result(result.clone());
     }
     builder.build()
 }
@@ -1032,6 +1082,76 @@ mod tests {
             .await
             .unwrap();
         assert!(registry.active_snapshot_pins(2_005).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn committed_idempotency_result_survives_registry_reopen() {
+        let temp = tempdir().unwrap();
+        let runtime = runtime();
+        let transaction_id = {
+            let registry = OpenTransactionRegistry::open(temp.path()).unwrap();
+            let handle = registry
+                .begin(
+                    &runtime,
+                    "cluster",
+                    "alice",
+                    "durable-result",
+                    Duration::from_secs(30),
+                    DurabilityLevel::Local,
+                    ReadConsistency::LocalSnapshot,
+                    1_000,
+                )
+                .await
+                .unwrap();
+            registry
+                .stage_logical_mutations(
+                    &handle.transaction_id,
+                    "alice",
+                    "cluster",
+                    vec![StagedLogicalMutation {
+                        key: LogicalKey {
+                            table_id: 1,
+                            application_key: b"key".to_vec(),
+                        },
+                        observed_version: None,
+                        value: Some(b"value".to_vec()),
+                    }],
+                    1_001,
+                )
+                .unwrap();
+            registry
+                .add_idempotency_result(
+                    &handle.transaction_id,
+                    "alice",
+                    crate::mvcc_transaction::IdempotencyResult {
+                        namespace: "bucket.create".into(),
+                        key: "request-1".into(),
+                        payload: b"response".to_vec(),
+                    },
+                    1_001,
+                )
+                .unwrap();
+            registry
+                .commit(&runtime, &handle.transaction_id, "alice", 1_002)
+                .await
+                .unwrap();
+            handle.transaction_id
+        };
+
+        let reopened = OpenTransactionRegistry::open(temp.path()).unwrap();
+        assert_eq!(
+            reopened
+                .resolved_idempotency_result(
+                    &transaction_id,
+                    "alice",
+                    "bucket.create",
+                    "request-1",
+                )
+                .unwrap()
+                .unwrap()
+                .payload,
+            b"response"
+        );
     }
 
     #[tokio::test]
