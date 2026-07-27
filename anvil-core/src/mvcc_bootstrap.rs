@@ -650,7 +650,8 @@ impl MvccSubsystem {
                     applied_watermark_report.clone(),
                 );
         let replication_service =
-            ReplicationServiceImpl::open(authorizer, &paths.replication_inbox)?;
+            ReplicationServiceImpl::open(authorizer, &paths.replication_inbox)?
+                .with_prepared_bundles(prepared.clone());
         let remote_nodes = peers
             .iter()
             .filter(|peer| peer.raft_node_id != config.mvcc_raft_node_id)

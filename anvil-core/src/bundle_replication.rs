@@ -236,6 +236,21 @@ impl AppendOnlyPreparedBundleStore {
             .read(identity)
     }
 
+    pub(crate) fn identities(&self) -> Result<Vec<BundleIdentity>> {
+        let log = self
+            .log
+            .lock()
+            .map_err(|_| anyhow::anyhow!("prepared bundle log lock poisoned"))?;
+        Ok(log
+            .index
+            .iter()
+            .map(|(hash, location)| BundleIdentity {
+                hash: hash.clone(),
+                length: location.payload_length,
+            })
+            .collect())
+    }
+
     /// Rewrites the append-only log retaining exactly the bundle identities
     /// authorised by a cluster-wide GC plan.
     ///

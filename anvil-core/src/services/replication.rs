@@ -21,9 +21,10 @@ use crate::{
         replication_stream_request, replication_stream_response,
     },
     replication::{
-        AckStatus, AuthenticatedPeer, ConnectionSession, ReplicationFrame, TransferKind,
-        TransferReceiver,
+        AckStatus, AuthenticatedPeer, CompleteTransferChunk, ConnectionSession, ReplicationFrame,
+        TransferKind, TransferReceiver,
     },
+    replication_client::bundle_transfer_id,
 };
 
 #[async_trait]
@@ -48,6 +49,7 @@ pub trait ReplicationConnectionAuthorizer: Send + Sync + 'static {
 pub struct ReplicationServiceImpl<A> {
     authorizer: Arc<A>,
     receiver: Arc<std::sync::Mutex<TransferReceiver>>,
+    prepared_bundles: Option<crate::bundle_replication::AppendOnlyPreparedBundleStore>,
     #[cfg(test)]
     frame_faults: Option<Arc<std::sync::Mutex<crate::mvcc_fault_injection::FrameFaultPlan>>>,
     #[cfg(test)]
@@ -59,6 +61,7 @@ impl<A> Clone for ReplicationServiceImpl<A> {
         Self {
             authorizer: self.authorizer.clone(),
             receiver: self.receiver.clone(),
+            prepared_bundles: self.prepared_bundles.clone(),
             #[cfg(test)]
             frame_faults: self.frame_faults.clone(),
             #[cfg(test)]
@@ -72,6 +75,7 @@ impl<A: ReplicationConnectionAuthorizer> ReplicationServiceImpl<A> {
         Ok(Self {
             authorizer: Arc::new(authorizer),
             receiver: Arc::new(std::sync::Mutex::new(TransferReceiver::open(directory)?)),
+            prepared_bundles: None,
             #[cfg(test)]
             frame_faults: None,
             #[cfg(test)]
@@ -81,6 +85,14 @@ impl<A: ReplicationConnectionAuthorizer> ReplicationServiceImpl<A> {
 
     pub(crate) fn receiver(&self) -> Arc<std::sync::Mutex<TransferReceiver>> {
         self.receiver.clone()
+    }
+
+    pub(crate) fn with_prepared_bundles(
+        mut self,
+        prepared_bundles: crate::bundle_replication::AppendOnlyPreparedBundleStore,
+    ) -> Self {
+        self.prepared_bundles = Some(prepared_bundles);
+        self
     }
 
     #[cfg(test)]
@@ -364,11 +376,27 @@ impl<A: ReplicationConnectionAuthorizer> ReplicationServiceImpl<A> {
                         }
                     };
                     let receiver = self.receiver.clone();
+                    let prepared_bundles = self.prepared_bundles.clone();
                     let result = tokio::task::spawn_blocking(move || {
-                        receiver
+                        let inbox_result = receiver
                             .lock()
                             .map_err(|_| anyhow::anyhow!("replication receiver lock poisoned"))?
-                            .read_complete_chunk(transfer_id, read.offset, max_bytes)
+                            .read_complete_chunk(transfer_id, read.offset, max_bytes);
+                        match inbox_result {
+                            Ok(chunk) => Ok(chunk),
+                            Err(inbox_error) => {
+                                let Some(prepared_bundles) = prepared_bundles else {
+                                    return Err(inbox_error);
+                                };
+                                read_prepared_bundle_chunk(
+                                    &prepared_bundles,
+                                    transfer_id,
+                                    read.offset,
+                                    max_bytes,
+                                )?
+                                .ok_or(inbox_error)
+                            }
+                        }
                     })
                     .await;
                     let chunk = match result {
@@ -585,6 +613,44 @@ fn encode_ack_status(status: AckStatus) -> ReplicationAckStatus {
     }
 }
 
+fn read_prepared_bundle_chunk(
+    prepared_bundles: &crate::bundle_replication::AppendOnlyPreparedBundleStore,
+    transfer_id: Uuid,
+    offset: u64,
+    max_bytes: usize,
+) -> anyhow::Result<Option<CompleteTransferChunk>> {
+    for identity in prepared_bundles.identities()? {
+        if bundle_transfer_id(&identity)? != transfer_id {
+            continue;
+        }
+        let Some(bytes) = prepared_bundles.read(&identity)? else {
+            continue;
+        };
+        if offset > identity.length {
+            anyhow::bail!("replication read offset exceeds prepared bundle length");
+        }
+        let start =
+            usize::try_from(offset).context("replication read offset exceeds address space")?;
+        let end = start.saturating_add(max_bytes).min(bytes.len());
+        let completed_hash: [u8; 32] = hex::decode(
+            identity
+                .hash
+                .strip_prefix("sha256:")
+                .context("prepared bundle identity must use sha256")?,
+        )?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("prepared bundle hash must contain 32 bytes"))?;
+        return Ok(Some(CompleteTransferChunk {
+            offset,
+            payload: bytes[start..end].to_vec(),
+            total_length: identity.length,
+            completed_hash,
+            finish: end == bytes.len(),
+        }));
+    }
+    Ok(None)
+}
+
 fn response(message: replication_stream_response::Message) -> ReplicationStreamResponse {
     ReplicationStreamResponse {
         message: Some(message),
@@ -602,8 +668,14 @@ async fn send_error(
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use sha2::{Digest, Sha256};
+
     use super::*;
-    use crate::mvcc_fault_injection::{FrameAction, FrameFaultPlan};
+    use crate::{
+        bundle_replication::AppendOnlyPreparedBundleStore,
+        mvcc_fault_injection::{FrameAction, FrameFaultPlan},
+        mvcc_transaction::{BundleIdentity, NodeIncarnation, PreparedBundleStore},
+    };
 
     struct Authorizer {
         calls: Arc<AtomicUsize>,
@@ -651,6 +723,43 @@ mod tests {
             prepared_at_unix_ms: 1,
             provisional: true,
         }
+    }
+
+    #[tokio::test]
+    async fn prepared_bundle_holder_serves_bundle_without_replication_inbox_copy() {
+        let prepared_directory = tempfile::tempdir().unwrap();
+        let prepared = AppendOnlyPreparedBundleStore::open(
+            prepared_directory.path(),
+            "cluster-a",
+            NodeIncarnation {
+                node_id: "node-a".into(),
+                incarnation: 1,
+            },
+            "zone-a",
+        )
+        .unwrap();
+        let bytes = b"coordinator-local-canonical-bundle";
+        let mut hash = Sha256::new();
+        hash.update(b"anvil.mvcc.transaction-bundle.v1");
+        hash.update((bytes.len() as u64).to_be_bytes());
+        hash.update(bytes);
+        let identity = BundleIdentity {
+            hash: format!("sha256:{}", hex::encode(hash.finalize())),
+            length: bytes.len() as u64,
+        };
+        prepared.persist(&identity, bytes).await.unwrap();
+        let transfer_id = bundle_transfer_id(&identity).unwrap();
+
+        let first = read_prepared_bundle_chunk(&prepared, transfer_id, 0, 7)
+            .unwrap()
+            .expect("prepared holder must resolve deterministic transfer identity");
+        assert_eq!(first.payload, &bytes[..7]);
+        assert!(!first.finish);
+        let rest = read_prepared_bundle_chunk(&prepared, transfer_id, 7, bytes.len())
+            .unwrap()
+            .expect("prepared holder must serve subsequent chunks");
+        assert_eq!(rest.payload, &bytes[7..]);
+        assert!(rest.finish);
     }
 
     #[test]

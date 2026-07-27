@@ -315,6 +315,22 @@ impl MvccApplyWorker {
         }
         let transfer_id = bundle_transfer_id(identity)?;
         let expected_hash = parse_hash(&identity.hash)?;
+        if let Some(receiver) = &self.shard_transfers {
+            let max_bytes =
+                usize::try_from(identity.length).context("bundle length exceeds address space")?;
+            let local_transfer = receiver
+                .lock()
+                .map_err(|_| anyhow!("replication receiver lock poisoned"))?
+                .read_complete_chunk(transfer_id, 0, max_bytes);
+            if let Ok(chunk) = local_transfer
+                && chunk.finish
+                && chunk.total_length == identity.length
+                && chunk.completed_hash == expected_hash
+            {
+                self.prepared.persist(identity, &chunk.payload).await?;
+                return Ok(chunk.payload);
+            }
+        }
         let mut failures = Vec::new();
         let peers = durable_peer_candidates(&self.peers, durable_holders);
         if peers.is_empty() {
