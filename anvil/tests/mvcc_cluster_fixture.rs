@@ -200,46 +200,25 @@ async fn public_local_object_returns_locally_then_promotes_and_survives_holder_l
     let actor = bootstrap_actor_on_every_node(&cluster, "local-durability-e2e").await;
     let payload = vec![0x51_u8; 384 * 1024];
 
-    // Upgrade work must execute where the local representation exists. Select
-    // a real committed transaction whose compact-Raft assignment names the
-    // coordinator; non-selected attempts remain valid independent local
-    // objects and exercise the same admission path.
-    let mut selected = None;
-    for attempt in 0..24 {
-        let key = format!("durability/local-{attempt}");
-        let response = public_object_transaction(
-            &cluster,
-            coordinator,
-            &actor,
-            &format!("local-durability-{attempt}"),
-            &key,
-            &payload,
-            anvil::anvil_api::MvccDurability::Local,
-        )
-        .await;
-        assert_eq!(response.state, anvil::anvil_api::WriteState::Committed as i32);
-        assert_eq!(
-            read_public_object(&cluster, coordinator, &actor, &key)
-                .await
-                .unwrap(),
-            payload,
-            "local durability returns with a readable local representation"
-        );
-        let logical_identity = format!("transaction/{}", response.mutation_id);
-        if cluster
-            .state(coordinator)
-            .mvcc
-            .reconcile_work_assignment("local-durability-upgrade", &logical_identity)
+    let object_key = "durability/local".to_string();
+    let response = public_object_transaction(
+        &cluster,
+        coordinator,
+        &actor,
+        "local-durability",
+        &object_key,
+        &payload,
+        anvil::anvil_api::MvccDurability::Local,
+    )
+    .await;
+    assert_eq!(response.state, anvil::anvil_api::WriteState::Committed as i32);
+    assert_eq!(
+        read_public_object(&cluster, coordinator, &actor, &object_key)
             .await
-            .unwrap()
-            .is_some()
-        {
-            selected = Some((key, response.mutation_id));
-            break;
-        }
-    }
-    let (object_key, _transaction_id) =
-        selected.expect("find a local upgrade assigned to its representation holder");
+            .unwrap(),
+        payload,
+        "local durability returns with a readable local representation"
+    );
     let endpoint = cluster.public_endpoint(coordinator).to_string();
     let mut objects =
         anvil::anvil_api::object_service_client::ObjectServiceClient::connect(endpoint)
@@ -283,9 +262,44 @@ async fn public_local_object_returns_locally_then_promotes_and_survives_holder_l
         .into_inner();
     assert_eq!(explicit.promotion_id, automatic.promotion_id);
 
+    let status_node = (coordinator + 1) % 3;
+    let mut remote_status =
+        anvil::anvil_api::object_service_client::ObjectServiceClient::connect(
+            cluster.public_endpoint(status_node).to_string(),
+        )
+        .await
+        .unwrap();
+    let initial_remote_status =
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                if let Ok(response) = remote_status
+                    .get_object_durability_promotion(authorized(
+                        anvil::anvil_api::GetObjectDurabilityPromotionRequest {
+                            bucket_name: actor.bucket_name.clone(),
+                            object_key: object_key.clone(),
+                            version_id: None,
+                        },
+                        &actor.token,
+                    ))
+                    .await
+                {
+                    return response.into_inner();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("non-holder can query promotion status from replicated MVCC state");
+    assert!(
+        matches!(
+            initial_remote_status.state.as_str(),
+            "pending" | "running" | "complete"
+        ),
+        "non-holder returned an invalid promotion state"
+    );
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
-            let status = objects
+            let status = remote_status
                 .get_object_durability_promotion(authorized(
                     anvil::anvil_api::GetObjectDurabilityPromotionRequest {
                         bucket_name: actor.bucket_name.clone(),
@@ -294,10 +308,8 @@ async fn public_local_object_returns_locally_then_promotes_and_survives_holder_l
                     },
                     &actor.token,
                 ))
-                .await
-                .unwrap()
-                .into_inner();
-            if status.state == "complete" {
+                .await;
+            if status.is_ok_and(|response| response.into_inner().state == "complete") {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -319,6 +331,32 @@ async fn public_local_object_returns_locally_then_promotes_and_survives_holder_l
         .filter(|node| *node != coordinator)
         .collect::<Vec<_>>();
     let survivor = cluster.wait_for_any_leader(&survivors).await.unwrap();
+    let mut survivor_objects =
+        anvil::anvil_api::object_service_client::ObjectServiceClient::connect(
+            cluster.public_endpoint(survivor).to_string(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let status = survivor_objects
+                .get_object_durability_promotion(authorized(
+                    anvil::anvil_api::GetObjectDurabilityPromotionRequest {
+                        bucket_name: actor.bucket_name.clone(),
+                        object_key: object_key.clone(),
+                        version_id: None,
+                    },
+                    &actor.token,
+                ))
+                .await;
+            if status.is_ok_and(|response| response.into_inner().state == "complete") {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("surviving node reports replicated promotion completion");
     wait_for_public_object(&cluster, survivor, &actor, &object_key, &payload).await;
 }
 

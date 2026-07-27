@@ -747,6 +747,7 @@ impl MvccSubsystem {
         );
         let upgrade_task = tokio::spawn(upgrade.run(
             self.runtime.local_store().clone(),
+            self.local_node.clone(),
             background_worker_id("local-durability-upgrade", &self.local_node),
             self.apply_shutdown.subscribe(),
         ));

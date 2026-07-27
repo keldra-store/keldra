@@ -271,9 +271,12 @@ pub trait LocalUpgradeManifestPublisher: Send + Sync {
         manifests: &[PhysicalObjectShardManifest],
         evidence: &[ObjectDurabilityEvidence],
     ) -> Result<()>;
+
+    async fn publish_completion(&self, job: &LocalDurabilityUpgradeJob) -> Result<()>;
 }
 
 const LOCAL_UPGRADE_MANIFEST_TABLE_ID: u16 = 0x7f15;
+const LOCAL_UPGRADE_STATUS_TABLE_ID: u16 = 0x7f16;
 
 pub fn resolve_promoted_manifest(
     store: &crate::mvcc_store::LocalMvccStore,
@@ -287,6 +290,17 @@ pub fn resolve_promoted_manifest(
         .read_latest(&key)?
         .map(|row| serde_json::from_slice(&row.value).map_err(Into::into))
         .transpose()
+}
+
+pub fn promotion_complete(
+    store: &crate::mvcc_store::LocalMvccStore,
+    job_id: &str,
+) -> Result<bool> {
+    let key = crate::mvcc_transaction::LogicalKey {
+        table_id: LOCAL_UPGRADE_STATUS_TABLE_ID,
+        application_key: format!("promotion/{job_id}").into_bytes(),
+    };
+    Ok(store.read_latest(&key)?.is_some())
 }
 
 #[async_trait]
@@ -364,6 +378,57 @@ impl LocalUpgradeManifestPublisher for Arc<crate::mvcc_bootstrap::MvccSubsystem>
             crate::mvcc_transaction::CertificationResult::Committed { .. }
         ) {
             bail!("local durability representation publication conflicted");
+        }
+        Ok(())
+    }
+
+    async fn publish_completion(&self, job: &LocalDurabilityUpgradeJob) -> Result<()> {
+        let job_id = job.job_id()?;
+        let principal = format!("local-durability-upgrade/{}", self.local_node.node_id);
+        let now = unix_time_ms()?;
+        let logical_identity = format!("transaction/{}", job.transaction_id);
+        let guard = self
+            .reconcile_work_assignment("local-durability-upgrade", &logical_identity)
+            .await?
+            .context("local durability upgrade is assigned to another node")?;
+        let handle = self
+            .open_transactions
+            .begin(
+                self.runtime.as_ref(),
+                job.cluster_id.clone(),
+                &principal,
+                format!("local-upgrade-complete/{job_id}"),
+                std::time::Duration::from_secs(30),
+                DurabilityLevel::Quorum,
+                crate::mvcc_transaction::ReadConsistency::Linearized,
+                now,
+            )
+            .await?;
+        self.stage_assignment_guard(&handle.transaction_id, &principal, &guard, now)?;
+        self.open_transactions.put(
+            &handle.transaction_id,
+            &job.cluster_id,
+            crate::mvcc_transaction::LogicalKey {
+                table_id: LOCAL_UPGRADE_STATUS_TABLE_ID,
+                application_key: format!("promotion/{job_id}").into_bytes(),
+            },
+            job.commit_version.to_be_bytes().to_vec(),
+            now,
+        )?;
+        let outcome = self
+            .open_transactions
+            .commit(
+                self.runtime.as_ref(),
+                &handle.transaction_id,
+                &principal,
+                unix_time_ms()?,
+            )
+            .await?;
+        if !matches!(
+            outcome.certification,
+            crate::mvcc_transaction::CertificationResult::Committed { .. }
+        ) {
+            bail!("local durability completion publication conflicted");
         }
         Ok(())
     }
@@ -526,7 +591,8 @@ where
 
         // This compact command is the sole consensus action in the workflow.
         self.placement.validate_assignment(&assignment)?;
-        self.consensus.publish_upgrade(job, holders).await
+        self.consensus.publish_upgrade(job, holders).await?;
+        self.manifests.publish_completion(job).await
     }
 
     /// Claims and executes at most one durably persisted job. The caller's
@@ -535,13 +601,24 @@ where
     pub async fn run_once(
         &self,
         store: &crate::mvcc_store::LocalMvccStore,
+        local_node: &NodeIncarnation,
         worker_id: &str,
         now_unix_ms: u64,
         lease_ms: u64,
         retry_after_unix_ms: u64,
     ) -> Result<bool> {
-        let Some((job_id, record)) =
-            store.claim_local_durability_upgrade(worker_id, now_unix_ms, lease_ms)?
+        let Some((job_id, record)) = store.claim_local_durability_upgrade_where(
+            worker_id,
+            now_unix_ms,
+            lease_ms,
+            |record| {
+                record
+                    .job
+                    .objects
+                    .iter()
+                    .all(|object| object.local_manifest.node == *local_node)
+            },
+        )?
         else {
             return Ok(false);
         };
@@ -579,6 +656,7 @@ where
     pub async fn run(
         self,
         store: crate::mvcc_store::LocalMvccStore,
+        local_node: NodeIncarnation,
         worker_id: String,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) {
@@ -588,7 +666,14 @@ where
             }
             let now = unix_time_ms().unwrap_or(1);
             if let Err(error) = self
-                .run_once(&store, &worker_id, now, 30_000, now.saturating_add(1_000))
+                .run_once(
+                    &store,
+                    &local_node,
+                    &worker_id,
+                    now,
+                    30_000,
+                    now.saturating_add(1_000),
+                )
                 .await
             {
                 tracing::warn!(%error, "local durability upgrade attempt will retry");

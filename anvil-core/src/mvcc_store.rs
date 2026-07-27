@@ -189,6 +189,49 @@ impl MvccStore {
         Ok(partitions)
     }
 
+    pub fn pinned_local_upgrade_assignments(
+        &self,
+    ) -> Result<std::collections::BTreeMap<u64, crate::mvcc_transaction::NodeIncarnation>> {
+        let mut assignments = std::collections::BTreeMap::new();
+        let cf = self.cf(CF_MATERIALISATION)?;
+        let prefix = self.key(b"local-upgrade/");
+        for row in self
+            .db
+            .iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward))
+        {
+            let (key, value) = row?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let record: LocalDurabilityUpgradeRecord = serde_json::from_slice(&value)?;
+            if record.state == LocalDurabilityUpgradeState::Complete {
+                continue;
+            }
+            let mut holders = record
+                .job
+                .objects
+                .iter()
+                .map(|object| object.local_manifest.node.clone());
+            let holder = holders
+                .next()
+                .context("local durability upgrade has no local holder")?;
+            if holders.any(|candidate| candidate != holder) {
+                bail!("one local durability upgrade spans multiple holder incarnations");
+            }
+            let partition_id = crate::mvcc_worker_authority::work_partition_id(
+                "local-durability-upgrade",
+                &format!("transaction/{}", record.job.transaction_id),
+            )?;
+            if assignments
+                .insert(partition_id, holder.clone())
+                .is_some_and(|existing| existing != holder)
+            {
+                bail!("local durability upgrade partition names conflicting holders");
+            }
+        }
+        Ok(assignments)
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let mut options = Options::default();
         options.create_if_missing(true);
@@ -882,6 +925,21 @@ impl MvccStore {
         now_unix_ms: u64,
         lease_ms: u64,
     ) -> Result<Option<(String, LocalDurabilityUpgradeRecord)>> {
+        self.claim_local_durability_upgrade_where(
+            worker_id,
+            now_unix_ms,
+            lease_ms,
+            |_| true,
+        )
+    }
+
+    pub fn claim_local_durability_upgrade_where(
+        &self,
+        worker_id: &str,
+        now_unix_ms: u64,
+        lease_ms: u64,
+        eligible: impl Fn(&LocalDurabilityUpgradeRecord) -> bool,
+    ) -> Result<Option<(String, LocalDurabilityUpgradeRecord)>> {
         if worker_id.trim().is_empty() || lease_ms == 0 {
             bail!("durability-upgrade worker and lease must be non-empty");
         }
@@ -897,7 +955,7 @@ impl MvccStore {
                 break;
             }
             let mut record: LocalDurabilityUpgradeRecord = serde_json::from_slice(&value)?;
-            if !record.claimable(now_unix_ms) {
+            if !record.claimable(now_unix_ms) || !eligible(&record) {
                 continue;
             }
             record.state = LocalDurabilityUpgradeState::Running;

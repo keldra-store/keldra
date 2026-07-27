@@ -55,6 +55,7 @@ impl BackgroundAssignmentReconciler {
         }
         self.consensus.linearized_read_barrier().await?;
         let mut required = self.store.required_background_work_partitions()?;
+        let pinned = self.store.pinned_local_upgrade_assignments()?;
         required.insert(
             crate::object_materialisation_runner::object_materialisation_outbox_partition(
                 &self.cluster_id,
@@ -76,13 +77,62 @@ impl BackgroundAssignmentReconciler {
             if !self.consensus.is_leader() {
                 break;
             }
-            changed = changed.saturating_add(usize::from(
+            let reconciled = if let Some(owner) = pinned.get(&partition_id) {
+                reconcile_partition_owner(
+                    &self.cluster_id,
+                    &self.consensus,
+                    partition_id,
+                    anvil_mvcc_consensus::NodeIncarnation {
+                        node_id: crate::mvcc_bootstrap::consensus_control_node_id(&owner.node_id),
+                        incarnation: owner.incarnation,
+                    },
+                )
+                .await?
+            } else {
                 reconcile_partition_assignment(&self.cluster_id, &self.consensus, partition_id)
-                    .await?,
-            ));
+                    .await?
+            };
+            changed = changed.saturating_add(usize::from(reconciled));
         }
         Ok(changed)
     }
+}
+
+async fn reconcile_partition_owner(
+    cluster_id: &str,
+    consensus: &OpenRaftConsensus,
+    partition_id: u64,
+    desired: NodeIncarnation,
+) -> Result<bool> {
+    consensus.linearized_read_barrier().await?;
+    let snapshot = consensus.applied_control_snapshot()?;
+    if !snapshot
+        .nodes
+        .iter()
+        .any(|(node_id, _raft_node_id, incarnation, _failure_domain)| {
+            *node_id == desired.node_id && *incarnation == desired.incarnation
+        })
+    {
+        bail!("local durability holder incarnation is not installed in compact-Raft");
+    }
+    let current = snapshot
+        .partitions
+        .iter()
+        .find(|(candidate, _)| *candidate == partition_id)
+        .map(|(_, assignment)| assignment);
+    if current.is_some_and(|assignment| assignment.owner == desired) {
+        return Ok(false);
+    }
+    let epoch = current
+        .map(|assignment| assignment.epoch.saturating_add(1))
+        .unwrap_or(1);
+    consensus
+        .assign_partition(cluster_id_hash(cluster_id), partition_id, desired, epoch)
+        .await
+        .with_context(|| {
+            format!("pin local durability partition {partition_id} at epoch {epoch}")
+        })?;
+    Ok(true)
 }
 
 /// Reconciles one deterministic compact-Raft partition assignment.

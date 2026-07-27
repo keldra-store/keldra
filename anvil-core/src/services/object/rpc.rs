@@ -65,6 +65,7 @@ fn object_promotion_status(
     object_key: &str,
     version_id: uuid::Uuid,
     record: &crate::mvcc_local_durability_upgrade::LocalDurabilityUpgradeRecord,
+    replicated_complete: bool,
 ) -> ObjectDurabilityPromotionStatus {
     use crate::mvcc_local_durability_upgrade::LocalDurabilityUpgradeState;
 
@@ -73,10 +74,14 @@ fn object_promotion_status(
         crate::mvcc_transaction::DurabilityLevel::Quorum => MvccDurability::Quorum,
         crate::mvcc_transaction::DurabilityLevel::Erasure => MvccDurability::Erasure,
     };
-    let state = match record.state {
-        LocalDurabilityUpgradeState::Pending => "pending",
-        LocalDurabilityUpgradeState::Running => "running",
-        LocalDurabilityUpgradeState::Complete => "complete",
+    let state = if replicated_complete {
+        "complete"
+    } else {
+        match record.state {
+            LocalDurabilityUpgradeState::Pending => "pending",
+            LocalDurabilityUpgradeState::Running => "running",
+            LocalDurabilityUpgradeState::Complete => "complete",
+        }
     };
     ObjectDurabilityPromotionStatus {
         request_id,
@@ -483,6 +488,11 @@ impl ObjectService for AppState {
             .request_local_durability_upgrade_for_object(&manifest.object_hash, requested)
             .map_err(|error| Status::failed_precondition(error.to_string()))?
             .ok_or_else(|| Status::failed_precondition("ObjectDurabilityPromotionIntentMissing"))?;
+        let replicated_complete = crate::mvcc_local_durability_upgrade::promotion_complete(
+            self.mvcc.runtime.local_store(),
+            &promotion_id,
+        )
+        .map_err(|error| Status::internal(error.to_string()))?;
         Ok(Response::new(object_promotion_status(
             request_id,
             promotion_id,
@@ -490,6 +500,7 @@ impl ObjectService for AppState {
             &req.object_key,
             object.version_id,
             &record,
+            replicated_complete,
         )))
     }
 
@@ -525,6 +536,11 @@ impl ObjectService for AppState {
             .local_durability_upgrade_for_object(&manifest.object_hash)
             .map_err(|error| Status::internal(error.to_string()))?
             .ok_or_else(|| Status::not_found("ObjectDurabilityPromotionNotFound"))?;
+        let replicated_complete = crate::mvcc_local_durability_upgrade::promotion_complete(
+            self.mvcc.runtime.local_store(),
+            &promotion_id,
+        )
+        .map_err(|error| Status::internal(error.to_string()))?;
         Ok(Response::new(object_promotion_status(
             request_id,
             promotion_id,
@@ -532,6 +548,7 @@ impl ObjectService for AppState {
             &req.object_key,
             object.version_id,
             &record,
+            replicated_complete,
         )))
     }
 
