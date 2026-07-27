@@ -8,8 +8,7 @@ use crate::{
     error_codes::AnvilErrorCode,
     formats::{Hash32, hash32, personaldb::PersonalDbLogRecord as CorePersonalDbLogRecord},
     partition_fence::{
-        PartitionOwnerStatus, PartitionRecoveryAcquire, PartitionWritePermit,
-        acquire_partition_recovery, publish_partition_ready, read_partition_owner,
+        PartitionWritePermit, read_partition_owner,
     },
     permissions::AnvilAction,
     personaldb_catchup::{
@@ -90,6 +89,21 @@ struct PersonalDbCommitActor {
     require_admission_protocol: bool,
 }
 
+impl PersonalDbCommitActor {
+    fn public(tenant_id: i64, principal: String, bearer_token: String) -> Self {
+        Self {
+            tenant_id,
+            principal,
+            bearer_token: Some(bearer_token),
+            require_public_commit_authorization: true,
+            // Cluster MVCC certification and compact-Raft assignment are the
+            // write authority. The retired proposal reservation/witness
+            // protocol must not run on public submissions.
+            require_admission_protocol: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CommittedPersonalDbChangeset {
     log_index: u64,
@@ -156,10 +170,9 @@ impl PersonalDbService for AppState {
         {
             return Err(Status::already_exists("PersonalDB group already exists"));
         }
-        self.persistence
-            .ensure_personaldb_group_ownership_fence(claims.tenant_id, &req.database_id)
-            .await
-            .map_err(personaldb_ownership_status)?;
+        let _write_permit = self
+            .personaldb_assignment_write_permit(claims.tenant_id, &req.database_id)
+            .await?;
 
         let now = now_rfc3339();
         let manifest = PersonalDbGroupManifest {
@@ -440,13 +453,8 @@ impl PersonalDbService for AppState {
         validate_claim_tenant(claims.tenant_id, req.tenant_id)?;
         validate_database_id(&req.database_id)?;
         let core_request = core_submit_request(req)?;
-        let actor = PersonalDbCommitActor {
-            tenant_id: claims.tenant_id,
-            principal: claims.sub.clone(),
-            bearer_token: Some(bearer_token),
-            require_public_commit_authorization: true,
-            require_admission_protocol: true,
-        };
+        let actor =
+            PersonalDbCommitActor::public(claims.tenant_id, claims.sub.clone(), bearer_token);
         let projection_definitions = list_projection_definitions_for_database(
             &self.storage,
             &self.mvcc,
@@ -704,54 +712,35 @@ impl AppState {
         &self,
         tenant_id: i64,
         database_id: &str,
-        recovered_through_sequence: u64,
+        _recovered_through_sequence: u64,
         recovered_manifest_hash: &str,
     ) -> Result<PartitionWritePermit, Status> {
         validate_hex32(recovered_manifest_hash, "recovered_manifest_hash")?;
-        self.persistence
-            .ensure_personaldb_group_ownership_fence(tenant_id, database_id)
+        self.personaldb_assignment_write_permit(tenant_id, database_id)
             .await
-            .map_err(personaldb_ownership_status)?;
-        let partition_family = personaldb_group_partition_family().to_string();
-        let partition_id = personaldb_group_partition_id(tenant_id, database_id);
-        let owner_node_id = self.personaldb_node_id();
-        let now_nanos = chrono::Utc::now()
-            .timestamp_nanos_opt()
-            .ok_or_else(|| Status::internal("partition owner timestamp overflow"))?;
-        let recovering = acquire_partition_recovery(
-            &self.storage,
-            PartitionRecoveryAcquire {
-                partition_family: partition_family.clone(),
-                partition_id: partition_id.clone(),
-                owner_node_id: owner_node_id.clone(),
-                recovered_through_sequence,
-                recovered_manifest_hash: recovered_manifest_hash.to_string(),
-                now_nanos,
-            },
-            self.persistence.partition_owner_signing_key(),
-        )
-        .await
-        .map_err(internal_status)?;
-        if recovering.status == PartitionOwnerStatus::Ready {
-            return recovering.write_permit().map_err(|err| {
-                Status::failed_precondition(format!("PersonalDB partition is not writable: {err}"))
-            });
-        }
-        let ready = publish_partition_ready(
-            &self.storage,
-            &partition_family,
-            &partition_id,
-            &owner_node_id,
-            recovering.fence_token,
-            recovered_through_sequence,
-            recovered_manifest_hash,
-            now_nanos.saturating_add(1),
-            self.persistence.partition_owner_signing_key(),
-        )
-        .await
-        .map_err(internal_status)?;
-        ready.write_permit().map_err(|err| {
-            Status::failed_precondition(format!("PersonalDB partition is not writable: {err}"))
+    }
+
+    async fn personaldb_assignment_write_permit(
+        &self,
+        tenant_id: i64,
+        database_id: &str,
+    ) -> Result<PartitionWritePermit, Status> {
+        let logical_identity = format!("tenant/{tenant_id}/personaldb/{database_id}");
+        let guard = self
+            .mvcc
+            .reconcile_work_assignment("personaldb-write", &logical_identity)
+            .await
+            .map_err(internal_status)?
+            .ok_or_else(|| {
+                Status::failed_precondition(
+                    "PersonalDB write is assigned to another cluster node",
+                )
+            })?;
+        Ok(PartitionWritePermit {
+            partition_family: "personaldb-write".to_string(),
+            partition_id: guard.partition_id.to_string(),
+            owner_node_id: guard.owner.node_id,
+            fence_token: guard.assignment_epoch,
         })
     }
 

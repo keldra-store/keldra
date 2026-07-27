@@ -2,6 +2,13 @@ use super::*;
 use crate::formats::hash32;
 
 #[test]
+fn public_commits_use_mvcc_assignment_without_legacy_witness_admission() {
+    let actor = PersonalDbCommitActor::public(7, "app".into(), "token".into());
+    assert!(actor.require_public_commit_authorization);
+    assert!(!actor.require_admission_protocol);
+}
+
+#[test]
 fn watch_cursor_split_round_trips() {
     let value = (37u128 << 64) | 99;
     let (low, high) = split_u128(value);
