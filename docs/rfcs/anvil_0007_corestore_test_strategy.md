@@ -1,11 +1,15 @@
 # ANVIL-0007: CoreStore Test Strategy
 
-Status: Draft for implementation
+Status: Superseded by `docs/rfcs/mvcc_under_raft.md`
 Audience: Anvil implementors, reviewers, release engineers
 Scope: correctness testing for CoreStore roots, generations, metadata
 replication, erasure-coded byte replication, explicit transactions, and recovery
 
-Related RFC: `docs/rfcs/anvil_0007_corestore_unified_storage_manifest.md`
+Historical RFC: `docs/rfcs/anvil_0007_corestore_unified_storage_manifest.md`
+
+This strategy describes the discarded root-anchor, landed-bytes, and CoreMeta
+quorum-certificate architecture. It is not an acceptance suite for the active
+implementation.
 
 ## 0. Decision
 

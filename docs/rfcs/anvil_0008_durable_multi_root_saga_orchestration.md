@@ -1,10 +1,13 @@
 # ANVIL-0008: Durable Multi-Root Saga Orchestration
 
-Status: Draft for implementation  
+Status: Superseded by `docs/rfcs/mvcc_under_raft.md`
 Normative dependency incorporated by reference: ANVIL-0007  
 Supersedes: ANVIL-0007 for combined ANVIL-0008 conformance; ANVIL-0008 prevails on conflict  
 Audience: Anvil implementors, operators, SDK authors, storage engineers, and API designers  
 Scope: Durable saga construction, execution, compensation, recovery, reference retention, scheduling, observability, and integration with CoreStore
+
+Cluster-local MVCC transactions remove the root boundary that motivated this
+compensating-SAGA design. This document is retained only as historical context.
 
 ## 1. Summary
 
@@ -3578,4 +3581,3 @@ PR:
     it?
 13. Does the native service descriptor coverage test recognise the new method?
 14. Does terminal cleanup leave zero saga-owned strong references?
-
