@@ -70,12 +70,15 @@ async fn upload_part_with_context(
 
 #[tokio::test]
 async fn implicit_native_retries_reconstruct_results_and_reject_changed_inputs_across_nodes() {
-    let cluster = isolated_test_cluster_with_config(
+    let mut cluster = isolated_test_cluster_with_config(
         "native retry must cross coordinators in a three-node quorum cluster",
         &["test-region-1", "test-region-1", "test-region-1"],
         |config| config.mvcc_default_durability = "quorum".to_string(),
     )
     .await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
     let actor = create_object_test_actor(
         &cluster,
         "implicit-native-retries-reconstruct-results-across-nodes",
@@ -246,12 +249,15 @@ async fn implicit_native_retries_reconstruct_results_and_reject_changed_inputs_a
 
 #[tokio::test]
 async fn multipart_and_append_payloads_round_trip_from_mvcc_representations() {
-    let cluster = isolated_test_cluster_with_config(
+    let mut cluster = isolated_test_cluster_with_config(
         "native payload representations must round-trip from erasure shards",
         &["test-region-1", "test-region-1", "test-region-1"],
         |config| config.mvcc_default_durability = "erasure".to_string(),
     )
     .await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
     let actor = create_object_test_actor(
         &cluster,
         "multipart-and-append-payloads-round-trip-from-mvcc",
