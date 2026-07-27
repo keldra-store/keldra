@@ -3080,6 +3080,8 @@ mod tests {
         store
             .apply_certified_bundle(5, &bundle("advance-hf", |_| {}))
             .unwrap();
+        drop(store);
+        let store = MvccStore::open(temp.path()).unwrap();
 
         let expected_partition = crate::mvcc_worker_authority::work_partition_id(
             "hf-ingestion-postcommit",

@@ -409,7 +409,7 @@ pub(super) fn projection_plan(
     let mut predicates = Vec::with_capacity(desired.len());
     for (tuple_key, value) in desired {
         let key = logical_key(&tuple_key)?;
-        let observed = mvcc.read_transaction_value(transaction_id, principal, &key)?;
+        let observed = mvcc.read_latest_value(&key)?;
         predicates.push((
             key.clone(),
             observed
@@ -760,6 +760,33 @@ fn read_key_transaction(
         .as_deref()
         .map(read_key_payload)
         .transpose()
+}
+
+pub(super) fn get_key_by_name_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    tenant_id: i64,
+    name: &str,
+) -> Result<Option<HfKey>> {
+    read_key_transaction(
+        mvcc,
+        transaction_id,
+        principal,
+        &key_name_key(tenant_id, name)?,
+    )
+}
+
+pub(super) fn get_ingestion_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    id: i64,
+) -> Result<Option<HfIngestion>> {
+    Ok(
+        read_status_projection_transaction(mvcc, transaction_id, principal, id)?
+            .map(|status| status.ingestion),
+    )
 }
 
 fn read_item_transaction(
