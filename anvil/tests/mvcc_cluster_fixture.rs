@@ -13,33 +13,137 @@ use anvil::{
     streaming_erasure::ErasureProfile,
 };
 use anvil_test_utils::mvcc_cluster::RealMvccCluster;
+use tonic::Request;
+
+fn authorized<T>(message: T, token: &str) -> Request<T> {
+    let mut request = Request::new(message);
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {token}").parse().unwrap(),
+    );
+    request
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn real_cluster_quorum_commit_is_readable_after_node_restart() {
     let mut cluster = RealMvccCluster::start().await.unwrap();
     let leader = cluster.wait_for_any_leader(&[0, 1, 2]).await.unwrap();
-    let key = LogicalKey {
-        table_id: 1,
-        application_key: b"fixture/smoke".to_vec(),
-    };
-    let outcome = cluster
-        .commit(leader, "fixture-smoke", key.clone(), b"value".to_vec())
+    let actor = cluster
+        .bootstrap_public_actor(leader, "fixture-public-bucket")
         .await
         .unwrap();
-    let commit_version = match outcome.certification {
-        CertificationResult::Committed { commit_version } => commit_version,
-        CertificationResult::Aborted { reason } => panic!("fixture smoke aborted: {reason:?}"),
-    };
+    let endpoint = cluster.public_endpoint(leader).to_string();
+    let cluster_id = cluster.state(leader).mvcc.cluster_id().to_string();
+    let mut transactions =
+        anvil::anvil_api::transaction_service_client::TransactionServiceClient::connect(
+            endpoint.clone(),
+        )
+        .await
+        .unwrap();
+    let foreign = transactions
+        .begin_transaction(authorized(
+            anvil::anvil_api::BeginTransactionRequest {
+                idempotency_key: "fixture-foreign-cluster".into(),
+                ttl_ms: 30_000,
+                read_consistency: anvil::anvil_api::MvccReadConsistency::Linearized as i32,
+                cluster_id: "different-cluster".into(),
+                durability: anvil::anvil_api::MvccDurability::Quorum as i32,
+            },
+            &actor.token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(foreign.code(), tonic::Code::FailedPrecondition);
+    let transaction = transactions
+        .begin_transaction(authorized(
+            anvil::anvil_api::BeginTransactionRequest {
+                idempotency_key: "fixture-public-transaction".into(),
+                ttl_ms: 30_000,
+                read_consistency: anvil::anvil_api::MvccReadConsistency::Linearized as i32,
+                cluster_id: cluster_id.clone(),
+                durability: anvil::anvil_api::MvccDurability::Quorum as i32,
+            },
+            &actor.token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut objects =
+        anvil::anvil_api::object_service_client::ObjectServiceClient::connect(endpoint.clone())
+            .await
+            .unwrap();
+    objects
+        .mutation_batch(authorized(
+            anvil::anvil_api::MutationBatchRequest {
+                bucket_name: actor.bucket_name.clone(),
+                mutation_context: Some(anvil::anvil_api::NativeMutationContext {
+                    tenant_id: actor.tenant_id,
+                    bucket_id: actor.bucket_id,
+                    principal: actor.principal.clone(),
+                    request_id: "fixture-public-write".into(),
+                    precondition: String::new(),
+                    authz_zookie_optional: String::new(),
+                    idempotency_key: "fixture-public-write".into(),
+                    transaction_id: Some(transaction.transaction_id.clone()),
+                    write_visibility: None,
+                }),
+                precondition: None,
+                operations: vec![anvil::anvil_api::MutationBatchOperation {
+                    op: Some(
+                        anvil::anvil_api::mutation_batch_operation::Op::PutObject(
+                            anvil::anvil_api::MutationBatchPutObject {
+                                object_key: "fixture/smoke".into(),
+                                payload: b"value".to_vec(),
+                                content_type: Some("application/octet-stream".into()),
+                                user_metadata_json: "{}".into(),
+                                storage_class: None,
+                            },
+                        ),
+                    ),
+                }],
+            },
+            &actor.token,
+        ))
+        .await
+        .unwrap();
+    transactions
+        .commit_transaction(authorized(
+            anvil::anvil_api::CommitTransactionRequest {
+                transaction_id: transaction.transaction_id,
+                cluster_id,
+            },
+            &actor.token,
+        ))
+        .await
+        .unwrap();
 
     cluster.restart_node(leader).await.unwrap();
-    let row = cluster
-        .state(leader)
-        .mvcc
-        .runtime
-        .read_at(&key, commit_version)
+    let mut objects = anvil::anvil_api::object_service_client::ObjectServiceClient::connect(
+        cluster.public_endpoint(leader).to_string(),
+    )
+    .await
+    .unwrap();
+    let mut response = objects
+        .get_object(authorized(
+            anvil::anvil_api::GetObjectRequest {
+                bucket_name: actor.bucket_name,
+                object_key: "fixture/smoke".into(),
+                version_id: None,
+                range: None,
+                consistency: anvil::anvil_api::ReadConsistency::Linearized as i32,
+            },
+            &actor.token,
+        ))
+        .await
         .unwrap()
-        .expect("committed row remains readable after restart");
-    assert_eq!(row.value, b"value");
+        .into_inner();
+    let mut bytes = Vec::new();
+    while let Some(frame) = response.message().await.unwrap() {
+        if let Some(anvil::anvil_api::get_object_response::Data::Chunk(chunk)) = frame.data {
+            bytes.extend(chunk);
+        }
+    }
+    assert_eq!(bytes, b"value");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]

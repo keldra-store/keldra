@@ -27,8 +27,18 @@ pub struct RealMvccCluster {
     _directories: Vec<TempDir>,
     configs: Vec<Config>,
     endpoints: Vec<String>,
+    public_endpoints: Vec<String>,
     states: Vec<Option<Arc<AppState>>>,
     transports: Vec<Option<JoinHandle<()>>>,
+    public_transports: Vec<Option<JoinHandle<()>>>,
+}
+
+pub struct PublicActor {
+    pub tenant_id: i64,
+    pub bucket_id: i64,
+    pub bucket_name: String,
+    pub principal: String,
+    pub token: String,
 }
 
 impl RealMvccCluster {
@@ -44,7 +54,15 @@ impl RealMvccCluster {
         for _ in 0..3 {
             listeners.push(TcpListener::bind("127.0.0.1:0").await?);
         }
+        let mut public_listeners = Vec::new();
+        for _ in 0..3 {
+            public_listeners.push(TcpListener::bind("127.0.0.1:0").await?);
+        }
         let endpoints = listeners
+            .iter()
+            .map(|listener| format!("http://{}", listener.local_addr().unwrap()))
+            .collect::<Vec<_>>();
+        let public_endpoints = public_listeners
             .iter()
             .map(|listener| format!("http://{}", listener.local_addr().unwrap()))
             .collect::<Vec<_>>();
@@ -98,8 +116,10 @@ impl RealMvccCluster {
             })
             .collect::<Vec<_>>();
         let mut listeners = listeners.into_iter().map(Some).collect::<Vec<_>>();
+        let mut public_listeners = public_listeners.into_iter().map(Some).collect::<Vec<_>>();
         let mut states = vec![None, None, None];
         let mut transports = vec![None, None, None];
+        let mut public_transports = vec![None, None, None];
         // Followers must be accepting consensus RPCs before the bootstrap
         // voter installs the three-node membership and initial control state.
         // Constructing node zero first deadlocks its quorum proposals against
@@ -116,14 +136,22 @@ impl RealMvccCluster {
                 listeners[index].take().expect("listener started once"),
                 &state,
             ));
+            public_transports[index] = Some(spawn_public_api(
+                public_listeners[index]
+                    .take()
+                    .expect("public listener started once"),
+                &state,
+            ));
             states[index] = Some(state);
         }
         let cluster = Self {
             _directories: directories,
             configs,
             endpoints,
+            public_endpoints,
             states,
             transports,
+            public_transports,
         };
         cluster.wait_for_any_leader(&[0, 1, 2]).await?;
         cluster.wait_for_system_realm().await?;
@@ -138,6 +166,10 @@ impl RealMvccCluster {
 
     pub fn endpoint(&self, node: usize) -> &str {
         &self.endpoints[node]
+    }
+
+    pub fn public_endpoint(&self, node: usize) -> &str {
+        &self.public_endpoints[node]
     }
 
     pub fn node_index(&self, node_id: &str) -> Option<usize> {
@@ -172,11 +204,18 @@ impl RealMvccCluster {
         if let Some(transport) = self.transports[node].take() {
             transport.abort();
         }
+        if let Some(transport) = self.public_transports[node].take() {
+            transport.abort();
+        }
     }
 
     /// Reopens the node from the same RocksDB directory and network identity.
     pub async fn restart_node(&mut self, node: usize) -> anyhow::Result<()> {
         if let Some(transport) = self.transports[node].take() {
+            transport.abort();
+            let _ = transport.await;
+        }
+        if let Some(transport) = self.public_transports[node].take() {
             transport.abort();
             let _ = transport.await;
         }
@@ -196,6 +235,9 @@ impl RealMvccCluster {
         let listener =
             TcpListener::bind(self.endpoints[node].trim_start_matches("http://")).await?;
         self.transports[node] = Some(spawn_transport(listener, &state));
+        let public_listener =
+            TcpListener::bind(self.public_endpoints[node].trim_start_matches("http://")).await?;
+        self.public_transports[node] = Some(spawn_public_api(public_listener, &state));
         self.states[node] = Some(state);
         Ok(())
     }
@@ -219,6 +261,53 @@ impl RealMvccCluster {
             }
         })
         .await?)
+    }
+
+    pub async fn bootstrap_public_actor(
+        &self,
+        node: usize,
+        bucket_name: &str,
+    ) -> anyhow::Result<PublicActor> {
+        let state = self.state(node);
+        state.persistence.create_region("e2e-region").await?;
+        let tenant = state
+            .persistence
+            .create_tenant("e2e-tenant", "e2e-tenant-key")
+            .await?;
+        let encrypted_secret = state.secret_keyring.encrypt(b"e2e-app-secret")?;
+        let app = state
+            .persistence
+            .create_app(
+                tenant.id,
+                "e2e-app",
+                "e2e-app",
+                &encrypted_secret,
+                None,
+                None,
+            )
+            .await?;
+        anvil_core::access_control::grant_storage_tenant_owner(
+            &state.persistence,
+            tenant.id,
+            &app.id.to_string(),
+            "e2e-fixture",
+            "grant fixture actor storage ownership",
+        )
+        .await?;
+        let bucket = state
+            .persistence
+            .create_bucket(tenant.id, bucket_name, "e2e-region")
+            .await?;
+        let token = state
+            .jwt_manager
+            .mint_token(app.id.to_string(), tenant.id)?;
+        Ok(PublicActor {
+            tenant_id: tenant.id,
+            bucket_id: bucket.id,
+            bucket_name: bucket.name,
+            principal: app.id.to_string(),
+            token,
+        })
     }
 
     pub async fn wait_for_applied_version(&self, node: usize, version: u64) -> anyhow::Result<()> {
@@ -306,9 +395,28 @@ fn spawn_transport(listener: TcpListener, state: &Arc<AppState>) -> JoinHandle<(
     })
 }
 
+fn spawn_public_api(listener: TcpListener, state: &Arc<AppState>) -> JoinHandle<()> {
+    let app_state = state.as_ref().clone();
+    let auth_state = app_state.clone();
+    let interceptor = anvil_core::services::AuthInterceptorFn::new(move |request| {
+        anvil_core::middleware::auth_interceptor(request, &auth_state)
+    });
+    let routes = anvil_core::services::create_grpc_router(app_state, interceptor);
+    tokio::spawn(async move {
+        Server::builder()
+            .add_routes(routes)
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .expect("real MVCC fixture public API");
+    })
+}
+
 impl Drop for RealMvccCluster {
     fn drop(&mut self) {
         for transport in self.transports.iter_mut().flatten() {
+            transport.abort();
+        }
+        for transport in self.public_transports.iter_mut().flatten() {
             transport.abort();
         }
     }
