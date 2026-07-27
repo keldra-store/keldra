@@ -488,6 +488,7 @@ async fn tenant_can_create_and_rotate_own_app_secret() {
         app_name: app_name.clone(),
         request_id: format!("create-{app_name}"),
         idempotency_key: uuid::Uuid::new_v4().to_string(),
+        options: None,
     });
     add_bearer(&mut create, &token);
     let created = auth_client
@@ -516,6 +517,7 @@ async fn tenant_can_create_and_rotate_own_app_secret() {
         app_name: app_name.clone(),
         request_id: format!("rotate-{app_name}"),
         idempotency_key: uuid::Uuid::new_v4().to_string(),
+        options: None,
     });
     add_bearer(&mut rotate, &token);
     let rotated = auth_client
@@ -545,6 +547,7 @@ async fn tenant_can_create_and_rotate_own_app_secret() {
         app_name,
         request_id: "delete-tenant-managed-app".to_string(),
         idempotency_key: uuid::Uuid::new_v4().to_string(),
+        options: None,
     });
     add_bearer(&mut delete, &token);
     auth_client
@@ -567,6 +570,7 @@ async fn tenant_cannot_manage_other_tenant_app_secret() {
         app_name: tenant_one_app.clone(),
         request_id: format!("create-{tenant_one_app}"),
         idempotency_key: uuid::Uuid::new_v4().to_string(),
+        options: None,
     });
     add_bearer(&mut create, &token);
     auth_client
@@ -589,6 +593,7 @@ async fn tenant_cannot_manage_other_tenant_app_secret() {
         app_name: tenant_one_app,
         request_id: "rotate-other-tenant-app".to_string(),
         idempotency_key: uuid::Uuid::new_v4().to_string(),
+        options: None,
     });
     add_bearer(&mut rotate, &tenant_b.token);
     let denied = auth_client
@@ -826,6 +831,7 @@ async fn tenant_audit_page_token_cannot_be_reused_by_other_tenant() {
             app_name: app_name.clone(),
             request_id: format!("create-{app_name}"),
             idempotency_key: uuid::Uuid::new_v4().to_string(),
+            options: None,
         });
         add_bearer(&mut create, &token);
         auth_client

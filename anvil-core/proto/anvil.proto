@@ -337,6 +337,7 @@ message ApplicationSecretResponse {
   string client_secret = 5;
   string audit_event_id = 6;
   string app_id = 7;
+  WriteState write_state = 8;
 }
 
 message GrantApplicationPolicyRequest {
@@ -2661,23 +2662,27 @@ message CreateApplicationCredentialRequest {
   string app_name = 1;
   string request_id = 2;
   string idempotency_key = 3;
+  WriteOptions options = 4;
 }
 
 message RotateApplicationCredentialSecretRequest {
   string app_name = 1;
   string request_id = 2;
   string idempotency_key = 3;
+  WriteOptions options = 4;
 }
 
 message DeleteApplicationCredentialRequest {
   string app_name = 1;
   string request_id = 2;
   string idempotency_key = 3;
+  WriteOptions options = 4;
 }
 
 message DeleteApplicationCredentialResponse {
   string request_id = 1;
   string app_id = 2;
+  WriteState write_state = 3;
 }
 
 message ListApplicationsRequest { PageRequest page = 1; }

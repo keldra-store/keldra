@@ -121,6 +121,7 @@ impl AdminService for AppState {
             client_secret,
             audit_event_id,
             app_id: app.id.to_string(),
+            write_state: WriteState::Committed as i32,
         }))
     }
 
@@ -166,6 +167,7 @@ impl AdminService for AppState {
             client_secret,
             audit_event_id,
             app_id: app.id.to_string(),
+            write_state: WriteState::Committed as i32,
         }))
     }
 

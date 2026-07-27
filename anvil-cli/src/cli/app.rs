@@ -30,6 +30,7 @@ pub async fn handle_app_command(command: &AppCommands, ctx: &Context) -> anyhow:
                 app_name: app_name.clone(),
                 request_id: format!("app-create-{}", uuid::Uuid::new_v4()),
                 idempotency_key: uuid::Uuid::new_v4().to_string(),
+                options: None,
             });
             add_auth(&mut request, &token);
             let response = client
@@ -46,6 +47,7 @@ pub async fn handle_app_command(command: &AppCommands, ctx: &Context) -> anyhow:
                 app_name: app_name.clone(),
                 request_id: format!("app-rotate-{}", uuid::Uuid::new_v4()),
                 idempotency_key: uuid::Uuid::new_v4().to_string(),
+                options: None,
             });
             add_auth(&mut request, &token);
             let response = client
@@ -62,6 +64,7 @@ pub async fn handle_app_command(command: &AppCommands, ctx: &Context) -> anyhow:
                 app_name: app_name.clone(),
                 request_id: format!("app-delete-{}", uuid::Uuid::new_v4()),
                 idempotency_key: uuid::Uuid::new_v4().to_string(),
+                options: None,
             });
             add_auth(&mut request, &token);
             let response = client

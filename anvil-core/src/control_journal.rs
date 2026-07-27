@@ -75,6 +75,13 @@ struct StoredControlApp {
     client_secret_encrypted: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TransactionAppDetails {
+    pub app: App,
+    pub tenant_id: i64,
+    pub client_secret_encrypted: Vec<u8>,
+}
+
 mod current;
 
 pub use current::{CurrentAppPage, CurrentRegionPage, CurrentTenantPage};
@@ -583,6 +590,398 @@ fn read_control_current_mvcc(
         .as_deref()
         .map(decode_control_current_row)
         .transpose()
+}
+
+fn read_control_current_in_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    tuple_key: &[u8],
+) -> Result<Option<ControlCurrentRecord>> {
+    let key =
+        crate::mvcc_product::coremeta_logical_key(CF_MESH, TABLE_CONTROL_CURRENT_ROW, tuple_key)?;
+    mvcc.read_transaction_value(transaction_id, principal, &key)?
+        .as_deref()
+        .map(decode_control_current_row)
+        .transpose()
+}
+
+pub(crate) fn read_app_by_tenant_name_in_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    tenant_id: i64,
+    name: &str,
+) -> Result<Option<TransactionAppDetails>> {
+    match read_control_current_in_transaction(
+        mvcc,
+        transaction_id,
+        principal,
+        &app_tenant_name_tuple_key(tenant_id, name)?,
+    )? {
+        Some(ControlCurrentRecord::App {
+            id,
+            tenant_id: stored_tenant_id,
+            name: stored_name,
+            client_id,
+            client_secret_encrypted,
+            active: true,
+        }) if stored_tenant_id == tenant_id && stored_name == name => {
+            Ok(Some(TransactionAppDetails {
+                app: App {
+                    id,
+                    name: stored_name,
+                    client_id,
+                },
+                tenant_id: stored_tenant_id,
+                client_secret_encrypted,
+            }))
+        }
+        Some(ControlCurrentRecord::App { active: false, .. }) | None => Ok(None),
+        Some(ControlCurrentRecord::App { .. }) => {
+            bail!("control tenant-app row does not match its key")
+        }
+        Some(_) => bail!("control tenant-app row contains a different record type"),
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ControlAppMutationPlan {
+    pub app: App,
+    mutations: Vec<crate::mvcc_product::ProductMutation>,
+    predicates: Vec<(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )>,
+    outbox_events: Vec<crate::mvcc_outbox::StreamOutboxEvent>,
+}
+
+impl ControlAppMutationPlan {
+    pub(crate) async fn stage(
+        self,
+        mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+        transaction_id: &str,
+        principal: &str,
+        now_unix_ms: u64,
+    ) -> Result<App> {
+        mvcc.stage_product_mutations(
+            transaction_id,
+            principal,
+            self.mutations,
+            now_unix_ms,
+        )?;
+        for (key, predicate) in self.predicates {
+            mvcc.stage_predicate(transaction_id, principal, key, predicate, now_unix_ms)?;
+        }
+        for event in self.outbox_events {
+            mvcc.open_transactions
+                .add_stream_event(transaction_id, event, now_unix_ms)?;
+        }
+        let assignment = mvcc
+            .reconcile_work_assignment("control-plane", mvcc.cluster_id())
+            .await?
+            .ok_or_else(|| anyhow!("this node does not own the cluster control-plane assignment"))?;
+        mvcc.stage_assignment_guard(transaction_id, principal, &assignment, now_unix_ms)?;
+        Ok(self.app)
+    }
+}
+
+fn deterministic_control_mutation_id(transaction_id: &str, operation: &str) -> uuid::Uuid {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"anvil.control.transaction-mutation.v1");
+    hasher.update(transaction_id.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(operation.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    uuid::Uuid::from_bytes(bytes)
+}
+
+fn plan_control_app_mutation(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    event: ControlEventBody,
+    mut current_updates: Vec<ControlCurrentRecord>,
+    audit_event: Option<&crate::tenant_audit::TenantAuditEvent>,
+    app: App,
+    operation: &str,
+) -> Result<ControlAppMutationPlan> {
+    use crate::mvcc_transaction::PredicateKind;
+
+    let revision_tuple_key = control_revision_tuple_key()?;
+    let revision_key = crate::mvcc_product::coremeta_logical_key(
+        CF_MESH,
+        TABLE_CONTROL_CURRENT_ROW,
+        &revision_tuple_key,
+    )?;
+    let revision = match read_control_current_in_transaction(
+        mvcc,
+        transaction_id,
+        principal,
+        &revision_tuple_key,
+    )? {
+        Some(ControlCurrentRecord::Revision { revision }) => revision,
+        Some(_) => bail!("control revision key contains a different record type"),
+        None => 0,
+    };
+    let next_revision = revision
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("control journal revision overflow"))?;
+    current_updates.push(ControlCurrentRecord::Revision {
+        revision: next_revision,
+    });
+
+    let mutation_id = deterministic_control_mutation_id(transaction_id, operation);
+    let mutation_id_string = mutation_id.to_string();
+    let mut operations = Vec::new();
+    for record in current_updates {
+        operations.extend(control_current_updates(record)?);
+    }
+    operations.push(CoreMutationOperation::StreamAppend {
+        partition_id: hex::encode(control_partition_id()),
+        stream_id: control_plane_stream_id(),
+        record_kind: "control_plane".to_string(),
+        payload: encode_control_event_body(&event, 0, mutation_id)?,
+        idempotency_key: Some(format!("control-plane:{mutation_id_string}")),
+    });
+
+    let mut predicate_keys = BTreeSet::new();
+    let mut predicates = Vec::new();
+    for operation in &operations {
+        let (cf, table_id, tuple_key) = match operation {
+            CoreMutationOperation::CoreMetaPut {
+                cf,
+                table_id,
+                tuple_key,
+                ..
+            }
+            | CoreMutationOperation::CoreMetaDelete {
+                cf,
+                table_id,
+                tuple_key,
+                ..
+            } => (cf, *table_id, tuple_key),
+            CoreMutationOperation::StreamAppend { .. } => continue,
+        };
+        let key = crate::mvcc_product::coremeta_logical_key(cf, table_id, tuple_key)?;
+        if !predicate_keys.insert(key.clone()) {
+            continue;
+        }
+        let kind = mvcc
+            .read_latest_value(&key)?
+            .map(|payload| PredicateKind::ValueHash(*blake3::hash(&payload).as_bytes()))
+            .unwrap_or(PredicateKind::Absent);
+        predicates.push((key, kind));
+    }
+    let mut product =
+        crate::mvcc_product::product_mutations_and_outbox_from_operations(operations)?;
+    if let Some(audit_event) = audit_event {
+        let audit = crate::tenant_audit::tenant_audit_mvcc_plan(
+            audit_event,
+            next_revision,
+            &mutation_id_string,
+        )?;
+        product.mutations.extend(audit.mutations);
+        product.outbox_events.extend(audit.outbox_events);
+    }
+    predicates.extend(product.predicates);
+    Ok(ControlAppMutationPlan {
+        app,
+        mutations: product.mutations,
+        predicates,
+        outbox_events: product.outbox_events,
+    })
+}
+
+pub(crate) fn plan_create_app_in_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    tenant_id: i64,
+    name: &str,
+    client_id: &str,
+    encrypted_secret: &[u8],
+    audit_event: Option<&crate::tenant_audit::TenantAuditEvent>,
+) -> Result<ControlAppMutationPlan> {
+    if read_control_current_in_transaction(
+        mvcc,
+        transaction_id,
+        principal,
+        &app_tenant_name_tuple_key(tenant_id, name)?,
+    )?
+    .is_some()
+    {
+        bail!("app already exists");
+    }
+    if read_control_current_in_transaction(
+        mvcc,
+        transaction_id,
+        principal,
+        &app_client_id_tuple_key(client_id)?,
+    )?
+    .is_some()
+    {
+        bail!("client_id already exists");
+    }
+    let max_allocated_id = match read_control_current_in_transaction(
+        mvcc,
+        transaction_id,
+        principal,
+        &id_allocator_tuple_key()?,
+    )? {
+        Some(ControlCurrentRecord::IdAllocator { max_allocated_id }) => max_allocated_id,
+        Some(_) => bail!("control ID allocator row contains a different record type"),
+        None => 0,
+    };
+    let id = max_allocated_id
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("control ID allocator overflow"))?;
+    let app = App {
+        id,
+        name: name.to_string(),
+        client_id: client_id.to_string(),
+    };
+    let record = ControlCurrentRecord::App {
+        id,
+        tenant_id,
+        name: name.to_string(),
+        client_id: client_id.to_string(),
+        client_secret_encrypted: encrypted_secret.to_vec(),
+        active: true,
+    };
+    plan_control_app_mutation(
+        mvcc,
+        transaction_id,
+        principal,
+        ControlEventBody::AppCreate {
+            id,
+            tenant_id,
+            name: name.to_string(),
+            client_id: client_id.to_string(),
+            client_secret_encrypted: encrypted_secret.to_vec(),
+        },
+        vec![
+            ControlCurrentRecord::IdAllocator {
+                max_allocated_id: id,
+            },
+            record,
+        ],
+        audit_event,
+        app,
+        "app-create",
+    )
+}
+
+pub(crate) fn plan_update_app_secret_in_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    app_id: i64,
+    encrypted_secret: &[u8],
+    audit_event: Option<&crate::tenant_audit::TenantAuditEvent>,
+) -> Result<ControlAppMutationPlan> {
+    let existing = match read_control_current_in_transaction(
+        mvcc,
+        transaction_id,
+        principal,
+        &app_id_tuple_key(app_id)?,
+    )? {
+        Some(ControlCurrentRecord::App {
+            id,
+            tenant_id,
+            name,
+            client_id,
+            client_secret_encrypted,
+            active: true,
+        }) => StoredControlApp {
+            id,
+            tenant_id,
+            name,
+            client_id,
+            client_secret_encrypted,
+        },
+        _ => bail!("app not found"),
+    };
+    let app = App {
+        id: existing.id,
+        name: existing.name.clone(),
+        client_id: existing.client_id.clone(),
+    };
+    plan_control_app_mutation(
+        mvcc,
+        transaction_id,
+        principal,
+        ControlEventBody::AppSecretUpdate {
+            app_id,
+            client_secret_encrypted: encrypted_secret.to_vec(),
+        },
+        vec![ControlCurrentRecord::App {
+            id: existing.id,
+            tenant_id: existing.tenant_id,
+            name: existing.name,
+            client_id: existing.client_id,
+            client_secret_encrypted: encrypted_secret.to_vec(),
+            active: true,
+        }],
+        audit_event,
+        app,
+        "app-rotate-secret",
+    )
+}
+
+pub(crate) fn plan_delete_app_in_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    app_id: i64,
+    audit_event: Option<&crate::tenant_audit::TenantAuditEvent>,
+) -> Result<ControlAppMutationPlan> {
+    let existing = match read_control_current_in_transaction(
+        mvcc,
+        transaction_id,
+        principal,
+        &app_id_tuple_key(app_id)?,
+    )? {
+        Some(ControlCurrentRecord::App {
+            id,
+            tenant_id,
+            name,
+            client_id,
+            client_secret_encrypted,
+            active: true,
+        }) => StoredControlApp {
+            id,
+            tenant_id,
+            name,
+            client_id,
+            client_secret_encrypted,
+        },
+        _ => bail!("app not found"),
+    };
+    let app = App {
+        id: existing.id,
+        name: existing.name.clone(),
+        client_id: existing.client_id.clone(),
+    };
+    plan_control_app_mutation(
+        mvcc,
+        transaction_id,
+        principal,
+        ControlEventBody::AppDelete { app_id },
+        vec![ControlCurrentRecord::App {
+            id: existing.id,
+            tenant_id: existing.tenant_id,
+            name: existing.name,
+            client_id: existing.client_id,
+            client_secret_encrypted: existing.client_secret_encrypted,
+            active: false,
+        }],
+        audit_event,
+        app,
+        "app-delete",
+    )
 }
 
 async fn append_control_event_mvcc(
