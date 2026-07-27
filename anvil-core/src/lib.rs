@@ -273,6 +273,9 @@ impl AppState {
         };
         let personaldb_protocol_keyring = Arc::new(personaldb_protocol_keyring);
         let persistence = persistence::Persistence::new(&arc_config)?;
+        persistence
+            .install_mvcc(mvcc.clone())
+            .context("install MVCC transaction staging in persistence")?;
         if !arc_config.region.is_empty() && !arc_config.requires_distributed_coremeta_recovery() {
             // A standalone node owns its local region bootstrap. Distributed
             // regions are installed through the admin topology bootstrap and
@@ -299,9 +302,6 @@ impl AppState {
             partition_signing_key,
             observability.clone(),
         );
-        persistence
-            .install_mvcc(mvcc.clone())
-            .context("install MVCC transaction staging in persistence")?;
         object_manager
             .install_mvcc(mvcc.clone())
             .context("install MVCC object runtime")?;
