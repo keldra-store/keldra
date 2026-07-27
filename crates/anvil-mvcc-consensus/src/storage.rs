@@ -68,6 +68,10 @@ pub enum RaftStorageError {
     LogHole { expected: u64, received: u64 },
     #[error("Raft log entries must be consecutive: previous {previous}, next {next}")]
     NonConsecutive { previous: u64, next: u64 },
+    #[error("Raft log truncation at {from} crosses purged boundary {purged}")]
+    TruncatePurged { from: u64, purged: u64 },
+    #[error("Raft log purge would move backward: current {current}, requested {requested}")]
+    PurgeRegression { current: u64, requested: u64 },
     #[error("Raft storage writer lock was poisoned")]
     WriterPoisoned,
 }
@@ -276,6 +280,11 @@ impl RocksRaftStore {
             .map_err(|_| RaftStorageError::WriterPoisoned)?;
         let cf_log = self.cf(CF_RAFT_LOG)?;
         let cf_meta = self.cf(CF_RAFT_META)?;
+        if let Some(purged) = self.last_purged_index()? {
+            if from <= purged {
+                return Err(RaftStorageError::TruncatePurged { from, purged });
+            }
+        }
         let mut batch = WriteBatch::default();
         if let Some(last) = self.last_log_index()? {
             if from > last {
@@ -321,9 +330,16 @@ impl RocksRaftStore {
             .map_err(|_| RaftStorageError::WriterPoisoned)?;
         let cf_log = self.cf(CF_RAFT_LOG)?;
         let cf_meta = self.cf(CF_RAFT_META)?;
-        let first = self
-            .last_purged_index()?
-            .map_or(0, |prior| prior.saturating_add(1));
+        let prior = self.last_purged_index()?;
+        if let Some(current) = prior {
+            if through < current {
+                return Err(RaftStorageError::PurgeRegression {
+                    current,
+                    requested: through,
+                });
+            }
+        }
+        let first = prior.map_or(0, |prior| prior.saturating_add(1));
         let mut batch = WriteBatch::default();
         for index in first..=through {
             batch.delete_cf(cf_log, self.log_key(index));
@@ -527,16 +543,25 @@ mod tests {
         {
             let store = store(dir.path());
             store
-                .append_logs(&[(0, vec![0]), (1, vec![1]), (2, vec![2])])
+                .append_logs(
+                    &(0..=11)
+                        .map(|index| (index, vec![index as u8]))
+                        .collect::<Vec<_>>(),
+                )
                 .unwrap();
             assert_eq!(
-                store.scan_logs(0, 3).unwrap(),
-                vec![(0, vec![0]), (1, vec![1]), (2, vec![2])]
+                store.scan_logs(8, 12).unwrap(),
+                vec![
+                    (8, vec![8]),
+                    (9, vec![9]),
+                    (10, vec![10]),
+                    (11, vec![11]),
+                ]
             );
         }
         let store = store(dir.path());
-        assert_eq!(store.last_log_index().unwrap(), Some(2));
-        assert_eq!(store.get_log(1).unwrap(), Some(vec![1]));
+        assert_eq!(store.last_log_index().unwrap(), Some(11));
+        assert_eq!(store.get_log(10).unwrap(), Some(vec![10]));
     }
 
     #[test]
@@ -587,6 +612,31 @@ mod tests {
         assert_eq!(store.last_purged_index().unwrap(), Some(2));
         assert_eq!(store.last_log_index().unwrap(), None);
         assert!(store.get_log(2).unwrap().is_none());
+    }
+
+    #[test]
+    fn purge_is_monotonic_and_truncate_cannot_cross_purged_boundary() {
+        let dir = TempDir::new().unwrap();
+        let store = store(dir.path());
+        store
+            .append_logs(&(0..=5).map(|i| (i, vec![i as u8])).collect::<Vec<_>>())
+            .unwrap();
+        store.purge_logs(2).unwrap();
+
+        assert!(matches!(
+            store.purge_logs(1),
+            Err(RaftStorageError::PurgeRegression {
+                current: 2,
+                requested: 1
+            })
+        ));
+        assert!(matches!(
+            store.truncate_logs(2),
+            Err(RaftStorageError::TruncatePurged { from: 2, purged: 2 })
+        ));
+        assert_eq!(store.last_purged_index().unwrap(), Some(2));
+        assert_eq!(store.last_log_index().unwrap(), Some(5));
+        assert_eq!(store.get_log(3).unwrap(), Some(vec![3]));
     }
 
     #[test]
@@ -720,11 +770,31 @@ mod tests {
         let snapshot = source.build_consensus_snapshot().unwrap().unwrap();
 
         let target_dir = TempDir::new().unwrap();
+        {
+            let target = store(target_dir.path());
+            target.install_consensus_snapshot(&snapshot).unwrap();
+        }
         let target = store(target_dir.path());
-        target.install_consensus_snapshot(&snapshot).unwrap();
         assert_eq!(
             target.load_consensus_state().unwrap().unwrap().last_applied,
             CommitVersion(11)
+        );
+    }
+
+    #[test]
+    fn invalid_snapshot_install_preserves_durable_state() {
+        let dir = TempDir::new().unwrap();
+        let store = store(dir.path());
+        let state = CertificationState::new([7; 32]).unwrap();
+        store.save_consensus_state(&state).unwrap();
+
+        assert!(matches!(
+            store.install_consensus_snapshot(b"not-a-certification-snapshot"),
+            Err(RaftStorageError::Codec(_))
+        ));
+        assert_eq!(
+            store.load_consensus_state().unwrap().unwrap().state,
+            state
         );
     }
 }
