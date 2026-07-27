@@ -178,8 +178,9 @@ pub async fn put_schema_revision(
     validate_schema_id(schema_id)?;
     crate::authz_schema_contract::validate_schema_set(&namespaces)?;
     crate::authz_schema_contract::canonicalize_schema_set(&mut namespaces);
-    let schema_digest = schema_digest(&namespaces)?;
-    let digest_key = schema_digest_tuple_key(tenant_id, schema_id, &schema_digest)?;
+    let canonical_schema_digest = schema_digest(&namespaces)?;
+    let digest_key =
+        schema_digest_tuple_key(tenant_id, schema_id, &canonical_schema_digest)?;
     if let Some(existing) = read_proto_row_latest_mvcc::<StoredAuthzSchemaRevision>(
         storage,
         mvcc,
@@ -204,7 +205,8 @@ pub async fn put_schema_revision(
     let principal = caller_binding
         .map(|binding| binding.principal.to_string())
         .unwrap_or_else(|| authz_head::transaction_principal(tenant_id));
-    let idempotency_key = format!("authz-schema:{tenant_id}:{schema_id}:{schema_digest}");
+    let idempotency_key =
+        format!("authz-schema:{tenant_id}:{schema_id}:{canonical_schema_digest}");
     let now_unix_ms = current_unix_ms();
     let handle = if caller_binding.is_none() {
         Some(
@@ -260,7 +262,7 @@ pub async fn put_schema_revision(
         schema_ref: StoredSchemaRef {
             schema_id: schema_id.to_string(),
             schema_revision: next_revision,
-            schema_digest,
+            schema_digest: canonical_schema_digest,
         },
         namespaces,
         authz_revision,

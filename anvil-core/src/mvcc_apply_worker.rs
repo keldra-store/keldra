@@ -336,7 +336,7 @@ impl MvccApplyWorker {
                 .await
             {
                 Ok(bytes) => match self.prepared.persist(identity, &bytes).await {
-                    Ok(()) => return Ok(bytes),
+                    Ok(_durability_evidence) => return Ok(bytes),
                     Err(error) => {
                         failures.push(format!(
                             "{}:{} returned bytes outside the committed identity: {error}",

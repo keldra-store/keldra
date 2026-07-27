@@ -1174,13 +1174,14 @@ pub async fn stage_delegated_action_tuple_with_tenant_audit(
     let relation =
         delegated_relation_for_action(storage, persistence, tenant_id, action.clone(), resource)
             .await?;
+    let assignment_relation = delegated_assignment_relation(&action, &relation);
     persistence
         .stage_authz_tuple_batch_with_tenant_audit(
             SYSTEM_STORAGE_TENANT_ID,
             vec![AuthzTupleBatchMutation {
                 namespace: relation.namespace,
                 object_id: relation.object_id,
-                relation: delegated_assignment_relation(&action, &relation),
+                relation: assignment_relation,
                 subject_kind: APP_SUBJECT_KIND.to_string(),
                 subject_id: grantee_principal_id.to_string(),
                 caveat_hash: String::new(),
@@ -1299,10 +1300,11 @@ pub async fn stage_delegated_action_tuple_batch_with_admin_audit(
             resource,
         )
         .await?;
+        let assignment_relation = delegated_assignment_relation(action, &relation);
         mutations.push(AuthzTupleBatchMutation {
             namespace: relation.namespace,
             object_id: relation.object_id,
-            relation: delegated_assignment_relation(action, &relation),
+            relation: assignment_relation,
             subject_kind: APP_SUBJECT_KIND.to_string(),
             subject_id: grantee_principal_id.to_string(),
             caveat_hash: String::new(),
