@@ -35,6 +35,7 @@ pub struct MvccApplyWorker {
     cluster_id_hash: [u8; 32],
     state: Arc<Mutex<ApplyWorkerState>>,
     prepared_bundle_gc_grace_ms: Option<u64>,
+    shard_transfers: Option<Arc<std::sync::Mutex<crate::replication::TransferReceiver>>>,
 }
 
 pub trait DecisionSource: Send + Sync {
@@ -94,6 +95,7 @@ impl MvccApplyWorker {
             local,
             state: Arc::new(Mutex::new(ApplyWorkerState::Stopped)),
             prepared_bundle_gc_grace_ms: None,
+            shard_transfers: None,
         }
     }
 
@@ -103,6 +105,14 @@ impl MvccApplyWorker {
         }
         self.prepared_bundle_gc_grace_ms = Some(grace_ms);
         Ok(self)
+    }
+
+    pub fn with_shard_transfer_retirement(
+        mut self,
+        receiver: Arc<std::sync::Mutex<crate::replication::TransferReceiver>>,
+    ) -> Self {
+        self.shard_transfers = Some(receiver);
+        self
     }
 
     pub fn state_handle(&self) -> Arc<Mutex<ApplyWorkerState>> {
@@ -224,6 +234,24 @@ impl MvccApplyWorker {
                 grace_ms,
             )?;
             self.prepared.compact_authorised(&retain)?;
+        }
+        // This is intentionally retried even when the watermark did not move:
+        // a crash after MVCC GC but before physical unlink must converge on
+        // restart, and the receiver operation is idempotent.
+        if let Some(receiver) = &self.shard_transfers {
+            let authorised = self.local.retirable_object_shard_transfers()?;
+            let removed = receiver
+                .lock()
+                .map_err(|_| anyhow!("replication receiver lock poisoned"))?
+                .retire_complete_object_shards(&authorised)?;
+            if removed != 0 {
+                tracing::info!(
+                    operation = "gc.shard_transfer",
+                    removed_transfers = removed,
+                    gc_watermark = gc.0,
+                    "retired unreferenced physical shard transfers"
+                );
+            }
         }
         Ok(applied)
     }

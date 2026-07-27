@@ -73,6 +73,10 @@ impl<A: ReplicationConnectionAuthorizer> ReplicationServiceImpl<A> {
         })
     }
 
+    pub(crate) fn receiver(&self) -> Arc<std::sync::Mutex<TransferReceiver>> {
+        self.receiver.clone()
+    }
+
     #[cfg(test)]
     pub fn with_frame_fault_plan(
         mut self,

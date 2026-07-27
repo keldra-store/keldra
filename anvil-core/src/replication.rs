@@ -6,7 +6,7 @@
 //! the complete transfer's content hash.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -310,6 +310,38 @@ impl TransferReceiver {
             completed_hash: metadata.final_hash,
             finish: offset + read_len as u64 == total_length,
         })
+    }
+
+    /// Idempotently retires complete object-shard transfers selected by a
+    /// cluster-authorised MVCC GC plan. Partial transfers and every other
+    /// transfer kind are deliberately outside this operation.
+    pub fn retire_complete_object_shards(&mut self, authorised: &BTreeSet<Uuid>) -> Result<usize> {
+        let mut removed = 0;
+        for transfer_id in authorised {
+            let Some(metadata) = self.metadata.get(transfer_id) else {
+                continue;
+            };
+            if metadata.kind != TransferKind::ObjectShard
+                || self.partial_path(*transfer_id).exists()
+            {
+                continue;
+            }
+            let complete = self.complete_path(*transfer_id);
+            if !complete.exists() {
+                continue;
+            }
+            fs::remove_file(&complete)?;
+            let metadata_path = self.metadata_path(*transfer_id);
+            if metadata_path.exists() {
+                fs::remove_file(metadata_path)?;
+            }
+            self.metadata.remove(transfer_id);
+            removed += 1;
+        }
+        if removed != 0 {
+            sync_directory(&self.directory)?;
+        }
+        Ok(removed)
     }
 
     pub fn receive(
@@ -642,5 +674,43 @@ mod tests {
         let ack = receiver.receive(&mut resumed, &retry).unwrap();
         assert_eq!(ack.status, AckStatus::Complete);
         assert_eq!(ack.persisted_through, 5);
+    }
+
+    #[test]
+    fn authorised_shard_retirement_is_idempotent_and_preserves_inflight_transfers() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut receiver = TransferReceiver::open(directory.path()).unwrap();
+        let peer = AuthenticatedPeer::new("node-b", 1).unwrap();
+        let mut session = ConnectionSession::establish("cluster-a", peer).unwrap();
+        let retired = Uuid::new_v4();
+        let inflight = Uuid::new_v4();
+        let bundle = Uuid::new_v4();
+        let complete = frame(&session, retired, 1, 0, b"retired", b"retired", true);
+        receiver.receive(&mut session, &complete).unwrap();
+        let partial = frame(&session, inflight, 2, 0, b"in", b"inflight", false);
+        receiver.receive(&mut session, &partial).unwrap();
+        let mut non_shard = frame(&session, bundle, 3, 0, b"bundle", b"bundle", true);
+        non_shard.kind = TransferKind::TransactionBundle;
+        receiver.receive(&mut session, &non_shard).unwrap();
+
+        let authorised = BTreeSet::from([retired, inflight, bundle]);
+        assert_eq!(
+            receiver
+                .retire_complete_object_shards(&authorised)
+                .unwrap(),
+            1
+        );
+        assert!(receiver.watermark(retired).unwrap().is_none());
+        assert_eq!(
+            receiver.watermark(inflight).unwrap().unwrap().persisted_through,
+            2
+        );
+        assert!(receiver.watermark(bundle).unwrap().unwrap().complete);
+        assert_eq!(
+            receiver
+                .retire_complete_object_shards(&authorised)
+                .unwrap(),
+            0
+        );
     }
 }

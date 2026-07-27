@@ -1335,6 +1335,69 @@ impl MvccStore {
         Ok(pins)
     }
 
+    /// Returns object-shard transfers whose retirement is authorised by a
+    /// placement overlay already below the locally applied cluster GC
+    /// watermark. Incomplete repair jobs pin their source and retiring
+    /// placements, so a retry never loses bytes it may still need.
+    pub fn retirable_object_shard_transfers(&self) -> Result<BTreeSet<uuid::Uuid>> {
+        let watermark = self.gc_watermark()?;
+        let mut authorised = BTreeSet::new();
+        let mut replacement_live = BTreeSet::new();
+        for (_, row) in self.scan_table_prefix_at(
+            crate::mvcc_shard_repair::ShardPlacementOverlay::TABLE_ID,
+            b"",
+            watermark,
+        )? {
+            let overlay: crate::mvcc_shard_repair::ShardPlacementOverlay =
+                serde_json::from_slice(&row.value)?;
+            overlay.replacement_manifest.validate()?;
+            replacement_live.extend(
+                overlay
+                    .replacement_manifest
+                    .placements
+                    .iter()
+                    .map(|placement| placement.transfer_id),
+            );
+            authorised.extend(
+                overlay
+                    .retired_after_commit
+                    .into_iter()
+                    .map(|placement| placement.transfer_id),
+            );
+        }
+
+        let cf = self.cf(CF_MATERIALISATION)?;
+        let prefix = self.key(b"shard-repair/");
+        for row in self
+            .db
+            .iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward))
+        {
+            let (key, value) = row?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let record: ShardRepairRecord = serde_json::from_slice(&value)?;
+            if record.state == ShardRepairState::Complete {
+                continue;
+            }
+            for placement in record
+                .job
+                .source_manifest
+                .placements
+                .iter()
+                .chain(record.job.retiring.iter())
+            {
+                authorised.remove(&placement.transfer_id);
+            }
+        }
+        // Catalog rows are immutable source manifests. A committed overlay is
+        // the authoritative cut-over for its explicitly retired placements;
+        // replacement placements remain live even if a malformed/duplicate
+        // overlay were ever to mention the same transfer.
+        authorised.retain(|transfer_id| !replacement_live.contains(transfer_id));
+        Ok(authorised)
+    }
+
     fn transition_object_materialisation(
         &self,
         job_id: &str,
