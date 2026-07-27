@@ -2,9 +2,10 @@ name: Anvil CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, 'release/**' ]
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -285,6 +286,62 @@ jobs:
 
       - name: Run server core integration gates
         run: ./scripts/release-gates.sh server-core
+
+  mvcc-e2e:
+    name: MVCC under Raft end-to-end acceptance
+    needs: server-core
+    runs-on: [self-hosted, linux, x64, worka-builder-2]
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: "8"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      ANVIL_RUST_TEST_THREADS: "1"
+      RUST_LOG: warn
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            cmake \
+            libclang-dev \
+            pkg-config \
+            libssl-dev \
+            protobuf-compiler \
+            ripgrep
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-v2-
+
+      - name: Prebuild MVCC acceptance binaries
+        run: cargo test --no-run -p anvil-server --test object_tests --test mvcc_cluster_fixture
+
+      - name: Run native object acceptance
+        run: |
+          cargo test -q -p anvil-server --test object_tests \
+            native_mvcc_acceptance -- --nocapture --test-threads=1
+
+      - name: Run cluster failure and repair acceptance
+        run: |
+          cargo test -q -p anvil-server --test mvcc_cluster_fixture \
+            -- --nocapture --test-threads=1
 
   docker-integration:
     name: Docker integration tests (${{ matrix.group }})
