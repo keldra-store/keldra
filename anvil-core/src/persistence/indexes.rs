@@ -2,6 +2,98 @@ use super::*;
 use crate::index_coremeta;
 
 impl Persistence {
+    pub(crate) async fn run_index_finalization_once(&self) -> Result<bool> {
+        let worker_id = format!("index-finalization/{}", self.owner_node_id());
+        let now = u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default();
+        let Some((job_id, record)) = self
+            .mvcc()?
+            .runtime
+            .local_store()
+            .claim_index_finalization_authorized(&worker_id, now, 30_000, |record| {
+                self.mvcc()
+                    .ok()?
+                    .claim_assignment(
+                        "index-finalization",
+                        &record.job.target_logical_identity(),
+                    )
+                    .ok()
+                    .flatten()
+                    .map(|guard| guard.lease_owner(&worker_id))
+            })?
+        else {
+            return Ok(false);
+        };
+        let guard = self
+            .mvcc()?
+            .claim_assignment(
+                "index-finalization",
+                &record.job.target_logical_identity(),
+            )?
+            .ok_or_else(|| anyhow!("index finalization assignment changed after claim"))?;
+        let lease_owner = guard.lease_owner(&worker_id);
+        let result = self.execute_index_finalization(&record.job).await;
+        match result {
+            Ok(()) => {
+                self.mvcc()?.validate_assignment(&guard)?;
+                self.mvcc()?
+                    .runtime
+                    .local_store()
+                    .complete_index_finalization(&job_id, &lease_owner)?;
+                Ok(true)
+            }
+            Err(error) => {
+                let shift = record.attempts.saturating_sub(1).min(10);
+                let delay = 250_u64.saturating_mul(1_u64 << shift);
+                self.mvcc()?
+                    .runtime
+                    .local_store()
+                    .retry_index_finalization(
+                        &job_id,
+                        &lease_owner,
+                        now.saturating_add(delay),
+                        &error.to_string(),
+                    )?;
+                Err(error)
+            }
+        }
+    }
+
+    async fn execute_index_finalization(
+        &self,
+        job: &crate::index_finalization_job::IndexFinalizationJob,
+    ) -> Result<()> {
+        let bucket = self
+            .get_bucket_by_name(job.tenant_id, &job.bucket_name)
+            .await?
+            .ok_or_else(|| anyhow!("committed index finalization bucket is missing"))?;
+        if job.event_type == "create" {
+            crate::access_control::grant_index_defaults(
+                self,
+                &bucket,
+                &job.index_name,
+                &job.creator_principal,
+                &job.creator_principal,
+                "grant committed index creator owner",
+            )
+            .await?;
+        }
+        let frozen: IndexDefinition = serde_json::from_value(job.frozen_definition.clone())?;
+        let Some(current) =
+            self.get_index_definition(job.tenant_id, job.bucket_id, &job.index_name)
+                .await?
+        else {
+            return Ok(());
+        };
+        if current.id != job.index_id
+            || current.version != job.index_version
+            || current != frozen
+        {
+            return Ok(());
+        }
+        self.enqueue_index_build_for_index(&bucket, &frozen).await?;
+        Ok(())
+    }
+
     pub async fn get_index_definition(
         &self,
         tenant_id: i64,
@@ -80,6 +172,31 @@ impl Persistence {
                 transaction_principal,
             )
             .await?;
+            if matches!(event_type, "create" | "update") {
+                let transaction_id =
+                    transaction_id.ok_or_else(|| anyhow!("index transaction id is required"))?;
+                let creator_principal = transaction_principal
+                    .ok_or_else(|| anyhow!("index transaction principal is required"))?;
+                let job = crate::index_finalization_job::IndexFinalizationJob {
+                    schema: crate::index_finalization_job::IndexFinalizationJob::SCHEMA.into(),
+                    cluster_id: self.mvcc()?.cluster_id().to_string(),
+                    transaction_id: transaction_id.to_string(),
+                    tenant_id,
+                    bucket_id,
+                    bucket_name: bucket_name.to_string(),
+                    index_name: index.name.clone(),
+                    index_id: index.id,
+                    index_version: index.version,
+                    event_type: event_type.to_string(),
+                    creator_principal: creator_principal.to_string(),
+                    frozen_definition: serde_json::to_value(index)?,
+                };
+                self.mvcc()?.open_transactions.add_job(
+                    transaction_id,
+                    job.encode()?,
+                    u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default(),
+                )?;
+            }
         } else {
             index_journal::append_index_definition_event_with_permit_mvcc(
                 &self.storage,

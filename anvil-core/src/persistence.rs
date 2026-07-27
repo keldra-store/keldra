@@ -427,7 +427,7 @@ pub enum AuthzTupleBatchWriteError {
     SchemaBindingChanged,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IndexDefinition {
     pub id: i64,
     pub tenant_id: i64,

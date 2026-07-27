@@ -210,6 +210,9 @@ pub async fn run(
     let task_slots = Arc::new(Semaphore::new(concurrency.max(1)));
     loop {
         core_store.wait_for_coremeta_recovery_ready().await;
+        if let Err(error) = persistence.run_index_finalization_once().await {
+            warn!(%error, "Committed index finalization attempt failed");
+        }
         if tokio::time::Instant::now() >= next_recovery {
             if let Err(error) = recover_interrupted_tasks(&persistence).await {
                 warn!(%error, "Failed to recover expired background tasks");

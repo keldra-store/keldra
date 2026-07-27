@@ -1,0 +1,177 @@
+use super::*;
+use anvil::anvil_api::{
+    BeginTransactionRequest, CommitTransactionRequest, MvccDurability, MvccReadConsistency,
+    WriteOptions, write_options,
+};
+use anvil::anvil_api::transaction_service_client::TransactionServiceClient;
+use tonic::Code;
+
+async fn begin_index_transaction(
+    client: &mut TransactionServiceClient<tonic::transport::Channel>,
+    token: &str,
+    cluster_id: &str,
+    label: &str,
+) -> String {
+    client
+        .begin_transaction(authorized(
+            BeginTransactionRequest {
+                idempotency_key: unique_test_name(label),
+                ttl_ms: 30_000,
+                read_consistency: MvccReadConsistency::Linearized as i32,
+                cluster_id: cluster_id.to_string(),
+                durability: MvccDurability::Quorum as i32,
+            },
+            token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .transaction_id
+}
+
+fn transactional_index_request(
+    bucket_name: &str,
+    index_name: &str,
+    transaction_id: String,
+) -> CreateIndexRequest {
+    CreateIndexRequest {
+        bucket_name: bucket_name.to_string(),
+        name: index_name.to_string(),
+        kind: IndexKind::Path as i32,
+        selector_json: serde_json::json!({"prefix": ""}).to_string(),
+        extractor_json: serde_json::json!({}).to_string(),
+        authorization_mode: "inherit_object".to_string(),
+        build_policy_json: serde_json::json!({}).to_string(),
+        options: Some(WriteOptions {
+            idempotency_key: unique_test_name("index-stage"),
+            consistency: 0,
+            wait_for_finalization: false,
+            preconditions: Vec::new(),
+            boundary_values: Vec::new(),
+            execution: Some(write_options::Execution::TransactionId(transaction_id)),
+        }),
+    }
+}
+
+#[tokio::test]
+async fn explicit_index_transaction_publishes_definition_and_finalises_after_commit() {
+    let cluster = shared_default_test_cluster().await;
+    let endpoint = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let cluster_id = cluster.states[0].mvcc.cluster_id().to_string();
+    let mut buckets = BucketServiceClient::connect(endpoint.clone()).await.unwrap();
+    let mut indexes = IndexServiceClient::connect(endpoint.clone()).await.unwrap();
+    let mut transactions = TransactionServiceClient::connect(endpoint).await.unwrap();
+    let bucket_name = unique_test_name("transactional-index-bucket");
+    buckets
+        .create_bucket(authorized(
+            CreateBucketRequest {
+                bucket_name: bucket_name.clone(),
+                region: "test-region-1".to_string(),
+                options: None,
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+    let transaction_id =
+        begin_index_transaction(&mut transactions, &token, &cluster_id, "index-success").await;
+    let index_name = unique_test_name("transactional-index");
+    let index = indexes
+        .create_index(authorized(
+            transactional_index_request(&bucket_name, &index_name, transaction_id.clone()),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .index
+        .expect("staged index definition");
+    transactions
+        .commit_transaction(authorized(
+            CommitTransactionRequest {
+                transaction_id: transaction_id.clone(),
+                cluster_id: cluster_id.clone(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+    drop(transactions);
+    let bucket = cluster.states[0]
+        .persistence
+        .get_bucket_by_name(1, &bucket_name)
+        .await
+        .unwrap()
+        .expect("committed index bucket");
+    wait_for_index_builds_for_indexes(
+        &cluster,
+        INDEX_EVENTUAL_CONSISTENCY_TIMEOUT,
+        1,
+        bucket.id,
+        &[index.id],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn conflicting_explicit_index_transactions_publish_only_one_definition() {
+    let cluster = shared_default_test_cluster().await;
+    let endpoint = cluster.grpc_addrs[0].clone();
+    let token = cluster.token.clone();
+    let cluster_id = cluster.states[0].mvcc.cluster_id().to_string();
+    let mut buckets = BucketServiceClient::connect(endpoint.clone()).await.unwrap();
+    let mut indexes = IndexServiceClient::connect(endpoint.clone()).await.unwrap();
+    let mut transactions = TransactionServiceClient::connect(endpoint).await.unwrap();
+    let bucket_name = unique_test_name("conflicting-index-bucket");
+    buckets
+        .create_bucket(authorized(
+            CreateBucketRequest {
+                bucket_name: bucket_name.clone(),
+                region: "test-region-1".to_string(),
+                options: None,
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+    let first = begin_index_transaction(&mut transactions, &token, &cluster_id, "index-first").await;
+    let second =
+        begin_index_transaction(&mut transactions, &token, &cluster_id, "index-second").await;
+    let index_name = unique_test_name("conflicting-index");
+    indexes
+        .create_index(authorized(
+            transactional_index_request(&bucket_name, &index_name, first.clone()),
+            &token,
+        ))
+        .await
+        .unwrap();
+    indexes
+        .create_index(authorized(
+            transactional_index_request(&bucket_name, &index_name, second.clone()),
+            &token,
+        ))
+        .await
+        .unwrap();
+    transactions
+        .commit_transaction(authorized(
+            CommitTransactionRequest {
+                transaction_id: first,
+                cluster_id: cluster_id.clone(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+    let conflict = transactions
+        .commit_transaction(authorized(
+            CommitTransactionRequest {
+                transaction_id: second,
+                cluster_id,
+            },
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(conflict.code(), Code::Aborted);
+}

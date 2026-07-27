@@ -559,6 +559,8 @@ mod list_indexes;
 mod query_spec;
 #[path = "index_tests/typed_lifecycle.rs"]
 mod typed_lifecycle;
+#[path = "index_tests/transactional_lifecycle.rs"]
+mod transactional_lifecycle;
 #[path = "index_tests/validation_diagnostics.rs"]
 mod validation_diagnostics;
 #[path = "index_tests/vector_hybrid.rs"]
