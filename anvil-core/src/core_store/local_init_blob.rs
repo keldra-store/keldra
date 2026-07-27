@@ -124,7 +124,6 @@ impl CoreStore {
             root_owner_failure_tracker: Arc::new(Mutex::new(
                 super::local_root_failover::RootOwnerFailureTracker::default(),
             )),
-            repair_task_scheduler: Arc::new(OnceLock::new()),
             pipeline_keyring,
             storage_classes,
             node_signing_keypair,

@@ -13,8 +13,8 @@ use crate::task_lease::{
     TaskLease,
 };
 use crate::tasks::{
-    HFIngestionItemState, HFIngestionState, RebalanceShardTaskPayload, RepairRunBackend,
-    RepairRunTaskPayload, TaskStatus, TaskType,
+    HFIngestionItemState, HFIngestionState, RepairRunBackend, RepairRunTaskPayload, TaskStatus,
+    TaskType,
 };
 use anyhow::{Result, anyhow};
 use futures_util::{Stream, StreamExt};
@@ -497,22 +497,6 @@ async fn execute_task_with_lease(
         .acquire_task_execution_lease(task)
         .await
         .map_err(|error| TaskExecutionFailure { lease: None, error })?;
-    if task.task_type == TaskType::RebalanceShard {
-        let mut lease = lease;
-        handle_rebalance_shard(persistence, core_store, task, &mut lease)
-            .await
-            .map_err(|error| TaskExecutionFailure {
-                lease: Some(lease.clone()),
-                error,
-            })?;
-        return check_execution_lease(persistence, core_store, &lease)
-            .await
-            .map_err(|error| TaskExecutionFailure {
-                lease: Some(lease),
-                error,
-            });
-    }
-
     let guard = TaskExecutionGuard::new_mvcc(
         persistence
             .mvcc_arc()
@@ -574,9 +558,10 @@ async fn execute_task_handler_with_lease_renewal(
                 handle_hf_ingestion(persistence, object_manager, task, keyring, guard).await?
             }
             TaskType::RebalanceShard => {
-                return Err(anyhow!(
-                    "RebalanceShard must use its lease-aware repair executor"
-                ));
+                warn!(
+                    task_id = task.id,
+                    "retiring legacy RebalanceShard task without execution; MVCC shard repair is authoritative"
+                );
             }
             TaskType::RepairRun => handle_repair_run(persistence, task, keyring, guard).await?,
         }
@@ -684,20 +669,6 @@ async fn handle_repair_run(
     Ok(())
 }
 
-async fn check_execution_lease(
-    persistence: &Persistence,
-    core_store: &CoreStore,
-    lease: &TaskLease,
-) -> Result<TaskLease> {
-    let _ = core_store;
-    task_lease::check_task_lease_mvcc(
-        persistence.mvcc()?,
-        lease,
-        current_time_nanos()?,
-        persistence.partition_owner_signing_key(),
-    )
-}
-
 async fn execution_lease_precondition(
     persistence: &Persistence,
     _core_store: &CoreStore,
@@ -715,155 +686,10 @@ async fn execution_lease_precondition(
     task_lease::task_lease_mvcc_predicate(lease)
 }
 
-async fn renew_execution_lease(
-    persistence: &Persistence,
-    core_store: &CoreStore,
-    lease: &TaskLease,
-    ttl_nanos: i64,
-) -> Result<TaskLease> {
-    let _ = core_store;
-    task_lease::renew_task_lease_mvcc(
-        persistence.mvcc()?,
-        lease,
-        current_time_nanos()?,
-        ttl_nanos,
-        persistence.partition_owner_signing_key(),
-    )
-    .await
-}
-
-fn task_lease_ttl_nanos(lease: &TaskLease) -> Result<i64> {
-    lease
-        .expires_at_nanos
-        .checked_sub(lease.acquired_at_nanos)
-        .filter(|ttl| *ttl > 0)
-        .ok_or_else(|| anyhow!("task lease has no positive renewal window"))
-}
-
-fn task_lease_renewal_delay(lease: &TaskLease, now_nanos: i64) -> Result<Duration> {
-    let remaining = lease.expires_at_nanos.saturating_sub(now_nanos);
-    if remaining <= 0 {
-        return Err(anyhow!("{LEASE_EXPIRED}: task lease expired"));
-    }
-    let delay_nanos = (remaining / 3).max(1);
-    Ok(Duration::from_nanos(
-        u64::try_from(delay_nanos).map_err(|_| anyhow!("task lease delay exceeds u64"))?,
-    ))
-}
-
 #[derive(Debug, Deserialize)]
 struct AuthzMaterializationPayload {
     tenant_id: i64,
     target_revision: u64,
-}
-
-async fn handle_rebalance_shard(
-    persistence: &Persistence,
-    core_store: &CoreStore,
-    task: &Task,
-    lease: &mut TaskLease,
-) -> anyhow::Result<()> {
-    let payload: RebalanceShardTaskPayload = serde_json::from_value(task.payload.clone())
-        .map_err(|error| anyhow!("invalid RebalanceShard task {} payload: {error}", task.id))?;
-    payload.validate()?;
-    let attempt_started_at_nanos = lease.acquired_at_nanos;
-    let ttl_nanos = task_lease_ttl_nanos(&lease)?;
-
-    *lease = check_execution_lease(persistence, core_store, lease).await?;
-    let open_finding_precondition = crate::task_lease::task_lease_mvcc_predicate(lease)?;
-    let open_finding = persistence
-        .write_rebalance_shard_finding(
-            &payload,
-            task.id,
-            lease.fence_token,
-            lease.lease_epoch,
-            attempt_started_at_nanos,
-            crate::repair_finding::RepairFindingStatus::Open,
-            open_finding_precondition,
-        )
-        .await?;
-    *lease = check_execution_lease(persistence, core_store, lease).await?;
-    let repair_finding_id = open_finding.finding_id;
-
-    let preparation =
-        core_store.prepare_shard_repair_for_task(&payload, &repair_finding_id, persistence.mvcc()?);
-    tokio::pin!(preparation);
-    let prepared = loop {
-        let renewal_delay = task_lease_renewal_delay(&lease, current_time_nanos()?)?;
-        tokio::select! {
-            biased;
-            _ = tokio::time::sleep(renewal_delay) => {
-                *lease = renew_execution_lease(
-                    persistence,
-                    core_store,
-                    lease,
-                    ttl_nanos,
-                ).await?;
-            }
-            result = &mut preparation => {
-                *lease = check_execution_lease(persistence, core_store, lease).await?;
-                break result?;
-            }
-        }
-    };
-    *lease = renew_execution_lease(persistence, core_store, lease, ttl_nanos).await?;
-    let lease_predicate = task_lease::task_lease_mvcc_predicate(lease)?;
-    let outcome = core_store
-        .publish_prepared_shard_repair(prepared, persistence.mvcc()?, lease_predicate)
-        .await?;
-    if outcome.requires_retry() {
-        let unresolved = outcome
-            .unresolved_placements()
-            .iter()
-            .map(|placement| {
-                format!(
-                    "{}:{}:{:?}",
-                    placement.shard_index, placement.expected_node_id, placement.reason
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        return Err(anyhow!(
-            "CoreStore shard repair remains incomplete and must retry: {unresolved}"
-        ));
-    }
-    let overlays_published = outcome.overlays_published();
-    let completed_status = rebalance_shard_completion_status(overlays_published);
-    *lease = check_execution_lease(persistence, core_store, lease).await?;
-    let completed_finding_precondition = crate::task_lease::task_lease_mvcc_predicate(lease)?;
-    let completed_finding = persistence
-        .write_rebalance_shard_finding(
-            &payload,
-            task.id,
-            lease.fence_token,
-            lease.lease_epoch,
-            attempt_started_at_nanos,
-            completed_status,
-            completed_finding_precondition,
-        )
-        .await;
-    *lease = renew_execution_lease(persistence, core_store, lease, ttl_nanos).await?;
-    completed_finding?;
-
-    info!(
-        task_id = task.id,
-        object_hash = %payload.object_hash,
-        block_id = %payload.block_id,
-        lease_fence_token = lease.fence_token,
-        overlays_published,
-        "RebalanceShard task completed"
-    );
-    Ok(())
-}
-
-fn rebalance_shard_completion_status(
-    overlays_published: bool,
-) -> crate::repair_finding::RepairFindingStatus {
-    if overlays_published {
-        crate::repair_finding::RepairFindingStatus::RepairedObjectShards
-    } else {
-        crate::repair_finding::RepairFindingStatus::VerifiedHealthy
-    }
 }
 
 async fn handle_authz_materialization(
@@ -1382,18 +1208,6 @@ mod tests {
                 .max(max_seen);
         }
         assert!(max_seen <= CLAIM_CONTENTION_MAX_DELAY + CLAIM_CONTENTION_MAX_DELAY / 2);
-    }
-
-    #[test]
-    fn rebalance_completion_finding_reflects_overlay_publication() {
-        assert_eq!(
-            rebalance_shard_completion_status(true),
-            crate::repair_finding::RepairFindingStatus::RepairedObjectShards
-        );
-        assert_eq!(
-            rebalance_shard_completion_status(false),
-            crate::repair_finding::RepairFindingStatus::VerifiedHealthy
-        );
     }
 
     #[tokio::test]

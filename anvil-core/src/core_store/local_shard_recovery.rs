@@ -1,4 +1,3 @@
-use super::local_stream_control::control_record_proto::decode_object_manifest_record;
 #[cfg(test)]
 use super::local_stream_control::control_record_proto::encode_object_manifest_record;
 use super::*;
@@ -15,17 +14,12 @@ use tonic::metadata::MetadataValue;
 
 #[path = "local_shard_recovery/repair_identity.rs"]
 mod repair_identity;
-#[path = "local_shard_recovery/task_executor.rs"]
-mod task_executor;
 
 use repair_identity::physical_shard_repair_operation_id;
 
 const OBJECT_SHARD_REPAIR_SCHEMA: &str = "anvil.mvcc.object-shard-repair.v2";
 const MVCC_OBJECT_SHARD_REPAIR_TABLE_ID: u16 = 0x8109;
 const SHARD_INVENTORY_SCHEMA: &str = "anvil.core.shard_inventory.v1";
-const SHARD_RECOVERY_SCAN_ROWS: usize = 64;
-const SHARD_RECOVERY_PAGE_DELAY: Duration = Duration::from_secs(2);
-const SHARD_RECOVERY_CYCLE_DELAY: Duration = Duration::from_secs(20);
 const SHARD_RECOVERY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, PartialEq, Message)]
@@ -154,34 +148,6 @@ impl CoreStore {
         Ok(())
     }
 
-    pub async fn run_distributed_shard_recovery(self) {
-        if self.node_identity == CoreStoreNodeIdentity::default() {
-            return;
-        }
-        let mut after = None;
-        loop {
-            self.wait_for_coremeta_recovery_ready().await;
-            match self
-                .schedule_repair_manifest_page(after.as_deref(), SHARD_RECOVERY_SCAN_ROWS)
-                .await
-            {
-                Ok(Some(cursor)) => {
-                    after = Some(cursor);
-                    tokio::time::sleep(SHARD_RECOVERY_PAGE_DELAY).await;
-                }
-                Ok(None) => {
-                    after = None;
-                    tokio::time::sleep(SHARD_RECOVERY_CYCLE_DELAY).await;
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "distributed shard recovery pass failed");
-                    after = None;
-                    tokio::time::sleep(SHARD_RECOVERY_CYCLE_DELAY).await;
-                }
-            }
-        }
-    }
-
     pub(crate) async fn shard_inventory_state(
         &self,
         encoded_descriptor: &str,
@@ -210,95 +176,6 @@ impl CoreStore {
             Ok(_) => Ok(ShardInventoryState::Present),
             Err(_) => Ok(ShardInventoryState::Divergent),
         }
-    }
-
-    async fn schedule_repair_manifest_page(
-        &self,
-        after_tuple_key: Option<&[u8]>,
-        limit: usize,
-    ) -> Result<Option<Vec<u8>>> {
-        if !self.owns_rebalance_shard_scheduler().await? {
-            return Ok(None);
-        }
-        let rows = self.scan_coremeta_prefix_page(
-            CF_OBJECT_VERSIONS,
-            TABLE_OBJECT_VERSION_META_ROW,
-            &object_manifest_meta_prefix(),
-            after_tuple_key,
-            limit,
-        )?;
-        for row in &rows {
-            let manifest = match decode_object_manifest_record(&row.payload) {
-                Ok(manifest) => manifest,
-                Err(error) => {
-                    tracing::warn!(%error, "skipping invalid object manifest during shard recovery");
-                    continue;
-                }
-            };
-            if manifest.encoding.profile_id == LOCAL_INLINE_PAYLOAD_PROFILE_ID {
-                continue;
-            }
-            if let Err(error) = self
-                .schedule_repair_for_manifest(manifest, &row.payload)
-                .await
-            {
-                tracing::warn!(%error, "object shard repair scheduling failed");
-            }
-        }
-        if rows.len() < limit {
-            return Ok(None);
-        }
-        rows.last()
-            .map(|row| core_meta_record_tuple_key(&row.key).map(ToOwned::to_owned))
-            .transpose()
-    }
-
-    async fn schedule_repair_for_manifest(
-        &self,
-        mut manifest: CoreObjectManifest,
-        encoded_manifest: &[u8],
-    ) -> Result<()> {
-        let payload = task_executor::rebalance_payload_from_manifest(&manifest, encoded_manifest)?;
-        validate_repair_manifest_identity(&manifest)?;
-        let profile = local_erasure_profile(&manifest.encoding.profile_id)?;
-        let candidates = self.active_object_peer_placements().await?;
-
-        let probes = self
-            .probe_object_placements(&manifest, profile, &candidates)
-            .await;
-        let present = probes
-            .iter()
-            .filter(|probe| probe.state == PlacementProbeState::Present)
-            .count();
-        let repairable = probes
-            .iter()
-            .filter(|probe| probe.state == PlacementProbeState::Repairable)
-            .count();
-        let unavailable = probes.len().saturating_sub(present + repairable);
-        tracing::debug!(
-            object_hash = %manifest.object_hash,
-            block_id = %manifest.encoding.block_id,
-            candidate_count = candidates.len(),
-            present,
-            repairable,
-            unavailable,
-            "completed object shard recovery probe"
-        );
-        if repairable == 0 {
-            return Ok(());
-        }
-        let priority = task_executor::repair_task_priority(&manifest.encoding.repair_priority)?;
-        let enqueued = self
-            .schedule_rebalance_shard_task(payload, priority)
-            .await?;
-        tracing::debug!(
-            object_hash = %manifest.object_hash,
-            block_id = %manifest.encoding.block_id,
-            priority,
-            enqueued,
-            "scheduled object shard recovery task"
-        );
-        Ok(())
     }
 
     async fn probe_object_placements(

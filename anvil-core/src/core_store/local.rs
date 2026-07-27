@@ -362,7 +362,6 @@ pub struct CoreStore {
     internal_channels: Arc<Mutex<BTreeMap<String, Channel>>>,
     coremeta_streams: Arc<Mutex<BTreeMap<String, local_coremeta_stream::CoreMetaPeerStream>>>,
     coremeta_recovery: Arc<local_coremeta_recovery::CoreMetaRecoveryState>,
-    repair_task_scheduler: Arc<OnceLock<local_repair_task_scheduler::RepairTaskScheduler>>,
     root_owner_failure_tracker: Arc<Mutex<local_root_failover::RootOwnerFailureTracker>>,
     pipeline_keyring: Option<Arc<CorePipelineKeyring>>,
     storage_classes: CoreStorageClassCatalog,
@@ -942,8 +941,6 @@ pub(crate) use local_object_metadata::{
 };
 #[path = "local_pending_finalisation.rs"]
 mod local_pending_finalisation;
-#[path = "local_repair_task_scheduler.rs"]
-mod local_repair_task_scheduler;
 pub(crate) use self::local_codec::{decode_core_object_ref_target, encode_core_object_ref_target};
 pub(crate) use self::local_coremeta_quorum::commit_coremeta_batch_for_storage;
 pub(crate) use self::local_io::{record_corestore_trace_event, write_file_atomic};

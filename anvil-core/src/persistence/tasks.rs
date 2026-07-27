@@ -6,12 +6,6 @@ const AUTHZ_MATERIALIZATION_DERIVED_INDEX_KIND: &str = "userset";
 const AUTHZ_MATERIALIZATION_MAX_STEPS_PER_TASK: usize = 256;
 const REBALANCE_SHARD_PARTITION_FAMILY: &str = "object_shard_repair";
 
-fn task_queue_is_owned_elsewhere(error: &anyhow::Error) -> bool {
-    let message = format!("{error:#}");
-    message.contains(OWNERSHIP_HELD)
-        || message.contains("partition owner row exists but is not committed-visible")
-}
-
 impl Persistence {
     pub async fn hard_delete_object(&self, _object_id: i64) -> Result<()> {
         // Object metadata is append-only in the native journal. Physical shard cleanup
@@ -61,20 +55,6 @@ impl Persistence {
         Ok(enqueued)
     }
 
-    pub async fn enqueue_rebalance_shard_task(
-        &self,
-        payload: &crate::tasks::RebalanceShardTaskPayload,
-        priority: i32,
-    ) -> Result<bool> {
-        payload.validate()?;
-        self.enqueue_task_if_absent(
-            crate::tasks::TaskType::RebalanceShard,
-            serde_json::to_value(payload).context("serialize RebalanceShard task payload")?,
-            priority,
-        )
-        .await
-    }
-
     pub async fn enqueue_repair_run(
         &self,
         payload: &crate::tasks::RepairRunTaskPayload,
@@ -107,137 +87,6 @@ impl Persistence {
             Some(_) => Err(anyhow!("repair task id names a different task type")),
             None => Ok(None),
         }
-    }
-
-    pub(crate) async fn owns_rebalance_shard_scheduler(&self) -> Result<bool> {
-        match self.task_queue_write_permit().await {
-            Ok(permit) => Ok(permit.owner_node_id == self.owner_node_id),
-            Err(error)
-                if is_retryable_partition_fence_error(&error)
-                    || task_queue_is_owned_elsewhere(&error) =>
-            {
-                Ok(false)
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    pub async fn write_rebalance_shard_finding(
-        &self,
-        payload: &crate::tasks::RebalanceShardTaskPayload,
-        task_id: i64,
-        lease_fence_token: u64,
-        lease_epoch: u64,
-        attempt_started_at_nanos: i64,
-        status: repair_finding::RepairFindingStatus,
-        lease_precondition: (
-            crate::mvcc_transaction::LogicalKey,
-            crate::mvcc_transaction::PredicateKind,
-        ),
-    ) -> Result<repair_finding::RepairFinding> {
-        payload.validate()?;
-        if lease_fence_token == 0 || lease_epoch == 0 {
-            return Err(anyhow!(
-                "shard repair finding lease fence and epoch must be nonzero"
-            ));
-        }
-
-        let scope_id = payload.object_digest()?.to_string();
-        let repair_task_id = task_lease_id(task_id)?;
-        let (stage, severity, code, message, overlays_published) = match status {
-            repair_finding::RepairFindingStatus::Open => (
-                "open",
-                repair_finding::RepairFindingSeverity::Warning,
-                "ObjectShardRepairStarted",
-                "CoreStore object block shard repair task started",
-                None,
-            ),
-            repair_finding::RepairFindingStatus::RepairedObjectShards => (
-                "completed",
-                repair_finding::RepairFindingSeverity::Info,
-                "ObjectShardRepairCompleted",
-                "CoreStore object block shard repair task published at least one overlay",
-                Some(true),
-            ),
-            repair_finding::RepairFindingStatus::VerifiedHealthy => (
-                "completed",
-                repair_finding::RepairFindingSeverity::Info,
-                "ObjectShardsVerifiedHealthy",
-                "CoreStore object block placements were already healthy after re-probe",
-                Some(false),
-            ),
-            _ => {
-                return Err(anyhow!(
-                    "shard repair finding status must be Open, RepairedObjectShards, or VerifiedHealthy"
-                ));
-            }
-        };
-
-        repair_finding::write_repair_finding_with_lease(
-            self.mvcc()?,
-            repair_finding::RepairFindingWrite {
-                finding_id: rebalance_shard_audit_finding_id(
-                    task_id,
-                    lease_fence_token,
-                    lease_epoch,
-                    stage,
-                ),
-                scope_kind: "object_shard".to_string(),
-                scope_id: scope_id.clone(),
-                repair_task_id,
-                lease_fence_token,
-                severity,
-                status,
-                code: code.to_string(),
-                message: message.to_string(),
-                subjects: vec![
-                    repair_finding::RepairSubjectRef {
-                        subject_kind: "core_object".to_string(),
-                        subject_id: payload.object_hash.clone(),
-                        generation: None,
-                        cursor: None,
-                        expected_hash: Some(scope_id),
-                        actual_hash: None,
-                    },
-                    repair_finding::RepairSubjectRef {
-                        subject_kind: "core_block".to_string(),
-                        subject_id: payload.block_id.clone(),
-                        generation: None,
-                        cursor: None,
-                        expected_hash: None,
-                        actual_hash: None,
-                    },
-                    repair_finding::RepairSubjectRef {
-                        subject_kind: "core_manifest".to_string(),
-                        subject_id: payload.manifest_ref.clone(),
-                        generation: Some(payload.manifest_root_generation),
-                        cursor: None,
-                        expected_hash: Some(payload.manifest_payload_digest_hex()?.to_string()),
-                        actual_hash: None,
-                    },
-                ],
-                proposed_action: repair_finding::RepairActionKind::RepairObjectShards,
-                evidence: serde_json::json!({
-                    "object_hash": payload.object_hash,
-                    "logical_size": payload.logical_size,
-                    "manifest_ref": payload.manifest_ref,
-                    "manifest_root_key_hash": payload.manifest_root_key_hash,
-                    "manifest_root_generation": payload.manifest_root_generation,
-                    "manifest_transaction_id": payload.manifest_transaction_id,
-                    "manifest_payload_digest": payload.manifest_payload_digest,
-                    "block_id": payload.block_id,
-                    "task_id": task_id,
-                    "lease_fence_token": lease_fence_token,
-                    "lease_epoch": lease_epoch,
-                    "stage": stage,
-                    "overlays_published": overlays_published,
-                }),
-                created_at_nanos: attempt_started_at_nanos,
-            },
-            &self.partition_owner_signing_key,
-            lease_precondition,
-        )
-        .await
     }
 
     pub(super) async fn enqueue_index_build_task(
@@ -1274,31 +1123,9 @@ fn rebalance_shard_lease_target(
     })
 }
 
-fn rebalance_shard_audit_finding_id(
-    task_id: i64,
-    lease_fence_token: u64,
-    lease_epoch: u64,
-    stage: &str,
-) -> String {
-    format!("object-shards-{task_id}-{lease_fence_token}-{lease_epoch}-{stage}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn repair_scheduler_defers_to_the_current_task_queue_owner() {
-        assert!(task_queue_is_owned_elsewhere(&anyhow!(
-            "{OWNERSHIP_HELD}: task queue is owned by another equal peer"
-        )));
-        assert!(task_queue_is_owned_elsewhere(&anyhow!(
-            "partition owner row exists but is not committed-visible"
-        )));
-        assert!(!task_queue_is_owned_elsewhere(&anyhow!(
-            "partition owner signature mismatch"
-        )));
-    }
 
     #[test]
     fn rebalance_shard_lease_target_is_stable_and_block_scoped() {
@@ -1347,16 +1174,6 @@ mod tests {
                 rebalance_shard_lease_target(&changed).unwrap().partition_id
             );
         }
-    }
-
-    #[test]
-    fn rebalance_shard_audit_finding_identity_changes_with_lease_epoch() {
-        let first = rebalance_shard_audit_finding_id(41, 7, 11, "open");
-        let retried = rebalance_shard_audit_finding_id(41, 7, 12, "open");
-
-        assert_ne!(first, retried);
-        assert_eq!(first, "object-shards-41-7-11-open");
-        assert_eq!(retried, "object-shards-41-7-12-open");
     }
 
     #[test]

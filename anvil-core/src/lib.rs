@@ -270,7 +270,6 @@ impl AppState {
         };
         let personaldb_protocol_keyring = Arc::new(personaldb_protocol_keyring);
         let persistence = persistence::Persistence::new(&arc_config)?;
-        core_store.install_repair_task_scheduler(persistence.clone())?;
         if !arc_config.region.is_empty() && !arc_config.requires_distributed_coremeta_recovery() {
             // A standalone node owns its local region bootstrap. Distributed
             // regions are installed through the admin topology bootstrap and
