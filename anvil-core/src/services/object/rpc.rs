@@ -21,7 +21,7 @@ async fn begin_implicit_native_transaction(
     state: &AppState,
     claims: &auth::Claims,
     context: Option<&NativeMutationContext>,
-    operation: &str,
+    target: &NativeIdempotencyTarget,
 ) -> Result<Option<crate::mvcc_open_transactions::TransactionHandle>, Status> {
     let context =
         context.ok_or_else(|| Status::invalid_argument("Missing native mutation context"))?;
@@ -29,6 +29,8 @@ async fn begin_implicit_native_transaction(
         return Ok(None);
     }
     let principal = object_manager::transaction_principal_from_claims(claims);
+    let idempotency_key =
+        super::native_mutation::implicit_native_transaction_key(context, target)?;
     state
         .mvcc
         .open_transactions
@@ -36,10 +38,7 @@ async fn begin_implicit_native_transaction(
             state.mvcc.runtime.as_ref(),
             state.mvcc.cluster_id().to_string(),
             principal,
-            format!(
-                "native:{operation}:{}:{}:{}",
-                claims.tenant_id, claims.sub, context.idempotency_key
-            ),
+            idempotency_key,
             std::time::Duration::from_secs(300),
             crate::mvcc_transaction::DurabilityLevel::Quorum,
             crate::mvcc_transaction::ReadConsistency::Linearized,
@@ -408,7 +407,7 @@ impl ObjectService for AppState {
             self,
             &claims,
             req.mutation_context.as_ref(),
-            "delete-object",
+            &target,
         )
         .await?;
         let transaction_id = requested_transaction_id.or_else(|| {
@@ -864,7 +863,7 @@ impl ObjectService for AppState {
             self,
             &claims,
             req.mutation_context.as_ref(),
-            "copy-object",
+            &target,
         )
         .await?;
         let transaction_id = requested_transaction_id.or_else(|| {
@@ -977,7 +976,7 @@ impl ObjectService for AppState {
             self,
             &claims,
             req.mutation_context.as_ref(),
-            "compose-object",
+            &target,
         )
         .await?;
         let transaction_id = requested_transaction_id.or_else(|| {
@@ -1089,7 +1088,7 @@ impl ObjectService for AppState {
             self,
             &claims,
             req.mutation_context.as_ref(),
-            "patch-json-object",
+            &target,
         )
         .await?;
         let transaction_id = requested_transaction_id.or_else(|| {
@@ -1194,7 +1193,7 @@ impl ObjectService for AppState {
             self,
             &claims,
             req.mutation_context.as_ref(),
-            "manifest-cas",
+            &target,
         )
         .await?;
         let transaction_id = requested_transaction_id.or_else(|| {
@@ -1429,7 +1428,7 @@ impl ObjectService for AppState {
             self,
             &claims,
             req.mutation_context.as_ref(),
-            "multipart-initiate",
+            &target,
         )
         .await?;
         let transaction_id = requested_transaction_id.or_else(|| {
@@ -1542,7 +1541,7 @@ impl ObjectService for AppState {
             self,
             &claims,
             metadata.mutation_context.as_ref(),
-            "multipart-upload-part",
+            &target,
         )
         .await?;
         let transaction_id = requested_transaction_id.or_else(|| {
@@ -1667,7 +1666,7 @@ impl ObjectService for AppState {
             self,
             &claims,
             req.mutation_context.as_ref(),
-            "multipart-complete",
+            &target,
         )
         .await?;
         let transaction_id = requested_transaction_id.or_else(|| {
@@ -1781,7 +1780,7 @@ impl ObjectService for AppState {
             self,
             &claims,
             req.mutation_context.as_ref(),
-            "multipart-abort",
+            &target,
         )
         .await?;
         let transaction_id = requested_transaction_id.or_else(|| {

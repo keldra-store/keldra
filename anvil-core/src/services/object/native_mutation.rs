@@ -47,7 +47,7 @@ pub(super) async fn begin_implicit_native_transaction(
     })
 }
 
-fn implicit_native_transaction_key(
+pub(super) fn implicit_native_transaction_key(
     context: &NativeMutationContext,
     target: &NativeIdempotencyTarget,
 ) -> Result<String, Status> {
