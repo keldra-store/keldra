@@ -37,6 +37,12 @@ pub trait ReplicationConnectionAuthorizer: Send + Sync + 'static {
         metadata: &MetadataMap,
         open: &ReplicationSessionOpen,
     ) -> Result<AuthenticatedPeer, Status>;
+
+    /// Revalidate only the applied incarnation fence before accepting another
+    /// frame on an authenticated stream.
+    fn authorize_incarnation(&self, _node_id: &str, _incarnation: u64) -> Result<(), Status> {
+        Ok(())
+    }
 }
 
 pub struct ReplicationServiceImpl<A> {
@@ -220,6 +226,13 @@ impl<A: ReplicationConnectionAuthorizer> ReplicationServiceImpl<A> {
         }
 
         while let Some(message) = inbound.next().await {
+            if let Err(error) = self
+                .authorizer
+                .authorize_incarnation(&session.peer().node_id, session.peer().incarnation)
+            {
+                send_error(&output, error).await;
+                return;
+            }
             let request = match message {
                 Ok(request) => request,
                 Err(error) => {

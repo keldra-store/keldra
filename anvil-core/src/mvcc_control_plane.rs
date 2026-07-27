@@ -208,18 +208,52 @@ impl MvccSubsystem {
                 },
             ));
         }
-        self.consensus
+        let replaced = snapshot
+            .nodes
+            .iter()
+            .find(|(id, _raft_node_id, incarnation, _domain)| {
+                *id == control_node_id && *incarnation != node.incarnation
+            })
+            .map(|(_, _, incarnation, _)| ConsensusNodeIncarnation {
+                node_id: control_node_id,
+                incarnation: *incarnation,
+            });
+        let installed = ConsensusNodeIncarnation {
+            node_id: control_node_id,
+            incarnation: node.incarnation,
+        };
+        let result = self
+            .consensus
             .install_node(
                 crate::mvcc_bootstrap::cluster_id_hash(self.cluster_id()),
-                ConsensusNodeIncarnation {
-                    node_id: control_node_id,
-                    incarnation: node.incarnation,
-                },
+                installed,
                 NodeId(raft_node_id),
                 failure_domain,
             )
             .await
-            .context("install cluster node")
+            .context("install cluster node")?;
+        if let Some(replaced) = replaced {
+            for (partition_id, assignment) in snapshot
+                .partitions
+                .iter()
+                .filter(|(_, assignment)| assignment.owner == replaced)
+            {
+                self.consensus
+                    .assign_partition(
+                        crate::mvcc_bootstrap::cluster_id_hash(self.cluster_id()),
+                        *partition_id,
+                        installed,
+                        assignment.epoch.saturating_add(1),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "move partition {partition_id} to replacement node incarnation"
+                        )
+                    })?;
+            }
+        }
+        Ok(result)
     }
 
     /// Fence and remove an incarnation after its Raft voter membership and
@@ -352,9 +386,8 @@ impl MvccSubsystem {
     ) -> Result<()> {
         authorization.require(self.cluster_id(), ClusterControlPermission::Nodes)?;
         self.replication_client
-            .replace_peer_endpoint(self.cluster_id(), node, endpoint.clone())
-            .await
-            .context("replace replication route")?;
+            .replace_peer_incarnation(self.cluster_id(), node, endpoint.clone())
+            .context("replace replication route and incarnation fence")?;
         self.consensus
             .add_learner(
                 NodeId(raft_node_id),

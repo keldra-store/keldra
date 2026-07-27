@@ -113,7 +113,7 @@ pub struct NodeConnectionAuthorizer {
     cluster_id: Arc<str>,
     token: Arc<str>,
     raft_nodes: Arc<BTreeMap<u64, MvccPeerConfig>>,
-    replication_nodes: Arc<BTreeMap<(String, u64), MvccPeerConfig>>,
+    replication_nodes: Arc<BTreeMap<String, MvccPeerConfig>>,
     storage: crate::storage::Storage,
     core_store: crate::core_store::CoreStore,
     runtime: Arc<ProductMvccRuntime>,
@@ -148,7 +148,7 @@ impl NodeConnectionAuthorizer {
                 peers
                     .iter()
                     .cloned()
-                    .map(|peer| ((peer.node_id.clone(), peer.incarnation), peer))
+                    .map(|peer| (peer.node_id.clone(), peer))
                     .collect(),
             ),
             storage,
@@ -221,7 +221,11 @@ impl NodeConnectionAuthorizer {
         Ok(())
     }
 
-    fn authorize_control_incarnation(&self, peer: &MvccPeerConfig) -> Result<(), Status> {
+    fn authorize_control_incarnation(
+        &self,
+        peer: &MvccPeerConfig,
+        presented_incarnation: u64,
+    ) -> Result<(), Status> {
         let snapshot = self
             .consensus
             .applied_control_snapshot()
@@ -232,7 +236,13 @@ impl NodeConnectionAuthorizer {
         // is the authority. Installing the first durability policy closes the
         // window; every reconnect thereafter must match Raft control state.
         if snapshot.durability_policy.generation == 0 {
-            return Ok(());
+            return if presented_incarnation == peer.incarnation {
+                Ok(())
+            } else {
+                Err(Status::permission_denied(
+                    "node incarnation does not match bootstrap peer configuration",
+                ))
+            };
         }
         let installed =
             snapshot
@@ -241,7 +251,7 @@ impl NodeConnectionAuthorizer {
                 .any(|(node_id, raft_node_id, incarnation, domain)| {
                     *node_id == consensus_control_node_id(&peer.node_id)
                         && raft_node_id.0 == peer.raft_node_id
-                        && *incarnation == peer.incarnation
+                        && *incarnation == presented_incarnation
                         && domain == &peer.failure_domain
                 });
         if !installed {
@@ -270,12 +280,17 @@ impl ConsensusConnectionAuthorizer for NodeConnectionAuthorizer {
             .raft_nodes
             .get(&open.node_id)
             .ok_or_else(|| Status::permission_denied("node is not in Raft peer configuration"))?;
-        if peer.incarnation != open.node_incarnation {
-            return Err(Status::permission_denied("stale Raft node incarnation"));
-        }
-        self.authorize_control_incarnation(peer)?;
+        self.authorize_control_incarnation(peer, open.node_incarnation)?;
         self.authorize_zanzibar(&peer.node_id).await?;
         Ok(())
+    }
+
+    fn authorize_incarnation(&self, node_id: u64, incarnation: u64) -> Result<(), Status> {
+        let peer = self
+            .raft_nodes
+            .get(&node_id)
+            .ok_or_else(|| Status::permission_denied("node is not in Raft peer configuration"))?;
+        self.authorize_control_incarnation(peer, incarnation)
     }
 }
 
@@ -294,11 +309,9 @@ impl ReplicationConnectionAuthorizer for NodeConnectionAuthorizer {
         }
         let peer = self
             .replication_nodes
-            .get(&(open.node_id.clone(), open.node_incarnation))
-            .ok_or_else(|| {
-                Status::permission_denied("node incarnation is not in peer configuration")
-            })?;
-        self.authorize_control_incarnation(peer)?;
+            .get(&open.node_id)
+            .ok_or_else(|| Status::permission_denied("node is not in peer configuration"))?;
+        self.authorize_control_incarnation(peer, open.node_incarnation)?;
         self.authorize_zanzibar(&peer.node_id).await?;
         AuthenticatedPeer::new_bound(
             open.node_id.clone(),
@@ -306,6 +319,14 @@ impl ReplicationConnectionAuthorizer for NodeConnectionAuthorizer {
             peer.endpoint.clone(),
         )
         .map_err(|error| Status::permission_denied(error.to_string()))
+    }
+
+    fn authorize_incarnation(&self, node_id: &str, incarnation: u64) -> Result<(), Status> {
+        let peer = self
+            .replication_nodes
+            .get(node_id)
+            .ok_or_else(|| Status::permission_denied("node is not in peer configuration"))?;
+        self.authorize_control_incarnation(peer, incarnation)
     }
 }
 

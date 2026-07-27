@@ -1,6 +1,10 @@
 //! Persistent client-side replication streams with application-level ACKs.
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -93,7 +97,7 @@ pub struct TonicReplicationStreamManager {
     local_node: NodeIncarnation,
     node_token: Arc<str>,
     options: ReplicationStreamOptions,
-    peers: Arc<BTreeMap<(String, NodeIncarnation), Arc<AsyncMutex<PeerState>>>>,
+    peers: Arc<RwLock<BTreeMap<(String, NodeIncarnation), Arc<AsyncMutex<PeerState>>>>>,
 }
 
 impl std::fmt::Debug for TonicReplicationStreamManager {
@@ -102,7 +106,14 @@ impl std::fmt::Debug for TonicReplicationStreamManager {
             .debug_struct("TonicReplicationStreamManager")
             .field("cluster_id", &self.cluster_id)
             .field("local_node", &self.local_node)
-            .field("peer_count", &self.peers.len())
+            .field(
+                "peer_count",
+                &self
+                    .peers
+                    .read()
+                    .expect("replication peer map lock poisoned")
+                    .len(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -161,7 +172,7 @@ impl TonicReplicationStreamManager {
             local_node,
             node_token: node_token.into(),
             options,
-            peers: Arc::new(states),
+            peers: Arc::new(RwLock::new(states)),
         })
     }
 
@@ -190,12 +201,55 @@ impl TonicReplicationStreamManager {
             .connect_lazy();
         let peer = self
             .peers
+            .read()
+            .expect("replication peer map lock poisoned")
             .get(&(cluster_id.to_string(), node.clone()))
             .with_context(|| format!("no replication peer for {cluster_id}/{node:?}"))?
             .clone();
         let mut peer = peer.lock().await;
         peer.channel = channel;
         peer.session = None;
+        Ok(())
+    }
+
+    /// Atomically fence every configured incarnation of a logical peer and
+    /// install the replacement route. Existing transfers retain their old
+    /// peer state, but no subsequent lookup can obtain it or count its ACK for
+    /// the replacement incarnation.
+    pub fn replace_peer_incarnation(
+        &self,
+        cluster_id: &str,
+        node: &NodeIncarnation,
+        endpoint: impl Into<String>,
+    ) -> Result<()> {
+        if cluster_id != &*self.cluster_id {
+            bail!("cross-cluster replication incarnation replacement is forbidden");
+        }
+        if node.node_id.trim().is_empty() || node.incarnation == 0 {
+            bail!("replacement replication peer requires a valid incarnation");
+        }
+        let endpoint = endpoint.into();
+        if endpoint.trim().is_empty() {
+            bail!("replacement replication endpoint must be non-empty");
+        }
+        require_secure_endpoint(&endpoint, self.options.allow_insecure_transport_for_tests)?;
+        let channel = Endpoint::from_shared(endpoint)?
+            .connect_timeout(self.options.operation_timeout)
+            .connect_lazy();
+        let mut peers = self
+            .peers
+            .write()
+            .expect("replication peer map lock poisoned");
+        peers.retain(|(configured_cluster, configured_node), _| {
+            configured_cluster != cluster_id || configured_node.node_id != node.node_id
+        });
+        peers.insert(
+            (cluster_id.to_string(), node.clone()),
+            Arc::new(AsyncMutex::new(PeerState {
+                channel,
+                session: None,
+            })),
+        );
         Ok(())
     }
 
@@ -221,6 +275,8 @@ impl TonicReplicationStreamManager {
         }
         let peer = self
             .peers
+            .read()
+            .expect("replication peer map lock poisoned")
             .get(&(target_cluster_id.to_string(), target.clone()))
             .with_context(|| format!("no replication endpoint for {target_cluster_id}/{target:?}"))?
             .clone();
@@ -295,6 +351,8 @@ impl TonicReplicationStreamManager {
     ) -> Result<Vec<u8>> {
         let peer = self
             .peers
+            .read()
+            .expect("replication peer map lock poisoned")
             .get(&(cluster_id.to_string(), target.clone()))
             .with_context(|| format!("no replication endpoint for {cluster_id}/{target:?}"))?
             .clone();
@@ -1226,6 +1284,50 @@ mod tests {
                 .to_string()
                 .contains("cross-cluster replication cannot provide transaction durability")
         );
+    }
+
+    #[test]
+    fn replacing_incarnation_removes_stale_replication_ack_route() {
+        let stale = NodeIncarnation {
+            node_id: "node-b".into(),
+            incarnation: 1,
+        };
+        let replacement = NodeIncarnation {
+            node_id: "node-b".into(),
+            incarnation: 2,
+        };
+        let manager = TonicReplicationStreamManager::new(
+            "cluster-a",
+            NodeIncarnation {
+                node_id: "node-a".into(),
+                incarnation: 1,
+            },
+            "test-token",
+            [ReplicationPeer {
+                cluster_id: "cluster-a".into(),
+                node: stale.clone(),
+                endpoint: "http://127.0.0.1:9".into(),
+            }],
+            ReplicationStreamOptions {
+                allow_insecure_transport_for_tests: true,
+                ..ReplicationStreamOptions::default()
+            },
+        )
+        .unwrap();
+
+        manager
+            .replace_peer_incarnation(
+                "cluster-a",
+                &replacement,
+                "http://127.0.0.1:10",
+            )
+            .unwrap();
+        let peers = manager
+            .peers
+            .read()
+            .expect("replication peer map lock poisoned");
+        assert!(!peers.contains_key(&("cluster-a".into(), stale)));
+        assert!(peers.contains_key(&("cluster-a".into(), replacement)));
     }
 
     #[tokio::test]

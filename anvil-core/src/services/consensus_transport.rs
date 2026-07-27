@@ -38,6 +38,14 @@ pub trait ConsensusConnectionAuthorizer: Send + Sync + 'static {
         metadata: &MetadataMap,
         open: &ConsensusSessionOpen,
     ) -> Result<(), Status>;
+
+    /// Revalidate only the cheap, locally applied incarnation fence. This is
+    /// intentionally separate from connection authentication: tokens and
+    /// Zanzibar are checked once, while a topology change can revoke an
+    /// already-open stream before its next Raft frame is dispatched.
+    fn authorize_incarnation(&self, _node_id: u64, _incarnation: u64) -> Result<(), Status> {
+        Ok(())
+    }
 }
 
 pub struct ConsensusTransportService<A> {
@@ -108,6 +116,9 @@ impl<A: ConsensusConnectionAuthorizer> ConsensusTransport for ConsensusTransport
 
         let (output, receiver) = mpsc::channel(32);
         let runtime = self.runtime.clone();
+        let authorizer = self.authorizer.clone();
+        let session_node_id = open.node_id;
+        let session_incarnation = open.node_incarnation;
         let applied_report = self.applied_report.clone();
         tokio::spawn(async move {
             if output
@@ -149,6 +160,12 @@ impl<A: ConsensusConnectionAuthorizer> ConsensusTransport for ConsensusTransport
                         return;
                     }
                 };
+                if let Err(error) =
+                    authorizer.authorize_incarnation(session_node_id, session_incarnation)
+                {
+                    let _ = output.send(Err(error)).await;
+                    return;
+                }
                 let mut reply = dispatch(&runtime, frame).await;
                 if let Some((node_id, incarnation, report)) = &applied_report {
                     reply.reporting_node_id = node_id.0;
