@@ -924,7 +924,10 @@ async fn admin_repair_diagnostics_and_audit_handlers_return_structured_responses
         .unwrap()
         .into_inner();
     assert_eq!(repair.request_id, "req-admin-directory-repair");
-    assert_eq!(repair.status, "empty_source");
+    // Product repairs are now durable background tasks.  The admin API
+    // acknowledges enqueueing immediately; the worker reports the eventual
+    // empty-source result through task status/diagnostics.
+    assert_eq!(repair.status, "pending");
     assert_eq!(repair.scope_kind, "bucket");
     assert!(repair.findings.is_empty());
     assert!(repair.audit_event_id.contains("req-admin-directory-repair"));
