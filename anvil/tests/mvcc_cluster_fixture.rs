@@ -1,14 +1,12 @@
 #![recursion_limit = "512"]
 
 use anvil::{
-    bundle_replication::BundleTargetStream,
+    bundle_replication::{BundleTarget, BundleTargetStream},
     mvcc_shard_repair::{
         MissingShardTarget, ShardMaintenanceKind, ShardRepairJob, ShardRepairState,
         resolve_manifest_at_snapshot,
     },
-    mvcc_transaction::{
-        BundleTarget, CertificationResult, DurabilityLevel, LogicalKey, ReadConsistency,
-    },
+    mvcc_transaction::{CertificationResult, DurabilityLevel, LogicalKey, ReadConsistency},
     object_shard_manifest::PhysicalObjectShardManifest,
     shard_placement::{DistributedIngest, ShardPlacementPolicy},
     streaming_erasure::ErasureProfile,
@@ -899,6 +897,10 @@ async fn real_cluster_reconstructs_a_deleted_shard_and_publishes_repaired_placem
         profile,
         DurabilityLevel::Erasure,
         &mut reader,
+        "fixture-repair-source",
+        0,
+        1,
+        false,
         object_identity,
         None,
         1,
