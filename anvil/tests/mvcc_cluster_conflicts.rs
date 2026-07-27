@@ -98,7 +98,10 @@ async fn concurrent_point_writes_commit_exactly_one_and_converge() {
             .unwrap();
     }
 
-    let winner = cluster.state(leader).mvcc.open_transactions
+    let winner = cluster
+        .state(leader)
+        .mvcc
+        .open_transactions
         .commit(
             cluster.state(leader).mvcc.runtime.as_ref(),
             &first.transaction_id,
@@ -107,7 +110,10 @@ async fn concurrent_point_writes_commit_exactly_one_and_converge() {
         )
         .await
         .unwrap();
-    let loser = cluster.state(other).mvcc.open_transactions
+    let loser = cluster
+        .state(other)
+        .mvcc
+        .open_transactions
         .commit(
             cluster.state(other).mvcc.runtime.as_ref(),
             &second.transaction_id,
@@ -142,7 +148,8 @@ async fn concurrent_range_observer_rejects_phantom_and_cluster_converges() {
     let inserter = begin(&cluster, leader, "range-conflict-inserter").await;
     let observer = begin(&cluster, observer_node, "range-conflict-observer").await;
     let observer_mvcc = &cluster.state(observer_node).mvcc;
-    observer_mvcc.open_transactions
+    observer_mvcc
+        .open_transactions
         .observe_range(
             &observer.transaction_id,
             observer_mvcc.cluster_id(),
@@ -153,7 +160,8 @@ async fn concurrent_range_observer_rejects_phantom_and_cluster_converges() {
             2,
         )
         .unwrap();
-    observer_mvcc.open_transactions
+    observer_mvcc
+        .open_transactions
         .put(
             &observer.transaction_id,
             observer_mvcc.cluster_id(),
@@ -164,7 +172,8 @@ async fn concurrent_range_observer_rejects_phantom_and_cluster_converges() {
         .unwrap();
 
     let inserter_mvcc = &cluster.state(leader).mvcc;
-    inserter_mvcc.open_transactions
+    inserter_mvcc
+        .open_transactions
         .put(
             &inserter.transaction_id,
             inserter_mvcc.cluster_id(),
@@ -173,7 +182,8 @@ async fn concurrent_range_observer_rejects_phantom_and_cluster_converges() {
             2,
         )
         .unwrap();
-    let inserted = inserter_mvcc.open_transactions
+    let inserted = inserter_mvcc
+        .open_transactions
         .commit(
             inserter_mvcc.runtime.as_ref(),
             &inserter.transaction_id,
@@ -182,7 +192,8 @@ async fn concurrent_range_observer_rejects_phantom_and_cluster_converges() {
         )
         .await
         .unwrap();
-    let rejected = observer_mvcc.open_transactions
+    let rejected = observer_mvcc
+        .open_transactions
         .commit(
             observer_mvcc.runtime.as_ref(),
             &observer.transaction_id,
@@ -201,7 +212,10 @@ async fn concurrent_range_observer_rejects_phantom_and_cluster_converges() {
     wait_for_value(&cluster, version, &phantom_key, b"inserted").await;
     for node in 0..3 {
         assert!(
-            cluster.state(node).mvcc.runtime
+            cluster
+                .state(node)
+                .mvcc
+                .runtime
                 .read_at(&observer_write, version)
                 .unwrap()
                 .is_none(),

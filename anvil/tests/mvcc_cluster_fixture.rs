@@ -5,9 +5,7 @@ use anvil::{
         MissingShardTarget, ShardMaintenanceKind, ShardRepairJob, ShardRepairState,
         resolve_manifest_at_snapshot,
     },
-    mvcc_transaction::{
-        CertificationResult, DurabilityLevel, LogicalKey, ReadConsistency,
-    },
+    mvcc_transaction::{CertificationResult, DurabilityLevel, LogicalKey, ReadConsistency},
     object_shard_manifest::PhysicalObjectShardManifest,
     shard_placement::{DistributedIngest, ShardPlacementPolicy},
     streaming_erasure::ErasureProfile,
@@ -17,10 +15,9 @@ use tonic::Request;
 
 fn authorized<T>(message: T, token: &str) -> Request<T> {
     let mut request = Request::new(message);
-    request.metadata_mut().insert(
-        "authorization",
-        format!("Bearer {token}").parse().unwrap(),
-    );
+    request
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
     request
 }
 
@@ -89,17 +86,15 @@ async fn real_cluster_quorum_commit_is_readable_after_node_restart() {
                 }),
                 precondition: None,
                 operations: vec![anvil::anvil_api::MutationBatchOperation {
-                    op: Some(
-                        anvil::anvil_api::mutation_batch_operation::Op::PutObject(
-                            anvil::anvil_api::MutationBatchPutObject {
-                                object_key: "fixture/smoke".into(),
-                                payload: b"value".to_vec(),
-                                content_type: Some("application/octet-stream".into()),
-                                user_metadata_json: "{}".into(),
-                                storage_class: None,
-                            },
-                        ),
-                    ),
+                    op: Some(anvil::anvil_api::mutation_batch_operation::Op::PutObject(
+                        anvil::anvil_api::MutationBatchPutObject {
+                            object_key: "fixture/smoke".into(),
+                            payload: b"value".to_vec(),
+                            content_type: Some("application/octet-stream".into()),
+                            user_metadata_json: "{}".into(),
+                            storage_class: None,
+                        },
+                    )),
                 }],
             },
             &actor.token,
@@ -249,7 +244,10 @@ async fn real_cluster_reconstructs_a_deleted_shard_and_publishes_repaired_placem
     cluster
         .remove_replication_transfer(lost_node, lost.transfer_id)
         .unwrap();
-    assert!(!lost_path.exists(), "the selected durable shard was removed");
+    assert!(
+        !lost_path.exists(),
+        "the selected durable shard was removed"
+    );
 
     let principal = "e2e-repair-producer";
     let handle = mvcc
@@ -296,12 +294,7 @@ async fn real_cluster_reconstructs_a_deleted_shard_and_publishes_repaired_placem
         .unwrap();
     let committed = mvcc
         .open_transactions
-        .commit(
-            mvcc.runtime.as_ref(),
-            &handle.transaction_id,
-            principal,
-            12,
-        )
+        .commit(mvcc.runtime.as_ref(), &handle.transaction_id, principal, 12)
         .await
         .unwrap();
     assert!(matches!(
@@ -312,7 +305,11 @@ async fn real_cluster_reconstructs_a_deleted_shard_and_publishes_repaired_placem
     tokio::time::timeout(std::time::Duration::from_secs(20), async {
         loop {
             let completed = (0..3).any(|node| {
-                cluster.state(node).mvcc.runtime.local_store()
+                cluster
+                    .state(node)
+                    .mvcc
+                    .runtime
+                    .local_store()
                     .shard_repair_record(&job_id)
                     .ok()
                     .flatten()
@@ -338,21 +335,16 @@ async fn real_cluster_reconstructs_a_deleted_shard_and_publishes_repaired_placem
     }));
     let reconstructed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     repaired
-        .read_range_chunks(
-            &mvcc.replication_client,
-            0,
-            repaired.object_length,
-            {
+        .read_range_chunks(&mvcc.replication_client, 0, repaired.object_length, {
+            let reconstructed = reconstructed.clone();
+            move |chunk| {
                 let reconstructed = reconstructed.clone();
-                move |chunk| {
-                    let reconstructed = reconstructed.clone();
-                    async move {
-                        reconstructed.lock().unwrap().extend_from_slice(&chunk);
-                        Ok(())
-                    }
+                async move {
+                    reconstructed.lock().unwrap().extend_from_slice(&chunk);
+                    Ok(())
                 }
-            },
-        )
+            }
+        })
         .await
         .unwrap();
     assert_eq!(*reconstructed.lock().unwrap(), payload);
