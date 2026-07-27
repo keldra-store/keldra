@@ -994,8 +994,7 @@ async fn commit_task_lease_plan(
             Ok(outcome) => outcome,
             Err(error)
                 if attempt < 4
-                    && error
-                        .to_string()
+                    && format!("{error:#}")
                         .contains("assignment predicate violates applied Raft control state") =>
             {
                 tokio::time::sleep(std::time::Duration::from_millis(

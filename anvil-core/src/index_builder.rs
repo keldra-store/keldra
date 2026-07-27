@@ -1578,12 +1578,9 @@ async fn publish_index_build_proof_and_checkpoint(
             }
             Err(error)
                 if attempt < 4
-                    && (error
-                        .to_string()
+                    && (format!("{error:#}")
                         .contains("assignment predicate violates applied Raft control state")
-                        || error
-                            .to_string()
-                            .contains("background work assignment changed")) =>
+                        || format!("{error:#}").contains("background work assignment changed")) =>
             {
                 tokio::time::sleep(Duration::from_millis(25 * u64::from(attempt + 1))).await;
             }
