@@ -745,6 +745,73 @@ impl ObjectManager {
         Ok(bytes)
     }
 
+    async fn stream_mvcc_compatible_object_ref(
+        &self,
+        object_ref: CoreObjectRef,
+        output: mpsc::Sender<Result<Vec<u8>, Status>>,
+    ) -> Result<(), Status> {
+        let Some(encoded) = object_ref.manifest_ref.strip_prefix(MVCC_OBJECT_REF_PREFIX) else {
+            return self
+                .core_store
+                .read_object_ref_chunks(object_ref, None, 256 * 1024, |chunk| {
+                    let output = output.clone();
+                    async move {
+                        output
+                            .send(Ok(chunk))
+                            .await
+                            .map_err(|_| anyhow!("multipart completion stream closed"))
+                    }
+                })
+                .await
+                .map_err(|error| Status::internal(error.to_string()));
+        };
+        let representation = URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|error| Status::data_loss(error.to_string()))?;
+        let representation: JsonValue = serde_json::from_slice(&representation)
+            .map_err(|error| Status::data_loss(error.to_string()))?;
+        match object_data_target_from_shard_map(&representation)
+            .map_err(|error| Status::data_loss(error.to_string()))?
+        {
+            ObjectDataTarget::MvccLocal(manifest) => {
+                let file = self
+                    .installed_mvcc()?
+                    .local_objects
+                    .open_verified(&manifest)
+                    .await
+                    .map_err(|error| Status::data_loss(error.to_string()))?;
+                let mut chunks = tokio_util::io::ReaderStream::with_capacity(file, 256 * 1024);
+                while let Some(chunk) = chunks.next().await {
+                    output
+                        .send(Ok(chunk.map_err(|error| Status::data_loss(error.to_string()))?.to_vec()))
+                        .await
+                        .map_err(|_| Status::cancelled("multipart completion stream closed"))?;
+                }
+                Ok(())
+            }
+            ObjectDataTarget::MvccShards(manifest) => manifest
+                .read_range_chunks(
+                    &self.installed_mvcc()?.replication_client,
+                    0,
+                    manifest.object_length,
+                    move |chunk| {
+                        let output = output.clone();
+                        async move {
+                            output
+                                .send(Ok(chunk))
+                                .await
+                                .map_err(|_| anyhow!("multipart completion stream closed"))
+                        }
+                    },
+                )
+                .await
+                .map_err(|error| Status::data_loss(error.to_string())),
+            ObjectDataTarget::LogicalFile(_) | ObjectDataTarget::ObjectRef(_) => Err(
+                Status::data_loss("MVCC compatibility reference contains a legacy target"),
+            ),
+        }
+    }
+
     async fn object_boundary_capture_limit(
         &self,
         tenant_id: i64,
@@ -1469,19 +1536,12 @@ impl ObjectManager {
         let (tx, rx) = mpsc::channel(4);
         tokio::spawn(async move {
             for object_ref in ordered_part_refs {
-                match object_manager
-                    .read_mvcc_compatible_object_ref(object_ref)
+                if let Err(error) = object_manager
+                    .stream_mvcc_compatible_object_ref(object_ref, tx.clone())
                     .await
                 {
-                    Ok(bytes) => {
-                        if tx.send(Ok(bytes)).await.is_err() {
-                            return;
-                        }
-                    }
-                    Err(error) => {
-                        let _ = tx.send(Err(error)).await;
-                        return;
-                    }
+                    let _ = tx.send(Err(error)).await;
+                    return;
                 }
             }
         });
