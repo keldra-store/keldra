@@ -43,8 +43,6 @@ impl PublicReadiness {
 pub(crate) fn is_recovery_rpc(path: &str) -> bool {
     [
         "/anvil.BlockStoreInternal/",
-        "/anvil.RootRegisterInternal/",
-        "/anvil.CoreMetaReplicationInternal/",
         "/anvil.AntiEntropyInternal/",
         "/anvil.CrossRegionProxyInternal/",
     ]
@@ -84,8 +82,10 @@ mod tests {
 
     #[test]
     fn only_internal_recovery_services_bypass_public_readiness() {
-        assert!(is_recovery_rpc("/anvil.RootRegisterInternal/ReadRoot"));
-        assert!(is_recovery_rpc(
+        assert!(is_recovery_rpc("/anvil.BlockStoreInternal/GetShard"));
+        assert!(is_recovery_rpc("/anvil.AntiEntropyInternal/ExchangeInventory"));
+        assert!(!is_recovery_rpc("/anvil.RootRegisterInternal/ReadRoot"));
+        assert!(!is_recovery_rpc(
             "/anvil.CoreMetaReplicationInternal/ExchangeCoreMetaInventory"
         ));
         assert!(!is_recovery_rpc("/anvil.ObjectService/GetObject"));
