@@ -258,8 +258,6 @@ pub(crate) async fn create_append_stream_with_permit_mvcc(
     )?;
     commit_append_mutations(
         mvcc,
-        tenant_id,
-        bucket_id,
         &append_metadata_partition_principal(tenant_id, bucket_id),
         &format!("append-create:{}", receipt.mutation_id),
         mutations,
@@ -281,14 +279,6 @@ pub(crate) async fn create_append_stream_with_permit_in_transaction(
     transaction_principal: &str,
 ) -> Result<AppendStreamMutation> {
     require_append_metadata_permit(tenant_id, bucket_id, permit)?;
-    stage_append_assignment_guard(
-        mvcc,
-        tenant_id,
-        bucket_id,
-        transaction_id,
-        transaction_principal,
-    )
-    .await?;
     let journal_head = crate::mvcc_product::stream_logical_key(
         crate::core_store::TABLE_STREAM_HEAD_ROW,
         &append_metadata_stream_id(tenant_id, bucket_id),
@@ -384,8 +374,6 @@ pub(crate) async fn append_stream_record_with_permit_in_partition(
     )?;
     commit_append_mutations(
         mvcc,
-        tenant_id,
-        bucket_id,
         authenticated_principal,
         &format!("append-record:{}", receipt.mutation_id),
         mutations,
@@ -410,14 +398,6 @@ pub(crate) async fn append_stream_record_with_permit_in_partition_transaction(
     transaction_principal: &str,
 ) -> Result<AppendStreamRecordMutation> {
     require_append_metadata_permit(tenant_id, bucket_id, permit)?;
-    stage_append_assignment_guard(
-        mvcc,
-        tenant_id,
-        bucket_id,
-        transaction_id,
-        transaction_principal,
-    )
-    .await?;
     let journal_head = crate::mvcc_product::stream_logical_key(
         crate::core_store::TABLE_STREAM_HEAD_ROW,
         &append_metadata_stream_id(tenant_id, bucket_id),
@@ -505,8 +485,6 @@ pub(crate) async fn seal_append_stream_with_permit_in_partition(
     let principal = append_metadata_partition_principal(tenant_id, bucket_id);
     commit_append_mutations(
         mvcc,
-        tenant_id,
-        bucket_id,
         &principal,
         &format!("append-seal:{}", receipt.mutation_id),
         mutations,
@@ -531,14 +509,6 @@ pub(crate) async fn seal_append_stream_with_permit_in_partition_transaction(
     transaction_principal: &str,
 ) -> Result<SealAppendStreamMutation> {
     require_append_metadata_permit(tenant_id, bucket_id, permit)?;
-    stage_append_assignment_guard(
-        mvcc,
-        tenant_id,
-        bucket_id,
-        transaction_id,
-        transaction_principal,
-    )
-    .await?;
     let mut sealed = stream.clone();
     sealed.sealed_at = Some(Utc::now());
     sealed.segment_hash = Some(segment_hash.to_string());
@@ -590,8 +560,6 @@ fn stage_append_body_mvcc(
 
 async fn commit_append_mutations(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
-    tenant_id: i64,
-    bucket_id: i64,
     principal: &str,
     logical_idempotency_key: &str,
     mutations: Vec<crate::mvcc_product::ProductMutation>,
@@ -622,14 +590,6 @@ async fn commit_append_mutations(
         )?;
     }
     mvcc.stage_product_mutations(&handle.transaction_id, principal, mutations, now)?;
-    stage_append_assignment_guard(
-        mvcc,
-        tenant_id,
-        bucket_id,
-        &handle.transaction_id,
-        principal,
-    )
-    .await?;
     let outcome = mvcc
         .open_transactions
         .commit(
@@ -645,26 +605,6 @@ async fn commit_append_mutations(
             Err(anyhow!("append journal transaction aborted: {reason:?}"))
         }
     }
-}
-
-async fn stage_append_assignment_guard(
-    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
-    tenant_id: i64,
-    bucket_id: i64,
-    transaction_id: &str,
-    principal: &str,
-) -> Result<()> {
-    let identity = format!("{tenant_id}:{bucket_id}");
-    let assignment = mvcc
-        .reconcile_work_assignment("append-journal", &identity)
-        .await?
-        .ok_or_else(|| anyhow!("this node does not own the append journal assignment"))?;
-    mvcc.stage_assignment_guard(
-        transaction_id,
-        principal,
-        &assignment,
-        u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default(),
-    )
 }
 
 fn value_predicate(value: Option<&[u8]>) -> crate::mvcc_transaction::PredicateKind {

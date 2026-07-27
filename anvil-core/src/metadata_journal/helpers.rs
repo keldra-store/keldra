@@ -318,7 +318,7 @@ pub(super) async fn publish_partition_manifest(
         )
         .await?;
     plan.stage(mvcc, &handle.transaction_id, &principal, now)?;
-    super::object_mutation::stage_object_metadata_assignment_guard(
+    super::object_mutation::stage_object_metadata_compaction_assignment_guard(
         mvcc,
         bucket,
         &handle.transaction_id,

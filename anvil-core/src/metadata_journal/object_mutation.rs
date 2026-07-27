@@ -217,8 +217,6 @@ async fn append_object_put_mutations_with_permit_inner(
                 now_unix_ms,
             )?;
         }
-        stage_object_metadata_assignment_guard(mvcc, bucket, transaction_id, transaction_principal)
-            .await?;
         for event in additions.outbox_events {
             mvcc.open_transactions
                 .add_stream_event(transaction_id, event, now_unix_ms)?;
@@ -412,8 +410,6 @@ pub(super) async fn append_object_mutation_inner(
                 now_unix_ms,
             )?;
         }
-        stage_object_metadata_assignment_guard(mvcc, bucket, transaction_id, transaction_principal)
-            .await?;
         return Ok(());
     }
     commit_object_metadata_plan(
@@ -469,7 +465,6 @@ async fn commit_object_metadata_plan(
         mvcc.open_transactions
             .add_stream_event(&handle.transaction_id, event, now)?;
     }
-    stage_object_metadata_assignment_guard(mvcc, bucket, &handle.transaction_id, principal).await?;
     let outcome = mvcc
         .open_transactions
         .commit(
@@ -487,7 +482,11 @@ async fn commit_object_metadata_plan(
     }
 }
 
-pub(super) async fn stage_object_metadata_assignment_guard(
+/// Fence the background compactor that publishes a materialized metadata manifest.
+///
+/// Foreground object mutations deliberately do not use this assignment: they
+/// may enter through any cluster member and are ordered by MVCC certification.
+pub(super) async fn stage_object_metadata_compaction_assignment_guard(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     bucket: &Bucket,
     transaction_id: &str,
