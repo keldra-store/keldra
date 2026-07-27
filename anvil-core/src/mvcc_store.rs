@@ -1644,6 +1644,28 @@ impl MvccStore {
         Ok(Some((id, record)))
     }
 
+    pub fn find_hf_ingestion_postcommit_by_transaction(
+        &self,
+        transaction_id: &str,
+    ) -> Result<Option<HfIngestionPostCommitRecord>> {
+        let cf = self.cf(CF_MATERIALISATION)?;
+        let prefix = self.key(b"hf-ingestion-postcommit/");
+        for row in self
+            .db
+            .iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward))
+        {
+            let (key, value) = row?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let record: HfIngestionPostCommitRecord = serde_json::from_slice(&value)?;
+            if record.job.transaction_id == transaction_id {
+                return Ok(Some(record));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn retry_hf_ingestion_postcommit(
         &self,
         job_id: &str,

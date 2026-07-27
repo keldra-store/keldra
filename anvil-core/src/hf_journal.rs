@@ -406,6 +406,14 @@ pub async fn get_key_encrypted(
     )
 }
 
+pub(crate) fn get_key_record(
+    mvcc: &MvccSubsystem,
+    tenant_id: i64,
+    name: &str,
+) -> Result<Option<HfKey>> {
+    projection::get_key_by_name(mvcc, mvcc.runtime.applied_version()?, tenant_id, name)
+}
+
 pub async fn get_key_encrypted_by_id(
     mvcc: &MvccSubsystem,
     tenant_id: i64,

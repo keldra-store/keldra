@@ -98,6 +98,8 @@ pub async fn start_node_with_admin_listener(
             );
             let personaldb_postcommit = worker_state.clone().run_personaldb_postcommit_loop();
             let git_source_postcommit = worker_state.clone().run_git_source_postcommit_loop();
+            let hf_ingestion_postcommit =
+                worker_state.clone().run_hf_ingestion_postcommit_loop();
             tokio::select! {
                 result = worker => {
                     if let Err(error) = result {
@@ -106,6 +108,7 @@ pub async fn start_node_with_admin_listener(
                 }
                 _ = personaldb_postcommit => unreachable!("PersonalDB postcommit worker completed"),
                 _ = git_source_postcommit => unreachable!("GitSource postcommit worker completed"),
+                _ = hf_ingestion_postcommit => unreachable!("HF ingestion postcommit worker completed"),
                 _ = shard_recovery => unreachable!("shard recovery supervisor completed"),
             }
         });
