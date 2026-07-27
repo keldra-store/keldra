@@ -119,6 +119,7 @@ pub mod node_identity;
 pub mod node_signing;
 pub mod object_links;
 pub mod object_manager;
+pub mod object_link_finalization_job;
 pub mod object_materialisation;
 pub mod object_materialisation_runner;
 pub mod index_finalization_job;

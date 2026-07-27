@@ -30,6 +30,9 @@ use crate::git_source_postcommit_job::{
 use crate::hf_ingestion_postcommit_job::{
     HfIngestionPostCommitJob, HfIngestionPostCommitRecord, HfIngestionPostCommitState,
 };
+use crate::object_link_finalization_job::{
+    ObjectLinkFinalizationJob, ObjectLinkFinalizationRecord, ObjectLinkFinalizationState,
+};
 use crate::bucket_locator_finalization_job::{
     BucketLocatorFinalizationJob, BucketLocatorFinalizationRecord,
     BucketLocatorFinalizationState,
@@ -171,6 +174,10 @@ impl MvccStore {
                 b"bucket-locator-finalization/".as_slice(),
                 "bucket-locator-finalization",
             ),
+            (
+                b"object-link-finalization/".as_slice(),
+                "object-link-finalization",
+            ),
         ] {
             let prefix = self.key(prefix_suffix);
             for row in self.db.iterator_cf(
@@ -221,6 +228,13 @@ impl MvccStore {
                     let record: BucketLocatorFinalizationRecord =
                         serde_json::from_slice(&value)?;
                     if record.state == BucketLocatorFinalizationState::Complete {
+                        continue;
+                    }
+                    record.job.target_logical_identity()
+                } else if kind == "object-link-finalization" {
+                    let record: ObjectLinkFinalizationRecord =
+                        serde_json::from_slice(&value)?;
+                    if record.state == ObjectLinkFinalizationState::Complete {
                         continue;
                     }
                     record.job.target_logical_identity()
@@ -519,6 +533,28 @@ impl MvccStore {
                     && existing.as_slice() != record.as_slice()
                 {
                     bail!("Hugging Face ingestion postcommit job identity collision");
+                }
+                batch.put_cf(materialisation_cf, key, record);
+                continue;
+            }
+            if schema.as_deref() == Some(ObjectLinkFinalizationJob::SCHEMA) {
+                let job = ObjectLinkFinalizationJob::decode(encoded_job)?;
+                if job.cluster_id != self.cluster_id || job.transaction_id != bundle.transaction_id
+                {
+                    bail!(
+                        "object-link finalization job belongs to another transaction or cluster"
+                    );
+                }
+                let key =
+                    self.key(format!("object-link-finalization/{}", job.job_id()?).as_bytes());
+                let record = serde_json::to_vec(&ObjectLinkFinalizationRecord::pending(
+                    job,
+                    commit_version,
+                ))?;
+                if let Some(existing) = self.db.get_cf(materialisation_cf, &key)?
+                    && existing.as_slice() != record.as_slice()
+                {
+                    bail!("object-link finalization job identity collision");
                 }
                 batch.put_cf(materialisation_cf, key, record);
                 continue;
@@ -1752,6 +1788,112 @@ impl MvccStore {
         })
     }
 
+    pub fn claim_object_link_finalization_authorized(
+        &self,
+        worker_id: &str,
+        now_unix_ms: u64,
+        lease_ms: u64,
+        eligible: impl Fn(&ObjectLinkFinalizationRecord) -> Option<String>,
+    ) -> Result<Option<(String, ObjectLinkFinalizationRecord)>> {
+        if worker_id.trim().is_empty() || lease_ms == 0 {
+            bail!("object-link finalization worker and lease must be non-empty");
+        }
+        let _transition = self.materialisation_transition.lock().unwrap();
+        let cf = self.cf(CF_MATERIALISATION)?;
+        let prefix = self.key(b"object-link-finalization/");
+        let mut incomplete = Vec::new();
+        for row in self
+            .db
+            .iterator_cf(cf, IteratorMode::From(&prefix, Direction::Forward))
+        {
+            let (key, value) = row?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let record: ObjectLinkFinalizationRecord = serde_json::from_slice(&value)?;
+            if record.state != ObjectLinkFinalizationState::Complete {
+                incomplete.push((key, record));
+            }
+        }
+        let candidate = incomplete
+            .iter()
+            .filter_map(|(key, record)| eligible(record).map(|owner| (key, record, owner)))
+            .filter(|(_, candidate, _)| {
+                !incomplete.iter().any(|(_, other)| {
+                    other.job.tenant_id == candidate.job.tenant_id
+                        && other.job.bucket_id == candidate.job.bucket_id
+                        && other.job.link_key == candidate.job.link_key
+                        && other.job.generation < candidate.job.generation
+                })
+            })
+            .min_by_key(|(_, record, _)| {
+                (
+                    record.job.tenant_id,
+                    record.job.bucket_id,
+                    record.job.link_key.as_str(),
+                    record.job.generation,
+                )
+            });
+        let Some((key, record, owner)) = candidate else {
+            return Ok(None);
+        };
+        let key = key.clone();
+        let mut record = record.clone();
+        if !record.claimable(now_unix_ms) {
+            return Ok(None);
+        }
+        record.state = ObjectLinkFinalizationState::Running;
+        record.attempts = record.attempts.saturating_add(1);
+        record.lease_owner = Some(owner);
+        record.lease_expires_unix_ms = Some(
+            now_unix_ms
+                .checked_add(lease_ms)
+                .context("object-link finalization lease overflow")?,
+        );
+        self.db.put_cf_opt(
+            cf,
+            &key,
+            serde_json::to_vec(&record)?,
+            &durable_write_options(),
+        )?;
+        let id = String::from_utf8(self.unscoped(&key)?.to_vec())?
+            .strip_prefix("object-link-finalization/")
+            .context("invalid object-link finalization key")?
+            .to_string();
+        Ok(Some((id, record)))
+    }
+
+    pub fn retry_object_link_finalization(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        next_attempt_unix_ms: u64,
+        error: &str,
+    ) -> Result<()> {
+        self.transition_object_link_finalization(job_id, worker_id, |record| {
+            record.state = ObjectLinkFinalizationState::Pending;
+            record.next_attempt_unix_ms = next_attempt_unix_ms;
+            record.lease_owner = None;
+            record.lease_expires_unix_ms = None;
+            record.last_error = Some(error.to_string());
+            Ok(())
+        })
+    }
+
+    pub fn complete_object_link_finalization(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+    ) -> Result<()> {
+        self.transition_object_link_finalization(job_id, worker_id, |record| {
+            record.state = ObjectLinkFinalizationState::Complete;
+            record.lease_owner = None;
+            record.lease_expires_unix_ms = None;
+            record.last_error = None;
+            Ok(())
+        })
+    }
+
     pub fn claim_bucket_locator_finalization_authorized(
         &self,
         worker_id: &str,
@@ -2138,6 +2280,21 @@ impl MvccStore {
             }
         }
         let bucket_locator_prefix = self.key(b"bucket-locator-finalization/");
+        let object_link_prefix = self.key(b"object-link-finalization/");
+        for row in self.db.iterator_cf(
+            materialisation_cf,
+            IteratorMode::From(&object_link_prefix, Direction::Forward),
+        ) {
+            let (key, value) = row?;
+            if !key.starts_with(&object_link_prefix) {
+                break;
+            }
+            let record: ObjectLinkFinalizationRecord = serde_json::from_slice(&value)?;
+            if record.state != ObjectLinkFinalizationState::Complete {
+                pins.materialisation_snapshots.insert(record.commit_version);
+                pins.transaction_ids.insert(record.job.transaction_id);
+            }
+        }
         for row in self.db.iterator_cf(
             materialisation_cf,
             IteratorMode::From(&bucket_locator_prefix, Direction::Forward),
@@ -2467,6 +2624,35 @@ impl MvccStore {
         Ok(())
     }
 
+    fn transition_object_link_finalization(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        update: impl FnOnce(&mut ObjectLinkFinalizationRecord) -> Result<()>,
+    ) -> Result<()> {
+        let _transition = self.materialisation_transition.lock().unwrap();
+        let cf = self.cf(CF_MATERIALISATION)?;
+        let key = self.key(format!("object-link-finalization/{job_id}").as_bytes());
+        let bytes = self
+            .db
+            .get_cf(cf, &key)?
+            .context("object-link finalization job not found")?;
+        let mut record: ObjectLinkFinalizationRecord = serde_json::from_slice(&bytes)?;
+        if record.state != ObjectLinkFinalizationState::Running
+            || record.lease_owner.as_deref() != Some(worker_id)
+        {
+            bail!("object-link finalization job is not leased by this worker");
+        }
+        update(&mut record)?;
+        self.db.put_cf_opt(
+            cf,
+            key,
+            serde_json::to_vec(&record)?,
+            &durable_write_options(),
+        )?;
+        Ok(())
+    }
+
     fn transition_bucket_locator_finalization(
         &self,
         job_id: &str,
@@ -2681,6 +2867,14 @@ impl MvccStore {
         )?;
         self.collect_completed_jobs(
             materialisation_cf,
+            b"object-link-finalization/",
+            safe_watermark,
+            &mut batch,
+            &mut deleted,
+            &mut deleted_bytes,
+        )?;
+        self.collect_completed_jobs(
+            materialisation_cf,
             b"idempotency-result/",
             safe_watermark,
             &mut batch,
@@ -2753,6 +2947,10 @@ impl MvccStore {
             } else if suffix == b"bucket-locator-finalization/" {
                 let record: BucketLocatorFinalizationRecord = serde_json::from_slice(&value)?;
                 record.state == BucketLocatorFinalizationState::Complete
+                    && record.commit_version < safe_watermark
+            } else if suffix == b"object-link-finalization/" {
+                let record: ObjectLinkFinalizationRecord = serde_json::from_slice(&value)?;
+                record.state == ObjectLinkFinalizationState::Complete
                     && record.commit_version < safe_watermark
             } else if suffix == b"idempotency-result/" {
                 let record: CommittedIdempotencyResult = serde_json::from_slice(&value)?;
@@ -2986,6 +3184,33 @@ mod tests {
         }
     }
 
+    fn object_link_job(
+        transaction_id: &str,
+        generation: u64,
+    ) -> ObjectLinkFinalizationJob {
+        ObjectLinkFinalizationJob {
+            schema: ObjectLinkFinalizationJob::SCHEMA.into(),
+            cluster_id: "cluster".into(),
+            transaction_id: transaction_id.into(),
+            tenant_id: 1,
+            bucket_id: 2,
+            bucket_name: "bucket".into(),
+            link_key: "links/latest".into(),
+            generation,
+            operation: crate::object_link_finalization_job::ObjectLinkFinalizationOperation::Put,
+            target_key: Some(format!("objects/{generation}")),
+            target_version_id: Some(
+                uuid::Uuid::from_u128(100 + generation as u128).to_string(),
+            ),
+            mutation_id: uuid::Uuid::from_u128(200 + generation as u128).to_string(),
+            consequences:
+                crate::object_link_finalization_job::ObjectLinkFinalizationConsequences {
+                    maintain_indexes: true,
+                    compact_metadata: true,
+                },
+        }
+    }
+
     fn bucket_locator_job(
         transaction_id: &str,
         operation_sequence: u64,
@@ -3132,6 +3357,110 @@ mod tests {
             store
                 .claim_git_source_postcommit_authorized("worker", 30, 5, |_| {
                     Some("assignment-owner".into())
+                })
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn object_link_jobs_survive_reopen_and_are_ordered_fenced_retryable_and_gc_pinned() {
+        let temp = tempdir().unwrap();
+        {
+            let store = MvccStore::open(temp.path()).unwrap();
+            for (version, transaction_id, generation) in
+                [(2, "link-1", 1), (3, "link-2", 2)]
+            {
+                store
+                    .apply_certified_bundle(
+                        version,
+                        &bundle(transaction_id, |builder| {
+                            builder.add_materialisation_job(
+                                object_link_job(transaction_id, generation)
+                                    .encode()
+                                    .unwrap(),
+                            );
+                        }),
+                    )
+                    .unwrap();
+            }
+            store
+                .apply_certified_bundle(5, &bundle("advance-link-jobs", |_| {}))
+                .unwrap();
+        }
+
+        let store = MvccStore::open(temp.path()).unwrap();
+        let partition = crate::mvcc_worker_authority::work_partition_id(
+            "object-link-finalization",
+            "tenant/1/bucket/2/object-link/links/latest/generation/1",
+        )
+        .unwrap();
+        assert!(
+            store
+                .required_background_work_partitions()
+                .unwrap()
+                .contains(&partition)
+        );
+        assert_eq!(
+            store
+                .unfinished_work_pins()
+                .unwrap()
+                .materialisation_snapshots,
+            [2_u64, 3].into_iter().collect()
+        );
+        assert!(store.garbage_collect(5).is_err());
+
+        let (first_id, first) = store
+            .claim_object_link_finalization_authorized("worker", 10, 5, |_| {
+                Some("assignment-7/owner".into())
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.job.generation, 1);
+        assert_eq!(first.lease_owner.as_deref(), Some("assignment-7/owner"));
+        assert!(
+            store
+                .complete_object_link_finalization(&first_id, "stale-owner")
+                .is_err()
+        );
+        store
+            .retry_object_link_finalization(&first_id, "assignment-7/owner", 20, "retry")
+            .unwrap();
+        assert!(
+            store
+                .claim_object_link_finalization_authorized("worker", 19, 5, |_| {
+                    Some("assignment-7/owner".into())
+                })
+                .unwrap()
+                .is_none()
+        );
+        let (first_id, first) = store
+            .claim_object_link_finalization_authorized("worker", 20, 5, |_| {
+                Some("assignment-8/owner".into())
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.job.generation, 1);
+        store
+            .complete_object_link_finalization(&first_id, "assignment-8/owner")
+            .unwrap();
+
+        let (second_id, second) = store
+            .claim_object_link_finalization_authorized("worker", 20, 5, |_| {
+                Some("assignment-8/owner".into())
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.job.generation, 2);
+        store
+            .complete_object_link_finalization(&second_id, "assignment-8/owner")
+            .unwrap();
+        assert!(store.unfinished_work_pins().unwrap().all().is_empty());
+        store.garbage_collect(5).unwrap();
+        assert!(
+            store
+                .claim_object_link_finalization_authorized("worker", 30, 5, |_| {
+                    Some("assignment-8/owner".into())
                 })
                 .unwrap()
                 .is_none()
