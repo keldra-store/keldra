@@ -6,6 +6,116 @@ pub(super) struct AdminImplicitTransaction {
     pub replayed: bool,
 }
 
+const ADMIN_APPLICATION_RESULT_NAMESPACE: &str = "admin.application-mutation.v1";
+const ADMIN_APPLICATION_RESULT_KEY: &str = "result";
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(super) struct AdminApplicationMutationResult {
+    pub input_hash: String,
+    pub request_id: String,
+    pub tenant_id: i64,
+    pub app_id: i64,
+    pub app_name: String,
+    pub client_id: String,
+    pub encrypted_secret: Vec<u8>,
+    pub audit_event_id: String,
+}
+
+pub(super) fn admin_application_input_hash(
+    operation: &str,
+    tenant_id: i64,
+    app_name: &str,
+    request_id: &str,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"anvil.admin.application-mutation.input.v1");
+    for component in [
+        operation,
+        &tenant_id.to_string(),
+        app_name,
+        request_id,
+    ] {
+        hasher.update(&(component.len() as u64).to_be_bytes());
+        hasher.update(component.as_bytes());
+    }
+    hex::encode(hasher.finalize().as_bytes())
+}
+
+pub(super) fn stage_admin_application_result(
+    state: &AppState,
+    transaction: &AdminImplicitTransaction,
+    result: &AdminApplicationMutationResult,
+    now_unix_ms: u64,
+) -> Result<(), Status> {
+    state
+        .mvcc
+        .open_transactions
+        .add_idempotency_result(
+            &transaction.transaction_id,
+            &transaction.principal,
+            crate::mvcc_transaction::IdempotencyResult {
+                namespace: ADMIN_APPLICATION_RESULT_NAMESPACE.to_string(),
+                key: ADMIN_APPLICATION_RESULT_KEY.to_string(),
+                payload: serde_json::to_vec(result)
+                    .map_err(|error| Status::internal(error.to_string()))?,
+            },
+            now_unix_ms,
+        )
+        .map_err(|error| Status::failed_precondition(error.to_string()))
+}
+
+pub(super) fn replay_admin_application_result(
+    state: &AppState,
+    transaction: &AdminImplicitTransaction,
+    expected_input_hash: &str,
+) -> Result<Option<AdminApplicationMutationResult>, Status> {
+    let Some(result) = state
+        .mvcc
+        .open_transactions
+        .resolved_idempotency_result(
+            &transaction.transaction_id,
+            &transaction.principal,
+            ADMIN_APPLICATION_RESULT_NAMESPACE,
+            ADMIN_APPLICATION_RESULT_KEY,
+        )
+        .map_err(|error| Status::failed_precondition(error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let result: AdminApplicationMutationResult = serde_json::from_slice(&result.payload)
+        .map_err(|error| Status::internal(error.to_string()))?;
+    if result.input_hash != expected_input_hash {
+        return Err(Status::already_exists(
+            "admin application idempotency key was already used for different input",
+        ));
+    }
+    Ok(Some(result))
+}
+
+pub(super) fn admin_application_response(
+    state: &AppState,
+    result: AdminApplicationMutationResult,
+) -> Result<ApplicationSecretResponse, Status> {
+    let client_secret = state
+        .secret_keyring
+        .decrypt(&result.encrypted_secret)
+        .map_err(|error| Status::internal(error.to_string()))
+        .and_then(|secret| {
+            String::from_utf8(secret)
+                .map_err(|_| Status::internal("stored application secret is not UTF-8"))
+        })?;
+    Ok(ApplicationSecretResponse {
+        request_id: result.request_id,
+        tenant_id: result.tenant_id.to_string(),
+        app_name: result.app_name,
+        client_id: result.client_id,
+        client_secret,
+        audit_event_id: result.audit_event_id,
+        app_id: result.app_id.to_string(),
+        write_state: WriteState::Committed as i32,
+    })
+}
+
 pub(super) async fn begin_admin_product_transaction(
     state: &AppState,
     principal: &AdminPrincipal,

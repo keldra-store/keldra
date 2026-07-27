@@ -648,6 +648,7 @@ pub(crate) fn read_app_by_tenant_name_in_transaction(
 #[derive(Debug)]
 pub(crate) struct ControlAppMutationPlan {
     pub app: App,
+    control_revision: u64,
     mutations: Vec<crate::mvcc_product::ProductMutation>,
     predicates: Vec<(
         crate::mvcc_transaction::LogicalKey,
@@ -657,6 +658,21 @@ pub(crate) struct ControlAppMutationPlan {
 }
 
 impl ControlAppMutationPlan {
+    pub(crate) fn with_admin_audit(
+        mut self,
+        event: &crate::admin_audit::AdminAuditEvent,
+        transaction_id: &str,
+    ) -> Result<Self> {
+        let audit = crate::admin_audit::admin_audit_mvcc_plan(
+            event,
+            self.control_revision,
+            transaction_id,
+        )?;
+        self.mutations.extend(audit.mutations);
+        self.outbox_events.extend(audit.outbox_events);
+        Ok(self)
+    }
+
     pub(crate) async fn stage(
         self,
         mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
@@ -790,6 +806,7 @@ fn plan_control_app_mutation(
     predicates.extend(product.predicates);
     Ok(ControlAppMutationPlan {
         app,
+        control_revision: next_revision,
         mutations: product.mutations,
         predicates,
         outbox_events: product.outbox_events,

@@ -85,9 +85,47 @@ impl AdminService for AppState {
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), true)?;
         let tenant_id = resolve_tenant_id(self, &req.tenant_id).await?;
-        let client_id = generated_client_id();
-        let client_secret = generated_client_secret();
-        let encrypted_secret = encrypt_admin_client_secret(self, &client_secret)?;
+        let transaction =
+            begin_admin_product_transaction(self, &principal, context, "application-create")
+                .await?;
+        let input_hash =
+            admin_application_input_hash("create", tenant_id, &req.app_name, &context.request_id);
+        if transaction.replayed {
+            let result = replay_admin_application_result(self, &transaction, &input_hash)?
+                .ok_or_else(|| {
+                    Status::failed_precondition(
+                        "committed admin application transaction is missing its response record",
+                    )
+                })?;
+            return admin_application_response(self, result).map(Response::new);
+        }
+        let prior_result = replay_admin_application_result(self, &transaction, &input_hash)?;
+        let client_id = prior_result
+            .as_ref()
+            .map(|result| result.client_id.clone())
+            .unwrap_or_else(|| {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"anvil.admin.application-client-id.v1");
+                hasher.update(transaction.transaction_id.as_bytes());
+                format!("app_{}", hex::encode(&hasher.finalize().as_bytes()[..16]))
+            });
+        let existing_app = crate::control_journal::read_app_by_tenant_name_in_transaction(
+            &self.mvcc,
+            &transaction.transaction_id,
+            &transaction.principal,
+            tenant_id,
+            &req.app_name,
+        )
+        .map_err(|err| Status::internal(err.to_string()))?;
+        let encrypted_secret = match prior_result.as_ref() {
+            Some(result) => result.encrypted_secret.clone(),
+            None if existing_app.is_some() => existing_app
+                .as_ref()
+                .expect("checked above")
+                .client_secret_encrypted
+                .clone(),
+            None => encrypt_admin_client_secret(self, &generated_client_secret())?,
+        };
         let audit_event = build_admin_audit_event(
             &principal,
             context,
@@ -101,28 +139,53 @@ impl AdminService for AppState {
             }),
         )?;
         let audit_event_id = audit_event.audit_event_id.clone();
-        let app = self
-            .persistence
-            .create_app(
+        let now = u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default();
+        let app = if let Some(existing) = existing_app {
+            if existing.app.client_id != client_id
+                || existing.client_secret_encrypted != encrypted_secret
+            {
+                return Err(Status::already_exists(
+                    "admin application transaction contains different staged input",
+                ));
+            }
+            existing.app
+        } else {
+            crate::control_journal::plan_create_app_in_transaction(
+                &self.mvcc,
+                &transaction.transaction_id,
+                &transaction.principal,
                 tenant_id,
                 &req.app_name,
                 &client_id,
                 &encrypted_secret,
                 None,
-                Some(&audit_event),
+            )
+            .and_then(|plan| {
+                plan.with_admin_audit(&audit_event, &transaction.transaction_id)
+            })
+            .map_err(|err| Status::internal(err.to_string()))?
+            .stage(
+                &self.mvcc,
+                &transaction.transaction_id,
+                &transaction.principal,
+                now,
             )
             .await
-            .map_err(|err| Status::internal(err.to_string()))?;
-        Ok(Response::new(ApplicationSecretResponse {
+            .map_err(|err| Status::failed_precondition(err.to_string()))?
+        };
+        let result = prior_result.unwrap_or(AdminApplicationMutationResult {
+            input_hash,
             request_id: context.request_id.clone(),
-            tenant_id: tenant_id.to_string(),
+            tenant_id,
+            app_id: app.id,
             app_name: app.name,
             client_id: app.client_id,
-            client_secret,
+            encrypted_secret,
             audit_event_id,
-            app_id: app.id.to_string(),
-            write_state: WriteState::Committed as i32,
-        }))
+        });
+        stage_admin_application_result(self, &transaction, &result, now)?;
+        commit_admin_product_transaction(self, &transaction).await?;
+        admin_application_response(self, result).map(Response::new)
     }
 
     async fn rotate_application_secret(
@@ -133,14 +196,35 @@ impl AdminService for AppState {
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let tenant_id = resolve_tenant_id(self, &req.tenant_id).await?;
-        let app = self
-            .persistence
-            .get_app_by_tenant_name(tenant_id, &req.app_name)
-            .await
-            .map_err(|err| Status::internal(err.to_string()))?
-            .ok_or_else(|| Status::not_found("Application not found"))?;
-        let client_secret = generated_client_secret();
-        let encrypted_secret = encrypt_admin_client_secret(self, &client_secret)?;
+        let transaction =
+            begin_admin_product_transaction(self, &principal, context, "application-secret-rotate")
+                .await?;
+        let input_hash =
+            admin_application_input_hash("rotate", tenant_id, &req.app_name, &context.request_id);
+        if transaction.replayed {
+            let result = replay_admin_application_result(self, &transaction, &input_hash)?
+                .ok_or_else(|| {
+                    Status::failed_precondition(
+                        "committed admin secret rotation is missing its response record",
+                    )
+                })?;
+            return admin_application_response(self, result).map(Response::new);
+        }
+        let prior_result = replay_admin_application_result(self, &transaction, &input_hash)?;
+        let app = crate::control_journal::read_app_by_tenant_name_in_transaction(
+            &self.mvcc,
+            &transaction.transaction_id,
+            &transaction.principal,
+            tenant_id,
+            &req.app_name,
+        )
+        .map_err(|err| Status::internal(err.to_string()))?
+        .ok_or_else(|| Status::not_found("Application not found"))?
+        .app;
+        let encrypted_secret = match prior_result.as_ref() {
+            Some(result) => result.encrypted_secret.clone(),
+            None => encrypt_admin_client_secret(self, &generated_client_secret())?,
+        };
         let audit_event = build_admin_audit_event(
             &principal,
             context,
@@ -155,20 +239,38 @@ impl AdminService for AppState {
             }),
         )?;
         let audit_event_id = audit_event.audit_event_id.clone();
-        self.persistence
-            .update_app_secret(app.id, &encrypted_secret, None, Some(&audit_event))
+        let now = u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default();
+        let app = crate::control_journal::plan_update_app_secret_in_transaction(
+            &self.mvcc,
+            &transaction.transaction_id,
+            &transaction.principal,
+            app.id,
+            &encrypted_secret,
+            None,
+        )
+        .and_then(|plan| plan.with_admin_audit(&audit_event, &transaction.transaction_id))
+        .map_err(|err| Status::internal(err.to_string()))?
+        .stage(
+            &self.mvcc,
+            &transaction.transaction_id,
+            &transaction.principal,
+            now,
+        )
             .await
-            .map_err(|err| Status::internal(err.to_string()))?;
-        Ok(Response::new(ApplicationSecretResponse {
+            .map_err(|err| Status::failed_precondition(err.to_string()))?;
+        let result = prior_result.unwrap_or(AdminApplicationMutationResult {
+            input_hash,
             request_id: context.request_id.clone(),
-            tenant_id: tenant_id.to_string(),
+            tenant_id,
+            app_id: app.id,
             app_name: app.name,
             client_id: app.client_id,
-            client_secret,
+            encrypted_secret,
             audit_event_id,
-            app_id: app.id.to_string(),
-            write_state: WriteState::Committed as i32,
-        }))
+        });
+        stage_admin_application_result(self, &transaction, &result, now)?;
+        commit_admin_product_transaction(self, &transaction).await?;
+        admin_application_response(self, result).map(Response::new)
     }
 
     async fn grant_application_policy(
