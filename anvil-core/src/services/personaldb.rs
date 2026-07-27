@@ -131,14 +131,17 @@ impl PersonalDbService for AppState {
             .map_err(internal_status)?;
         let claims = request_claims(&request)?.clone();
         let req = request.into_inner();
-        let transaction_id =
+        let mut transaction_id =
             crate::services::transaction_context::write_options_transaction_id(
                 req.options.as_ref(),
             )?
             .map(ToOwned::to_owned);
-        let transaction_principal = transaction_id
+        let internal_transaction = transaction_id.is_none();
+        let mut transaction_principal = transaction_id
             .as_ref()
             .map(|_| crate::object_manager::transaction_principal_from_claims(&claims));
+        let implicit_principal =
+            crate::object_manager::transaction_principal_from_claims(&claims);
         validate_database_id(&req.database_id)?;
         validate_hex32(&req.schema_hash, "schema_hash")?;
         validate_hex32(&req.genesis_hash, "genesis_hash")?;
@@ -162,7 +165,7 @@ impl PersonalDbService for AppState {
         if transaction_id.is_none()
             && let Some(commit_version) = PersonalDbWritePlan::resolved_commit_version(
                 &self.mvcc,
-                &claims.sub,
+                &implicit_principal,
                 &create_idempotency_key,
             )
             .await
@@ -188,21 +191,32 @@ impl PersonalDbService for AppState {
             )
             .map_err(internal_status)?
             .ok_or_else(|| Status::internal("Committed PersonalDB head is missing"))?;
-            access_control::grant_personaldb_group_defaults(
-                &self.persistence,
-                claims.tenant_id,
-                &req.database_id,
-                &claims.sub,
-                &claims.sub,
-                "grant creator PersonalDB group owner",
-            )
-            .await
-            .map_err(internal_status)?;
             return Ok(Response::new(PersonalDbGroupResponse {
                 manifest: Some(group_manifest_record(manifest)),
                 committed_head: Some(committed_head_record(committed_head)),
                 write_state: WriteState::Committed as i32,
             }));
+        }
+        if internal_transaction {
+            let now = u64::try_from(chrono::Utc::now().timestamp_millis())
+                .map_err(|_| Status::internal("PersonalDB timestamp predates Unix epoch"))?;
+            let handle = self
+                .mvcc
+                .open_transactions
+                .begin(
+                    self.mvcc.runtime.as_ref(),
+                    self.mvcc.cluster_id().to_string(),
+                    implicit_principal.clone(),
+                    create_idempotency_key.clone(),
+                    std::time::Duration::from_secs(300),
+                    crate::mvcc_transaction::DurabilityLevel::Quorum,
+                    crate::mvcc_transaction::ReadConsistency::Linearized,
+                    now,
+                )
+                .await
+                .map_err(internal_status)?;
+            transaction_principal = Some(implicit_principal);
+            transaction_id = Some(handle.transaction_id);
         }
         if read_personaldb_group_manifest(
             &self.storage,
@@ -371,53 +385,43 @@ impl PersonalDbService for AppState {
                 )
                 .await
                 .map_err(internal_status)?;
+            if internal_transaction {
+                let outcome = self
+                    .mvcc
+                    .open_transactions
+                    .commit(
+                        self.mvcc.runtime.as_ref(),
+                        transaction_id,
+                        transaction_principal.as_deref().ok_or_else(|| {
+                            Status::internal("missing PersonalDB transaction principal")
+                        })?,
+                        u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+                    )
+                    .await
+                    .map_err(internal_status)?;
+                if let crate::mvcc_transaction::CertificationResult::Aborted { reason } =
+                    outcome.certification
+                {
+                    return Err(Status::aborted(format!(
+                        "PersonalDB create transaction aborted: {reason:?}"
+                    )));
+                }
+                crate::mvcc_fault_injection::hit(
+                    crate::mvcc_fault_injection::FaultPoint::PersonalDbAfterCreateCommit,
+                )
+                .map_err(internal_status)?;
+            }
             return Ok(Response::new(PersonalDbGroupResponse {
                 manifest: Some(group_manifest_record(manifest)),
                 committed_head: Some(committed_head_record(committed_head)),
-                write_state: WriteState::Staged as i32,
+                write_state: if internal_transaction {
+                    WriteState::Committed as i32
+                } else {
+                    WriteState::Staged as i32
+                },
             }));
         }
-        let commit_version = write_plan.commit(&self.mvcc).await.map_err(internal_status)?;
-        crate::mvcc_fault_injection::hit(
-            crate::mvcc_fault_injection::FaultPoint::PersonalDbAfterCreateCommit,
-        )
-        .map_err(internal_status)?;
-        access_control::grant_personaldb_group_defaults(
-            &self.persistence,
-            claims.tenant_id,
-            &committed_head.database_id,
-            &claims.sub,
-            &claims.sub,
-            "grant creator PersonalDB group owner",
-        )
-        .await
-        .map_err(internal_status)?;
-
-        let manifest = read_personaldb_group_manifest(
-            &self.storage,
-            &self.mvcc,
-            claims.tenant_id,
-            &committed_head.database_id,
-            protocol_keyring.trust_store(),
-            commit_version,
-        )
-        .await
-        .map_err(internal_status)?
-        .ok_or_else(|| Status::internal("Committed PersonalDB manifest is missing"))?;
-        let committed_head = read_personaldb_committed_head_at_snapshot(
-            &self.mvcc,
-            claims.tenant_id,
-            &committed_head.database_id,
-            protocol_keyring.trust_store(),
-            commit_version,
-        )
-        .map_err(internal_status)?
-        .ok_or_else(|| Status::internal("Committed PersonalDB head is missing"))?;
-        Ok(Response::new(PersonalDbGroupResponse {
-            manifest: Some(group_manifest_record(manifest)),
-            committed_head: Some(committed_head_record(committed_head)),
-            write_state: WriteState::Committed as i32,
-        }))
+        unreachable!("PersonalDB create always has an explicit or internal transaction")
     }
 
     async fn get_personal_db_group(
