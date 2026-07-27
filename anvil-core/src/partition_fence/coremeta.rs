@@ -454,7 +454,10 @@ pub(super) async fn write_partition_owner_state_mvcc(
 
 pub(super) fn is_partition_fence_cas_conflict(error: &anyhow::Error) -> bool {
     is_retryable_mutation_conflict(error)
-        || error.to_string().contains(super::OWNERSHIP_CAS_CONFLICT)
+        // Fence CAS failures are frequently wrapped by CoreStore admission
+        // and consensus errors.  Inspect the complete chain so callers retry
+        // transient ownership races instead of surfacing them as fatal.
+        || format!("{error:#}").contains(super::OWNERSHIP_CAS_CONFLICT)
 }
 
 fn read_committed_fence_row(
