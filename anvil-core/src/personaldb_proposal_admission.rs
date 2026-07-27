@@ -720,6 +720,28 @@ pub fn stage_personaldb_committed_head_mvcc(
     Ok(())
 }
 
+pub fn stage_personaldb_committed_head_seed(
+    plan: &mut PersonalDbWritePlan,
+    tenant_id: i64,
+    database_id: &str,
+    head: &PersonalDbCommittedHead,
+    trust_store: &PublicKeyTrustStore,
+) -> Result<()> {
+    head.verify(trust_store)?;
+    let tuple = committed_head_key(tenant_id, database_id)?;
+    let key = crate::mvcc_product::coremeta_logical_key(
+        CF_PERSONALDB,
+        TABLE_PERSONALDB_GROUP_ROW,
+        &tuple,
+    )?;
+    plan.stage_put(
+        key,
+        encode_committed_head(head)?,
+        crate::mvcc_transaction::PredicateKind::Absent,
+    );
+    Ok(())
+}
+
 pub async fn reserve_personaldb_proposal(
     authority: &PersonalDbAdmissionAuthority<'_>,
     claim: ProposalIdempotencyClaimIdentityV1,

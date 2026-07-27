@@ -39,6 +39,43 @@ pub struct PersonalDbWritePlan {
 }
 
 impl PersonalDbWritePlan {
+    pub async fn resolved_commit_version(
+        mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+        principal: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<u64>> {
+        let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default();
+        let handle = mvcc
+            .open_transactions
+            .begin(
+                mvcc.runtime.as_ref(),
+                mvcc.cluster_id(),
+                principal,
+                idempotency_key,
+                std::time::Duration::from_secs(30),
+                crate::mvcc_transaction::DurabilityLevel::Quorum,
+                crate::mvcc_transaction::ReadConsistency::Linearized,
+                now,
+            )
+            .await?;
+        let status = mvcc
+            .open_transactions
+            .status(&handle.transaction_id, principal, now)?;
+        match status.result {
+            Some(crate::mvcc_transaction::CertificationResult::Committed {
+                commit_version,
+            }) => Ok(Some(commit_version)),
+            Some(crate::mvcc_transaction::CertificationResult::Aborted { reason }) => {
+                bail!("PersonalDB MVCC write plan previously aborted: {reason:?}")
+            }
+            None if status.state == "open" => Ok(None),
+            None => bail!(
+                "PersonalDB MVCC write plan is not retryable while transaction is {}",
+                status.state
+            ),
+        }
+    }
+
     pub fn new(
         tenant_id: i64,
         group_id: impl Into<String>,
