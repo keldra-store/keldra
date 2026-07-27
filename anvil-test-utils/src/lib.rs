@@ -1415,59 +1415,63 @@ impl TestCluster {
             let state = AppState::new(node_config, personaldb_test_protocol_keyring())
                 .await
                 .unwrap();
-            state.persistence.create_region(region_name).await.unwrap();
-            let tenant = if let Some(existing) = state
-                .persistence
-                .get_tenant_by_name("default")
-                .await
-                .unwrap()
-            {
-                existing
-            } else {
-                state
+            if regions.len() == 1 {
+                state.persistence.create_region(region_name).await.unwrap();
+                let tenant = if let Some(existing) = state
                     .persistence
-                    .create_tenant("default", "default-key")
+                    .get_tenant_by_name("default")
                     .await
                     .unwrap()
-            };
-            if state
-                .persistence
-                .get_app_by_client_id("test-app")
-                .await
-                .unwrap()
-                .is_none()
-            {
-                let encrypted_secret = state.secret_keyring.encrypt(b"test-secret").unwrap();
-                let app = state
+                {
+                    existing
+                } else {
+                    state
+                        .persistence
+                        .create_tenant("default", "default-key")
+                        .await
+                        .unwrap()
+                };
+                if state
                     .persistence
-                    .create_app(
+                    .get_app_by_client_id("test-app")
+                    .await
+                    .unwrap()
+                    .is_none()
+                {
+                    let encrypted_secret = state.secret_keyring.encrypt(b"test-secret").unwrap();
+                    let app = state
+                        .persistence
+                        .create_app(
+                            tenant.id,
+                            "test-app",
+                            "test-app",
+                            &encrypted_secret,
+                            None,
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    access_control::grant_storage_tenant_owner(
+                        &state.persistence,
                         tenant.id,
-                        "test-app",
-                        "test-app",
-                        &encrypted_secret,
-                        None,
-                        None,
+                        &app.id.to_string(),
+                        "test-cluster",
+                        "grant test app ownership of its storage tenant",
                     )
                     .await
                     .unwrap();
-                access_control::grant_storage_tenant_owner(
-                    &state.persistence,
-                    tenant.id,
-                    &app.id.to_string(),
-                    "test-cluster",
-                    "grant test app ownership of its storage tenant",
-                )
-                .await
-                .unwrap();
+                }
             }
             states.push(state);
         }
-        for region in unique_regions {
-            for state in &states {
-                state.persistence.create_region(&region).await.unwrap();
+        if regions.len() == 1 {
+            for region in unique_regions {
+                for state in &states {
+                    state.persistence.create_region(&region).await.unwrap();
+                }
             }
+            install_canonical_coremeta_bootstrap_snapshot(&states);
         }
-        install_canonical_coremeta_bootstrap_snapshot(&states);
 
         Self {
             nodes: Vec::new(),
@@ -1536,7 +1540,7 @@ impl TestCluster {
         );
 
         let token_start = Instant::now();
-        if get_new_token {
+        if get_new_token && self.states.len() == 1 {
             let test_app = self.states[0]
                 .persistence
                 .get_app_by_client_id("test-app")
@@ -1579,6 +1583,7 @@ impl TestCluster {
                         .await
                         .expect("initialize multi-node test MVCC membership");
                     self.mvcc_membership_initialized = true;
+                    self.seed_multi_node_mvcc_bootstrap(get_new_token).await;
                 }
                 let http_ready_start = Instant::now();
                 let ready_addrs = self
@@ -1626,6 +1631,124 @@ impl TestCluster {
                 );
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn seed_multi_node_mvcc_bootstrap(&mut self, mint_token: bool) {
+        debug_assert!(self.states.len() > 1);
+        let leader = &self.states[0];
+        let regions = self
+            .states
+            .iter()
+            .map(|state| state.config.region.clone())
+            .collect::<BTreeSet<_>>();
+        for region in &regions {
+            leader.persistence.create_region(region).await.unwrap();
+        }
+        let tenant = if let Some(existing) = leader
+            .persistence
+            .get_tenant_by_name("default")
+            .await
+            .unwrap()
+        {
+            existing
+        } else {
+            leader
+                .persistence
+                .create_tenant("default", "default-key")
+                .await
+                .unwrap()
+        };
+        let app = if let Some(existing) = leader
+            .persistence
+            .get_app_by_client_id("test-app")
+            .await
+            .unwrap()
+        {
+            existing
+        } else {
+            let encrypted_secret = leader.secret_keyring.encrypt(b"test-secret").unwrap();
+            leader
+                .persistence
+                .create_app(
+                    tenant.id,
+                    "test-app",
+                    "test-app",
+                    &encrypted_secret,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+        };
+        access_control::grant_storage_tenant_owner(
+            &leader.persistence,
+            tenant.id,
+            &app.id.to_string(),
+            "test-cluster",
+            "grant test app ownership of its storage tenant",
+        )
+        .await
+        .unwrap();
+
+        let committed_version = anvil_mvcc_consensus::Consensus::observed_commit_version(
+            leader.mvcc.consensus.as_ref(),
+        )
+        .0;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let mut converged = true;
+                for state in &self.states {
+                    let applied = state
+                        .mvcc
+                        .runtime
+                        .local_store()
+                        .decision_watermark()
+                        .unwrap();
+                    let regions_visible = state
+                        .persistence
+                        .list_regions()
+                        .await
+                        .unwrap()
+                        .into_iter()
+                        .collect::<BTreeSet<_>>();
+                    let tenant_visible = state
+                        .persistence
+                        .get_tenant_by_name("default")
+                        .await
+                        .unwrap()
+                        .is_some();
+                    let app_visible = state
+                        .persistence
+                        .get_app_by_client_id("test-app")
+                        .await
+                        .unwrap()
+                        .is_some();
+                    if applied < committed_version
+                        || !regions.is_subset(&regions_visible)
+                        || !tenant_visible
+                        || !app_visible
+                    {
+                        converged = false;
+                        break;
+                    }
+                }
+                if converged {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("multi-node test MVCC bootstrap did not materialize on every replica");
+        let minted_token = mint_token.then(|| {
+            leader
+                .jwt_manager
+                .mint_token(app.id.to_string(), tenant.id)
+                .unwrap()
+        });
+        if let Some(token) = minted_token {
+            self.token = token;
         }
     }
 
@@ -1727,7 +1850,9 @@ impl TestCluster {
             projection,
         )
         .unwrap();
-        install_canonical_coremeta_bootstrap_snapshot(&self.states);
+        if self.states.len() == 1 {
+            install_canonical_coremeta_bootstrap_snapshot(&self.states);
+        }
     }
 
     #[allow(unused)]
