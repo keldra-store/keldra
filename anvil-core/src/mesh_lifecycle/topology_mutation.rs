@@ -23,6 +23,16 @@ struct PreparedTopologyMutation {
     control_append: Option<PreparedControlStreamAppend>,
 }
 
+pub(super) async fn read_topology_mutation_state(
+    storage: &Storage,
+    authority: Option<&LifecycleControlWriteAuthority<'_>>,
+) -> LifecycleResult<MeshLifecycleState> {
+    match authority {
+        Some(authority) => read_lifecycle_state_projection_mvcc(authority.mvcc),
+        None => read_state(storage).await,
+    }
+}
+
 pub(super) fn fenced_control_mutation<'a, T>(
     stream_family: &'a str,
     record_key: String,
@@ -86,7 +96,62 @@ pub(super) async fn commit_topology_mutation(
     control: Option<LifecycleControlMutation<'_>>,
 ) -> LifecycleResult<()> {
     let store = CoreStore::new(storage.clone()).await?;
-    let prepared = prepare_topology_mutation(storage, &store, row, control).await?;
+    let mvcc = control.as_ref().map(|control| match &control.writer {
+        LifecycleControlWriter::Fenced(authority) => authority.mvcc,
+    });
+    let prepared = prepare_topology_mutation(storage, &store, mvcc, row, control).await?;
+    if let Some(mvcc) = mvcc {
+        let mut plan = crate::mvcc_product::product_mutations_and_outbox_from_operations(
+            prepared.batch.operations,
+        )
+        .map_err(|error| LifecycleError::InvalidArgument(error.to_string()))?;
+        for precondition in prepared.batch.preconditions {
+            let CoreMutationPrecondition::CoreMetaRow {
+                cf,
+                table_id,
+                tuple_key,
+                expected_payload_hash,
+                require_absent,
+                require_present,
+                ..
+            } = precondition
+            else {
+                continue;
+            };
+            let key = crate::mvcc_product::coremeta_logical_key(&cf, table_id, &tuple_key)
+                .map_err(|error| LifecycleError::InvalidArgument(error.to_string()))?;
+            let kind = if require_absent {
+                crate::mvcc_transaction::PredicateKind::Absent
+            } else if expected_payload_hash.is_some() {
+                let value = mvcc
+                    .read_latest_value(&key)
+                    .map_err(|error| LifecycleError::InvalidArgument(error.to_string()))?
+                    .ok_or_else(|| {
+                        LifecycleError::InvalidArgument(
+                            "topology CAS row disappeared before MVCC staging".to_string(),
+                        )
+                    })?;
+                crate::mvcc_transaction::PredicateKind::ValueHash(*blake3::hash(&value).as_bytes())
+            } else if require_present {
+                crate::mvcc_transaction::PredicateKind::Exists
+            } else {
+                continue;
+            };
+            plan.predicates.push((key, kind));
+        }
+        mvcc.autocommit_product_mutations_with_predicates_and_outbox(
+            &prepared.batch.committed_by_principal,
+            &prepared.batch.transaction_id,
+            plan.mutations,
+            plan.predicates,
+            plan.outbox_events,
+            crate::mvcc_transaction::DurabilityLevel::Quorum,
+            u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+        )
+        .await
+        .map_err(|error| LifecycleError::InvalidArgument(error.to_string()))?;
+        return Ok(());
+    }
     let receipt = store.commit_mutation_batch(prepared.batch).await?;
     ensure_committed(&receipt)?;
     if let Some(control) = prepared.control_append.as_ref() {
@@ -100,6 +165,7 @@ pub(super) async fn commit_topology_mutation(
 async fn prepare_topology_mutation(
     storage: &Storage,
     store: &CoreStore,
+    mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
     row: record_proto::EncodedLifecycleProjectionRow,
     control: Option<LifecycleControlMutation<'_>>,
 ) -> LifecycleResult<PreparedTopologyMutation> {
@@ -119,7 +185,10 @@ async fn prepare_topology_mutation(
     let activated_at_unix_nanos = topology_mutation_timestamp_nanos(&mutation_created_at)?;
     let mutation_identity = topology_mutation_identity(&row, control.as_ref());
 
-    let mut state = read_lifecycle_state_projection_with_core_store(store)?;
+    let mut state = match mvcc {
+        Some(mvcc) => read_lifecycle_state_projection_mvcc(mvcc)?,
+        None => read_lifecycle_state_projection_with_core_store(store)?,
+    };
     match state.topology_head.as_ref() {
         Some(head) => {
             record_proto::validate_topology_head(head)?;
@@ -213,7 +282,15 @@ async fn prepare_topology_mutation(
     for row in rows {
         let table_id = lifecycle_projection_table_id(row.kind)?;
         let tuple_key = lifecycle_projection_row_key(row.kind, &row.record_key)?;
-        let current = store.read_coremeta_row(CF_MESH, table_id, &tuple_key)?;
+        let current = match mvcc {
+            Some(mvcc) => mvcc
+                .read_latest_value(
+                    &crate::mvcc_product::coremeta_logical_key(CF_MESH, table_id, &tuple_key)
+                        .map_err(|error| LifecycleError::InvalidArgument(error.to_string()))?,
+                )
+                .map_err(|error| LifecycleError::InvalidArgument(error.to_string()))?,
+            None => store.read_coremeta_row(CF_MESH, table_id, &tuple_key)?,
+        };
         preconditions.push(CoreMutationPrecondition::CoreMetaRow {
             cf: CF_MESH.to_string(),
             table_id,
@@ -451,7 +528,7 @@ pub(super) async fn prepare_topology_batch_for_test(
     row: record_proto::EncodedLifecycleProjectionRow,
 ) -> LifecycleResult<CoreMutationBatch> {
     let store = CoreStore::new(storage.clone()).await?;
-    Ok(prepare_topology_mutation(storage, &store, row, None)
+    Ok(prepare_topology_mutation(storage, &store, None, row, None)
         .await?
         .batch)
 }
@@ -463,7 +540,7 @@ pub(super) async fn commit_topology_mutation_with_failure_injection_for_test(
     control: LifecycleControlMutation<'_>,
 ) -> LifecycleResult<()> {
     let store = CoreStore::new(storage.clone()).await?;
-    let mut prepared = prepare_topology_mutation(storage, &store, row, Some(control)).await?;
+    let mut prepared = prepare_topology_mutation(storage, &store, None, row, Some(control)).await?;
     let state = read_lifecycle_state_projection_with_core_store(&store)?;
     let head = state.topology_head.ok_or_else(|| {
         LifecycleError::InvalidArgument(

@@ -28,7 +28,8 @@ async fn create_region_inner(
         require_identifier(default_cell, "default cell")?;
     }
 
-    let mut state = read_state(storage).await?;
+    let mut state =
+        topology_mutation::read_topology_mutation_state(storage, authority.as_ref()).await?;
     if state.regions.contains_key(&input.region) {
         return Err(LifecycleError::AlreadyExists {
             resource_kind: "region",
@@ -121,7 +122,8 @@ async fn transition_region_inner(
     authority: Option<LifecycleControlWriteAuthority<'_>>,
 ) -> LifecycleResult<RegionDescriptor> {
     require_identifier(region, "region")?;
-    let mut state = read_state(storage).await?;
+    let mut state =
+        topology_mutation::read_topology_mutation_state(storage, authority.as_ref()).await?;
     {
         let descriptor = state
             .regions
@@ -217,7 +219,8 @@ async fn activate_region_inner(
 ) -> LifecycleResult<RegionDescriptor> {
     require_identifier(region, "region")?;
 
-    let mut state = read_state(storage).await?;
+    let mut state =
+        topology_mutation::read_topology_mutation_state(storage, authority.as_ref()).await?;
     let current = state
         .regions
         .get(region)

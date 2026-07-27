@@ -26,7 +26,8 @@ async fn register_cell_inner(
     require_identifier(&input.cell_id, "cell id")?;
     require_identifier(&input.failure_domain, "cell failure domain")?;
 
-    let mut state = read_state(storage).await?;
+    let mut state =
+        topology_mutation::read_topology_mutation_state(storage, authority.as_ref()).await?;
     if !state.regions.contains_key(&input.region) {
         return Err(LifecycleError::NotFound {
             resource_kind: "region",
@@ -128,7 +129,8 @@ async fn transition_cell_inner(
     authority: Option<LifecycleControlWriteAuthority<'_>>,
 ) -> LifecycleResult<CellDescriptor> {
     let key = cell_key(region, cell_id)?;
-    let mut state = read_state(storage).await?;
+    let mut state =
+        topology_mutation::read_topology_mutation_state(storage, authority.as_ref()).await?;
     let descriptor = state
         .cells
         .get_mut(&key)

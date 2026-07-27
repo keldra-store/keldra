@@ -299,6 +299,7 @@ pub struct BucketDrainExceptionInput {
 pub struct LifecycleControlWriteAuthority<'a> {
     pub permit: &'a PartitionWritePermit,
     pub signing_key: &'a [u8],
+    pub mvcc: &'a crate::mvcc_bootstrap::MvccSubsystem,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -443,6 +444,29 @@ fn read_lifecycle_state_projection_with_core_store(
         let prefix = lifecycle_projection_row_prefix()?;
         for row in scan_lifecycle_projection_rows(store, table_id, &prefix)? {
             apply_lifecycle_projection_row(&mut state, table_id, &row.payload)?;
+        }
+    }
+    Ok(state)
+}
+
+pub(crate) fn read_lifecycle_state_projection_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+) -> LifecycleResult<MeshLifecycleState> {
+    let mut state = MeshLifecycleState::default();
+    let tuple_prefix = lifecycle_projection_row_prefix()?;
+    let application_prefix =
+        crate::mvcc_product::coremeta_application_prefix(CF_MESH, &tuple_prefix)?;
+    let snapshot = mvcc
+        .runtime
+        .applied_version()
+        .map_err(|error| LifecycleError::InvalidArgument(error.to_string()))?;
+    for table_id in [TABLE_MESH_PARTITION_ROW, TABLE_MESH_NODE_ROW] {
+        for (_, row) in mvcc
+            .runtime
+            .scan_table_prefix_at(table_id, &application_prefix, snapshot)
+            .map_err(|error| LifecycleError::InvalidArgument(error.to_string()))?
+        {
+            apply_lifecycle_projection_row(&mut state, table_id, &row.value)?;
         }
     }
     Ok(state)

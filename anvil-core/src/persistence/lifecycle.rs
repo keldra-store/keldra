@@ -15,6 +15,14 @@ fn runtime_cursor_error(kind: &str) -> crate::mesh_lifecycle::LifecycleError {
 }
 
 impl Persistence {
+    fn lifecycle_mvcc(
+        &self,
+    ) -> crate::mesh_lifecycle::LifecycleResult<&crate::mvcc_bootstrap::MvccSubsystem> {
+        self.mvcc().map_err(|error| {
+            crate::mesh_lifecycle::LifecycleError::InvalidArgument(error.to_string())
+        })
+    }
+
     pub async fn create_region(&self, name: &str) -> Result<bool> {
         if control_journal::region_exists_mvcc(self.mvcc()?, name).await? {
             return Ok(false);
@@ -72,6 +80,7 @@ impl Persistence {
             crate::mesh_lifecycle::LifecycleControlWriteAuthority {
                 permit: &permit,
                 signing_key: &self.partition_owner_signing_key,
+                mvcc: self.lifecycle_mvcc()?,
             },
         )
         .await
@@ -104,6 +113,7 @@ impl Persistence {
             crate::mesh_lifecycle::LifecycleControlWriteAuthority {
                 permit: &permit,
                 signing_key: &self.partition_owner_signing_key,
+                mvcc: self.lifecycle_mvcc()?,
             },
         )
         .await
@@ -136,6 +146,7 @@ impl Persistence {
             crate::mesh_lifecycle::LifecycleControlWriteAuthority {
                 permit: &permit,
                 signing_key: &self.partition_owner_signing_key,
+                mvcc: self.lifecycle_mvcc()?,
             },
         )
         .await
@@ -144,7 +155,12 @@ impl Persistence {
     pub async fn list_region_descriptors(
         &self,
     ) -> crate::mesh_lifecycle::LifecycleResult<Vec<crate::mesh_lifecycle::RegionDescriptor>> {
-        crate::mesh_lifecycle::list_regions(&self.storage).await
+        Ok(
+            crate::mesh_lifecycle::read_lifecycle_state_projection_mvcc(self.lifecycle_mvcc()?)?
+                .regions
+                .into_values()
+                .collect(),
+        )
     }
 
     pub async fn register_cell_descriptor(
@@ -171,6 +187,7 @@ impl Persistence {
             crate::mesh_lifecycle::LifecycleControlWriteAuthority {
                 permit: &permit,
                 signing_key: &self.partition_owner_signing_key,
+                mvcc: self.lifecycle_mvcc()?,
             },
         )
         .await
@@ -206,6 +223,7 @@ impl Persistence {
             crate::mesh_lifecycle::LifecycleControlWriteAuthority {
                 permit: &permit,
                 signing_key: &self.partition_owner_signing_key,
+                mvcc: self.lifecycle_mvcc()?,
             },
         )
         .await
@@ -215,7 +233,13 @@ impl Persistence {
         &self,
         region_filter: Option<&str>,
     ) -> crate::mesh_lifecycle::LifecycleResult<Vec<crate::mesh_lifecycle::CellDescriptor>> {
-        crate::mesh_lifecycle::list_cells(&self.storage, region_filter).await
+        Ok(
+            crate::mesh_lifecycle::read_lifecycle_state_projection_mvcc(self.lifecycle_mvcc()?)?
+                .cells
+                .into_values()
+                .filter(|cell| region_filter.is_none_or(|region| cell.region == region))
+                .collect(),
+        )
     }
 
     pub async fn register_node_descriptor(
@@ -244,6 +268,7 @@ impl Persistence {
             crate::mesh_lifecycle::LifecycleControlWriteAuthority {
                 permit: &permit,
                 signing_key: &self.partition_owner_signing_key,
+                mvcc: self.lifecycle_mvcc()?,
             },
         )
         .await?;
@@ -263,10 +288,12 @@ impl Persistence {
         target: crate::mesh_lifecycle::LifecycleState,
         drain: Option<crate::mesh_lifecycle::NodeDrainDescriptor>,
     ) -> crate::mesh_lifecycle::LifecycleResult<crate::mesh_lifecycle::NodeDescriptor> {
-        let node = crate::mesh_lifecycle::list_nodes(&self.storage, None, None)
-            .await?
-            .into_iter()
-            .find(|node| node.node_id == node_id)
+        let node = crate::mesh_lifecycle::read_lifecycle_state_projection_mvcc(
+            self.lifecycle_mvcc()?,
+        )?
+        .nodes
+        .into_values()
+        .find(|node| node.node_id == node_id)
             .ok_or_else(|| crate::mesh_lifecycle::LifecycleError::NotFound {
                 resource_kind: "node",
                 resource_id: node_id.to_string(),
@@ -320,6 +347,7 @@ impl Persistence {
             crate::mesh_lifecycle::LifecycleControlWriteAuthority {
                 permit: &permit,
                 signing_key: &self.partition_owner_signing_key,
+                mvcc: self.lifecycle_mvcc()?,
             },
         )
         .await
@@ -631,7 +659,14 @@ impl Persistence {
         region_filter: Option<&str>,
         cell_filter: Option<&str>,
     ) -> crate::mesh_lifecycle::LifecycleResult<Vec<crate::mesh_lifecycle::NodeDescriptor>> {
-        crate::mesh_lifecycle::list_nodes(&self.storage, region_filter, cell_filter).await
+        Ok(
+            crate::mesh_lifecycle::read_lifecycle_state_projection_mvcc(self.lifecycle_mvcc()?)?
+                .nodes
+                .into_values()
+                .filter(|node| region_filter.is_none_or(|region| node.region == region))
+                .filter(|node| cell_filter.is_none_or(|cell| node.cell_id == cell))
+                .collect(),
+        )
     }
 
     pub async fn create_host_alias_descriptor(

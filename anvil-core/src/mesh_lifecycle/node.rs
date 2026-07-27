@@ -43,7 +43,8 @@ async fn register_node_inner(
     }
     let capacity_json_hash = capacity_json_hash(&input.capacity_json)?;
 
-    let mut state = read_state(storage).await?;
+    let mut state =
+        topology_mutation::read_topology_mutation_state(storage, authority.as_ref()).await?;
     if !state.regions.contains_key(&input.region) {
         return Err(LifecycleError::NotFound {
             resource_kind: "region",
@@ -158,7 +159,8 @@ async fn transition_node_inner(
     authority: Option<LifecycleControlWriteAuthority<'_>>,
 ) -> LifecycleResult<NodeDescriptor> {
     require_identifier(node_id, "node id")?;
-    let mut state = read_state(storage).await?;
+    let mut state =
+        topology_mutation::read_topology_mutation_state(storage, authority.as_ref()).await?;
     let current = state
         .nodes
         .get(node_id)
