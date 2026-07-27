@@ -1520,11 +1520,26 @@ impl ObjectService for AppState {
         .await?;
         let requested_transaction_id =
             native_transaction_id(metadata.mutation_context.as_ref())?;
+        let incoming_payload = stream.map(|chunk_result| match chunk_result {
+            Ok(chunk) => match chunk.data {
+                Some(upload_part_request::Data::Chunk(bytes)) => Ok(bytes),
+                _ => Ok(vec![]),
+            },
+            Err(error) => Err(error),
+        });
+        let (scratch_path, payload_size, payload_digest) = self
+            .storage
+            .stream_to_temp_file(incoming_payload)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let scratch = super::native_put_rpc::NativeScratchFile::new(scratch_path);
         let target =
             NativeIdempotencyTarget::new("UploadPart", &metadata.bucket_name, &metadata.object_key)
                 .with_parameters(serde_json::json!({
                     "upload_id": metadata.upload_id.clone(),
-                    "part_number": metadata.part_number
+                    "part_number": metadata.part_number,
+                    "payload_hash": format!("sha256:{payload_digest}"),
+                    "payload_size": payload_size
                 }));
         let (attempt, replay) = begin_native_mutation::<UploadPartResponse>(
             self,
@@ -1564,13 +1579,19 @@ impl ObjectService for AppState {
         let part_version_id = metadata.part_number.to_string();
         let upload_id = uuid::Uuid::parse_str(&metadata.upload_id)
             .map_err(|_| Status::invalid_argument("Invalid upload_id"))?;
-        let data_stream = stream.map(|chunk_result| match chunk_result {
-            Ok(chunk) => match chunk.data {
-                Some(upload_part_request::Data::Chunk(bytes)) => Ok(bytes),
-                _ => Ok(vec![]),
+        let scratch_file = match tokio::fs::File::open(scratch.path()).await {
+            Ok(file) => file,
+            Err(error) => {
+                return Err(Status::internal(error.to_string()));
+            }
+        };
+        let data_stream = tokio_util::io::ReaderStream::new(scratch_file).map(
+            |result: Result<bytes::Bytes, std::io::Error>| {
+                result
+                    .map(|bytes| bytes.to_vec())
+                    .map_err(|error| Status::internal(error.to_string()))
             },
-            Err(e) => Err(e),
-        });
+        );
 
         let result = self
             .object_manager
@@ -1584,7 +1605,8 @@ impl ObjectService for AppState {
                 transaction_id,
                 transaction_principal.as_deref(),
             )
-            .await?;
+            .await;
+        let result = result?;
         let authz_revision = latest_authz_revision(self, claims.tenant_id).await?;
 
         let response = UploadPartResponse {

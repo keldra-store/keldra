@@ -77,7 +77,12 @@ async fn upload_part_with_context(
 
 #[tokio::test]
 async fn implicit_native_retries_reconstruct_results_and_reject_changed_inputs_across_nodes() {
-    let cluster = shared_default_test_cluster().await;
+    let cluster = isolated_test_cluster_with_config(
+        "native retry must cross coordinators in a three-node quorum cluster",
+        &["test-region-1", "test-region-1", "test-region-1"],
+        |config| config.mvcc_default_durability = "quorum".to_string(),
+    )
+    .await;
     let actor = create_object_test_actor(
         &cluster,
         "implicit-native-retries-reconstruct-results-across-nodes",
@@ -132,8 +137,8 @@ async fn implicit_native_retries_reconstruct_results_and_reject_changed_inputs_a
         &mut second_node,
         &actor.token,
         &bucket_name,
-        "different-target.bin",
-        b"durable payload",
+        "retry.bin",
+        b"different payload",
         put_context,
     )
     .await
@@ -245,7 +250,12 @@ async fn implicit_native_retries_reconstruct_results_and_reject_changed_inputs_a
 
 #[tokio::test]
 async fn multipart_and_append_payloads_round_trip_from_mvcc_representations() {
-    let cluster = shared_default_test_cluster().await;
+    let cluster = isolated_test_cluster_with_config(
+        "native payload representations must round-trip from erasure shards",
+        &["test-region-1", "test-region-1", "test-region-1"],
+        |config| config.mvcc_default_durability = "erasure".to_string(),
+    )
+    .await;
     let actor = create_object_test_actor(
         &cluster,
         "multipart-and-append-payloads-round-trip-from-mvcc",
@@ -324,8 +334,8 @@ async fn multipart_and_append_payloads_round_trip_from_mvcc_representations() {
             &bucket_name,
             "assembled.bin",
             &first_initiate.upload_id,
-            part_number + 100,
-            payload,
+            part_number,
+            b"changed",
             context,
         )
         .await

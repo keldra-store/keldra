@@ -2,6 +2,34 @@ use super::rpc::{native_transaction_id, object_write_visibility, write_state_for
 use super::*;
 use crate::mvcc_transaction::{DurabilityLevel, ReadConsistency};
 
+pub(super) struct NativeScratchFile {
+    path: std::path::PathBuf,
+}
+
+impl NativeScratchFile {
+    pub(super) fn new(path: std::path::PathBuf) -> Self {
+        Self { path }
+    }
+
+    pub(super) fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for NativeScratchFile {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_file(&self.path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                path = %self.path.display(),
+                %error,
+                "failed to remove native mutation scratch file"
+            );
+        }
+    }
+}
+
 pub(crate) async fn execute_native_put(
     state: &AppState,
     claims: auth::Claims,
@@ -21,7 +49,17 @@ pub(crate) async fn execute_native_put(
         .await?;
     let requested_transaction_id = native_transaction_id(mutation_context.as_ref())?;
     let write_visibility = object_write_visibility(mutation_context.as_ref())?;
-    let target = NativeIdempotencyTarget::new("PutObject", &bucket_name, &object_key);
+    let (scratch_path, payload_size, payload_digest) = state
+        .storage
+        .stream_to_temp_file(data_stream)
+        .await
+        .map_err(|error| Status::internal(error.to_string()))?;
+    let scratch = NativeScratchFile::new(scratch_path);
+    let target = NativeIdempotencyTarget::new("PutObject", &bucket_name, &object_key)
+        .with_parameters(serde_json::json!({
+            "payload_hash": format!("sha256:{payload_digest}"),
+            "payload_size": payload_size
+        }));
     let (attempt, replay) = begin_native_mutation::<PutObjectResponse>(
         state,
         mutation_context.as_ref(),
@@ -59,7 +97,7 @@ pub(crate) async fn execute_native_put(
                 state.mvcc.runtime.as_ref(),
                 state.config.mvcc_cluster_id.clone(),
                 transaction_principal.clone(),
-                implicit_transaction_idempotency_key(context, &bucket_name, &object_key),
+                super::native_mutation::implicit_native_transaction_key(context, &target)?,
                 std::time::Duration::from_secs(300),
                 configured_default_durability(&state.config.mvcc_default_durability)?,
                 ReadConsistency::Linearized,
@@ -71,13 +109,26 @@ pub(crate) async fn execute_native_put(
         &internal_transaction_id
     };
 
-    let object = state
+    let scratch_file = match tokio::fs::File::open(scratch.path()).await {
+        Ok(file) => file,
+        Err(error) => {
+            return Err(Status::internal(error.to_string()));
+        }
+    };
+    let replay_stream = tokio_util::io::ReaderStream::new(scratch_file).map(
+        |result: Result<bytes::Bytes, std::io::Error>| {
+            result
+                .map(|bytes| bytes.to_vec())
+                .map_err(|error| Status::internal(error.to_string()))
+        },
+    );
+    let object_result = state
         .object_manager
         .put_object(
             &claims,
             &bucket_name,
             &object_key,
-            data_stream,
+            replay_stream,
             ObjectWriteOptions {
                 content_type,
                 user_metadata,
@@ -87,7 +138,8 @@ pub(crate) async fn execute_native_put(
                 visibility: write_visibility,
             },
         )
-        .await?;
+        .await;
+    let object = object_result?;
     let response = PutObjectResponse {
         etag: object.etag,
         version_id: object.version_id.to_string(),
@@ -133,24 +185,6 @@ pub(super) fn configured_default_durability(value: &str) -> Result<DurabilityLev
     }
 }
 
-fn implicit_transaction_idempotency_key(
-    context: &NativeMutationContext,
-    bucket_name: &str,
-    object_key: &str,
-) -> String {
-    let mut hash = blake3::Hasher::new();
-    for value in [
-        "implicit-put-object",
-        context.idempotency_key.as_str(),
-        bucket_name,
-        object_key,
-    ] {
-        hash.update(&(value.len() as u64).to_be_bytes());
-        hash.update(value.as_bytes());
-    }
-    format!("implicit-put:{}", hash.finalize().to_hex())
-}
-
 fn current_unix_ms() -> Result<u64, Status> {
     let elapsed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -192,20 +226,4 @@ mod tests {
         assert!(configured_default_durability("eventual").is_err());
     }
 
-    #[test]
-    fn implicit_transaction_identity_is_stable_for_retries_and_target_scoped() {
-        let context = NativeMutationContext {
-            idempotency_key: "request-7".into(),
-            ..Default::default()
-        };
-        let first = implicit_transaction_idempotency_key(&context, "bucket", "one");
-        assert_eq!(
-            first,
-            implicit_transaction_idempotency_key(&context, "bucket", "one")
-        );
-        assert_ne!(
-            first,
-            implicit_transaction_idempotency_key(&context, "bucket", "two")
-        );
-    }
 }
