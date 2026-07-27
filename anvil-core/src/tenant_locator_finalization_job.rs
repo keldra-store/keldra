@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{mvcc_product::ProductMutation, mvcc_transaction::LogicalKey, persistence::Tenant};
 
-pub const TABLE_TENANT_LOCATOR_FINALIZATION: u64 = 0x746c_6a6f_6201;
+pub const TABLE_TENANT_LOCATOR_FINALIZATION: u16 = 0x6201;
 pub const TENANT_LOCATOR_FINALIZATION_PREFIX: &[u8] = b"anvil.tenant-locator-finalization.v1/";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -5,8 +5,9 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    sync::{Mutex, OnceLock},
 };
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum FaultPoint {
@@ -83,16 +84,26 @@ impl DeterministicFaults {
     }
 }
 
+#[cfg(test)]
 static INSTALLED: OnceLock<Mutex<Option<DeterministicFaults>>> = OnceLock::new();
 
+#[cfg(test)]
 pub fn install(faults: DeterministicFaults) {
     *INSTALLED.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(faults);
 }
 
+#[cfg(not(test))]
+pub fn install(_faults: DeterministicFaults) {}
+
+#[cfg(test)]
 pub fn clear() {
     *INSTALLED.get_or_init(|| Mutex::new(None)).lock().unwrap() = None;
 }
 
+#[cfg(not(test))]
+pub fn clear() {}
+
+#[cfg(test)]
 pub fn hit(point: FaultPoint) -> Result<(), InjectedFault> {
     #[cfg(debug_assertions)]
     if let Some(path) = std::env::var_os("ANVIL_MVCC_HARD_CRASH_CONTROL_FILE") {
@@ -116,6 +127,11 @@ pub fn hit(point: FaultPoint) -> Result<(), InjectedFault> {
         Some(faults) => faults.check(point),
         None => Ok(()),
     }
+}
+
+#[cfg(not(test))]
+pub fn hit(_point: FaultPoint) -> Result<(), InjectedFault> {
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

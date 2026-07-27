@@ -2,7 +2,8 @@ use anyhow::{Result, anyhow};
 
 use crate::{
     mvcc_product::ProductMutation,
-    mvcc_transaction::{DurabilityLevel, TransactionRuntime},
+    mvcc_open_transactions::TransactionRuntime,
+    mvcc_transaction::DurabilityLevel,
     tenant_locator_finalization_job::{
         TABLE_TENANT_LOCATOR_FINALIZATION, TENANT_LOCATOR_FINALIZATION_PREFIX,
         TenantLocatorFinalizationJob,

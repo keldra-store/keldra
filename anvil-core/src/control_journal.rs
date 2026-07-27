@@ -75,7 +75,7 @@ struct StoredControlApp {
     client_secret_encrypted: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct TransactionAppDetails {
     pub app: App,
     pub tenant_id: i64,
@@ -505,6 +505,7 @@ pub(crate) fn plan_create_tenant_in_transaction(
                 cf,
                 table_id,
                 tuple_key,
+                ..
             } => (cf, *table_id, tuple_key),
             CoreMutationOperation::StreamAppend { .. } => continue,
         };

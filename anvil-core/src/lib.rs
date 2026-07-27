@@ -96,7 +96,6 @@ pub mod mvcc_control_plane;
 mod mvcc_crash_restart_acceptance;
 #[cfg(test)]
 mod mvcc_cross_feature_tests;
-#[cfg(test)]
 pub mod mvcc_fault_injection;
 pub mod mvcc_gc;
 pub mod mvcc_gc_coordinator;

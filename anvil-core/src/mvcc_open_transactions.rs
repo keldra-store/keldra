@@ -1435,7 +1435,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(registry.pinned_snapshots(10).unwrap().is_empty());
+        assert!(registry.active_snapshot_pins(10).unwrap().is_empty());
     }
 
     #[tokio::test]
