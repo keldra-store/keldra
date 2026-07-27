@@ -32,8 +32,7 @@ impl AuditService for AppState {
             action: none_if_empty(&req.action),
         };
         let revision =
-            tenant_audit::tenant_audit_collection_revision(&self.storage, claims.tenant_id)
-                .await
+            tenant_audit::tenant_audit_collection_revision_mvcc(&self.mvcc, claims.tenant_id)
                 .map_err(|err| Status::internal(err.to_string()))?;
         let cursor = decode_tenant_audit_cursor(
             req.page.as_ref(),
@@ -48,14 +47,13 @@ impl AuditService for AppState {
             .map(hex::decode)
             .transpose()
             .map_err(|_| Status::invalid_argument("Invalid tenant audit cursor"))?;
-        let page = tenant_audit::list_tenant_audit_event_page_after(
-            &self.storage,
+        let page = tenant_audit::list_tenant_audit_event_page_after_mvcc(
+            &self.mvcc,
             claims.tenant_id,
             filter,
             after_cursor.as_deref(),
             limit,
         )
-        .await
         .map_err(|err| Status::internal(err.to_string()))?;
         if page.revision != revision {
             return Err(Status::aborted(
@@ -93,7 +91,7 @@ pub(crate) async fn record_tenant_audit_event(
 ) -> Result<String, Status> {
     let event = build_tenant_audit_event(claims, request_id, resource_id, action, details)?;
     let audit_event_id = event.audit_event_id.clone();
-    tenant_audit::append_tenant_audit_event(&state.storage, &event)
+    tenant_audit::append_tenant_audit_event_mvcc(&state.mvcc, &event)
         .await
         .map_err(|err| Status::internal(err.to_string()))?;
     Ok(audit_event_id)

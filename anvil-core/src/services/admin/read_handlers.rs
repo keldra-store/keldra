@@ -194,8 +194,7 @@ pub(super) async fn list_audit_events(
     let request_id = require_request_id(&req.request_id)?.to_string();
     let page = req.page.as_ref();
     let limit = page_limit(page)?;
-    let revision = admin_audit::audit_collection_revision(&state.storage)
-        .await
+    let revision = admin_audit::audit_collection_revision_mvcc(&state.mvcc)
         .map_err(|err| Status::internal(err.to_string()))?;
     let filters = [
         ("principal_id", req.principal_id.as_str()),
@@ -217,8 +216,8 @@ pub(super) async fn list_audit_events(
         .map(hex::decode)
         .transpose()
         .map_err(|_| Status::invalid_argument("Invalid admin audit cursor"))?;
-    let page = admin_audit::list_audit_event_page_after(
-        &state.storage,
+    let page = admin_audit::list_audit_event_page_after_mvcc(
+        &state.mvcc,
         AuditEventFilter {
             principal_id: none_if_empty(&req.principal_id),
             resource_id: none_if_empty(&req.resource_id),
@@ -227,7 +226,6 @@ pub(super) async fn list_audit_events(
         after_cursor.as_deref(),
         limit,
     )
-    .await
     .map_err(|err| Status::internal(err.to_string()))?;
     if page.revision != revision {
         return Err(Status::aborted(

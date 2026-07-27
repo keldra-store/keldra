@@ -1291,7 +1291,7 @@ pub(super) async fn record_admin_audit_event(
 ) -> Result<String, Status> {
     let event = build_admin_audit_event(principal, context, action, resource_id, details)?;
     let audit_event_id = event.audit_event_id.clone();
-    admin_audit::append_audit_event(&state.storage, &event)
+    admin_audit::append_audit_event_mvcc(&state.mvcc, &event)
         .await
         .map_err(|err| Status::internal(err.to_string()))?;
     Ok(audit_event_id)
@@ -1340,7 +1340,7 @@ pub(super) async fn record_admin_audit_event_with_suffix(
         created_at: Utc::now().to_rfc3339(),
         details_json: admin_audit_details_json(principal, context, details)?,
     };
-    admin_audit::append_audit_event(&state.storage, &event)
+    admin_audit::append_audit_event_mvcc(&state.mvcc, &event)
         .await
         .map_err(|err| Status::internal(err.to_string()))?;
     Ok(audit_event_id)

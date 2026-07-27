@@ -126,6 +126,42 @@ pub async fn append_audit_event(storage: &Storage, event: &AdminAuditEvent) -> R
     Ok(())
 }
 
+pub async fn append_audit_event_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    event: &AdminAuditEvent,
+) -> Result<()> {
+    require_direct_audit_action(event)?;
+    let generation = audit_event_revision_generation(event).max(1);
+    let transaction_id = format!("admin-audit:{}", event.audit_event_id);
+    let mut plan = admin_audit_mvcc_plan(event, generation, &transaction_id)?;
+    plan.predicates.extend(
+        audit_projection_keys(event)?
+            .into_iter()
+            .map(|tuple_key| {
+                Ok((
+                    crate::mvcc_product::coremeta_logical_key(
+                        CF_OBSERVABILITY,
+                        TABLE_OBSERVABILITY_CURSOR_ROW,
+                        &tuple_key,
+                    )?,
+                    crate::mvcc_transaction::PredicateKind::Absent,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?,
+    );
+    mvcc.autocommit_product_mutations_with_predicates_and_outbox(
+        "system:admin-audit",
+        &transaction_id,
+        plan.mutations,
+        plan.predicates,
+        plan.outbox_events,
+        crate::mvcc_transaction::DurabilityLevel::Quorum,
+        chrono::Utc::now().timestamp_millis().max(0) as u64,
+    )
+    .await?;
+    Ok(())
+}
+
 /// Contract for the deliberately small set of control-plane consequences that
 /// are outside a cluster MVCC transaction. Product mutations must compose
 /// `admin_audit_mvcc_plan` into the transaction that changes their state.
@@ -249,6 +285,87 @@ pub async fn list_audit_event_page_after(
         next_cursor,
         revision: audit_collection_revision(storage).await?,
     })
+}
+
+pub fn list_audit_event_page_after_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    filter: AuditEventFilter<'_>,
+    after_cursor: Option<&[u8]>,
+    limit: usize,
+) -> Result<AdminAuditEventPage> {
+    if !(1..=ADMIN_AUDIT_PAGE_MAX).contains(&limit) {
+        return Err(anyhow!(
+            "admin audit page size must be between 1 and {ADMIN_AUDIT_PAGE_MAX}"
+        ));
+    }
+    let prefix = audit_projection_prefix(&filter)?;
+    let application_prefix =
+        crate::mvcc_product::coremeta_application_prefix(CF_OBSERVABILITY, &prefix)?;
+    let snapshot = mvcc.runtime.applied_version()?;
+    let mut rows = mvcc.runtime.scan_table_prefix_at(
+        TABLE_OBSERVABILITY_CURSOR_ROW,
+        &application_prefix,
+        snapshot,
+    )?;
+    if let Some(after_cursor) = after_cursor {
+        rows.retain(|(key, _)| {
+            crate::mvcc_product::coremeta_tuple_from_logical_key(key, CF_OBSERVABILITY)
+                .is_ok_and(|tuple| tuple > after_cursor)
+        });
+    }
+    let has_more = rows.len() > limit;
+    rows.truncate(limit);
+    let next_cursor = if has_more {
+        rows.last()
+            .map(|(key, _)| {
+                crate::mvcc_product::coremeta_tuple_from_logical_key(key, CF_OBSERVABILITY)
+                    .map(Vec::from)
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let events = rows
+        .into_iter()
+        .map(|(_, row)| decode_audit_projection(&row.value))
+        .collect::<Result<Vec<_>>>()?;
+    if events.iter().any(|event| !matches_filter(event, &filter)) {
+        return Err(anyhow!("admin audit projection scope mismatch"));
+    }
+    Ok(AdminAuditEventPage {
+        events,
+        next_cursor,
+        revision: audit_collection_revision_mvcc(mvcc)?,
+    })
+}
+
+pub fn audit_collection_revision_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+) -> Result<String> {
+    let prefix = core_meta_tuple_key(&[CoreMetaTuplePart::Utf8("admin-audit")])?;
+    audit_projection_revision_mvcc(mvcc, &prefix, b"anvil-admin-audit-mvcc-revision-v1")
+}
+
+fn audit_projection_revision_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tuple_prefix: &[u8],
+    domain: &[u8],
+) -> Result<String> {
+    let application_prefix =
+        crate::mvcc_product::coremeta_application_prefix(CF_OBSERVABILITY, tuple_prefix)?;
+    let snapshot = mvcc.runtime.applied_version()?;
+    let rows = mvcc.runtime.scan_table_prefix_at(
+        TABLE_OBSERVABILITY_CURSOR_ROW,
+        &application_prefix,
+        snapshot,
+    )?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(domain);
+    for (key, row) in rows {
+        hasher.update(&key.application_key);
+        hasher.update(&row.commit_version.to_le_bytes());
+    }
+    Ok(hex::encode(hasher.finalize().as_bytes()))
 }
 
 pub async fn audit_collection_revision(storage: &Storage) -> Result<String> {
