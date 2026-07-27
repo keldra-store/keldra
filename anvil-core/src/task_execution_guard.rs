@@ -1,5 +1,5 @@
 use crate::task_lease::{self, LEASE_EXPIRED, TaskLease};
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,6 +18,7 @@ pub(crate) struct TaskExecutionGuard {
     mvcc: Arc<crate::mvcc_bootstrap::MvccSubsystem>,
     signing_key: Arc<[u8]>,
     ttl_nanos: i64,
+    assignment: crate::mvcc_worker_authority::AssignmentGuard,
 }
 
 impl TaskExecutionGuard {
@@ -36,13 +37,22 @@ impl TaskExecutionGuard {
             .filter(|ttl| *ttl > 0)
             .ok_or_else(|| anyhow!("task lease has no positive renewal window"))?;
         lease.verify(&signing_key)?;
+        let assignment_identity = format!("{}:{}", lease.owner.tenant_id, lease.task_id);
+        let assignment = mvcc
+            .claim_assignment("task-lease", &assignment_identity)?
+            .context("local node no longer owns the task lease assignment")?;
 
         Ok(Self {
             lease: Arc::new(Mutex::new(lease)),
             mvcc,
             signing_key: Arc::from(signing_key),
             ttl_nanos,
+            assignment,
         })
+    }
+
+    pub(crate) fn assignment(&self) -> &crate::mvcc_worker_authority::AssignmentGuard {
+        &self.assignment
     }
 
     /// Returns the exact in-process lease version without changing it.

@@ -23,23 +23,38 @@ env:
 
 jobs:
   build-image:
-    name: Build Anvil test image
+    name: Build Anvil test image (${{ matrix.platform }})
     runs-on: [self-hosted, linux, x64, worka-builder-2]
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
-      ANVIL_DOCKER_PLATFORM: linux/amd64
-      ANVIL_IMAGE: anvil:test-amd64-${{ github.run_id }}-${{ github.run_attempt }}
-      # The self-hosted builder may be ARM even though the runner label is
-      # x64. Always use the reproducible Zig cross-build path for the amd64
-      # image instead of assuming the host architecture.
+      ANVIL_DOCKER_PLATFORM: ${{ matrix.platform }}
+      ANVIL_IMAGE: anvil:test-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+      # Always use the reproducible Zig cross-build path. The self-hosted
+      # builder architecture must not determine either runtime artifact.
       ANVIL_USE_NATIVE_CARGO: "0"
       ANVIL_BUILD_PROFILE: ci
       ANVIL_INCLUDE_TEST_TOOLS: "1"
       ANVIL_RUNTIME_BASE: ubuntu:24.04
       CARGO_BUILD_JOBS: "8"
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            artifact: anvil-test-image-amd64
+          - platform: linux/arm64
+            arch: arm64
+            artifact: anvil-test-image-arm64
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Set up emulation for image smoke checks
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: amd64,arm64
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -88,19 +103,19 @@ jobs:
 
       - name: Smoke check image binaries and test tooling
         run: |
-          timeout 30s docker run --platform linux/amd64 --rm "$ANVIL_IMAGE" anvil-server --version
-          timeout 30s docker run --platform linux/amd64 --rm "$ANVIL_IMAGE" anvil --version
-          timeout 30s docker run --platform linux/amd64 --rm "$ANVIL_IMAGE" anvil-admin --version
-          timeout 30s docker run --platform linux/amd64 --rm "$ANVIL_IMAGE" ip -Version
+          timeout 30s docker run --platform "${{ matrix.platform }}" --rm "$ANVIL_IMAGE" anvil-server --version
+          timeout 30s docker run --platform "${{ matrix.platform }}" --rm "$ANVIL_IMAGE" anvil --version
+          timeout 30s docker run --platform "${{ matrix.platform }}" --rm "$ANVIL_IMAGE" anvil-admin --version
+          timeout 30s docker run --platform "${{ matrix.platform }}" --rm "$ANVIL_IMAGE" ip -Version
 
       - name: Export Docker image artifact
-        run: docker save "$ANVIL_IMAGE" -o "${{ runner.temp }}/anvil-test-image-amd64.tar"
+        run: docker save "$ANVIL_IMAGE" -o "${{ runner.temp }}/${{ matrix.artifact }}.tar"
 
       - name: Upload Docker image artifact
         uses: actions/upload-artifact@v4
         with:
-          name: anvil-test-image-amd64
-          path: ${{ runner.temp }}/anvil-test-image-amd64.tar
+          name: ${{ matrix.artifact }}
+          path: ${{ runner.temp }}/${{ matrix.artifact }}.tar
           if-no-files-found: error
           compression-level: 0
           retention-days: 1
@@ -255,13 +270,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: coremeta-performance-quick
-          path: target/anvil/perf/coremeta/quick/
+          path: target/anvil/perf/mvcc/quick/
           if-no-files-found: error
           retention-days: 14
 
   server-core:
     name: Server core integration tests
-    needs: coremeta-performance
+    needs: rust-unit
     runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 60
     env:
@@ -311,11 +326,12 @@ jobs:
     name: MVCC under Raft end-to-end acceptance
     needs: server-core
     runs-on: [self-hosted, linux, x64, worka-builder-2]
-    timeout-minutes: 120
+    timeout-minutes: 180
     env:
       CARGO_BUILD_JOBS: "8"
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
+      ANVIL_GATE_STEP_TIMEOUT_SECONDS: "5400"
       ANVIL_RUST_TEST_THREADS: "1"
       RUST_LOG: warn
     steps:
@@ -350,44 +366,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-v2-
 
-      - name: Prebuild MVCC acceptance binaries
-        run: |
-          cargo test --no-run -p anvil-server \
-            --test object_tests \
-            --test mvcc_cluster_conflicts \
-            --test mvcc_cluster_fixture \
-            --test mvcc_gc_cluster \
-            --test mvcc_partition_fixture \
-            --test mvcc_process_cluster \
-            --test mvcc_snapshot_stability \
-            --test coremeta_bounded_contracts
-
-      - name: Run native object acceptance
-        run: |
-          cargo test -q -p anvil-server --test object_tests \
-            native_mvcc_acceptance -- --nocapture --test-threads=1
-
-      - name: Run cluster failure and repair acceptance
-        run: |
-          cargo test -q -p anvil-server --test mvcc_cluster_fixture \
-            -- --nocapture --test-threads=1
-
-      - name: Run MVCC conflict, partition, and GC acceptance
-        run: |
-          for test_target in \
-            mvcc_cluster_conflicts \
-            mvcc_gc_cluster \
-            mvcc_partition_fixture \
-            mvcc_snapshot_stability \
-            coremeta_bounded_contracts; do
-            cargo test -q -p anvil-server --test "$test_target" \
-              -- --nocapture --test-threads=1
-          done
-
-      - name: Run process crash and restart acceptance
-        run: |
-          cargo test -q -p anvil-server --test mvcc_process_cluster \
-            -- --nocapture --test-threads=1
+      - name: Run native MVCC and transaction acceptance gates
+        run: ./scripts/release-gates.sh mvcc-e2e
 
   docker-integration:
     name: Docker integration tests (${{ matrix.group }})

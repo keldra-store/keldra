@@ -105,6 +105,28 @@ fn materialisation_job(cluster_id: &str, transaction_id: &str) -> Vec<u8> {
     .unwrap()
 }
 
+fn transaction_outbox_records(
+    state: &AppState,
+    transaction_id: &str,
+) -> Vec<crate::mvcc_store::OutboxRecord> {
+    state
+        .mvcc
+        .runtime
+        .local_store()
+        .outbox_records_after(0, usize::MAX)
+        .unwrap()
+        .into_iter()
+        .filter(|record| record.transaction_id == transaction_id)
+        .collect()
+}
+
+fn materialisation_job_id(cluster_id: &str, transaction_id: &str) -> String {
+    ObjectMaterialisationJob::decode(&materialisation_job(cluster_id, transaction_id))
+        .unwrap()
+        .job_id()
+        .unwrap()
+}
+
 async fn begin(
     state: &AppState,
     idempotency_key: &str,
@@ -203,22 +225,16 @@ async fn one_transaction_atomically_publishes_every_cross_feature_projection() {
     for (key, expected) in feature_rows() {
         assert_eq!(state.mvcc.read_latest_value(&key).unwrap(), Some(expected));
     }
-    let outbox = state
-        .mvcc
-        .runtime
-        .local_store()
-        .outbox_records_after(0, 10)
-        .unwrap();
+    let outbox = transaction_outbox_records(&state, &transaction.transaction_id);
     assert_eq!(outbox.len(), 1);
     assert_eq!(outbox[0].commit_version, commit_version);
-    assert_eq!(outbox[0].payload, b"object-committed");
-    let job_id = ObjectMaterialisationJob::decode(&materialisation_job(
-        state.mvcc.cluster_id(),
-        &transaction.transaction_id,
-    ))
-    .unwrap()
-    .job_id()
-    .unwrap();
+    let stream_event = crate::mvcc_outbox::StreamOutboxEvent::decode(&outbox[0].payload).unwrap();
+    assert_eq!(stream_event.partition_id, 7);
+    assert_eq!(stream_event.stream_id, "events");
+    assert_eq!(stream_event.stream_partition, "partition-7");
+    assert_eq!(stream_event.record_kind, "object.committed");
+    assert_eq!(stream_event.payload, b"object-committed");
+    let job_id = materialisation_job_id(state.mvcc.cluster_id(), &transaction.transaction_id);
     assert!(
         state
             .mvcc
@@ -283,14 +299,66 @@ async fn one_conflicting_feature_aborts_without_partial_visibility() {
         let expected = (key == conflict_key).then(|| b"winner".to_vec());
         assert_eq!(state.mvcc.read_latest_value(&key).unwrap(), expected);
     }
+    assert!(transaction_outbox_records(&state, &transaction.transaction_id).is_empty());
+    let job_id = materialisation_job_id(state.mvcc.cluster_id(), &transaction.transaction_id);
     assert!(
         state
             .mvcc
             .runtime
             .local_store()
-            .outbox_records_after(0, 10)
+            .object_materialisation_record(&job_id)
             .unwrap()
-            .is_empty()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn a_deleted_logical_key_can_be_recreated() {
+    let (_directory, state) = state().await;
+    let key = feature_key(0x7101, "recreated-after-delete");
+
+    let create_version = state
+        .mvcc
+        .autocommit_product_mutations(
+            PRINCIPAL,
+            "create-before-delete",
+            vec![ProductMutation::put(key.clone(), b"first".to_vec())],
+            DurabilityLevel::Local,
+            NOW,
+        )
+        .await
+        .unwrap();
+    let delete_version = state
+        .mvcc
+        .autocommit_product_mutations(
+            PRINCIPAL,
+            "delete-before-recreate",
+            vec![ProductMutation::delete(key.clone())],
+            DurabilityLevel::Local,
+            NOW + 1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(state.mvcc.read_latest_value(&key).unwrap(), None);
+
+    let recreate_version = state
+        .mvcc
+        .autocommit_product_mutations_with_predicates(
+            PRINCIPAL,
+            "recreate-after-delete",
+            vec![ProductMutation::put(key.clone(), b"second".to_vec())],
+            vec![(key.clone(), crate::mvcc_transaction::PredicateKind::Absent)],
+            DurabilityLevel::Local,
+            NOW + 2,
+        )
+        .await
+        .unwrap();
+
+    assert!(create_version < delete_version);
+    assert!(delete_version < recreate_version);
+    assert_eq!(
+        state.mvcc.read_latest_value(&key).unwrap(),
+        Some(b"second".to_vec())
     );
 }
 
@@ -358,7 +426,7 @@ fn local_apply_watermark_rejects_backward_versions_without_changing_visibility()
     let newer_key = feature_key(0x7101, "newer");
     let older_key = feature_key(0x7101, "older");
     let mut newer = TransactionBundleBuilder::new(
-        "cluster-a",
+        "cluster",
         "newer-transaction",
         0,
         PRINCIPAL,
@@ -370,7 +438,7 @@ fn local_apply_watermark_rejects_backward_versions_without_changing_visibility()
         .unwrap();
 
     let mut older = TransactionBundleBuilder::new(
-        "cluster-a",
+        "cluster",
         "older-transaction",
         0,
         PRINCIPAL,

@@ -24,9 +24,10 @@ use openraft::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AppliedDecision, CertificationResult, CertificationState, CertifyTransaction,
-    ClusterControlState, CommitVersion, CommittedBundleDecision, Consensus, ConsensusCommand,
-    ConsensusError, ControlApplyResult, NodeId, NodeIncarnation, RaftStorageError, RocksRaftStore,
+    AppliedDecision, CertificationError, CertificationResult, CertificationState,
+    CertifyTransaction, ClusterControlState, CommitVersion, CommittedBundleDecision, Consensus,
+    ConsensusCommand, ConsensusError, ControlApplyResult, NodeId, NodeIncarnation,
+    RaftStorageError, RocksRaftStore, TransactionId,
     storage::{KEY_LAST_PURGED_LOG_ID, KEY_OPENRAFT_STATE},
 };
 
@@ -398,6 +399,10 @@ pub struct OpenRaftConsensus {
     raft: openraft::Raft<AnvilRaftConfig>,
     store: RocksRaftStore,
     network: Arc<dyn ConsensusRpcFactory>,
+    // Weak entries keep the gate table bounded while every clone of this
+    // runtime shares serialization for an active transaction attempt.
+    certification_gates:
+        Arc<std::sync::Mutex<BTreeMap<TransactionId, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -409,6 +414,50 @@ pub struct AppliedControlSnapshot {
 }
 
 impl OpenRaftConsensus {
+    fn certification_gate(&self, transaction_id: TransactionId) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = self
+            .certification_gates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        if let Some(gate) = gates
+            .get(&transaction_id)
+            .and_then(std::sync::Weak::upgrade)
+        {
+            return gate;
+        }
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        gates.insert(transaction_id, Arc::downgrade(&gate));
+        gate
+    }
+
+    fn applied_certification_retry(
+        &self,
+        command: &CertifyTransaction,
+    ) -> Result<Option<CertificationResult>, ConsensusError> {
+        let state = self
+            .store
+            .read_state_value::<MachineState>(KEY_OPENRAFT_STATE)
+            .map_err(|error| ConsensusError::Storage(error.to_string()))?
+            .ok_or_else(|| ConsensusError::Storage("Raft state machine is missing".into()))?;
+        if state.certification.cluster_id_hash() != command.cluster_id_hash {
+            return Ok(None);
+        }
+        let Some(result) = state
+            .certification
+            .transaction_result(command.transaction_id)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        if result.bundle_hash() != command.bundle_hash {
+            return Err(ConsensusError::Rejected(
+                CertificationError::TransactionIdentityMismatch.to_string(),
+            ));
+        }
+        Ok(Some(result))
+    }
+
     async fn request_current_leader(
         &self,
         kind: ConsensusRpcKind,
@@ -555,6 +604,15 @@ impl OpenRaftConsensus {
         ConsensusCommand::Certify(command.clone())
             .validate_section9_boundary()
             .map_err(|reason| ConsensusError::Rejected(reason.into()))?;
+        let gate = self.certification_gate(command.transaction_id);
+        let _guard = gate.lock().await;
+        // A retry may arrive on a newly elected leader before its caller knows
+        // whether the prior proposal committed. Confirm leadership and wait for
+        // the applied state before deciding that this transaction is unseen.
+        self.linearized_read_barrier_locally().await?;
+        if let Some(result) = self.applied_certification_retry(&command)? {
+            return Ok(result);
+        }
         let response = self
             .raft
             .client_write(ConsensusCommand::Certify(command))
@@ -761,6 +819,7 @@ impl OpenRaftConsensus {
             raft,
             store: runtime_store,
             network,
+            certification_gates: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -1151,72 +1210,104 @@ impl RaftStateMachine<AnvilRaftConfig> for OpenRaftStateMachine {
                         RaftApplyResult::Noop
                     }
                     EntryPayload::Normal(ConsensusCommand::Certify(command)) => {
-                        let policy = state.control.durability_policy();
-                        let required_holders = match command.durability {
-                            crate::DurabilityLevel::Local => 1,
-                            crate::DurabilityLevel::Quorum | crate::DurabilityLevel::Erasure => {
-                                usize::from(policy.bundle_quorum_holders)
-                            }
-                        };
-                        let current_holders = command
-                            .durable_holders
-                            .iter()
-                            .filter(|holder| {
-                                state.control.node_incarnation(holder.node_id)
-                                    == Some(holder.incarnation)
-                            })
-                            .collect::<Vec<_>>();
-                        let holder_raft_ids = current_holders
-                            .iter()
-                            .filter_map(|holder| state.control.raft_node_id(holder.node_id))
-                            .map(|node_id| node_id.0)
-                            .collect::<BTreeSet<_>>();
-                        let voter_safe =
-                            matches!(command.durability, crate::DurabilityLevel::Local)
-                                || holders_intersect_every_election_quorum(
-                                    &state.membership,
-                                    &holder_raft_ids,
-                                );
-                        let assignments_current =
-                            command.assignment_predicates.iter().all(|predicate| {
-                                state.control.topology_epoch() == predicate.topology_epoch
-                                    && state.control.partition(predicate.partition_id).is_some_and(
-                                        |current| {
-                                            current.epoch == predicate.assignment_epoch
-                                                && current.owner == predicate.owner
-                                        },
-                                    )
-                            });
-                        if policy.generation == 0
-                            || required_holders == 0
-                            || current_holders.len() < required_holders
-                            || !voter_safe
-                        {
-                            RaftApplyResult::Rejected(
-                                "durability evidence violates applied Raft control state".into(),
-                            )
-                        } else if !assignments_current {
-                            RaftApplyResult::Rejected(
-                                "assignment predicate violates applied Raft control state".into(),
-                            )
-                        } else {
-                            let result = state
-                                .certification
-                                .apply(CommitVersion(log_id.index), &command);
-                            match result {
-                                Ok(result) => {
-                                    if matches!(result, CertificationResult::Committed { .. }) {
-                                        committed_bundle = Some(CommittedBundleDecision {
-                                            cluster_id_hash: command.cluster_id_hash,
-                                            bundle_hash: command.bundle_hash,
-                                            bundle_length: command.bundle_length,
-                                            durability: command.durability,
-                                            durable_holders: command.durable_holders.clone(),
-                                        });
+                        let position = CommitVersion(log_id.index);
+                        match state.certification.replay(position, &command) {
+                            Ok(Some(result)) => RaftApplyResult::Certification(result),
+                            Err(error) => RaftApplyResult::Rejected(error.to_string()),
+                            Ok(None) => {
+                                let policy = state.control.durability_policy();
+                                let required_holders = match command.durability {
+                                    crate::DurabilityLevel::Local => 1,
+                                    crate::DurabilityLevel::Quorum
+                                    | crate::DurabilityLevel::Erasure => {
+                                        usize::from(policy.bundle_quorum_holders)
                                     }
-                                    RaftApplyResult::Certification(result)
+                                };
+                                let current_holders = command
+                                    .durable_holders
+                                    .iter()
+                                    .filter(|holder| {
+                                        state.control.node_incarnation(holder.node_id)
+                                            == Some(holder.incarnation)
+                                    })
+                                    .collect::<Vec<_>>();
+                                let holder_raft_ids = current_holders
+                                    .iter()
+                                    .filter_map(|holder| state.control.raft_node_id(holder.node_id))
+                                    .map(|node_id| node_id.0)
+                                    .collect::<BTreeSet<_>>();
+                                let voter_safe =
+                                    matches!(command.durability, crate::DurabilityLevel::Local)
+                                        || holders_intersect_every_election_quorum(
+                                            &state.membership,
+                                            &holder_raft_ids,
+                                        );
+                                let assignment_conflict =
+                                    command.assignment_predicates.iter().find_map(|predicate| {
+                                        let current =
+                                            state.control.partition(predicate.partition_id);
+                                        (!current.is_some_and(|assignment| {
+                                            assignment.epoch == predicate.assignment_epoch
+                                                && assignment.owner == predicate.owner
+                                        }))
+                                        .then_some(
+                                            crate::CertificationAbort::AssignmentConflict {
+                                                partition_id: predicate.partition_id,
+                                                expected_epoch: CommitVersion(
+                                                    predicate.assignment_epoch,
+                                                ),
+                                                actual_epoch: current.map(|assignment| {
+                                                    CommitVersion(assignment.epoch)
+                                                }),
+                                                expected_topology_epoch: CommitVersion(
+                                                    predicate.topology_epoch,
+                                                ),
+                                                actual_topology_epoch: CommitVersion(
+                                                    state.control.topology_epoch(),
+                                                ),
+                                            },
+                                        )
+                                    });
+                                if policy.generation == 0
+                                    || required_holders == 0
+                                    || current_holders.len() < required_holders
+                                    || !voter_safe
+                                {
+                                    RaftApplyResult::Rejected(
+                                        "durability evidence violates applied Raft control state"
+                                            .into(),
+                                    )
+                                } else if let Some(reason) = assignment_conflict {
+                                    match state.certification.abort(position, &command, reason) {
+                                        Ok(result) => RaftApplyResult::Certification(result),
+                                        Err(error) => RaftApplyResult::Rejected(error.to_string()),
+                                    }
+                                } else {
+                                    let result = state.certification.apply(position, &command);
+                                    match result {
+                                        Ok(result) => {
+                                            if matches!(
+                                                &result,
+                                                CertificationResult::Committed {
+                                                    commit_version,
+                                                    ..
+                                                } if *commit_version == position
+                                            ) {
+                                                committed_bundle = Some(CommittedBundleDecision {
+                                                    cluster_id_hash: command.cluster_id_hash,
+                                                    bundle_hash: command.bundle_hash,
+                                                    bundle_length: command.bundle_length,
+                                                    durability: command.durability,
+                                                    durable_holders: command
+                                                        .durable_holders
+                                                        .clone(),
+                                                });
+                                            }
+                                            RaftApplyResult::Certification(result)
+                                        }
+                                        Err(error) => RaftApplyResult::Rejected(error.to_string()),
+                                    }
                                 }
-                                Err(error) => RaftApplyResult::Rejected(error.to_string()),
                             }
                         }
                     }
@@ -1906,10 +1997,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_transaction_advances_raft_applied_id_but_keeps_commit_version() {
+    async fn duplicate_transaction_advances_raft_applied_id_without_republishing_bundle() {
         let directory = TempDir::new().unwrap();
-        let (_, mut machine) =
-            stores(RocksRaftStore::open(directory.path(), 0).unwrap(), [1; 32]).unwrap();
+        let store = RocksRaftStore::open(directory.path(), 0).unwrap();
+        let (_, mut machine) = stores(store.clone(), [1; 32]).unwrap();
         let command = CertifyTransaction {
             cluster_id_hash: [1; 32],
             transaction_id: TransactionId([1; 16]),
@@ -1964,6 +2055,19 @@ mod tests {
             }])
             .await
             .unwrap();
+        machine
+            .apply([Entry {
+                log_id: LogId::new(CommittedLeaderId::new(1, 1), 4),
+                payload: EntryPayload::Normal(ConsensusCommand::RemoveNode {
+                    cluster_id_hash: [1; 32],
+                    node: NodeIncarnation {
+                        node_id: NodeId(1),
+                        incarnation: 1,
+                    },
+                }),
+            }])
+            .await
+            .unwrap();
         let retry = machine
             .apply([Entry {
                 log_id: log_id_9,
@@ -1982,6 +2086,144 @@ mod tests {
             )]
         ));
         assert_eq!(machine.applied_state().await.unwrap().0, Some(log_id_9));
+        let state: MachineState = store.read_state_value(KEY_OPENRAFT_STATE).unwrap().unwrap();
+        assert!(matches!(
+            state.decisions.get(&CommitVersion(3)),
+            Some(Some(decision))
+                if decision.bundle_hash == BundleHash([2; 32])
+                    && decision.bundle_length == 1
+        ));
+        assert_eq!(state.decisions.get(&CommitVersion(9)), Some(&None));
+    }
+
+    #[tokio::test]
+    async fn stale_assignment_predicate_is_a_stable_abort_not_a_rejected_raft_entry() {
+        let directory = TempDir::new().unwrap();
+        let store = RocksRaftStore::open(directory.path(), 0).unwrap();
+        let (_, mut machine) = stores(store.clone(), [1; 32]).unwrap();
+        let owner = NodeIncarnation {
+            node_id: NodeId(1),
+            incarnation: 1,
+        };
+        machine
+            .apply([
+                Entry {
+                    log_id: LogId::new(CommittedLeaderId::new(1, 1), 1),
+                    payload: EntryPayload::Normal(ConsensusCommand::InstallNode {
+                        cluster_id_hash: [1; 32],
+                        node: owner,
+                        raft_node_id: NodeId(1),
+                        failure_domain: "zone-a".into(),
+                    }),
+                },
+                Entry {
+                    log_id: LogId::new(CommittedLeaderId::new(1, 1), 2),
+                    payload: EntryPayload::Normal(ConsensusCommand::SetDurabilityPolicy {
+                        cluster_id_hash: [1; 32],
+                        generation: 1,
+                        bundle_quorum_holders: 1,
+                        tolerated_failure_domains: 0,
+                    }),
+                },
+                Entry {
+                    log_id: LogId::new(CommittedLeaderId::new(1, 1), 3),
+                    payload: EntryPayload::Normal(ConsensusCommand::AssignPartition {
+                        cluster_id_hash: [1; 32],
+                        partition_id: 7,
+                        owner,
+                        epoch: 1,
+                    }),
+                },
+                Entry {
+                    log_id: LogId::new(CommittedLeaderId::new(1, 1), 4),
+                    payload: EntryPayload::Normal(ConsensusCommand::AssignPartition {
+                        cluster_id_hash: [1; 32],
+                        partition_id: 7,
+                        owner,
+                        epoch: 2,
+                    }),
+                },
+            ])
+            .await
+            .unwrap();
+        let command = CertifyTransaction {
+            cluster_id_hash: [1; 32],
+            transaction_id: TransactionId([9; 16]),
+            snapshot_version: CommitVersion(0),
+            point_observations: vec![],
+            range_observations: vec![],
+            predicates: vec![],
+            assignment_predicates: vec![crate::AssignmentPredicate {
+                partition_id: 7,
+                owner,
+                assignment_epoch: 1,
+                topology_epoch: 3,
+            }],
+            written_point_keys: vec![],
+            written_points: vec![],
+            advanced_range_stamps: vec![],
+            bundle_hash: BundleHash([8; 32]),
+            bundle_length: 1,
+            durability: DurabilityLevel::Local,
+            durable_holders: vec![owner],
+        };
+
+        let first = machine
+            .apply([Entry {
+                log_id: LogId::new(CommittedLeaderId::new(1, 1), 5),
+                payload: EntryPayload::Normal(ConsensusCommand::Certify(command.clone())),
+            }])
+            .await
+            .unwrap();
+        assert!(matches!(
+            first.as_slice(),
+            [RaftApplyResult::Certification(
+                CertificationResult::Aborted {
+                    at_version: CommitVersion(5),
+                    reason: crate::CertificationAbort::AssignmentConflict {
+                        partition_id: 7,
+                        expected_epoch: CommitVersion(1),
+                        actual_epoch: Some(CommitVersion(2)),
+                        ..
+                    },
+                    ..
+                }
+            )]
+        ));
+
+        let retry = machine
+            .apply([Entry {
+                log_id: LogId::new(CommittedLeaderId::new(1, 1), 6),
+                payload: EntryPayload::Normal(ConsensusCommand::Certify(command.clone())),
+            }])
+            .await
+            .unwrap();
+        assert_eq!(retry, first);
+        let state: MachineState = store.read_state_value(KEY_OPENRAFT_STATE).unwrap().unwrap();
+        assert_eq!(state.decisions.get(&CommitVersion(5)), Some(&None));
+        assert_eq!(state.decisions.get(&CommitVersion(6)), Some(&None));
+
+        let mut malformed = command;
+        malformed.transaction_id = TransactionId([10; 16]);
+        malformed.bundle_hash = BundleHash([10; 32]);
+        malformed.assignment_predicates[0].topology_epoch = 0;
+        let malformed_result = machine
+            .apply([Entry {
+                log_id: LogId::new(CommittedLeaderId::new(1, 1), 7),
+                payload: EntryPayload::Normal(ConsensusCommand::Certify(malformed)),
+            }])
+            .await
+            .unwrap();
+        assert!(matches!(
+            malformed_result.as_slice(),
+            [RaftApplyResult::Certification(
+                CertificationResult::Aborted {
+                    at_version: CommitVersion(7),
+                    reason: crate::CertificationAbort::InvalidCommand(reason),
+                    ..
+                }
+            )] if reason.contains("non-zero exact authority")
+        ));
     }
 
     #[tokio::test]
@@ -2037,11 +2279,36 @@ mod tests {
                 .unwrap(),
             ControlApplyResult::DurabilityPolicySet(_)
         ));
-        let result = runtime.certify(test_command(8)).await.unwrap();
-        let committed = match result {
+        let command = test_command(8);
+        let (first, concurrent_retry) = tokio::join!(
+            runtime.certify(command.clone()),
+            runtime.certify(command.clone())
+        );
+        let first = first.unwrap();
+        assert_eq!(concurrent_retry.unwrap(), first);
+        let committed = match first {
             CertificationResult::Committed { commit_version, .. } => commit_version,
             other => panic!("unexpected result: {other:?}"),
         };
+        assert_eq!(
+            runtime.observed_commit_version(),
+            committed,
+            "concurrent retry must not allocate another Raft position"
+        );
+
+        let mut mismatched = command;
+        mismatched.bundle_hash = BundleHash([9; 32]);
+        let cursor_before_mismatch = runtime.observed_commit_version();
+        assert!(matches!(
+            runtime.certify(mismatched).await,
+            Err(ConsensusError::Rejected(reason))
+                if reason == CertificationError::TransactionIdentityMismatch.to_string()
+        ));
+        assert_eq!(
+            runtime.observed_commit_version(),
+            cursor_before_mismatch,
+            "bundle identity mismatch must be rejected before Raft"
+        );
         assert_eq!(
             runtime.linearized_read_barrier().await.unwrap(),
             runtime.observed_commit_version()
@@ -2140,10 +2407,16 @@ mod tests {
         .await
         .unwrap();
         wait_for_single_node_leader(&restarted).await;
+        let cursor_before_retry = restarted.observed_commit_version();
         assert_eq!(
             restarted.certify(test_command(retained_id)).await.unwrap(),
             retained_result,
             "certification retry state must survive snapshot-backed log purge"
+        );
+        assert_eq!(
+            restarted.observed_commit_version(),
+            cursor_before_retry,
+            "restart retry must not allocate another Raft position"
         );
         restarted.shutdown().await.unwrap();
     }

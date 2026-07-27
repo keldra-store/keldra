@@ -167,6 +167,24 @@ pub async fn write_index_segment_coremeta_record(
         crate::mvcc_transaction::PredicateKind,
     )],
 ) -> Result<()> {
+    write_index_segment_coremeta_record_with_assignment(
+        mvcc,
+        record,
+        additional_preconditions,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn write_index_segment_coremeta_record_with_assignment(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    record: &IndexSegmentCoreMetaRecord,
+    additional_preconditions: &[(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )],
+    assignment: Option<&crate::mvcc_worker_authority::AssignmentGuard>,
+) -> Result<()> {
     validate_index_segment_record(record)?;
     let payload = encode_index_segment_record(record);
     let tuple_keys = [
@@ -218,16 +236,31 @@ pub async fn write_index_segment_coremeta_record(
         "index-segment:{}:{}:{}",
         record.index_id, record.generation, record.segment_hash
     );
-    mvcc.autocommit_product_mutations_with_predicates(
-        &format!("index-builder:{}", record.index_id),
-        &logical_transaction_id,
-        operations,
-        preconditions,
-        crate::mvcc_transaction::DurabilityLevel::Quorum,
-        u64::try_from(chrono::Utc::now().timestamp_millis())
-            .map_err(|_| anyhow!("index segment timestamp predates Unix epoch"))?,
-    )
-    .await?;
+    let principal = format!("index-builder:{}", record.index_id);
+    let now_unix_ms = u64::try_from(chrono::Utc::now().timestamp_millis())
+        .map_err(|_| anyhow!("index segment timestamp predates Unix epoch"))?;
+    if let Some(assignment) = assignment {
+        mvcc.autocommit_product_mutations_with_predicates_and_assignment(
+            &principal,
+            &logical_transaction_id,
+            operations,
+            preconditions,
+            assignment,
+            crate::mvcc_transaction::DurabilityLevel::Quorum,
+            now_unix_ms,
+        )
+        .await?;
+    } else {
+        mvcc.autocommit_product_mutations_with_predicates(
+            &principal,
+            &logical_transaction_id,
+            operations,
+            preconditions,
+            crate::mvcc_transaction::DurabilityLevel::Quorum,
+            now_unix_ms,
+        )
+        .await?;
+    }
     Ok(())
 }
 

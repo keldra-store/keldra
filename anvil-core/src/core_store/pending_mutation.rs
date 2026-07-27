@@ -101,6 +101,7 @@ pub(super) enum CorePendingMutationTarget {
         transaction_id: String,
         scope_partition: String,
         operation_count: u64,
+        logical_request_hash: String,
     },
 }
 
@@ -117,9 +118,9 @@ impl CorePendingMutationTarget {
                 partition_id,
                 ..
             } => ("stream", vec![partition_id.as_str(), stream_id.as_str()]),
-            Self::MutationBatch {
-                scope_partition, ..
-            } => ("mutation-batch", vec![scope_partition.as_str()]),
+            Self::MutationBatch { transaction_id, .. } => {
+                ("mutation-batch", vec![transaction_id.as_str()])
+            }
         };
         let mut identity_input = Vec::new();
         for part in parts {
@@ -372,6 +373,8 @@ struct CoreMutationBatchTargetProto {
     scope_partition: String,
     #[prost(uint64, tag = "3")]
     operation_count: u64,
+    #[prost(string, tag = "4")]
+    logical_request_hash: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -1475,10 +1478,12 @@ fn target_to_proto(value: &CorePendingMutationTarget) -> Result<CorePendingMutat
             transaction_id,
             scope_partition,
             operation_count,
+            logical_request_hash,
         } => Kind::MutationBatch(CoreMutationBatchTargetProto {
             transaction_id: transaction_id.clone(),
             scope_partition: scope_partition.clone(),
             operation_count: *operation_count,
+            logical_request_hash: logical_request_hash.clone(),
         }),
     };
     Ok(CorePendingMutationTargetProto { kind: Some(kind) })
@@ -1515,6 +1520,7 @@ fn target_from_proto(value: CorePendingMutationTargetProto) -> Result<CorePendin
             transaction_id: value.transaction_id,
             scope_partition: value.scope_partition,
             operation_count: value.operation_count,
+            logical_request_hash: value.logical_request_hash,
         },
     })
 }

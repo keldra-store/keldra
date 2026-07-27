@@ -205,6 +205,14 @@ mod mvcc_lifecycle_tests {
     }
 
     #[test]
+    fn assignment_conflict_has_stable_public_code() {
+        assert_eq!(
+            certification_abort_name(&CertificationAbort::AssignmentConflict { partition_id: 41 }),
+            "TransactionAssignmentConflict"
+        );
+    }
+
+    #[test]
     fn registry_status_preserves_public_lifecycle_fields() {
         let status = transaction_status(TransactionRegistryStatus {
             cluster_id: "cluster-a".to_string(),
@@ -399,6 +407,9 @@ fn certification_abort_name(reason: &crate::mvcc_transaction::CertificationAbort
         }
         crate::mvcc_transaction::CertificationAbort::PredicateConflict { .. } => {
             "TransactionPredicateConflict"
+        }
+        crate::mvcc_transaction::CertificationAbort::AssignmentConflict { .. } => {
+            "TransactionAssignmentConflict"
         }
     }
 }

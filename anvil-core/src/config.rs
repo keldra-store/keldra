@@ -151,7 +151,7 @@ pub struct Config {
     pub mvcc_node_connection_token: String,
 
     /// Allows plaintext MVCC node endpoints in in-process test harnesses only.
-    #[arg(skip)]
+    #[arg(skip = cfg!(test))]
     pub allow_test_only_insecure_mvcc_transport: bool,
 
     /// Directory used for Anvil-owned object bytes, metadata journals, indexes, and manifests.

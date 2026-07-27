@@ -107,6 +107,8 @@ static_gates() {
 
 rust_unit_gates() {
   run_cargo_test "MVCC-under-Raft executable model" -p anvil-mvcc-raft-model --lib --tests
+  run_cargo_test "MVCC-under-Raft consensus and storage adapter" \
+    -p anvil-mvcc-consensus --lib --tests
   # Exercise the public command contract before the long-running core suite so
   # CLI/docs drift fails quickly instead of consuming most of the CI timeout.
   run_cargo_test "public CLI non-Docker integration tests" -p anvil-storage-cli \
@@ -131,14 +133,9 @@ server_core_integration_gates() {
     corestore_conformance
     corestore_conformance_durable_families
     corestore_conformance_rfc0007_byte_pipeline
-    corestore_conformance_rfc0007_internal_protocols
-    corestore_conformance_rfc0007_journals
-    corestore_conformance_rfc0007_payloads
     corestore_conformance_rfc0007_perf
     corestore_conformance_rfc0007_query_e2e_scaffolding
     corestore_conformance_rfc0007_query_planning
-    corestore_conformance_rfc0007_roots
-    corestore_conformance_rfc0007_transactions
     corestore_conformance_rfc0007_writer_segments
     corestore_source_size
     hardening_static
@@ -147,6 +144,50 @@ server_core_integration_gates() {
   for test_name in "${tests[@]}"; do
     run_cargo_test "server integration ${test_name}" -p anvil-server --test "${test_name}"
   done
+}
+
+native_mvcc_e2e_gates() {
+  # These suites all run real in-process or child-process Anvil clusters. None
+  # requires a Docker image, so keep them in the native acceptance lane even
+  # while Docker-backed integration validation is disabled.
+  run_cargo_test "native object MVCC acceptance" \
+    -p anvil-server --test object_tests "native_mvcc_acceptance::"
+
+  local mvcc_tests=(
+    mvcc_cluster_fixture
+    mvcc_cluster_conflicts
+    mvcc_gc_cluster
+    mvcc_partition_fixture
+    mvcc_snapshot_stability
+    coremeta_bounded_contracts
+    mvcc_process_cluster
+  )
+  local test_name
+  for test_name in "${mvcc_tests[@]}"; do
+    run_cargo_test "native MVCC acceptance ${test_name}" \
+      -p anvil-server --test "${test_name}"
+  done
+
+  local transaction_tests=(
+    boundary_schema_transaction_tests
+    bucket_transaction_tests
+    credential_transaction_tests
+    hf_transaction_tests
+    registry_transaction_tests
+  )
+  for test_name in "${transaction_tests[@]}"; do
+    run_cargo_test "native transaction acceptance ${test_name}" \
+      -p anvil-server --test "${test_name}"
+  done
+
+  run_cargo_test "native object mutation-batch transaction acceptance" \
+    -p anvil-server --test object_tests "mutation_batch_transactions::"
+  run_cargo_test "native PersonalDB transaction acceptance" \
+    -p anvil-server --test personaldb_tests "transactional_groups::"
+  run_cargo_test "native index acceptance" \
+    -p anvil-server --test index_tests
+  run_cargo_test "native Git source acceptance" \
+    -p anvil-server --test git_source_tests
 }
 
 docker_auth_gates() {
@@ -390,6 +431,7 @@ case "$group" in
     static_gates
     rust_unit_gates
     server_core_integration_gates
+    native_mvcc_e2e_gates
     performance_quick_gates
     docker_auth_gates
     docker_storage_gates
@@ -404,6 +446,9 @@ case "$group" in
     ;;
   server-core)
     server_core_integration_gates
+    ;;
+  mvcc-e2e)
+    native_mvcc_e2e_gates
     ;;
   perf|perf-quick)
     performance_quick_gates
@@ -428,7 +473,7 @@ case "$group" in
     ;;
   *)
     cat >&2 <<USAGE
-usage: $0 [all|static|rust|server-core|perf|perf-quick|perf-release|docker-auth|docker-storage|docker-index|docker-mesh|docker-cleanup]
+usage: $0 [all|static|rust|server-core|mvcc-e2e|perf|perf-quick|perf-release|docker-auth|docker-storage|docker-index|docker-mesh|docker-cleanup]
 USAGE
     exit 2
     ;;

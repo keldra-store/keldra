@@ -1126,6 +1126,22 @@ pub async fn list_bucket_drain_exceptions(
         .collect())
 }
 
+pub fn list_bucket_drain_exceptions_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    region_filter: Option<&str>,
+) -> LifecycleResult<Vec<BucketDrainExceptionDescriptor>> {
+    if let Some(region) = region_filter.filter(|region| !region.is_empty()) {
+        require_identifier(region, "bucket drain exception region")?;
+    }
+    Ok(read_lifecycle_state_projection_mvcc(mvcc)?
+        .bucket_drain_exceptions
+        .into_values()
+        .filter(|exception| {
+            region_filter.is_none_or(|region| region.is_empty() || exception.region == region)
+        })
+        .collect())
+}
+
 mod helpers;
 pub use helpers::*;
 

@@ -638,7 +638,9 @@ mod tests {
         )
         .unwrap();
         let local = LocalMvccStore::open(local_directory.path()).unwrap();
-        local.advance_decision_watermark(8).unwrap();
+        for position in 1..=8 {
+            local.advance_decision_watermark(position).unwrap();
+        }
         let registry = Arc::new(OpenTransactionRegistry::open(registry_directory.path()).unwrap());
         let now = unix_time_ms().unwrap();
         let transaction = registry
@@ -733,7 +735,10 @@ mod tests {
             node: remote.clone(),
             endpoint: format!("http://{address}"),
         };
-        let options = ReplicationStreamOptions::default();
+        let options = ReplicationStreamOptions {
+            allow_insecure_transport_for_tests: true,
+            ..ReplicationStreamOptions::default()
+        };
         let uploader = TonicReplicationStreamManager::new(
             "cluster",
             NodeIncarnation {

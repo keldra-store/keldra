@@ -2,11 +2,13 @@
 
 use std::{sync::Arc, time::Duration};
 
-use anvil_mvcc_consensus::{Consensus, NodeIncarnation, OpenRaftConsensus};
+use anvil_mvcc_consensus::{Consensus, ConsensusError, NodeIncarnation, OpenRaftConsensus};
 use anyhow::{Context, Result, bail};
 use tokio::sync::watch;
 
 use crate::{mvcc_bootstrap::cluster_id_hash, mvcc_store::LocalMvccStore};
+
+const ASSIGNMENT_RECONCILE_ATTEMPTS: usize = 4;
 
 pub struct BackgroundAssignmentReconciler {
     cluster_id: String,
@@ -104,35 +106,55 @@ async fn reconcile_partition_owner(
     partition_id: u64,
     desired: NodeIncarnation,
 ) -> Result<bool> {
-    consensus.linearized_read_barrier().await?;
-    let snapshot = consensus.applied_control_snapshot()?;
-    if !snapshot
-        .nodes
-        .iter()
-        .any(|(node_id, _raft_node_id, incarnation, _failure_domain)| {
-            *node_id == desired.node_id && *incarnation == desired.incarnation
-        })
-    {
-        bail!("local durability holder incarnation is not installed in compact-Raft");
+    for attempt in 0..ASSIGNMENT_RECONCILE_ATTEMPTS {
+        consensus.linearized_read_barrier().await?;
+        let snapshot = consensus.applied_control_snapshot()?;
+        if !snapshot
+            .nodes
+            .iter()
+            .any(|(node_id, _raft_node_id, incarnation, _failure_domain)| {
+                *node_id == desired.node_id && *incarnation == desired.incarnation
+            })
+        {
+            bail!("local durability holder incarnation is not installed in compact-Raft");
+        }
+        let current = snapshot
+            .partitions
+            .iter()
+            .find(|(candidate, _)| *candidate == partition_id)
+            .map(|(_, assignment)| assignment);
+        if current.is_some_and(|assignment| assignment.owner == desired) {
+            return Ok(false);
+        }
+        let epoch = current
+            .map(|assignment| {
+                assignment
+                    .epoch
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("compact-Raft partition epoch overflow"))
+            })
+            .transpose()?
+            .unwrap_or(1);
+        match consensus
+            .assign_partition(cluster_id_hash(cluster_id), partition_id, desired, epoch)
+            .await
+        {
+            Ok(_) => return Ok(true),
+            Err(error)
+                if assignment_reconciliation_raced(&error)
+                    && attempt + 1 < ASSIGNMENT_RECONCILE_ATTEMPTS => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "pin local durability partition {partition_id} at epoch {epoch} \
+                         (reconciliation attempt {})",
+                        attempt + 1
+                    )
+                });
+            }
+        }
     }
-    let current = snapshot
-        .partitions
-        .iter()
-        .find(|(candidate, _)| *candidate == partition_id)
-        .map(|(_, assignment)| assignment);
-    if current.is_some_and(|assignment| assignment.owner == desired) {
-        return Ok(false);
-    }
-    let epoch = current
-        .map(|assignment| assignment.epoch.saturating_add(1))
-        .unwrap_or(1);
-    consensus
-        .assign_partition(cluster_id_hash(cluster_id), partition_id, desired, epoch)
-        .await
-        .with_context(|| {
-            format!("pin local durability partition {partition_id} at epoch {epoch}")
-        })?;
-    Ok(true)
+    unreachable!("bounded pinned assignment reconciliation returns from every final attempt")
 }
 
 /// Reconciles one deterministic compact-Raft partition assignment.
@@ -145,41 +167,76 @@ pub(crate) async fn reconcile_partition_assignment(
     consensus: &OpenRaftConsensus,
     partition_id: u64,
 ) -> Result<bool> {
-    if !consensus.is_leader() {
-        bail!("compact-Raft leader must reconcile a missing partition assignment");
+    for attempt in 0..ASSIGNMENT_RECONCILE_ATTEMPTS {
+        if !consensus.is_leader() {
+            bail!("compact-Raft leader must reconcile a missing partition assignment");
+        }
+        consensus.linearized_read_barrier().await?;
+        let snapshot = consensus.applied_control_snapshot()?;
+        let installed = snapshot
+            .nodes
+            .iter()
+            .map(
+                |(node_id, _raft_node_id, incarnation, _failure_domain)| NodeIncarnation {
+                    node_id: *node_id,
+                    incarnation: *incarnation,
+                },
+            )
+            .collect::<Vec<_>>();
+        let desired = rendezvous_owner(partition_id, &installed)
+            .context("partition assignment requires at least one installed compact-Raft node")?;
+        let current = snapshot
+            .partitions
+            .iter()
+            .find(|(candidate, _)| *candidate == partition_id)
+            .map(|(_, assignment)| assignment);
+        if current.is_some_and(|assignment| assignment.owner == desired) {
+            return Ok(false);
+        }
+        let epoch = current
+            .map(|assignment| {
+                assignment
+                    .epoch
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("compact-Raft partition epoch overflow"))
+            })
+            .transpose()?
+            .unwrap_or(1);
+        match consensus
+            .assign_partition(cluster_id_hash(cluster_id), partition_id, desired, epoch)
+            .await
+        {
+            Ok(_) => return Ok(true),
+            Err(error)
+                if assignment_reconciliation_raced(&error)
+                    && attempt + 1 < ASSIGNMENT_RECONCILE_ATTEMPTS =>
+            {
+                // Another reconciler or topology command won after our
+                // linearized snapshot. Re-read applied state: if it installed
+                // the same owner the next iteration is an idempotent success;
+                // otherwise propose the next epoch for the new topology.
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "assign compact-Raft partition {partition_id} at epoch {epoch} \
+                         (reconciliation attempt {})",
+                        attempt + 1
+                    )
+                });
+            }
+        }
     }
-    consensus.linearized_read_barrier().await?;
-    let snapshot = consensus.applied_control_snapshot()?;
-    let installed = snapshot
-        .nodes
-        .iter()
-        .map(
-            |(node_id, _raft_node_id, incarnation, _failure_domain)| NodeIncarnation {
-                node_id: *node_id,
-                incarnation: *incarnation,
-            },
-        )
-        .collect::<Vec<_>>();
-    let desired = rendezvous_owner(partition_id, &installed)
-        .context("partition assignment requires at least one installed compact-Raft node")?;
-    let current = snapshot
-        .partitions
-        .iter()
-        .find(|(candidate, _)| *candidate == partition_id)
-        .map(|(_, assignment)| assignment);
-    if current.is_some_and(|assignment| assignment.owner == desired) {
-        return Ok(false);
-    }
-    let epoch = current
-        .map(|assignment| assignment.epoch.saturating_add(1))
-        .unwrap_or(1);
-    consensus
-        .assign_partition(cluster_id_hash(cluster_id), partition_id, desired, epoch)
-        .await
-        .with_context(|| {
-            format!("assign compact-Raft partition {partition_id} at epoch {epoch}")
-        })?;
-    Ok(true)
+    unreachable!("bounded assignment reconciliation returns from every final attempt")
+}
+
+fn assignment_reconciliation_raced(error: &ConsensusError) -> bool {
+    matches!(
+        error,
+        ConsensusError::Rejected(reason)
+            if reason == "partition epoch must increase"
+                || reason == "partition owner incarnation is not installed"
+    )
 }
 
 pub(crate) fn rendezvous_owner(
@@ -216,5 +273,21 @@ mod tests {
         let mut reincarnated = nodes;
         reincarnated[0].incarnation = 2;
         assert!(rendezvous_owner(7, &reincarnated).is_some());
+    }
+
+    #[test]
+    fn only_applied_assignment_races_are_retried() {
+        assert!(assignment_reconciliation_raced(&ConsensusError::Rejected(
+            "partition epoch must increase".into()
+        )));
+        assert!(assignment_reconciliation_raced(&ConsensusError::Rejected(
+            "partition owner incarnation is not installed".into()
+        )));
+        assert!(!assignment_reconciliation_raced(
+            &ConsensusError::ForwardToLeader
+        ));
+        assert!(!assignment_reconciliation_raced(&ConsensusError::Rejected(
+            "partition identity and epoch must be non-zero".into()
+        )));
     }
 }

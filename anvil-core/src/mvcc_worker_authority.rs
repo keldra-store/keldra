@@ -19,12 +19,8 @@ pub struct AssignmentGuard {
 impl AssignmentGuard {
     pub fn lease_owner(&self, worker_id: &str) -> String {
         format!(
-            "{worker_id}/partition-{}/assignment-{}/topology-{}/{}-{}",
-            self.partition_id,
-            self.assignment_epoch,
-            self.topology_epoch,
-            self.owner.node_id,
-            self.owner.incarnation
+            "{worker_id}/partition-{}/assignment-{}/{}-{}",
+            self.partition_id, self.assignment_epoch, self.owner.node_id, self.owner.incarnation
         )
     }
 }
@@ -148,15 +144,14 @@ impl MvccSubsystem {
             node_id: crate::mvcc_bootstrap::consensus_control_node_id(&guard.owner.node_id),
             incarnation: guard.owner.incarnation,
         };
-        if snapshot.topology_epoch != guard.topology_epoch
-            || !snapshot
-                .partitions
-                .iter()
-                .any(|(partition_id, assignment)| {
-                    *partition_id == guard.partition_id
-                        && assignment.epoch == guard.assignment_epoch
-                        && assignment.owner == owner
-                })
+        if !snapshot
+            .partitions
+            .iter()
+            .any(|(partition_id, assignment)| {
+                *partition_id == guard.partition_id
+                    && assignment.epoch == guard.assignment_epoch
+                    && assignment.owner == owner
+            })
         {
             bail!("background work assignment changed while execution was in flight");
         }

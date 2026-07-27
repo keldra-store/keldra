@@ -490,13 +490,12 @@ impl AppState {
             &req.bucket_name,
         )
         .await?;
-        mesh_lifecycle::ensure_new_writable_placement(
-            &self.storage,
+        mesh_lifecycle::ensure_new_writable_placement_mvcc(
+            &self.mvcc,
             &req.region,
             &self.config.cell_id,
             &self.config.node_id,
         )
-        .await
         .map_err(|err| Status::failed_precondition(err.to_string()))?;
         let principal = crate::object_manager::transaction_principal_from_claims(claims);
         if bucket_journal::read_current_bucket_in_transaction(

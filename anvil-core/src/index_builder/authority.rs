@@ -2,7 +2,7 @@ use crate::{
     core_store::CoreMutationPrecondition,
     partition_fence::{
         AcquireOwnership, MAX_OWNERSHIP_LEASE_MS, OwnershipPrincipal, OwnershipResource,
-        OwnershipResourceKind, RenewOwnership, commit_implicit_ownership_plan,
+        OwnershipResourceKind, RenewOwnership, commit_implicit_ownership_plan_with_assignment,
         ownership_fence_precondition, ownership_fence_predicate_mvcc,
         plan_acquire_ownership_in_transaction, plan_renew_ownership_in_transaction,
         read_ownership_fence_mvcc,
@@ -16,11 +16,25 @@ use std::future::Future;
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DirectRepairIndexBuildAuthority<'a> {
     mvcc: &'a crate::mvcc_bootstrap::MvccSubsystem,
+    assignment: Option<&'a crate::mvcc_worker_authority::AssignmentGuard>,
 }
 
 impl<'a> DirectRepairIndexBuildAuthority<'a> {
     pub(crate) fn new(mvcc: &'a crate::mvcc_bootstrap::MvccSubsystem) -> Self {
-        Self { mvcc }
+        Self {
+            mvcc,
+            assignment: None,
+        }
+    }
+
+    pub(crate) fn for_assignment(
+        mvcc: &'a crate::mvcc_bootstrap::MvccSubsystem,
+        assignment: &'a crate::mvcc_worker_authority::AssignmentGuard,
+    ) -> Self {
+        Self {
+            mvcc,
+            assignment: Some(assignment),
+        }
     }
 }
 
@@ -35,6 +49,7 @@ pub(crate) struct IndexBuildOwnership {
     resource: OwnershipResource,
     owner: OwnershipPrincipal,
     fence: u64,
+    assignment: crate::mvcc_worker_authority::AssignmentGuard,
 }
 
 impl IndexBuildOwnership {
@@ -45,7 +60,11 @@ impl IndexBuildOwnership {
         index_storage_id: &str,
         builder_node_id: &str,
         signing_key: &[u8],
+        authority: IndexBuildAuthority<'_>,
     ) -> Result<Self> {
+        let assignment = authority
+            .work_assignment("index-build", index_storage_id)
+            .await?;
         let resource = OwnershipResource {
             resource_kind: OwnershipResourceKind::IndexPartition,
             resource_id: format!(
@@ -60,21 +79,27 @@ impl IndexBuildOwnership {
             .ok_or_else(|| anyhow!("index build ownership TTL overflow"))?;
 
         let transaction_principal = format!("node:{builder_node_id}");
-        let record = if let Some(record) =
-            read_ownership_fence_mvcc(mvcc, owner.tenant_id, &resource, signing_key)?
-            && record.owner.same_security_owner(&owner)
-            && record.is_active_unexpired(now_nanos)
-        {
+        let existing = read_ownership_fence_mvcc(mvcc, owner.tenant_id, &resource, signing_key)?;
+        let record = if let Some(record) = existing.as_ref().filter(|record| {
+            record.owner.same_security_owner(&owner) && record.is_active_unexpired(now_nanos)
+        }) {
+            let idempotency_key = internal_ownership_idempotency_key(
+                "index-build",
+                "renew",
+                &resource,
+                &owner,
+                record.generation,
+                record.fence,
+            );
             let request = RenewOwnership {
-                request_id: format!("index-build-renew-{}", resource.resource_id),
+                request_id: idempotency_key.clone(),
                 resource: resource.clone(),
                 owner: owner.clone(),
                 current_fence: record.fence,
                 now_nanos,
                 ttl_nanos,
             };
-            let idempotency_key = request.request_id.clone();
-            commit_implicit_ownership_plan(
+            commit_implicit_ownership_plan_with_assignment(
                 mvcc,
                 &transaction_principal,
                 &idempotency_key,
@@ -82,6 +107,7 @@ impl IndexBuildOwnership {
                 owner.tenant_id,
                 &resource,
                 signing_key,
+                Some(&assignment),
                 |transaction_id| {
                     plan_renew_ownership_in_transaction(
                         mvcc,
@@ -95,16 +121,27 @@ impl IndexBuildOwnership {
             .await?
             .record
         } else {
+            let (observed_generation, observed_fence) = existing
+                .as_ref()
+                .map(|record| (record.generation, record.fence))
+                .unwrap_or_default();
+            let idempotency_key = internal_ownership_idempotency_key(
+                "index-build",
+                "acquire",
+                &resource,
+                &owner,
+                observed_generation,
+                observed_fence,
+            );
             let request = AcquireOwnership {
-                request_id: format!("index-build-acquire-{}", resource.resource_id),
-                idempotency_key: format!("index-build-owner-{}", resource.resource_id),
+                request_id: idempotency_key.clone(),
+                idempotency_key: idempotency_key.clone(),
                 resource: resource.clone(),
                 owner: owner.clone(),
                 now_nanos,
                 ttl_nanos,
             };
-            let idempotency_key = request.idempotency_key.clone();
-            commit_implicit_ownership_plan(
+            commit_implicit_ownership_plan_with_assignment(
                 mvcc,
                 &transaction_principal,
                 &idempotency_key,
@@ -112,6 +149,7 @@ impl IndexBuildOwnership {
                 owner.tenant_id,
                 &resource,
                 signing_key,
+                Some(&assignment),
                 |transaction_id| {
                     plan_acquire_ownership_in_transaction(
                         mvcc,
@@ -129,7 +167,12 @@ impl IndexBuildOwnership {
             resource,
             owner,
             fence: record.fence,
+            assignment,
         })
+    }
+
+    pub(crate) fn assignment(&self) -> &crate::mvcc_worker_authority::AssignmentGuard {
+        &self.assignment
     }
 
     async fn precondition(
@@ -169,7 +212,41 @@ impl IndexBuildOwnership {
     }
 }
 
-impl IndexBuildAuthority<'_> {
+pub(super) fn internal_ownership_idempotency_key(
+    scope: &str,
+    operation: &str,
+    resource: &OwnershipResource,
+    owner: &OwnershipPrincipal,
+    observed_generation: u64,
+    observed_fence: u64,
+) -> String {
+    fn hash_component(hasher: &mut blake3::Hasher, value: &[u8]) {
+        hasher.update(&(value.len() as u64).to_be_bytes());
+        hasher.update(value);
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    for component in [
+        scope,
+        operation,
+        resource.resource_kind.as_str(),
+        resource.resource_id.as_str(),
+        owner.principal_kind.as_str(),
+        owner.principal_id.as_str(),
+        owner.actor_instance_id.as_str(),
+    ] {
+        hash_component(&mut hasher, component.as_bytes());
+    }
+    hash_component(&mut hasher, &owner.tenant_id.to_be_bytes());
+    hash_component(&mut hasher, &observed_generation.to_be_bytes());
+    hash_component(&mut hasher, &observed_fence.to_be_bytes());
+    format!(
+        "{scope}-ownership-{operation}-{}",
+        hasher.finalize().to_hex()
+    )
+}
+
+impl<'a> IndexBuildAuthority<'a> {
     pub(crate) fn mvcc(&self) -> Result<&crate::mvcc_bootstrap::MvccSubsystem> {
         match self {
             Self::Task(guard) => guard.mvcc(),
@@ -188,6 +265,28 @@ impl IndexBuildAuthority<'_> {
             }
             Self::DirectRepair(_) => direct_actor.to_string(),
         }
+    }
+
+    pub(crate) fn assignment(self) -> Option<&'a crate::mvcc_worker_authority::AssignmentGuard> {
+        match self {
+            Self::Task(guard) => Some(guard.assignment()),
+            Self::DirectRepair(authority) => authority.assignment,
+        }
+    }
+
+    pub(crate) async fn work_assignment(
+        self,
+        kind: &str,
+        logical_identity: &str,
+    ) -> Result<crate::mvcc_worker_authority::AssignmentGuard> {
+        if let Some(assignment) = self.assignment() {
+            self.mvcc()?.validate_assignment(assignment)?;
+            return Ok(assignment.clone());
+        }
+        self.mvcc()?
+            .reconcile_work_assignment(kind, logical_identity)
+            .await?
+            .ok_or_else(|| anyhow!("index build is assigned to another node"))
     }
 
     /// Publishes one authoritative mutation with a fresh ownership CAS and,
@@ -249,4 +348,32 @@ fn current_time_nanos() -> Result<i64> {
     chrono::Utc::now()
         .timestamp_nanos_opt()
         .ok_or_else(|| anyhow!("index build timestamp cannot be represented in nanoseconds"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn internal_ownership_keys_are_stable_for_retries_and_advance_with_fence_state() {
+        let resource = OwnershipResource {
+            resource_kind: OwnershipResourceKind::IndexPartition,
+            resource_id: "tenant/7/bucket/9/index_build/example".to_string(),
+        };
+        let owner = OwnershipPrincipal::node("node-a");
+        let key =
+            internal_ownership_idempotency_key("index-build", "renew", &resource, &owner, 4, 2);
+        assert_eq!(
+            key,
+            internal_ownership_idempotency_key("index-build", "renew", &resource, &owner, 4, 2,)
+        );
+        assert_ne!(
+            key,
+            internal_ownership_idempotency_key("index-build", "renew", &resource, &owner, 5, 2,)
+        );
+        assert_ne!(
+            key,
+            internal_ownership_idempotency_key("index-build", "acquire", &resource, &owner, 4, 2,)
+        );
+    }
 }

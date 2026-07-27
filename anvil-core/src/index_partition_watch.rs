@@ -184,6 +184,37 @@ pub(crate) async fn publish_prepared_index_partition_watch(
         crate::mvcc_transaction::PredicateKind,
     )],
 ) -> Result<u128> {
+    publish_prepared_index_partition_watch_inner(mvcc, prepared, additional_preconditions, None)
+        .await
+}
+
+pub(crate) async fn publish_prepared_index_partition_watch_with_assignment(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    prepared: PreparedIndexPartitionWatch,
+    additional_preconditions: &[(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )],
+    assignment: &crate::mvcc_worker_authority::AssignmentGuard,
+) -> Result<u128> {
+    publish_prepared_index_partition_watch_inner(
+        mvcc,
+        prepared,
+        additional_preconditions,
+        Some(assignment),
+    )
+    .await
+}
+
+async fn publish_prepared_index_partition_watch_inner(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    prepared: PreparedIndexPartitionWatch,
+    additional_preconditions: &[(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )],
+    assignment: Option<&crate::mvcc_worker_authority::AssignmentGuard>,
+) -> Result<u128> {
     let event_key = watch_event_key(
         prepared.tenant_id,
         prepared.bucket_id,
@@ -208,22 +239,37 @@ pub(crate) async fn publish_prepared_index_partition_watch(
             },
         ),
     ]);
-    mvcc.autocommit_product_mutations_with_predicates(
-        "index-partition-watch",
-        &prepared.logical_id,
-        vec![
-            crate::mvcc_product::ProductMutation::put(event_key, prepared.payload),
-            crate::mvcc_product::ProductMutation::put(
-                prepared.head_key,
-                prepared.next_sequence.to_be_bytes().to_vec(),
-            ),
-        ],
-        predicates,
-        crate::mvcc_transaction::DurabilityLevel::Quorum,
-        u64::try_from(chrono::Utc::now().timestamp_millis())
-            .map_err(|_| anyhow!("index partition watch timestamp predates Unix epoch"))?,
-    )
-    .await?;
+    let mutations = vec![
+        crate::mvcc_product::ProductMutation::put(event_key, prepared.payload),
+        crate::mvcc_product::ProductMutation::put(
+            prepared.head_key,
+            prepared.next_sequence.to_be_bytes().to_vec(),
+        ),
+    ];
+    let now_unix_ms = u64::try_from(chrono::Utc::now().timestamp_millis())
+        .map_err(|_| anyhow!("index partition watch timestamp predates Unix epoch"))?;
+    if let Some(assignment) = assignment {
+        mvcc.autocommit_product_mutations_with_predicates_and_assignment(
+            "index-partition-watch",
+            &prepared.logical_id,
+            mutations,
+            predicates,
+            assignment,
+            crate::mvcc_transaction::DurabilityLevel::Quorum,
+            now_unix_ms,
+        )
+        .await?;
+    } else {
+        mvcc.autocommit_product_mutations_with_predicates(
+            "index-partition-watch",
+            &prepared.logical_id,
+            mutations,
+            predicates,
+            crate::mvcc_transaction::DurabilityLevel::Quorum,
+            now_unix_ms,
+        )
+        .await?;
+    }
     Ok(u128::from(prepared.next_sequence))
 }
 

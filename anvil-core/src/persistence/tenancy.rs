@@ -177,22 +177,21 @@ impl Persistence {
     ) -> Result<Bucket, tonic::Status> {
         let total_start = std::time::Instant::now();
         let step_start = std::time::Instant::now();
-        crate::mesh_lifecycle::ensure_new_writable_placement(
-            &self.storage,
+        let mvcc = self
+            .mvcc()
+            .map_err(|e| tonic::Status::internal(e.to_string()))?;
+        crate::mesh_lifecycle::ensure_new_writable_placement_mvcc(
+            mvcc,
             region,
             &self.cell_id,
             &self.owner_node_id,
         )
-        .await
         .map_err(|err| tonic::Status::failed_precondition(err.to_string()))?;
         crate::emit_test_timing(
             "persistence.create_bucket ensure_new_writable_placement",
             step_start.elapsed(),
         );
         let step_start = std::time::Instant::now();
-        let mvcc = self
-            .mvcc()
-            .map_err(|e| tonic::Status::internal(e.to_string()))?;
         if bucket_journal::read_current_bucket_mvcc(mvcc, tenant_id, name)
             .map_err(|e| tonic::Status::internal(e.to_string()))?
             .is_some()

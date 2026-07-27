@@ -1,16 +1,21 @@
 //! Dependency-injected node facade for the complete MVCC transaction path.
 
+use std::time::Duration;
+
 use anyhow::{Result, bail};
 
 use crate::{
     mvcc_consensus_adapter::ConsensusTransactionCertifier,
-    mvcc_store::{ApplyOutcome, LocalMvccStore, VisibleRow},
+    mvcc_store::{ApplyOutcome, LocalMvccStore, PointSnapshot, VisibleRow},
     mvcc_transaction::{
         BundleReplicator, CertificationResult, ClusterOwnershipResolver, DurabilityLevel,
         DurabilityPolicy, LogicalKey, PreparedBundleStore, ReadConsistency, TransactionBundle,
         TransactionCoordinator,
     },
 };
+
+const FOREGROUND_APPLY_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const FOREGROUND_APPLY_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Owns the product data path while leaving transport, persistence location,
 /// and the concrete consensus runtime injectable by node startup.
@@ -110,6 +115,9 @@ where
     ) -> Result<CommitOutcome> {
         let total_started_at = std::time::Instant::now();
         let certification = self.coordinator.commit(bundle.clone(), durability).await?;
+        if let CertificationResult::Committed { commit_version } = &certification {
+            self.wait_for_apply_turn(*commit_version).await?;
+        }
         let outcome = self.apply_certification(bundle, certification)?;
         crate::perf::record_transaction_duration(
             "total",
@@ -121,6 +129,23 @@ where
             total_started_at.elapsed(),
         );
         Ok(outcome)
+    }
+
+    async fn wait_for_apply_turn(&self, commit_version: u64) -> Result<()> {
+        let predecessor = commit_version.saturating_sub(1);
+        let deadline = tokio::time::Instant::now() + FOREGROUND_APPLY_WAIT_TIMEOUT;
+        loop {
+            let watermark = self.local.decision_watermark()?;
+            if watermark >= predecessor {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!(
+                    "committed MVCC decision {commit_version} cannot become locally visible before decision {predecessor}; local decision watermark is {watermark}"
+                );
+            }
+            tokio::time::sleep(FOREGROUND_APPLY_POLL_INTERVAL).await;
+        }
     }
 
     /// Applies an outcome received during restart recovery or replica catch-up.
@@ -178,6 +203,10 @@ where
         self.local.read_at(key, snapshot)
     }
 
+    pub fn read_point_at(&self, key: &LogicalKey, snapshot: u64) -> Result<PointSnapshot> {
+        self.local.read_point_at(key, snapshot)
+    }
+
     pub fn read_latest(&self, key: &LogicalKey) -> Result<Option<VisibleRow>> {
         self.local.read_latest(key)
     }
@@ -190,6 +219,17 @@ where
     ) -> Result<Vec<(LogicalKey, VisibleRow)>> {
         self.local
             .scan_table_prefix_at(table_id, application_prefix, snapshot)
+    }
+
+    pub fn scan_table_prefix_at_bounded(
+        &self,
+        table_id: u16,
+        application_prefix: &[u8],
+        snapshot: u64,
+        max_rows: usize,
+    ) -> Result<Vec<(LogicalKey, VisibleRow)>> {
+        self.local
+            .scan_table_prefix_at_bounded(table_id, application_prefix, snapshot, max_rows)
     }
 
     pub fn applied_version(&self) -> Result<u64> {
@@ -211,6 +251,7 @@ mod tests {
     use anyhow::Result;
     use async_trait::async_trait;
     use tempfile::tempdir;
+    use tokio::sync::Notify;
 
     use super::*;
     use crate::mvcc_transaction::{
@@ -273,6 +314,7 @@ mod tests {
     struct Consensus {
         state: Arc<Mutex<ConsensusState>>,
         stages: Arc<Mutex<Vec<&'static str>>>,
+        certified: Option<Arc<Notify>>,
     }
 
     struct ConsensusState {
@@ -310,6 +352,10 @@ mod tests {
             state
                 .decisions
                 .insert(command.transaction_id, result.clone());
+            drop(state);
+            if let Some(certified) = &self.certified {
+                certified.notify_one();
+            }
             Ok(result)
         }
 
@@ -364,6 +410,7 @@ mod tests {
                 decisions: BTreeMap::new(),
             })),
             stages,
+            certified: None,
         }
     }
 
@@ -454,6 +501,61 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn later_foreground_commit_waits_for_local_predecessor() {
+        let temp = tempdir().unwrap();
+        let stages = Arc::new(Mutex::new(Vec::new()));
+        let certified = Arc::new(Notify::new());
+        let mut consensus = consensus(stages.clone());
+        consensus.state.lock().unwrap().next_version = 2;
+        consensus.certified = Some(certified.clone());
+        let runtime = Arc::new(runtime(temp.path(), consensus, stages));
+        let local = runtime.local_store().clone();
+        let first_key = LogicalKey {
+            table_id: 4,
+            application_key: b"first".to_vec(),
+        };
+        let second_key = LogicalKey {
+            table_id: 4,
+            application_key: b"second".to_vec(),
+        };
+        let second = bundle("second", second_key.clone(), b"second");
+        let pending = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move { runtime.commit(second, DurabilityLevel::Local).await })
+        };
+
+        certified.notified().await;
+        tokio::task::yield_now().await;
+        assert!(!pending.is_finished());
+        assert_eq!(local.decision_watermark().unwrap(), 0);
+        assert!(runtime.read_latest(&second_key).unwrap().is_none());
+
+        local
+            .apply_certified_bundle_and_advance(1, &bundle("first", first_key.clone(), b"first"), 1)
+            .unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(1), pending)
+            .await
+            .expect("foreground commit should resume after its predecessor")
+            .expect("foreground commit task should not panic")
+            .expect("foreground commit should apply");
+        assert_eq!(
+            outcome.certification,
+            CertificationResult::Committed { commit_version: 2 }
+        );
+        assert_eq!(outcome.local_apply, Some(ApplyOutcome::Applied));
+        assert_eq!(local.decision_watermark().unwrap(), 2);
+        assert_eq!(
+            runtime.read_latest(&first_key).unwrap().unwrap().value,
+            b"first"
+        );
+        assert_eq!(
+            runtime.read_latest(&second_key).unwrap().unwrap().value,
+            b"second"
+        );
+    }
+
     #[test]
     fn catch_up_applies_only_verified_committed_decisions() {
         let temp = tempdir().unwrap();
@@ -477,7 +579,7 @@ mod tests {
         let committed = runtime
             .apply_certification(
                 transaction,
-                CertificationResult::Committed { commit_version: 7 },
+                CertificationResult::Committed { commit_version: 1 },
             )
             .unwrap();
         assert_eq!(committed.local_apply, Some(ApplyOutcome::Applied));

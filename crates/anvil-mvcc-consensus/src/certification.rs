@@ -146,6 +146,65 @@ impl CertificationState {
         Ok(result)
     }
 
+    /// Advances the certification cursor and returns a stable result for an
+    /// already-seen transaction. New transaction attempts return `None` and
+    /// must still pass the caller's current control-state checks before apply.
+    pub fn replay(
+        &mut self,
+        position: CommitVersion,
+        command: &CertifyTransaction,
+    ) -> Result<Option<CertificationResult>, CertificationError> {
+        if position <= self.last_applied {
+            return Err(CertificationError::NonMonotonicPosition {
+                last: self.last_applied,
+                proposed: position,
+            });
+        }
+        if self.cluster_id_hash == [0; 32] || self.cluster_id_hash != command.cluster_id_hash {
+            return Ok(None);
+        }
+        let Some(result) = self.recent_results.get(&command.transaction_id) else {
+            return Ok(None);
+        };
+        self.last_applied = position;
+        if result.bundle_hash() != command.bundle_hash {
+            return Err(CertificationError::TransactionIdentityMismatch);
+        }
+        Ok(Some(result.clone()))
+    }
+
+    /// Records a deterministic abort discovered by the surrounding replicated
+    /// control state, while preserving transaction retry deduplication.
+    pub fn abort(
+        &mut self,
+        position: CommitVersion,
+        command: &CertifyTransaction,
+        reason: CertificationAbort,
+    ) -> Result<CertificationResult, CertificationError> {
+        if position <= self.last_applied {
+            return Err(CertificationError::NonMonotonicPosition {
+                last: self.last_applied,
+                proposed: position,
+            });
+        }
+        if self.cluster_id_hash == [0; 32] || self.cluster_id_hash != command.cluster_id_hash {
+            return self.apply(position, command);
+        }
+        if let Some(result) = self.recent_results.get(&command.transaction_id) {
+            self.last_applied = position;
+            if result.bundle_hash() != command.bundle_hash {
+                return Err(CertificationError::TransactionIdentityMismatch);
+            }
+            return Ok(result.clone());
+        }
+        let reason = validate_canonical(command).err().unwrap_or(reason);
+        let result = aborted(position, command, reason);
+        self.last_applied = position;
+        self.recent_results
+            .insert(command.transaction_id, result.clone());
+        Ok(result)
+    }
+
     fn first_conflict(&self, command: &CertifyTransaction) -> Option<CertificationAbort> {
         for observation in &command.point_observations {
             let actual = self.point_latest_write.get(&observation.key).copied();
@@ -221,6 +280,7 @@ fn validate_canonical(command: &CertifyTransaction) -> Result<(), CertificationA
     check_sorted_unique(&command.point_observations, "point observations")?;
     check_sorted_unique(&command.range_observations, "range observations")?;
     check_sorted_unique(&command.predicates, "explicit predicates")?;
+    validate_assignment_predicates(&command.assignment_predicates)?;
     check_sorted_unique(&command.written_point_keys, "written point keys")?;
     check_sorted_unique(&command.written_points, "written points")?;
     if !command.written_points.is_empty()
@@ -244,6 +304,31 @@ fn validate_canonical(command: &CertifyTransaction) -> Result<(), CertificationA
     if command.durable_holders.is_empty() {
         return Err(CertificationAbort::InvalidCommand(
             "at least one durable holder is required".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_assignment_predicates(
+    predicates: &[crate::AssignmentPredicate],
+) -> Result<(), CertificationAbort> {
+    if predicates
+        .windows(2)
+        .any(|pair| pair[0].partition_id >= pair[1].partition_id)
+    {
+        return Err(CertificationAbort::InvalidCommand(
+            "assignment predicates must be sorted and unique by partition".into(),
+        ));
+    }
+    if predicates.iter().any(|predicate| {
+        predicate.partition_id == 0
+            || predicate.assignment_epoch == 0
+            || predicate.topology_epoch == 0
+            || predicate.owner.node_id.0 == 0
+            || predicate.owner.incarnation == 0
+    }) {
+        return Err(CertificationAbort::InvalidCommand(
+            "assignment predicates require non-zero exact authority".into(),
         ));
     }
     Ok(())

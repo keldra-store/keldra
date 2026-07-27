@@ -73,6 +73,24 @@ pub async fn write_writer_segment_catalog_record(
         crate::mvcc_transaction::PredicateKind,
     )],
 ) -> Result<()> {
+    write_writer_segment_catalog_record_with_assignment(
+        mvcc,
+        record,
+        additional_preconditions,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn write_writer_segment_catalog_record_with_assignment(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    record: &WriterSegmentCatalogRecord,
+    additional_preconditions: &[(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )],
+    assignment: Option<&crate::mvcc_worker_authority::AssignmentGuard>,
+) -> Result<()> {
     validate_record(record)?;
     let write_lock = writer_lock(&record.family, &record.scope)?;
     let _guard = write_lock.lock().await;
@@ -92,16 +110,31 @@ pub async fn write_writer_segment_catalog_record(
         .transpose()?;
     let (mutations, mut predicates, transaction_id) = plan_mutation(record, current.as_ref())?;
     predicates.extend_from_slice(additional_preconditions);
-    mvcc.autocommit_product_mutations_with_predicates(
-        &writer_realm(&record.family, &record.scope),
-        &transaction_id,
-        mutations,
-        predicates,
-        crate::mvcc_transaction::DurabilityLevel::Quorum,
-        u64::try_from(chrono::Utc::now().timestamp_millis())
-            .map_err(|_| anyhow!("writer segment publication timestamp predates Unix epoch"))?,
-    )
-    .await?;
+    let principal = writer_realm(&record.family, &record.scope);
+    let now_unix_ms = u64::try_from(chrono::Utc::now().timestamp_millis())
+        .map_err(|_| anyhow!("writer segment publication timestamp predates Unix epoch"))?;
+    if let Some(assignment) = assignment {
+        mvcc.autocommit_product_mutations_with_predicates_and_assignment(
+            &principal,
+            &transaction_id,
+            mutations,
+            predicates,
+            assignment,
+            crate::mvcc_transaction::DurabilityLevel::Quorum,
+            now_unix_ms,
+        )
+        .await?;
+    } else {
+        mvcc.autocommit_product_mutations_with_predicates(
+            &principal,
+            &transaction_id,
+            mutations,
+            predicates,
+            crate::mvcc_transaction::DurabilityLevel::Quorum,
+            now_unix_ms,
+        )
+        .await?;
+    }
     Ok(())
 }
 

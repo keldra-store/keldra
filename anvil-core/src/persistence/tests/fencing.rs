@@ -4,9 +4,9 @@ use super::*;
 async fn persistence_global_journal_writes_use_current_fence_tokens() {
     Box::pin(async {
         let temp = tempdir().unwrap();
-        let persistence = persistence_with_mvcc(&test_config(temp.path()))
-            .await
-            .unwrap();
+        let mut config = test_config(temp.path());
+        config.region = "local".to_string();
+        let persistence = persistence_with_active_topology(&config).await.unwrap();
 
         persistence.create_region("local").await.unwrap();
         bind_persistence_test_authz_schema(&persistence, 1).await;
@@ -166,8 +166,9 @@ async fn force_expired_partition_is_recovered_under_a_higher_fence() {
     let manifest_hash = hex::encode([7; 32]);
     let now_nanos = Utc::now().timestamp_nanos_opt().unwrap();
 
-    let recovering = crate::partition_fence::acquire_partition_recovery(
+    let recovering = crate::partition_fence::acquire_partition_recovery_mvcc(
         &persistence.storage,
+        persistence.mvcc().unwrap(),
         crate::partition_fence::PartitionRecoveryAcquire {
             partition_family: partition_family.to_string(),
             partition_id: partition_id.clone(),
@@ -180,8 +181,9 @@ async fn force_expired_partition_is_recovered_under_a_higher_fence() {
     )
     .await
     .unwrap();
-    let previous = crate::partition_fence::publish_partition_ready(
+    let previous = crate::partition_fence::publish_partition_ready_mvcc(
         &persistence.storage,
+        persistence.mvcc().unwrap(),
         partition_family,
         &partition_id,
         "unreachable-node",
@@ -193,8 +195,9 @@ async fn force_expired_partition_is_recovered_under_a_higher_fence() {
     )
     .await
     .unwrap();
-    crate::partition_fence::force_expire_partition_owner_for_node(
+    crate::partition_fence::force_expire_partition_owner_for_node_mvcc(
         &persistence.storage,
+        persistence.mvcc().unwrap(),
         partition_family,
         &partition_id,
         "unreachable-node",
@@ -208,13 +211,12 @@ async fn force_expired_partition_is_recovered_under_a_higher_fence() {
         .global_write_permit(partition_family, partition_id.clone())
         .await
         .unwrap();
-    let current = crate::partition_fence::read_partition_owner(
-        &persistence.storage,
+    let current = crate::partition_fence::read_partition_owner_mvcc(
+        persistence.mvcc().unwrap(),
         partition_family,
         &partition_id,
         &persistence.partition_owner_signing_key,
     )
-    .await
     .unwrap()
     .expect("replacement partition owner");
 

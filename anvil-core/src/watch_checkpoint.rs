@@ -2,8 +2,8 @@ use crate::{
     core_store::{
         CF_MATERIALISATION, CoreMetaBatchOp, CoreMetaBatchOpKind, CoreMetaStore, CoreMetaTuplePart,
         CoreMetaVisibilityState, TABLE_MATERIALISATION_CURSOR_ROW, TABLE_WATCH_CHECKPOINT_ROW,
-        commit_coremeta_batch_for_storage, core_meta_committed_row_common, core_meta_root_key_hash,
-        core_meta_tuple_key, decode_deterministic_proto, encode_deterministic_proto,
+        commit_coremeta_batch_for_storage, core_meta_committed_row_common, core_meta_tuple_key,
+        decode_deterministic_proto, encode_deterministic_proto,
     },
     formats::hash32,
     mvcc_bootstrap::MvccSubsystem,
@@ -17,8 +17,6 @@ use serde::{Deserialize, Serialize};
 
 const WATCH_CHECKPOINT_ROW_SCHEMA: &str = "anvil.coremeta.watch_checkpoint.v1";
 const WATCH_CHECKPOINT_LAG_ROW_SCHEMA: &str = "anvil.coremeta.watch_checkpoint_lag.v1";
-// CoreStore replaces this value and the empty transaction id before publication.
-const CORE_META_PUBLICATION_GENERATION_PLACEHOLDER: u64 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WatchCheckpoint {
@@ -459,7 +457,7 @@ fn encode_watch_checkpoint_row(checkpoint: &WatchCheckpoint) -> Result<Vec<u8>> 
         return Err(anyhow!("watch checkpoint row hash mismatch"));
     }
     Ok(encode_deterministic_proto(&WatchCheckpointRowProto {
-        common: Some(watch_checkpoint_publication_candidate_common(checkpoint)),
+        common: Some(watch_checkpoint_mvcc_common(checkpoint)),
         schema: WATCH_CHECKPOINT_ROW_SCHEMA.to_string(),
         checkpoint_bytes: encode_watch_checkpoint(checkpoint),
     }))
@@ -530,7 +528,7 @@ fn decode_watch_checkpoint_row(bytes: &[u8]) -> Result<WatchCheckpoint> {
         .ok_or_else(|| anyhow!("watch checkpoint row missing CoreMeta common"))?;
     let checkpoint = decode_watch_checkpoint(&row.checkpoint_bytes)?;
     validate_unsigned_checkpoint(&checkpoint)?;
-    validate_watch_checkpoint_publication_common(&checkpoint, common)?;
+    validate_watch_checkpoint_mvcc_common(&checkpoint, common)?;
     Ok(checkpoint)
 }
 
@@ -569,32 +567,29 @@ fn decode_watch_checkpoint_lag_record(bytes: &[u8]) -> Result<WatchCheckpointLag
     Ok(record)
 }
 
-fn watch_checkpoint_publication_candidate_common(
+fn watch_checkpoint_mvcc_common(
     checkpoint: &WatchCheckpoint,
 ) -> crate::core_store::CoreMetaRowCommonProto {
-    core_meta_committed_row_common(
-        "system",
-        watch_checkpoint_root_key_hash(&checkpoint.watch_stream_id, &checkpoint.consumer_id),
-        CORE_META_PUBLICATION_GENERATION_PLACEHOLDER,
-        "",
-        checkpoint.updated_at_nanos.max(0) as u64,
-    )
+    // The enclosing MVCC row carries transaction identity, commit version, and
+    // visibility. This payload must not claim a second, legacy root
+    // publication that the native MVCC path never performs.
+    core_meta_committed_row_common("", "", 0, "", checkpoint.updated_at_nanos.max(0) as u64)
 }
 
-fn validate_watch_checkpoint_publication_common(
+fn validate_watch_checkpoint_mvcc_common(
     checkpoint: &WatchCheckpoint,
     common: &crate::core_store::CoreMetaRowCommonProto,
 ) -> Result<()> {
-    let expected_shape = watch_checkpoint_publication_candidate_common(checkpoint);
-    if common.realm_id != expected_shape.realm_id
-        || common.root_key_hash != expected_shape.root_key_hash
-        || common.root_generation == 0
-        || common.transaction_id.is_empty()
+    let expected_shape = watch_checkpoint_mvcc_common(checkpoint);
+    if !common.realm_id.is_empty()
+        || !common.root_key_hash.is_empty()
+        || common.root_generation != 0
+        || !common.transaction_id.is_empty()
         || common.visibility_state_enum() != CoreMetaVisibilityState::Committed
         || common.payload_schema_version != expected_shape.payload_schema_version
     {
         return Err(anyhow!(
-            "watch checkpoint row has invalid rooted CoreMeta publication metadata"
+            "watch checkpoint row has invalid MVCC CoreMeta metadata"
         ));
     }
     Ok(())
@@ -616,17 +611,6 @@ fn validate_watch_checkpoint_lag_common(
         ));
     }
     Ok(())
-}
-
-fn watch_checkpoint_root_anchor_key(watch_stream_id: &str, consumer_id: &str) -> String {
-    format!("watch-checkpoint/{watch_stream_id}/{consumer_id}")
-}
-
-fn watch_checkpoint_root_key_hash(watch_stream_id: &str, consumer_id: &str) -> String {
-    core_meta_root_key_hash(&watch_checkpoint_root_anchor_key(
-        watch_stream_id,
-        consumer_id,
-    ))
 }
 
 fn watch_checkpoint_tuple_key(watch_stream_id: &str, consumer_id: &str) -> Result<Vec<u8>> {

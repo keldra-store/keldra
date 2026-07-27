@@ -44,6 +44,8 @@ fn test_mutation_target() -> CorePendingMutationTarget {
         transaction_id: "test-transaction".to_string(),
         scope_partition: "core-control".to_string(),
         operation_count: 0,
+        logical_request_hash:
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string(),
     }
 }
 

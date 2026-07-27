@@ -470,11 +470,14 @@ mod app_state_tests {
             ..Config::default()
         };
         let state = AppState::new(
-            config,
+            config.clone(),
             personaldb_signing::PersonalDbProtocolKeyring::disabled(),
         )
         .await
         .unwrap();
+        crate::test_support::install_active_test_topology(&state.persistence, &config)
+            .await
+            .unwrap();
         state.persistence.create_region("local").await.unwrap();
         let tenant = state
             .persistence
@@ -821,10 +824,32 @@ mod app_state_tests {
         assert!(state.persistence.list_regions().await.unwrap().is_empty());
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-    async fn distributed_mvcc_quorum_certifies_replicates_and_applies_in_order() {
+    #[test]
+    fn distributed_mvcc_quorum_certifies_replicates_and_applies_in_order() {
+        std::thread::Builder::new()
+            .name("distributed-mvcc-e2e-test".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .worker_threads(6)
+                    .thread_stack_size(16 * 1024 * 1024)
+                    .build()
+                    .unwrap()
+                    .block_on(
+                        distributed_mvcc_quorum_certifies_replicates_and_applies_in_order_body(),
+                    )
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    async fn distributed_mvcc_quorum_certifies_replicates_and_applies_in_order_body() {
         use crate::anvil_api::{
+            BoundaryDimension, BoundarySource, PutBoundarySchemaRequest,
             consensus_transport_server::ConsensusTransportServer,
+            object_service_server::ObjectService as _,
             replication_service_server::ReplicationServiceServer,
         };
         use crate::bundle_replication::BundleTargetStream as _;
@@ -840,14 +865,19 @@ mod app_state_tests {
             tempfile::tempdir().unwrap(),
             tempfile::tempdir().unwrap(),
         ];
-        let listeners = [
-            TcpListener::bind("127.0.0.1:0").await.unwrap(),
-            TcpListener::bind("127.0.0.1:0").await.unwrap(),
-            TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        let mut listeners = vec![
+            Some(TcpListener::bind("127.0.0.1:0").await.unwrap()),
+            Some(TcpListener::bind("127.0.0.1:0").await.unwrap()),
+            Some(TcpListener::bind("127.0.0.1:0").await.unwrap()),
         ];
         let endpoints = listeners
             .iter()
-            .map(|listener| format!("http://{}", listener.local_addr().unwrap()))
+            .map(|listener| {
+                format!(
+                    "http://{}",
+                    listener.as_ref().unwrap().local_addr().unwrap()
+                )
+            })
             .collect::<Vec<_>>();
         let peers = endpoints
             .iter()
@@ -865,9 +895,9 @@ mod app_state_tests {
             })
             .collect::<Vec<_>>();
         let peers_json = serde_json::to_string(&peers).unwrap();
-        let mut states = Vec::new();
+        let mut configs = Vec::new();
         for (index, directory) in directories.iter().enumerate() {
-            let config = Config {
+            configs.push(Config {
                 jwt_secret: "test-secret".into(),
                 anvil_secret_encryption_key:
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
@@ -895,21 +925,24 @@ mod app_state_tests {
                 mvcc_tolerated_failure_domains: 1,
                 mvcc_rpc_timeout_ms: 5_000,
                 ..Config::default()
-            };
-            states.push(
-                AppState::new(
-                    config,
-                    personaldb_signing::PersonalDbProtocolKeyring::disabled(),
-                )
-                .await
-                .unwrap(),
-            );
+            });
         }
-        let mut servers = Vec::new();
-        for (listener, state) in listeners.into_iter().zip(states.iter()) {
+        // Followers must be serving before the bootstrap node initializes the
+        // three-voter membership. AppState initialization on node 1 waits for
+        // that membership to elect it and install the initial control state.
+        let mut states = (0..3).map(|_| None).collect::<Vec<_>>();
+        let mut servers = (0..3).map(|_| None).collect::<Vec<_>>();
+        for index in [1_usize, 2, 0] {
+            let state = AppState::new(
+                configs[index].clone(),
+                personaldb_signing::PersonalDbProtocolKeyring::disabled(),
+            )
+            .await
+            .unwrap();
             let consensus = state.mvcc.consensus_service.clone();
             let replication = state.mvcc.replication_service.clone();
-            servers.push(tokio::spawn(async move {
+            let listener = listeners[index].take().unwrap();
+            servers[index] = Some(tokio::spawn(async move {
                 Server::builder()
                     .add_service(ConsensusTransportServer::new(consensus))
                     .add_service(ReplicationServiceServer::new(replication))
@@ -917,7 +950,10 @@ mod app_state_tests {
                     .await
                     .unwrap();
             }));
+            states[index] = Some(state);
         }
+        let states = states.into_iter().map(Option::unwrap).collect::<Vec<_>>();
+        let mut servers = servers.into_iter().map(Option::unwrap).collect::<Vec<_>>();
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 if states[0]
@@ -934,6 +970,9 @@ mod app_state_tests {
         })
         .await
         .expect("node one becomes leader");
+        crate::test_support::install_active_test_topology(&states[0].persistence, &configs[0])
+            .await
+            .unwrap();
 
         let principal = "distributed-e2e-principal";
         let key = LogicalKey {
@@ -1095,36 +1134,43 @@ mod app_state_tests {
                 .await
                 .unwrap();
         }
-        states[0]
-            .core_store
-            .put_boundary_schema(core_store::PutBoundarySchema {
-                schema: core_store::CoreBoundarySchema {
-                    schema: core_store::CORE_BOUNDARY_SCHEMA_SCHEMA.into(),
-                    bucket: core_store::boundary_schema_bucket_key(tenant.id, &bucket.name),
-                    generation: 1,
-                    dimensions: vec![core_store::CoreBoundaryDimension {
-                        name: "partition".into(),
-                        source: core_store::CoreBoundarySource::UserMetadataJsonPointer {
-                            pointer: "/partition".into(),
-                        },
-                        value_type: "string".into(),
-                        categories: vec!["storage_partition".into()],
-                        required: true,
-                        cardinality: "low".into(),
-                        max_values_per_block: 1,
-                        placement_affinity: "prefer_colocate".into(),
-                        compaction_scope: "require_same_value".into(),
-                        shared_ranges_allowed: false,
-                        shared_record_kinds: Vec::new(),
-                        deprecated: false,
-                    }],
-                    created_at: String::new(),
-                },
-                expected_generation: None,
-                mutation_id: "distributed-boundary-schema".into(),
-            })
+        let mut boundary_schema_request = tonic::Request::new(PutBoundarySchemaRequest {
+            bucket_name: bucket.name.clone(),
+            expected_generation: None,
+            dimensions: vec![BoundaryDimension {
+                name: "partition".into(),
+                source: Some(BoundarySource {
+                    kind: "user_metadata_json_pointer".into(),
+                    value: "/partition".into(),
+                    max_body_bytes: 0,
+                }),
+                value_type: "string".into(),
+                categories: vec!["storage_partition".into()],
+                required: true,
+                cardinality: "low".into(),
+                max_values_per_block: 1,
+                placement_affinity: "prefer_colocate".into(),
+                compaction_scope: "require_same_value".into(),
+                shared_ranges_allowed: false,
+                shared_record_kinds: Vec::new(),
+                deprecated: false,
+            }],
+            mutation_id: "distributed-boundary-schema".into(),
+            transaction_id: None,
+        });
+        boundary_schema_request
+            .extensions_mut()
+            .insert(claims.clone());
+        let boundary_schema = states[0]
+            .put_boundary_schema(boundary_schema_request)
             .await
-            .unwrap();
+            .unwrap()
+            .into_inner()
+            .schema
+            .expect("public boundary-schema write returns the committed schema");
+        assert_eq!(boundary_schema.bucket_name, bucket.name);
+        assert_eq!(boundary_schema.generation, 1);
+        assert_eq!(boundary_schema.dimensions.len(), 1);
 
         let erasure_key = LogicalKey {
             table_id: 0x7f01,
@@ -1171,7 +1217,9 @@ mod app_state_tests {
         );
         let manifest: object_shard_manifest::PhysicalObjectShardManifest =
             serde_json::from_value(materialised_shard_map["manifest"].clone()).unwrap();
-        assert_eq!(manifest.placements.len(), 2);
+        assert_eq!(manifest.data_shards, 2);
+        assert_eq!(manifest.parity_shards, 1);
+        assert_eq!(manifest.placements.len(), 3);
         states[0]
             .mvcc
             .open_transactions
@@ -1224,7 +1272,41 @@ mod app_state_tests {
             }
         })
         .await
-        .expect("distributed materialisation completes");
+        .unwrap_or_else(|_| {
+            let pending = states[0]
+                .mvcc
+                .runtime
+                .local_store()
+                .read_latest(&materialisation_key)
+                .unwrap()
+                .map(|row| {
+                    serde_json::from_slice::<object_materialisation::ObjectMaterialisationResult>(
+                        &row.value,
+                    )
+                    .unwrap()
+                });
+            let records = states
+                .iter()
+                .map(|state| {
+                    pending.as_ref().and_then(|result| {
+                        state
+                            .mvcc
+                            .runtime
+                            .local_store()
+                            .object_materialisation_record(&result.job_id)
+                            .unwrap()
+                    })
+                })
+                .collect::<Vec<_>>();
+            let control = states
+                .iter()
+                .map(|state| state.mvcc.consensus.applied_control_snapshot().unwrap())
+                .collect::<Vec<_>>();
+            panic!(
+                "distributed materialisation timed out; pending={pending:?}; \
+                 queue_records={records:?}; control={control:?}"
+            )
+        });
         assert_eq!(
             materialisation.index_marker["outcomes"]
                 .as_array()

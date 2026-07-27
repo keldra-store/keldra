@@ -295,6 +295,21 @@ pub async fn ensure_region_accepts_new_writes(
     ensure_region_accepts_new_writes_in_state(&state, region)
 }
 
+pub fn ensure_region_accepts_new_writes_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    region: &str,
+) -> LifecycleResult<()> {
+    require_identifier(region, "region")?;
+    let state = read_lifecycle_state_projection_mvcc(mvcc)?;
+    if !state.regions.contains_key(region) {
+        return Err(LifecycleError::NotFound {
+            resource_kind: "region",
+            resource_id: region.to_string(),
+        });
+    }
+    ensure_region_accepts_new_writes_in_state(&state, region)
+}
+
 pub async fn ensure_new_writable_placement(
     storage: &Storage,
     region: &str,
@@ -306,6 +321,43 @@ pub async fn ensure_new_writable_placement(
     require_identifier(node_id, "node id")?;
 
     let state = read_state(storage).await?;
+    ensure_region_accepts_new_writes_in_state(&state, region)?;
+    ensure_cell_accepts_new_writes_in_state(&state, region, cell_id)?;
+    ensure_node_accepts_new_writes_in_state(&state, region, cell_id, node_id)?;
+    Ok(())
+}
+
+pub fn ensure_new_writable_placement_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    region: &str,
+    cell_id: &str,
+    node_id: &str,
+) -> LifecycleResult<()> {
+    require_identifier(region, "region")?;
+    require_identifier(cell_id, "cell id")?;
+    require_identifier(node_id, "node id")?;
+
+    let state = read_lifecycle_state_projection_mvcc(mvcc)?;
+    if !state.regions.contains_key(region) {
+        return Err(LifecycleError::NotFound {
+            resource_kind: "region",
+            resource_id: region.to_string(),
+        });
+    }
+    let expected_cell_key = cell_key(region, cell_id)?;
+    if !state.cells.contains_key(&expected_cell_key) {
+        return Err(LifecycleError::NotFound {
+            resource_kind: "cell",
+            resource_id: format!("{region}/{cell_id}"),
+        });
+    }
+    if !state.nodes.contains_key(node_id) {
+        return Err(LifecycleError::NotFound {
+            resource_kind: "node",
+            resource_id: node_id.to_string(),
+        });
+    }
+
     ensure_region_accepts_new_writes_in_state(&state, region)?;
     ensure_cell_accepts_new_writes_in_state(&state, region, cell_id)?;
     ensure_node_accepts_new_writes_in_state(&state, region, cell_id, node_id)?;

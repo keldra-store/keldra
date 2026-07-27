@@ -430,6 +430,11 @@ A **point observation** records the version observed for one logical key:
 PointObservation = (logical_key_hash, observed_version_or_absent)
 ```
 
+`observed_version_or_absent` is the newest committed row version visible at the
+transaction snapshot. A tombstone contributes its commit version even though
+the logical value is absent. `absent` means that no committed value or
+tombstone existed for the key at that snapshot.
+
 ### 6.37 Range Observation
 
 A **range observation** records the version of an ordered interval used by a
@@ -853,7 +858,11 @@ version are updated in the same RocksDB batch.
 ### 12.3 Tombstones
 
 A delete writes a tombstone at the transaction's commit version. It does not
-immediately remove older versions.
+immediately remove older versions. Ordinary value reads expose a selected
+tombstone as an absent value, but point observations retain the tombstone's
+commit version for certification. This distinction allows a later transaction
+to recreate the key without falsely claiming that the key has never been
+written.
 
 ### 12.4 Visibility
 
@@ -980,10 +989,13 @@ For a key observed at version `V`:
 latest_certified_write_version(key) == V
 ```
 
-For a key observed absent:
+This includes a logically absent key whose newest visible row version is a
+tombstone at `V`.
+
+For a key observed with no committed row version:
 
 ```text
-latest visible version at snapshot was absent
+no value or tombstone existed at the snapshot
 and no later certification wrote the key
 ```
 

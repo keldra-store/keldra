@@ -41,7 +41,11 @@ pub enum DurabilityLevel {
     Erasure,
 }
 
-/// Version observed for one logical key. `None` means absent.
+/// Newest committed row version observed for one logical key.
+///
+/// A tombstone contributes its commit version even though the logical value is
+/// absent. `None` means no committed value or tombstone existed at the
+/// transaction snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PointObservation {
     pub key: LogicalKeyHash,
@@ -67,6 +71,7 @@ pub enum PredicateKind {
 pub struct ExplicitPredicate {
     pub key: LogicalKeyHash,
     pub kind: PredicateKind,
+    /// Observed row version, including the commit version of a tombstone.
     pub observed_version: Option<CommitVersion>,
 }
 
@@ -344,6 +349,13 @@ pub enum CertificationAbort {
         range: RangeConflictKey,
         expected: Option<CommitVersion>,
         actual: Option<CommitVersion>,
+    },
+    AssignmentConflict {
+        partition_id: u64,
+        expected_epoch: CommitVersion,
+        actual_epoch: Option<CommitVersion>,
+        expected_topology_epoch: CommitVersion,
+        actual_topology_epoch: CommitVersion,
     },
 }
 

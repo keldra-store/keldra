@@ -279,12 +279,11 @@ impl MvccOutboxRunner {
         guard: &crate::mvcc_worker_authority::AssignmentGuard,
     ) -> Result<bool> {
         let snapshot = self.linearized_control_snapshot().await?;
-        Ok(snapshot.topology_epoch == guard.topology_epoch
-            && snapshot.partitions.iter().any(|(id, assignment)| {
-                *id == guard.partition_id
-                    && assignment.epoch == guard.assignment_epoch
-                    && assignment.owner == self.local_node
-            }))
+        Ok(snapshot.partitions.iter().any(|(id, assignment)| {
+            *id == guard.partition_id
+                && assignment.epoch == guard.assignment_epoch
+                && assignment.owner == self.local_node
+        }))
     }
 
     async fn linearized_control_snapshot(

@@ -488,6 +488,42 @@ impl ShardRebalanceReconciler {
                 now,
             )
             .await?;
+        let transaction_status =
+            self.mvcc
+                .open_transactions
+                .status(&handle.transaction_id, &principal, now)?;
+        match transaction_status.state {
+            // The completed scan stores the next snapshot before its own
+            // checkpoint transaction is certified. Until another commit
+            // advances that snapshot, the next pass deliberately derives the
+            // same idempotency key. Treat that as an idle replay instead of
+            // trying to append jobs to a resolved draft.
+            "committed" => return Ok(false),
+            // A process can stop after durably sealing the bundle but before
+            // resolving its local transaction registry entry. Resume that
+            // exact bundle; it can no longer accept newly staged page data.
+            "committing" => {
+                let outcome = self
+                    .mvcc
+                    .open_transactions
+                    .commit(
+                        self.mvcc.runtime.as_ref(),
+                        &handle.transaction_id,
+                        &principal,
+                        now,
+                    )
+                    .await?;
+                if !matches!(
+                    outcome.certification,
+                    crate::mvcc_transaction::CertificationResult::Committed { .. }
+                ) {
+                    bail!("resumed rebalance page transaction was not committed");
+                }
+                return Ok(!page.is_empty());
+            }
+            "open" => {}
+            state => bail!("rebalance page transaction is {state}"),
+        }
         for (key, row) in &page {
             let manifest: PhysicalObjectShardManifest = serde_json::from_slice(&row.value)?;
             let resolved = resolve_manifest_at_snapshot(
@@ -917,9 +953,9 @@ impl ShardRepairRunner {
             .mvcc
             .runtime
             .local_store()
-            .read_at(&overlay_key, handle.snapshot_version)?;
+            .read_point_at(&overlay_key, handle.snapshot_version)?;
         let mut retired_after_commit = job.retiring.clone();
-        if let Some(row) = &observed {
+        if let Some(row) = observed.visible() {
             let current: ShardPlacementOverlay = serde_json::from_slice(&row.value)?;
             if current.cluster_id != job.cluster_id
                 || current.target_logical_identity != job.target_logical_identity
@@ -973,7 +1009,7 @@ impl ShardRepairRunner {
             &handle.transaction_id,
             &job.cluster_id,
             overlay_key.clone(),
-            observed.as_ref().map(|row| row.commit_version),
+            observed.observed_version(),
             now_unix_ms(),
         )?;
         self.mvcc.open_transactions.put(
@@ -1332,6 +1368,19 @@ mod tests {
             .unwrap();
         assert_eq!(record.state, ShardRepairState::Complete);
         assert_eq!(record.attempts, 1);
+        subsystem.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn completed_rebalance_checkpoint_is_an_idle_idempotent_replay() {
+        let _serial = REPAIR_EXECUTION_TEST_LOCK.lock().unwrap();
+        let (_directory, subsystem) = test_subsystem().await;
+        let reconciler =
+            ShardRebalanceReconciler::new(subsystem.clone(), "rebalance-worker").unwrap();
+
+        assert!(!reconciler.run_once(10).await.unwrap());
+        assert!(!reconciler.run_once(11).await.unwrap());
+
         subsystem.shutdown().await;
     }
 

@@ -3,7 +3,7 @@ mod fencing;
 mod helpers;
 mod index_definition_lifecycle;
 use crate::task_execution_guard::TaskExecutionGuard;
-use crate::test_support::persistence_with_mvcc;
+use crate::test_support::{persistence_with_active_topology, persistence_with_mvcc};
 use helpers::*;
 use serde_json::json;
 use tempfile::tempdir;
@@ -123,6 +123,37 @@ async fn claim_authz_materialization_guard(
     .unwrap()
 }
 
+async fn acquire_test_ownership(
+    persistence: &Persistence,
+    request: crate::partition_fence::AcquireOwnership,
+) -> crate::partition_fence::OwnershipFenceOutcome {
+    let principal = format!("test:ownership:{}", request.request_id);
+    let idempotency_key = request.idempotency_key.clone();
+    let tenant_id = request.owner.tenant_id;
+    let resource = request.resource.clone();
+    let now_nanos = request.now_nanos;
+    crate::partition_fence::commit_implicit_ownership_plan(
+        persistence.mvcc().unwrap(),
+        &principal,
+        &idempotency_key,
+        now_nanos,
+        tenant_id,
+        &resource,
+        &persistence.partition_owner_signing_key,
+        |transaction_id| {
+            crate::partition_fence::plan_acquire_ownership_in_transaction(
+                persistence.mvcc().unwrap(),
+                transaction_id,
+                &principal,
+                request,
+                &persistence.partition_owner_signing_key,
+            )
+        },
+    )
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
 async fn authz_tuple_write_enqueues_and_materializes_bounded_authorization_state() {
     let temp = tempdir().unwrap();
@@ -184,7 +215,11 @@ async fn authz_tuple_write_enqueues_and_materializes_bounded_authorization_state
         .await
         .unwrap();
     assert_eq!(outcome.processed_revision, record.revision as u64);
-    assert_eq!(outcome.source_rows_visited, 1);
+    assert_eq!(
+        outcome.source_rows_visited,
+        usize::try_from(record.revision).unwrap(),
+        "source visit accounting includes lookahead scans across schema-only revisions"
+    );
     let materialized = crate::authz_segment::resolve_materialized_permission_at_revision(
         &persistence.storage,
         persistence.mvcc().unwrap(),
@@ -269,7 +304,11 @@ async fn authz_materialization_task_catches_up_a_grouped_revision_backlog() {
         .unwrap();
 
     assert_eq!(outcome.processed_revision, target_revision);
-    assert_eq!(outcome.source_rows_visited, 8);
+    assert_eq!(
+        outcome.source_rows_visited,
+        usize::try_from(target_revision).unwrap(),
+        "source visit accounting includes lookahead scans across schema-only revisions"
+    );
     for revision in 1..=target_revision {
         assert!(
             crate::authz_segment::existing_authz_tuple_segment_ref(
@@ -393,7 +432,7 @@ async fn measure_authz_permission_checks(
 #[tokio::test]
 async fn empty_bucket_index_build_materialises_an_empty_typed_json_segment() {
     let temp = tempdir().unwrap();
-    let persistence = persistence_with_mvcc(&test_config(temp.path()))
+    let persistence = persistence_with_active_topology(&test_config(temp.path()))
         .await
         .unwrap();
     let tenant = persistence
@@ -499,9 +538,9 @@ async fn empty_bucket_index_build_materialises_an_empty_typed_json_segment() {
 #[tokio::test]
 async fn tenant_and_bucket_creation_materialise_mesh_directory_locators() {
     let temp = tempdir().unwrap();
-    let persistence = persistence_with_mvcc(&test_config(temp.path()))
-        .await
-        .unwrap();
+    let mut config = test_config(temp.path());
+    config.region = "eu-west-1".to_string();
+    let persistence = persistence_with_active_topology(&config).await.unwrap();
 
     let tenant = persistence
         .create_tenant("tenant-a", "unused")
@@ -541,8 +580,8 @@ async fn tenant_and_bucket_creation_materialise_mesh_directory_locators() {
         )
     );
 
-    let tenant_name_owner = read_partition_owner(
-        &persistence.storage,
+    let tenant_name_owner = read_partition_owner_mvcc(
+        persistence.mvcc().unwrap(),
         mesh_directory::CONTROL_PARTITION_FAMILY,
         &mesh_directory::control_partition_id(
             mesh_directory::RoutingRecordFamily::TenantName.stream_family(),
@@ -550,13 +589,12 @@ async fn tenant_and_bucket_creation_materialise_mesh_directory_locators() {
         ),
         &persistence.partition_owner_signing_key,
     )
-    .await
     .unwrap()
     .expect("tenant-name control partition owner");
     assert_eq!(tenant_name_owner.owner_node_id, persistence.owner_node_id);
 
-    let bucket_locator_owner = read_partition_owner(
-        &persistence.storage,
+    let bucket_locator_owner = read_partition_owner_mvcc(
+        persistence.mvcc().unwrap(),
         mesh_directory::CONTROL_PARTITION_FAMILY,
         &mesh_directory::control_partition_id(
             mesh_directory::RoutingRecordFamily::BucketLocator.stream_family(),
@@ -564,7 +602,6 @@ async fn tenant_and_bucket_creation_materialise_mesh_directory_locators() {
         ),
         &persistence.partition_owner_signing_key,
     )
-    .await
     .unwrap()
     .expect("bucket-locator control partition owner");
     assert_eq!(
@@ -686,11 +723,10 @@ async fn region_drain_applies_read_only_exceptions_to_bucket_locators() {
     );
     assert_eq!(locator.generation, 2);
 
-    let exceptions = crate::mesh_lifecycle::list_bucket_drain_exceptions(
-        &persistence.storage,
+    let exceptions = crate::mesh_lifecycle::list_bucket_drain_exceptions_mvcc(
+        persistence.mvcc().unwrap(),
         Some("test-region"),
     )
-    .await
     .unwrap();
     assert_eq!(exceptions.len(), 1);
     assert_eq!(
@@ -855,8 +891,9 @@ async fn node_drain_completion_requires_no_runtime_ownership_and_force_offline_e
         .await
         .unwrap();
 
-    let partition_owner = crate::partition_fence::acquire_partition_recovery(
+    let partition_owner = crate::partition_fence::acquire_partition_recovery_mvcc(
         &persistence.storage,
+        persistence.mvcc().unwrap(),
         crate::partition_fence::PartitionRecoveryAcquire {
             partition_family: "object_metadata".to_string(),
             partition_id: hex::encode([8; 32]),
@@ -869,8 +906,9 @@ async fn node_drain_completion_requires_no_runtime_ownership_and_force_offline_e
     )
     .await
     .unwrap();
-    let partition_owner = crate::partition_fence::publish_partition_ready(
+    let partition_owner = crate::partition_fence::publish_partition_ready_mvcc(
         &persistence.storage,
+        persistence.mvcc().unwrap(),
         &partition_owner.partition_family,
         &partition_owner.partition_id,
         "worker-node",
@@ -884,8 +922,8 @@ async fn node_drain_completion_requires_no_runtime_ownership_and_force_offline_e
     .unwrap();
     let stale_partition_permit = partition_owner.write_permit().unwrap();
 
-    crate::partition_fence::acquire_ownership(
-        &persistence.storage,
+    acquire_test_ownership(
+        &persistence,
         crate::partition_fence::AcquireOwnership {
             request_id: "worker-control-acquire".to_string(),
             idempotency_key: "worker-control-acquire".to_string(),
@@ -905,10 +943,8 @@ async fn node_drain_completion_requires_no_runtime_ownership_and_force_offline_e
             now_nanos,
             ttl_nanos,
         },
-        &persistence.partition_owner_signing_key,
     )
-    .await
-    .unwrap();
+    .await;
 
     let task_lease = crate::task_lease::acquire_task_lease_mvcc(
         persistence.mvcc().unwrap(),
@@ -991,12 +1027,11 @@ async fn node_drain_completion_requires_no_runtime_ownership_and_force_offline_e
             .unwrap()
             .is_empty()
     );
-    let stale_rejection = crate::partition_fence::validate_partition_write(
-        &persistence.storage,
+    let stale_rejection = crate::partition_fence::partition_write_predicate_mvcc(
+        persistence.mvcc().unwrap(),
         &stale_partition_permit,
         &persistence.partition_owner_signing_key,
     )
-    .await
     .unwrap_err();
     assert_eq!(
         stale_rejection.code,
@@ -1036,8 +1071,11 @@ fn persistence_replays_anvil_owned_state_after_fresh_instance() {
 
 async fn persistence_replays_anvil_owned_state_after_fresh_instance_body() {
     let temp = tempdir().unwrap();
-    let first_config = test_config(temp.path());
-    let persistence = persistence_with_mvcc(&first_config).await.unwrap();
+    let mut first_config = test_config(temp.path());
+    first_config.region = "local".to_string();
+    let persistence = persistence_with_active_topology(&first_config)
+        .await
+        .unwrap();
 
     persistence.create_region("local").await.unwrap();
     let tenant = persistence
@@ -1206,9 +1244,12 @@ async fn persistence_replays_anvil_owned_state_after_fresh_instance_body() {
         .await
         .unwrap();
 
+    persistence.mvcc().unwrap().shutdown().await;
     drop(persistence);
 
-    let replayed = persistence_with_mvcc(&first_config).await.unwrap();
+    let replayed = persistence_with_active_topology(&first_config)
+        .await
+        .unwrap();
 
     assert!(
         replayed
@@ -1396,8 +1437,11 @@ async fn persistence_replays_anvil_owned_state_after_fresh_instance_body() {
 #[tokio::test]
 async fn persistence_compacts_object_metadata_and_restarts_from_manifest() {
     let temp = tempdir().unwrap();
-    let first_config = test_config(temp.path());
-    let persistence = persistence_with_mvcc(&first_config).await.unwrap();
+    let mut first_config = test_config(temp.path());
+    first_config.region = "local".to_string();
+    let persistence = persistence_with_active_topology(&first_config)
+        .await
+        .unwrap();
 
     persistence.create_region("local").await.unwrap();
     let bucket = persistence
@@ -1445,8 +1489,11 @@ async fn persistence_compacts_object_metadata_and_restarts_from_manifest() {
     assert_eq!(sealed.metadata_record_count, 2);
     assert_eq!(sealed.directory_record_count, 2);
 
+    persistence.mvcc().unwrap().shutdown().await;
     drop(persistence);
-    let restarted = persistence_with_mvcc(&first_config).await.unwrap();
+    let restarted = persistence_with_active_topology(&first_config)
+        .await
+        .unwrap();
 
     let replayed = restarted
         .get_object(bucket.id, "docs/a.txt")
@@ -1515,10 +1562,9 @@ async fn persistence_compacts_object_metadata_and_restarts_from_manifest() {
 #[tokio::test]
 async fn object_metadata_writes_use_one_authoritative_partition_fence() {
     let temp = tempdir().unwrap();
-    let persistence = persistence_with_mvcc(&test_config(temp.path()))
+    let persistence = persistence_with_active_topology(&test_config(temp.path()))
         .await
         .unwrap();
-    register_active_mesh_placement(&persistence).await;
     let tenant = persistence
         .create_tenant("tenant-a", "unused")
         .await
@@ -1554,24 +1600,22 @@ async fn object_metadata_writes_use_one_authoritative_partition_fence() {
         .await
         .unwrap();
 
-    let owner = read_partition_owner(
-        &persistence.storage,
+    let owner = crate::partition_fence::read_partition_owner_mvcc(
+        persistence.mvcc().unwrap(),
         "object_metadata",
         &partition_id,
         &persistence.partition_owner_signing_key,
     )
-    .await
     .unwrap()
     .expect("object metadata partition owner");
     assert_eq!(owner.owner_node_id, persistence.owner_node_id);
     assert!(
-        read_ownership_fence(
-            &persistence.storage,
+        crate::partition_fence::read_ownership_fence_mvcc(
+            persistence.mvcc().unwrap(),
             0,
             &resource,
             &persistence.partition_owner_signing_key,
         )
-        .await
         .unwrap()
         .is_none(),
         "ordinary data writes must not stack a generic resource lease on the partition fence"
@@ -1584,9 +1628,10 @@ async fn persistence_schedules_deduplicated_object_metadata_compaction_tasks() {
     let config = Config {
         object_metadata_compaction_frame_threshold: 2,
         object_metadata_compaction_bytes_threshold: 0,
+        region: "local".to_string(),
         ..test_config(temp.path())
     };
-    let persistence = persistence_with_mvcc(&config).await.unwrap();
+    let persistence = persistence_with_active_topology(&config).await.unwrap();
 
     persistence.create_region("local").await.unwrap();
     let bucket = persistence
@@ -1781,8 +1826,9 @@ fn task_queue_retries_coremeta_target_conflicts() {
 #[tokio::test]
 async fn persistence_task_execution_lease_targets_object_metadata_partition() {
     let temp = tempdir().unwrap();
-    let config = test_config(temp.path());
-    let persistence = persistence_with_mvcc(&config).await.unwrap();
+    let mut config = test_config(temp.path());
+    config.region = "local".to_string();
+    let persistence = persistence_with_active_topology(&config).await.unwrap();
 
     persistence.create_region("local").await.unwrap();
     let bucket = persistence

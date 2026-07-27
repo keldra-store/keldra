@@ -587,22 +587,18 @@ async fn coordinator_failure_before_proposal_is_retryable_without_a_commit() {
         table_id: 1,
         application_key: b"before-proposal".to_vec(),
     };
-    mvcc_fault_injection::install(
-        DeterministicFaults::default().fail_at(FaultPoint::BeforeProposal, 1),
-    );
-    let version_before = cluster.states[0].mvcc.consensus.observed_commit_version();
     let transaction_id = cluster.stage_write(0, "before-proposal", key.clone()).await;
-    let first = cluster.states[0]
-        .mvcc
-        .open_transactions
-        .commit(
+    let version_before = cluster.states[0].mvcc.consensus.observed_commit_version();
+    let first = mvcc_fault_injection::scoped(
+        DeterministicFaults::default().fail_at(FaultPoint::BeforeProposal, 1),
+        cluster.states[0].mvcc.open_transactions.commit(
             cluster.states[0].mvcc.runtime.as_ref(),
             &transaction_id,
             "fault-principal",
             3,
-        )
-        .await;
-    mvcc_fault_injection::clear();
+        ),
+    )
+    .await;
     assert!(first.unwrap_err().to_string().contains("BeforeProposal"));
     assert_eq!(
         cluster.states[0].mvcc.read_latest_value(&key).unwrap(),
@@ -663,21 +659,17 @@ async fn coordinator_failure_after_proposal_recovers_the_stable_commit() {
         table_id: 1,
         application_key: b"after-proposal".to_vec(),
     };
-    mvcc_fault_injection::install(
-        DeterministicFaults::default().fail_at(FaultPoint::AfterProposal, 1),
-    );
     let transaction_id = cluster.stage_write(0, "after-proposal", key.clone()).await;
-    let first = cluster.states[0]
-        .mvcc
-        .open_transactions
-        .commit(
+    let first = mvcc_fault_injection::scoped(
+        DeterministicFaults::default().fail_at(FaultPoint::AfterProposal, 1),
+        cluster.states[0].mvcc.open_transactions.commit(
             cluster.states[0].mvcc.runtime.as_ref(),
             &transaction_id,
             "fault-principal",
             3,
-        )
-        .await;
-    mvcc_fault_injection::clear();
+        ),
+    )
+    .await;
     assert!(first.unwrap_err().to_string().contains("AfterProposal"));
     assert_eq!(
         cluster.states[0]
@@ -710,6 +702,17 @@ async fn coordinator_failure_after_proposal_recovers_the_stable_commit() {
         }
     };
     assert_eq!(commit_version, committed_before_response.0);
+    let committed_bundle = cluster.states[0]
+        .mvcc
+        .consensus
+        .applied_decisions_after(anvil_mvcc_consensus::CommitVersion(
+            commit_version.saturating_sub(1),
+        ))
+        .unwrap()
+        .into_iter()
+        .find(|decision| decision.position.0 == commit_version)
+        .and_then(|decision| decision.committed_bundle)
+        .expect("stable commit has one committed bundle decision");
     let replay = cluster.states[0]
         .mvcc
         .open_transactions
@@ -723,9 +726,21 @@ async fn coordinator_failure_after_proposal_recovers_the_stable_commit() {
         .unwrap();
     assert_eq!(replay.certification, recovered.certification);
     assert_eq!(
-        cluster.states[0].mvcc.consensus.observed_commit_version().0,
-        commit_version,
-        "resolved retry must not allocate a second commit version"
+        cluster.states[0]
+            .mvcc
+            .consensus
+            .applied_decisions_after(anvil_mvcc_consensus::CommitVersion(commit_version))
+            .unwrap()
+            .into_iter()
+            .filter(|decision| {
+                decision
+                    .committed_bundle
+                    .as_ref()
+                    .is_some_and(|bundle| bundle.bundle_hash == committed_bundle.bundle_hash)
+            })
+            .count(),
+        0,
+        "resolved retry must not create a second committed bundle decision"
     );
     assert_eq!(
         cluster.states[0].mvcc.read_latest_value(&key).unwrap(),

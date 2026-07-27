@@ -248,23 +248,26 @@ pub(super) async fn bucket_locators_blocking_region_drain(
     region: &str,
 ) -> LifecycleResult<Vec<String>> {
     if let Some(mvcc) = mvcc {
-        return Ok(mesh_directory::list_bucket_locators_mvcc(mvcc)
-            .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?
-            .into_iter()
-            .filter(|locator| {
-                locator.home_region.as_str() == region
-                    && bucket_locator_blocks_region_drain(locator.status)
-            })
-            .take(MAX_DRAIN_BLOCKER_DETAILS)
-            .map(|locator| {
-                format!(
-                    "{}/{}:{:?}",
-                    locator.tenant_id.as_str(),
-                    locator.bucket_name.as_str(),
-                    locator.status
-                )
-            })
-            .collect());
+        return Ok(mesh_directory::list_bucket_locators_mvcc(
+            mvcc,
+            mesh_directory::MVCC_ROUTING_LIST_HARD_LIMIT,
+        )
+        .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?
+        .into_iter()
+        .filter(|locator| {
+            locator.home_region.as_str() == region
+                && bucket_locator_blocks_region_drain(locator.status)
+        })
+        .take(MAX_DRAIN_BLOCKER_DETAILS)
+        .map(|locator| {
+            format!(
+                "{}/{}:{:?}",
+                locator.tenant_id.as_str(),
+                locator.bucket_name.as_str(),
+                locator.status
+            )
+        })
+        .collect());
     }
     let mut blockers = Vec::new();
     let mut cursor = None;
@@ -378,8 +381,11 @@ pub(super) async fn bucket_locators_without_valid_drain_exception(
     };
     let mut blockers = Vec::new();
     if let Some(mvcc) = mvcc {
-        for locator in mesh_directory::list_bucket_locators_mvcc(mvcc)
-            .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?
+        for locator in mesh_directory::list_bucket_locators_mvcc(
+            mvcc,
+            mesh_directory::MVCC_ROUTING_LIST_HARD_LIMIT,
+        )
+        .map_err(|err| LifecycleError::InvalidArgument(err.to_string()))?
         {
             if let Some(blocker) = bucket_locator_drain_exception_blocker(&state, region, &locator)
                 && push_drain_blocker(&mut blockers, blocker)

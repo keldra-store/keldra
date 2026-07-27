@@ -113,61 +113,6 @@ pub(super) fn descriptor_projection_row_key(
     Ok((family, record_key, row_key))
 }
 
-pub(super) async fn write_descriptor_projection<T: StoredRoutingRecord>(
-    storage: &Storage,
-    descriptor_key: &str,
-    descriptor: &T,
-    require_absent: bool,
-) -> MeshDirectoryResult<()> {
-    let family = descriptor.routing_family();
-    let record_key = descriptor.routing_record_key();
-    let expected_descriptor_key = routing_record_descriptor_key_for_key(family, &record_key)?;
-    ensure_descriptor_key_matches(descriptor_key, &expected_descriptor_key)?;
-    let row_key = routing_projection_row_key(family, &record_key)?;
-    let store = CoreStore::new(storage.clone()).await?;
-    let current = store.read_coremeta_row(CF_MESH, TABLE_MESH_PARTITION_ROW, &row_key)?;
-    if require_absent && current.is_some() {
-        return Err(MeshDirectoryError::Io(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            format!("routing descriptor already exists: {descriptor_key}"),
-        )));
-    }
-    let payload = record_proto::encode_routing_projection_row(descriptor_key, descriptor)?;
-    store
-        .commit_mutation_batch(CoreMutationBatch {
-            transaction_id: format!(
-                "mesh-directory-projection:{}:{}",
-                family.stream_family(),
-                uuid::Uuid::new_v4()
-            ),
-            scope_partition: MESH_DIRECTORY_PROJECTION_PARTITION_ID.to_string(),
-            committed_by_principal: "mesh-directory".to_string(),
-            // Mesh-directory visibility is the committed CoreMeta row. Legacy
-            // root publication is not an authority in the MVCC-under-Raft
-            // design and must not invoke the discarded finalisation path.
-            root_publications: Vec::new(),
-            preconditions: vec![CoreMutationPrecondition::CoreMetaRow {
-                cf: CF_MESH.to_string(),
-                table_id: TABLE_MESH_PARTITION_ROW,
-                tuple_key: row_key.clone(),
-                expected_payload_hash: current
-                    .as_ref()
-                    .map(|payload| core_meta_payload_digest(TABLE_MESH_PARTITION_ROW, payload)),
-                require_absent: require_absent || current.is_none(),
-                require_present: !require_absent && current.is_some(),
-            }],
-            operations: vec![CoreMutationOperation::CoreMetaPut {
-                partition_id: MESH_DIRECTORY_PROJECTION_PARTITION_ID.to_string(),
-                cf: CF_MESH.to_string(),
-                table_id: TABLE_MESH_PARTITION_ROW,
-                tuple_key: row_key,
-                payload,
-            }],
-        })
-        .await?;
-    Ok(())
-}
-
 pub(super) async fn write_descriptor_projection_mvcc<T: StoredRoutingRecord>(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     descriptor_key: &str,
@@ -219,6 +164,7 @@ pub(super) async fn write_descriptor_projection_mvcc<T: StoredRoutingRecord>(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) async fn read_descriptor_projection_payload(
     storage: &Storage,
     descriptor_key: &str,
@@ -235,6 +181,7 @@ pub(super) async fn read_descriptor_projection_payload(
     ))
 }
 
+#[cfg(test)]
 pub(super) async fn read_descriptor_projection_payload_proto(
     storage: &Storage,
     descriptor_key: &str,
@@ -279,49 +226,6 @@ pub(super) fn read_descriptor_projection_payload_proto_mvcc(
         });
     }
     Ok(Some(row.payload_proto))
-}
-
-#[cfg(test)]
-pub(super) async fn delete_descriptor_projection(
-    storage: &Storage,
-    descriptor_key: &str,
-) -> MeshDirectoryResult<()> {
-    let (family, _record_key, row_key) = descriptor_projection_row_key(descriptor_key)?;
-    let store = CoreStore::new(storage.clone()).await?;
-    let Some(current) = store.read_coremeta_row(CF_MESH, TABLE_MESH_PARTITION_ROW, &row_key)?
-    else {
-        return Ok(());
-    };
-    store
-        .commit_mutation_batch(CoreMutationBatch {
-            transaction_id: format!(
-                "mesh-directory-projection-delete:{}:{}",
-                family.stream_family(),
-                uuid::Uuid::new_v4()
-            ),
-            scope_partition: MESH_DIRECTORY_PROJECTION_PARTITION_ID.to_string(),
-            committed_by_principal: "mesh-directory-test".to_string(),
-            root_publications: Vec::new(),
-            preconditions: vec![CoreMutationPrecondition::CoreMetaRow {
-                cf: CF_MESH.to_string(),
-                table_id: TABLE_MESH_PARTITION_ROW,
-                tuple_key: row_key.clone(),
-                expected_payload_hash: Some(core_meta_payload_digest(
-                    TABLE_MESH_PARTITION_ROW,
-                    &current,
-                )),
-                require_absent: false,
-                require_present: true,
-            }],
-            operations: vec![CoreMutationOperation::CoreMetaDelete {
-                partition_id: MESH_DIRECTORY_PROJECTION_PARTITION_ID.to_string(),
-                cf: CF_MESH.to_string(),
-                table_id: TABLE_MESH_PARTITION_ROW,
-                tuple_key: row_key,
-            }],
-        })
-        .await?;
-    Ok(())
 }
 
 pub(super) fn partition_key_bytes(domain: &str, components: &[&str]) -> Vec<u8> {

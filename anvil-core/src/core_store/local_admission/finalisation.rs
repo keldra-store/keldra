@@ -439,6 +439,7 @@ impl CoreStore {
             transaction_id,
             scope_partition,
             operation_count,
+            logical_request_hash: _,
         } = &admission.target
         else {
             bail!("CoreStore preceding finalisation rows require a mutation-batch root scope");

@@ -1009,6 +1009,25 @@ mod tests {
         }
     }
 
+    fn index_finalization_job(transaction_id: &str) -> Vec<u8> {
+        crate::index_finalization_job::IndexFinalizationJob {
+            schema: crate::index_finalization_job::IndexFinalizationJob::SCHEMA.to_string(),
+            cluster_id: "cluster".to_string(),
+            transaction_id: transaction_id.to_string(),
+            tenant_id: 1,
+            bucket_id: 1,
+            bucket_name: "bucket".to_string(),
+            index_name: "index".to_string(),
+            index_id: 1,
+            index_version: 1,
+            event_type: "created".to_string(),
+            creator_principal: "alice".to_string(),
+            frozen_definition: serde_json::json!({}),
+        }
+        .encode()
+        .unwrap()
+    }
+
     struct GatedRuntime {
         calls: AtomicUsize,
         first_started: Notify,
@@ -1260,8 +1279,9 @@ mod tests {
                 1_003,
             )
             .unwrap();
+        let job = index_finalization_job(&handle.transaction_id);
         registry
-            .add_job(&handle.transaction_id, b"job".to_vec(), 1_004)
+            .add_job(&handle.transaction_id, job.clone(), 1_004)
             .unwrap();
         registry
             .commit(&runtime, &handle.transaction_id, "alice", 1_005)
@@ -1278,7 +1298,7 @@ mod tests {
                 .payload,
             b"event"
         );
-        assert_eq!(bundles[0].materialisation_jobs, [b"job".to_vec()]);
+        assert_eq!(bundles[0].materialisation_jobs, [job]);
     }
 
     #[tokio::test]

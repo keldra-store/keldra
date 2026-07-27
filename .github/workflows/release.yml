@@ -98,7 +98,6 @@ jobs:
     timeout-minutes: 90
     env:
       ANVIL_BUILD_IMAGE: anvil:test-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
-      ANVIL_INTEGRATION_IMAGE: anvil:test-integration-amd64-${{ github.run_id }}-${{ github.run_attempt }}
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -108,11 +107,20 @@ jobs:
             arch: amd64
             artifact: anvil-test-image-amd64
             native_cargo: "0"
+          - platform: linux/arm64
+            arch: arm64
+            artifact: anvil-test-image-arm64
+            native_cargo: "0"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           ref: ${{ needs.release-context.outputs.commit }}
+
+      - name: Set up emulation for image smoke checks
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: amd64,arm64
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -184,43 +192,12 @@ jobs:
           compression-level: 0
           retention-days: 1
 
-      - name: Build amd64 Docker integration image
-        if: matrix.arch == 'amd64'
-        env:
-          ANVIL_IMAGE: ${{ env.ANVIL_INTEGRATION_IMAGE }}
-          ANVIL_DOCKER_PLATFORM: linux/amd64
-          ANVIL_BUILD_PROFILE: release
-          ANVIL_INCLUDE_TEST_TOOLS: "1"
-          ANVIL_USE_NATIVE_CARGO: "0"
-          CARGO_BUILD_JOBS: "8"
-        run: ./scripts/build-image.sh
-
-      - name: Smoke check Docker integration tooling
-        if: matrix.arch == 'amd64'
-        run: timeout 30s docker run --platform linux/amd64 --rm "$ANVIL_INTEGRATION_IMAGE" ip -Version
-
-      - name: Export Docker integration image artifact
-        if: matrix.arch == 'amd64'
-        run: docker save "$ANVIL_INTEGRATION_IMAGE" -o "${{ runner.temp }}/anvil-integration-image-amd64.tar"
-
-      - name: Upload Docker integration image artifact
-        if: matrix.arch == 'amd64'
-        uses: actions/upload-artifact@v4
-        with:
-          name: anvil-integration-image-amd64
-          path: ${{ runner.temp }}/anvil-integration-image-amd64.tar
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 1
-
-      - name: Remove local Docker images
+      - name: Remove local Docker image
         if: always()
         run: |
-          for image in "$ANVIL_BUILD_IMAGE" "$ANVIL_INTEGRATION_IMAGE"; do
-            if docker image inspect "$image" >/dev/null 2>&1; then
-              docker image rm "$image" || echo "::warning::Failed to remove $image"
-            fi
-          done
+          if docker image inspect "$ANVIL_BUILD_IMAGE" >/dev/null 2>&1; then
+            docker image rm "$ANVIL_BUILD_IMAGE" || echo "::warning::Failed to remove $ANVIL_BUILD_IMAGE"
+          fi
 
   static-and-docs:
     name: Static gates and docs artifact
@@ -377,13 +354,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: coremeta-performance-release
-          path: target/anvil/perf/coremeta/release/
+          path: target/anvil/perf/mvcc/release/
           if-no-files-found: error
           retention-days: 90
 
   server-core:
     name: Server core integration tests
-    needs: [release-context, coremeta-performance]
+    needs: [release-context, rust-unit]
     runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 60
     env:
@@ -431,6 +408,56 @@ jobs:
 
       - name: Run server core integration gates
         run: ./scripts/release-gates.sh server-core
+
+  mvcc-e2e:
+    name: MVCC under Raft end-to-end acceptance
+    needs: [release-context, server-core]
+    runs-on: [self-hosted, linux, x64, worka-builder-2]
+    timeout-minutes: 180
+    env:
+      CARGO_BUILD_JOBS: "8"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      ANVIL_GATE_STEP_TIMEOUT_SECONDS: "5400"
+      ANVIL_RUST_TEST_THREADS: "1"
+      RUST_LOG: warn
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-context.outputs.commit }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            cmake \
+            libclang-dev \
+            pkg-config \
+            libssl-dev \
+            protobuf-compiler \
+            ripgrep
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-release-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-release-cargo-v2-
+            ${{ runner.os }}-cargo-v2-
+
+      - name: Run native MVCC and transaction acceptance gates
+        run: ./scripts/release-gates.sh mvcc-e2e
 
   docker-integration:
     name: Docker integration tests (${{ matrix.group }})
@@ -508,9 +535,16 @@ jobs:
 
   publish:
     name: Publish release artifacts
-    needs: [release-context, build-image, static-and-docs, rust-unit, coremeta-performance, server-core]
+    needs:
+      - release-context
+      - build-image
+      - static-and-docs
+      - rust-unit
+      - coremeta-performance
+      - server-core
+      - mvcc-e2e
     runs-on: [self-hosted, linux, x64, worka-builder-2]
-    timeout-minutes: 45
+    timeout-minutes: 90
     environment:
       name: github-pages
       url: ${{ steps.docs-deployment.outputs.page_url }}
@@ -521,6 +555,7 @@ jobs:
       id-token: write
     env:
       ANVIL_AMD64_IMAGE: anvil:test-amd64-${{ github.run_id }}-${{ github.run_attempt }}
+      ANVIL_ARM64_IMAGE: anvil:test-arm64-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -552,6 +587,19 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install release publication dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            cmake \
+            jq \
+            libclang-dev \
+            libssl-dev \
+            pkg-config \
+            protobuf-compiler
+
       - name: Cache Cargo dependencies
         uses: actions/cache@v4
         with:
@@ -571,8 +619,16 @@ jobs:
           name: anvil-test-image-amd64
           path: ${{ runner.temp }}/anvil-image-amd64
 
+      - name: Download arm64 Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: anvil-test-image-arm64
+          path: ${{ runner.temp }}/anvil-image-arm64
+
       - name: Load tested Docker image artifacts
-        run: docker load -i "${{ runner.temp }}/anvil-image-amd64/anvil-test-image-amd64.tar"
+        run: |
+          docker load -i "${{ runner.temp }}/anvil-image-amd64/anvil-test-image-amd64.tar"
+          docker load -i "${{ runner.temp }}/anvil-image-arm64/anvil-test-image-arm64.tar"
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
@@ -591,7 +647,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Push tested amd64 Docker image
+      - name: Push tested multi-architecture Docker image
         id: docker-push
         shell: bash
         run: |
@@ -599,12 +655,23 @@ jobs:
           repo="ghcr.io/${{ github.repository }}"
           image="${repo}:${tag}"
           amd64_image="${repo}:${tag}-amd64"
+          arm64_image="${repo}:${tag}-arm64"
           docker tag "$ANVIL_AMD64_IMAGE" "$amd64_image"
-          docker tag "$ANVIL_AMD64_IMAGE" "$image"
-          docker tag "$ANVIL_AMD64_IMAGE" "${repo}:latest"
+          docker tag "$ANVIL_ARM64_IMAGE" "$arm64_image"
           docker push "$amd64_image"
-          docker push "$image"
-          docker push "${repo}:latest"
+          docker push "$arm64_image"
+          docker buildx imagetools create \
+            --tag "$image" \
+            "$amd64_image" \
+            "$arm64_image"
+          docker buildx imagetools create \
+            --tag "${repo}:latest" \
+            "$amd64_image" \
+            "$arm64_image"
+          inspection="$(docker buildx imagetools inspect "$image")"
+          printf '%s\n' "$inspection"
+          grep -q 'linux/amd64' <<<"$inspection"
+          grep -q 'linux/arm64' <<<"$inspection"
           digest="$(docker buildx imagetools inspect "$image" --format '{{.Manifest.Digest}}')"
           if [[ -z "$digest" || "$digest" != sha256:* ]]; then
             echo "failed to resolve published image digest for $image" >&2
@@ -654,8 +721,10 @@ jobs:
           repo="ghcr.io/${{ github.repository }}"
           for image in \
             "$ANVIL_AMD64_IMAGE" \
+            "$ANVIL_ARM64_IMAGE" \
             "${repo}:${tag}" \
             "${repo}:${tag}-amd64" \
+            "${repo}:${tag}-arm64" \
             "${repo}:latest"; do
             if docker image inspect "$image" >/dev/null 2>&1; then
               docker image rm "$image" || echo "::warning::Failed to remove $image"

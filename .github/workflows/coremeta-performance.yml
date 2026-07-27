@@ -64,6 +64,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: coremeta-performance-release-${{ github.run_id }}
-          path: target/anvil/perf/coremeta/release/
+          path: target/anvil/perf/mvcc/release/
           if-no-files-found: error
           retention-days: 90

@@ -940,7 +940,7 @@ mod tests {
             ..Config::default()
         };
         let storage = Storage::new_at(temp.path()).await.unwrap();
-        let persistence = crate::test_support::persistence_with_mvcc(&config)
+        let persistence = crate::test_support::persistence_with_active_topology(&config)
             .await
             .unwrap();
         crate::system_realm::ensure_bootstrapped(

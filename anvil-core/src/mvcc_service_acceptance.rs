@@ -59,7 +59,8 @@ fn personaldb_effects_are_certified_or_durable_postcommit_work() {
 fn tenant_locator_obligation_is_retryable_and_only_removed_after_publication() {
     let worker = include_str!("persistence/tenant_locator_finalization.rs");
     let admin = include_str!("services/admin.rs");
-    assert!(admin.contains("locator_job.mutation()"));
+    let compact_admin = admin.split_whitespace().collect::<String>();
+    assert!(compact_admin.contains("locator_job.mutation()"));
     let publish = worker
         .find("write_mesh_tenant_locators(")
         .expect("worker must publish the mesh locator");

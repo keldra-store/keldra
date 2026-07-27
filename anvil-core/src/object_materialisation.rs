@@ -68,6 +68,17 @@ impl ObjectMaterialisationJob {
         Ok(hex::encode(Sha256::digest(self.canonical_bytes()?)))
     }
 
+    /// Keeps all derived publications for a bucket on one compact-Raft work
+    /// owner. Index ownership is bucket-scoped in practice: hashing each
+    /// object version independently would move consecutive builds between
+    /// nodes while the prior node still holds the index publication fence.
+    pub fn assignment_logical_identity(&self) -> String {
+        format!(
+            "tenant/{}/bucket/{}/object-materialisation",
+            self.tenant_id, self.bucket_id
+        )
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.schema != Self::SCHEMA
             || self.cluster_id.trim().is_empty()
@@ -298,6 +309,15 @@ mod tests {
         assert_eq!(
             ObjectMaterialisationJob::decode(&job.canonical_bytes().unwrap()).unwrap(),
             job
+        );
+        let mut next_object = job.clone();
+        next_object.object_key = "other".into();
+        next_object.object_version_id = "other-version".into();
+        next_object.target_logical_identity =
+            "tenant/1/bucket/2/object/other/version/other-version".into();
+        assert_eq!(
+            job.assignment_logical_identity(),
+            next_object.assignment_logical_identity()
         );
     }
 

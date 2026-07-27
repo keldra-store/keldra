@@ -761,13 +761,12 @@ impl AdminService for AppState {
             if !crate::validation::is_valid_bucket_name(&req.bucket_name) {
                 return Err(Status::invalid_argument("Invalid bucket name"));
             }
-            mesh_lifecycle::ensure_new_writable_placement(
-                &self.storage,
+            mesh_lifecycle::ensure_new_writable_placement_mvcc(
+                &self.mvcc,
                 &req.region,
                 &self.config.cell_id,
                 &self.config.node_id,
             )
-            .await
             .map_err(|err| Status::failed_precondition(err.to_string()))?;
             if crate::bucket_journal::read_current_bucket_in_transaction(
                 &self.mvcc,

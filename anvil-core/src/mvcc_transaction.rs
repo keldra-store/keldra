@@ -37,6 +37,9 @@ pub struct LogicalKey {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PointObservation {
     pub key: LogicalKey,
+    /// The newest committed row version visible at the transaction snapshot.
+    /// This includes a tombstone's commit version; `None` means the key had no
+    /// committed value or tombstone at that snapshot.
     pub observed_version: Option<CommitVersion>,
 }
 
@@ -62,6 +65,8 @@ pub enum PredicateKind {
 pub struct ExplicitPredicate {
     pub key: LogicalKey,
     pub kind: PredicateKind,
+    /// The observed row version, including a tombstone version when the
+    /// predicate observed a logically absent but previously deleted key.
     pub observed_version: Option<CommitVersion>,
 }
 
@@ -971,6 +976,7 @@ pub enum CertificationAbort {
     PointConflict { key_hash: [u8; 32] },
     RangeConflict { range_hash: [u8; 32] },
     PredicateConflict { key_hash: [u8; 32] },
+    AssignmentConflict { partition_id: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1180,6 +1186,7 @@ where
                 CertificationAbort::PointConflict { .. } => "point",
                 CertificationAbort::RangeConflict { .. } => "range",
                 CertificationAbort::PredicateConflict { .. } => "predicate",
+                CertificationAbort::AssignmentConflict { .. } => "assignment",
                 CertificationAbort::InvalidCommand(_) => "invalid_command",
             });
         }

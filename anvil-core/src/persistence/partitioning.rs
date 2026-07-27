@@ -9,7 +9,7 @@ use tokio::sync::Mutex as TokioMutex;
 const PARTITION_OWNER_ACQUIRE_LOCK_STRIPES: usize = 256;
 const PARTITION_OWNER_ACQUIRE_ATTEMPTS: usize = 32;
 const MESH_ROUTING_PAGE_SIZE: usize = 512;
-const MESH_ROUTING_ADMIN_RESULT_CAP: usize = 100_000;
+const MESH_ROUTING_ADMIN_RESULT_CAP: usize = mesh_directory::MVCC_ROUTING_LIST_HARD_LIMIT;
 
 static PARTITION_OWNER_ACQUIRE_LOCKS: LazyLock<Vec<TokioMutex<()>>> = LazyLock::new(|| {
     (0..PARTITION_OWNER_ACQUIRE_LOCK_STRIPES)
@@ -207,7 +207,7 @@ impl Persistence {
             now,
         )?;
         if let Some(existing) =
-            mesh_directory::read_bucket_locator(&self.storage, &locator.key()).await?
+            mesh_directory::read_bucket_locator_mvcc(self.mvcc()?, &locator.key())?
             && existing.status == mesh_directory::BucketLocatorStatus::Deleted
         {
             locator.generation = existing.generation.saturating_add(1);
@@ -235,7 +235,7 @@ impl Persistence {
         let tenant_id = mesh_directory::TenantId::new(bucket.tenant_id.to_string())?;
         let bucket_name = mesh_directory::BucketName::canonicalize(&bucket.name)?;
         let key = mesh_directory::BucketLocatorKey::new(tenant_id, bucket_name);
-        let Some(existing) = mesh_directory::read_bucket_locator(&self.storage, &key).await? else {
+        let Some(existing) = mesh_directory::read_bucket_locator_mvcc(self.mvcc()?, &key)? else {
             return Ok(());
         };
         if existing.status == mesh_directory::BucketLocatorStatus::Deleted {
@@ -254,7 +254,10 @@ impl Persistence {
         tenant_name: &str,
     ) -> Result<Option<mesh_directory::TenantNameDescriptor>> {
         let tenant_name = mesh_directory::TenantName::canonicalize(tenant_name)?;
-        Ok(mesh_directory::read_tenant_name_descriptor(&self.storage, &tenant_name).await?)
+        Ok(mesh_directory::read_tenant_name_descriptor_mvcc(
+            self.mvcc()?,
+            &tenant_name,
+        )?)
     }
 
     pub async fn get_mesh_bucket_locator(
@@ -266,7 +269,10 @@ impl Persistence {
             mesh_directory::TenantId::new(tenant_id.to_string())?,
             mesh_directory::BucketName::canonicalize(bucket_name)?,
         );
-        Ok(mesh_directory::read_bucket_locator(&self.storage, &key).await?)
+        Ok(mesh_directory::read_bucket_locator_mvcc(
+            self.mvcc()?,
+            &key,
+        )?)
     }
 
     pub async fn list_mesh_routing_records(
@@ -278,30 +284,13 @@ impl Persistence {
             .unwrap_or_else(|| mesh_directory::RoutingRecordFamily::all().to_vec());
         let mut records = Vec::new();
         for family in families {
-            let mut after_tuple_key = None;
-            loop {
-                let page = mesh_directory::page_projected_routing_records(
-                    &self.storage,
-                    family,
-                    after_tuple_key.as_deref(),
-                    MESH_ROUTING_PAGE_SIZE,
-                )
-                .await?;
-                if records.len().saturating_add(page.records.len()) > MESH_ROUTING_ADMIN_RESULT_CAP
-                {
-                    return Err(anyhow!(
-                        "mesh routing admin result exceeds bounded cap of {MESH_ROUTING_ADMIN_RESULT_CAP} records"
-                    ));
-                }
-                records.extend(page.records);
-                let Some(next_tuple_key) = page.next_tuple_key else {
-                    break;
-                };
-                if after_tuple_key.as_ref() == Some(&next_tuple_key) {
-                    return Err(anyhow!("mesh routing page cursor did not advance"));
-                }
-                after_tuple_key = Some(next_tuple_key);
-            }
+            let remaining = MESH_ROUTING_ADMIN_RESULT_CAP.saturating_sub(records.len());
+            let family_records = mesh_directory::list_routing_record_descriptors_mvcc(
+                self.mvcc()?,
+                family,
+                remaining,
+            )?;
+            records.extend(family_records);
         }
         Ok(records)
     }
@@ -558,34 +547,12 @@ impl Persistence {
         &self,
         region: &str,
     ) -> Result<Vec<mesh_directory::BucketLocatorDescriptor>> {
-        let mut locators = Vec::new();
-        let mut after_tuple_key = None;
-        loop {
-            let page = mesh_directory::page_bucket_locators(
-                &self.storage,
-                after_tuple_key.as_deref(),
-                MESH_ROUTING_PAGE_SIZE,
-            )
-            .await?;
-            if locators.len().saturating_add(page.locators.len()) > MESH_ROUTING_ADMIN_RESULT_CAP {
-                return Err(anyhow!(
-                    "regional bucket locator result exceeds bounded cap of {MESH_ROUTING_ADMIN_RESULT_CAP} records"
-                ));
-            }
-            locators.extend(
-                page.locators
-                    .into_iter()
-                    .filter(|locator| locator.home_region.as_str() == region),
-            );
-            let Some(next_tuple_key) = page.next_tuple_key else {
-                break;
-            };
-            if after_tuple_key.as_ref() == Some(&next_tuple_key) {
-                return Err(anyhow!("bucket locator page cursor did not advance"));
-            }
-            after_tuple_key = Some(next_tuple_key);
-        }
-        Ok(locators)
+        let locators =
+            mesh_directory::list_bucket_locators_mvcc(self.mvcc()?, MESH_ROUTING_ADMIN_RESULT_CAP)?;
+        Ok(locators
+            .into_iter()
+            .filter(|locator| locator.home_region.as_str() == region)
+            .collect())
     }
 
     pub(super) async fn write_mesh_bucket_locator_descriptor(
@@ -623,8 +590,7 @@ impl Persistence {
         if bucket.region == target_region {
             return Ok(bucket);
         }
-        crate::mesh_lifecycle::ensure_region_accepts_new_writes(&self.storage, target_region)
-            .await?;
+        crate::mesh_lifecycle::ensure_region_accepts_new_writes_mvcc(self.mvcc()?, target_region)?;
 
         let target_cell = self
             .choose_bucket_home_cell(target_region)
@@ -633,8 +599,7 @@ impl Persistence {
         let tenant = mesh_directory::TenantId::new(tenant_id.to_string())?;
         let name = mesh_directory::BucketName::canonicalize(bucket_name)?;
         let key = mesh_directory::BucketLocatorKey::new(tenant, name);
-        let existing = mesh_directory::read_bucket_locator(&self.storage, &key)
-            .await?
+        let existing = mesh_directory::read_bucket_locator_mvcc(self.mvcc()?, &key)?
             .ok_or_else(|| anyhow!("bucket locator not found"))?;
 
         let mut moved = existing.clone();

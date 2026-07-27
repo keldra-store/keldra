@@ -943,6 +943,26 @@ impl CoreStore {
         Ok(bytes)
     }
 
+    pub(super) async fn admitted_mutation_batch(
+        &self,
+        admission: &CorePendingMutationRecord,
+    ) -> Result<CoreMutationBatch> {
+        let shard = admission.target.admission_shard();
+        let (stored, inline_payload, _) = self
+            .read_pending_mutation_at(&shard.hash, admission.sequence)?
+            .ok_or_else(|| anyhow!("CoreStore admitted mutation batch has no pending row"))?;
+        if stored.mutation_id != admission.mutation_id
+            || stored.sequence != admission.sequence
+            || stored.target != admission.target
+        {
+            bail!("CoreStore admitted mutation batch point state is inconsistent");
+        }
+        let payload = self
+            .pending_mutation_payload_bytes(&stored, &inline_payload)
+            .await?;
+        decode_core_mutation_batch(&payload)
+    }
+
     pub(super) async fn next_core_mutation_sequence(
         &self,
         target: &CorePendingMutationTarget,

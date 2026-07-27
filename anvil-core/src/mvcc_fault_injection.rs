@@ -6,6 +6,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
+#[cfg(test)]
+use std::{cell::RefCell, future::Future};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum FaultPoint {
@@ -86,6 +88,21 @@ impl DeterministicFaults {
 static INSTALLED: OnceLock<Mutex<Option<DeterministicFaults>>> = OnceLock::new();
 
 #[cfg(test)]
+tokio::task_local! {
+    static SCOPED: RefCell<DeterministicFaults>;
+}
+
+/// Applies deterministic faults only to the supplied async task. Background
+/// maintenance tasks in the same test process cannot consume these ordinals.
+#[cfg(test)]
+pub async fn scoped<F>(faults: DeterministicFaults, future: F) -> F::Output
+where
+    F: Future,
+{
+    SCOPED.scope(RefCell::new(faults), future).await
+}
+
+#[cfg(test)]
 pub fn install(faults: DeterministicFaults) {
     *INSTALLED.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(faults);
 }
@@ -119,6 +136,9 @@ pub fn hit(point: FaultPoint) -> Result<(), InjectedFault> {
         == Some(format!("{point:?}").as_str())
     {
         std::process::abort();
+    }
+    if let Ok(result) = SCOPED.try_with(|faults| faults.borrow_mut().check(point)) {
+        return result;
     }
     let mut installed = INSTALLED.get_or_init(|| Mutex::new(None)).lock().unwrap();
     match installed.as_mut() {

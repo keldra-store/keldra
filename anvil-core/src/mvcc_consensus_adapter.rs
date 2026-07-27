@@ -162,6 +162,33 @@ pub(crate) fn to_consensus_command(
     advanced_range_stamps.sort();
     advanced_range_stamps.dedup();
 
+    let mut assignment_predicates = request
+        .assignment_predicates
+        .iter()
+        .map(|predicate| consensus::AssignmentPredicate {
+            partition_id: predicate.partition_id,
+            assignment_epoch: predicate.assignment_epoch,
+            topology_epoch: predicate.topology_epoch,
+            owner: node_incarnation(&predicate.owner),
+        })
+        .collect::<Vec<_>>();
+    assignment_predicates.sort_by_key(|predicate| predicate.partition_id);
+    if assignment_predicates
+        .windows(2)
+        .any(|pair| pair[0].partition_id == pair[1].partition_id)
+    {
+        anyhow::bail!("assignment predicates must be unique by partition");
+    }
+    if assignment_predicates.iter().any(|predicate| {
+        predicate.partition_id == 0
+            || predicate.assignment_epoch == 0
+            || predicate.topology_epoch == 0
+            || predicate.owner.node_id.0 == 0
+            || predicate.owner.incarnation == 0
+    }) {
+        anyhow::bail!("assignment predicates require non-zero exact authority");
+    }
+
     let command = consensus::CertifyTransaction {
         cluster_id_hash: cluster_id_hash(&request.cluster_id),
         transaction_id: transaction_id(&request.cluster_id, &request.transaction_id),
@@ -169,16 +196,7 @@ pub(crate) fn to_consensus_command(
         point_observations,
         range_observations,
         predicates,
-        assignment_predicates: request
-            .assignment_predicates
-            .iter()
-            .map(|predicate| consensus::AssignmentPredicate {
-                partition_id: predicate.partition_id,
-                assignment_epoch: predicate.assignment_epoch,
-                topology_epoch: predicate.topology_epoch,
-                owner: node_incarnation(&predicate.owner),
-            })
-            .collect(),
+        assignment_predicates,
         written_point_keys,
         written_points,
         advanced_range_stamps,
@@ -189,7 +207,7 @@ pub(crate) fn to_consensus_command(
             product::DurabilityLevel::Quorum => consensus::DurabilityLevel::Quorum,
             product::DurabilityLevel::Erasure => consensus::DurabilityLevel::Erasure,
         },
-        durable_holders: valid_durable_holders(request),
+        durable_holders: valid_bundle_holders(&request.cluster_id, &request.bundle_holders),
     };
     if serde_json::to_vec(&command)?.len() > request.max_command_bytes {
         anyhow::bail!("transaction exceeds certification command byte limit");
@@ -197,40 +215,18 @@ pub(crate) fn to_consensus_command(
     Ok(command)
 }
 
-fn valid_durable_holders(
-    request: &product::CertificationRequest,
+fn valid_bundle_holders(
+    cluster_id: &str,
+    evidence: &[product::BundleDurabilityEvidence],
 ) -> Vec<consensus::NodeIncarnation> {
     let mut holders = BTreeSet::new();
-    for evidence in &request.bundle_holders {
-        if evidence.cluster_id == request.cluster_id
-            && evidence.complete
-            && evidence.hash_verified
-            && evidence.fsynced
+    for holder in evidence {
+        if holder.cluster_id == cluster_id
+            && holder.complete
+            && holder.hash_verified
+            && holder.fsynced
         {
-            holders.insert(node_incarnation(&evidence.node));
-        }
-    }
-    for evidence in &request.object_durability {
-        match evidence {
-            product::ObjectDurabilityEvidence::LocalRepresentation {
-                cluster_id,
-                node,
-                complete: true,
-                hash_verified: true,
-                fsynced: true,
-                ..
-            }
-            | product::ObjectDurabilityEvidence::ShardPlacement {
-                cluster_id,
-                node,
-                complete: true,
-                hash_verified: true,
-                fsynced: true,
-                ..
-            } if cluster_id == &request.cluster_id => {
-                holders.insert(node_incarnation(node));
-            }
-            _ => {}
+            holders.insert(node_incarnation(&holder.node));
         }
     }
     holders.into_iter().collect()
@@ -258,6 +254,9 @@ fn from_consensus_result(result: consensus::CertificationResult) -> product::Cer
                 }
                 consensus::CertificationAbort::PredicateConflict { key, .. } => {
                     product::CertificationAbort::PredicateConflict { key_hash: key.0 }
+                }
+                consensus::CertificationAbort::AssignmentConflict { partition_id, .. } => {
+                    product::CertificationAbort::AssignmentConflict { partition_id }
                 }
             };
             product::CertificationResult::Aborted { reason }
@@ -445,7 +444,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_holders_never_promote_evidence_from_another_cluster() {
+    fn bundle_holders_never_promote_evidence_from_another_cluster() {
         let mut request = request();
         request
             .bundle_holders
@@ -457,21 +456,9 @@ mod tests {
                 hash_verified: true,
                 fsynced: true,
             });
-        request
-            .object_durability
-            .push(product::ObjectDurabilityEvidence::LocalRepresentation {
-                cluster_id: "foreign".into(),
-                object_hash: format!("sha256:{}", "b".repeat(64)),
-                node: node("foreign-object"),
-                failure_domain: "zone-foreign".into(),
-                complete: true,
-                hash_verified: true,
-                fsynced: true,
-            });
 
-        let holders = valid_durable_holders(&request);
+        let holders = valid_bundle_holders(&request.cluster_id, &request.bundle_holders);
         assert!(!holders.contains(&node_incarnation(&node("foreign-bundle"))));
-        assert!(!holders.contains(&node_incarnation(&node("foreign-object"))));
     }
 
     fn request_for_bundle(bundle: product::TransactionBundle) -> product::CertificationRequest {
@@ -512,9 +499,40 @@ mod tests {
     }
 
     #[test]
-    fn invalid_durability_evidence_never_becomes_a_raft_holder() {
+    fn only_valid_bundle_evidence_becomes_a_raft_holder() {
+        let mut request = request();
+        request
+            .bundle_holders
+            .push(bundle_evidence("invalid-bundle", true, false, true));
+
+        let command = to_consensus_command(&request).unwrap();
+        assert_eq!(command.durable_holders.len(), 2);
+        assert!(
+            command
+                .durable_holders
+                .contains(&node_incarnation(&node("a")))
+        );
+        assert!(
+            command
+                .durable_holders
+                .contains(&node_incarnation(&node("c")))
+        );
+        assert!(
+            !command
+                .durable_holders
+                .contains(&node_incarnation(&node("invalid-bundle")))
+        );
+    }
+
+    #[test]
+    fn object_durability_nodes_never_become_raft_bundle_holders() {
         let command = to_consensus_command(&request()).unwrap();
-        assert_eq!(command.durable_holders.len(), 3);
+        assert_eq!(command.durable_holders.len(), 2);
+        assert!(
+            !command
+                .durable_holders
+                .contains(&node_incarnation(&node("b")))
+        );
         assert!(
             !command
                 .durable_holders
@@ -594,6 +612,28 @@ mod tests {
                 reason: product::CertificationAbort::RangeConflict {
                     range_hash: range.0,
                 },
+            }
+        );
+    }
+
+    #[test]
+    fn assignment_conflict_maps_to_product_partition_identity() {
+        let aborted = from_consensus_result(consensus::CertificationResult::Aborted {
+            at_version: consensus::CommitVersion(20),
+            bundle_hash: consensus::BundleHash([1; 32]),
+            reason: consensus::CertificationAbort::AssignmentConflict {
+                partition_id: 41,
+                expected_epoch: consensus::CommitVersion(17),
+                actual_epoch: Some(consensus::CommitVersion(18)),
+                expected_topology_epoch: consensus::CommitVersion(7),
+                actual_topology_epoch: consensus::CommitVersion(8),
+            },
+        });
+
+        assert_eq!(
+            aborted,
+            product::CertificationResult::Aborted {
+                reason: product::CertificationAbort::AssignmentConflict { partition_id: 41 },
             }
         );
     }

@@ -72,6 +72,43 @@ pub struct VisibleRow {
     pub value: Vec<u8>,
 }
 
+/// The newest committed row version visible at one snapshot.
+///
+/// Value-facing reads intentionally flatten both [`Self::Unwritten`] and
+/// [`Self::Tombstone`] to `None`. Transaction certification must retain the
+/// distinction: a tombstone is an observed committed write whose version must
+/// participate in conflict detection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PointSnapshot {
+    Unwritten,
+    Tombstone { commit_version: CommitVersion },
+    Value(VisibleRow),
+}
+
+impl PointSnapshot {
+    pub fn observed_version(&self) -> Option<CommitVersion> {
+        match self {
+            Self::Unwritten => None,
+            Self::Tombstone { commit_version } => Some(*commit_version),
+            Self::Value(row) => Some(row.commit_version),
+        }
+    }
+
+    pub fn visible(&self) -> Option<&VisibleRow> {
+        match self {
+            Self::Value(row) => Some(row),
+            Self::Unwritten | Self::Tombstone { .. } => None,
+        }
+    }
+
+    pub fn into_visible(self) -> Option<VisibleRow> {
+        match self {
+            Self::Value(row) => Some(row),
+            Self::Unwritten | Self::Tombstone { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommittedIdempotencyResult {
     pub transaction_id: String,
@@ -198,7 +235,7 @@ impl MvccStore {
                     if record.state == ObjectMaterialisationState::Complete {
                         continue;
                     }
-                    record.job.target_logical_identity
+                    record.job.assignment_logical_identity()
                 } else if kind == "shard-repair" {
                     let record: ShardRepairRecord = serde_json::from_slice(&value)?;
                     if record.state == ShardRepairState::Complete {
@@ -384,6 +421,9 @@ impl MvccStore {
         if bundle.cluster_id != self.cluster_id {
             bail!("transaction bundle belongs to another cluster");
         }
+        let current_decision_watermark = decision_position
+            .map(|position| self.validate_decision_position_unlocked(position))
+            .transpose()?;
         let identity = bundle.identity()?.hash;
         let applied_key = self.key(&commit_version.to_be_bytes());
         let applied_cf = self.cf(CF_APPLIED)?;
@@ -397,6 +437,18 @@ impl MvccStore {
             bail!("commit version {commit_version} was already applied with another bundle");
         }
 
+        if let (Some(position), Some(current)) = (decision_position, current_decision_watermark) {
+            if position <= current {
+                bail!(
+                    "MVCC decision position {position} was already processed without commit version {commit_version}"
+                );
+            }
+            if commit_version != position {
+                bail!(
+                    "unseen commit version {commit_version} cannot be applied at decision position {position}"
+                );
+            }
+        }
         let applied_version = self.applied_version()?;
         if commit_version <= applied_version {
             bail!(
@@ -902,6 +954,16 @@ impl MvccStore {
         key: &LogicalKey,
         snapshot_version: CommitVersion,
     ) -> Result<Option<VisibleRow>> {
+        Ok(self.read_point_at(key, snapshot_version)?.into_visible())
+    }
+
+    /// Reads the complete point state at `snapshot_version`, retaining a
+    /// tombstone's commit version for MVCC conflict observations.
+    pub fn read_point_at(
+        &self,
+        key: &LogicalKey,
+        snapshot_version: CommitVersion,
+    ) -> Result<PointSnapshot> {
         let gc_watermark = self.gc_watermark()?;
         if snapshot_version < gc_watermark {
             bail!("snapshot {snapshot_version} is below local GC watermark {gc_watermark}");
@@ -919,14 +981,14 @@ impl MvccStore {
             .db
             .iterator_cf(versions_cf, IteratorMode::From(&seek, Direction::Forward));
         let Some(row) = rows.next() else {
-            return Ok(None);
+            return Ok(PointSnapshot::Unwritten);
         };
         let (encoded_key, encoded_value) = row?;
         if !encoded_key.starts_with(&prefix) {
-            return Ok(None);
+            return Ok(PointSnapshot::Unwritten);
         }
         let version = decode_versioned_key(self.unscoped(&encoded_key)?)?.1;
-        decode_visible_row(version, &encoded_value)
+        decode_point_snapshot(version, &encoded_value)
     }
 
     pub fn read_latest(&self, key: &LogicalKey) -> Result<Option<VisibleRow>> {
@@ -937,8 +999,14 @@ impl MvccStore {
         else {
             return Ok(None);
         };
-        let version = decode_u64(&head, "MVCC head")?;
-        self.read_at(key, version)
+        let head_version = decode_u64(&head, "MVCC head")?;
+        let readable_version = self.readable_version()?;
+        if head_version > readable_version {
+            bail!(
+                "MVCC head version {head_version} is above local readable version {readable_version}"
+            );
+        }
+        self.read_at(key, readable_version)
     }
 
     pub fn scan_table_prefix_at(
@@ -947,6 +1015,26 @@ impl MvccStore {
         application_prefix: &[u8],
         snapshot_version: CommitVersion,
     ) -> Result<Vec<(LogicalKey, VisibleRow)>> {
+        self.scan_table_prefix_at_bounded(
+            table_id,
+            application_prefix,
+            snapshot_version,
+            usize::MAX,
+        )
+    }
+
+    /// Scans at most `max_rows` visible rows from one table/application prefix.
+    ///
+    /// The bound is applied while iterating RocksDB heads, before callers
+    /// decode or retain application payloads. This is the primitive for admin
+    /// and control-plane list operations whose result sizes must be capped.
+    pub fn scan_table_prefix_at_bounded(
+        &self,
+        table_id: u16,
+        application_prefix: &[u8],
+        snapshot_version: CommitVersion,
+        max_rows: usize,
+    ) -> Result<Vec<(LogicalKey, VisibleRow)>> {
         let gc_watermark = self.gc_watermark()?;
         if snapshot_version < gc_watermark {
             bail!("snapshot {snapshot_version} is below local GC watermark {gc_watermark}");
@@ -954,6 +1042,9 @@ impl MvccStore {
         let readable_version = self.readable_version()?;
         if snapshot_version > readable_version {
             bail!("snapshot {snapshot_version} is above local readable version {readable_version}");
+        }
+        if max_rows == 0 {
+            return Ok(Vec::new());
         }
 
         let heads_cf = self.cf(CF_HEADS)?;
@@ -972,6 +1063,9 @@ impl MvccStore {
             }
             if let Some(row) = self.read_at(&key, snapshot_version)? {
                 visible.push((key, row));
+                if visible.len() == max_rows {
+                    break;
+                }
             }
         }
         Ok(visible)
@@ -999,7 +1093,7 @@ impl MvccStore {
     }
 
     fn advance_decision_watermark_unlocked(&self, position: CommitVersion) -> Result<()> {
-        let current = self.decision_watermark()?;
+        let current = self.validate_decision_position_unlocked(position)?;
         if position <= current {
             return Ok(());
         }
@@ -1010,6 +1104,20 @@ impl MvccStore {
             &durable_write_options(),
         )?;
         Ok(())
+    }
+
+    fn validate_decision_position_unlocked(
+        &self,
+        position: CommitVersion,
+    ) -> Result<CommitVersion> {
+        let current = self.decision_watermark()?;
+        let expected = current.saturating_add(1);
+        if position > expected {
+            bail!(
+                "MVCC decision gap: local watermark is {current}, expected decision {expected}, found {position}"
+            );
+        }
+        Ok(current)
     }
 
     /// Durably records that a committed `local` transaction lost its sole
@@ -3067,10 +3175,12 @@ fn encode_value(value: &[u8]) -> Vec<u8> {
     encoded
 }
 
-fn decode_visible_row(version: CommitVersion, encoded: &[u8]) -> Result<Option<VisibleRow>> {
+fn decode_point_snapshot(version: CommitVersion, encoded: &[u8]) -> Result<PointSnapshot> {
     match encoded.split_first() {
-        Some((&TOMBSTONE, [])) => Ok(None),
-        Some((&VALUE, value)) => Ok(Some(VisibleRow {
+        Some((&TOMBSTONE, [])) => Ok(PointSnapshot::Tombstone {
+            commit_version: version,
+        }),
+        Some((&VALUE, value)) => Ok(PointSnapshot::Value(VisibleRow {
             commit_version: version,
             value: value.to_vec(),
         })),
@@ -3825,6 +3935,17 @@ mod tests {
         assert_eq!(at_two.len(), 1);
         assert_eq!(at_two[0].0.application_key, b"part/a");
         assert_eq!(at_two[0].1.value, b"a2");
+
+        let bounded = store
+            .scan_table_prefix_at_bounded(7, b"part/", 1, 1)
+            .unwrap();
+        assert_eq!(bounded.len(), 1);
+        assert_eq!(
+            store
+                .scan_table_prefix_at_bounded(7, b"part/", 1, 0)
+                .unwrap(),
+            Vec::new()
+        );
     }
 
     #[test]
@@ -3850,7 +3971,7 @@ mod tests {
                 "size": 3,
             }),
             source_manifest_hash:
-                "sha256:0000000000000000000000000000000000000000000000000000000000000000".into(),
+                "0000000000000000000000000000000000000000000000000000000000000000".into(),
             content_type: Some("application/json".into()),
             user_metadata: serde_json::json!({}),
             index_policy_snapshot: serde_json::json!({}),
@@ -3964,6 +4085,47 @@ mod tests {
     }
 
     #[test]
+    fn point_snapshots_retain_tombstone_commit_versions() {
+        let temp = tempdir().unwrap();
+        let store = MvccStore::open(temp.path()).unwrap();
+        let row = key(1, b"deleted");
+        let never_written = key(1, b"never-written");
+        store
+            .apply_certified_bundle(
+                3,
+                &bundle("put-before-point-delete", |builder| {
+                    builder.put(row.clone(), b"value".to_vec());
+                }),
+            )
+            .unwrap();
+        store
+            .apply_certified_bundle(
+                8,
+                &bundle("point-delete", |builder| {
+                    builder.delete(row.clone());
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.read_point_at(&row, 7).unwrap(),
+            PointSnapshot::Value(VisibleRow {
+                commit_version: 3,
+                value: b"value".to_vec(),
+            })
+        );
+        assert_eq!(
+            store.read_point_at(&row, 8).unwrap(),
+            PointSnapshot::Tombstone { commit_version: 8 }
+        );
+        assert_eq!(
+            store.read_point_at(&never_written, 8).unwrap(),
+            PointSnapshot::Unwritten
+        );
+        assert_eq!(store.read_at(&row, 8).unwrap(), None);
+    }
+
+    #[test]
     fn non_data_decisions_advance_the_readable_snapshot_watermark() {
         let temp = tempdir().unwrap();
         let store = MvccStore::open(temp.path()).unwrap();
@@ -3981,6 +4143,65 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("snapshot 2 is above local readable version 1")
+        );
+    }
+
+    #[test]
+    fn decision_watermark_cannot_advance_over_a_missing_position() {
+        let temp = tempdir().unwrap();
+        let store = MvccStore::open(temp.path()).unwrap();
+
+        let error = store.advance_decision_watermark(2).unwrap_err();
+
+        assert!(error.to_string().contains("MVCC decision gap"));
+        assert_eq!(store.decision_watermark().unwrap(), 0);
+        assert_eq!(store.readable_version().unwrap(), 0);
+
+        store.advance_decision_watermark(1).unwrap();
+        store.advance_decision_watermark(2).unwrap();
+        assert_eq!(store.decision_watermark().unwrap(), 2);
+    }
+
+    #[test]
+    fn committed_bundle_cannot_skip_an_unapplied_decision() {
+        let temp = tempdir().unwrap();
+        let store = MvccStore::open(temp.path()).unwrap();
+        let first_key = key(1, b"first");
+        let second_key = key(1, b"second");
+        let first = bundle("first", |builder| {
+            builder.put(first_key.clone(), b"first".to_vec());
+        });
+        let second = bundle("second", |builder| {
+            builder.put(second_key.clone(), b"second".to_vec());
+        });
+
+        let error = store
+            .apply_certified_bundle_and_advance(2, &second, 2)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("MVCC decision gap"));
+        assert_eq!(store.applied_version().unwrap(), 0);
+        assert_eq!(store.decision_watermark().unwrap(), 0);
+        assert_eq!(store.readable_version().unwrap(), 0);
+        assert!(store.read_latest(&second_key).unwrap().is_none());
+        assert!(store.read_at(&second_key, 2).is_err());
+
+        store
+            .apply_certified_bundle_and_advance(1, &first, 1)
+            .unwrap();
+        store
+            .apply_certified_bundle_and_advance(2, &second, 2)
+            .unwrap();
+
+        assert_eq!(store.applied_version().unwrap(), 2);
+        assert_eq!(store.decision_watermark().unwrap(), 2);
+        assert_eq!(
+            store.read_latest(&first_key).unwrap().unwrap().value,
+            b"first"
+        );
+        assert_eq!(
+            store.read_latest(&second_key).unwrap().unwrap().value,
+            b"second"
         );
     }
 
@@ -4121,6 +4342,10 @@ mod tests {
             .unwrap();
 
         store.garbage_collect(6).unwrap();
+        assert_eq!(
+            store.read_point_at(&row, 6).unwrap(),
+            PointSnapshot::Tombstone { commit_version: 5 }
+        );
         assert_eq!(store.read_at(&row, 6).unwrap(), None);
         assert_eq!(store.read_latest(&row).unwrap(), None);
     }

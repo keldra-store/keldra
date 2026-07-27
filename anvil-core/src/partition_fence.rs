@@ -398,16 +398,41 @@ impl OwnershipFenceWritePlan {
         principal: &str,
         now_unix_ms: u64,
     ) -> Result<()> {
+        self.stage_into_transaction_with_assignment(
+            mvcc,
+            transaction_id,
+            principal,
+            now_unix_ms,
+            None,
+        )
+        .await
+    }
+
+    async fn stage_into_transaction_with_assignment(
+        self,
+        mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+        transaction_id: &str,
+        principal: &str,
+        now_unix_ms: u64,
+        assignment: Option<&crate::mvcc_worker_authority::AssignmentGuard>,
+    ) -> Result<()> {
         mvcc.open_transactions.binding(transaction_id, principal)?;
-        let assignment = mvcc
-            .reconcile_work_assignment("ownership-fence", &self.assignment_identity)
-            .await?
-            .ok_or_else(|| anyhow!("local node does not own the ownership-fence assignment"))?;
+        let reconciled;
+        let assignment = if let Some(assignment) = assignment {
+            mvcc.validate_assignment(assignment)?;
+            assignment
+        } else {
+            reconciled = mvcc
+                .reconcile_work_assignment("ownership-fence", &self.assignment_identity)
+                .await?
+                .ok_or_else(|| anyhow!("local node does not own the ownership-fence assignment"))?;
+            &reconciled
+        };
         mvcc.stage_product_mutations(transaction_id, principal, self.mutations, now_unix_ms)?;
         for (key, predicate) in self.predicates {
             mvcc.stage_predicate(transaction_id, principal, key, predicate, now_unix_ms)?;
         }
-        mvcc.stage_assignment_guard(transaction_id, principal, &assignment, now_unix_ms)
+        mvcc.stage_assignment_guard(transaction_id, principal, assignment, now_unix_ms)
     }
 }
 
@@ -421,14 +446,49 @@ pub(crate) async fn commit_implicit_ownership_plan(
     signing_key: &[u8],
     planner: impl FnOnce(&str) -> Result<OwnershipFenceWritePlan>,
 ) -> Result<OwnershipFenceOutcome> {
+    commit_implicit_ownership_plan_with_assignment(
+        mvcc,
+        principal,
+        idempotency_key,
+        now_nanos,
+        tenant_id,
+        resource,
+        signing_key,
+        None,
+        planner,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn commit_implicit_ownership_plan_with_assignment(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    principal: &str,
+    idempotency_key: &str,
+    now_nanos: i64,
+    tenant_id: i64,
+    resource: &OwnershipResource,
+    signing_key: &[u8],
+    assignment: Option<&crate::mvcc_worker_authority::AssignmentGuard>,
+    planner: impl FnOnce(&str) -> Result<OwnershipFenceWritePlan>,
+) -> Result<OwnershipFenceOutcome> {
     let now_unix_ms = u64::try_from(now_nanos / 1_000_000).unwrap_or_default();
+    let assignment_scoped_idempotency_key = assignment.map(|assignment| {
+        format!(
+            "{idempotency_key}:assignment-{}-{}",
+            assignment.partition_id, assignment.assignment_epoch
+        )
+    });
+    let transaction_idempotency_key = assignment_scoped_idempotency_key
+        .as_deref()
+        .unwrap_or(idempotency_key);
     let handle = mvcc
         .open_transactions
         .begin(
             mvcc.runtime.as_ref(),
             mvcc.cluster_id(),
             principal,
-            idempotency_key,
+            transaction_idempotency_key,
             std::time::Duration::from_secs(30),
             crate::mvcc_transaction::DurabilityLevel::Quorum,
             crate::mvcc_transaction::ReadConsistency::Linearized,
@@ -441,8 +501,14 @@ pub(crate) async fn commit_implicit_ownership_plan(
     let planned_outcome = if status.state == "open" {
         let plan = planner(&handle.transaction_id)?;
         let outcome = plan.outcome.clone();
-        plan.stage_into_transaction(mvcc, &handle.transaction_id, principal, now_unix_ms)
-            .await?;
+        plan.stage_into_transaction_with_assignment(
+            mvcc,
+            &handle.transaction_id,
+            principal,
+            now_unix_ms,
+            assignment,
+        )
+        .await?;
         Some(outcome)
     } else {
         None

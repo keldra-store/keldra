@@ -19,7 +19,8 @@ use crate::media_extraction::{
 use crate::metadata_journal;
 use crate::partition_fence::{
     AcquireOwnership, MAX_OWNERSHIP_LEASE_MS, OwnershipPrincipal, OwnershipResource,
-    OwnershipResourceKind, acquire_ownership,
+    OwnershipResourceKind, RenewOwnership, plan_acquire_ownership_in_transaction,
+    plan_renew_ownership_in_transaction, read_ownership_fence_mvcc,
 };
 use crate::persistence::{AppendStream, AppendStreamRecord, Bucket, IndexDefinition, Object};
 use crate::storage::Storage;
@@ -42,8 +43,8 @@ use std::time::Duration;
 
 mod authority;
 mod helpers;
-use authority::IndexBuildOwnership;
 pub(crate) use authority::{DirectRepairIndexBuildAuthority, IndexBuildAuthority};
+use authority::{IndexBuildOwnership, internal_ownership_idempotency_key};
 use helpers::*;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -473,35 +474,40 @@ async fn build_full_text_index_from_source(
         &index_storage_id,
         builder_node_id,
         partition_owner_signing_key,
+        authority,
     )
     .await?;
     let staged_for_catalog = &staged_segment;
+    let catalog_assignment = ownership.assignment().clone();
     authority
         .publish_mvcc_with(
             storage,
             &ownership,
             partition_owner_signing_key,
             |preconditions| async move {
-                full_text_segment::publish_full_text_segment_catalog(
+                full_text_segment::publish_full_text_segment_catalog_with_assignment(
                     authority.mvcc()?,
                     staged_for_catalog,
                     &preconditions,
+                    &catalog_assignment,
                 )
                 .await
             },
         )
         .await?;
     let staged_for_locator = &staged_segment;
+    let locator_assignment = ownership.assignment().clone();
     authority
         .publish_mvcc_with(
             storage,
             &ownership,
             partition_owner_signing_key,
             |preconditions| async move {
-                full_text_segment::publish_full_text_segment_locator(
+                full_text_segment::publish_full_text_segment_locator_with_assignment(
                     authority.mvcc()?,
                     staged_for_locator,
                     &preconditions,
+                    &locator_assignment,
                 )
                 .await
             },
@@ -750,35 +756,40 @@ async fn build_typed_json_index_from_source(
         &index_storage_id,
         builder_node_id,
         partition_owner_signing_key,
+        authority,
     )
     .await?;
     let staged_for_catalog = &staged_segment;
+    let catalog_assignment = ownership.assignment().clone();
     authority
         .publish_mvcc_with(
             storage,
             &ownership,
             partition_owner_signing_key,
             |preconditions| async move {
-                typed_field_segment::publish_typed_field_segment_catalog(
+                typed_field_segment::publish_typed_field_segment_catalog_with_assignment(
                     authority.mvcc()?,
                     staged_for_catalog,
                     &preconditions,
+                    &catalog_assignment,
                 )
                 .await
             },
         )
         .await?;
     let staged_for_locator = &staged_segment;
+    let locator_assignment = ownership.assignment().clone();
     authority
         .publish_mvcc_with(
             storage,
             &ownership,
             partition_owner_signing_key,
             |preconditions| async move {
-                typed_field_segment::publish_typed_field_segment_locator(
+                typed_field_segment::publish_typed_field_segment_locator_with_assignment(
                     authority.mvcc()?,
                     staged_for_locator,
                     &preconditions,
+                    &locator_assignment,
                 )
                 .await
             },
@@ -961,35 +972,40 @@ pub(crate) async fn build_metadata_backed_index(
         &index_storage_id,
         builder_node_id,
         partition_owner_signing_key,
+        authority,
     )
     .await?;
     let staged_for_catalog = &staged_segment;
+    let catalog_assignment = ownership.assignment().clone();
     authority
         .publish_mvcc_with(
             storage,
             &ownership,
             partition_owner_signing_key,
             |preconditions| async move {
-                typed_field_segment::publish_typed_field_segment_catalog(
+                typed_field_segment::publish_typed_field_segment_catalog_with_assignment(
                     authority.mvcc()?,
                     staged_for_catalog,
                     &preconditions,
+                    &catalog_assignment,
                 )
                 .await
             },
         )
         .await?;
     let staged_for_locator = &staged_segment;
+    let locator_assignment = ownership.assignment().clone();
     authority
         .publish_mvcc_with(
             storage,
             &ownership,
             partition_owner_signing_key,
             |preconditions| async move {
-                typed_field_segment::publish_typed_field_segment_locator(
+                typed_field_segment::publish_typed_field_segment_locator_with_assignment(
                     authority.mvcc()?,
                     staged_for_locator,
                     &preconditions,
+                    &locator_assignment,
                 )
                 .await
             },
@@ -1378,35 +1394,40 @@ async fn build_vector_index_with_policy(
         &index_storage_id,
         builder_node_id,
         partition_owner_signing_key,
+        authority,
     )
     .await?;
     let staged_for_catalog = &staged_segment;
+    let catalog_assignment = ownership.assignment().clone();
     authority
         .publish_mvcc_with(
             storage,
             &ownership,
             partition_owner_signing_key,
             |preconditions| async move {
-                vector_segment::publish_vector_segment_catalog(
+                vector_segment::publish_vector_segment_catalog_with_assignment(
                     authority.mvcc()?,
                     staged_for_catalog,
                     &preconditions,
+                    &catalog_assignment,
                 )
                 .await
             },
         )
         .await?;
     let staged_for_locator = &staged_segment;
+    let locator_assignment = ownership.assignment().clone();
     authority
         .publish_mvcc_with(
             storage,
             &ownership,
             partition_owner_signing_key,
             |preconditions| async move {
-                vector_segment::publish_vector_segment_locator(
+                vector_segment::publish_vector_segment_locator_with_assignment(
                     authority.mvcc()?,
                     staged_for_locator,
                     &preconditions,
+                    &locator_assignment,
                 )
                 .await
             },
@@ -1496,7 +1517,7 @@ async fn publish_index_build_proof_and_checkpoint(
     builder_node_id: &str,
     signing_key: &[u8],
     authority: IndexBuildAuthority<'_>,
-    _ownership: &IndexBuildOwnership,
+    ownership: &IndexBuildOwnership,
 ) -> Result<derived_index_proof::DerivedIndexProof> {
     let payload_actor = authority.deterministic_payload_actor(builder_node_id).await;
     let publication_digest = deterministic_build_digest(source_manifest_hash, segment_hashes);
@@ -1543,18 +1564,21 @@ async fn publish_index_build_proof_and_checkpoint(
     let principal = format!("index-builder:{payload_actor}");
     let mut published = None;
     for attempt in 0..5u8 {
-        let assignment = mvcc
-            .reconcile_work_assignment("index-build", index_storage_id)
-            .await?
-            .ok_or_else(|| anyhow!("index build is assigned to another node"))?;
+        let assignment = ownership.assignment();
+        authority.mvcc()?.validate_assignment(assignment)?;
         let idempotency_key = format!(
-            "index-proof-checkpoint:{}:{}:{}:{}",
-            index_storage_id, generation, publication_digest, attempt
+            "index-proof-checkpoint:{}:{}:{}:{}:assignment-{}-{}",
+            index_storage_id,
+            generation,
+            publication_digest,
+            attempt,
+            assignment.partition_id,
+            assignment.assignment_epoch
         );
         let publish = |lease_predicate| {
             publish_index_build_mvcc_transaction(
                 mvcc,
-                &assignment,
+                assignment,
                 &principal,
                 &idempotency_key,
                 &prepared_proof,
@@ -1713,13 +1737,14 @@ fn deterministic_build_digest(source_manifest_hash: &str, segment_hashes: &[Stri
 
 #[allow(clippy::too_many_arguments)]
 async fn acquire_index_partition_watch_authority(
-    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     bucket_id: i64,
     partition_id: &str,
     payload: &IndexPartitionWatchPayload,
     builder_node_id: &str,
     signing_key: &[u8],
+    assignment: &crate::mvcc_worker_authority::AssignmentGuard,
 ) -> Result<index_partition_watch::IndexPartitionWatchWriteAuthority> {
     let resource_id = index_partition_watch::index_partition_watch_resource_id(
         tenant_id,
@@ -1737,19 +1762,90 @@ async fn acquire_index_partition_watch_authority(
     let ttl_nanos = i64::try_from(MAX_OWNERSHIP_LEASE_MS)?
         .checked_mul(1_000_000)
         .ok_or_else(|| anyhow!("index partition watch ownership TTL overflow"))?;
-    let acquired = acquire_ownership(
-        storage,
-        AcquireOwnership {
-            request_id: format!("index-watch-acquire-{resource_id}"),
-            idempotency_key: format!("index-watch-owner-{resource_id}"),
-            resource,
-            owner: OwnershipPrincipal::node(builder_node_id),
+    let owner = OwnershipPrincipal::node(builder_node_id);
+    let principal = format!("node:{builder_node_id}");
+    let existing = read_ownership_fence_mvcc(mvcc, owner.tenant_id, &resource, signing_key)?;
+    let acquired = if let Some(record) = existing.as_ref().filter(|record| {
+        record.owner.same_security_owner(&owner) && record.is_active_unexpired(now_nanos)
+    }) {
+        let idempotency_key = internal_ownership_idempotency_key(
+            "index-watch",
+            "renew",
+            &resource,
+            &owner,
+            record.generation,
+            record.fence,
+        );
+        let request = RenewOwnership {
+            request_id: idempotency_key.clone(),
+            resource: resource.clone(),
+            owner: owner.clone(),
+            current_fence: record.fence,
             now_nanos,
             ttl_nanos,
-        },
-        signing_key,
-    )
-    .await?;
+        };
+        crate::partition_fence::commit_implicit_ownership_plan_with_assignment(
+            mvcc,
+            &principal,
+            &idempotency_key,
+            now_nanos,
+            owner.tenant_id,
+            &resource,
+            signing_key,
+            Some(assignment),
+            |transaction_id| {
+                plan_renew_ownership_in_transaction(
+                    mvcc,
+                    transaction_id,
+                    &principal,
+                    request,
+                    signing_key,
+                )
+            },
+        )
+        .await?
+    } else {
+        let (observed_generation, observed_fence) = existing
+            .as_ref()
+            .map(|record| (record.generation, record.fence))
+            .unwrap_or_default();
+        let idempotency_key = internal_ownership_idempotency_key(
+            "index-watch",
+            "acquire",
+            &resource,
+            &owner,
+            observed_generation,
+            observed_fence,
+        );
+        let request = AcquireOwnership {
+            request_id: idempotency_key.clone(),
+            idempotency_key: idempotency_key.clone(),
+            resource: resource.clone(),
+            owner: owner.clone(),
+            now_nanos,
+            ttl_nanos,
+        };
+        crate::partition_fence::commit_implicit_ownership_plan_with_assignment(
+            mvcc,
+            &principal,
+            &idempotency_key,
+            now_nanos,
+            owner.tenant_id,
+            &resource,
+            signing_key,
+            Some(assignment),
+            |transaction_id| {
+                plan_acquire_ownership_in_transaction(
+                    mvcc,
+                    transaction_id,
+                    &principal,
+                    request,
+                    signing_key,
+                )
+            },
+        )
+        .await?
+    };
     Ok(index_partition_watch::IndexPartitionWatchWriteAuthority {
         owner_node_id: builder_node_id.to_string(),
         fence: acquired.record.fence,
@@ -1788,13 +1884,14 @@ async fn publish_index_build_watch(
         &digest,
     );
     let watch_authority = acquire_index_partition_watch_authority(
-        storage,
+        authority.mvcc()?,
         tenant_id,
         bucket_id,
         partition_id,
         &payload,
         builder_node_id,
         signing_key,
+        ownership.assignment(),
     )
     .await?;
     let prepared = index_partition_watch::prepare_index_partition_watch_record(
@@ -1810,16 +1907,18 @@ async fn publish_index_build_watch(
         signing_key,
     )
     .await?;
+    let watch_assignment = ownership.assignment().clone();
     authority
         .publish_mvcc_with(
             storage,
             ownership,
             signing_key,
             |preconditions| async move {
-                index_partition_watch::publish_prepared_index_partition_watch(
+                index_partition_watch::publish_prepared_index_partition_watch_with_assignment(
                     authority.mvcc()?,
                     prepared,
                     &preconditions,
+                    &watch_assignment,
                 )
                 .await
                 .map(|_| ())

@@ -275,14 +275,15 @@ impl MvccSubsystem {
             .open_transactions
             .handle(transaction_id)?
             .snapshot_version;
-        let visible = self.runtime.read_at(&key, snapshot)?;
+        let point = self.runtime.read_point_at(&key, snapshot)?;
+        let visible = point.visible();
         let satisfied = match &kind {
             crate::mvcc_transaction::PredicateKind::Unique
             | crate::mvcc_transaction::PredicateKind::Absent => visible.is_none(),
             crate::mvcc_transaction::PredicateKind::Exists => visible.is_some(),
-            crate::mvcc_transaction::PredicateKind::ValueHash(expected) => visible
-                .as_ref()
-                .is_some_and(|row| blake3::hash(&row.value).as_bytes() == expected),
+            crate::mvcc_transaction::PredicateKind::ValueHash(expected) => {
+                visible.is_some_and(|row| blake3::hash(&row.value).as_bytes() == expected)
+            }
         };
         if !satisfied {
             bail!("MVCC transaction predicate is false at its snapshot");
@@ -292,7 +293,7 @@ impl MvccSubsystem {
             &binding.cluster_id,
             key,
             kind,
-            visible.map(|row| row.commit_version),
+            point.observed_version(),
             now_unix_ms,
         )
     }
@@ -348,6 +349,29 @@ impl MvccSubsystem {
         .await
     }
 
+    pub async fn autocommit_product_mutations_with_predicates_and_assignment(
+        &self,
+        principal: &str,
+        idempotency_key: &str,
+        mutations: Vec<ProductMutation>,
+        predicates: Vec<(LogicalKey, crate::mvcc_transaction::PredicateKind)>,
+        assignment: &crate::mvcc_worker_authority::AssignmentGuard,
+        durability: DurabilityLevel,
+        now_unix_ms: u64,
+    ) -> Result<u64> {
+        self.autocommit_product_mutations_with_predicates_outbox_and_assignment(
+            principal,
+            idempotency_key,
+            mutations,
+            predicates,
+            Vec::new(),
+            Some(assignment),
+            durability,
+            now_unix_ms,
+        )
+        .await
+    }
+
     pub async fn autocommit_product_mutations_with_predicates_and_outbox(
         &self,
         principal: &str,
@@ -358,16 +382,49 @@ impl MvccSubsystem {
         durability: DurabilityLevel,
         now_unix_ms: u64,
     ) -> Result<u64> {
+        self.autocommit_product_mutations_with_predicates_outbox_and_assignment(
+            principal,
+            idempotency_key,
+            mutations,
+            predicates,
+            outbox_events,
+            None,
+            durability,
+            now_unix_ms,
+        )
+        .await
+    }
+
+    async fn autocommit_product_mutations_with_predicates_outbox_and_assignment(
+        &self,
+        principal: &str,
+        idempotency_key: &str,
+        mutations: Vec<ProductMutation>,
+        predicates: Vec<(LogicalKey, crate::mvcc_transaction::PredicateKind)>,
+        outbox_events: Vec<crate::mvcc_outbox::StreamOutboxEvent>,
+        assignment: Option<&crate::mvcc_worker_authority::AssignmentGuard>,
+        durability: DurabilityLevel,
+        now_unix_ms: u64,
+    ) -> Result<u64> {
         if mutations.is_empty() {
             bail!("MVCC autocommit requires at least one mutation");
         }
+        let assignment_scoped_idempotency_key = assignment.map(|assignment| {
+            format!(
+                "{idempotency_key}:assignment-{}-{}",
+                assignment.partition_id, assignment.assignment_epoch
+            )
+        });
+        let transaction_idempotency_key = assignment_scoped_idempotency_key
+            .as_deref()
+            .unwrap_or(idempotency_key);
         let handle = self
             .open_transactions
             .begin(
                 self.runtime.as_ref(),
                 self.cluster_id(),
                 principal,
-                idempotency_key,
+                transaction_idempotency_key,
                 Duration::from_secs(30),
                 durability,
                 ReadConsistency::Linearized,
@@ -391,6 +448,14 @@ impl MvccSubsystem {
                 self.open_transactions.add_stream_event(
                     &handle.transaction_id,
                     event,
+                    now_unix_ms,
+                )?;
+            }
+            if let Some(assignment) = assignment {
+                self.stage_assignment_guard(
+                    &handle.transaction_id,
+                    principal,
+                    assignment,
                     now_unix_ms,
                 )?;
             }
@@ -455,8 +520,8 @@ impl MvccSubsystem {
             .map(|mutation| {
                 let observed_version = self
                     .runtime
-                    .read_at(&mutation.key, snapshot)?
-                    .map(|row| row.commit_version);
+                    .read_point_at(&mutation.key, snapshot)?
+                    .observed_version();
                 Ok(StagedLogicalMutation {
                     key: mutation.key,
                     observed_version,

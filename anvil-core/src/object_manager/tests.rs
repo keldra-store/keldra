@@ -65,7 +65,7 @@ async fn seeded_object_manager(
     let config = test_config(&storage_path);
     let storage = Storage::new_at(&config.storage_path).await.unwrap();
     let core_store = CoreStore::new(storage.clone()).await.unwrap();
-    let persistence = crate::test_support::persistence_with_mvcc(&config)
+    let persistence = crate::test_support::persistence_with_active_topology(&config)
         .await
         .unwrap();
     system_realm::ensure_bootstrapped(

@@ -190,8 +190,7 @@ async fn mesh_bucket_move_requires_routing_and_bucket_zanzibar_permissions() {
         anvil::mesh_directory::TenantId::new(tenant.tenant_id).unwrap(),
         anvil::mesh_directory::BucketName::canonicalize("movable-assets").unwrap(),
     );
-    let locator = anvil::mesh_directory::read_bucket_locator(&node.state.storage, &locator_key)
-        .await
+    let locator = anvil::mesh_directory::read_bucket_locator_mvcc(&node.state.mvcc, &locator_key)
         .unwrap()
         .unwrap();
     assert_eq!(locator.home_region.as_str(), "us-east-1");

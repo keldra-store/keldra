@@ -319,6 +319,24 @@ pub(crate) async fn publish_typed_field_segment_catalog(
     write_writer_segment_catalog_record(mvcc, &staged.catalog, additional_preconditions).await
 }
 
+pub(crate) async fn publish_typed_field_segment_catalog_with_assignment(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    staged: &StagedTypedFieldSegment,
+    additional_preconditions: &[(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )],
+    assignment: &crate::mvcc_worker_authority::AssignmentGuard,
+) -> Result<()> {
+    crate::writer_segment_catalog::write_writer_segment_catalog_record_with_assignment(
+        mvcc,
+        &staged.catalog,
+        additional_preconditions,
+        Some(assignment),
+    )
+    .await
+}
+
 pub(crate) async fn publish_typed_field_segment_locator(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     staged: &StagedTypedFieldSegment,
@@ -331,6 +349,24 @@ pub(crate) async fn publish_typed_field_segment_locator(
         mvcc,
         &staged.locator,
         additional_preconditions,
+    )
+    .await
+}
+
+pub(crate) async fn publish_typed_field_segment_locator_with_assignment(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    staged: &StagedTypedFieldSegment,
+    additional_preconditions: &[(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )],
+    assignment: &crate::mvcc_worker_authority::AssignmentGuard,
+) -> Result<()> {
+    index_coremeta::write_index_segment_coremeta_record_with_assignment(
+        mvcc,
+        &staged.locator,
+        additional_preconditions,
+        Some(assignment),
     )
     .await
 }

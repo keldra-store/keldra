@@ -1,40 +1,129 @@
 use super::*;
 use crate::partition_fence::{
-    PartitionRecoveryAcquire, acquire_partition_recovery, publish_partition_ready,
+    PartitionRecoveryAcquire, acquire_partition_recovery_mvcc, publish_partition_ready_mvcc,
 };
 use crate::storage::Storage;
+use crate::{
+    config::Config,
+    core_store::CoreStore,
+    mvcc_assignment_reconciler::BackgroundAssignmentReconciler,
+    mvcc_bootstrap::{MvccSubsystem, consensus_control_node_id},
+    mvcc_outbox::MvccOutboxRunner,
+    observability::Observability,
+};
+use std::path::Path;
 use tempfile::tempdir;
 
 const NOW: &str = "2026-07-02T00:00:00Z";
 const TEST_SIGNING_KEY: &[u8] = b"mesh-directory-control-stream-test-key";
 
-async fn collect_routing_records_for_test(
-    storage: &Storage,
+#[test]
+fn routing_mutation_idempotency_separates_lifecycle_transitions() {
+    let digest = ControlRecordDigest::blake3(b"descriptor");
+    let reserve = routing_mutation_idempotency_key(
+        "tenant_name",
+        "abcd",
+        "acme",
+        "create",
+        1,
+        &digest,
+        Some("req-1"),
+    );
+    let reserve_retry = routing_mutation_idempotency_key(
+        "tenant_name",
+        "abcd",
+        "acme",
+        "create",
+        1,
+        &digest,
+        Some("req-1"),
+    );
+    let activate = routing_mutation_idempotency_key(
+        "tenant_name",
+        "abcd",
+        "acme",
+        "upsert",
+        2,
+        &digest,
+        Some("req-1"),
+    );
+
+    assert_eq!(reserve, reserve_retry);
+    assert_ne!(reserve, activate);
+}
+
+fn test_config(storage_path: &Path) -> Config {
+    Config {
+        node_id: "node-test".to_string(),
+        public_api_addr: "127.0.0.1:50051".to_string(),
+        api_listen_addr: "127.0.0.1:0".to_string(),
+        allow_test_only_insecure_mvcc_transport: true,
+        storage_path: storage_path.to_string_lossy().into_owned(),
+        anvil_secret_encryption_key:
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        ..Config::default()
+    }
+}
+
+async fn storage_with_mvcc(storage_path: &Path) -> (Storage, MvccSubsystem) {
+    let config = test_config(storage_path);
+    let storage = Storage::new_at(storage_path).await.unwrap();
+    let core_store = CoreStore::new(storage.clone()).await.unwrap();
+    let mvcc = MvccSubsystem::bootstrap(&config, core_store.core_meta_database())
+        .await
+        .unwrap();
+    (storage, mvcc)
+}
+
+async fn drain_control_outbox(storage: &Storage, mvcc: &MvccSubsystem) {
+    let reconciler = BackgroundAssignmentReconciler::new(
+        mvcc.cluster_id(),
+        mvcc.consensus.clone(),
+        mvcc.runtime.local_store().clone(),
+    )
+    .unwrap();
+    let outbox = MvccOutboxRunner::new(
+        mvcc.runtime.local_store().clone(),
+        mvcc.consensus.clone(),
+        consensus_control_node_id(&mvcc.local_node.node_id),
+        mvcc.local_node.clone(),
+        CoreStore::new(storage.clone()).await.unwrap(),
+        Observability::default(),
+    )
+    .unwrap();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        reconciler.run_once().await.unwrap();
+        while outbox.run_once().await.unwrap() {}
+        if mvcc.runtime.local_store().outbox_backlog(0).unwrap().0 == 0 {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "MVCC control-stream outbox did not drain"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+fn collect_routing_records_for_test(
+    mvcc: &MvccSubsystem,
     family: RoutingRecordFamily,
 ) -> Vec<RoutingRecordDescriptor> {
-    let mut cursor = None;
-    let mut records = Vec::new();
-    loop {
-        let page = page_projected_routing_records(storage, family, cursor.as_deref(), 128)
-            .await
-            .unwrap();
-        records.extend(page.records);
-        let Some(next_cursor) = page.next_tuple_key else {
-            break;
-        };
-        cursor = Some(next_cursor);
-    }
-    records
+    list_routing_record_descriptors_mvcc(mvcc, family, MVCC_ROUTING_LIST_HARD_LIMIT).unwrap()
 }
 
 async fn mesh_permit(
     storage: &Storage,
+    mvcc: &MvccSubsystem,
     family: RoutingRecordFamily,
     partition: &str,
 ) -> PartitionWritePermit {
     let partition_id = control_partition_id(family.stream_family(), partition);
-    let recovering = acquire_partition_recovery(
+    let recovering = acquire_partition_recovery_mvcc(
         storage,
+        mvcc,
         PartitionRecoveryAcquire {
             partition_family: CONTROL_PARTITION_FAMILY.to_string(),
             partition_id: partition_id.clone(),
@@ -47,8 +136,9 @@ async fn mesh_permit(
     )
     .await
     .unwrap();
-    let ready = publish_partition_ready(
+    let ready = publish_partition_ready_mvcc(
         storage,
+        mvcc,
         CONTROL_PARTITION_FAMILY,
         &partition_id,
         "node-test",
@@ -63,11 +153,14 @@ async fn mesh_permit(
     ready.write_permit().unwrap()
 }
 
-fn authority(permit: &PartitionWritePermit) -> MeshControlWriteAuthority<'_> {
+fn authority<'a>(
+    permit: &'a PartitionWritePermit,
+    mvcc: &'a MvccSubsystem,
+) -> MeshControlWriteAuthority<'a> {
     MeshControlWriteAuthority {
         permit,
         signing_key: TEST_SIGNING_KEY,
-        mvcc: None,
+        mvcc: Some(mvcc),
     }
 }
 
@@ -203,7 +296,7 @@ fn tenant_name_canonicalization_rejects_dotted_names() {
 #[tokio::test]
 async fn tenant_name_reservation_is_create_once_and_promoted_by_generation() {
     let temp = tempdir().unwrap();
-    let storage = Storage::new_at(temp.path()).await.unwrap();
+    let (storage, mvcc) = storage_with_mvcc(temp.path()).await;
     let tenant_name = TenantName::canonicalize("Acme").unwrap();
     let tenant_id = TenantId::new("tenant_01").unwrap();
     let reserved = TenantNameDescriptor::reserved(
@@ -218,11 +311,12 @@ async fn tenant_name_reservation_is_create_once_and_promoted_by_generation() {
 
     let name_permit = mesh_permit(
         &storage,
+        &mvcc,
         RoutingRecordFamily::TenantName,
         &reserved.partition(),
     )
     .await;
-    let name_authority = authority(&name_permit);
+    let name_authority = authority(&name_permit, &mvcc);
 
     let written = reserve_tenant_name(&storage, &reserved, name_authority)
         .await
@@ -249,6 +343,7 @@ async fn tenant_name_reservation_is_create_once_and_promoted_by_generation() {
     assert_eq!(active_retry.status, TenantNameStatus::Active);
     assert_eq!(active_retry.generation, 2);
 
+    drain_control_outbox(&storage, &mvcc).await;
     let stream = mesh_control_stream::read_control_stream_page(
         &storage,
         RoutingRecordFamily::TenantName.stream_family(),
@@ -274,9 +369,9 @@ async fn tenant_name_reservation_is_create_once_and_promoted_by_generation() {
 }
 
 #[tokio::test]
-async fn routing_reads_and_lists_use_control_stream_when_projection_is_stale_or_missing() {
+async fn routing_reads_and_lists_use_mvcc_while_compatibility_projection_is_missing() {
     let temp = tempdir().unwrap();
-    let storage = Storage::new_at(temp.path()).await.unwrap();
+    let (storage, mvcc) = storage_with_mvcc(temp.path()).await;
     let tenant_name = TenantName::canonicalize("Acme").unwrap();
     let tenant_id = TenantId::new("tenant_01").unwrap();
     let reserved = TenantNameDescriptor::reserved(
@@ -290,70 +385,55 @@ async fn routing_reads_and_lists_use_control_stream_when_projection_is_stale_or_
     .unwrap();
     let name_permit = mesh_permit(
         &storage,
+        &mvcc,
         RoutingRecordFamily::TenantName,
         &reserved.partition(),
     )
     .await;
-    let name_authority = authority(&name_permit);
+    let name_authority = authority(&name_permit, &mvcc);
     reserve_tenant_name(&storage, &reserved, name_authority)
         .await
         .unwrap();
     let active = activate_tenant_name(&storage, &tenant_name, &tenant_id, 1, NOW, name_authority)
         .await
         .unwrap();
-    let mut stale_projection = active.clone();
-    stale_projection.tenant_id = TenantId::new("tenant_wrong").unwrap();
-    stale_projection.generation = 99;
-    write_descriptor(&storage, &active.descriptor_key(), &stale_projection)
-        .await
-        .unwrap();
-
-    let read = read_tenant_name_descriptor(&storage, &tenant_name)
-        .await
-        .unwrap()
-        .expect("tenant-name from stream");
-    assert_eq!(read.tenant_id.as_str(), "tenant_01");
-    assert_eq!(read.generation, 2);
-    let repaired_projection: serde_json::Value = serde_json::from_str(
-        &read_descriptor_projection_payload(&storage, &active.descriptor_key())
-            .await
-            .unwrap()
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(repaired_projection["tenant_id"], "tenant_01");
-    assert_eq!(repaired_projection["generation"], 2);
-
-    delete_descriptor_projection(&storage, &active.descriptor_key())
-        .await
-        .unwrap();
-    let recovered = read_tenant_name_descriptor(&storage, &tenant_name)
-        .await
-        .unwrap()
-        .expect("tenant-name rebuilt from stream");
-    assert_eq!(recovered.tenant_id.as_str(), "tenant_01");
     assert!(
         read_descriptor_projection_payload(&storage, &active.descriptor_key())
             .await
             .unwrap()
-            .is_some()
+            .is_none(),
+        "compatibility CoreStore projection should not be an MVCC read dependency"
     );
 
-    let listed = collect_routing_records_for_test(&storage, RoutingRecordFamily::TenantName).await;
+    let read = read_tenant_name_descriptor_mvcc(&mvcc, &tenant_name)
+        .unwrap()
+        .expect("tenant-name from native MVCC");
+    assert_eq!(read.tenant_id.as_str(), "tenant_01");
+    assert_eq!(read.generation, 2);
+
+    let listed = collect_routing_records_for_test(&mvcc, RoutingRecordFamily::TenantName);
     let listed_acme = listed
         .iter()
         .find(|record| record.record_key == "acme")
-        .expect("acme listed from stream");
+        .expect("acme listed from native MVCC");
     let listed_payload: serde_json::Value =
         serde_json::from_str(&listed_acme.payload_json).unwrap();
     assert_eq!(listed_payload["tenant_id"], "tenant_01");
     assert_eq!(listed_acme.generation, 2);
+
+    let bounded = list_routing_record_descriptors_mvcc(&mvcc, RoutingRecordFamily::TenantName, 0)
+        .unwrap_err();
+    assert!(
+        bounded
+            .to_string()
+            .contains("exceeds bounded limit of 0 records")
+    );
 }
 
 #[tokio::test]
 async fn tenant_name_reservation_rejects_competing_tenant_ids_and_stale_generations() {
     let temp = tempdir().unwrap();
-    let storage = Storage::new_at(temp.path()).await.unwrap();
+    let (storage, mvcc) = storage_with_mvcc(temp.path()).await;
     let tenant_name = TenantName::canonicalize("Acme").unwrap();
     let tenant_id = TenantId::new("tenant_01").unwrap();
     let reserved = TenantNameDescriptor::reserved(
@@ -367,11 +447,12 @@ async fn tenant_name_reservation_rejects_competing_tenant_ids_and_stale_generati
     .unwrap();
     let name_permit = mesh_permit(
         &storage,
+        &mvcc,
         RoutingRecordFamily::TenantName,
         &reserved.partition(),
     )
     .await;
-    let name_authority = authority(&name_permit);
+    let name_authority = authority(&name_permit, &mvcc);
     reserve_tenant_name(&storage, &reserved, name_authority)
         .await
         .unwrap();
@@ -404,7 +485,7 @@ async fn tenant_name_reservation_rejects_competing_tenant_ids_and_stale_generati
 #[tokio::test]
 async fn tenant_name_recovery_completes_reserved_name_when_locator_exists() {
     let temp = tempdir().unwrap();
-    let storage = Storage::new_at(temp.path()).await.unwrap();
+    let (storage, mvcc) = storage_with_mvcc(temp.path()).await;
     let mesh_id = MeshId::new("mesh_01").unwrap();
     let tenant_name = TenantName::canonicalize("Acme").unwrap();
     let tenant_id = TenantId::new("tenant_01").unwrap();
@@ -419,11 +500,12 @@ async fn tenant_name_recovery_completes_reserved_name_when_locator_exists() {
     .unwrap();
     let name_permit = mesh_permit(
         &storage,
+        &mvcc,
         RoutingRecordFamily::TenantName,
         &reserved.partition(),
     )
     .await;
-    let name_authority = authority(&name_permit);
+    let name_authority = authority(&name_permit, &mvcc);
     reserve_tenant_name(&storage, &reserved, name_authority)
         .await
         .unwrap();
@@ -437,13 +519,19 @@ async fn tenant_name_recovery_completes_reserved_name_when_locator_exists() {
     .unwrap();
     let locator_permit = mesh_permit(
         &storage,
+        &mvcc,
         RoutingRecordFamily::TenantLocator,
         &locator_descriptor.partition(),
     )
     .await;
-    create_tenant_locator(&storage, &locator_descriptor, authority(&locator_permit))
-        .await
-        .unwrap();
+    create_tenant_locator(
+        &storage,
+        &locator_descriptor,
+        authority(&locator_permit, &mvcc),
+    )
+    .await
+    .unwrap();
+    drain_control_outbox(&storage, &mvcc).await;
 
     let recovered = recover_tenant_name_reservation(
         &storage,
@@ -462,7 +550,7 @@ async fn tenant_name_recovery_completes_reserved_name_when_locator_exists() {
 #[tokio::test]
 async fn tenant_name_recovery_tombstones_expired_reserved_name_without_locator() {
     let temp = tempdir().unwrap();
-    let storage = Storage::new_at(temp.path()).await.unwrap();
+    let (storage, mvcc) = storage_with_mvcc(temp.path()).await;
     let tenant_name = TenantName::canonicalize("Acme").unwrap();
     let reserved = TenantNameDescriptor::reserved(
         MeshId::new("mesh_01").unwrap(),
@@ -475,14 +563,16 @@ async fn tenant_name_recovery_tombstones_expired_reserved_name_without_locator()
     .unwrap();
     let name_permit = mesh_permit(
         &storage,
+        &mvcc,
         RoutingRecordFamily::TenantName,
         &reserved.partition(),
     )
     .await;
-    let name_authority = authority(&name_permit);
+    let name_authority = authority(&name_permit, &mvcc);
     reserve_tenant_name(&storage, &reserved, name_authority)
         .await
         .unwrap();
+    drain_control_outbox(&storage, &mvcc).await;
 
     let recovered = recover_tenant_name_reservation(
         &storage,
@@ -497,7 +587,12 @@ async fn tenant_name_recovery_tombstones_expired_reserved_name_without_locator()
     assert_eq!(recovered.status, TenantNameStatus::Tombstoned);
     assert_eq!(recovered.generation, 2);
 
-    let listed = collect_routing_records_for_test(&storage, RoutingRecordFamily::TenantName).await;
+    drain_control_outbox(&storage, &mvcc).await;
+    let projected = read_tenant_name_descriptor_mvcc(&mvcc, &tenant_name)
+        .unwrap()
+        .expect("tombstoned tenant-name projected in MVCC");
+    assert_eq!(projected.status, TenantNameStatus::Tombstoned);
+    let listed = collect_routing_records_for_test(&mvcc, RoutingRecordFamily::TenantName);
     assert!(listed.iter().any(|record| {
         record.record_key == tenant_name.as_str()
             && record.payload_json.contains("\"status\":\"tombstoned\"")

@@ -67,20 +67,20 @@ impl PreparedBundleLog {
             return Ok(());
         }
         let original_len = self.file.metadata()?.len();
-        let append_result = append_record(
-            &mut self.file,
-            identity,
-            bytes,
-            unix_time_ms()?,
-            &mut self.index,
-        )
-        .and_then(|()| {
+        let append_result: Result<()> = (|| {
             #[cfg(any(test, debug_assertions))]
             crate::mvcc_fault_injection::hit(
                 crate::mvcc_fault_injection::FaultPoint::PreparedBundleWrite,
             )?;
+            append_record(
+                &mut self.file,
+                identity,
+                bytes,
+                unix_time_ms()?,
+                &mut self.index,
+            )?;
             self.file.sync_data().map_err(Into::into)
-        });
+        })();
         if let Err(error) = append_result {
             self.index.remove(&identity.hash);
             self.file

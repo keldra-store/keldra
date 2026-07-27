@@ -1804,8 +1804,8 @@ impl TestCluster {
 
         let projection = anvil_core::mesh_lifecycle::BootstrapMeshLifecycleProjection {
             regions: regions.clone(),
-            cells,
-            nodes,
+            cells: cells.clone(),
+            nodes: nodes.clone(),
         };
 
         let node_default_grants = self
@@ -1851,28 +1851,112 @@ impl TestCluster {
             projection,
         )
         .unwrap();
-        // The bootstrap snapshot is written directly to CoreStore.  The
-        // public control-plane handlers read the applied MVCC projection, so
-        // make the region descriptors visible there as well before exercising
-        // those handlers.  Without this bridge a freshly seeded test cluster
-        // can create buckets successfully (legacy region row) but reject
-        // host-alias operations with "region not found".
+
+        // Keep the physical bootstrap projection while CoreStore shard
+        // placement still reads it, but seed the authoritative topology through
+        // the same MVCC persistence APIs as production. Existing non-joining
+        // lifecycle state is preserved across TestCluster restarts.
+        let mut existing_regions = canonical
+            .persistence
+            .list_region_descriptors()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|descriptor| (descriptor.region.clone(), descriptor))
+            .collect::<BTreeMap<_, _>>();
+        let mut seeded_regions = Vec::with_capacity(regions.len());
         for region in &regions {
-            let input = region.clone();
-            let descriptor = match canonical.persistence.create_region_descriptor(input).await {
-                Ok(descriptor) => descriptor,
-                Err(anvil_core::mesh_lifecycle::LifecycleError::AlreadyExists { .. }) => continue,
-                Err(error) => panic!("seed MVCC region descriptor: {error:?}"),
+            let descriptor = match existing_regions.remove(&region.region) {
+                Some(descriptor) => descriptor,
+                None => canonical
+                    .persistence
+                    .create_region_descriptor(region.clone())
+                    .await
+                    .unwrap_or_else(|error| panic!("seed MVCC region descriptor: {error:?}")),
             };
-            canonical
-                .persistence
-                .transition_region_descriptor(
-                    &descriptor.region,
-                    descriptor.generation,
-                    anvil_core::mesh_lifecycle::LifecycleState::Active,
+            seeded_regions.push(descriptor);
+        }
+
+        let mut existing_cells = canonical
+            .persistence
+            .list_cell_descriptors(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|descriptor| {
+                (
+                    (descriptor.region.clone(), descriptor.cell_id.clone()),
+                    descriptor,
                 )
-                .await
-                .unwrap_or_else(|error| panic!("activate MVCC region descriptor: {error:?}"));
+            })
+            .collect::<BTreeMap<_, _>>();
+        for cell in &cells {
+            let key = (cell.region.clone(), cell.cell_id.clone());
+            let descriptor = match existing_cells.remove(&key) {
+                Some(descriptor) => descriptor,
+                None => canonical
+                    .persistence
+                    .register_cell_descriptor(cell.clone())
+                    .await
+                    .unwrap_or_else(|error| panic!("seed MVCC cell descriptor: {error:?}")),
+            };
+            if descriptor.state == anvil_core::mesh_lifecycle::LifecycleState::Joining {
+                canonical
+                    .persistence
+                    .transition_cell_descriptor(
+                        &descriptor.region,
+                        &descriptor.cell_id,
+                        descriptor.generation,
+                        anvil_core::mesh_lifecycle::LifecycleState::Active,
+                    )
+                    .await
+                    .unwrap_or_else(|error| panic!("activate MVCC cell descriptor: {error:?}"));
+            }
+        }
+
+        for descriptor in seeded_regions {
+            if descriptor.state == anvil_core::mesh_lifecycle::LifecycleState::Joining {
+                canonical
+                    .persistence
+                    .transition_region_descriptor(
+                        &descriptor.region,
+                        descriptor.generation,
+                        anvil_core::mesh_lifecycle::LifecycleState::Active,
+                    )
+                    .await
+                    .unwrap_or_else(|error| panic!("activate MVCC region descriptor: {error:?}"));
+            }
+        }
+
+        let mut existing_nodes = canonical
+            .persistence
+            .list_node_descriptors(None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|descriptor| (descriptor.node_id.clone(), descriptor))
+            .collect::<BTreeMap<_, _>>();
+        for node in &nodes {
+            let descriptor = match existing_nodes.remove(&node.node_id) {
+                Some(descriptor) => descriptor,
+                None => canonical
+                    .persistence
+                    .register_node_descriptor(node.clone())
+                    .await
+                    .unwrap_or_else(|error| panic!("seed MVCC node descriptor: {error:?}")),
+            };
+            if descriptor.state == anvil_core::mesh_lifecycle::LifecycleState::Joining {
+                canonical
+                    .persistence
+                    .transition_node_descriptor(
+                        &descriptor.node_id,
+                        descriptor.generation,
+                        anvil_core::mesh_lifecycle::LifecycleState::Active,
+                        None,
+                    )
+                    .await
+                    .unwrap_or_else(|error| panic!("activate MVCC node descriptor: {error:?}"));
+            }
         }
         if self.states.len() == 1 {
             install_canonical_coremeta_bootstrap_snapshot(&self.states);

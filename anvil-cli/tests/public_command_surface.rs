@@ -74,7 +74,12 @@ fn run_anvil_with_token(config_dir: &TempDir, token: &str, args: &[&str]) -> Out
     output
 }
 
-fn run_anvil_eventually(config_dir: &TempDir, args: &[&str], timeout: Duration) -> Output {
+fn run_anvil_eventually(
+    config_dir: &TempDir,
+    args: &[&str],
+    expected_stdout: &[&str],
+    timeout: Duration,
+) -> Output {
     let start = std::time::Instant::now();
     loop {
         let config_path = config_dir.path().join("config.toml");
@@ -87,7 +92,13 @@ fn run_anvil_eventually(config_dir: &TempDir, args: &[&str], timeout: Duration) 
             .args(&all_args)
             .output()
             .expect("run anvil");
-        if output.status.success() {
+        let contains_expected_stdout = {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            expected_stdout
+                .iter()
+                .all(|expected| stdout.contains(expected))
+        };
+        if output.status.success() && contains_expected_stdout {
             return output;
         }
         if start.elapsed() >= timeout {
@@ -368,6 +379,7 @@ async fn tenant_tutorial_commands_run_without_admin_port_e2e() {
             "--limit",
             "2",
         ],
+        &["app-v1.txt", "app-v2.txt"],
         Duration::from_secs(30),
     );
     let query_output = stdout(&query);

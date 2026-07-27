@@ -274,6 +274,9 @@ impl TonicReplicationStreamManager {
                 bail!("replication link is partitioned by fixture");
             }
         }
+        if target_cluster_id != &*self.cluster_id {
+            bail!("cross-cluster replication cannot provide transaction durability");
+        }
         let peer = self
             .peers
             .read()
@@ -281,9 +284,6 @@ impl TonicReplicationStreamManager {
             .get(&(target_cluster_id.to_string(), target.clone()))
             .with_context(|| format!("no replication endpoint for {target_cluster_id}/{target:?}"))?
             .clone();
-        if target_cluster_id != &*self.cluster_id {
-            bail!("cross-cluster replication cannot provide transaction durability");
-        }
         let mut peer = peer.lock().await;
         let mut last_error = None;
         for _ in 0..=self.options.reconnect_attempts {
@@ -351,6 +351,9 @@ impl TonicReplicationStreamManager {
         expected_length: u64,
         expected_hash: [u8; 32],
     ) -> Result<Vec<u8>> {
+        if cluster_id != &*self.cluster_id {
+            bail!("cross-cluster replication reads require a separate replication boundary");
+        }
         let peer = self
             .peers
             .read()
@@ -358,9 +361,6 @@ impl TonicReplicationStreamManager {
             .get(&(cluster_id.to_string(), target.clone()))
             .with_context(|| format!("no replication endpoint for {cluster_id}/{target:?}"))?
             .clone();
-        if cluster_id != &*self.cluster_id {
-            bail!("cross-cluster replication reads require a separate replication boundary");
-        }
         let mut peer = peer.lock().await;
         let mut last_error = None;
         for _ in 0..=self.options.reconnect_attempts {
@@ -1274,7 +1274,7 @@ mod tests {
             },
             "test-token",
             [ReplicationPeer {
-                cluster_id: "cluster-b".into(),
+                cluster_id: "cluster-a".into(),
                 node: remote.clone(),
                 endpoint: "http://127.0.0.1:9".into(),
             }],

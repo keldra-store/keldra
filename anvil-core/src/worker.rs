@@ -1162,7 +1162,11 @@ async fn handle_delete_bucket(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{config::Config, storage::Storage, test_support::persistence_with_mvcc};
+    use crate::{
+        config::Config,
+        storage::Storage,
+        test_support::{persistence_with_active_topology, persistence_with_mvcc},
+    };
     use chrono::Utc;
     use tempfile::tempdir;
 
@@ -1307,8 +1311,9 @@ mod tests {
     #[tokio::test]
     async fn object_metadata_compaction_task_seals_manifest() {
         let temp = tempdir().unwrap();
-        let config = test_config(temp.path());
-        let persistence = persistence_with_mvcc(&config).await.unwrap();
+        let mut config = test_config(temp.path());
+        config.region = "local".to_string();
+        let persistence = persistence_with_active_topology(&config).await.unwrap();
 
         persistence.create_region("local").await.unwrap();
         let bucket = persistence

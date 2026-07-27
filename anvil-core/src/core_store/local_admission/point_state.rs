@@ -428,6 +428,14 @@ pub(super) fn pending_mutation_request_hash(
     record: &CorePendingMutationRecord,
     inline_payload: &[u8],
 ) -> Result<String> {
+    if let CorePendingMutationTarget::MutationBatch {
+        logical_request_hash,
+        ..
+    } = &record.target
+    {
+        validate_hash(logical_request_hash, "mutation batch logical request hash")?;
+        return Ok(logical_request_hash.clone());
+    }
     let mut normalized = record.clone();
     normalized.sequence = 0;
     normalized.created_at_unix_nanos = 0;

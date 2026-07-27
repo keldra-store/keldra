@@ -81,7 +81,7 @@ impl<E: ObjectMaterialisationExecutor> ObjectMaterialisationRunner<E> {
                     self.mvcc
                         .claim_assignment(
                             "object-materialisation",
-                            &record.job.target_logical_identity,
+                            &record.job.assignment_logical_identity(),
                         )
                         .ok()
                         .flatten()
@@ -95,7 +95,7 @@ impl<E: ObjectMaterialisationExecutor> ObjectMaterialisationRunner<E> {
             .mvcc
             .claim_assignment(
                 "object-materialisation",
-                &record.job.target_logical_identity,
+                &record.job.assignment_logical_identity(),
             )?
             .context("materialisation assignment changed after claim")?;
         let lease_owner = guard.lease_owner(&self.worker_id);
@@ -167,21 +167,43 @@ impl MvccMaterialisationPublisher {
         Self { mvcc }
     }
 
-    pub async fn publish(&self, mut result: ObjectMaterialisationResult) -> Result<()> {
+    pub async fn publish(
+        &self,
+        mut result: ObjectMaterialisationResult,
+        assignment: &crate::mvcc_worker_authority::AssignmentGuard,
+    ) -> Result<()> {
         anyhow::ensure!(
             result.cluster_id == self.mvcc.cluster_id(),
             "materialisation result belongs to another cluster"
         );
+        self.mvcc.validate_assignment(assignment)?;
         result.state = ObjectMaterialisationState::Complete;
         let result_key = result.result_key()?;
         let status_key = result.status_key()?;
-        if let Some(existing) = self.mvcc.runtime.local_store().read_latest(&status_key)?
-            && existing.value == result.canonical_bytes()?
-        {
-            return Ok(());
+        if let Some(existing) = self.mvcc.runtime.local_store().read_latest(&status_key)? {
+            let existing_result: ObjectMaterialisationResult =
+                serde_json::from_slice(&existing.value)?;
+            anyhow::ensure!(
+                existing_result.canonical_bytes()? == existing.value,
+                "existing materialisation result is not canonical"
+            );
+            if existing_result.state == ObjectMaterialisationState::Complete {
+                anyhow::ensure!(
+                    existing_result.cluster_id == result.cluster_id
+                        && existing_result.target_logical_identity
+                            == result.target_logical_identity
+                        && existing_result.job_id == result.job_id,
+                    "materialisation target is already complete for another job"
+                );
+                return Ok(());
+            }
         }
         let principal = "system/object-materialisation";
         let now = now_unix_ms();
+        let idempotency_key = format!(
+            "object-materialisation:{}:assignment-{}-{}",
+            result.job_id, assignment.partition_id, assignment.assignment_epoch
+        );
         let handle = self
             .mvcc
             .open_transactions
@@ -189,7 +211,7 @@ impl MvccMaterialisationPublisher {
                 self.mvcc.runtime.as_ref(),
                 result.cluster_id.clone(),
                 principal,
-                format!("object-materialisation:{}", result.job_id),
+                idempotency_key,
                 Duration::from_secs(300),
                 DurabilityLevel::Quorum,
                 ReadConsistency::Linearized,
@@ -206,6 +228,8 @@ impl MvccMaterialisationPublisher {
             ],
             now,
         )?;
+        self.mvcc
+            .stage_assignment_guard(&handle.transaction_id, principal, assignment, now)?;
         let (outbox_partition_id, stream_partition) =
             object_materialisation_outbox_partition(&result.cluster_id)?;
         let event_payload = serde_json::to_vec(&serde_json::json!({
@@ -396,7 +420,9 @@ impl ObjectMaterialisationExecutor for MvccObjectMaterialisationExecutor {
                     source_manifest_hash: job.source_manifest_hash.clone(),
                 };
                 let authority = crate::index_builder::IndexBuildAuthority::DirectRepair(
-                    crate::index_builder::DirectRepairIndexBuildAuthority::new(&self.mvcc),
+                    crate::index_builder::DirectRepairIndexBuildAuthority::for_assignment(
+                        &self.mvcc, assignment,
+                    ),
                 );
                 let outcome = match frozen.kind.as_str() {
                     "typed_json" => {
@@ -455,22 +481,25 @@ impl ObjectMaterialisationExecutor for MvccObjectMaterialisationExecutor {
         self.mvcc.validate_assignment(assignment)?;
         self.publisher
             // Publishing is the final transactionally visible state transition.
-            .publish(ObjectMaterialisationResult {
-                schema: ObjectMaterialisationResult::SCHEMA.into(),
-                cluster_id: job.cluster_id.clone(),
-                target_logical_identity: job.target_logical_identity.clone(),
-                job_id: job_id.to_string(),
-                state: ObjectMaterialisationState::Complete,
-                boundary_schema_hash: job.boundary_schema_hash.clone(),
-                derived_boundaries: serde_json::to_value(boundaries)?,
-                index_marker: serde_json::json!({
-                    "requested": job.requested_operations.maintain_indexes,
-                    "policy_snapshot": job.index_policy_snapshot,
-                    "authz_revision": job.authz_revision,
-                    "outcomes": index_outcomes,
-                }),
-                updated_at_unix_ms: now_unix_ms(),
-            })
+            .publish(
+                ObjectMaterialisationResult {
+                    schema: ObjectMaterialisationResult::SCHEMA.into(),
+                    cluster_id: job.cluster_id.clone(),
+                    target_logical_identity: job.target_logical_identity.clone(),
+                    job_id: job_id.to_string(),
+                    state: ObjectMaterialisationState::Complete,
+                    boundary_schema_hash: job.boundary_schema_hash.clone(),
+                    derived_boundaries: serde_json::to_value(boundaries)?,
+                    index_marker: serde_json::json!({
+                        "requested": job.requested_operations.maintain_indexes,
+                        "policy_snapshot": job.index_policy_snapshot,
+                        "authz_revision": job.authz_revision,
+                        "outcomes": index_outcomes,
+                    }),
+                    updated_at_unix_ms: job.requested_at_unix_ms,
+                },
+                assignment,
+            )
             .await
     }
 }

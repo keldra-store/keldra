@@ -4,7 +4,7 @@ use std::collections::HashSet;
 #[tokio::test]
 async fn concurrent_index_creates_allocate_distinct_ids_and_cursors() {
     let temp = tempdir().unwrap();
-    let persistence = persistence_with_mvcc(&test_config(temp.path()))
+    let persistence = persistence_with_active_topology(&test_config(temp.path()))
         .await
         .unwrap();
     let tenant = persistence

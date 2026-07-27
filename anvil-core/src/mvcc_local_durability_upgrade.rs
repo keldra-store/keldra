@@ -338,12 +338,12 @@ impl LocalUpgradeManifestPublisher for Arc<crate::mvcc_bootstrap::MvccSubsystem>
             let observed = self
                 .runtime
                 .local_store()
-                .read_at(&key, handle.snapshot_version)?;
+                .read_point_at(&key, handle.snapshot_version)?;
             self.open_transactions.observe_point(
                 &handle.transaction_id,
                 &job.cluster_id,
                 key.clone(),
-                observed.as_ref().map(|row| row.commit_version),
+                observed.observed_version(),
                 now,
             )?;
             self.open_transactions.put(

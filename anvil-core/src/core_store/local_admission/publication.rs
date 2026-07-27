@@ -312,7 +312,9 @@ impl CoreStore {
             self.read_admission_mutation_head(&shard.hash, &requested.mutation_id)?
         {
             if head.request_hash != request_hashes.mutation {
-                bail!("CoreStore pending mutation retry conflicts with the mutation point head");
+                bail!(
+                    "CoreStore mutation idempotency conflict: retry differs from the mutation point head"
+                );
             }
             return self.resolve_existing_admission_head(
                 shard,

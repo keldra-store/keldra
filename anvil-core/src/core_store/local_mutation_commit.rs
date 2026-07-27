@@ -228,6 +228,46 @@ impl CoreStore {
         }
         Self::complete_implicit_stream_root_publications(&mut batch)?;
         validate_batch_partitions(&batch)?;
+        let logical_request_hash = logical_mutation_batch_request_hash(&batch)?;
+        let target = CorePendingMutationTarget::MutationBatch {
+            transaction_id: batch.transaction_id.clone(),
+            scope_partition: batch.scope_partition.clone(),
+            operation_count: batch.operations.len() as u64,
+            logical_request_hash,
+        };
+        let admission_shard = target.admission_shard();
+        if self
+            .read_admission_mutation_head(&admission_shard.hash, &batch.transaction_id)?
+            .is_some()
+        {
+            let admission = self
+                .admit_core_mutation_outcome(
+                    "mutation.batch",
+                    WriterFamily::CoreControl.as_str(),
+                    target.clone(),
+                    batch.transaction_id.clone(),
+                    Some(batch.transaction_id.clone()),
+                    CorePendingMutationPayload::Empty,
+                    Vec::new(),
+                )
+                .await?;
+            let receipt = match admission {
+                CoreAdmissionOutcome::Finalised(finalisation) => {
+                    mutation_batch_receipt_from_finalisation(finalisation)?
+                }
+                CoreAdmissionOutcome::Pending(admission) => {
+                    let admitted_batch = self.admitted_mutation_batch(&admission).await?;
+                    self.recover_admitted_mutation_batch(admitted_batch, &admission)
+                        .await?
+                }
+            };
+            crate::emit_test_timing(
+                format!("core_store.commit_mutation_batch total tx={timing_name}"),
+                total_start.elapsed(),
+            );
+            self.notify_committed_stream_appends(&receipt.stream_appends);
+            return Ok(receipt);
+        }
         let step_start = std::time::Instant::now();
         let operation_guards = self.acquire_batch_locks(&batch).await?;
         crate::emit_test_timing(
@@ -242,6 +282,7 @@ impl CoreStore {
             format!("core_store.commit_mutation_batch read_transaction tx={timing_name}"),
             step_start.elapsed(),
         );
+        let batch_payload = encode_core_mutation_batch(&batch)?;
         let step_start = std::time::Instant::now();
         self.validate_mutation_preconditions_unlocked(
             &batch.preconditions,
@@ -252,7 +293,6 @@ impl CoreStore {
             format!("core_store.commit_mutation_batch validate_preconditions tx={timing_name}"),
             step_start.elapsed(),
         );
-        let batch_payload = encode_core_mutation_batch(&batch)?;
         // Run admission and finalisation in an owned task. Once this task is
         // spawned, cancelling an RPC cannot strand a durable pending mutation.
         let store = self.clone();
@@ -271,11 +311,7 @@ impl CoreStore {
                     .admit_core_mutation_outcome(
                         "mutation.batch",
                         WriterFamily::CoreControl.as_str(),
-                        CorePendingMutationTarget::MutationBatch {
-                            transaction_id: batch.transaction_id.clone(),
-                            scope_partition: batch.scope_partition.clone(),
-                            operation_count: batch.operations.len() as u64,
-                        },
+                        target,
                         batch.transaction_id.clone(),
                         Some(batch.transaction_id.clone()),
                         pending_mutation_payload,
@@ -288,6 +324,7 @@ impl CoreStore {
                         return mutation_batch_receipt_from_finalisation(finalisation);
                     }
                 };
+                let admitted_batch = store.admitted_mutation_batch(&admission).await?;
                 crate::emit_test_timing(
                     format!(
                         "core_store.commit_mutation_batch admission tx={finalisation_timing_name}"
@@ -300,7 +337,11 @@ impl CoreStore {
                 // successor generation before this publication is durable.
                 operation_guards.release_mutable_guards();
                 let first_attempt = store
-                    .finalise_admitted_mutation_batch(&batch, &admission, &finalisation_timing_name)
+                    .finalise_admitted_mutation_batch(
+                        &admitted_batch,
+                        &admission,
+                        &finalisation_timing_name,
+                    )
                     .await;
                 drop(operation_guards);
                 match first_attempt {
@@ -308,11 +349,12 @@ impl CoreStore {
                     Err(first_error) => {
                         let retryable_conflict = is_retryable_mutation_conflict(&first_error);
                         tracing::error!(
-                            transaction_id = %batch.transaction_id,
+                            transaction_id = %admitted_batch.transaction_id,
                             error = %first_error,
                             "CoreStore admitted mutation finalisation failed; recovering in-process"
                         );
-                        let recovery = store.recover_admitted_mutation_batch(batch, &admission);
+                        let recovery =
+                            store.recover_admitted_mutation_batch(admitted_batch, &admission);
                         let receipt = recovery.await.with_context(|| {
                             format!(
                                 "recover admitted CoreStore mutation after finalisation error: {first_error:#}"
@@ -677,6 +719,26 @@ impl CoreStore {
     ) -> Result<super::local_mutation_preparation::PreparedMutationBatch> {
         super::local_mutation_preparation::prepare_mutation_batch_operations(self, batch).await
     }
+}
+
+fn logical_mutation_batch_request_hash(batch: &CoreMutationBatch) -> Result<String> {
+    let mut normalized = batch.clone();
+    for operation in &mut normalized.operations {
+        let CoreMutationOperation::CoreMetaPut { payload, .. } = operation else {
+            continue;
+        };
+        let mut common = core_meta_row_common_from_payload(payload)?;
+        if common.root_key_hash.is_empty() {
+            continue;
+        }
+        common.root_generation = 0;
+        common.transaction_id.clear();
+        *payload = replace_core_meta_row_common(payload, &common)?;
+    }
+    Ok(format!(
+        "sha256:{}",
+        sha256_hex(&encode_core_mutation_batch(&normalized)?)
+    ))
 }
 
 impl CoreStore {
