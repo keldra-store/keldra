@@ -9,6 +9,7 @@ pub(super) struct AdminImplicitTransaction {
 const ADMIN_APPLICATION_RESULT_NAMESPACE: &str = "admin.application-mutation.v1";
 const ADMIN_APPLICATION_RESULT_KEY: &str = "result";
 const ADMIN_POLICY_RESULT_NAMESPACE: &str = "admin.application-policy-mutation.v1";
+const ADMIN_TENANT_RESULT_NAMESPACE: &str = "admin.tenant-mutation.v1";
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(super) struct AdminApplicationMutationResult {
@@ -171,6 +172,57 @@ pub(super) fn stage_or_verify_admin_policy_result(
             &transaction.principal,
             crate::mvcc_transaction::IdempotencyResult {
                 namespace: ADMIN_POLICY_RESULT_NAMESPACE.to_string(),
+                key: "result".to_string(),
+                payload: input_hash.as_bytes().to_vec(),
+            },
+            now_unix_ms,
+        )
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    Ok(false)
+}
+
+pub(super) fn admin_tenant_input_hash(name: &str, home_region: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"anvil.admin.tenant-mutation.input.v1");
+    for component in [name, home_region] {
+        hasher.update(&(component.len() as u64).to_be_bytes());
+        hasher.update(component.as_bytes());
+    }
+    hex::encode(hasher.finalize().as_bytes())
+}
+
+pub(super) fn stage_or_verify_admin_tenant_result(
+    state: &AppState,
+    transaction: &AdminImplicitTransaction,
+    input_hash: &str,
+    now_unix_ms: u64,
+) -> Result<bool, Status> {
+    if let Some(result) = state
+        .mvcc
+        .open_transactions
+        .resolved_idempotency_result(
+            &transaction.transaction_id,
+            &transaction.principal,
+            ADMIN_TENANT_RESULT_NAMESPACE,
+            "result",
+        )
+        .map_err(|error| Status::failed_precondition(error.to_string()))?
+    {
+        if result.payload != input_hash.as_bytes() {
+            return Err(Status::already_exists(
+                "admin tenant idempotency key was already used for different input",
+            ));
+        }
+        return Ok(true);
+    }
+    state
+        .mvcc
+        .open_transactions
+        .add_idempotency_result(
+            &transaction.transaction_id,
+            &transaction.principal,
+            crate::mvcc_transaction::IdempotencyResult {
+                namespace: ADMIN_TENANT_RESULT_NAMESPACE.to_string(),
                 key: "result".to_string(),
                 payload: input_hash.as_bytes().to_vec(),
             },

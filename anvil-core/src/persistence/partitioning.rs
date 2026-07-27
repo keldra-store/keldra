@@ -113,7 +113,7 @@ impl Persistence {
         self.task_notify.notify_waiters();
     }
 
-    pub(super) async fn write_mesh_tenant_locators(
+    pub(crate) async fn write_mesh_tenant_locators(
         &self,
         tenant: &Tenant,
         idempotency_key: &str,

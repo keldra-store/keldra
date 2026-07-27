@@ -372,6 +372,168 @@ pub(crate) async fn create_tenant_with_permit_mvcc(
     Ok(tenant)
 }
 
+#[derive(Debug)]
+pub(crate) struct ControlTenantMutationPlan {
+    pub tenant: Tenant,
+    mutations: Vec<crate::mvcc_product::ProductMutation>,
+    predicates: Vec<(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )>,
+    outbox_events: Vec<crate::mvcc_outbox::StreamOutboxEvent>,
+}
+
+impl ControlTenantMutationPlan {
+    pub(crate) async fn stage(
+        self,
+        mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+        transaction_id: &str,
+        principal: &str,
+        now_unix_ms: u64,
+    ) -> Result<Tenant> {
+        mvcc.stage_product_mutations(transaction_id, principal, self.mutations, now_unix_ms)?;
+        for (key, predicate) in self.predicates {
+            mvcc.stage_predicate(transaction_id, principal, key, predicate, now_unix_ms)?;
+        }
+        for event in self.outbox_events {
+            mvcc.open_transactions
+                .add_stream_event(transaction_id, event, now_unix_ms)?;
+        }
+        let assignment = mvcc
+            .reconcile_work_assignment("control-plane", mvcc.cluster_id())
+            .await?
+            .ok_or_else(|| anyhow!("this node does not own the cluster control-plane assignment"))?;
+        mvcc.stage_assignment_guard(transaction_id, principal, &assignment, now_unix_ms)?;
+        Ok(self.tenant)
+    }
+}
+
+pub(crate) fn plan_create_tenant_in_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    name: &str,
+    admin_audit_event: &crate::admin_audit::AdminAuditEvent,
+) -> Result<ControlTenantMutationPlan> {
+    use crate::mvcc_transaction::PredicateKind;
+
+    if read_control_current_in_transaction(
+        mvcc,
+        transaction_id,
+        principal,
+        &tenant_name_tuple_key(name)?,
+    )?
+    .is_some()
+    {
+        bail!("tenant already exists");
+    }
+    let max_allocated_id = match read_control_current_in_transaction(
+        mvcc,
+        transaction_id,
+        principal,
+        &id_allocator_tuple_key()?,
+    )? {
+        Some(ControlCurrentRecord::IdAllocator { max_allocated_id }) => max_allocated_id,
+        Some(_) => bail!("control ID allocator row contains a different record type"),
+        None => 0,
+    };
+    let tenant = Tenant {
+        id: max_allocated_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("control ID allocator overflow"))?,
+        name: name.to_string(),
+    };
+    let revision_tuple_key = control_revision_tuple_key()?;
+    let revision = match read_control_current_in_transaction(
+        mvcc,
+        transaction_id,
+        principal,
+        &revision_tuple_key,
+    )? {
+        Some(ControlCurrentRecord::Revision { revision }) => revision,
+        Some(_) => bail!("control revision key contains a different record type"),
+        None => 0,
+    };
+    let next_revision = revision
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("control journal revision overflow"))?;
+    let mutation_id = deterministic_control_mutation_id(transaction_id, "tenant-create");
+    let mutation_id_string = mutation_id.to_string();
+    let mut operations = Vec::new();
+    for record in [
+        ControlCurrentRecord::IdAllocator {
+            max_allocated_id: tenant.id,
+        },
+        ControlCurrentRecord::Tenant {
+            id: tenant.id,
+            name: tenant.name.clone(),
+            active: true,
+        },
+        ControlCurrentRecord::Revision {
+            revision: next_revision,
+        },
+    ] {
+        operations.extend(control_current_updates(record)?);
+    }
+    operations.push(CoreMutationOperation::StreamAppend {
+        partition_id: hex::encode(control_partition_id()),
+        stream_id: control_plane_stream_id(),
+        record_kind: "control_plane".to_string(),
+        payload: encode_control_event_body(
+            &ControlEventBody::TenantUpsert {
+                id: tenant.id,
+                name: tenant.name.clone(),
+            },
+            0,
+            mutation_id,
+        )?,
+        idempotency_key: Some(format!("control-plane:{mutation_id_string}")),
+    });
+    let mut predicates = Vec::new();
+    let mut predicate_keys = BTreeSet::new();
+    for operation in &operations {
+        let (cf, table_id, tuple_key) = match operation {
+            CoreMutationOperation::CoreMetaPut {
+                cf,
+                table_id,
+                tuple_key,
+                ..
+            }
+            | CoreMutationOperation::CoreMetaDelete {
+                cf,
+                table_id,
+                tuple_key,
+            } => (cf, *table_id, tuple_key),
+            CoreMutationOperation::StreamAppend { .. } => continue,
+        };
+        let key = crate::mvcc_product::coremeta_logical_key(cf, table_id, tuple_key)?;
+        if predicate_keys.insert(key.clone()) {
+            predicates.push((
+                key.clone(),
+                mvcc.read_latest_value(&key)?
+                    .map(|payload| PredicateKind::ValueHash(*blake3::hash(&payload).as_bytes()))
+                    .unwrap_or(PredicateKind::Absent),
+            ));
+        }
+    }
+    let mut product =
+        crate::mvcc_product::product_mutations_and_outbox_from_operations(operations)?;
+    let audit = crate::admin_audit::admin_audit_mvcc_plan(
+        admin_audit_event,
+        next_revision,
+        &mutation_id_string,
+    )?;
+    product.mutations.extend(audit.mutations);
+    product.outbox_events.extend(audit.outbox_events);
+    predicates.extend(product.predicates);
+    Ok(ControlTenantMutationPlan {
+        tenant,
+        mutations: product.mutations,
+        predicates,
+        outbox_events: product.outbox_events,
+    })
+}
+
 pub fn read_tenant_by_name_mvcc(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     name: &str,
@@ -578,6 +740,34 @@ pub fn page_tenants_mvcc(
         tenants,
         next_tuple_key,
     })
+}
+
+pub(crate) fn read_tenant_by_name_in_transaction(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    name: &str,
+) -> Result<Option<Tenant>> {
+    match read_control_current_in_transaction(
+        mvcc,
+        transaction_id,
+        principal,
+        &tenant_name_tuple_key(name)?,
+    )? {
+        Some(ControlCurrentRecord::Tenant {
+            id,
+            name: stored_name,
+            active,
+        }) if stored_name == name => Ok(active.then_some(Tenant {
+            id,
+            name: stored_name,
+        })),
+        Some(ControlCurrentRecord::Tenant { .. }) => {
+            bail!("control tenant-name row does not match its key")
+        }
+        Some(_) => bail!("control tenant-name row contains a different record type"),
+        None => Ok(None),
+    }
 }
 
 fn read_control_current_mvcc(

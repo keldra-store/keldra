@@ -61,11 +61,56 @@ impl AdminService for AppState {
             }),
         )?;
         let audit_event_id = audit_event.audit_event_id.clone();
-        let tenant = self
-            .persistence
-            .create_tenant_with_admin_audit(&req.name, "admin-created", Some(&audit_event))
+        let transaction =
+            begin_admin_product_transaction(self, &principal, context, "tenant-create").await?;
+        let input_hash = admin_tenant_input_hash(&req.name, &home_region);
+        let now = u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default();
+        let tenant = if transaction.replayed {
+            stage_or_verify_admin_tenant_result(self, &transaction, &input_hash, now)?;
+            self.persistence
+                .get_tenant_by_name(&req.name)
+                .await
+                .map_err(|err| Status::internal(err.to_string()))?
+                .ok_or_else(|| {
+                    Status::failed_precondition(
+                        "committed admin tenant transaction is missing its tenant",
+                    )
+                })?
+        } else {
+            let tenant = match crate::control_journal::read_tenant_by_name_in_transaction(
+                &self.mvcc,
+                &transaction.transaction_id,
+                &transaction.principal,
+                &req.name,
+            )
+            .map_err(|err| Status::internal(err.to_string()))?
+            {
+                Some(tenant) => tenant,
+                None => crate::control_journal::plan_create_tenant_in_transaction(
+                    &self.mvcc,
+                    &transaction.transaction_id,
+                    &transaction.principal,
+                    &req.name,
+                    &audit_event,
+                )
+                .map_err(|err| Status::internal(err.to_string()))?
+                .stage(
+                    &self.mvcc,
+                    &transaction.transaction_id,
+                    &transaction.principal,
+                    now,
+                )
+                .await
+                .map_err(|err| Status::failed_precondition(err.to_string()))?,
+            };
+            stage_or_verify_admin_tenant_result(self, &transaction, &input_hash, now)?;
+            commit_admin_product_transaction(self, &transaction).await?;
+            tenant
+        };
+        self.persistence
+            .write_mesh_tenant_locators(&tenant, context.idempotency_key.trim())
             .await
-            .map_err(|err| Status::internal(err.to_string()))?;
+            .map_err(|err| Status::failed_precondition(err.to_string()))?;
         Ok(Response::new(TenantAdminResponse {
             request_id: context.request_id.clone(),
             tenant: Some(TenantAdminDescriptor {
