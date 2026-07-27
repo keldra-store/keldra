@@ -378,6 +378,13 @@ impl TransactionBundle {
                     )?;
                     (job.cluster_id, job.transaction_id)
                 }
+                Some(crate::object_link_finalization_job::ObjectLinkFinalizationJob::SCHEMA) => {
+                    let job =
+                        crate::object_link_finalization_job::ObjectLinkFinalizationJob::decode(
+                            encoded_job,
+                        )?;
+                    (job.cluster_id, job.transaction_id)
+                }
                 _ => {
                     let job = crate::object_materialisation::ObjectMaterialisationJob::decode(
                         encoded_job,
