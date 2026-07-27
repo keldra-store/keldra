@@ -204,29 +204,41 @@ impl CoreStore {
             return self.resume_root_publication_intent(intent).await;
         }
 
-        let coordinator_scope = publications_by_hash
+        let coordinator_scope = if let Some((root_key_hash, publication)) = publications_by_hash
             .iter()
             .find(|(_, publication)| publication.transaction_coordinator)
-            .map(|(root_key_hash, _)| {
-                let generations = replicated_rows.get(root_key_hash).ok_or_else(|| {
-                    anyhow!(
-                        "CoreMeta transaction coordinator root {root_key_hash} has no rows"
-                    )
-                })?;
+        {
+            if let Some(generations) = replicated_rows.get(root_key_hash) {
                 if generations.len() != 1 {
                     bail!(
                         "CoreMeta transaction coordinator root {root_key_hash} must publish exactly one generation"
                     );
                 }
-                Ok::<_, anyhow::Error>((
+                Some((
                     root_key_hash.clone(),
                     *generations
                         .first_key_value()
                         .expect("one coordinator generation was checked")
                         .0,
                 ))
-            })
-            .transpose()?;
+            } else {
+                // A control root may coordinate a mutation without owning a
+                // row in that mutation. In that case it is not advanced; use
+                // its current durable generation for the manifest binding.
+                let generation = self
+                        .read_latest_root_anchor(&publication.root_anchor_key)
+                        .await?
+                        .map(|anchor| anchor.root_generation)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "CoreMeta transaction coordinator root {root_key_hash} has no durable anchor"
+                            )
+                        })?;
+                Some((root_key_hash.clone(), generation))
+            }
+        } else {
+            None
+        };
 
         let publication_created_at = unix_timestamp_nanos();
         let mut inputs = Vec::with_capacity(replicated_rows.len());
