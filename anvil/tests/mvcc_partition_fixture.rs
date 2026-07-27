@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 use anvil::mvcc_transaction::{CertificationResult, LogicalKey};
 use anvil_test_utils::mvcc_cluster::RealMvccCluster;
 
