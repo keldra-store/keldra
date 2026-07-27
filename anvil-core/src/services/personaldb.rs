@@ -75,6 +75,14 @@ use tokio::sync::OwnedMutexGuard;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
+use prost::Message;
+
+const PERSONALDB_PROJECTION_WRITEBACK_RESULT_NAMESPACE: &str =
+    "personaldb.projection-writeback-response.v1";
+
+fn projection_writeback_result_key(request: &CoreSubmitChangeset) -> String {
+    format!("{}:{}", request.database_id, request.idempotency_key)
+}
 
 #[derive(Debug, Clone)]
 struct PersonalDbCommitActor {
@@ -1248,6 +1256,62 @@ impl AppState {
                 )
                 .await
                 .map_err(internal_status)?;
+            let status = self
+                .mvcc
+                .open_transactions
+                .status(&handle.transaction_id, &actor.principal, now)
+                .map_err(internal_status)?;
+            if matches!(status.state, "committed" | "committing") {
+                let outcome = self
+                    .mvcc
+                    .open_transactions
+                    .commit(
+                        self.mvcc.runtime.as_ref(),
+                        &handle.transaction_id,
+                        &actor.principal,
+                        now,
+                    )
+                    .await
+                    .map_err(internal_status)?;
+                let commit_version = match outcome.certification {
+                    crate::mvcc_transaction::CertificationResult::Committed {
+                        commit_version,
+                    } => commit_version,
+                    crate::mvcc_transaction::CertificationResult::Aborted { reason } => {
+                        return Err(Status::aborted(format!(
+                            "PersonalDB projection writeback aborted: {reason:?}"
+                        )));
+                    }
+                };
+                let result = self
+                    .mvcc
+                    .open_transactions
+                    .resolved_idempotency_result(
+                        &handle.transaction_id,
+                        &actor.principal,
+                        PERSONALDB_PROJECTION_WRITEBACK_RESULT_NAMESPACE,
+                        &projection_writeback_result_key(&request),
+                    )
+                    .map_err(internal_status)?
+                    .ok_or_else(|| {
+                        Status::failed_precondition(
+                            "committed projection writeback is missing its response record",
+                        )
+                    })?;
+                let mut response = SubmitPersonalDbChangesetResponse::decode(
+                    result.payload.as_slice(),
+                )
+                .map_err(internal_status)?;
+                response.write_state = WriteState::Committed as i32;
+                response.watch_cursor_low = commit_version;
+                response.watch_cursor_high = 0;
+                return Ok(Response::new(response));
+            }
+            if status.state == "aborted" {
+                return Err(Status::aborted(
+                    "PersonalDB projection writeback previously aborted",
+                ));
+            }
             let mut response = Box::pin(self.commit_personaldb_projection_writeback(
                 request,
                 actor.clone(),
@@ -1426,6 +1490,7 @@ impl AppState {
                 "{}/{}",
                 definition.database_id, definition.projection_id
             )];
+            let result_key = projection_writeback_result_key(&target_request);
             let staged_source = self
                 .commit_personaldb_changeset(
                     source_request,
@@ -1434,10 +1499,24 @@ impl AppState {
                     &excluded_projection_ids,
                 )
                 .await?;
-            return Ok(submit_changeset_response(
+            let response = submit_changeset_response(
                 staged_source,
                 WriteState::Staged,
-            ));
+            );
+            self.mvcc
+                .open_transactions
+                .add_idempotency_result(
+                    caller_transaction.0,
+                    caller_transaction.1,
+                    crate::mvcc_transaction::IdempotencyResult {
+                        namespace: PERSONALDB_PROJECTION_WRITEBACK_RESULT_NAMESPACE.to_string(),
+                        key: result_key,
+                        payload: response.get_ref().encode_to_vec(),
+                    },
+                    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+                )
+                .map_err(internal_status)?;
+            return Ok(response);
         }
         Err(Status::internal(
             "PersonalDB projection writeback reached commit without a transaction",
