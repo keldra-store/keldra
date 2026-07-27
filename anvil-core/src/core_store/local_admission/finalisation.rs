@@ -482,6 +482,19 @@ impl CoreStore {
             publication.root_anchor_key.as_str() == scope_partition.as_str()
                 && publication.transaction_coordinator
         }) {
+            let declared_summary = batch
+                .root_publications
+                .iter()
+                .map(|publication| {
+                    format!(
+                        "{} (coordinator={}, families={:?})",
+                        publication.root_anchor_key,
+                        publication.transaction_coordinator,
+                        publication.writer_families
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
             let publication_summary = publications
                 .iter()
                 .map(|publication| {
@@ -493,7 +506,7 @@ impl CoreStore {
                 .collect::<Vec<_>>()
                 .join(", ");
             bail!(
-                "CoreStore finalisation mutation plan is missing its coordinator root: scope_partition={scope_partition}, publications=[{publication_summary}]"
+                "CoreStore finalisation mutation plan is missing its coordinator root: scope_partition={scope_partition}, declared_publications=[{declared_summary}], selected_publications=[{publication_summary}]"
             );
         }
         Ok(publications)
