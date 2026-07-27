@@ -1,12 +1,14 @@
 #![recursion_limit = "512"]
 
-use std::{path::PathBuf, time::Duration};
+use std::{io::Write, path::PathBuf, time::Duration};
 
 use anvil::anvil_api::{MvccReadConsistency, WriteState};
 use anvil_test_utils::{
     GrpcLostResponseProxy, mvcc_process_cluster::ProcessMvccCluster,
 };
 use rusqlite::{Connection, session::Session};
+use flate2::{Compression, write::ZlibEncoder};
+use sha1::{Digest, Sha1};
 
 const PERSONALDB_PROCESS_SCHEMA: &str = "CREATE TABLE items(
     id INTEGER PRIMARY KEY NOT NULL,
@@ -29,6 +31,59 @@ fn personaldb_insert_changeset() -> Vec<u8> {
     session.changeset_strm(&mut output).unwrap();
     assert!(!output.is_empty());
     output
+}
+
+fn process_git_pack() -> (String, Vec<u8>) {
+    fn object_id(kind: &str, data: &[u8]) -> Vec<u8> {
+        let mut hasher = Sha1::new();
+        hasher.update(format!("{kind} {}\0", data.len()).as_bytes());
+        hasher.update(data);
+        hasher.finalize().to_vec()
+    }
+    fn append(pack: &mut Vec<u8>, kind: u8, data: &[u8]) {
+        let mut size = data.len() as u64;
+        let mut first = (kind << 4) | ((size as u8) & 0x0f);
+        size >>= 4;
+        if size != 0 {
+            first |= 0x80;
+        }
+        pack.push(first);
+        while size != 0 {
+            let mut byte = (size as u8) & 0x7f;
+            size >>= 7;
+            if size != 0 {
+                byte |= 0x80;
+            }
+            pack.push(byte);
+        }
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(data).unwrap();
+        pack.extend_from_slice(&encoder.finish().unwrap());
+    }
+
+    let blob = b"process crash recovery\n".to_vec();
+    let blob_id = object_id("blob", &blob);
+    let mut tree = Vec::new();
+    tree.extend_from_slice(b"100644 README.md\0");
+    tree.extend_from_slice(&blob_id);
+    let tree_id = object_id("tree", &tree);
+    let commit = format!(
+        "tree {}\nauthor A <a@example.test> 0 +0000\ncommitter A <a@example.test> 0 +0000\n\nprocess\n",
+        hex::encode(tree_id)
+    )
+    .into_bytes();
+    let commit_id = object_id("commit", &commit);
+    let objects = [(1_u8, commit), (2_u8, tree), (3_u8, blob)];
+    let mut pack = Vec::new();
+    pack.extend_from_slice(b"PACK");
+    pack.extend_from_slice(&2_u32.to_be_bytes());
+    pack.extend_from_slice(&(objects.len() as u32).to_be_bytes());
+    for (kind, data) in objects {
+        append(&mut pack, kind, &data);
+    }
+    let checksum = Sha1::digest(&pack);
+    pack.extend_from_slice(&checksum);
+    (hex::encode(commit_id), pack)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -358,6 +413,130 @@ async fn committed_personaldb_submit_survives_two_coordinator_crashes_without_cl
     })
     .await
     .expect("same-disk replay completes the exact PersonalDB row-owner grants");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn committed_git_pack_survives_two_postcommit_crashes_without_client_retry_or_duplicate_watch()
+{
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_anvil-server"));
+    let mut cluster = ProcessMvccCluster::start(binary).await.unwrap();
+    let coordinator = cluster.wait_for_leader(&[0, 1, 2]).await.unwrap();
+    cluster.bootstrap_object_placement(coordinator).await.unwrap();
+    let bucket_name = format!("git-crash-{}", uuid::Uuid::new_v4().simple());
+    cluster
+        .create_bucket(coordinator, &bucket_name)
+        .await
+        .unwrap();
+    let repository_id = format!("repo-crash-{}", uuid::Uuid::new_v4().simple());
+    let (commit_id, pack) = process_git_pack();
+    let transaction = cluster
+        .begin_transaction(coordinator, MvccReadConsistency::Linearized)
+        .await
+        .unwrap();
+    let staged = cluster
+        .stage_git_pack(
+            coordinator,
+            &repository_id,
+            &bucket_name,
+            pack,
+            &transaction.transaction_id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(staged.write_state, WriteState::Staged as i32);
+    assert!(
+        !cluster
+            .object_exists(coordinator, &bucket_name, &staged.object_key)
+            .await
+            .unwrap(),
+        "staged Git pack object must remain invisible before certification"
+    );
+
+    cluster
+        .arm_hard_crash(coordinator, "GitSourcePostCommitBeforeEffects")
+        .unwrap();
+    let committed = cluster
+        .commit_transaction(
+            cluster.public_endpoint(coordinator),
+            transaction.transaction_id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(committed.state, WriteState::Committed as i32);
+    cluster
+        .wait_for_hard_crash(coordinator, Duration::from_secs(45))
+        .await
+        .unwrap();
+
+    let survivors = [0, 1, 2]
+        .into_iter()
+        .filter(|node| *node != coordinator)
+        .collect::<Vec<_>>();
+    let survivor = cluster.wait_for_leader(&survivors).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if cluster
+                .object_exists(survivor, &bucket_name, &staged.object_key)
+                .await
+                .unwrap_or(false)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("certified Git pack object survives the coordinator crash");
+
+    cluster
+        .arm_hard_crash(coordinator, "GitSourcePostCommitAfterEffects")
+        .unwrap();
+    cluster.restart(coordinator).await.unwrap();
+    cluster
+        .wait_for_hard_crash(coordinator, Duration::from_secs(45))
+        .await
+        .unwrap();
+    cluster.restart(coordinator).await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let events = cluster
+                .git_source_watch_events(
+                    coordinator,
+                    &repository_id,
+                    Duration::from_millis(250),
+                )
+                .await
+                .unwrap_or_default();
+            if events.len() == 1
+                && events[0].generation == staged.generation
+                && events[0].source_hash == staged.source_hash
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("same-disk replay materializes exactly one GitSource watch event");
+    let blob = cluster
+        .get_git_blob_by_path(coordinator, &repository_id, &commit_id, "README.md")
+        .await
+        .expect("same-disk replay materializes the GitSource index");
+    assert_eq!(blob.pack_object_version_id, staged.version_id);
+    let events = cluster
+        .git_source_watch_events(
+            coordinator,
+            &repository_id,
+            Duration::from_millis(750),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        events.len(),
+        1,
+        "post-effect crash recovery must not duplicate GitSource watch publication"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

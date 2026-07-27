@@ -17,6 +17,8 @@ use anvil::anvil_api::{
     BootstrapMeshTopologyRequest, CommitTransactionRequest, CreateBucketRequest,
     CheckPermissionRequest, CreateIndexRequest, CreatePersonalDbGroupRequest,
     GetPersonalDbGroupRequest, IndexDefinitionRecord, IndexKind,
+    GetGitBlobByPathRequest, GitBlobLocation, GitPackMetadata, PutGitPackRequest,
+    PutGitPackResponse, WatchGitSourceRequest, WatchGitSourceResponse,
     ListIndexesRequest, QueryIndexRequest, QueryIndexResponse, ReadAuthzTuplesRequest,
     PersonalDbGroupResponse, PersonalDbVoterAck, SubmitPersonalDbChangesetRequest,
     SubmitPersonalDbChangesetResponse, WriteOptions,
@@ -29,10 +31,12 @@ use anvil::anvil_api::{
     auth_service_client::AuthServiceClient,
     bucket_service_client::BucketServiceClient,
     index_service_client::IndexServiceClient,
+    git_source_service_client::GitSourceServiceClient,
     mesh_control_service_client::MeshControlServiceClient,
     mutation_batch_operation,
     object_service_client::ObjectServiceClient,
     personal_db_service_client::PersonalDbServiceClient,
+    put_git_pack_request,
     transaction_service_client::TransactionServiceClient,
     write_options,
 };
@@ -304,6 +308,101 @@ impl ProcessMvccCluster {
             ))
             .await?
             .into_inner())
+    }
+
+    pub async fn stage_git_pack(
+        &self,
+        node: usize,
+        repository_id: &str,
+        bucket_name: &str,
+        pack: Vec<u8>,
+        transaction_id: &str,
+    ) -> anyhow::Result<PutGitPackResponse> {
+        let mut client = GitSourceServiceClient::connect(self.public_endpoint(node)).await?;
+        let request = authorized(
+            tokio_stream::iter(vec![
+                PutGitPackRequest {
+                    data: Some(put_git_pack_request::Data::Metadata(GitPackMetadata {
+                        repository_id: repository_id.to_string(),
+                        bucket_name: bucket_name.to_string(),
+                        options: Some(WriteOptions {
+                            idempotency_key: format!("process-git-{repository_id}"),
+                            consistency: 0,
+                            wait_for_finalization: false,
+                            preconditions: Vec::new(),
+                            boundary_values: Vec::new(),
+                            execution: Some(write_options::Execution::TransactionId(
+                                transaction_id.to_string(),
+                            )),
+                        }),
+                    })),
+                },
+                PutGitPackRequest {
+                    data: Some(put_git_pack_request::Data::Chunk(pack)),
+                },
+            ]),
+            &self.admin_token,
+        );
+        Ok(client.put_git_pack(request).await?.into_inner())
+    }
+
+    pub async fn get_git_blob_by_path(
+        &self,
+        node: usize,
+        repository_id: &str,
+        commit_id: &str,
+        tree_path: &str,
+    ) -> anyhow::Result<GitBlobLocation> {
+        let mut client = GitSourceServiceClient::connect(self.public_endpoint(node)).await?;
+        client
+            .get_git_blob_by_path(authorized(
+                GetGitBlobByPathRequest {
+                    repository_id: repository_id.to_string(),
+                    commit_id: commit_id.to_string(),
+                    tree_path: tree_path.to_string(),
+                },
+                &self.admin_token,
+            ))
+            .await?
+            .into_inner()
+            .location
+            .context("GitSource blob path is missing")
+    }
+
+    pub async fn git_source_watch_events(
+        &self,
+        node: usize,
+        repository_id: &str,
+        collection_window: Duration,
+    ) -> anyhow::Result<Vec<WatchGitSourceResponse>> {
+        use futures_util::StreamExt;
+
+        let mut client = GitSourceServiceClient::connect(self.public_endpoint(node)).await?;
+        let mut stream = client
+            .watch_git_source(authorized(
+                WatchGitSourceRequest {
+                    repository_id: repository_id.to_string(),
+                    after_cursor_low: 0,
+                    after_cursor_high: 0,
+                },
+                &self.admin_token,
+            ))
+            .await?
+            .into_inner();
+        let mut events = Vec::new();
+        let deadline = tokio::time::Instant::now() + collection_window;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, stream.next()).await {
+                Ok(Some(Ok(event))) => events.push(event),
+                Ok(Some(Err(error))) => return Err(error.into()),
+                Ok(None) | Err(_) => break,
+            }
+        }
+        Ok(events)
     }
 
     pub async fn stage_personaldb_submit(
@@ -758,6 +857,8 @@ impl ProcessMvccCluster {
                 "IndexFinalizationAfterExecute",
                 "PersonalDbPostCommitBeforeEffects",
                 "PersonalDbPostCommitAfterEffects",
+                "GitSourcePostCommitBeforeEffects",
+                "GitSourcePostCommitAfterEffects",
             ];
         if !PROCESS_SAFE_POINTS.contains(&fault_point) {
             bail!("fault point is not enabled for process-backed hard crashes");

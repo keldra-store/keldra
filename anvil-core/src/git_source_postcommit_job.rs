@@ -52,7 +52,7 @@ impl GitSourcePostCommitJob {
         if self.schema != Self::SCHEMA
             || self.cluster_id.trim().is_empty()
             || self.transaction_id.trim().is_empty()
-            || self.tenant_id <= 0
+            || self.tenant_id < 0
             || self.repository_id.trim().is_empty()
             || self.bucket_name.trim().is_empty()
             || self.object_key.trim().is_empty()

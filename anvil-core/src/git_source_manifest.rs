@@ -282,8 +282,8 @@ fn validate_manifest(manifest: &GitSourceRepositoryManifest) -> Result<()> {
     if manifest.format_version != 1 {
         return Err(anyhow!("unsupported git source manifest version"));
     }
-    if manifest.tenant_id <= 0 {
-        return Err(anyhow!("git source manifest tenant id must be positive"));
+    if manifest.tenant_id < 0 {
+        return Err(anyhow!("git source manifest tenant id must be nonnegative"));
     }
     require_nonempty(&manifest.repository_id, "repository_id")?;
     require_nonempty(&manifest.bucket_name, "bucket_name")?;
@@ -303,8 +303,8 @@ fn validate_manifest(manifest: &GitSourceRepositoryManifest) -> Result<()> {
 }
 
 fn manifest_tuple_key(tenant_id: i64, repository_id: &str) -> Result<Vec<u8>> {
-    if tenant_id <= 0 {
-        return Err(anyhow!("git source manifest tenant id must be positive"));
+    if tenant_id < 0 {
+        return Err(anyhow!("git source manifest tenant id must be nonnegative"));
     }
     require_safe_component(repository_id, "repository_id")?;
     core_meta_tuple_key(&[
