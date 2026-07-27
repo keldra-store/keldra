@@ -20,7 +20,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let config = Config::parse();
+    let mut config = Config::parse();
+    // The process-backed integration fixture needs real child processes and
+    // independent listeners, but deliberately uses loopback h2c rather than
+    // provisioning certificates. Keep this escape hatch out of release
+    // builds: production peer transport remains TLS-only.
+    #[cfg(debug_assertions)]
+    if std::env::var_os("ANVIL_TEST_ALLOW_INSECURE_MVCC_TRANSPORT").is_some() {
+        config.allow_test_only_insecure_mvcc_transport = true;
+    }
     config.validate_admin_listener_bind()?;
 
     let addr = config
