@@ -50,29 +50,16 @@ pub(super) async fn create_append_stream_rpc(
     }
     let transaction_principal = object_manager::transaction_principal_from_claims(&claims);
     let implicit_transaction = if requested_transaction_id.is_none() {
-        let context = req
-            .mutation_context
-            .as_ref()
-            .ok_or_else(|| Status::invalid_argument("Missing native mutation context"))?;
         Some(
-            state
-                .mvcc
-                .open_transactions
-                .begin(
-                    state.mvcc.runtime.as_ref(),
-                    state.mvcc.cluster_id().to_string(),
-                    transaction_principal.clone(),
-                    format!(
-                        "append-stream-create:{}:{}:{}",
-                        claims.tenant_id, claims.sub, context.idempotency_key
-                    ),
-                    std::time::Duration::from_secs(300),
-                    crate::mvcc_transaction::DurabilityLevel::Quorum,
-                    crate::mvcc_transaction::ReadConsistency::Linearized,
-                    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
-                )
-                .await
-                .map_err(|error| Status::failed_precondition(error.to_string()))?,
+            begin_implicit_native_transaction(
+                state,
+                req.mutation_context
+                    .as_ref()
+                    .expect("validated native mutation context"),
+                &target,
+                &claims,
+            )
+            .await?,
         )
     } else {
         None
@@ -117,57 +104,9 @@ pub(super) async fn create_append_stream_rpc(
         },
         write_state: write_state_for_transaction(requested_transaction_id),
     };
-    if let Some(handle) = implicit_transaction.as_ref() {
-        let implicit_context = req
-            .mutation_context
-            .clone()
-            .ok_or_else(|| Status::invalid_argument("Missing native mutation context"))?;
-        let idempotency_plan = crate::native_idempotency::prepare_response_for_implicit_batch(
-            &state.mvcc,
-            &implicit_context,
-            &target,
-            &response,
-        )
-        .await?;
-        state
-            .mvcc
-            .stage_product_mutations(
-                &handle.transaction_id,
-                &transaction_principal,
-                idempotency_plan.mutations,
-                u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
-            )
-            .map_err(|error| Status::internal(error.to_string()))?;
-        for (key, predicate) in idempotency_plan.predicates {
-            state
-                .mvcc
-                .stage_predicate(
-                    &handle.transaction_id,
-                    &transaction_principal,
-                    key,
-                    predicate,
-                    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
-                )
-                .map_err(|error| Status::failed_precondition(error.to_string()))?;
-        }
-        let outcome = state
-            .mvcc
-            .open_transactions
-            .commit(
-                state.mvcc.runtime.as_ref(),
-                &handle.transaction_id,
-                &transaction_principal,
-                u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
-            )
-            .await
-            .map_err(|error| Status::failed_precondition(error.to_string()))?;
-        if let crate::mvcc_transaction::CertificationResult::Aborted { reason } =
-            outcome.certification
-        {
-            return Err(Status::aborted(format!(
-                "append stream create transaction aborted: {reason:?}"
-            )));
-        }
+    if let Some(transaction) = implicit_transaction.as_ref() {
+        stage_implicit_native_response(state, &attempt, &target, &response, transaction).await?;
+        commit_implicit_native_transaction(state, transaction).await?;
     } else {
         complete_native_mutation(state, &attempt, &target, &response).await?;
     }
