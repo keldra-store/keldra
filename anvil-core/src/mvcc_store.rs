@@ -1343,6 +1343,7 @@ impl MvccStore {
         let watermark = self.gc_watermark()?;
         let mut authorised = BTreeSet::new();
         let mut replacement_live = BTreeSet::new();
+        let mut published_repairs = BTreeSet::new();
         for (_, row) in self.scan_table_prefix_at(
             crate::mvcc_shard_repair::ShardPlacementOverlay::TABLE_ID,
             b"",
@@ -1351,6 +1352,10 @@ impl MvccStore {
             let overlay: crate::mvcc_shard_repair::ShardPlacementOverlay =
                 serde_json::from_slice(&row.value)?;
             overlay.replacement_manifest.validate()?;
+            published_repairs.insert((
+                overlay.target_logical_identity.clone(),
+                overlay.source_manifest_hash.clone(),
+            ));
             replacement_live.extend(
                 overlay
                     .replacement_manifest
@@ -1378,6 +1383,12 @@ impl MvccStore {
             }
             let record: ShardRepairRecord = serde_json::from_slice(&value)?;
             if record.state == ShardRepairState::Complete {
+                continue;
+            }
+            if published_repairs.contains(&(
+                record.job.target_logical_identity.clone(),
+                record.job.source_manifest_hash.clone(),
+            )) {
                 continue;
             }
             for placement in record

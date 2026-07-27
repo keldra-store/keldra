@@ -191,6 +191,18 @@ impl RealMvccCluster {
             .join(format!("{transfer_id}.complete"))
     }
 
+    pub fn replication_transfer_metadata_path(
+        &self,
+        node: usize,
+        transfer_id: uuid::Uuid,
+    ) -> std::path::PathBuf {
+        std::path::Path::new(&self.configs[node].storage_path)
+            .join("mvcc")
+            .join(&self.configs[node].mvcc_cluster_id)
+            .join("replication-inbox")
+            .join(format!("{transfer_id}.meta"))
+    }
+
     pub fn remove_replication_transfer(
         &self,
         node: usize,

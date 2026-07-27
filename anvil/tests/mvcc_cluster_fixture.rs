@@ -193,6 +193,50 @@ fn authorized<T>(message: T, token: &str) -> Request<T> {
     request
 }
 
+async fn enqueue_repair_job(
+    mvcc: &anvil::mvcc_bootstrap::MvccSubsystem,
+    principal: &str,
+    id: &str,
+    mut job: ShardRepairJob,
+    now: u64,
+) -> (String, u64) {
+    let handle = mvcc
+        .open_transactions
+        .begin(
+            mvcc.runtime.as_ref(),
+            mvcc.cluster_id().to_string(),
+            principal,
+            id,
+            std::time::Duration::from_secs(30),
+            DurabilityLevel::Quorum,
+            ReadConsistency::Linearized,
+            now,
+        )
+        .await
+        .unwrap();
+    job.transaction_id = handle.transaction_id.clone();
+    job.originating_snapshot_version = handle.snapshot_version;
+    let job_id = job.job_id().unwrap();
+    mvcc.open_transactions
+        .add_job(&handle.transaction_id, job.canonical_bytes().unwrap(), now + 1)
+        .unwrap();
+    let committed = mvcc
+        .open_transactions
+        .commit(
+            mvcc.runtime.as_ref(),
+            &handle.transaction_id,
+            principal,
+            now + 2,
+        )
+        .await
+        .unwrap();
+    let version = match committed.certification {
+        CertificationResult::Committed { commit_version } => commit_version,
+        CertificationResult::Aborted { reason } => panic!("repair enqueue aborted: {reason:?}"),
+    };
+    (job_id, version)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn public_local_object_returns_locally_then_promotes_and_survives_holder_loss() {
     let mut cluster = RealMvccCluster::start().await.unwrap();
@@ -905,4 +949,159 @@ async fn real_cluster_reconstructs_a_deleted_shard_and_publishes_repaired_placem
         .await
         .unwrap();
     assert_eq!(*reconstructed.lock().unwrap(), payload);
+
+    // Publish a real replacement overlay while a second durable repair record
+    // pins the retiring transfer. The cluster GC watermark may advance, but
+    // physical retirement must wait for that repair state to be released.
+    let retiring = repaired
+        .placements
+        .iter()
+        .find(|placement| {
+            placement.stripe_ordinal == lost.stripe_ordinal
+                && placement.shard_ordinal == lost.shard_ordinal
+        })
+        .unwrap()
+        .clone();
+    let retiring_node = cluster.node_index(&retiring.node_id).unwrap();
+    let retiring_path =
+        cluster.replication_transfer_path(retiring_node, retiring.transfer_id);
+    let retiring_meta =
+        cluster.replication_transfer_metadata_path(retiring_node, retiring.transfer_id);
+    assert!(retiring_path.is_file() && retiring_meta.is_file());
+    let replacement_target = candidates
+        .iter()
+        .find(|candidate| candidate.node.node_id != retiring.node_id)
+        .unwrap()
+        .clone();
+    let retirement_target_identity = format!(
+        "cluster/{}/object/{}",
+        mvcc.cluster_id(),
+        repaired.object_hash
+    );
+    let base_job = ShardRepairJob {
+        schema: ShardRepairJob::SCHEMA.to_string(),
+        cluster_id: mvcc.cluster_id().to_string(),
+        transaction_id: "assigned-at-enqueue".into(),
+        kind: ShardMaintenanceKind::Rebalance,
+        target_logical_identity: retirement_target_identity.clone(),
+        source_manifest: repaired.clone(),
+        source_manifest_hash: hex::encode(
+            blake3::hash(&repaired.canonical_bytes().unwrap()).as_bytes(),
+        ),
+        missing: vec![MissingShardTarget {
+            stripe_ordinal: retiring.stripe_ordinal,
+            shard_ordinal: retiring.shard_ordinal,
+            target: replacement_target,
+        }],
+        retiring: vec![retiring.clone()],
+        originating_snapshot_version: 0,
+        requested_at_unix_ms: 30,
+    };
+    let mut pin_job = base_job.clone();
+    pin_job.requested_at_unix_ms = 1_000_000_000_000;
+    pin_job.target_logical_identity = format!("retirement-pin/{object_identity}");
+    let (pin_job_id, _) =
+        enqueue_repair_job(mvcc, "e2e-retirement-pin", "retirement-pin", pin_job, 30)
+            .await;
+    let (rebalance_job_id, _) = enqueue_repair_job(
+        mvcc,
+        "e2e-retirement-rebalance",
+        "retirement-rebalance",
+        base_job,
+        40,
+    )
+    .await;
+
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            if (0..3).any(|node| {
+                cluster
+                    .state(node)
+                    .mvcc
+                    .runtime
+                    .local_store()
+                    .shard_repair_record(&rebalance_job_id)
+                    .unwrap()
+                    .is_some_and(|record| record.state == ShardRepairState::Complete)
+            }) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("rebalance publishes replacement overlay");
+    let overlay_row = mvcc
+        .runtime
+        .local_store()
+        .read_latest(&LogicalKey {
+            table_id: anvil::mvcc_shard_repair::ShardPlacementOverlay::TABLE_ID,
+            application_key: retirement_target_identity.into_bytes(),
+        })
+        .unwrap()
+        .expect("replacement overlay is visible");
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert!(
+        retiring_path.is_file() && retiring_meta.is_file(),
+        "incomplete repair state pins the retired physical shard"
+    );
+
+    for node in 0..3 {
+        let pin_worker = format!("e2e-release-retirement-pin-{node}");
+        let store = cluster.state(node).mvcc.runtime.local_store();
+        let claimed = store
+            .claim_shard_repair_where(
+                &pin_worker,
+                1_000_000_000_000,
+                1_000,
+                |record| record.job.job_id().ok().as_deref() == Some(pin_job_id.as_str()),
+            )
+            .unwrap()
+            .expect("future repair pin becomes claimable");
+        assert_eq!(claimed.0, pin_job_id);
+        store
+            .complete_shard_repair(&pin_job_id, &pin_worker)
+            .unwrap();
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            if !retiring_path.exists() && !retiring_meta.exists() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("GC-authorised retirement unlinks shard payload and metadata");
+    assert!(
+        cluster
+            .state(retiring_node)
+            .mvcc
+            .runtime
+            .local_store()
+            .gc_watermark()
+            .unwrap()
+            >= overlay_row.commit_version,
+        "physical unlink follows the applied cluster GC watermark"
+    );
+
+    let final_snapshot = mvcc.runtime.local_store().readable_version().unwrap();
+    let final_manifest =
+        resolve_manifest_at_snapshot(mvcc.runtime.local_store(), &manifest, final_snapshot)
+            .unwrap();
+    let final_bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    final_manifest
+        .read_range_chunks(&mvcc.replication_client, 0, final_manifest.object_length, {
+            let final_bytes = final_bytes.clone();
+            move |chunk| {
+                let final_bytes = final_bytes.clone();
+                async move {
+                    final_bytes.lock().unwrap().extend_from_slice(&chunk);
+                    Ok(())
+                }
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(*final_bytes.lock().unwrap(), payload);
 }
