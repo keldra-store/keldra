@@ -458,8 +458,26 @@ impl CoreStore {
         {
             bail!("CoreStore finalisation mutation plan does not match its admission target");
         }
-        let publications =
+        let mut publications =
             self.select_declared_publications_for_ops(ops, &batch.root_publications)?;
+        // The coordinator is part of the transaction manifest even when it
+        // does not own a data row in this mutation (for example, a control
+        // root coordinating a projection-root update). The operation-based
+        // selector intentionally omits such roots, so restore the declared
+        // coordinator before validating the finalisation plan.
+        if let Some(coordinator) = batch
+            .root_publications
+            .iter()
+            .find(|publication| publication.transaction_coordinator)
+        {
+            let coordinator = CoreMetaRootPublication::from(coordinator);
+            if !publications
+                .iter()
+                .any(|publication| publication.root_key_hash() == coordinator.root_key_hash())
+            {
+                publications.push(coordinator);
+            }
+        }
         if !publications.iter().any(|publication| {
             publication.root_anchor_key.as_str() == scope_partition.as_str()
                 && publication.transaction_coordinator
