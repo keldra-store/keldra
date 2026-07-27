@@ -811,6 +811,30 @@ impl Persistence {
         written_by: &str,
         transaction_id: &str,
         transaction_principal: &str,
+        options: Option<&AuthzTupleBatchWriteOptions>,
+    ) -> Result<Vec<AuthzTupleRecord>> {
+        self.stage_authz_tuple_batch_with_tenant_audit(
+            tenant_id,
+            mutations,
+            written_by,
+            transaction_id,
+            transaction_principal,
+            options,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn stage_authz_tuple_batch_with_tenant_audit(
+        &self,
+        tenant_id: i64,
+        mutations: Vec<AuthzTupleBatchMutation>,
+        written_by: &str,
+        transaction_id: &str,
+        transaction_principal: &str,
+        options: Option<&AuthzTupleBatchWriteOptions>,
+        tenant_audit_event: Option<&crate::tenant_audit::TenantAuditEvent>,
     ) -> Result<Vec<AuthzTupleRecord>> {
         let permit = self.authz_write_permit(tenant_id).await?;
         let writes = authz_tuple_batch_writes(tenant_id, &mutations, written_by);
@@ -820,7 +844,7 @@ impl Persistence {
             writes,
             &permit,
             None,
-            None,
+            tenant_audit_event,
             options,
             authz_journal::AuthzTransactionBinding {
                 transaction_id,

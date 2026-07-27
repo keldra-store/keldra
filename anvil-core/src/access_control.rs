@@ -1139,11 +1139,43 @@ pub async fn stage_delegated_action_tuple(
     transaction_id: &str,
     transaction_principal: &str,
 ) -> Result<(), Status> {
+    stage_delegated_action_tuple_with_tenant_audit(
+        storage,
+        persistence,
+        tenant_id,
+        grantee_principal_id,
+        action,
+        resource,
+        operation,
+        written_by,
+        reason,
+        transaction_id,
+        transaction_principal,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn stage_delegated_action_tuple_with_tenant_audit(
+    storage: &Storage,
+    persistence: &Persistence,
+    tenant_id: i64,
+    grantee_principal_id: &str,
+    action: AnvilAction,
+    resource: &str,
+    operation: &str,
+    written_by: &str,
+    reason: &str,
+    transaction_id: &str,
+    transaction_principal: &str,
+    audit_event: Option<&crate::tenant_audit::TenantAuditEvent>,
+) -> Result<(), Status> {
     let relation =
         delegated_relation_for_action(storage, persistence, tenant_id, action.clone(), resource)
             .await?;
     persistence
-        .stage_authz_tuple_batch(
+        .stage_authz_tuple_batch_with_tenant_audit(
             SYSTEM_STORAGE_TENANT_ID,
             vec![AuthzTupleBatchMutation {
                 namespace: relation.namespace,
@@ -1159,6 +1191,7 @@ pub async fn stage_delegated_action_tuple(
             transaction_id,
             transaction_principal,
             None,
+            audit_event,
         )
         .await
         .map_err(authz_tuple_write_status)?;

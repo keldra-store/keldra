@@ -20,6 +20,101 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
+struct ImplicitAuthTransaction {
+    transaction_id: String,
+    principal: String,
+    replayed: bool,
+}
+
+impl AppState {
+    async fn begin_implicit_auth_transaction(
+        &self,
+        claims: &auth::Claims,
+        context: Option<&PublicMutationContext>,
+        operation: &str,
+    ) -> Result<ImplicitAuthTransaction, Status> {
+        let principal = crate::object_manager::transaction_principal_from_claims(claims);
+        let supplied = context
+            .map(|context| context.idempotency_key.trim())
+            .filter(|key| !key.is_empty());
+        let idempotency_key = supplied
+            .map(|key| format!("auth:{}:{}:{operation}:{key}", claims.tenant_id, claims.sub))
+            .unwrap_or_else(|| {
+                format!(
+                    "auth:{}:{}:{operation}:{}",
+                    claims.tenant_id,
+                    claims.sub,
+                    uuid::Uuid::new_v4()
+                )
+            });
+        let now = u64::try_from(chrono::Utc::now().timestamp_millis())
+            .map_err(|_| Status::internal("authorization mutation predates Unix epoch"))?;
+        let handle = self
+            .mvcc
+            .open_transactions
+            .begin(
+                self.mvcc.runtime.as_ref(),
+                self.mvcc.cluster_id(),
+                &principal,
+                &idempotency_key,
+                std::time::Duration::from_secs(300),
+                crate::mvcc_transaction::DurabilityLevel::Quorum,
+                crate::mvcc_transaction::ReadConsistency::Linearized,
+                now,
+            )
+            .await
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        let status = self
+            .mvcc
+            .open_transactions
+            .status(&handle.transaction_id, &principal, now)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        if status.state == "committing" {
+            self.commit_implicit_auth_transaction(&ImplicitAuthTransaction {
+                transaction_id: handle.transaction_id.clone(),
+                principal: principal.clone(),
+                replayed: false,
+            })
+            .await?;
+        } else if status.state == "aborted" {
+            return Err(Status::aborted(
+                "implicit authorization transaction previously aborted",
+            ));
+        }
+        Ok(ImplicitAuthTransaction {
+            transaction_id: handle.transaction_id,
+            principal,
+            replayed: matches!(status.state, "committed" | "committing"),
+        })
+    }
+
+    async fn commit_implicit_auth_transaction(
+        &self,
+        transaction: &ImplicitAuthTransaction,
+    ) -> Result<(), Status> {
+        let outcome = self
+            .mvcc
+            .open_transactions
+            .commit(
+                self.mvcc.runtime.as_ref(),
+                &transaction.transaction_id,
+                &transaction.principal,
+                u64::try_from(chrono::Utc::now().timestamp_millis())
+                    .map_err(|_| Status::internal("authorization commit predates Unix epoch"))?,
+            )
+            .await
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        match outcome.certification {
+            crate::mvcc_transaction::CertificationResult::Committed { .. } => Ok(()),
+            crate::mvcc_transaction::CertificationResult::Aborted { reason } => {
+                Err(Status::aborted(format!(
+                    "implicit authorization transaction aborted: {reason:?}"
+                )))
+            }
+        }
+    }
+}
+
 async fn public_access_grant_record(
     state: &AppState,
     app: &crate::persistence::App,
@@ -465,8 +560,23 @@ impl AuthService for AppState {
             "policy.grant",
             serde_json::json!({ "grantee_app_id": app.id, "action": req.action }),
         )?;
-        if let Some(transaction_id) = transaction_id {
-            access_control::stage_delegated_action_tuple(
+        let implicit = if transaction_id.is_none() {
+            Some(
+                self.begin_implicit_auth_transaction(
+                    claims,
+                    req.context.as_ref(),
+                    "grant-access",
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let effective_transaction_id = transaction_id
+            .or_else(|| implicit.as_ref().map(|transaction| transaction.transaction_id.as_str()))
+            .ok_or_else(|| Status::internal("authorization transaction is missing"))?;
+        if !implicit.as_ref().is_some_and(|transaction| transaction.replayed) {
+            access_control::stage_delegated_action_tuple_with_tenant_audit(
                 &self.storage,
                 &self.persistence,
                 claims.tenant_id,
@@ -476,28 +586,20 @@ impl AuthService for AppState {
                 "add",
                 &claims.sub,
                 "tenant access grant",
-                transaction_id,
+                effective_transaction_id,
                 &crate::object_manager::transaction_principal_from_claims(claims),
+                implicit.as_ref().map(|_| &audit_event),
             )
             .await?;
-        } else {
-            access_control::write_delegated_action_tuple(
-            &self.storage,
-            &self.persistence,
-            claims.tenant_id,
-            &app.id.to_string(),
-            delegated_action,
-            &req.resource,
-            "add",
-            &claims.sub,
-            "tenant access grant",
-            &audit_event,
-        )
-        .await?;
+        }
+        if let Some(transaction) = implicit.as_ref()
+            && !transaction.replayed
+        {
+            self.commit_implicit_auth_transaction(transaction).await?;
         }
 
         Ok(Response::new(GrantAccessResponse {
-            write_state: if transaction_id.is_some() {
+            write_state: if implicit.is_none() {
                 WriteState::Staged as i32
             } else {
                 WriteState::Committed as i32
@@ -544,8 +646,23 @@ impl AuthService for AppState {
             "policy.revoke",
             serde_json::json!({ "grantee_app_id": app.id, "action": req.action }),
         )?;
-        if let Some(transaction_id) = transaction_id {
-            access_control::stage_delegated_action_tuple(
+        let implicit = if transaction_id.is_none() {
+            Some(
+                self.begin_implicit_auth_transaction(
+                    claims,
+                    req.context.as_ref(),
+                    "revoke-access",
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let effective_transaction_id = transaction_id
+            .or_else(|| implicit.as_ref().map(|transaction| transaction.transaction_id.as_str()))
+            .ok_or_else(|| Status::internal("authorization transaction is missing"))?;
+        if !implicit.as_ref().is_some_and(|transaction| transaction.replayed) {
+            access_control::stage_delegated_action_tuple_with_tenant_audit(
                 &self.storage,
                 &self.persistence,
                 claims.tenant_id,
@@ -555,28 +672,20 @@ impl AuthService for AppState {
                 "remove",
                 &claims.sub,
                 "tenant access revoke",
-                transaction_id,
+                effective_transaction_id,
                 &crate::object_manager::transaction_principal_from_claims(claims),
+                implicit.as_ref().map(|_| &audit_event),
             )
             .await?;
-        } else {
-            access_control::write_delegated_action_tuple(
-            &self.storage,
-            &self.persistence,
-            claims.tenant_id,
-            &app.id.to_string(),
-            delegated_action,
-            &req.resource,
-            "remove",
-            &claims.sub,
-            "tenant access revoke",
-            &audit_event,
-        )
-        .await?;
+        }
+        if let Some(transaction) = implicit.as_ref()
+            && !transaction.replayed
+        {
+            self.commit_implicit_auth_transaction(transaction).await?;
         }
 
         Ok(Response::new(RevokeAccessResponse {
-            write_state: if transaction_id.is_some() {
+            write_state: if implicit.is_none() {
                 WriteState::Staged as i32
             } else {
                 WriteState::Committed as i32
@@ -691,14 +800,45 @@ impl AuthService for AppState {
         )
         .await?;
 
-        if let Some(transaction_id) = transaction_id {
+        let implicit = if transaction_id.is_none() {
+            Some(
+                self.begin_implicit_auth_transaction(
+                    claims,
+                    req.context.as_ref(),
+                    "set-public-access",
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let effective_transaction_id = transaction_id
+            .or_else(|| implicit.as_ref().map(|transaction| transaction.transaction_id.as_str()))
+            .ok_or_else(|| Status::internal("authorization transaction is missing"))?;
+        if let Some(transaction) = implicit.as_ref()
+            && transaction.replayed
+        {
+            let bucket = bucket_journal::read_current_bucket_mvcc(
+                &self.mvcc,
+                claims.tenant_id,
+                &req.bucket,
+            )
+            .map_err(|error| Status::internal(error.to_string()))?
+            .filter(|bucket| bucket.is_public_read == req.allow_public_read)
+            .ok_or_else(|| {
+                Status::already_exists(
+                    "public-access idempotency key was already used for different input",
+                )
+            })?;
+            let _ = bucket;
+        } else {
             let bucket = self
                 .persistence
                 .stage_bucket_public_access(
                     claims.tenant_id,
                     &req.bucket,
                     req.allow_public_read,
-                    transaction_id,
+                    effective_transaction_id,
                     &transaction_principal,
                 )
                 .await
@@ -709,30 +849,20 @@ impl AuthService for AppState {
                 req.allow_public_read,
                 &claims.sub,
                 "bucket public-read policy update",
-                transaction_id,
+                effective_transaction_id,
                 &transaction_principal,
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        } else {
-            let bucket = self
-                .persistence
-                .set_bucket_public_access(claims.tenant_id, &req.bucket, req.allow_public_read)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
-            access_control::write_bucket_public_read_tuple(
-                &self.persistence,
-                &bucket,
-                req.allow_public_read,
-                &claims.sub,
-                "bucket public-read policy update",
-            )
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        }
+        if let Some(transaction) = implicit.as_ref()
+            && !transaction.replayed
+        {
+            self.commit_implicit_auth_transaction(transaction).await?;
         }
 
         Ok(Response::new(SetPublicAccessResponse {
-            write_state: if transaction_id.is_some() {
+            write_state: if implicit.is_none() {
                 WriteState::Staged as i32
             } else {
                 WriteState::Committed as i32
