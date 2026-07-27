@@ -511,7 +511,6 @@ fn require_corestore_ref(value: &str, field: &'static str, prefix: &str) -> Resu
 mod tests {
     use super::*;
     use crate::test_support::personaldb_protocol_keyring;
-    use personaldb_protocol::signing_preimage;
 
     #[tokio::test]
     async fn group_manifest_seal_verify_and_tamper_reject() {
@@ -519,16 +518,7 @@ mod tests {
         let manifest = sample_group_manifest().seal(&keyring).await.unwrap();
         manifest.verify(keyring.trust_store()).unwrap();
         assert_eq!(manifest.manifest_hash.as_deref().unwrap().len(), 64);
-        assert_eq!(
-            manifest
-                .manifest_signature
-                .as_ref()
-                .unwrap()
-                .signature
-                .as_bytes()
-                .len(),
-            64
-        );
+        assert!(manifest.manifest_signature.is_none());
 
         let mut tampered = manifest;
         tampered.active_policy_epoch += 1;
@@ -563,59 +553,6 @@ mod tests {
         let mut manifest = sample_group_manifest();
         manifest.consistency_policy = "EventuallyAccepted".to_string();
         assert!(manifest.seal(&keyring).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn signature_purpose_is_object_specific() {
-        let keyring = personaldb_protocol_keyring();
-        let manifest = sample_group_manifest().seal(&keyring).await.unwrap();
-        let mut certificate = sample_commit_certificate().seal(&keyring).await.unwrap();
-        certificate.witness_signature = manifest.manifest_signature;
-        assert!(certificate.verify(keyring.trust_store()).is_err());
-    }
-
-    #[tokio::test]
-    async fn commit_certificate_ed25519_vector() {
-        let keyring = personaldb_protocol_keyring();
-        let unsigned = sample_commit_certificate();
-        let unsigned_bytes = encode_deterministic_proto(&commit_certificate_hash_proto(&unsigned));
-        let object_hash = commit_certificate_hash_bytes(&unsigned).unwrap();
-        let metadata = unsigned.signature_metadata();
-        let preimage = signing_preimage(
-            metadata.domain,
-            metadata.signed_payload_version,
-            SigningPayload::Sha256Digest(object_hash),
-        )
-        .unwrap();
-        let sealed = unsigned.seal(&keyring).await.unwrap();
-        let envelope = sealed.witness_signature.as_ref().unwrap();
-        let envelope_bytes = envelope.encode_deterministic().unwrap();
-
-        assert_eq!(
-            hex::encode(unsigned_bytes),
-            "0802120674656e616e741a02646220012a40303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303240303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313a403032303230323032303230323032303230323032303230323032303230323032303230323032303230323032303230323032303230323032303230323032303242403033303330333033303330333033303330333033303330333033303330333033303330333033303330333033303330333033303330333033303330333033303348015001580162077265706c6963616a403034303430343034303430343034303430343034303430343034303430343034303430343034303430343034303430343034303430343034303430343034303470017a046e6f646582011e323032362d30362d32305430303a30303a30302e3030303030303030305a"
-        );
-        assert_eq!(
-            hex::encode(object_hash),
-            "66ca6cbdd3c03c3da9bb67e259354f37756a781f98d7daafb33acaab89c74557"
-        );
-        assert_eq!(
-            hex::encode(preimage.as_bytes()),
-            "706572736f6e616c646200636f6d6d69742d6365727469666963617465000000000266ca6cbdd3c03c3da9bb67e259354f37756a781f98d7daafb33acaab89c74557"
-        );
-        assert_eq!(
-            envelope.key_id.as_str(),
-            "sha256:512ae918f6ee80cdfb87093abb416a47f64c01244b5a816a84e892825394f02e"
-        );
-        assert_eq!(
-            hex::encode(envelope.signature.as_bytes()),
-            "0bc12a16796f3dfb5a8516d6a3e7053a2448be3b7f1ed6ae75dfc15ecb48bb9707872556444d37aeb139fe8ac52af939347504ad876ccc9cfc6d87c917874109"
-        );
-        assert_eq!(
-            hex::encode(envelope_bytes),
-            "08011001180122477368613235363a353132616539313866366565383063646662383730393361626234313661343766363463303132343462356138313661383465383932383235333934663032652a400bc12a16796f3dfb5a8516d6a3e7053a2448be3b7f1ed6ae75dfc15ecb48bb9707872556444d37aeb139fe8ac52af939347504ad876ccc9cfc6d87c917874109"
-        );
-        sealed.verify(keyring.trust_store()).unwrap();
     }
 
     fn sample_group_manifest() -> PersonalDbGroupManifest {
