@@ -700,23 +700,23 @@ impl Persistence {
         let now_nanos = Utc::now()
             .timestamp_nanos_opt()
             .ok_or_else(|| anyhow!("partition owner timestamp overflow"))?;
-        let mut owner = read_partition_owner(
-            &self.storage,
+        let mvcc = self.mvcc()?;
+        let mut owner = read_partition_owner_mvcc(
+            mvcc,
             partition_family,
             partition_id,
             &self.partition_owner_signing_key,
-        )
-        .await?;
+        )?;
         if let Some(current_owner) = owner.as_ref()
             && current_owner.owner_node_id != self.owner_node_id
             && !partition_owner_is_force_expired(current_owner)
         {
-            // The force-expiry mutation is coordinated through CoreStore. A
-            // different node can commit it only after root-register quorum has
-            // fenced the unreachable publisher; a healthy owner therefore
-            // remains authoritative and this request fails closed.
-            force_expire_partition_owner_for_node(
+            // The force-expiry CAS is certified in the cluster's MVCC-under-
+            // Raft log. A concurrent owner transition therefore wins exactly
+            // once and this request fails closed on stale state.
+            force_expire_partition_owner_for_node_mvcc(
                 &self.storage,
+                mvcc,
                 partition_family,
                 partition_id,
                 &current_owner.owner_node_id,
@@ -724,13 +724,12 @@ impl Persistence {
                 &self.partition_owner_signing_key,
             )
             .await?;
-            owner = read_partition_owner(
-                &self.storage,
+            owner = read_partition_owner_mvcc(
+                mvcc,
                 partition_family,
                 partition_id,
                 &self.partition_owner_signing_key,
-            )
-            .await?;
+            )?;
         }
 
         if let Some(owner) = owner {
@@ -756,8 +755,9 @@ impl Persistence {
             if owner.status == PartitionOwnerStatus::Ready {
                 return owner.write_permit().map_err(Into::into);
             }
-            let ready = publish_partition_ready(
+            let ready = publish_partition_ready_mvcc(
                 &self.storage,
+                mvcc,
                 partition_family,
                 partition_id,
                 &self.owner_node_id,
@@ -789,8 +789,10 @@ impl Persistence {
         recovered_manifest_hash: &str,
         now_nanos: i64,
     ) -> Result<PartitionWritePermit> {
-        let recovering = acquire_partition_recovery(
+        let mvcc = self.mvcc()?;
+        let recovering = acquire_partition_recovery_mvcc(
             &self.storage,
+            mvcc,
             PartitionRecoveryAcquire {
                 partition_family: partition_family.to_string(),
                 partition_id: partition_id.to_string(),
@@ -805,8 +807,9 @@ impl Persistence {
         if recovering.status == PartitionOwnerStatus::Ready {
             return recovering.write_permit().map_err(Into::into);
         }
-        let ready = publish_partition_ready(
+        let ready = publish_partition_ready_mvcc(
             &self.storage,
+            mvcc,
             partition_family,
             partition_id,
             &self.owner_node_id,

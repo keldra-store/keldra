@@ -16,6 +16,9 @@ fn runtime_cursor_error(kind: &str) -> crate::mesh_lifecycle::LifecycleError {
 
 impl Persistence {
     pub async fn create_region(&self, name: &str) -> Result<bool> {
+        if control_journal::region_exists_mvcc(self.mvcc()?, name).await? {
+            return Ok(false);
+        }
         let permit = self.control_write_permit().await?;
         control_journal::create_region_with_permit_mvcc(
             &self.storage,

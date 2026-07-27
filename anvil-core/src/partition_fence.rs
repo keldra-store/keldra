@@ -23,7 +23,8 @@ pub use coremeta::{
 use coremeta::{
     is_partition_fence_cas_conflict, ownership_fence_by_node_key, ownership_fence_row_key,
     partition_owner_row_key, read_ownership_fence_state, read_partition_owner_state,
-    write_ownership_fence_state, write_partition_owner_state,
+    read_partition_owner_state_mvcc, write_ownership_fence_state, write_partition_owner_state,
+    write_partition_owner_state_mvcc,
 };
 
 pub const OWNERSHIP_HELD: &str = "OwnershipHeld";
@@ -1433,14 +1434,61 @@ pub async fn force_expire_partition_owner_for_node(
     now_nanos: i64,
     signing_key: &[u8],
 ) -> Result<Option<PartitionOwnerState>> {
+    force_expire_partition_owner_for_node_inner(
+        storage,
+        None,
+        partition_family,
+        partition_id,
+        owner_node_id,
+        now_nanos,
+        signing_key,
+    )
+    .await
+}
+
+pub(crate) async fn force_expire_partition_owner_for_node_mvcc(
+    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    partition_family: &str,
+    partition_id: &str,
+    owner_node_id: &str,
+    now_nanos: i64,
+    signing_key: &[u8],
+) -> Result<Option<PartitionOwnerState>> {
+    force_expire_partition_owner_for_node_inner(
+        storage,
+        Some(mvcc),
+        partition_family,
+        partition_id,
+        owner_node_id,
+        now_nanos,
+        signing_key,
+    )
+    .await
+}
+
+async fn force_expire_partition_owner_for_node_inner(
+    storage: &Storage,
+    mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
+    partition_family: &str,
+    partition_id: &str,
+    owner_node_id: &str,
+    now_nanos: i64,
+    signing_key: &[u8],
+) -> Result<Option<PartitionOwnerState>> {
     let failover_started_at = std::time::Instant::now();
     if now_nanos < 0 {
         return Err(anyhow!("partition owner timestamp must be nonnegative"));
     }
     for _ in 0..MAX_PARTITION_FENCE_CAS_ATTEMPTS {
-        let Some((ref_value, mut owner)) =
-            read_partition_owner_state(storage, partition_family, partition_id, signing_key)
-                .await?
+        let Some((ref_value, mut owner)) = read_partition_owner_state_backend(
+            storage,
+            mvcc,
+            partition_family,
+            partition_id,
+            signing_key,
+        )
+        .await?
         else {
             crate::perf::record_partition_failover_duration(
                 "unknown",
@@ -1467,7 +1515,7 @@ pub async fn force_expire_partition_owner_for_node(
         owner.status = PartitionOwnerStatus::Recovering;
         owner.updated_at_nanos = now_nanos;
         owner = owner.seal(signing_key)?;
-        match write_partition_owner_state(storage, &owner, Some(&ref_value)).await {
+        match write_partition_owner_state_backend(storage, mvcc, &owner, Some(&ref_value)).await {
             Ok(()) => {
                 crate::perf::record_root_generation_in_doubt(
                     "partition_owner",
@@ -1498,11 +1546,30 @@ pub async fn acquire_partition_recovery(
     request: PartitionRecoveryAcquire,
     signing_key: &[u8],
 ) -> Result<PartitionOwnerState> {
+    acquire_partition_recovery_inner(storage, None, request, signing_key).await
+}
+
+pub(crate) async fn acquire_partition_recovery_mvcc(
+    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    request: PartitionRecoveryAcquire,
+    signing_key: &[u8],
+) -> Result<PartitionOwnerState> {
+    acquire_partition_recovery_inner(storage, Some(mvcc), request, signing_key).await
+}
+
+async fn acquire_partition_recovery_inner(
+    storage: &Storage,
+    mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
+    request: PartitionRecoveryAcquire,
+    signing_key: &[u8],
+) -> Result<PartitionOwnerState> {
     let failover_started_at = std::time::Instant::now();
     validate_recovery_acquire(&request)?;
     for _ in 0..MAX_PARTITION_FENCE_CAS_ATTEMPTS {
-        let existing = read_partition_owner_state(
+        let existing = read_partition_owner_state_backend(
             storage,
+            mvcc,
             &request.partition_family,
             &request.partition_id,
             signing_key,
@@ -1563,8 +1630,9 @@ pub async fn acquire_partition_recovery(
             owner_signature: None,
         }
         .seal(signing_key)?;
-        match write_partition_owner_state(
+        match write_partition_owner_state_backend(
             storage,
+            mvcc,
             &state,
             existing.as_ref().map(|(ref_value, _)| ref_value),
         )
@@ -1608,15 +1676,75 @@ pub async fn publish_partition_ready(
     now_nanos: i64,
     signing_key: &[u8],
 ) -> Result<PartitionOwnerState> {
+    publish_partition_ready_inner(
+        storage,
+        None,
+        partition_family,
+        partition_id,
+        owner_node_id,
+        fence_token,
+        recovered_through_sequence,
+        recovered_manifest_hash,
+        now_nanos,
+        signing_key,
+    )
+    .await
+}
+
+pub(crate) async fn publish_partition_ready_mvcc(
+    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    partition_family: &str,
+    partition_id: &str,
+    owner_node_id: &str,
+    fence_token: u64,
+    recovered_through_sequence: u64,
+    recovered_manifest_hash: &str,
+    now_nanos: i64,
+    signing_key: &[u8],
+) -> Result<PartitionOwnerState> {
+    publish_partition_ready_inner(
+        storage,
+        Some(mvcc),
+        partition_family,
+        partition_id,
+        owner_node_id,
+        fence_token,
+        recovered_through_sequence,
+        recovered_manifest_hash,
+        now_nanos,
+        signing_key,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_partition_ready_inner(
+    storage: &Storage,
+    mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
+    partition_family: &str,
+    partition_id: &str,
+    owner_node_id: &str,
+    fence_token: u64,
+    recovered_through_sequence: u64,
+    recovered_manifest_hash: &str,
+    now_nanos: i64,
+    signing_key: &[u8],
+) -> Result<PartitionOwnerState> {
     let failover_started_at = std::time::Instant::now();
     validate_hex32(recovered_manifest_hash, "recovered manifest hash")?;
     if now_nanos < 0 {
         return Err(anyhow!("partition owner timestamp must be nonnegative"));
     }
     for _ in 0..MAX_PARTITION_FENCE_CAS_ATTEMPTS {
-        let Some((ref_value, mut state)) =
-            read_partition_owner_state(storage, partition_family, partition_id, signing_key)
-                .await?
+        let Some((ref_value, mut state)) = read_partition_owner_state_backend(
+            storage,
+            mvcc,
+            partition_family,
+            partition_id,
+            signing_key,
+        )
+        .await?
         else {
             return Err(FenceRejection {
                 code: AnvilErrorCode::PartitionNotOwned,
@@ -1650,7 +1778,7 @@ pub async fn publish_partition_ready(
         state.updated_at_nanos = now_nanos;
         state.generation = increment_counter(state.generation, "partition owner generation")?;
         state = state.seal(signing_key)?;
-        match write_partition_owner_state(storage, &state, Some(&ref_value)).await {
+        match write_partition_owner_state_backend(storage, mvcc, &state, Some(&ref_value)).await {
             Ok(()) => {
                 crate::perf::record_partition_failover_duration(
                     "unknown",
@@ -1870,6 +1998,47 @@ pub async fn read_partition_owner(
             .await?
             .map(|(_, owner)| owner),
     )
+}
+
+pub(crate) fn read_partition_owner_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    partition_family: &str,
+    partition_id: &str,
+    signing_key: &[u8],
+) -> Result<Option<PartitionOwnerState>> {
+    Ok(
+        read_partition_owner_state_mvcc(mvcc, partition_family, partition_id, signing_key)?
+            .map(|(_, owner)| owner),
+    )
+}
+
+async fn read_partition_owner_state_backend(
+    storage: &Storage,
+    mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
+    partition_family: &str,
+    partition_id: &str,
+    signing_key: &[u8],
+) -> Result<Option<(Vec<u8>, PartitionOwnerState)>> {
+    match mvcc {
+        Some(mvcc) => {
+            read_partition_owner_state_mvcc(mvcc, partition_family, partition_id, signing_key)
+        }
+        None => {
+            read_partition_owner_state(storage, partition_family, partition_id, signing_key).await
+        }
+    }
+}
+
+async fn write_partition_owner_state_backend(
+    storage: &Storage,
+    mvcc: Option<&crate::mvcc_bootstrap::MvccSubsystem>,
+    owner: &PartitionOwnerState,
+    expected_ref: Option<&Vec<u8>>,
+) -> Result<()> {
+    match mvcc {
+        Some(mvcc) => write_partition_owner_state_mvcc(mvcc, owner, expected_ref).await,
+        None => write_partition_owner_state(storage, owner, expected_ref).await,
+    }
 }
 
 fn validate_acquire_ownership(request: &AcquireOwnership) -> Result<()> {

@@ -238,6 +238,29 @@ pub(super) async fn read_partition_owner_state(
     Ok(Some((bytes, owner)))
 }
 
+pub(super) fn read_partition_owner_state_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    partition_family: &str,
+    partition_id: &str,
+    signing_key: &[u8],
+) -> Result<Option<(Vec<u8>, PartitionOwnerState)>> {
+    let row_key = partition_owner_row_key(partition_family, partition_id)?;
+    let key = crate::mvcc_product::coremeta_logical_key(
+        CF_LEASES_FENCES,
+        TABLE_PARTITION_OWNER_ROW,
+        &row_key,
+    )?;
+    let Some(bytes) = mvcc.read_latest_value(&key)? else {
+        return Ok(None);
+    };
+    let owner = decode_partition_owner_record(&bytes)?;
+    owner.verify(signing_key)?;
+    if owner.partition_family != partition_family || owner.partition_id != partition_id {
+        return Err(anyhow!("partition owner row scope mismatch"));
+    }
+    Ok(Some((bytes, owner)))
+}
+
 pub(super) async fn write_partition_owner_state(
     storage: &Storage,
     owner: &PartitionOwnerState,
@@ -271,8 +294,79 @@ pub(super) async fn write_partition_owner_state(
     .await
 }
 
+pub(super) async fn write_partition_owner_state_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    owner: &PartitionOwnerState,
+    expected_ref: Option<&Vec<u8>>,
+) -> Result<()> {
+    use crate::mvcc_transaction::{DurabilityLevel, PredicateKind};
+
+    let row_key = partition_owner_row_key(&owner.partition_family, &owner.partition_id)?;
+    let main_key = crate::mvcc_product::coremeta_logical_key(
+        CF_LEASES_FENCES,
+        TABLE_PARTITION_OWNER_ROW,
+        &row_key,
+    )?;
+    let payload = encode_partition_owner_record(owner)?;
+    let previous = expected_ref
+        .map(|payload| decode_partition_owner_record(payload))
+        .transpose()?;
+    let old_projection_key = previous
+        .as_ref()
+        .map(partition_owner_by_node_key)
+        .transpose()?;
+    let new_projection_key = partition_owner_by_node_key(owner)?;
+
+    let mut mutations = vec![crate::mvcc_product::ProductMutation::put(
+        main_key.clone(),
+        payload.clone(),
+    )];
+    if let Some(old_projection_key) = old_projection_key
+        && old_projection_key != new_projection_key
+    {
+        mutations.push(crate::mvcc_product::ProductMutation::delete(
+            crate::mvcc_product::coremeta_logical_key(
+                CF_LEASES_FENCES,
+                TABLE_PARTITION_OWNER_ROW,
+                &old_projection_key,
+            )?,
+        ));
+    }
+    mutations.push(crate::mvcc_product::ProductMutation::put(
+        crate::mvcc_product::coremeta_logical_key(
+            CF_LEASES_FENCES,
+            TABLE_PARTITION_OWNER_ROW,
+            &new_projection_key,
+        )?,
+        payload,
+    ));
+    let predicate = expected_ref
+        .map(|expected| PredicateKind::ValueHash(*blake3::hash(expected).as_bytes()))
+        .unwrap_or(PredicateKind::Absent);
+    let now_unix_ms = u64::try_from(owner.updated_at_nanos.max(0))
+        .unwrap_or(u64::MAX)
+        .saturating_div(1_000_000);
+    mvcc.autocommit_product_mutations_with_predicates(
+        "partition-fence",
+        &partition_owner_transaction_id(owner),
+        mutations,
+        vec![(main_key, predicate)],
+        DurabilityLevel::Quorum,
+        now_unix_ms,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| {
+        anyhow!(
+            "{}: MVCC partition-owner CAS failed: {error}",
+            super::OWNERSHIP_CAS_CONFLICT
+        )
+    })
+}
+
 pub(super) fn is_partition_fence_cas_conflict(error: &anyhow::Error) -> bool {
     is_retryable_mutation_conflict(error)
+        || error.to_string().contains(super::OWNERSHIP_CAS_CONFLICT)
 }
 
 fn read_committed_fence_row(

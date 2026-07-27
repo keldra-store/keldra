@@ -263,6 +263,30 @@ pub(crate) async fn create_region_with_permit_mvcc(
     Ok(true)
 }
 
+pub(crate) async fn region_exists_mvcc(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    name: &str,
+) -> Result<bool> {
+    let key = crate::mvcc_product::coremeta_logical_key(
+        CF_MESH,
+        TABLE_CONTROL_CURRENT_ROW,
+        &region_tuple_key(name)?,
+    )?;
+    let snapshot = mvcc
+        .runtime
+        .snapshot(crate::mvcc_transaction::ReadConsistency::Linearized)
+        .await?;
+    let current = mvcc
+        .runtime
+        .read_at(&key, snapshot)?
+        .map(|row| decode_control_current_row(&row.value))
+        .transpose()?;
+    Ok(matches!(
+        current,
+        Some(ControlCurrentRecord::Region { active: true, .. })
+    ))
+}
+
 pub fn current_control_collection_revision_mvcc(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
 ) -> Result<String> {
