@@ -64,14 +64,6 @@ jobs:
         with:
           version: 0.14.1
 
-      - name: Install cargo-zigbuild
-        run: |
-          if cargo zigbuild --version 2>/dev/null | grep -q 'cargo-zigbuild 0.20.1'; then
-            echo "cargo-zigbuild 0.20.1 is already installed"
-          else
-            cargo install cargo-zigbuild --version 0.20.1 --locked --force
-          fi
-
       - name: Install system build dependencies
         run: |
           sudo apt-get update
@@ -89,14 +81,38 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/bin/
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-v2-pr-image-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-v3-image-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-v2-pr-image-
-            ${{ runner.os }}-cargo-v2-
+            ${{ runner.os }}-cargo-v3-image-${{ matrix.arch }}-
+
+      - name: Install pinned cross-build toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! cargo zigbuild --version 2>/dev/null | grep -Fxq 'cargo-zigbuild 0.20.1'; then
+            cargo install cargo-zigbuild --version 0.20.1 --locked --force
+          fi
+
+          cargo_zigbuild_version="$(cargo zigbuild --version)"
+          zig_path="$(command -v zig)"
+          zig_version="$("$zig_path" version)"
+          test "$cargo_zigbuild_version" = 'cargo-zigbuild 0.20.1'
+          test "$zig_version" = '0.14.1'
+
+          {
+            printf 'CARGO_ZIGBUILD_ZIG_PATH=%s\n' "$zig_path"
+            printf 'CARGO_ZIGBUILD_PYTHON_PATH=%s/anvil-no-python-zig-%s-%s\n' \
+              "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            printf 'CARGO_ZIGBUILD_CACHE_DIR=%s/anvil-cargo-zigbuild-%s-%s-%s\n' \
+              "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" '${{ matrix.arch }}'
+          } >> "$GITHUB_ENV"
+
+      - name: Discard arm64 artifacts from incompatible Zig versions
+        if: matrix.arch == 'arm64'
+        run: cargo clean --profile ci --target aarch64-unknown-linux-gnu
 
       - name: Build Docker image from host-built binaries
         run: ./scripts/build-image.sh
