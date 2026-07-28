@@ -1240,6 +1240,87 @@ pub struct TestCluster {
     _cluster_permit: Option<OwnedSemaphorePermit>,
 }
 
+fn test_cluster_lifecycle_projection(
+    states: &[AppState],
+) -> anvil_core::mesh_lifecycle::BootstrapMeshLifecycleProjection {
+    let mut seen_regions = BTreeSet::new();
+    let mut regions = Vec::new();
+    let mut seen_cells = BTreeSet::new();
+    let mut cells = Vec::new();
+    let mut nodes = Vec::new();
+
+    for source in states {
+        if seen_regions.insert(source.config.region.clone()) {
+            regions.push(anvil_core::mesh_lifecycle::CreateRegionDescriptor {
+                mesh_id: source.config.mesh_id.clone(),
+                region: source.config.region.clone(),
+                public_base_url: source.config.public_api_addr.clone(),
+                virtual_host_suffix: format!("{}.test.anvil.local", source.config.region),
+                placement_weight: 100,
+                default_cell: Some(source.config.cell_id.clone()),
+            });
+        }
+
+        let cell_key = format!("{}/{}", source.config.region, source.config.cell_id);
+        if seen_cells.insert(cell_key) {
+            cells.push(anvil_core::mesh_lifecycle::RegisterCellDescriptor {
+                mesh_id: source.config.mesh_id.clone(),
+                region: source.config.region.clone(),
+                cell_id: source.config.cell_id.clone(),
+                placement_weight: 100,
+                failure_domain: source.config.cell_id.clone(),
+            });
+        }
+
+        nodes.push(anvil_core::mesh_lifecycle::RegisterNodeDescriptor {
+            mesh_id: source.config.mesh_id.clone(),
+            node_id: source.config.node_id.clone(),
+            region: source.config.region.clone(),
+            cell_id: source.config.cell_id.clone(),
+            receipt_signing_public_key: source.core_store.local_receipt_signing_public_key(),
+            public_api_addr: source.config.public_api_addr.clone(),
+            capabilities: vec![
+                anvil_core::mesh_lifecycle::NodeCapability::Object,
+                anvil_core::mesh_lifecycle::NodeCapability::Index,
+                anvil_core::mesh_lifecycle::NodeCapability::PersonalDb,
+                anvil_core::mesh_lifecycle::NodeCapability::Metadata,
+                anvil_core::mesh_lifecycle::NodeCapability::Gateway,
+                anvil_core::mesh_lifecycle::NodeCapability::Admin,
+            ],
+            capacity_json: "{}".to_string(),
+        });
+    }
+
+    anvil_core::mesh_lifecycle::BootstrapMeshLifecycleProjection {
+        regions,
+        cells,
+        nodes,
+    }
+}
+
+fn install_test_cluster_physical_lifecycle_projection(
+    states: &[AppState],
+    projection: &anvil_core::mesh_lifecycle::BootstrapMeshLifecycleProjection,
+) {
+    for target in states {
+        for source in states {
+            target
+                .core_store
+                .register_node_receipt_signing_public_key(
+                    &source.config.node_id,
+                    &source.core_store.local_receipt_signing_public_key(),
+                )
+                .unwrap();
+        }
+        anvil_core::mesh_lifecycle::install_bootstrap_lifecycle_projection(
+            &target.storage,
+            &target.core_store,
+            projection.clone(),
+        )
+        .unwrap();
+    }
+}
+
 impl TestCluster {
     pub async fn create_bucket(&self, bucket_name: &str, region: &str) {
         let mut bucket_client =
@@ -1372,6 +1453,10 @@ impl TestCluster {
         )
         .unwrap();
         config.mvcc_cluster_id = mvcc_cluster_id;
+        // The production bootstrap contract explicitly grants every genesis
+        // node. Keep the in-process fixture equivalent so node-to-node
+        // authorization does not depend on topology seeded after readiness.
+        config.bootstrap_node_ids = node_ids.clone();
         if regions.len() > 1
             && config.mvcc_bundle_quorum_holders == 1
             && config.mvcc_tolerated_failure_domains == 0
@@ -1473,6 +1558,11 @@ impl TestCluster {
             }
             install_canonical_coremeta_bootstrap_snapshot(&states);
         }
+        // Physical placement and receipt verification are bootstrap inputs,
+        // not post-readiness data. Install them before listeners can admit
+        // background materialization work.
+        let physical_projection = test_cluster_lifecycle_projection(&states);
+        install_test_cluster_physical_lifecycle_projection(&states, &physical_projection);
 
         Self {
             nodes: Vec::new(),
@@ -1573,6 +1663,25 @@ impl TestCluster {
                     format!("start_and_converge port_ready nodes={node_count}"),
                     start.elapsed(),
                 );
+                let transport_ready_start = Instant::now();
+                let reachable_addrs = self
+                    .grpc_addrs
+                    .iter()
+                    .chain(self.admin_addrs.iter())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                assert!(
+                    wait_for_all_http_reachable(
+                        &reachable_addrs,
+                        timeout.saturating_sub(start.elapsed())
+                    )
+                    .await,
+                    "Cluster ports opened but HTTP services did not start on every node"
+                );
+                emit_test_timing(
+                    format!("start_and_converge transport_ready nodes={node_count}"),
+                    transport_ready_start.elapsed(),
+                );
                 if !self.mvcc_membership_initialized {
                     self.states[0]
                         .mvcc
@@ -1587,15 +1696,12 @@ impl TestCluster {
                     self.seed_multi_node_mvcc_bootstrap(get_new_token).await;
                 }
                 let http_ready_start = Instant::now();
-                let ready_addrs = self
-                    .grpc_addrs
-                    .iter()
-                    .chain(self.admin_addrs.iter())
-                    .cloned()
-                    .collect::<Vec<_>>();
                 assert!(
-                    wait_for_all_http_ready(&ready_addrs, timeout.saturating_sub(start.elapsed()))
-                        .await,
+                    wait_for_all_http_ready(
+                        &reachable_addrs,
+                        timeout.saturating_sub(start.elapsed())
+                    )
+                    .await,
                     "Cluster listeners opened but HTTP readiness probes did not pass for all nodes"
                 );
                 emit_test_timing(
@@ -1762,59 +1868,10 @@ impl TestCluster {
     }
 
     async fn seed_corestore_mesh_lifecycle(&self) {
-        let mut seen_regions = BTreeSet::new();
-        let mut regions = Vec::new();
-        let mut seen_cells = BTreeSet::new();
-        let mut cells = Vec::new();
-        let mut nodes = Vec::new();
-
-        for source in &self.states {
-            if seen_regions.insert(source.config.region.clone()) {
-                regions.push(anvil_core::mesh_lifecycle::CreateRegionDescriptor {
-                    mesh_id: source.config.mesh_id.clone(),
-                    region: source.config.region.clone(),
-                    public_base_url: source.config.public_api_addr.clone(),
-                    virtual_host_suffix: format!("{}.test.anvil.local", source.config.region),
-                    placement_weight: 100,
-                    default_cell: Some(source.config.cell_id.clone()),
-                });
-            }
-
-            let cell_key = format!("{}/{}", source.config.region, source.config.cell_id);
-            if seen_cells.insert(cell_key) {
-                cells.push(anvil_core::mesh_lifecycle::RegisterCellDescriptor {
-                    mesh_id: source.config.mesh_id.clone(),
-                    region: source.config.region.clone(),
-                    cell_id: source.config.cell_id.clone(),
-                    placement_weight: 100,
-                    failure_domain: source.config.cell_id.clone(),
-                });
-            }
-
-            nodes.push(anvil_core::mesh_lifecycle::RegisterNodeDescriptor {
-                mesh_id: source.config.mesh_id.clone(),
-                node_id: source.config.node_id.clone(),
-                region: source.config.region.clone(),
-                cell_id: source.config.cell_id.clone(),
-                receipt_signing_public_key: source.core_store.local_receipt_signing_public_key(),
-                public_api_addr: source.config.public_api_addr.clone(),
-                capabilities: vec![
-                    anvil_core::mesh_lifecycle::NodeCapability::Object,
-                    anvil_core::mesh_lifecycle::NodeCapability::Index,
-                    anvil_core::mesh_lifecycle::NodeCapability::PersonalDb,
-                    anvil_core::mesh_lifecycle::NodeCapability::Metadata,
-                    anvil_core::mesh_lifecycle::NodeCapability::Gateway,
-                    anvil_core::mesh_lifecycle::NodeCapability::Admin,
-                ],
-                capacity_json: "{}".to_string(),
-            });
-        }
-
-        let projection = anvil_core::mesh_lifecycle::BootstrapMeshLifecycleProjection {
-            regions: regions.clone(),
-            cells: cells.clone(),
-            nodes: nodes.clone(),
-        };
+        let projection = test_cluster_lifecycle_projection(&self.states);
+        let regions = projection.regions.clone();
+        let cells = projection.cells.clone();
+        let nodes = projection.nodes.clone();
 
         let node_default_grants = self
             .states
@@ -1844,23 +1901,7 @@ impl TestCluster {
                 canonical.config.node_id
             )
         });
-        for target in &self.states {
-            for source in &self.states {
-                target
-                    .core_store
-                    .register_node_receipt_signing_public_key(
-                        &source.config.node_id,
-                        &source.core_store.local_receipt_signing_public_key(),
-                    )
-                    .unwrap();
-            }
-            anvil_core::mesh_lifecycle::install_bootstrap_lifecycle_projection(
-                &target.storage,
-                &target.core_store,
-                projection.clone(),
-            )
-            .unwrap();
-        }
+        install_test_cluster_physical_lifecycle_projection(&self.states, &projection);
 
         // Keep the physical bootstrap projection while CoreStore shard
         // placement still reads it, but seed the authoritative topology through
@@ -2230,6 +2271,28 @@ async fn wait_for_all_http_ready(base_urls: &[String], timeout: Duration) -> boo
             return true;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    false
+}
+
+async fn wait_for_all_http_reachable(base_urls: &[String], timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        let mut all_reachable = true;
+        for base_url in base_urls {
+            let health_url = format!("{}/health", base_url.trim_end_matches('/'));
+            if !matches!(
+                tokio::time::timeout(Duration::from_secs(2), reqwest::get(&health_url)).await,
+                Ok(Ok(_))
+            ) {
+                all_reachable = false;
+                break;
+            }
+        }
+        if all_reachable {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     false
 }

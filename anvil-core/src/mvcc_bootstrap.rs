@@ -69,6 +69,27 @@ fn raft_store_is_empty(store: &RocksRaftStore) -> Result<bool> {
     Ok(!has_retained_log && !has_purged_log)
 }
 
+async fn wait_for_committed_initial_membership(
+    consensus: &OpenRaftConsensus,
+    expected_voters: &BTreeSet<NodeId>,
+) -> Result<()> {
+    // OpenRaft may elect the bootstrap node before its initial membership
+    // entry is committed. A later membership change is only safe after that
+    // entry reaches the applied state machine.
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let applied_voters = consensus.applied_voter_ids()?;
+            if consensus.is_leader() && &applied_voters == expected_voters {
+                return Ok::<_, anvil_mvcc_consensus::ConsensusError>(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("initial MVCC Raft membership was not committed by the bootstrap leader")??;
+    Ok(())
+}
+
 #[derive(Clone)]
 struct RaftClusterOwnershipResolver {
     cluster_id: String,
@@ -464,7 +485,7 @@ impl MvccSubsystem {
         if self.peers.iter().any(|peer| peer.cluster_id != cluster_id) {
             bail!("test MVCC membership contains a peer from another cluster");
         }
-        let members = self
+        let members: BTreeMap<_, _> = self
             .peers
             .iter()
             .filter(|peer| peer.voter)
@@ -477,17 +498,14 @@ impl MvccSubsystem {
                 )
             })
             .collect();
+        let expected_voters = members.keys().copied().collect::<BTreeSet<_>>();
         self.consensus
             .initialize(members)
             .await
             .context("initialize configured test MVCC membership")?;
-        tokio::time::timeout(Duration::from_secs(15), async {
-            while !self.consensus.is_leader() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .context("test MVCC bootstrap node did not become leader")?;
+        wait_for_committed_initial_membership(&self.consensus, &expected_voters)
+            .await
+            .context("wait for configured test MVCC membership")?;
         for peer in self.peers.iter().filter(|peer| !peer.voter) {
             self.consensus
                 .add_learner(
@@ -722,7 +740,7 @@ impl MvccSubsystem {
             .context("start MVCC Raft runtime")?,
         );
         if config.mvcc_bootstrap_membership && raft_is_empty {
-            let members = peers
+            let members: BTreeMap<_, _> = peers
                 .iter()
                 .filter(|peer| peer.voter)
                 .map(|peer| {
@@ -734,19 +752,14 @@ impl MvccSubsystem {
                     )
                 })
                 .collect();
+            let expected_voters = members.keys().copied().collect::<BTreeSet<_>>();
             consensus
                 .initialize(members)
                 .await
                 .context("initialize MVCC Raft membership")?;
-            tokio::time::timeout(Duration::from_secs(15), async {
-                while !consensus.is_leader() {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .context(
-                "local node did not become leader while installing initial Raft control state",
-            )?;
+            wait_for_committed_initial_membership(&consensus, &expected_voters)
+                .await
+                .context("wait for initial MVCC Raft membership")?;
             for peer in peers.iter().filter(|peer| !peer.voter) {
                 consensus
                     .add_learner(
