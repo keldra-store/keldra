@@ -132,10 +132,11 @@ The following are release boundaries, not hidden background features:
 - **Hugging Face ingestion is disabled.** Key storage remains available, but
   ingestion start/status/cancel RPCs return `Unimplemented`, and ingestion
   actions cannot be delegated in this release.
-- **Boundary-schema retry responses are not byte-equivalent.** A retry of an
-  already committed implicit write can return the same schema hash with a
-  different textual prefix. The committed schema remains available; canonical
-  retry-response equivalence is deferred.
+- **Boundary-schema retry responses are not equivalent.** A retry of an already
+  committed implicit write can return a different schema-hash value because the
+  initial and reconstructed responses currently hash different representations.
+  The committed schema remains available; canonical retry-response equivalence
+  is deferred.
 - **Mixed-version rolling upgrades are not a supported guarantee yet.** Upgrade
   a controlled deployment using backups, release-pinned artifacts, and the
   release's documented validation sequence.

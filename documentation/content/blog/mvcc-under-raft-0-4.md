@@ -104,8 +104,9 @@ Version 0.4.0 intentionally does not claim the following:
   cancellation RPCs fail closed with `Unimplemented`; ingestion actions cannot
   be delegated in 0.4.0.
 - An idempotent retry of an already-committed boundary-schema write may return
-  the same hash in a different textual representation. The committed schema is
-  retained, but exact retry-response equivalence is deferred to 0.4.1.
+  a different schema-hash value because the initial and reconstructed responses
+  currently hash different representations. The committed schema is retained,
+  but exact retry-response equivalence is deferred to 0.4.1.
 - Explicit transactions carrying object payloads must request `local`
   durability. Server-created implicit object/Git transactions and the CLI
   `transaction begin` default use `local`. Raw `BeginTransaction` requests that
