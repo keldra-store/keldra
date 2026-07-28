@@ -8,7 +8,7 @@ use anvil::anvil_api::{
     PutBucketPolicyRequest, WriteOptions, write_options,
 };
 use anvil::system_realm::{SYSTEM_BUCKET_NAMESPACE, SYSTEM_STORAGE_TENANT_ID};
-use anvil_test_utils::{TestCluster, isolated_test_cluster};
+use anvil_test_utils::{ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT, TestCluster, isolated_test_cluster};
 use tonic::{Code, Request};
 
 fn authorized<T>(message: T, token: &str) -> Request<T> {
@@ -106,7 +106,10 @@ async fn commit(
 
 #[tokio::test]
 async fn bucket_create_and_policy_use_one_transaction_overlay_and_publish_default_grants() {
-    let cluster = isolated_test_cluster("bucket-transaction-overlay", &["test-region-1"]).await;
+    let mut cluster = isolated_test_cluster("bucket-transaction-overlay", &["test-region-1"]).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
     let endpoint = cluster.grpc_addrs[0].clone();
     let mut transactions = TransactionServiceClient::connect(endpoint.clone())
         .await
@@ -218,7 +221,11 @@ async fn bucket_create_and_policy_use_one_transaction_overlay_and_publish_defaul
 
 #[tokio::test]
 async fn bucket_name_conflict_aborts_every_bucket_mutation_in_losing_transaction() {
-    let cluster = isolated_test_cluster("bucket-transaction-conflict", &["test-region-1"]).await;
+    let mut cluster =
+        isolated_test_cluster("bucket-transaction-conflict", &["test-region-1"]).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
     let endpoint = cluster.grpc_addrs[0].clone();
     let mut transactions = TransactionServiceClient::connect(endpoint.clone())
         .await
@@ -261,7 +268,10 @@ async fn bucket_name_conflict_aborts_every_bucket_mutation_in_losing_transaction
 
 #[tokio::test]
 async fn implicit_bucket_mutations_reconstruct_committed_outcomes_after_lost_responses() {
-    let cluster = isolated_test_cluster("bucket-implicit-retry", &["test-region-1"]).await;
+    let mut cluster = isolated_test_cluster("bucket-implicit-retry", &["test-region-1"]).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
     let endpoint = cluster.grpc_addrs[0].clone();
     let mut buckets = BucketServiceClient::connect(endpoint).await.unwrap();
     let bucket_name = format!("bucket-retry-{}", uuid::Uuid::new_v4().simple());

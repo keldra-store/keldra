@@ -85,9 +85,25 @@ fn rfc_0006_no_durable_bypass_feature_families_are_corestore_backed() {
     let families = [
         DurableFeatureFamily {
             name: "object_payload",
-            source_files: &["anvil-core/src/object_manager.rs"],
-            required_terms: &["put_object", "PutBlob", "anvil.core.object_data_target.v1"],
-            corestore_terms: &["CoreStore", ".put_blob"],
+            source_files: &[
+                "anvil-core/src/object_manager.rs",
+                "anvil-core/src/mvcc_physical_payload.rs",
+            ],
+            required_terms: &[
+                "put_object",
+                "prepare_mvcc_object_ingest",
+                "anvil.core.object_data_target.v1",
+            ],
+            corestore_terms: &[
+                "prepare_mvcc_physical_payload",
+                "DistributedIngest::encode",
+                "ShardPlacementPolicy",
+                "DurabilityLevel::Quorum",
+                ".record_ingest(",
+                ".add_manifest(",
+                "stage_product_mutations",
+                "ProductMutation::put",
+            ],
         },
         DurableFeatureFamily {
             name: "object_metadata",
@@ -258,9 +274,13 @@ fn rfc_0006_no_durable_bypass_feature_families_are_corestore_backed() {
                 "create_gateway_repository",
             ],
             corestore_terms: &[
-                "CoreStore",
-                "CoreMetaBatchOp",
-                ".commit_coremeta_root_groups",
+                "coremeta_logical_key",
+                "PredicateKind::ValueHash",
+                "PredicateKind::Absent",
+                "ProductMutation::put",
+                "autocommit_product_mutations_with_predicates",
+                "DurabilityLevel::Quorum",
+                "mvcc.runtime",
             ],
         },
         DurableFeatureFamily {
@@ -273,8 +293,12 @@ fn rfc_0006_no_durable_bypass_feature_families_are_corestore_backed() {
             corestore_terms: &[
                 "CoreStore",
                 ".write_logical_file_with_locator",
-                "CoreMetaBatchOp",
-                ".commit_coremeta_root_groups",
+                "put_record_row",
+                "coremeta_logical_key",
+                "ProductMutation::put",
+                "autocommit_product_mutations_with_predicates",
+                "DurabilityLevel::Quorum",
+                "read_mvcc_core_object_ref",
             ],
         },
         DurableFeatureFamily {
@@ -289,11 +313,14 @@ fn rfc_0006_no_durable_bypass_feature_families_are_corestore_backed() {
                 "resolve_gateway_mount",
             ],
             corestore_terms: &[
-                "CoreStore",
-                "CoreMutationBatch",
-                "CoreMutationOperation::CoreMetaPut",
-                ".commit_mutation_batch",
-                ".scan_coremeta_prefix_page",
+                "coremeta_logical_key",
+                "ProductMutation::put",
+                "ProductMutation::delete",
+                "PredicateKind::ValueHash",
+                "autocommit_product_mutations_with_predicates",
+                "DurabilityLevel::Quorum",
+                "scan_table_prefix_at",
+                "applied_version",
             ],
         },
         DurableFeatureFamily {

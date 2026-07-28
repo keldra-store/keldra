@@ -6,7 +6,9 @@ use anvil::anvil_api::{
     BeginTransactionRequest, CommitTransactionRequest, CreateHfKeyRequest, MvccDurability,
     MvccReadConsistency, WriteOptions, WriteState, write_options,
 };
-use anvil_test_utils::{TestCluster, isolated_test_cluster, unique_test_name};
+use anvil_test_utils::{
+    ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT, TestCluster, isolated_test_cluster, unique_test_name,
+};
 
 fn authorized<T>(mut request: tonic::Request<T>, token: &str) -> tonic::Request<T> {
     request
@@ -70,7 +72,10 @@ async fn create_key(
 
 #[tokio::test]
 async fn hf_key_writes_stage_and_conflicting_transactions_abort() {
-    let cluster = isolated_test_cluster("hf-key-transactions", &["test-region-1"]).await;
+    let mut cluster = isolated_test_cluster("hf-key-transactions", &["test-region-1"]).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
     let key_name = unique_test_name("hf-key-conflict");
     let first = begin(&cluster, "hf-first").await;
     let second = begin(&cluster, "hf-second").await;
@@ -128,7 +133,10 @@ async fn hf_key_writes_stage_and_conflicting_transactions_abort() {
 
 #[tokio::test]
 async fn hf_key_implicit_retry_reconstructs_the_committed_response() {
-    let cluster = isolated_test_cluster("hf-key-lost-response", &["test-region-1"]).await;
+    let mut cluster = isolated_test_cluster("hf-key-lost-response", &["test-region-1"]).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
     let key_name = unique_test_name("hf-key-retry");
     let idempotency_key = uuid::Uuid::new_v4().to_string();
     let mut keys = HuggingFaceKeyServiceClient::connect(cluster.grpc_addrs[0].clone())

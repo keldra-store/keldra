@@ -2,7 +2,9 @@
 
 use anvil::anvil_api::registry_service_client::RegistryServiceClient;
 use anvil::anvil_api::{PutPackageBlobRequest, WriteOptions};
-use anvil_test_utils::{isolated_test_cluster, unique_test_name};
+use anvil_test_utils::{
+    ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT, isolated_test_cluster, unique_test_name,
+};
 use sha2::{Digest, Sha256};
 
 fn authorized<T>(mut request: tonic::Request<T>, token: &str) -> tonic::Request<T> {
@@ -14,7 +16,10 @@ fn authorized<T>(mut request: tonic::Request<T>, token: &str) -> tonic::Request<
 
 #[tokio::test]
 async fn implicit_registry_blob_retry_reconstructs_the_committed_outcome() {
-    let cluster = isolated_test_cluster("registry-implicit-retry", &["test-region-1"]).await;
+    let mut cluster = isolated_test_cluster("registry-implicit-retry", &["test-region-1"]).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
     let mut registry = RegistryServiceClient::connect(cluster.grpc_addrs[0].clone())
         .await
         .unwrap();

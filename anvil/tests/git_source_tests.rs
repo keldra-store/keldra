@@ -13,7 +13,8 @@ use anvil::git_source_index::{GitSourceIndexWrite, write_git_source_index};
 use anvil::git_source_watch::{GitSourceWatchPayload, append_git_source_watch_record};
 use anvil::writer_segment_catalog::read_writer_segment_catalog_record;
 use anvil_test_utils::{
-    TestCluster, isolated_test_cluster, shared_default_test_cluster, unique_test_name,
+    ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT, TestCluster, isolated_test_cluster,
+    shared_default_test_cluster, unique_test_name,
 };
 use flate2::{Compression, write::ZlibEncoder};
 use futures_util::StreamExt;
@@ -424,7 +425,10 @@ async fn put_git_pack_implicitly(
 
 #[tokio::test]
 async fn implicit_git_pack_retry_reconstructs_the_committed_outcome() {
-    let cluster = isolated_test_cluster("git-source-implicit-retry", &["test-region-1"]).await;
+    let mut cluster = isolated_test_cluster("git-source-implicit-retry", &["test-region-1"]).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
     let repository_id = unique_test_name("repo-retry");
     let bucket_name = unique_test_name("git-retry-packs");
     cluster.create_bucket(&bucket_name, "test-region-1").await;
@@ -476,7 +480,11 @@ async fn commit_git_transaction(
 
 #[tokio::test]
 async fn git_packs_and_manifests_commit_atomically_across_repositories() {
-    let cluster = isolated_test_cluster("git-source-transaction-success", &["test-region-1"]).await;
+    let mut cluster =
+        isolated_test_cluster("git-source-transaction-success", &["test-region-1"]).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
     let endpoint = cluster.grpc_addrs[0].clone();
     let bucket_name = unique_test_name("git-transaction-bucket");
     cluster.create_bucket(&bucket_name, "test-region-1").await;
@@ -530,8 +538,11 @@ async fn git_packs_and_manifests_commit_atomically_across_repositories() {
 
 #[tokio::test]
 async fn git_repository_conflict_aborts_every_manifest_and_pack_in_losing_transaction() {
-    let cluster =
+    let mut cluster =
         isolated_test_cluster("git-source-transaction-conflict", &["test-region-1"]).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
     let endpoint = cluster.grpc_addrs[0].clone();
     let bucket_name = unique_test_name("git-conflict-bucket");
     cluster.create_bucket(&bucket_name, "test-region-1").await;

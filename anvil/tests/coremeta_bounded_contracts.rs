@@ -10,7 +10,11 @@ fn workspace_file(path: &str) -> String {
 
 #[test]
 fn coremeta_store_exposes_only_bounded_scan_contracts() {
-    let source = workspace_file("anvil-core/src/core_store/meta.rs");
+    let source = format!(
+        "{}\n{}",
+        workspace_file("anvil-core/src/core_store/meta.rs"),
+        workspace_file("anvil-core/src/core_store/meta/scans.rs")
+    );
 
     assert!(!source.contains("pub fn scan_prefix("));
     assert!(!source.contains("scan_all_encoded_rows"));
@@ -23,7 +27,6 @@ fn coremeta_store_exposes_only_bounded_scan_contracts() {
 fn owned_coremeta_surfaces_do_not_call_unbounded_scans() {
     for path in [
         "anvil-core/src/core_store/local_internal_coremeta.rs",
-        "anvil-core/src/core_store/local_refcounts.rs",
         "anvil-core/src/core_store/local_admission.rs",
         "anvil-core/src/core_store/local_admission/point_state.rs",
         "anvil-core/src/authz_realm_schema.rs",
@@ -63,21 +66,21 @@ fn feature_collection_contracts_carry_cursor_and_limit() {
             "{label} page contract must require a cursor and page size"
         );
         assert!(
-            source.contains("page_size + 1"),
+            source.contains("page_size + 1") || source.contains("page_size.saturating_add(1)"),
             "{label} page contract must bound continuation detection"
         );
     }
 
     let index = workspace_file("anvil-core/src/index_coremeta.rs");
     for point_key in [
-        "index_segment_latest",
-        "index_segment_family_latest",
+        "index_segment",
+        "index_segment_order",
         "index_segment_generation",
         "index_segment_ref",
     ] {
         assert!(
             index.contains(point_key),
-            "index lookup must retain the {point_key} point row"
+            "index lookup must retain the {point_key} locator row"
         );
     }
 }

@@ -150,6 +150,7 @@ impl ProcessMvccCluster {
             cluster.wait_for_admin(node).await?;
         }
         cluster.bootstrap_cluster_topology(coordinator).await?;
+        cluster.wait_for_public_ready(&[0, 1, 2]).await?;
         Ok(cluster)
     }
 
@@ -1120,7 +1121,8 @@ impl ProcessMvccCluster {
             bail!("cannot restart a running process MVCC node");
         }
         self.spawn_node(node).await?;
-        self.wait_for_admin(node).await
+        self.wait_for_admin(node).await?;
+        self.wait_for_public_ready(&[node]).await
     }
 
     /// Start a clean replacement process with the same logical node ID,
@@ -1381,6 +1383,27 @@ impl ProcessMvccCluster {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    async fn wait_for_public_ready(&self, nodes: &[usize]) -> anyhow::Result<()> {
+        let probes = nodes.iter().copied().map(|node| {
+            let endpoint = self.public_endpoint(node);
+            async move {
+                (
+                    node,
+                    crate::wait_for_http_ready(&endpoint, STARTUP_TIMEOUT).await,
+                )
+            }
+        });
+        let unavailable = futures_util::future::join_all(probes)
+            .await
+            .into_iter()
+            .filter_map(|(node, ready)| (!ready).then_some(node))
+            .collect::<Vec<_>>();
+        if !unavailable.is_empty() {
+            bail!("process MVCC public readiness did not converge for nodes {unavailable:?}");
+        }
+        Ok(())
     }
 
     async fn wait_for_admin_transport(&mut self, node: usize) -> anyhow::Result<()> {

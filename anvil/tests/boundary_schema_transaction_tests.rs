@@ -6,7 +6,9 @@ use anvil::anvil_api::{
     BeginTransactionRequest, CommitTransactionRequest, MvccDurability, MvccReadConsistency,
     PutBoundarySchemaRequest,
 };
-use anvil_test_utils::{TestCluster, isolated_test_cluster, unique_test_name};
+use anvil_test_utils::{
+    ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT, TestCluster, isolated_test_cluster, unique_test_name,
+};
 
 fn authorized<T>(mut request: tonic::Request<T>, token: &str) -> tonic::Request<T> {
     request
@@ -61,7 +63,11 @@ async fn put(
 
 #[tokio::test]
 async fn implicit_boundary_schema_retry_reconstructs_the_committed_schema() {
-    let cluster = isolated_test_cluster("boundary-schema-lost-response", &["test-region-1"]).await;
+    let mut cluster =
+        isolated_test_cluster("boundary-schema-lost-response", &["test-region-1"]).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
     let bucket_name = unique_test_name("boundary-retry");
     cluster.create_bucket(&bucket_name, "test-region-1").await;
     let mutation_id = uuid::Uuid::new_v4().to_string();
@@ -77,7 +83,10 @@ async fn implicit_boundary_schema_retry_reconstructs_the_committed_schema() {
 
 #[tokio::test]
 async fn concurrent_boundary_schema_transactions_conflict() {
-    let cluster = isolated_test_cluster("boundary-schema-conflict", &["test-region-1"]).await;
+    let mut cluster = isolated_test_cluster("boundary-schema-conflict", &["test-region-1"]).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
     let bucket_name = unique_test_name("boundary-conflict");
     cluster.create_bucket(&bucket_name, "test-region-1").await;
     let first = begin(&cluster, "boundary-first").await;

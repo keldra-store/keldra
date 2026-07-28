@@ -90,7 +90,11 @@ fn transactional_group_request(
 
 #[tokio::test]
 async fn bucket_and_personaldb_group_commit_atomically_in_one_public_transaction() {
-    let cluster = isolated_test_cluster("bucket-personaldb-transaction", &["test-region-1"]).await;
+    let mut cluster =
+        isolated_test_cluster("bucket-personaldb-transaction", &["test-region-1"]).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
     let endpoint = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
     let cluster_id = cluster.states[0].mvcc.cluster_id().to_string();
@@ -174,7 +178,10 @@ async fn bucket_and_personaldb_group_commit_atomically_in_one_public_transaction
 
 #[tokio::test]
 async fn personaldb_conflict_aborts_the_other_transactions_bucket_write() {
-    let cluster = isolated_test_cluster("bucket-personaldb-conflict", &["test-region-1"]).await;
+    let mut cluster = isolated_test_cluster("bucket-personaldb-conflict", &["test-region-1"]).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
     let endpoint = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
     let cluster_id = cluster.states[0].mvcc.cluster_id().to_string();
@@ -250,7 +257,10 @@ async fn personaldb_conflict_aborts_the_other_transactions_bucket_write() {
 
 #[tokio::test]
 async fn bucket_and_personaldb_submit_commit_atomically_and_conflict_as_one_bundle() {
-    let cluster = isolated_test_cluster("bucket-personaldb-submit", &["test-region-1"]).await;
+    let mut cluster = isolated_test_cluster("bucket-personaldb-submit", &["test-region-1"]).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
     let endpoint = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
     let cluster_id = cluster.states[0].mvcc.cluster_id().to_string();
@@ -378,8 +388,11 @@ fn transactional_projection_request(
 
 #[tokio::test]
 async fn personaldb_projection_definition_is_invisible_until_transaction_commit() {
-    let cluster =
+    let mut cluster =
         isolated_test_cluster("personaldb-projection-transaction", &["test-region-1"]).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
     let endpoint = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
     let cluster_id = cluster.states[0].mvcc.cluster_id().to_string();
@@ -462,7 +475,11 @@ async fn personaldb_projection_definition_is_invisible_until_transaction_commit(
 
 #[tokio::test]
 async fn projection_conflict_aborts_an_unrelated_bucket_in_the_losing_transaction() {
-    let cluster = isolated_test_cluster("personaldb-projection-conflict", &["test-region-1"]).await;
+    let mut cluster =
+        isolated_test_cluster("personaldb-projection-conflict", &["test-region-1"]).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
     let endpoint = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
     let cluster_id = cluster.states[0].mvcc.cluster_id().to_string();
@@ -538,8 +555,11 @@ async fn projection_conflict_aborts_an_unrelated_bucket_in_the_losing_transactio
 
 #[tokio::test]
 async fn projection_writeback_stages_source_and_target_heads_in_one_transaction() {
-    let cluster =
+    let mut cluster =
         isolated_test_cluster("projection-writeback-transaction", &["test-region-1"]).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
     let actor =
         create_transactional_personaldb_actor(&cluster, "projection-writeback-transaction").await;
     let token = actor.token.clone();
@@ -676,7 +696,11 @@ async fn projection_writeback_stages_source_and_target_heads_in_one_transaction(
 
 #[tokio::test]
 async fn projection_writeback_conflict_aborts_both_groups_and_unrelated_writes() {
-    let cluster = isolated_test_cluster("projection-writeback-conflict", &["test-region-1"]).await;
+    let mut cluster =
+        isolated_test_cluster("projection-writeback-conflict", &["test-region-1"]).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
     let actor =
         create_transactional_personaldb_actor(&cluster, "projection-writeback-conflict").await;
     let token = actor.token.clone();

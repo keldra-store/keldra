@@ -5,15 +5,6 @@ use super::preconditions::*;
 use super::routing::*;
 use super::util::*;
 use super::*;
-use anvil_core::{
-    mesh_directory::{
-        self, BucketId, BucketLocatorDescriptor, BucketName, CellId, MeshControlWriteAuthority,
-        MeshId, RegionName, RoutingRecordFamily, TenantId,
-    },
-    partition_fence::{
-        PartitionRecoveryAcquire, acquire_partition_recovery, publish_partition_ready,
-    },
-};
 use anvil_test_utils::personaldb_test_protocol_keyring;
 use futures_util::TryStreamExt;
 use tempfile::tempdir;
@@ -75,6 +66,102 @@ fn routing_config_with_policy(
     }
 }
 
+async fn provision_active_test_placement(state: &AppState, region: &str) {
+    use anvil_core::mesh_lifecycle::{
+        BootstrapMeshLifecycleProjection, CreateRegionDescriptor, LifecycleState, NodeCapability,
+        RegisterCellDescriptor, RegisterNodeDescriptor, install_bootstrap_lifecycle_projection,
+    };
+
+    let mesh_id = state.config.mesh_id.clone();
+    let cell_id = state.config.cell_id.clone();
+    let node_id = state.config.node_id.clone();
+    let receipt_signing_public_key = state.core_store.local_receipt_signing_public_key();
+    let region_input = CreateRegionDescriptor {
+        mesh_id: mesh_id.clone(),
+        region: region.to_string(),
+        public_base_url: format!("https://{region}.anvil-storage.test"),
+        virtual_host_suffix: format!("{region}.anvil-storage.test"),
+        placement_weight: 100,
+        default_cell: Some(cell_id.clone()),
+    };
+    let cell_input = RegisterCellDescriptor {
+        mesh_id: mesh_id.clone(),
+        region: region.to_string(),
+        cell_id: cell_id.clone(),
+        placement_weight: 100,
+        failure_domain: state.config.mvcc_failure_domain.clone(),
+    };
+    let node_input = RegisterNodeDescriptor {
+        mesh_id,
+        node_id: node_id.clone(),
+        region: region.to_string(),
+        cell_id: cell_id.clone(),
+        receipt_signing_public_key: receipt_signing_public_key.clone(),
+        public_api_addr: state.config.public_api_addr.clone(),
+        // The routing tests add an Object-capable node explicitly when they
+        // expect proxy selection. This placement node must not make the
+        // proxy-unavailable cases appear routable.
+        capabilities: vec![NodeCapability::Metadata],
+        capacity_json: "{}".to_string(),
+    };
+
+    state
+        .core_store
+        .register_node_receipt_signing_public_key(&node_id, &receipt_signing_public_key)
+        .unwrap();
+    install_bootstrap_lifecycle_projection(
+        &state.storage,
+        &state.core_store,
+        BootstrapMeshLifecycleProjection {
+            regions: vec![region_input.clone()],
+            cells: vec![cell_input.clone()],
+            nodes: vec![node_input.clone()],
+        },
+    )
+    .unwrap();
+
+    let region_descriptor = state
+        .persistence
+        .create_region_descriptor(region_input)
+        .await
+        .unwrap();
+    let cell_descriptor = state
+        .persistence
+        .register_cell_descriptor(cell_input)
+        .await
+        .unwrap();
+    state
+        .persistence
+        .transition_cell_descriptor(
+            region,
+            &cell_id,
+            cell_descriptor.generation,
+            LifecycleState::Active,
+        )
+        .await
+        .unwrap();
+    state
+        .persistence
+        .transition_region_descriptor(region, region_descriptor.generation, LifecycleState::Active)
+        .await
+        .unwrap();
+    let node_descriptor = state
+        .persistence
+        .register_node_descriptor(node_input)
+        .await
+        .unwrap();
+    state
+        .persistence
+        .transition_node_descriptor(
+            &node_id,
+            node_descriptor.generation,
+            LifecycleState::Active,
+            None,
+        )
+        .await
+        .unwrap();
+}
+
 async fn seeded_remote_bucket_route(
     policy: CrossRegionRoutingPolicy,
 ) -> (tempfile::TempDir, AppState, Claims, ObjectRoute) {
@@ -86,6 +173,7 @@ async fn seeded_remote_bucket_route(
     )
     .await
     .unwrap();
+    provision_active_test_placement(&state, "eu-west-1").await;
     let tenant = state
         .persistence
         .create_tenant("acme", "remote-bucket-test")
@@ -113,46 +201,15 @@ async fn seeded_remote_bucket_route(
 }
 
 async fn seed_active_proxy_node(state: &AppState, region: &str, endpoint: &str) {
-    use anvil_core::mesh_lifecycle::{
-        CreateRegionDescriptor, LifecycleState, NodeCapability, RegisterCellDescriptor,
-        RegisterNodeDescriptor,
-    };
+    use anvil_core::mesh_lifecycle::{LifecycleState, NodeCapability, RegisterNodeDescriptor};
 
-    state
-        .persistence
-        .create_region_descriptor(CreateRegionDescriptor {
-            mesh_id: "default".to_string(),
-            region: region.to_string(),
-            public_base_url: format!("https://{region}.anvil-storage.test"),
-            virtual_host_suffix: format!("{region}.anvil-storage.test"),
-            placement_weight: 100,
-            default_cell: Some("default".to_string()),
-        })
-        .await
-        .unwrap();
-    state
-        .persistence
-        .register_cell_descriptor(RegisterCellDescriptor {
-            mesh_id: "default".to_string(),
-            region: region.to_string(),
-            cell_id: "default".to_string(),
-            placement_weight: 100,
-            failure_domain: "rack-a".to_string(),
-        })
-        .await
-        .unwrap();
-    state
-        .persistence
-        .transition_cell_descriptor(region, "default", 1, LifecycleState::Active)
-        .await
-        .unwrap();
     state
         .persistence
         .register_node_descriptor(RegisterNodeDescriptor {
             mesh_id: "default".to_string(),
             node_id: "remote-object-node".to_string(),
             region: region.to_string(),
-            cell_id: "default".to_string(),
+            cell_id: state.config.cell_id.clone(),
             receipt_signing_public_key: anvil_core::node_signing::NodeSigningKeypair::generate()
                 .unwrap()
                 .public_key_bytes()
@@ -170,7 +227,7 @@ async fn seed_active_proxy_node(state: &AppState, region: &str, endpoint: &str) 
         .unwrap();
 }
 
-async fn seeded_remote_bucket_locator_only(
+async fn seeded_remote_bucket_locator(
     policy: CrossRegionRoutingPolicy,
 ) -> (tempfile::TempDir, AppState, Claims, String) {
     let temp = tempdir().unwrap();
@@ -181,69 +238,17 @@ async fn seeded_remote_bucket_locator_only(
     )
     .await
     .unwrap();
+    provision_active_test_placement(&state, "eu-west-1").await;
     let tenant = state
         .persistence
         .create_tenant("acme", "remote-locator-only-test")
         .await
         .unwrap();
-    let bucket_name = BucketName::canonicalize("releases").unwrap();
-    let object_prefix = format!("objects/{}/{}/", tenant.id, bucket_name.as_str());
-    let locator = BucketLocatorDescriptor::active(
-        MeshId::new("default").unwrap(),
-        TenantId::new(tenant.id.to_string()).unwrap(),
-        bucket_name.clone(),
-        BucketId::new("remote-bucket-id").unwrap(),
-        RegionName::new("eu-west-1").unwrap(),
-        CellId::new("default").unwrap(),
-        "regional-primary",
-        object_prefix,
-        "2026-07-02T00:00:00Z",
-    )
-    .unwrap();
-    let partition = locator.partition();
-    let control_partition_id = mesh_directory::control_partition_id(
-        RoutingRecordFamily::BucketLocator.stream_family(),
-        &partition,
-    );
-    let signing_key = hex::decode(&state.config.anvil_secret_encryption_key).unwrap();
-    let recovering = acquire_partition_recovery(
-        &state.storage,
-        PartitionRecoveryAcquire {
-            partition_family: mesh_directory::CONTROL_PARTITION_FAMILY.to_string(),
-            partition_id: control_partition_id,
-            owner_node_id: state.config.node_id.clone(),
-            recovered_through_sequence: 0,
-            recovered_manifest_hash: hex::encode([0; 32]),
-            now_nanos: 1,
-        },
-        &signing_key,
-    )
-    .await
-    .unwrap();
-    let ready = publish_partition_ready(
-        &state.storage,
-        &recovering.partition_family,
-        &recovering.partition_id,
-        &state.config.node_id,
-        recovering.fence_token,
-        0,
-        &hex::encode([0; 32]),
-        2,
-        &signing_key,
-    )
-    .await
-    .unwrap();
-    mesh_directory::write_bucket_locator(
-        &state.storage,
-        &locator,
-        MeshControlWriteAuthority {
-            permit: &ready.write_permit().unwrap(),
-            signing_key: &signing_key,
-            mvcc: None,
-        },
-    )
-    .await
-    .unwrap();
+    let bucket = state
+        .persistence
+        .create_bucket(tenant.id, "releases", "eu-west-1")
+        .await
+        .unwrap();
 
     let claims = Claims {
         sub: "test-app".to_string(),
@@ -260,7 +265,7 @@ async fn seeded_remote_bucket_locator_only(
     )
     .await
     .unwrap();
-    (temp, state, claims, bucket_name.as_str().to_string())
+    (temp, state, claims, bucket.name)
 }
 
 async fn seeded_local_object_link() -> (tempfile::TempDir, AppState, Claims, String, String) {
@@ -272,6 +277,7 @@ async fn seeded_local_object_link() -> (tempfile::TempDir, AppState, Claims, Str
     )
     .await
     .unwrap();
+    provision_active_test_placement(&state, "us-east-1").await;
     let tenant = state
         .persistence
         .create_tenant("acme", "local-link-test")
@@ -689,7 +695,7 @@ fn remote_bucket_message_parser_strips_internal_suffix_for_redirects() {
 fn head_bucket_uses_remote_locator_before_local_bucket_metadata() {
     run_s3_gateway_async_test(async move {
         let (_temp, state, claims, bucket) =
-            seeded_remote_bucket_locator_only(CrossRegionRoutingPolicy::RedirectPreferred).await;
+            seeded_remote_bucket_locator(CrossRegionRoutingPolicy::RedirectPreferred).await;
         let mut req = Request::builder()
             .uri(format!("/{bucket}"))
             .body(Body::empty())

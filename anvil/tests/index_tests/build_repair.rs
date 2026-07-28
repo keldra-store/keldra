@@ -433,6 +433,9 @@ async fn test_full_text_index_build_uses_source_cursor_snapshot() {
         &["test-region-1"],
     )
     .await;
+    cluster
+        .seed_corestore_mesh_lifecycle_for_state_only_tests()
+        .await;
     let persistence = &cluster.states[0].persistence;
     let tenant_id = 1;
     let bucket_name = unique_test_name("cursor-snapshot");
@@ -620,6 +623,9 @@ async fn test_index_build_requires_current_rfc_ownership_fence() {
         &["test-region-1"],
     )
     .await;
+    cluster
+        .seed_corestore_mesh_lifecycle_for_state_only_tests()
+        .await;
     let persistence = &cluster.states[0].persistence;
     let tenant_id = 1;
     let bucket_name = unique_test_name("index-fence");
@@ -720,6 +726,9 @@ async fn test_index_enqueue_rebuilds_when_checkpoint_exists_but_proof_is_missing
         &["test-region-1"],
     )
     .await;
+    cluster
+        .seed_corestore_mesh_lifecycle_for_state_only_tests()
+        .await;
     let persistence = &cluster.states[0].persistence;
     let tenant_id = 1;
     let bucket_name = unique_test_name("index-missing-proof");
@@ -1145,6 +1154,9 @@ async fn test_index_build_followup_waits_for_running_build_and_catches_up_after_
         &["test-region-1"],
     )
     .await;
+    cluster
+        .seed_corestore_mesh_lifecycle_for_state_only_tests()
+        .await;
     let persistence = &cluster.states[0].persistence;
     let tenant_id = 1;
     let bucket_name = unique_test_name("index-handoff");

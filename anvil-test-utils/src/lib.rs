@@ -1753,6 +1753,13 @@ impl TestCluster {
         }
     }
 
+    /// Seed canonical lifecycle state without starting listeners or the
+    /// background worker. State-only tests use this before calling persistence
+    /// APIs whose production admission checks require an active region.
+    pub async fn seed_corestore_mesh_lifecycle_for_state_only_tests(&self) {
+        self.seed_corestore_mesh_lifecycle().await;
+    }
+
     async fn seed_corestore_mesh_lifecycle(&self) {
         let mut seen_regions = BTreeSet::new();
         let mut regions = Vec::new();

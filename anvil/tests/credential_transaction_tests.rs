@@ -7,7 +7,7 @@ use anvil::anvil_api::{
     DeleteApplicationCredentialRequest, GetAccessTokenRequest, MvccDurability, MvccReadConsistency,
     RotateApplicationCredentialSecretRequest, WriteOptions, WriteState, write_options,
 };
-use anvil_test_utils::{TestCluster, isolated_test_cluster};
+use anvil_test_utils::{ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT, TestCluster, isolated_test_cluster};
 use tonic::{Code, Request};
 
 fn authorized<T>(message: T, token: &str) -> Request<T> {
@@ -56,7 +56,10 @@ fn transaction_options(transaction_id: &str) -> WriteOptions {
 
 #[tokio::test]
 async fn credential_create_is_invisible_until_its_caller_transaction_commits() {
-    let cluster = isolated_test_cluster("credential-transaction", &["test-region-1"]).await;
+    let mut cluster = isolated_test_cluster("credential-transaction", &["test-region-1"]).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
     let endpoint = cluster.grpc_addrs[0].clone();
     let mut transactions = TransactionServiceClient::connect(endpoint.clone())
         .await
@@ -110,7 +113,10 @@ async fn credential_create_is_invisible_until_its_caller_transaction_commits() {
 
 #[tokio::test]
 async fn implicit_credential_retry_reconstructs_secret_and_rejects_changed_input() {
-    let cluster = isolated_test_cluster("credential-idempotency", &["test-region-1"]).await;
+    let mut cluster = isolated_test_cluster("credential-idempotency", &["test-region-1"]).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
     let endpoint = cluster.grpc_addrs[0].clone();
     let mut auth = AuthServiceClient::connect(endpoint).await.unwrap();
     let app_name = format!("credential-retry-{}", uuid::Uuid::new_v4().simple());
@@ -154,7 +160,10 @@ async fn implicit_credential_retry_reconstructs_secret_and_rejects_changed_input
 
 #[tokio::test]
 async fn implicit_rotate_and_delete_retries_reconstruct_their_original_responses() {
-    let cluster = isolated_test_cluster("credential-rotate-delete", &["test-region-1"]).await;
+    let mut cluster = isolated_test_cluster("credential-rotate-delete", &["test-region-1"]).await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
     let endpoint = cluster.grpc_addrs[0].clone();
     let mut auth = AuthServiceClient::connect(endpoint).await.unwrap();
     let app_name = format!("credential-lifecycle-{}", uuid::Uuid::new_v4().simple());
