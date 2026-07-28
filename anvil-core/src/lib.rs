@@ -216,6 +216,13 @@ pub struct AppState {
     pub mvcc: Arc<mvcc_bootstrap::MvccSubsystem>,
 }
 
+fn bootstrap_system_realm_before_coremeta_recovery(
+    mvcc_peer_count: usize,
+    marker_exists: bool,
+) -> bool {
+    mvcc_peer_count == 1 || !marker_exists
+}
+
 impl AppState {
     pub async fn new(
         config: Config,
@@ -227,6 +234,7 @@ impl AppState {
             || !personaldb_protocol_keyring.trust_store().is_empty();
         let partition_signing_key = hex::decode(&config.anvil_secret_encryption_key)?;
         let arc_config = Arc::new(config);
+        let distributed_coremeta_recovery = arc_config.requires_distributed_coremeta_recovery();
         let jwt_manager = Arc::new(JwtManager::new(arc_config.jwt_secret.clone()));
         let storage = storage::Storage::new_at(&arc_config.storage_path).await?;
         let core_store = core_store::CoreStore::new_with_pipeline_keyring_and_identity(
@@ -241,10 +249,17 @@ impl AppState {
                 internal_bearer_token: (!arc_config.corestore_internal_bearer_token.is_empty())
                     .then(|| arc_config.corestore_internal_bearer_token.clone()),
             },
-            // The replacement architecture performs cluster recovery through
-            // MVCC/OpenRaft. Legacy root/CoreMeta publication recovery is not
-            // a startup authority and carries no migration obligation.
-            core_store::CoreStoreStartupRecovery::Immediate,
+            if distributed_coremeta_recovery {
+                // Raft/MVCC remains the cluster startup authority. CoreStore
+                // must nevertheless defer replay of a same-disk pending
+                // mutation until its local CoreMeta history has caught up to
+                // the physical root-register quorum; replaying it here can
+                // otherwise publish from a stale root before this process can
+                // serve or consume recovery RPCs.
+                core_store::CoreStoreStartupRecovery::Distributed
+            } else {
+                core_store::CoreStoreStartupRecovery::Immediate
+            },
         )
         .await?;
         let mvcc = Arc::new(
@@ -279,7 +294,7 @@ impl AppState {
             .context("install MVCC transaction staging in persistence")?;
         if !arc_config.region.is_empty()
             && arc_config.mvcc_bootstrap_membership
-            && !arc_config.requires_distributed_coremeta_recovery()
+            && !distributed_coremeta_recovery
         {
             // A standalone node owns its local region bootstrap. Distributed
             // regions are installed through the admin topology bootstrap and
@@ -309,57 +324,68 @@ impl AppState {
         object_manager
             .install_mvcc(mvcc.clone())
             .context("install MVCC object runtime")?;
-        if mvcc.peers.len() == 1 {
-            system_realm::ensure_bootstrapped(
-                &arc_config,
-                &persistence,
-                &storage,
-                secret_keyring.as_ref(),
-            )
-            .await
-            .context("bootstrap system realm")?;
-        } else {
-            // A multi-node AppState must return before the initial quorum
-            // can exist. Raft also chooses the bootstrap work owner, which
-            // need not be the membership bootstrap node. Every node
-            // therefore retries the idempotent operation; only the
-            // assignment owner can commit it and all others stop once its
-            // marker is applied locally.
-            let bootstrap_config = arc_config.clone();
-            let bootstrap_persistence = persistence.clone();
-            let bootstrap_storage = storage.clone();
-            let bootstrap_keyring = secret_keyring.clone();
-            tokio::spawn(async move {
-                loop {
-                    if !bootstrap_persistence
-                        .mvcc()
-                        .is_ok_and(|mvcc| mvcc.consensus.is_leader())
-                    {
-                        tokio::time::sleep(Duration::from_millis(250)).await;
-                        continue;
-                    }
-                    match system_realm::ensure_bootstrapped(
-                        &bootstrap_config,
-                        &bootstrap_persistence,
-                        &bootstrap_storage,
-                        bootstrap_keyring.as_ref(),
-                    )
-                    .await
-                    {
-                        Ok(()) => return,
-                        Err(error) => {
-                            tracing::debug!(
-                                error = %format!("{error:#}"),
-                                "system realm bootstrap is waiting for its Raft assignment"
-                            );
+        let system_realm_marker_exists = system_realm::bootstrap_marker_exists_in_runtime(
+            mvcc.runtime.as_ref(),
+            &system_realm::normalized_mesh_id(&arc_config.mesh_id),
+        )?;
+        if bootstrap_system_realm_before_coremeta_recovery(
+            mvcc.peers.len(),
+            system_realm_marker_exists,
+        ) {
+            // A fresh multi-node cluster has no active physical topology from
+            // which CoreMeta recovery can select peers. Its admin topology RPC
+            // is itself protected by the first system-realm grants, so the
+            // first-ever bootstrap must retain the synthetic local-control
+            // path. A restart with an existing marker defers schema upgrade
+            // until distributed root history has reconciled in `anvil`.
+            if mvcc.peers.len() > 1 {
+                let bootstrap_config = arc_config.clone();
+                let bootstrap_persistence = persistence.clone();
+                let bootstrap_storage = storage.clone();
+                let bootstrap_keyring = secret_keyring.clone();
+                tokio::spawn(async move {
+                    loop {
+                        if !bootstrap_persistence
+                            .mvcc()
+                            .is_ok_and(|mvcc| mvcc.consensus.is_leader())
+                        {
                             tokio::time::sleep(Duration::from_millis(250)).await;
+                            continue;
+                        }
+                        match system_realm::ensure_bootstrapped(
+                            &bootstrap_config,
+                            &bootstrap_persistence,
+                            &bootstrap_storage,
+                            bootstrap_keyring.as_ref(),
+                        )
+                        .await
+                        {
+                            Ok(()) => return,
+                            Err(error) => {
+                                tracing::debug!(
+                                    error = %format!("{error:#}"),
+                                    "system realm bootstrap is waiting for its Raft assignment"
+                                );
+                                tokio::time::sleep(Duration::from_millis(250)).await;
+                            }
                         }
                     }
-                }
-            });
+                });
+            } else {
+                system_realm::ensure_bootstrapped(
+                    &arc_config,
+                    &persistence,
+                    &storage,
+                    secret_keyring.as_ref(),
+                )
+                .await
+                .context("bootstrap system realm")?;
+            }
         }
-        mvcc.start_background_work(core_store.clone(), observability.clone())
-            .context("start MVCC background workers")?;
+        if !distributed_coremeta_recovery {
+            mvcc.start_background_work(core_store.clone(), observability.clone())
+                .context("start MVCC background workers")?;
+        }
 
         Ok(Self {
             persistence,
@@ -410,6 +436,13 @@ mod app_state_tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64
+    }
+
+    #[test]
+    fn only_first_ever_distributed_system_realm_bootstraps_before_coremeta_recovery() {
+        assert!(bootstrap_system_realm_before_coremeta_recovery(3, false));
+        assert!(!bootstrap_system_realm_before_coremeta_recovery(3, true));
+        assert!(bootstrap_system_realm_before_coremeta_recovery(1, true));
     }
 
     #[tokio::test]

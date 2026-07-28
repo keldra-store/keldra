@@ -93,6 +93,11 @@ pub(crate) fn is_bootstrap_internal_rpc(path: &str) -> bool {
         // public product API during bootstrap.
         "/anvil.ConsensusTransport/",
         "/anvil.ReplicationService/",
+        // Distributed CoreStore replay is deliberately deferred until these
+        // authenticated services reconcile the local root/cache history.
+        // They are repair transport, not public transaction authority.
+        "/anvil.RootRegisterInternal/",
+        "/anvil.CoreMetaReplicationInternal/",
     ]
     .iter()
     .any(|prefix| path.starts_with(prefix))
@@ -156,10 +161,10 @@ mod tests {
         assert!(is_bootstrap_internal_rpc(
             "/anvil.ReplicationService/Replicate"
         ));
-        assert!(!is_bootstrap_internal_rpc(
+        assert!(is_bootstrap_internal_rpc(
             "/anvil.RootRegisterInternal/ReadRoot"
         ));
-        assert!(!is_bootstrap_internal_rpc(
+        assert!(is_bootstrap_internal_rpc(
             "/anvil.CoreMetaReplicationInternal/ExchangeCoreMetaInventory"
         ));
         assert!(!is_bootstrap_internal_rpc(

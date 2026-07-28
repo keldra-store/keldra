@@ -44,7 +44,30 @@ pub async fn start_node_with_admin_listener(
     // MVCC/OpenRaft bootstrap completed before AppState was returned. Public
     // traffic remains closed until local ordered apply has caught up and the
     // cluster-local system realm is visible.
-    let system_realm_ready = state.system_realm_is_bootstrapped()?;
+    let distributed_coremeta_recovery = state.config.requires_distributed_coremeta_recovery();
+    let _coremeta_recovery_task = state
+        .core_store
+        .start_coremeta_distributed_recovery(distributed_coremeta_recovery);
+    if distributed_coremeta_recovery {
+        let background_state = state.clone();
+        tokio::spawn(async move {
+            background_state
+                .core_store
+                .wait_for_coremeta_recovery_ready()
+                .await;
+            if let Err(error) = background_state.mvcc.start_background_work(
+                background_state.core_store.clone(),
+                background_state.observability.clone(),
+            ) {
+                error!(%error, "deferred MVCC background work failed to start");
+            }
+        });
+    }
+    let persisted_system_realm_ready = state.system_realm_is_bootstrapped()?;
+    // On a distributed node the marker alone is not enough: an existing
+    // marker still runs schema upgrade work, which can write CoreStore data.
+    // Re-admit it only after local CoreMeta history has reconciled.
+    let system_realm_ready = persisted_system_realm_ready && !distributed_coremeta_recovery;
     let public_readiness =
         startup_readiness::PublicReadiness::new(system_realm_ready, state.mvcc.clone());
     let consensus_readiness = public_readiness.clone();
@@ -74,11 +97,20 @@ pub async fn start_node_with_admin_listener(
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
     });
-    if !system_realm_ready {
+    if distributed_coremeta_recovery || !system_realm_ready {
         let startup_state = state.clone();
         let startup_readiness = public_readiness.clone();
         tokio::spawn(async move {
             loop {
+                if distributed_coremeta_recovery {
+                    // A persisted MVCC marker remains the public readiness
+                    // authority. Its idempotent schema upgrade must nevertheless
+                    // wait until local CoreMeta history is safe to extend.
+                    startup_state
+                        .core_store
+                        .wait_for_coremeta_recovery_ready()
+                        .await;
+                }
                 match startup_state.ensure_system_realm_bootstrapped().await {
                     Ok(()) => {
                         startup_readiness.mark_system_realm_ready();
@@ -97,9 +129,17 @@ pub async fn start_node_with_admin_listener(
         let worker_state = state.clone();
         let worker_readiness = public_readiness.clone();
         tokio::spawn(async move {
-            // Recovery and system-realm bootstrap establish the canonical
-            // metadata view. Background maintenance must not race either one.
+            // Raft/MVCC and system-realm readiness admit the public plane.
+            // CoreStore maintenance additionally requires its local streamed
+            // metadata history to be reconciled before it replays durable
+            // jobs from a same-disk restart.
             worker_readiness.wait_until_ready().await;
+            if distributed_coremeta_recovery {
+                worker_state
+                    .core_store
+                    .wait_for_coremeta_recovery_ready()
+                    .await;
+            }
             // Queue scanning must share the worker capability and cancellation scope.
             let worker = anvil_core::worker::run(
                 worker_state.persistence.clone(),

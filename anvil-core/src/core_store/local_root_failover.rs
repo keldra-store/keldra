@@ -111,6 +111,25 @@ enum OwnerProbeState {
     Failed,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OwnerProbeObservation {
+    Current,
+    Advanced {
+        owner_node_id: String,
+        generation: u64,
+    },
+    Failed,
+}
+
+impl OwnerProbeObservation {
+    fn state(&self) -> OwnerProbeState {
+        match self {
+            Self::Current | Self::Advanced { .. } => OwnerProbeState::Healthy,
+            Self::Failed => OwnerProbeState::Failed,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct RootOwnerFailureScope {
     register_ownership_set_hash: String,
@@ -236,9 +255,28 @@ impl CoreStore {
         let profile = self.default_coremeta_quorum_profile()?;
         let replicas = self.select_coremeta_replicas(&profile).await?;
         let current_hash = hash_root_anchor_record(&current)?;
-        let probe_state = self
-            .probe_root_owner(&current, &current_hash, &replicas)
+        let probe = self
+            .probe_root_owner_observation(&current, &current_hash, &replicas)
             .await;
+        if let OwnerProbeObservation::Advanced {
+            owner_node_id,
+            generation,
+        } = &probe
+        {
+            // A valid newer anchor proves that the observed owner is alive and
+            // that this node is behind. Treating it as a failed liveness probe
+            // starts a failover vote against stale terms. Route directly to
+            // the newer declared owner and let supervised anti-entropy install
+            // the missing generations locally.
+            self.request_coremeta_root_repair(root_key_hash, *generation);
+            if owner_node_id == &self.node_identity.node_id {
+                bail!(
+                    "CoreStore local root history is behind generation {generation}; repair has been queued"
+                );
+            }
+            return remote_write_route(owner_node_id, &replicas);
+        }
+        let probe_state = probe.state();
         let target_node_id =
             root_write_target_node(&current.publisher_node_id, probe_state, &replicas)
                 .ok_or_else(|| anyhow!("CoreStore root write route has no eligible target"))?
@@ -259,12 +297,22 @@ impl CoreStore {
                         })?;
                     let refreshed_hash = hash_root_anchor_record(&refreshed)?;
                     let refreshed_probe = self
-                        .probe_root_owner(&refreshed, &refreshed_hash, &replicas)
+                        .probe_root_owner_observation(&refreshed, &refreshed_hash, &replicas)
                         .await;
-                    if refreshed_probe == OwnerProbeState::Healthy
-                        && refreshed.publisher_node_id != self.node_identity.node_id
-                    {
-                        return remote_write_route(&refreshed.publisher_node_id, &replicas);
+                    match refreshed_probe {
+                        OwnerProbeObservation::Current
+                            if refreshed.publisher_node_id != self.node_identity.node_id =>
+                        {
+                            return remote_write_route(&refreshed.publisher_node_id, &replicas);
+                        }
+                        OwnerProbeObservation::Advanced {
+                            owner_node_id,
+                            generation,
+                        } if owner_node_id != self.node_identity.node_id => {
+                            self.request_coremeta_root_repair(root_key_hash, generation);
+                            return remote_write_route(&owner_node_id, &replicas);
+                        }
+                        _ => {}
                     }
                     return Err(failover_error);
                 }
@@ -379,12 +427,14 @@ impl CoreStore {
         {
             bail!("CoreStore root failover observation is stale");
         }
-        let current = self
+        let current_head = self
             .read_internal_root_anchor_by_hash(&request.root_key_hash, request.observed_generation)
             .await?;
-        if current.generation != request.observed_generation
-            || current.root_anchor_hash != request.observed_root_hash
-        {
+        if !failover_observation_matches_current_head(
+            request.observed_generation,
+            &request.observed_root_hash,
+            &current_head,
+        ) {
             bail!("CoreStore root failover observation does not match the committed root");
         }
         let profile = self.default_coremeta_quorum_profile()?;
@@ -639,6 +689,17 @@ impl CoreStore {
         let mut grants = BTreeMap::<String, FailoverVoteReceipt>::new();
         let mut vote_errors = Vec::new();
         for round in 0..ROOT_FAILOVER_VOTE_ROUNDS {
+            let latest = self
+                .read_current_root_anchor_unverified(&current.root_key_hash)?
+                .ok_or_else(|| anyhow!("CoreStore root disappeared during failover voting"))?;
+            if latest.root_generation != current.root_generation
+                || hash_root_anchor_record(&latest)? != current_hash
+            {
+                bail!(
+                    "CoreStore root advanced during failover voting; retry routing from generation {}",
+                    latest.root_generation
+                );
+            }
             let mut pending = FuturesUnordered::new();
             for replica in &voters {
                 let node_id = replica.node_id.clone();
@@ -760,20 +821,31 @@ impl CoreStore {
         current_hash: &str,
         replicas: &[LocalShardPlacement],
     ) -> OwnerProbeState {
+        self.probe_root_owner_observation(current, current_hash, replicas)
+            .await
+            .state()
+    }
+
+    async fn probe_root_owner_observation(
+        &self,
+        current: &CoreRootAnchorRecord,
+        current_hash: &str,
+        replicas: &[LocalShardPlacement],
+    ) -> OwnerProbeObservation {
         if current.publisher_node_id == self.node_identity.node_id {
-            return OwnerProbeState::Healthy;
+            return OwnerProbeObservation::Current;
         }
         let Some(owner) = replicas
             .iter()
             .find(|replica| replica.node_id == current.publisher_node_id)
         else {
-            return OwnerProbeState::Failed;
+            return OwnerProbeObservation::Failed;
         };
         let Some(bearer) = self.node_identity.internal_bearer_token.as_deref() else {
-            return OwnerProbeState::Failed;
+            return OwnerProbeObservation::Failed;
         };
         let Ok(authorization) = MetadataValue::try_from(format!("Bearer {bearer}")) else {
-            return OwnerProbeState::Failed;
+            return OwnerProbeObservation::Failed;
         };
         let request = ReadRootRequest {
             header: self.internal_request_header("root.read").ok(),
@@ -807,15 +879,11 @@ impl CoreStore {
             ),
         )
         .await;
-        match result {
-            Ok(Ok(read))
-                if read.generation == current.root_generation
-                    && read.root_anchor_hash == current_hash =>
-            {
-                OwnerProbeState::Healthy
-            }
-            _ => OwnerProbeState::Failed,
-        }
+        let Ok(Ok(read)) = result else {
+            return OwnerProbeObservation::Failed;
+        };
+        classify_owner_probe_read(current, current_hash, &read)
+            .unwrap_or(OwnerProbeObservation::Failed)
     }
 
     fn validate_failover_grant_evidence(
@@ -1414,6 +1482,44 @@ fn failover_candidate_score(
     )
 }
 
+fn classify_owner_probe_read(
+    current: &CoreRootAnchorRecord,
+    current_hash: &str,
+    read: &crate::anvil_api::RootAnchorRead,
+) -> Result<OwnerProbeObservation> {
+    if read.root_key_hash != current.root_key_hash {
+        bail!("CoreStore root owner probe returned another root");
+    }
+    let anchor = decode_root_anchor_record(&read.root_anchor_record)?;
+    validate_root_anchor_record(&anchor)?;
+    if anchor.root_key_hash != read.root_key_hash || anchor.root_generation != read.generation {
+        bail!("CoreStore root owner probe response scope is inconsistent");
+    }
+    let observed_hash = hash_root_anchor_record(&anchor)?;
+    if observed_hash != read.root_anchor_hash {
+        bail!("CoreStore root owner probe response hash is inconsistent");
+    }
+    match read.generation.cmp(&current.root_generation) {
+        std::cmp::Ordering::Equal if observed_hash == current_hash => {
+            Ok(OwnerProbeObservation::Current)
+        }
+        std::cmp::Ordering::Greater => Ok(OwnerProbeObservation::Advanced {
+            owner_node_id: anchor.publisher_node_id,
+            generation: anchor.root_generation,
+        }),
+        _ => bail!("CoreStore root owner probe response is stale or conflicting"),
+    }
+}
+
+fn failover_observation_matches_current_head(
+    observed_generation: u64,
+    observed_root_hash: &str,
+    current_head: &CoreInternalRootAnchorRead,
+) -> bool {
+    current_head.generation == observed_generation
+        && current_head.root_anchor_hash == observed_root_hash
+}
+
 fn root_write_target_node<'a>(
     current_owner_node_id: &'a str,
     probe_state: OwnerProbeState,
@@ -1661,6 +1767,43 @@ mod tests {
             root_write_target_node("node-a", OwnerProbeState::Healthy, &replicas),
             Some("node-a")
         );
+    }
+
+    #[test]
+    fn newer_owner_observation_does_not_count_as_liveness_failure() {
+        let observation = OwnerProbeObservation::Advanced {
+            owner_node_id: "node-b".to_string(),
+            generation: 8,
+        };
+        assert_eq!(observation.state(), OwnerProbeState::Healthy);
+        assert_eq!(
+            OwnerProbeObservation::Failed.state(),
+            OwnerProbeState::Failed
+        );
+    }
+
+    #[test]
+    fn voter_rejects_failover_observation_behind_its_current_head() {
+        let current_head = CoreInternalRootAnchorRead {
+            root_key_hash:
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+            generation: 8,
+            root_anchor_record: Vec::new(),
+            root_anchor_hash:
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_string(),
+        };
+        assert!(!failover_observation_matches_current_head(
+            7,
+            &current_head.root_anchor_hash,
+            &current_head,
+        ));
+        assert!(failover_observation_matches_current_head(
+            8,
+            &current_head.root_anchor_hash,
+            &current_head,
+        ));
     }
 
     #[test]

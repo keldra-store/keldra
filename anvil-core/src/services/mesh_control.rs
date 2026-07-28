@@ -145,6 +145,11 @@ impl MeshControlService for AppState {
                 };
                 (physical_state, Vec::new(), local_already_initialised)
             };
+        // The recovery supervisor may be backing off because a fresh node had
+        // no active physical peers before this bootstrap installed them.
+        // Wake it immediately instead of making public admission depend on the
+        // next periodic retry.
+        self.core_store.wake_coremeta_distributed_recovery();
         let already_initialised = if imports_canonical_snapshot {
             crate::mesh_lifecycle::await_authoritative_bootstrap_lifecycle_projection(
                 &self.mvcc,

@@ -226,6 +226,12 @@ impl CoreStore {
         self.coremeta_recovery.ready.load(Ordering::Acquire)
     }
 
+    pub fn wake_coremeta_distributed_recovery(&self) {
+        if self.coremeta_distributed_recovery_required() {
+            self.coremeta_recovery.wake.notify_one();
+        }
+    }
+
     pub(in crate::core_store::local) fn coremeta_distributed_recovery_required(&self) -> bool {
         self.coremeta_recovery
             .distributed_required
