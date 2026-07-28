@@ -136,8 +136,12 @@ fn page_tokens_bind_boundary_schema_generation() {
         repo_file("anvil-core/src/services/index/query_candidates.rs")
     );
     assert!(operations.contains("index_page_token_boundary_hash"));
-    assert!(operations.contains("read_boundary_schema_generation_hash"));
+    assert!(operations.contains("boundary_schema_current_tuple_key"));
+    assert!(operations.contains("crate::mvcc_product::coremeta_logical_key"));
+    assert!(operations.contains(".read_latest_value(&logical_key)"));
+    assert!(operations.contains("authoritative_boundary_generation_hash"));
     assert!(operations.contains("anvil.query.boundary_schema_generation_hash.v1"));
+    assert!(!operations.contains("read_boundary_schema_generation_hash"));
 }
 
 #[test]
