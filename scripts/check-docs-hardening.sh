@@ -61,7 +61,12 @@ pseudo_patterns = [
 for path in list(root.rglob('*.md')) + list(Path('docs').rglob('*.md')):
     text = path.read_text()
     for pattern, message in pseudo_patterns:
-        if pattern.search(text):
+        checked_text = text
+        if message == 'Anvil docs must not mention Worka':
+            # Release metadata must name the canonical container repository.
+            # Keep the branding prohibition everywhere else.
+            checked_text = checked_text.replace('ghcr.io/worka-ai/anvil', '')
+        if pattern.search(checked_text):
             errors.append(f'{path}: {message}')
 
 command_families = {
