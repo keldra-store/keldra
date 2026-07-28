@@ -7,6 +7,19 @@ async fn create_active_region_for_bucket_move(
     label: &str,
     region: &str,
 ) {
+    let (cell_id, node_id, receipt_signing_public_key) = if region == node.state.config.region {
+        (
+            node.state.config.cell_id.clone(),
+            node.state.config.node_id.clone(),
+            node.state.core_store.local_receipt_signing_public_key(),
+        )
+    } else {
+        (
+            format!("{label}-cell"),
+            format!("{label}-node"),
+            test_receipt_signing_public_key(),
+        )
+    };
     let region_descriptor = client
         .create_region(with_auth(
             tonic::Request::new(CreateRegionRequest {
@@ -15,7 +28,7 @@ async fn create_active_region_for_bucket_move(
                 public_base_url: format!("https://{region}.anvil-storage.test"),
                 virtual_host_suffix: format!("{region}.anvil-storage.test"),
                 placement_weight: 100,
-                default_cell: format!("{label}-cell"),
+                default_cell: cell_id.clone(),
             }),
             token,
         ))
@@ -30,8 +43,9 @@ async fn create_active_region_for_bucket_move(
         token,
         label,
         region,
-        &format!("{label}-cell"),
-        &format!("{label}-node"),
+        &cell_id,
+        &node_id,
+        receipt_signing_public_key,
     )
     .await;
 

@@ -59,8 +59,9 @@ async fn admin_host_aliases_are_generation_checked_and_lifecycle_managed() {
         &token,
         "alias",
         "eu-west-1",
-        "cell-a",
-        "node-a",
+        &node.state.config.cell_id,
+        &node.state.config.node_id,
+        node.state.core_store.local_receipt_signing_public_key(),
     )
     .await;
     let _region = client
@@ -305,8 +306,9 @@ async fn admin_mutations_are_returned_by_durable_audit_listing() {
         &token,
         "audit",
         "eu-west-1",
-        "cell-a",
-        "node-a",
+        &node.state.config.cell_id,
+        &node.state.config.node_id,
+        node.state.core_store.local_receipt_signing_public_key(),
     )
     .await;
     let active_region_response = client

@@ -219,6 +219,7 @@ async fn prepare_active_region_dependencies(
     region: &str,
     cell_id: &str,
     node_id: &str,
+    receipt_signing_public_key: Vec<u8>,
 ) {
     let cell = client
         .register_cell(with_auth(
@@ -259,7 +260,7 @@ async fn prepare_active_region_dependencies(
                 node_id: node_id.to_string(),
                 region: region.to_string(),
                 cell_id: cell_id.to_string(),
-                receipt_signing_public_key: test_receipt_signing_public_key(),
+                receipt_signing_public_key,
                 public_api_addr: "http://127.0.0.1:50051".to_string(),
                 capabilities: vec![1, 6],
                 capacity_json: "{}".to_string(),
