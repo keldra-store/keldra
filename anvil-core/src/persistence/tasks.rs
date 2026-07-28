@@ -296,6 +296,7 @@ impl Persistence {
         &self,
         request: task_lease::TaskLeaseAcquire,
     ) -> Result<task_lease::TaskLease> {
+        self.linearized_named_task_lease_snapshot().await?;
         task_lease::acquire_task_lease_mvcc(
             self.mvcc()?,
             request,
@@ -309,6 +310,7 @@ impl Persistence {
         expected: &task_lease::TaskLease,
         checkpoint_cursor: u128,
     ) -> Result<task_lease::TaskLease> {
+        self.linearized_named_task_lease_snapshot().await?;
         task_lease::checkpoint_task_lease_mvcc(
             self.mvcc()?,
             expected,
@@ -324,6 +326,7 @@ impl Persistence {
         expected: &task_lease::TaskLease,
         committed_cursor: u128,
     ) -> Result<task_lease::TaskLease> {
+        self.linearized_named_task_lease_snapshot().await?;
         task_lease::commit_task_lease_mvcc(
             self.mvcc()?,
             expected,
@@ -339,12 +342,21 @@ impl Persistence {
         tenant_id: i64,
         task_id: &str,
     ) -> Result<Option<task_lease::TaskLease>> {
-        task_lease::read_task_lease_mvcc(
+        let snapshot = self.linearized_named_task_lease_snapshot().await?;
+        task_lease::read_task_lease_mvcc_at_snapshot(
             self.mvcc()?,
             tenant_id,
             task_id,
             &self.partition_owner_signing_key,
+            snapshot,
         )
+    }
+
+    async fn linearized_named_task_lease_snapshot(&self) -> Result<u64> {
+        self.mvcc()?
+            .runtime
+            .snapshot(crate::mvcc_transaction::ReadConsistency::Linearized)
+            .await
     }
 
     pub(crate) async fn named_task_lease_fenced_precondition(
@@ -355,6 +367,7 @@ impl Persistence {
         crate::mvcc_transaction::LogicalKey,
         crate::mvcc_transaction::PredicateKind,
     )> {
+        self.linearized_named_task_lease_snapshot().await?;
         task_lease::check_task_lease_mvcc(
             self.mvcc()?,
             lease,
@@ -402,6 +415,7 @@ impl Persistence {
         tenant_id: i64,
         task_id: &str,
     ) -> Result<Option<task_lease::TaskLease>> {
+        self.linearized_named_task_lease_snapshot().await?;
         task_lease::force_release_task_lease_mvcc(
             self.mvcc()?,
             tenant_id,

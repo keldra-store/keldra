@@ -3,7 +3,11 @@
 use std::process::{Command, Output};
 use std::time::Duration;
 
-use anvil_test_utils::TestCluster;
+use anvil::anvil_api::{
+    AcquireTaskLeaseRequest, CheckpointTaskLeaseRequest, CommitTaskLeaseRequest,
+    ReadTaskLeaseRequest, coordination_service_client::CoordinationServiceClient,
+};
+use anvil_test_utils::{TestCluster, authenticated_request};
 use tempfile::{TempDir, tempdir};
 
 fn assert_anvil_help(args: &[&str], expected: &[&str]) {
@@ -139,7 +143,7 @@ async fn run_anvil_expect_failure(config_dir: &TempDir, args: &[&str]) -> Output
     output
 }
 
-async fn start_cluster_for_public_cli() -> (TestCluster, TempDir) {
+async fn start_six_node_public_cluster() -> TestCluster {
     // The production ec-4-2 profile requires six distinct node failure domains.
     let mut cluster = TestCluster::new(&[
         "test-region-1",
@@ -151,7 +155,11 @@ async fn start_cluster_for_public_cli() -> (TestCluster, TempDir) {
     ])
     .await;
     cluster.start_and_converge(Duration::from_secs(10)).await;
+    cluster
+}
 
+async fn start_cluster_for_public_cli() -> (TestCluster, TempDir) {
+    let cluster = start_six_node_public_cluster().await;
     let config_dir = tempdir().unwrap();
     let app_name = format!("public-cli-{}", uuid::Uuid::new_v4().simple());
     let (client_id, client_secret) = cluster
@@ -316,6 +324,107 @@ fn admin_cli_rejects_public_port_e2e() {
         .output()
         .expect("run anvil-admin against closed public-like port");
     assert!(!output.status.success());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 12)]
+async fn public_named_task_lease_mutations_are_cluster_endpoint_agnostic_e2e() {
+    let cluster = start_six_node_public_cluster().await;
+    let token = cluster.token.clone();
+    let task_id = format!("public-lease-{}", uuid::Uuid::new_v4().simple());
+
+    let mut node_a = CoordinationServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let mut node_b = CoordinationServiceClient::connect(cluster.grpc_addrs[3].clone())
+        .await
+        .unwrap();
+    let mut node_c = CoordinationServiceClient::connect(cluster.grpc_addrs[4].clone())
+        .await
+        .unwrap();
+    let mut node_d = CoordinationServiceClient::connect(cluster.grpc_addrs[5].clone())
+        .await
+        .unwrap();
+
+    let acquired = node_a
+        .acquire_task_lease(authenticated_request(
+            tonic::Request::new(AcquireTaskLeaseRequest {
+                task_id: task_id.clone(),
+                task_kind: "public-endpoint-regression".to_string(),
+                partition_family: "bucket".to_string(),
+                partition_id: format!("{:064x}", 1_u8),
+                owner_label: "public-client".to_string(),
+                source_cursor_low: 0,
+                source_cursor_high: 0,
+                requested_ttl_nanos: 30_000_000_000,
+                options: None,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .lease
+        .expect("acquired lease");
+
+    let checkpointed = node_b
+        .checkpoint_task_lease(authenticated_request(
+            tonic::Request::new(CheckpointTaskLeaseRequest {
+                task_id: task_id.clone(),
+                fence_token: acquired.fence_token,
+                checkpoint_cursor_low: 1,
+                checkpoint_cursor_high: 0,
+                expected_root_generation: acquired.root_generation,
+                expected_lease_epoch: acquired.lease_epoch,
+                expected_expires_at_nanos: acquired.expires_at_nanos,
+                expected_lease_hash: acquired.lease_hash,
+                options: None,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .lease
+        .expect("checkpointed lease");
+    assert_eq!(checkpointed.checkpoint_cursor_low, 1);
+
+    let committed = node_c
+        .commit_task_lease(authenticated_request(
+            tonic::Request::new(CommitTaskLeaseRequest {
+                task_id: task_id.clone(),
+                fence_token: checkpointed.fence_token,
+                committed_cursor_low: 2,
+                committed_cursor_high: 0,
+                expected_root_generation: checkpointed.root_generation,
+                expected_lease_epoch: checkpointed.lease_epoch,
+                expected_expires_at_nanos: checkpointed.expires_at_nanos,
+                expected_lease_hash: checkpointed.lease_hash,
+                options: None,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(committed.committed);
+    assert_eq!(
+        committed
+            .previous_lease
+            .expect("committed lease")
+            .checkpoint_cursor_low,
+        2
+    );
+
+    let read = node_d
+        .read_task_lease(authenticated_request(
+            tonic::Request::new(ReadTaskLeaseRequest { task_id }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!read.found);
+    assert!(read.lease.is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 12)]
