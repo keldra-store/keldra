@@ -1,4 +1,5 @@
 use super::*;
+use crate::object_manager;
 
 #[path = "rpc_helpers.rs"]
 mod rpc_helpers;

@@ -36,7 +36,11 @@ pub(super) fn object_listing_distinct_entry_count(
     entries.len()
 }
 
-fn object_listing_common_prefix(key: &str, prefix: &str, delimiter: &str) -> Option<String> {
+pub(super) fn object_listing_common_prefix(
+    key: &str,
+    prefix: &str,
+    delimiter: &str,
+) -> Option<String> {
     if delimiter.is_empty() {
         return None;
     }

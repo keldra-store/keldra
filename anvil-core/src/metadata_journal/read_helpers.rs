@@ -40,7 +40,7 @@ pub(super) async fn expected_directory_entries_from_metadata(
     )
 }
 
-fn directory_entries_from_object_version_bodies(
+pub(super) fn directory_entries_from_object_version_bodies(
     body_records: Vec<(usize, ObjectVersionBody)>,
 ) -> Result<std::collections::BTreeMap<Vec<u8>, DirectoryEntryBody>> {
     let mut versions_by_key = object_versions_by_key(body_records);
