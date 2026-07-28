@@ -116,7 +116,7 @@ pub fn validate_namespace_shape(namespace: &AuthzNamespaceSchema) -> Result<()> 
                 namespace.namespace, member.relation
             ));
         }
-        validate_component(&member.relation, "authorization member")?;
+        validate_relation_component(&member.relation, "authorization member")?;
         if !members.insert(member.relation.as_str()) {
             return invalid(format!(
                 "duplicate authorization schema member {}#{}",
@@ -301,14 +301,14 @@ fn validate_rules(namespace: &AuthzNamespaceSchema, member: &AuthzRelationSchema
     for rule in &member.rules {
         match rule.kind.as_str() {
             "inherit" => {
-                validate_component(&rule.relation, "inherited member")?;
+                validate_relation_component(&rule.relation, "inherited member")?;
                 require_rule_empty(&rule.tuple_relation, "tuple_relation", namespace, member)?;
                 require_rule_empty(&rule.target_relation, "target_relation", namespace, member)?;
             }
             "computed" | "tuple_to_userset" => {
                 require_rule_empty(&rule.relation, "relation", namespace, member)?;
-                validate_component(&rule.tuple_relation, "tuple relation")?;
-                validate_component(&rule.target_relation, "target relation")?;
+                validate_relation_component(&rule.tuple_relation, "tuple relation")?;
+                validate_relation_component(&rule.target_relation, "target relation")?;
             }
             _ => {
                 return invalid(format!(
@@ -412,7 +412,7 @@ fn validate_tuple(
         return invalid("authorization tuple batch must target one bound realm");
     }
     validate_id(tuple.object_id, "authorization resource id")?;
-    validate_component(tuple.relation, "authorization relation")?;
+    validate_relation_component(tuple.relation, "authorization relation")?;
     validate_component(tuple.subject_kind, "authorization subject kind")?;
     validate_id(tuple.subject_id, "authorization subject id")?;
     if !matches!(tuple.operation, "add" | "remove") {
@@ -604,7 +604,7 @@ fn parse_canonical_userset(value: &str) -> Result<LocalUserset<'_>> {
         .ok_or_else(|| contract_error("userset subject id is not canonical"))?;
     validate_component(userset.namespace, "userset namespace")?;
     validate_id(userset.object_id, "userset object id")?;
-    validate_component(userset.relation, "userset relation")?;
+    validate_relation_component(userset.relation, "userset relation")?;
     Ok(LocalUserset {
         namespace: userset.namespace,
         object_id: userset.object_id,
@@ -621,6 +621,14 @@ fn validate_component(value: &str, label: &str) -> Result<()> {
         || value.contains('#')
     {
         return invalid(format!("{label} must be a safe component"));
+    }
+    Ok(())
+}
+
+fn validate_relation_component(value: &str, label: &str) -> Result<()> {
+    validate_id(value, label)?;
+    if value == "." || value == ".." || value.contains('/') || value.contains('#') {
+        return invalid(format!("{label} must be a safe relation component"));
     }
     Ok(())
 }
@@ -839,6 +847,54 @@ mod tests {
                     PUBLIC_SUBJECT_ID,
                 ),
                 tuple("parent", "doc-1", "folder", "folder-1"),
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn accepts_action_qualified_personaldb_row_relations() {
+        let app_subject = selector(AuthzSubjectSelectorKind::AnyCanonicalId, "app", "");
+        let schema = vec![namespace(
+            "personaldb_row",
+            [
+                "personaldb:insert",
+                "personaldb:update",
+                "personaldb:delete",
+            ]
+            .into_iter()
+            .map(|relation| direct(relation, vec![app_subject.clone()]))
+            .collect(),
+        )];
+        validate_schema_set(&schema).unwrap();
+        validate_tuple_batch(
+            &schema,
+            DEFAULT_AUTHZ_REALM_ID,
+            &[
+                AuthzTupleShape {
+                    namespace: "realm__default__personaldb_row",
+                    object_id: "tenant-1/db/items/1",
+                    relation: "personaldb:insert",
+                    subject_kind: "app",
+                    subject_id: "42",
+                    operation: "add",
+                },
+                AuthzTupleShape {
+                    namespace: "realm__default__personaldb_row",
+                    object_id: "tenant-1/db/items/1",
+                    relation: "personaldb:update",
+                    subject_kind: "app",
+                    subject_id: "42",
+                    operation: "add",
+                },
+                AuthzTupleShape {
+                    namespace: "realm__default__personaldb_row",
+                    object_id: "tenant-1/db/items/1",
+                    relation: "personaldb:delete",
+                    subject_kind: "app",
+                    subject_id: "42",
+                    operation: "add",
+                },
             ],
         )
         .unwrap();

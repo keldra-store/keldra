@@ -14,13 +14,15 @@ use std::{
 
 use anvil::anvil_api::{
     AdminRequestContext, ApplicationPoliciesRequest, ApplicationPolicyMutation,
-    BeginTransactionRequest, BeginTransactionResponse, BootstrapMeshTopologyRequest,
-    CommitTransactionRequest, CreateApplicationRequest, CreateBucketRequest, CreateIndexRequest,
-    CreatePersonalDbGroupRequest, CreateTenantRequest, GetGitBlobByPathRequest,
-    GetLocalNodeDescriptorRequest, GetObjectRequest, GetPersonalDbGroupRequest,
-    GetTransactionRequest, GitBlobLocation, GitPackMetadata, HeadObjectRequest,
-    IndexDefinitionRecord, IndexKind, ListAccessGrantsRequest, ListIndexesRequest,
-    ListRoutingRecordsRequest, MutationBatchOperation, MutationBatchPutObject,
+    ApplyAuthzSchemaRequest, AuthzAllowedSubject, AuthzNamespaceSchema, AuthzRelationSchema,
+    AuthzSchemaMemberKind, AuthzScope, AuthzSubjectSelectorKind, BeginTransactionRequest,
+    BeginTransactionResponse, BootstrapMeshTopologyRequest, CommitTransactionRequest,
+    CreateApplicationRequest, CreateBucketRequest, CreateIndexRequest,
+    CreatePersonalDbGroupRequest, CreateTenantRequest, GetAuthzSchemaBindingRequest,
+    GetGitBlobByPathRequest, GetLocalNodeDescriptorRequest, GetObjectRequest,
+    GetPersonalDbGroupRequest, GetTransactionRequest, GitBlobLocation, GitPackMetadata,
+    HeadObjectRequest, IndexDefinitionRecord, IndexKind, ListAccessGrantsRequest,
+    ListIndexesRequest, ListRoutingRecordsRequest, MutationBatchOperation, MutationBatchPutObject,
     MutationBatchRequest, MutationBatchResponse, MvccDurability, MvccReadConsistency,
     NativeMutationContext, NodeCapability, PersonalDbGroupResponse, PersonalDbVoterAck,
     PutCellRequest, PutGitPackRequest, PutGitPackResponse, PutNodeRequest, PutRegionRequest,
@@ -852,6 +854,14 @@ impl ProcessMvccCluster {
                             action: "authz:tuple_read".to_string(),
                             resource: "default".to_string(),
                         },
+                        ApplicationPolicyMutation {
+                            action: "authz:schema_read".to_string(),
+                            resource: "default".to_string(),
+                        },
+                        ApplicationPolicyMutation {
+                            action: "authz:schema_write".to_string(),
+                            resource: "default".to_string(),
+                        },
                     ],
                 },
                 &self.admin_token,
@@ -861,12 +871,110 @@ impl ProcessMvccCluster {
         let token = JwtManager::new(JWT_SECRET.to_string())
             .mint_token(principal.clone(), tenant_id)
             .context("mint process MVCC data-plane token")?;
+        self.bootstrap_personaldb_authz_schema(coordinator, tenant_id, &token)
+            .await?;
         self.data_plane_actor = Some(DataPlaneActor {
             tenant_id,
             principal,
             token,
         });
         Ok(())
+    }
+
+    async fn bootstrap_personaldb_authz_schema(
+        &self,
+        coordinator: usize,
+        tenant_id: i64,
+        token: &str,
+    ) -> anyhow::Result<()> {
+        let app_subject = || AuthzAllowedSubject {
+            selector_kind: AuthzSubjectSelectorKind::AnyCanonicalId as i32,
+            subject_kind: anvil_core::access_control::APP_SUBJECT_KIND.to_string(),
+            subject_id: String::new(),
+        };
+        let direct_relation = |relation: &str| AuthzRelationSchema {
+            relation: relation.to_string(),
+            rules: Vec::new(),
+            member_kind: AuthzSchemaMemberKind::DirectRelation as i32,
+            allowed_subjects: vec![app_subject()],
+        };
+        let mut auth = AuthServiceClient::connect(self.public_endpoint(coordinator)).await?;
+        let applied = auth
+            .apply_authz_schema(authorized(
+                ApplyAuthzSchemaRequest {
+                    context: None,
+                    namespaces: vec![AuthzNamespaceSchema {
+                        namespace: "personaldb_row".to_string(),
+                        relations: [
+                            "personaldb:insert",
+                            "personaldb:update",
+                            "personaldb:delete",
+                        ]
+                        .into_iter()
+                        .map(direct_relation)
+                        .collect(),
+                        schema_json: String::new(),
+                        schema_hash: String::new(),
+                        schema_version: 0,
+                        authz_revision: 0,
+                        applied_at: String::new(),
+                    }],
+                    reason: "install process MVCC PersonalDB authorization schema".to_string(),
+                },
+                token,
+            ))
+            .await?
+            .into_inner();
+        if applied.schema_version == 0 {
+            bail!("process PersonalDB authorization schema did not commit");
+        }
+
+        let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+        loop {
+            let mut unavailable = Vec::new();
+            for node in 0..self.nodes.len() {
+                let result = async {
+                    let mut auth =
+                        AuthServiceClient::connect(self.public_endpoint(node)).await?;
+                    let binding = auth
+                        .get_authz_schema_binding(authorized(
+                            GetAuthzSchemaBindingRequest {
+                                scope: Some(AuthzScope {
+                                    anvil_storage_tenant_id: tenant_id.to_string(),
+                                    authz_realm_id: "default".to_string(),
+                                }),
+                            },
+                            token,
+                        ))
+                        .await?
+                        .into_inner();
+                    let revision = binding
+                        .schema_ref
+                        .context("process authz binding response omitted schema reference")?
+                        .schema_revision;
+                    if revision != applied.schema_version {
+                        bail!(
+                            "process authz binding revision {revision} does not match committed revision {}",
+                            applied.schema_version
+                        );
+                    }
+                    Ok::<_, anyhow::Error>(())
+                }
+                .await;
+                if let Err(error) = result {
+                    unavailable.push((node, error.to_string()));
+                }
+            }
+            if unavailable.is_empty() {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!(
+                    "process PersonalDB authorization schema did not become visible on every node: {unavailable:?}"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     async fn bootstrap_cluster_topology(&self, coordinator: usize) -> anyhow::Result<()> {
