@@ -123,7 +123,7 @@ mod ownership;
 pub use ownership::*;
 use ownership::{
     decode_ownership_fence_record, decode_partition_owner_record, encode_ownership_fence_record,
-    encode_partition_owner_record, ownership_fence_record_to_proto,
+    encode_partition_owner_record, ownership_fence_record_to_proto, ownership_resource_hash,
 };
 
 pub async fn force_expire_partition_owner_for_node(

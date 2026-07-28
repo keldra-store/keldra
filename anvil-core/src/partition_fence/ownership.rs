@@ -39,7 +39,10 @@ fn ownership_resource_kind_from_str(value: &str) -> Result<OwnershipResourceKind
     })
 }
 
-fn ownership_resource_hash(tenant_id: i64, resource: &OwnershipResource) -> Result<String> {
+pub(super) fn ownership_resource_hash(
+    tenant_id: i64,
+    resource: &OwnershipResource,
+) -> Result<String> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(tenant_id.to_string().as_bytes());
     bytes.push(0);
@@ -144,7 +147,7 @@ impl OwnershipFenceRecord {
 }
 
 impl OwnershipFenceState {
-    fn as_str(self) -> &'static str {
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::Active => "active",
             Self::Transferring => "transferring",
