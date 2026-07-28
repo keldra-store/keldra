@@ -103,10 +103,23 @@ async fn isolated_follower_cannot_ack_or_apply_until_replication_heals() {
             .state(follower)
             .mvcc
             .runtime
-            .read_at(&key, commit_version)
+            .local_store()
+            .decision_watermark()
             .unwrap()
-            .is_none(),
-        "isolated follower must not apply a decision without its bundle"
+            < commit_version,
+        "isolated follower must remain below the majority commit watermark"
+    );
+    let isolated_read = cluster
+        .state(follower)
+        .mvcc
+        .runtime
+        .read_at(&key, commit_version)
+        .expect_err("isolated follower must not serve a snapshot it has not applied");
+    assert!(
+        isolated_read
+            .to_string()
+            .contains("above local readable version"),
+        "isolated follower must reject the unapplied snapshot: {isolated_read:#}"
     );
 
     cluster.heal(follower);
