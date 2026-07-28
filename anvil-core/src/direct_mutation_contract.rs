@@ -18,7 +18,18 @@ fn production_rocksdb_mutations_are_confined_to_reviewed_storage_boundaries() {
         .unwrap()
         .to_path_buf();
     let allowed = BTreeMap::from([
-        ("anvil-core/src/mvcc_store.rs", MutationClass::CanonicalMvcc),
+        (
+            "anvil-core/src/mvcc_store/background_work.rs",
+            MutationClass::CanonicalMvcc,
+        ),
+        (
+            "anvil-core/src/mvcc_store/garbage_collection.rs",
+            MutationClass::CanonicalMvcc,
+        ),
+        (
+            "anvil-core/src/mvcc_store/store_access.rs",
+            MutationClass::CanonicalMvcc,
+        ),
         (
             "anvil-core/src/mvcc_open_transactions.rs",
             MutationClass::CanonicalMvcc,

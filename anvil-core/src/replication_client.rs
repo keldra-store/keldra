@@ -1467,8 +1467,8 @@ mod tests {
         assert!(peers.contains_key(&("cluster-a".into(), replacement)));
     }
 
-    #[test]
-    fn routed_incarnation_snapshot_tracks_replacement() {
+    #[tokio::test]
+    async fn routed_incarnation_snapshot_tracks_replacement() {
         let replacement = NodeIncarnation {
             node_id: "node-b".into(),
             incarnation: 2,

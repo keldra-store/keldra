@@ -6,7 +6,10 @@
 
 #[test]
 fn admin_product_mutations_use_internal_transactions_and_certified_consequences() {
-    let source = include_str!("services/admin.rs");
+    let source = concat!(
+        include_str!("services/admin.rs"),
+        include_str!("services/admin/application_mutations.rs"),
+    );
     for operation in [
         "tenant-create",
         "application-create",
@@ -45,7 +48,10 @@ fn admin_retry_keys_bind_changed_input() {
 
 #[test]
 fn personaldb_effects_are_certified_or_durable_postcommit_work() {
-    let source = include_str!("services/personaldb.rs");
+    let source = concat!(
+        include_str!("services/personaldb.rs"),
+        include_str!("services/personaldb/postcommit.rs"),
+    );
     assert!(source.contains("stage_personaldb_row_owner_grants("));
     assert!(source.contains("PersonalDbPostCommitJob"));
     assert!(source.contains("add_job("));
@@ -58,7 +64,7 @@ fn personaldb_effects_are_certified_or_durable_postcommit_work() {
 #[test]
 fn tenant_locator_obligation_is_retryable_and_only_removed_after_publication() {
     let worker = include_str!("persistence/tenant_locator_finalization.rs");
-    let admin = include_str!("services/admin.rs");
+    let admin = include_str!("services/admin/application_mutations.rs");
     let compact_admin = admin.split_whitespace().collect::<String>();
     assert!(compact_admin.contains("locator_job.mutation()"));
     let publish = worker
