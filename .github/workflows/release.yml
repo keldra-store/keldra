@@ -689,7 +689,7 @@ jobs:
           printf '%s\n' "$inspection"
           grep -q 'linux/amd64' <<<"$inspection"
           grep -q 'linux/arm64' <<<"$inspection"
-          digest="$(docker buildx imagetools inspect "$image" --format '{{.Manifest.Digest}}')"
+          digest="$(awk '$1 == "Digest:" { print $2; exit }' <<<"$inspection")"
           if [[ -z "$digest" || "$digest" != sha256:* ]]; then
             echo "failed to resolve published image digest for $image" >&2
             exit 1

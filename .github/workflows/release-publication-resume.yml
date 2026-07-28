@@ -1,0 +1,214 @@
+name: Resume Anvil Release Publication
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to publish
+        required: true
+        type: string
+      expected_commit:
+        description: Exact commit already validated by the source release run
+        required: true
+        type: string
+      source_run_id:
+        description: Release run whose required validation jobs passed
+        required: true
+        type: string
+      expected_image_digest:
+        description: Exact multi-architecture GHCR manifest digest
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+  packages: read
+
+concurrency:
+  group: anvil-release
+  cancel-in-progress: false
+
+env:
+  CARGO_TARGET_DIR: /home/github-runner/.cache/anvil/cargo-target
+
+jobs:
+  publish:
+    name: Resume publication from validated artifacts
+    runs-on: [self-hosted, linux, x64, worka-builder-2]
+    timeout-minutes: 90
+    steps:
+      - name: Checkout workflow revision
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install publication dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            cmake \
+            jq \
+            libclang-dev \
+            libssl-dev \
+            pkg-config \
+            protobuf-compiler
+
+      - name: Verify immutable validation evidence
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9A-Za-z][0-9A-Za-z._-]{0,126}$ ]]; then
+            echo "release tag must be a v-prefixed Docker-compatible tag" >&2
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "expected commit must be a full lowercase Git SHA" >&2
+            exit 1
+          fi
+          if [[ ! "$SOURCE_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "source run id must be numeric" >&2
+            exit 1
+          fi
+
+          git fetch --force --no-tags origin \
+            "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          tag_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
+          if [[ "$tag_commit" != "$EXPECTED_COMMIT" ]]; then
+            echo "release tag does not match the validated commit" >&2
+            exit 1
+          fi
+
+          api_headers=(
+            -H "Authorization: Bearer ${GH_TOKEN}"
+            -H "Accept: application/vnd.github+json"
+            -H "X-GitHub-Api-Version: 2022-11-28"
+          )
+          run_json="$(
+            curl --fail --silent --show-error --location \
+              "${api_headers[@]}" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}"
+          )"
+          if [[ "$(jq -r '.name' <<<"$run_json")" != "Anvil Release" ]] ||
+             [[ "$(jq -r '.head_sha' <<<"$run_json")" != "$EXPECTED_COMMIT" ]]; then
+            echo "source run is not the Anvil release run for the validated commit" >&2
+            exit 1
+          fi
+
+          jobs_json="$(
+            curl --fail --silent --show-error --location \
+              "${api_headers[@]}" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/jobs?per_page=100"
+          )"
+          required_jobs=(
+            "Resolve immutable release context"
+            "Static gates and docs artifact"
+            "Build release image (linux/amd64)"
+            "Build release image (linux/arm64)"
+            "Rust unit and client tests"
+            "Server core integration tests"
+            "MVCC under Raft end-to-end acceptance"
+          )
+          for job_name in "${required_jobs[@]}"; do
+            conclusion="$(
+              jq -r --arg name "$job_name" \
+                '[.jobs[] | select(.name == $name) | .conclusion] | if length == 1 then .[0] else "invalid" end' \
+                <<<"$jobs_json"
+            )"
+            if [[ "$conclusion" != "success" ]]; then
+              echo "required source job is not uniquely successful: ${job_name}" >&2
+              exit 1
+            fi
+          done
+
+      - name: Checkout validated release commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.expected_commit }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Require publishing credentials
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
+            echo "CARGO_REGISTRY_TOKEN is required to publish anvil-storage" >&2
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify published multi-architecture image
+        id: docker-image
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          EXPECTED_IMAGE_DIGEST: ${{ inputs.expected_image_digest }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY}:${RELEASE_TAG}"
+          inspection="$(docker buildx imagetools inspect "$image")"
+          printf '%s\n' "$inspection"
+          grep -q 'linux/amd64' <<<"$inspection"
+          grep -q 'linux/arm64' <<<"$inspection"
+          digest="$(awk '$1 == "Digest:" { print $2; exit }' <<<"$inspection")"
+          if [[ "$digest" != "$EXPECTED_IMAGE_DIGEST" ]]; then
+            echo "published image digest does not match validated publication evidence" >&2
+            exit 1
+          fi
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Verify published documentation
+        run: |
+          curl --fail --silent --show-error --location \
+            --retry 5 --retry-delay 2 \
+            "https://${GITHUB_REPOSITORY_OWNER}.github.io/anvil/" \
+            >/dev/null
+
+      - name: Publish Rust client crate
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="anvil-storage") | .version')"
+          if scripts/crate-version-exists.py anvil-storage "$version"; then
+            echo "anvil-storage $version is already published; skipping cargo publish"
+          else
+            cargo publish -p anvil-storage --token "$CARGO_REGISTRY_TOKEN"
+          fi
+
+      - name: Render release notes from blog post
+        run: |
+          scripts/render-release-notes.py \
+            --tag "${{ inputs.tag }}" \
+            --docker-image "${{ steps.docker-image.outputs.image }}" \
+            --image-digest "${{ steps.docker-image.outputs.digest }}" \
+            --crate-version "anvil-storage $(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="anvil-storage") | .version')" \
+            --commit-sha "${{ inputs.expected_commit }}" \
+            --docs-url "https://${{ github.repository_owner }}.github.io/anvil/" \
+            --output release-notes.md
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          body_path: release-notes.md
+          make_latest: true
