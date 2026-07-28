@@ -1,4 +1,4 @@
-//! Process-backed three-node MVCC cluster fixture.
+//! Process-backed MVCC cluster fixture.
 //!
 //! Unlike [`crate::mvcc_cluster::RealMvccCluster`], every node here is an
 //! `anvil-server` OS child with its own RocksDB directory. This is intentionally
@@ -52,6 +52,8 @@ const ENCRYPTION_KEY: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 const ADMIN_PRINCIPAL: &str = "process-mvcc-admin";
 const DATA_PLANE_APP_NAME: &str = "process-mvcc-data-plane";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+const PROCESS_NODE_COUNT: usize = 6;
+const RAFT_VOTER_COUNT: usize = 3;
 
 #[derive(Debug)]
 struct ProcessNode {
@@ -80,8 +82,8 @@ struct DataPlaneActor {
     token: String,
 }
 
-/// Three `anvil-server` children with stable addresses and persistent,
-/// independent storage directories.
+/// Six `anvil-server` children with stable addresses and persistent,
+/// independent storage directories: three Raft voters and three learners.
 #[derive(Debug)]
 pub struct ProcessMvccCluster {
     _directory: TempDir,
@@ -99,8 +101,8 @@ impl ProcessMvccCluster {
     pub async fn start(binary: impl AsRef<Path>) -> anyhow::Result<Self> {
         let directory = tempfile::tempdir().context("create process MVCC cluster directory")?;
         let cluster_id = format!("process-e2e-{}", uuid::Uuid::new_v4().simple());
-        let mut reserved_addrs = reserve_loopback_addresses(6)?;
-        let admin_addrs = reserved_addrs.split_off(3);
+        let mut reserved_addrs = reserve_loopback_addresses(PROCESS_NODE_COUNT * 2)?;
+        let admin_addrs = reserved_addrs.split_off(PROCESS_NODE_COUNT);
         let api_addrs = reserved_addrs;
         let peers_json = serde_json::to_string(
             &api_addrs
@@ -114,7 +116,7 @@ impl ProcessMvccCluster {
                         "incarnation": 1,
                         "endpoint": format!("http://{address}"),
                         "failure_domain": format!("zone-{}", index + 1),
-                        "voter": true,
+                        "voter": index < RAFT_VOTER_COUNT,
                     })
                 })
                 .collect::<Vec<_>>(),
@@ -148,24 +150,26 @@ impl ProcessMvccCluster {
             admin_token,
             data_plane_actor: None,
             nodes,
-            obsolete_nodes: (0..3).map(|_| None).collect(),
+            obsolete_nodes: (0..PROCESS_NODE_COUNT).map(|_| None).collect(),
             obsolete_children: Vec::new(),
         };
 
         // Followers must finish constructing their RPC services before the
         // bootstrap voter attempts to install the initial membership.
-        for node in [1_usize, 2] {
+        for node in 1..PROCESS_NODE_COUNT {
             cluster.spawn_node(node).await?;
             cluster.wait_for_admin_transport(node).await?;
         }
         cluster.spawn_node(0).await?;
         cluster.wait_for_admin_transport(0).await?;
         let coordinator = cluster.wait_for_leader(&[0, 1, 2]).await?;
-        for node in 0..3 {
+        for node in 0..PROCESS_NODE_COUNT {
             cluster.wait_for_admin(node).await?;
         }
         cluster.bootstrap_cluster_topology(coordinator).await?;
-        cluster.wait_for_public_ready(&[0, 1, 2]).await?;
+        cluster
+            .wait_for_public_ready(&(0..PROCESS_NODE_COUNT).collect::<Vec<_>>())
+            .await?;
         cluster.bootstrap_data_plane_actor(coordinator).await?;
         Ok(cluster)
     }
@@ -1213,6 +1217,15 @@ impl ProcessMvccCluster {
         Ok(node)
     }
 
+    /// Wait for whichever active process owns the compact-Raft-assigned job.
+    pub async fn wait_for_any_armed_hard_crash(
+        &mut self,
+        timeout: Duration,
+    ) -> anyhow::Result<usize> {
+        let candidates = (0..self.nodes.len()).collect::<Vec<_>>();
+        self.wait_for_any_hard_crash(&candidates, timeout).await
+    }
+
     fn verify_expected_hard_crash(
         &self,
         node: usize,
@@ -1307,6 +1320,7 @@ impl ProcessMvccCluster {
         let obsolete = self.obsolete_nodes[node]
             .as_ref()
             .context("node has no retired incarnation")?;
+        let internal_token = self.internal_node_token(node)?;
         let addresses = reserve_loopback_addresses(2)?;
         let api_addr = addresses[0];
         let admin_addr = addresses[1];
@@ -1330,6 +1344,7 @@ impl ProcessMvccCluster {
             .env("MVCC_TOLERATED_FAILURE_DOMAINS", "1")
             .env("MVCC_RPC_TIMEOUT_MS", "1000")
             .env("MVCC_NODE_CONNECTION_TOKEN", "process-e2e-node-token")
+            .env("CORESTORE_INTERNAL_BEARER_TOKEN", internal_token)
             .env("STORAGE_PATH", &obsolete.storage_path)
             .env("BOOTSTRAP_SYSTEM_ADMIN_SUBJECT_KIND", "app")
             .env("BOOTSTRAP_SYSTEM_ADMIN_SUBJECT_ID", ADMIN_PRINCIPAL)
@@ -1431,6 +1446,7 @@ impl ProcessMvccCluster {
 
     async fn spawn_node(&mut self, node: usize) -> anyhow::Result<()> {
         std::fs::create_dir_all(&self.nodes[node].storage_path)?;
+        let internal_token = self.internal_node_token(node)?;
         let stderr = std::fs::File::create(&self.nodes[node].stderr_path)
             .context("create process MVCC node stderr log")?;
         let child = Command::new(&self.binary)
@@ -1462,12 +1478,13 @@ impl ProcessMvccCluster {
             .env("MVCC_TOLERATED_FAILURE_DOMAINS", "1")
             .env("MVCC_RPC_TIMEOUT_MS", "1000")
             .env("MVCC_NODE_CONNECTION_TOKEN", "process-e2e-node-token")
+            .env("CORESTORE_INTERNAL_BEARER_TOKEN", internal_token)
             .env("STORAGE_PATH", &self.nodes[node].storage_path)
             .env("BOOTSTRAP_SYSTEM_ADMIN_SUBJECT_KIND", "app")
             .env("BOOTSTRAP_SYSTEM_ADMIN_SUBJECT_ID", ADMIN_PRINCIPAL)
             .env(
                 "BOOTSTRAP_NODE_IDS",
-                (1..=3)
+                (1..=PROCESS_NODE_COUNT)
                     .map(|id| format!("{}-node-{id}", self.cluster_id))
                     .collect::<Vec<_>>()
                     .join(","),
@@ -1486,6 +1503,13 @@ impl ProcessMvccCluster {
             .with_context(|| format!("spawn {}", self.binary.display()))?;
         self.nodes[node].child = Some(child);
         Ok(())
+    }
+
+    fn internal_node_token(&self, node: usize) -> anyhow::Result<String> {
+        JwtManager::new(JWT_SECRET.to_string()).mint_token(
+            format!("{}-node-{}", self.cluster_id, node + 1),
+            SYSTEM_STORAGE_TENANT_ID,
+        )
     }
 
     async fn wait_for_admin(&mut self, node: usize) -> anyhow::Result<()> {

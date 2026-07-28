@@ -251,7 +251,14 @@ async fn implicit_native_retries_reconstruct_results_and_reject_changed_inputs_a
 async fn multipart_and_append_payloads_round_trip_from_mvcc_representations() {
     let mut cluster = isolated_test_cluster_with_config(
         "native payload representations must round-trip from erasure shards",
-        &["test-region-1", "test-region-1", "test-region-1"],
+        &[
+            "test-region-1",
+            "test-region-1",
+            "test-region-1",
+            "test-region-1",
+            "test-region-1",
+            "test-region-1",
+        ],
         |config| config.mvcc_default_durability = "erasure".to_string(),
     )
     .await;

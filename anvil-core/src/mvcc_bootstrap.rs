@@ -488,6 +488,18 @@ impl MvccSubsystem {
         })
         .await
         .context("test MVCC bootstrap node did not become leader")?;
+        for peer in self.peers.iter().filter(|peer| !peer.voter) {
+            self.consensus
+                .add_learner(
+                    NodeId(peer.raft_node_id),
+                    ConsensusNode {
+                        address: peer.endpoint.clone(),
+                    },
+                    true,
+                )
+                .await
+                .context("add configured test MVCC learner")?;
+        }
         let cluster_hash = cluster_id_hash(cluster_id);
         for peer in self.peers.iter() {
             self.consensus
@@ -735,6 +747,18 @@ impl MvccSubsystem {
             .context(
                 "local node did not become leader while installing initial Raft control state",
             )?;
+            for peer in peers.iter().filter(|peer| !peer.voter) {
+                consensus
+                    .add_learner(
+                        NodeId(peer.raft_node_id),
+                        ConsensusNode {
+                            address: peer.endpoint.clone(),
+                        },
+                        true,
+                    )
+                    .await
+                    .context("add configured MVCC learner")?;
+            }
             let cluster_hash = cluster_id_hash(&config.mvcc_cluster_id);
             for peer in &peers {
                 consensus
@@ -854,6 +878,12 @@ impl MvccSubsystem {
             );
         }
         let open_transactions = Arc::new(OpenTransactionRegistry::from_db(core_meta_db)?);
+        crate::mvcc_physical_payload::restore_durable_object_evidence(
+            &open_transactions,
+            &object_evidence,
+            &local_objects,
+        )
+        .context("restore durable MVCC object evidence")?;
         let authorization_core_store =
             crate::core_store::CoreStore::new(materialisation_storage.clone()).await?;
         let authorizer = NodeConnectionAuthorizer::new(

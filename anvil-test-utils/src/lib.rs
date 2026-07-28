@@ -51,6 +51,7 @@ static SHARED_DOCKER_CLUSTER: OnceLock<Arc<DockerTestCluster>> = OnceLock::new()
 
 const DEFAULT_TEST_REGION: &str = "test-region-1";
 pub const ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const TEST_CLUSTER_RAFT_VOTER_COUNT: usize = 3;
 const SHARED_CLUSTER_REGIONS: [&str; 6] = [
     DEFAULT_TEST_REGION,
     DEFAULT_TEST_REGION,
@@ -1364,7 +1365,7 @@ impl TestCluster {
                         "incarnation": 1,
                         "endpoint": grpc_addrs[node_index],
                         "failure_domain": format!("test-cell-{}", node_index + 1),
-                        "voter": true,
+                        "voter": node_index < TEST_CLUSTER_RAFT_VOTER_COUNT,
                     })
                 })
                 .collect::<Vec<_>>(),

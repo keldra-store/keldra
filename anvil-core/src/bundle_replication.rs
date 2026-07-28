@@ -18,6 +18,7 @@ use crate::{
         NodeIncarnation, ObjectDurabilityEvidence, ObjectShardManifestReference,
         PreparedBundleStore, ReplicationEvidence, TransactionBundle,
     },
+    object_shard_manifest::PhysicalObjectShardManifest,
     replication::{AckStatus, ReplicationAck},
     shard_placement::DistributedIngestResult,
 };
@@ -374,33 +375,112 @@ pub trait BundleTargetStream: Send + Sync {
 /// Holds only evidence produced by successful ingest/local persistence.
 #[derive(Clone, Default)]
 pub struct ObjectEvidenceRegistry {
-    evidence: Arc<Mutex<BTreeMap<String, Vec<ObjectDurabilityEvidence>>>>,
+    evidence: Arc<Mutex<BTreeMap<ObjectShardManifestReference, Vec<ObjectDurabilityEvidence>>>>,
 }
 
 impl ObjectEvidenceRegistry {
-    pub fn record_ingest(&self, result: &DistributedIngestResult) -> Result<()> {
+    pub fn record_ingest(
+        &self,
+        manifest: &PhysicalObjectShardManifest,
+        result: &DistributedIngestResult,
+    ) -> Result<()> {
+        manifest.validate()?;
+        let reference = manifest.reference()?;
         for evidence in &result.evidence {
-            let ObjectDurabilityEvidence::ShardPlacement { object_hash, .. } = evidence else {
+            let ObjectDurabilityEvidence::ShardPlacement {
+                stripe_ordinal,
+                shard_ordinal,
+                node,
+                failure_domain,
+                ..
+            } = evidence
+            else {
                 bail!("distributed ingest returned non-shard evidence");
             };
-            self.record(object_hash, evidence.clone())?;
+            if !manifest.placements.iter().any(|placement| {
+                placement.stripe_ordinal == *stripe_ordinal
+                    && placement.shard_ordinal == *shard_ordinal
+                    && placement.node_id == node.node_id
+                    && placement.node_incarnation == node.incarnation
+                    && placement.failure_domain == *failure_domain
+            }) {
+                bail!("distributed ingest evidence is absent from its physical manifest");
+            }
+            self.record(&reference, evidence.clone())?;
         }
         Ok(())
     }
 
-    pub fn record(&self, object_hash: &str, evidence: ObjectDurabilityEvidence) -> Result<()> {
-        let evidence_hash = match &evidence {
-            ObjectDurabilityEvidence::LocalRepresentation { object_hash, .. }
-            | ObjectDurabilityEvidence::ShardPlacement { object_hash, .. } => object_hash,
-        };
-        if evidence_hash != object_hash {
-            bail!("object durability evidence was registered under another object hash");
+    /// Rehydrate evidence from a canonical manifest that was durably staged
+    /// only after its shard transfers returned complete, verified, fsynced
+    /// acknowledgements.
+    pub fn record_manifest(&self, manifest: &PhysicalObjectShardManifest) -> Result<()> {
+        manifest.validate()?;
+        let reference = manifest.reference()?;
+        for placement in &manifest.placements {
+            self.record(
+                &reference,
+                ObjectDurabilityEvidence::ShardPlacement {
+                    cluster_id: manifest.cluster_id.clone(),
+                    object_hash: manifest.object_hash.clone(),
+                    encoding_generation: manifest.encoding_generation,
+                    stripe_ordinal: placement.stripe_ordinal,
+                    shard_ordinal: placement.shard_ordinal,
+                    data_shards: manifest.data_shards,
+                    parity_shards: manifest.parity_shards,
+                    node: NodeIncarnation {
+                        node_id: placement.node_id.clone(),
+                        incarnation: placement.node_incarnation,
+                    },
+                    failure_domain: placement.failure_domain.clone(),
+                    complete: true,
+                    hash_verified: true,
+                    fsynced: true,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn record(
+        &self,
+        manifest: &ObjectShardManifestReference,
+        evidence: ObjectDurabilityEvidence,
+    ) -> Result<()> {
+        match &evidence {
+            ObjectDurabilityEvidence::LocalRepresentation { object_hash, .. } => {
+                if object_hash != &manifest.object_hash
+                    || manifest.encoding_generation != 1
+                    || manifest.data_shards != 1
+                    || manifest.parity_shards != 0
+                    || manifest.stripe_count != 1
+                {
+                    bail!("local object durability evidence does not match its manifest");
+                }
+            }
+            ObjectDurabilityEvidence::ShardPlacement {
+                object_hash,
+                encoding_generation,
+                stripe_ordinal,
+                data_shards,
+                parity_shards,
+                ..
+            } => {
+                if object_hash != &manifest.object_hash
+                    || encoding_generation != &manifest.encoding_generation
+                    || data_shards != &manifest.data_shards
+                    || parity_shards != &manifest.parity_shards
+                    || *stripe_ordinal >= manifest.stripe_count
+                {
+                    bail!("shard durability evidence does not match its manifest");
+                }
+            }
         }
         let mut registry = self
             .evidence
             .lock()
             .map_err(|_| anyhow::anyhow!("object evidence registry lock poisoned"))?;
-        let entries = registry.entry(object_hash.to_string()).or_default();
+        let entries = registry.entry(manifest.clone()).or_default();
         if !entries.contains(&evidence) {
             entries.push(evidence);
         }
@@ -417,31 +497,20 @@ impl ObjectEvidenceRegistry {
             .map_err(|_| anyhow::anyhow!("object evidence registry lock poisoned"))?;
         let mut result = Vec::new();
         for manifest in manifests {
-            let entries = registry.get(&manifest.object_hash).with_context(|| {
+            let entries = registry.get(manifest).with_context(|| {
                 format!("no ingest evidence for object {}", manifest.object_hash)
             })?;
-            let matching = entries.iter().filter(|entry| match entry {
-                ObjectDurabilityEvidence::LocalRepresentation { object_hash, .. } => {
-                    object_hash == &manifest.object_hash
-                }
-                ObjectDurabilityEvidence::ShardPlacement {
-                    object_hash,
-                    encoding_generation,
-                    data_shards,
-                    parity_shards,
-                    stripe_ordinal,
-                    ..
-                } => {
-                    object_hash == &manifest.object_hash
-                        && *encoding_generation == manifest.encoding_generation
-                        && *data_shards == manifest.data_shards
-                        && *parity_shards == manifest.parity_shards
-                        && *stripe_ordinal < manifest.stripe_count
-                }
-            });
-            result.extend(matching.cloned());
+            result.extend(entries.iter().cloned());
         }
         Ok(result)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn evidence_for_test(
+        &self,
+        manifests: &[ObjectShardManifestReference],
+    ) -> Result<Vec<ObjectDurabilityEvidence>> {
+        self.evidence_for(manifests)
     }
 }
 
@@ -998,12 +1067,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn evidence_is_scoped_to_the_exact_manifest_reference() {
+        let first = manifest();
+        let mut second = first.clone();
+        second.manifest_hash = format!("sha256:{}", "c".repeat(64));
+        let objects = ObjectEvidenceRegistry::default();
+        objects.record(&first, shard_evidence(&first)).unwrap();
+
+        assert!(
+            objects
+                .evidence_for_test(std::slice::from_ref(&second))
+                .unwrap_err()
+                .to_string()
+                .contains("no ingest evidence")
+        );
+    }
+
     #[tokio::test]
     async fn replicator_combines_recorded_shards_with_only_matching_complete_bundle_acks() {
         let manifest = manifest();
         let objects = ObjectEvidenceRegistry::default();
         objects
-            .record(&manifest.object_hash, shard_evidence(&manifest))
+            .record(&manifest, shard_evidence(&manifest))
             .unwrap();
         let replicator = StreamingBundleReplicator::new(
             Transport {
@@ -1050,7 +1136,9 @@ mod tests {
             }
         }
 
-        let manifest = manifest();
+        let mut manifest = manifest();
+        manifest.data_shards = 1;
+        manifest.parity_shards = 0;
         let objects = ObjectEvidenceRegistry::default();
         let replicator = StreamingBundleReplicator::new(
             RejectTransport,
@@ -1079,9 +1167,7 @@ mod tests {
             hash_verified: true,
             fsynced: true,
         };
-        objects
-            .record(&manifest.object_hash, local.clone())
-            .unwrap();
+        objects.record(&manifest, local.clone()).unwrap();
         let evidence = replicator
             .replicate(
                 &identity(bytes),

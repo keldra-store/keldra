@@ -41,6 +41,53 @@ pub struct LocalObjectIngestResult {
     pub evidence: ObjectDurabilityEvidence,
 }
 
+impl LocalObjectManifest {
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != 1
+            || self.cluster_id.trim().is_empty()
+            || self.node.node_id.trim().is_empty()
+            || self.node.incarnation == 0
+            || self.failure_domain.trim().is_empty()
+            || self
+                .object_hash
+                .strip_prefix("sha256:")
+                .is_none_or(|digest| {
+                    digest.len() != 64 || !digest.bytes().all(|value| value.is_ascii_hexdigit())
+                })
+        {
+            bail!("invalid local object manifest");
+        }
+        Ok(())
+    }
+
+    pub fn reference(&self) -> Result<ObjectShardManifestReference> {
+        self.validate()?;
+        let manifest_bytes = serde_json::to_vec(self)?;
+        Ok(ObjectShardManifestReference {
+            object_hash: self.object_hash.clone(),
+            manifest_hash: format!("sha256:{}", hex::encode(Sha256::digest(manifest_bytes))),
+            object_length: self.object_length,
+            encoding_generation: 1,
+            data_shards: 1,
+            parity_shards: 0,
+            stripe_count: 1,
+        })
+    }
+
+    pub fn durability_evidence(&self) -> Result<ObjectDurabilityEvidence> {
+        self.validate()?;
+        Ok(ObjectDurabilityEvidence::LocalRepresentation {
+            cluster_id: self.cluster_id.clone(),
+            object_hash: self.object_hash.clone(),
+            node: self.node.clone(),
+            failure_domain: self.failure_domain.clone(),
+            complete: true,
+            hash_verified: true,
+            fsynced: true,
+        })
+    }
+}
+
 impl LocalObjectStore {
     pub fn open(
         directory: impl AsRef<Path>,
@@ -112,29 +159,30 @@ impl LocalObjectStore {
             node: self.node.clone(),
             failure_domain: self.failure_domain.to_string(),
         };
-        let manifest_bytes = serde_json::to_vec(&manifest)?;
-        let reference = ObjectShardManifestReference {
-            object_hash: object_hash.clone(),
-            manifest_hash: format!("sha256:{}", hex::encode(Sha256::digest(manifest_bytes))),
-            object_length: length,
-            encoding_generation: 1,
-            data_shards: 1,
-            parity_shards: 0,
-            stripe_count: 1,
-        };
+        let reference = manifest.reference()?;
+        let evidence = manifest.durability_evidence()?;
         Ok(LocalObjectIngestResult {
             manifest,
             reference,
-            evidence: ObjectDurabilityEvidence::LocalRepresentation {
-                cluster_id: self.cluster_id.to_string(),
-                object_hash,
-                node: self.node.clone(),
-                failure_domain: self.failure_domain.to_string(),
-                complete: true,
-                hash_verified: true,
-                fsynced: true,
-            },
+            evidence,
         })
+    }
+
+    /// Verify that a durable local manifest is bound to this store and that its
+    /// fsynced representation still has the recorded length and content hash.
+    pub fn verify(&self, manifest: &LocalObjectManifest) -> Result<()> {
+        manifest.validate()?;
+        if manifest.cluster_id != &*self.cluster_id
+            || manifest.node != self.node
+            || manifest.failure_domain != &*self.failure_domain
+        {
+            bail!("local object manifest is invalid for this store");
+        }
+        verify_file(
+            &self.path_for_hash(&manifest.object_hash)?,
+            &manifest.object_hash,
+            manifest.object_length,
+        )
     }
 
     pub fn read_range(

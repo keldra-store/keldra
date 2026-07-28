@@ -92,7 +92,7 @@ impl WriteOperation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ObjectShardManifestReference {
     pub object_hash: String,
     pub manifest_hash: String,

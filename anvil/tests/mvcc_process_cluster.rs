@@ -213,7 +213,7 @@ async fn committed_index_finalization_survives_two_worker_crashes_without_commit
         .unwrap();
     assert_eq!(committed.state, WriteState::Committed as i32);
     let worker = cluster
-        .wait_for_any_hard_crash(&[0, 1, 2], Duration::from_secs(45))
+        .wait_for_any_armed_hard_crash(Duration::from_secs(45))
         .await
         .unwrap();
 
@@ -354,7 +354,7 @@ async fn committed_personaldb_submit_survives_two_worker_crashes_without_client_
         .unwrap();
     assert_eq!(committed.state, WriteState::Committed as i32);
     let worker = cluster
-        .wait_for_any_hard_crash(&[0, 1, 2], Duration::from_secs(45))
+        .wait_for_any_armed_hard_crash(Duration::from_secs(45))
         .await
         .unwrap();
 
@@ -453,7 +453,7 @@ async fn committed_bucket_locator_survives_two_worker_crashes_without_client_ret
         .unwrap();
     assert_eq!(committed.state, WriteState::Committed as i32);
     let worker = cluster
-        .wait_for_any_hard_crash(&[0, 1, 2], Duration::from_secs(45))
+        .wait_for_any_armed_hard_crash(Duration::from_secs(45))
         .await
         .unwrap();
 
@@ -534,7 +534,7 @@ async fn committed_git_pack_survives_two_worker_crashes_without_client_retry_or_
         .unwrap();
     assert_eq!(committed.state, WriteState::Committed as i32);
     let worker = cluster
-        .wait_for_any_hard_crash(&[0, 1, 2], Duration::from_secs(45))
+        .wait_for_any_armed_hard_crash(Duration::from_secs(45))
         .await
         .unwrap();
 

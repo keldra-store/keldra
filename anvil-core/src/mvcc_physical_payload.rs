@@ -15,18 +15,184 @@ use tonic::Status;
 use uuid::Uuid;
 
 use crate::{
+    bundle_replication::ObjectEvidenceRegistry,
     core_store::{CoreCompressionDescriptor, CoreObjectEncoding, CoreObjectRef},
-    local_object_store::LocalObjectManifest,
+    local_object_store::{LocalObjectManifest, LocalObjectStore},
     mvcc_bootstrap::MvccSubsystem,
     mvcc_local_durability_upgrade::{LocalDurabilityUpgradeJob, LocalDurabilityUpgradeObject},
+    mvcc_open_transactions::OpenTransactionRegistry,
     mvcc_shard_repair::{MissingShardTarget, ShardMaintenanceKind, ShardRepairJob},
-    mvcc_transaction::DurabilityLevel,
+    mvcc_transaction::{DurabilityLevel, TransactionBundle, WriteOperation},
     object_shard_manifest::PhysicalObjectShardManifest,
     shard_placement::{DistributedIngest, ShardPlacementPolicy},
     streaming_erasure::ErasureProfile,
 };
 
 pub(crate) const MVCC_PHYSICAL_PAYLOAD_REF_PREFIX: &str = "anvil-mvcc-target:";
+
+/// Restore the in-memory evidence cache from manifests already bound to
+/// durable, unresolved transaction drafts.
+///
+/// The manifest catalog value and its compact reference are stored in the same
+/// transaction bundle. Recovery validates that exact binding before treating
+/// the manifest's placements as acknowledgements; it never probes remote
+/// shards or synthesizes evidence from topology.
+pub(crate) fn restore_durable_object_evidence(
+    transactions: &OpenTransactionRegistry,
+    evidence: &ObjectEvidenceRegistry,
+    local_objects: &LocalObjectStore,
+) -> Result<usize> {
+    let mut restored = 0;
+    for recoverable in transactions.recoverable_transaction_bundles()? {
+        let result = restore_bundle_object_evidence(
+            &recoverable.bundle,
+            recoverable.require_complete_evidence,
+            evidence,
+            local_objects,
+        );
+        match result {
+            Ok(count) => restored += count,
+            Err(error) if !recoverable.require_complete_evidence => {
+                tracing::warn!(
+                    transaction_id = %recoverable.bundle.transaction_id,
+                    %error,
+                    "skipping invalid open transaction during object evidence recovery"
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(restored)
+}
+
+fn restore_bundle_object_evidence(
+    bundle: &TransactionBundle,
+    require_complete_evidence: bool,
+    evidence: &ObjectEvidenceRegistry,
+    local_objects: &LocalObjectStore,
+) -> Result<usize> {
+    // Validate all bundle identities and ownership claims before trusting a
+    // catalog entry from it.
+    bundle.canonical_bytes()?;
+    let mut shard_manifests = Vec::new();
+    for reference in bundle
+        .shard_manifests
+        .iter()
+        .filter(|reference| reference.parity_shards > 0)
+    {
+        let expected_key = crate::mvcc_transaction::LogicalKey {
+            table_id: crate::mvcc_shard_repair::SHARD_MANIFEST_CATALOG_TABLE_ID,
+            application_key: format!("manifest/{}", reference.object_hash).into_bytes(),
+        };
+        let mut matching_writes = bundle
+            .writes
+            .iter()
+            .filter(|write| write.key() == &expected_key);
+        let Some(write) = matching_writes.next() else {
+            if require_complete_evidence {
+                bail!(
+                    "committing transaction {} lacks the staged catalog manifest for {}",
+                    bundle.transaction_id,
+                    reference.object_hash
+                );
+            }
+            continue;
+        };
+        if matching_writes.next().is_some() {
+            bail!(
+                "transaction {} has duplicate catalog manifests for {}",
+                bundle.transaction_id,
+                reference.object_hash
+            );
+        }
+        let WriteOperation::Put { key, value } = write else {
+            bail!(
+                "transaction {} deletes the catalog manifest for {}",
+                bundle.transaction_id,
+                reference.object_hash
+            );
+        };
+        let manifest: PhysicalObjectShardManifest = serde_json::from_slice(value)
+            .context("decode staged physical object shard manifest")?;
+        if manifest.canonical_bytes()?.as_slice() != value.as_slice() {
+            bail!("staged physical object shard manifest is not canonical");
+        }
+        if manifest.cluster_id != bundle.cluster_id {
+            bail!("staged physical object shard manifest belongs to another cluster");
+        }
+        if crate::mvcc_shard_repair::manifest_catalog_key(&manifest) != *key {
+            bail!("staged physical object shard manifest uses the wrong catalog key");
+        }
+        if &manifest.reference()? != reference {
+            bail!("staged physical object shard manifest does not match its bundle reference");
+        }
+        shard_manifests.push(manifest);
+    }
+
+    let mut local_manifests = Vec::new();
+    for reference in bundle
+        .shard_manifests
+        .iter()
+        .filter(|reference| reference.parity_shards == 0)
+    {
+        let mut matching = Vec::new();
+        for encoded_job in &bundle.materialisation_jobs {
+            let schema = serde_json::from_slice::<JsonValue>(encoded_job)?
+                .get("schema")
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned);
+            if schema.as_deref() != Some(LocalDurabilityUpgradeJob::SCHEMA) {
+                continue;
+            }
+            let job: LocalDurabilityUpgradeJob = serde_json::from_slice(encoded_job)
+                .context("decode staged local durability upgrade job")?;
+            job.validate()?;
+            if job.canonical_bytes()?.as_slice() != encoded_job.as_slice() {
+                bail!("staged local durability upgrade job is not canonical");
+            }
+            if job.cluster_id != bundle.cluster_id || job.transaction_id != bundle.transaction_id {
+                bail!("local durability upgrade job belongs to another transaction");
+            }
+            for object in &job.objects {
+                if object.local_manifest.object_hash != reference.object_hash {
+                    continue;
+                }
+                if &object.local_manifest.reference()? != reference {
+                    bail!("local object manifest does not match its bundle reference");
+                }
+                matching.push(object.local_manifest.clone());
+            }
+        }
+        if matching.len() > 1 {
+            bail!(
+                "transaction {} has duplicate local manifests for {}",
+                bundle.transaction_id,
+                reference.object_hash
+            );
+        }
+        let Some(manifest) = matching.pop() else {
+            if require_complete_evidence {
+                bail!(
+                    "committing transaction {} lacks the local manifest for {}",
+                    bundle.transaction_id,
+                    reference.object_hash
+                );
+            }
+            continue;
+        };
+        local_objects.verify(&manifest)?;
+        local_manifests.push((reference.clone(), manifest));
+    }
+
+    // Do not admit a prefix of the evidence if a later reference is malformed.
+    for manifest in &shard_manifests {
+        evidence.record_manifest(manifest)?;
+    }
+    for (reference, manifest) in &local_manifests {
+        evidence.record(reference, manifest.durability_evidence()?)?;
+    }
+    Ok(shard_manifests.len() + local_manifests.len())
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum MvccPhysicalPayloadLocator {
@@ -98,7 +264,7 @@ where
                 .await
                 .map_err(|error| Status::internal(error.to_string()))?;
             mvcc.object_evidence
-                .record(&ingest.manifest.object_hash, ingest.evidence)
+                .record(&ingest.reference, ingest.evidence)
                 .map_err(|error| Status::internal(error.to_string()))?;
             mvcc.open_transactions
                 .add_manifest(
@@ -189,7 +355,7 @@ where
                 stage_missing_shard_repair(mvcc, &binding.cluster_id, request, &plan, &manifest)?;
             }
             mvcc.object_evidence
-                .record_ingest(&ingest)
+                .record_ingest(&manifest, &ingest)
                 .map_err(|error| Status::internal(error.to_string()))?;
             mvcc.open_transactions
                 .add_manifest(

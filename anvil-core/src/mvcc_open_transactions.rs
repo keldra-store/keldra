@@ -153,6 +153,11 @@ pub struct OpenTransactionRegistry {
     snapshot_gc_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
+pub(crate) struct RecoverableTransactionBundle {
+    pub bundle: TransactionBundle,
+    pub require_complete_evidence: bool,
+}
+
 impl OpenTransactionRegistry {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let mut options = Options::default();
@@ -691,6 +696,57 @@ impl OpenTransactionRegistry {
         Ok(draft.mutations.writes.clone())
     }
 
+    /// Rebuild canonical bundles for durable transactions which may still
+    /// enter certification after this process restarts.
+    ///
+    /// A `Committing` draft stores both its staged mutations and the frozen
+    /// bundle. Requiring those representations to agree prevents recovery from
+    /// binding physical durability evidence to a different transaction.
+    pub(crate) fn recoverable_transaction_bundles(
+        &self,
+    ) -> Result<Vec<RecoverableTransactionBundle>> {
+        let _guard = self.transition.lock().unwrap();
+        let cf = self.cf(CF_TRANSACTIONS)?;
+        let mut bundles = Vec::new();
+        for row in self.db.iterator_cf(cf, IteratorMode::Start) {
+            let (key, value) = row?;
+            let draft: Draft =
+                serde_json::from_slice(&value).context("decode recoverable transaction draft")?;
+            if key.as_ref() != draft.transaction_id.as_bytes() {
+                bail!("persisted transaction draft key does not match its transaction ID");
+            }
+            match &draft.state {
+                DraftState::Open => match build_bundle(&draft) {
+                    Ok(bundle) => bundles.push(RecoverableTransactionBundle {
+                        bundle,
+                        require_complete_evidence: false,
+                    }),
+                    Err(error) => {
+                        tracing::warn!(
+                            transaction_id = %draft.transaction_id,
+                            %error,
+                            "skipping invalid open transaction during evidence recovery"
+                        );
+                    }
+                },
+                DraftState::Committing { bundle } => {
+                    let staged = build_bundle(&draft)?;
+                    if bundle != &staged {
+                        bail!(
+                            "persisted committing bundle does not match its transaction's staged mutations"
+                        );
+                    }
+                    bundles.push(RecoverableTransactionBundle {
+                        bundle: bundle.clone(),
+                        require_complete_evidence: true,
+                    });
+                }
+                DraftState::Resolved { .. } | DraftState::RolledBack | DraftState::Expired => {}
+            }
+        }
+        Ok(bundles)
+    }
+
     pub fn status(
         &self,
         transaction_id: &str,
@@ -1052,6 +1108,96 @@ mod tests {
         .unwrap()
     }
 
+    fn physical_manifest(
+        cluster_id: &str,
+    ) -> crate::object_shard_manifest::PhysicalObjectShardManifest {
+        crate::object_shard_manifest::PhysicalObjectShardManifest {
+            schema_version: crate::object_shard_manifest::OBJECT_SHARD_MANIFEST_SCHEMA,
+            cluster_id: cluster_id.to_string(),
+            object_identity: uuid::Uuid::from_bytes([7; 16]),
+            object_hash: "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+                .to_string(),
+            object_length: 3,
+            encoding_generation: 4,
+            data_shards: 1,
+            parity_shards: 1,
+            shard_bytes: 256 * 1024,
+            stripe_count: 1,
+            placements: vec![
+                crate::object_shard_manifest::PhysicalShardPlacement {
+                    stripe_ordinal: 0,
+                    shard_ordinal: 0,
+                    payload_length: 3,
+                    payload_hash: [1; 32],
+                    transfer_id: uuid::Uuid::from_bytes([1; 16]),
+                    node_id: "node-a".to_string(),
+                    node_incarnation: 1,
+                    failure_domain: "zone-a".to_string(),
+                },
+                crate::object_shard_manifest::PhysicalShardPlacement {
+                    stripe_ordinal: 0,
+                    shard_ordinal: 1,
+                    payload_length: 3,
+                    payload_hash: [2; 32],
+                    transfer_id: uuid::Uuid::from_bytes([2; 16]),
+                    node_id: "node-b".to_string(),
+                    node_incarnation: 1,
+                    failure_domain: "zone-b".to_string(),
+                },
+            ],
+        }
+    }
+
+    async fn stage_manifest_draft(
+        registry: &OpenTransactionRegistry,
+        idempotency_key: &str,
+        reference: ObjectShardManifestReference,
+        catalog_value: Vec<u8>,
+    ) -> String {
+        let handle = registry
+            .begin(
+                &runtime(),
+                "cluster",
+                "alice",
+                idempotency_key,
+                Duration::from_secs(30),
+                DurabilityLevel::Quorum,
+                ReadConsistency::LocalSnapshot,
+                1_000,
+            )
+            .await
+            .unwrap();
+        registry
+            .add_manifest(&handle.transaction_id, "cluster", reference.clone(), 1_001)
+            .unwrap();
+        registry
+            .put(
+                &handle.transaction_id,
+                "cluster",
+                LogicalKey {
+                    table_id: crate::mvcc_shard_repair::SHARD_MANIFEST_CATALOG_TABLE_ID,
+                    application_key: format!("manifest/{}", reference.object_hash).into_bytes(),
+                },
+                catalog_value,
+                1_001,
+            )
+            .unwrap();
+        handle.transaction_id
+    }
+
+    fn recovery_local_store(path: impl AsRef<Path>) -> crate::local_object_store::LocalObjectStore {
+        crate::local_object_store::LocalObjectStore::open(
+            path,
+            "cluster",
+            crate::mvcc_transaction::NodeIncarnation {
+                node_id: "node-a".to_string(),
+                incarnation: 1,
+            },
+            "zone-a",
+        )
+        .unwrap()
+    }
+
     struct GatedRuntime {
         calls: AtomicUsize,
         first_started: Notify,
@@ -1091,6 +1237,34 @@ mod tests {
                 certification: result,
                 local_apply: Some(ApplyOutcome::Replayed),
             })
+        }
+    }
+
+    struct FailingCommitRuntime;
+
+    #[async_trait]
+    impl TransactionRuntime for FailingCommitRuntime {
+        async fn transaction_snapshot(
+            &self,
+            _consistency: ReadConsistency,
+        ) -> Result<CommitVersion> {
+            Ok(9)
+        }
+
+        async fn commit_transaction_bundle(
+            &self,
+            _bundle: TransactionBundle,
+            _durability: DurabilityLevel,
+        ) -> Result<CommitOutcome> {
+            bail!("leave the durable draft in Committing for restart recovery")
+        }
+
+        fn apply_transaction_decision(
+            &self,
+            _bundle: TransactionBundle,
+            _result: CertificationResult,
+        ) -> Result<CommitOutcome> {
+            bail!("the failing test runtime has no prior decision")
         }
     }
 
@@ -1137,6 +1311,263 @@ mod tests {
             .await
             .unwrap();
         assert!(registry.active_snapshot_pins(2_005).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn restart_restores_only_an_exact_durable_catalog_manifest() {
+        let temp = tempdir().unwrap();
+        let manifest = physical_manifest("cluster");
+        let reference = manifest.reference().unwrap();
+        {
+            let registry = OpenTransactionRegistry::open(temp.path()).unwrap();
+            let transaction_id = stage_manifest_draft(
+                &registry,
+                "recover-manifest",
+                reference.clone(),
+                manifest.canonical_bytes().unwrap(),
+            )
+            .await;
+            registry
+                .commit(&FailingCommitRuntime, &transaction_id, "alice", 1_002)
+                .await
+                .unwrap_err();
+        }
+
+        let registry = OpenTransactionRegistry::open(temp.path()).unwrap();
+        let evidence = crate::bundle_replication::ObjectEvidenceRegistry::default();
+        let local_objects = recovery_local_store(temp.path().join("local-objects"));
+        assert_eq!(
+            crate::mvcc_physical_payload::restore_durable_object_evidence(
+                &registry,
+                &evidence,
+                &local_objects,
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            evidence
+                .evidence_for_test(std::slice::from_ref(&reference))
+                .unwrap()
+                .len(),
+            manifest.placements.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_rejects_mismatched_or_malformed_catalog_manifest() {
+        let mismatched = tempdir().unwrap();
+        let manifest = physical_manifest("cluster");
+        let mut wrong_reference = manifest.reference().unwrap();
+        wrong_reference.data_shards += 1;
+        let registry = OpenTransactionRegistry::open(mismatched.path()).unwrap();
+        let transaction_id = stage_manifest_draft(
+            &registry,
+            "mismatched-manifest",
+            wrong_reference,
+            manifest.canonical_bytes().unwrap(),
+        )
+        .await;
+        registry
+            .commit(&FailingCommitRuntime, &transaction_id, "alice", 1_002)
+            .await
+            .unwrap_err();
+        let local_objects = recovery_local_store(mismatched.path().join("local-objects"));
+        let error = crate::mvcc_physical_payload::restore_durable_object_evidence(
+            &registry,
+            &crate::bundle_replication::ObjectEvidenceRegistry::default(),
+            &local_objects,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match its bundle reference")
+        );
+
+        let malformed = tempdir().unwrap();
+        let registry = OpenTransactionRegistry::open(malformed.path()).unwrap();
+        let transaction_id = stage_manifest_draft(
+            &registry,
+            "malformed-manifest",
+            manifest.reference().unwrap(),
+            b"not-a-manifest".to_vec(),
+        )
+        .await;
+        registry
+            .commit(&FailingCommitRuntime, &transaction_id, "alice", 1_002)
+            .await
+            .unwrap_err();
+        let local_objects = recovery_local_store(malformed.path().join("local-objects"));
+        let error = crate::mvcc_physical_payload::restore_durable_object_evidence(
+            &registry,
+            &crate::bundle_replication::ObjectEvidenceRegistry::default(),
+            &local_objects,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("decode staged physical object shard manifest")
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_skips_an_incomplete_open_manifest_but_rejects_it_once_committing() {
+        let temp = tempdir().unwrap();
+        let manifest = physical_manifest("cluster");
+        let reference = manifest.reference().unwrap();
+        let registry = OpenTransactionRegistry::open(temp.path()).unwrap();
+        let handle = registry
+            .begin(
+                &runtime(),
+                "cluster",
+                "alice",
+                "partial-open",
+                Duration::from_secs(30),
+                DurabilityLevel::Quorum,
+                ReadConsistency::LocalSnapshot,
+                1_000,
+            )
+            .await
+            .unwrap();
+        registry
+            .add_manifest(&handle.transaction_id, "cluster", reference, 1_001)
+            .unwrap();
+        let evidence = crate::bundle_replication::ObjectEvidenceRegistry::default();
+        let local_objects = recovery_local_store(temp.path().join("local-objects"));
+        assert_eq!(
+            crate::mvcc_physical_payload::restore_durable_object_evidence(
+                &registry,
+                &evidence,
+                &local_objects,
+            )
+            .unwrap(),
+            0
+        );
+
+        registry
+            .commit(
+                &FailingCommitRuntime,
+                &handle.transaction_id,
+                "alice",
+                1_002,
+            )
+            .await
+            .unwrap_err();
+        let error = crate::mvcc_physical_payload::restore_durable_object_evidence(
+            &registry,
+            &evidence,
+            &local_objects,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("lacks the staged catalog manifest")
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_restores_local_evidence_only_after_reverifying_the_file() {
+        let temp = tempdir().unwrap();
+        let object_directory = temp.path().join("local-objects");
+        let local_objects = recovery_local_store(&object_directory);
+        let mut reader = tokio::io::BufReader::new(&b"abc"[..]);
+        let ingest = local_objects.persist(&mut reader).await.unwrap();
+        let reference = ingest.reference.clone();
+
+        let transaction_id = {
+            let registry = OpenTransactionRegistry::open(temp.path()).unwrap();
+            let handle = registry
+                .begin(
+                    &runtime(),
+                    "cluster",
+                    "alice",
+                    "recover-local-manifest",
+                    Duration::from_secs(30),
+                    DurabilityLevel::Local,
+                    ReadConsistency::LocalSnapshot,
+                    1_000,
+                )
+                .await
+                .unwrap();
+            registry
+                .add_manifest(&handle.transaction_id, "cluster", reference.clone(), 1_001)
+                .unwrap();
+            let job = crate::mvcc_local_durability_upgrade::LocalDurabilityUpgradeJob {
+                schema: crate::mvcc_local_durability_upgrade::LocalDurabilityUpgradeJob::SCHEMA
+                    .into(),
+                cluster_id: "cluster".into(),
+                transaction_id: handle.transaction_id.clone(),
+                commit_version: 0,
+                bundle: None,
+                target: DurabilityLevel::Erasure,
+                objects: vec![
+                    crate::mvcc_local_durability_upgrade::LocalDurabilityUpgradeObject {
+                        object_identity: uuid::Uuid::from_bytes([9; 16]),
+                        local_manifest: ingest.manifest,
+                    },
+                ],
+                requested_at_unix_ms: 1_001,
+            };
+            registry
+                .add_job(
+                    &handle.transaction_id,
+                    job.canonical_bytes().unwrap(),
+                    1_001,
+                )
+                .unwrap();
+            registry
+                .commit(
+                    &FailingCommitRuntime,
+                    &handle.transaction_id,
+                    "alice",
+                    1_002,
+                )
+                .await
+                .unwrap_err();
+            handle.transaction_id
+        };
+
+        let registry = OpenTransactionRegistry::open(temp.path()).unwrap();
+        let evidence = crate::bundle_replication::ObjectEvidenceRegistry::default();
+        assert_eq!(
+            crate::mvcc_physical_payload::restore_durable_object_evidence(
+                &registry,
+                &evidence,
+                &local_objects,
+            )
+            .unwrap(),
+            1
+        );
+        assert!(matches!(
+            evidence
+                .evidence_for_test(std::slice::from_ref(&reference))
+                .unwrap()
+                .as_slice(),
+            [crate::mvcc_transaction::ObjectDurabilityEvidence::LocalRepresentation { .. }]
+        ));
+        assert!(
+            registry
+                .status(&transaction_id, "alice", 1_003)
+                .unwrap()
+                .state
+                == "committing"
+        );
+
+        let digest = reference.object_hash.strip_prefix("sha256:").unwrap();
+        std::fs::remove_file(object_directory.join(format!("{digest}.object"))).unwrap();
+        let error = crate::mvcc_physical_payload::restore_durable_object_evidence(
+            &registry,
+            &crate::bundle_replication::ObjectEvidenceRegistry::default(),
+            &local_objects,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("No such file")
+                || error.to_string().contains("cannot find the path")
+        );
     }
 
     #[tokio::test]
