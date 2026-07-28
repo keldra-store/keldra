@@ -127,6 +127,9 @@ The following are release boundaries, not hidden background features:
 - **Only local object durability is available.** Explicit `quorum` and
   `erasure` object writes fail closed because one node cannot provide the
   required shard placement. A lost sole volume can lose committed data.
+- **Object-link reads are not release-qualified.** Store and read ordinary
+  objects directly. S3 object-link follow and link-metadata response modes are
+  deferred to 0.4.1.
 - **Index reads are a limited preview.** Index create/update/delete/list/query
   and diagnostics remain available, including path/prefix query, but query
   completeness and freshness are not release-qualified. Do not use results for

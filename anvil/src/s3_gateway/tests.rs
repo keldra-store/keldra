@@ -62,6 +62,7 @@ fn routing_config_with_policy(
         cross_region_routing_policy: policy,
         bootstrap_system_admin_subject_kind: "app".to_string(),
         bootstrap_system_admin_subject_id: "admin-principal".to_string(),
+        allow_test_only_insecure_mvcc_transport: true,
         ..anvil_core::config::Config::default()
     }
 }

@@ -98,6 +98,8 @@ Version 0.4.0 intentionally does not claim the following:
   workflows. A bucket created in an explicit transaction cannot have its policy
   changed in that transaction. If the response to a successful implicit bucket
   delete is lost, retrying it can return `NotFound`; verify the bucket state.
+- S3 object-link follow and link-metadata response modes are not
+  release-qualified. Store and read ordinary objects directly.
 - Index create/update/delete/list/query/diagnostics remain available, including
   path/prefix query, but query completeness and freshness are not
   release-qualified. Index watch RPCs fail closed with `Unimplemented`, and
