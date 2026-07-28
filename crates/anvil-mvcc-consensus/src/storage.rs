@@ -73,6 +73,8 @@ pub enum RaftStorageError {
     PurgeRegression { current: u64, requested: u64 },
     #[error("Raft storage writer lock was poisoned")]
     WriterPoisoned,
+    #[error("Raft state-machine transition lock was poisoned")]
+    StateTransitionPoisoned,
 }
 
 /// RocksDB primitives used by the OpenRaft adapter.
@@ -86,7 +88,10 @@ pub struct RocksRaftStore {
     db: Arc<DB>,
     group_id: u64,
     writer: Arc<Mutex<()>>,
+    state_transition: Arc<Mutex<()>>,
     log_write_fault_hook: Option<Arc<dyn Fn() -> Result<(), String> + Send + Sync>>,
+    #[cfg(test)]
+    state_transition_lock_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
     active_sync_writes: Arc<AtomicU64>,
     #[cfg(test)]
@@ -121,7 +126,10 @@ impl RocksRaftStore {
             db,
             group_id,
             writer: Arc::new(Mutex::new(())),
+            state_transition: Arc::new(Mutex::new(())),
             log_write_fault_hook: None,
+            #[cfg(test)]
+            state_transition_lock_hook: None,
             #[cfg(test)]
             active_sync_writes: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
@@ -141,6 +149,15 @@ impl RocksRaftStore {
         hook: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
     ) -> Self {
         self.log_write_fault_hook = Some(hook);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_state_transition_lock_hook(
+        mut self,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        self.state_transition_lock_hook = Some(hook);
         self
     }
 
@@ -234,6 +251,20 @@ impl RocksRaftStore {
             .get_cf(self.cf(CF_CONSENSUS_STATE)?, self.scoped_key(key))?
             .map(|bytes| decode(ValueKind::StoredOpenRaftState, &bytes))
             .transpose()
+    }
+
+    /// Serializes whole-state read/modify/write transitions across OpenRaft's
+    /// apply, snapshot-build, and snapshot-install executors.
+    pub(crate) fn lock_state_transition(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, ()>, RaftStorageError> {
+        #[cfg(test)]
+        if let Some(hook) = &self.state_transition_lock_hook {
+            hook();
+        }
+        self.state_transition
+            .lock()
+            .map_err(|_| RaftStorageError::StateTransitionPoisoned)
     }
 
     pub(crate) fn sync_state_value<T: Serialize>(

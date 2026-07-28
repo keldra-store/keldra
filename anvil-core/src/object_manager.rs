@@ -57,6 +57,7 @@ pub struct ObjectManager {
     cross_region_routing_policy: CrossRegionRoutingPolicy,
     signing_key: Vec<u8>,
     observability: Observability,
+    implicit_write_durability: crate::mvcc_transaction::DurabilityLevel,
     mvcc: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<crate::mvcc_bootstrap::MvccSubsystem>>>,
 }
 
@@ -216,6 +217,7 @@ impl ObjectManager {
         cross_region_routing_policy: CrossRegionRoutingPolicy,
         signing_key: Vec<u8>,
         observability: Observability,
+        implicit_write_durability: crate::mvcc_transaction::DurabilityLevel,
     ) -> Self {
         Self {
             persistence,
@@ -225,6 +227,7 @@ impl ObjectManager {
             cross_region_routing_policy,
             signing_key,
             observability,
+            implicit_write_durability,
             mvcc: Default::default(),
         }
     }
@@ -261,7 +264,7 @@ impl ObjectManager {
         );
     }
 
-    pub async fn put_object_with_implicit_quorum_transaction<S>(
+    pub async fn put_object_with_implicit_transaction<S>(
         &self,
         claims: &auth::Claims,
         bucket_name: &str,
@@ -289,7 +292,7 @@ impl ObjectManager {
                 principal.clone(),
                 idempotency_key,
                 Duration::from_secs(300),
-                crate::mvcc_transaction::DurabilityLevel::Quorum,
+                self.implicit_write_durability,
                 crate::mvcc_transaction::ReadConsistency::Linearized,
                 now,
             )
@@ -344,7 +347,7 @@ impl ObjectManager {
                 principal,
                 idempotency_key,
                 Duration::from_secs(300),
-                crate::mvcc_transaction::DurabilityLevel::Quorum,
+                self.implicit_write_durability,
                 crate::mvcc_transaction::ReadConsistency::Linearized,
                 Self::current_unix_ms_for_object()?,
             )

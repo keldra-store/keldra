@@ -309,7 +309,7 @@ async fn begin_git_transaction(
                 ttl_ms: 30_000,
                 read_consistency: MvccReadConsistency::Linearized as i32,
                 cluster_id: cluster.states[0].mvcc.cluster_id().to_string(),
-                durability: MvccDurability::Quorum as i32,
+                durability: MvccDurability::Local as i32,
             },
             &cluster.token,
         ))

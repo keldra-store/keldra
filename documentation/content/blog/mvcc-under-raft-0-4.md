@@ -58,9 +58,12 @@ Internal node connections are persistent gRPC streams. Every operation has a
 request identity and an explicit acknowledgement, so a socket that merely
 appears connected is not counted as durable progress.
 
-On the supported single-node topology, `local`, `quorum`, and `erasure` cannot
-create physical redundancy: all durable state still depends on one node and
-one volume. Losing that volume can lose committed data. Backups are mandatory.
+On the supported single-node topology, implicit object writes default to
+`local`. Explicit `quorum` and `erasure` object transactions fail closed
+because there are not enough physical shard targets; Anvil never silently
+downgrades an explicit durability request. All committed 0.4.0 customer data
+still depends on one node and one volume. Losing that volume can lose committed
+data, so backups are mandatory.
 
 ## Startup and retry safety
 
@@ -97,6 +100,18 @@ Version 0.4.0 intentionally does not claim the following:
 - Git pack ingest and object/S3 readback are supported only for a tenant
   administrator. Git query/tree/blob lookup and watch RPCs fail closed with
   `Unimplemented`; Git actions cannot be delegated in 0.4.0.
+- Hugging Face key storage remains available, but ingestion start, status, and
+  cancellation RPCs fail closed with `Unimplemented`; ingestion actions cannot
+  be delegated in 0.4.0.
+- An idempotent retry of an already-committed boundary-schema write may return
+  the same hash in a different textual representation. The committed schema is
+  retained, but exact retry-response equivalence is deferred to 0.4.1.
+- Explicit transactions carrying object payloads must request `local`
+  durability. Server-created implicit object/Git transactions and the CLI
+  `transaction begin` default use `local`. Raw `BeginTransaction` requests that
+  send `UNSPECIFIED` still resolve to `quorum`; set `LOCAL` explicitly.
+  Explicit `quorum` and `erasure` payload writes require multiple shard targets
+  and are unavailable on the supported one-node topology.
 - Mixed-version rolling upgrades are not supported.
 - This release does not set a performance service-level objective.
 

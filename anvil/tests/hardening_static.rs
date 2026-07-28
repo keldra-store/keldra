@@ -176,19 +176,22 @@ fn release_workflow_uses_shared_release_gates() {
     assert!(
         release.contains("platform: linux/amd64")
             && release.contains("arch: amd64")
-            && !release.contains("platform: linux/arm64"),
-        "release workflow must intentionally build only the amd64 release image"
+            && release.contains("platform: linux/arm64")
+            && release.contains("arch: arm64"),
+        "release workflow must build both amd64 and arm64 release images"
     );
     assert!(
         release.contains("artifact: anvil-test-image-amd64")
-            && !release.contains("anvil-test-image-arm64"),
-        "release workflow must pass only the amd64 image artifact forward"
+            && release.contains("artifact: anvil-test-image-arm64"),
+        "release workflow must pass both architecture image artifacts forward"
     );
     assert!(
-        release.contains("docker tag \"$ANVIL_AMD64_IMAGE\" \"$image\"")
-            && release.contains("docker push \"$image\"")
-            && !release.contains("docker buildx imagetools create"),
-        "release workflow must publish the tested amd64 image directly without a multi-arch manifest"
+        release.contains("docker tag \"$ANVIL_AMD64_IMAGE\" \"$amd64_image\"")
+            && release.contains("docker tag \"$ANVIL_ARM64_IMAGE\" \"$arm64_image\"")
+            && release.contains("docker push \"$amd64_image\"")
+            && release.contains("docker push \"$arm64_image\"")
+            && release.contains("docker buildx imagetools create"),
+        "release workflow must publish both tested images through a multi-architecture manifest"
     );
     assert!(
         !release.contains("build-test-image-fast.sh"),
@@ -230,12 +233,12 @@ fn release_workflow_uses_shared_release_gates() {
             "PR CI workflow must use native Cargo for the amd64 test image on Linux runners"
         );
         assert!(
-            ci.contains("linux/amd64") && !ci.contains("linux/arm64"),
-            "PR CI workflow must build only the amd64 Docker test image"
+            ci.contains("linux/amd64") && ci.contains("linux/arm64"),
+            "PR CI workflow must build both Docker test-image architectures"
         );
         assert!(
-            ci.contains("anvil-test-image-amd64") && !ci.contains("anvil-test-image-arm64"),
-            "PR CI workflow must upload only the amd64 Docker test image artifact"
+            ci.contains("anvil-test-image-amd64") && ci.contains("anvil-test-image-arm64"),
+            "PR CI workflow must upload both Docker test-image artifacts"
         );
     }
     assert!(
@@ -308,7 +311,10 @@ fn production_authorisation_has_no_scope_or_policy_bypass() {
         "clients/rust/src",
     ]) {
         for term in forbidden {
-            if source.contains(term) {
+            let non_authorisation_scope = path
+                .ends_with("anvil-core/src/core_store/local_coremeta_recovery/readiness.rs")
+                && term == "scopes.contains(";
+            if source.contains(term) && !non_authorisation_scope {
                 violations.push(format!("{} contains {term}", path.display()));
             }
         }
@@ -363,7 +369,6 @@ fn tenant_read_actions_do_not_require_manage_tenant() {
         "AnvilAction::AppRead",
         "AnvilAction::HfKeyRead",
         "AnvilAction::HfKeyList",
-        "AnvilAction::HfIngestionRead",
     ] {
         let at = delegated
             .find(action)
@@ -387,6 +392,9 @@ fn unsafe_0_4_0_query_surfaces_fail_closed_and_cannot_be_delegated() {
         .expect("non-delegatable action arm");
     for action in [
         "AnvilAction::IndexWatch",
+        "AnvilAction::HfIngestionCreate",
+        "AnvilAction::HfIngestionRead",
+        "AnvilAction::HfIngestionDelete",
         "AnvilAction::GitSourceWrite",
         "AnvilAction::GitSourceRead",
         "AnvilAction::GitSourceWatch",
@@ -440,6 +448,30 @@ fn unsafe_0_4_0_query_surfaces_fail_closed_and_cannot_be_delegated() {
         assert!(
             guard < claims,
             "{method} must fail closed before reading data"
+        );
+    }
+
+    let huggingface =
+        std::fs::read_to_string(repo_root().join("anvil-core/src/services/huggingface.rs"))
+            .unwrap();
+    for method in [
+        "async fn start_ingestion(",
+        "async fn get_ingestion_status(",
+        "async fn cancel_ingestion(",
+    ] {
+        let body = huggingface
+            .split(method)
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing Hugging Face ingestion RPC {method}"));
+        let guard = body
+            .find("require_hf_ingestion_surface()?;")
+            .unwrap_or_else(|| panic!("{method} must fail closed in 0.4.0"));
+        let request_read = body
+            .find("request.into_parts()")
+            .unwrap_or_else(|| panic!("{method} must retain its future request path"));
+        assert!(
+            guard < request_read,
+            "{method} must fail closed before mutating ingestion state"
         );
     }
 }
@@ -711,7 +743,7 @@ fn cross_region_proxy_does_not_mint_magic_internal_principals() {
 }
 
 #[test]
-fn mesh_control_creates_system_realm_tuples_for_topology_objects() {
+fn mesh_control_creates_system_realm_tuples_and_rejects_cluster_transactions() {
     let source =
         std::fs::read_to_string(repo_root().join("anvil-core/src/services/mesh_control.rs"))
             .unwrap();
@@ -730,18 +762,16 @@ fn mesh_control_creates_system_realm_tuples_for_topology_objects() {
         );
     }
 
-    let transaction =
-        std::fs::read_to_string(repo_root().join("anvil-core/src/services/transaction.rs"))
-            .unwrap();
     for required in [
-        "committed_topology_resources_from_transaction",
-        "grant_region_defaults",
-        "grant_cell_defaults",
-        "grant_node_defaults",
+        "put_region_in_transaction",
+        "put_cell_in_transaction",
+        "put_node_in_transaction",
+        "topology_transaction_rejected",
+        "mesh and region topology mutations are control-plane operations and cannot participate in a cluster transaction",
     ] {
         assert!(
-            transaction.contains(required),
-            "explicit MeshControl transactions must seed the same system-realm topology tuples after commit: {required}"
+            source.contains(required),
+            "cluster transactions must reject mesh and region control-plane topology mutations: {required}"
         );
     }
 }

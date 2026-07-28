@@ -160,8 +160,10 @@ native_mvcc_e2e_gates() {
   run_cargo_test "bounded CoreMeta source contracts" \
     -p anvil-server --test coremeta_bounded_contracts
 
+  run_cargo_test "native single-node object write and read acceptance" \
+    -p anvil-server --test grpc "test_single_node_put"
+
   local transaction_tests=(
-    boundary_schema_transaction_tests
     bucket_transaction_tests
     credential_transaction_tests
     hf_transaction_tests

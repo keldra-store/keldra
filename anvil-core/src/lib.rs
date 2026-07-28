@@ -320,6 +320,8 @@ impl AppState {
             arc_config.cross_region_routing_policy,
             partition_signing_key,
             observability.clone(),
+            services::object::configured_default_durability(&arc_config.mvcc_default_durability)
+                .map_err(|status| anyhow::anyhow!(status.to_string()))?,
         );
         object_manager
             .install_mvcc(mvcc.clone())

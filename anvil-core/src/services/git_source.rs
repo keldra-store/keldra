@@ -98,7 +98,9 @@ impl GitSourceService for AppState {
                         transaction_principal.clone(),
                         idempotency_key,
                         std::time::Duration::from_secs(300),
-                        crate::mvcc_transaction::DurabilityLevel::Quorum,
+                        crate::services::object::configured_default_durability(
+                            &self.config.mvcc_default_durability,
+                        )?,
                         crate::mvcc_transaction::ReadConsistency::Linearized,
                         now,
                     )

@@ -139,7 +139,7 @@ pub struct Config {
     pub mvcc_shard_gc_grace_ms: u64,
 
     /// Durability used by single-operation writes that create an internal MVCC transaction.
-    #[arg(long, env, default_value = "quorum")]
+    #[arg(long, env, default_value = "local")]
     pub mvcc_default_durability: String,
 
     /// Failure-domain losses that erasure durability must tolerate.
@@ -239,7 +239,7 @@ impl Default for Config {
             mvcc_bundle_quorum_holders: 1,
             mvcc_prepared_bundle_gc_grace_ms: 86_400_000,
             mvcc_shard_gc_grace_ms: 86_400_000,
-            mvcc_default_durability: "quorum".to_string(),
+            mvcc_default_durability: "local".to_string(),
             mvcc_tolerated_failure_domains: 0,
             mvcc_rpc_timeout_ms: 10_000,
             mvcc_node_connection_token: String::new(),

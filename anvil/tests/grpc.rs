@@ -276,8 +276,36 @@ async fn test_single_node_put() {
         format!("Bearer {}", token).parse().unwrap(),
     );
 
-    let result = object_client.put_object(put_object_req).await;
-    assert!(result.is_ok());
+    let written = object_client
+        .put_object(put_object_req)
+        .await
+        .expect("single-node default object write")
+        .into_inner();
+    let mut get_object_req = tonic::Request::new(GetObjectRequest {
+        bucket_name,
+        object_key,
+        version_id: Some(written.version_id),
+        range: None,
+        ..Default::default()
+    });
+    get_object_req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    let mut response_stream = object_client
+        .get_object(get_object_req)
+        .await
+        .expect("single-node object read")
+        .into_inner();
+    let mut downloaded_data = Vec::new();
+    while let Some(response) = response_stream.next().await {
+        if let Some(anvil_api::get_object_response::Data::Chunk(bytes)) =
+            response.expect("single-node object response").data
+        {
+            downloaded_data.extend_from_slice(&bytes);
+        }
+    }
+    assert_eq!(downloaded_data, data);
 }
 
 #[tokio::test]

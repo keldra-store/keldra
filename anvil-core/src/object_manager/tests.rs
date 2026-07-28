@@ -118,6 +118,7 @@ async fn seeded_object_manager(
         CrossRegionRoutingPolicy::RedirectPreferred,
         hex::decode(&config.anvil_secret_encryption_key).unwrap(),
         Observability::default(),
+        crate::mvcc_transaction::DurabilityLevel::Local,
     );
     manager.install_mvcc(mvcc).unwrap();
     (temp, manager, bucket, claims)

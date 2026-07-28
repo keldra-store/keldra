@@ -208,7 +208,7 @@ async fn proxy_put(
 
     let object = state
         .object_manager
-        .put_object_with_implicit_quorum_transaction(
+        .put_object_with_implicit_transaction(
             &original_claims,
             &header.bucket_name,
             &header.object_key,

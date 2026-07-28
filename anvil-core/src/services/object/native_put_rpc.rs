@@ -223,7 +223,7 @@ pub(super) async fn hash_native_payload(
     Ok((format!("sha256:{}", hex::encode(digest.finalize())), size))
 }
 
-pub(super) fn configured_default_durability(value: &str) -> Result<DurabilityLevel, Status> {
+pub(crate) fn configured_default_durability(value: &str) -> Result<DurabilityLevel, Status> {
     match value.trim().to_ascii_lowercase().as_str() {
         "local" => Ok(DurabilityLevel::Local),
         "quorum" => Ok(DurabilityLevel::Quorum),

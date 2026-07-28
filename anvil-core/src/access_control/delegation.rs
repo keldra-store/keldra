@@ -74,6 +74,9 @@ pub async fn delegated_relation_for_action(
         | AnvilAction::RepairRead
         | AnvilAction::InternalProxyObject
         | AnvilAction::IndexWatch
+        | AnvilAction::HfIngestionCreate
+        | AnvilAction::HfIngestionRead
+        | AnvilAction::HfIngestionDelete
         | AnvilAction::GitSourceWrite
         | AnvilAction::GitSourceRead
         | AnvilAction::GitSourceWatch => {
@@ -223,18 +226,12 @@ pub async fn delegated_relation_for_action(
         | AnvilAction::HfKeyCreate
         | AnvilAction::HfKeyRead
         | AnvilAction::HfKeyDelete
-        | AnvilAction::HfKeyList
-        | AnvilAction::HfIngestionCreate
-        | AnvilAction::HfIngestionRead
-        | AnvilAction::HfIngestionDelete => Ok(DelegatedSystemRelation {
+        | AnvilAction::HfKeyList => Ok(DelegatedSystemRelation {
             namespace: system_realm_namespace(SYSTEM_STORAGE_TENANT_NAMESPACE),
             object_id: storage_tenant_object_id(tenant_id),
             relation: if matches!(
                 action,
-                AnvilAction::HfIngestionRead
-                    | AnvilAction::HfKeyRead
-                    | AnvilAction::HfKeyList
-                    | AnvilAction::AppRead
+                AnvilAction::HfKeyRead | AnvilAction::HfKeyList | AnvilAction::AppRead
             ) {
                 "read_tenant"
             } else if matches!(action, AnvilAction::PolicyRead) {

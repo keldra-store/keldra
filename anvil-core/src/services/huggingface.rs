@@ -4,6 +4,13 @@ use tonic::{Request, Response, Status};
 
 use crate::anvil_api as api;
 
+const HF_INGESTION_0_4_0_LIMITATION: &str =
+    "Hugging Face ingestion RPCs are unavailable in Anvil 0.4.0";
+
+fn require_hf_ingestion_surface() -> Result<(), Status> {
+    Err(Status::unimplemented(HF_INGESTION_0_4_0_LIMITATION))
+}
+
 #[tonic::async_trait]
 
 impl api::hugging_face_key_service_server::HuggingFaceKeyService for AppState {
@@ -225,6 +232,7 @@ impl api::hf_ingestion_service_server::HfIngestionService for AppState {
         &self,
         request: Request<api::StartHfIngestionRequest>,
     ) -> Result<Response<api::StartHfIngestionResponse>, Status> {
+        require_hf_ingestion_surface()?;
         tracing::info!(?request, "ENTERED start_ingestion");
         let (_metadata, extensions, req) = request.into_parts();
         if req.key_name.is_empty() || req.repo.is_empty() || req.target_bucket.is_empty() {
@@ -346,6 +354,7 @@ impl api::hf_ingestion_service_server::HfIngestionService for AppState {
         &self,
         request: Request<api::GetHfIngestionStatusRequest>,
     ) -> Result<Response<api::GetHfIngestionStatusResponse>, Status> {
+        require_hf_ingestion_surface()?;
         let (_metadata, extensions, req) = request.into_parts();
         let claims = auth::try_get_claims_from_extensions(&extensions)
             .ok_or_else(|| Status::unauthenticated("Missing authentication claims"))?;
@@ -397,6 +406,7 @@ impl api::hf_ingestion_service_server::HfIngestionService for AppState {
         &self,
         request: Request<api::CancelHfIngestionRequest>,
     ) -> Result<Response<api::CancelHfIngestionResponse>, Status> {
+        require_hf_ingestion_surface()?;
         let (_metadata, extensions, req) = request.into_parts();
         let claims = auth::try_get_claims_from_extensions(&extensions)
             .ok_or_else(|| Status::unauthenticated("Missing authentication claims"))?;

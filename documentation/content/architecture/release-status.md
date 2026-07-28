@@ -66,12 +66,18 @@ The architecture defines three durability levels:
 | Level | Acknowledgement boundary | Node-loss posture |
 | --- | --- | --- |
 | `local` | The local representation and transaction bundle are durable on the coordinating node. | Loss of that holder before a durability upgrade may lose committed data. |
-| `quorum` | Bundle and physical-holder evidence satisfy the configured quorum policy. | On the supported one-node topology this is a quorum of one and adds no physical redundancy. |
+| `quorum` | Bundle and physical-holder evidence satisfy the configured quorum policy. | Object-payload transactions require multiple shard targets and therefore fail closed on the supported one-node topology. |
 | `erasure` | Enough erasure shards are durably acknowledged across the configured placement to satisfy the erasure policy. | Multi-node erasure placement is not release-qualified in 0.4.0. |
 
 The implementation contains direct streaming erasure placement, but 0.4.0 does
 not qualify that path for customer durability. No durability label can turn one
 machine and one volume into node-loss tolerance.
+
+Server-created implicit object/Git transactions and the public CLI default to
+`local` in 0.4.0. Raw `BeginTransaction` callers must send `LOCAL`;
+`UNSPECIFIED` still resolves to `quorum`. Explicit `quorum` or `erasure`
+requests are not silently downgraded: an object transaction using either level
+fails when the required shard placement is not available.
 
 Internal cluster connections use persistent gRPC streams with request IDs and
 explicit acknowledgements. A write is not counted as durable merely because it
@@ -110,9 +116,9 @@ The following are release boundaries, not hidden background features:
   original durable volume and identity.
 - **Transactions are cluster-local.** There is no cross-cluster two-phase
   commit, saga layer, or mesh-wide serial order.
-- **All durability levels share one failure domain.** `quorum` is a quorum of
-  one, and `erasure` is not release-qualified. A lost sole volume can lose
-  committed data.
+- **Only local object durability is available.** Explicit `quorum` and
+  `erasure` object writes fail closed because one node cannot provide the
+  required shard placement. A lost sole volume can lose committed data.
 - **Index reads are a limited preview.** Index create/update/delete/list/query
   and diagnostics remain available, including path/prefix query, but query
   completeness and freshness are not release-qualified. Do not use results for
@@ -123,6 +129,13 @@ The following are release boundaries, not hidden background features:
   the stored objects through the object API or S3 gateway. Git object/tree/blob
   query and watch RPCs return `Unimplemented`, and Git actions cannot be
   delegated in this release.
+- **Hugging Face ingestion is disabled.** Key storage remains available, but
+  ingestion start/status/cancel RPCs return `Unimplemented`, and ingestion
+  actions cannot be delegated in this release.
+- **Boundary-schema retry responses are not byte-equivalent.** A retry of an
+  already committed implicit write can return the same schema hash with a
+  different textual prefix. The committed schema remains available; canonical
+  retry-response equivalence is deferred.
 - **Mixed-version rolling upgrades are not a supported guarantee yet.** Upgrade
   a controlled deployment using backups, release-pinned artifacts, and the
   release's documented validation sequence.

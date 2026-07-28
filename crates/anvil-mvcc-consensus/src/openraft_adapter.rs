@@ -1308,6 +1308,7 @@ pub(crate) struct OpenRaftSnapshotBuilder {
 
 impl RaftSnapshotBuilder<AnvilRaftConfig> for OpenRaftSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot<AnvilRaftConfig>, StorageError<u64>> {
+        let state_transition = self.store.lock_state_transition().map_err(write_error)?;
         let mut state: MachineState = self
             .store
             .read_state_value(KEY_OPENRAFT_STATE)
@@ -1326,6 +1327,7 @@ impl RaftSnapshotBuilder<AnvilRaftConfig> for OpenRaftSnapshotBuilder {
         self.store
             .sync_state_value(KEY_OPENRAFT_STATE, &state)
             .map_err(write_error)?;
+        drop(state_transition);
         let bytes = binary_codec::encode(ValueKind::OpenRaftSnapshot, &state)
             .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Read, error))?;
         let meta = SnapshotMeta {
@@ -1372,6 +1374,7 @@ impl RaftStateMachine<AnvilRaftConfig> for OpenRaftStateMachine {
         I: IntoIterator<Item = RaftEntry> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
+        let _state_transition = self.store.lock_state_transition().map_err(write_error)?;
         let mut state: MachineState = self
             .store
             .read_state_value(KEY_OPENRAFT_STATE)
@@ -1676,6 +1679,7 @@ impl RaftStateMachine<AnvilRaftConfig> for OpenRaftStateMachine {
                 "snapshot body does not match its metadata or configured cluster",
             ));
         }
+        let _state_transition = self.store.lock_state_transition().map_err(write_error)?;
         self.store
             .sync_state_value(KEY_OPENRAFT_STATE, &state)
             .map_err(write_error)

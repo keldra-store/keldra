@@ -975,7 +975,7 @@ async fn handle_hf_ingestion(
                 attempt += 1;
                 info!("Putting object, attempt {}", attempt);
                 let res = object_manager
-                    .put_object_with_implicit_quorum_transaction(
+                    .put_object_with_implicit_transaction(
                         &requester_claims,
                         &target_bucket,
                         &full_key,
@@ -1057,7 +1057,7 @@ async fn handle_hf_ingestion(
             }));
 
             let res: Result<Object, Status> = object_manager
-                .put_object_with_implicit_quorum_transaction(
+                .put_object_with_implicit_transaction(
                     &requester_claims,
                     &target_bucket,
                     &index_key,
@@ -1369,6 +1369,7 @@ mod tests {
             config.cross_region_routing_policy,
             hex::decode(&config.anvil_secret_encryption_key).unwrap(),
             crate::observability::Observability::default(),
+            crate::mvcc_transaction::DurabilityLevel::Local,
         );
         let keyring = Arc::new(config.secret_keyring().unwrap());
         execute_task_with_lease(

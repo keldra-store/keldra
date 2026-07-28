@@ -1379,7 +1379,7 @@ impl ObjectManager {
             )
             .await
         } else {
-            self.put_object_with_implicit_quorum_transaction(
+            self.put_object_with_implicit_transaction(
                 &claims,
                 destination_bucket_name,
                 destination_object_key,
@@ -1461,7 +1461,7 @@ impl ObjectManager {
             )
             .await
         } else {
-            self.put_object_with_implicit_quorum_transaction(
+            self.put_object_with_implicit_transaction(
                 &claims,
                 destination_bucket_name,
                 destination_object_key,
@@ -1516,7 +1516,7 @@ impl ObjectManager {
             self.put_object(&claims, bucket_name, object_key, payload, options)
                 .await
         } else {
-            self.put_object_with_implicit_quorum_transaction(
+            self.put_object_with_implicit_transaction(
                 &claims,
                 bucket_name,
                 object_key,

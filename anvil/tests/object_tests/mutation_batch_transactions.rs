@@ -108,7 +108,7 @@ impl SingleNodeMutationBatchFixture {
                     ttl_ms,
                     read_consistency: MvccReadConsistency::Linearized as i32,
                     cluster_id: self.cluster_id.clone(),
-                    durability: MvccDurability::Quorum as i32,
+                    durability: MvccDurability::Local as i32,
                 },
                 token,
             ))

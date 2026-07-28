@@ -45,7 +45,7 @@ pub enum TransactionCommands {
         ttl_ms: u64,
         #[clap(long, value_enum, default_value = "linearized")]
         read_consistency: TransactionReadConsistency,
-        #[clap(long, value_enum, default_value = "quorum")]
+        #[clap(long, value_enum, default_value = "local")]
         durability: TransactionDurability,
         #[clap(long)]
         idempotency_key: Option<String>,

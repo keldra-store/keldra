@@ -1,5 +1,6 @@
 use std::{
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, mpsc},
+    thread,
     time::Duration,
 };
 
@@ -394,6 +395,66 @@ async fn failed_state_machine_write_preserves_state_and_last_applied_atomically(
     assert_eq!(persisted.last_applied_log_id, None);
     assert_eq!(persisted.control.node_incarnation(owner.node_id), None);
     assert!(persisted.decisions.is_empty());
+}
+
+#[test]
+fn snapshot_build_and_apply_serialize_whole_state_transitions() {
+    let directory = TempDir::new().unwrap();
+    let store = RocksRaftStore::open(directory.path(), 0).unwrap();
+    stores(store.clone(), [3; 32]).unwrap();
+
+    let state_transition = store.lock_state_transition().unwrap();
+    let (attempt_tx, attempt_rx) = mpsc::channel();
+    let instrumented_store = store
+        .clone()
+        .with_state_transition_lock_hook(Arc::new(move || {
+            attempt_tx.send(()).unwrap();
+        }));
+    let (_, mut machine) = stores(instrumented_store.clone(), [3; 32]).unwrap();
+    let mut builder = OpenRaftSnapshotBuilder {
+        store: instrumented_store,
+        cluster_id_hash: [3; 32],
+    };
+    let (done_tx, done_rx) = mpsc::channel();
+
+    let snapshot_done = done_tx.clone();
+    let snapshot_thread = thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(builder.build_snapshot())
+            .unwrap();
+        snapshot_done.send("snapshot").unwrap();
+    });
+    let apply_thread = thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(machine.apply([Entry {
+                log_id: LogId::new(CommittedLeaderId::new(1, 1), 1),
+                payload: EntryPayload::Blank,
+            }]))
+            .unwrap();
+        done_tx.send("apply").unwrap();
+    });
+
+    attempt_rx.recv().unwrap();
+    attempt_rx.recv().unwrap();
+    assert_eq!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+    drop(state_transition);
+
+    snapshot_thread.join().unwrap();
+    apply_thread.join().unwrap();
+    let mut completions = [done_rx.recv().unwrap(), done_rx.recv().unwrap()];
+    completions.sort_unstable();
+    assert_eq!(completions, ["apply", "snapshot"]);
+
+    let persisted: MachineState = store.read_state_value(KEY_OPENRAFT_STATE).unwrap().unwrap();
+    assert_eq!(
+        persisted.last_applied_log_id,
+        Some(LogId::new(CommittedLeaderId::new(1, 1), 1))
+    );
+    assert_eq!(persisted.snapshot_generation, 1);
 }
 
 #[tokio::test]

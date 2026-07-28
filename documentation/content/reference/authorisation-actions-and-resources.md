@@ -239,16 +239,18 @@ Append streams are modelled under the object family today.
 
 ### Hugging Face integration
 
-The current source includes Hugging Face key and ingestion actions. Treat these as tenant integration permissions, not admin permissions.
+Hugging Face key storage remains available in Anvil 0.4.0. Ingestion
+start/status/cancel RPCs return `Unimplemented`, and ingestion actions cannot be
+delegated through tenant access grants.
 
 | Operation | Action | Resource checked | Notes |
 | --- | --- | --- | --- |
 | Create key | `hf_key:create` | Key name | Stores encrypted server-side credential material. |
 | Delete key | `hf_key:delete` | Key name | Removes a named key. |
 | List keys | `hf_key:list` | `*` | Current coarse scope: no narrow list resource. |
-| Start ingestion | `hf_ingestion:create` | `*` | Current coarse scope: start is global within the tenant. |
-| Read ingestion status | `hf_ingestion:read` | Ingestion id | Status lookup by id. |
-| Cancel ingestion | `hf_ingestion:delete` | Ingestion id | Cancels an ingestion job. |
+| Start ingestion | `hf_ingestion:create` | `*` | Unavailable in 0.4.0. |
+| Read ingestion status | `hf_ingestion:read` | Ingestion id | Unavailable in 0.4.0. |
+| Cancel ingestion | `hf_ingestion:delete` | Ingestion id | Unavailable in 0.4.0. |
 
 `hf_key:read` exists in the action parser, but the current service paths above use create, delete, and list.
 
@@ -352,7 +354,7 @@ Some current checks are broader than an ideal product policy model. Treat these 
 | App lifecycle | App create/read/rotate/delete checks `tenant:<tenant_id>`, not one app name. |
 | Policy listing | Requires app-management read at tenant level and filters returned grant records by policy coverage. |
 | Tenant audit listing | Current public tenant audit listing uses authenticated tenant identity and does not check a separate public audit action. |
-| HF list/start | Key listing and ingestion start currently check `*` within their action families. |
+| HF key list | Key listing checks `*` within its action family. Ingestion RPCs are unavailable in 0.4.0. |
 | Authz caveats | Caveat hashes are stored and matched; expressions are not evaluated today. |
 | System realm management | The admin system realm is bootstrapped and checked by server code. There is no public tenant path to alter its schema. |
 
