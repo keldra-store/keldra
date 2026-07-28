@@ -85,6 +85,15 @@ async fn mesh_bucket_move_requires_routing_and_bucket_zanzibar_permissions() {
         .await
         .unwrap();
 
+    create_active_region_for_bucket_move(
+        &node,
+        &mut admin_client,
+        &admin_token,
+        "mesh-move-source",
+        "eu-west-1",
+    )
+    .await;
+
     let tenant = admin_client
         .create_tenant(with_auth(
             tonic::Request::new(CreateTenantRequest {
@@ -204,6 +213,15 @@ async fn admin_tenant_app_and_bucket_workflow_issues_usable_credentials() {
         .await
         .unwrap();
 
+    create_active_region_for_bucket_move(
+        &node,
+        &mut admin_client,
+        &token,
+        "admin-workflow-source",
+        "eu-west-1",
+    )
+    .await;
+
     let tenant = admin_client
         .create_tenant(with_auth(
             tonic::Request::new(CreateTenantRequest {
@@ -293,6 +311,15 @@ async fn admin_routing_records_list_and_repair_mesh_locators() {
     let mut client = AdminServiceClient::connect(node.admin_url.clone())
         .await
         .unwrap();
+
+    create_active_region_for_bucket_move(
+        &node,
+        &mut client,
+        &token,
+        "routing-repair-source",
+        "eu-west-1",
+    )
+    .await;
 
     let tenant = node
         .state

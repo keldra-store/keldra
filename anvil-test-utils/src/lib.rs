@@ -2175,7 +2175,7 @@ pub async fn wait_for_port(addr: SocketAddr, timeout: Duration) -> bool {
     false
 }
 
-async fn wait_for_http_ready(base_url: &str, timeout: Duration) -> bool {
+pub async fn wait_for_http_ready(base_url: &str, timeout: Duration) -> bool {
     let start = Instant::now();
     let ready_url = format!("{}/ready", base_url.trim_end_matches('/'));
     while start.elapsed() < timeout {

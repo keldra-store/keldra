@@ -3,7 +3,7 @@
 use anvil::anvil_api::admin_service_client::AdminServiceClient;
 use anvil::anvil_api::auth_service_client::AuthServiceClient;
 use anvil::anvil_api::*;
-use anvil_test_utils::{personaldb_test_protocol_keyring, wait_for_port};
+use anvil_test_utils::{personaldb_test_protocol_keyring, wait_for_http_ready, wait_for_port};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::task::JoinHandle;
@@ -74,6 +74,10 @@ async fn spawn_admin_node() -> AdminNode {
 
     assert!(wait_for_port(public_addr, Duration::from_secs(5)).await);
     assert!(wait_for_port(admin_addr, Duration::from_secs(5)).await);
+    assert!(
+        wait_for_http_ready(&format!("http://{public_addr}"), Duration::from_secs(5)).await,
+        "public API did not report ready after its listeners became reachable"
+    );
 
     AdminNode {
         public_url: format!("http://{public_addr}"),

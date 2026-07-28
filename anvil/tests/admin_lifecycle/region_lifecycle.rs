@@ -515,10 +515,11 @@ async fn admin_region_drain_applies_bucket_dispositions_and_exceptions() {
         .unwrap()
         .expect("bucket locator");
     assert_eq!(format!("{:?}", locator.status), "ReadOnly");
-    let exceptions =
-        anvil::mesh_lifecycle::list_bucket_drain_exceptions(&node.state.storage, Some("eu-west-1"))
-            .await
-            .unwrap();
+    let exceptions = anvil::mesh_lifecycle::list_bucket_drain_exceptions_mvcc(
+        &node.state.mvcc,
+        Some("eu-west-1"),
+    )
+    .unwrap();
     assert_eq!(exceptions.len(), 1);
     assert_eq!(exceptions[0].bucket_name, "docs");
 

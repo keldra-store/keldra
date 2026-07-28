@@ -6,6 +6,10 @@ use std::time::Duration;
 
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+fn startup_apply_requirement(consensus_ready: bool, confirmed_commit_version: u64) -> Option<u64> {
+    consensus_ready.then_some(confirmed_commit_version)
+}
+
 #[derive(Clone)]
 pub(crate) struct PublicReadiness {
     system_realm_ready: Arc<AtomicBool>,
@@ -41,10 +45,6 @@ impl PublicReadiness {
         self.consensus_ready.store(true, Ordering::Release);
     }
 
-    pub(crate) fn mark_consensus_unready(&self) {
-        self.consensus_ready.store(false, Ordering::Release);
-    }
-
     pub(crate) fn consensus_ready(&self) -> bool {
         self.consensus_ready.load(Ordering::Acquire)
     }
@@ -57,12 +57,14 @@ impl PublicReadiness {
         // Read the release-published readiness flag before its associated
         // version. An Acquire that observes `true` therefore also observes the
         // preceding version store in `mark_consensus_ready`.
-        if !self.consensus_ready() {
+        let Some(required_version) =
+            startup_apply_requirement(self.consensus_ready(), self.confirmed_commit_version())
+        else {
             return false;
-        }
-        let required_version = self
-            .confirmed_commit_version()
-            .max(self.mvcc.observed_commit_version());
+        };
+        // Startup readiness is a one-way latch against the commit version
+        // confirmed by the initial linearized barrier. Normal later commits
+        // must not close public admission while their local apply is in flight.
         self.mvcc.apply_worker_is_ready_at(required_version)
     }
 
@@ -125,6 +127,20 @@ pub(crate) fn unavailable_response(grpc: bool) -> Response<Body> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_apply_requirement_does_not_follow_later_observed_commits() {
+        let confirmed_startup_version = 17;
+        let later_observed_version = 42;
+
+        assert_eq!(
+            startup_apply_requirement(false, confirmed_startup_version),
+            None
+        );
+        let required = startup_apply_requirement(true, confirmed_startup_version);
+        assert_eq!(required, Some(confirmed_startup_version));
+        assert_ne!(required, Some(later_observed_version));
+    }
 
     #[test]
     fn only_internal_bootstrap_services_bypass_public_readiness() {

@@ -58,14 +58,16 @@ pub async fn start_node_with_admin_listener(
             .await
             {
                 Ok(Ok(commit_version)) => {
+                    while !consensus_mvcc.apply_worker_is_ready_at(commit_version) {
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    }
                     consensus_readiness.mark_consensus_ready(commit_version);
+                    break;
                 }
                 Ok(Err(error)) => {
-                    consensus_readiness.mark_consensus_unready();
                     tracing::debug!(%error, "cluster readiness barrier is unavailable");
                 }
                 Err(_) => {
-                    consensus_readiness.mark_consensus_unready();
                     tracing::debug!("cluster readiness barrier timed out");
                 }
             }

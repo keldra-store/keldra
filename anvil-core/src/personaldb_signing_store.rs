@@ -908,12 +908,13 @@ fn validate_signing_key_publication_common(
     );
     if common.realm_id != expected_shape.realm_id
         || common.root_key_hash != expected_shape.root_key_hash
-        || common.root_generation == 0
-        || common.transaction_id.is_empty()
+        || common.root_generation != expected_shape.root_generation
+        || common.transaction_id != expected_shape.transaction_id
         || common.visibility_state_enum() != CoreMetaVisibilityState::Committed
         || common.payload_schema_version != expected_shape.payload_schema_version
+        || common.created_at_unix_nanos == 0
     {
-        bail!("{label} has invalid rooted CoreMeta publication metadata");
+        bail!("{label} has invalid MVCC CoreMeta metadata");
     }
     Ok(())
 }

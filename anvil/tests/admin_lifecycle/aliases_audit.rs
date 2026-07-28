@@ -284,35 +284,6 @@ async fn admin_mutations_are_returned_by_durable_audit_listing() {
         .unwrap()
         .into_inner();
 
-    let bucket_response = client
-        .create_bucket_admin(with_auth(
-            tonic::Request::new(CreateBucketAdminRequest {
-                context: Some(context("audit-create-bucket", 0)),
-                tenant_id: tenant.tenant_id.clone(),
-                bucket_name: "release-assets".to_string(),
-                region: "eu-west-1".to_string(),
-            }),
-            &token,
-        ))
-        .await
-        .unwrap()
-        .into_inner();
-    let bucket = bucket_response.bucket.clone().unwrap();
-
-    let public_bucket_response = client
-        .set_bucket_public_access_admin(with_auth(
-            tonic::Request::new(SetBucketPublicAccessAdminRequest {
-                context: Some(context("audit-public-bucket", 1)),
-                tenant_id: tenant.tenant_id.clone(),
-                bucket_name: bucket.name.clone(),
-                allow_public_read: true,
-            }),
-            &token,
-        ))
-        .await
-        .unwrap()
-        .into_inner();
-
     let region_response = client
         .create_region(with_auth(
             tonic::Request::new(CreateRegionRequest {
@@ -348,6 +319,35 @@ async fn admin_mutations_are_returned_by_durable_audit_listing() {
                     "eu-west-1",
                 )
                 .await,
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let bucket_response = client
+        .create_bucket_admin(with_auth(
+            tonic::Request::new(CreateBucketAdminRequest {
+                context: Some(context("audit-create-bucket", 0)),
+                tenant_id: tenant.tenant_id.clone(),
+                bucket_name: "release-assets".to_string(),
+                region: "eu-west-1".to_string(),
+            }),
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let bucket = bucket_response.bucket.clone().unwrap();
+
+    let public_bucket_response = client
+        .set_bucket_public_access_admin(with_auth(
+            tonic::Request::new(SetBucketPublicAccessAdminRequest {
+                context: Some(context("audit-public-bucket", 1)),
+                tenant_id: tenant.tenant_id.clone(),
+                bucket_name: bucket.name.clone(),
+                allow_public_read: true,
             }),
             &token,
         ))
