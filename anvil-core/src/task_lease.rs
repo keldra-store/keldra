@@ -134,9 +134,9 @@ impl TaskLease {
     pub fn seal(mut self, _signing_key: &[u8]) -> Result<Self> {
         validate_unsigned_lease(&self)?;
         self.lease_hash = Some(hash_task_lease(&self)?);
-        // Cluster-local lease authority is the certified MVCC row plus its
-        // compact-Raft assignment guard. A second per-record MAC adds no
-        // authority and was removed from the active path.
+        // Named/public lease authority is the certified MVCC row itself.
+        // Node-owned background execution additionally carries a compact-Raft
+        // assignment guard. A second per-record MAC adds no authority.
         self.lease_signature = None;
         Ok(self)
     }
@@ -214,28 +214,19 @@ pub struct TaskLeasePage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TaskLeaseAssignmentDomain {
-    PerLease { identity: String },
     BackgroundTaskQueue,
 }
 
 impl TaskLeaseAssignmentDomain {
-    fn per_lease(tenant_id: i64, task_id: &str) -> Self {
-        Self::PerLease {
-            identity: format!("{tenant_id}:{task_id}"),
-        }
-    }
-
-    fn for_lease(lease: &TaskLease) -> Self {
-        if is_background_task_execution_lease(lease) {
-            Self::BackgroundTaskQueue
-        } else {
-            Self::per_lease(lease.owner.tenant_id, &lease.task_id)
-        }
+    /// Public/named leases are themselves the MVCC authority and may be
+    /// mutated through any cluster coordinator. Only node-owned background
+    /// execution is additionally fenced by a compact-Raft work assignment.
+    fn for_lease(lease: &TaskLease) -> Option<Self> {
+        is_background_task_execution_lease(lease).then_some(Self::BackgroundTaskQueue)
     }
 
     fn kind_and_identity(&self) -> (&str, &str) {
         match self {
-            Self::PerLease { identity } => ("task-lease", identity),
             Self::BackgroundTaskQueue => {
                 (TASK_QUEUE_ASSIGNMENT_KIND, TASK_QUEUE_ASSIGNMENT_IDENTITY)
             }
@@ -244,7 +235,6 @@ impl TaskLeaseAssignmentDomain {
 
     fn ownership_error(&self) -> &'static str {
         match self {
-            Self::PerLease { .. } => "local node does not own the task lease assignment",
             Self::BackgroundTaskQueue => "local node does not own the task queue assignment",
         }
     }
@@ -254,10 +244,25 @@ pub(crate) fn claim_task_lease_assignment(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     lease: &TaskLease,
 ) -> Result<crate::mvcc_worker_authority::AssignmentGuard> {
-    let domain = TaskLeaseAssignmentDomain::for_lease(lease);
+    let domain = TaskLeaseAssignmentDomain::for_lease(lease)
+        .ok_or_else(|| anyhow!("task execution guard requires a background execution lease"))?;
     let (kind, identity) = domain.kind_and_identity();
     mvcc.claim_assignment(kind, identity)?
         .ok_or_else(|| anyhow!(domain.ownership_error()))
+}
+
+async fn reconcile_task_lease_assignment(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    domain: Option<&TaskLeaseAssignmentDomain>,
+) -> Result<Option<crate::mvcc_worker_authority::AssignmentGuard>> {
+    let Some(domain) = domain else {
+        return Ok(None);
+    };
+    let (kind, identity) = domain.kind_and_identity();
+    mvcc.reconcile_work_assignment(kind, identity)
+        .await?
+        .ok_or_else(|| anyhow!(domain.ownership_error()))
+        .map(Some)
 }
 
 /// One cluster-local lease transition ready to join either a caller-owned
@@ -274,7 +279,7 @@ pub struct TaskLeaseWritePlan {
         crate::mvcc_transaction::LogicalKey,
         crate::mvcc_transaction::PredicateKind,
     )>,
-    assignment_domain: TaskLeaseAssignmentDomain,
+    assignment_domain: Option<TaskLeaseAssignmentDomain>,
 }
 
 impl TaskLeaseWritePlan {
@@ -286,16 +291,18 @@ impl TaskLeaseWritePlan {
         now_unix_ms: u64,
     ) -> Result<()> {
         mvcc.open_transactions.binding(transaction_id, principal)?;
-        let (assignment_kind, assignment_identity) = self.assignment_domain.kind_and_identity();
-        let assignment = mvcc
-            .reconcile_work_assignment(assignment_kind, assignment_identity)
-            .await?
-            .ok_or_else(|| anyhow!(self.assignment_domain.ownership_error()))?;
+        let assignment =
+            reconcile_task_lease_assignment(mvcc, self.assignment_domain.as_ref()).await?;
         mvcc.stage_product_mutations(transaction_id, principal, self.mutations, now_unix_ms)?;
         for (key, predicate) in self.predicates {
             mvcc.stage_predicate(transaction_id, principal, key, predicate, now_unix_ms)?;
         }
-        mvcc.stage_assignment_guard(transaction_id, principal, &assignment, now_unix_ms)
+        match assignment {
+            Some(assignment) => {
+                mvcc.stage_assignment_guard(transaction_id, principal, &assignment, now_unix_ms)
+            }
+            None => Ok(()),
+        }
     }
 }
 
@@ -1014,11 +1021,8 @@ async fn commit_task_lease_plan(
     now_unix_ms: u64,
 ) -> Result<()> {
     for attempt in 0..5u8 {
-        let (assignment_kind, assignment_identity) = plan.assignment_domain.kind_and_identity();
-        let assignment = mvcc
-            .reconcile_work_assignment(assignment_kind, assignment_identity)
-            .await?
-            .ok_or_else(|| anyhow!(plan.assignment_domain.ownership_error()))?;
+        let assignment =
+            reconcile_task_lease_assignment(mvcc, plan.assignment_domain.as_ref()).await?;
         let attempt_key = format!("{idempotency_key}:{attempt}");
         let handle = mvcc
             .open_transactions
@@ -1046,12 +1050,14 @@ async fn commit_task_lease_plan(
             for (key, kind) in plan.predicates.clone() {
                 mvcc.stage_predicate(&handle.transaction_id, principal, key, kind, now_unix_ms)?;
             }
-            mvcc.stage_assignment_guard(
-                &handle.transaction_id,
-                principal,
-                &assignment,
-                now_unix_ms,
-            )?;
+            if let Some(assignment) = assignment.as_ref() {
+                mvcc.stage_assignment_guard(
+                    &handle.transaction_id,
+                    principal,
+                    assignment,
+                    now_unix_ms,
+                )?;
+            }
         }
         let outcome = match mvcc
             .open_transactions
@@ -1317,7 +1323,7 @@ mod tests {
     }
 
     #[test]
-    fn background_execution_and_named_lease_assignment_domains_stay_distinct() {
+    fn only_background_execution_leases_require_assignment_authority() {
         let lease = background_lease();
         for task_type in [
             crate::tasks::TaskType::DeleteObject,
@@ -1340,34 +1346,57 @@ mod tests {
 
         let background_plan = task_lease_put_plan(&lease, None).unwrap();
         assert_eq!(
-            background_plan.assignment_domain.kind_and_identity(),
-            (TASK_QUEUE_ASSIGNMENT_KIND, TASK_QUEUE_ASSIGNMENT_IDENTITY)
+            background_plan
+                .assignment_domain
+                .as_ref()
+                .map(TaskLeaseAssignmentDomain::kind_and_identity),
+            Some((TASK_QUEUE_ASSIGNMENT_KIND, TASK_QUEUE_ASSIGNMENT_IDENTITY))
         );
         let background_release = task_lease_delete_plan(&lease).unwrap();
         assert_eq!(
-            background_release.assignment_domain.kind_and_identity(),
-            (TASK_QUEUE_ASSIGNMENT_KIND, TASK_QUEUE_ASSIGNMENT_IDENTITY)
+            background_release
+                .assignment_domain
+                .as_ref()
+                .map(TaskLeaseAssignmentDomain::kind_and_identity),
+            Some((TASK_QUEUE_ASSIGNMENT_KIND, TASK_QUEUE_ASSIGNMENT_IDENTITY))
         );
 
         let mut named = lease.clone();
         named.owner.tenant_id = 7;
         assert!(!is_background_task_execution_lease(&named));
         let named_plan = task_lease_put_plan(&named, None).unwrap();
+        assert_eq!(named_plan.assignment_domain, None);
         assert_eq!(
-            named_plan.assignment_domain.kind_and_identity(),
-            ("task-lease", "7:task-42")
+            task_lease_delete_plan(&named).unwrap().assignment_domain,
+            None
         );
         named.owner.tenant_id = 0;
         named.task_id = "customer-task".to_string();
         assert!(!is_background_task_execution_lease(&named));
+        assert_eq!(
+            task_lease_put_plan(&named, None).unwrap().assignment_domain,
+            None
+        );
 
         let mut public = lease.clone();
         public.owner.principal_kind = "app".to_string();
         assert!(!is_background_task_execution_lease(&public));
+        assert_eq!(
+            task_lease_put_plan(&public, None)
+                .unwrap()
+                .assignment_domain,
+            None
+        );
 
         let mut repair_claim = lease;
         repair_claim.task_id = "repair:finding-42".to_string();
         repair_claim.task_kind = "repair".to_string();
         assert!(!is_background_task_execution_lease(&repair_claim));
+        assert_eq!(
+            task_lease_put_plan(&repair_claim, None)
+                .unwrap()
+                .assignment_domain,
+            None
+        );
     }
 }
