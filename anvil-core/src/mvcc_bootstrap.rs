@@ -4,11 +4,13 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
 
-use anvil_mvcc_consensus::{ConsensusNode, NodeId, OpenRaftConsensus, RocksRaftStore};
+use anvil_mvcc_consensus::{
+    CommitVersion, Consensus as _, ConsensusNode, NodeId, OpenRaftConsensus, RocksRaftStore,
+};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use rocksdb::DB;
@@ -26,7 +28,7 @@ use crate::{
     },
     local_object_store::LocalObjectStore,
     mesh_lifecycle::NodeCapability,
-    mvcc_apply_worker::{ApplyWorkerState, MvccApplyWorker},
+    mvcc_apply_worker::{ApplyWorkerReadiness, ApplyWorkerState, MvccApplyWorker},
     mvcc_gc_coordinator::MvccGarbageCollectionCoordinator,
     mvcc_node_runtime::MvccNodeRuntime,
     mvcc_open_transactions::OpenTransactionRegistry,
@@ -40,8 +42,8 @@ use crate::{
     },
     services::{
         consensus_transport::{
-            ConsensusConnectionAuthorizer, ConsensusTransportService, LocalGcSafetyReport,
-            TonicConsensusRpcFactory,
+            AppliedWatermarkReports, ConsensusConnectionAuthorizer, ConsensusTransportService,
+            LocalGcSafetyReport, TonicConsensusRpcFactory,
         },
         replication::{ReplicationConnectionAuthorizer, ReplicationServiceImpl},
     },
@@ -94,8 +96,8 @@ fn default_voter() -> bool {
 pub struct NodeConnectionAuthorizer {
     cluster_id: Arc<str>,
     token: Arc<str>,
-    raft_nodes: Arc<BTreeMap<u64, MvccPeerConfig>>,
-    replication_nodes: Arc<BTreeMap<String, MvccPeerConfig>>,
+    raft_nodes: Arc<RwLock<BTreeMap<u64, MvccPeerConfig>>>,
+    replication_nodes: Arc<RwLock<BTreeMap<String, MvccPeerConfig>>>,
     storage: crate::storage::Storage,
     core_store: crate::core_store::CoreStore,
     runtime: Arc<ProductMvccRuntime>,
@@ -119,20 +121,20 @@ impl NodeConnectionAuthorizer {
         Self {
             cluster_id: cluster_id.into(),
             token: token.into(),
-            raft_nodes: Arc::new(
+            raft_nodes: Arc::new(RwLock::new(
                 peers
                     .iter()
                     .cloned()
                     .map(|peer| (peer.raft_node_id, peer))
                     .collect(),
-            ),
-            replication_nodes: Arc::new(
+            )),
+            replication_nodes: Arc::new(RwLock::new(
                 peers
                     .iter()
                     .cloned()
                     .map(|peer| (peer.node_id.clone(), peer))
                     .collect(),
-            ),
+            )),
             storage,
             core_store,
             runtime,
@@ -140,6 +142,71 @@ impl NodeConnectionAuthorizer {
             allow_test_bypass,
             consensus,
         }
+    }
+
+    fn replace_peer(
+        &self,
+        replaced_raft_node_id: u64,
+        raft_node_id: u64,
+        node: &NodeIncarnation,
+        failure_domain: &str,
+        endpoint: &str,
+    ) -> Result<()> {
+        if replaced_raft_node_id == 0
+            || raft_node_id == 0
+            || replaced_raft_node_id == raft_node_id
+            || node.node_id.trim().is_empty()
+            || node.incarnation == 0
+            || failure_domain.trim().is_empty()
+            || endpoint.trim().is_empty()
+        {
+            bail!("replacement authorization route is incomplete");
+        }
+        let current = self
+            .replication_nodes
+            .read()
+            .map_err(|_| anyhow::anyhow!("replication authorization map lock poisoned"))?
+            .get(&node.node_id)
+            .cloned()
+            .context("replacement node is not in peer configuration")?;
+        if current.cluster_id != self.cluster_id.as_ref() {
+            bail!("replacement authorization route belongs to another cluster");
+        }
+        if current.raft_node_id != replaced_raft_node_id && current.raft_node_id != raft_node_id {
+            bail!("replacement names neither the configured old nor new Raft node ID");
+        }
+        let replacement = MvccPeerConfig {
+            cluster_id: current.cluster_id,
+            raft_node_id,
+            node_id: node.node_id.clone(),
+            incarnation: node.incarnation,
+            endpoint: endpoint.to_string(),
+            failure_domain: failure_domain.to_string(),
+            voter: current.voter,
+        };
+        let mut raft_nodes = self
+            .raft_nodes
+            .write()
+            .map_err(|_| anyhow::anyhow!("Raft authorization map lock poisoned"))?;
+        if raft_nodes
+            .get(&raft_node_id)
+            .is_some_and(|configured| configured.node_id != node.node_id)
+        {
+            bail!("replacement Raft node ID is already bound to another logical node");
+        }
+        if raft_nodes
+            .get(&replaced_raft_node_id)
+            .is_some_and(|configured| configured.node_id == node.node_id)
+        {
+            raft_nodes.remove(&replaced_raft_node_id);
+        }
+        raft_nodes.insert(raft_node_id, replacement.clone());
+        drop(raft_nodes);
+        self.replication_nodes
+            .write()
+            .map_err(|_| anyhow::anyhow!("replication authorization map lock poisoned"))?
+            .insert(node.node_id.clone(), replacement);
+        Ok(())
     }
 
     fn authorize_token(&self, metadata: &MetadataMap) -> Result<(), Status> {
@@ -260,9 +327,12 @@ impl ConsensusConnectionAuthorizer for NodeConnectionAuthorizer {
         }
         let peer = self
             .raft_nodes
+            .read()
+            .map_err(|_| Status::unavailable("Raft authorization map lock poisoned"))?
             .get(&open.node_id)
+            .cloned()
             .ok_or_else(|| Status::permission_denied("node is not in Raft peer configuration"))?;
-        self.authorize_control_incarnation(peer, open.node_incarnation)?;
+        self.authorize_control_incarnation(&peer, open.node_incarnation)?;
         self.authorize_zanzibar(&peer.node_id).await?;
         Ok(())
     }
@@ -270,9 +340,12 @@ impl ConsensusConnectionAuthorizer for NodeConnectionAuthorizer {
     fn authorize_incarnation(&self, node_id: u64, incarnation: u64) -> Result<(), Status> {
         let peer = self
             .raft_nodes
+            .read()
+            .map_err(|_| Status::unavailable("Raft authorization map lock poisoned"))?
             .get(&node_id)
+            .cloned()
             .ok_or_else(|| Status::permission_denied("node is not in Raft peer configuration"))?;
-        self.authorize_control_incarnation(peer, incarnation)
+        self.authorize_control_incarnation(&peer, incarnation)
     }
 }
 
@@ -291,9 +364,12 @@ impl ReplicationConnectionAuthorizer for NodeConnectionAuthorizer {
         }
         let peer = self
             .replication_nodes
+            .read()
+            .map_err(|_| Status::unavailable("replication authorization map lock poisoned"))?
             .get(&open.node_id)
+            .cloned()
             .ok_or_else(|| Status::permission_denied("node is not in peer configuration"))?;
-        self.authorize_control_incarnation(peer, open.node_incarnation)?;
+        self.authorize_control_incarnation(&peer, open.node_incarnation)?;
         self.authorize_zanzibar(&peer.node_id).await?;
         AuthenticatedPeer::new_bound(
             open.node_id.clone(),
@@ -306,9 +382,12 @@ impl ReplicationConnectionAuthorizer for NodeConnectionAuthorizer {
     fn authorize_incarnation(&self, node_id: &str, incarnation: u64) -> Result<(), Status> {
         let peer = self
             .replication_nodes
+            .read()
+            .map_err(|_| Status::unavailable("replication authorization map lock poisoned"))?
             .get(node_id)
+            .cloned()
             .ok_or_else(|| Status::permission_denied("node is not in peer configuration"))?;
-        self.authorize_control_incarnation(peer, incarnation)
+        self.authorize_control_incarnation(&peer, incarnation)
     }
 }
 
@@ -326,9 +405,13 @@ pub struct MvccSubsystem {
     pub materialisation_embedding_providers: crate::embedding_provider::EmbeddingProviderRegistry,
     pub consensus_service: ConsensusTransportService<NodeConnectionAuthorizer>,
     pub replication_service: ReplicationServiceImpl<NodeConnectionAuthorizer>,
+    connection_authorizer: NodeConnectionAuthorizer,
+    applied_reports: AppliedWatermarkReports,
+    membership_change: tokio::sync::Mutex<()>,
     pub peers: Arc<[MvccPeerConfig]>,
     pub local_node: NodeIncarnation,
     pub apply_worker_state: Arc<tokio::sync::Mutex<ApplyWorkerState>>,
+    apply_worker_readiness: ApplyWorkerReadiness,
     apply_shutdown: tokio::sync::watch::Sender<bool>,
     apply_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     object_materialisation_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -441,22 +524,21 @@ impl MvccSubsystem {
         if snapshot.durability_policy.generation == 0 {
             bail!("Raft durability policy is not installed");
         }
+        let routed = self
+            .replication_client
+            .routed_node_incarnations(self.cluster_id())?;
         let mut candidates = Vec::new();
         for (control_node_id, _raft_node_id, incarnation, failure_domain) in snapshot.nodes {
-            let peer = self
-                .peers
+            let node = routed
                 .iter()
-                .find(|peer| consensus_control_node_id(&peer.node_id) == control_node_id)
+                .find(|node| {
+                    consensus_control_node_id(&node.node_id) == control_node_id
+                        && node.incarnation == incarnation
+                })
                 .context("Raft control state names a node without a transport route")?;
-            if peer.incarnation != incarnation {
-                bail!("Raft control state node incarnation is newer than its transport route");
-            }
             candidates.push(ShardTarget {
                 cluster_id: self.cluster_id().to_string(),
-                node: NodeIncarnation {
-                    node_id: peer.node_id.clone(),
-                    incarnation,
-                },
+                node: node.clone(),
                 failure_domain,
             });
         }
@@ -473,6 +555,94 @@ impl MvccSubsystem {
             .first()
             .map(|peer| peer.cluster_id.as_str())
             .expect("validated MVCC topology is non-empty")
+    }
+
+    pub fn apply_worker_is_ready(&self) -> bool {
+        self.apply_worker_is_ready_at(self.consensus.observed_commit_version().0)
+    }
+
+    pub fn apply_worker_is_ready_at(&self, commit_version: u64) -> bool {
+        self.apply_worker_readiness
+            .is_ready_at(CommitVersion(commit_version))
+    }
+
+    pub fn apply_worker_applied_watermark(&self) -> u64 {
+        self.apply_worker_readiness.applied_watermark()
+    }
+
+    pub fn observed_commit_version(&self) -> u64 {
+        self.consensus.observed_commit_version().0
+    }
+
+    pub async fn confirm_cluster_commit_barrier(&self) -> Result<u64> {
+        self.consensus
+            .linearized_read_barrier()
+            .await
+            .map(|version| version.0)
+            .context("confirm cluster consensus read barrier")
+    }
+
+    pub(crate) fn replace_runtime_peer_projection(
+        &self,
+        replaced_raft_node_id: u64,
+        raft_node_id: u64,
+        node: &NodeIncarnation,
+        failure_domain: &str,
+        endpoint: &str,
+    ) -> Result<()> {
+        self.replication_client.replace_peer_incarnation(
+            self.cluster_id(),
+            node,
+            endpoint.to_string(),
+        )?;
+        self.bundle_replicator.replace_target_incarnation(
+            self.cluster_id(),
+            node,
+            failure_domain,
+        )?;
+        self.connection_authorizer.replace_peer(
+            replaced_raft_node_id,
+            raft_node_id,
+            node,
+            failure_domain,
+            endpoint,
+        )
+    }
+
+    pub(crate) async fn membership_change_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.membership_change.lock().await
+    }
+
+    pub(crate) async fn wait_for_node_applied(
+        &self,
+        raft_node_id: NodeId,
+        incarnation: u64,
+        watermark: u64,
+    ) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if !self.consensus.is_leader() {
+                bail!("cluster leadership changed during replacement catch-up");
+            }
+            if self
+                .applied_reports
+                .node(raft_node_id)
+                .is_some_and(|report| {
+                    report.incarnation == incarnation && report.watermark >= watermark
+                })
+            {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!(
+                    "replacement Raft node {} incarnation {} did not apply through MVCC watermark {}",
+                    raft_node_id.0,
+                    incarnation,
+                    watermark
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     pub async fn bootstrap(config: &Config, core_meta_db: Arc<DB>) -> Result<Self> {
@@ -693,43 +863,41 @@ impl MvccSubsystem {
                     applied_watermark_report.clone(),
                 );
         let replication_service =
-            ReplicationServiceImpl::open(authorizer, &paths.replication_inbox)?
-                .with_prepared_bundles(prepared.clone());
-        let remote_nodes = peers
-            .iter()
-            .filter(|peer| peer.raft_node_id != config.mvcc_raft_node_id)
-            .map(|peer| NodeIncarnation {
-                node_id: peer.node_id.clone(),
-                incarnation: peer.incarnation,
-            })
-            .collect::<Vec<_>>();
+            ReplicationServiceImpl::open(authorizer.clone(), &paths.replication_inbox)?
+                .with_prepared_bundles(prepared.clone())
+                .with_mvcc_checkpoint_store(local_store.clone());
         let worker = MvccApplyWorker::new(
             consensus.clone(),
             config.mvcc_cluster_id.clone(),
             prepared.clone(),
             replication_client.clone(),
-            remote_nodes,
             local_store,
         )
-        .with_prepared_bundle_gc_grace(config.mvcc_prepared_bundle_gc_grace_ms)
-        .context("configure prepared bundle GC grace")?
-        .with_open_transactions(open_transactions.clone())
-        .with_shard_transfer_retirement(replication_service.receiver());
+        .with_shard_transfer_receiver(replication_service.receiver());
         let apply_worker_state = worker.state_handle();
+        let apply_worker_readiness = worker.readiness_handle();
         let (apply_shutdown, apply_shutdown_rx) = tokio::sync::watch::channel(false);
         let apply_task = tokio::spawn(worker.run(apply_shutdown_rx));
-        let gc_coordinator = MvccGarbageCollectionCoordinator::new(
-            config.mvcc_cluster_id.clone(),
-            NodeId(config.mvcc_raft_node_id),
-            consensus.clone(),
-            open_transactions.clone(),
-            runtime.local_store().clone(),
-            applied_reports,
-            applied_watermark_report.clone(),
-            Duration::from_secs(1),
-        )?;
         let (gc_shutdown, gc_shutdown_rx) = tokio::sync::watch::channel(false);
-        let gc_task = tokio::spawn(gc_coordinator.run(gc_shutdown_rx));
+        let gc_task = if crate::mvcc_gc::MVCC_GARBAGE_COLLECTION_ENABLED {
+            let gc_coordinator = MvccGarbageCollectionCoordinator::new(
+                config.mvcc_cluster_id.clone(),
+                NodeId(config.mvcc_raft_node_id),
+                consensus.clone(),
+                open_transactions.clone(),
+                runtime.local_store().clone(),
+                applied_reports.clone(),
+                applied_watermark_report.clone(),
+                Duration::from_secs(1),
+            )?;
+            Some(tokio::spawn(gc_coordinator.run(gc_shutdown_rx)))
+        } else {
+            tracing::info!(
+                operation = "gc.disabled",
+                "MVCC and physical garbage collection are disabled for Anvil v0.4.0"
+            );
+            None
+        };
 
         Ok(Self {
             consensus,
@@ -745,9 +913,13 @@ impl MvccSubsystem {
             materialisation_embedding_providers,
             consensus_service,
             replication_service,
+            connection_authorizer: authorizer,
+            applied_reports,
+            membership_change: tokio::sync::Mutex::new(()),
             peers: peers.into(),
             local_node: local_incarnation,
             apply_worker_state,
+            apply_worker_readiness,
             apply_shutdown,
             apply_task: Mutex::new(Some(apply_task)),
             object_materialisation_task: Mutex::new(None),
@@ -757,7 +929,7 @@ impl MvccSubsystem {
             outbox_task: Mutex::new(None),
             assignment_reconciler_task: Mutex::new(None),
             gc_shutdown,
-            gc_task: Mutex::new(Some(gc_task)),
+            gc_task: Mutex::new(gc_task),
         })
     }
 

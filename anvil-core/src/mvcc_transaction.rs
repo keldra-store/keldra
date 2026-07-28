@@ -954,6 +954,7 @@ impl TransactionResourceLimits {
 pub struct CertificationRequest {
     pub cluster_id: String,
     pub transaction_id: String,
+    pub principal: String,
     pub snapshot_version: CommitVersion,
     pub bundle: BundleIdentity,
     pub durability: DurabilityLevel,
@@ -1156,6 +1157,7 @@ where
             .certify(CertificationRequest {
                 cluster_id: bundle.cluster_id,
                 transaction_id: bundle.transaction_id,
+                principal: bundle.authenticated_principal,
                 snapshot_version: bundle.snapshot_version,
                 bundle: identity,
                 durability,

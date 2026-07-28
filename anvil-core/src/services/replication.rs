@@ -50,6 +50,7 @@ pub struct ReplicationServiceImpl<A> {
     authorizer: Arc<A>,
     receiver: Arc<std::sync::Mutex<TransferReceiver>>,
     prepared_bundles: Option<crate::bundle_replication::AppendOnlyPreparedBundleStore>,
+    mvcc_checkpoint_store: Option<crate::mvcc_store::LocalMvccStore>,
     #[cfg(test)]
     frame_faults: Option<Arc<std::sync::Mutex<crate::mvcc_fault_injection::FrameFaultPlan>>>,
     #[cfg(test)]
@@ -62,6 +63,7 @@ impl<A> Clone for ReplicationServiceImpl<A> {
             authorizer: self.authorizer.clone(),
             receiver: self.receiver.clone(),
             prepared_bundles: self.prepared_bundles.clone(),
+            mvcc_checkpoint_store: self.mvcc_checkpoint_store.clone(),
             #[cfg(test)]
             frame_faults: self.frame_faults.clone(),
             #[cfg(test)]
@@ -76,6 +78,7 @@ impl<A: ReplicationConnectionAuthorizer> ReplicationServiceImpl<A> {
             authorizer: Arc::new(authorizer),
             receiver: Arc::new(std::sync::Mutex::new(TransferReceiver::open(directory)?)),
             prepared_bundles: None,
+            mvcc_checkpoint_store: None,
             #[cfg(test)]
             frame_faults: None,
             #[cfg(test)]
@@ -92,6 +95,14 @@ impl<A: ReplicationConnectionAuthorizer> ReplicationServiceImpl<A> {
         prepared_bundles: crate::bundle_replication::AppendOnlyPreparedBundleStore,
     ) -> Self {
         self.prepared_bundles = Some(prepared_bundles);
+        self
+    }
+
+    pub(crate) fn with_mvcc_checkpoint_store(
+        mut self,
+        store: crate::mvcc_store::LocalMvccStore,
+    ) -> Self {
+        self.mvcc_checkpoint_store = Some(store);
         self
     }
 
@@ -163,7 +174,7 @@ impl<A: ReplicationConnectionAuthorizer> ReplicationServiceImpl<A> {
     fn should_drop_complete_ack(&self, status: AckStatus) -> bool {
         use std::sync::atomic::Ordering;
 
-        if status != AckStatus::Complete {
+        if !matches!(status, AckStatus::Complete | AckStatus::Applied) {
             return false;
         }
         self.dropped_complete_acks
@@ -457,17 +468,43 @@ impl<A: ReplicationConnectionAuthorizer> ReplicationServiceImpl<A> {
 
             let persist_started_at = std::time::Instant::now();
             let receiver = self.receiver.clone();
+            let checkpoint_store = self.mvcc_checkpoint_store.clone();
+            let completed_checkpoint = frames
+                .iter()
+                .rev()
+                .find(|frame| frame.kind == TransferKind::MvccCatchUp && frame.finish)
+                .map(|frame| (frame.transfer_id, frame.total_length));
             let result = tokio::task::spawn_blocking(move || {
-                let result = receiver
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("replication receiver lock poisoned"))
-                    .and_then(|mut receiver| {
-                        let mut last_ack = None;
-                        for frame in &frames {
-                            last_ack = Some(receiver.receive(&mut session, frame)?);
+                let result = (|| -> anyhow::Result<_> {
+                    let mut receiver = receiver
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("replication receiver lock poisoned"))?;
+                    let mut last_ack = None;
+                    for frame in &frames {
+                        last_ack = Some(receiver.receive(&mut session, frame)?);
+                    }
+                    let mut ack = last_ack.context("frame fault plan emitted no frames")?;
+                    if let Some((transfer_id, total_length)) = completed_checkpoint {
+                        let store = checkpoint_store
+                            .context("MVCC catch-up receiver has no checkpoint store")?;
+                        let max_bytes = usize::try_from(total_length)
+                            .context("MVCC checkpoint exceeds local address space")?;
+                        let checkpoint = receiver.read_complete_chunk(transfer_id, 0, max_bytes)?;
+                        if !checkpoint.finish
+                            || checkpoint.offset != 0
+                            || checkpoint.total_length != total_length
+                            || checkpoint.payload.len() as u64 != total_length
+                        {
+                            anyhow::bail!("completed MVCC checkpoint transfer is incomplete");
                         }
-                        last_ack.context("frame fault plan emitted no frames")
-                    });
+                        drop(receiver);
+                        store
+                            .install_checkpoint_bytes(&checkpoint.payload)
+                            .context("install transferred MVCC checkpoint")?;
+                        ack.status = AckStatus::Applied;
+                    }
+                    Ok(ack)
+                })();
                 (session, result)
             })
             .await;
@@ -674,6 +711,7 @@ mod tests {
     use crate::{
         bundle_replication::AppendOnlyPreparedBundleStore,
         mvcc_fault_injection::{FrameAction, FrameFaultPlan},
+        mvcc_store::LocalMvccStore,
         mvcc_transaction::{BundleIdentity, NodeIncarnation, PreparedBundleStore},
     };
 
@@ -790,6 +828,89 @@ mod tests {
                 .collect::<Vec<_>>(),
             [2, 1]
         );
+    }
+
+    #[tokio::test]
+    async fn mvcc_checkpoint_ack_means_the_target_store_applied_it() {
+        let donor_directory = tempfile::tempdir().unwrap();
+        let donor = LocalMvccStore::open(donor_directory.path()).unwrap();
+        donor.advance_decision_watermark(1).unwrap();
+        let checkpoint = donor.export_checkpoint_bytes().unwrap();
+        let checkpoint_len = checkpoint.len() as u64;
+
+        let target_directory = tempfile::tempdir().unwrap();
+        let target = LocalMvccStore::open(target_directory.path()).unwrap();
+        let inbox = tempfile::tempdir().unwrap();
+        let service = ReplicationServiceImpl::open(
+            Authorizer {
+                calls: Arc::new(AtomicUsize::new(0)),
+            },
+            inbox.path(),
+        )
+        .unwrap()
+        .with_mvcc_checkpoint_store(target.clone());
+        let mut metadata = MetadataMap::new();
+        metadata.insert("authorization", "Bearer node-token".parse().unwrap());
+        let (tx, mut rx) = mpsc::channel(8);
+        let (input_tx, input_rx) = mpsc::channel(8);
+        let task = tokio::spawn(async move {
+            service
+                .serve(metadata, ReceiverStream::new(input_rx), tx)
+                .await
+        });
+        input_tx
+            .send(Ok(request(replication_stream_request::Message::Open(
+                ReplicationSessionOpen {
+                    node_id: "node-b".into(),
+                    node_incarnation: 2,
+                    requested_session_id: String::new(),
+                    cluster_id: "cluster".into(),
+                },
+            ))))
+            .await
+            .unwrap();
+        let accepted = rx.recv().await.unwrap().unwrap();
+        let session_id = match accepted.message.unwrap() {
+            replication_stream_response::Message::Accepted(accepted) => accepted.session_id,
+            _ => panic!("expected accepted session"),
+        };
+        let transfer_id = Uuid::new_v4();
+        input_tx
+            .send(Ok(request(replication_stream_request::Message::Frame(
+                ReplicationDataFrame {
+                    session_id,
+                    cluster_id: "cluster".into(),
+                    sequence: 1,
+                    partition: "mvcc-checkpoint/1".into(),
+                    transfer_id: transfer_id.to_string(),
+                    kind: ReplicationTransferKind::MvccCatchUp as i32,
+                    offset: 0,
+                    payload_checksum: blake3::hash(&checkpoint).as_bytes().to_vec(),
+                    final_hash: blake3::hash(&checkpoint).as_bytes().to_vec(),
+                    total_length: checkpoint.len() as u64,
+                    payload: checkpoint,
+                    finish: true,
+                    transaction_id: String::new(),
+                    prepared_snapshot_version: 0,
+                    prepared_at_unix_ms: 0,
+                    provisional: false,
+                },
+            ))))
+            .await
+            .unwrap();
+
+        let ack = rx.recv().await.unwrap().unwrap();
+        match ack.message.unwrap() {
+            replication_stream_response::Message::Ack(ack) => {
+                assert_eq!(ack.status, ReplicationAckStatus::Applied as i32);
+                assert_eq!(ack.persisted_through, checkpoint_len);
+                assert_eq!(ack.completed_hash.len(), 32);
+            }
+            _ => panic!("expected applied checkpoint acknowledgement"),
+        }
+        assert_eq!(target.decision_watermark().unwrap(), 1);
+        drop(input_tx);
+        task.await.unwrap();
     }
 
     #[tokio::test]

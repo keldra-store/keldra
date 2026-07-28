@@ -133,8 +133,13 @@ pub struct Config {
     #[arg(long, env, default_value_t = 86_400_000)]
     pub mvcc_prepared_bundle_gc_grace_ms: u64,
 
+    /// Minimum rollback window after an obsolete object shard first becomes
+    /// eligible for retirement under the cluster GC watermark.
+    #[arg(long, env, default_value_t = 86_400_000)]
+    pub mvcc_shard_gc_grace_ms: u64,
+
     /// Durability used by single-operation writes that create an internal MVCC transaction.
-    #[arg(long, env, default_value = "local")]
+    #[arg(long, env, default_value = "quorum")]
     pub mvcc_default_durability: String,
 
     /// Failure-domain losses that erasure durability must tolerate.
@@ -233,7 +238,8 @@ impl Default for Config {
             mvcc_cluster_id: "default".to_string(),
             mvcc_bundle_quorum_holders: 1,
             mvcc_prepared_bundle_gc_grace_ms: 86_400_000,
-            mvcc_default_durability: "local".to_string(),
+            mvcc_shard_gc_grace_ms: 86_400_000,
+            mvcc_default_durability: "quorum".to_string(),
             mvcc_tolerated_failure_domains: 0,
             mvcc_rpc_timeout_ms: 10_000,
             mvcc_node_connection_token: String::new(),

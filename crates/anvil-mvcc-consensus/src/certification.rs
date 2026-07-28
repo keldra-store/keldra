@@ -5,7 +5,7 @@ use thiserror::Error;
 
 use crate::{
     CertificationAbort, CertificationResult, CertifyTransaction, CommitVersion, LogicalKeyHash,
-    PredicateKind, RangeConflictKey, TransactionId,
+    PredicateKind, RangeConflictKey, TransactionId, TransactionOutcome,
 };
 
 /// Complete deterministic state replicated by the certification state machine.
@@ -16,7 +16,7 @@ pub struct CertificationState {
     point_latest_write: BTreeMap<LogicalKeyHash, CommitVersion>,
     point_latest_value_hash: BTreeMap<LogicalKeyHash, Option<[u8; 32]>>,
     range_latest_write: BTreeMap<RangeConflictKey, CommitVersion>,
-    recent_results: BTreeMap<TransactionId, CertificationResult>,
+    recent_results: BTreeMap<TransactionId, TransactionOutcome>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -63,6 +63,15 @@ impl CertificationState {
         &self,
         transaction_id: TransactionId,
     ) -> Option<&CertificationResult> {
+        self.recent_results
+            .get(&transaction_id)
+            .map(|outcome| &outcome.result)
+    }
+
+    pub fn transaction_outcome(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Option<&TransactionOutcome> {
         self.recent_results.get(&transaction_id)
     }
 
@@ -75,7 +84,7 @@ impl CertificationState {
     pub fn garbage_collect_results(&mut self, watermark: CommitVersion) -> usize {
         let before = self.recent_results.len();
         self.recent_results
-            .retain(|_, result| certification_result_version(result) >= watermark);
+            .retain(|_, outcome| certification_result_version(&outcome.result) >= watermark);
         before - self.recent_results.len()
     }
 
@@ -104,17 +113,17 @@ impl CertificationState {
                 ),
             );
             self.last_applied = position;
-            self.recent_results
-                .insert(command.transaction_id, result.clone());
+            self.recent_results.insert(
+                command.transaction_id,
+                transaction_outcome(command, result.clone()),
+            );
             return Ok(result);
         }
 
-        if let Some(result) = self.recent_results.get(&command.transaction_id) {
+        if let Some(outcome) = self.recent_results.get(&command.transaction_id) {
             self.last_applied = position;
-            if result.bundle_hash() != command.bundle_hash {
-                return Err(CertificationError::TransactionIdentityMismatch);
-            }
-            return Ok(result.clone());
+            validate_retry_identity(outcome, command)?;
+            return Ok(outcome.result.clone());
         }
 
         let result = match validate_canonical(command) {
@@ -141,8 +150,10 @@ impl CertificationState {
         };
 
         self.last_applied = position;
-        self.recent_results
-            .insert(command.transaction_id, result.clone());
+        self.recent_results.insert(
+            command.transaction_id,
+            transaction_outcome(command, result.clone()),
+        );
         Ok(result)
     }
 
@@ -163,14 +174,12 @@ impl CertificationState {
         if self.cluster_id_hash == [0; 32] || self.cluster_id_hash != command.cluster_id_hash {
             return Ok(None);
         }
-        let Some(result) = self.recent_results.get(&command.transaction_id) else {
+        let Some(outcome) = self.recent_results.get(&command.transaction_id) else {
             return Ok(None);
         };
         self.last_applied = position;
-        if result.bundle_hash() != command.bundle_hash {
-            return Err(CertificationError::TransactionIdentityMismatch);
-        }
-        Ok(Some(result.clone()))
+        validate_retry_identity(outcome, command)?;
+        Ok(Some(outcome.result.clone()))
     }
 
     /// Records a deterministic abort discovered by the surrounding replicated
@@ -190,18 +199,18 @@ impl CertificationState {
         if self.cluster_id_hash == [0; 32] || self.cluster_id_hash != command.cluster_id_hash {
             return self.apply(position, command);
         }
-        if let Some(result) = self.recent_results.get(&command.transaction_id) {
+        if let Some(outcome) = self.recent_results.get(&command.transaction_id) {
             self.last_applied = position;
-            if result.bundle_hash() != command.bundle_hash {
-                return Err(CertificationError::TransactionIdentityMismatch);
-            }
-            return Ok(result.clone());
+            validate_retry_identity(outcome, command)?;
+            return Ok(outcome.result.clone());
         }
         let reason = validate_canonical(command).err().unwrap_or(reason);
         let result = aborted(position, command, reason);
         self.last_applied = position;
-        self.recent_results
-            .insert(command.transaction_id, result.clone());
+        self.recent_results.insert(
+            command.transaction_id,
+            transaction_outcome(command, result.clone()),
+        );
         Ok(result)
     }
 
@@ -259,6 +268,32 @@ fn certification_result_version(result: &CertificationResult) -> CommitVersion {
     }
 }
 
+fn transaction_outcome(
+    command: &CertifyTransaction,
+    result: CertificationResult,
+) -> TransactionOutcome {
+    TransactionOutcome {
+        principal_hash: command.principal_hash,
+        snapshot_version: command.snapshot_version,
+        durability: command.durability,
+        result,
+    }
+}
+
+fn validate_retry_identity(
+    outcome: &TransactionOutcome,
+    command: &CertifyTransaction,
+) -> Result<(), CertificationError> {
+    if outcome.result.bundle_hash() != command.bundle_hash
+        || outcome.principal_hash != command.principal_hash
+        || outcome.snapshot_version != command.snapshot_version
+        || outcome.durability != command.durability
+    {
+        return Err(CertificationError::TransactionIdentityMismatch);
+    }
+    Ok(())
+}
+
 fn aborted(
     position: CommitVersion,
     command: &CertifyTransaction,
@@ -275,6 +310,11 @@ fn validate_canonical(command: &CertifyTransaction) -> Result<(), CertificationA
     if command.cluster_id_hash == [0; 32] {
         return Err(CertificationAbort::InvalidCommand(
             "cluster identity is required".to_string(),
+        ));
+    }
+    if command.principal_hash == [0; 32] {
+        return Err(CertificationAbort::InvalidCommand(
+            "transaction principal identity is required".to_string(),
         ));
     }
     check_sorted_unique(&command.point_observations, "point observations")?;
@@ -359,6 +399,7 @@ mod tests {
         CertifyTransaction {
             cluster_id_hash: [1; 32],
             transaction_id: TransactionId([id; 16]),
+            principal_hash: [2; 32],
             snapshot_version: CommitVersion(0),
             point_observations: vec![],
             range_observations: vec![],
@@ -476,6 +517,27 @@ mod tests {
         let retry = state.apply(CommitVersion(99), &tx).unwrap();
         assert_eq!(first, retry);
         assert_eq!(state.last_applied(), CommitVersion(99));
+    }
+
+    #[test]
+    fn terminal_outcome_is_compact_and_principal_bound() {
+        let mut state = CertificationState::new([1; 32]).unwrap();
+        let mut tx = command(1);
+        tx.snapshot_version = CommitVersion(3);
+        tx.durability = DurabilityLevel::Quorum;
+        let result = state.apply(CommitVersion(4), &tx).unwrap();
+        let outcome = state.transaction_outcome(tx.transaction_id).unwrap();
+        assert_eq!(outcome.principal_hash, tx.principal_hash);
+        assert_eq!(outcome.snapshot_version, CommitVersion(3));
+        assert_eq!(outcome.durability, DurabilityLevel::Quorum);
+        assert_eq!(outcome.result, result);
+
+        let mut wrong_principal = tx;
+        wrong_principal.principal_hash = [9; 32];
+        assert_eq!(
+            state.apply(CommitVersion(5), &wrong_principal),
+            Err(CertificationError::TransactionIdentityMismatch)
+        );
     }
 
     #[test]

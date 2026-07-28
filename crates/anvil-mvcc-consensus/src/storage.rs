@@ -21,15 +21,14 @@ thread_local! {
     static SYNC_WRITE_FAILURE: Cell<Option<(u64, u64)>> = const { Cell::new(None) };
 }
 
-use bincode::{
-    config,
-    serde::{decode_from_slice, encode_to_vec},
-};
 use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, DB, Options, WriteBatch, WriteOptions};
 use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
-use crate::{CertificationState, CommitVersion};
+use crate::{
+    CertificationState, CommitVersion,
+    binary_codec::{self, ValueKind},
+};
 
 pub const CF_RAFT_VOTE: &str = "cf_raft_vote";
 pub const CF_RAFT_LOG: &str = "cf_raft_log";
@@ -150,7 +149,7 @@ impl RocksRaftStore {
             .writer
             .lock()
             .map_err(|_| RaftStorageError::WriterPoisoned)?;
-        let bytes = encode(vote)?;
+        let bytes = encode(ValueKind::StoredVote, vote)?;
         let cf = self.cf(CF_RAFT_VOTE)?;
         let mut batch = WriteBatch::default();
         batch.put_cf(cf, self.scoped_key(KEY_VOTE), bytes);
@@ -161,7 +160,7 @@ impl RocksRaftStore {
         let cf = self.cf(CF_RAFT_VOTE)?;
         self.db
             .get_cf(cf, self.scoped_key(KEY_VOTE))?
-            .map(|bytes| decode(&bytes))
+            .map(|bytes| decode(ValueKind::StoredVote, &bytes))
             .transpose()
     }
 
@@ -223,7 +222,7 @@ impl RocksRaftStore {
     ) -> Result<Option<T>, RaftStorageError> {
         self.db
             .get_cf(self.cf(CF_RAFT_META)?, self.scoped_key(key))?
-            .map(|bytes| decode(&bytes))
+            .map(|bytes| decode(ValueKind::StoredPurgedLogId, &bytes))
             .transpose()
     }
 
@@ -233,7 +232,7 @@ impl RocksRaftStore {
     ) -> Result<Option<T>, RaftStorageError> {
         self.db
             .get_cf(self.cf(CF_CONSENSUS_STATE)?, self.scoped_key(key))?
-            .map(|bytes| decode(&bytes))
+            .map(|bytes| decode(ValueKind::StoredOpenRaftState, &bytes))
             .transpose()
     }
 
@@ -250,7 +249,7 @@ impl RocksRaftStore {
         batch.put_cf(
             self.cf(CF_CONSENSUS_STATE)?,
             self.scoped_key(key),
-            encode(value)?,
+            encode(ValueKind::StoredOpenRaftState, value)?,
         );
         self.sync_write(batch)
     }
@@ -356,7 +355,7 @@ impl RocksRaftStore {
             batch.put_cf(
                 cf_meta,
                 self.scoped_key(KEY_LAST_PURGED_LOG_ID),
-                encode(log_id)?,
+                encode(ValueKind::StoredPurgedLogId, log_id)?,
             );
         }
         self.sync_write(batch)
@@ -377,7 +376,11 @@ impl RocksRaftStore {
             .map_err(|_| RaftStorageError::WriterPoisoned)?;
         let cf = self.cf(CF_CONSENSUS_STATE)?;
         let mut batch = WriteBatch::default();
-        batch.put_cf(cf, self.scoped_key(KEY_CERTIFICATION_STATE), encode(state)?);
+        batch.put_cf(
+            cf,
+            self.scoped_key(KEY_CERTIFICATION_STATE),
+            encode(ValueKind::StoredCertificationState, state)?,
+        );
         self.sync_write(batch)
     }
 
@@ -388,7 +391,8 @@ impl RocksRaftStore {
         self.db
             .get_cf(cf, self.scoped_key(KEY_CERTIFICATION_STATE))?
             .map(|bytes| {
-                let state: CertificationState = decode(&bytes)?;
+                let state: CertificationState =
+                    decode(ValueKind::StoredCertificationState, &bytes)?;
                 Ok(PersistedConsensusState {
                     last_applied: state.last_applied(),
                     state,
@@ -402,13 +406,13 @@ impl RocksRaftStore {
     /// Transaction bundles and product rows are deliberately absent.
     pub fn build_consensus_snapshot(&self) -> Result<Option<Vec<u8>>, RaftStorageError> {
         self.load_consensus_state()?
-            .map(|persisted| encode(&persisted.state))
+            .map(|persisted| encode(ValueKind::CertificationSnapshot, &persisted.state))
             .transpose()
     }
 
     /// Atomically install a compact certification snapshot.
     pub fn install_consensus_snapshot(&self, bytes: &[u8]) -> Result<(), RaftStorageError> {
-        let state: CertificationState = decode(bytes)?;
+        let state: CertificationState = decode(ValueKind::CertificationSnapshot, bytes)?;
         self.save_consensus_state(&state)
     }
 
@@ -500,23 +504,12 @@ impl Drop for ActiveSyncWriteGuard<'_> {
     }
 }
 
-fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, RaftStorageError> {
-    encode_to_vec(value, config::standard())
-        .map_err(|error| RaftStorageError::Codec(error.to_string()))
+fn encode<T: Serialize + ?Sized>(kind: ValueKind, value: &T) -> Result<Vec<u8>, RaftStorageError> {
+    binary_codec::encode(kind, value).map_err(|error| RaftStorageError::Codec(error.to_string()))
 }
 
-fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, RaftStorageError> {
-    decode_from_slice(bytes, config::standard())
-        .and_then(|(value, consumed)| {
-            if consumed == bytes.len() {
-                Ok(value)
-            } else {
-                Err(bincode::error::DecodeError::OtherString(
-                    "trailing bytes in consensus value".into(),
-                ))
-            }
-        })
-        .map_err(|error| RaftStorageError::Codec(error.to_string()))
+fn decode<T: DeserializeOwned>(kind: ValueKind, bytes: &[u8]) -> Result<T, RaftStorageError> {
+    binary_codec::decode(kind, bytes).map_err(|error| RaftStorageError::Codec(error.to_string()))
 }
 
 #[cfg(test)]
@@ -707,6 +700,7 @@ mod tests {
                     &CertifyTransaction {
                         cluster_id_hash: [1; 32],
                         transaction_id: TransactionId([1; 16]),
+                        principal_hash: [2; 32],
                         snapshot_version: CommitVersion(0),
                         point_observations: vec![],
                         range_observations: vec![],
@@ -743,6 +737,7 @@ mod tests {
                 &CertifyTransaction {
                     cluster_id_hash: [1; 32],
                     transaction_id: TransactionId([4; 16]),
+                    principal_hash: [2; 32],
                     snapshot_version: CommitVersion(0),
                     point_observations: vec![],
                     range_observations: vec![],

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -7,12 +7,24 @@ use crate::{
     PartitionAssignment,
 };
 
+/// Compact, consensus-authoritative identity transition for the latest
+/// clean-disk replacement of one logical product node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeReplacementTransition {
+    pub node_id: NodeId,
+    pub replaced_raft_node_id: NodeId,
+    pub replacement_raft_node_id: NodeId,
+    pub replacement_incarnation: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterControlState {
     cluster_id_hash: [u8; 32],
     nodes: BTreeMap<NodeId, u64>,
     raft_node_ids: BTreeMap<NodeId, NodeId>,
+    retired_raft_node_ids: BTreeSet<NodeId>,
     node_failure_domains: BTreeMap<NodeId, String>,
+    replacement_transitions: BTreeMap<NodeId, NodeReplacementTransition>,
     incarnation_fences: BTreeMap<NodeId, u64>,
     partitions: BTreeMap<u64, PartitionAssignment>,
     durability_policy: ConsensusDurabilityPolicy,
@@ -29,7 +41,9 @@ impl ClusterControlState {
             cluster_id_hash,
             nodes: BTreeMap::new(),
             raft_node_ids: BTreeMap::new(),
+            retired_raft_node_ids: BTreeSet::new(),
             node_failure_domains: BTreeMap::new(),
+            replacement_transitions: BTreeMap::new(),
             incarnation_fences: BTreeMap::new(),
             partitions: BTreeMap::new(),
             durability_policy: ConsensusDurabilityPolicy::default(),
@@ -50,6 +64,10 @@ impl ClusterControlState {
         self.raft_node_ids.get(&node_id).copied()
     }
 
+    pub fn retired_raft_node_ids(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.retired_raft_node_ids.iter().copied()
+    }
+
     pub fn nodes(&self) -> impl Iterator<Item = (NodeId, NodeId, u64, &str)> {
         self.nodes.iter().filter_map(|(node_id, incarnation)| {
             self.raft_node_ids.get(node_id).and_then(|raft_node_id| {
@@ -58,6 +76,14 @@ impl ClusterControlState {
                     .map(|domain| (*node_id, *raft_node_id, *incarnation, domain.as_str()))
             })
         })
+    }
+
+    pub fn replacement_transition(&self, node_id: NodeId) -> Option<NodeReplacementTransition> {
+        self.replacement_transitions.get(&node_id).copied()
+    }
+
+    pub fn replacement_transitions(&self) -> impl Iterator<Item = NodeReplacementTransition> + '_ {
+        self.replacement_transitions.values().copied()
     }
 
     pub fn incarnation_fence(&self, node_id: NodeId) -> u64 {
@@ -112,15 +138,46 @@ impl ClusterControlState {
                 {
                     return Err("Raft node ID is already bound to another product node".into());
                 }
+                if self.retired_raft_node_ids.contains(raft_node_id) {
+                    return Err("retired Raft node IDs cannot be reused".into());
+                }
+                if self
+                    .replacement_transitions
+                    .iter()
+                    .any(|(installed, transition)| {
+                        installed != &node.node_id
+                            && (transition.replaced_raft_node_id == *raft_node_id
+                                || transition.replacement_raft_node_id == *raft_node_id)
+                    })
+                {
+                    return Err("Raft node ID is fenced by another product node replacement".into());
+                }
                 let fence = self.incarnation_fence(node.node_id);
                 let current = self.node_incarnation(node.node_id).unwrap_or(0);
                 if node.incarnation <= fence || node.incarnation <= current {
                     return Err("node incarnation must advance its durable fence".into());
                 }
+                let replaced_raft_node_id = self.raft_node_ids.get(&node.node_id).copied();
                 self.nodes.insert(node.node_id, node.incarnation);
                 self.raft_node_ids.insert(node.node_id, *raft_node_id);
                 self.node_failure_domains
                     .insert(node.node_id, failure_domain.clone());
+                if let Some(replaced_raft_node_id) =
+                    replaced_raft_node_id.filter(|replaced| replaced != raft_node_id)
+                {
+                    self.retired_raft_node_ids.insert(replaced_raft_node_id);
+                    self.replacement_transitions.insert(
+                        node.node_id,
+                        NodeReplacementTransition {
+                            node_id: node.node_id,
+                            replaced_raft_node_id,
+                            replacement_raft_node_id: *raft_node_id,
+                            replacement_incarnation: node.incarnation,
+                        },
+                    );
+                } else {
+                    self.replacement_transitions.remove(&node.node_id);
+                }
                 self.incarnation_fences
                     .insert(node.node_id, node.incarnation);
                 self.topology_epoch = self.topology_epoch.saturating_add(1);
@@ -138,8 +195,11 @@ impl ClusterControlState {
                     return Err("node still owns authoritative partitions".into());
                 }
                 self.nodes.remove(&node.node_id);
-                self.raft_node_ids.remove(&node.node_id);
+                if let Some(retired_raft_node_id) = self.raft_node_ids.remove(&node.node_id) {
+                    self.retired_raft_node_ids.insert(retired_raft_node_id);
+                }
                 self.node_failure_domains.remove(&node.node_id);
+                self.replacement_transitions.remove(&node.node_id);
                 self.incarnation_fences
                     .insert(node.node_id, node.incarnation);
                 self.topology_epoch = self.topology_epoch.saturating_add(1);
@@ -318,7 +378,7 @@ mod tests {
             .apply(&ConsensusCommand::InstallNode {
                 cluster_id_hash: CLUSTER,
                 node: node(2),
-                raft_node_id: NodeId(1),
+                raft_node_id: NodeId(2),
                 failure_domain: "zone-a".into(),
             })
             .unwrap();
@@ -350,5 +410,82 @@ mod tests {
             .unwrap();
         assert!(state.topology_epoch() > node_epoch);
         assert_eq!(state.durability_policy().generation, 1);
+    }
+
+    #[test]
+    fn clean_disk_replacement_retains_authoritative_raft_identity_transition() {
+        let mut state = ClusterControlState::new(CLUSTER).unwrap();
+        state
+            .apply(&ConsensusCommand::InstallNode {
+                cluster_id_hash: CLUSTER,
+                node: node(1),
+                raft_node_id: NodeId(1),
+                failure_domain: "zone-a".into(),
+            })
+            .unwrap();
+        state
+            .apply(&ConsensusCommand::InstallNode {
+                cluster_id_hash: CLUSTER,
+                node: node(2),
+                raft_node_id: NodeId(4),
+                failure_domain: "zone-a".into(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            state.replacement_transition(NodeId(1)),
+            Some(NodeReplacementTransition {
+                node_id: NodeId(1),
+                replaced_raft_node_id: NodeId(1),
+                replacement_raft_node_id: NodeId(4),
+                replacement_incarnation: 2,
+            })
+        );
+
+        let other_node = NodeIncarnation {
+            node_id: NodeId(2),
+            incarnation: 1,
+        };
+        assert!(
+            state
+                .apply(&ConsensusCommand::InstallNode {
+                    cluster_id_hash: CLUSTER,
+                    node: other_node,
+                    raft_node_id: NodeId(1),
+                    failure_domain: "zone-b".into(),
+                })
+                .is_err(),
+            "an obsolete Raft identity remains fenced to its logical node"
+        );
+
+        state
+            .apply(&ConsensusCommand::InstallNode {
+                cluster_id_hash: CLUSTER,
+                node: node(3),
+                raft_node_id: NodeId(5),
+                failure_domain: "zone-a".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            state.replacement_transition(NodeId(1)),
+            Some(NodeReplacementTransition {
+                node_id: NodeId(1),
+                replaced_raft_node_id: NodeId(4),
+                replacement_raft_node_id: NodeId(5),
+                replacement_incarnation: 3,
+            })
+        );
+
+        assert!(
+            state
+                .apply(&ConsensusCommand::InstallNode {
+                    cluster_id_hash: CLUSTER,
+                    node: node(4),
+                    raft_node_id: NodeId(1),
+                    failure_domain: "zone-a".into(),
+                })
+                .is_err(),
+            "an earlier obsolete Raft identity remains permanently fenced"
+        );
     }
 }

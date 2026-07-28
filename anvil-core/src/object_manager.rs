@@ -2,10 +2,10 @@ use crate::{
     access_control, auth, bucket_journal,
     core_store::{
         AuthzScopeRef, CoreBoundarySchema, CoreBoundarySource, CoreBoundaryValue, CoreByteRange,
-        CoreCompressionDescriptor, CoreManifestLocator, CoreObjectEncoding, CoreObjectRef,
-        CorePrefetchPolicy, CoreStore, GetBlob, core_object_ref_from_logical_file_write,
-        decode_core_object_ref_target, decode_manifest_locator_proto,
-        encode_core_object_ref_target, encode_manifest_locator_proto,
+        CoreManifestLocator, CoreObjectRef, CorePrefetchPolicy, CoreStore, GetBlob,
+        core_object_ref_from_logical_file_write, decode_core_object_ref_target,
+        decode_manifest_locator_proto, encode_core_object_ref_target,
+        encode_manifest_locator_proto,
     },
     error_codes::AnvilErrorCode,
     formats::writer::WriterFamily,
@@ -17,16 +17,13 @@ use crate::{
     permissions::AnvilAction,
     persistence::{Bucket, MetadataMutationReceipt, Object, Persistence},
     routing::{self, CrossRegionRoutingPolicy},
-    shard_placement::{DistributedIngest, ShardPlacementPolicy},
     storage::Storage,
-    streaming_erasure::ErasureProfile,
     validation, watch_log,
 };
 use anyhow::{Context, Result as AnyhowResult, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{Stream, StreamExt, TryStreamExt};
 use serde_json::Value as JsonValue;
-use sha2::Digest as _;
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::pin::Pin;
 use std::sync::{Mutex, OnceLock};
@@ -90,10 +87,9 @@ struct PreparedMvccObjectIngest {
     object_hash: String,
     object_length: u64,
     shard_map: JsonValue,
+    object_ref: CoreObjectRef,
     boundary_payload: Option<Vec<u8>>,
 }
-
-const MVCC_OBJECT_REF_PREFIX: &str = "anvil-mvcc-target:";
 
 #[derive(Debug, Clone)]
 pub struct AbortMultipartUploadResult {
@@ -395,16 +391,6 @@ impl ObjectManager {
     where
         S: Stream<Item = Result<Vec<u8>, Status>> + Unpin + Send,
     {
-        let mvcc = self.installed_mvcc()?;
-        let binding = mvcc
-            .open_transactions
-            .binding(transaction_id, transaction_principal)
-            .map_err(|error| Status::failed_precondition(error.to_string()))?;
-        if binding.cluster_id != mvcc.cluster_id() {
-            return Err(Status::failed_precondition(
-                "transaction belongs to another cluster",
-            ));
-        }
         let boundary_capture =
             boundary_capture_limit.map(|_| std::sync::Arc::new(Mutex::new(Vec::new())));
         let capture = boundary_capture.clone();
@@ -427,205 +413,18 @@ impl ObjectManager {
             .map_err(|status| std::io::Error::other(status.to_string()));
         let mut reader = StreamReader::new(reader_stream);
         let now = Self::current_unix_ms_for_object()?;
-
-        let target = match binding.durability {
-            crate::mvcc_transaction::DurabilityLevel::Local => {
-                let ingest = mvcc
-                    .local_objects
-                    .persist(&mut reader)
-                    .await
-                    .map_err(|error| Status::internal(error.to_string()))?;
-                mvcc.object_evidence
-                    .record(&ingest.manifest.object_hash, ingest.evidence)
-                    .map_err(|error| Status::internal(error.to_string()))?;
-                mvcc.open_transactions
-                    .add_manifest(transaction_id, &binding.cluster_id, ingest.reference, now)
-                    .map_err(|error| Status::failed_precondition(error.to_string()))?;
-                let upgrade = crate::mvcc_local_durability_upgrade::LocalDurabilityUpgradeJob {
-                    schema: crate::mvcc_local_durability_upgrade::LocalDurabilityUpgradeJob::SCHEMA
-                        .into(),
-                    cluster_id: binding.cluster_id.clone(),
-                    transaction_id: transaction_id.to_string(),
-                    commit_version: 0,
-                    bundle: None,
-                    target: crate::mvcc_transaction::DurabilityLevel::Erasure,
-                    objects: vec![
-                        crate::mvcc_local_durability_upgrade::LocalDurabilityUpgradeObject {
-                            object_identity: provisional_mvcc_object_identity(
-                                &binding.cluster_id,
-                                transaction_id,
-                                bucket_name,
-                                object_key,
-                            ),
-                            local_manifest: ingest.manifest.clone(),
-                        },
-                    ],
-                    requested_at_unix_ms: now,
-                };
-                mvcc.open_transactions
-                    .add_job(
-                        transaction_id,
-                        upgrade
-                            .canonical_bytes()
-                            .map_err(|error| Status::internal(error.to_string()))?,
-                        now,
-                    )
-                    .map_err(|error| Status::failed_precondition(error.to_string()))?;
-                ObjectDataTarget::MvccLocal(ingest.manifest)
-            }
-            durability @ (crate::mvcc_transaction::DurabilityLevel::Quorum
-            | crate::mvcc_transaction::DurabilityLevel::Erasure) => {
-                let (candidates, tolerated_failure_domains, _) = mvcc
-                    .live_shard_placement()
-                    .map_err(|error| Status::failed_precondition(error.to_string()))?;
-                if candidates.len() < 2 {
-                    return Err(Status::failed_precondition(
-                        "distributed object durability requires at least two shard targets",
-                    ));
-                }
-                let parity_shards = tolerated_failure_domains.max(1).min(candidates.len() - 1);
-                let profile = ErasureProfile {
-                    data_shards: candidates.len() - parity_shards,
-                    parity_shards,
-                    shard_bytes: 256 * 1024,
-                };
-                let policy = ShardPlacementPolicy {
-                    tolerated_failure_domains,
-                };
-                let object_identity = provisional_mvcc_object_identity(
-                    &binding.cluster_id,
-                    transaction_id,
-                    bucket_name,
-                    object_key,
-                );
-                let plan = policy
-                    .plan(object_identity, 1, profile, &candidates)
-                    .map_err(|error| Status::failed_precondition(error.to_string()))?;
-                let prepared_snapshot_version = mvcc
-                    .open_transactions
-                    .handle(transaction_id)
-                    .map_err(|error| Status::failed_precondition(error.to_string()))?
-                    .snapshot_version;
-                let ingest = DistributedIngest::encode(
-                    &mvcc.replication_client,
-                    &plan,
-                    policy,
-                    profile,
-                    durability,
-                    &mut reader,
-                    transaction_id,
-                    prepared_snapshot_version,
-                    now,
-                    true,
-                    object_identity,
-                    None,
-                    1,
-                )
-                .await
-                .map_err(|error| Status::unavailable(error.to_string()))?;
-                let manifest =
-                    crate::object_shard_manifest::PhysicalObjectShardManifest::from_ingest(
-                        &binding.cluster_id,
-                        object_identity,
-                        1,
-                        profile.data_shards,
-                        profile.parity_shards,
-                        profile.shard_bytes,
-                        &ingest,
-                    )
-                    .map_err(|error| Status::internal(error.to_string()))?;
-                if durability == crate::mvcc_transaction::DurabilityLevel::Quorum {
-                    let mut missing = Vec::new();
-                    for stripe_ordinal in 0..manifest.stripe_count {
-                        for (shard_ordinal, target) in plan.targets_by_ordinal.iter().enumerate() {
-                            let shard_ordinal = u16::try_from(shard_ordinal)
-                                .map_err(|_| Status::internal("shard ordinal exceeds u16"))?;
-                            if !manifest.placements.iter().any(|placement| {
-                                placement.stripe_ordinal == stripe_ordinal
-                                    && placement.shard_ordinal == shard_ordinal
-                            }) {
-                                missing.push(crate::mvcc_shard_repair::MissingShardTarget {
-                                    stripe_ordinal,
-                                    shard_ordinal,
-                                    target: target.clone(),
-                                });
-                            }
-                        }
-                    }
-                    if !missing.is_empty() {
-                        let repair = crate::mvcc_shard_repair::ShardRepairJob {
-                            schema: crate::mvcc_shard_repair::ShardRepairJob::SCHEMA.to_string(),
-                            cluster_id: binding.cluster_id.clone(),
-                            transaction_id: transaction_id.to_string(),
-                            kind: crate::mvcc_shard_repair::ShardMaintenanceKind::Repair,
-                            target_logical_identity: format!(
-                                "cluster/{}/object/{}",
-                                binding.cluster_id, manifest.object_hash
-                            ),
-                            source_manifest: manifest.clone(),
-                            source_manifest_hash: hex::encode(
-                                blake3::hash(
-                                    &manifest
-                                        .canonical_bytes()
-                                        .map_err(|error| Status::internal(error.to_string()))?,
-                                )
-                                .as_bytes(),
-                            ),
-                            missing,
-                            retiring: Vec::new(),
-                            originating_snapshot_version: mvcc
-                                .open_transactions
-                                .handle(transaction_id)
-                                .map_err(|error| Status::failed_precondition(error.to_string()))?
-                                .snapshot_version,
-                            requested_at_unix_ms: now,
-                        };
-                        mvcc.open_transactions
-                            .add_job(
-                                transaction_id,
-                                repair
-                                    .canonical_bytes()
-                                    .map_err(|error| Status::internal(error.to_string()))?,
-                                now,
-                            )
-                            .map_err(|error| Status::failed_precondition(error.to_string()))?;
-                    }
-                }
-                mvcc.object_evidence
-                    .record_ingest(&ingest)
-                    .map_err(|error| Status::internal(error.to_string()))?;
-                mvcc.open_transactions
-                    .add_manifest(
-                        transaction_id,
-                        &binding.cluster_id,
-                        manifest
-                            .reference()
-                            .map_err(|error| Status::internal(error.to_string()))?,
-                        now,
-                    )
-                    .map_err(|error| Status::failed_precondition(error.to_string()))?;
-                crate::mvcc_shard_repair::stage_manifest_catalog_entry(
-                    mvcc,
-                    transaction_id,
-                    transaction_principal,
-                    &manifest,
-                    now,
-                )
-                .map_err(|error| Status::failed_precondition(error.to_string()))?;
-                ObjectDataTarget::MvccShards(manifest)
-            }
-        };
-        let (object_hash, object_length) = match &target {
-            ObjectDataTarget::MvccLocal(manifest) => {
-                (manifest.object_hash.clone(), manifest.object_length)
-            }
-            ObjectDataTarget::MvccShards(manifest) => {
-                (manifest.object_hash.clone(), manifest.object_length)
-            }
-            ObjectDataTarget::LogicalFile(_) | ObjectDataTarget::ObjectRef(_) => {
-                unreachable!("MVCC ingest produced a legacy object target")
-            }
-        };
+        let prepared = crate::mvcc_physical_payload::prepare_mvcc_physical_payload(
+            self.installed_mvcc()?,
+            &mut reader,
+            crate::mvcc_physical_payload::PrepareMvccPhysicalPayload {
+                transaction_id,
+                transaction_principal,
+                logical_scope: bucket_name,
+                logical_key: object_key,
+                prepared_at_unix_ms: now,
+            },
+        )
+        .await?;
         let boundary_payload = boundary_capture.map(|capture| {
             capture
                 .lock()
@@ -633,9 +432,11 @@ impl ObjectManager {
                 .clone()
         });
         Ok(PreparedMvccObjectIngest {
-            object_hash,
-            object_length,
-            shard_map: object_data_target_to_shard_map(&target)
+            object_hash: prepared.object_hash.clone(),
+            object_length: prepared.object_length,
+            shard_map: prepared.shard_map(),
+            object_ref: prepared
+                .object_ref()
                 .map_err(|error| Status::internal(error.to_string()))?,
             boundary_payload,
         })
@@ -644,106 +445,26 @@ impl ObjectManager {
     fn mvcc_ingest_object_ref(
         prepared: &PreparedMvccObjectIngest,
     ) -> Result<CoreObjectRef, Status> {
-        let representation = serde_json::to_vec(&prepared.shard_map)
-            .map_err(|error| Status::internal(error.to_string()))?;
-        Ok(CoreObjectRef {
-            hash: prepared.object_hash.clone(),
-            logical_size: prepared.object_length,
-            manifest_ref: format!(
-                "{MVCC_OBJECT_REF_PREFIX}{}",
-                URL_SAFE_NO_PAD.encode(representation)
-            ),
-            // Append and multipart journal schemas still expose CoreObjectRef.
-            // The authoritative representation is the MVCC manifest embedded
-            // above; these compatibility fields are never used for reads.
-            encoding: CoreObjectEncoding {
-                block_id: String::new(),
-                profile_id: "mvcc".to_string(),
-                data_shards: 1,
-                parity_shards: 0,
-                minimum_read_shards: 1,
-                minimum_write_ack_shards: 1,
-                stripe_size: prepared.object_length,
-                placement_scope: "cluster".to_string(),
-                repair_priority: "normal".to_string(),
-                stored_hash: prepared.object_hash.clone(),
-                compression: CoreCompressionDescriptor {
-                    algorithm: "none".to_string(),
-                    level: 0,
-                    uncompressed_length: prepared.object_length,
-                    compressed_length: prepared.object_length,
-                    dictionary_id: String::new(),
-                    descriptor_hash: String::new(),
-                },
-                encryption: "none".to_string(),
-            },
-            placements: Vec::new(),
-        })
+        Ok(prepared.object_ref.clone())
     }
 
     async fn read_mvcc_compatible_object_ref(
         &self,
         object_ref: CoreObjectRef,
     ) -> Result<Vec<u8>, Status> {
-        let Some(encoded) = object_ref.manifest_ref.strip_prefix(MVCC_OBJECT_REF_PREFIX) else {
-            return self
-                .core_store
-                .get_blob(GetBlob { object_ref })
-                .await
-                .map_err(|error| Status::internal(error.to_string()));
-        };
-        let representation = URL_SAFE_NO_PAD
-            .decode(encoded)
-            .map_err(|error| Status::data_loss(error.to_string()))?;
-        let representation: JsonValue = serde_json::from_slice(&representation)
-            .map_err(|error| Status::data_loss(error.to_string()))?;
-        let target = object_data_target_from_shard_map(&representation)
-            .map_err(|error| Status::data_loss(error.to_string()))?;
-        let bytes = match target {
-            ObjectDataTarget::MvccLocal(manifest) => self
-                .installed_mvcc()?
-                .local_objects
-                .read_range(&manifest, 0, manifest.object_length)
-                .map_err(|error| Status::data_loss(error.to_string()))?,
-            ObjectDataTarget::MvccShards(manifest) => {
-                let output = std::sync::Arc::new(Mutex::new(Vec::new()));
-                let sink = output.clone();
-                manifest
-                    .read_range_chunks(
-                        &self.installed_mvcc()?.replication_client,
-                        0,
-                        manifest.object_length,
-                        move |chunk| {
-                            let sink = sink.clone();
-                            async move {
-                                sink.lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .extend_from_slice(&chunk);
-                                Ok(())
-                            }
-                        },
-                    )
-                    .await
-                    .map_err(|error| Status::data_loss(error.to_string()))?;
-                std::sync::Arc::try_unwrap(output)
-                    .map_err(|_| Status::internal("MVCC payload reader retained output"))?
-                    .into_inner()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-            }
-            ObjectDataTarget::LogicalFile(_) | ObjectDataTarget::ObjectRef(_) => {
-                return Err(Status::data_loss(
-                    "MVCC compatibility reference contains a legacy target",
-                ));
-            }
-        };
-        if object_ref.hash != format!("sha256:{}", hex::encode(sha2::Sha256::digest(&bytes)))
-            || object_ref.logical_size != bytes.len() as u64
+        if let Some(bytes) = crate::mvcc_physical_payload::read_mvcc_core_object_ref(
+            self.installed_mvcc()?,
+            &object_ref,
+        )
+        .await
+        .map_err(|error| Status::data_loss(error.to_string()))?
         {
-            return Err(Status::data_loss(
-                "MVCC object reference verification failed",
-            ));
+            return Ok(bytes);
         }
-        Ok(bytes)
+        self.core_store
+            .get_blob(GetBlob { object_ref })
+            .await
+            .map_err(|error| Status::internal(error.to_string()))
     }
 
     async fn stream_mvcc_compatible_object_ref(
@@ -751,7 +472,10 @@ impl ObjectManager {
         object_ref: CoreObjectRef,
         output: mpsc::Sender<Result<Vec<u8>, Status>>,
     ) -> Result<(), Status> {
-        let Some(encoded) = object_ref.manifest_ref.strip_prefix(MVCC_OBJECT_REF_PREFIX) else {
+        let Some(locator) =
+            crate::mvcc_physical_payload::decode_core_object_ref_locator(&object_ref)
+                .map_err(|error| Status::data_loss(error.to_string()))?
+        else {
             return self
                 .core_store
                 .read_object_ref_chunks(object_ref, None, 256 * 1024, |chunk| {
@@ -766,15 +490,8 @@ impl ObjectManager {
                 .await
                 .map_err(|error| Status::internal(error.to_string()));
         };
-        let representation = URL_SAFE_NO_PAD
-            .decode(encoded)
-            .map_err(|error| Status::data_loss(error.to_string()))?;
-        let representation: JsonValue = serde_json::from_slice(&representation)
-            .map_err(|error| Status::data_loss(error.to_string()))?;
-        match object_data_target_from_shard_map(&representation)
-            .map_err(|error| Status::data_loss(error.to_string()))?
-        {
-            ObjectDataTarget::MvccLocal(manifest) => {
+        match locator {
+            crate::mvcc_physical_payload::MvccPhysicalPayloadLocator::Local(manifest) => {
                 let file = self
                     .installed_mvcc()?
                     .local_objects
@@ -792,7 +509,7 @@ impl ObjectManager {
                 }
                 Ok(())
             }
-            ObjectDataTarget::MvccShards(manifest) => manifest
+            crate::mvcc_physical_payload::MvccPhysicalPayloadLocator::Shards(manifest) => manifest
                 .read_range_chunks(
                     &self.installed_mvcc()?.replication_client,
                     0,
@@ -809,9 +526,6 @@ impl ObjectManager {
                 )
                 .await
                 .map_err(|error| Status::data_loss(error.to_string())),
-            ObjectDataTarget::LogicalFile(_) | ObjectDataTarget::ObjectRef(_) => Err(
-                Status::data_loss("MVCC compatibility reference contains a legacy target"),
-            ),
         }
     }
 
@@ -2174,39 +1888,29 @@ fn object_data_target_to_shard_map(target: &ObjectDataTarget) -> AnyhowResult<Js
             "kind": "object_ref",
             "target": encode_core_object_ref_target(object_ref)?,
         })),
-        ObjectDataTarget::MvccShards(manifest) => Ok(serde_json::json!({
-            "schema": "anvil.mvcc.object_shard_manifest.v1",
-            "manifest": manifest,
-        })),
-        ObjectDataTarget::MvccLocal(manifest) => Ok(serde_json::json!({
-            "schema": "anvil.mvcc.local_object_manifest.v1",
-            "manifest": manifest,
-        })),
+        ObjectDataTarget::MvccShards(manifest) => {
+            Ok(crate::mvcc_physical_payload::encode_shard_map(
+                &crate::mvcc_physical_payload::MvccPhysicalPayloadLocator::Shards(manifest.clone()),
+            ))
+        }
+        ObjectDataTarget::MvccLocal(manifest) => {
+            Ok(crate::mvcc_physical_payload::encode_shard_map(
+                &crate::mvcc_physical_payload::MvccPhysicalPayloadLocator::Local(manifest.clone()),
+            ))
+        }
     }
 }
 
 fn object_data_target_from_shard_map(value: &JsonValue) -> AnyhowResult<ObjectDataTarget> {
-    if value.get("schema").and_then(JsonValue::as_str)
-        == Some("anvil.mvcc.local_object_manifest.v1")
-    {
-        let manifest = serde_json::from_value(
-            value
-                .get("manifest")
-                .cloned()
-                .context("MVCC local object manifest is missing")?,
-        )?;
-        return Ok(ObjectDataTarget::MvccLocal(manifest));
-    }
-    if value.get("schema").and_then(JsonValue::as_str)
-        == Some("anvil.mvcc.object_shard_manifest.v1")
-    {
-        let manifest = serde_json::from_value(
-            value
-                .get("manifest")
-                .cloned()
-                .context("MVCC object shard manifest is missing")?,
-        )?;
-        return Ok(ObjectDataTarget::MvccShards(manifest));
+    if let Some(locator) = crate::mvcc_physical_payload::decode_shard_map(value)? {
+        return Ok(match locator {
+            crate::mvcc_physical_payload::MvccPhysicalPayloadLocator::Local(manifest) => {
+                ObjectDataTarget::MvccLocal(manifest)
+            }
+            crate::mvcc_physical_payload::MvccPhysicalPayloadLocator::Shards(manifest) => {
+                ObjectDataTarget::MvccShards(manifest)
+            }
+        });
     }
     if value.get("schema").and_then(JsonValue::as_str) == Some("anvil.core.object_data_target.v1") {
         let kind = value
@@ -2235,22 +1939,6 @@ fn object_data_target_from_shard_map(value: &JsonValue) -> AnyhowResult<ObjectDa
 
 fn canonical_json_bytes(value: &JsonValue) -> AnyhowResult<Vec<u8>> {
     serde_json::to_vec(&canonical_json(value)).map_err(Into::into)
-}
-
-fn provisional_mvcc_object_identity(
-    cluster_id: &str,
-    transaction_id: &str,
-    bucket_name: &str,
-    object_key: &str,
-) -> uuid::Uuid {
-    let mut hash = blake3::Hasher::new();
-    for value in [cluster_id, transaction_id, bucket_name, object_key] {
-        hash.update(&(value.len() as u64).to_be_bytes());
-        hash.update(value.as_bytes());
-    }
-    let mut bytes = [0; 16];
-    bytes.copy_from_slice(&hash.finalize().as_bytes()[..16]);
-    uuid::Uuid::from_bytes(bytes)
 }
 
 fn canonical_json(value: &JsonValue) -> JsonValue {

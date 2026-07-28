@@ -68,7 +68,7 @@ async fn upload_part_with_context(
         .map(tonic::Response::into_inner)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn implicit_native_retries_reconstruct_results_and_reject_changed_inputs_across_nodes() {
     let mut cluster = isolated_test_cluster_with_config(
         "native retry must cross coordinators in a three-node quorum cluster",
@@ -247,7 +247,7 @@ async fn implicit_native_retries_reconstruct_results_and_reject_changed_inputs_a
     ));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn multipart_and_append_payloads_round_trip_from_mvcc_representations() {
     let mut cluster = isolated_test_cluster_with_config(
         "native payload representations must round-trip from erasure shards",

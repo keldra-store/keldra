@@ -347,7 +347,19 @@ impl LocalUpgradeManifestPublisher for Arc<crate::mvcc_bootstrap::MvccSubsystem>
                 now,
             )
             .await?;
+        if resume_publication(
+            self,
+            &handle.transaction_id,
+            &principal,
+            now,
+            "representation",
+        )
+        .await?
+        {
+            return Ok(());
+        }
         self.stage_assignment_guard(&handle.transaction_id, &principal, &guard, now)?;
+        let mut mutations = Vec::with_capacity(manifests.len().saturating_mul(2));
         for manifest in manifests {
             manifest.validate()?;
             let key = crate::mvcc_transaction::LogicalKey {
@@ -358,28 +370,32 @@ impl LocalUpgradeManifestPublisher for Arc<crate::mvcc_bootstrap::MvccSubsystem>
                 .runtime
                 .local_store()
                 .read_point_at(&key, handle.snapshot_version)?;
-            self.open_transactions.observe_point(
-                &handle.transaction_id,
-                &job.cluster_id,
-                key.clone(),
-                observed.observed_version(),
-                now,
-            )?;
-            self.open_transactions.put(
-                &handle.transaction_id,
-                &job.cluster_id,
+            mutations.push(crate::mvcc_open_transactions::StagedLogicalMutation {
                 key,
-                manifest.canonical_bytes()?,
-                now,
-            )?;
-            crate::mvcc_shard_repair::stage_manifest_catalog_entry(
-                self,
-                &handle.transaction_id,
-                &principal,
-                manifest,
-                now,
-            )?;
+                observed_version: observed.observed_version(),
+                value: Some(manifest.canonical_bytes()?),
+            });
+            let catalog_key = crate::mvcc_shard_repair::manifest_catalog_key(manifest);
+            let catalog_observed = self
+                .runtime
+                .local_store()
+                .read_point_at(&catalog_key, handle.snapshot_version)?;
+            mutations.push(crate::mvcc_open_transactions::StagedLogicalMutation {
+                key: catalog_key,
+                observed_version: catalog_observed.observed_version(),
+                value: Some(manifest.canonical_bytes()?),
+            });
         }
+        // One durable registry mutation makes a crash during staging
+        // retry-safe. Re-entering an Open idempotent transaction replaces
+        // writes by key instead of creating a non-canonical duplicate.
+        self.open_transactions.stage_logical_mutations(
+            &handle.transaction_id,
+            &principal,
+            &job.cluster_id,
+            mutations,
+            now,
+        )?;
         let outcome = self
             .open_transactions
             .commit(
@@ -389,13 +405,7 @@ impl LocalUpgradeManifestPublisher for Arc<crate::mvcc_bootstrap::MvccSubsystem>
                 unix_time_ms()?,
             )
             .await?;
-        if !matches!(
-            outcome.certification,
-            crate::mvcc_transaction::CertificationResult::Committed { .. }
-        ) {
-            bail!("local durability representation publication conflicted");
-        }
-        Ok(())
+        require_committed_publication(outcome, "representation")
     }
 
     async fn publish_completion(&self, job: &LocalDurabilityUpgradeJob) -> Result<()> {
@@ -424,15 +434,27 @@ impl LocalUpgradeManifestPublisher for Arc<crate::mvcc_bootstrap::MvccSubsystem>
                 now,
             )
             .await?;
+        if resume_publication(self, &handle.transaction_id, &principal, now, "completion").await? {
+            return Ok(());
+        }
         self.stage_assignment_guard(&handle.transaction_id, &principal, &guard, now)?;
-        self.open_transactions.put(
+        let key = crate::mvcc_transaction::LogicalKey {
+            table_id: LOCAL_UPGRADE_STATUS_TABLE_ID,
+            application_key: format!("promotion/{job_id}").into_bytes(),
+        };
+        let observed = self
+            .runtime
+            .local_store()
+            .read_point_at(&key, handle.snapshot_version)?;
+        self.open_transactions.stage_logical_mutations(
             &handle.transaction_id,
+            &principal,
             &job.cluster_id,
-            crate::mvcc_transaction::LogicalKey {
-                table_id: LOCAL_UPGRADE_STATUS_TABLE_ID,
-                application_key: format!("promotion/{job_id}").into_bytes(),
-            },
-            job.commit_version.to_be_bytes().to_vec(),
+            vec![crate::mvcc_open_transactions::StagedLogicalMutation {
+                key,
+                observed_version: observed.observed_version(),
+                value: Some(job.commit_version.to_be_bytes().to_vec()),
+            }],
             now,
         )?;
         let outcome = self
@@ -444,13 +466,52 @@ impl LocalUpgradeManifestPublisher for Arc<crate::mvcc_bootstrap::MvccSubsystem>
                 unix_time_ms()?,
             )
             .await?;
-        if !matches!(
-            outcome.certification,
-            crate::mvcc_transaction::CertificationResult::Committed { .. }
-        ) {
-            bail!("local durability completion publication conflicted");
+        require_committed_publication(outcome, "completion")
+    }
+}
+
+async fn resume_publication(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    transaction_id: &str,
+    principal: &str,
+    now_unix_ms: u64,
+    phase: &str,
+) -> Result<bool> {
+    let status = mvcc
+        .open_transactions
+        .status(transaction_id, principal, now_unix_ms)?;
+    match status.state {
+        "open" => Ok(false),
+        "committing" => {
+            let outcome = mvcc
+                .open_transactions
+                .commit(
+                    mvcc.runtime.as_ref(),
+                    transaction_id,
+                    principal,
+                    now_unix_ms,
+                )
+                .await?;
+            require_committed_publication(outcome, phase)?;
+            Ok(true)
         }
+        "committed" => Ok(true),
+        "aborted" => bail!("local durability {phase} publication conflicted"),
+        state => bail!("local durability {phase} publication transaction is {state}"),
+    }
+}
+
+fn require_committed_publication(
+    outcome: crate::mvcc_node_runtime::CommitOutcome,
+    phase: &str,
+) -> Result<()> {
+    if matches!(
+        outcome.certification,
+        crate::mvcc_transaction::CertificationResult::Committed { .. }
+    ) {
         Ok(())
+    } else {
+        bail!("local durability {phase} publication conflicted")
     }
 }
 

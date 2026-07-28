@@ -191,7 +191,8 @@ pub(crate) fn to_consensus_command(
 
     let command = consensus::CertifyTransaction {
         cluster_id_hash: cluster_id_hash(&request.cluster_id),
-        transaction_id: transaction_id(&request.cluster_id, &request.transaction_id),
+        transaction_id: consensus_transaction_id(&request.cluster_id, &request.transaction_id),
+        principal_hash: consensus_principal_hash(&request.cluster_id, &request.principal),
         snapshot_version: consensus::CommitVersion(request.snapshot_version),
         point_observations,
         range_observations,
@@ -232,7 +233,9 @@ fn valid_bundle_holders(
     holders.into_iter().collect()
 }
 
-fn from_consensus_result(result: consensus::CertificationResult) -> product::CertificationResult {
+pub(crate) fn from_consensus_result(
+    result: consensus::CertificationResult,
+) -> product::CertificationResult {
     match result {
         consensus::CertificationResult::Committed { commit_version, .. } => {
             product::CertificationResult::Committed {
@@ -268,7 +271,7 @@ fn cluster_id_hash(value: &str) -> [u8; 32] {
     domain_hash(b"anvil.mvcc.cluster-id.v1", &[value.as_bytes()])
 }
 
-fn transaction_id(cluster_id: &str, value: &str) -> consensus::TransactionId {
+pub(crate) fn consensus_transaction_id(cluster_id: &str, value: &str) -> consensus::TransactionId {
     let digest = domain_hash(
         b"anvil.mvcc.transaction-id.v1",
         &[cluster_id.as_bytes(), value.as_bytes()],
@@ -276,6 +279,23 @@ fn transaction_id(cluster_id: &str, value: &str) -> consensus::TransactionId {
     let mut id = [0_u8; 16];
     id.copy_from_slice(&digest[..16]);
     consensus::TransactionId(id)
+}
+
+pub(crate) fn consensus_principal_hash(cluster_id: &str, principal: &str) -> [u8; 32] {
+    domain_hash(
+        b"anvil.mvcc.transaction-principal.v1",
+        &[cluster_id.as_bytes(), principal.as_bytes()],
+    )
+}
+
+pub(crate) fn from_consensus_durability(
+    durability: consensus::DurabilityLevel,
+) -> product::DurabilityLevel {
+    match durability {
+        consensus::DurabilityLevel::Local => product::DurabilityLevel::Local,
+        consensus::DurabilityLevel::Quorum => product::DurabilityLevel::Quorum,
+        consensus::DurabilityLevel::Erasure => product::DurabilityLevel::Erasure,
+    }
 }
 
 fn logical_key_hash(cluster_id: &str, key: &product::LogicalKey) -> consensus::LogicalKeyHash {
@@ -367,6 +387,7 @@ mod tests {
         product::CertificationRequest {
             cluster_id: "cluster".to_string(),
             transaction_id: "tx-a".to_string(),
+            principal: "tenant/1/principal/alice".to_string(),
             snapshot_version: 7,
             bundle: product::BundleIdentity {
                 hash: format!("sha256:{}", "a".repeat(64)),
@@ -481,6 +502,7 @@ mod tests {
         product::CertificationRequest {
             cluster_id: bundle.cluster_id,
             transaction_id: bundle.transaction_id,
+            principal: bundle.authenticated_principal,
             snapshot_version: bundle.snapshot_version,
             bundle: identity,
             durability: product::DurabilityLevel::Local,

@@ -531,17 +531,24 @@ async fn put_gateway_blob_in_transaction(
         return Ok(existing.record);
     }
 
-    let store = CoreStore::new(storage.clone()).await?;
-    let payload_write = write_gateway_logical_file_with_locator(
-        &store,
-        WriterFamily::Registry.as_str(),
-        1,
-        ref_name.clone(),
-        bytes.to_vec(),
-        format!("gateway-blob:{tenant_id}:{gateway}:{registry_instance_id}:{repository}:{digest}"),
+    let mut payload = std::io::Cursor::new(bytes);
+    let prepared = crate::mvcc_physical_payload::prepare_mvcc_physical_payload(
+        mvcc,
+        &mut payload,
+        crate::mvcc_physical_payload::PrepareMvccPhysicalPayload {
+            transaction_id,
+            transaction_principal: &transaction_principal,
+            logical_scope: "registry",
+            logical_key: &ref_name,
+            prepared_at_unix_ms: u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default(),
+        },
     )
-    .await?;
-    let object_ref = core_object_ref_from_logical_file_write(&payload_write);
+    .await
+    .map_err(|error| anyhow!(error.to_string()))?;
+    if prepared.object_hash.as_str() != digest || prepared.object_length != bytes.len() as u64 {
+        bail!("registry MVCC payload locator does not match the accepted blob");
+    }
+    let object_ref = prepared.object_ref()?;
     let mut record = GatewayBlobRecord {
         schema: GATEWAY_BLOB_SCHEMA.to_string(),
         tenant_id,

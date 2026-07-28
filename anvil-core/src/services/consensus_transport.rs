@@ -28,6 +28,13 @@ use crate::anvil_api::{
 };
 
 const NODE_TOKEN_HEADER: &str = "x-anvil-node-token";
+const CONSENSUS_PROTOBUF_OVERHEAD_BYTES: usize = 1024 * 1024;
+
+/// Maximum encoded protobuf message accepted by the persistent consensus
+/// transport. The consensus envelope owns the payload bound; this additional
+/// allowance covers protobuf framing and the stream request/response wrapper.
+pub(crate) const CONSENSUS_TRANSPORT_MESSAGE_BYTES: usize =
+    anvil_mvcc_consensus::MAX_CONSENSUS_RPC_PAYLOAD_BYTES + CONSENSUS_PROTOBUF_OVERHEAD_BYTES;
 
 #[async_trait]
 pub trait ConsensusConnectionAuthorizer: Send + Sync + 'static {
@@ -185,6 +192,7 @@ impl<A: ConsensusConnectionAuthorizer> ConsensusTransport for ConsensusTransport
                     reply.reporting_node_id = node_id.0;
                     reply.reporting_node_incarnation = *incarnation;
                     let snapshot = report.snapshot();
+                    reply.mvcc_safety_report_generation = snapshot.generation;
                     reply.mvcc_applied_watermark = snapshot.watermark;
                     reply.has_active_snapshot_pin = snapshot.oldest_active_snapshot.is_some();
                     reply.oldest_active_snapshot =
@@ -215,6 +223,7 @@ async fn dispatch(runtime: &OpenRaftConsensus, frame: ConsensusRpcFrame) -> Cons
         3 => ConsensusRpcKind::InstallSnapshot,
         4 => ConsensusRpcKind::ForwardCertify,
         5 => ConsensusRpcKind::ForwardLinearizedRead,
+        6 => ConsensusRpcKind::ForwardTransactionOutcome,
         other => {
             return ConsensusRpcReply {
                 request_id: frame.request_id,
@@ -263,6 +272,7 @@ async fn dispatch(runtime: &OpenRaftConsensus, frame: ConsensusRpcFrame) -> Cons
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AppliedWatermarkReport {
     pub incarnation: u64,
+    pub generation: u64,
     pub watermark: u64,
     pub oldest_active_snapshot: Option<u64>,
     pub oldest_unfinished_work: Option<u64>,
@@ -274,17 +284,34 @@ pub struct LocalGcSafetyReport {
 }
 
 impl LocalGcSafetyReport {
+    /// Publishes a new generation only when the safety-relevant state changes.
+    ///
+    /// The wall-clock floor lets a same-incarnation process restart normally
+    /// advance beyond reports cached by the leader without making every Raft
+    /// ACK a new report. If the clock moved backwards, the leader deliberately
+    /// keeps the older report (and its pins) until this generation catches up.
     pub fn update(
         &self,
+        generation_floor: u64,
         watermark: u64,
         oldest_active_snapshot: Option<u64>,
         oldest_unfinished_work: Option<u64>,
     ) {
-        *self
+        let mut report = self
             .report
             .lock()
-            .expect("local GC safety report lock poisoned") = AppliedWatermarkReport {
+            .expect("local GC safety report lock poisoned");
+        if report.generation != 0
+            && report.watermark == watermark
+            && report.oldest_active_snapshot == oldest_active_snapshot
+            && report.oldest_unfinished_work == oldest_unfinished_work
+        {
+            return;
+        }
+        let generation = generation_floor.max(report.generation.saturating_add(1));
+        *report = AppliedWatermarkReport {
             incarnation: 0,
+            generation,
             watermark,
             oldest_active_snapshot,
             oldest_unfinished_work,
@@ -307,8 +334,9 @@ pub struct AppliedWatermarkReports {
 impl AppliedWatermarkReports {
     pub fn record(&self, node_id: NodeId, mut report: AppliedWatermarkReport) {
         let incarnation = report.incarnation;
+        let generation = report.generation;
         let watermark = report.watermark;
-        if node_id.0 == 0 || incarnation == 0 {
+        if node_id.0 == 0 || incarnation == 0 || generation == 0 {
             return;
         }
         let mut reports = self
@@ -317,6 +345,8 @@ impl AppliedWatermarkReports {
             .expect("applied watermark report lock poisoned");
         match reports.get(&node_id) {
             Some(current) if current.incarnation > incarnation => {}
+            Some(current)
+                if current.incarnation == incarnation && current.generation >= generation => {}
             Some(current)
                 if current.incarnation == incarnation && current.watermark > watermark => {}
             _ => {
@@ -331,6 +361,14 @@ impl AppliedWatermarkReports {
             .lock()
             .expect("applied watermark report lock poisoned")
             .clone()
+    }
+
+    pub fn node(&self, node_id: NodeId) -> Option<AppliedWatermarkReport> {
+        self.reports
+            .lock()
+            .expect("applied watermark report lock poisoned")
+            .get(&node_id)
+            .copied()
     }
 }
 
@@ -466,6 +504,8 @@ impl TonicConsensusRpcClient {
             .map_err(|error| ConsensusRpcError::Protocol(format!("invalid node token: {error}")))?;
         request.metadata_mut().insert(NODE_TOKEN_HEADER, token);
         let mut input = ConsensusTransportClient::new(channel)
+            .max_decoding_message_size(CONSENSUS_TRANSPORT_MESSAGE_BYTES)
+            .max_encoding_message_size(CONSENSUS_TRANSPORT_MESSAGE_BYTES)
             .exchange(request)
             .await
             .map_err(|error| ConsensusRpcError::Unreachable(error.to_string()))?
@@ -504,6 +544,7 @@ impl TonicConsensusRpcClient {
                         ConsensusRpcKind::InstallSnapshot => 3,
                         ConsensusRpcKind::ForwardCertify => 4,
                         ConsensusRpcKind::ForwardLinearizedRead => 5,
+                        ConsensusRpcKind::ForwardTransactionOutcome => 6,
                     },
                     payload: rpc.payload,
                 })),
@@ -556,6 +597,7 @@ impl TonicConsensusRpcClient {
                 self.target_node_id,
                 AppliedWatermarkReport {
                     incarnation: reply.reporting_node_incarnation,
+                    generation: reply.mvcc_safety_report_generation,
                     watermark: reply.mvcc_applied_watermark,
                     oldest_active_snapshot: reply
                         .has_active_snapshot_pin
@@ -634,37 +676,124 @@ mod tests {
     use crate::anvil_api::consensus_transport_server::ConsensusTransportServer;
 
     #[test]
+    fn transport_message_limit_includes_protobuf_wrapper_headroom() {
+        assert_eq!(
+            CONSENSUS_TRANSPORT_MESSAGE_BYTES,
+            anvil_mvcc_consensus::MAX_CONSENSUS_RPC_PAYLOAD_BYTES + 1024 * 1024
+        );
+        assert!(
+            CONSENSUS_TRANSPORT_MESSAGE_BYTES
+                > anvil_mvcc_consensus::MAX_CONSENSUS_RPC_PAYLOAD_BYTES
+        );
+    }
+
+    #[test]
     fn applied_watermark_reports_are_incarnation_fenced_and_monotonic() {
         let reports = AppliedWatermarkReports::default();
         let node = NodeId(7);
-        let report = |incarnation, watermark| AppliedWatermarkReport {
+        let report = |incarnation, generation, watermark| AppliedWatermarkReport {
             incarnation,
+            generation,
             watermark,
             oldest_active_snapshot: None,
             oldest_unfinished_work: None,
         };
-        reports.record(node, report(2, 40));
-        reports.record(node, report(2, 39));
-        reports.record(node, report(1, 100));
+        reports.record(node, report(2, 10, 40));
+        reports.record(node, report(2, 11, 39));
+        reports.record(node, report(1, 100, 100));
         assert_eq!(
             reports.snapshot().get(&node),
             Some(&AppliedWatermarkReport {
                 incarnation: 2,
+                generation: 10,
                 watermark: 40,
                 oldest_active_snapshot: None,
                 oldest_unfinished_work: None,
             })
         );
-        reports.record(node, report(3, 4));
+        reports.record(node, report(3, 1, 4));
         assert_eq!(
-            reports.snapshot().get(&node),
-            Some(&AppliedWatermarkReport {
+            reports.node(node),
+            Some(AppliedWatermarkReport {
                 incarnation: 3,
+                generation: 1,
                 watermark: 4,
                 oldest_active_snapshot: None,
                 oldest_unfinished_work: None,
             })
         );
+    }
+
+    #[test]
+    fn safety_report_generation_orders_pin_changes_at_the_same_watermark() {
+        let reports = AppliedWatermarkReports::default();
+        let node = NodeId(7);
+        let report = |generation, pin| AppliedWatermarkReport {
+            incarnation: 2,
+            generation,
+            watermark: 48,
+            oldest_active_snapshot: None,
+            oldest_unfinished_work: pin,
+        };
+
+        reports.record(node, report(10, Some(44)));
+        reports.record(node, report(12, None));
+        reports.record(node, report(11, Some(44)));
+        assert_eq!(
+            reports.node(node).unwrap().oldest_unfinished_work,
+            None,
+            "an older concurrent ACK cannot reintroduce a released work pin"
+        );
+
+        reports.record(node, report(13, Some(48)));
+        reports.record(node, report(12, None));
+        assert_eq!(
+            reports.node(node).unwrap().oldest_unfinished_work,
+            Some(48),
+            "an older concurrent ACK cannot erase a newly published work pin"
+        );
+    }
+
+    #[test]
+    fn local_safety_report_generation_advances_when_watermark_does_not() {
+        let report = LocalGcSafetyReport::default();
+        report.update(100, 48, None, Some(44));
+        assert_eq!(report.snapshot().generation, 100);
+        report.update(100, 48, None, None);
+        let refreshed = report.snapshot();
+        assert_eq!(refreshed.generation, 101);
+        assert_eq!(refreshed.watermark, 48);
+        assert_eq!(refreshed.oldest_unfinished_work, None);
+        report.update(200, 48, None, None);
+        assert_eq!(
+            report.snapshot().generation,
+            101,
+            "periodic ACKs do not manufacture safety-report generations"
+        );
+    }
+
+    #[test]
+    fn same_incarnation_restart_with_lower_generation_keeps_cached_pins_fail_closed() {
+        let reports = AppliedWatermarkReports::default();
+        let node = NodeId(7);
+        let report = |generation, watermark, pin| AppliedWatermarkReport {
+            incarnation: 2,
+            generation,
+            watermark,
+            oldest_active_snapshot: None,
+            oldest_unfinished_work: pin,
+        };
+
+        reports.record(node, report(1_000, 48, Some(44)));
+        reports.record(node, report(900, 60, None));
+        assert_eq!(
+            reports.node(node).unwrap().oldest_unfinished_work,
+            Some(44),
+            "a restarted process cannot clear cached pins with an older generation"
+        );
+        reports.record(node, report(1_001, 60, None));
+        assert_eq!(reports.node(node).unwrap().watermark, 60);
+        assert_eq!(reports.node(node).unwrap().oldest_unfinished_work, None);
     }
 
     struct UnusedNetwork;
@@ -756,6 +885,7 @@ mod tests {
         CertifyTransaction {
             cluster_id_hash: cluster_hash,
             transaction_id: TransactionId([id; 16]),
+            principal_hash: [2; 32],
             snapshot_version: CommitVersion(0),
             point_observations: vec![PointObservation {
                 key,

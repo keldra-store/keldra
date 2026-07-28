@@ -1,96 +1,157 @@
 ---
 title: Release Architecture Status
-description: Public release status for Anvil 0.3.0, including storage layout, indexing capabilities, mesh transport, S3 compatibility, tests, and performance progression.
+description: Public architecture and operational status for the Anvil 0.4.0 MVCC-under-Raft release.
 ---
 
 # Release Architecture Status
 
-This page records the practical architecture status for the 0.3.0 release. It is written for readers who need to know what is structurally in place, what behaviour is available today, and where the implementation is intentionally staged for future releases.
+Anvil 0.4.0 is the first release of the cluster-local MVCC-under-Raft
+architecture. This page states what the release does, where its guarantees
+begin and end, and which operations are deliberately unavailable. It should be
+read before putting customer data on this release.
 
-The release criterion here is not whether every future capability is complete. It is whether the storage architecture is coherent enough that applications can depend on it without expecting a disruptive storage migration in the next patch. On that question, the answer is yes: CoreMeta is the metadata plane, RocksDB is its local engine, bounded inline payloads are explicit, larger durable bytes go through the byte pipeline, index segment bodies follow normal writer-output rules, and gateways map into the same tenant/bucket/object/security model.
+Anvil remains an alpha-stage product. Version 0.4.0 is suitable for a controlled
+deployment whose operator can pin the image, preserve every node's durable
+volume, monitor capacity, and restore the tested topology after a failure. It
+is not yet a hands-off storage service for arbitrary membership changes.
 
-## Storage status
+## Transaction and consensus boundary
 
-| Area | Current status |
-| --- | --- |
-| Metadata | Stored as CoreMeta rows in RocksDB column families. |
-| Tiny payloads | Stored in `cf_inline_payloads` when eligible under the inline policy. Raw inline cap defaults to 32 KiB; encoded CoreMeta value cap is 64 KiB. |
-| Large payloads | Stored through the CoreStore byte pipeline using erasure-coded shard placement. |
-| Index segment bodies | Writer segment output; inline if tiny, otherwise byte-pipeline stored. Segment locators are CoreMeta rows. |
-| Streams | Ordered append records with CoreMeta stream heads/indexes and CoreStore payload storage. |
-| Mesh metadata | Logical CoreMeta replication with quorum evidence and commit certificates. |
-| Gateway records | Registry/gateway/git-source metadata is CoreMeta-backed; large blobs use the byte pipeline. |
-| Operator exports | Bootstrap credential JSON and reports can be exported outside storage; they are not Anvil source-of-truth state. |
+The topology is a mesh containing regions, with one or more clusters in each
+region. A cluster is the transaction, MVCC-version, conflict, durability-policy,
+and consensus boundary.
 
-## Index status
+Each cluster has one OpenRaft group that establishes a total order for compact
+transaction certification decisions. Transactions may touch multiple keys,
+tables, and physical partitions owned by the same cluster. They cannot span
+clusters, regions, or the whole mesh. Commit versions are meaningful only
+inside the cluster that assigned them.
 
-| Index family | Available behaviour |
-| --- | --- |
-| Path | Prefix/listing-shaped acceleration over object metadata. |
-| Metadata filter | Equality filters over object user metadata. |
-| Typed JSON | Object body, object metadata, and append-record field extraction with equality, membership, range, prefix, existence, null/missing, ordering, and boundary participation where supported. |
-| Full text | Tokenised postings, BM25 scoring, phrase mode, selected text extractors, and final visibility checks. |
-| Vector | HNSW graph, configured dimensions/metric/modality, caller-supplied or provider-generated vectors, and final visibility checks. |
-| Hybrid | Full-text plus vector candidate blending with a fixed current scoring recipe. |
-| PersonalDB row metadata | Row/projection-oriented metadata indexes for PersonalDB workflows. |
-| Git source | Source-pack/repository-oriented index records. |
+Raft stores only the compact state needed to make deterministic decisions:
 
-The staged query-language work is expressiveness, not storage redesign. Full-text boolean grammar can extend the current postings model. Hybrid fusion can become more configurable over the current segment model. Prefix watches can remain simple while indexed queries handle richer predicates.
+- transaction identity, snapshot version, requested durability, bundle hash,
+  and a fixed-size caller binding used to fence retries;
+- point and range observations, write-conflict keys, and the resulting compact
+  committed or aborted outcome;
+- cluster identity, fixed membership, node incarnations, partition assignments,
+  and durability-policy state;
+- OpenRaft vote, log, membership, and snapshot metadata.
 
-## Mesh and watch status
+Object bodies, transaction bundles, product rows, indexes, authorisation data,
+tokens, erasure shards, and materialisation jobs are not carried in the Raft
+log. They use Anvil's data and bundle replication paths.
 
-CoreMeta metadata quorum traffic uses persistent bidirectional gRPC streams. The stream tracks request ids, pending responses, timeout, closure, eviction, and reconnect. TCP_NODELAY is enabled on server listeners. Blob shard writes are still separate internal calls, while shard reads stream response chunks. This leaves room for transport optimisation without changing the durable layout.
+## MVCC behaviour
 
-Prefix watches are implemented as bucket/prefix/cursor streams. They are suitable for object-change consumers that know their prefix. They are not intended to become a general query language. Index, authz, PersonalDB, and other derived systems expose watch or watch-like surfaces for maintenance and catch-up.
+Ordinary transactional reads use one cluster-local snapshot. Certification
+rejects a commit when a point or range observed at that snapshot conflicts with
+a newer committed write. A successful certification assigns one commit version
+to the complete transaction; an aborted transaction publishes none of its
+writes.
 
-## S3 compatibility status
+The public API is held unready during startup until the cluster consensus
+barrier is available, ordered local apply has caught up to the confirmed
+version, and the system authorisation realm is visible. Internal bootstrap
+traffic and the readiness probe have narrowly scoped exceptions so a node can
+recover without serving ordinary customer operations early.
 
-The S3-compatible gateway supports normal object-shaped operations through the official AWS SDK in the test suite: put, get, list, range get, multipart flows, public/private access, routing/alias cases, streaming upload, and index/compaction interactions. S3 remains a gateway. Use the native API or Rust client for Anvil-specific capabilities such as relationship-aware queries, typed indexes, watches, leases, PersonalDB, and repair workflows.
+The release uses a single sequencer per cluster. That is an intentional
+correctness-first implementation, not a promise that one cluster scales without
+bound. Additional clusters are independent transaction domains.
 
-## Performance progression
+## Physical durability
 
-The table below shows the end-user performance progression from the optimisation investigation. Times are wall-clock measurements from the observed runs. A dash means the value was not recorded in that run.
+The configured durability level controls which physical work must complete
+before a transaction can be acknowledged:
 
-### Write path
+| Level | Acknowledgement boundary | Node-loss posture |
+| --- | --- | --- |
+| `local` | The local representation and transaction bundle are durable on the coordinating node. | Loss of that holder before a durability upgrade may lose committed data. |
+| `quorum` | Bundle and physical-holder evidence satisfy the cluster's configured quorum policy. | This is the default for public writes. |
+| `erasure` | Enough erasure shards are durably acknowledged across the configured placement to satisfy the erasure policy. | Tolerates the failure-domain loss configured by that policy. |
 
-| Run | Main change | Tenant | App | 7 grants | Token | Bucket | PUT 27B | Authz write |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Baseline | before optimisation | 66.42s | 16.02s | 19.48s | - | 48.70s | 32.01s | 19.04s |
-| v1 | first three optimisations | 7.871s | 1.781s | 5.043s | 54.1ms | 9.291s | 6.976s | 5.679s |
-| v2 | inline path | 7.904s | 1.826s | 5.107s | 1.86ms | 9.067s | 6.941s | 2.426s |
-| v3 | authz delta | 7.944s | 1.841s | 2.119s | 1.95ms | 5.989s | 3.691s | 2.440s |
-| v4 | CoreMeta batching | 5.366s | 1.333s | 1.544s | 5.16ms | 4.350s | 2.814s | 1.998s |
-| v5 | stream batching | 3.914s | 816ms | 1.296s | 2.21ms | 3.226s | 2.439s | 1.656s |
-| v6 | RPC instrumentation | 3.878s | 833ms | 1.248s | 2.10ms | 3.289s | 2.691s | 1.758s |
-| v7 | CoreMeta streaming | 1.261s | 272ms | 373ms | 3.88ms | 1.462s | 1.500s | 531ms |
+For non-local object writes, the ingesting node forms erasure stripes while it
+reads the upload and streams the resulting shards directly to their target
+nodes. It does not first replicate the complete object to several nodes and
+schedule a second full-file erasure conversion.
 
-### Read and query path
+Internal cluster connections use persistent gRPC streams with request IDs and
+explicit acknowledgements. A write is not counted as durable merely because it
+was submitted to a socket.
 
-| Run | GET 27B | Permission check | List authz objects | List objects cold | List objects warm |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Baseline | 440ms | 280-480ms | - | 26.26s | 1.33s |
-| v1 | 8.86ms | 5.11ms | 4.71ms | 403ms | 401ms |
-| v2 | 7.07ms | 3.70ms | 4.28ms | 365ms | 363ms |
-| v3 | 6.06ms | 6.39ms | 7.59ms | 24.5ms | 24.0ms |
-| v4 | 4.45ms | 5.60ms | 5.08ms | 25.2ms | 21.0ms |
-| v5 | 4.99ms | 4.70ms | 4.94ms | 21.2ms | 18.5ms |
-| v6 | 10.6ms | 5.86ms | 5.24ms | 27.3ms | 20.9ms |
-| v7 | 9.86ms | 5.51ms | 7.49ms | 21.4ms | 19.6ms |
+Operators must configure enough distinct nodes and failure domains for their
+chosen quorum and erasure policies. A single-node deployment can exercise the
+API, but it cannot turn one physical machine into node-loss durability.
 
-These figures show the shape of the release: metadata-heavy writes moved from tens of seconds into low-single-digit seconds, token/read/check paths are millisecond-scale, and listing moved from multi-second cold paths into tens of milliseconds in the measured runs. The remaining performance work is normal optimisation over the current architecture rather than a reason to change the storage model.
+## Storage and restart status
 
-## Verification posture
+OpenRaft durable state and Anvil's local MVCC state share the node's RocksDB
+storage boundary. Persistent consensus values use Anvil-owned, bounded,
+versioned binary encodings rather than a generic object serializer. Existing
+specialised on-disk formats used by other subsystems remain unchanged.
 
-The repository contains broad source, integration, Docker, S3 gateway, CoreStore conformance, query-planning, authz, object, client, and model tests. The release process should still run the release gate before tagging. This page is an architecture status report; it does not replace a green CI run.
+An in-place process restart is expected to reuse the same durable node volume
+and identity. Startup recovery replays compact decisions, fetches referenced
+bundles when needed, advances ordered apply, and only then opens the public
+plane.
 
-## Staged extensions
+Back up every node's durable storage and deployment configuration before an
+upgrade. Do not reuse a lost Raft identity on a blank volume.
 
-The following items are intentionally described as staged extensions:
+## Deliberate 0.4.0 limitations
 
-- richer full-text boolean query grammar over the existing postings architecture;
-- more configurable hybrid fusion over the existing full-text/vector segment architecture;
-- application-level heartbeat signals for long-idle internal streams;
-- broader streaming optimisation for blob shard writes;
-- richer filtered watch APIs where an index query is not the better interface.
+The following are release boundaries, not hidden background features:
 
-Those extensions improve behaviour and ergonomics, but they do not require replacing RocksDB CoreMeta, changing the inline payload rule, or replacing the erasure-coded byte pipeline.
+- **MVCC and physical garbage collection are disabled.** Old row versions,
+  transaction recovery evidence, bundles, and physical payloads are retained.
+  Disk consumption therefore grows with writes, overwrites, and deletes.
+- **The voter set is fixed at initial cluster bootstrap.** Runtime voter or
+  learner reconfiguration is not a supported operator action in 0.4.0.
+- **Clean-disk node replacement is unsupported.** Restart a node with its
+  original durable volume. Rebuilding a lost node into an existing cluster is
+  deferred until checkpoint installation and replacement fencing are complete.
+- **Transactions are cluster-local.** There is no cross-cluster two-phase
+  commit, saga layer, or mesh-wide serial order.
+- **`local` durability is explicitly lossy under holder failure.** Use the
+  default `quorum` level for customer writes unless that risk is acceptable.
+- **Mixed-version rolling upgrades are not a supported guarantee yet.** Upgrade
+  a controlled deployment using backups, release-pinned artifacts, and the
+  release's documented validation sequence.
+- **No performance target is claimed by this release.** The immediate gate is
+  end-to-end correctness and recovery for the supported fixed topology.
+
+Because garbage collection is off, capacity alerts are a correctness control
+for this release. Leave enough headroom for MVCC history, Raft state, bundles,
+and erasure shards for the full planned deployment window.
+
+## Public surfaces retained
+
+The native gRPC API, Rust client, S3-compatible object gateway, object
+versioning, metadata and search indexes, Zanzibar-style relationship
+authorisation, watches, task leases, PersonalDB witnessing, and the separate
+public/admin planes remain the customer-facing product surfaces. Internally,
+their authoritative mutations now pass through the cluster-local transaction
+path where the implementation has been converted.
+
+Applications should use the native API or Rust client for Anvil-specific
+features. Existing S3-compatible tooling is appropriate for object-shaped
+operations, but S3 remains a gateway rather than the storage model.
+
+## Release evidence
+
+The public 0.4.0 artifacts are:
+
+- Rust client: `anvil-storage 0.4.0`;
+- Docker image: `ghcr.io/worka-ai/anvil:v0.4.0`;
+- GitHub release and source tag: `v0.4.0`.
+
+The Docker tag must be a multi-platform manifest containing `linux/amd64` and
+`linux/arm64`. Treat the tag as available only after the release workflow has
+built and smoke-checked both images, published the manifest, verified its
+platform list and digest, published the Rust client when necessary, and created
+the GitHub release.
+
+Before promotion, run a real write/read/delete cycle, a conflicting-transaction
+case, an index query with authorisation, a process restart over the same volume,
+and a cluster failover within the fixed topology. A healthy process is not by
+itself proof that ordered apply or physical durability is healthy.

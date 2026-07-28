@@ -51,6 +51,10 @@ async fn spawn_admin_node() -> AdminNode {
         // Background task execution is covered separately and would leave
         // detached workers competing across the nodes created by this binary.
         run_background_worker: false,
+        // This in-process fixture binds its single-node MVCC transport to an
+        // ephemeral plaintext loopback endpoint. Production configurations
+        // remain TLS-only.
+        allow_test_only_insecure_mvcc_transport: true,
         ..anvil::config::Config::default()
     };
 

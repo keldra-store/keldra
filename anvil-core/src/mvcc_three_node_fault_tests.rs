@@ -840,7 +840,24 @@ async fn coordinator_failure_after_proposal_recovers_the_stable_commit() {
             .state,
         "committing"
     );
-    let committed_before_response = cluster.states[0].mvcc.consensus.observed_commit_version();
+    let committed_before_response = cluster.states[0]
+        .mvcc
+        .consensus
+        .linearized_transaction_outcome(crate::mvcc_consensus_adapter::consensus_transaction_id(
+            cluster.states[0].mvcc.cluster_id(),
+            &transaction_id,
+        ))
+        .await
+        .unwrap()
+        .expect("failed response still has a linearized terminal transaction outcome");
+    let committed_before_response = match committed_before_response.result {
+        anvil_mvcc_consensus::CertificationResult::Committed { commit_version, .. } => {
+            commit_version.0
+        }
+        anvil_mvcc_consensus::CertificationResult::Aborted { reason, .. } => {
+            panic!("post-proposal crash recorded an abort: {reason:?}")
+        }
+    };
 
     cluster.restart_node(0).await;
     cluster.wait_for_any_leader(&[0, 1, 2]).await;
@@ -861,7 +878,7 @@ async fn coordinator_failure_after_proposal_recovers_the_stable_commit() {
             panic!("indeterminate proposal resolved as abort: {reason:?}")
         }
     };
-    assert_eq!(commit_version, committed_before_response.0);
+    assert_eq!(commit_version, committed_before_response);
     let committed_bundle = cluster.states[0]
         .mvcc
         .consensus

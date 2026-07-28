@@ -63,9 +63,12 @@ const CF_OUTBOX: &str = MVCC_COLUMN_FAMILIES[5];
 const APPLIED_VERSION_KEY: &[u8] = b"applied_version";
 const GC_WATERMARK_KEY: &[u8] = b"gc_watermark";
 const DECISION_WATERMARK_KEY: &[u8] = b"decision_watermark";
+const INSTALLED_CHECKPOINT_KEY: &[u8] = b"installed_checkpoint";
 const LOCAL_DURABILITY_VIOLATION_PREFIX: &[u8] = b"local-durability-violation/";
 const VALUE: u8 = 1;
 const TOMBSTONE: u8 = 0;
+pub const MVCC_CHECKPOINT_FORMAT_VERSION: u16 = 1;
+const MVCC_CHECKPOINT_MAGIC: &[u8] = b"ANVIL-MVCC-CHECKPOINT";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VisibleRow {
@@ -121,6 +124,252 @@ pub struct CommittedIdempotencyResult {
 pub enum ApplyOutcome {
     Applied,
     Replayed,
+}
+
+/// A cluster-scoped, point-in-time copy of the ordinary local MVCC state.
+///
+/// Raft snapshots deliberately exclude product rows and durable work bodies.
+/// A clean-disk node therefore installs one of these checkpoints outside Raft,
+/// then resumes ordered bundle application after `decision_watermark`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MvccCheckpoint {
+    pub format_version: u16,
+    pub cluster_id: String,
+    pub decision_watermark: CommitVersion,
+    pub applied_version: CommitVersion,
+    pub gc_watermark: CommitVersion,
+    pub column_families: Vec<MvccCheckpointColumnFamily>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MvccCheckpointColumnFamily {
+    pub name: String,
+    /// Keys are cluster-scope-relative and strictly lexicographically sorted.
+    pub entries: Vec<MvccCheckpointEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MvccCheckpointEntry {
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MvccCheckpointInstallOutcome {
+    Installed,
+    Replayed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct InstalledMvccCheckpoint {
+    format_version: u16,
+    cluster_id: String,
+    checkpoint_id: [u8; 32],
+    decision_watermark: CommitVersion,
+}
+
+impl MvccCheckpoint {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(MVCC_CHECKPOINT_MAGIC);
+        encoded.extend_from_slice(&self.format_version.to_be_bytes());
+        encode_checkpoint_bytes_u32(&mut encoded, self.cluster_id.as_bytes(), "cluster ID")?;
+        encoded.extend_from_slice(&self.decision_watermark.to_be_bytes());
+        encoded.extend_from_slice(&self.applied_version.to_be_bytes());
+        encoded.extend_from_slice(&self.gc_watermark.to_be_bytes());
+        encoded.extend_from_slice(
+            &u16::try_from(self.column_families.len())
+                .context("MVCC checkpoint has too many column families")?
+                .to_be_bytes(),
+        );
+        for column in &self.column_families {
+            encode_checkpoint_bytes_u16(
+                &mut encoded,
+                column.name.as_bytes(),
+                "column-family name",
+            )?;
+            encoded.extend_from_slice(
+                &u64::try_from(column.entries.len())
+                    .context("MVCC checkpoint has too many entries")?
+                    .to_be_bytes(),
+            );
+            for entry in &column.entries {
+                encode_checkpoint_bytes_u32(&mut encoded, &entry.key, "entry key")?;
+                encoded.extend_from_slice(
+                    &u64::try_from(entry.value.len())
+                        .context("MVCC checkpoint entry value is too large")?
+                        .to_be_bytes(),
+                );
+                encoded.extend_from_slice(&entry.value);
+            }
+        }
+        Ok(encoded)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut decoder = MvccCheckpointDecoder::new(bytes);
+        if decoder.take(MVCC_CHECKPOINT_MAGIC.len())? != MVCC_CHECKPOINT_MAGIC {
+            bail!("MVCC checkpoint magic is invalid");
+        }
+        let format_version = decoder.u16()?;
+        let cluster_id = String::from_utf8(decoder.bytes_u32("cluster ID")?.to_vec())
+            .context("MVCC checkpoint cluster ID is not UTF-8")?;
+        let decision_watermark = decoder.u64()?;
+        let applied_version = decoder.u64()?;
+        let gc_watermark = decoder.u64()?;
+        let column_count = usize::from(decoder.u16()?);
+        if column_count != MVCC_COLUMN_FAMILIES.len() {
+            bail!("MVCC checkpoint does not contain the complete column-family set");
+        }
+        let mut column_families = Vec::with_capacity(column_count);
+        for _ in 0..column_count {
+            let name = String::from_utf8(decoder.bytes_u16("column-family name")?.to_vec())
+                .context("MVCC checkpoint column-family name is not UTF-8")?;
+            let entry_count = decoder.collection_len("column-family entries", 13)?;
+            let mut entries = Vec::with_capacity(entry_count);
+            for _ in 0..entry_count {
+                let key = decoder.bytes_u32("entry key")?.to_vec();
+                let value_len = decoder.usize_u64("entry value")?;
+                let value = decoder.take(value_len)?.to_vec();
+                entries.push(MvccCheckpointEntry { key, value });
+            }
+            column_families.push(MvccCheckpointColumnFamily { name, entries });
+        }
+        if !decoder.is_finished() {
+            bail!("MVCC checkpoint has trailing bytes");
+        }
+        let checkpoint = Self {
+            format_version,
+            cluster_id,
+            decision_watermark,
+            applied_version,
+            gc_watermark,
+            column_families,
+        };
+        checkpoint.validate()?;
+        if checkpoint.encode()?.as_slice() != bytes {
+            bail!("MVCC checkpoint encoding is not canonical");
+        }
+        Ok(checkpoint)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.format_version != MVCC_CHECKPOINT_FORMAT_VERSION {
+            bail!(
+                "unsupported MVCC checkpoint format version {}",
+                self.format_version
+            );
+        }
+        if self.cluster_id.trim().is_empty() {
+            bail!("MVCC checkpoint cluster ID is required");
+        }
+        if self.applied_version > self.decision_watermark {
+            bail!("MVCC checkpoint applied version exceeds its decision watermark");
+        }
+        if self.gc_watermark > self.decision_watermark {
+            bail!("MVCC checkpoint GC watermark exceeds its decision watermark");
+        }
+        if self.column_families.len() != MVCC_COLUMN_FAMILIES.len() {
+            bail!("MVCC checkpoint does not contain the complete column-family set");
+        }
+        for (column, expected_name) in self.column_families.iter().zip(MVCC_COLUMN_FAMILIES) {
+            if column.name != expected_name {
+                bail!(
+                    "MVCC checkpoint column-family order mismatch: expected {expected_name}, found {}",
+                    column.name
+                );
+            }
+            if column.entries.iter().any(|entry| entry.key.is_empty()) {
+                bail!("MVCC checkpoint contains an empty scope-relative key");
+            }
+            if column
+                .entries
+                .windows(2)
+                .any(|pair| pair[0].key >= pair[1].key)
+            {
+                bail!(
+                    "MVCC checkpoint column family {} is not strictly sorted and unique",
+                    column.name
+                );
+            }
+        }
+
+        let versions = &self.column_families[0];
+        for entry in &versions.entries {
+            let (_, version) = decode_versioned_key(&entry.key)?;
+            if version > self.applied_version {
+                bail!("MVCC checkpoint contains a row above its applied version");
+            }
+            decode_point_snapshot(version, &entry.value)
+                .context("validate MVCC checkpoint row encoding")?;
+        }
+
+        let heads = &self.column_families[1];
+        for entry in &heads.entries {
+            let logical_key = decode_logical_key(&entry.key)?;
+            let head_version = decode_u64(&entry.value, "MVCC checkpoint head version")?;
+            if head_version > self.applied_version {
+                bail!("MVCC checkpoint contains a head above its applied version");
+            }
+            let versioned_key = encode_versioned_key(&logical_key, head_version)?;
+            if versions
+                .entries
+                .binary_search_by(|candidate| candidate.key.cmp(&versioned_key))
+                .is_err()
+            {
+                bail!("MVCC checkpoint head does not reference a retained row version");
+            }
+        }
+
+        let applied = &self.column_families[2];
+        for entry in &applied.entries {
+            let version = decode_u64(&entry.key, "MVCC checkpoint applied-bundle version")?;
+            if version > self.applied_version {
+                bail!("MVCC checkpoint contains bundle evidence above its applied version");
+            }
+            if entry.value.is_empty() {
+                bail!("MVCC checkpoint contains empty applied-bundle evidence");
+            }
+        }
+
+        let meta = &self.column_families[3];
+        if checkpoint_meta_version(meta, APPLIED_VERSION_KEY)? != self.applied_version
+            || checkpoint_meta_version(meta, DECISION_WATERMARK_KEY)? != self.decision_watermark
+            || checkpoint_meta_version(meta, GC_WATERMARK_KEY)? != self.gc_watermark
+        {
+            bail!("MVCC checkpoint watermarks do not match its metadata rows");
+        }
+        if checkpoint_entry(meta, INSTALLED_CHECKPOINT_KEY).is_some() {
+            bail!("MVCC checkpoint must not contain a donor-local install marker");
+        }
+        Ok(())
+    }
+
+    /// Deterministic identity used to make checkpoint installation retryable.
+    pub fn identity(&self) -> Result<[u8; 32]> {
+        self.validate()?;
+        let mut hash = Sha256::new();
+        hash.update(b"anvil.mvcc.local-checkpoint.v1");
+        hash.update(self.format_version.to_be_bytes());
+        hash_checkpoint_component(&mut hash, self.cluster_id.as_bytes());
+        hash.update(self.decision_watermark.to_be_bytes());
+        hash.update(self.applied_version.to_be_bytes());
+        hash.update(self.gc_watermark.to_be_bytes());
+        hash.update((self.column_families.len() as u64).to_be_bytes());
+        for column in &self.column_families {
+            hash_checkpoint_component(&mut hash, column.name.as_bytes());
+            hash.update((column.entries.len() as u64).to_be_bytes());
+            for entry in &column.entries {
+                hash_checkpoint_component(&mut hash, &entry.key);
+                hash_checkpoint_component(&mut hash, &entry.value);
+            }
+        }
+        let digest = hash.finalize();
+        let mut identity = [0; 32];
+        identity.copy_from_slice(&digest);
+        Ok(identity)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -376,6 +625,158 @@ impl MvccStore {
             materialisation_transition: Arc::new(Mutex::new(())),
             outbox_transition: Arc::new(Mutex::new(())),
         })
+    }
+
+    /// Capture all cluster-scoped MVCC column families at one RocksDB sequence.
+    ///
+    /// The transition locks are held only while the RocksDB snapshot is
+    /// created. Export iteration then proceeds without stopping transaction
+    /// application or background workers.
+    pub fn export_checkpoint(&self) -> Result<MvccCheckpoint> {
+        let decision_transition = self.decision_transition.lock().unwrap();
+        let materialisation_transition = self.materialisation_transition.lock().unwrap();
+        let outbox_transition = self.outbox_transition.lock().unwrap();
+        let snapshot = self.db.snapshot();
+        drop(outbox_transition);
+        drop(materialisation_transition);
+        drop(decision_transition);
+
+        let mut column_families = Vec::with_capacity(MVCC_COLUMN_FAMILIES.len());
+        for name in MVCC_COLUMN_FAMILIES {
+            let cf = self.cf(name)?;
+            let mut entries = Vec::new();
+            for row in snapshot.iterator_cf(cf, IteratorMode::From(&self.scope, Direction::Forward))
+            {
+                let (key, value) = row?;
+                if !key.starts_with(&self.scope) {
+                    break;
+                }
+                let relative_key = self.unscoped(&key)?.to_vec();
+                if name == CF_META && relative_key == INSTALLED_CHECKPOINT_KEY {
+                    continue;
+                }
+                entries.push(MvccCheckpointEntry {
+                    key: relative_key,
+                    value: value.to_vec(),
+                });
+            }
+            column_families.push(MvccCheckpointColumnFamily {
+                name: name.to_string(),
+                entries,
+            });
+        }
+
+        let meta = &column_families[3];
+        let checkpoint = MvccCheckpoint {
+            format_version: MVCC_CHECKPOINT_FORMAT_VERSION,
+            cluster_id: self.cluster_id.clone(),
+            decision_watermark: checkpoint_meta_version(meta, DECISION_WATERMARK_KEY)?,
+            applied_version: checkpoint_meta_version(meta, APPLIED_VERSION_KEY)?,
+            gc_watermark: checkpoint_meta_version(meta, GC_WATERMARK_KEY)?,
+            column_families,
+        };
+        checkpoint.validate()?;
+        Ok(checkpoint)
+    }
+
+    pub fn export_checkpoint_bytes(&self) -> Result<Vec<u8>> {
+        self.export_checkpoint()?.encode()
+    }
+
+    /// Atomically install a checkpoint into a clean replacement's cluster
+    /// scope.
+    ///
+    /// A successful retry is detected by a donor-independent content identity.
+    /// A later retry may install a different checkpoint only when none of its
+    /// watermarks moves local state backwards. This lets preparation resume
+    /// after the first checkpoint was applied but the learner admission did
+    /// not complete.
+    pub fn install_checkpoint(
+        &self,
+        checkpoint: &MvccCheckpoint,
+    ) -> Result<MvccCheckpointInstallOutcome> {
+        checkpoint.validate()?;
+        if checkpoint.cluster_id != self.cluster_id {
+            bail!("MVCC checkpoint belongs to another cluster");
+        }
+        let checkpoint_id = checkpoint.identity()?;
+        let _decision_transition = self.decision_transition.lock().unwrap();
+        let _materialisation_transition = self.materialisation_transition.lock().unwrap();
+        let _outbox_transition = self.outbox_transition.lock().unwrap();
+        let meta_cf = self.cf(CF_META)?;
+        let marker_key = self.key(INSTALLED_CHECKPOINT_KEY);
+        let current_decision_watermark = self.decision_watermark()?;
+        let current_applied_version = self.applied_version()?;
+        let current_gc_watermark = self.gc_watermark()?;
+
+        if let Some(bytes) = self.db.get_cf(meta_cf, &marker_key)? {
+            let marker: InstalledMvccCheckpoint = serde_json::from_slice(&bytes)
+                .context("decode installed MVCC checkpoint marker")?;
+            if marker.format_version != MVCC_CHECKPOINT_FORMAT_VERSION
+                || marker.cluster_id != self.cluster_id
+            {
+                bail!("installed MVCC checkpoint marker is invalid");
+            }
+            if marker.checkpoint_id == checkpoint_id
+                && marker.decision_watermark == checkpoint.decision_watermark
+            {
+                if current_decision_watermark < checkpoint.decision_watermark {
+                    bail!("installed MVCC checkpoint watermark regressed");
+                }
+                return Ok(MvccCheckpointInstallOutcome::Replayed);
+            }
+        }
+
+        if checkpoint.decision_watermark < current_decision_watermark
+            || checkpoint.applied_version < current_applied_version
+            || checkpoint.gc_watermark < current_gc_watermark
+        {
+            bail!("MVCC checkpoint installation cannot move local watermarks backwards");
+        }
+
+        let mut batch = WriteBatch::default();
+        for name in MVCC_COLUMN_FAMILIES {
+            let cf = self.cf(name)?;
+            for row in self
+                .db
+                .iterator_cf(cf, IteratorMode::From(&self.scope, Direction::Forward))
+            {
+                let (key, _) = row?;
+                if !key.starts_with(&self.scope) {
+                    break;
+                }
+                batch.delete_cf(cf, key);
+            }
+        }
+        for column in &checkpoint.column_families {
+            let cf = self.cf(&column.name)?;
+            for entry in &column.entries {
+                batch.put_cf(cf, self.key(&entry.key), &entry.value);
+            }
+        }
+        batch.put_cf(
+            meta_cf,
+            marker_key,
+            serde_json::to_vec(&InstalledMvccCheckpoint {
+                format_version: MVCC_CHECKPOINT_FORMAT_VERSION,
+                cluster_id: self.cluster_id.clone(),
+                checkpoint_id,
+                decision_watermark: checkpoint.decision_watermark,
+            })?,
+        );
+        self.db.write_opt(batch, &durable_write_options())?;
+
+        if self.decision_watermark()? != checkpoint.decision_watermark
+            || self.applied_version()? != checkpoint.applied_version
+            || self.gc_watermark()? != checkpoint.gc_watermark
+        {
+            bail!("installed MVCC checkpoint watermark verification failed");
+        }
+        Ok(MvccCheckpointInstallOutcome::Installed)
+    }
+
+    pub fn install_checkpoint_bytes(&self, bytes: &[u8]) -> Result<MvccCheckpointInstallOutcome> {
+        self.install_checkpoint(&MvccCheckpoint::decode(bytes)?)
     }
 
     /// Atomically applies a certified bundle and advances the applied version.
@@ -3285,6 +3686,127 @@ fn decode_u64(bytes: &[u8], field: &str) -> Result<u64> {
         .map_err(|_| anyhow!("invalid {field}"))
 }
 
+fn encode_checkpoint_bytes_u16(encoded: &mut Vec<u8>, bytes: &[u8], field: &str) -> Result<()> {
+    let length = u16::try_from(bytes.len())
+        .with_context(|| format!("MVCC checkpoint {field} exceeds u16 length"))?;
+    encoded.extend_from_slice(&length.to_be_bytes());
+    encoded.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn encode_checkpoint_bytes_u32(encoded: &mut Vec<u8>, bytes: &[u8], field: &str) -> Result<()> {
+    let length = u32::try_from(bytes.len())
+        .with_context(|| format!("MVCC checkpoint {field} exceeds u32 length"))?;
+    encoded.extend_from_slice(&length.to_be_bytes());
+    encoded.extend_from_slice(bytes);
+    Ok(())
+}
+
+struct MvccCheckpointDecoder<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> MvccCheckpointDecoder<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn take(&mut self, length: usize) -> Result<&'a [u8]> {
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or_else(|| anyhow!("MVCC checkpoint length overflow"))?;
+        let value = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or_else(|| anyhow!("MVCC checkpoint is truncated"))?;
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn u16(&mut self) -> Result<u16> {
+        Ok(u16::from_be_bytes(
+            self.take(std::mem::size_of::<u16>())?
+                .try_into()
+                .expect("fixed-size slice"),
+        ))
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_be_bytes(
+            self.take(std::mem::size_of::<u32>())?
+                .try_into()
+                .expect("fixed-size slice"),
+        ))
+    }
+
+    fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_be_bytes(
+            self.take(std::mem::size_of::<u64>())?
+                .try_into()
+                .expect("fixed-size slice"),
+        ))
+    }
+
+    fn bytes_u16(&mut self, field: &str) -> Result<&'a [u8]> {
+        let length = usize::from(self.u16()?);
+        self.take(length)
+            .with_context(|| format!("decode MVCC checkpoint {field}"))
+    }
+
+    fn bytes_u32(&mut self, field: &str) -> Result<&'a [u8]> {
+        let length = usize::try_from(self.u32()?)
+            .with_context(|| format!("MVCC checkpoint {field} length exceeds usize"))?;
+        self.take(length)
+            .with_context(|| format!("decode MVCC checkpoint {field}"))
+    }
+
+    fn usize_u64(&mut self, field: &str) -> Result<usize> {
+        usize::try_from(self.u64()?)
+            .with_context(|| format!("MVCC checkpoint {field} length exceeds usize"))
+    }
+
+    fn collection_len(&mut self, field: &str, minimum_item_bytes: usize) -> Result<usize> {
+        let length = self.usize_u64(field)?;
+        if minimum_item_bytes == 0 {
+            bail!("MVCC checkpoint {field} has an invalid item-width bound");
+        }
+        let remaining = self.bytes.len().saturating_sub(self.offset);
+        if length > remaining / minimum_item_bytes {
+            bail!("MVCC checkpoint {field} count exceeds the remaining input");
+        }
+        Ok(length)
+    }
+
+    fn is_finished(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
+}
+
+fn checkpoint_entry<'a>(
+    column: &'a MvccCheckpointColumnFamily,
+    key: &[u8],
+) -> Option<&'a MvccCheckpointEntry> {
+    column
+        .entries
+        .binary_search_by(|entry| entry.key.as_slice().cmp(key))
+        .ok()
+        .map(|index| &column.entries[index])
+}
+
+fn checkpoint_meta_version(meta: &MvccCheckpointColumnFamily, key: &[u8]) -> Result<CommitVersion> {
+    checkpoint_entry(meta, key)
+        .map(|entry| decode_u64(&entry.value, "MVCC checkpoint metadata version"))
+        .transpose()
+        .map(|value| value.unwrap_or(0))
+}
+
+fn hash_checkpoint_component(hash: &mut Sha256, bytes: &[u8]) {
+    hash.update((bytes.len() as u64).to_be_bytes());
+    hash.update(bytes);
+}
+
 fn durable_write_options() -> WriteOptions {
     let mut options = WriteOptions::default();
     options.set_sync(true);
@@ -3428,6 +3950,155 @@ mod tests {
         assert_eq!(store.read_at(&row, 2).unwrap().unwrap().value, b"old");
         assert_eq!(store.read_at(&row, 4).unwrap().unwrap().value, b"old");
         assert_eq!(store.read_latest(&row).unwrap().unwrap().value, b"new");
+    }
+
+    #[test]
+    fn replacement_checkpoint_retry_can_advance_but_never_roll_back() {
+        let source_directory = tempdir().unwrap();
+        let source = MvccStore::open(source_directory.path()).unwrap();
+        let row = key(7, b"checkpoint-retry");
+        source
+            .apply_certified_bundle_and_advance(
+                1,
+                &bundle("checkpoint-v1", |builder| {
+                    builder.put(row.clone(), b"one".to_vec());
+                }),
+                1,
+            )
+            .unwrap();
+        let first = source.export_checkpoint().unwrap();
+
+        let target_directory = tempdir().unwrap();
+        let target = MvccStore::open(target_directory.path()).unwrap();
+        assert_eq!(
+            target.install_checkpoint(&first).unwrap(),
+            MvccCheckpointInstallOutcome::Installed
+        );
+
+        source
+            .apply_certified_bundle_and_advance(
+                2,
+                &bundle("checkpoint-v2", |builder| {
+                    builder.put(row.clone(), b"two".to_vec());
+                }),
+                2,
+            )
+            .unwrap();
+        let second = source.export_checkpoint().unwrap();
+        assert_eq!(
+            target.install_checkpoint(&second).unwrap(),
+            MvccCheckpointInstallOutcome::Installed
+        );
+        assert_eq!(
+            target.read_latest(&row).unwrap().unwrap().value,
+            b"two",
+            "a retry resumes from the newer donor checkpoint"
+        );
+        assert!(
+            target.install_checkpoint(&first).is_err(),
+            "a stale retry cannot roll back an installed checkpoint"
+        );
+        assert_eq!(
+            target.install_checkpoint(&second).unwrap(),
+            MvccCheckpointInstallOutcome::Replayed
+        );
+    }
+
+    #[test]
+    fn checkpoint_after_gc_restores_current_rows_and_accepts_ordered_deltas() {
+        let source_directory = tempdir().unwrap();
+        let source = MvccStore::open(source_directory.path()).unwrap();
+        let row = key(8, b"checkpoint-after-gc");
+        source
+            .apply_certified_bundle_and_advance(
+                1,
+                &bundle("checkpoint-old", |builder| {
+                    builder.put(row.clone(), b"old".to_vec());
+                }),
+                1,
+            )
+            .unwrap();
+        source
+            .apply_certified_bundle_and_advance(
+                2,
+                &bundle("checkpoint-current", |builder| {
+                    builder.put(row.clone(), b"current".to_vec());
+                }),
+                2,
+            )
+            .unwrap();
+        source.garbage_collect(2).unwrap();
+        let bytes = source.export_checkpoint_bytes().unwrap();
+
+        let target_directory = tempdir().unwrap();
+        let target = MvccStore::open(target_directory.path()).unwrap();
+        assert_eq!(
+            target.install_checkpoint_bytes(&bytes).unwrap(),
+            MvccCheckpointInstallOutcome::Installed
+        );
+        assert_eq!(target.decision_watermark().unwrap(), 2);
+        assert_eq!(target.applied_version().unwrap(), 2);
+        assert_eq!(target.gc_watermark().unwrap(), 2);
+        assert_eq!(target.read_latest(&row).unwrap().unwrap().value, b"current");
+
+        target
+            .apply_certified_bundle_and_advance(
+                3,
+                &bundle("checkpoint-delta", |builder| {
+                    builder.put(row.clone(), b"delta".to_vec());
+                }),
+                3,
+            )
+            .unwrap();
+        assert_eq!(target.read_latest(&row).unwrap().unwrap().value, b"delta");
+    }
+
+    #[test]
+    fn checkpoint_decode_and_install_reject_corruption_and_foreign_clusters() {
+        let source_directory = tempdir().unwrap();
+        let source = MvccStore::open(source_directory.path()).unwrap();
+        source.advance_decision_watermark(1).unwrap();
+        let mut bytes = source.export_checkpoint_bytes().unwrap();
+        *bytes.last_mut().unwrap() ^= 0xff;
+
+        let target_directory = tempdir().unwrap();
+        let target = MvccStore::open(target_directory.path()).unwrap();
+        assert!(target.install_checkpoint_bytes(&bytes).is_err());
+        assert_eq!(target.decision_watermark().unwrap(), 0);
+
+        let mut foreign = source.export_checkpoint().unwrap();
+        foreign.cluster_id = "another-cluster".into();
+        assert!(target.install_checkpoint(&foreign).is_err());
+        assert_eq!(target.decision_watermark().unwrap(), 0);
+    }
+
+    #[test]
+    fn checkpoint_encoding_is_canonical_and_bounded_by_the_input() {
+        let directory = tempdir().unwrap();
+        let store = MvccStore::open(directory.path()).unwrap();
+        store.advance_decision_watermark(1).unwrap();
+        let checkpoint = store.export_checkpoint().unwrap();
+        let encoded = checkpoint.encode().unwrap();
+
+        assert_eq!(MvccCheckpoint::decode(&encoded).unwrap(), checkpoint);
+        for prefix_length in 0..encoded.len() {
+            assert!(
+                MvccCheckpoint::decode(&encoded[..prefix_length]).is_err(),
+                "truncated checkpoint prefix {prefix_length} unexpectedly decoded"
+            );
+        }
+
+        let mut with_trailing_byte = encoded;
+        with_trailing_byte.push(0);
+        assert!(MvccCheckpoint::decode(&with_trailing_byte).is_err());
+
+        let hostile_count_bytes = u64::MAX.to_be_bytes();
+        let mut hostile_count = MvccCheckpointDecoder::new(&hostile_count_bytes);
+        assert!(
+            hostile_count
+                .collection_len("hostile collection", 1)
+                .is_err()
+        );
     }
 
     #[test]

@@ -81,6 +81,7 @@ impl MvccGarbageCollectionCoordinator {
             .next();
         let local_work_pin = self.local.unfinished_work_pins()?.all().into_iter().next();
         self.local_report.update(
+            now,
             self.local.readable_version()?,
             local_snapshot_pin,
             local_work_pin,
@@ -146,6 +147,17 @@ impl MvccGarbageCollectionCoordinator {
             },
         )?;
         if proposal.watermark == current {
+            if head > current {
+                tracing::debug!(
+                    operation = "gc.coordinate",
+                    current_watermark = current,
+                    cluster_head = head,
+                    replica_applied_watermarks = ?proposal.pins.replica_applied_watermarks,
+                    active_snapshots = ?proposal.pins.active_snapshots,
+                    unfinished_work_pins = ?proposal.pins.unfinished_work_pins,
+                    "cluster MVCC garbage-collection watermark remains pinned"
+                );
+            }
             return Ok(Some(current));
         }
         let started = std::time::Instant::now();

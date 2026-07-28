@@ -895,16 +895,17 @@ async fn real_cluster_fetches_a_missing_committed_bundle_before_advancing_apply_
     assert_eq!(row.value, b"fetched-from-authenticated-holder");
 
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    assert_eq!(
+    assert!(
         cluster
             .state(lagging)
             .mvcc
             .runtime
             .local_store()
             .decision_watermark()
-            .unwrap(),
-        commit_version,
-        "the recovered decision is not re-applied after its watermark advances"
+            .unwrap()
+            >= commit_version,
+        "the recovered decision remains applied while later background transactions may advance \
+         the watermark"
     );
 }
 
@@ -1252,12 +1253,9 @@ async fn real_cluster_reconstructs_a_deleted_shard_and_publishes_repaired_placem
         }
     }
 
-    // Retirement evidence only becomes authoritative once the overlay is at
-    // or below the cluster GC watermark. Ensure every replica has applied the
-    // overlay, allow its periodic safety report to observe that the repair
-    // pins are gone, then issue a real transaction so the refreshed reports
-    // are ACKed through the persistent Raft streams. This avoids mistaking a
-    // correctly retained post-watermark shard for a failed physical unlink.
+    // v0.4.0 deliberately disables automatic MVCC and physical GC. Ensure
+    // every replica has applied the replacement overlay and issue a barrier
+    // transaction, then prove the obsolete physical shard remains retained.
     for node in 0..3 {
         cluster
             .wait_for_applied_version(node, overlay_row.commit_version)
@@ -1289,31 +1287,21 @@ async fn real_cluster_reconstructs_a_deleted_shard_and_publishes_repaired_placem
             .await
             .unwrap();
     }
-    cluster
-        .wait_for_gc_watermark(retiring_node, overlay_row.commit_version)
-        .await
-        .expect("cluster GC watermark reaches committed retirement evidence");
-
-    tokio::time::timeout(std::time::Duration::from_secs(20), async {
-        loop {
-            if !retiring_path.exists() && !retiring_meta.exists() {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("GC-authorised retirement unlinks shard payload and metadata");
+    tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
     assert!(
+        retiring_path.is_file() && retiring_meta.is_file(),
+        "v0.4.0 retains obsolete physical shard payload and metadata"
+    );
+    assert_eq!(
         cluster
             .state(retiring_node)
             .mvcc
             .runtime
             .local_store()
             .gc_watermark()
-            .unwrap()
-            >= overlay_row.commit_version,
-        "physical unlink follows the applied cluster GC watermark"
+            .unwrap(),
+        0,
+        "v0.4.0 must not advance the local GC watermark"
     );
 
     let final_snapshot = mvcc.runtime.local_store().readable_version().unwrap();

@@ -10,7 +10,6 @@ publish = false
 
 [dependencies]
 async-trait = "0.1.89"
-bincode = { version = "2.0.1", features = ["serde"] }
 openraft = { version = "=0.9.24", features = ["serde", "storage-v2"] }
 rocksdb = { version = "0.24.0", default-features = false, features = ["bindgen-runtime", "lz4", "zstd"] }
 serde = { version = "1.0.228", features = ["derive"] }

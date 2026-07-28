@@ -691,16 +691,22 @@ message RegisterNodeRequest {
 message ReplaceClusterNodeIncarnationRequest {
   AdminRequestContext context = 1;
   string cluster_id = 2;
+  // Fresh Raft identity for the clean-disk replacement. It MUST differ from
+  // replaced_raft_node_id and MUST NOT already be a member.
   uint64 raft_node_id = 3;
   string node_id = 4;
   uint64 incarnation = 5;
   string failure_domain = 6;
   string endpoint = 7;
-  // Exactly one call, directed to the current cluster leader, installs the
-  // compact-Raft control record and OpenRaft route. Calls to every other
-  // surviving coordinator set this false and update only their local
-  // replication route after observing that committed control record.
+  // Phase one, directed to the current cluster leader, fences the old
+  // incarnation, removes its voter ID, and catches up the fresh learner.
+  // Calls to every other surviving coordinator set this false and update only
+  // their local route projection.
   bool install_control = 8;
+  uint64 replaced_raft_node_id = 9;
+  // Explicit final phase, directed to the current leader only after every
+  // surviving voter has refreshed its local route projection.
+  bool promote_to_voter = 10;
 }
 
 message GetLocalNodeDescriptorRequest {}
@@ -4345,6 +4351,10 @@ message ConsensusRpcReply {
   uint64 oldest_active_snapshot = 8;
   bool has_unfinished_work_pin = 9;
   uint64 oldest_unfinished_work = 10;
+  // Orders pin-state changes that occur without advancing the MVCC apply
+  // watermark. Required because multiple authenticated Raft streams can
+  // return otherwise equal-watermark reports out of order.
+  uint64 mvcc_safety_report_generation = 11;
 }
 
 message ConsensusStreamRequest {

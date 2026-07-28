@@ -3,6 +3,14 @@
 //! Product crates depend on the types and [`Consensus`] interface exported
 //! here. OpenRaft and its storage contracts remain implementation details.
 
+/// Maximum encoded payload carried by one consensus RPC or log-like envelope.
+///
+/// Transport implementations must allow this payload plus their framing
+/// overhead. Durable aggregate state and snapshots use a separate, larger
+/// private bound because they can contain many individually bounded entries.
+pub const MAX_CONSENSUS_RPC_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+
+mod binary_codec;
 mod certification;
 mod consensus;
 mod control;
@@ -16,7 +24,7 @@ mod types;
 
 pub use certification::{CertificationError, CertificationState};
 pub use consensus::{Consensus, ConsensusError};
-pub use control::ClusterControlState;
+pub use control::{ClusterControlState, NodeReplacementTransition};
 pub use gc::{GarbageCollectionPins, GarbageCollectionSafetyError};
 pub use openraft_adapter::{
     AppliedControlSnapshot, ConsensusNode, ConsensusRpc, ConsensusRpcClient, ConsensusRpcError,
@@ -31,5 +39,5 @@ pub use types::{
     ConsensusDurabilityPolicy, ControlApplyResult, DurabilityLevel, ExplicitPredicate,
     LocalDurabilityViolation, LogicalKeyHash, NodeId, NodeIncarnation, PartitionAssignment,
     PointObservation, PredicateKind, RangeConflictKey, RangeObservation, TransactionId,
-    WrittenPoint,
+    TransactionOutcome, WrittenPoint,
 };

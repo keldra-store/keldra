@@ -5,7 +5,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
 };
 
 use anyhow::{Context, Result, bail};
@@ -448,7 +448,7 @@ impl ObjectEvidenceRegistry {
 #[derive(Clone)]
 pub struct StreamingBundleReplicator<T> {
     transport: T,
-    targets: Vec<BundleTarget>,
+    targets: Arc<RwLock<Vec<BundleTarget>>>,
     objects: ObjectEvidenceRegistry,
 }
 
@@ -477,9 +477,60 @@ impl<T> StreamingBundleReplicator<T> {
         }
         Ok(Self {
             transport,
-            targets,
+            targets: Arc::new(RwLock::new(targets)),
             objects,
         })
+    }
+
+    /// Replace the runtime durability target for one logical node.
+    ///
+    /// Clones of the replicator share this projection, including the clone
+    /// retained by the transaction coordinator. This keeps new bundle
+    /// durability acknowledgements fenced to the installed incarnation after
+    /// a clean-disk node replacement.
+    pub fn replace_target_incarnation(
+        &self,
+        cluster_id: &str,
+        node: &NodeIncarnation,
+        failure_domain: &str,
+    ) -> Result<()> {
+        if cluster_id.trim().is_empty()
+            || node.node_id.trim().is_empty()
+            || node.incarnation == 0
+            || failure_domain.trim().is_empty()
+        {
+            bail!("replacement bundle target must have a valid cluster, node and failure domain");
+        }
+        let mut targets = self
+            .targets
+            .write()
+            .map_err(|_| anyhow::anyhow!("bundle replication target lock poisoned"))?;
+        let mut replaced = false;
+        for target in targets
+            .iter_mut()
+            .filter(|target| target.cluster_id == cluster_id && target.node.node_id == node.node_id)
+        {
+            target.node = node.clone();
+            target.failure_domain = failure_domain.to_string();
+            replaced = true;
+        }
+        if replaced {
+            targets.sort_by(|left, right| {
+                right
+                    .voter
+                    .cmp(&left.voter)
+                    .then_with(|| left.node.cmp(&right.node))
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn targets_snapshot(&self) -> Vec<BundleTarget> {
+        self.targets
+            .read()
+            .expect("bundle replication target lock poisoned")
+            .clone()
     }
 }
 
@@ -497,7 +548,12 @@ impl<T: BundleTargetStream> BundleReplicator for StreamingBundleReplicator<T> {
         let mut bundle_holders = Vec::new();
         if durability != DurabilityLevel::Local {
             let expected_hash = parse_sha256(&identity.hash)?;
-            for target in &self.targets {
+            let targets = self
+                .targets
+                .read()
+                .map_err(|_| anyhow::anyhow!("bundle replication target lock poisoned"))?
+                .clone();
+            for target in &targets {
                 let ack = match self.transport.send_bundle(target, identity, bytes).await {
                     Ok(ack) => ack,
                     Err(error) => {
@@ -865,6 +921,7 @@ mod tests {
         );
     }
 
+    #[derive(Clone)]
     struct Transport {
         status_by_node: BTreeMap<String, AckStatus>,
         corrupt_hash_node: Option<String>,
@@ -1084,7 +1141,37 @@ mod tests {
             ObjectEvidenceRegistry::default(),
         )
         .unwrap();
-        assert!(replicator.targets[0].voter);
-        assert_eq!(replicator.targets[0].node.node_id, "node-z");
+        let targets = replicator.targets_snapshot();
+        assert!(targets[0].voter);
+        assert_eq!(targets[0].node.node_id, "node-z");
+    }
+
+    #[test]
+    fn cloned_replicators_observe_replacement_target_incarnations() {
+        let replicator = StreamingBundleReplicator::new(
+            Transport {
+                status_by_node: BTreeMap::new(),
+                corrupt_hash_node: None,
+                failed_nodes: BTreeSet::new(),
+            },
+            vec![target("node-a", "zone-a")],
+            ObjectEvidenceRegistry::default(),
+        )
+        .unwrap();
+        let coordinator_clone = replicator.clone();
+        replicator
+            .replace_target_incarnation(
+                "cluster-a",
+                &NodeIncarnation {
+                    node_id: "node-a".into(),
+                    incarnation: 2,
+                },
+                "zone-replacement",
+            )
+            .unwrap();
+
+        let targets = coordinator_clone.targets_snapshot();
+        assert_eq!(targets[0].node.incarnation, 2);
+        assert_eq!(targets[0].failure_domain, "zone-replacement");
     }
 }

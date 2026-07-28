@@ -221,6 +221,26 @@ struct TransferMetadata {
     prepared_snapshot_version: u64,
     prepared_at_unix_ms: u64,
     provisional: bool,
+    /// Local durable deadline armed only after the cluster GC watermark makes
+    /// a replacement placement authoritative. This is deliberately mutable
+    /// receiver state, not part of the immutable transfer identity.
+    #[serde(default)]
+    retirement_not_before_unix_ms: Option<u64>,
+}
+
+impl TransferMetadata {
+    fn has_same_immutable_identity(&self, other: &Self) -> bool {
+        self.transfer_id == other.transfer_id
+            && self.cluster_id == other.cluster_id
+            && self.partition == other.partition
+            && self.kind == other.kind
+            && self.total_length == other.total_length
+            && self.final_hash == other.final_hash
+            && self.transaction_id == other.transaction_id
+            && self.prepared_snapshot_version == other.prepared_snapshot_version
+            && self.prepared_at_unix_ms == other.prepared_at_unix_ms
+            && self.provisional == other.provisional
+    }
 }
 
 /// Disk-backed receiver for resumable immutable transfers.
@@ -321,32 +341,81 @@ impl TransferReceiver {
     }
 
     /// Idempotently retires complete object-shard transfers selected by a
-    /// cluster-authorised MVCC GC plan. Partial transfers and every other
-    /// transfer kind are deliberately outside this operation.
-    pub fn retire_complete_object_shards(&mut self, authorised: &BTreeSet<Uuid>) -> Result<usize> {
-        let mut removed = 0;
-        for transfer_id in authorised {
-            let Some(metadata) = self.metadata.get(transfer_id) else {
+    /// cluster-authorised MVCC GC plan after a durable local rollback window.
+    ///
+    /// The deadline starts when this receiver first observes the transfer as
+    /// authorised, rather than when the shard was originally prepared. If a
+    /// newer placement or a work pin withdraws authorisation before expiry,
+    /// the deadline is cleared and a later authorisation must serve a complete
+    /// new grace period. Partial transfers and every other transfer kind are
+    /// deliberately outside this operation.
+    pub fn retire_complete_object_shards(
+        &mut self,
+        authorised: &BTreeSet<Uuid>,
+        now_unix_ms: u64,
+        grace_ms: u64,
+    ) -> Result<usize> {
+        if grace_ms == 0 {
+            bail!("complete shard retirement grace must be non-zero");
+        }
+        let transfer_ids = self.metadata.keys().copied().collect::<Vec<_>>();
+        let mut retire = Vec::new();
+        let mut metadata_changed = false;
+        for transfer_id in transfer_ids {
+            let Some(metadata) = self.metadata.get(&transfer_id).cloned() else {
                 continue;
             };
-            if metadata.kind != TransferKind::ObjectShard
-                || self.partial_path(*transfer_id).exists()
-            {
+            let complete = self.complete_path(transfer_id);
+            let partial = self.partial_path(transfer_id);
+            let authorised_complete_shard = authorised.contains(&transfer_id)
+                && metadata.kind == TransferKind::ObjectShard
+                && !partial.exists();
+            if !authorised_complete_shard {
+                if metadata.retirement_not_before_unix_ms.is_some() {
+                    let mut updated = metadata;
+                    updated.retirement_not_before_unix_ms = None;
+                    self.replace_metadata(&updated)?;
+                    self.metadata.insert(transfer_id, updated);
+                    metadata_changed = true;
+                }
                 continue;
             }
-            let complete = self.complete_path(*transfer_id);
-            if !complete.exists() {
-                continue;
+            match metadata.retirement_not_before_unix_ms {
+                // The payload is normally still present here. It may already
+                // be absent if the process stopped after unlinking `.complete`
+                // but before unlinking its metadata; the expired durable
+                // deadline makes finishing that interrupted retirement safe.
+                Some(deadline) if now_unix_ms >= deadline => retire.push(transfer_id),
+                Some(_) => {}
+                None if complete.exists() => {
+                    let mut updated = metadata;
+                    updated.retirement_not_before_unix_ms = Some(
+                        now_unix_ms
+                            .checked_add(grace_ms)
+                            .context("complete shard retirement deadline overflow")?,
+                    );
+                    self.replace_metadata(&updated)?;
+                    self.metadata.insert(transfer_id, updated);
+                    metadata_changed = true;
+                }
+                None => {}
             }
-            fs::remove_file(&complete)?;
-            let metadata_path = self.metadata_path(*transfer_id);
+        }
+
+        let mut removed = 0;
+        for transfer_id in retire {
+            let complete = self.complete_path(transfer_id);
+            if complete.exists() {
+                fs::remove_file(&complete)?;
+            }
+            let metadata_path = self.metadata_path(transfer_id);
             if metadata_path.exists() {
                 fs::remove_file(metadata_path)?;
             }
-            self.metadata.remove(transfer_id);
+            self.metadata.remove(&transfer_id);
             removed += 1;
         }
-        if removed != 0 {
+        if metadata_changed || removed != 0 {
             sync_directory(&self.directory)?;
         }
         Ok(removed)
@@ -432,6 +501,7 @@ impl TransferReceiver {
             prepared_snapshot_version: frame.prepared_snapshot_version,
             prepared_at_unix_ms: frame.prepared_at_unix_ms,
             provisional: frame.provisional,
+            retirement_not_before_unix_ms: None,
         };
         if frame.kind == TransferKind::ObjectShard
             && frame.provisional
@@ -485,6 +555,10 @@ impl TransferReceiver {
         } else {
             file.seek(SeekFrom::End(0))?;
             file.write_all(&frame.payload)?;
+        }
+        #[cfg(any(test, debug_assertions))]
+        if frame.kind == TransferKind::ObjectShard && frame.finish {
+            crate::mvcc_fault_injection::hit(crate::mvcc_fault_injection::FaultPoint::ShardWrite)?;
         }
         file.sync_data()?;
         let persisted_through = file.metadata()?.len();
@@ -541,7 +615,7 @@ impl TransferReceiver {
 
     fn ensure_metadata(&mut self, expected: &TransferMetadata) -> Result<()> {
         if let Some(existing) = self.metadata.get(&expected.transfer_id) {
-            if existing != expected {
+            if !existing.has_same_immutable_identity(expected) {
                 bail!("transfer ID was reused with different immutable metadata");
             }
             return Ok(());
@@ -558,6 +632,21 @@ impl TransferReceiver {
         fs::rename(&temporary, &path)?;
         sync_directory(&self.directory)?;
         self.metadata.insert(expected.transfer_id, expected.clone());
+        Ok(())
+    }
+
+    fn replace_metadata(&self, metadata: &TransferMetadata) -> Result<()> {
+        let path = self.metadata_path(metadata.transfer_id);
+        let temporary = path.with_extension("meta.retirement.tmp");
+        let bytes = serde_json::to_vec(metadata)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, &path)?;
         Ok(())
     }
 
@@ -819,7 +908,7 @@ mod tests {
     }
 
     #[test]
-    fn authorised_shard_retirement_is_idempotent_and_preserves_inflight_transfers() {
+    fn authorised_shard_retirement_waits_for_durable_grace_and_preserves_inflight_transfers() {
         let directory = tempfile::tempdir().unwrap();
         let mut receiver = TransferReceiver::open(directory.path()).unwrap();
         let peer = AuthenticatedPeer::new("node-b", 1).unwrap();
@@ -837,7 +926,34 @@ mod tests {
 
         let authorised = BTreeSet::from([retired, inflight, bundle]);
         assert_eq!(
-            receiver.retire_complete_object_shards(&authorised).unwrap(),
+            receiver
+                .retire_complete_object_shards(&authorised, 100, 10)
+                .unwrap(),
+            0
+        );
+        assert!(receiver.watermark(retired).unwrap().unwrap().complete);
+        drop(receiver);
+
+        let mut receiver = TransferReceiver::open(directory.path()).unwrap();
+        assert_eq!(
+            receiver
+                .retire_complete_object_shards(&authorised, 109, 10)
+                .unwrap(),
+            0
+        );
+        // Replaying a completed frame after the mutable deadline was persisted
+        // must still match the transfer's immutable identity.
+        let peer = AuthenticatedPeer::new("node-b", 1).unwrap();
+        let mut resumed = ConnectionSession::establish("cluster-a", peer).unwrap();
+        let replay = frame(&resumed, retired, 1, 0, b"retired", b"retired", true);
+        assert_eq!(
+            receiver.receive(&mut resumed, &replay).unwrap().status,
+            AckStatus::Complete
+        );
+        assert_eq!(
+            receiver
+                .retire_complete_object_shards(&authorised, 110, 10)
+                .unwrap(),
             1
         );
         assert!(receiver.watermark(retired).unwrap().is_none());
@@ -851,8 +967,99 @@ mod tests {
         );
         assert!(receiver.watermark(bundle).unwrap().unwrap().complete);
         assert_eq!(
-            receiver.retire_complete_object_shards(&authorised).unwrap(),
+            receiver
+                .retire_complete_object_shards(&authorised, 120, 10)
+                .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn withdrawing_retirement_authorisation_restarts_the_full_grace_window() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut receiver = TransferReceiver::open(directory.path()).unwrap();
+        let peer = AuthenticatedPeer::new("node-b", 1).unwrap();
+        let mut session = ConnectionSession::establish("cluster-a", peer).unwrap();
+        let transfer_id = Uuid::new_v4();
+        let complete = frame(&session, transfer_id, 1, 0, b"rollback", b"rollback", true);
+        receiver.receive(&mut session, &complete).unwrap();
+
+        let authorised = BTreeSet::from([transfer_id]);
+        assert_eq!(
+            receiver
+                .retire_complete_object_shards(&authorised, 100, 10)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            receiver
+                .retire_complete_object_shards(&BTreeSet::new(), 105, 10)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            receiver
+                .retire_complete_object_shards(&authorised, 200, 10)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            receiver
+                .retire_complete_object_shards(&authorised, 209, 10)
+                .unwrap(),
+            0
+        );
+        assert!(receiver.watermark(transfer_id).unwrap().is_some());
+        assert_eq!(
+            receiver
+                .retire_complete_object_shards(&authorised, 210, 10)
+                .unwrap(),
+            1
+        );
+        assert!(receiver.watermark(transfer_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn restart_finishes_retirement_interrupted_between_payload_and_metadata_unlink() {
+        let directory = tempfile::tempdir().unwrap();
+        let transfer_id = Uuid::new_v4();
+        let authorised = BTreeSet::from([transfer_id]);
+        {
+            let mut receiver = TransferReceiver::open(directory.path()).unwrap();
+            let peer = AuthenticatedPeer::new("node-b", 1).unwrap();
+            let mut session = ConnectionSession::establish("cluster-a", peer).unwrap();
+            let complete = frame(
+                &session,
+                transfer_id,
+                1,
+                0,
+                b"interrupted",
+                b"interrupted",
+                true,
+            );
+            receiver.receive(&mut session, &complete).unwrap();
+            assert_eq!(
+                receiver
+                    .retire_complete_object_shards(&authorised, 100, 10)
+                    .unwrap(),
+                0
+            );
+        }
+
+        fs::remove_file(directory.path().join(format!("{transfer_id}.complete"))).unwrap();
+        let mut receiver = TransferReceiver::open(directory.path()).unwrap();
+        assert_eq!(
+            receiver
+                .retire_complete_object_shards(&authorised, 110, 10)
+                .unwrap(),
+            1
+        );
+        assert!(receiver.watermark(transfer_id).unwrap().is_none());
+        assert!(
+            !directory
+                .path()
+                .join(format!("{transfer_id}.meta"))
+                .exists()
         );
     }
 }

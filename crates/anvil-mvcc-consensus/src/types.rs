@@ -96,6 +96,12 @@ pub struct AssignmentPredicate {
 pub struct CertifyTransaction {
     pub cluster_id_hash: [u8; 32],
     pub transaction_id: TransactionId,
+    /// One-way identity of the authenticated transaction principal.
+    ///
+    /// Consensus retains this fixed-size binding so a different principal
+    /// cannot recover a terminal outcome after the original coordinator is
+    /// lost. The principal string remains outside Raft.
+    pub principal_hash: [u8; 32],
     pub snapshot_version: CommitVersion,
     pub point_observations: Vec<PointObservation>,
     pub range_observations: Vec<RangeObservation>,
@@ -196,6 +202,7 @@ impl ConsensusCommand {
             Self::Certify(CertifyTransaction {
                 cluster_id_hash: _,
                 transaction_id: _,
+                principal_hash: _,
                 snapshot_version: _,
                 point_observations,
                 range_observations,
@@ -316,6 +323,20 @@ pub struct CommittedBundleDecision {
     pub durable_holders: Vec<NodeIncarnation>,
 }
 
+/// Compact terminal transaction state retained for retry and status recovery.
+///
+/// Product data, the public transaction ID, and the principal string remain in
+/// the replicated bundle or caller request. This record contains only the
+/// consensus-certified identity and fields required to answer an unknown
+/// commit outcome after a coordinator is lost.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransactionOutcome {
+    pub principal_hash: [u8; 32],
+    pub snapshot_version: CommitVersion,
+    pub durability: DurabilityLevel,
+    pub result: CertificationResult,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalDurabilityViolation {
     pub commit_version: CommitVersion,
@@ -389,6 +410,7 @@ mod section9_boundary_tests {
         CertifyTransaction {
             cluster_id_hash: [1; 32],
             transaction_id: TransactionId([2; 16]),
+            principal_hash: [3; 32],
             snapshot_version: CommitVersion(3),
             point_observations: vec![PointObservation {
                 key: LogicalKeyHash([4; 32]),
@@ -480,8 +502,29 @@ mod section9_boundary_tests {
         ];
         for command in commands {
             command.validate_section9_boundary().unwrap();
+            let entry = openraft::Entry::<crate::openraft_adapter::AnvilRaftConfig> {
+                log_id: openraft::LogId::default(),
+                payload: openraft::EntryPayload::Normal(command),
+            };
             let encoded =
-                bincode::serde::encode_to_vec(&command, bincode::config::standard()).unwrap();
+                crate::binary_codec::encode(crate::binary_codec::ValueKind::StoredLogEntry, &entry)
+                    .unwrap();
+            assert_eq!(
+                encoded,
+                crate::binary_codec::encode(
+                    crate::binary_codec::ValueKind::StoredLogEntry,
+                    &entry,
+                )
+                .unwrap(),
+                "Raft log encoding must be deterministic"
+            );
+            let decoded: openraft::Entry<crate::openraft_adapter::AnvilRaftConfig> =
+                crate::binary_codec::decode(
+                    crate::binary_codec::ValueKind::StoredLogEntry,
+                    &encoded,
+                )
+                .unwrap();
+            assert_eq!(decoded, entry);
             for marker in forbidden {
                 assert!(
                     !encoded.windows(marker.len()).any(|window| window == marker),

@@ -75,7 +75,7 @@ impl TransactionService for AppState {
             "received public transaction request"
         );
         validate_local_cluster(self, &req.cluster_id)?;
-        let outcome = self
+        let local_outcome = self
             .mvcc
             .open_transactions
             .commit(
@@ -84,9 +84,32 @@ impl TransactionService for AppState {
                 &principal,
                 now_unix_ms()?,
             )
-            .await
-            .map_err(mvcc_status)?;
-        let _commit_version = match outcome.certification {
+            .await;
+        let (certification, replayed) = match local_outcome {
+            Ok(outcome) => {
+                let replayed = matches!(
+                    outcome.local_apply,
+                    Some(crate::mvcc_store::ApplyOutcome::Replayed)
+                );
+                (outcome.certification, replayed)
+            }
+            Err(error) if is_unknown_transaction(&error) => {
+                let outcome = consensus_transaction_outcome(
+                    self,
+                    &req.cluster_id,
+                    &req.transaction_id,
+                    &principal,
+                )
+                .await?
+                .ok_or_else(|| Status::not_found("TransactionNotFound"))?;
+                (
+                    crate::mvcc_consensus_adapter::from_consensus_result(outcome.result),
+                    true,
+                )
+            }
+            Err(error) => return Err(mvcc_status(error)),
+        };
+        let _commit_version = match certification {
             crate::mvcc_transaction::CertificationResult::Committed { commit_version } => {
                 commit_version
             }
@@ -111,10 +134,7 @@ impl TransactionService for AppState {
             state: WriteState::Committed as i32,
             root_generation: None,
             transaction_manifest_ref: None,
-            idempotency_outcome: if matches!(
-                outcome.local_apply,
-                Some(crate::mvcc_store::ApplyOutcome::Replayed)
-            ) {
+            idempotency_outcome: if replayed {
                 "replayed".to_string()
             } else {
                 "accepted".to_string()
@@ -151,12 +171,26 @@ impl TransactionService for AppState {
         let principal = transaction_principal(&request)?;
         let req = request.into_inner();
         validate_local_cluster(self, &req.cluster_id)?;
-        let status = self
-            .mvcc
-            .open_transactions
-            .status(&req.transaction_id, &principal, now_unix_ms()?)
-            .map_err(mvcc_status)?;
-        Ok(Response::new(transaction_status(status)))
+        let local_status =
+            self.mvcc
+                .open_transactions
+                .status(&req.transaction_id, &principal, now_unix_ms()?);
+        let status = match local_status {
+            Ok(status) => transaction_status(status),
+            Err(error) if is_unknown_transaction(&error) => {
+                let outcome = consensus_transaction_outcome(
+                    self,
+                    &req.cluster_id,
+                    &req.transaction_id,
+                    &principal,
+                )
+                .await?
+                .ok_or_else(|| Status::not_found("TransactionNotFound"))?;
+                consensus_transaction_status(&req.cluster_id, &req.transaction_id, outcome)
+            }
+            Err(error) => return Err(mvcc_status(error)),
+        };
+        Ok(Response::new(status))
     }
 }
 
@@ -275,6 +309,37 @@ mod mvcc_lifecycle_tests {
     }
 
     #[test]
+    fn compact_consensus_outcome_preserves_terminal_status_and_principal_fence() {
+        let cluster_id = "cluster-a";
+        let principal = "tenant/1/principal/alice";
+        let outcome = anvil_mvcc_consensus::TransactionOutcome {
+            principal_hash: crate::mvcc_consensus_adapter::consensus_principal_hash(
+                cluster_id, principal,
+            ),
+            snapshot_version: anvil_mvcc_consensus::CommitVersion(17),
+            durability: anvil_mvcc_consensus::DurabilityLevel::Quorum,
+            result: anvil_mvcc_consensus::CertificationResult::Committed {
+                commit_version: anvil_mvcc_consensus::CommitVersion(23),
+                bundle_hash: anvil_mvcc_consensus::BundleHash([7; 32]),
+            },
+        };
+        validate_consensus_outcome_principal(cluster_id, principal, &outcome).unwrap();
+        let mismatch =
+            validate_consensus_outcome_principal(cluster_id, "tenant/1/principal/bob", &outcome)
+                .unwrap_err();
+        assert_eq!(mismatch.code(), tonic::Code::PermissionDenied);
+
+        let status = consensus_transaction_status(cluster_id, "transaction-a", outcome);
+        assert_eq!(status.cluster_id, cluster_id);
+        assert_eq!(status.transaction_id, "transaction-a");
+        assert_eq!(status.state, "committed");
+        assert_eq!(status.snapshot_version, 17);
+        assert_eq!(status.expires_at_unix_ms, 0);
+        assert_eq!(status.commit_version, Some(23));
+        assert_eq!(status.durability, MvccDurability::Quorum as i32);
+    }
+
+    #[test]
     fn cluster_validation_rejects_empty_and_foreign_clusters() {
         let missing = validate_cluster_id("cluster-a", "").unwrap_err();
         assert_eq!(missing.code(), tonic::Code::InvalidArgument);
@@ -340,6 +405,65 @@ fn transaction_status(
         cluster_id: transaction.cluster_id,
         durability: durability_to_proto(transaction.durability) as i32,
     }
+}
+
+async fn consensus_transaction_outcome(
+    state: &AppState,
+    cluster_id: &str,
+    transaction_id: &str,
+    principal: &str,
+) -> Result<Option<anvil_mvcc_consensus::TransactionOutcome>, Status> {
+    let consensus_id =
+        crate::mvcc_consensus_adapter::consensus_transaction_id(cluster_id, transaction_id);
+    let outcome = state
+        .mvcc
+        .consensus
+        .linearized_transaction_outcome(consensus_id)
+        .await
+        .map_err(|error| Status::unavailable(error.to_string()))?;
+    if let Some(outcome) = &outcome {
+        validate_consensus_outcome_principal(cluster_id, principal, outcome)?;
+    }
+    Ok(outcome)
+}
+
+fn validate_consensus_outcome_principal(
+    cluster_id: &str,
+    principal: &str,
+    outcome: &anvil_mvcc_consensus::TransactionOutcome,
+) -> Result<(), Status> {
+    let caller = crate::mvcc_consensus_adapter::consensus_principal_hash(cluster_id, principal);
+    if caller != outcome.principal_hash {
+        return Err(Status::permission_denied("TransactionPrincipalMismatch"));
+    }
+    Ok(())
+}
+
+fn consensus_transaction_status(
+    cluster_id: &str,
+    transaction_id: &str,
+    outcome: anvil_mvcc_consensus::TransactionOutcome,
+) -> TransactionStatus {
+    let result = crate::mvcc_consensus_adapter::from_consensus_result(outcome.result);
+    let state = match &result {
+        crate::mvcc_transaction::CertificationResult::Committed { .. } => "committed",
+        crate::mvcc_transaction::CertificationResult::Aborted { .. } => "aborted",
+    };
+    transaction_status(crate::mvcc_open_transactions::TransactionRegistryStatus {
+        cluster_id: cluster_id.to_string(),
+        transaction_id: transaction_id.to_string(),
+        snapshot_version: outcome.snapshot_version.0,
+        // Expiry governs only an open local draft. A Raft outcome is terminal
+        // and therefore has no remaining expiry deadline.
+        expires_at_unix_ms: 0,
+        state,
+        result: Some(result),
+        durability: crate::mvcc_consensus_adapter::from_consensus_durability(outcome.durability),
+    })
+}
+
+fn is_unknown_transaction(error: &anyhow::Error) -> bool {
+    error.to_string().contains("unknown transaction")
 }
 
 fn read_consistency(value: i32) -> Result<crate::mvcc_transaction::ReadConsistency, Status> {

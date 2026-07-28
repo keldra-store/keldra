@@ -42,9 +42,36 @@ pub async fn start_node_with_admin_listener(
     state: AppState,
 ) -> Result<()> {
     // MVCC/OpenRaft bootstrap completed before AppState was returned. Public
-    // traffic remains closed until the cluster-local system realm is visible.
+    // traffic remains closed until local ordered apply has caught up and the
+    // cluster-local system realm is visible.
     let system_realm_ready = state.system_realm_is_bootstrapped()?;
-    let public_readiness = startup_readiness::PublicReadiness::new(system_realm_ready);
+    let public_readiness =
+        startup_readiness::PublicReadiness::new(system_realm_ready, state.mvcc.clone());
+    let consensus_readiness = public_readiness.clone();
+    let consensus_mvcc = state.mvcc.clone();
+    tokio::spawn(async move {
+        loop {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                consensus_mvcc.confirm_cluster_commit_barrier(),
+            )
+            .await
+            {
+                Ok(Ok(commit_version)) => {
+                    consensus_readiness.mark_consensus_ready(commit_version);
+                }
+                Ok(Err(error)) => {
+                    consensus_readiness.mark_consensus_unready();
+                    tracing::debug!(%error, "cluster readiness barrier is unavailable");
+                }
+                Err(_) => {
+                    consensus_readiness.mark_consensus_unready();
+                    tracing::debug!("cluster readiness barrier timed out");
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    });
     if !system_realm_ready {
         let startup_state = state.clone();
         let startup_readiness = public_readiness.clone();
@@ -124,7 +151,7 @@ pub async fn start_node_with_admin_listener(
             admin_auth_interceptor.clone(),
         )
     });
-    let s3_app = s3_gateway::app(state.clone());
+    let s3_app = s3_gateway::app(state.clone(), public_readiness.clone());
 
     let app = tower::service_fn(move |req: axum::extract::Request| {
         let grpc_router = grpc_axum.clone();

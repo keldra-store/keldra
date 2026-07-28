@@ -156,6 +156,13 @@ a new node incarnation.
 A **node ID** is the stable identifier assigned to a node. It is not an IP
 address, socket address, process ID, or container ID.
 
+### 6.2.1 Raft Node ID
+
+A **Raft node ID** is the identity OpenRaft uses for one durable Raft vote and
+log history. It is distinct from Anvil's stable logical node ID. A process may
+retain a Raft node ID only when it proves continuity with that Raft identity's
+durable state; a clean-disk replacement receives a fresh Raft node ID.
+
 ### 6.3 Node Incarnation
 
 A **node incarnation** is:
@@ -476,7 +483,10 @@ state. It does not read arbitrary local product data.
 
 A **certification command** is the compact application entry proposed to
 OpenRaft. It identifies the prepared bundle, requested durability, read
-observations, and write conflict keys.
+observations, write conflict keys, and a fixed-size one-way binding to the
+authenticated principal. The binding is identity metadata for retry fencing;
+it is not authorization evidence and does not replace authorization at the
+public API boundary.
 
 ### 6.42 Certification Result
 
@@ -627,10 +637,16 @@ MVCC replication protocol.
 
 Only the following application state may be proposed through OpenRaft:
 
-1. transaction certification commands;
-2. transaction outcomes produced by deterministic certification;
+1. transaction certification commands, including a fixed-size transaction ID
+   and fixed-size one-way authenticated-principal binding;
+2. compact transaction outcomes produced by deterministic certification,
+   including that same principal binding, the original snapshot and durability
+   level, and the committed or aborted certification result;
 3. compact point-conflict versions and range stamps;
-4. cluster identity and node-incarnation installation/removal;
+4. cluster identity, node-incarnation installation/removal, and one compact
+   latest clean-disk replacement transition per logical node containing the
+   old Raft ID, fresh Raft ID, and replacement incarnation, plus compact
+   retired-Raft-ID tombstones that prevent durable identity reuse;
 5. OpenRaft voter and learner membership;
 6. authoritative partition assignments and assignment epochs;
 7. durability-policy generations;
@@ -669,6 +685,13 @@ The following must not appear in Raft application entries or snapshots:
 - per-request authorization evidence;
 - cryptographic receipt signatures.
 
+The fixed-size principal binding permitted above is not a token, principal
+string, Zanzibar tuple, capability, or proof of authorization. It is a
+domain-separated digest derived from `cluster_id` and the authenticated
+principal at the public API boundary. Its only purpose in consensus is to
+prevent another principal from recovering or replaying a terminal transaction
+outcome after the coordinator-local transaction record is unavailable.
+
 ### 9.3 Certification State
 
 The deterministic certification state is:
@@ -679,8 +702,23 @@ last_applied_log_id
 stored_membership
 point_latest_write_version: logical_key_hash -> commit_version
 range_latest_write_stamp: range_conflict_key -> commit_version
-recent_transaction_results: transaction_id -> certification_result
-cluster_configuration
+recent_transaction_outcomes:
+  transaction_id -> {
+    principal_hash[32],
+    snapshot_version,
+    durability,
+    certification_result
+  }
+cluster_configuration:
+  installed_nodes: logical_node_id -> { raft_node_id, incarnation, failure_domain }
+  latest_replacements: logical_node_id -> {
+    obsolete_raft_node_id,
+    fresh_raft_node_id,
+    replacement_incarnation
+  }
+  retired_raft_node_ids: set<raft_node_id>
+  partition_assignments: partition_id -> { owner_incarnation, assignment_epoch }
+  durability_policy
 gc_safety_watermark
 ```
 
@@ -692,8 +730,16 @@ group/cluster prefix.
 Conflict state may use a bounded hierarchical range structure to prevent the
 consensus snapshot from growing once per historical transaction.
 
-Recent transaction results may be pruned after their idempotency retention
-window and all relevant GC safety conditions expire.
+The principal string, token, authorization tuples, transaction bundle, and
+product values are not part of the retained outcome. A repeated certification
+command must reproduce the same transaction ID, principal hash, snapshot,
+durability, and bundle hash; otherwise it is a transaction-identity mismatch.
+An outcome lookup supplies only the transaction ID and caller-derived
+principal hash and cannot alter the retained result.
+
+Recent transaction outcomes may be pruned only after their public idempotency
+retention window and all relevant GC safety conditions expire. A GC watermark
+alone does not shorten the advertised retry window.
 
 ## 10. OpenRaft Choice and Encapsulation
 
@@ -788,7 +834,7 @@ cf_raft_meta:
 cf_consensus_state:
   point | logical_key_hash -> latest_write_version
   range | range_conflict_key -> latest_write_stamp
-  tx | transaction_id -> certification_result
+  tx | transaction_id -> compact_transaction_outcome
   cluster | key -> cluster configuration value
 ```
 
@@ -943,6 +989,7 @@ conflict.
 struct CertifyTransaction {
     cluster_id: ClusterId,
     transaction_id: TransactionId,
+    principal_hash: [u8; 32],
     snapshot_version: CommitVersion,
     point_observations: Vec<PointObservation>,
     range_observations: Vec<RangeObservation>,
@@ -960,7 +1007,9 @@ Every repeated field must be canonically sorted and unique.
 The command contains conflict metadata, not row values.
 The state machine rejects a command whose `cluster_id` does not equal the
 consensus group's durable cluster identity. Conflict keys and transaction IDs
-are domain-separated by `cluster_id`.
+are domain-separated by `cluster_id`. `principal_hash` is likewise
+domain-separated by `cluster_id`; the authenticated principal string remains
+in the bundle and outside Raft.
 
 ### 14.2 Deterministic Certification
 
@@ -1480,8 +1529,26 @@ invisible and are eventually garbage-collected.
 
 ### 21.2 Failure After Proposal but Before Response
 
-The client retries with the same transaction ID. Certification returns the
-recorded result if applied, or safely determines the result through OpenRaft.
+The client retries with the same transaction ID and authenticated principal.
+If the receiving node still has the coordinator-local transaction record, the
+ordinary idempotent commit path is used. If that record is absent, both
+`GetTransaction` and `CommitTransaction` use the following recovery path:
+
+1. derive the cluster-scoped compact transaction ID and principal hash;
+2. route one transaction-outcome request to the current OpenRaft leader;
+3. on that leader, complete a linearized-read barrier and then read the retained
+   outcome from the same leader's applied state machine;
+4. return only the compact terminal outcome or absence;
+5. compare its principal hash with the caller's derived principal hash;
+6. reconstruct the public committed or aborted response from the retained
+   snapshot, durability, and certification result.
+
+The barrier and state lookup must not be split between a leader and a
+potentially lagging follower. Recovery does not fetch the transaction bundle,
+does not submit another certification command, and does not re-authorize from
+data stored in Raft. A principal mismatch is rejected. Absence is reported only
+after the leader-linearized lookup and means either the transaction never
+certified or its advertised idempotency window has expired.
 
 ### 21.3 Missing Bundle on an Applying Node
 
@@ -1512,12 +1579,103 @@ discarding data.
 
 ### 21.6 Node Catch-Up
 
-A lagging node catches up in two coordinated streams:
+A lagging node that retains its local MVCC history catches up in two coordinated
+streams:
 
 1. OpenRaft catches up compact decisions.
 2. Anvil replication fetches referenced transaction bundles and physical data.
 
 The node serves snapshots only through its applied watermark.
+
+A clean-disk node cannot use this path after GC because compact Raft state and
+retained bundles do not reconstruct rows below the GC watermark. It first
+installs the out-of-Raft MVCC checkpoint defined in Section 21.7.
+
+### 21.7 Clean-Disk Node Replacement
+
+A process that cannot prove continuity with a node's durable Raft vote and log
+state is a new node incarnation and MUST receive a fresh Raft node ID. Stable
+logical node identity does not permit reusing the obsolete Raft voter ID.
+
+Clean-disk voter replacement is a split, retryable operation:
+
+1. The current leader validates that the requested product incarnation
+   advances the installed incarnation, that the fresh Raft node ID differs
+   from the obsolete ID, and that the fresh ID is neither a voter, learner, nor
+   another product node's Raft identity.
+2. While the replacement is still a non-member under its fresh Raft ID, the
+   leader commits the higher product incarnation and fresh Raft mapping in
+   compact control state. The same deterministic state-machine transition
+   retains the logical node ID, obsolete Raft ID, fresh Raft ID, and replacement
+   incarnation as the consensus-authoritative identity for retries. This
+   immediately fences acknowledgements and authenticated streams from the
+   obsolete product incarnation.
+3. The leader removes the obsolete Raft voter ID through OpenRaft joint
+   consensus with `retain_removed_as_learner = false`.
+4. Each surviving node replaces its local replication, bundle-target, and
+   connection-authorization route projections. The obsolete Raft ID is removed
+   from connection authorization and the fresh ID is bound to the replacement
+   incarnation and endpoint.
+5. Before adding the fresh Raft ID as a learner, the leader captures a
+   point-in-time checkpoint of every cluster-scoped local MVCC column family.
+   The checkpoint contains ordinary product rows, heads, durable work/outbox
+   state, and its applied, decision, and GC watermarks. It excludes Raft state,
+   other clusters, and donor-local checkpoint-install metadata. Its decision
+   watermark MUST be at or above the consensus GC watermark.
+6. The leader streams the checkpoint outside Raft over the authenticated,
+   persistent replication connection. Each frame is durably acknowledged. The
+   final acknowledgement is `Applied`, not merely `Complete`: the replacement
+   has verified the cluster, format, canonical ordering and checkpoint identity
+   and atomically installed the full local state before acknowledging.
+7. The leader adds the fresh Raft ID as a learner and waits for OpenRaft log
+   catch-up. Installing the checkpoint before learner admission prevents its
+   ordinary apply worker racing from an empty store.
+8. After learner catch-up, the leader captures a leader-local linearized
+   decision barrier. The replacement replays every retained decision after the
+   checkpoint watermark in order and reports its applied decision watermark.
+   Reaching the barrier proves that every product bundle at or below it has
+   been applied; control-only positions advance only the sequential decision
+   cursor. Raft log match alone is not product-data catch-up.
+9. The prepare operation returns without promotion. The operator MUST refresh
+   the local route projection on every surviving voter.
+10. A separate explicit promotion operation revalidates the incarnation,
+   confirms that the obsolete voter is absent, rechecks Raft and product MVCC
+   catch-up, and adds the fresh Raft ID to the voter set through joint
+   consensus.
+
+The prepare and promotion phases MUST be idempotent. A retry with the new
+control record installed but the obsolete voter still present completes its
+removal. A retry with the fresh ID installed as a learner resumes catch-up. A
+retry after promotion refreshes local routes and returns success. Promotion
+MUST NOT be hidden inside the prepare call because the leader cannot infer that
+every other survivor has refreshed its process-local route projection.
+
+Every retry validates its caller-supplied IDs against the retained replacement
+transition before changing membership or local authorization routes. The
+obsolete ID is never inferred from the already-overwritten current node tuple
+and is never trusted solely because a caller supplied it. The compact
+transition is retained after promotion for idempotent retries and is replaced
+by the next accepted clean-disk replacement of that logical node.
+
+An obsolete Raft ID is also inserted into a consensus-retained retired-ID set.
+Retired IDs MUST never be allocated to any logical node again, including the
+same logical node in a later replacement. Retaining only the latest transition
+is not sufficient fencing: after two replacements, an older disk may still
+reappear with the first durable Raft identity.
+
+Installing an advanced node incarnation also advances every authoritative
+partition still owned by an older incarnation of the same logical node. This
+reconciliation is independently retryable: an exact node-install retry MUST
+continue scanning and moving stale partition assignments rather than returning
+early merely because the new node tuple is already installed.
+
+The checkpoint is a bounded state transfer, not retained transaction history.
+GC continues to prune old row versions, decision records, and bundle bodies.
+A retry may install a newer checkpoint only when its decision watermark does
+not move the replacement backwards; exact checkpoint retries are content
+identified and idempotent. The apply worker remains alive while an empty
+replacement is below the cluster GC watermark so checkpoint installation can
+repair that state, then resumes ordered deltas.
 
 ## 22. Garbage Collection
 
@@ -1528,6 +1686,15 @@ An uncommitted prepared bundle may be removed when:
 - no committed certification result references it;
 - its preparation retention period expired;
 - no active certification attempt may still refer to it.
+
+Once a coordinator-local draft has durably entered `Committing`, both its
+snapshot/conflict-history pin and its prepared-bundle transaction-identity pin
+remain active independently of the client transaction TTL. Expiry, process
+restart, and loss of an in-memory coordinator cannot release either pin.
+Terminal resolution to a recorded committed or aborted outcome is required
+before normal retention and GC policy may release them. This prevents MVCC
+history needed for deterministic retry or the already-prepared immutable bundle
+from being collected while the certification outcome is unknown.
 
 ### 22.2 Shard GC
 

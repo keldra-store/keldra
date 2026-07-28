@@ -1761,6 +1761,11 @@ impl AdminService for AppState {
         &self,
         request: Request<ReplaceClusterNodeIncarnationRequest>,
     ) -> Result<Response<AdminMutationResponse>, Status> {
+        if !crate::mvcc_control_plane::DYNAMIC_CLUSTER_MEMBERSHIP_ENABLED {
+            return Err(Status::unimplemented(
+                "clean-disk replacement and dynamic cluster membership are not supported in Anvil v0.4.0",
+            ));
+        }
         let principal = require_admin(&request, self, SystemAdminRelation::ManageNodes).await?;
         let claims = request
             .extensions()
@@ -1775,6 +1780,8 @@ impl AdminService for AppState {
             ));
         }
         if req.raft_node_id == 0
+            || req.replaced_raft_node_id == 0
+            || req.raft_node_id == req.replaced_raft_node_id
             || req.node_id.trim().is_empty()
             || req.incarnation == 0
             || req.failure_domain.trim().is_empty()
@@ -1782,6 +1789,11 @@ impl AdminService for AppState {
         {
             return Err(Status::invalid_argument(
                 "replacement requires non-zero Raft/incarnation IDs, logical node ID, failure domain and endpoint",
+            ));
+        }
+        if req.install_control && req.promote_to_voter {
+            return Err(Status::invalid_argument(
+                "replacement preparation and voter promotion are separate phases",
             ));
         }
         let authorization = crate::mvcc_control_plane::authorize_node_control(
@@ -1795,28 +1807,40 @@ impl AdminService for AppState {
             node_id: req.node_id.clone(),
             incarnation: req.incarnation,
         };
-        if req.install_control {
+        if req.promote_to_voter {
             self.mvcc
-                .install_cluster_node(
+                .promote_cluster_node_replacement(
                     &authorization,
+                    req.replaced_raft_node_id,
                     req.raft_node_id,
-                    node.clone(),
-                    req.failure_domain.clone(),
+                    &node,
+                    &req.failure_domain,
+                    req.endpoint.clone(),
                 )
                 .await
                 .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        } else if req.install_control {
             self.mvcc
-                .replace_cluster_endpoint(
+                .prepare_cluster_node_replacement(
                     &authorization,
+                    req.replaced_raft_node_id,
                     req.raft_node_id,
                     &node,
+                    &req.failure_domain,
                     req.endpoint.clone(),
                 )
                 .await
                 .map_err(|error| Status::failed_precondition(error.to_string()))?;
         } else {
             self.mvcc
-                .replace_local_replication_route(&authorization, &node, req.endpoint.clone())
+                .replace_local_replication_route(
+                    &authorization,
+                    req.replaced_raft_node_id,
+                    req.raft_node_id,
+                    &node,
+                    &req.failure_domain,
+                    req.endpoint.clone(),
+                )
                 .map_err(|error| Status::failed_precondition(error.to_string()))?;
         }
         let resource_id = format!(
@@ -1831,12 +1855,14 @@ impl AdminService for AppState {
             &resource_id,
             json!({
                 "cluster_id": req.cluster_id,
+                "replaced_raft_node_id": req.replaced_raft_node_id,
                 "raft_node_id": req.raft_node_id,
                 "node_id": req.node_id,
                 "incarnation": req.incarnation,
                 "failure_domain": req.failure_domain,
                 "endpoint": req.endpoint,
                 "installed_control": req.install_control,
+                "promoted_to_voter": req.promote_to_voter,
             }),
         )
         .await?;

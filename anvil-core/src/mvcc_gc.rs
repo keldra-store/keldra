@@ -11,6 +11,10 @@ use crate::{
     mvcc_transaction::CommitVersion,
 };
 
+/// v0.4.0 retains every MVCC version and physical payload. Re-enable this only
+/// after replica pin freshness and crash-safe cleanup are proven end to end.
+pub const MVCC_GARBAGE_COLLECTION_ENABLED: bool = false;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GarbageCollectionProposal {
     pub current_watermark: CommitVersion,
@@ -75,6 +79,9 @@ pub async fn advance_garbage_collection_watermark(
     cluster_id_hash: [u8; 32],
     proposal: &GarbageCollectionProposal,
 ) -> Result<CommitVersion> {
+    if !MVCC_GARBAGE_COLLECTION_ENABLED {
+        bail!("MVCC garbage collection is disabled in Anvil v0.4.0");
+    }
     if proposal.watermark < proposal.current_watermark {
         return Err(GarbageCollectionSafetyError::WatermarkMovedBackwards {
             current: ConsensusVersion(proposal.current_watermark),

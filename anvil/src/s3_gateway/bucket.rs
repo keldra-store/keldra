@@ -1428,13 +1428,35 @@ mod list_bucket_pagination_tests {
     }
 }
 
-pub(super) async fn readiness_check(State(state): State<AppState>) -> Response {
+pub(super) async fn readiness_check(
+    State(state): State<AppState>,
+    Extension(public_readiness): Extension<crate::startup_readiness::PublicReadiness>,
+) -> Response {
     let coremeta = state.core_store.coremeta_recovery_snapshot();
-    if coremeta.ready {
+    let mvcc_apply_ready = public_readiness.mvcc_apply_ready();
+    let system_realm_ready = public_readiness.system_realm_ready();
+    let system_realm_error = state
+        .system_realm_is_bootstrapped()
+        .err()
+        .map(|error| error.to_string());
+    if coremeta.ready && public_readiness.public_api_ready() {
         (axum::http::StatusCode::OK, "READY").into_response()
     } else {
         let body = serde_json::json!({
             "status": "not_ready",
+            "consensus": {
+                "ready": public_readiness.consensus_ready(),
+                "confirmed_commit_version": public_readiness.confirmed_commit_version(),
+            },
+            "mvcc_apply": {
+                "ready": mvcc_apply_ready,
+                "applied_watermark": state.mvcc.apply_worker_applied_watermark(),
+                "observed_commit_version": state.mvcc.observed_commit_version(),
+            },
+            "system_realm": {
+                "ready": system_realm_ready,
+                "last_error": system_realm_error,
+            },
             "coremeta": {
                 "ready": coremeta.ready,
                 "distributed_required": coremeta.distributed_required,

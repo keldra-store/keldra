@@ -960,10 +960,66 @@ async fn public_erasure_object_retries_after_remote_shard_crash_before_sync() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "clean-disk replacement and dynamic membership are not supported in v0.4.0"]
 async fn killed_node_is_replaced_by_higher_incarnation_and_catches_up() {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_anvil-server"));
     let mut cluster = ProcessMvccCluster::start(binary).await.unwrap();
     let old_leader = cluster.wait_for_leader(&[0, 1, 2]).await.unwrap();
+    let bucket_name = format!("replacement-checkpoint-{}", uuid::Uuid::new_v4().simple());
+    let object_key = "state/before-replacement.bin";
+    let payload = b"ordinary MVCC state must survive clean-disk replacement";
+    let bucket_id = cluster
+        .create_bucket(old_leader, &bucket_name)
+        .await
+        .unwrap();
+    let transaction = cluster
+        .begin_transaction(old_leader, MvccReadConsistency::Linearized)
+        .await
+        .unwrap();
+    cluster
+        .stage_object_puts(
+            old_leader,
+            &bucket_name,
+            bucket_id,
+            &transaction.transaction_id,
+            &[(object_key, payload.as_slice())],
+        )
+        .await
+        .unwrap();
+    let committed = cluster
+        .commit_transaction(
+            cluster.public_endpoint(old_leader),
+            transaction.transaction_id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(committed.state, WriteState::Committed as i32);
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let mut visible_everywhere = true;
+            for node in 0..3 {
+                if !cluster
+                    .read_object(node, &bucket_name, object_key)
+                    .await
+                    .is_ok_and(|bytes| bytes.as_slice() == payload)
+                {
+                    visible_everywhere = false;
+                    break;
+                }
+            }
+            if visible_everywhere {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("pre-replacement product state is visible on every original node");
+    // The coordinator runs once per second. Give it multiple complete rounds
+    // so the replacement exercises checkpoint restore after old decisions and
+    // row versions are eligible for GC, not merely replay from position zero.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
     let replaced = (0..3).find(|node| *node != old_leader).unwrap();
     cluster.sigkill(replaced).await.unwrap();
 
@@ -983,6 +1039,7 @@ async fn killed_node_is_replaced_by_higher_incarnation_and_catches_up() {
             .await
             .unwrap();
     }
+    cluster.promote_replacement(leader, replaced).await.unwrap();
 
     let before = cluster
         .begin_transaction(leader, MvccReadConsistency::Linearized)
@@ -1009,6 +1066,11 @@ async fn killed_node_is_replaced_by_higher_incarnation_and_catches_up() {
     .await
     .expect("higher incarnation catches up and serves its applied snapshot");
     assert_eq!(replacement.state, "open");
+    let restored = cluster
+        .read_object(replaced, &bucket_name, object_key)
+        .await
+        .expect("replacement restores pre-GC product state from the MVCC checkpoint");
+    assert_eq!(restored.as_slice(), payload);
 
     let obsolete_endpoint = cluster.spawn_obsolete_incarnation(replaced).await.unwrap();
     let obsolete_local = tokio::time::timeout(Duration::from_secs(10), async {

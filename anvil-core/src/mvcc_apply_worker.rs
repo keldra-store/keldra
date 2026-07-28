@@ -1,6 +1,12 @@
 //! Ordered application of committed, metadata-only Raft decisions.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use anvil_mvcc_consensus::{
     AppliedDecision, BundleHash, CommitVersion, ConsensusError, LocalDurabilityViolation,
@@ -12,7 +18,6 @@ use tokio::sync::{Mutex, watch};
 
 use crate::{
     bundle_replication::AppendOnlyPreparedBundleStore,
-    mvcc_open_transactions::OpenTransactionRegistry,
     mvcc_store::{LocalDurabilityViolationRecord, LocalMvccStore},
     mvcc_transaction::NodeIncarnation,
     mvcc_transaction::{BundleIdentity, PreparedBundleStore, TransactionBundle},
@@ -21,9 +26,47 @@ use crate::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApplyWorkerState {
+    CatchingUp,
     Running,
+    Retrying(String),
     Stopped,
     Unrecoverable(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct ApplyWorkerReadiness {
+    healthy: Arc<AtomicBool>,
+    applied_watermark: Arc<AtomicU64>,
+}
+
+impl Default for ApplyWorkerReadiness {
+    fn default() -> Self {
+        Self {
+            healthy: Arc::new(AtomicBool::new(false)),
+            applied_watermark: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+impl ApplyWorkerReadiness {
+    pub fn is_ready_at(&self, observed_commit: CommitVersion) -> bool {
+        self.healthy.load(Ordering::Acquire)
+            && self.applied_watermark.load(Ordering::Acquire) >= observed_commit.0
+    }
+
+    pub fn applied_watermark(&self) -> u64 {
+        self.applied_watermark.load(Ordering::Acquire)
+    }
+
+    fn mark_ready(&self, applied_watermark: u64) {
+        self.applied_watermark
+            .store(applied_watermark, Ordering::Release);
+        self.healthy.store(true, Ordering::Release);
+    }
+
+    fn mark_unready(&self) {
+        self.healthy.store(false, Ordering::Release);
+    }
 }
 
 pub struct MvccApplyWorker {
@@ -31,13 +74,11 @@ pub struct MvccApplyWorker {
     cluster_id: String,
     prepared: AppendOnlyPreparedBundleStore,
     replication: TonicReplicationStreamManager,
-    peers: Arc<[NodeIncarnation]>,
     local: LocalMvccStore,
     cluster_id_hash: [u8; 32],
     state: Arc<Mutex<ApplyWorkerState>>,
-    prepared_bundle_gc_grace_ms: Option<u64>,
+    readiness: ApplyWorkerReadiness,
     shard_transfers: Option<Arc<std::sync::Mutex<crate::replication::TransferReceiver>>>,
-    open_transactions: Option<Arc<OpenTransactionRegistry>>,
 }
 
 pub trait DecisionSource: Send + Sync {
@@ -83,7 +124,6 @@ impl MvccApplyWorker {
         cluster_id: impl Into<String>,
         prepared: AppendOnlyPreparedBundleStore,
         replication: TonicReplicationStreamManager,
-        peers: impl Into<Arc<[NodeIncarnation]>>,
         local: LocalMvccStore,
     ) -> Self {
         let cluster_id = cluster_id.into();
@@ -93,32 +133,14 @@ impl MvccApplyWorker {
             cluster_id,
             prepared,
             replication,
-            peers: peers.into(),
             local,
             state: Arc::new(Mutex::new(ApplyWorkerState::Stopped)),
-            prepared_bundle_gc_grace_ms: None,
+            readiness: ApplyWorkerReadiness::default(),
             shard_transfers: None,
-            open_transactions: None,
         }
     }
 
-    pub fn with_open_transactions(
-        mut self,
-        open_transactions: Arc<OpenTransactionRegistry>,
-    ) -> Self {
-        self.open_transactions = Some(open_transactions);
-        self
-    }
-
-    pub fn with_prepared_bundle_gc_grace(mut self, grace_ms: u64) -> Result<Self> {
-        if grace_ms == 0 {
-            bail!("prepared bundle GC grace must be non-zero");
-        }
-        self.prepared_bundle_gc_grace_ms = Some(grace_ms);
-        Ok(self)
-    }
-
-    pub fn with_shard_transfer_retirement(
+    pub fn with_shard_transfer_receiver(
         mut self,
         receiver: Arc<std::sync::Mutex<crate::replication::TransferReceiver>>,
     ) -> Self {
@@ -130,20 +152,41 @@ impl MvccApplyWorker {
         self.state.clone()
     }
 
+    pub fn readiness_handle(&self) -> ApplyWorkerReadiness {
+        self.readiness.clone()
+    }
+
     pub async fn run(self, mut shutdown: watch::Receiver<bool>) {
-        *self.state.lock().await = ApplyWorkerState::Running;
+        self.readiness.mark_unready();
+        *self.state.lock().await = ApplyWorkerState::CatchingUp;
         loop {
             if *shutdown.borrow() {
+                self.readiness.mark_unready();
                 *self.state.lock().await = ApplyWorkerState::Stopped;
                 return;
             }
             match self.apply_available().await {
-                Ok(_) => {}
+                Ok(_) => match self.local.decision_watermark() {
+                    Ok(applied_watermark) => {
+                        self.readiness.mark_ready(applied_watermark);
+                        let mut state = self.state.lock().await;
+                        if !matches!(*state, ApplyWorkerState::Running) {
+                            *state = ApplyWorkerState::Running;
+                        }
+                    }
+                    Err(error) => {
+                        self.readiness.mark_unready();
+                        *self.state.lock().await = ApplyWorkerState::Retrying(error.to_string());
+                    }
+                },
                 Err(error) if is_unrecoverable(&error) => {
+                    self.readiness.mark_unready();
                     *self.state.lock().await = ApplyWorkerState::Unrecoverable(error.to_string());
-                    return;
                 }
-                Err(_) => {}
+                Err(error) => {
+                    self.readiness.mark_unready();
+                    *self.state.lock().await = ApplyWorkerState::Retrying(error.to_string());
+                }
             }
             tokio::select! {
                 _ = shutdown.changed() => {}
@@ -225,91 +268,9 @@ impl MvccApplyWorker {
             crate::perf::record_mvcc_state(watermark.0, observed_commit.0, 0);
             applied += 1;
         }
-        let should_advance_gc = self.local.gc_watermark()? < gc.0;
-        let mut advanced_gc = false;
-        if should_advance_gc {
-            if let Some(open_transactions) = &self.open_transactions {
-                let gate = open_transactions.snapshot_gc_gate();
-                let _gc_guard = gate.lock().await;
-                let oldest_pin = open_transactions
-                    .active_snapshot_pins(unix_time_ms()?)?
-                    .into_iter()
-                    .next();
-                if oldest_pin.is_none_or(|pin| pin >= gc.0) {
-                    self.local
-                        .garbage_collect(gc.0)
-                        .context("apply consensus-approved MVCC GC watermark locally")?;
-                    advanced_gc = true;
-                } else {
-                    tracing::debug!(
-                        operation = "gc.apply",
-                        proposed_watermark = gc.0,
-                        oldest_active_snapshot = oldest_pin,
-                        "deferring local MVCC garbage collection behind durable snapshot pin"
-                    );
-                }
-            } else {
-                self.local
-                    .garbage_collect(gc.0)
-                    .context("apply consensus-approved MVCC GC watermark locally")?;
-                advanced_gc = true;
-            }
-        }
-        if advanced_gc && let Some(grace_ms) = self.prepared_bundle_gc_grace_ms {
-            let reachable_bundles = self
-                .consensus
-                .applied_decisions_after(CommitVersion(gc.0.saturating_sub(1)))?
-                .into_iter()
-                .filter_map(|decision| decision.committed_bundle)
-                .map(|bundle| bundle_identity(bundle.bundle_hash, bundle.bundle_length))
-                .collect::<Vec<_>>();
-            let unfinished_transaction_ids = self.local.unfinished_work_pins()?.transaction_ids;
-            let retain = self.prepared.retain_plan(
-                &reachable_bundles,
-                &unfinished_transaction_ids,
-                unix_time_ms()?,
-                grace_ms,
-            )?;
-            self.prepared.compact_authorised(&retain)?;
-        }
-        // This is intentionally retried even when the watermark did not move:
-        // a crash after MVCC GC but before physical unlink must converge on
-        // restart, and the receiver operation is idempotent.
-        if let Some(receiver) = &self.shard_transfers {
-            let local_node = self.replication.local_node();
-            let authorised = self.local.retirable_object_shard_transfers(local_node)?;
-            let protected = self.local.protected_object_shard_transfers(local_node)?;
-            let mut receiver = receiver
-                .lock()
-                .map_err(|_| anyhow!("replication receiver lock poisoned"))?;
-            let removed = receiver.retire_complete_object_shards(&authorised)?;
-            let orphaned = if let Some(grace_ms) = self.prepared_bundle_gc_grace_ms {
-                receiver.retire_orphan_provisional_object_shards(
-                    gc.0,
-                    unix_time_ms()?,
-                    grace_ms,
-                    &protected,
-                )?
-            } else {
-                0
-            };
-            if removed != 0 {
-                tracing::info!(
-                    operation = "gc.shard_transfer",
-                    removed_transfers = removed,
-                    gc_watermark = gc.0,
-                    "retired unreferenced physical shard transfers"
-                );
-            }
-            if orphaned != 0 {
-                tracing::info!(
-                    operation = "gc.provisional_shard",
-                    removed_transfers = orphaned,
-                    gc_watermark = gc.0,
-                    "retired orphan provisional shard transfers"
-                );
-            }
-        }
+        // v0.4.0 deliberately retains all MVCC versions, prepared bundles and
+        // physical shards. Automatic collection stays disabled until replica
+        // pin freshness and crash-safe cleanup have end-to-end coverage.
         Ok(applied)
     }
 
@@ -368,7 +329,10 @@ impl MvccApplyWorker {
             }
         }
         let mut failures = Vec::new();
-        let peers = durable_peer_candidates(&self.peers, durable_holders);
+        let routed = self
+            .replication
+            .routed_node_incarnations(&self.cluster_id)?;
+        let peers = durable_peer_candidates(&routed, durable_holders);
         if peers.is_empty() {
             bail!(
                 "canonical bundle {} is not locally available and no committed durable holder is reachable",
@@ -422,15 +386,6 @@ fn durable_peer_candidates<'a>(
         .collect()
 }
 
-fn unix_time_ms() -> Result<u64> {
-    u64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_millis(),
-    )
-    .context("system time exceeds u64 milliseconds")
-}
-
 fn bundle_identity(hash: BundleHash, length: u64) -> BundleIdentity {
     BundleIdentity {
         hash: format!("sha256:{}", hex::encode(hash.0)),
@@ -476,12 +431,7 @@ mod tests {
     use crate::{
         anvil_api::{ReplicationSessionOpen, replication_service_server::ReplicationServiceServer},
         bundle_replication::{BundleTarget, BundleTargetStream},
-        mvcc_node_runtime::CommitOutcome,
-        mvcc_open_transactions::TransactionRuntime,
-        mvcc_transaction::{
-            CertificationResult, DurabilityLevel, HierarchicalRangeStampScheme, LogicalKey,
-            ReadConsistency, TransactionBundleBuilder,
-        },
+        mvcc_transaction::{HierarchicalRangeStampScheme, LogicalKey, TransactionBundleBuilder},
         replication::AuthenticatedPeer,
         replication_client::{ReplicationPeer, ReplicationStreamOptions},
         services::replication::{ReplicationConnectionAuthorizer, ReplicationServiceImpl},
@@ -505,31 +455,6 @@ mod tests {
         decisions: StdMutex<Vec<AppliedDecision>>,
         gc: CommitVersion,
         violations: Vec<LocalDurabilityViolation>,
-    }
-
-    struct SnapshotRuntime(CommitVersion);
-
-    #[async_trait]
-    impl TransactionRuntime for SnapshotRuntime {
-        async fn transaction_snapshot(&self, _: ReadConsistency) -> Result<u64> {
-            Ok(self.0.0)
-        }
-
-        async fn commit_transaction_bundle(
-            &self,
-            _: TransactionBundle,
-            _: DurabilityLevel,
-        ) -> Result<CommitOutcome> {
-            unreachable!()
-        }
-
-        fn apply_transaction_decision(
-            &self,
-            _: TransactionBundle,
-            _: CertificationResult,
-        ) -> Result<CommitOutcome> {
-            unreachable!()
-        }
     }
 
     impl DecisionSource for Source {
@@ -604,7 +529,6 @@ mod tests {
                 ReplicationStreamOptions::default(),
             )
             .unwrap(),
-            Vec::<NodeIncarnation>::new(),
             local,
         )
     }
@@ -621,58 +545,6 @@ mod tests {
                 durable_holders: Vec::new(),
             }),
         }
-    }
-
-    #[tokio::test]
-    async fn durable_snapshot_pin_defers_local_consensus_gc_until_resolution() {
-        let prepared_directory = tempdir().unwrap();
-        let local_directory = tempdir().unwrap();
-        let registry_directory = tempdir().unwrap();
-        let prepared = AppendOnlyPreparedBundleStore::open(
-            prepared_directory.path(),
-            "cluster",
-            NodeIncarnation {
-                node_id: "node-a".into(),
-                incarnation: 1,
-            },
-            "zone-a",
-        )
-        .unwrap();
-        let local = LocalMvccStore::open(local_directory.path()).unwrap();
-        for position in 1..=8 {
-            local.advance_decision_watermark(position).unwrap();
-        }
-        let registry = Arc::new(OpenTransactionRegistry::open(registry_directory.path()).unwrap());
-        let now = unix_time_ms().unwrap();
-        let transaction = registry
-            .begin(
-                &SnapshotRuntime(CommitVersion(7)),
-                "cluster",
-                "principal",
-                "pin-before-gc",
-                Duration::from_secs(30),
-                DurabilityLevel::Quorum,
-                ReadConsistency::Linearized,
-                now,
-            )
-            .await
-            .unwrap();
-        let source = Arc::new(Source {
-            decisions: StdMutex::new(Vec::new()),
-            gc: CommitVersion(8),
-            violations: vec![],
-        });
-        let running =
-            worker(source, prepared, local.clone()).with_open_transactions(registry.clone());
-
-        assert_eq!(running.apply_available().await.unwrap(), 0);
-        assert_eq!(local.gc_watermark().unwrap(), 0);
-
-        registry
-            .rollback(&transaction.transaction_id, "principal", now + 1)
-            .unwrap();
-        assert_eq!(running.apply_available().await.unwrap(), 0);
-        assert_eq!(local.gc_watermark().unwrap(), 8);
     }
 
     #[tokio::test]
@@ -808,7 +680,6 @@ mod tests {
             "cluster",
             prepared.clone(),
             downloader,
-            [remote],
             local.clone(),
         );
 
@@ -900,7 +771,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn applies_consensus_gc_watermark_only_after_local_catch_up() {
+    async fn retains_physical_versions_when_consensus_has_a_gc_watermark() {
         let prepared_directory = tempdir().unwrap();
         let local_directory = tempdir().unwrap();
         let prepared = AppendOnlyPreparedBundleStore::open(
@@ -928,7 +799,7 @@ mod tests {
                 .unwrap(),
             0
         );
-        assert_eq!(local.gc_watermark().unwrap(), 1);
+        assert_eq!(local.gc_watermark().unwrap(), 0);
     }
 
     #[tokio::test]

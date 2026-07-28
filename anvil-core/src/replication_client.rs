@@ -194,6 +194,30 @@ impl TonicReplicationStreamManager {
         &self.local_node
     }
 
+    /// Snapshot the node incarnations in the current runtime route map.
+    ///
+    /// This projection changes when a clean-disk replacement is installed, so
+    /// callers must not keep bootstrap peer incarnations as routing authority.
+    pub fn routed_node_incarnations(&self, cluster_id: &str) -> Result<Vec<NodeIncarnation>> {
+        if cluster_id != &*self.cluster_id {
+            bail!("cross-cluster replication route inspection is forbidden");
+        }
+        let mut nodes = self
+            .peers
+            .read()
+            .map_err(|_| anyhow!("replication peer map lock poisoned"))?
+            .keys()
+            .filter(|(configured_cluster, _)| configured_cluster == cluster_id)
+            .map(|(_, node)| node.clone())
+            .collect::<Vec<_>>();
+        if !nodes.contains(&self.local_node) {
+            nodes.push(self.local_node.clone());
+        }
+        nodes.sort();
+        nodes.dedup();
+        Ok(nodes)
+    }
+
     /// Replaces the transport endpoint for one configured peer incarnation.
     ///
     /// The peer mutex serializes this topology transition with transfers. Any
@@ -623,14 +647,16 @@ impl TonicReplicationStreamManager {
             if watermark.persisted_through != bytes.len() as u64 || completed_hash != final_hash {
                 bail!("peer complete watermark differs from immutable transfer");
             }
-            return Ok(ReplicationAck {
-                session_id: session.session_id,
-                acknowledged_sequence: session.next_sequence.saturating_sub(1),
-                transfer_id,
-                persisted_through: watermark.persisted_through,
-                completed_hash: Some(completed_hash),
-                status: AckStatus::Complete,
-            });
+            if kind != ReplicationTransferKind::MvccCatchUp {
+                return Ok(ReplicationAck {
+                    session_id: session.session_id,
+                    acknowledged_sequence: session.next_sequence.saturating_sub(1),
+                    transfer_id,
+                    persisted_through: watermark.persisted_through,
+                    completed_hash: Some(completed_hash),
+                    status: AckStatus::Complete,
+                });
+            }
         }
 
         let mut offset = usize::try_from(watermark.persisted_through)
@@ -725,17 +751,63 @@ impl TonicReplicationStreamManager {
                 bail!("replication peer rejected transfer");
             }
             if finish {
-                if ack.status != AckStatus::Complete
+                let expected_status = if kind == ReplicationTransferKind::MvccCatchUp {
+                    AckStatus::Applied
+                } else {
+                    AckStatus::Complete
+                };
+                if ack.status != expected_status
                     || ack.persisted_through != bytes.len() as u64
                     || ack.completed_hash != Some(final_hash)
                 {
-                    bail!("final replication frame did not receive matching Complete ACK");
+                    bail!(
+                        "final replication frame did not receive matching {expected_status:?} ACK"
+                    );
                 }
                 return Ok(ack);
             }
             offset = usize::try_from(ack.persisted_through)
                 .context("ACK watermark does not fit client address space")?;
         }
+    }
+
+    /// Transfer a consistent local-MVCC checkpoint to a clean-disk replacement.
+    ///
+    /// A successful return requires an `Applied` ACK, not merely persistence of
+    /// the checkpoint bytes in the replication inbox.
+    pub async fn send_mvcc_checkpoint(
+        &self,
+        target: &NodeIncarnation,
+        decision_watermark: u64,
+        bytes: &[u8],
+    ) -> Result<ReplicationAck> {
+        if bytes.is_empty() {
+            bail!("MVCC checkpoint requires a non-empty payload");
+        }
+        let final_hash = *blake3::hash(bytes).as_bytes();
+        let identity = format!("mvcc-checkpoint/{decision_watermark}");
+        let transfer_id = deterministic_transfer_id(
+            ReplicationTransferKind::MvccCatchUp,
+            identity.as_bytes(),
+            final_hash,
+            bytes.len() as u64,
+        );
+        let ack = self
+            .transfer(
+                &self.cluster_id,
+                target,
+                identity,
+                ReplicationTransferKind::MvccCatchUp,
+                transfer_id,
+                bytes,
+                final_hash,
+                None,
+            )
+            .await?;
+        if ack.status != AckStatus::Applied {
+            bail!("MVCC checkpoint transfer completed without an Applied ACK");
+        }
+        Ok(ack)
     }
 }
 
@@ -1393,6 +1465,50 @@ mod tests {
             .expect("replication peer map lock poisoned");
         assert!(!peers.contains_key(&("cluster-a".into(), stale)));
         assert!(peers.contains_key(&("cluster-a".into(), replacement)));
+    }
+
+    #[test]
+    fn routed_incarnation_snapshot_tracks_replacement() {
+        let replacement = NodeIncarnation {
+            node_id: "node-b".into(),
+            incarnation: 2,
+        };
+        let manager = TonicReplicationStreamManager::new(
+            "cluster-a",
+            NodeIncarnation {
+                node_id: "node-a".into(),
+                incarnation: 1,
+            },
+            "test-token",
+            [ReplicationPeer {
+                cluster_id: "cluster-a".into(),
+                node: NodeIncarnation {
+                    node_id: "node-b".into(),
+                    incarnation: 1,
+                },
+                endpoint: "http://127.0.0.1:9".into(),
+            }],
+            ReplicationStreamOptions {
+                allow_insecure_transport_for_tests: true,
+                ..ReplicationStreamOptions::default()
+            },
+        )
+        .unwrap();
+
+        manager
+            .replace_peer_incarnation("cluster-a", &replacement, "http://127.0.0.1:10")
+            .unwrap();
+
+        assert_eq!(
+            manager.routed_node_incarnations("cluster-a").unwrap(),
+            vec![
+                NodeIncarnation {
+                    node_id: "node-a".into(),
+                    incarnation: 1,
+                },
+                replacement,
+            ]
+        );
     }
 
     #[tokio::test]

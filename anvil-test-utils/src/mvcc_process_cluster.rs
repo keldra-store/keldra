@@ -56,6 +56,7 @@ struct ProcessNode {
     api_addr: SocketAddr,
     admin_addr: SocketAddr,
     storage_path: PathBuf,
+    raft_node_id: u64,
     incarnation: u64,
     hard_crash_control_path: PathBuf,
     child: Option<Child>,
@@ -65,6 +66,7 @@ struct ProcessNode {
 struct ObsoleteNode {
     storage_path: PathBuf,
     peers_json: String,
+    raft_node_id: u64,
     incarnation: u64,
 }
 
@@ -114,6 +116,7 @@ impl ProcessMvccCluster {
                 api_addr,
                 admin_addr,
                 storage_path: directory.path().join(format!("node-{}", index + 1)),
+                raft_node_id: index as u64 + 1,
                 incarnation: 1,
                 hard_crash_control_path: directory
                     .path()
@@ -178,13 +181,15 @@ impl ProcessMvccCluster {
             .context("leader wait requires at least one live candidate")?;
         let factory = TonicConsensusRpcFactory::new(
             self.cluster_id.clone(),
-            NodeId(source as u64 + 1),
+            NodeId(self.nodes[source].raft_node_id),
             self.nodes[source].incarnation,
             "process-e2e-node-token",
             Duration::from_secs(1),
         );
-        let probe_payload = bincode::serde::encode_to_vec((), bincode::config::standard())
-            .context("encode process MVCC leader probe")?;
+        // ForwardLinearizedRead has no request body. The consensus handler
+        // rejects non-empty payloads, so the test probe exercises the same
+        // boundary as production follower forwarding.
+        let probe_payload = Vec::new();
         let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
         loop {
             for &node in candidates {
@@ -195,7 +200,7 @@ impl ProcessMvccCluster {
                     continue;
                 }
                 let mut client = factory.client(
-                    NodeId(node as u64 + 1),
+                    NodeId(candidate.raft_node_id),
                     &ConsensusNode {
                         address: self.public_endpoint(node),
                     },
@@ -1118,8 +1123,9 @@ impl ProcessMvccCluster {
         self.wait_for_admin(node).await
     }
 
-    /// Start a clean replacement process with the same logical and Raft node
-    /// IDs, endpoint and failure domain but a strictly newer incarnation.
+    /// Start a clean replacement process with the same logical node ID,
+    /// endpoint and failure domain, but a fresh Raft ID and strictly newer
+    /// product incarnation.
     pub async fn spawn_replacement(&mut self, node: usize, incarnation: u64) -> anyhow::Result<()> {
         if self.nodes[node].child.is_some() {
             bail!("replacement requires the old process to be stopped");
@@ -1127,11 +1133,24 @@ impl ProcessMvccCluster {
         if incarnation <= self.nodes[node].incarnation {
             bail!("replacement incarnation must advance");
         }
+        let replacement_raft_node_id =
+            self.nodes
+                .iter()
+                .map(|candidate| candidate.raft_node_id)
+                .chain(self.obsolete_nodes.iter().filter_map(|candidate| {
+                    candidate.as_ref().map(|obsolete| obsolete.raft_node_id)
+                }))
+                .max()
+                .unwrap_or_default()
+                .checked_add(1)
+                .context("process replacement Raft node ID overflow")?;
         self.obsolete_nodes[node] = Some(ObsoleteNode {
             storage_path: self.nodes[node].storage_path.clone(),
             peers_json: self.peers_json.clone(),
+            raft_node_id: self.nodes[node].raft_node_id,
             incarnation: self.nodes[node].incarnation,
         });
+        self.nodes[node].raft_node_id = replacement_raft_node_id;
         self.nodes[node].incarnation = incarnation;
         self.nodes[node].storage_path = self
             ._directory
@@ -1139,6 +1158,7 @@ impl ProcessMvccCluster {
             .join(format!("node-{}-incarnation-{incarnation}", node + 1));
         let mut peers: Vec<serde_json::Value> = serde_json::from_str(&self.peers_json)?;
         peers[node]["incarnation"] = serde_json::json!(incarnation);
+        peers[node]["raft_node_id"] = serde_json::json!(replacement_raft_node_id);
         self.peers_json = serde_json::to_string(&peers)?;
         self.spawn_node(node).await?;
         // This is a clean disk whose newer incarnation has not yet been
@@ -1169,7 +1189,7 @@ impl ProcessMvccCluster {
             .env("REGION", "process-e2e-region")
             .env("CELL_ID", format!("zone-{}", node + 1))
             .env("NODE_ID", format!("{}-node-{}", self.cluster_id, node + 1))
-            .env("MVCC_RAFT_NODE_ID", (node + 1).to_string())
+            .env("MVCC_RAFT_NODE_ID", obsolete.raft_node_id.to_string())
             .env("MVCC_NODE_INCARNATION", obsolete.incarnation.to_string())
             .env("MVCC_FAILURE_DOMAIN", format!("zone-{}", node + 1))
             .env("MVCC_PEERS_JSON", &obsolete.peers_json)
@@ -1207,32 +1227,76 @@ impl ProcessMvccCluster {
         replaced_node: usize,
         install_control: bool,
     ) -> anyhow::Result<()> {
-        let mut client =
-            AdminServiceClient::connect(format!("http://{}", self.nodes[coordinator].admin_addr))
-                .await?;
-        client
-            .replace_cluster_node_incarnation(authorized(
-                ReplaceClusterNodeIncarnationRequest {
-                    context: Some(AdminRequestContext {
-                        request_id: uuid::Uuid::new_v4().to_string(),
-                        idempotency_key: uuid::Uuid::new_v4().to_string(),
-                        audit_reason: "process MVCC incarnation replacement acceptance".into(),
-                        expected_generation: self.nodes[replaced_node]
-                            .incarnation
-                            .saturating_sub(1),
-                    }),
-                    cluster_id: self.cluster_id.clone(),
-                    raft_node_id: replaced_node as u64 + 1,
-                    node_id: format!("{}-node-{}", self.cluster_id, replaced_node + 1),
-                    incarnation: self.nodes[replaced_node].incarnation,
-                    failure_domain: format!("zone-{}", replaced_node + 1),
-                    endpoint: self.public_endpoint(replaced_node),
-                    install_control,
-                },
-                &self.admin_token,
-            ))
-            .await?;
-        Ok(())
+        self.submit_replacement_phase(coordinator, replaced_node, install_control, false)
+            .await
+    }
+
+    /// Explicitly promote a prepared learner after every surviving voter has
+    /// refreshed its local runtime route projection.
+    pub async fn promote_replacement(
+        &self,
+        coordinator: usize,
+        replaced_node: usize,
+    ) -> anyhow::Result<()> {
+        self.submit_replacement_phase(coordinator, replaced_node, false, true)
+            .await
+    }
+
+    async fn submit_replacement_phase(
+        &self,
+        coordinator: usize,
+        replaced_node: usize,
+        install_control: bool,
+        promote_to_voter: bool,
+    ) -> anyhow::Result<()> {
+        let endpoint = format!("http://{}", self.nodes[coordinator].admin_addr);
+        let replaced_raft_node_id = self.obsolete_nodes[replaced_node]
+            .as_ref()
+            .context("replacement has no obsolete Raft identity")?
+            .raft_node_id;
+        let request = ReplaceClusterNodeIncarnationRequest {
+            context: Some(AdminRequestContext {
+                request_id: uuid::Uuid::new_v4().to_string(),
+                idempotency_key: uuid::Uuid::new_v4().to_string(),
+                audit_reason: "process MVCC incarnation replacement acceptance".into(),
+                expected_generation: self.nodes[replaced_node].incarnation.saturating_sub(1),
+            }),
+            cluster_id: self.cluster_id.clone(),
+            raft_node_id: self.nodes[replaced_node].raft_node_id,
+            node_id: format!("{}-node-{}", self.cluster_id, replaced_node + 1),
+            incarnation: self.nodes[replaced_node].incarnation,
+            failure_domain: format!("zone-{}", replaced_node + 1),
+            endpoint: self.public_endpoint(replaced_node),
+            install_control,
+            replaced_raft_node_id,
+            promote_to_voter,
+        };
+        let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+        loop {
+            let mut client = AdminServiceClient::connect(endpoint.clone()).await?;
+            match client
+                .replace_cluster_node_incarnation(authorized(request.clone(), &self.admin_token))
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(status)
+                    if !install_control
+                        && !promote_to_voter
+                        && status.code() == tonic::Code::FailedPrecondition
+                        && status
+                            .message()
+                            .contains("replacement incarnation is not committed") =>
+                {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(status).context(
+                            "follower did not apply replacement control before route timeout",
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(status) => return Err(status.into()),
+            }
+        }
     }
 
     async fn spawn_node(&mut self, node: usize) -> anyhow::Result<()> {
@@ -1246,14 +1310,20 @@ impl ProcessMvccCluster {
             .env("REGION", "process-e2e-region")
             .env("CELL_ID", format!("zone-{}", node + 1))
             .env("NODE_ID", format!("{}-node-{}", self.cluster_id, node + 1))
-            .env("MVCC_RAFT_NODE_ID", (node + 1).to_string())
+            .env(
+                "MVCC_RAFT_NODE_ID",
+                self.nodes[node].raft_node_id.to_string(),
+            )
             .env(
                 "MVCC_NODE_INCARNATION",
                 self.nodes[node].incarnation.to_string(),
             )
             .env("MVCC_FAILURE_DOMAIN", format!("zone-{}", node + 1))
             .env("MVCC_PEERS_JSON", &self.peers_json)
-            .env("MVCC_BOOTSTRAP_MEMBERSHIP", (node == 0).to_string())
+            .env(
+                "MVCC_BOOTSTRAP_MEMBERSHIP",
+                (node == 0 && self.nodes[node].incarnation == 1).to_string(),
+            )
             .env("MVCC_RAFT_GROUP_ID", "1")
             .env("MVCC_CLUSTER_ID", &self.cluster_id)
             .env("MVCC_BUNDLE_QUORUM_HOLDERS", "2")
@@ -1272,6 +1342,10 @@ impl ProcessMvccCluster {
             )
             .env("ANVIL_TEST_ENABLE_PROCESS_HARD_CRASH", "1")
             .env("ANVIL_TEST_ALLOW_INSECURE_MVCC_TRANSPORT", "1")
+            .env(
+                "ANVIL_MVCC_HARD_CRASH_CONTROL_FILE",
+                &self.nodes[node].hard_crash_control_path,
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

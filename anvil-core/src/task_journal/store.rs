@@ -23,10 +23,14 @@ use crate::{
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Duration};
 
 const MAX_TASK_PAGE_ROWS: usize = 1_000;
 const MAX_QUEUE_CAS_ATTEMPTS: usize = 64;
+// Task mutations stage several durable rows and may queue behind other
+// producers. They are internal maintenance transactions, not abandoned client
+// drafts, so their expiry budget must cover bounded serialization under load.
+const TASK_MUTATION_TRANSACTION_TTL: Duration = Duration::from_secs(5 * 60);
 const TASK_JOURNAL_HEAD_SCHEMA: &str = "anvil.task.journal-head.v2";
 const TASK_JOURNAL_EVENT_SCHEMA: &str = "anvil.task.journal-event.v2";
 const TASK_JOURNAL_STREAM_ID: &str = "task_queue:global";
@@ -468,7 +472,7 @@ async fn commit_task_mutation(
             mvcc.cluster_id(),
             &principal,
             idempotency_key,
-            std::time::Duration::from_secs(30),
+            TASK_MUTATION_TRANSACTION_TTL,
             crate::mvcc_transaction::DurabilityLevel::Quorum,
             ReadConsistency::Linearized,
             now,

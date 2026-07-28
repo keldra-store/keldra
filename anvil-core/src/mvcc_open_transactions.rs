@@ -214,16 +214,40 @@ impl OpenTransactionRegistry {
         for row in self.db.iterator_cf(cf, IteratorMode::Start) {
             let (_, value) = row?;
             let draft: Draft = serde_json::from_slice(&value)?;
-            if draft.expires_at_unix_ms > now_unix_ms
-                && matches!(
-                    draft.state,
-                    DraftState::Open | DraftState::Committing { .. }
-                )
+            // TTL closes a draft which has not started committing. Once the
+            // durable state is `Committing`, certification owns resolution
+            // and the snapshot must stay pinned regardless of elapsed client
+            // TTL; otherwise GC can discard conflict/MVCC history underneath
+            // an in-flight commit.
+            if matches!(&draft.state, DraftState::Committing { .. })
+                || (matches!(&draft.state, DraftState::Open)
+                    && draft.expires_at_unix_ms > now_unix_ms)
             {
                 snapshots.insert(draft.snapshot_version);
             }
         }
         Ok(snapshots)
+    }
+
+    /// Returns transaction identities whose canonical bundle may already have
+    /// been prepared but is not yet represented by locally applied
+    /// post-commit work.
+    ///
+    /// `commit` persists `Committing` before handing the bundle to the runtime.
+    /// Prepared-bundle GC must retain these identities: otherwise a concurrent
+    /// GC pass can unlink the bundle after local persistence but before the
+    /// compact consensus decision and its materialisation jobs are applied.
+    pub fn prepared_bundle_transaction_pins(&self) -> Result<BTreeSet<String>> {
+        let cf = self.cf(CF_TRANSACTIONS)?;
+        let mut transactions = BTreeSet::new();
+        for row in self.db.iterator_cf(cf, IteratorMode::Start) {
+            let (_, value) = row?;
+            let draft: Draft = serde_json::from_slice(&value)?;
+            if matches!(draft.state, DraftState::Committing { .. }) {
+                transactions.insert(draft.transaction_id);
+            }
+        }
+        Ok(transactions)
     }
 
     pub async fn begin(
@@ -1520,6 +1544,15 @@ mod tests {
                 .unwrap()
         });
         runtime.first_started.notified().await;
+        assert_eq!(
+            registry.active_snapshot_pins(50_000).unwrap(),
+            BTreeSet::from([handle.snapshot_version]),
+            "a committing transaction remains pinned after its client TTL"
+        );
+        assert_eq!(
+            registry.prepared_bundle_transaction_pins().unwrap(),
+            BTreeSet::from([handle.transaction_id.clone()])
+        );
         let status = registry
             .status_by_idempotency("cluster", "resume", "alice", 12)
             .unwrap()
@@ -1537,6 +1570,13 @@ mod tests {
             retry.certification,
             CertificationResult::Committed { commit_version: 12 }
         );
+        assert!(
+            registry
+                .prepared_bundle_transaction_pins()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(registry.active_snapshot_pins(50_000).unwrap().is_empty());
     }
 
     #[tokio::test]

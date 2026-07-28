@@ -8,8 +8,8 @@
 use std::collections::BTreeSet;
 
 use anvil_mvcc_consensus::{
-    CommitVersion, ConsensusNode, ControlApplyResult, NodeId,
-    NodeIncarnation as ConsensusNodeIncarnation,
+    AppliedControlSnapshot, CommitVersion, ConsensusNode, ControlApplyResult, NodeId,
+    NodeIncarnation as ConsensusNodeIncarnation, NodeReplacementTransition,
 };
 use anyhow::{Context, Result, bail};
 use tonic::Status;
@@ -21,6 +21,69 @@ use crate::{
     storage::Storage,
     system_realm::{SYSTEM_NAMESPACE, SYSTEM_OBJECT_ID},
 };
+
+/// v0.4.0 supports only the fixed voter set supplied at initial cluster
+/// bootstrap. Clean-disk replacement and runtime membership changes remain
+/// unavailable until their recovery protocol is proven end to end.
+pub const DYNAMIC_CLUSTER_MEMBERSHIP_ENABLED: bool = false;
+
+fn require_dynamic_cluster_membership() -> Result<()> {
+    if !DYNAMIC_CLUSTER_MEMBERSHIP_ENABLED {
+        bail!("dynamic cluster membership is not supported in Anvil v0.4.0");
+    }
+    Ok(())
+}
+
+fn stale_replacement_partitions(
+    snapshot: &AppliedControlSnapshot,
+    installed: ConsensusNodeIncarnation,
+) -> Vec<(u64, anvil_mvcc_consensus::PartitionAssignment)> {
+    snapshot
+        .partitions
+        .iter()
+        .filter(|(_, assignment)| {
+            assignment.owner.node_id == installed.node_id && assignment.owner != installed
+        })
+        .cloned()
+        .collect()
+}
+
+fn authoritative_replacement_transition(
+    snapshot: &AppliedControlSnapshot,
+    node_id: NodeId,
+    replaced_raft_node_id: NodeId,
+    replacement_raft_node_id: NodeId,
+    replacement_incarnation: u64,
+) -> Result<NodeReplacementTransition> {
+    let transition = snapshot
+        .node_replacements
+        .iter()
+        .find(|transition| transition.node_id == node_id)
+        .copied()
+        .context("replacement identity transition is not installed in Raft control state")?;
+    if transition.replaced_raft_node_id != replaced_raft_node_id
+        || transition.replacement_raft_node_id != replacement_raft_node_id
+        || transition.replacement_incarnation != replacement_incarnation
+    {
+        bail!("replacement request does not match the Raft-authoritative identity transition");
+    }
+    if !snapshot
+        .retired_raft_node_ids
+        .contains(&transition.replaced_raft_node_id)
+    {
+        bail!("Raft-authoritative replacement did not retire its obsolete identity");
+    }
+    if snapshot
+        .nodes
+        .iter()
+        .any(|(installed_node_id, raft_node_id, _, _)| {
+            *installed_node_id != node_id && *raft_node_id == transition.replaced_raft_node_id
+        })
+    {
+        bail!("obsolete Raft node ID is now bound to another logical node");
+    }
+    Ok(transition)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClusterControlPermission {
@@ -144,6 +207,7 @@ impl MvccSubsystem {
         blocking: bool,
     ) -> Result<()> {
         authorization.require(self.cluster_id(), ClusterControlPermission::Nodes)?;
+        require_dynamic_cluster_membership()?;
         if raft_node_id == 0 || endpoint.trim().is_empty() {
             bail!("learner node ID and endpoint are required");
         }
@@ -166,6 +230,7 @@ impl MvccSubsystem {
         retain_removed_as_learners: bool,
     ) -> Result<()> {
         authorization.require(self.cluster_id(), ClusterControlPermission::Nodes)?;
+        require_dynamic_cluster_membership()?;
         if voters.is_empty() || voters.contains(&0) {
             bail!("the cluster voter set must contain non-zero node IDs");
         }
@@ -189,67 +254,48 @@ impl MvccSubsystem {
         failure_domain: String,
     ) -> Result<ControlApplyResult> {
         authorization.require(self.cluster_id(), ClusterControlPermission::Nodes)?;
+        require_dynamic_cluster_membership()?;
         let control_node_id = consensus_control_node_id(&node.node_id);
         let snapshot = self.consensus.applied_control_snapshot()?;
-        if snapshot
-            .nodes
-            .iter()
-            .any(|(id, installed_raft_id, incarnation, domain)| {
-                *id == control_node_id
-                    && installed_raft_id.0 == raft_node_id
-                    && *incarnation == node.incarnation
-                    && *domain == failure_domain
-            })
-        {
-            return Ok(ControlApplyResult::NodeInstalled(
-                ConsensusNodeIncarnation {
-                    node_id: control_node_id,
-                    incarnation: node.incarnation,
-                },
-            ));
-        }
-        let replaced = snapshot
-            .nodes
-            .iter()
-            .find(|(id, _raft_node_id, incarnation, _domain)| {
-                *id == control_node_id && *incarnation != node.incarnation
-            })
-            .map(|(_, _, incarnation, _)| ConsensusNodeIncarnation {
-                node_id: control_node_id,
-                incarnation: *incarnation,
-            });
         let installed = ConsensusNodeIncarnation {
             node_id: control_node_id,
             incarnation: node.incarnation,
         };
-        let result = self
-            .consensus
-            .install_node(
-                crate::mvcc_bootstrap::cluster_id_hash(self.cluster_id()),
-                installed,
-                NodeId(raft_node_id),
-                failure_domain,
-            )
-            .await
-            .context("install cluster node")?;
-        if let Some(replaced) = replaced {
-            for (partition_id, assignment) in snapshot
-                .partitions
+        let exact_retry =
+            snapshot
+                .nodes
                 .iter()
-                .filter(|(_, assignment)| assignment.owner == replaced)
-            {
-                self.consensus
-                    .assign_partition(
-                        crate::mvcc_bootstrap::cluster_id_hash(self.cluster_id()),
-                        *partition_id,
-                        installed,
-                        assignment.epoch.saturating_add(1),
-                    )
-                    .await
-                    .with_context(|| {
-                        format!("move partition {partition_id} to replacement node incarnation")
-                    })?;
-            }
+                .any(|(id, installed_raft_id, incarnation, domain)| {
+                    *id == control_node_id
+                        && installed_raft_id.0 == raft_node_id
+                        && *incarnation == node.incarnation
+                        && *domain == failure_domain
+                });
+        let result = if exact_retry {
+            ControlApplyResult::NodeInstalled(installed)
+        } else {
+            self.consensus
+                .install_node(
+                    crate::mvcc_bootstrap::cluster_id_hash(self.cluster_id()),
+                    installed,
+                    NodeId(raft_node_id),
+                    failure_domain,
+                )
+                .await
+                .context("install cluster node")?
+        };
+        for (partition_id, assignment) in stale_replacement_partitions(&snapshot, installed) {
+            self.consensus
+                .assign_partition(
+                    crate::mvcc_bootstrap::cluster_id_hash(self.cluster_id()),
+                    partition_id,
+                    installed,
+                    assignment.epoch.saturating_add(1),
+                )
+                .await
+                .with_context(|| {
+                    format!("move partition {partition_id} to replacement node incarnation")
+                })?;
         }
         Ok(result)
     }
@@ -263,6 +309,7 @@ impl MvccSubsystem {
         node: NodeIncarnation,
     ) -> Result<ControlApplyResult> {
         authorization.require(self.cluster_id(), ClusterControlPermission::Nodes)?;
+        require_dynamic_cluster_membership()?;
         let node = ConsensusNodeIncarnation {
             node_id: consensus_control_node_id(&node.node_id),
             incarnation: node.incarnation,
@@ -356,6 +403,9 @@ impl MvccSubsystem {
         watermark: CommitVersion,
     ) -> Result<ControlApplyResult> {
         authorization.require(self.cluster_id(), ClusterControlPermission::Partitions)?;
+        if !crate::mvcc_gc::MVCC_GARBAGE_COLLECTION_ENABLED {
+            bail!("MVCC garbage collection is disabled in Anvil v0.4.0");
+        }
         let current = self.consensus.gc_safety_watermark()?;
         if watermark == current {
             return Ok(ControlApplyResult::GcWatermarkAdvanced(current));
@@ -372,28 +422,258 @@ impl MvccSubsystem {
             .context("advance GC safety watermark")
     }
 
-    /// Replace both the data-stream route and the OpenRaft node route. The
-    /// latter is expressed as an idempotent learner metadata refresh and does
-    /// not change the voter set.
-    pub async fn replace_cluster_endpoint(
+    /// Fence a clean-disk replacement, remove the obsolete voter identity,
+    /// install the fresh identity as a caught-up learner, and stop before
+    /// promotion so operators can refresh every survivor's local routes.
+    pub async fn prepare_cluster_node_replacement(
         &self,
         authorization: &AuthorizedClusterControl,
+        replaced_raft_node_id: u64,
         raft_node_id: u64,
         node: &NodeIncarnation,
+        failure_domain: &str,
         endpoint: String,
     ) -> Result<()> {
         authorization.require(self.cluster_id(), ClusterControlPermission::Nodes)?;
+        require_dynamic_cluster_membership()?;
+        if replaced_raft_node_id == 0 || raft_node_id == 0 || replaced_raft_node_id == raft_node_id
+        {
+            bail!("clean-disk replacement requires distinct non-zero old and new Raft node IDs");
+        }
+        if self.local_node.node_id == node.node_id {
+            bail!("the current leader cannot replace its own clean-disk incarnation");
+        }
+        if !self.consensus.is_leader() {
+            bail!("replacement preparation must execute on the current cluster leader");
+        }
+        let _membership = self.membership_change_guard().await;
+        self.consensus
+            .linearized_read_barrier_locally()
+            .await
+            .context("confirm local leadership for replacement preparation")?;
+        let snapshot = self.consensus.applied_control_snapshot()?;
+        let control_node_id = consensus_control_node_id(&node.node_id);
+        let installed = snapshot
+            .nodes
+            .iter()
+            .find(|(node_id, _, _, _)| *node_id == control_node_id)
+            .context("replacement logical node is not installed in cluster control")?;
+        let replacement_is_installed = installed.1.0 == raft_node_id
+            && installed.2 == node.incarnation
+            && installed.3 == failure_domain;
+        if replacement_is_installed {
+            authoritative_replacement_transition(
+                &snapshot,
+                control_node_id,
+                NodeId(replaced_raft_node_id),
+                NodeId(raft_node_id),
+                node.incarnation,
+            )?;
+        } else {
+            if installed.1.0 != replaced_raft_node_id {
+                bail!("replacement old Raft node ID does not match cluster control");
+            }
+            if node.incarnation <= installed.2 {
+                bail!("replacement incarnation must advance");
+            }
+            if snapshot
+                .nodes
+                .iter()
+                .any(|(other_node_id, installed_raft_node_id, _, _)| {
+                    *other_node_id != control_node_id && installed_raft_node_id.0 == raft_node_id
+                })
+            {
+                bail!("replacement Raft node ID is already bound to another logical node");
+            }
+            if snapshot
+                .retired_raft_node_ids
+                .contains(&NodeId(raft_node_id))
+            {
+                bail!("retired Raft node IDs cannot be reused for a replacement");
+            }
+            if self
+                .consensus
+                .applied_member_ids()?
+                .contains(&NodeId(raft_node_id))
+            {
+                bail!("fresh replacement Raft node ID is already a voter or learner");
+            }
+        }
+        self.install_cluster_node(
+            authorization,
+            raft_node_id,
+            node.clone(),
+            failure_domain.to_string(),
+        )
+        .await?;
+
+        let installed_snapshot = self.consensus.applied_control_snapshot()?;
+        let transition = authoritative_replacement_transition(
+            &installed_snapshot,
+            control_node_id,
+            NodeId(replaced_raft_node_id),
+            NodeId(raft_node_id),
+            node.incarnation,
+        )?;
+        let authoritative_old_id = transition.replaced_raft_node_id;
+        let authoritative_new_id = transition.replacement_raft_node_id;
+        let mut voters = self.consensus.applied_voter_ids()?;
+        if voters.contains(&authoritative_old_id) && voters.contains(&authoritative_new_id) {
+            bail!("replacement and obsolete Raft voter IDs are both active");
+        }
+        if voters.contains(&authoritative_new_id) {
+            self.replace_runtime_peer_projection(
+                authoritative_old_id.0,
+                authoritative_new_id.0,
+                node,
+                failure_domain,
+                &endpoint,
+            )
+            .context("refresh completed replacement runtime routes")?;
+            return Ok(());
+        }
+
+        if voters.remove(&authoritative_old_id) {
+            if voters.is_empty() {
+                bail!("cannot replace the cluster's final Raft voter");
+            }
+            self.consensus
+                .change_membership(voters, false)
+                .await
+                .context("remove obsolete Raft voter before learner installation")?;
+        }
+        self.replace_runtime_peer_projection(
+            authoritative_old_id.0,
+            authoritative_new_id.0,
+            node,
+            failure_domain,
+            &endpoint,
+        )
+        .context("replace runtime routes and incarnation fence")?;
+
+        let checkpoint = self
+            .runtime
+            .local_store()
+            .export_checkpoint()
+            .context("capture replacement MVCC checkpoint")?;
+        let consensus_gc = self.consensus.gc_safety_watermark()?;
+        if checkpoint.decision_watermark < consensus_gc.0 {
+            bail!(
+                "replacement MVCC checkpoint watermark {} is below consensus GC watermark {}",
+                checkpoint.decision_watermark,
+                consensus_gc.0
+            );
+        }
+        let checkpoint_watermark = checkpoint.decision_watermark;
+        let checkpoint_bytes = checkpoint.encode().context("encode MVCC checkpoint")?;
         self.replication_client
-            .replace_peer_incarnation(self.cluster_id(), node, endpoint.clone())
-            .context("replace replication route and incarnation fence")?;
+            .send_mvcc_checkpoint(node, checkpoint_watermark, &checkpoint_bytes)
+            .await
+            .context("transfer and install replacement MVCC checkpoint")?;
+
         self.consensus
             .add_learner(
-                NodeId(raft_node_id),
+                authoritative_new_id,
                 ConsensusNode { address: endpoint },
                 true,
             )
             .await
-            .context("replace OpenRaft route")
+            .context("install fresh replacement as an OpenRaft learner")?;
+        let delta_barrier = self
+            .consensus
+            .linearized_read_barrier_locally()
+            .await
+            .context("capture post-checkpoint replacement delta barrier")?
+            .0;
+        self.wait_for_node_applied(authoritative_new_id, node.incarnation, delta_barrier)
+            .await
+            .context("wait for replacement MVCC checkpoint delta catch-up")
+    }
+
+    /// Promote a prepared replacement only after the caller has refreshed the
+    /// local route projection on every surviving voter.
+    pub async fn promote_cluster_node_replacement(
+        &self,
+        authorization: &AuthorizedClusterControl,
+        replaced_raft_node_id: u64,
+        raft_node_id: u64,
+        node: &NodeIncarnation,
+        failure_domain: &str,
+        endpoint: String,
+    ) -> Result<()> {
+        authorization.require(self.cluster_id(), ClusterControlPermission::Nodes)?;
+        require_dynamic_cluster_membership()?;
+        if replaced_raft_node_id == 0 || raft_node_id == 0 || replaced_raft_node_id == raft_node_id
+        {
+            bail!("replacement promotion requires distinct non-zero old and new Raft node IDs");
+        }
+        if !self.consensus.is_leader() {
+            bail!("replacement promotion must execute on the current cluster leader");
+        }
+        let _membership = self.membership_change_guard().await;
+        self.consensus
+            .linearized_read_barrier_locally()
+            .await
+            .context("confirm local leadership for replacement promotion")?;
+        let snapshot = self.consensus.applied_control_snapshot()?;
+        let control_node_id = consensus_control_node_id(&node.node_id);
+        let installed = snapshot.nodes.iter().any(
+            |(node_id, installed_raft_node_id, incarnation, installed_failure_domain)| {
+                *node_id == control_node_id
+                    && installed_raft_node_id.0 == raft_node_id
+                    && *incarnation == node.incarnation
+                    && installed_failure_domain == failure_domain
+            },
+        );
+        if !installed {
+            bail!("replacement must be prepared before voter promotion");
+        }
+        let transition = authoritative_replacement_transition(
+            &snapshot,
+            control_node_id,
+            NodeId(replaced_raft_node_id),
+            NodeId(raft_node_id),
+            node.incarnation,
+        )?;
+        let authoritative_old_id = transition.replaced_raft_node_id;
+        let authoritative_new_id = transition.replacement_raft_node_id;
+        let mut voters = self.consensus.applied_voter_ids()?;
+        if voters.contains(&authoritative_old_id) {
+            bail!("obsolete Raft voter is still present during replacement promotion");
+        }
+        self.replace_runtime_peer_projection(
+            authoritative_old_id.0,
+            authoritative_new_id.0,
+            node,
+            failure_domain,
+            &endpoint,
+        )
+        .context("refresh leader replacement runtime routes before promotion")?;
+        if voters.contains(&authoritative_new_id) {
+            return Ok(());
+        }
+        self.consensus
+            .add_learner(
+                authoritative_new_id,
+                ConsensusNode { address: endpoint },
+                true,
+            )
+            .await
+            .context("confirm replacement learner catch-up before promotion")?;
+        let delta_barrier = self
+            .consensus
+            .linearized_read_barrier_locally()
+            .await
+            .context("capture replacement promotion delta barrier")?
+            .0;
+        self.wait_for_node_applied(authoritative_new_id, node.incarnation, delta_barrier)
+            .await
+            .context("confirm replacement product MVCC catch-up before promotion")?;
+        voters.insert(authoritative_new_id);
+        self.consensus
+            .change_membership(voters, false)
+            .await
+            .context("promote fresh replacement Raft voter")
     }
 
     /// Replace only this coordinator's replication route after the cluster
@@ -402,28 +682,49 @@ impl MvccSubsystem {
     pub fn replace_local_replication_route(
         &self,
         authorization: &AuthorizedClusterControl,
+        replaced_raft_node_id: u64,
+        raft_node_id: u64,
         node: &NodeIncarnation,
+        failure_domain: &str,
         endpoint: String,
     ) -> Result<()> {
         authorization.require(self.cluster_id(), ClusterControlPermission::Nodes)?;
-        let installed = self.consensus.applied_control_snapshot()?.nodes.iter().any(
-            |(node_id, _raft_node_id, incarnation, _failure_domain)| {
-                *node_id == consensus_control_node_id(&node.node_id)
+        require_dynamic_cluster_membership()?;
+        let snapshot = self.consensus.applied_control_snapshot()?;
+        let control_node_id = consensus_control_node_id(&node.node_id);
+        let installed = snapshot.nodes.iter().any(
+            |(node_id, installed_raft_node_id, incarnation, installed_failure_domain)| {
+                *node_id == control_node_id
+                    && installed_raft_node_id.0 == raft_node_id
                     && *incarnation == node.incarnation
+                    && installed_failure_domain == failure_domain
             },
         );
         if !installed {
             bail!("replacement incarnation is not committed in local Raft control state");
         }
-        self.replication_client
-            .replace_peer_incarnation(self.cluster_id(), node, endpoint)
-            .context("replace local replication route and incarnation fence")
+        let transition = authoritative_replacement_transition(
+            &snapshot,
+            control_node_id,
+            NodeId(replaced_raft_node_id),
+            NodeId(raft_node_id),
+            node.incarnation,
+        )?;
+        self.replace_runtime_peer_projection(
+            transition.replaced_raft_node_id.0,
+            transition.replacement_raft_node_id.0,
+            node,
+            failure_domain,
+            &endpoint,
+        )
+        .context("replace local runtime routes and incarnation fence")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anvil_mvcc_consensus::{ConsensusDurabilityPolicy, PartitionAssignment};
 
     #[test]
     fn cluster_capabilities_are_cluster_and_permission_scoped() {
@@ -445,6 +746,55 @@ mod tests {
             nodes
                 .require("cluster-a", ClusterControlPermission::Policies)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn exact_install_retry_still_reconciles_stale_partition_incarnations() {
+        let logical_node = NodeId(7);
+        let installed = ConsensusNodeIncarnation {
+            node_id: logical_node,
+            incarnation: 2,
+        };
+        let snapshot = AppliedControlSnapshot {
+            topology_epoch: 3,
+            nodes: vec![(logical_node, NodeId(11), 2, "zone-a".into())],
+            retired_raft_node_ids: BTreeSet::new(),
+            node_replacements: Vec::new(),
+            partitions: vec![
+                (
+                    1,
+                    PartitionAssignment {
+                        owner: ConsensusNodeIncarnation {
+                            node_id: logical_node,
+                            incarnation: 1,
+                        },
+                        epoch: 4,
+                    },
+                ),
+                (
+                    2,
+                    PartitionAssignment {
+                        owner: installed,
+                        epoch: 5,
+                    },
+                ),
+            ],
+            durability_policy: ConsensusDurabilityPolicy::default(),
+        };
+
+        assert_eq!(
+            stale_replacement_partitions(&snapshot, installed),
+            vec![(
+                1,
+                PartitionAssignment {
+                    owner: ConsensusNodeIncarnation {
+                        node_id: logical_node,
+                        incarnation: 1,
+                    },
+                    epoch: 4,
+                },
+            )]
         );
     }
 }

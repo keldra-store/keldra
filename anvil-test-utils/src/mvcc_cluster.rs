@@ -114,6 +114,7 @@ impl RealMvccCluster {
                 mvcc_tolerated_failure_domains: 1,
                 mvcc_rpc_timeout_ms: 1_000,
                 mvcc_prepared_bundle_gc_grace_ms: 1,
+                mvcc_shard_gc_grace_ms: 1,
                 allow_test_only_insecure_mvcc_transport: true,
                 bootstrap_node_ids: (1..=3)
                     .map(|node| format!("{cluster_id}-node-{node}"))

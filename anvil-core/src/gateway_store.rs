@@ -486,12 +486,18 @@ pub async fn read_gateway_blob(
         &repository,
         digest,
     )?;
-    let bytes = CoreStore::new(storage.clone())
-        .await?
-        .get_blob(GetBlob {
-            object_ref: record.object_ref.clone(),
-        })
-        .await?;
+    let bytes = if let Some(bytes) =
+        crate::mvcc_physical_payload::read_mvcc_core_object_ref(mvcc, &record.object_ref).await?
+    {
+        bytes
+    } else {
+        CoreStore::new(storage.clone())
+            .await?
+            .get_blob(GetBlob {
+                object_ref: record.object_ref.clone(),
+            })
+            .await?
+    };
     let actual_digest = format!("sha256:{}", sha256_hex(&bytes));
     if actual_digest != record.digest || bytes.len() as u64 != record.size_bytes {
         bail!("gateway blob payload does not match its record");

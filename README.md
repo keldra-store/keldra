@@ -32,7 +32,7 @@ CoreStore is split into a metadata plane and a byte plane. CoreMeta uses RocksDB
 ## Release Surfaces
 
 - **Server:** Docker image and release binaries. The server crate is not published to crates.io.
-- **Rust client:** `anvil-storage = "0.3.0"` on crates.io.
+- **Rust client:** `anvil-storage = "0.4.0"` on crates.io.
 - **CLIs:** `anvil` for tenant/public operations and `anvil-admin` for private admin-plane operations.
 - **Documentation:** Fission static site in `documentation/`, published by a separate docs workflow.
 - **Protocol bindings:** generated gRPC bindings are packaged with the Rust client.
@@ -42,7 +42,7 @@ CoreStore is split into a metadata plane and a byte plane. CoreMeta uses RocksDB
 Anvil is Docker-first. Set `ANVIL_IMAGE` to the image published for the release you want to run, preferably pinned by tag or digest:
 
 ```sh
-export ANVIL_IMAGE="ghcr.io/worka-ai/anvil:v0.3.0"
+export ANVIL_IMAGE="ghcr.io/worka-ai/anvil:v0.4.0"
 docker pull "$ANVIL_IMAGE"
 ```
 
@@ -57,7 +57,7 @@ Add the Rust client to an application:
 
 ```toml
 [dependencies]
-anvil-storage = "0.3.0"
+anvil-storage = "0.4.0"
 ```
 
 Use the client with a bearer token minted by Anvil:
@@ -130,7 +130,7 @@ Anvil is licensed under the Apache 2.0 License. See `LICENSE`.
 A single-node local run is useful for learning the planes before building a larger topology. Keep the storage path on a volume, generate real secret material for anything you intend to keep, and remember that the admin listener is private even in local demos.
 
 ```sh
-export ANVIL_IMAGE="ghcr.io/worka-ai/anvil:v0.3.0"
+export ANVIL_IMAGE="ghcr.io/worka-ai/anvil:v0.4.0"
 export ANVIL_SECRET_ENCRYPTION_KEY="$(anvil-admin key generate-secret-encryption-key)"
 
 docker run --rm \

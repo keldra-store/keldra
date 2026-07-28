@@ -61,7 +61,7 @@ href = "/reference/public-cli/"
 
 [[site.nav]]
 title = "Blog"
-href = "/blog/admin-api-key-rotation/"
+href = "/blog/mvcc-under-raft-0-4/"
 
 [[site.routes]]
 kind = "content"

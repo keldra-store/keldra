@@ -26,7 +26,7 @@ use anvil_core::validation;
 use axum::{
     Router,
     body::{Body, Bytes},
-    extract::{ConnectInfo, Path, Query, Request, State},
+    extract::{ConnectInfo, Extension, Path, Query, Request, State},
     http::{self, HeaderMap, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -142,9 +142,13 @@ async fn commit_s3_write_transaction(
     Ok(())
 }
 
-pub fn app(state: AppState) -> Router {
+pub(crate) fn app(
+    state: AppState,
+    public_readiness: crate::startup_readiness::PublicReadiness,
+) -> Router {
     let public = Router::new()
         .route("/ready", get(readiness_check))
+        .layer(Extension(public_readiness))
         .with_state(state.clone());
 
     let s3_routes = Router::new()

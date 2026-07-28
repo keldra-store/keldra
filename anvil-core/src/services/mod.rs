@@ -150,9 +150,11 @@ pub fn create_grpc_router(state: AppState, auth_interceptor: AuthInterceptorFn) 
         state.clone(),
         auth_closure,
     ))
-    .add_service(ConsensusTransportServer::new(
-        state.mvcc.consensus_service.clone(),
-    ))
+    .add_service(
+        ConsensusTransportServer::new(state.mvcc.consensus_service.clone())
+            .max_decoding_message_size(consensus_transport::CONSENSUS_TRANSPORT_MESSAGE_BYTES)
+            .max_encoding_message_size(consensus_transport::CONSENSUS_TRANSPORT_MESSAGE_BYTES),
+    )
     .add_service(ReplicationServiceServer::new(
         state.mvcc.replication_service.clone(),
     ))

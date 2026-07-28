@@ -92,7 +92,11 @@ impl StreamingErasureEncoder {
                 object_length += read as u64;
                 filled += read;
             }
-            if filled == 0 {
+            // An empty object still needs one durable physical stripe. Its
+            // data and parity shards are all zeroes, while the logical length
+            // remains zero and the content hash remains SHA-256(empty).
+            // Exact non-empty stripe multiples must not gain an extra stripe.
+            if filled == 0 && stripe_ordinal != 0 {
                 break;
             }
             stripe[filled..].fill(0);
@@ -199,5 +203,29 @@ mod tests {
         assert_eq!(sink.0[0].4, b"abcd");
         assert_eq!(sink.0[1].4, b"efgh");
         assert_eq!(sink.0[3].4, b"ijk\0");
+    }
+
+    #[tokio::test]
+    async fn empty_object_emits_one_durable_zero_length_stripe() {
+        let encoder = StreamingErasureEncoder::new(ErasureProfile {
+            data_shards: 2,
+            parity_shards: 1,
+            shard_bytes: 4,
+        })
+        .unwrap();
+        let mut reader = std::io::Cursor::new(Vec::<u8>::new());
+        let mut sink = Sink::default();
+        let result = encoder
+            .encode(&mut reader, "tx", 1, 1, true, Uuid::new_v4(), 1, &mut sink)
+            .await
+            .unwrap();
+
+        assert_eq!(result.object_length, 0);
+        let empty_hash: [u8; 32] = Sha256::digest([]).into();
+        assert_eq!(result.content_hash, empty_hash);
+        assert_eq!(result.stripe_count, 1);
+        assert_eq!(sink.0.len(), 3);
+        assert!(sink.0.iter().all(|entry| entry.3 == 0));
+        assert!(sink.0.iter().all(|entry| entry.4.as_slice() == [0; 4]));
     }
 }

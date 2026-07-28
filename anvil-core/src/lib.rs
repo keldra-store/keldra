@@ -105,6 +105,7 @@ pub mod mvcc_node_runtime;
 mod mvcc_observability_contract;
 pub mod mvcc_open_transactions;
 pub mod mvcc_outbox;
+pub(crate) mod mvcc_physical_payload;
 #[cfg(test)]
 mod mvcc_process_crash_acceptance;
 pub mod mvcc_product;

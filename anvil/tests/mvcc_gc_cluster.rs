@@ -3,10 +3,11 @@
 use std::{collections::BTreeMap, time::Duration};
 
 use anvil::{
-    mvcc_gc::{advance_garbage_collection_watermark, plan_garbage_collection},
-    mvcc_transaction::{
-        BundleIdentity, CertificationResult, DurabilityLevel, LogicalKey, ReadConsistency,
+    mvcc_gc::{
+        MVCC_GARBAGE_COLLECTION_ENABLED, advance_garbage_collection_watermark,
+        plan_garbage_collection,
     },
+    mvcc_transaction::{BundleIdentity, CertificationResult, LogicalKey},
 };
 use anvil_mvcc_consensus::{CommitVersion, GarbageCollectionPins, NodeId, NodeIncarnation};
 use anvil_test_utils::mvcc_cluster::RealMvccCluster;
@@ -54,104 +55,60 @@ fn replica_pins(cluster: &RealMvccCluster) -> GarbageCollectionPins {
     }
 }
 
-async fn advance_gc(
-    cluster: &RealMvccCluster,
-    leader: usize,
-    requested: u64,
-    now_unix_ms: u64,
-) -> u64 {
-    let state = cluster.state(leader);
-    let current = state.mvcc.runtime.local_store().gc_watermark().unwrap();
-    let head = state.mvcc.runtime.applied_version().unwrap();
-    let proposal = plan_garbage_collection(
-        &state.mvcc.open_transactions,
-        state.mvcc.runtime.local_store(),
-        now_unix_ms,
-        current,
-        requested,
-        head,
-        replica_pins(cluster),
-    )
-    .unwrap();
-    advance_garbage_collection_watermark(
-        &state.mvcc.consensus,
-        cluster_hash(state.mvcc.cluster_id()),
-        &proposal,
-    )
-    .await
-    .unwrap()
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn real_cluster_gc_respects_snapshot_and_lagging_replica_then_reclaims_after_catchup() {
+async fn v040_rejects_gc_advancement_and_retains_physical_history() {
+    assert!(!MVCC_GARBAGE_COLLECTION_ENABLED);
+
     let cluster = RealMvccCluster::start().await.unwrap();
     let leader = cluster.wait_for_any_leader(&[0, 1, 2]).await.unwrap();
-    let lagging = [0, 1, 2].into_iter().find(|node| *node != leader).unwrap();
     let key = LogicalKey {
         table_id: 17,
         application_key: b"gc/retained-history".to_vec(),
     };
 
     let first = cluster
-        .commit(leader, "gc-history-1", key.clone(), b"one".to_vec())
+        .commit(leader, "gc-disabled-1", key.clone(), b"one".to_vec())
         .await
         .unwrap();
     let first_version = committed_version(&first.certification);
     let second = cluster
-        .commit(leader, "gc-history-2", key.clone(), b"two".to_vec())
+        .commit(leader, "gc-disabled-2", key.clone(), b"two".to_vec())
         .await
         .unwrap();
-    let snapshot_version = committed_version(&second.certification);
+    let head = committed_version(&second.certification);
     for node in 0..3 {
-        cluster
-            .wait_for_applied_version(node, snapshot_version)
-            .await
-            .unwrap();
+        cluster.wait_for_readable_version(node, head).await.unwrap();
     }
 
-    let principal = "gc-snapshot-principal";
-    let snapshot = cluster
-        .state(leader)
-        .mvcc
-        .open_transactions
-        .begin(
-            cluster.state(leader).mvcc.runtime.as_ref(),
-            cluster.state(leader).mvcc.cluster_id(),
-            principal,
-            "gc-active-snapshot",
-            Duration::from_secs(60),
-            DurabilityLevel::Quorum,
-            ReadConsistency::Linearized,
-            1_000,
-        )
-        .await
-        .unwrap();
-    assert!(snapshot.snapshot_version >= snapshot_version);
-    let snapshot_version = snapshot.snapshot_version;
-    for node in 0..3 {
-        cluster
-            .wait_for_readable_version(node, snapshot_version)
-            .await
-            .unwrap();
-    }
+    let state = cluster.state(leader);
+    let proposal = plan_garbage_collection(
+        &state.mvcc.open_transactions,
+        state.mvcc.runtime.local_store(),
+        1_000,
+        0,
+        head,
+        head,
+        replica_pins(&cluster),
+    )
+    .unwrap();
+    assert!(proposal.watermark > 0);
+    let error = advance_garbage_collection_watermark(
+        &state.mvcc.consensus,
+        cluster_hash(state.mvcc.cluster_id()),
+        &proposal,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("garbage collection is disabled in Anvil v0.4.0")
+    );
 
-    cluster.partition(lagging);
-    let third = cluster
-        .commit(leader, "gc-history-3", key.clone(), b"three".to_vec())
-        .await
-        .unwrap();
-    let third_version = committed_version(&third.certification);
-    let fourth = cluster
-        .commit(leader, "gc-history-4", key.clone(), b"four".to_vec())
-        .await
-        .unwrap();
-    let head = committed_version(&fourth.certification);
-
-    let decisions = cluster
-        .state(leader)
+    let decisions = state
         .mvcc
         .consensus
-        .applied_decisions_after(CommitVersion(snapshot_version))
+        .applied_decisions_after(CommitVersion(0))
         .unwrap();
     let prepared = decisions
         .iter()
@@ -162,97 +119,38 @@ async fn real_cluster_gc_respects_snapshot_and_lagging_replica_then_reclaims_aft
         })
         .collect::<Vec<_>>();
     assert!(!prepared.is_empty());
-    for identity in &prepared {
-        assert!(
+
+    // Wait across multiple former coordinator ticks. An accidental restart of
+    // automatic GC would advance at least one watermark or retire history.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    assert_eq!(
+        state.mvcc.consensus.gc_safety_watermark().unwrap(),
+        CommitVersion(0)
+    );
+    for node in 0..3 {
+        assert_eq!(
             cluster
-                .state(leader)
+                .state(node)
                 .mvcc
-                .prepared_bundle(identity)
-                .unwrap()
-                .is_some()
+                .runtime
+                .local_store()
+                .gc_watermark()
+                .unwrap(),
+            0
         );
     }
 
-    let pinned = advance_gc(&cluster, leader, head, 1_001).await;
-    assert_eq!(pinned, snapshot_version);
-    cluster
-        .wait_for_gc_watermark(leader, snapshot_version)
-        .await
-        .unwrap();
-    let retained = cluster
-        .state(leader)
+    let retained = state
         .mvcc
         .runtime
-        .read_at(&key, snapshot_version)
+        .read_at(&key, first_version)
         .unwrap()
-        .expect("active snapshot history remains readable");
-    assert_eq!(retained.value, b"two");
-    assert!(
-        cluster
-            .state(leader)
-            .mvcc
-            .runtime
-            .read_at(&key, first_version)
-            .is_err(),
-        "history below the approved watermark is rejected"
-    );
-
-    cluster
-        .state(leader)
-        .mvcc
-        .open_transactions
-        .rollback(&snapshot.transaction_id, principal, 1_002)
-        .unwrap();
-    let still_lagging = advance_gc(&cluster, leader, head, 1_003).await;
-    assert!(
-        still_lagging < third_version,
-        "the partitioned replica must continue to pin collection"
-    );
-
-    cluster.heal(lagging);
-    cluster
-        .wait_for_applied_version(lagging, head)
-        .await
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(5)).await;
-    let final_watermark = advance_gc(&cluster, leader, head, 1_004).await;
-    assert_eq!(final_watermark, head);
-    for node in 0..3 {
-        cluster.wait_for_gc_watermark(node, head).await.unwrap();
+        .expect("v0.4.0 retains historical MVCC rows");
+    assert_eq!(retained.value, b"one");
+    for identity in prepared {
+        assert!(
+            state.mvcc.prepared_bundle(&identity).unwrap().is_some(),
+            "v0.4.0 retains prepared bundle bytes"
+        );
     }
-    tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            let obsolete_removed = decisions
-                .iter()
-                .filter(|decision| decision.position.0 < head)
-                .filter_map(|decision| decision.committed_bundle.as_ref())
-                .map(|bundle| BundleIdentity {
-                    hash: format!("sha256:{}", hex::encode(bundle.bundle_hash.0)),
-                    length: bundle.bundle_length,
-                })
-                .any(|identity| {
-                    cluster
-                        .state(leader)
-                        .mvcc
-                        .prepared_bundle(&identity)
-                        .unwrap()
-                        .is_none()
-                });
-            if obsolete_removed {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("obsolete prepared bundles are compacted after GC");
-    assert!(
-        cluster
-            .state(leader)
-            .mvcc
-            .runtime
-            .read_at(&key, snapshot_version)
-            .is_err(),
-        "released snapshot history is below the final watermark"
-    );
 }

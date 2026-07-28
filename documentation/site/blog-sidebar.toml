@@ -1,8 +1,13 @@
 [[items]]
 title = "Blog"
-href = "/blog/admin-api-key-rotation/"
+href = "/blog/mvcc-under-raft-0-4/"
 level = 0
 group = true
+
+[[items]]
+title = "Anvil 0.4.0"
+href = "/blog/mvcc-under-raft-0-4/"
+level = 1
 
 [[items]]
 title = "CoreStore unified storage"
