@@ -158,11 +158,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if ! cargo zigbuild --version 2>/dev/null | grep -Fxq 'cargo-zigbuild 0.20.1'; then
+          if ! cargo-zigbuild --version 2>/dev/null | grep -Fxq 'cargo-zigbuild 0.20.1'; then
             cargo install cargo-zigbuild --version 0.20.1 --locked --force
           fi
 
-          cargo_zigbuild_version="$(cargo zigbuild --version)"
+          cargo_zigbuild_version="$(cargo-zigbuild --version)"
           zig_path="$(command -v zig)"
           zig_version="$("$zig_path" version)"
           test "$cargo_zigbuild_version" = 'cargo-zigbuild 0.20.1'
