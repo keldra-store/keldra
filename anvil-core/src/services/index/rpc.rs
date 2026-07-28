@@ -1,5 +1,12 @@
 use super::*;
 
+const INDEX_WATCH_SURFACE_0_4_0_LIMITATION: &str =
+    "Index watch RPCs are unavailable in Anvil 0.4.0";
+
+fn require_index_watch_surface() -> Result<(), Status> {
+    Err(Status::unimplemented(INDEX_WATCH_SURFACE_0_4_0_LIMITATION))
+}
+
 fn index_write_transaction_id(options: Option<&WriteOptions>) -> Result<Option<&str>, Status> {
     crate::services::transaction_context::write_options_transaction_id(options)
 }
@@ -714,6 +721,7 @@ impl IndexService for AppState {
         &self,
         request: Request<WatchIndexDefinitionRequest>,
     ) -> Result<Response<Self::WatchIndexDefinitionStream>, Status> {
+        require_index_watch_surface()?;
         let claims = request
             .extensions()
             .get::<auth::Claims>()
@@ -784,6 +792,7 @@ impl IndexService for AppState {
         &self,
         request: Request<WatchIndexPartitionRequest>,
     ) -> Result<Response<Self::WatchIndexPartitionStream>, Status> {
+        require_index_watch_surface()?;
         let claims = request
             .extensions()
             .get::<auth::Claims>()

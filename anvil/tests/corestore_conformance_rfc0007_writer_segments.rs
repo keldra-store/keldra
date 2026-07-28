@@ -102,7 +102,8 @@ fn format_aware_segments_are_corestore_writer_outputs_not_json_envelopes() {
         "build_writer_segment_logical_file(",
         "decode_writer_segment(",
         "encode_writer_segment_header",
-        "write_personaldb_logical_file_as_data_locator_with_preconditions",
+        "prepare_personaldb_logical_file_as_data_locator(",
+        "plan.stage_data_locator_row(&row)?",
         "into_write_logical_file_request()?",
     ] {
         assert!(

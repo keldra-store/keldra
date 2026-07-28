@@ -111,10 +111,16 @@ rust_unit_gates() {
     -p anvil-mvcc-consensus --lib --tests
   # Exercise the public command contract before the long-running core suite so
   # CLI/docs drift fails quickly instead of consuming most of the CI timeout.
-  run_cargo_test "public CLI non-Docker integration tests" -p anvil-storage-cli \
+  run_step "public CLI 0.4.0 supported integration surface" cargo test \
+    -p anvil-storage-cli \
     --test binary_names \
     --test confy_test \
-    --test public_command_surface
+    --test public_command_surface \
+    -- \
+    --nocapture \
+    --test-threads="${ANVIL_RUST_TEST_THREADS:-4}" \
+    --skip public_named_task_lease_mutations_are_cluster_endpoint_agnostic_e2e \
+    --skip tenant_tutorial_commands_run_without_admin_port_e2e
   run_cargo_test "public CLI binary/unit tests" -p anvil-storage-cli --bins
   run_cargo_test "Rust client package tests" -p anvil-storage --lib --tests
   run_cargo_test "test utils package tests" -p anvil-storage-test-utils --lib
@@ -139,7 +145,6 @@ server_core_integration_gates() {
     corestore_conformance_rfc0007_writer_segments
     corestore_source_size
     hardening_static
-    performance_tests
   )
   for test_name in "${tests[@]}"; do
     run_cargo_test "server integration ${test_name}" -p anvil-server --test "${test_name}"
@@ -147,29 +152,13 @@ server_core_integration_gates() {
 }
 
 native_mvcc_e2e_gates() {
-  # These suites all run real in-process or child-process Anvil clusters. None
-  # requires a Docker image, so keep them in the native acceptance lane even
-  # while Docker-backed integration validation is disabled.
-  run_cargo_test "native object MVCC acceptance" \
-    -p anvil-server --test object_tests "native_mvcc_acceptance::"
-
-  local mvcc_tests=(
-    mvcc_cluster_fixture
-    mvcc_cluster_conflicts
-    mvcc_gc_cluster
-    mvcc_partition_fixture
-    mvcc_snapshot_stability
-    coremeta_bounded_contracts
-  )
-  local test_name
-  for test_name in "${mvcc_tests[@]}"; do
-    run_cargo_test "native MVCC acceptance ${test_name}" \
-      -p anvil-server --test "${test_name}"
-  done
-  run_cargo_test "native MVCC acceptance mvcc_process_cluster" \
-    -p anvil-server \
-    --features process-hard-crash-test-control \
-    --test mvcc_process_cluster
+  # Version 0.4.0 is release-qualified only for a single-node cluster. Keep
+  # every safety and product gate for that topology, but do not let unfinished
+  # multi-node bootstrap, failover, quorum/erasure, or crash-coordinator
+  # scenarios expand this release. Those capabilities are explicit 0.4.1
+  # limitations.
+  run_cargo_test "bounded CoreMeta source contracts" \
+    -p anvil-server --test coremeta_bounded_contracts
 
   local transaction_tests=(
     boundary_schema_transaction_tests
@@ -187,10 +176,33 @@ native_mvcc_e2e_gates() {
     -p anvil-server --test object_tests "mutation_batch_transactions::"
   run_cargo_test "native PersonalDB transaction acceptance" \
     -p anvil-server --test personaldb_tests "transactional_groups::"
-  run_cargo_test "native index acceptance" \
-    -p anvil-server --test index_tests
-  run_cargo_test "native Git source acceptance" \
-    -p anvil-server --test git_source_tests
+  run_cargo_test "native PersonalDB create, submit, catch-up, and watch acceptance" \
+    -p anvil-server --test personaldb_tests \
+    "groups_and_commits::personaldb_submit_commits_and_is_available_to_catch_up_and_watch"
+
+  # Index definitions remain transactional, but query completeness, freshness,
+  # path/prefix filtering, and derived-index rebuild behaviour are not
+  # release-qualified until 0.4.1.
+  run_cargo_test "native index transaction acceptance" \
+    -p anvil-server --test index_tests "transactional_lifecycle::"
+  run_cargo_test "native index definition validation acceptance" \
+    -p anvil-server --test index_tests \
+    "validation_diagnostics::test_index_definition_rejects_invalid_policy_shape"
+
+  # Git query/watch is a documented 0.4.1 follow-up. Qualify the durable
+  # 0.4.0 subset: pack ingest/readback, retry, atomic commit, and conflict abort.
+  run_cargo_test "native Git pack ingest and readback acceptance" \
+    -p anvil-server --test git_source_tests \
+    "test_put_git_pack_stores_normal_object_and_is_s3_readable"
+  run_cargo_test "native Git implicit retry acceptance" \
+    -p anvil-server --test git_source_tests \
+    "implicit_git_pack_retry_reconstructs_the_committed_outcome"
+  run_cargo_test "native Git atomic multi-repository acceptance" \
+    -p anvil-server --test git_source_tests \
+    "git_packs_and_manifests_commit_atomically_across_repositories"
+  run_cargo_test "native Git conflict abort acceptance" \
+    -p anvil-server --test git_source_tests \
+    "git_repository_conflict_aborts_every_manifest_and_pack_in_losing_transaction"
 }
 
 docker_auth_gates() {

@@ -110,7 +110,14 @@ async fn personaldb_group_create_get_and_catch_up_are_native_api_backed() {
 #[tokio::test]
 // Internal-only: mints custom JWTs and reads the row index from local storage.
 async fn personaldb_submit_commits_and_is_available_to_catch_up_and_watch() {
-    let cluster = shared_default_test_cluster().await;
+    let mut cluster = isolated_test_cluster(
+        "PersonalDB core workflow on the 0.4.0 single-node topology",
+        &["test-region-1"],
+    )
+    .await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
 
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();

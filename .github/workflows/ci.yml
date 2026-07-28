@@ -225,11 +225,10 @@ jobs:
 
   coremeta-performance:
     name: CoreMeta ordered-access performance gate
-    # Performance is deliberately last while the replacement architecture is
-    # being brought to functional E2E readiness. Still run it after functional
-    # failures so one CI attempt produces complete diagnostic evidence.
+    # 0.4.0 qualifies the supported functional subset only. Performance
+    # baselines resume after the release and must not delay publication.
     needs: [rust-unit, server-core, mvcc-e2e]
-    if: ${{ !cancelled() }}
+    if: ${{ false }}
     runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 60
     env:

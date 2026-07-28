@@ -170,16 +170,21 @@ Admin host-alias lifecycle uses system-realm `manage_host_aliases`, not these pu
 
 ### Indexes, search, diagnostics, and query visibility
 
+In Anvil 0.4.0, index list, query, and diagnostics remain available, but their
+completeness and freshness are not release-qualified. Index watch RPCs return
+`Unimplemented`, and `index:watch` cannot be delegated through tenant access
+grants.
+
 | Operation | Action | Resource checked | Notes |
 | --- | --- | --- | --- |
 | Create index | `index:create` | `bucket/index_name` | Applies to path, metadata, typed JSON, full-text, vector, hybrid, and accepted source kinds. |
 | Update index | `index:update` | `bucket/index_name` | Also used by disable. |
 | Drop index | `index:delete` | `bucket/index_name` | Removes the definition. |
 | List indexes | `index:read` | Bucket name | Current coarse scope: not one index definition. |
-| Query index | `index:read` | Bucket name | Current coarse scope: not one index definition. Result visibility can still be filtered by object authorisation depending on index authorisation mode. |
-| Index diagnostics | `index:read` | Bucket name | Public `diagnostics list` and `index diagnostics` both read index diagnostics. |
-| Watch index definitions | `index:watch` | Bucket name | Current coarse scope: bucket-level. |
-| Watch index partitions | `index:watch` | Bucket name | Current coarse scope: bucket-level. |
+| Query index | `index:read` | Bucket name | Available as a non-authoritative preview in 0.4.0; completeness and freshness are not release-qualified. |
+| Index diagnostics | `index:read` | Bucket name | Available in 0.4.0. |
+| Watch index definitions | `index:watch` | Bucket name | Unavailable in 0.4.0. |
+| Watch index partitions | `index:watch` | Bucket name | Unavailable in 0.4.0. |
 
 For `inherit_object` indexes, returned hits are additionally filtered by object visibility. `index_only` and `public` modes expose index rows to callers with `index:read` on the bucket, so do not use them for sensitive object-derived data unless that is intended.
 
@@ -189,12 +194,12 @@ For `inherit_object` indexes, returned hits are additionally filtered by object 
 | --- | --- | --- | --- |
 | Bucket metadata watch | `bucket:watch` | Bucket name or `*` | API-only in current public CLI. |
 | Object prefix watch | `object:list` | Bucket name | Current scope is bucket-level, not prefix-level. |
-| Index definition watch | `index:watch` | Bucket name | Public CLI exposes index-definition watch. |
-| Index partition watch | `index:watch` | Bucket name | Public CLI exposes index-partition watch. |
+| Index definition watch | `index:watch` | Bucket name | Returns `Unimplemented` in 0.4.0. |
+| Index partition watch | `index:watch` | Bucket name | Returns `Unimplemented` in 0.4.0. |
 | Authz tuple watch | `authz:watch` | Namespace or `*` | Public CLI exposes tuple-log watch by namespace. |
 | Authz namespace and derived-lag watches | `authz:watch` | Namespace or derived index id | API-only surfaces. |
 | PersonalDB group/projection watch | `personaldb:watch` | PersonalDB resource or projection resource, or matching relationship | Public CLI exposes compact PersonalDB watch helpers. |
-| Git source watch | `git_source:watch` | `repository:<repository_id>` | Current source service surface; public CLI coverage is not the main workflow. |
+| Git source watch | `git_source:watch` | `repository:<repository_id>` | Returns `Unimplemented` in 0.4.0. |
 
 ### Append streams
 
@@ -249,11 +254,15 @@ The current source includes Hugging Face key and ingestion actions. Treat these 
 
 ### Git source
 
+Anvil 0.4.0 enables only tenant-administrator pack ingest. Git actions cannot
+be delegated through tenant access grants, and Git query/watch RPCs return
+`Unimplemented`.
+
 | Operation | Action | Resource checked | Notes |
 | --- | --- | --- | --- |
-| Write source pack | `git_source:write` | `repository:<repository_id>` | Service stores pack objects under object storage internally. |
-| Read source query/blob data | `git_source:read` or relationship `git_repository` reader | `repository:<repository_id>` | Relationship fallback uses namespace `git_repository`, object id `<repository_id>`, relation `reader`. |
-| Watch source records | `git_source:watch` | `repository:<repository_id>` | API surface exists; not the main public CLI workflow. |
+| Write source pack | `git_source:write` | Tenant administrator | Service stores pack objects under object storage internally; repository-scoped delegation is unavailable in 0.4.0. |
+| Read source query/blob data | `git_source:read` | `repository:<repository_id>` | Returns `Unimplemented` in 0.4.0. Read the stored pack through the authorised object API or S3 gateway. |
+| Watch source records | `git_source:watch` | `repository:<repository_id>` | Returns `Unimplemented` in 0.4.0. |
 
 ### Repair, diagnostics, and tenant audit
 

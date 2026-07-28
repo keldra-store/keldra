@@ -72,7 +72,11 @@ pub async fn delegated_relation_for_action(
         | AnvilAction::MeshRead
         | AnvilAction::RepairRun
         | AnvilAction::RepairRead
-        | AnvilAction::InternalProxyObject => {
+        | AnvilAction::InternalProxyObject
+        | AnvilAction::IndexWatch
+        | AnvilAction::GitSourceWrite
+        | AnvilAction::GitSourceRead
+        | AnvilAction::GitSourceWatch => {
             return Err(Status::permission_denied(
                 "This action cannot be delegated through tenant access grants",
             ));
@@ -149,8 +153,7 @@ pub async fn delegated_relation_for_action(
         AnvilAction::IndexCreate
         | AnvilAction::IndexUpdate
         | AnvilAction::IndexDelete
-        | AnvilAction::IndexRead
-        | AnvilAction::IndexWatch => {
+        | AnvilAction::IndexRead => {
             let (bucket_name, index_name) = split_bucket_key(&resource);
             let bucket = read_bucket_for_tenant(persistence, tenant_id, bucket_name).await?;
             if let Some(index_name) = index_name {
@@ -161,7 +164,7 @@ pub async fn delegated_relation_for_action(
                         AnvilAction::IndexCreate
                         | AnvilAction::IndexUpdate
                         | AnvilAction::IndexDelete => "define",
-                        AnvilAction::IndexRead | AnvilAction::IndexWatch => "query",
+                        AnvilAction::IndexRead => "query",
                         _ => unreachable!(),
                     }
                     .to_string(),
@@ -174,7 +177,7 @@ pub async fn delegated_relation_for_action(
                         AnvilAction::IndexCreate
                         | AnvilAction::IndexUpdate
                         | AnvilAction::IndexDelete => "manage_indexes",
-                        AnvilAction::IndexRead | AnvilAction::IndexWatch => "query_indexes",
+                        AnvilAction::IndexRead => "query_indexes",
                         _ => unreachable!(),
                     }
                     .to_string(),
@@ -223,17 +226,12 @@ pub async fn delegated_relation_for_action(
         | AnvilAction::HfKeyList
         | AnvilAction::HfIngestionCreate
         | AnvilAction::HfIngestionRead
-        | AnvilAction::HfIngestionDelete
-        | AnvilAction::GitSourceWrite
-        | AnvilAction::GitSourceRead
-        | AnvilAction::GitSourceWatch => Ok(DelegatedSystemRelation {
+        | AnvilAction::HfIngestionDelete => Ok(DelegatedSystemRelation {
             namespace: system_realm_namespace(SYSTEM_STORAGE_TENANT_NAMESPACE),
             object_id: storage_tenant_object_id(tenant_id),
             relation: if matches!(
                 action,
-                AnvilAction::GitSourceRead
-                    | AnvilAction::GitSourceWatch
-                    | AnvilAction::HfIngestionRead
+                AnvilAction::HfIngestionRead
                     | AnvilAction::HfKeyRead
                     | AnvilAction::HfKeyList
                     | AnvilAction::AppRead

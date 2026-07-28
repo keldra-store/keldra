@@ -1,7 +1,7 @@
 ---
-title: Anvil 0.4.0: cluster-local MVCC under Raft
+title: Anvil 0.4.0: single-node MVCC foundation
 slug: /blog/mvcc-under-raft-0-4/
-description: Anvil 0.4.0 introduces cluster-local MVCC certification, direct streaming erasure placement, and an explicit fixed-topology safety boundary.
+description: Anvil 0.4.0 ships a deliberately narrow single-node object, PersonalDB, and Git-ingest release on the new MVCC-under-Raft foundation.
 release: v0.4.0
 release_date: 2026-07-28
 artifacts:
@@ -9,17 +9,17 @@ artifacts:
   docker_image: ghcr.io/worka-ai/anvil:v0.4.0
 ---
 
-# Anvil 0.4.0: cluster-local MVCC under Raft
+# Anvil 0.4.0: single-node MVCC foundation
 
 Anvil 0.4.0 replaces the previous metadata commit path with one coherent
 transaction model: MVCC provides snapshots and conflict detection, while one
 OpenRaft group per cluster orders compact certification decisions. Object data
 and product rows stay out of the Raft log.
 
-This is an alpha release for controlled customer deployments. It establishes
-the correctness boundary needed by products building on Anvil, while making the
-remaining operational gaps explicit instead of presenting unfinished recovery
-paths as supported.
+This is an alpha release for controlled, single-node customer deployments. It
+qualifies the object API, core PersonalDB workflows, and Git pack ingest on one
+durable node. Multi-node operation, derived-index correctness, and Git
+query/watch are not release-qualified in 0.4.0.
 
 ## What changed
 
@@ -46,22 +46,21 @@ Object bodies, metadata rows, index data, authorisation tuples, transaction
 bundles, and erasure shards are replicated by their own storage paths rather
 than inflating the consensus log.
 
-## Direct erasure placement
+## Multi-node storage design
 
-Non-local object writes no longer require several complete-file replicas
-followed by a background erasure-coding pass. The ingesting node forms bounded
-stripes as bytes arrive, erasure-codes each stripe, and streams the shards
-directly to their assigned nodes. The foreground transaction records the
-resulting physical evidence before certification.
+The implementation contains the direct-streaming erasure design for future
+multi-node releases: the ingesting node forms bounded stripes and streams
+shards to assigned nodes instead of first writing complete replicas. That path
+is not release-qualified in 0.4.0 and must not be treated as node-loss
+protection.
 
 Internal node connections are persistent gRPC streams. Every operation has a
 request identity and an explicit acknowledgement, so a socket that merely
 appears connected is not counted as durable progress.
 
-The public default is `quorum` durability. `erasure` requires the configured
-shard and failure-domain threshold before acknowledgement. `local` remains
-available for workloads that deliberately accept that losing the sole holder
-before an upgrade can lose committed data.
+On the supported single-node topology, `local`, `quorum`, and `erasure` cannot
+create physical redundancy: all durable state still depends on one node and
+one volume. Losing that volume can lose committed data. Backups are mandatory.
 
 ## Startup and retry safety
 
@@ -69,10 +68,10 @@ Customer traffic remains closed while a node is recovering. The public plane
 opens only after a cluster consensus barrier succeeds, ordered local apply has
 reached the confirmed version, and the system authorisation realm is visible.
 
-If a coordinator loses its response after proposing a transaction, a retry can
-recover the compact outcome from the current leader after a linearized barrier.
-The retained outcome is bound to the original caller without placing bearer
-tokens or authorisation data in Raft.
+If the single-node coordinator loses a response after proposing a transaction,
+an idempotent retry can recover the compact outcome. The retained outcome is
+bound to the original caller without placing bearer tokens or authorisation
+data in Raft.
 
 OpenRaft state and local MVCC state use the node's CoreMeta RocksDB database.
 Anvil owns the bounded, versioned binary encoding of its durable consensus
@@ -82,13 +81,22 @@ values; direct application use of `bincode` has been removed.
 
 Version 0.4.0 intentionally does not claim the following:
 
+- The supported topology is exactly one Anvil node in one cluster. Multi-node
+  bootstrap, restart, quorum/erasure durability, coordinator recovery, and
+  leader failover are not supported.
 - MVCC and physical garbage collection are disabled, so storage consumption
   grows with every write, overwrite, and delete.
-- The voter set is fixed at initial cluster bootstrap. Runtime membership
-  changes are unsupported.
-- A node cannot be replaced from a blank disk. Restart it with the same durable
-  volume and identity.
+- Clean-disk replacement is unsupported. Restart with the same durable volume
+  and identity. Product-level crash/restart recovery is not yet
+  release-qualified even though component storage reopen tests are present.
 - Transactions cannot cross cluster boundaries.
+- Index create/update/delete/list/query/diagnostics remain available, including
+  path/prefix query, but query completeness and freshness are not
+  release-qualified. Index watch RPCs fail closed with `Unimplemented`, and
+  `index:watch` cannot be delegated.
+- Git pack ingest and object/S3 readback are supported only for a tenant
+  administrator. Git query/tree/blob lookup and watch RPCs fail closed with
+  `Unimplemented`; Git actions cannot be delegated in 0.4.0.
 - Mixed-version rolling upgrades are not supported.
 - This release does not set a performance service-level objective.
 
@@ -101,18 +109,25 @@ The new transaction architecture is a clean alpha-stage replacement. Anvil
 0.4.0 on new storage, import application data through supported APIs where
 needed, and do not point a 0.4.0 node at a 0.3.x volume.
 
-## What applications keep
+## Supported customer subset
 
-The native gRPC API and Rust client remain the preferred integration surfaces.
-The S3-compatible gateway remains available for object-shaped operations.
-Object versions, metadata and search indexes, Zanzibar-style relationship
-authorisation, watches, task leases, PersonalDB witnessing, and the separate
-public and admin planes remain product capabilities.
+The native gRPC API and Rust client remain the preferred integration surfaces,
+and the S3-compatible gateway remains available for object-shaped operations.
+The 0.4.0 release gate covers authenticated object mutation/readback,
+transaction conflicts and retry, core PersonalDB create/submit/catch-up/watch,
+Git pack ingest and object/S3 readback, Zanzibar enforcement, and the separate
+public and admin planes on one node.
 
-Public API compatibility has been preserved where it did not compromise the new
-transaction model. Because Anvil is still alpha, applications should pin the
-0.4 client and image together and treat compiler or protocol errors as required
-upgrade work rather than depending on accidental compatibility.
+Index-derived data is not authoritative in this release. Applications must read
+objects through the authorised object API or S3 gateway and must not use index
+results for completeness, authorisation, or workflow decisions. Git consumers
+must read stored pack objects rather than the unavailable Git query/watch RPCs.
+
+Protocol messages remain available where they did not compromise the new
+transaction model, but the fail-closed RPCs above are intentional capability
+cuts. Because Anvil is still alpha, applications should pin the 0.4 client and
+image together and treat compiler, protocol, or `Unimplemented` errors as
+required upgrade work rather than depending on accidental compatibility.
 
 ## Release validation
 
@@ -126,10 +141,11 @@ Before promoting the image to customer traffic, validate:
 1. an authenticated native object write, read, range read, overwrite, and
    delete;
 2. an S3-compatible write and read if the gateway is used;
-3. a transaction conflict where exactly one incompatible writer commits;
-4. an authorised index query;
-5. an in-place restart over the same durable volume;
-6. leader failover in the configured fixed cluster.
+3. PersonalDB group creation, submit, catch-up, and watch;
+4. Git pack ingest followed by object or S3 readback;
+5. a transaction conflict where exactly one incompatible writer commits;
+6. a controlled in-place restart over a backed-up copy of the same durable
+   volume.
 
 The detailed guarantee and limitation matrix is in
 [Release Architecture Status](/architecture/release-status/).

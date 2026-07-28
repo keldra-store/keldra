@@ -324,12 +324,15 @@ fn production_authorisation_has_no_scope_or_policy_bypass() {
 fn tenant_read_actions_do_not_require_manage_tenant() {
     let source =
         std::fs::read_to_string(repo_root().join("anvil-core/src/access_control.rs")).unwrap();
+    let delegated_source =
+        std::fs::read_to_string(repo_root().join("anvil-core/src/access_control/delegation.rs"))
+            .unwrap();
     let action_allows = source
         .split("pub async fn action_allows")
         .nth(1)
         .and_then(|tail| tail.split("pub async fn require_action").next())
         .expect("action_allows body");
-    let delegated = source
+    let delegated = delegated_source
         .split("pub async fn delegated_relation_for_action")
         .nth(1)
         .and_then(|tail| {
@@ -338,24 +341,106 @@ fn tenant_read_actions_do_not_require_manage_tenant() {
         })
         .expect("delegated_relation_for_action body");
 
-    for body in [action_allows, delegated] {
-        for action in [
-            "AnvilAction::AppRead",
-            "AnvilAction::HfKeyRead",
-            "AnvilAction::HfKeyList",
-            "AnvilAction::HfIngestionRead",
-            "AnvilAction::GitSourceRead",
-            "AnvilAction::GitSourceWatch",
-        ] {
-            let at = body
-                .find(action)
-                .unwrap_or_else(|| panic!("{action} missing from tenant read authorization path"));
-            let nearby = &body[at..body.len().min(at + 1800)];
-            assert!(
-                nearby.contains("\"read_tenant\""),
-                "{action} must resolve through read_tenant, not manage_tenant"
-            );
-        }
+    for action in [
+        "AnvilAction::AppRead",
+        "AnvilAction::HfKeyRead",
+        "AnvilAction::HfKeyList",
+        "AnvilAction::HfIngestionRead",
+        "AnvilAction::GitSourceRead",
+        "AnvilAction::GitSourceWatch",
+    ] {
+        let at = action_allows
+            .find(action)
+            .unwrap_or_else(|| panic!("{action} missing from tenant read authorization path"));
+        let nearby = &action_allows[at..action_allows.len().min(at + 1800)];
+        assert!(
+            nearby.contains("\"read_tenant\""),
+            "{action} must resolve through read_tenant, not manage_tenant"
+        );
+    }
+
+    for action in [
+        "AnvilAction::AppRead",
+        "AnvilAction::HfKeyRead",
+        "AnvilAction::HfKeyList",
+        "AnvilAction::HfIngestionRead",
+    ] {
+        let at = delegated
+            .find(action)
+            .unwrap_or_else(|| panic!("{action} missing from tenant read authorization path"));
+        let nearby = &delegated[at..delegated.len().min(at + 1800)];
+        assert!(
+            nearby.contains("\"read_tenant\""),
+            "{action} must resolve through read_tenant, not manage_tenant"
+        );
+    }
+}
+
+#[test]
+fn unsafe_0_4_0_query_surfaces_fail_closed_and_cannot_be_delegated() {
+    let delegated =
+        std::fs::read_to_string(repo_root().join("anvil-core/src/access_control/delegation.rs"))
+            .unwrap();
+    let non_delegatable = delegated
+        .split("AnvilAction::TenantManage")
+        .next()
+        .expect("non-delegatable action arm");
+    for action in [
+        "AnvilAction::IndexWatch",
+        "AnvilAction::GitSourceWrite",
+        "AnvilAction::GitSourceRead",
+        "AnvilAction::GitSourceWatch",
+    ] {
+        assert!(
+            non_delegatable.contains(action),
+            "{action} must remain non-delegatable while its 0.4.0 authorization model is cut"
+        );
+    }
+
+    let git =
+        std::fs::read_to_string(repo_root().join("anvil-core/src/services/git_source.rs")).unwrap();
+    for method in [
+        "async fn get_git_object(",
+        "async fn get_git_blob_by_path(",
+        "async fn list_git_tree(",
+        "async fn watch_git_source(",
+    ] {
+        let body = git
+            .split(method)
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing Git RPC {method}"));
+        let guard = body
+            .find("require_git_source_read_surface()?;")
+            .unwrap_or_else(|| panic!("{method} must fail closed in 0.4.0"));
+        let claims = body
+            .find("let claims")
+            .unwrap_or_else(|| panic!("{method} must retain its future authorization path"));
+        assert!(
+            guard < claims,
+            "{method} must fail closed before reading data"
+        );
+    }
+
+    let index =
+        std::fs::read_to_string(repo_root().join("anvil-core/src/services/index/rpc.rs")).unwrap();
+    for method in [
+        "async fn watch_index_definition(",
+        "async fn watch_index_partition(",
+    ] {
+        let body = index
+            .split(method)
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing index RPC {method}"));
+        let guard = body
+            .find("require_index_watch_surface()?;")
+            .unwrap_or_else(|| panic!("{method} must fail closed in 0.4.0"));
+        let claims = body
+            .find("let claims")
+            .unwrap_or_else(|| panic!("{method} must retain its future authorization path"));
+        assert!(
+            guard < claims,
+            "{method} must fail closed before reading data"
+        );
     }
 }
 

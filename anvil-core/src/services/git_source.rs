@@ -13,6 +13,15 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
+const GIT_SOURCE_READ_SURFACE_0_4_0_LIMITATION: &str =
+    "Git source query and watch RPCs are unavailable in Anvil 0.4.0";
+
+fn require_git_source_read_surface() -> Result<(), Status> {
+    Err(Status::unimplemented(
+        GIT_SOURCE_READ_SURFACE_0_4_0_LIMITATION,
+    ))
+}
+
 #[tonic::async_trait]
 impl GitSourceService for AppState {
     type WatchGitSourceStream = std::pin::Pin<
@@ -313,6 +322,7 @@ impl GitSourceService for AppState {
         &self,
         request: Request<GetGitObjectRequest>,
     ) -> Result<Response<GetGitObjectResponse>, Status> {
+        require_git_source_read_surface()?;
         let claims = authorize_git_source_read(&request)?;
         let req = request.into_inner();
         validate_component("repository_id", &req.repository_id)?;
@@ -369,6 +379,7 @@ impl GitSourceService for AppState {
         &self,
         request: Request<GetGitBlobByPathRequest>,
     ) -> Result<Response<GetGitBlobByPathResponse>, Status> {
+        require_git_source_read_surface()?;
         let claims = authorize_git_source_read(&request)?;
         let req = request.into_inner();
         validate_component("repository_id", &req.repository_id)?;
@@ -390,6 +401,7 @@ impl GitSourceService for AppState {
         &self,
         request: Request<ListGitTreeRequest>,
     ) -> Result<Response<ListGitTreeResponse>, Status> {
+        require_git_source_read_surface()?;
         let claims = authorize_git_source_read(&request)?;
         let req = request.into_inner();
         validate_component("repository_id", &req.repository_id)?;
@@ -433,6 +445,7 @@ impl GitSourceService for AppState {
         &self,
         request: Request<WatchGitSourceRequest>,
     ) -> Result<Response<Self::WatchGitSourceStream>, Status> {
+        require_git_source_read_surface()?;
         let claims = request
             .extensions()
             .get::<auth::Claims>()

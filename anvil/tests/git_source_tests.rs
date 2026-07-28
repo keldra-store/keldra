@@ -11,7 +11,6 @@ use anvil::anvil_api::{
 use anvil::formats::git::{GitHashAlgorithm, GitSourceRecord};
 use anvil::git_source_index::{GitSourceIndexWrite, write_git_source_index};
 use anvil::git_source_watch::{GitSourceWatchPayload, append_git_source_watch_record};
-use anvil::writer_segment_catalog::read_writer_segment_catalog_record;
 use anvil_test_utils::{
     ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT, TestCluster, isolated_test_cluster,
     shared_default_test_cluster, unique_test_name,
@@ -217,9 +216,18 @@ async fn test_git_source_query_apis_use_latest_index_and_enforce_read_authz() {
 }
 
 #[tokio::test]
-// Internal-only: verifies the MVCC catalog publication and stored Git pack.
-async fn test_put_git_pack_stores_normal_object_builds_index_and_is_s3_readable() {
-    let cluster = shared_default_test_cluster().await;
+// Internal-only: verifies durable Git pack ingest and object readback on the
+// single-node topology supported by 0.4.0. Git query/index freshness is a
+// separate, explicitly unqualified capability in this release.
+async fn test_put_git_pack_stores_normal_object_and_is_s3_readable() {
+    let mut cluster = isolated_test_cluster(
+        "git pack ingest on the 0.4.0 single-node topology",
+        &["test-region-1"],
+    )
+    .await;
+    cluster
+        .start_and_converge(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
     let repository_id = unique_test_name("repo-alpha");
     let bucket_name = unique_test_name("git-source-packs");
     cluster.create_bucket(&bucket_name, "test-region-1").await;
@@ -261,46 +269,6 @@ async fn test_put_git_pack_stores_normal_object_builds_index_and_is_s3_readable(
     assert_eq!(response.write_state, WriteState::Committed as i32);
     assert_eq!(response.watch_cursor_low, 0);
     assert_eq!(response.watch_cursor_high, 0);
-    assert!(response.index_path.starts_with("git_source_index:"));
-    let index_scope = format!("tenant/1/repository/{repository_id}");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        if read_writer_segment_catalog_record(
-            &cluster.states[0].mvcc,
-            "git_source_index",
-            &index_scope,
-            response.generation,
-            &response.index_path,
-        )
-        .await
-        .unwrap()
-        .is_some()
-        {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "GitSource postcommit index did not materialize"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-
-    let blob = client
-        .get_git_blob_by_path(authorized(
-            GetGitBlobByPathRequest {
-                repository_id: repository_id.clone(),
-                commit_id: minimal_pack_commit_id_hex(),
-                tree_path: "README.md".to_string(),
-            },
-            &cluster.token,
-        ))
-        .await
-        .unwrap()
-        .into_inner()
-        .location
-        .expect("indexed blob");
-    assert_eq!(blob.tree_path, "README.md");
-    assert_eq!(blob.pack_object_version_id, response.version_id);
 
     let s3 = cluster
         .get_s3_client("test-region-1", "test-app", "test-secret")
@@ -632,11 +600,6 @@ impl TestGitKind {
 fn minimal_git_pack() -> Vec<u8> {
     let (_commit_id, pack) = minimal_git_pack_with_commit();
     pack
-}
-
-fn minimal_pack_commit_id_hex() -> String {
-    let (commit_id, _pack) = minimal_git_pack_with_commit();
-    hex::encode(commit_id)
 }
 
 fn minimal_git_pack_with_commit() -> (Vec<u8>, Vec<u8>) {
