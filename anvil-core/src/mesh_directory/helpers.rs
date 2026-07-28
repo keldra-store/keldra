@@ -126,27 +126,33 @@ pub(super) async fn write_descriptor_projection_mvcc<T: StoredRoutingRecord>(
     let row_key = routing_projection_row_key(family, &record_key)?;
     let key =
         crate::mvcc_product::coremeta_logical_key(CF_MESH, TABLE_MESH_PARTITION_ROW, &row_key)?;
-    let current = mvcc.read_latest_value(&key)?;
-    if require_absent && current.is_some() {
+    let snapshot = mvcc.runtime.applied_version()?;
+    let current = mvcc.runtime.read_point_at(&key, snapshot)?;
+    let current_value = current.visible().map(|row| row.value.clone());
+    if require_absent && current_value.is_some() {
         return Err(MeshDirectoryError::Io(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             format!("routing descriptor already exists: {descriptor_key}"),
         )));
     }
     let payload = record_proto::encode_routing_projection_row(descriptor_key, descriptor)?;
-    if current.as_deref() == Some(payload.as_slice()) {
+    if current_value.as_deref() == Some(payload.as_slice()) {
         return Ok(());
     }
-    let predicate = current
+    let predicate = current_value
         .as_ref()
         .map(|payload| {
             crate::mvcc_transaction::PredicateKind::ValueHash(*blake3::hash(payload).as_bytes())
         })
         .unwrap_or(crate::mvcc_transaction::PredicateKind::Absent);
     let transaction_id = format!(
-        "mesh-directory-projection:{}:{}",
+        "mesh-directory-projection-repair:{}:{}:{}",
         family.stream_family(),
-        hex::encode(blake3::hash(&payload).as_bytes())
+        hex::encode(blake3::hash(&payload).as_bytes()),
+        current
+            .observed_version()
+            .map(|version| version.to_string())
+            .unwrap_or_else(|| "unwritten".to_string()),
     );
     mvcc.autocommit_product_mutations_with_predicates(
         "mesh-directory",

@@ -8,7 +8,6 @@ use tokio::sync::Mutex as TokioMutex;
 
 const PARTITION_OWNER_ACQUIRE_LOCK_STRIPES: usize = 256;
 const PARTITION_OWNER_ACQUIRE_ATTEMPTS: usize = 32;
-const MESH_ROUTING_PAGE_SIZE: usize = 512;
 const MESH_ROUTING_ADMIN_RESULT_CAP: usize = mesh_directory::MVCC_ROUTING_LIST_HARD_LIMIT;
 
 static PARTITION_OWNER_ACQUIRE_LOCKS: LazyLock<Vec<TokioMutex<()>>> = LazyLock::new(|| {
@@ -305,39 +304,19 @@ impl Persistence {
             .map(|family| vec![family])
             .unwrap_or_else(|| mesh_directory::RoutingRecordFamily::all().to_vec())
         {
-            let mut after_tuple_key = None;
-            let mut record_count = 0_usize;
-            loop {
-                let page = mesh_directory::page_projected_routing_records(
-                    &self.storage,
-                    family,
-                    after_tuple_key.as_deref(),
-                    MESH_ROUTING_PAGE_SIZE,
-                )
-                .await?;
-                record_count = record_count.saturating_add(page.records.len());
-                if record_count > MESH_ROUTING_ADMIN_RESULT_CAP {
-                    return Err(anyhow!(
-                        "mesh routing diagnostic exceeds bounded cap of {MESH_ROUTING_ADMIN_RESULT_CAP} records"
+            for record in mesh_directory::list_routing_record_descriptors_mvcc(
+                self.mvcc()?,
+                family,
+                MESH_ROUTING_ADMIN_RESULT_CAP,
+            )? {
+                by_stream
+                    .entry((record.family, record.partition.clone()))
+                    .or_default()
+                    .push(mesh_control_stream::ControlProjectionRecord::new(
+                        record.record_key,
+                        record.generation,
+                        record.payload_json.into_bytes(),
                     ));
-                }
-                for record in page.records {
-                    by_stream
-                        .entry((record.family, record.partition.clone()))
-                        .or_default()
-                        .push(mesh_control_stream::ControlProjectionRecord::new(
-                            record.record_key,
-                            record.generation,
-                            record.payload_json.into_bytes(),
-                        ));
-                }
-                let Some(next_tuple_key) = page.next_tuple_key else {
-                    break;
-                };
-                if after_tuple_key.as_ref() == Some(&next_tuple_key) {
-                    return Err(anyhow!("mesh routing diagnostic cursor did not advance"));
-                }
-                after_tuple_key = Some(next_tuple_key);
             }
             let stream_family = family.stream_family();
             let mut cursor = None;

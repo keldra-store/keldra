@@ -737,14 +737,7 @@ impl AdminService for AppState {
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), true)?;
         let tenant_id = resolve_tenant_id(self, &req.tenant_id).await?;
-        let audit_event = build_admin_audit_event(
-            &principal,
-            context,
-            "admin.bucket.create",
-            &bucket_resource_id(tenant_id, &req.bucket_name),
-            json!({ "resource_kind": "bucket", "tenant_id": tenant_id, "bucket_name": &req.bucket_name, "region": &req.region }),
-        )?;
-        let audit_event_id = audit_event.audit_event_id.clone();
+        let audit_event_id = audit_event_id(&principal, context);
         let transaction =
             begin_admin_product_transaction(self, &principal, context, "bucket-create").await?;
         let bucket = if transaction.replayed {
@@ -795,6 +788,20 @@ impl AdminService for AppState {
                 created_at: Utc::now(),
                 is_public_read: false,
             };
+            let audit_event = build_admin_audit_event(
+                &principal,
+                context,
+                "admin.bucket.create",
+                &bucket_resource_id(tenant_id, &bucket.name),
+                json!({
+                    "resource_kind": "bucket",
+                    "tenant_id": tenant_id,
+                    "bucket_id": bucket.id,
+                    "bucket_name": &bucket.name,
+                    "region": &bucket.region,
+                    "is_public_read": bucket.is_public_read,
+                }),
+            )?;
             let operation_sequence = crate::bucket_journal::stage_bucket_mutation_in_transaction(
                 &self.mvcc,
                 &bucket,
@@ -873,14 +880,7 @@ impl AdminService for AppState {
         let req = request.into_inner();
         let context = require_mutation_context(req.context.as_ref(), false)?;
         let tenant_id = resolve_tenant_id(self, &req.tenant_id).await?;
-        let audit_event = build_admin_audit_event(
-            &principal,
-            context,
-            "admin.bucket.public_access.set",
-            &bucket_resource_id(tenant_id, &req.bucket_name),
-            json!({ "resource_kind": "bucket", "tenant_id": tenant_id, "bucket_name": &req.bucket_name, "allow_public_read": req.allow_public_read }),
-        )?;
-        let audit_event_id = audit_event.audit_event_id.clone();
+        let audit_event_id = audit_event_id(&principal, context);
         let transaction =
             begin_admin_product_transaction(self, &principal, context, "bucket-public-access")
                 .await?;
@@ -912,6 +912,21 @@ impl AdminService for AppState {
             .map_err(|err| Status::internal(err.to_string()))?
             .ok_or_else(|| Status::not_found("Bucket not found"))?;
             bucket.is_public_read = req.allow_public_read;
+            let audit_event = build_admin_audit_event(
+                &principal,
+                context,
+                "admin.bucket.public_access.set",
+                &bucket_resource_id(tenant_id, &bucket.name),
+                json!({
+                    "resource_kind": "bucket",
+                    "tenant_id": tenant_id,
+                    "bucket_id": bucket.id,
+                    "bucket_name": &bucket.name,
+                    "region": &bucket.region,
+                    "allow_public_read": req.allow_public_read,
+                    "is_public_read": bucket.is_public_read,
+                }),
+            )?;
             let operation_sequence = crate::bucket_journal::stage_bucket_mutation_in_transaction(
                 &self.mvcc,
                 &bucket,

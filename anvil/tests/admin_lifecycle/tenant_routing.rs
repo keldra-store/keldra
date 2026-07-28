@@ -69,6 +69,19 @@ async fn create_active_region_for_bucket_move(
 }
 
 async fn delete_routing_projection_row(node: &AdminNode, stream_family: &str, record_key: &str) {
+    while node
+        .state
+        .mvcc
+        .runtime
+        .local_store()
+        .outbox_backlog(0)
+        .unwrap()
+        .0
+        != 0
+    {
+        tokio::task::yield_now().await;
+    }
+
     let row_key = anvil::core_store::core_meta_tuple_key(&[
         anvil::core_store::CoreMetaTuplePart::Utf8("mesh-directory-projection"),
         anvil::core_store::CoreMetaTuplePart::Utf8(stream_family),
@@ -94,14 +107,6 @@ async fn delete_routing_projection_row(node: &AdminNode, stream_family: &str, re
             u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap(),
         )
         .await
-        .unwrap();
-    anvil::core_store::CoreMetaStore::open(node.state.storage.core_store_meta_path())
-        .unwrap()
-        .delete(
-            anvil::core_store::CF_MESH,
-            anvil::core_store::TABLE_MESH_PARTITION_ROW,
-            &row_key,
-        )
         .unwrap();
 }
 

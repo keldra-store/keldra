@@ -496,7 +496,7 @@ async fn admin_mutations_are_returned_by_durable_audit_listing() {
 
     let tenant_event = find_event(&tenant_response.audit_event_id, "admin.tenant.create");
     assert_eq!(tenant_event.audit_event_id, tenant_response.audit_event_id);
-    assert_eq!(tenant_event.resource_id, format!("tenant:{tenant_id}"));
+    assert_eq!(tenant_event.resource_id, "tenant-name:audit-tenant");
     assert_eq!(tenant_event.principal_id, "admin-principal");
     let tenant_details = details(tenant_event);
     assert_eq!(tenant_details["tenant_name"], "audit-tenant");
