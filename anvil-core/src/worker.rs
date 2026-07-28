@@ -108,6 +108,7 @@ fn classify_worker_claim_error(error: &anyhow::Error) -> WorkerClaimError {
             OWNERSHIP_OWNER_MISMATCH,
             LEASE_HELD,
             "partition owner row exists but is not committed-visible",
+            "local node does not own the task queue assignment",
         ],
     ) {
         return WorkerClaimError::OwnershipContention;
@@ -1191,6 +1192,11 @@ mod tests {
             WorkerClaimError::OwnershipContention
         );
         let error = anyhow!("partition owner row exists but is not committed-visible");
+        assert_eq!(
+            classify_worker_claim_error(&error),
+            WorkerClaimError::OwnershipContention
+        );
+        let error = anyhow!("local node does not own the task queue assignment");
         assert_eq!(
             classify_worker_claim_error(&error),
             WorkerClaimError::OwnershipContention

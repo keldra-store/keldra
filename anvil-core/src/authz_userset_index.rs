@@ -462,7 +462,7 @@ pub async fn write_derived_userset_index(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     index: &AuthzDerivedUsersetIndex,
 ) -> Result<()> {
-    write_derived_userset_index_with_predicates(storage, mvcc, index, &[]).await
+    write_derived_userset_index_with_predicates(storage, mvcc, index, &[], None).await
 }
 
 pub(crate) async fn write_derived_userset_index_with_predicates(
@@ -473,6 +473,7 @@ pub(crate) async fn write_derived_userset_index_with_predicates(
         crate::mvcc_transaction::LogicalKey,
         crate::mvcc_transaction::PredicateKind,
     )],
+    task_publication_assignment: Option<crate::mvcc_worker_authority::AssignmentGuard>,
 ) -> Result<()> {
     validate_derived_userset_index(index, index.tenant_id, &index.derived_index_id)?;
     let bytes = encode_derived_userset_index(index)?;
@@ -507,6 +508,7 @@ pub(crate) async fn write_derived_userset_index_with_predicates(
         writer_generation,
         &object_ref,
         additional_predicates,
+        task_publication_assignment,
     )
     .await?;
     Ok(())
@@ -540,6 +542,7 @@ async fn write_derived_userset_index_row_mvcc(
         crate::mvcc_transaction::LogicalKey,
         crate::mvcc_transaction::PredicateKind,
     )],
+    task_publication_assignment: Option<crate::mvcc_worker_authority::AssignmentGuard>,
 ) -> Result<()> {
     let row = AuthzDerivedUsersetIndexRow {
         tenant_id: index.tenant_id,
@@ -559,12 +562,23 @@ async fn write_derived_userset_index_row_mvcc(
         return Ok(());
     }
 
-    let assignment = mvcc
-        .reconcile_authz_tuple_assignment(index.tenant_id)
-        .await?
-        .ok_or_else(|| {
-            anyhow!("this node is not the assigned authorization userset index publisher")
-        })?;
+    let assignment = if let Some(assignment) = task_publication_assignment {
+        let task_queue_partition =
+            crate::mvcc_worker_authority::work_partition_id("task-queue", "global")?;
+        if assignment.partition_id != task_queue_partition {
+            return Err(anyhow!(
+                "authorization task publication requires the task queue assignment"
+            ));
+        }
+        mvcc.validate_assignment(&assignment)?;
+        assignment
+    } else {
+        mvcc.reconcile_authz_tuple_assignment(index.tenant_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow!("this node is not the assigned authorization userset index publisher")
+            })?
+    };
     let principal = format!("authz-derived-userset:tenant/{}", index.tenant_id);
     let now_unix_ms = u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default();
     let handle = mvcc

@@ -29,16 +29,17 @@ fn assert_anvil_help(args: &[&str], expected: &[&str]) {
     }
 }
 
-fn run_anvil(config_dir: &TempDir, args: &[&str]) -> Output {
+async fn run_anvil(config_dir: &TempDir, args: &[&str]) -> Output {
     let config_path = config_dir.path().join("config.toml");
     let mut all_args = vec![
         "--config".to_string(),
         config_path.to_string_lossy().into_owned(),
     ];
     all_args.extend(args.iter().map(|arg| arg.to_string()));
-    let output = Command::new(env!("CARGO_BIN_EXE_anvil"))
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_anvil"))
         .args(&all_args)
         .output()
+        .await
         .expect("run anvil");
     if !output.status.success() {
         panic!(
@@ -51,17 +52,18 @@ fn run_anvil(config_dir: &TempDir, args: &[&str]) -> Output {
     output
 }
 
-fn run_anvil_with_token(config_dir: &TempDir, token: &str, args: &[&str]) -> Output {
+async fn run_anvil_with_token(config_dir: &TempDir, token: &str, args: &[&str]) -> Output {
     let config_path = config_dir.path().join("config.toml");
     let mut all_args = vec![
         "--config".to_string(),
         config_path.to_string_lossy().into_owned(),
     ];
     all_args.extend(args.iter().map(|arg| arg.to_string()));
-    let output = Command::new(env!("CARGO_BIN_EXE_anvil"))
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_anvil"))
         .env("ANVIL_AUTH_TOKEN", token)
         .args(&all_args)
         .output()
+        .await
         .expect("run anvil");
     if !output.status.success() {
         panic!(
@@ -74,7 +76,7 @@ fn run_anvil_with_token(config_dir: &TempDir, token: &str, args: &[&str]) -> Out
     output
 }
 
-fn run_anvil_eventually(
+async fn run_anvil_eventually(
     config_dir: &TempDir,
     args: &[&str],
     expected_stdout: &[&str],
@@ -88,9 +90,10 @@ fn run_anvil_eventually(
             config_path.to_string_lossy().into_owned(),
         ];
         all_args.extend(args.iter().map(|arg| arg.to_string()));
-        let output = Command::new(env!("CARGO_BIN_EXE_anvil"))
+        let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_anvil"))
             .args(&all_args)
             .output()
+            .await
             .expect("run anvil");
         let contains_expected_stdout = {
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -110,20 +113,21 @@ fn run_anvil_eventually(
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        std::thread::sleep(Duration::from_millis(500));
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 
-fn run_anvil_expect_failure(config_dir: &TempDir, args: &[&str]) -> Output {
+async fn run_anvil_expect_failure(config_dir: &TempDir, args: &[&str]) -> Output {
     let config_path = config_dir.path().join("config.toml");
     let mut all_args = vec![
         "--config".to_string(),
         config_path.to_string_lossy().into_owned(),
     ];
     all_args.extend(args.iter().map(|arg| arg.to_string()));
-    let output = Command::new(env!("CARGO_BIN_EXE_anvil"))
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_anvil"))
         .args(&all_args)
         .output()
+        .await
         .expect("run anvil");
     assert!(
         !output.status.success(),
@@ -167,7 +171,8 @@ async fn start_cluster_for_public_cli() -> (TestCluster, TempDir) {
             &client_secret,
             "--default",
         ],
-    );
+    )
+    .await;
     (cluster, config_dir)
 }
 
@@ -313,11 +318,11 @@ fn admin_cli_rejects_public_port_e2e() {
     assert!(!output.status.success());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 12)]
 async fn tenant_tutorial_commands_run_without_admin_port_e2e() {
     let (_cluster, config_dir) = start_cluster_for_public_cli().await;
     let bucket = format!("public-cli-{}", uuid::Uuid::new_v4().simple());
-    run_anvil(&config_dir, &["bucket", "create", &bucket, "test-region-1"]);
+    run_anvil(&config_dir, &["bucket", "create", &bucket, "test-region-1"]).await;
 
     let temp = tempdir().unwrap();
     let v1 = temp.path().join("v1.txt");
@@ -329,20 +334,23 @@ async fn tenant_tutorial_commands_run_without_admin_port_e2e() {
     run_anvil(
         &config_dir,
         &["object", "put", v1.to_str().unwrap(), &obj_v1],
-    );
+    )
+    .await;
     run_anvil(
         &config_dir,
         &["object", "put", v2.to_str().unwrap(), &obj_v2],
-    );
+    )
+    .await;
 
     let latest = format!("s3://{bucket}/latest.txt");
-    let created = run_anvil(&config_dir, &["object", "link", "create", &latest, &obj_v1]);
+    let created = run_anvil(&config_dir, &["object", "link", "create", &latest, &obj_v1]).await;
     assert!(stdout(&created).contains("latest.txt -> app-v1.txt"));
     let gen1 = parse_link_generation(&created);
     let listed = run_anvil(
         &config_dir,
         &["object", "link", "list", &format!("s3://{bucket}/")],
-    );
+    )
+    .await;
     assert!(stdout(&listed).contains("latest.txt -> app-v1.txt"));
     let updated = run_anvil(
         &config_dir,
@@ -355,7 +363,8 @@ async fn tenant_tutorial_commands_run_without_admin_port_e2e() {
             "--expected-generation",
             &gen1,
         ],
-    );
+    )
+    .await;
     assert!(stdout(&updated).contains("latest.txt -> app-v2.txt"));
     let gen2 = parse_link_generation(&updated);
     run_anvil(
@@ -368,13 +377,15 @@ async fn tenant_tutorial_commands_run_without_admin_port_e2e() {
             "--expected-generation",
             &gen2,
         ],
-    );
+    )
+    .await;
 
     run_anvil(
         &config_dir,
         &["index", "create", &bucket, "by-path", "path"],
-    );
-    let indexes = run_anvil(&config_dir, &["index", "list", &bucket]);
+    )
+    .await;
+    let indexes = run_anvil(&config_dir, &["index", "list", &bucket]).await;
     assert!(stdout(&indexes).contains("by-path"));
     let query = run_anvil_eventually(
         &config_dir,
@@ -390,7 +401,8 @@ async fn tenant_tutorial_commands_run_without_admin_port_e2e() {
         ],
         &["app-v1.txt", "app-v2.txt"],
         Duration::from_secs(30),
-    );
+    )
+    .await;
     let query_output = stdout(&query);
     assert!(query_output.contains("app-v1.txt"), "{query_output}");
     assert!(query_output.contains("app-v2.txt"), "{query_output}");
@@ -404,13 +416,15 @@ async fn tenant_tutorial_commands_run_without_admin_port_e2e() {
             "--page-size",
             "5",
         ],
-    );
+    )
+    .await;
     run_anvil(
         &config_dir,
         &["repair", "run", "directory", &bucket, "--rebuild"],
-    );
+    )
+    .await;
 
-    let stream = run_anvil(&config_dir, &["stream", "create", &bucket, "events/app"]);
+    let stream = run_anvil(&config_dir, &["stream", "create", &bucket, "events/app"]).await;
     let stream_id = parse_stream_id(&stream);
     run_anvil(
         &config_dir,
@@ -422,7 +436,8 @@ async fn tenant_tutorial_commands_run_without_admin_port_e2e() {
             &stream_id,
             "event-one",
         ],
-    );
+    )
+    .await;
     let stream_read = run_anvil(
         &config_dir,
         &[
@@ -433,15 +448,17 @@ async fn tenant_tutorial_commands_run_without_admin_port_e2e() {
             &stream_id,
             "--include-payload",
         ],
-    );
+    )
+    .await;
     assert!(stdout(&stream_read).contains("event-one"));
     run_anvil(
         &config_dir,
         &["stream", "seal-segment", &bucket, "events/app", &stream_id],
-    );
+    )
+    .await;
 
     let task_id = format!("cli-task-{}", uuid::Uuid::new_v4().simple());
-    let lease_token = stdout(&run_anvil(&config_dir, &["auth", "get-token"]))
+    let lease_token = stdout(&run_anvil(&config_dir, &["auth", "get-token"]).await)
         .trim()
         .to_string();
     let lease_partition = format!("{:064x}", 1_u8);
@@ -456,33 +473,38 @@ async fn tenant_tutorial_commands_run_without_admin_port_e2e() {
             "bucket",
             &lease_partition,
         ],
-    );
+    )
+    .await;
     let fence = parse_fence(&lease);
     run_anvil_with_token(
         &config_dir,
         &lease_token,
         &["lease", "checkpoint", &task_id, &fence, "1", "1"],
-    );
+    )
+    .await;
     run_anvil_with_token(
         &config_dir,
         &lease_token,
         &["lease", "commit", &task_id, &fence, "2", "2"],
-    );
+    )
+    .await;
 
     let app_name = format!("tenant-app-{}", uuid::Uuid::new_v4().simple());
-    let created_app = run_anvil(&config_dir, &["app", "create", &app_name]);
+    let created_app = run_anvil(&config_dir, &["app", "create", &app_name]).await;
     assert!(stdout(&created_app).contains(&app_name));
     run_anvil(
         &config_dir,
         &["auth", "grant", &app_name, "bucket:read", &bucket],
-    );
-    let grants = run_anvil(&config_dir, &["auth", "list-grants", &app_name]);
+    )
+    .await;
+    let grants = run_anvil(&config_dir, &["auth", "list-grants", &app_name]).await;
     assert!(stdout(&grants).contains(&app_name));
     run_anvil(
         &config_dir,
         &["auth", "revoke", &app_name, "bucket:read", &bucket],
-    );
-    run_anvil(&config_dir, &["app", "rotate-secret", &app_name]);
+    )
+    .await;
+    run_anvil(&config_dir, &["app", "rotate-secret", &app_name]).await;
 
     let host = format!("{}.example.test", uuid::Uuid::new_v4().simple());
     let alias = run_anvil(
@@ -495,7 +517,8 @@ async fn tenant_tutorial_commands_run_without_admin_port_e2e() {
             "--region",
             "test-region-1",
         ],
-    );
+    )
+    .await;
     let challenge = parse_host_alias_challenge(&alias);
     let alias_generation = parse_host_alias_generation(&alias);
     run_anvil(
@@ -508,14 +531,15 @@ async fn tenant_tutorial_commands_run_without_admin_port_e2e() {
             "--expected-generation",
             &alias_generation,
         ],
-    );
-    let alias_list = run_anvil(&config_dir, &["host-alias", "list"]);
+    )
+    .await;
+    let alias_list = run_anvil(&config_dir, &["host-alias", "list"]).await;
     assert!(stdout(&alias_list).contains(&host));
 
-    let audit = run_anvil(&config_dir, &["audit", "list", "--page-size", "20"]);
+    let audit = run_anvil(&config_dir, &["audit", "list", "--page-size", "20"]).await;
     assert!(stdout(&audit).contains("object_link") || stdout(&audit).contains("host_alias"));
 
-    let bad_admin = run_anvil_expect_failure(&config_dir, &["admin", "node", "list"]);
+    let bad_admin = run_anvil_expect_failure(&config_dir, &["admin", "node", "list"]).await;
     assert!(
         String::from_utf8_lossy(&bad_admin.stderr).contains("unrecognized subcommand")
             || String::from_utf8_lossy(&bad_admin.stderr).contains("error")

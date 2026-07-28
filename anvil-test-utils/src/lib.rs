@@ -1830,15 +1830,6 @@ impl TestCluster {
         let Some(canonical) = self.states.first() else {
             return;
         };
-        for source in &self.states {
-            canonical
-                .core_store
-                .register_node_receipt_signing_public_key(
-                    &source.config.node_id,
-                    &source.core_store.local_receipt_signing_public_key(),
-                )
-                .unwrap();
-        }
         anvil_core::access_control::grant_node_defaults_batch(
             &canonical.persistence,
             &node_default_grants,
@@ -1852,12 +1843,23 @@ impl TestCluster {
                 canonical.config.node_id
             )
         });
-        anvil_core::mesh_lifecycle::install_bootstrap_lifecycle_projection(
-            &canonical.storage,
-            &canonical.core_store,
-            projection,
-        )
-        .unwrap();
+        for target in &self.states {
+            for source in &self.states {
+                target
+                    .core_store
+                    .register_node_receipt_signing_public_key(
+                        &source.config.node_id,
+                        &source.core_store.local_receipt_signing_public_key(),
+                    )
+                    .unwrap();
+            }
+            anvil_core::mesh_lifecycle::install_bootstrap_lifecycle_projection(
+                &target.storage,
+                &target.core_store,
+                projection.clone(),
+            )
+            .unwrap();
+        }
 
         // Keep the physical bootstrap projection while CoreStore shard
         // placement still reads it, but seed the authoritative topology through
@@ -1964,9 +1966,6 @@ impl TestCluster {
                     .await
                     .unwrap_or_else(|error| panic!("activate MVCC node descriptor: {error:?}"));
             }
-        }
-        if self.states.len() == 1 {
-            install_canonical_coremeta_bootstrap_snapshot(&self.states);
         }
     }
 

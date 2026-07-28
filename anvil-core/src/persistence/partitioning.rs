@@ -1008,6 +1008,10 @@ impl Persistence {
     }
 
     pub(super) async fn task_queue_write_permit(&self) -> Result<PartitionWritePermit> {
+        self.mvcc()?
+            .reconcile_work_assignment("task-queue", "global")
+            .await?
+            .ok_or_else(|| anyhow!("local node does not own the task queue assignment"))?;
         let partition_id = hex::encode(task_journal::task_queue_partition_id());
         self.global_write_permit("task_queue", partition_id).await
     }

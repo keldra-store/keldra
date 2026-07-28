@@ -210,11 +210,34 @@ async fn authz_tuple_write_enqueues_and_materializes_bounded_authorization_state
     assert!(unavailable.to_string().contains("AuthzRevisionUnavailable"));
 
     let guard = claim_authz_materialization_guard(&persistence, 1, record.revision as u64).await;
+    assert_eq!(
+        guard.assignment().partition_id,
+        crate::mvcc_worker_authority::work_partition_id("task-queue", "global").unwrap(),
+        "background authz materialization must execute under the task-queue assignment"
+    );
+    assert!(
+        persistence
+            .mvcc()
+            .unwrap()
+            .claim_assignment("authz-tuple", "1")
+            .unwrap()
+            .is_none(),
+        "the tenant authz assignment must be absent before the task publication regression"
+    );
     let outcome = persistence
         .run_authz_materialization_task(1, record.revision as u64, &guard)
         .await
         .unwrap();
     assert_eq!(outcome.processed_revision, record.revision as u64);
+    assert!(
+        persistence
+            .mvcc()
+            .unwrap()
+            .claim_assignment("authz-tuple", "1")
+            .unwrap()
+            .is_none(),
+        "task publication must stage its task-queue assignment without independently reconciling tenant authz ownership"
+    );
     assert_eq!(
         outcome.source_rows_visited,
         usize::try_from(record.revision).unwrap(),

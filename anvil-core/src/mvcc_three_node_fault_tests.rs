@@ -429,6 +429,20 @@ async fn non_owner_producer_enqueues_but_worker_mutations_remain_assignment_fenc
         format!("{failure_error:#}").contains("local node does not own the task queue assignment"),
         "unexpected failure transition error: {failure_error:#}"
     );
+    let legacy_owner_after_rejected_worker_mutations =
+        crate::partition_fence::read_partition_owner_mvcc(
+            &cluster.states[producer].mvcc,
+            "task_queue",
+            &legacy_partition_id,
+            cluster.states[producer]
+                .persistence
+                .partition_owner_signing_key(),
+        )
+        .unwrap();
+    assert_eq!(
+        legacy_owner_after_rejected_worker_mutations, legacy_owner_before,
+        "rejected non-owner worker mutations must not acquire or transfer legacy task-queue partition ownership"
+    );
     let unchanged = cluster.states[producer]
         .persistence
         .list_tasks_page(None, 1_000)

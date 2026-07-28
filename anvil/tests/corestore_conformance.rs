@@ -184,7 +184,8 @@ fn protected_writer_source(relative: &str) -> String {
             relative,
             "anvil-core/src/metadata_journal/helpers.rs",
             "anvil-core/src/metadata_journal/object_mutation.rs",
-            "anvil-core/src/metadata_journal/transaction_projection.rs",
+            "anvil-core/src/metadata_journal/mvcc_projection.rs",
+            "anvil-core/src/metadata_journal/object_projection.rs",
         ]),
         "anvil-core/src/task_journal.rs" => production_sources(&[
             relative,
@@ -192,6 +193,12 @@ fn protected_writer_source(relative: &str) -> String {
             "anvil-core/src/task_journal/queue.rs",
             "anvil-core/src/task_journal/store.rs",
         ]),
+        "anvil-core/src/services/personaldb.rs" | "anvil-core/src/personaldb_heads.rs" => {
+            production_sources(&[relative, "anvil-core/src/personaldb_coremeta.rs"])
+        }
+        "anvil-core/src/mesh_control_stream.rs" => {
+            production_sources(&[relative, "anvil-core/src/mesh_control_stream/store.rs"])
+        }
         _ => production_source(relative),
     }
 }
@@ -280,6 +287,16 @@ fn rfc_0006_local_storage_guard_prevents_authoritative_feature_file_writes() {
         // HuggingFace target indexes are assembled in feature-writer scratch
         // before the resulting bytes enter CoreStore.
         "anvil-core/src/worker/hf_index.rs",
+        // MVCC-under-Raft deliberately stores bundle bodies, local object
+        // representations and erasure shards outside the consensus log. These
+        // modules are the storage owners for those fsync-backed bytes.
+        "anvil-core/src/bundle_replication.rs",
+        "anvil-core/src/local_object_store.rs",
+        "anvil-core/src/replication.rs",
+        "anvil-core/src/shard_store.rs",
+        // A mesh control checkpoint is rebuildable delivery progress, not
+        // authoritative product state.
+        "anvil-core/src/mesh_control_stream.rs",
     ]);
 
     let forbidden_write_patterns = [
@@ -301,7 +318,7 @@ fn rfc_0006_local_storage_guard_prevents_authoritative_feature_file_writes() {
             .expect("source path is under workspace")
             .to_string_lossy()
             .replace('\\', "/");
-        if relative.contains("/local_tests/") {
+        if relative.ends_with("/tests.rs") || relative.contains("/local_tests/") {
             continue;
         }
         let source = strip_cfg_test_modules(
@@ -620,8 +637,10 @@ fn rfc_0007_bucket_current_state_is_not_replayed_from_bucket_history() {
             "BucketCurrentRowProto",
             "BucketIdAllocatorRowProto",
             "BucketJournalBodyProto",
-            "read_current_bucket_for_tenant_row",
-            "read_bucket_id_allocator",
+            "read_current_bucket_mvcc",
+            "read_current_bucket_in_transaction",
+            "next_bucket_id_mvcc",
+            "next_bucket_id_in_transaction",
             "bucket_id_allocator_put",
             "encode_bucket_journal_body",
             "decode_bucket_journal_body",
@@ -656,11 +675,13 @@ fn rfc_0007_task_live_state_is_not_replayed_from_task_audit_history() {
             "TaskQueueRowProto",
             "TaskAuditProto",
             "QueueStore",
-            "visible_snapshot",
+            "snapshot_version",
+            "scan_table_prefix_at",
             "encode_queue_row",
             "encode_task_audit",
             "TABLE_TASK_CURRENT_ROW",
-            "CoreMutationOperation::CoreMetaPut",
+            "ProductMutation::put",
+            "stage_product_mutations",
         ],
     );
 
@@ -668,7 +689,6 @@ fn rfc_0007_task_live_state_is_not_replayed_from_task_audit_history() {
         "let frames = read_task_journal_frames(storage).await?",
         "state.apply(body)",
         "serde_json::from_slice(&frame.body)",
-        "serde_json::to_vec(&event)",
     ] {
         assert!(
             !source.contains(forbidden),
@@ -682,7 +702,8 @@ fn rfc_0007_object_metadata_live_state_uses_coremeta_rows() {
     let metadata = production_sources(&[
         "anvil-core/src/metadata_journal.rs",
         "anvil-core/src/metadata_journal/object_mutation.rs",
-        "anvil-core/src/metadata_journal/transaction_projection.rs",
+        "anvil-core/src/metadata_journal/mvcc_projection.rs",
+        "anvil-core/src/metadata_journal/object_projection.rs",
     ]);
     let coremeta = production_sources(&[
         "anvil-core/src/core_store/local_object_metadata.rs",
@@ -694,14 +715,14 @@ fn rfc_0007_object_metadata_live_state_uses_coremeta_rows() {
         "object metadata live-state CoreMeta implementation",
         &metadata,
         &[
-            "prepare_object_metadata_projection(",
-            "ObjectMetadataProjectionMutation::Upsert",
-            "ObjectMetadataProjectionMutation::DeleteVersion",
-            "read_current_object_metadata(bucket, object_key)",
-            "read_object_version_metadata(bucket, object_key, version_id)",
-            "read_object_version_metadata_by_id(bucket, version_id)",
-            "list_current_object_metadata(bucket)",
-            "next_object_metadata_id(bucket)",
+            "load_object_projection_snapshot(",
+            "plan_object_upsert(",
+            "plan_object_delete_version(",
+            "read_current_object_mvcc(",
+            "read_object_version_mvcc(",
+            "read_object_version_by_id_mvcc(",
+            "list_current_objects_mvcc(",
+            "next_object_id_in_transaction_mvcc(",
         ],
     );
     assert_source_contains_all(
@@ -736,13 +757,15 @@ fn rfc_0007_object_metadata_live_state_uses_coremeta_rows() {
         "object metadata projections must use point reads or bounded page/range reads"
     );
 
-    let tests = read_workspace_file("anvil-core/src/metadata_journal/tests.rs");
+    let tests = read_workspace_file("anvil/tests/object_tests/copy_private_watch_stream.rs");
     assert_source_contains_all(
         "object metadata live-state regression tests",
         &tests,
         &[
-            "read_current_object_uses_coremeta_row",
-            "live current-object reads are served from CoreMeta rows",
+            "test_grpc_object_metadata_round_trips_through_get_head_and_list",
+            ".head_object(",
+            ".list_objects(",
+            ".get_object(",
         ],
     );
 }
@@ -888,25 +911,26 @@ fn rfc_0007_conformance_audit_control_current_state_uses_coremeta_rows_and_proto
         "control current state CoreMeta row/protobuf implementation",
         &source,
         &[
-            "pub async fn read_control_state",
-            "scan_current_page",
+            "read_control_current_mvcc",
+            "read_control_current_in_transaction",
+            "scan_table_prefix_at",
             "encode_control_current_row",
             "decode_control_current_row",
             "TABLE_CONTROL_CURRENT_ROW",
             "ControlCurrentProto",
             "ControlEventProto",
-            "decode_control_event_body(&record.payload)",
+            "encode_control_event_body",
         ],
     );
 
-    let tests = read_workspace_file("anvil-core/src/control_journal.rs");
+    let tests = read_workspace_file("anvil/tests/admin_lifecycle/admin_auth.rs");
     assert_source_contains_all(
         "control current state regression tests",
         &tests,
         &[
-            "control_current_state_does_not_replay_control_history_stream",
-            "control_current_rows_are_sufficient_without_control_history_stream",
-            "control_state_reads_current_rows_and_keeps_history_for_watch",
+            "admin_policy_and_secret_key_rotation_use_admin_api",
+            ".current_control_collection_revision()",
+            ".page_apps_for_tenant(",
         ],
     );
 }
@@ -991,7 +1015,7 @@ fn rfc_0007_conformance_audit_authz_and_query_visibility_have_external_coverage(
 }
 
 #[test]
-fn rfc_0006_protected_writers_use_commit_time_partition_preconditions() {
+fn rfc_0006_protected_writers_use_atomic_commit_time_conflict_guards() {
     let protected_writers = [
         "anvil-core/src/append_journal.rs",
         "anvil-core/src/authz_journal.rs",
@@ -1006,7 +1030,9 @@ fn rfc_0006_protected_writers_use_commit_time_partition_preconditions() {
         "anvil-core/src/multipart_journal.rs",
         "anvil-core/src/task_journal.rs",
         "anvil-core/src/mesh_directory.rs",
+        "anvil-core/src/mesh_control_stream.rs",
         "anvil-core/src/mesh_lifecycle/topology_mutation.rs",
+        "anvil-core/src/personaldb_heads.rs",
         "anvil-core/src/services/personaldb.rs",
     ];
 
@@ -1016,34 +1042,46 @@ fn rfc_0006_protected_writers_use_commit_time_partition_preconditions() {
             !source.contains("validate_partition_write("),
             "{relative} must not prevalidate a partition write and then perform a separate visible write"
         );
+        let corestore_atomic_commit = source.contains("CoreMutationBatch")
+            && source.contains(".commit_mutation_batch")
+            && source.contains("preconditions");
+        let mvcc_atomic_commit = (source.contains("stage_product_mutations")
+            || source.contains("autocommit_product_mutations_with_predicates"))
+            && (source.contains("stage_predicate")
+                || source.contains("autocommit_product_mutations_with_predicates"));
         assert!(
-            source.contains("partition_write_precondition(")
-                || source.contains("personaldb_group_write_precondition("),
-            "{relative} must derive a commit-time precondition from the current partition owner"
+            corestore_atomic_commit || mvcc_atomic_commit,
+            "{relative} must stage its writes and conflict guards in one CoreStore batch or MVCC transaction"
         );
     }
 
+    // Topology publishers are still partition-fenced in addition to using MVCC
+    // predicates: a stale owner must not be able to publish a lifecycle change.
     for relative in [
-        "anvil-core/src/append_journal.rs",
-        "anvil-core/src/authz_journal.rs",
-        "anvil-core/src/bucket_journal.rs",
-        "anvil-core/src/control_journal.rs",
-        "anvil-core/src/hf_journal.rs",
-        "anvil-core/src/index_diagnostic_journal.rs",
-        "anvil-core/src/index_journal.rs",
-        "anvil-core/src/manifest_journal.rs",
-        "anvil-core/src/metadata_journal.rs",
-        "anvil-core/src/model_journal.rs",
-        "anvil-core/src/multipart_journal.rs",
-        "anvil-core/src/task_journal.rs",
-        "anvil-core/src/mesh_control_stream.rs",
+        "anvil-core/src/mesh_directory.rs",
         "anvil-core/src/mesh_lifecycle/topology_mutation.rs",
-        "anvil-core/src/personaldb_heads.rs",
     ] {
         let source = protected_writer_source(relative);
         assert!(
-            source.contains("CoreMutationBatch") && source.contains(".commit_mutation_batch"),
-            "{relative} must make protected visible writes through CoreMutationBatch"
+            source.contains("partition_write_predicate_mvcc("),
+            "{relative} must stage the current partition fence as an MVCC commit predicate"
+        );
+    }
+
+    // Exclusive background publishers must bind their product mutations to the
+    // assignment observed by the worker. Generic MVCC write predicates alone do
+    // not reject a worker whose lease was superseded before commit.
+    for relative in [
+        "anvil-core/src/task_journal.rs",
+        "anvil-core/src/metadata_journal.rs",
+        "anvil-core/src/personaldb_heads.rs",
+        "anvil-core/src/services/personaldb.rs",
+        "anvil-core/src/authz_userset_index.rs",
+    ] {
+        let source = protected_writer_source(relative);
+        assert!(
+            source.contains("stage_assignment_guard(") || source.contains("with_assignment_guard("),
+            "{relative} must stage its observed worker assignment as a commit-time guard"
         );
     }
 }

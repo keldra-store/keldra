@@ -395,6 +395,7 @@ async fn publish_derived_userset_index(
             source_head_predicate,
         } => {
             let source_head_predicate = source_head_predicate.clone();
+            let assignment = guard.assignment().clone();
             guard
                 .publish_mvcc_with(move |task_lease_predicate| async move {
                     let preconditions = [source_head_predicate, task_lease_predicate];
@@ -403,6 +404,7 @@ async fn publish_derived_userset_index(
                         mvcc,
                         &derived,
                         &preconditions,
+                        Some(assignment),
                     )
                     .await
                 })
