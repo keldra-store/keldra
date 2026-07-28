@@ -68,13 +68,33 @@ async fn create_active_region_for_bucket_move(
         .unwrap();
 }
 
-fn delete_routing_projection_row(node: &AdminNode, stream_family: &str, record_key: &str) {
+async fn delete_routing_projection_row(node: &AdminNode, stream_family: &str, record_key: &str) {
     let row_key = anvil::core_store::core_meta_tuple_key(&[
         anvil::core_store::CoreMetaTuplePart::Utf8("mesh-directory-projection"),
         anvil::core_store::CoreMetaTuplePart::Utf8(stream_family),
         anvil::core_store::CoreMetaTuplePart::Utf8(record_key),
     ])
     .unwrap();
+    let logical_key = anvil::mvcc_product::coremeta_logical_key(
+        anvil::core_store::CF_MESH,
+        anvil::core_store::TABLE_MESH_PARTITION_ROW,
+        &row_key,
+    )
+    .unwrap();
+    node.state
+        .mvcc
+        .autocommit_product_mutations(
+            "test:routing-projection-corruption",
+            &format!(
+                "test:routing-projection-corruption:{}",
+                uuid::Uuid::new_v4()
+            ),
+            vec![anvil::mvcc_product::ProductMutation::delete(logical_key)],
+            anvil::mvcc_transaction::DurabilityLevel::Quorum,
+            u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap(),
+        )
+        .await
+        .unwrap();
     anvil::core_store::CoreMetaStore::open(node.state.storage.core_store_meta_path())
         .unwrap()
         .delete(
@@ -87,7 +107,7 @@ fn delete_routing_projection_row(node: &AdminNode, stream_family: &str, record_k
 
 #[tokio::test]
 async fn mesh_bucket_move_requires_routing_and_bucket_zanzibar_permissions() {
-    let node = spawn_admin_node().await;
+    let node = spawn_admin_node_with_background_worker().await;
     let admin_token = admin_token(&node);
     let mut admin_client = AdminServiceClient::connect(node.admin_url.clone())
         .await
@@ -138,6 +158,23 @@ async fn mesh_bucket_move_requires_routing_and_bucket_zanzibar_permissions() {
         .bucket
         .unwrap();
     assert_eq!(bucket.region, "eu-west-1");
+    let locator_key = anvil::mesh_directory::BucketLocatorKey::new(
+        anvil::mesh_directory::TenantId::new(tenant.tenant_id.clone()).unwrap(),
+        anvil::mesh_directory::BucketName::canonicalize("movable-assets").unwrap(),
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if anvil::mesh_directory::read_bucket_locator_mvcc(&node.state.mvcc, &locator_key)
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background worker did not publish the committed bucket locator");
 
     create_active_region_for_bucket_move(
         &node,
@@ -209,10 +246,6 @@ async fn mesh_bucket_move_requires_routing_and_bucket_zanzibar_permissions() {
         .unwrap()
         .unwrap();
     assert_eq!(moved.region, "us-east-1");
-    let locator_key = anvil::mesh_directory::BucketLocatorKey::new(
-        anvil::mesh_directory::TenantId::new(tenant.tenant_id).unwrap(),
-        anvil::mesh_directory::BucketName::canonicalize("movable-assets").unwrap(),
-    );
     let locator = anvil::mesh_directory::read_bucket_locator_mvcc(&node.state.mvcc, &locator_key)
         .unwrap()
         .unwrap();
@@ -374,7 +407,8 @@ async fn admin_routing_records_list_and_repair_mesh_locators() {
         &node,
         "bucket_locator",
         &format!("{}/route-bucket", tenant.id),
-    );
+    )
+    .await;
 
     let missing_after_delete = client
         .list_routing_records(with_auth(
@@ -485,7 +519,8 @@ async fn admin_routing_records_list_and_repair_mesh_locators() {
         &node,
         "bucket_locator",
         &format!("{}/route-bucket", tenant.id),
-    );
+    )
+    .await;
     let projection_repair = client
         .run_repair(with_auth(
             tonic::Request::new(RunRepairRequest {

@@ -481,7 +481,7 @@ impl BundleTargetStream for DurableBundleTargets {
         std::io::Write::write_all(&mut file, bytes)?;
         file.sync_all()?;
         *self.elapsed.lock().unwrap() += started.elapsed();
-        let digest: [u8; 32] = Sha256::digest(bytes).into();
+        let digest = bundle_digest(bytes);
         Ok(ReplicationAck {
             session_id: Uuid::nil(),
             acknowledged_sequence: 1,
@@ -549,7 +549,7 @@ async fn openraft_consensus(path: &std::path::Path) -> OpenRaftConsensus {
             .await
             .is_ok()
         {
-            return consensus;
+            break;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -557,6 +557,29 @@ async fn openraft_consensus(path: &std::path::Path) -> OpenRaftConsensus {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    for (node_id, raft_node_id, failure_domain) in [
+        ("node-1", 1, "zone-1"),
+        ("node-2", 2, "zone-2"),
+        ("node-3", 3, "zone-3"),
+    ] {
+        consensus
+            .install_node(
+                cluster_hash,
+                anvil_mvcc_consensus::NodeIncarnation {
+                    node_id: consensus_control_node_id(node_id),
+                    incarnation: 1,
+                },
+                RaftNodeId(raft_node_id),
+                failure_domain.into(),
+            )
+            .await
+            .expect("install benchmark durability holder");
+    }
+    consensus
+        .set_durability_policy(cluster_hash, 1, 2, 1)
+        .await
+        .expect("install benchmark durability policy");
+    consensus
 }
 
 fn domain_hash(domain: &[u8], fields: &[&[u8]]) -> [u8; 32] {
@@ -568,6 +591,13 @@ fn domain_hash(domain: &[u8], fields: &[&[u8]]) -> [u8; 32] {
         hasher.update(field);
     }
     hasher.finalize().into()
+}
+
+fn consensus_control_node_id(node_id: &str) -> RaftNodeId {
+    let digest = domain_hash(b"anvil.node-id.v1", &[node_id.as_bytes()]);
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    RaftNodeId(u64::from_be_bytes(bytes))
 }
 
 struct CompleteShardTarget(Arc<Mutex<Duration>>);
@@ -729,14 +759,19 @@ async fn run_reconnect_resume(payload_bytes: usize) -> Result<()> {
 }
 
 fn bundle_identity(bytes: &[u8]) -> BundleIdentity {
+    let digest = bundle_digest(bytes);
+    BundleIdentity {
+        hash: format!("sha256:{}", hex::encode(digest)),
+        length: bytes.len() as u64,
+    }
+}
+
+fn bundle_digest(bytes: &[u8]) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(b"anvil.mvcc.transaction-bundle.v1");
     hash.update((bytes.len() as u64).to_be_bytes());
     hash.update(bytes);
-    BundleIdentity {
-        hash: format!("sha256:{}", hex::encode(hash.finalize())),
-        length: bytes.len() as u64,
-    }
+    hash.finalize().into()
 }
 
 fn run_retained_history_read() -> Result<()> {

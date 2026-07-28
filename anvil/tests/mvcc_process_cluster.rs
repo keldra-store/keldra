@@ -246,41 +246,52 @@ async fn committed_index_finalization_survives_two_worker_crashes_without_commit
     cluster
         .arm_hard_crash(worker, "IndexFinalizationAfterExecute")
         .unwrap();
-    cluster.restart(worker).await.unwrap();
+    cluster
+        .restart_for_expected_hard_crash(worker)
+        .await
+        .unwrap();
     cluster
         .wait_for_hard_crash(worker, Duration::from_secs(45))
         .await
         .unwrap();
     cluster.restart(worker).await.unwrap();
 
-    tokio::time::timeout(Duration::from_secs(60), async {
-        loop {
-            let indexes = cluster
-                .list_indexes(worker, &bucket_name)
-                .await
-                .unwrap_or_default();
-            let exact = indexes
-                .iter()
-                .filter(|index| {
-                    index.index_id == staged.index_id && index.version == staged.version
-                })
-                .count();
-            let owner_grant_count = cluster
-                .index_creator_access_grant_count(worker, &bucket_name, index_name)
-                .await
-                .unwrap_or_default();
-            let queryable = cluster
-                .query_path_index(worker, &bucket_name, index_name)
-                .await
-                .is_ok();
-            if exact == 1 && owner_grant_count == 1 && queryable {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+    let replay_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let indexes = cluster.list_indexes(worker, &bucket_name).await;
+        let exact = indexes
+            .as_ref()
+            .map(|indexes| {
+                indexes
+                    .iter()
+                    .filter(|index| {
+                        index.index_id == staged.index_id && index.version == staged.version
+                    })
+                    .count()
+            })
+            .unwrap_or_default();
+        let owner_grants = cluster
+            .index_creator_access_grant_count(worker, &bucket_name, index_name)
+            .await;
+        let owner_grant_count = owner_grants.as_ref().copied().unwrap_or_default();
+        let query = cluster
+            .query_path_index(worker, &bucket_name, index_name)
+            .await;
+        if exact == 1 && owner_grant_count == 1 && query.is_ok() {
+            break;
         }
-    })
-    .await
-    .expect("same-disk replay completes creator grant and exact-version build");
+        if tokio::time::Instant::now() >= replay_deadline {
+            panic!(
+                "same-disk replay did not complete creator grant and exact-version build: \
+                 exact definitions={exact}, definition error={:?}, creator grants={owner_grant_count}, \
+                 grant error={:?}, query error={:?}",
+                indexes.as_ref().err(),
+                owner_grants.as_ref().err(),
+                query.as_ref().err(),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -289,20 +300,20 @@ async fn committed_personaldb_submit_survives_two_worker_crashes_without_client_
     let mut cluster = ProcessMvccCluster::start(binary).await.unwrap();
     let coordinator = cluster.wait_for_leader(&[0, 1, 2]).await.unwrap();
     let database_id = format!("personaldb-crash-{}", uuid::Uuid::new_v4().simple());
-    cluster
-        .create_personaldb_group(coordinator, &database_id, PERSONALDB_PROCESS_SCHEMA)
+    let (personaldb_owner, _) = cluster
+        .create_personaldb_group_on_owner(coordinator, &database_id, PERSONALDB_PROCESS_SCHEMA)
         .await
         .unwrap();
     let genesis_hash = hex::encode(anvil::formats::hash32(
         format!("genesis:{database_id}").as_bytes(),
     ));
     let transaction = cluster
-        .begin_transaction(coordinator, MvccReadConsistency::Linearized)
+        .begin_transaction(personaldb_owner, MvccReadConsistency::Linearized)
         .await
         .unwrap();
     let staged = cluster
         .stage_personaldb_submit(
-            coordinator,
+            personaldb_owner,
             &database_id,
             &genesis_hash,
             personaldb_insert_changeset(),
@@ -313,7 +324,7 @@ async fn committed_personaldb_submit_survives_two_worker_crashes_without_client_
     assert_eq!(staged.write_state, WriteState::Staged as i32);
     assert_eq!(
         cluster
-            .get_personaldb_group(coordinator, &database_id)
+            .get_personaldb_group(personaldb_owner, &database_id)
             .await
             .unwrap()
             .committed_head
@@ -324,7 +335,7 @@ async fn committed_personaldb_submit_survives_two_worker_crashes_without_client_
     );
     assert_eq!(
         cluster
-            .personaldb_row_owner_tuple_count(coordinator, &database_id, "items", "1")
+            .personaldb_row_owner_tuple_count(personaldb_owner, &database_id, "items", "1")
             .await
             .unwrap(),
         0,
@@ -336,7 +347,7 @@ async fn committed_personaldb_submit_survives_two_worker_crashes_without_client_
         .unwrap();
     let committed = cluster
         .commit_transaction(
-            cluster.public_endpoint(coordinator),
+            cluster.public_endpoint(personaldb_owner),
             transaction.transaction_id,
         )
         .await
@@ -375,7 +386,10 @@ async fn committed_personaldb_submit_survives_two_worker_crashes_without_client_
     cluster
         .arm_hard_crash(worker, "PersonalDbPostCommitAfterEffects")
         .unwrap();
-    cluster.restart(worker).await.unwrap();
+    cluster
+        .restart_for_expected_hard_crash(worker)
+        .await
+        .unwrap();
     cluster
         .wait_for_hard_crash(worker, Duration::from_secs(45))
         .await
@@ -446,7 +460,10 @@ async fn committed_bucket_locator_survives_two_worker_crashes_without_client_ret
     cluster
         .arm_hard_crash(worker, "BucketLocatorFinalizationAfterEffects")
         .unwrap();
-    cluster.restart(worker).await.unwrap();
+    cluster
+        .restart_for_expected_hard_crash(worker)
+        .await
+        .unwrap();
     cluster
         .wait_for_hard_crash(worker, Duration::from_secs(45))
         .await
@@ -544,7 +561,10 @@ async fn committed_git_pack_survives_two_worker_crashes_without_client_retry_or_
     cluster
         .arm_hard_crash(worker, "GitSourcePostCommitAfterEffects")
         .unwrap();
-    cluster.restart(worker).await.unwrap();
+    cluster
+        .restart_for_expected_hard_crash(worker)
+        .await
+        .unwrap();
     cluster
         .wait_for_hard_crash(worker, Duration::from_secs(45))
         .await
@@ -616,7 +636,9 @@ async fn public_object_batch_recovers_after_leader_crashes_before_local_batch_wr
         );
     }
 
-    cluster.arm_hard_crash(leader, "MvccBatchWrite").unwrap();
+    cluster
+        .arm_transaction_hard_crash(leader, "MvccBatchWrite", &transaction.transaction_id)
+        .unwrap();
     let commit = cluster.commit_transaction(
         cluster.public_endpoint(leader),
         transaction.transaction_id.clone(),

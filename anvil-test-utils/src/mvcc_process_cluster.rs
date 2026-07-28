@@ -58,6 +58,7 @@ struct ProcessNode {
     api_addr: SocketAddr,
     admin_addr: SocketAddr,
     storage_path: PathBuf,
+    stderr_path: PathBuf,
     raft_node_id: u64,
     incarnation: u64,
     hard_crash_control_path: PathBuf,
@@ -126,6 +127,9 @@ impl ProcessMvccCluster {
                 api_addr,
                 admin_addr,
                 storage_path: directory.path().join(format!("node-{}", index + 1)),
+                stderr_path: directory
+                    .path()
+                    .join(format!("node-{}-stderr.log", index + 1)),
                 raft_node_id: index as u64 + 1,
                 incarnation: 1,
                 hard_crash_control_path: directory
@@ -425,6 +429,51 @@ impl ProcessMvccCluster {
             ))
             .await?
             .into_inner())
+    }
+
+    /// Create a PersonalDB group on its compact-partition owner.
+    ///
+    /// The first request may establish an assignment whose owner is not the
+    /// caller. Probe the remaining live nodes only when the server reports
+    /// that exact routing result; all other failures remain test failures.
+    pub async fn create_personaldb_group_on_owner(
+        &self,
+        preferred_node: usize,
+        database_id: &str,
+        schema_sql: &str,
+    ) -> anyhow::Result<(usize, PersonalDbGroupResponse)> {
+        if preferred_node >= self.nodes.len() {
+            bail!("preferred PersonalDB node index is out of bounds");
+        }
+        let candidates = std::iter::once(preferred_node)
+            .chain((0..self.nodes.len()).filter(|candidate| *candidate != preferred_node))
+            .filter(|candidate| self.nodes[*candidate].child.is_some())
+            .collect::<Vec<_>>();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+
+        loop {
+            for &candidate in &candidates {
+                match self
+                    .create_personaldb_group(candidate, database_id, schema_sql)
+                    .await
+                {
+                    Ok(group) => return Ok((candidate, group)),
+                    Err(error)
+                        if error.downcast_ref::<tonic::Status>().is_some_and(|status| {
+                            status.code() == tonic::Code::FailedPrecondition
+                                && status.message()
+                                    == "PersonalDB write is assigned to another cluster node"
+                        }) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!(
+                    "PersonalDB write assignment for {database_id} did not become available on any live node"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     pub async fn stage_git_pack(
@@ -1045,6 +1094,27 @@ impl ProcessMvccCluster {
             .context("arm process MVCC hard crash")
     }
 
+    /// Arm a one-shot fault for one transaction so unrelated background MVCC
+    /// batches cannot consume the process control.
+    pub fn arm_transaction_hard_crash(
+        &self,
+        node: usize,
+        fault_point: &str,
+        transaction_id: &str,
+    ) -> anyhow::Result<()> {
+        if fault_point != "MvccBatchWrite" {
+            bail!("transaction-scoped hard crash is only supported for MvccBatchWrite");
+        }
+        if transaction_id.trim().is_empty() {
+            bail!("transaction-scoped hard crash requires a transaction identity");
+        }
+        std::fs::write(
+            &self.nodes[node].hard_crash_control_path,
+            format!("{fault_point}:{transaction_id}"),
+        )
+        .context("arm transaction-scoped process MVCC hard crash")
+    }
+
     /// Arm the same worker fault on every live node.
     ///
     /// Background work is placed by compact-Raft partition assignment, not by
@@ -1172,6 +1242,15 @@ impl ProcessMvccCluster {
         self.spawn_node(node).await?;
         self.wait_for_admin(node).await?;
         self.wait_for_public_ready(&[node]).await
+    }
+
+    /// Relaunch a node whose recovery worker is expected to abort before the
+    /// public and admin readiness probes can complete.
+    pub async fn restart_for_expected_hard_crash(&mut self, node: usize) -> anyhow::Result<()> {
+        if self.nodes[node].child.is_some() {
+            bail!("cannot restart a running process MVCC node");
+        }
+        self.spawn_node(node).await
     }
 
     /// Start a clean replacement process with the same logical node ID,
@@ -1352,6 +1431,8 @@ impl ProcessMvccCluster {
 
     async fn spawn_node(&mut self, node: usize) -> anyhow::Result<()> {
         std::fs::create_dir_all(&self.nodes[node].storage_path)?;
+        let stderr = std::fs::File::create(&self.nodes[node].stderr_path)
+            .context("create process MVCC node stderr log")?;
         let child = Command::new(&self.binary)
             .env("JWT_SECRET", JWT_SECRET)
             .env("ANVIL_SECRET_ENCRYPTION_KEY", ENCRYPTION_KEY)
@@ -1399,7 +1480,7 @@ impl ProcessMvccCluster {
             )
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(stderr))
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("spawn {}", self.binary.display()))?;
@@ -1411,12 +1492,11 @@ impl ProcessMvccCluster {
         let endpoint = format!("http://{}", self.nodes[node].admin_addr);
         let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
         loop {
-            if self.nodes[node]
-                .child
-                .as_mut()
-                .is_some_and(|child| matches!(child.try_wait(), Ok(Some(_))))
-            {
-                bail!("process MVCC node {node} exited during startup");
+            if let Some(status) = self.node_exit_status(node)? {
+                bail!(
+                    "process MVCC node {node} exited during startup with {status}; stderr tail:\n{}",
+                    self.node_stderr_tail(node)
+                );
             }
             if let Ok(mut client) = AdminServiceClient::connect(endpoint.clone()).await {
                 let request = authorized(
@@ -1428,7 +1508,10 @@ impl ProcessMvccCluster {
                 }
             }
             if tokio::time::Instant::now() >= deadline {
-                bail!("process MVCC node {node} did not become ready");
+                bail!(
+                    "process MVCC node {node} did not become ready; stderr tail:\n{}",
+                    self.node_stderr_tail(node)
+                );
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -1459,12 +1542,11 @@ impl ProcessMvccCluster {
         let endpoint = format!("http://{}", self.nodes[node].admin_addr);
         let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
         loop {
-            if self.nodes[node]
-                .child
-                .as_mut()
-                .is_some_and(|child| matches!(child.try_wait(), Ok(Some(_))))
-            {
-                bail!("process MVCC node {node} exited during startup");
+            if let Some(status) = self.node_exit_status(node)? {
+                bail!(
+                    "process MVCC node {node} exited during startup with {status}; stderr tail:\n{}",
+                    self.node_stderr_tail(node)
+                );
             }
             if let Ok(mut client) = AdminServiceClient::connect(endpoint.clone()).await {
                 // The system realm is committed through this cluster's Raft
@@ -1483,9 +1565,37 @@ impl ProcessMvccCluster {
                 }
             }
             if tokio::time::Instant::now() >= deadline {
-                bail!("process MVCC node {node} admin transport did not become ready");
+                bail!(
+                    "process MVCC node {node} admin transport did not become ready; stderr tail:\n{}",
+                    self.node_stderr_tail(node)
+                );
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    fn node_exit_status(
+        &mut self,
+        node: usize,
+    ) -> anyhow::Result<Option<std::process::ExitStatus>> {
+        let Some(child) = self.nodes[node].child.as_mut() else {
+            return Ok(None);
+        };
+        child
+            .try_wait()
+            .context("inspect process MVCC node startup status")
+    }
+
+    fn node_stderr_tail(&self, node: usize) -> String {
+        const MAX_TAIL_BYTES: usize = 16 * 1024;
+
+        match std::fs::read(&self.nodes[node].stderr_path) {
+            Ok(bytes) if bytes.is_empty() => "<empty>".to_string(),
+            Ok(bytes) => {
+                let offset = bytes.len().saturating_sub(MAX_TAIL_BYTES);
+                String::from_utf8_lossy(&bytes[offset..]).into_owned()
+            }
+            Err(error) => format!("<unavailable: {error}>"),
         }
     }
 }

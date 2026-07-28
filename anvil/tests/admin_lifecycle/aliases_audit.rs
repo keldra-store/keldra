@@ -482,18 +482,19 @@ async fn admin_mutations_are_returned_by_durable_audit_listing() {
         .unwrap_err();
     assert_eq!(stale_revision.code(), Code::InvalidArgument);
 
-    let find_event = |action: &str| {
+    let find_event = |audit_event_id: &str, action: &str| {
         audit
             .events
             .iter()
-            .find(|event| event.action == action)
-            .unwrap_or_else(|| panic!("missing audit event for {action}"))
+            .find(|event| event.audit_event_id == audit_event_id)
+            .filter(|event| event.action == action)
+            .unwrap_or_else(|| panic!("missing audit event {audit_event_id} for {action}"))
     };
     let details = |event: &AuditEventRecord| -> serde_json::Value {
         serde_json::from_str(&event.details_json).unwrap()
     };
 
-    let tenant_event = find_event("admin.tenant.create");
+    let tenant_event = find_event(&tenant_response.audit_event_id, "admin.tenant.create");
     assert_eq!(tenant_event.audit_event_id, tenant_response.audit_event_id);
     assert_eq!(tenant_event.resource_id, format!("tenant:{tenant_id}"));
     assert_eq!(tenant_event.principal_id, "admin-principal");
@@ -513,14 +514,14 @@ async fn admin_mutations_are_returned_by_durable_audit_listing() {
         ))
     );
 
-    let app_event = find_event("admin.app.create");
+    let app_event = find_event(&app_response.audit_event_id, "admin.app.create");
     assert_eq!(app_event.audit_event_id, app_response.audit_event_id);
     let app_details = details(app_event);
     assert_eq!(app_details["tenant_id"], tenant_id);
     assert_eq!(app_details["app_name"], "publisher");
     assert_eq!(app_details["authorised_relation"], "manage_apps");
 
-    let bucket_event = find_event("admin.bucket.create");
+    let bucket_event = find_event(&bucket_response.audit_event_id, "admin.bucket.create");
     assert_eq!(bucket_event.audit_event_id, bucket_response.audit_event_id);
     assert_eq!(
         bucket_event.resource_id,
@@ -530,7 +531,10 @@ async fn admin_mutations_are_returned_by_durable_audit_listing() {
     assert_eq!(bucket_details["bucket_id"], bucket.bucket_id);
     assert_eq!(bucket_details["region"], "eu-west-1");
 
-    let public_bucket_event = find_event("admin.bucket.public_access.set");
+    let public_bucket_event = find_event(
+        &public_bucket_response.audit_event_id,
+        "admin.bucket.public_access.set",
+    );
     assert_eq!(
         public_bucket_event.audit_event_id,
         public_bucket_response.audit_event_id
@@ -539,14 +543,17 @@ async fn admin_mutations_are_returned_by_durable_audit_listing() {
     assert_eq!(public_bucket_details["allow_public_read"], true);
     assert_eq!(public_bucket_details["expected_generation"], 1);
 
-    let region_event = find_event("admin.region.create");
+    let region_event = find_event(&region_response.audit_event_id, "admin.region.create");
     assert_eq!(region_event.audit_event_id, region_response.audit_event_id);
     assert_eq!(region_event.resource_id, "region:eu-west-1");
     let region_details = details(region_event);
     assert_eq!(region_details["state"], "joining");
     assert_eq!(region_details["placement_weight"], 100);
 
-    let active_region_event = find_event("admin.region.activate");
+    let active_region_event = find_event(
+        &active_region_response.audit_event_id,
+        "admin.region.activate",
+    );
     assert_eq!(
         active_region_event.audit_event_id,
         active_region_response.audit_event_id
@@ -555,7 +562,10 @@ async fn admin_mutations_are_returned_by_durable_audit_listing() {
     assert_eq!(active_region_details["state"], "active");
     assert!(active_region_details["activation_checkpoint"].is_object());
 
-    let host_alias_event = find_event("admin.host_alias.create");
+    let host_alias_event = find_event(
+        &host_alias_response.audit_event_id,
+        "admin.host_alias.create",
+    );
     assert_eq!(
         host_alias_event.audit_event_id,
         host_alias_response.audit_event_id

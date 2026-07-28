@@ -37,10 +37,8 @@ impl TaskExecutionGuard {
             .filter(|ttl| *ttl > 0)
             .ok_or_else(|| anyhow!("task lease has no positive renewal window"))?;
         lease.verify(&signing_key)?;
-        let assignment_identity = format!("{}:{}", lease.owner.tenant_id, lease.task_id);
-        let assignment = mvcc
-            .claim_assignment("task-lease", &assignment_identity)?
-            .context("local node no longer owns the task lease assignment")?;
+        let assignment = task_lease::claim_task_lease_assignment(&mvcc, &lease)
+            .context("local node no longer owns the task execution assignment")?;
 
         Ok(Self {
             lease: Arc::new(Mutex::new(lease)),

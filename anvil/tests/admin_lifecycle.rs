@@ -24,6 +24,14 @@ impl Drop for AdminNode {
 }
 
 async fn spawn_admin_node() -> AdminNode {
+    spawn_admin_node_with_worker(false).await
+}
+
+async fn spawn_admin_node_with_background_worker() -> AdminNode {
+    spawn_admin_node_with_worker(true).await
+}
+
+async fn spawn_admin_node_with_worker(run_background_worker: bool) -> AdminNode {
     let temp = tempfile::tempdir().unwrap();
     let storage_path = temp.path().join("node-a");
     let public_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -47,10 +55,10 @@ async fn spawn_admin_node() -> AdminNode {
         storage_path: storage_path.to_string_lossy().into_owned(),
         personaldb_snapshot_entry_threshold: 1024,
         personaldb_snapshot_payload_bytes_threshold: 64 * 1024 * 1024,
-        // These tests exercise synchronous administrative lifecycle APIs.
-        // Background task execution is covered separately and would leave
-        // detached workers competing across the nodes created by this binary.
-        run_background_worker: false,
+        // Most tests exercise synchronous administrative lifecycle APIs.
+        // Only the explicit background-worker fixture enables task execution;
+        // detached workers would otherwise compete across this test binary.
+        run_background_worker,
         // This in-process fixture binds its single-node MVCC transport to an
         // ephemeral plaintext loopback endpoint. Production configurations
         // remain TLS-only.
@@ -129,6 +137,23 @@ async fn activation_checkpoint_json_from_existing_streams(
     node: &AdminNode,
     region: &str,
 ) -> String {
+    // Lifecycle mutations commit their control-stream append through the MVCC
+    // outbox. Wait for those durable appends to reach CoreStore before taking
+    // the synthetic checkpoint snapshot, otherwise the outbox can add a new
+    // partition between this helper's scan and activation validation.
+    while node
+        .state
+        .mvcc
+        .runtime
+        .local_store()
+        .outbox_backlog(0)
+        .unwrap()
+        .0
+        != 0
+    {
+        tokio::task::yield_now().await;
+    }
+
     let mut required_streams = Vec::new();
     let stream_families = anvil::mesh_directory::RoutingRecordFamily::all()
         .into_iter()

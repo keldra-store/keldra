@@ -219,6 +219,9 @@ struct TransferMetadata {
     final_hash: [u8; 32],
     transaction_id: String,
     prepared_snapshot_version: u64,
+    /// Timestamp from the first frame accepted by this receiver. Retries may
+    /// carry a different wall-clock value, but must not replace this durable
+    /// timestamp because provisional-shard GC is anchored to it.
     prepared_at_unix_ms: u64,
     provisional: bool,
     /// Local durable deadline armed only after the cluster GC watermark makes
@@ -238,7 +241,6 @@ impl TransferMetadata {
             && self.final_hash == other.final_hash
             && self.transaction_id == other.transaction_id
             && self.prepared_snapshot_version == other.prepared_snapshot_version
-            && self.prepared_at_unix_ms == other.prepared_at_unix_ms
             && self.provisional == other.provisional
     }
 }
@@ -618,6 +620,8 @@ impl TransferReceiver {
             if !existing.has_same_immutable_identity(expected) {
                 bail!("transfer ID was reused with different immutable metadata");
             }
+            // The first accepted timestamp and any receiver-local retirement
+            // deadline remain authoritative across idempotent retries.
             return Ok(());
         }
         let path = self.metadata_path(expected.transfer_id);
@@ -778,6 +782,71 @@ mod tests {
         let ack = receiver.receive(&mut resumed_session, &resumed).unwrap();
         assert_eq!(ack.status, AckStatus::Complete);
         assert_eq!(ack.completed_hash, Some(*blake3::hash(whole).as_bytes()));
+    }
+
+    #[test]
+    fn retry_with_new_prepared_timestamp_preserves_first_persisted_timestamp() {
+        let directory = tempfile::tempdir().unwrap();
+        let peer = AuthenticatedPeer::new("node-b", 3).unwrap();
+        let mut first_session = ConnectionSession::establish("cluster-a", peer.clone()).unwrap();
+        let transfer_id = Uuid::new_v4();
+        let whole = b"persistent-stream";
+        let mut first = frame(
+            &first_session,
+            transfer_id,
+            1,
+            0,
+            &whole[..10],
+            whole,
+            false,
+        );
+        first.prepared_at_unix_ms = 10;
+
+        let mut receiver = TransferReceiver::open(directory.path()).unwrap();
+        let ack = receiver.receive(&mut first_session, &first).unwrap();
+        assert_eq!(ack.status, AckStatus::Persisted);
+        drop(receiver);
+
+        let mut receiver = TransferReceiver::open(directory.path()).unwrap();
+        let mut retry_session = ConnectionSession::establish("cluster-a", peer).unwrap();
+        let mut retry = frame(
+            &retry_session,
+            transfer_id,
+            1,
+            10,
+            &whole[10..],
+            whole,
+            true,
+        );
+        retry.prepared_at_unix_ms = 100;
+        let ack = receiver.receive(&mut retry_session, &retry).unwrap();
+        assert_eq!(ack.status, AckStatus::Complete);
+        assert_eq!(
+            receiver
+                .metadata
+                .get(&transfer_id)
+                .unwrap()
+                .prepared_at_unix_ms,
+            10
+        );
+        drop(receiver);
+
+        let mut receiver = TransferReceiver::open(directory.path()).unwrap();
+        assert_eq!(
+            receiver
+                .metadata
+                .get(&transfer_id)
+                .unwrap()
+                .prepared_at_unix_ms,
+            10
+        );
+        assert_eq!(
+            receiver
+                .retire_orphan_provisional_object_shards(2, 20, 10, &BTreeSet::new())
+                .unwrap(),
+            1,
+            "retry timestamp must not extend the receiver's durable GC grace"
+        );
     }
 
     #[test]

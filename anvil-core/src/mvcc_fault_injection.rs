@@ -119,7 +119,7 @@ pub fn clear() {
 pub fn clear() {}
 
 #[cfg(all(feature = "process-hard-crash-test-control", debug_assertions))]
-fn abort_process_if_armed(point: FaultPoint) {
+fn abort_process_if_armed(point: FaultPoint, qualifier: Option<&str>) {
     if std::env::var("ANVIL_TEST_ENABLE_PROCESS_HARD_CRASH")
         .ok()
         .as_deref()
@@ -129,8 +129,12 @@ fn abort_process_if_armed(point: FaultPoint) {
     }
     if let Some(path) = std::env::var_os("ANVIL_MVCC_HARD_CRASH_CONTROL_FILE") {
         let path = std::path::PathBuf::from(path);
+        let expected = qualifier.map_or_else(
+            || format!("{point:?}"),
+            |qualifier| format!("{point:?}:{qualifier}"),
+        );
         if std::fs::read_to_string(&path)
-            .is_ok_and(|configured| configured.trim() == format!("{point:?}"))
+            .is_ok_and(|configured| configured.trim() == expected)
             // Claim the one-shot control before aborting. If another task
             // already consumed it, this process must continue normally.
             && std::fs::remove_file(path).is_ok()
@@ -141,12 +145,24 @@ fn abort_process_if_armed(point: FaultPoint) {
 }
 
 pub fn hit(point: FaultPoint) -> Result<(), InjectedFault> {
+    hit_inner(point, None)
+}
+
+/// Hits a fault only when both its point and transaction identity match.
+///
+/// Process-backed tests use this for hooks which are also reached by unrelated
+/// background transactions. Unit-test fault plans remain point-scoped.
+pub fn hit_for_transaction(point: FaultPoint, transaction_id: &str) -> Result<(), InjectedFault> {
+    hit_inner(point, Some(transaction_id))
+}
+
+fn hit_inner(point: FaultPoint, qualifier: Option<&str>) -> Result<(), InjectedFault> {
     // Process-backed acceptance tests run `CARGO_BIN_EXE_anvil-server`, which
     // is not compiled with `cfg(test)`. Keep this hook behind both an explicit
     // non-default feature and a child-process environment gate. Release builds
     // additionally compile it out through `debug_assertions`.
     #[cfg(all(feature = "process-hard-crash-test-control", debug_assertions))]
-    abort_process_if_armed(point);
+    abort_process_if_armed(point, qualifier);
 
     #[cfg(test)]
     {
@@ -166,7 +182,7 @@ pub fn hit(point: FaultPoint) -> Result<(), InjectedFault> {
     }
     #[cfg(not(test))]
     {
-        let _ = point;
+        let _ = (point, qualifier);
         Ok(())
     }
 }

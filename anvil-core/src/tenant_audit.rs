@@ -171,6 +171,7 @@ pub fn list_tenant_audit_event_page_after_mvcc(
         &application_prefix,
         snapshot,
     )?;
+    rows.sort_by(|(left, _), (right, _)| left.application_key.cmp(&right.application_key));
     if let Some(after_cursor) = after_cursor {
         rows.retain(|(key, _)| {
             crate::mvcc_product::coremeta_tuple_from_logical_key(key, CF_OBSERVABILITY)

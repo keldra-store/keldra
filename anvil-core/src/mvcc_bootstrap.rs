@@ -57,6 +57,18 @@ pub type ProductMvccRuntime = MvccNodeRuntime<
     OpenRaftConsensus,
 >;
 
+fn raft_store_is_empty(store: &RocksRaftStore) -> Result<bool> {
+    let has_retained_log = store
+        .last_log_index()
+        .context("inspect MVCC Raft log")?
+        .is_some();
+    let has_purged_log = store
+        .last_purged_index()
+        .context("inspect MVCC Raft purge boundary")?
+        .is_some();
+    Ok(!has_retained_log && !has_purged_log)
+}
+
 #[derive(Clone)]
 struct RaftClusterOwnershipResolver {
     cluster_id: String,
@@ -666,10 +678,10 @@ impl MvccSubsystem {
             crate::mvcc_fault_injection::hit(crate::mvcc_fault_injection::FaultPoint::RaftLogWrite)
                 .map_err(|error| error.to_string())
         }));
-        let raft_is_empty = raft_store
-            .last_log_index()
-            .context("inspect MVCC Raft log")?
-            .is_none();
+        // A valid snapshot may cover and purge every retained log entry.
+        // Absence of a current log therefore does not make an existing group
+        // eligible for membership initialization.
+        let raft_is_empty = raft_store_is_empty(&raft_store)?;
         #[cfg(test)]
         if !raft_is_empty {
             crate::mvcc_fault_injection::hit(
@@ -1241,6 +1253,20 @@ fn normalize_endpoint(endpoint: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn purged_raft_history_is_not_a_new_consensus_group() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = RocksRaftStore::open(directory.path(), 7).unwrap();
+        assert!(raft_store_is_empty(&store).unwrap());
+
+        store.append_logs(&[(0, vec![0])]).unwrap();
+        store.purge_logs(0).unwrap();
+
+        assert_eq!(store.last_log_index().unwrap(), None);
+        assert_eq!(store.last_purged_index().unwrap(), Some(0));
+        assert!(!raft_store_is_empty(&store).unwrap());
+    }
 
     #[test]
     fn background_worker_identity_names_the_local_incarnation() {

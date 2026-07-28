@@ -1084,7 +1084,10 @@ impl MvccStore {
             );
         }
         #[cfg(any(test, debug_assertions))]
-        crate::mvcc_fault_injection::hit(crate::mvcc_fault_injection::FaultPoint::MvccBatchWrite)?;
+        crate::mvcc_fault_injection::hit_for_transaction(
+            crate::mvcc_fault_injection::FaultPoint::MvccBatchWrite,
+            &bundle.transaction_id,
+        )?;
         self.db.write_opt(batch, &durable_write_options())?;
         Ok(ApplyOutcome::Applied)
     }
