@@ -13,22 +13,23 @@ use std::{
 };
 
 use anvil::anvil_api::{
-    AdminRequestContext, BeginTransactionRequest, BeginTransactionResponse,
-    BootstrapMeshTopologyRequest, CheckPermissionRequest, CommitTransactionRequest,
-    CreateBucketRequest, CreateIndexRequest, CreatePersonalDbGroupRequest, GetGitBlobByPathRequest,
+    AdminRequestContext, ApplicationPoliciesRequest, ApplicationPolicyMutation,
+    BeginTransactionRequest, BeginTransactionResponse, BootstrapMeshTopologyRequest,
+    CommitTransactionRequest, CreateApplicationRequest, CreateBucketRequest, CreateIndexRequest,
+    CreatePersonalDbGroupRequest, CreateTenantRequest, GetGitBlobByPathRequest,
     GetLocalNodeDescriptorRequest, GetObjectRequest, GetPersonalDbGroupRequest,
     GetTransactionRequest, GitBlobLocation, GitPackMetadata, HeadObjectRequest,
-    IndexDefinitionRecord, IndexKind, ListIndexesRequest, ListRoutingRecordsRequest,
-    MutationBatchOperation, MutationBatchPutObject, MutationBatchRequest, MutationBatchResponse,
-    MvccDurability, MvccReadConsistency, NativeMutationContext, NodeCapability,
-    PersonalDbGroupResponse, PersonalDbVoterAck, PutCellRequest, PutGitPackRequest,
-    PutGitPackResponse, PutNodeRequest, PutRegionRequest, QueryIndexRequest, QueryIndexResponse,
-    ReadAuthzTuplesRequest, ReadConsistency, ReplaceClusterNodeIncarnationRequest,
-    RoutingRecordFamily, SubmitPersonalDbChangesetRequest, SubmitPersonalDbChangesetResponse,
-    TransactionStatus, WatchGitSourceRequest, WatchGitSourceResponse, WriteOptions, WriteResponse,
-    admin_service_client::AdminServiceClient, auth_service_client::AuthServiceClient,
-    bucket_service_client::BucketServiceClient, git_source_service_client::GitSourceServiceClient,
-    index_service_client::IndexServiceClient,
+    IndexDefinitionRecord, IndexKind, ListAccessGrantsRequest, ListIndexesRequest,
+    ListRoutingRecordsRequest, MutationBatchOperation, MutationBatchPutObject,
+    MutationBatchRequest, MutationBatchResponse, MvccDurability, MvccReadConsistency,
+    NativeMutationContext, NodeCapability, PersonalDbGroupResponse, PersonalDbVoterAck,
+    PutCellRequest, PutGitPackRequest, PutGitPackResponse, PutNodeRequest, PutRegionRequest,
+    QueryIndexRequest, QueryIndexResponse, ReadAuthzTuplesRequest, ReadConsistency,
+    ReplaceClusterNodeIncarnationRequest, RoutingRecordFamily, SubmitPersonalDbChangesetRequest,
+    SubmitPersonalDbChangesetResponse, TransactionStatus, WatchGitSourceRequest,
+    WatchGitSourceResponse, WriteOptions, WriteResponse, admin_service_client::AdminServiceClient,
+    auth_service_client::AuthServiceClient, bucket_service_client::BucketServiceClient,
+    git_source_service_client::GitSourceServiceClient, index_service_client::IndexServiceClient,
     mesh_control_service_client::MeshControlServiceClient, mutation_batch_operation,
     object_service_client::ObjectServiceClient,
     personal_db_service_client::PersonalDbServiceClient, put_git_pack_request,
@@ -49,6 +50,7 @@ use tonic::Request;
 const JWT_SECRET: &str = "process-mvcc-fixture-secret";
 const ENCRYPTION_KEY: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const ADMIN_PRINCIPAL: &str = "process-mvcc-admin";
+const DATA_PLANE_APP_NAME: &str = "process-mvcc-data-plane";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
@@ -70,6 +72,13 @@ struct ObsoleteNode {
     incarnation: u64,
 }
 
+#[derive(Debug)]
+struct DataPlaneActor {
+    tenant_id: i64,
+    principal: String,
+    token: String,
+}
+
 /// Three `anvil-server` children with stable addresses and persistent,
 /// independent storage directories.
 #[derive(Debug)]
@@ -79,6 +88,7 @@ pub struct ProcessMvccCluster {
     cluster_id: String,
     peers_json: String,
     admin_token: String,
+    data_plane_actor: Option<DataPlaneActor>,
     nodes: Vec<ProcessNode>,
     obsolete_nodes: Vec<Option<ObsoleteNode>>,
     obsolete_children: Vec<Child>,
@@ -132,6 +142,7 @@ impl ProcessMvccCluster {
             cluster_id,
             peers_json,
             admin_token,
+            data_plane_actor: None,
             nodes,
             obsolete_nodes: (0..3).map(|_| None).collect(),
             obsolete_children: Vec::new(),
@@ -151,6 +162,7 @@ impl ProcessMvccCluster {
         }
         cluster.bootstrap_cluster_topology(coordinator).await?;
         cluster.wait_for_public_ready(&[0, 1, 2]).await?;
+        cluster.bootstrap_data_plane_actor(coordinator).await?;
         Ok(cluster)
     }
 
@@ -160,6 +172,12 @@ impl ProcessMvccCluster {
 
     pub fn cluster_id(&self) -> &str {
         &self.cluster_id
+    }
+
+    fn data_plane_actor(&self) -> &DataPlaneActor {
+        self.data_plane_actor
+            .as_ref()
+            .expect("process MVCC data-plane actor is bootstrapped before the fixture is returned")
     }
 
     /// Find the current leader through OpenRaft's leader-local linearized read
@@ -273,7 +291,7 @@ impl ProcessMvccCluster {
                     cluster_id: self.cluster_id.clone(),
                     durability: durability as i32,
                 },
-                &self.admin_token,
+                &self.data_plane_actor().token,
             ))
             .await?
             .into_inner())
@@ -291,7 +309,7 @@ impl ProcessMvccCluster {
                     transaction_id,
                     cluster_id: self.cluster_id.clone(),
                 },
-                &self.admin_token,
+                &self.data_plane_actor().token,
             ))
             .await?
             .into_inner())
@@ -309,7 +327,7 @@ impl ProcessMvccCluster {
                     transaction_id: transaction_id.to_string(),
                     cluster_id: self.cluster_id.clone(),
                 },
-                &self.admin_token,
+                &self.data_plane_actor().token,
             ))
             .await?
             .into_inner())
@@ -324,7 +342,7 @@ impl ProcessMvccCluster {
                     region: "process-e2e-region".to_string(),
                     options: None,
                 },
-                &self.admin_token,
+                &self.data_plane_actor().token,
             ))
             .await?
             .into_inner()
@@ -354,7 +372,7 @@ impl ProcessMvccCluster {
                         )),
                     }),
                 },
-                &self.admin_token,
+                &self.data_plane_actor().token,
             ))
             .await?
             .into_inner()
@@ -403,7 +421,7 @@ impl ProcessMvccCluster {
                     schema_sql: schema_sql.to_string(),
                     options: None,
                 },
-                &self.admin_token,
+                &self.data_plane_actor().token,
             ))
             .await?
             .into_inner())
@@ -440,7 +458,7 @@ impl ProcessMvccCluster {
                     data: Some(put_git_pack_request::Data::Chunk(pack)),
                 },
             ]),
-            &self.admin_token,
+            &self.data_plane_actor().token,
         );
         Ok(client.put_git_pack(request).await?.into_inner())
     }
@@ -460,7 +478,7 @@ impl ProcessMvccCluster {
                     commit_id: commit_id.to_string(),
                     tree_path: tree_path.to_string(),
                 },
-                &self.admin_token,
+                &self.data_plane_actor().token,
             ))
             .await?
             .into_inner()
@@ -484,7 +502,7 @@ impl ProcessMvccCluster {
                     after_cursor_low: 0,
                     after_cursor_high: 0,
                 },
-                &self.admin_token,
+                &self.data_plane_actor().token,
             ))
             .await?
             .into_inner();
@@ -516,10 +534,10 @@ impl ProcessMvccCluster {
         Ok(client
             .submit_personal_db_changeset(authorized(
                 SubmitPersonalDbChangesetRequest {
-                    tenant_id: SYSTEM_STORAGE_TENANT_ID,
+                    tenant_id: self.data_plane_actor().tenant_id,
                     database_id: database_id.to_string(),
-                    principal: ADMIN_PRINCIPAL.to_string(),
-                    session_token: self.admin_token.clone(),
+                    principal: self.data_plane_actor().principal.clone(),
+                    session_token: self.data_plane_actor().token.clone(),
                     request_id: format!("process-submit-{database_id}"),
                     idempotency_key: format!("process-submit-{database_id}"),
                     base_log_index: 0,
@@ -527,9 +545,9 @@ impl ProcessMvccCluster {
                     client_log_epoch: 1,
                     membership_epoch: 1,
                     policy_epoch: 1,
-                    leader_replica_id: ADMIN_PRINCIPAL.to_string(),
+                    leader_replica_id: self.data_plane_actor().principal.clone(),
                     voter_acks: vec![PersonalDbVoterAck {
-                        replica_id: ADMIN_PRINCIPAL.to_string(),
+                        replica_id: self.data_plane_actor().principal.clone(),
                         log_index: 1,
                         log_hash: hex::encode(anvil::formats::hash32(&changeset_bytes)),
                         signature: "process-fixture".to_string(),
@@ -548,7 +566,7 @@ impl ProcessMvccCluster {
                         )),
                     }),
                 },
-                &self.admin_token,
+                &self.data_plane_actor().token,
             ))
             .await?
             .into_inner())
@@ -563,10 +581,10 @@ impl ProcessMvccCluster {
         Ok(client
             .get_personal_db_group(authorized(
                 GetPersonalDbGroupRequest {
-                    tenant_id: SYSTEM_STORAGE_TENANT_ID,
+                    tenant_id: self.data_plane_actor().tenant_id,
                     database_id: database_id.to_string(),
                 },
-                &self.admin_token,
+                &self.data_plane_actor().token,
             ))
             .await?
             .into_inner())
@@ -580,12 +598,10 @@ impl ProcessMvccCluster {
         resource_id: &str,
     ) -> anyhow::Result<usize> {
         let mut client = AuthServiceClient::connect(self.public_endpoint(node)).await?;
-        let namespace = anvil_core::authz_scope::encode_realm_namespace(
-            anvil_core::authz_scope::DEFAULT_AUTHZ_REALM_ID,
-            "personaldb_row",
-        );
+        let actor = self.data_plane_actor();
         let object_id = format!(
-            "tenant-{SYSTEM_STORAGE_TENANT_ID}/{database_id}/{resource_type}/{resource_id}"
+            "tenant-{}/{database_id}/{resource_type}/{resource_id}",
+            actor.tenant_id
         );
         let mut count = 0;
         for relation in [
@@ -596,11 +612,11 @@ impl ProcessMvccCluster {
             count += client
                 .read_authz_tuples(authorized(
                     ReadAuthzTuplesRequest {
-                        namespace: namespace.clone(),
+                        namespace: "personaldb_row".to_string(),
                         object_id: object_id.clone(),
                         relation: relation.to_string(),
                         subject_kind: anvil_core::access_control::APP_SUBJECT_KIND.to_string(),
-                        subject_id: ADMIN_PRINCIPAL.to_string(),
+                        subject_id: actor.principal.clone(),
                         caveat_hash: String::new(),
                         consistency: "latest".to_string(),
                         zookie: String::new(),
@@ -608,7 +624,7 @@ impl ProcessMvccCluster {
                         page_token: String::new(),
                         scope: None,
                     },
-                    &self.admin_token,
+                    &actor.token,
                 ))
                 .await?
                 .into_inner()
@@ -647,7 +663,7 @@ impl ProcessMvccCluster {
                         )),
                     }),
                 },
-                &self.admin_token,
+                &self.data_plane_actor().token,
             ))
             .await?
             .into_inner()
@@ -668,7 +684,7 @@ impl ProcessMvccCluster {
                     include_disabled: true,
                     page: None,
                 },
-                &self.admin_token,
+                &self.data_plane_actor().token,
             ))
             .await?
             .into_inner()
@@ -700,71 +716,104 @@ impl ProcessMvccCluster {
                     lag_timeout_ms: 1_000,
                     boundary_predicates_json: String::new(),
                 },
-                &self.admin_token,
+                &self.data_plane_actor().token,
             ))
             .await?
             .into_inner())
     }
 
-    pub async fn index_creator_is_owner(
+    pub async fn index_creator_access_grant_count(
         &self,
         node: usize,
-        bucket_id: i64,
-        index_name: &str,
-    ) -> anyhow::Result<bool> {
-        let mut client = AuthServiceClient::connect(self.public_endpoint(node)).await?;
-        Ok(client
-            .check_permission(authorized(
-                CheckPermissionRequest {
-                    namespace: anvil_core::access_control::system_realm_namespace(
-                        anvil_core::system_realm::SYSTEM_INDEX_NAMESPACE,
-                    ),
-                    object_id: format!("{bucket_id}/{index_name}"),
-                    relation: "owner".to_string(),
-                    subject_kind: anvil_core::access_control::APP_SUBJECT_KIND.to_string(),
-                    subject_id: ADMIN_PRINCIPAL.to_string(),
-                    caveat_hash: String::new(),
-                    consistency: "latest".to_string(),
-                    zookie: String::new(),
-                    scope: None,
-                },
-                &self.admin_token,
-            ))
-            .await?
-            .into_inner()
-            .allowed)
-    }
-
-    pub async fn index_creator_owner_tuple_count(
-        &self,
-        node: usize,
-        bucket_id: i64,
+        bucket_name: &str,
         index_name: &str,
     ) -> anyhow::Result<usize> {
         let mut client = AuthServiceClient::connect(self.public_endpoint(node)).await?;
+        let actor = self.data_plane_actor();
+        let resource = format!("{bucket_name}/{index_name}");
         Ok(client
-            .read_authz_tuples(authorized(
-                ReadAuthzTuplesRequest {
-                    namespace: anvil_core::access_control::system_realm_namespace(
-                        anvil_core::system_realm::SYSTEM_INDEX_NAMESPACE,
-                    ),
-                    object_id: format!("{bucket_id}/{index_name}"),
-                    relation: "owner".to_string(),
-                    subject_kind: anvil_core::access_control::APP_SUBJECT_KIND.to_string(),
-                    subject_id: ADMIN_PRINCIPAL.to_string(),
-                    caveat_hash: String::new(),
-                    consistency: "latest".to_string(),
-                    zookie: String::new(),
-                    page_size: 100,
-                    page_token: String::new(),
-                    scope: None,
+            .list_access_grants(authorized(
+                ListAccessGrantsRequest {
+                    app: DATA_PLANE_APP_NAME.to_string(),
+                    page: None,
+                },
+                &actor.token,
+            ))
+            .await?
+            .into_inner()
+            .grants
+            .into_iter()
+            .filter(|grant| grant.action == "index:create" && grant.resource == resource)
+            .count())
+    }
+
+    async fn bootstrap_data_plane_actor(&mut self, coordinator: usize) -> anyhow::Result<()> {
+        let endpoint = format!("http://{}", self.nodes[coordinator].admin_addr);
+        let mut admin = AdminServiceClient::connect(endpoint).await?;
+        let tenant_name = format!("{}-tenant", self.cluster_id);
+        let tenant = admin
+            .create_tenant(authorized(
+                CreateTenantRequest {
+                    context: Some(admin_context("create process MVCC data-plane tenant")),
+                    name: tenant_name,
+                    home_region: "process-e2e-region".to_string(),
                 },
                 &self.admin_token,
             ))
             .await?
             .into_inner()
-            .tuples
-            .len())
+            .tenant
+            .context("process data-plane tenant response omitted tenant")?;
+        let tenant_id = tenant
+            .tenant_id
+            .parse::<i64>()
+            .context("process data-plane tenant id is not numeric")?;
+        let application = admin
+            .create_application(authorized(
+                CreateApplicationRequest {
+                    context: Some(admin_context("create process MVCC data-plane application")),
+                    tenant_id: tenant_id.to_string(),
+                    app_name: DATA_PLANE_APP_NAME.to_string(),
+                },
+                &self.admin_token,
+            ))
+            .await?
+            .into_inner();
+        if application.app_id.is_empty() {
+            bail!("process data-plane application response omitted app id");
+        }
+        admin
+            .grant_application_policies(authorized(
+                ApplicationPoliciesRequest {
+                    context: Some(admin_context(
+                        "grant process MVCC data-plane application permissions",
+                    )),
+                    tenant_id: tenant_id.to_string(),
+                    app_name: DATA_PLANE_APP_NAME.to_string(),
+                    policies: vec![
+                        ApplicationPolicyMutation {
+                            action: "tenant:manage".to_string(),
+                            resource: format!("tenant:{tenant_id}"),
+                        },
+                        ApplicationPolicyMutation {
+                            action: "authz:tuple_read".to_string(),
+                            resource: "default".to_string(),
+                        },
+                    ],
+                },
+                &self.admin_token,
+            ))
+            .await?;
+        let principal = application.app_id;
+        let token = JwtManager::new(JWT_SECRET.to_string())
+            .mint_token(principal.clone(), tenant_id)
+            .context("mint process MVCC data-plane token")?;
+        self.data_plane_actor = Some(DataPlaneActor {
+            tenant_id,
+            principal,
+            token,
+        });
+        Ok(())
     }
 
     async fn bootstrap_cluster_topology(&self, coordinator: usize) -> anyhow::Result<()> {
@@ -870,9 +919,9 @@ impl ProcessMvccCluster {
                 MutationBatchRequest {
                     bucket_name: bucket_name.to_string(),
                     mutation_context: Some(NativeMutationContext {
-                        tenant_id: SYSTEM_STORAGE_TENANT_ID,
+                        tenant_id: self.data_plane_actor().tenant_id,
                         bucket_id,
-                        principal: ADMIN_PRINCIPAL.to_string(),
+                        principal: self.data_plane_actor().principal.clone(),
                         request_id: uuid::Uuid::new_v4().to_string(),
                         precondition: "none".to_string(),
                         authz_zookie_optional: String::new(),
@@ -896,7 +945,7 @@ impl ProcessMvccCluster {
                         })
                         .collect(),
                 },
-                &self.admin_token,
+                &self.data_plane_actor().token,
             ))
             .await?
             .into_inner())
@@ -917,7 +966,7 @@ impl ProcessMvccCluster {
                     version_id: None,
                     ..Default::default()
                 },
-                &self.admin_token,
+                &self.data_plane_actor().token,
             ))
             .await
         {
@@ -945,7 +994,7 @@ impl ProcessMvccCluster {
                         mode: Some(anvil::anvil_api::read_consistency::Mode::Latest(true)),
                     }),
                 },
-                &self.admin_token,
+                &self.data_plane_actor().token,
             ))
             .await?
             .into_inner();
@@ -1481,6 +1530,16 @@ fn reserve_loopback_addresses(count: usize) -> anyhow::Result<Vec<SocketAddr>> {
         .iter()
         .map(|listener| listener.local_addr())
         .collect::<Result<Vec<_>, _>>()?)
+}
+
+fn admin_context(reason: &str) -> AdminRequestContext {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    AdminRequestContext {
+        request_id: request_id.clone(),
+        idempotency_key: request_id,
+        audit_reason: reason.to_string(),
+        expected_generation: 0,
+    }
 }
 
 fn authorized<T>(message: T, token: &str) -> Request<T> {

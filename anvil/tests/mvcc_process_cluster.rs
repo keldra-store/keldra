@@ -159,7 +159,7 @@ async fn committed_index_finalization_survives_two_worker_crashes_without_commit
     let coordinator = cluster.wait_for_leader(&[0, 1, 2]).await.unwrap();
     let bucket_name = format!("index-finalization-{}", uuid::Uuid::new_v4().simple());
     let index_name = "committed-path";
-    let bucket_id = cluster
+    cluster
         .create_bucket(coordinator, &bucket_name)
         .await
         .unwrap();
@@ -185,19 +185,13 @@ async fn committed_index_finalization_survives_two_worker_crashes_without_commit
             .is_empty(),
         "the staged definition must not publish before certification"
     );
-    assert!(
-        !cluster
-            .index_creator_is_owner(coordinator, bucket_id, index_name)
-            .await
-            .unwrap(),
-        "creator grants must not escape before certification"
-    );
     assert_eq!(
         cluster
-            .index_creator_owner_tuple_count(coordinator, bucket_id, index_name)
+            .index_creator_access_grant_count(coordinator, &bucket_name, index_name)
             .await
             .unwrap(),
-        0
+        0,
+        "creator grants must not escape before certification"
     );
     assert!(
         cluster
@@ -271,19 +265,15 @@ async fn committed_index_finalization_survives_two_worker_crashes_without_commit
                     index.index_id == staged.index_id && index.version == staged.version
                 })
                 .count();
-            let owner = cluster
-                .index_creator_is_owner(worker, bucket_id, index_name)
-                .await
-                .unwrap_or(false);
-            let owner_tuple_count = cluster
-                .index_creator_owner_tuple_count(worker, bucket_id, index_name)
+            let owner_grant_count = cluster
+                .index_creator_access_grant_count(worker, &bucket_name, index_name)
                 .await
                 .unwrap_or_default();
             let queryable = cluster
                 .query_path_index(worker, &bucket_name, index_name)
                 .await
                 .is_ok();
-            if exact == 1 && owner && owner_tuple_count == 1 && queryable {
+            if exact == 1 && owner_grant_count == 1 && queryable {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;

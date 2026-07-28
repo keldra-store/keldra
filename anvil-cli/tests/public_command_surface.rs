@@ -136,7 +136,7 @@ fn run_anvil_expect_failure(config_dir: &TempDir, args: &[&str]) -> Output {
 }
 
 async fn start_cluster_for_public_cli() -> (TestCluster, TempDir) {
-    let mut cluster = TestCluster::new(&["test-region-1"]).await;
+    let mut cluster = TestCluster::new(&["test-region-1", "test-region-1", "test-region-1"]).await;
     cluster.start_and_converge(Duration::from_secs(10)).await;
 
     let config_dir = tempdir().unwrap();
