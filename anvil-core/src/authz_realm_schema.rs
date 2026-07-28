@@ -342,13 +342,28 @@ pub async fn bind_schema(
     validate_realm_id(realm_id)?;
     let revision_key =
         schema_revision_tuple_key(tenant_id, &schema_ref.schema_id, schema_ref.schema_revision)?;
-    let schema = read_proto_row_latest_mvcc::<StoredAuthzSchemaRevision>(
-        storage,
-        mvcc,
-        tenant_id,
-        revision_key,
-    )
-    .await?
+    let schema = match caller_binding {
+        Some(binding) => {
+            read_proto_row_transaction_mvcc::<StoredAuthzSchemaRevision>(
+                storage,
+                mvcc,
+                binding.transaction_id,
+                binding.principal,
+                tenant_id,
+                revision_key,
+            )
+            .await?
+        }
+        None => {
+            read_proto_row_latest_mvcc::<StoredAuthzSchemaRevision>(
+                storage,
+                mvcc,
+                tenant_id,
+                revision_key,
+            )
+            .await?
+        }
+    }
     .ok_or_else(|| anyhow!("authorization schema revision not found"))?;
     validate_stored_schema_revision(&schema)?;
     if schema.schema_ref != schema_ref {

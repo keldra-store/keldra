@@ -93,13 +93,29 @@ Version 0.4.0 intentionally does not claim the following:
   and identity. Product-level crash/restart recovery is not yet
   release-qualified even though component storage reopen tests are present.
 - Transactions cannot cross cluster boundaries.
+- Advanced public product transactions are not release-qualified. Use separate
+  implicit operations for bucket, credential, registry, index, and Git
+  workflows. A bucket created in an explicit transaction cannot have its policy
+  changed in that transaction. If the response to a successful implicit bucket
+  delete is lost, retrying it can return `NotFound`; verify the bucket state.
 - Index create/update/delete/list/query/diagnostics remain available, including
   path/prefix query, but query completeness and freshness are not
   release-qualified. Index watch RPCs fail closed with `Unimplemented`, and
   `index:watch` cannot be delegated.
-- Git pack ingest and object/S3 readback are supported only for a tenant
+- Individual-pack Git ingest and object/S3 readback are supported only for a tenant
   administrator. Git query/tree/blob lookup and watch RPCs fail closed with
-  `Unimplemented`; Git actions cannot be delegated in 0.4.0.
+  `Unimplemented`; Git actions cannot be delegated in 0.4.0. Lost-response
+  retry reconstruction and multi-repository explicit transactions are not
+  release-qualified.
+- PersonalDB changeset submission requires a `personaldb_row` namespace schema
+  in the tenant's `default` authorisation realm. Its direct
+  `personaldb:insert`, `personaldb:update`, and `personaldb:delete` relations
+  must allow the submitting `app` principals. Advanced multi-resource
+  PersonalDB transactions and projection writeback are not release-qualified.
+- A PersonalDB validation or authorisation rejection can occur after Anvil
+  creates the implicit submission transaction. Its idempotency key can remain
+  reserved after the transaction expires; the rejected changeset is not
+  committed, so use a fresh key for a corrected request.
 - Hugging Face key storage remains available, but ingestion start, status, and
   cancellation RPCs fail closed with `Unimplemented`; ingestion actions cannot
   be delegated in 0.4.0.
@@ -129,10 +145,10 @@ needed, and do not point a 0.4.0 node at a 0.3.x volume.
 
 The native gRPC API and Rust client remain the preferred integration surfaces,
 and the S3-compatible gateway remains available for object-shaped operations.
-The 0.4.0 release gate covers authenticated object mutation/readback,
-transaction conflicts and retry, core PersonalDB create/submit/catch-up/watch,
-Git pack ingest and object/S3 readback, Zanzibar enforcement, and the separate
-public and admin planes on one node.
+The 0.4.0 release gate covers authenticated object mutation/readback, core
+PersonalDB create/submit/catch-up/watch, individual-pack Git ingest and object/S3
+readback, Zanzibar enforcement, and the separate public and admin planes on one
+node.
 
 Index-derived data is not authoritative in this release. Applications must read
 objects through the authorised object API or S3 gateway and must not use index
@@ -157,10 +173,10 @@ Before promoting the image to customer traffic, validate:
 1. an authenticated native object write, read, range read, overwrite, and
    delete;
 2. an S3-compatible write and read if the gateway is used;
-3. PersonalDB group creation, submit, catch-up, and watch;
+3. PersonalDB row-authorisation schema installation followed by group creation,
+   submit, catch-up, and watch;
 4. Git pack ingest followed by object or S3 readback;
-5. a transaction conflict where exactly one incompatible writer commits;
-6. a controlled in-place restart over a backed-up copy of the same durable
+5. a controlled in-place restart over a backed-up copy of the same durable
    volume.
 
 The detailed guarantee and limitation matrix is in

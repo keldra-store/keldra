@@ -5,10 +5,12 @@ use anvil::anvil_api::bucket_service_client::BucketServiceClient;
 use anvil::anvil_api::personal_db_service_client::PersonalDbServiceClient;
 use anvil::anvil_api::transaction_service_client::TransactionServiceClient;
 use anvil::anvil_api::{
-    BeginTransactionRequest, CommitTransactionRequest, CreateBucketRequest,
-    CreatePersonalDbGroupRequest, CreatePersonalDbProjectionRequest, GetPersonalDbGroupRequest,
-    GetPersonalDbProjectionRequest, ListBucketsRequest, MvccDurability, MvccReadConsistency,
-    PersonalDbCatchUpRequest, PersonalDbVoterAck, SubmitPersonalDbChangesetRequest,
+    ApplyAuthzSchemaRequest, AuthzAllowedSubject, AuthzNamespaceSchema, AuthzRelationSchema,
+    AuthzSchemaMemberKind, AuthzSubjectSelectorKind, BeginTransactionRequest,
+    CommitTransactionRequest, CreateBucketRequest, CreatePersonalDbGroupRequest,
+    CreatePersonalDbProjectionRequest, GetPersonalDbGroupRequest, GetPersonalDbProjectionRequest,
+    ListBucketsRequest, MvccDurability, MvccReadConsistency, PersonalDbCatchUpRequest,
+    PersonalDbVoterAck, PublicMutationContext, SubmitPersonalDbChangesetRequest,
     WatchPersonalDbGroupRequest, WatchPersonalDbProjectionRequest, WriteAuthzTupleRequest,
     WriteOptions, write_options,
 };
@@ -33,7 +35,6 @@ use anvil::personaldb_watch::{
 use anvil_test_utils::*;
 use futures_util::StreamExt;
 use rusqlite::{Connection, session::Session};
-use std::time::Duration;
 use tonic::{Code, Request};
 
 const PERSONALDB_TEST_SCHEMA_SQL: &str = "CREATE TABLE items(
@@ -53,6 +54,54 @@ fn personaldb_test_schema_hash() -> String {
 
 fn personaldb_projection_test_schema_hash() -> String {
     hex::encode(hash32(PERSONALDB_PROJECTION_TEST_SCHEMA_SQL.as_bytes()))
+}
+
+async fn bind_personaldb_row_authz_schema(grpc_addr: &str, token: &str) {
+    let app_subject = AuthzAllowedSubject {
+        selector_kind: AuthzSubjectSelectorKind::AnyCanonicalId as i32,
+        subject_kind: "app".to_string(),
+        subject_id: String::new(),
+    };
+    let relations = [
+        "personaldb:insert",
+        "personaldb:update",
+        "personaldb:delete",
+    ]
+    .into_iter()
+    .map(|relation| AuthzRelationSchema {
+        relation: relation.to_string(),
+        rules: Vec::new(),
+        member_kind: AuthzSchemaMemberKind::DirectRelation as i32,
+        allowed_subjects: vec![app_subject.clone()],
+    })
+    .collect();
+    let mut client = AuthServiceClient::connect(grpc_addr.to_string())
+        .await
+        .unwrap();
+    client
+        .apply_authz_schema(authorized(
+            ApplyAuthzSchemaRequest {
+                context: Some(PublicMutationContext {
+                    request_id: format!("personaldb-schema-{}", uuid::Uuid::new_v4()),
+                    idempotency_key: uuid::Uuid::new_v4().to_string(),
+                    expected_generation: 0,
+                    transaction_id: None,
+                }),
+                namespaces: vec![AuthzNamespaceSchema {
+                    namespace: "personaldb_row".to_string(),
+                    relations,
+                    schema_json: r#"{"namespace":"personaldb_row"}"#.to_string(),
+                    schema_hash: String::new(),
+                    schema_version: 0,
+                    authz_revision: 0,
+                    applied_at: String::new(),
+                }],
+                reason: "install PersonalDB row authorization schema for acceptance".to_string(),
+            },
+            token,
+        ))
+        .await
+        .unwrap();
 }
 
 fn authorized<T>(message: T, token: &str) -> Request<T> {
@@ -269,19 +318,6 @@ fn projection_definition_with_ambiguous_writeback_for_tenant(
         target_table: "items_projection".to_string(),
     });
     definition
-}
-
-fn malformed_submit_request(
-    database_id: &str,
-    genesis_hash: &str,
-    session_token: &str,
-) -> SubmitPersonalDbChangesetRequest {
-    submit_request(
-        database_id,
-        genesis_hash,
-        session_token,
-        b"not a sqlite changeset".to_vec(),
-    )
 }
 
 fn submit_request(

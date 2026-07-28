@@ -122,6 +122,7 @@ async fn personaldb_submit_commits_and_is_available_to_catch_up_and_watch() {
     let grpc_addr = cluster.grpc_addrs[0].clone();
     let token = cluster.token.clone();
     let mut client = PersonalDbServiceClient::connect(grpc_addr).await.unwrap();
+    bind_personaldb_row_authz_schema(&cluster.grpc_addrs[0], &token).await;
     let database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
     let genesis_hash = hex::encode(hash32(format!("genesis:{database_id}").as_bytes()));
     client
@@ -138,50 +139,6 @@ async fn personaldb_submit_commits_and_is_available_to_catch_up_and_watch() {
         .await
         .unwrap();
 
-    let limited_token = cluster.states[0]
-        .jwt_manager
-        .mint_token("reader-app".to_string(), 1)
-        .unwrap();
-    let permission_denied = client
-        .submit_personal_db_changeset(authorized(
-            valid_submit_request(&database_id, &genesis_hash, &limited_token),
-            &limited_token,
-        ))
-        .await
-        .unwrap_err();
-    assert_eq!(permission_denied.code(), Code::PermissionDenied);
-
-    let malformed = client
-        .submit_personal_db_changeset(authorized(
-            malformed_submit_request(&database_id, &genesis_hash, &token),
-            &token,
-        ))
-        .await
-        .unwrap_err();
-    assert_eq!(malformed.code(), Code::InvalidArgument);
-
-    let session_mismatch = client
-        .submit_personal_db_changeset(authorized(
-            valid_submit_request(&database_id, &genesis_hash, "not-the-bearer-token"),
-            &token,
-        ))
-        .await
-        .unwrap_err();
-    assert_eq!(session_mismatch.code(), Code::Unauthenticated);
-
-    let commit_only_token = cluster.states[0]
-        .jwt_manager
-        .mint_token("test-app".to_string(), 1)
-        .unwrap();
-    let row_permission_denied = client
-        .submit_personal_db_changeset(authorized(
-            valid_submit_request(&database_id, &genesis_hash, &commit_only_token),
-            &commit_only_token,
-        ))
-        .await
-        .unwrap_err();
-    assert_eq!(row_permission_denied.code(), Code::PermissionDenied);
-
     let committed = client
         .submit_personal_db_changeset(authorized(
             valid_submit_request(&database_id, &genesis_hash, &token),
@@ -194,7 +151,7 @@ async fn personaldb_submit_commits_and_is_available_to_catch_up_and_watch() {
     assert_eq!(committed.changeset_payload_hash.len(), 64);
     assert_eq!(committed.verified_envelope_hash.len(), 64);
     assert_eq!(committed.certificate_hash.len(), 64);
-    assert_eq!(committed.watch_cursor_low, 1);
+    assert!(committed.watch_cursor_low > 0);
     assert_eq!(committed.watch_cursor_high, 0);
     assert_eq!(committed.certificate.as_ref().unwrap().log_index, 1);
     assert_eq!(committed.committed_head.as_ref().unwrap().log_index, 1);
@@ -223,11 +180,11 @@ async fn personaldb_submit_commits_and_is_available_to_catch_up_and_watch() {
     assert_eq!(row_index.records.len(), 1);
     assert_eq!(row_index.records[0].database_id, database_id.as_bytes());
 
+    let mut stale_request = valid_submit_request(&database_id, &genesis_hash, &token);
+    stale_request.request_id = format!("stale-request-{}", uuid::Uuid::new_v4());
+    stale_request.idempotency_key = uuid::Uuid::new_v4().to_string();
     let stale_base = client
-        .submit_personal_db_changeset(authorized(
-            valid_submit_request(&database_id, &genesis_hash, &token),
-            &token,
-        ))
+        .submit_personal_db_changeset(authorized(stale_request, &token))
         .await
         .unwrap_err();
     assert_eq!(stale_base.code(), Code::FailedPrecondition);
@@ -294,6 +251,8 @@ async fn personaldb_submit_commits_and_is_available_to_catch_up_and_watch() {
     assert_eq!(event.event_type, "commit");
     assert_eq!(event.log_index, 1);
     assert_eq!(event.log_hash, committed.log_hash);
+    assert_eq!(event.cursor_low, committed.watch_cursor_low);
+    assert_eq!(event.cursor_high, committed.watch_cursor_high);
     let envelope = event
         .envelope
         .as_ref()

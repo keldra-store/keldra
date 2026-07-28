@@ -116,6 +116,14 @@ The following are release boundaries, not hidden background features:
   original durable volume and identity.
 - **Transactions are cluster-local.** There is no cross-cluster two-phase
   commit, saga layer, or mesh-wide serial order.
+- **Advanced public product transactions are not release-qualified.** Use
+  independent implicit operations for bucket, credential, registry, index, and
+  Git workflows. In particular, a bucket created in an explicit transaction
+  cannot have its policy changed in that same transaction because
+  authorisation resolves committed bucket state. A retry of an implicit bucket
+  delete after its successful response was lost can return `NotFound`; verify
+  the bucket state instead of treating that retry response as proof the delete
+  failed.
 - **Only local object durability is available.** Explicit `quorum` and
   `erasure` object writes fail closed because one node cannot provide the
   required shard placement. A lost sole volume can lose committed data.
@@ -125,10 +133,23 @@ The following are release boundaries, not hidden background features:
   authorisation or workflow decisions. Index watch RPCs return `Unimplemented`,
   and `index:watch` cannot be delegated. Derived indexes are non-authoritative
   and may be rebuilt.
-- **Git is an ingest subset.** A tenant administrator may ingest packs and read
-  the stored objects through the object API or S3 gateway. Git object/tree/blob
-  query and watch RPCs return `Unimplemented`, and Git actions cannot be
-  delegated in this release.
+- **Git is an ingest subset.** A tenant administrator may ingest packs
+  individually and read the stored objects through the object API or S3
+  gateway. Git
+  object/tree/blob query and watch RPCs return `Unimplemented`, and Git actions
+  cannot be delegated in this release. Lost-response retry reconstruction and
+  multi-repository explicit transactions are not release-qualified.
+- **PersonalDB requires its row-authorisation schema.** Before submitting a
+  changeset, install a `personaldb_row` namespace schema in the tenant's
+  `default` authorisation realm. Define the `personaldb:insert`,
+  `personaldb:update`, and `personaldb:delete` direct relations and allow the
+  submitting `app` principals. Advanced multi-resource PersonalDB transactions
+  and projection writeback are not release-qualified.
+- **Use a new idempotency key after a rejected implicit PersonalDB submit.** A
+  validation or authorisation rejection can occur after Anvil creates the
+  submission transaction. In 0.4.0, its durable idempotency reservation is not
+  released when the transaction expires, so use a fresh key for a corrected
+  request. These rejections fail closed and do not commit the changeset.
 - **Hugging Face ingestion is disabled.** Key storage remains available, but
   ingestion start/status/cancel RPCs return `Unimplemented`, and ingestion
   actions cannot be delegated in this release.
@@ -152,8 +173,9 @@ and erasure shards for the full planned deployment window.
 The customer-qualified subset is the native object API, the Rust client,
 S3-compatible object operations, object versions and metadata, Zanzibar-style
 relationship authorisation, core PersonalDB create/submit/catch-up/watch, Git
-pack ingest for a tenant administrator, and the separate public/admin planes.
-Their authoritative mutations pass through the single-node transaction path.
+individual-pack ingest for a tenant administrator, and the separate public/admin
+planes. Their authoritative mutations pass through the single-node transaction
+path.
 
 Applications should use the native API or Rust client for Anvil-specific
 features. Existing S3-compatible tooling is appropriate for object-shaped
@@ -173,8 +195,8 @@ built and smoke-checked both images, published the manifest, verified its
 platform list and digest, published the Rust client when necessary, and created
 the GitHub release.
 
-Before promotion, run a real object write/read/delete cycle, a PersonalDB
-submit/catch-up cycle, Git pack ingest plus object/S3 readback, a
-conflicting-transaction case, and a controlled restart over a backed-up copy of
-the same volume. Do not use index results as correctness evidence, and do not
-use Git query/watch or index watch RPCs as 0.4.0 validation steps.
+Before promotion, run a real object write/read/delete cycle, a schema-bound
+PersonalDB submit/catch-up cycle, Git pack ingest plus object/S3 readback, a
+controlled restart over a backed-up copy of the same volume. Do not use index
+results as correctness evidence, and do not use explicit product transactions,
+Git query/watch, or index watch RPCs as 0.4.0 validation steps.

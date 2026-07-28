@@ -196,7 +196,7 @@ struct OwnershipPrincipalProto {
 }
 
 #[derive(Clone, PartialEq, Message)]
-struct OwnershipFenceRecordProto {
+pub(super) struct OwnershipFenceRecordProto {
     #[prost(message, optional, tag = "1")]
     pub(super) common: Option<crate::core_store::CoreMetaRowCommonProto>,
     #[prost(uint32, tag = "2")]

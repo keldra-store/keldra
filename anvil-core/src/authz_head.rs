@@ -100,16 +100,19 @@ pub(crate) fn read_mvcc(
         TABLE_AUTHZ_HEAD_ROW,
         &tuple_key(tenant_id)?,
     )?;
-    let payload = mvcc.read_transaction_value(transaction_id, principal, &key)?;
-    let (head, predicate) = match payload {
-        Some(payload) => (
-            decode(&payload, tenant_id)?,
-            crate::mvcc_transaction::PredicateKind::ValueHash(*blake3::hash(&payload).as_bytes()),
-        ),
-        None => (
-            initial(tenant_id),
-            crate::mvcc_transaction::PredicateKind::Absent,
-        ),
+    let head = match mvcc.read_transaction_value(transaction_id, principal, &key)? {
+        Some(payload) => decode(&payload, tenant_id)?,
+        None => initial(tenant_id),
+    };
+    let snapshot_version = mvcc
+        .open_transactions
+        .handle(transaction_id)?
+        .snapshot_version;
+    let predicate = match mvcc.runtime.read_at(&key, snapshot_version)? {
+        Some(row) => {
+            crate::mvcc_transaction::PredicateKind::ValueHash(*blake3::hash(&row.value).as_bytes())
+        }
+        None => crate::mvcc_transaction::PredicateKind::Absent,
     };
     Ok(MvccAuthzHeadSnapshot {
         head,

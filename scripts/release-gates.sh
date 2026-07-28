@@ -153,8 +153,8 @@ server_core_integration_gates() {
 
 native_mvcc_e2e_gates() {
   # Version 0.4.0 is release-qualified only for a single-node cluster. Keep
-  # every safety and product gate for that topology, but do not let unfinished
-  # multi-node bootstrap, failover, quorum/erasure, or crash-coordinator
+  # the safety gates and the narrow customer product paths for that topology,
+  # but do not let unfinished multi-node or advanced product-transaction
   # scenarios expand this release. Those capabilities are explicit 0.4.1
   # limitations.
   run_cargo_test "bounded CoreMeta source contracts" \
@@ -163,48 +163,16 @@ native_mvcc_e2e_gates() {
   run_cargo_test "native single-node object write and read acceptance" \
     -p anvil-server --test grpc "test_single_node_put"
 
-  local transaction_tests=(
-    bucket_transaction_tests
-    credential_transaction_tests
-    hf_transaction_tests
-    registry_transaction_tests
-  )
-  for test_name in "${transaction_tests[@]}"; do
-    run_cargo_test "native transaction acceptance ${test_name}" \
-      -p anvil-server --test "${test_name}"
-  done
-
-  run_cargo_test "native object mutation-batch transaction acceptance" \
-    -p anvil-server --test object_tests "mutation_batch_transactions::"
-  run_cargo_test "native PersonalDB transaction acceptance" \
-    -p anvil-server --test personaldb_tests "transactional_groups::"
   run_cargo_test "native PersonalDB create, submit, catch-up, and watch acceptance" \
     -p anvil-server --test personaldb_tests \
     "groups_and_commits::personaldb_submit_commits_and_is_available_to_catch_up_and_watch"
 
-  # Index definitions remain transactional, but query completeness, freshness,
-  # path/prefix filtering, and derived-index rebuild behaviour are not
-  # release-qualified until 0.4.1.
-  run_cargo_test "native index transaction acceptance" \
-    -p anvil-server --test index_tests "transactional_lifecycle::"
-  run_cargo_test "native index definition validation acceptance" \
-    -p anvil-server --test index_tests \
-    "validation_diagnostics::test_index_definition_rejects_invalid_policy_shape"
-
-  # Git query/watch is a documented 0.4.1 follow-up. Qualify the durable
-  # 0.4.0 subset: pack ingest/readback, retry, atomic commit, and conflict abort.
+  # Git query/watch, retry reconstruction, and multi-repository explicit
+  # transactions are documented 0.4.1 follow-ups. Qualify only pack
+  # ingest/readback for the 0.4.0 subset.
   run_cargo_test "native Git pack ingest and readback acceptance" \
     -p anvil-server --test git_source_tests \
     "test_put_git_pack_stores_normal_object_and_is_s3_readable"
-  run_cargo_test "native Git implicit retry acceptance" \
-    -p anvil-server --test git_source_tests \
-    "implicit_git_pack_retry_reconstructs_the_committed_outcome"
-  run_cargo_test "native Git atomic multi-repository acceptance" \
-    -p anvil-server --test git_source_tests \
-    "git_packs_and_manifests_commit_atomically_across_repositories"
-  run_cargo_test "native Git conflict abort acceptance" \
-    -p anvil-server --test git_source_tests \
-    "git_repository_conflict_aborts_every_manifest_and_pack_in_losing_transaction"
 }
 
 docker_auth_gates() {
