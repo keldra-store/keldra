@@ -39,7 +39,7 @@ anvil = { package = "anvil-server", path = "../anvil", version = "0.4.0" }
 tempfile = "3.10.1"
 uuid = { version = "1.18", features = ["v4"] }
 blake3 = "1.8"
-personaldb-protocol = "=0.1.0"
+personaldb-protocol = { git = "ssh://git@github.com/worka-ai/personaldb.git", rev = "dac88b572e278b44012481dedab741a082753fc3" }
 
 [build-dependencies]
 tonic-build = "0.14.2"

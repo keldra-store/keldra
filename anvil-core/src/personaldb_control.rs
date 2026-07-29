@@ -38,10 +38,10 @@ pub struct PersonalDbSnapshotManifest {
     pub database_id: String,
     pub log_index: u64,
     pub log_hash: String,
-    pub state_hash: String,
+    pub state_sha256: String,
     pub schema_hash: String,
     pub snapshot_object_key: String,
-    pub snapshot_object_hash: String,
+    pub snapshot_object_sha256: String,
     pub source_segment_start: u64,
     pub source_segment_end: u64,
     pub row_index_generation: u64,
@@ -116,13 +116,13 @@ struct PersonalDbSnapshotManifestHashProto {
     #[prost(string, tag = "5")]
     log_hash: String,
     #[prost(string, tag = "6")]
-    state_hash: String,
+    state_sha256: String,
     #[prost(string, tag = "7")]
     schema_hash: String,
     #[prost(string, tag = "8")]
     snapshot_object_key: String,
     #[prost(string, tag = "9")]
-    snapshot_object_hash: String,
+    snapshot_object_sha256: String,
     #[prost(uint64, tag = "10")]
     source_segment_start: u64,
     #[prost(uint64, tag = "11")]
@@ -373,10 +373,10 @@ fn snapshot_manifest_hash_proto(
         database_id: manifest.database_id.clone(),
         log_index: manifest.log_index,
         log_hash: manifest.log_hash.clone(),
-        state_hash: manifest.state_hash.clone(),
+        state_sha256: manifest.state_sha256.clone(),
         schema_hash: manifest.schema_hash.clone(),
         snapshot_object_key: manifest.snapshot_object_key.clone(),
-        snapshot_object_hash: manifest.snapshot_object_hash.clone(),
+        snapshot_object_sha256: manifest.snapshot_object_sha256.clone(),
         source_segment_start: manifest.source_segment_start,
         source_segment_end: manifest.source_segment_end,
         row_index_generation: manifest.row_index_generation,
@@ -426,13 +426,13 @@ pub(crate) fn validate_group_manifest_unsigned(manifest: &PersonalDbGroupManifes
 pub(crate) fn validate_snapshot_manifest_unsigned(
     manifest: &PersonalDbSnapshotManifest,
 ) -> Result<()> {
-    if manifest.format_version != 1 {
+    if manifest.format_version != 2 {
         return Err(anyhow!("unsupported personaldb snapshot manifest version"));
     }
     validate_hex32(&manifest.log_hash, "log_hash")?;
-    validate_hex32(&manifest.state_hash, "state_hash")?;
+    validate_hex32(&manifest.state_sha256, "state_sha256")?;
     validate_hex32(&manifest.schema_hash, "schema_hash")?;
-    validate_hex32(&manifest.snapshot_object_hash, "snapshot_object_hash")?;
+    validate_hex32(&manifest.snapshot_object_sha256, "snapshot_object_sha256")?;
     require_nonempty(&manifest.tenant_id, "tenant_id")?;
     require_nonempty(&manifest.database_id, "database_id")?;
     require_corestore_ref(
@@ -531,7 +531,7 @@ mod tests {
         let manifest = sample_snapshot_manifest().seal(&keyring).await.unwrap();
         manifest.verify(keyring.trust_store()).unwrap();
         let mut tampered = manifest;
-        tampered.snapshot_object_hash = hex::encode([7; 32]);
+        tampered.snapshot_object_sha256 = hex::encode([7; 32]);
         assert!(tampered.verify(keyring.trust_store()).is_err());
     }
 
@@ -577,20 +577,21 @@ mod tests {
 
     fn sample_snapshot_manifest() -> PersonalDbSnapshotManifest {
         PersonalDbSnapshotManifest {
-            format_version: 1,
+            format_version: 2,
             tenant_id: "tenant".to_string(),
             database_id: "db".to_string(),
             log_index: 1000,
             log_hash: hex::encode([1; 32]),
-            state_hash: hex::encode([2; 32]),
+            state_sha256: hex::encode([2; 32]),
             schema_hash: hex::encode([3; 32]),
             snapshot_object_key: concat!(
                 "personaldb_snapshot_object:tenant:tenant:database:db:",
                 "log:00000000000000001000:",
-                "state:0000000000000000000000000000000000000000000000000000000000000002"
+                "state-sha256:",
+                "0000000000000000000000000000000000000000000000000000000000000002"
             )
             .to_string(),
-            snapshot_object_hash: hex::encode([4; 32]),
+            snapshot_object_sha256: hex::encode([4; 32]),
             source_segment_start: 1,
             source_segment_end: 1000,
             row_index_generation: 12,

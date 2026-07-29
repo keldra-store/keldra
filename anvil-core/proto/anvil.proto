@@ -2567,6 +2567,8 @@ service PersonalDbService {
   rpc GetPersonalDbProjection(GetPersonalDbProjectionRequest) returns (PersonalDbProjectionResponse);
   rpc SubmitPersonalDbChangeset(SubmitPersonalDbChangesetRequest) returns (SubmitPersonalDbChangesetResponse);
   rpc CatchUpPersonalDb(PersonalDbCatchUpRequest) returns (PersonalDbCatchUpResponse);
+  rpc GetLatestPersonalDbProjectionSnapshot(GetLatestPersonalDbProjectionSnapshotRequest) returns (PersonalDbProjectionSnapshotDescriptor);
+  rpc StreamPersonalDbSnapshot(PersonalDbProjectionSnapshotRequest) returns (stream PersonalDbProjectionSnapshotFrame);
   rpc WatchPersonalDbGroup(WatchPersonalDbGroupRequest) returns (stream WatchPersonalDbGroupResponse);
   rpc WatchPersonalDbProjection(WatchPersonalDbProjectionRequest) returns (stream WatchPersonalDbProjectionResponse);
 }
@@ -3467,6 +3469,37 @@ message PersonalDbCatchUpEntry {
     bytes changeset_bytes = 2;
     PersonalDbCommitCertificateRecord certificate = 3;
     bytes certificate_bytes = 4;
+}
+
+message GetLatestPersonalDbProjectionSnapshotRequest {
+    int64 tenant_id = 1;
+    string database_id = 2;
+    string projection_id = 3;
+    string request_id = 4;
+}
+
+message PersonalDbProjectionSnapshotDescriptor {
+    // Canonical personaldb_protocol::GroupDescriptor bytes.
+    bytes signed_group_descriptor = 1;
+    // Canonical personaldb_protocol::SignedSnapshotTargetManifestV1 bytes.
+    bytes signed_snapshot_manifest = 2;
+}
+
+message PersonalDbProjectionSnapshotRequest {
+    int64 tenant_id = 1;
+    string database_id = 2;
+    string projection_id = 3;
+    string request_id = 4;
+    string snapshot_id = 5;
+    uint64 start_offset = 6;
+    uint64 max_bytes = 7;
+}
+
+message PersonalDbProjectionSnapshotFrame {
+    // Present on the first frame of every range response.
+    bytes signed_group_descriptor = 1;
+    // Canonical personaldb_protocol::PersonalDbSnapshotFrameV1 bytes.
+    bytes snapshot_frame = 2;
 }
 
 message PersonalDbLogRecord {

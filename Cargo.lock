@@ -3926,16 +3926,16 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "personaldb-protocol"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f891f5c93c4ff47365446e19d26871acc65d360cea3c6ddaa2991cfa46ddc4b"
+source = "git+ssh://git@github.com/worka-ai/personaldb.git?rev=dac88b572e278b44012481dedab741a082753fc3#dac88b572e278b44012481dedab741a082753fc3"
 dependencies = [
  "ed25519-dalek 3.0.0",
  "hex",
  "prost",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.17",
- "unicode-normalization",
+ "uuid",
 ]
 
 [[package]]

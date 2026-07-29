@@ -141,6 +141,7 @@ pub mod personaldb_heads;
 pub mod personaldb_postcommit_job;
 pub mod personaldb_projection;
 pub mod personaldb_projection_builder;
+pub mod personaldb_projection_snapshot;
 pub mod personaldb_projection_writeback;
 pub mod personaldb_proposal_admission;
 pub mod personaldb_repair;

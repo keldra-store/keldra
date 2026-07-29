@@ -258,6 +258,41 @@ pub(super) fn validate_projection_id(projection_id: &str) -> Result<(), Status> 
     Ok(())
 }
 
+pub(super) fn validate_snapshot_request_id(request_id: &str) -> Result<(), Status> {
+    if request_id.len() > personaldb_protocol::MAX_PROTOCOL_ID_BYTES {
+        return Err(Status::invalid_argument(
+            "request_id exceeds the protocol bound",
+        ));
+    }
+    let parsed = uuid::Uuid::parse_str(request_id)
+        .map_err(|_| Status::invalid_argument("request_id must be a UUIDv7 string"))?;
+    if parsed.get_version_num() != 7 || parsed.hyphenated().to_string() != request_id {
+        return Err(Status::invalid_argument(
+            "request_id must be a canonical UUIDv7 string",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_snapshot_id(snapshot_id: &str) -> Result<(), Status> {
+    let Some(digest) = snapshot_id.strip_prefix("sha256-") else {
+        return Err(Status::invalid_argument(
+            "snapshot_id must use the sha256-<hex> form",
+        ));
+    };
+    if digest.len() != 64
+        || !digest
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(Status::invalid_argument(
+            "snapshot_id must contain a canonical lowercase SHA-256 digest",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn validate_projection_definition_scope(
     tenant_id: i64,
     database_id: &str,

@@ -52,3 +52,14 @@ fn snapshot_policy_uses_spec_defaults_for_zero_config_values() {
     let policy = configured_personaldb_snapshot_policy(&config);
     assert_eq!(policy, PersonalDbSnapshotPolicy::default());
 }
+
+#[test]
+fn projection_snapshot_identifiers_are_canonical_and_bounded() {
+    validate_snapshot_request_id("01890f3e-7b2c-7cc4-98c4-dc0c0c07398f").unwrap();
+    assert!(validate_snapshot_request_id("not-a-uuid").is_err());
+    assert!(validate_snapshot_request_id("01890F3E-7B2C-7CC4-98C4-DC0C0C07398F").is_err());
+
+    validate_snapshot_id(&format!("sha256-{}", "a".repeat(64))).unwrap();
+    assert!(validate_snapshot_id(&format!("sha256-{}", "A".repeat(64))).is_err());
+    assert!(validate_snapshot_id("sha256-short").is_err());
+}

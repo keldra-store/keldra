@@ -8,8 +8,9 @@ use anvil::anvil_api::{
     ApplyAuthzSchemaRequest, AuthzAllowedSubject, AuthzNamespaceSchema, AuthzRelationSchema,
     AuthzSchemaMemberKind, AuthzSubjectSelectorKind, BeginTransactionRequest,
     CommitTransactionRequest, CreateBucketRequest, CreatePersonalDbGroupRequest,
-    CreatePersonalDbProjectionRequest, GetPersonalDbGroupRequest, GetPersonalDbProjectionRequest,
-    ListBucketsRequest, MvccDurability, MvccReadConsistency, PersonalDbCatchUpRequest,
+    CreatePersonalDbProjectionRequest, GetLatestPersonalDbProjectionSnapshotRequest,
+    GetPersonalDbGroupRequest, GetPersonalDbProjectionRequest, ListBucketsRequest, MvccDurability,
+    MvccReadConsistency, PersonalDbCatchUpRequest, PersonalDbProjectionSnapshotRequest,
     PersonalDbVoterAck, PublicMutationContext, SubmitPersonalDbChangesetRequest,
     WatchPersonalDbGroupRequest, WatchPersonalDbProjectionRequest, WriteAuthzTupleRequest,
     WriteOptions, write_options,
@@ -20,9 +21,10 @@ use anvil::formats::hash32;
 use anvil::personaldb_envelope::{
     PersonalDbEnvelopeDerivationInput, derive_verified_mutation_envelope,
 };
+use anvil::personaldb_heads::read_personaldb_snapshots_head_at_snapshot;
 use anvil::personaldb_projection::{
     ColumnMapping, ProjectionDefinition, ProjectionResourceBinding, RowFilter, TableMapping,
-    WriteBackPolicy,
+    WriteBackPolicy, sha256_projection_definition,
 };
 use anvil::personaldb_row_index::{personaldb_row_index_data_id, read_personaldb_row_index};
 use anvil::personaldb_snapshot_store::{
@@ -34,6 +36,10 @@ use anvil::personaldb_watch::{
 };
 use anvil_test_utils::*;
 use futures_util::StreamExt;
+use personaldb_protocol::{
+    DatabaseGroupKind, GroupDescriptor, PersonalDbSnapshotFrameV1, Sha256Digest,
+    SignedSnapshotTargetManifestV1,
+};
 use rusqlite::{Connection, session::Session};
 use tonic::{Code, Request};
 

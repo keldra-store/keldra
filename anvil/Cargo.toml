@@ -139,7 +139,7 @@ tonic-prost-build = { version = "0.14.2" }
 anvil-storage = { path = "../clients/rust", version = "0.4.0" }
 anvil-test-utils = { package = "anvil-storage-test-utils", path = "../anvil-test-utils", version = "0.4.0" }
 anvil-mvcc-consensus = { path = "../crates/anvil-mvcc-consensus", version = "0.4.0" }
-personaldb-protocol = "=0.1.0"
+personaldb-protocol = { git = "ssh://git@github.com/worka-ai/personaldb.git", rev = "dac88b572e278b44012481dedab741a082753fc3" }
 aws-config = "1.1.7"
 aws-sdk-s3 = "1.18.0"
 http-body-util = "0.1.1"

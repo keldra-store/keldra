@@ -241,6 +241,351 @@ async fn personaldb_source_commit_builds_projection_group_and_watch_event() {
     );
 }
 
+struct DecodedSnapshotPage {
+    descriptor_bytes: Vec<u8>,
+    descriptor: GroupDescriptor,
+    header: personaldb_protocol::SnapshotHeaderV1,
+    bytes: Vec<u8>,
+    end: personaldb_protocol::SnapshotEndV1,
+}
+
+async fn read_snapshot_page(
+    client: &mut PersonalDbServiceClient<tonic::transport::Channel>,
+    token: &str,
+    database_id: &str,
+    snapshot_id: &str,
+    start_offset: u64,
+    max_bytes: u64,
+) -> DecodedSnapshotPage {
+    let response = client
+        .stream_personal_db_snapshot(authorized(
+            PersonalDbProjectionSnapshotRequest {
+                tenant_id: 1,
+                database_id: database_id.to_string(),
+                projection_id: "projection-items".to_string(),
+                request_id: "01890f3e-7b2c-7cc4-98c4-dc0c0c07398f".to_string(),
+                snapshot_id: snapshot_id.to_string(),
+                start_offset,
+                max_bytes,
+            },
+            token,
+        ))
+        .await
+        .unwrap();
+    let mut stream = response.into_inner();
+    let first = stream.next().await.unwrap().unwrap();
+    assert!(!first.signed_group_descriptor.is_empty());
+    let descriptor = GroupDescriptor::decode_canonical(&first.signed_group_descriptor).unwrap();
+    let header = match PersonalDbSnapshotFrameV1::decode_canonical(&first.snapshot_frame).unwrap() {
+        PersonalDbSnapshotFrameV1::Header(header) => *header,
+        other => panic!("first snapshot frame was not a header: {other:?}"),
+    };
+    assert_eq!(header.start_offset, start_offset);
+
+    let mut expected_offset = start_offset;
+    let mut bytes = Vec::new();
+    let end = loop {
+        let frame = stream.next().await.unwrap().unwrap();
+        assert!(frame.signed_group_descriptor.is_empty());
+        match PersonalDbSnapshotFrameV1::decode_canonical(&frame.snapshot_frame).unwrap() {
+            PersonalDbSnapshotFrameV1::Chunk(chunk) => {
+                assert_eq!(chunk.offset, expected_offset);
+                assert_eq!(chunk.chunk_sha256, Sha256Digest::hash(&chunk.data));
+                expected_offset += chunk.data.len() as u64;
+                bytes.extend_from_slice(&chunk.data);
+            }
+            PersonalDbSnapshotFrameV1::End(end) => break end,
+            other => panic!("unexpected snapshot frame: {other:?}"),
+        }
+    };
+    assert!(stream.next().await.is_none());
+    assert_eq!(end.delivered_length, bytes.len() as u64);
+    assert_eq!(end.delivered_sha256, Sha256Digest::hash(&bytes));
+    assert_eq!(end.next_offset, expected_offset);
+    assert_eq!(header.end_offset_exclusive, expected_offset);
+
+    DecodedSnapshotPage {
+        descriptor_bytes: first.signed_group_descriptor,
+        descriptor,
+        header,
+        bytes,
+        end,
+    }
+}
+
+#[tokio::test]
+async fn projection_snapshot_stream_is_authorized_canonical_tamper_evident_and_resumable() {
+    let cluster = shared_default_test_cluster().await;
+    let token = cluster.token.clone();
+    let mut client = PersonalDbServiceClient::connect(cluster.grpc_addrs[0].clone())
+        .await
+        .unwrap();
+    let source_database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
+    let projection_database_id = format!("db-{}", uuid::Uuid::new_v4().simple());
+    let source_genesis = create_group(&mut client, &token, &source_database_id).await;
+    create_group_with_schema(
+        &mut client,
+        &token,
+        &projection_database_id,
+        PERSONALDB_PROJECTION_TEST_SCHEMA_SQL,
+        &personaldb_projection_test_schema_hash(),
+    )
+    .await;
+    let definition = projection_definition(&projection_database_id, &source_database_id);
+    let created = client
+        .create_personal_db_projection(authorized(
+            CreatePersonalDbProjectionRequest {
+                tenant_id: 1,
+                database_id: projection_database_id.clone(),
+                projection_definition_json: serde_json::to_string(&definition).unwrap(),
+                options: None,
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let created_definition: ProjectionDefinition =
+        serde_json::from_str(&created.projection_definition_json).unwrap();
+    client
+        .submit_personal_db_changeset(authorized(
+            valid_submit_request(&source_database_id, &source_genesis, &token),
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    let unauthenticated = client
+        .get_latest_personal_db_projection_snapshot(Request::new(
+            GetLatestPersonalDbProjectionSnapshotRequest {
+                tenant_id: 1,
+                database_id: projection_database_id.clone(),
+                projection_id: "projection-items".to_string(),
+                request_id: "01890f3e-7b2c-7cc4-98c4-dc0c0c07398f".to_string(),
+            },
+        ))
+        .await
+        .expect_err("snapshot discovery without a bearer token must fail");
+    assert_eq!(unauthenticated.code(), Code::Unauthenticated);
+
+    let discovery = client
+        .get_latest_personal_db_projection_snapshot(authorized(
+            GetLatestPersonalDbProjectionSnapshotRequest {
+                tenant_id: 1,
+                database_id: projection_database_id.clone(),
+                projection_id: "projection-items".to_string(),
+                request_id: "01890f3e-7b2c-7cc4-98c4-dc0c0c07398f".to_string(),
+            },
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!discovery.signed_group_descriptor.is_empty());
+    assert!(!discovery.signed_snapshot_manifest.is_empty());
+    assert!(discovery.signed_group_descriptor.len() <= 1024 * 1024);
+    assert!(discovery.signed_snapshot_manifest.len() <= 1024 * 1024);
+    let discovered_descriptor =
+        GroupDescriptor::decode_canonical(&discovery.signed_group_descriptor).unwrap();
+    let discovered_manifest =
+        SignedSnapshotTargetManifestV1::decode_canonical(&discovery.signed_snapshot_manifest)
+            .unwrap();
+    assert_eq!(
+        discovered_descriptor.encode_deterministic().unwrap(),
+        discovery.signed_group_descriptor
+    );
+    assert_eq!(
+        discovered_manifest.encode_deterministic().unwrap(),
+        discovery.signed_snapshot_manifest
+    );
+    let state = &cluster.states[0];
+    let trust_store = state.personaldb_protocol_keyring.trust_store();
+    discovered_descriptor.verify(trust_store).unwrap();
+    discovered_manifest.verify(trust_store).unwrap();
+    let snapshot_id = discovered_manifest.manifest.snapshot_id.clone();
+
+    let syntactic_snapshot_id = format!("sha256-{}", "0".repeat(64));
+    assert_ne!(syntactic_snapshot_id, snapshot_id);
+    let mismatch = client
+        .stream_personal_db_snapshot(authorized(
+            PersonalDbProjectionSnapshotRequest {
+                tenant_id: 1,
+                database_id: projection_database_id.clone(),
+                projection_id: "projection-items".to_string(),
+                request_id: "01890f3e-7b2c-7cc4-98c4-dc0c0c07398f".to_string(),
+                snapshot_id: syntactic_snapshot_id,
+                start_offset: 0,
+                max_bytes: 1,
+            },
+            &token,
+        ))
+        .await
+        .expect_err("a mismatched snapshot identity must fail closed");
+    assert_eq!(mismatch.code(), Code::FailedPrecondition);
+
+    let unauthenticated_stream = client
+        .stream_personal_db_snapshot(Request::new(PersonalDbProjectionSnapshotRequest {
+            tenant_id: 1,
+            database_id: projection_database_id.clone(),
+            projection_id: "projection-items".to_string(),
+            request_id: "01890f3e-7b2c-7cc4-98c4-dc0c0c07398f".to_string(),
+            snapshot_id: snapshot_id.clone(),
+            start_offset: 0,
+            max_bytes: 1,
+        }))
+        .await
+        .expect_err("snapshot export without a bearer token must fail");
+    assert_eq!(unauthenticated_stream.code(), Code::Unauthenticated);
+
+    let snapshot_version = state.mvcc.runtime.applied_version().unwrap();
+    let snapshot_head = read_personaldb_snapshots_head_at_snapshot(
+        state.mvcc.as_ref(),
+        1,
+        &projection_database_id,
+        state.personaldb_protocol_keyring.trust_store(),
+        snapshot_version,
+    )
+    .unwrap()
+    .expect("projection snapshot head");
+    let source_manifest = read_personaldb_snapshot_manifest_by_ref(
+        &state.storage,
+        state.mvcc.as_ref(),
+        &snapshot_head.latest_snapshot_manifest_ref,
+        state.personaldb_protocol_keyring.trust_store(),
+        snapshot_version,
+    )
+    .await
+    .unwrap()
+    .expect("projection snapshot manifest");
+    assert_eq!(source_manifest.format_version, 2);
+    assert_eq!(
+        snapshot_id,
+        format!("sha256-{}", source_manifest.snapshot_object_sha256)
+    );
+
+    let outsider = create_storage_test_actor(&cluster, "projection-snapshot-denied").await;
+    let mut outsider_client = PersonalDbServiceClient::connect(outsider.grpc_addr)
+        .await
+        .unwrap();
+    let discovery_denied = outsider_client
+        .get_latest_personal_db_projection_snapshot(authorized(
+            GetLatestPersonalDbProjectionSnapshotRequest {
+                tenant_id: outsider.tenant_id,
+                database_id: projection_database_id.clone(),
+                projection_id: "projection-items".to_string(),
+                request_id: "01890f3e-7b2c-7cc4-98c4-dc0c0c07398f".to_string(),
+            },
+            &outsider.token,
+        ))
+        .await
+        .expect_err("an unrelated tenant must not discover a projection snapshot");
+    assert_eq!(discovery_denied.code(), Code::PermissionDenied);
+    let denied = outsider_client
+        .stream_personal_db_snapshot(authorized(
+            PersonalDbProjectionSnapshotRequest {
+                tenant_id: outsider.tenant_id,
+                database_id: projection_database_id.clone(),
+                projection_id: "projection-items".to_string(),
+                request_id: "01890f3e-7b2c-7cc4-98c4-dc0c0c07398f".to_string(),
+                snapshot_id: snapshot_id.clone(),
+                start_offset: 0,
+                max_bytes: 1,
+            },
+            &outsider.token,
+        ))
+        .await
+        .expect_err("an unrelated tenant must not read a projection snapshot");
+    assert_eq!(denied.code(), Code::PermissionDenied);
+
+    let first = read_snapshot_page(
+        &mut client,
+        &token,
+        &projection_database_id,
+        &snapshot_id,
+        0,
+        1,
+    )
+    .await;
+    assert!(!first.end.complete);
+    assert_eq!(first.end.next_offset, 1);
+    let second = read_snapshot_page(
+        &mut client,
+        &token,
+        &projection_database_id,
+        &snapshot_id,
+        first.end.next_offset,
+        32 * 1024 * 1024,
+    )
+    .await;
+    assert!(second.end.complete);
+    assert_eq!(first.descriptor_bytes, discovery.signed_group_descriptor);
+    assert_eq!(first.header.signed_manifest, discovered_manifest);
+    assert_eq!(first.descriptor_bytes, second.descriptor_bytes);
+    assert_eq!(first.header.signed_manifest, second.header.signed_manifest);
+
+    first.descriptor.verify(trust_store).unwrap();
+    first.header.signed_manifest.verify(trust_store).unwrap();
+    assert_eq!(first.descriptor.group_kind(), DatabaseGroupKind::Projection);
+    assert_eq!(
+        first.descriptor.schema_hash(),
+        Sha256Digest::hash(PERSONALDB_PROJECTION_TEST_SCHEMA_SQL.as_bytes())
+    );
+    assert_eq!(
+        first.descriptor.projection_definition_hash(),
+        Some(Sha256Digest::from_bytes(
+            sha256_projection_definition(&created_definition).unwrap()
+        ))
+    );
+    let signed_manifest = &first.header.signed_manifest.manifest;
+    assert_eq!(
+        signed_manifest.committed_head,
+        first.descriptor.committed_head().clone()
+    );
+    assert_eq!(
+        signed_manifest.uncompressed_sha256,
+        Sha256Digest::from_prefixed_hex(&source_manifest.state_sha256).unwrap()
+    );
+
+    let mut streamed = first.bytes;
+    streamed.extend_from_slice(&second.bytes);
+    assert_eq!(streamed.len() as u64, signed_manifest.compressed_length);
+    assert_eq!(
+        Sha256Digest::hash(&streamed),
+        signed_manifest.compressed_sha256
+    );
+    let stored = read_personaldb_snapshot_object(
+        &state.storage,
+        state.mvcc.as_ref(),
+        1,
+        &projection_database_id,
+        &source_manifest,
+        trust_store,
+        snapshot_version,
+    )
+    .await
+    .unwrap()
+    .expect("stored projection snapshot object");
+    assert_eq!(streamed, stored);
+
+    let mut tampered_descriptor = first.descriptor_bytes;
+    let last = tampered_descriptor.len() - 1;
+    tampered_descriptor[last] ^= 1;
+    let tampered_result = GroupDescriptor::decode_canonical(&tampered_descriptor)
+        .and_then(|descriptor| descriptor.verify(trust_store));
+    assert!(tampered_result.is_err());
+    let mut tampered_manifest = discovery.signed_snapshot_manifest;
+    let last = tampered_manifest.len() - 1;
+    tampered_manifest[last] ^= 1;
+    let tampered_result = SignedSnapshotTargetManifestV1::decode_canonical(&tampered_manifest)
+        .and_then(|manifest| manifest.verify(trust_store));
+    assert!(tampered_result.is_err());
+    streamed[0] ^= 1;
+    assert_ne!(
+        Sha256Digest::hash(&streamed),
+        signed_manifest.compressed_sha256
+    );
+}
+
 #[tokio::test]
 async fn personaldb_projection_resource_relation_filter_uses_authz_index() {
     let cluster = shared_docker_test_cluster().await;

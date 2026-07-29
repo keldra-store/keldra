@@ -37,6 +37,9 @@ use crate::{
         ProjectionAuthorizationCheck, ProjectionAuthorizationDecisions, ProjectionBuildInput,
         build_projection_changeset_with_authorization, collect_projection_authorization_checks,
     },
+    personaldb_projection_snapshot::{
+        MAX_SNAPSHOT_PAGE_BYTES, prepare_projection_snapshot, read_projection_snapshot_range,
+    },
     personaldb_projection_writeback::{
         ProjectionWriteBackInput, build_projection_writeback_changeset,
     },
@@ -69,13 +72,22 @@ use crate::{
     services::watch_envelope::{self, WatchEnvelopeParts},
 };
 use prost::Message;
+use sha2::{Digest as _, Sha256};
+use std::sync::LazyLock;
 use tokio::sync::OwnedMutexGuard;
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 const PERSONALDB_PROJECTION_WRITEBACK_RESULT_NAMESPACE: &str =
     "personaldb.projection-writeback-response.v1";
+const PERSONALDB_SNAPSHOT_STREAM_LIMIT: usize = 16;
+const PERSONALDB_SNAPSHOT_DESCRIPTOR_COMPONENT_MAX_BYTES: usize = 1024 * 1024;
+const PERSONALDB_SNAPSHOT_STREAM_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5 * 60);
+static PERSONALDB_SNAPSHOT_STREAMS: LazyLock<std::sync::Arc<Semaphore>> =
+    LazyLock::new(|| std::sync::Arc::new(Semaphore::new(PERSONALDB_SNAPSHOT_STREAM_LIMIT)));
 
 fn projection_writeback_result_key(request: &CoreSubmitChangeset) -> String {
     format!("{}:{}", request.database_id, request.idempotency_key)

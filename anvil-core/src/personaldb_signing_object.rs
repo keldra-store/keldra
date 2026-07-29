@@ -10,9 +10,12 @@ use crate::{
     },
 };
 use anyhow::{Result, bail};
-use personaldb_protocol::{ProtocolSignable, SignatureMetadata, SigningPayload};
+use personaldb_protocol::{
+    PreparedProtocolSignature, ProtocolSignable, SignatureMetadata, SigningPayload,
+};
 
 const MAX_PERSONALDB_SIGNING_STRING_BYTES: usize = 4 * 1024;
+const MAX_PERSONALDB_CANONICAL_SIGNING_BYTES: usize = 1024 * 1024;
 
 /// A validated PersonalDB control object that Anvil may sign.
 ///
@@ -25,6 +28,7 @@ pub enum PersonalDbSigningObject {
     CommitCertificate(PersonalDbCommitCertificate),
     CommittedHead(PersonalDbCommittedHead),
     SnapshotsHead(PersonalDbSnapshotsHead),
+    CanonicalProtocol(PreparedProtocolSignature),
 }
 
 impl PersonalDbSigningObject {
@@ -37,6 +41,12 @@ impl PersonalDbSigningObject {
             }
             Self::CommittedHead(head) => validate_committed_head_unsigned(head),
             Self::SnapshotsHead(head) => validate_snapshots_head_unsigned(head),
+            Self::CanonicalProtocol(prepared) => {
+                if prepared.payload_len() > MAX_PERSONALDB_CANONICAL_SIGNING_BYTES {
+                    bail!("canonical PersonalDB signing payload exceeds the protocol bound");
+                }
+                Ok(())
+            }
         }?;
         self.validate_string_bounds()
     }
@@ -60,10 +70,10 @@ impl PersonalDbSigningObject {
                 ("tenant_id", &manifest.tenant_id),
                 ("database_id", &manifest.database_id),
                 ("log_hash", &manifest.log_hash),
-                ("state_hash", &manifest.state_hash),
+                ("state_sha256", &manifest.state_sha256),
                 ("schema_hash", &manifest.schema_hash),
                 ("snapshot_object_key", &manifest.snapshot_object_key),
-                ("snapshot_object_hash", &manifest.snapshot_object_hash),
+                ("snapshot_object_sha256", &manifest.snapshot_object_sha256),
                 ("created_at", &manifest.created_at),
                 ("created_by_node", &manifest.created_by_node),
             ],
@@ -105,6 +115,7 @@ impl PersonalDbSigningObject {
                 ("updated_at", &head.updated_at),
                 ("updated_by_node", &head.updated_by_node),
             ],
+            Self::CanonicalProtocol(_) => &[],
         };
 
         for (name, value) in fields {
@@ -124,6 +135,7 @@ impl ProtocolSignable for PersonalDbSigningObject {
             Self::CommitCertificate(object) => object.signature_metadata(),
             Self::CommittedHead(object) => object.signature_metadata(),
             Self::SnapshotsHead(object) => object.signature_metadata(),
+            Self::CanonicalProtocol(object) => object.signature_metadata(),
         }
     }
 
@@ -134,6 +146,7 @@ impl ProtocolSignable for PersonalDbSigningObject {
             Self::CommitCertificate(object) => object.signing_payload(),
             Self::CommittedHead(object) => object.signing_payload(),
             Self::SnapshotsHead(object) => object.signing_payload(),
+            Self::CanonicalProtocol(object) => object.signing_payload(),
         }
     }
 }

@@ -20,11 +20,16 @@ use crate::{
 use anyhow::{Context, Result, anyhow};
 use personaldb_protocol::PublicKeyTrustStore;
 use rusqlite::Connection;
-use std::{io::Cursor, path::Path};
+use sha2::{Digest as _, Sha256};
+use std::{
+    io::{Cursor, Write},
+    path::Path,
+};
 use tempfile::NamedTempFile;
 
 pub const DEFAULT_SNAPSHOT_ENTRY_THRESHOLD: u64 = 1024;
 pub const DEFAULT_SNAPSHOT_PAYLOAD_BYTES_THRESHOLD: u64 = 64 * 1024 * 1024;
+pub const PERSONALDB_SNAPSHOT_COMPRESSION_LEVEL: i32 = 9;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PersonalDbSnapshotPolicy {
@@ -54,7 +59,7 @@ pub struct PersonalDbSnapshotBuildRequest<'a> {
 pub struct PersonalDbSnapshotBuildResult {
     pub manifest: PersonalDbSnapshotManifest,
     pub compressed_sqlite_bytes: Vec<u8>,
-    pub uncompressed_state_hash: Hash32,
+    pub uncompressed_state_sha256: Hash32,
 }
 
 pub async fn maybe_build_personaldb_snapshot(
@@ -208,26 +213,26 @@ async fn build_snapshot(
     let sqlite_bytes = tokio::fs::read(&temp_path)
         .await
         .with_context(|| format!("read personaldb snapshot builder {}", temp_path.display()))?;
-    let uncompressed_state_hash = hash32(&sqlite_bytes);
-    let compressed_sqlite_bytes = zstd::stream::encode_all(Cursor::new(&sqlite_bytes), 3)?;
-    let snapshot_object_hash = hash32(&compressed_sqlite_bytes);
-    let state_hash = hex::encode(uncompressed_state_hash);
+    let uncompressed_state_sha256: Hash32 = Sha256::digest(&sqlite_bytes).into();
+    let compressed_sqlite_bytes = compress_personaldb_snapshot(&sqlite_bytes)?;
+    let snapshot_object_sha256: Hash32 = Sha256::digest(&compressed_sqlite_bytes).into();
+    let state_sha256 = hex::encode(uncompressed_state_sha256);
     let snapshot_object_key = personaldb_snapshot_object_ref_name(
         request.tenant_id,
         request.database_id,
         committed_head.log_index,
-        &state_hash,
+        &state_sha256,
     )?;
     let manifest = PersonalDbSnapshotManifest {
-        format_version: 1,
+        format_version: 2,
         tenant_id: request.tenant_id.to_string(),
         database_id: request.database_id.to_string(),
         log_index: committed_head.log_index,
         log_hash: committed_head.log_hash.clone(),
-        state_hash,
+        state_sha256,
         schema_hash: committed_head.schema_hash.clone(),
         snapshot_object_key,
-        snapshot_object_hash: hex::encode(snapshot_object_hash),
+        snapshot_object_sha256: hex::encode(snapshot_object_sha256),
         source_segment_start: new_records
             .first()
             .map(|record| record.log_index)
@@ -256,8 +261,21 @@ async fn build_snapshot(
     Ok(PersonalDbSnapshotBuildResult {
         manifest,
         compressed_sqlite_bytes,
-        uncompressed_state_hash,
+        uncompressed_state_sha256,
     })
+}
+
+fn compress_personaldb_snapshot(sqlite_bytes: &[u8]) -> Result<Vec<u8>> {
+    let source_len = u64::try_from(sqlite_bytes.len())
+        .map_err(|_| anyhow!("personaldb snapshot exceeds the supported length"))?;
+    let mut encoder =
+        zstd::stream::Encoder::new(Vec::new(), PERSONALDB_SNAPSHOT_COMPRESSION_LEVEL)?;
+    encoder.include_checksum(true)?;
+    encoder.include_contentsize(true)?;
+    encoder.include_dictid(false)?;
+    encoder.set_pledged_src_size(Some(source_len))?;
+    encoder.write_all(sqlite_bytes)?;
+    Ok(encoder.finish()?)
 }
 
 async fn restore_snapshot_database_scratch(
@@ -297,6 +315,11 @@ async fn restore_snapshot_database_scratch(
     .await?
     .ok_or_else(|| anyhow!("personaldb snapshot object missing"))?;
     let sqlite_bytes = zstd::stream::decode_all(Cursor::new(compressed))?;
+    if hex::encode(Sha256::digest(&sqlite_bytes)) != manifest.state_sha256 {
+        return Err(anyhow!(
+            "personaldb restored snapshot state SHA-256 mismatch"
+        ));
+    }
     tokio::fs::write(target_path, sqlite_bytes)
         .await
         .with_context(|| format!("restore personaldb snapshot {}", target_path.display()))?;
@@ -314,7 +337,7 @@ async fn publish_snapshots_head(
         request.tenant_id,
         request.database_id,
         manifest.log_index,
-        &manifest.state_hash,
+        &manifest.state_sha256,
     )?;
     let head = PersonalDbSnapshotsHead {
         format_version: 2,
@@ -484,4 +507,29 @@ fn validate_request(request: &PersonalDbSnapshotBuildRequest<'_>) -> Result<()> 
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_compression_is_deterministic_and_self_describing() {
+        let source = b"canonical PersonalDB projection snapshot";
+        let first = compress_personaldb_snapshot(source).unwrap();
+        let second = compress_personaldb_snapshot(source).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(&first[..4], &[0x28, 0xb5, 0x2f, 0xfd]);
+        assert_ne!(first[4] & 0x04, 0, "zstd checksum flag must be set");
+        assert_eq!(
+            zstd::zstd_safe::get_frame_content_size(&first).unwrap(),
+            Some(source.len() as u64)
+        );
+        assert_eq!(zstd::zstd_safe::get_dict_id_from_frame(&first), None);
+        assert_eq!(
+            zstd::stream::decode_all(Cursor::new(first)).unwrap(),
+            source
+        );
+    }
 }

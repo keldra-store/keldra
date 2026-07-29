@@ -11,6 +11,12 @@ impl PersonalDbService for AppState {
                 + Send,
         >,
     >;
+    type StreamPersonalDbSnapshotStream = std::pin::Pin<
+        Box<
+            dyn futures_core::Stream<Item = Result<PersonalDbProjectionSnapshotFrame, Status>>
+                + Send,
+        >,
+    >;
 
     async fn create_personal_db_group(
         &self,
@@ -749,6 +755,256 @@ impl PersonalDbService for AppState {
         .await
         .map_err(internal_status)?;
         Ok(Response::new(catch_up_response(response)))
+    }
+
+    async fn get_latest_personal_db_projection_snapshot(
+        &self,
+        request: Request<GetLatestPersonalDbProjectionSnapshotRequest>,
+    ) -> Result<Response<PersonalDbProjectionSnapshotDescriptor>, Status> {
+        let claims = request_claims(&request)?.clone();
+        let req = request.into_inner();
+        validate_claim_tenant(claims.tenant_id, req.tenant_id)?;
+        validate_database_id(&req.database_id)?;
+        validate_projection_id(&req.projection_id)?;
+        validate_snapshot_request_id(&req.request_id)?;
+        if !personaldb_projection_access_allowed(
+            &self.storage,
+            &self.mvcc,
+            &claims,
+            &req.database_id,
+            &req.projection_id,
+            AnvilAction::PersonalDbRead,
+        )
+        .await?
+        {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+        let _permit = PERSONALDB_SNAPSHOT_STREAMS
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("Too many PersonalDB snapshot exports"))?;
+        let _commit_guard = self
+            .personaldb_commit_guard(claims.tenant_id, &req.database_id)
+            .await;
+        let assignment = self
+            .personaldb_write_assignment(claims.tenant_id, &req.database_id)
+            .await?;
+        let prepared = prepare_projection_snapshot(
+            &self.storage,
+            &self.mvcc,
+            &self.personaldb_protocol_keyring,
+            claims.tenant_id,
+            &req.database_id,
+            &req.projection_id,
+            &assignment,
+        )
+        .await
+        .map_err(internal_status)?;
+        let signed_group_descriptor = prepared
+            .group_descriptor
+            .encode_deterministic()
+            .map_err(internal_status)?;
+        let signed_snapshot_manifest = prepared
+            .signed_manifest
+            .encode_deterministic()
+            .map_err(internal_status)?;
+        if signed_group_descriptor.len() > PERSONALDB_SNAPSHOT_DESCRIPTOR_COMPONENT_MAX_BYTES
+            || signed_snapshot_manifest.len() > PERSONALDB_SNAPSHOT_DESCRIPTOR_COMPONENT_MAX_BYTES
+        {
+            return Err(Status::internal(
+                "Signed PersonalDB snapshot descriptor exceeded its response bound",
+            ));
+        }
+        Ok(Response::new(PersonalDbProjectionSnapshotDescriptor {
+            signed_group_descriptor,
+            signed_snapshot_manifest,
+        }))
+    }
+
+    async fn stream_personal_db_snapshot(
+        &self,
+        request: Request<PersonalDbProjectionSnapshotRequest>,
+    ) -> Result<Response<Self::StreamPersonalDbSnapshotStream>, Status> {
+        let claims = request_claims(&request)?.clone();
+        let req = request.into_inner();
+        validate_claim_tenant(claims.tenant_id, req.tenant_id)?;
+        validate_database_id(&req.database_id)?;
+        validate_projection_id(&req.projection_id)?;
+        validate_snapshot_request_id(&req.request_id)?;
+        validate_snapshot_id(&req.snapshot_id)?;
+        if req.max_bytes == 0 || req.max_bytes > MAX_SNAPSHOT_PAGE_BYTES {
+            return Err(Status::invalid_argument(
+                "max_bytes must be within the bounded snapshot page limit",
+            ));
+        }
+        if !personaldb_projection_access_allowed(
+            &self.storage,
+            &self.mvcc,
+            &claims,
+            &req.database_id,
+            &req.projection_id,
+            AnvilAction::PersonalDbRead,
+        )
+        .await?
+        {
+            return Err(Status::permission_denied("Permission denied"));
+        }
+        let permit = PERSONALDB_SNAPSHOT_STREAMS
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("Too many PersonalDB snapshot streams"))?;
+        let _commit_guard = self
+            .personaldb_commit_guard(claims.tenant_id, &req.database_id)
+            .await;
+        let assignment = self
+            .personaldb_write_assignment(claims.tenant_id, &req.database_id)
+            .await?;
+        let prepared = prepare_projection_snapshot(
+            &self.storage,
+            &self.mvcc,
+            &self.personaldb_protocol_keyring,
+            claims.tenant_id,
+            &req.database_id,
+            &req.projection_id,
+            &assignment,
+        )
+        .await
+        .map_err(internal_status)?;
+        if prepared.snapshot_id() != req.snapshot_id {
+            return Err(Status::failed_precondition(
+                "Requested snapshot_id is not the current signed projection snapshot",
+            ));
+        }
+        if req.start_offset > prepared.compressed_length {
+            return Err(Status::out_of_range(
+                "start_offset exceeds the signed projection snapshot",
+            ));
+        }
+        let end_offset = req
+            .start_offset
+            .checked_add(req.max_bytes)
+            .unwrap_or(u64::MAX)
+            .min(prepared.compressed_length);
+        let signed_group_descriptor = prepared
+            .group_descriptor
+            .encode_deterministic()
+            .map_err(internal_status)?;
+        let header = personaldb_protocol::PersonalDbSnapshotFrameV1::Header(Box::new(
+            personaldb_protocol::SnapshotHeaderV1 {
+                request_id: req.request_id.clone(),
+                signed_manifest: prepared.signed_manifest.clone(),
+                start_offset: req.start_offset,
+                end_offset_exclusive: end_offset,
+                trust_bundle_version: prepared.trust_bundle_version,
+            },
+        ))
+        .encode_deterministic()
+        .map_err(internal_status)?;
+
+        let storage = self.storage.clone();
+        let mvcc = self.mvcc.clone();
+        let keyring = self.personaldb_protocol_keyring.clone();
+        let tenant_id = claims.tenant_id;
+        let database_id = req.database_id;
+        let start_offset = req.start_offset;
+        let (tx, rx) = mpsc::channel(4);
+        tokio::spawn(async move {
+            let _permit = permit;
+            let result = tokio::time::timeout(PERSONALDB_SNAPSHOT_STREAM_TIMEOUT, async {
+                if tx
+                    .send(Ok(PersonalDbProjectionSnapshotFrame {
+                        signed_group_descriptor,
+                        snapshot_frame: header,
+                    }))
+                    .await
+                    .is_err()
+                {
+                    return Ok::<(), Status>(());
+                }
+
+                let mut offset = start_offset;
+                let mut delivered = Sha256::new();
+                while offset < end_offset {
+                    let chunk_end = offset
+                        .checked_add(prepared.signed_manifest.manifest.chunk_size as u64)
+                        .unwrap_or(u64::MAX)
+                        .min(end_offset);
+                    let range = read_projection_snapshot_range(
+                        &storage,
+                        &mvcc,
+                        &keyring,
+                        tenant_id,
+                        &database_id,
+                        &prepared,
+                        prepared.snapshot_version,
+                        offset,
+                        chunk_end,
+                    )
+                    .await
+                    .map_err(internal_status)?;
+                    delivered.update(&range.bytes);
+                    let chunk = personaldb_protocol::PersonalDbSnapshotFrameV1::Chunk(
+                        personaldb_protocol::SnapshotChunkV1 {
+                            offset,
+                            chunk_sha256: crate::personaldb_projection_snapshot::delivered_digest(
+                                &range.bytes,
+                            ),
+                            data: range.bytes,
+                        },
+                    )
+                    .encode_deterministic()
+                    .map_err(internal_status)?;
+                    if tx
+                        .send(Ok(PersonalDbProjectionSnapshotFrame {
+                            signed_group_descriptor: Vec::new(),
+                            snapshot_frame: chunk,
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                    offset = chunk_end;
+                }
+                let delivered_length = end_offset - start_offset;
+                let end = personaldb_protocol::PersonalDbSnapshotFrameV1::End(
+                    personaldb_protocol::SnapshotEndV1 {
+                        delivered_length,
+                        delivered_sha256: personaldb_protocol::Sha256Digest::from_bytes(
+                            delivered.finalize().into(),
+                        ),
+                        next_offset: end_offset,
+                        complete: end_offset == prepared.compressed_length,
+                    },
+                )
+                .encode_deterministic()
+                .map_err(internal_status)?;
+                let _ = tx
+                    .send(Ok(PersonalDbProjectionSnapshotFrame {
+                        signed_group_descriptor: Vec::new(),
+                        snapshot_frame: end,
+                    }))
+                    .await;
+                Ok(())
+            })
+            .await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(status)) => {
+                    let _ = tx.send(Err(status)).await;
+                }
+                Err(_) => {
+                    let _ = tx
+                        .send(Err(Status::deadline_exceeded(
+                            "PersonalDB snapshot stream exceeded its duration bound",
+                        )))
+                        .await;
+                }
+            }
+        });
+        Ok(Response::new(
+            Box::pin(ReceiverStream::new(rx)) as Self::StreamPersonalDbSnapshotStream
+        ))
     }
 
     async fn watch_personal_db_group(

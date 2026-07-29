@@ -886,18 +886,20 @@ fn personaldb_signing_packaging_has_no_external_signer_sidecars() {
 }
 
 #[test]
-fn personaldb_protocol_is_a_public_exact_dependency() {
+fn personaldb_protocol_is_an_exact_qualified_revision() {
     let root = repo_root();
     for relative in ["anvil-core/Cargo.toml", "anvil-test-utils/Cargo.toml"] {
         let manifest = std::fs::read_to_string(root.join(relative)).unwrap();
         assert!(
-            manifest.contains("personaldb-protocol = \"=0.1.0\""),
-            "{relative} must pin the published PersonalDB protocol crate exactly"
+            manifest.contains(
+                "personaldb-protocol = { git = \"ssh://git@github.com/worka-ai/personaldb.git\", rev = \"dac88b572e278b44012481dedab741a082753fc3\" }"
+            ),
+            "{relative} must pin the qualified PersonalDB protocol revision exactly"
         );
-        for forbidden in ["ssh://", "git@github.com", "git ="] {
+        for forbidden in ["branch =", "tag ="] {
             assert!(
                 !manifest.contains(forbidden),
-                "{relative} must not require private Git access through {forbidden}"
+                "{relative} must not use a mutable Git reference through {forbidden}"
             );
         }
     }

@@ -15,6 +15,7 @@ use crate::{
 use anyhow::{Result, anyhow};
 use prost::Message;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 const PERSONALDB_PROJECTION_DEFINITION_PREFIX: &str = "personaldb_projection_definition:";
 const PERSONALDB_PROJECTION_DEFINITION_KIND: &str = "projection_definition";
@@ -243,6 +244,12 @@ pub fn hash_projection_definition(definition: &ProjectionDefinition) -> Result<S
     Ok(hex::encode(hash32(&encode_projection_definition(
         &unsigned,
     )?)))
+}
+
+pub fn sha256_projection_definition(definition: &ProjectionDefinition) -> Result<[u8; 32]> {
+    let mut unsigned = definition.clone();
+    unsigned.definition_hash = None;
+    Ok(Sha256::digest(encode_projection_definition(&unsigned)?).into())
 }
 
 pub async fn write_projection_definition(

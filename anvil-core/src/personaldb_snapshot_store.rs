@@ -1,6 +1,9 @@
 use crate::{
     anvil_api::SignatureEnvelopeV1 as WireSignatureEnvelopeV1,
-    core_store::{decode_deterministic_proto, encode_deterministic_proto},
+    core_store::{
+        AuthzScopeRef, CoreByteRange, CorePrefetchPolicy, CoreStore, CoreTraceContext,
+        ReadLogicalRangeRequest, decode_deterministic_proto, encode_deterministic_proto,
+    },
     formats::{Hash32, hash32},
     personaldb_control::PersonalDbSnapshotManifest,
     personaldb_coremeta::{
@@ -13,6 +16,7 @@ use crate::{
 use anyhow::{Result, anyhow};
 use personaldb_protocol::PublicKeyTrustStore;
 use prost::Message;
+use sha2::{Digest as _, Sha256};
 
 const PERSONALDB_SNAPSHOT_OBJECT_REF_PREFIX: &str = "personaldb_snapshot_object:";
 const PERSONALDB_SNAPSHOT_MANIFEST_REF_PREFIX: &str = "personaldb_snapshot_manifest:";
@@ -21,6 +25,12 @@ const PERSONALDB_SNAPSHOT_MANIFEST_REF_PREFIX: &str = "personaldb_snapshot_manif
 pub struct PersonalDbSnapshotWriteResult {
     pub object_ref: String,
     pub manifest_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersonalDbSnapshotObjectRange {
+    pub bytes: Vec<u8>,
+    pub total_length: u64,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -36,13 +46,13 @@ struct PersonalDbSnapshotManifestProto {
     #[prost(string, tag = "5")]
     log_hash: String,
     #[prost(string, tag = "6")]
-    state_hash: String,
+    state_sha256: String,
     #[prost(string, tag = "7")]
     schema_hash: String,
     #[prost(string, tag = "8")]
     snapshot_object_key: String,
     #[prost(string, tag = "9")]
-    snapshot_object_hash: String,
+    snapshot_object_sha256: String,
     #[prost(uint64, tag = "10")]
     source_segment_start: u64,
     #[prost(uint64, tag = "11")]
@@ -70,18 +80,18 @@ pub async fn write_personaldb_snapshot(
 ) -> Result<PersonalDbSnapshotWriteResult> {
     manifest.verify(trust_store)?;
     ensure_manifest_scope(tenant_id, database_id, manifest)?;
-    let state_hash = decode_hex32(&manifest.state_hash, "state_hash")?;
-    let snapshot_object_hash =
-        decode_hex32(&manifest.snapshot_object_hash, "snapshot_object_hash")?;
-    if hash32(compressed_sqlite_bytes) != snapshot_object_hash {
-        return Err(anyhow!("personaldb snapshot object hash mismatch"));
+    let state_sha256 = decode_hex32(&manifest.state_sha256, "state_sha256")?;
+    let snapshot_object_sha256 =
+        decode_hex32(&manifest.snapshot_object_sha256, "snapshot_object_sha256")?;
+    if sha256(compressed_sqlite_bytes) != snapshot_object_sha256 {
+        return Err(anyhow!("personaldb snapshot object SHA-256 mismatch"));
     }
 
     let object_ref = personaldb_snapshot_object_ref_name(
         tenant_id,
         database_id,
         manifest.log_index,
-        &manifest.state_hash,
+        &manifest.state_sha256,
     )?;
     if manifest.snapshot_object_key != object_ref {
         return Err(anyhow!(
@@ -98,8 +108,8 @@ pub async fn write_personaldb_snapshot(
         "snapshot_object",
         manifest.log_index,
         compressed_sqlite_bytes.to_vec(),
-        manifest.snapshot_object_hash.clone(),
-        vec![format!("state_hash:{}", manifest.state_hash)],
+        manifest.snapshot_object_sha256.clone(),
+        vec![format!("state_sha256:{}", manifest.state_sha256)],
         format!(
             "personaldb-snapshot-object:{tenant_id}:{database_id}:{}",
             manifest.log_index
@@ -111,7 +121,7 @@ pub async fn write_personaldb_snapshot(
         tenant_id,
         database_id,
         manifest.log_index,
-        &hex::encode(state_hash),
+        &hex::encode(state_sha256),
     )?;
     let manifest_bytes = encode_snapshot_manifest(manifest)?;
     write_personaldb_bytes_as_data_locator_mvcc(
@@ -127,7 +137,7 @@ pub async fn write_personaldb_snapshot(
             .manifest_hash
             .clone()
             .unwrap_or_else(|| hex::encode(hash32(manifest_ref.as_bytes()))),
-        vec![format!("state_hash:{}", manifest.state_hash)],
+        vec![format!("state_sha256:{}", manifest.state_sha256)],
         format!(
             "personaldb-snapshot-manifest:{tenant_id}:{database_id}:{}",
             manifest.log_index
@@ -147,12 +157,12 @@ pub async fn read_personaldb_snapshot_manifest(
     tenant_id: i64,
     database_id: &str,
     log_index: u64,
-    state_hash: &str,
+    state_sha256: &str,
     trust_store: &PublicKeyTrustStore,
     snapshot_version: u64,
 ) -> Result<Option<PersonalDbSnapshotManifest>> {
     let manifest_ref =
-        personaldb_snapshot_manifest_ref_name(tenant_id, database_id, log_index, state_hash)?;
+        personaldb_snapshot_manifest_ref_name(tenant_id, database_id, log_index, state_sha256)?;
     let Some(manifest) = read_personaldb_snapshot_manifest_by_ref(
         storage,
         mvcc,
@@ -165,7 +175,7 @@ pub async fn read_personaldb_snapshot_manifest(
         return Ok(None);
     };
     ensure_manifest_scope(tenant_id, database_id, &manifest)?;
-    if manifest.log_index != log_index || manifest.state_hash != state_hash {
+    if manifest.log_index != log_index || manifest.state_sha256 != state_sha256 {
         return Err(anyhow!("personaldb snapshot manifest ref scope mismatch"));
     }
     Ok(Some(manifest))
@@ -215,7 +225,7 @@ pub async fn read_personaldb_snapshot_object(
         tenant_id,
         database_id,
         manifest.log_index,
-        &manifest.state_hash,
+        &manifest.state_sha256,
     )?;
     if manifest.snapshot_object_key != expected_object_ref {
         return Err(anyhow!(
@@ -238,10 +248,96 @@ pub async fn read_personaldb_snapshot_object(
         ));
     }
     let bytes = read_personaldb_data_locator_bytes(storage, &row).await?;
-    if hash32(&bytes) != decode_hex32(&manifest.snapshot_object_hash, "snapshot_object_hash")? {
-        return Err(anyhow!("personaldb snapshot object hash mismatch"));
+    if sha256(&bytes) != decode_hex32(&manifest.snapshot_object_sha256, "snapshot_object_sha256")? {
+        return Err(anyhow!("personaldb snapshot object SHA-256 mismatch"));
     }
     Ok(Some(bytes))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn read_personaldb_snapshot_object_range(
+    storage: &Storage,
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    tenant_id: i64,
+    database_id: &str,
+    manifest: &PersonalDbSnapshotManifest,
+    trust_store: &PublicKeyTrustStore,
+    snapshot_version: u64,
+    start: u64,
+    end_exclusive: u64,
+) -> Result<Option<PersonalDbSnapshotObjectRange>> {
+    manifest.verify(trust_store)?;
+    ensure_manifest_scope(tenant_id, database_id, manifest)?;
+    let expected_object_ref = personaldb_snapshot_object_ref_name(
+        tenant_id,
+        database_id,
+        manifest.log_index,
+        &manifest.state_sha256,
+    )?;
+    if manifest.snapshot_object_key != expected_object_ref {
+        return Err(anyhow!(
+            "personaldb snapshot object key does not match CoreStore object identity"
+        ));
+    }
+    let Some(row) = read_personaldb_data_locator_row_at_snapshot(
+        mvcc,
+        tenant_id,
+        database_id,
+        &manifest.snapshot_object_key,
+        snapshot_version,
+    )?
+    else {
+        return Ok(None);
+    };
+    if row.data_kind != "snapshot_object"
+        || row.sqlite_changeset_hash != manifest.snapshot_object_sha256
+    {
+        return Err(anyhow!(
+            "personaldb snapshot object locator does not match its manifest"
+        ));
+    }
+    let store = CoreStore::new(storage.clone()).await?;
+    let logical_manifest = store
+        .read_logical_file_manifest(&row.payload_locator)
+        .await?;
+    if start > end_exclusive || end_exclusive > logical_manifest.logical_size {
+        return Err(anyhow!("personaldb snapshot object range is invalid"));
+    }
+    let range_length = end_exclusive - start;
+    if range_length > personaldb_protocol::MAX_SYNC_CHUNK_BYTES as u64 {
+        return Err(anyhow!(
+            "personaldb snapshot object range exceeds the protocol chunk bound"
+        ));
+    }
+    let bytes = if range_length == 0 {
+        Vec::new()
+    } else {
+        store
+            .read_logical_range(ReadLogicalRangeRequest {
+                ranges: vec![CoreByteRange {
+                    start,
+                    end_exclusive,
+                }],
+                manifest: logical_manifest.clone(),
+                authz_scope: AuthzScopeRef {
+                    anvil_storage_tenant_id: tenant_id.to_string(),
+                    authz_realm_id: crate::personaldb_coremeta::personaldb_realm_id(tenant_id),
+                },
+                expected_boundary: None,
+                prefetch_policy: CorePrefetchPolicy::default(),
+                trace_context: CoreTraceContext::default(),
+            })
+            .await?
+    };
+    if bytes.len() as u64 != range_length {
+        return Err(anyhow!(
+            "personaldb snapshot object range returned the wrong byte count"
+        ));
+    }
+    Ok(Some(PersonalDbSnapshotObjectRange {
+        bytes,
+        total_length: logical_manifest.logical_size,
+    }))
 }
 
 fn encode_snapshot_manifest(manifest: &PersonalDbSnapshotManifest) -> Result<Vec<u8>> {
@@ -268,10 +364,10 @@ fn snapshot_manifest_to_proto(
         database_id: manifest.database_id.clone(),
         log_index: manifest.log_index,
         log_hash: manifest.log_hash.clone(),
-        state_hash: manifest.state_hash.clone(),
+        state_sha256: manifest.state_sha256.clone(),
         schema_hash: manifest.schema_hash.clone(),
         snapshot_object_key: manifest.snapshot_object_key.clone(),
-        snapshot_object_hash: manifest.snapshot_object_hash.clone(),
+        snapshot_object_sha256: manifest.snapshot_object_sha256.clone(),
         source_segment_start: manifest.source_segment_start,
         source_segment_end: manifest.source_segment_end,
         row_index_generation: manifest.row_index_generation,
@@ -295,10 +391,10 @@ fn snapshot_manifest_from_proto(
         database_id: proto.database_id,
         log_index: proto.log_index,
         log_hash: proto.log_hash,
-        state_hash: proto.state_hash,
+        state_sha256: proto.state_sha256,
         schema_hash: proto.schema_hash,
         snapshot_object_key: proto.snapshot_object_key,
-        snapshot_object_hash: proto.snapshot_object_hash,
+        snapshot_object_sha256: proto.snapshot_object_sha256,
         source_segment_start: proto.source_segment_start,
         source_segment_end: proto.source_segment_end,
         row_index_generation: proto.row_index_generation,
@@ -335,16 +431,20 @@ fn decode_hex32(value: &str, field: &'static str) -> Result<Hash32> {
         .map_err(|_| anyhow!("{field} must be hex32"))?)
 }
 
+fn sha256(bytes: &[u8]) -> Hash32 {
+    Sha256::digest(bytes).into()
+}
+
 pub fn personaldb_snapshot_object_ref_name(
     tenant_id: i64,
     database_id: &str,
     log_index: u64,
-    state_hash: &str,
+    state_sha256: &str,
 ) -> Result<String> {
     validate_scope_component(tenant_id, database_id)?;
-    decode_hex32(state_hash, "state_hash")?;
+    decode_hex32(state_sha256, "state_sha256")?;
     Ok(format!(
-        "{PERSONALDB_SNAPSHOT_OBJECT_REF_PREFIX}tenant:{tenant_id}:database:{database_id}:log:{log_index:020}:state:{state_hash}"
+        "{PERSONALDB_SNAPSHOT_OBJECT_REF_PREFIX}tenant:{tenant_id}:database:{database_id}:log:{log_index:020}:state-sha256:{state_sha256}"
     ))
 }
 
@@ -352,12 +452,12 @@ pub fn personaldb_snapshot_manifest_ref_name(
     tenant_id: i64,
     database_id: &str,
     log_index: u64,
-    state_hash: &str,
+    state_sha256: &str,
 ) -> Result<String> {
     validate_scope_component(tenant_id, database_id)?;
-    decode_hex32(state_hash, "state_hash")?;
+    decode_hex32(state_sha256, "state_sha256")?;
     Ok(format!(
-        "{PERSONALDB_SNAPSHOT_MANIFEST_REF_PREFIX}tenant:{tenant_id}:database:{database_id}:log:{log_index:020}:state:{state_hash}"
+        "{PERSONALDB_SNAPSHOT_MANIFEST_REF_PREFIX}tenant:{tenant_id}:database:{database_id}:log:{log_index:020}:state-sha256:{state_sha256}"
     ))
 }
 
