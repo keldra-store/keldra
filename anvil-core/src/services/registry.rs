@@ -340,7 +340,9 @@ async fn begin_registry_mutation(
             principal.clone(),
             idempotency_key,
             std::time::Duration::from_secs(300),
-            crate::mvcc_transaction::DurabilityLevel::Quorum,
+            crate::services::object::configured_default_durability(
+                &state.config.mvcc_default_durability,
+            )?,
             crate::mvcc_transaction::ReadConsistency::Linearized,
             now,
         )

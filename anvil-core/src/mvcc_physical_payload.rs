@@ -274,28 +274,33 @@ where
                     request.prepared_at_unix_ms,
                 )
                 .map_err(|error| Status::failed_precondition(error.to_string()))?;
-            let upgrade = LocalDurabilityUpgradeJob {
-                schema: LocalDurabilityUpgradeJob::SCHEMA.into(),
-                cluster_id: binding.cluster_id.clone(),
-                transaction_id: request.transaction_id.to_string(),
-                commit_version: 0,
-                bundle: None,
-                target: DurabilityLevel::Erasure,
-                objects: vec![LocalDurabilityUpgradeObject {
-                    object_identity,
-                    local_manifest: ingest.manifest.clone(),
-                }],
-                requested_at_unix_ms: request.prepared_at_unix_ms,
-            };
-            mvcc.open_transactions
-                .add_job(
-                    request.transaction_id,
-                    upgrade
-                        .canonical_bytes()
-                        .map_err(|error| Status::internal(error.to_string()))?,
-                    request.prepared_at_unix_ms,
-                )
+            let (upgrade_targets, _, _) = mvcc
+                .live_shard_placement()
                 .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            if upgrade_targets.len() >= 2 {
+                let upgrade = LocalDurabilityUpgradeJob {
+                    schema: LocalDurabilityUpgradeJob::SCHEMA.into(),
+                    cluster_id: binding.cluster_id.clone(),
+                    transaction_id: request.transaction_id.to_string(),
+                    commit_version: 0,
+                    bundle: None,
+                    target: DurabilityLevel::Erasure,
+                    objects: vec![LocalDurabilityUpgradeObject {
+                        object_identity,
+                        local_manifest: ingest.manifest.clone(),
+                    }],
+                    requested_at_unix_ms: request.prepared_at_unix_ms,
+                };
+                mvcc.open_transactions
+                    .add_job(
+                        request.transaction_id,
+                        upgrade
+                            .canonical_bytes()
+                            .map_err(|error| Status::internal(error.to_string()))?,
+                        request.prepared_at_unix_ms,
+                    )
+                    .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            }
             MvccPhysicalPayloadLocator::Local(ingest.manifest)
         }
         durability @ (DurabilityLevel::Quorum | DurabilityLevel::Erasure) => {
