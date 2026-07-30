@@ -43,6 +43,7 @@ const CLAIM_FATAL_DELAY: Duration = Duration::from_secs(5);
 const INTERRUPTED_TASK_RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
 const UNLEASED_RUNNING_TASK_GRACE: Duration = Duration::from_secs(30);
 const TASK_OUTCOME_PERSIST_TIMEOUT: Duration = Duration::from_secs(30);
+const MAINTENANCE_PASS_STALL_WARNING: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerClaimError {
@@ -171,6 +172,144 @@ async fn wait_for_task_or_delay(task_notify: &Arc<tokio::sync::Notify>, delay: D
     }
 }
 
+struct MaintenancePass {
+    name: &'static str,
+    started_at: Option<tokio::time::Instant>,
+    last_stall_warning_at: Option<tokio::time::Instant>,
+    execution: Option<tokio::task::JoinHandle<Result<bool>>>,
+}
+
+impl MaintenancePass {
+    fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            started_at: None,
+            last_stall_warning_at: None,
+            execution: None,
+        }
+    }
+
+    async fn poll_or_start<F, Fut>(&mut self, start: F)
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<bool>> + Send + 'static,
+    {
+        if self
+            .execution
+            .as_ref()
+            .is_some_and(|execution| !execution.is_finished())
+        {
+            self.warn_if_stalled();
+            return;
+        }
+
+        if let Some(execution) = self.execution.take() {
+            let elapsed_ms = self
+                .started_at
+                .take()
+                .map(|started| started.elapsed().as_millis())
+                .unwrap_or_default();
+            self.last_stall_warning_at = None;
+            match execution.await {
+                Ok(Ok(changed)) => {
+                    debug!(
+                        pass_name = self.name,
+                        changed, elapsed_ms, "Background maintenance pass completed"
+                    );
+                }
+                Ok(Err(error)) => {
+                    warn!(
+                        pass_name = self.name,
+                        elapsed_ms,
+                        %error,
+                        "Background maintenance pass failed"
+                    );
+                }
+                Err(error) => {
+                    error!(
+                        pass_name = self.name,
+                        elapsed_ms,
+                        %error,
+                        "Background maintenance pass task stopped unexpectedly"
+                    );
+                }
+            }
+        }
+
+        debug!(
+            pass_name = self.name,
+            "Starting background maintenance pass"
+        );
+        self.started_at = Some(tokio::time::Instant::now());
+        self.execution = Some(tokio::spawn(start()));
+    }
+
+    fn warn_if_stalled(&mut self) {
+        let Some(started_at) = self.started_at else {
+            return;
+        };
+        let now = tokio::time::Instant::now();
+        if now.duration_since(started_at) < MAINTENANCE_PASS_STALL_WARNING
+            || self.last_stall_warning_at.is_some_and(|last_warning| {
+                now.duration_since(last_warning) < MAINTENANCE_PASS_STALL_WARNING
+            })
+        {
+            return;
+        }
+        self.last_stall_warning_at = Some(now);
+        warn!(
+            pass_name = self.name,
+            elapsed_ms = now.duration_since(started_at).as_millis(),
+            "Background maintenance pass remains in flight; task claims continue"
+        );
+    }
+}
+
+impl Drop for MaintenancePass {
+    fn drop(&mut self) {
+        if let Some(execution) = self.execution.take() {
+            // Cancelling worker::run previously dropped whichever inline
+            // finalizer it was awaiting. Preserve that shutdown ownership
+            // instead of detaching maintenance beyond the worker.
+            execution.abort();
+        }
+    }
+}
+
+async fn poll_maintenance_passes(
+    persistence: &Persistence,
+    index_finalization: &mut MaintenancePass,
+    bucket_locator_finalization: &mut MaintenancePass,
+    tenant_locator_finalization: &mut MaintenancePass,
+) {
+    // These finalizers own disjoint durable job and target-key domains:
+    // index/authz defaults, mesh bucket locators, and mesh tenant locators.
+    // Each operation is fenced, idempotently replayable, and leaves a
+    // conflicting job eligible for its existing durable retry path. Running
+    // one single-flight pass per kind therefore cannot overlap effects for the
+    // same job, while an unrelated kind cannot block task-queue claims.
+    let index_persistence = persistence.clone();
+    index_finalization
+        .poll_or_start(move || async move { index_persistence.run_index_finalization_once().await })
+        .await;
+    let bucket_persistence = persistence.clone();
+    bucket_locator_finalization
+        .poll_or_start(move || async move {
+            bucket_persistence
+                .run_bucket_locator_finalization_once()
+                .await
+        })
+        .await;
+    let tenant_persistence = persistence.clone();
+    tenant_locator_finalization
+        .poll_or_start(move || async move {
+            tenant_persistence
+                .run_tenant_locator_finalization_once()
+                .await
+        })
+        .await;
+}
+
 #[derive(Deserialize)]
 struct DeleteObjectPayload {
     object_id: i64,
@@ -226,16 +365,17 @@ pub async fn run(
     let task_notify = persistence.task_notify();
     let mut claim_backoff = WorkerClaimBackoff::default();
     let task_slots = Arc::new(Semaphore::new(concurrency.max(1)));
+    let mut index_finalization = MaintenancePass::new("index_finalization");
+    let mut bucket_locator_finalization = MaintenancePass::new("bucket_locator_finalization");
+    let mut tenant_locator_finalization = MaintenancePass::new("tenant_locator_finalization");
     loop {
-        if let Err(error) = persistence.run_index_finalization_once().await {
-            warn!(%error, "Committed index finalization attempt failed");
-        }
-        if let Err(error) = persistence.run_bucket_locator_finalization_once().await {
-            warn!(%error, "Committed bucket locator finalization attempt failed");
-        }
-        if let Err(error) = persistence.run_tenant_locator_finalization_once().await {
-            warn!(%error, "Committed tenant locator finalization attempt failed");
-        }
+        poll_maintenance_passes(
+            &persistence,
+            &mut index_finalization,
+            &mut bucket_locator_finalization,
+            &mut tenant_locator_finalization,
+        )
+        .await;
         if tokio::time::Instant::now() >= next_recovery {
             if let Err(error) = recover_interrupted_tasks(&persistence).await {
                 warn!(%error, "Failed to recover expired background tasks");
@@ -1295,6 +1435,59 @@ mod tests {
         assert!(
             await_task_outcome_persistence(Duration::from_secs(1), async {}).await,
             "completed finalization must not be reported as timed out"
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_maintenance_pass_remains_single_flight_and_does_not_block_task_claims() {
+        let temp = tempdir().unwrap();
+        let config = test_config(temp.path());
+        let persistence = persistence_with_mvcc(&config).await.unwrap();
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        persistence
+            .enqueue_task(
+                TaskType::IndexBuild,
+                json!({
+                    "tenant_id": 1,
+                    "bucket_id": 2,
+                    "index_id": 3,
+                    "index_version": 1,
+                    "source_cursor": 0,
+                }),
+                0,
+            )
+            .await
+            .unwrap();
+
+        let mut maintenance = MaintenancePass::new("never_returns");
+        let first_starts = starts.clone();
+        maintenance
+            .poll_or_start(move || async move {
+                first_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::pending::<Result<bool>>().await
+            })
+            .await;
+        tokio::task::yield_now().await;
+        let duplicate_starts = starts.clone();
+        maintenance
+            .poll_or_start(move || async move {
+                duplicate_starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(false)
+            })
+            .await;
+
+        let claimed =
+            tokio::time::timeout(Duration::from_secs(1), persistence.claim_pending_tasks(1))
+                .await
+                .expect("in-flight maintenance must not block task claims")
+                .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].task_type, TaskType::IndexBuild);
+        assert_eq!(
+            starts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "polling an in-flight maintenance pass must not start an overlap"
         );
     }
 
