@@ -345,6 +345,12 @@ impl CoreMetaStore {
         options.create_if_missing(true);
         options.create_missing_column_families(true);
         options.set_max_open_files(512);
+        // CoreMeta has several column families with very different write
+        // rates. Without an explicit aggregate limit, an infrequently written
+        // family can pin every WAL created by busy families until its memtable
+        // is eventually flushed. Keep the recovery window bounded by asking
+        // RocksDB to flush the family retaining the oldest WAL.
+        options.set_max_total_wal_size(256 * 1024 * 1024);
         let descriptors = column_families()
             .iter()
             .map(|name| ColumnFamilyDescriptor::new(*name, cf_options(name)))
