@@ -21,15 +21,15 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  CARGO_TARGET_DIR: /home/github-runner/.cache/anvil/cargo-target
-  # The self-hosted release runner has the locked private Git dependencies in
-  # its persistent Cargo cache. Candidate publication must not depend on an
-  # unscoped personal token or refetch a mutable repository view.
-  CARGO_NET_OFFLINE: "true"
+  STAGING_RELEASE: v0.4.1-worka-v0.1.0-rc9-image-staging
+  STAGING_ASSET: anvil-v0.4.1-worka-v0.1.0-rc9-amd64.tar.zst
+  EXPECTED_ARCHIVE_SHA256: c23dd368110b581bbfcb6d78bc68ebd7958768d492e19da35bef0c7fac9a2c47
+  EXPECTED_IMAGE_ID: sha256:56cdc11005afb14958d2bb75ff44590f106d815be1a16ec8da3040b5a1dbe4d6
+  EXPECTED_SERVER_SHA256: c49e809a77e1c7b5fa3d00e51fab6a37a817a283c5020471aaf98a680330d677
 
 jobs:
   publish-amd64:
-    name: Build and publish linux/amd64
+    name: Verify and publish linux/amd64
     runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 90
     steps:
@@ -65,30 +65,39 @@ jobs:
           printf 'image=ghcr.io/%s:%s\n' \
             "${GITHUB_REPOSITORY,,}" "$IMAGE_TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install system build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            clang \
-            cmake \
-            libclang-dev \
-            pkg-config \
-            libssl-dev \
-            protobuf-compiler
-
-      - name: Build candidate image
+      - name: Download and verify qualified image
+        shell: bash
         env:
-          ANVIL_IMAGE: ${{ steps.candidate.outputs.image }}
-          ANVIL_DOCKER_PLATFORM: linux/amd64
-          ANVIL_RUNTIME_BASE: debian:trixie-slim
-          ANVIL_BUILD_PROFILE: release
-          ANVIL_USE_NATIVE_CARGO: "1"
-          CARGO_BUILD_JOBS: "8"
-        run: ./scripts/build-image.sh
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE: ${{ steps.candidate.outputs.image }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          release_metadata="$(
+            gh release view "$STAGING_RELEASE" \
+              --json isDraft,targetCommitish \
+              --jq '[.isDraft, .targetCommitish] | @tsv'
+          )"
+          test "$release_metadata" = $'true\t'"$SOURCE_COMMIT"
+          gh release download "$STAGING_RELEASE" \
+            --pattern "$STAGING_ASSET" \
+            --dir "$RUNNER_TEMP"
+          archive="$RUNNER_TEMP/$STAGING_ASSET"
+          printf '%s  %s\n' "$EXPECTED_ARCHIVE_SHA256" "$archive" |
+            sha256sum --check --strict -
+          zstd --decompress --stdout "$archive" | docker load
+          test "$(docker image inspect "$EXPECTED_IMAGE_ID" --format '{{.Id}}')" = \
+            "$EXPECTED_IMAGE_ID"
+          test "$(docker image inspect "$EXPECTED_IMAGE_ID" --format '{{.Os}}/{{.Architecture}}')" = \
+            "linux/amd64"
+          server_sha="$(
+            docker run --platform linux/amd64 --rm \
+              --entrypoint sha256sum "$EXPECTED_IMAGE_ID" \
+              /usr/local/bin/anvil-server |
+              awk '{print $1}'
+          )"
+          test "$server_sha" = "$EXPECTED_SERVER_SHA256"
+          docker tag "$EXPECTED_IMAGE_ID" "$IMAGE"
 
       - name: Smoke check image binaries
         env:
@@ -116,12 +125,25 @@ jobs:
         run: |
           set -euo pipefail
           docker push "$IMAGE"
-          digest="$(docker image inspect "$IMAGE" --format '{{index .RepoDigests 0}}')"
+          docker pull --platform linux/amd64 "$IMAGE"
+          test "$(docker image inspect "$IMAGE" --format '{{.Id}}')" = "$EXPECTED_IMAGE_ID"
+          test "$(docker image inspect "$IMAGE" --format '{{.Os}}/{{.Architecture}}')" = \
+            "linux/amd64"
+          repository="${IMAGE%:*}"
+          digest="$(
+            docker image inspect "$IMAGE" \
+              --format '{{range .RepoDigests}}{{println .}}{{end}}' |
+              grep -F "${repository}@sha256:" |
+              head -n 1
+          )"
+          test -n "$digest"
           printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
           {
             printf '### Candidate image\n\n'
             printf -- '- Source: `%s`\n' "$SOURCE_COMMIT"
             printf -- '- Image: `%s`\n' "$IMAGE"
             printf -- '- Digest: `%s`\n' "$digest"
+            printf -- '- Image ID: `%s`\n' "$EXPECTED_IMAGE_ID"
+            printf -- '- Server SHA-256: `%s`\n' "$EXPECTED_SERVER_SHA256"
             printf -- '- Platform: `linux/amd64`\n'
           } >> "$GITHUB_STEP_SUMMARY"
