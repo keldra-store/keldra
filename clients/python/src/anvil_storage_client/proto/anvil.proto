@@ -39,6 +39,7 @@ service AdminService {
   rpc ListCells(ListCellsRequest) returns (ListCellsResponse);
 
   rpc RegisterNode(RegisterNodeRequest) returns (NodeResponse);
+  rpc ReplaceClusterNodeIncarnation(ReplaceClusterNodeIncarnationRequest) returns (AdminMutationResponse);
   rpc GetLocalNodeDescriptor(GetLocalNodeDescriptorRequest) returns (NodeResponse);
   rpc ActivateNode(ActivateNodeRequest) returns (NodeResponse);
   rpc DrainNode(DrainNodeRequest) returns (DrainOperationResponse);
@@ -685,6 +686,27 @@ message RegisterNodeRequest {
   repeated NodeCapability capabilities = 8;
   bytes receipt_signing_public_key = 9;
   string capacity_json = 10;
+}
+
+message ReplaceClusterNodeIncarnationRequest {
+  AdminRequestContext context = 1;
+  string cluster_id = 2;
+  // Fresh Raft identity for the clean-disk replacement. It MUST differ from
+  // replaced_raft_node_id and MUST NOT already be a member.
+  uint64 raft_node_id = 3;
+  string node_id = 4;
+  uint64 incarnation = 5;
+  string failure_domain = 6;
+  string endpoint = 7;
+  // Phase one, directed to the current cluster leader, fences the old
+  // incarnation, removes its voter ID, and catches up the fresh learner.
+  // Calls to every other surviving coordinator set this false and update only
+  // their local route projection.
+  bool install_control = 8;
+  uint64 replaced_raft_node_id = 9;
+  // Explicit final phase, directed to the current leader only after every
+  // surviving voter has refreshed its local route projection.
+  bool promote_to_voter = 10;
 }
 
 message GetLocalNodeDescriptorRequest {}
@@ -1396,6 +1418,8 @@ service ObjectService {
   rpc GetObject(GetObjectRequest) returns (stream GetObjectResponse);
   rpc DeleteObject(DeleteObjectRequest) returns (DeleteObjectResponse);
   rpc HeadObject(HeadObjectRequest) returns (HeadObjectResponse);
+  rpc PromoteObjectDurability(PromoteObjectDurabilityRequest) returns (ObjectDurabilityPromotionStatus);
+  rpc GetObjectDurabilityPromotion(GetObjectDurabilityPromotionRequest) returns (ObjectDurabilityPromotionStatus);
   rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
   rpc ListObjectVersions(ListObjectVersionsRequest) returns (ListObjectVersionsResponse);
   rpc CopyObject(CopyObjectRequest) returns (CopyObjectResponse);
@@ -1612,7 +1636,38 @@ message HeadObjectResponse {
     string index_policy_snapshot = 8;
     string content_type = 9;
     string user_metadata_json = 10;
-    string storage_class = 11;
+  string storage_class = 11;
+}
+
+// Idempotently requests post-commit promotion of an object written with local
+// durability. The object version makes the request stable when a key advances.
+message PromoteObjectDurabilityRequest {
+  string bucket_name = 1;
+  string object_key = 2;
+  optional string version_id = 3;
+  MvccDurability target_durability = 4;
+  string idempotency_key = 5;
+}
+
+// Reads the durable promotion state for the selected object version.
+message GetObjectDurabilityPromotionRequest {
+  string bucket_name = 1;
+  string object_key = 2;
+  optional string version_id = 3;
+}
+
+message ObjectDurabilityPromotionStatus {
+  string request_id = 1;
+  string promotion_id = 2;
+  string bucket_name = 3;
+  string object_key = 4;
+  string version_id = 5;
+  MvccDurability target_durability = 6;
+  string state = 7;
+  uint32 attempts = 8;
+  uint64 requested_at_unix_ms = 9;
+  uint64 next_attempt_unix_ms = 10;
+  optional string last_error = 11;
 }
 
 message ListObjectsRequest {
@@ -2845,6 +2900,8 @@ message AuthzNamespaceSchema {
     string namespace = 1;
     repeated AuthzRelationSchema relations = 2;
     string schema_json = 10;
+    // Input values are ignored during publication. Responses contain Anvil's
+    // authoritative deterministic-protobuf-domain hash of canonical semantics.
     string schema_hash = 11;
     uint64 schema_version = 12;
     uint64 authz_revision = 13;
