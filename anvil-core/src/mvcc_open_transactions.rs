@@ -613,15 +613,29 @@ impl OpenTransactionRegistry {
         };
 
         let outcome = match resolved {
-            Some(result) if is_read_only_bundle(&bundle) => CommitOutcome {
+            Some(result) if is_read_only_bundle(&bundle) => Ok(CommitOutcome {
                 certification: result,
                 local_apply: None,
-            },
-            Some(result) => runtime.apply_transaction_decision(bundle.clone(), result)?,
+            }),
+            Some(result) => runtime.apply_transaction_decision(bundle.clone(), result),
             None => {
                 runtime
                     .commit_transaction_bundle(bundle.clone(), durability)
-                    .await?
+                    .await
+            }
+        };
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if crate::mvcc_transaction::is_pre_certification_failure(&error) {
+                    let _guard = self.transition.lock().unwrap();
+                    let mut draft = self.load_for_principal(transaction_id, principal)?;
+                    if matches!(draft.state, DraftState::Committing { .. }) {
+                        draft.state = DraftState::Open;
+                        self.save(&draft)?;
+                    }
+                }
+                return Err(error);
             }
         };
         let _guard = self.transition.lock().unwrap();
@@ -636,6 +650,53 @@ impl OpenTransactionRegistry {
 
     pub fn handle(&self, transaction_id: &str) -> Result<TransactionHandle> {
         Ok(handle(&self.load(transaction_id)?))
+    }
+
+    pub(crate) fn logical_key_for_conflict_hash(
+        &self,
+        transaction_id: &str,
+        principal: &str,
+        key_hash: [u8; 32],
+    ) -> Result<Option<LogicalKey>> {
+        let draft = self.load_for_principal(transaction_id, principal)?;
+        let mut keys = BTreeSet::new();
+        keys.extend(draft.mutations.points.iter().map(|point| point.key.clone()));
+        keys.extend(
+            draft
+                .mutations
+                .predicates
+                .iter()
+                .map(|predicate| predicate.key.clone()),
+        );
+        keys.extend(
+            draft
+                .mutations
+                .writes
+                .iter()
+                .map(|write| write.key().clone()),
+        );
+        let resolved_bundle = match &draft.state {
+            DraftState::Committing { bundle } | DraftState::Resolved { bundle, .. } => Some(bundle),
+            DraftState::Open | DraftState::RolledBack | DraftState::Expired => None,
+        };
+        if let Some(bundle) = resolved_bundle {
+            keys.extend(
+                bundle
+                    .point_observations
+                    .iter()
+                    .map(|point| point.key.clone()),
+            );
+            keys.extend(
+                bundle
+                    .predicates
+                    .iter()
+                    .map(|predicate| predicate.key.clone()),
+            );
+            keys.extend(bundle.writes.iter().map(|write| write.key().clone()));
+        }
+        Ok(keys.into_iter().find(|key| {
+            crate::mvcc_consensus_adapter::logical_key_hash(&draft.cluster_id, key).0 == key_hash
+        }))
     }
 
     pub fn binding(&self, transaction_id: &str, principal: &str) -> Result<TransactionBinding> {
@@ -807,6 +868,11 @@ impl OpenTransactionRegistry {
         let mut draft = self.load_for_principal(transaction_id, principal)?;
         match draft.state {
             DraftState::Open if now_unix_ms < draft.expires_at_unix_ms => {
+                // Rolled-back intent must not remain as predicate-visible or
+                // recovery-visible staged state. Physical payloads are
+                // content-addressed and reclaimed independently once their
+                // manifest references are no longer pinned here.
+                draft.mutations = DraftMutations::default();
                 draft.state = DraftState::RolledBack;
                 self.save(&draft)?;
             }

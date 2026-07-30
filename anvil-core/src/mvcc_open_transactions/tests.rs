@@ -226,6 +226,79 @@ impl TransactionRuntime for FailingCommitRuntime {
     }
 }
 
+struct DefinitePreCertificationFailureRuntime;
+
+#[async_trait]
+impl TransactionRuntime for DefinitePreCertificationFailureRuntime {
+    async fn transaction_snapshot(&self, _consistency: ReadConsistency) -> Result<CommitVersion> {
+        Ok(9)
+    }
+
+    async fn commit_transaction_bundle(
+        &self,
+        _bundle: TransactionBundle,
+        _durability: DurabilityLevel,
+    ) -> Result<CommitOutcome> {
+        Err(crate::mvcc_transaction::pre_certification_failure(anyhow!(
+            "single-node topology cannot satisfy quorum"
+        )))
+    }
+
+    fn apply_transaction_decision(
+        &self,
+        _bundle: TransactionBundle,
+        _result: CertificationResult,
+    ) -> Result<CommitOutcome> {
+        bail!("a definite pre-certification failure has no prior decision")
+    }
+}
+
+#[tokio::test]
+async fn conflict_hash_diagnostics_resolve_the_staged_logical_key() {
+    let temp = tempdir().unwrap();
+    let registry = OpenTransactionRegistry::open(temp.path()).unwrap();
+    let key = LogicalKey {
+        table_id: 71,
+        application_key: b"diagnostic-key".to_vec(),
+    };
+    let handle = registry
+        .begin(
+            &runtime(),
+            "cluster",
+            "alice",
+            "diagnostic-transaction",
+            Duration::from_secs(30),
+            DurabilityLevel::Quorum,
+            ReadConsistency::LocalSnapshot,
+            1_000,
+        )
+        .await
+        .unwrap();
+    registry
+        .put(
+            &handle.transaction_id,
+            "cluster",
+            key.clone(),
+            b"value".to_vec(),
+            1_001,
+        )
+        .unwrap();
+    let key_hash = crate::mvcc_consensus_adapter::logical_key_hash("cluster", &key).0;
+
+    assert_eq!(
+        registry
+            .logical_key_for_conflict_hash(&handle.transaction_id, "alice", key_hash)
+            .unwrap(),
+        Some(key)
+    );
+    assert_eq!(
+        registry
+            .logical_key_for_conflict_hash(&handle.transaction_id, "alice", [0; 32])
+            .unwrap(),
+        None
+    );
+}
+
 #[tokio::test]
 async fn durable_open_sessions_pin_snapshots_until_resolution_or_expiry() {
     let temp = tempdir().unwrap();
@@ -866,6 +939,140 @@ async fn begin_idempotency_is_principal_bound() {
             )
             .await
             .is_err()
+    );
+}
+
+#[tokio::test]
+async fn rollback_discards_all_staged_intent_and_does_not_pin_recovery() {
+    let temp = tempdir().unwrap();
+    let registry = OpenTransactionRegistry::open(temp.path()).unwrap();
+    let runtime = runtime();
+    let handle = registry
+        .begin(
+            &runtime,
+            "cluster",
+            "alice",
+            "rolled-back",
+            Duration::from_secs(30),
+            DurabilityLevel::Local,
+            ReadConsistency::LocalSnapshot,
+            10,
+        )
+        .await
+        .unwrap();
+    registry
+        .put(
+            &handle.transaction_id,
+            "cluster",
+            LogicalKey {
+                table_id: 7,
+                application_key: b"absent-head".to_vec(),
+            },
+            b"staged".to_vec(),
+            11,
+        )
+        .unwrap();
+    registry
+        .add_job(&handle.transaction_id, br#"{"staged":"job"}"#.to_vec(), 11)
+        .unwrap();
+
+    let status = registry
+        .rollback(&handle.transaction_id, "alice", 12)
+        .unwrap();
+    assert_eq!(status.state, "rolled_back");
+    let draft = registry.load(&handle.transaction_id).unwrap();
+    assert!(draft.mutations.points.is_empty());
+    assert!(draft.mutations.predicates.is_empty());
+    assert!(draft.mutations.writes.is_empty());
+    assert!(draft.mutations.manifests.is_empty());
+    assert!(draft.mutations.events.is_empty());
+    assert!(draft.mutations.jobs.is_empty());
+    assert!(
+        registry
+            .recoverable_transaction_bundles()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        registry
+            .prepared_bundle_transaction_pins()
+            .unwrap()
+            .is_empty()
+    );
+
+    let fresh = registry
+        .begin(
+            &runtime,
+            "cluster",
+            "alice",
+            "fresh-after-rollback",
+            Duration::from_secs(30),
+            DurabilityLevel::Local,
+            ReadConsistency::LocalSnapshot,
+            13,
+        )
+        .await
+        .unwrap();
+    assert_ne!(fresh.transaction_id, handle.transaction_id);
+}
+
+#[tokio::test]
+async fn definite_pre_certification_failure_returns_to_open_for_safe_rollback() {
+    let temp = tempdir().unwrap();
+    let registry = OpenTransactionRegistry::open(temp.path()).unwrap();
+    let runtime = DefinitePreCertificationFailureRuntime;
+    let handle = registry
+        .begin(
+            &runtime,
+            "cluster",
+            "alice",
+            "quorum-impossible",
+            Duration::from_secs(30),
+            DurabilityLevel::Quorum,
+            ReadConsistency::LocalSnapshot,
+            10,
+        )
+        .await
+        .unwrap();
+    registry
+        .put(
+            &handle.transaction_id,
+            "cluster",
+            LogicalKey {
+                table_id: 7,
+                application_key: b"absent-head".to_vec(),
+            },
+            b"staged".to_vec(),
+            11,
+        )
+        .unwrap();
+
+    let error = registry
+        .commit(&runtime, &handle.transaction_id, "alice", 12)
+        .await
+        .unwrap_err();
+    assert!(crate::mvcc_transaction::is_pre_certification_failure(
+        &error
+    ));
+    assert_eq!(
+        registry
+            .status(&handle.transaction_id, "alice", 12)
+            .unwrap()
+            .state,
+        "open"
+    );
+    assert_eq!(
+        registry
+            .rollback(&handle.transaction_id, "alice", 13)
+            .unwrap()
+            .state,
+        "rolled_back"
+    );
+    assert!(
+        registry
+            .recoverable_transaction_bundles()
+            .unwrap()
+            .is_empty()
     );
 }
 

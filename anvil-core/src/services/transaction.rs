@@ -114,7 +114,30 @@ impl TransactionService for AppState {
                 commit_version
             }
             crate::mvcc_transaction::CertificationResult::Aborted { reason } => {
-                tracing::warn!(?reason, transaction_id = %req.transaction_id, "MVCC transaction conflicted");
+                let conflict_key = match &reason {
+                    crate::mvcc_transaction::CertificationAbort::PointConflict { key_hash }
+                    | crate::mvcc_transaction::CertificationAbort::PredicateConflict { key_hash } => {
+                        self.mvcc
+                            .open_transactions
+                            .logical_key_for_conflict_hash(
+                                &req.transaction_id,
+                                &principal,
+                                *key_hash,
+                            )
+                            .ok()
+                            .flatten()
+                    }
+                    _ => None,
+                };
+                tracing::warn!(
+                    ?reason,
+                    transaction_id = %req.transaction_id,
+                    conflict_table_id = conflict_key.as_ref().map(|key| key.table_id),
+                    conflict_application_key = conflict_key
+                        .as_ref()
+                        .map(|key| hex::encode(&key.application_key)),
+                    "MVCC transaction conflicted"
+                );
                 return Err(Status::aborted(certification_abort_name(&reason)));
             }
         };

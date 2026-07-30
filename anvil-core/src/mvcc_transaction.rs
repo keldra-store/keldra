@@ -13,6 +13,26 @@ use sha2::{Digest, Sha256};
 
 pub type CommitVersion = u64;
 
+#[derive(Debug, thiserror::Error)]
+#[error("transaction failed before certification: {source}")]
+pub struct PreCertificationFailure {
+    #[source]
+    source: anyhow::Error,
+}
+
+pub(crate) fn pre_certification_failure(error: impl Into<anyhow::Error>) -> anyhow::Error {
+    PreCertificationFailure {
+        source: error.into(),
+    }
+    .into()
+}
+
+pub fn is_pre_certification_failure(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<PreCertificationFailure>().is_some())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DurabilityLevel {
@@ -1085,14 +1105,19 @@ where
         durability: DurabilityLevel,
     ) -> Result<CertificationResult> {
         let build_started_at = std::time::Instant::now();
-        bundle.canonicalize()?;
+        bundle.canonicalize().map_err(pre_certification_failure)?;
         for claim in &bundle.ownership_claims {
             self.ownership_resolver
-                .validate_claim(&bundle.cluster_id, claim)?;
+                .validate_claim(&bundle.cluster_id, claim)
+                .map_err(pre_certification_failure)?;
         }
-        let bytes = bundle.canonical_bytes()?;
-        self.resource_limits.validate_bundle(&bundle, &bytes)?;
-        let identity = bundle.identity()?;
+        let bytes = bundle
+            .canonical_bytes()
+            .map_err(pre_certification_failure)?;
+        self.resource_limits
+            .validate_bundle(&bundle, &bytes)
+            .map_err(pre_certification_failure)?;
+        let identity = bundle.identity().map_err(pre_certification_failure)?;
         crate::perf::record_transaction_duration("build", "ok", build_started_at.elapsed());
         crate::perf::record_transaction_shape(
             bundle.point_observations.len() as u64,
@@ -1110,12 +1135,17 @@ where
         );
 
         let replication_started_at = std::time::Instant::now();
-        let local_bundle = self.store.persist(&identity, &bytes).await?;
+        let local_bundle = self
+            .store
+            .persist(&identity, &bytes)
+            .await
+            .map_err(pre_certification_failure)?;
         let coordinator_incarnation = local_bundle.node.clone();
         let mut evidence = self
             .replicator
             .replicate(&identity, &bytes, &bundle.shard_manifests, durability)
-            .await?;
+            .await
+            .map_err(pre_certification_failure)?;
         evidence.bundle_holders.push(local_bundle);
         evidence
             .bundle_holders
@@ -1131,7 +1161,8 @@ where
             &bundle.shard_manifests,
             &evidence,
             &coordinator_incarnation,
-        )?;
+        )
+        .map_err(pre_certification_failure)?;
         crate::perf::record_transaction_duration(
             "replication",
             "ok",
