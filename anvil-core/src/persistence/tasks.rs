@@ -175,9 +175,7 @@ impl Persistence {
         let latest_revision = u64::try_from(latest_revision.max(0))
             .context("authorization tuple revision exceeds supported range")?;
         let target_revision = requested_revision.max(latest_revision);
-        let source_permit = self.authz_write_permit(tenant_id).await?;
-        let source_head_predicate =
-            crate::authz_head::latest_mvcc_predicate(self.mvcc()?, tenant_id)?;
+        let _source_permit = self.authz_write_permit(tenant_id).await?;
         let source_fence_token =
             authz_journal::latest_authz_journal_fence_token(self.mvcc()?, tenant_id)?;
 
@@ -201,7 +199,6 @@ impl Persistence {
                     step_target,
                     source_fence_token,
                     guard,
-                    &source_head_predicate,
                 )
                 .await?;
             steps = steps.saturating_add(1);
