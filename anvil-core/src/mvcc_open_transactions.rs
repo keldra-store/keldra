@@ -1,9 +1,9 @@
 //! Durable, scope-free transaction sessions for the public MVCC API path.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     time::Duration,
 };
 
@@ -140,6 +140,16 @@ struct DraftMutations {
     #[serde(default)]
     assignment_predicates: Vec<crate::mvcc_transaction::AssignmentPredicate>,
     writes: Vec<WriteOperation>,
+    /// Derived values visible to reads in this transaction but deliberately
+    /// excluded from its certified bundle.
+    ///
+    /// Object projections depend on the Raft-assigned commit cursor and are
+    /// installed authoritatively at apply time. Retaining their foreground
+    /// form here preserves read-your-writes semantics across multiple RPCs in
+    /// one explicit transaction without reintroducing those projection rows
+    /// as certification keys.
+    #[serde(default)]
+    read_overlays: Vec<WriteOperation>,
     manifests: Vec<ObjectShardManifestReference>,
     events: Vec<Vec<u8>>,
     jobs: Vec<Vec<u8>>,
@@ -150,6 +160,7 @@ struct DraftMutations {
 pub struct OpenTransactionRegistry {
     db: Arc<DB>,
     transition: Mutex<()>,
+    commit_gates: Mutex<BTreeMap<String, Weak<tokio::sync::Mutex<()>>>>,
     snapshot_gc_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -178,6 +189,7 @@ impl OpenTransactionRegistry {
                 )?,
             ),
             transition: Mutex::new(()),
+            commit_gates: Mutex::new(BTreeMap::new()),
             snapshot_gc_gate: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
@@ -191,6 +203,7 @@ impl OpenTransactionRegistry {
         Ok(Self {
             db,
             transition: Mutex::new(()),
+            commit_gates: Mutex::new(BTreeMap::new()),
             snapshot_gc_gate: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
@@ -469,9 +482,42 @@ impl OpenTransactionRegistry {
         mutations: Vec<StagedLogicalMutation>,
         now_unix_ms: u64,
     ) -> Result<()> {
+        self.stage_logical_mutations_with_read_overlays(
+            transaction_id,
+            principal,
+            owning_cluster_id,
+            mutations,
+            Vec::new(),
+            now_unix_ms,
+        )
+    }
+
+    /// Atomically stage certified mutations and transaction-local derived
+    /// values used only for read-your-writes.
+    ///
+    /// Read overlays must never overlap certified writes: one key cannot be
+    /// both an authoritative foreground mutation and an apply-time derived
+    /// projection in the same transaction.
+    pub fn stage_logical_mutations_with_read_overlays(
+        &self,
+        transaction_id: &str,
+        principal: &str,
+        owning_cluster_id: &str,
+        mutations: Vec<StagedLogicalMutation>,
+        read_overlays: Vec<WriteOperation>,
+        now_unix_ms: u64,
+    ) -> Result<()> {
         self.mutate_for_principal(transaction_id, principal, now_unix_ms, |draft| {
             ensure_owning_cluster(draft, owning_cluster_id)?;
             for mutation in mutations {
+                if draft
+                    .mutations
+                    .read_overlays
+                    .iter()
+                    .any(|write| write.key() == &mutation.key)
+                {
+                    bail!("certified write overlaps a transaction read overlay");
+                }
                 if !draft
                     .mutations
                     .points
@@ -494,6 +540,21 @@ impl OpenTransactionRegistry {
                     },
                     None => WriteOperation::Delete { key: mutation.key },
                 });
+            }
+            for overlay in read_overlays {
+                if draft
+                    .mutations
+                    .writes
+                    .iter()
+                    .any(|write| write.key() == overlay.key())
+                {
+                    bail!("transaction read overlay overlaps a certified write");
+                }
+                draft
+                    .mutations
+                    .read_overlays
+                    .retain(|write| write.key() != overlay.key());
+                draft.mutations.read_overlays.push(overlay);
             }
             Ok(())
         })
@@ -574,6 +635,12 @@ impl OpenTransactionRegistry {
         principal: &str,
         now_unix_ms: u64,
     ) -> Result<CommitOutcome> {
+        // Only one runtime commit attempt may exist for a durable transaction
+        // in this process. Without this gate, a retry can report a definite
+        // pre-certification failure and reopen shared state while an earlier
+        // attempt has already entered consensus.
+        let commit_gate = self.commit_gate(transaction_id);
+        let _commit_guard = commit_gate.lock().await;
         let (bundle, resolved, durability) = {
             let _guard = self.transition.lock().unwrap();
             let mut draft = self.load_for_principal(transaction_id, principal)?;
@@ -630,9 +697,20 @@ impl OpenTransactionRegistry {
                 if crate::mvcc_transaction::is_pre_certification_failure(&error) {
                     let _guard = self.transition.lock().unwrap();
                     let mut draft = self.load_for_principal(transaction_id, principal)?;
-                    if matches!(draft.state, DraftState::Committing { .. }) {
-                        draft.state = DraftState::Open;
-                        self.save(&draft)?;
+                    match &draft.state {
+                        DraftState::Committing {
+                            bundle: persisted_bundle,
+                        } if persisted_bundle == &bundle => {
+                            draft.state = DraftState::Open;
+                            self.save(&draft)?;
+                        }
+                        DraftState::Resolved {
+                            bundle: persisted_bundle,
+                            ..
+                        } if persisted_bundle == &bundle => {}
+                        _ => {
+                            bail!("transaction state changed during a failed commit attempt");
+                        }
                     }
                 }
                 return Err(error);
@@ -640,11 +718,22 @@ impl OpenTransactionRegistry {
         };
         let _guard = self.transition.lock().unwrap();
         let mut draft = self.load_for_principal(transaction_id, principal)?;
-        draft.state = DraftState::Resolved {
-            bundle,
-            result: outcome.certification.clone(),
-        };
-        self.save(&draft)?;
+        match &draft.state {
+            DraftState::Committing {
+                bundle: persisted_bundle,
+            } if persisted_bundle == &bundle => {
+                draft.state = DraftState::Resolved {
+                    bundle,
+                    result: outcome.certification.clone(),
+                };
+                self.save(&draft)?;
+            }
+            DraftState::Resolved {
+                bundle: persisted_bundle,
+                result,
+            } if persisted_bundle == &bundle && result == &outcome.certification => {}
+            _ => bail!("transaction state changed during a successful commit attempt"),
+        }
         Ok(outcome)
     }
 
@@ -732,10 +821,18 @@ impl OpenTransactionRegistry {
         }
         Ok(draft
             .mutations
-            .writes
+            .read_overlays
             .iter()
             .rev()
             .find(|write| write.key() == key)
+            .or_else(|| {
+                draft
+                    .mutations
+                    .writes
+                    .iter()
+                    .rev()
+                    .find(|write| write.key() == key)
+            })
             .map(|write| match write {
                 WriteOperation::Put { value, .. } => Some(value.clone()),
                 WriteOperation::Delete { .. } => None,
@@ -754,7 +851,16 @@ impl OpenTransactionRegistry {
         ) {
             bail!("transaction can no longer be read");
         }
-        Ok(draft.mutations.writes.clone())
+        let mut writes = draft
+            .mutations
+            .writes
+            .into_iter()
+            .map(|write| (write.key().clone(), write))
+            .collect::<BTreeMap<_, _>>();
+        for overlay in draft.mutations.read_overlays {
+            writes.insert(overlay.key().clone(), overlay);
+        }
+        Ok(writes.into_values().collect())
     }
 
     /// Rebuild canonical bundles for durable transactions which may still
@@ -980,6 +1086,17 @@ impl OpenTransactionRegistry {
             &durable_write_options(),
         )?;
         Ok(())
+    }
+
+    fn commit_gate(&self, transaction_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = self.commit_gates.lock().unwrap();
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        if let Some(gate) = gates.get(transaction_id).and_then(Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        gates.insert(transaction_id.to_string(), Arc::downgrade(&gate));
+        gate
     }
 
     fn cf(&self, name: &str) -> Result<&ColumnFamily> {

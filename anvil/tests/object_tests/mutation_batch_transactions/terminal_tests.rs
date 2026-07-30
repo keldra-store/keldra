@@ -359,3 +359,176 @@ async fn rollback_and_expiry_never_publish_staged_mutation_batches() {
     assert_eq!(expired_status.state, "expired");
     assert_object_missing(&fixture, &mut object_client, expired_key).await;
 }
+
+#[tokio::test]
+async fn rollback_after_definite_failure_allows_fresh_not_exists_on_same_key() {
+    let mut fixture = SingleNodeMutationBatchFixture::new("tx-rollback-fresh-not-exists").await;
+    let mut transaction_client = fixture.transaction_client().await;
+    let mut object_client = fixture.object_client().await;
+    let object_key = "terminal/fresh-after-failed-quorum.json";
+    let precondition = || WritePrecondition {
+        object_versions: vec![ObjectVersionPrecondition {
+            bucket_name: fixture.bucket_name.clone(),
+            object_key: object_key.to_string(),
+            expected_version_id: None,
+            must_not_exist: true,
+        }],
+        lease_fence: None,
+    };
+
+    let failed = fixture
+        .begin_transaction_with_durability_as(
+            &mut transaction_client,
+            "single-node-impossible-quorum",
+            EXPLICIT_TRANSACTION_TTL_MS,
+            &fixture.actor.token,
+            MvccDurability::Quorum,
+        )
+        .await;
+    let failure = object_client
+        .mutation_batch(authorized(
+            MutationBatchRequest {
+                bucket_name: fixture.bucket_name.clone(),
+                mutation_context: Some(
+                    fixture.mutation_context("failed-quorum-write", &failed.transaction_id),
+                ),
+                precondition: Some(precondition()),
+                operations: vec![small_put(object_key, br#"{"attempt":"failed"}"#.to_vec())],
+            },
+            &fixture.actor.token,
+        ))
+        .await
+        .expect_err("one shard target must reject quorum staging before publication");
+    assert_eq!(failure.code(), Code::FailedPrecondition);
+    assert!(
+        failure
+            .message()
+            .contains("distributed object durability requires at least two shard targets")
+    );
+    let failed_status = transaction_client
+        .get_transaction(authorized(
+            fixture.get_transaction_request(failed.transaction_id.clone()),
+            &fixture.actor.token,
+        ))
+        .await
+        .expect("read transaction after definite pre-certification failure")
+        .into_inner();
+    assert_eq!(
+        failed_status.state, "open",
+        "a definite staging failure must leave the transaction explicitly rollbackable"
+    );
+    transaction_client
+        .rollback_transaction(authorized(
+            fixture.rollback_request(
+                failed.transaction_id.clone(),
+                "single-node quorum cannot be certified",
+            ),
+            &fixture.actor.token,
+        ))
+        .await
+        .expect("rollback after definite pre-certification failure");
+    assert_object_missing(&fixture, &mut object_client, object_key).await;
+
+    let fresh = fixture
+        .begin_transaction(
+            &mut transaction_client,
+            "fresh-local-after-rollback",
+            EXPLICIT_TRANSACTION_TTL_MS,
+        )
+        .await;
+    assert_ne!(fresh.transaction_id, failed.transaction_id);
+    object_client
+        .mutation_batch(authorized(
+            MutationBatchRequest {
+                bucket_name: fixture.bucket_name.clone(),
+                mutation_context: Some(
+                    fixture.mutation_context("fresh-local-write", &fresh.transaction_id),
+                ),
+                precondition: Some(precondition()),
+                operations: vec![small_put(
+                    object_key,
+                    br#"{"attempt":"committed"}"#.to_vec(),
+                )],
+            },
+            &fixture.actor.token,
+        ))
+        .await
+        .expect("fresh same-key not-exists write must stage after rollback");
+    let committed = transaction_client
+        .commit_transaction(authorized(
+            fixture.commit_request(fresh.transaction_id),
+            &fixture.actor.token,
+        ))
+        .await
+        .expect("fresh same-key local transaction must commit")
+        .into_inner();
+    assert_eq!(committed.state, WriteState::Committed as i32);
+    assert_eq!(
+        get_object_bytes_for_test(
+            &mut object_client,
+            &fixture.actor.token,
+            &fixture.bucket_name,
+            object_key,
+            None,
+        )
+        .await,
+        br#"{"attempt":"committed"}"#.to_vec()
+    );
+
+    fixture
+        ._cluster
+        .restart(ISOLATED_TEST_CLUSTER_STARTUP_TIMEOUT)
+        .await;
+    let mut restarted_object_client = fixture.object_client().await;
+    assert_eq!(
+        get_object_bytes_for_test(
+            &mut restarted_object_client,
+            &fixture.actor.token,
+            &fixture.bucket_name,
+            object_key,
+            None,
+        )
+        .await,
+        br#"{"attempt":"committed"}"#.to_vec(),
+        "the fresh committed head must remain readable after restart"
+    );
+
+    let mut restarted_transaction_client = fixture.transaction_client().await;
+    let conflicting = fixture
+        .begin_transaction(
+            &mut restarted_transaction_client,
+            "readable-head-must-conflict",
+            EXPLICIT_TRANSACTION_TTL_MS,
+        )
+        .await;
+    let conflict = restarted_object_client
+        .mutation_batch(authorized(
+            MutationBatchRequest {
+                bucket_name: fixture.bucket_name.clone(),
+                mutation_context: Some(
+                    fixture.mutation_context("readable-head-conflict", &conflicting.transaction_id),
+                ),
+                precondition: Some(precondition()),
+                operations: vec![small_put(object_key, br#"{"attempt":"hidden"}"#.to_vec())],
+            },
+            &fixture.actor.token,
+        ))
+        .await
+        .expect_err("a genuinely committed readable head must fail must_not_exist");
+    assert!(
+        matches!(conflict.code(), Code::Aborted | Code::FailedPrecondition),
+        "unexpected readable-head conflict status: {conflict:?}"
+    );
+    assert_eq!(
+        get_object_bytes_for_test(
+            &mut restarted_object_client,
+            &fixture.actor.token,
+            &fixture.bucket_name,
+            object_key,
+            None,
+        )
+        .await,
+        br#"{"attempt":"committed"}"#.to_vec(),
+        "the conflicting committed head must remain readable"
+    );
+}

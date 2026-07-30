@@ -12,7 +12,9 @@ use crate::{
     core_store::{CoreMutationOperation, TABLE_STREAM_RECORD_INDEX_ROW},
     mvcc_bootstrap::MvccSubsystem,
     mvcc_open_transactions::StagedLogicalMutation,
-    mvcc_transaction::{CertificationResult, DurabilityLevel, LogicalKey, ReadConsistency},
+    mvcc_transaction::{
+        CertificationResult, DurabilityLevel, LogicalKey, ReadConsistency, WriteOperation,
+    },
 };
 use serde::{Deserialize, Serialize};
 
@@ -516,6 +518,25 @@ impl MvccSubsystem {
         mutations: Vec<ProductMutation>,
         now_unix_ms: u64,
     ) -> Result<()> {
+        self.stage_product_mutations_with_read_overlays(
+            transaction_id,
+            principal,
+            mutations,
+            Vec::new(),
+            now_unix_ms,
+        )
+    }
+
+    /// Stage authoritative product mutations together with apply-time-derived
+    /// values that are visible only inside the owning transaction.
+    pub fn stage_product_mutations_with_read_overlays(
+        &self,
+        transaction_id: &str,
+        principal: &str,
+        mutations: Vec<ProductMutation>,
+        read_overlays: Vec<ProductMutation>,
+        now_unix_ms: u64,
+    ) -> Result<()> {
         let binding = self.open_transactions.binding(transaction_id, principal)?;
         let snapshot = self
             .open_transactions
@@ -535,13 +556,25 @@ impl MvccSubsystem {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        self.open_transactions.stage_logical_mutations(
-            transaction_id,
-            principal,
-            &binding.cluster_id,
-            staged,
-            now_unix_ms,
-        )
+        let read_overlays = read_overlays
+            .into_iter()
+            .map(|mutation| match mutation.value {
+                Some(value) => WriteOperation::Put {
+                    key: mutation.key,
+                    value,
+                },
+                None => WriteOperation::Delete { key: mutation.key },
+            })
+            .collect();
+        self.open_transactions
+            .stage_logical_mutations_with_read_overlays(
+                transaction_id,
+                principal,
+                &binding.cluster_id,
+                staged,
+                read_overlays,
+                now_unix_ms,
+            )
     }
 }
 

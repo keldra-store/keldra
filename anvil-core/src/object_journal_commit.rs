@@ -5,6 +5,8 @@
 //! is part of the certified bundle; the Raft-assigned commit version and the
 //! canonical job/entry ordinals provide its deterministic cursor at apply.
 
+use std::collections::BTreeMap;
+
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +39,122 @@ pub struct ObjectJournalCommitEntry {
     /// bundle, so an absent value intentionally means "journal facts only".
     #[serde(default)]
     pub(crate) projection_snapshot: Option<crate::metadata_journal::ObjectProjectionSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CommittedProjectionReference {
+    object_id: i64,
+    projection_generation: u64,
+}
+
+/// Canonical object identities assigned to every journal entry in one
+/// certified bundle.
+///
+/// Transaction-local projection snapshots can refer to objects staged by an
+/// earlier RPC. Materialisation jobs are canonically sorted before
+/// certification, so all cursor assignments must be known before any snapshot
+/// is rebased; relying on traversal order would make those references depend
+/// on encoded job ordering.
+pub(crate) struct ObjectJournalCommitAssignments {
+    by_mutation: BTreeMap<(i64, i64, uuid::Uuid), CommittedProjectionReference>,
+}
+
+impl ObjectJournalCommitAssignments {
+    pub(crate) fn for_jobs(commit_version: u64, jobs: &[ObjectJournalCommitJob]) -> Result<Self> {
+        if jobs.len() > ObjectJournalCommitJob::MAX_JOBS_PER_TRANSACTION {
+            bail!("too many materialisation jobs for object journal cursor");
+        }
+        let mut by_mutation = BTreeMap::new();
+        for (job_ordinal, job) in jobs.iter().enumerate() {
+            job.validate()?;
+            for (entry_ordinal, entry) in job.entries.iter().enumerate() {
+                let cursor = commit_cursor(commit_version, job_ordinal, entry_ordinal)?;
+                let object_id = i64::try_from(cursor).map_err(|_| {
+                    anyhow!("object journal cursor exceeds committed object ID range")
+                })?;
+                let scope = (
+                    job.bucket.tenant_id,
+                    job.bucket.id,
+                    entry.object.mutation_id,
+                );
+                if by_mutation
+                    .insert(
+                        scope,
+                        CommittedProjectionReference {
+                            object_id,
+                            projection_generation: cursor,
+                        },
+                    )
+                    .is_some()
+                {
+                    bail!("object journal mutation identity is duplicated");
+                }
+            }
+        }
+        Ok(Self { by_mutation })
+    }
+
+    fn for_job_at_ordinal(
+        commit_version: u64,
+        job_ordinal: usize,
+        job: &ObjectJournalCommitJob,
+    ) -> Result<Self> {
+        job.validate()?;
+        let mut by_mutation = BTreeMap::new();
+        for (entry_ordinal, entry) in job.entries.iter().enumerate() {
+            let cursor = commit_cursor(commit_version, job_ordinal, entry_ordinal)?;
+            let object_id = i64::try_from(cursor)
+                .map_err(|_| anyhow!("object journal cursor exceeds committed object ID range"))?;
+            by_mutation.insert(
+                (
+                    job.bucket.tenant_id,
+                    job.bucket.id,
+                    entry.object.mutation_id,
+                ),
+                CommittedProjectionReference {
+                    object_id,
+                    projection_generation: cursor,
+                },
+            );
+        }
+        Ok(Self { by_mutation })
+    }
+
+    fn rebase_entry(
+        &self,
+        bucket: &Bucket,
+        entry: &ObjectJournalCommitEntry,
+    ) -> ObjectJournalCommitEntry {
+        let mut entry = entry.clone();
+        let Some(snapshot) = entry.projection_snapshot.as_mut() else {
+            return entry;
+        };
+        if let Some(current) = snapshot.current.as_mut() {
+            self.rebase_object(bucket, current);
+        }
+        if let Some(original) = snapshot.original.as_mut() {
+            if let Some(reference) = self.reference(bucket, &original.object) {
+                original.object.id = reference.object_id;
+                original.row_generation = reference.projection_generation;
+            }
+        }
+        if let Some(successor) = snapshot.delete_current_successor.as_mut() {
+            self.rebase_object(bucket, successor);
+        }
+        entry
+    }
+
+    fn rebase_object(&self, bucket: &Bucket, object: &mut Object) {
+        if let Some(reference) = self.reference(bucket, object) {
+            object.id = reference.object_id;
+        }
+    }
+
+    fn reference(&self, bucket: &Bucket, object: &Object) -> Option<CommittedProjectionReference> {
+        self.by_mutation
+            .get(&(bucket.tenant_id, bucket.id, object.mutation_id))
+            .copied()
+    }
 }
 
 impl ObjectJournalCommitJob {
@@ -131,6 +249,17 @@ impl ObjectJournalCommitJob {
         commit_version: u64,
         job_ordinal: usize,
     ) -> Result<Vec<ProductMutation>> {
+        let assignments =
+            ObjectJournalCommitAssignments::for_job_at_ordinal(commit_version, job_ordinal, self)?;
+        self.committed_mutations_with_assignments(commit_version, job_ordinal, &assignments)
+    }
+
+    pub(crate) fn committed_mutations_with_assignments(
+        &self,
+        commit_version: u64,
+        job_ordinal: usize,
+        assignments: &ObjectJournalCommitAssignments,
+    ) -> Result<Vec<ProductMutation>> {
         self.validate()?;
         if job_ordinal >= Self::MAX_JOBS_PER_TRANSACTION {
             bail!("too many materialisation jobs for object journal cursor");
@@ -138,9 +267,10 @@ impl ObjectJournalCommitJob {
         let mut mutations = Vec::with_capacity(self.entries.len().saturating_mul(5));
         for (entry_ordinal, entry) in self.entries.iter().enumerate() {
             let cursor = commit_cursor(commit_version, job_ordinal, entry_ordinal)?;
+            let entry = assignments.rebase_entry(&self.bucket, entry);
             let (entry, projection_mutations) = crate::metadata_journal::prepare_committed_entry(
                 &self.bucket,
-                entry,
+                &entry,
                 cursor,
                 &self.transaction_id,
             )?;

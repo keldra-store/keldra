@@ -140,6 +140,7 @@ async fn append_object_put_mutations_with_permit_inner(
 
     let mut projection_predicates = Vec::new();
     let mut mutation_fences = std::collections::BTreeMap::new();
+    let mut projection_overlays = std::collections::BTreeMap::new();
     let mut journal_entries = Vec::with_capacity(objects.len());
     for object in objects {
         let loaded = load_object_projection_snapshot(
@@ -156,6 +157,12 @@ async fn append_object_put_mutations_with_permit_inner(
             transaction_id,
         )? {
             mutation_fences.insert(fence.key.clone(), fence);
+        }
+        if transaction_principal.is_some() {
+            for projection in plan_object_upsert(bucket, object, &loaded.snapshot, transaction_id)?
+            {
+                projection_overlays.insert(projection.key.clone(), projection);
+            }
         }
         let watch_event = object_watch_event(bucket, object, ObjectJournalMutation::Put);
         journal_entries.push(crate::object_journal_commit::ObjectJournalCommitEntry {
@@ -183,10 +190,11 @@ async fn append_object_put_mutations_with_permit_inner(
     mutations.append(&mut additions.mutations);
     predicates.extend(projection_predicates);
     if let Some(transaction_principal) = transaction_principal {
-        mvcc.stage_product_mutations(
+        mvcc.stage_product_mutations_with_read_overlays(
             transaction_id,
             transaction_principal,
             mutations,
+            projection_overlays.into_values().collect(),
             u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
         )?;
         let now_unix_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default();
@@ -372,6 +380,20 @@ pub(super) async fn append_object_mutation_inner(
     )?;
     let projection_predicates = loaded.predicates;
     let projection_snapshot = loaded.snapshot;
+    let projection_overlays = if mvcc_transaction_id.is_some() {
+        match mutation {
+            ObjectJournalMutation::Put
+            | ObjectJournalMutation::Copy
+            | ObjectJournalMutation::DeleteMarker => {
+                plan_object_upsert(bucket, object, &projection_snapshot, transaction_id)?
+            }
+            ObjectJournalMutation::DeleteVersion => {
+                plan_object_delete_version(bucket, object, &projection_snapshot, transaction_id)?
+            }
+        }
+    } else {
+        Vec::new()
+    };
     let mut mutations = plan_object_mutation_fences(
         bucket,
         object,
@@ -409,10 +431,11 @@ pub(super) async fn append_object_mutation_inner(
     if mvcc_transaction_id.is_some() {
         let transaction_principal = transaction_principal
             .ok_or_else(|| anyhow!("object metadata MVCC transaction principal missing"))?;
-        mvcc.stage_product_mutations(
+        mvcc.stage_product_mutations_with_read_overlays(
             transaction_id,
             transaction_principal,
             mutations,
+            projection_overlays,
             u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
         )?;
         for event in outbox_events {

@@ -182,6 +182,10 @@ impl TransactionRuntime for GatedRuntime {
         if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
             self.first_started.notify_one();
             self.release_first.notified().await;
+        } else {
+            return Err(crate::mvcc_transaction::pre_certification_failure(anyhow!(
+                "a concurrent retry failed before certification"
+            )));
         }
         Ok(CommitOutcome {
             certification: CertificationResult::Committed { commit_version: 12 },
@@ -973,6 +977,108 @@ async fn rollback_discards_all_staged_intent_and_does_not_pin_recovery() {
         )
         .unwrap();
     registry
+        .observe_point(
+            &handle.transaction_id,
+            "cluster",
+            LogicalKey {
+                table_id: 8,
+                application_key: b"observed".to_vec(),
+            },
+            None,
+            11,
+        )
+        .unwrap();
+    registry
+        .observe_range(
+            &handle.transaction_id,
+            "cluster",
+            9,
+            Some(b"a".to_vec()),
+            Some(b"z".to_vec()),
+            None,
+            11,
+        )
+        .unwrap();
+    registry
+        .add_predicate(
+            &handle.transaction_id,
+            "cluster",
+            LogicalKey {
+                table_id: 10,
+                application_key: b"predicate".to_vec(),
+            },
+            crate::mvcc_transaction::PredicateKind::Absent,
+            None,
+            11,
+        )
+        .unwrap();
+    registry
+        .require_assignment(
+            &handle.transaction_id,
+            "alice",
+            crate::mvcc_transaction::AssignmentPredicate {
+                partition_id: 1,
+                assignment_epoch: 2,
+                topology_epoch: 3,
+                owner: crate::mvcc_transaction::NodeIncarnation {
+                    node_id: "node-a".into(),
+                    incarnation: 4,
+                },
+            },
+            11,
+        )
+        .unwrap();
+    registry
+        .add_manifest(
+            &handle.transaction_id,
+            "cluster",
+            physical_manifest("cluster").reference().unwrap(),
+            11,
+        )
+        .unwrap();
+    registry
+        .add_stream_event(
+            &handle.transaction_id,
+            crate::mvcc_outbox::StreamOutboxEvent::new(
+                1,
+                "rollback-stream",
+                "rollback-partition",
+                "rollback",
+                b"event".to_vec(),
+            )
+            .unwrap(),
+            11,
+        )
+        .unwrap();
+    registry
+        .add_idempotency_result(
+            &handle.transaction_id,
+            "alice",
+            crate::mvcc_transaction::IdempotencyResult {
+                namespace: "rollback".into(),
+                key: "request".into(),
+                payload: b"result".to_vec(),
+            },
+            11,
+        )
+        .unwrap();
+    registry
+        .stage_logical_mutations_with_read_overlays(
+            &handle.transaction_id,
+            "alice",
+            "cluster",
+            Vec::new(),
+            vec![WriteOperation::Put {
+                key: LogicalKey {
+                    table_id: 11,
+                    application_key: b"derived-projection".to_vec(),
+                },
+                value: b"overlay".to_vec(),
+            }],
+            11,
+        )
+        .unwrap();
+    registry
         .add_job(&handle.transaction_id, br#"{"staged":"job"}"#.to_vec(), 11)
         .unwrap();
 
@@ -982,11 +1088,15 @@ async fn rollback_discards_all_staged_intent_and_does_not_pin_recovery() {
     assert_eq!(status.state, "rolled_back");
     let draft = registry.load(&handle.transaction_id).unwrap();
     assert!(draft.mutations.points.is_empty());
+    assert!(draft.mutations.ranges.is_empty());
     assert!(draft.mutations.predicates.is_empty());
+    assert!(draft.mutations.assignment_predicates.is_empty());
     assert!(draft.mutations.writes.is_empty());
+    assert!(draft.mutations.read_overlays.is_empty());
     assert!(draft.mutations.manifests.is_empty());
     assert!(draft.mutations.events.is_empty());
     assert!(draft.mutations.jobs.is_empty());
+    assert!(draft.mutations.idempotency_results.is_empty());
     assert!(
         registry
             .recoverable_transaction_bundles()
@@ -1014,6 +1124,91 @@ async fn rollback_discards_all_staged_intent_and_does_not_pin_recovery() {
         .await
         .unwrap();
     assert_ne!(fresh.transaction_id, handle.transaction_id);
+}
+
+#[tokio::test]
+async fn transaction_read_overlay_is_durable_visible_and_excluded_from_certification() {
+    let temp = tempdir().unwrap();
+    let transaction_id = {
+        let registry = OpenTransactionRegistry::open(temp.path()).unwrap();
+        let handle = registry
+            .begin(
+                &runtime(),
+                "cluster",
+                "alice",
+                "durable-read-overlay",
+                Duration::from_secs(30),
+                DurabilityLevel::Local,
+                ReadConsistency::LocalSnapshot,
+                10,
+            )
+            .await
+            .unwrap();
+        let certified_key = LogicalKey {
+            table_id: 7,
+            application_key: b"mutation-fence".to_vec(),
+        };
+        let overlay_key = LogicalKey {
+            table_id: 8,
+            application_key: b"object-current".to_vec(),
+        };
+        registry
+            .stage_logical_mutations_with_read_overlays(
+                &handle.transaction_id,
+                "alice",
+                "cluster",
+                vec![StagedLogicalMutation {
+                    key: certified_key.clone(),
+                    observed_version: None,
+                    value: Some(b"fence".to_vec()),
+                }],
+                vec![WriteOperation::Put {
+                    key: overlay_key.clone(),
+                    value: b"projection".to_vec(),
+                }],
+                11,
+            )
+            .unwrap();
+        assert_eq!(
+            registry
+                .staged_value(&handle.transaction_id, "alice", &overlay_key)
+                .unwrap(),
+            Some(Some(b"projection".to_vec()))
+        );
+        let draft = registry.load(&handle.transaction_id).unwrap();
+        let bundle = build_bundle(&draft).unwrap();
+        assert_eq!(bundle.writes.len(), 1);
+        assert_eq!(bundle.writes[0].key(), &certified_key);
+        assert!(
+            registry
+                .staged_writes(&handle.transaction_id, "alice")
+                .unwrap()
+                .iter()
+                .any(|write| write.key() == &overlay_key)
+        );
+        handle.transaction_id
+    };
+
+    let registry = OpenTransactionRegistry::open(temp.path()).unwrap();
+    let overlay_key = LogicalKey {
+        table_id: 8,
+        application_key: b"object-current".to_vec(),
+    };
+    assert_eq!(
+        registry
+            .staged_value(&transaction_id, "alice", &overlay_key)
+            .unwrap(),
+        Some(Some(b"projection".to_vec()))
+    );
+    registry.rollback(&transaction_id, "alice", 12).unwrap();
+    let draft = registry.load(&transaction_id).unwrap();
+    assert!(draft.mutations.read_overlays.is_empty());
+    assert!(
+        registry
+            .recoverable_transaction_bundles()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -1090,7 +1285,7 @@ fn idempotency_status_lookup_is_read_only() {
 }
 
 #[tokio::test]
-async fn committing_idempotency_retry_resumes_to_the_same_outcome() {
+async fn concurrent_pre_cert_failure_cannot_reopen_an_inflight_commit() {
     let temp = tempdir().unwrap();
     let registry = Arc::new(OpenTransactionRegistry::open(temp.path()).unwrap());
     let runtime = Arc::new(GatedRuntime {
@@ -1149,12 +1344,30 @@ async fn committing_idempotency_retry_resumes_to_the_same_outcome() {
         .unwrap();
     assert_eq!(status.state, "committing");
 
-    let retry = registry
-        .commit(runtime.as_ref(), &handle.transaction_id, "alice", 12)
-        .await
-        .unwrap();
+    let retry_registry = registry.clone();
+    let retry_runtime = runtime.clone();
+    let retry_transaction_id = handle.transaction_id.clone();
+    let mut retry = tokio::spawn(async move {
+        retry_registry
+            .commit(retry_runtime.as_ref(), &retry_transaction_id, "alice", 12)
+            .await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut retry)
+            .await
+            .is_err(),
+        "a concurrent retry must wait for the owning commit attempt"
+    );
+    assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        registry
+            .rollback(&handle.transaction_id, "alice", 12)
+            .is_err(),
+        "an in-flight commit must never be made rollbackable by a retry"
+    );
     runtime.release_first.notify_one();
     let first = first.await.unwrap();
+    let retry = retry.await.unwrap().unwrap();
     assert_eq!(retry.certification, first.certification);
     assert_eq!(
         retry.certification,
@@ -1167,6 +1380,13 @@ async fn committing_idempotency_retry_resumes_to_the_same_outcome() {
             .is_empty()
     );
     assert!(registry.active_snapshot_pins(50_000).unwrap().is_empty());
+    assert_eq!(
+        registry
+            .status(&handle.transaction_id, "alice", 50_000)
+            .unwrap()
+            .state,
+        "committed"
+    );
 }
 
 #[tokio::test]

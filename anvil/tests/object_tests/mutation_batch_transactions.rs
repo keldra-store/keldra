@@ -101,6 +101,18 @@ impl SingleNodeMutationBatchFixture {
         ttl_ms: u64,
         token: &str,
     ) -> BeginTransactionResponse {
+        self.begin_transaction_with_durability_as(client, tag, ttl_ms, token, MvccDurability::Local)
+            .await
+    }
+
+    async fn begin_transaction_with_durability_as(
+        &self,
+        client: &mut TransactionServiceClient<tonic::transport::Channel>,
+        tag: &str,
+        ttl_ms: u64,
+        token: &str,
+        durability: MvccDurability,
+    ) -> BeginTransactionResponse {
         let response = client
             .begin_transaction(authorized(
                 BeginTransactionRequest {
@@ -108,7 +120,7 @@ impl SingleNodeMutationBatchFixture {
                     ttl_ms,
                     read_consistency: MvccReadConsistency::Linearized as i32,
                     cluster_id: self.cluster_id.clone(),
-                    durability: MvccDurability::Local as i32,
+                    durability: durability as i32,
                 },
                 token,
             ))
@@ -330,6 +342,122 @@ async fn strict_visibility_stages_and_commits_an_absent_object_put() {
         ))
         .await
         .expect("strict absent-object put is visible after commit");
+}
+
+#[tokio::test]
+async fn unrelated_object_transactions_commit_without_shared_projection_conflicts() {
+    let fixture = SingleNodeMutationBatchFixture::new("tx-unrelated-object-projections").await;
+    let mut first_transaction_client = fixture.transaction_client().await;
+    let mut second_transaction_client = fixture.transaction_client().await;
+    let mut first_object_client = fixture.object_client().await;
+    let mut second_object_client = fixture.object_client().await;
+    let first = fixture
+        .begin_transaction(
+            &mut first_transaction_client,
+            "unrelated-first",
+            EXPLICIT_TRANSACTION_TTL_MS,
+        )
+        .await;
+    let second = fixture
+        .begin_transaction(
+            &mut second_transaction_client,
+            "unrelated-second",
+            EXPLICIT_TRANSACTION_TTL_MS,
+        )
+        .await;
+    assert_eq!(
+        first.snapshot_version, second.snapshot_version,
+        "both transactions must certify from the same starting snapshot"
+    );
+
+    let first_key = "unrelated/first.json";
+    let second_key = "unrelated/second.json";
+    for (client, transaction_id, object_key, payload, tag) in [
+        (
+            &mut first_object_client,
+            first.transaction_id.as_str(),
+            first_key,
+            br#"{"writer":1}"#.to_vec(),
+            "unrelated-first-write",
+        ),
+        (
+            &mut second_object_client,
+            second.transaction_id.as_str(),
+            second_key,
+            br#"{"writer":2}"#.to_vec(),
+            "unrelated-second-write",
+        ),
+    ] {
+        client
+            .mutation_batch(authorized(
+                MutationBatchRequest {
+                    bucket_name: fixture.bucket_name.clone(),
+                    mutation_context: Some(fixture.mutation_context(tag, transaction_id)),
+                    precondition: Some(WritePrecondition {
+                        object_versions: vec![ObjectVersionPrecondition {
+                            bucket_name: fixture.bucket_name.clone(),
+                            object_key: object_key.to_string(),
+                            expected_version_id: None,
+                            must_not_exist: true,
+                        }],
+                        lease_fence: None,
+                    }),
+                    operations: vec![small_put(object_key, payload)],
+                },
+                &fixture.actor.token,
+            ))
+            .await
+            .expect("stage unrelated object");
+    }
+
+    let first_commit = first_transaction_client.commit_transaction(authorized(
+        fixture.commit_request(first.transaction_id),
+        &fixture.actor.token,
+    ));
+    let second_commit = second_transaction_client.commit_transaction(authorized(
+        fixture.commit_request(second.transaction_id),
+        &fixture.actor.token,
+    ));
+    let (first_commit, second_commit) = tokio::join!(first_commit, second_commit);
+    assert_eq!(
+        first_commit
+            .expect("first unrelated transaction must commit")
+            .into_inner()
+            .state,
+        WriteState::Committed as i32
+    );
+    assert_eq!(
+        second_commit
+            .expect("second unrelated transaction must commit")
+            .into_inner()
+            .state,
+        WriteState::Committed as i32
+    );
+
+    let mut reader = fixture.object_client().await;
+    assert_eq!(
+        list_keys(
+            &fixture,
+            &mut reader,
+            "unrelated/",
+            Some(ReadConsistency {
+                mode: Some(anvil_api::read_consistency::Mode::Latest(true)),
+            }),
+        )
+        .await,
+        vec![first_key.to_string(), second_key.to_string()]
+    );
+    let mut watch = watch_prefix(&fixture, &mut reader, "unrelated/", 0).await;
+    let first_event = next_watch_event(&mut watch).await;
+    let second_event = next_watch_event(&mut watch).await;
+    assert!(first_event.cursor < second_event.cursor);
+    assert_eq!(
+        [first_event.object_key, second_event.object_key]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([first_key.to_string(), second_key.to_string()]),
+        "watch history must contain both unrelated commits exactly once"
+    );
 }
 
 fn unix_time_ms() -> u64 {

@@ -1576,6 +1576,23 @@ impl TestCluster {
         for node in nodes {
             let _ = node.await;
         }
+        let configs = self
+            .states
+            .iter()
+            .map(|state| state.config.as_ref().clone())
+            .collect::<Vec<_>>();
+        for state in &self.states {
+            state.mvcc.shutdown().await;
+            state.mvcc.consensus.shutdown().await.unwrap();
+        }
+        self.states.clear();
+        for config in configs {
+            self.states.push(
+                AppState::new(config, personaldb_test_protocol_keyring())
+                    .await
+                    .unwrap(),
+            );
+        }
         self.start_and_converge(timeout).await;
     }
 

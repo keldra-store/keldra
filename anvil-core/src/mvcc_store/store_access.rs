@@ -419,20 +419,46 @@ impl MvccStore {
         // derived value without masking overlap with an explicitly certified
         // bundle write (the duplicate check below still rejects that).
         let mut committed_object_writes = BTreeMap::new();
-        let mut journal_job_ordinal = 0;
-        for encoded_job in &bundle.materialisation_jobs {
-            let schema = serde_json::from_slice::<serde_json::Value>(encoded_job)?
-                .get("schema")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned);
-            if !schema
-                .as_deref()
-                .is_some_and(crate::object_journal_commit::ObjectJournalCommitJob::is_schema)
-            {
-                continue;
-            }
-            let job = crate::object_journal_commit::ObjectJournalCommitJob::decode(encoded_job)?;
-            for mutation in job.committed_mutations(commit_version, journal_job_ordinal)? {
+        let object_journal_jobs = bundle
+            .materialisation_jobs
+            .iter()
+            .filter_map(|encoded_job| {
+                let schema = serde_json::from_slice::<serde_json::Value>(encoded_job)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|value| {
+                        Ok(value
+                            .get("schema")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned))
+                    });
+                match schema {
+                    Ok(Some(schema))
+                        if crate::object_journal_commit::ObjectJournalCommitJob::is_schema(
+                            &schema,
+                        ) =>
+                    {
+                        Some(
+                            crate::object_journal_commit::ObjectJournalCommitJob::decode(
+                                encoded_job,
+                            ),
+                        )
+                    }
+                    Ok(_) => None,
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let object_journal_assignments =
+            crate::object_journal_commit::ObjectJournalCommitAssignments::for_jobs(
+                commit_version,
+                &object_journal_jobs,
+            )?;
+        for (journal_job_ordinal, job) in object_journal_jobs.iter().enumerate() {
+            for mutation in job.committed_mutations_with_assignments(
+                commit_version,
+                journal_job_ordinal,
+                &object_journal_assignments,
+            )? {
                 let write = match mutation.value {
                     Some(value) => WriteOperation::Put {
                         key: mutation.key,
@@ -442,7 +468,6 @@ impl MvccStore {
                 };
                 committed_object_writes.insert(write.key().clone(), write);
             }
-            journal_job_ordinal += 1;
         }
         committed_writes.extend(committed_object_writes.into_values());
         committed_writes.sort_by(|left, right| left.key().cmp(right.key()));

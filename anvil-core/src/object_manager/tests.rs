@@ -124,6 +124,72 @@ async fn seeded_object_manager(
     (temp, manager, bucket, claims)
 }
 
+fn object_precondition_test_object(bucket: &Bucket, object_key: &str) -> Object {
+    Object {
+        id: 1,
+        tenant_id: bucket.tenant_id,
+        bucket_id: bucket.id,
+        key: object_key.to_string(),
+        kind: Default::default(),
+        content_hash: "sha256:test-object".to_string(),
+        size: 11,
+        etag: "test-object-etag".to_string(),
+        content_type: Some("application/json".to_string()),
+        version_id: uuid::Uuid::new_v4(),
+        mutation_id: uuid::Uuid::new_v4(),
+        index_policy_snapshot: "{}".to_string(),
+        user_metadata_hash: String::new(),
+        authz_revision: 1,
+        record_hash: String::new(),
+        created_at: chrono::Utc::now(),
+        deleted_at: None,
+        storage_class: None,
+        user_meta: None,
+        shard_map: None,
+        checksum: None,
+        link: None,
+    }
+}
+
+async fn seed_object_precondition_state(
+    manager: &ObjectManager,
+    bucket: &Bucket,
+    object: &Object,
+    fence_payload: Option<Vec<u8>>,
+) {
+    let mvcc = manager.installed_mvcc().unwrap();
+    let current_key =
+        crate::metadata_journal::object_current_logical_key(bucket, &object.key).unwrap();
+    let current_payload =
+        crate::core_store::encode_object_metadata_row_at_generation_for_transaction(
+            object,
+            1,
+            "object-precondition-test-seed",
+        )
+        .unwrap();
+    let mut mutations = vec![crate::mvcc_product::ProductMutation::put(
+        current_key,
+        current_payload,
+    )];
+    if let Some(fence_payload) = fence_payload {
+        mutations.push(crate::mvcc_product::ProductMutation::put(
+            crate::metadata_journal::object_current_mutation_fence_logical_key(bucket, &object.key)
+                .unwrap(),
+            fence_payload,
+        ));
+    }
+    let now_unix_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
+    mvcc.autocommit_product_mutations(
+        "object-precondition-test",
+        &format!("seed-object-precondition-{}", uuid::Uuid::new_v4()),
+        mutations,
+        crate::mvcc_transaction::DurabilityLevel::Local,
+        now_unix_ms,
+    )
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn object_precondition_certifies_the_current_mutation_fence() {
     let (_temp, manager, bucket, claims) = seeded_object_manager("precondition-fence").await;
@@ -152,6 +218,136 @@ async fn object_precondition_certifies_the_current_mutation_fence() {
         crate::mvcc_transaction::PredicateKind::Absent
     ));
     assert!(snapshot.object.is_none());
+}
+
+#[tokio::test]
+async fn object_precondition_hashes_the_existing_base_mutation_fence() {
+    let (_temp, manager, bucket, claims) =
+        seeded_object_manager("precondition-existing-fence").await;
+    let object_key = "operations/provision/existing.json";
+    let object = object_precondition_test_object(&bucket, object_key);
+    let base_fence = b"committed-base-fence".to_vec();
+    seed_object_precondition_state(&manager, &bucket, &object, Some(base_fence.clone())).await;
+
+    let snapshot = manager
+        .object_mutation_precondition_snapshot(
+            &claims,
+            &bucket.name,
+            object_key,
+            AnvilAction::ObjectWrite,
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        snapshot.precondition.0,
+        crate::metadata_journal::object_current_mutation_fence_logical_key(&bucket, object_key)
+            .unwrap()
+    );
+    assert_eq!(
+        snapshot.precondition.1,
+        crate::mvcc_transaction::PredicateKind::ValueHash(*blake3::hash(&base_fence).as_bytes())
+    );
+    assert_eq!(
+        snapshot.object.unwrap().version_id,
+        object.version_id,
+        "the semantic object must still come from the current projection"
+    );
+}
+
+#[tokio::test]
+async fn object_precondition_is_absent_for_an_upgrade_projection_without_a_fence() {
+    let (_temp, manager, bucket, claims) =
+        seeded_object_manager("precondition-upgrade-state").await;
+    let object_key = "operations/provision/legacy.json";
+    let object = object_precondition_test_object(&bucket, object_key);
+    seed_object_precondition_state(&manager, &bucket, &object, None).await;
+
+    let snapshot = manager
+        .object_mutation_precondition_snapshot(
+            &claims,
+            &bucket.name,
+            object_key,
+            AnvilAction::ObjectWrite,
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        snapshot.precondition.1,
+        crate::mvcc_transaction::PredicateKind::Absent
+    ));
+    assert_eq!(
+        snapshot.object.unwrap().version_id,
+        object.version_id,
+        "a legacy current projection remains semantically readable before its first fence write"
+    );
+}
+
+#[tokio::test]
+async fn transaction_object_precondition_ignores_a_same_key_staged_fence() {
+    let (_temp, manager, bucket, claims) = seeded_object_manager("precondition-staged-fence").await;
+    let object_key = "operations/provision/staged.json";
+    let object = object_precondition_test_object(&bucket, object_key);
+    let base_fence = b"committed-base-fence".to_vec();
+    let staged_fence = b"same-transaction-staged-fence".to_vec();
+    seed_object_precondition_state(&manager, &bucket, &object, Some(base_fence.clone())).await;
+
+    let mvcc = manager.installed_mvcc().unwrap();
+    let principal = transaction_principal_from_claims(&claims);
+    let now_unix_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
+    let transaction = mvcc
+        .open_transactions
+        .begin(
+            mvcc.runtime.as_ref(),
+            mvcc.cluster_id(),
+            &principal,
+            "object-precondition-staged-fence",
+            std::time::Duration::from_secs(30),
+            crate::mvcc_transaction::DurabilityLevel::Local,
+            crate::mvcc_transaction::ReadConsistency::Linearized,
+            now_unix_ms,
+        )
+        .await
+        .unwrap();
+    let fence_key =
+        crate::metadata_journal::object_current_mutation_fence_logical_key(&bucket, object_key)
+            .unwrap();
+    mvcc.stage_product_mutations(
+        &transaction.transaction_id,
+        &principal,
+        vec![crate::mvcc_product::ProductMutation::put(
+            fence_key,
+            staged_fence.clone(),
+        )],
+        now_unix_ms.saturating_add(1),
+    )
+    .unwrap();
+
+    let snapshot = manager
+        .object_mutation_precondition_snapshot(
+            &claims,
+            &bucket.name,
+            object_key,
+            AnvilAction::ObjectWrite,
+            Some((&transaction.transaction_id, &principal)),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        snapshot.precondition.1,
+        crate::mvcc_transaction::PredicateKind::ValueHash(*blake3::hash(&base_fence).as_bytes()),
+        "the predicate must certify the transaction's base snapshot"
+    );
+    assert_ne!(
+        snapshot.precondition.1,
+        crate::mvcc_transaction::PredicateKind::ValueHash(*blake3::hash(&staged_fence).as_bytes()),
+        "a fence staged by this transaction must not become a self-conflicting predicate"
+    );
+    assert_eq!(snapshot.object.unwrap().version_id, object.version_id);
 }
 
 fn boundary_schema() -> CoreBoundarySchema {

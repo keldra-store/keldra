@@ -1195,7 +1195,8 @@ where
         let written_keys = written_points.iter().map(|(key, _)| key.clone()).collect();
         let certification_started_at = std::time::Instant::now();
         #[cfg(test)]
-        crate::mvcc_fault_injection::hit(crate::mvcc_fault_injection::FaultPoint::BeforeProposal)?;
+        crate::mvcc_fault_injection::hit(crate::mvcc_fault_injection::FaultPoint::BeforeProposal)
+            .map_err(pre_certification_failure)?;
         let result = self
             .certifier
             .certify(CertificationRequest {

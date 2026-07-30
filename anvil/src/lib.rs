@@ -274,7 +274,7 @@ pub async fn start_node_with_admin_listener(
         info!("Anvil admin gRPC listener available on {}", admin_addr);
     }
 
-    let server_task = tokio::spawn(async move {
+    let server_task = async move {
         let listener = listener.tap_io(|stream| {
             if let Err(error) = stream.set_nodelay(true) {
                 tracing::warn!(%error, "failed to enable TCP_NODELAY on public connection");
@@ -285,27 +285,26 @@ pub async fn start_node_with_admin_listener(
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
         .await
-    });
-    let admin_server_task = admin_listener
-        .zip(admin_axum)
-        .map(|(admin_listener, admin_app)| {
-            tokio::spawn(async move {
+    };
+    let admin_server_task =
+        admin_listener
+            .zip(admin_axum)
+            .map(|(admin_listener, admin_app)| async move {
                 let admin_listener = admin_listener.tap_io(|stream| {
                     if let Err(error) = stream.set_nodelay(true) {
                         tracing::warn!(%error, "failed to enable TCP_NODELAY on admin connection");
                     }
                 });
                 axum::serve(admin_listener, admin_app.into_make_service()).await
-            })
-        });
+            });
 
     // Run the public and optional admin gRPC servers concurrently.
     if let Some(admin_server_task) = admin_server_task {
         let (server_result, admin_result) = tokio::join!(server_task, admin_server_task);
-        server_result??;
-        admin_result??;
+        server_result?;
+        admin_result?;
     } else {
-        server_task.await??;
+        server_task.await?;
     }
 
     Ok(())

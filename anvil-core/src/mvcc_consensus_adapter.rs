@@ -59,9 +59,14 @@ where
             transaction_id = %request.transaction_id,
             "proposing compact transaction certification command"
         );
+        // Deterministic command construction occurs before any consensus
+        // proposal. Mark those failures as definite so the durable registry
+        // can safely return Committing -> Open for an explicit rollback or
+        // corrected retry.
+        let command = prepare_consensus_command(&request)?;
         let result = self
             .consensus
-            .certify(to_consensus_command(&request)?)
+            .certify(command)
             .await
             .context("consensus certification failed");
         let elapsed = started_at.elapsed();
@@ -88,6 +93,12 @@ where
             }
         }
     }
+}
+
+fn prepare_consensus_command(
+    request: &product::CertificationRequest,
+) -> Result<consensus::CertifyTransaction> {
+    to_consensus_command(request).map_err(product::pre_certification_failure)
 }
 
 pub(crate) fn to_consensus_command(
@@ -569,12 +580,13 @@ mod tests {
     fn certification_command_byte_limit_is_enforced_before_raft() {
         let mut request = request();
         request.max_command_bytes = 1;
-        let error = to_consensus_command(&request).unwrap_err();
+        let error = prepare_consensus_command(&request).unwrap_err();
         assert!(
             error
                 .to_string()
                 .contains("certification command byte limit")
         );
+        assert!(product::is_pre_certification_failure(&error));
     }
 
     #[test]

@@ -790,7 +790,8 @@ async fn coordinator_failure_before_proposal_is_retryable_without_a_commit() {
             .status(&transaction_id, "fault-principal", 3)
             .unwrap()
             .state,
-        "committing"
+        "open",
+        "a definite failure before proposal must return the draft to Open"
     );
 
     cluster.restart_node(0).await;
@@ -824,6 +825,111 @@ async fn coordinator_failure_before_proposal_is_retryable_without_a_commit() {
         .unwrap();
         assert!(cluster.states[node].mvcc.runtime.applied_version().unwrap() >= commit_version);
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn quorum_rollback_after_definite_failure_allows_fresh_absent_cas() {
+    let mut cluster = ThreeNodeFixture::start().await;
+    let principal = "fault-principal";
+    let key = LogicalKey {
+        table_id: 1,
+        application_key: b"quorum-fresh-after-rollback".to_vec(),
+    };
+    let failed_transaction_id = cluster
+        .stage_write(0, "quorum-failed-before-proposal", key.clone())
+        .await;
+    cluster.states[0]
+        .mvcc
+        .open_transactions
+        .observe_point(&failed_transaction_id, "fault-e2e", key.clone(), None, 2)
+        .unwrap();
+
+    let failure = mvcc_fault_injection::scoped(
+        DeterministicFaults::default().fail_at(FaultPoint::BeforeProposal, 1),
+        cluster.states[0].mvcc.open_transactions.commit(
+            cluster.states[0].mvcc.runtime.as_ref(),
+            &failed_transaction_id,
+            principal,
+            3,
+        ),
+    )
+    .await
+    .expect_err("the injected definite pre-proposal failure must be returned");
+    assert!(failure.to_string().contains("BeforeProposal"));
+    assert_eq!(
+        cluster.states[0]
+            .mvcc
+            .open_transactions
+            .status(&failed_transaction_id, principal, 3)
+            .unwrap()
+            .state,
+        "open"
+    );
+    cluster.states[0]
+        .mvcc
+        .open_transactions
+        .rollback(&failed_transaction_id, principal, 4)
+        .unwrap();
+    assert_eq!(
+        cluster.states[0].mvcc.read_latest_value(&key).unwrap(),
+        None,
+        "rollback must leave no readable or predicate-visible value"
+    );
+
+    let fresh_transaction_id = cluster
+        .stage_write(0, "quorum-fresh-after-rollback", key.clone())
+        .await;
+    assert_ne!(fresh_transaction_id, failed_transaction_id);
+    cluster.states[0]
+        .mvcc
+        .open_transactions
+        .observe_point(&fresh_transaction_id, "fault-e2e", key.clone(), None, 5)
+        .unwrap();
+    let committed = cluster.states[0]
+        .mvcc
+        .open_transactions
+        .commit(
+            cluster.states[0].mvcc.runtime.as_ref(),
+            &fresh_transaction_id,
+            principal,
+            6,
+        )
+        .await
+        .unwrap();
+    let CertificationResult::Committed { commit_version } = committed.certification else {
+        panic!("fresh absent-CAS transaction did not commit");
+    };
+
+    for node in 0..3 {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if cluster.states[node].mvcc.read_latest_value(&key).unwrap()
+                    == Some(b"quorum-fresh-after-rollback".to_vec())
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fresh quorum commit becomes readable on every node");
+        assert!(cluster.states[node].mvcc.runtime.applied_version().unwrap() >= commit_version);
+    }
+
+    cluster.restart_node(0).await;
+    cluster.wait_for_any_leader(&[0, 1, 2]).await;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if cluster.states[0].mvcc.read_latest_value(&key).unwrap()
+                == Some(b"quorum-fresh-after-rollback".to_vec())
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("fresh quorum commit remains readable after node restart and Raft replay");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
