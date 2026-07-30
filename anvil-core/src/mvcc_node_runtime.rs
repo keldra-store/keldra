@@ -91,11 +91,14 @@ where
             let gc_watermark = self.local.gc_watermark()?;
             let required = target.max(gc_watermark);
             if readable >= required {
-                return Ok(if consistency == ReadConsistency::LocalSnapshot {
-                    readable
-                } else {
-                    required
-                });
+                // The consensus barrier is a lower bound, not the snapshot to
+                // return. Local-durability decisions may already be visible on
+                // this node without advancing the distributed consensus read
+                // index. Returning the older barrier would let a transaction
+                // begin behind a commit this node has already acknowledged,
+                // violating monotonic/read-your-writes ordering and producing
+                // an unavoidable predicate conflict on the next mutation.
+                return Ok(readable);
             }
             if tokio::time::Instant::now() >= deadline {
                 bail!(
@@ -438,6 +441,34 @@ mod tests {
         ));
         assert_eq!(*stages.lock().unwrap(), ["persist", "replicate", "certify"]);
         assert_eq!(runtime.read_latest(&key).unwrap().unwrap().value, b"value");
+    }
+
+    #[tokio::test]
+    async fn linearized_snapshot_includes_newer_locally_applied_decisions() {
+        let temp = tempdir().unwrap();
+        let stages = Arc::new(Mutex::new(Vec::new()));
+        let runtime = runtime(temp.path(), consensus(stages.clone()), stages);
+        let key = LogicalKey {
+            table_id: 1,
+            application_key: b"local-ahead-of-consensus-barrier".to_vec(),
+        };
+        let transaction = bundle("locally-applied", key.clone(), b"value");
+
+        let outcome = runtime
+            .apply_certification(
+                transaction,
+                CertificationResult::Committed { commit_version: 1 },
+            )
+            .unwrap();
+        assert_eq!(outcome.local_apply, Some(ApplyOutcome::Applied));
+        assert_eq!(runtime.read_latest(&key).unwrap().unwrap().value, b"value");
+
+        // The test consensus barrier remains at zero. Linearized begin must
+        // still retain this node's newer acknowledged/local decision.
+        assert_eq!(
+            runtime.snapshot(ReadConsistency::Linearized).await.unwrap(),
+            1
+        );
     }
 
     #[tokio::test]
