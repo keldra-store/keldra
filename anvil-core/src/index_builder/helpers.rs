@@ -324,7 +324,7 @@ pub(super) fn normalize_vector(values: &mut [f32], metric: VectorMetric) {
     }
 }
 
-pub(super) fn selector_matches(selector: &JsonValue, object: &Object) -> bool {
+pub(crate) fn selector_matches(selector: &JsonValue, object: &Object) -> bool {
     if selector.is_null() {
         return true;
     }

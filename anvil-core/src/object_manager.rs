@@ -903,6 +903,9 @@ impl ObjectManager {
                 .map_err(|error| Status::internal(error.to_string()))?
                 .into_iter()
                 .filter(|definition| definition.enabled)
+                .filter(|definition| {
+                    crate::index_builder::helpers::selector_matches(&definition.selector, &object)
+                })
                 .map(
                     |definition| crate::object_materialisation::FrozenIndexDefinition {
                         id: definition.id,
