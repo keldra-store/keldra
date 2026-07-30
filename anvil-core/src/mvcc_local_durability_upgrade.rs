@@ -208,6 +208,10 @@ pub struct LocalUpgradePlacement {
 
 #[async_trait]
 pub trait LocalUpgradePlacementProvider: Send + Sync {
+    fn distributed_upgrade_available(&self) -> Result<bool> {
+        Ok(true)
+    }
+
     async fn assignment(
         &self,
         job: &LocalDurabilityUpgradeJob,
@@ -227,6 +231,11 @@ pub trait LocalUpgradePlacementProvider: Send + Sync {
 
 #[async_trait]
 impl LocalUpgradePlacementProvider for Arc<crate::mvcc_bootstrap::MvccSubsystem> {
+    fn distributed_upgrade_available(&self) -> Result<bool> {
+        self.live_shard_placement()
+            .map(|(candidates, _, _)| candidates.len() >= 2)
+    }
+
     async fn assignment(
         &self,
         job: &LocalDurabilityUpgradeJob,
@@ -698,6 +707,9 @@ where
         lease_ms: u64,
         retry_after_unix_ms: u64,
     ) -> Result<bool> {
+        if !self.placement.distributed_upgrade_available()? {
+            return Ok(false);
+        }
         let Some((job_id, record)) = store.claim_local_durability_upgrade_where(
             worker_id,
             now_unix_ms,
@@ -733,6 +745,14 @@ where
                 Ok(true)
             }
             Err(error) => {
+                let retry_after_unix_ms = if error
+                    .to_string()
+                    .contains("distributed durability upgrade requires at least two shard targets")
+                {
+                    now_unix_ms.saturating_add(60 * 60 * 1_000)
+                } else {
+                    retry_after_unix_ms
+                };
                 store.retry_local_durability_upgrade(
                     &job_id,
                     &lease_owner,

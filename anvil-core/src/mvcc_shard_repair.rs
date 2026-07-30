@@ -389,6 +389,13 @@ impl ShardRebalanceReconciler {
         }
         let (candidates, tolerated_failure_domains, control_epoch) =
             self.mvcc.live_shard_placement()?;
+        // Rebalancing cannot improve placement when there is no alternative
+        // live target. In particular, a documented single-node/local
+        // deployment must not continuously publish empty checkpoint
+        // transactions while unrelated work assignments advance topology.
+        if !topology_can_rebalance(candidates.len()) {
+            return Ok(false);
+        }
         let epoch = topology_epoch(&candidates, tolerated_failure_domains, control_epoch)?;
         let checkpoint_key = crate::mvcc_transaction::LogicalKey {
             table_id: SHARD_REBALANCE_CHECKPOINT_TABLE_ID,
@@ -462,6 +469,9 @@ impl ShardRebalanceReconciler {
             })
             .take(REBALANCE_PAGE_SIZE)
             .collect::<Vec<_>>();
+        if page.is_empty() && checkpoint.after_application_key.is_none() {
+            return Ok(false);
+        }
         let principal = self.worker_id.clone();
         let cursor_hash = blake3::hash(
             checkpoint
@@ -594,6 +604,10 @@ impl ShardRebalanceReconciler {
         }
         Ok(!page.is_empty())
     }
+}
+
+fn topology_can_rebalance(live_target_count: usize) -> bool {
+    live_target_count > 1
 }
 
 pub fn placement_overlay_key(
@@ -1593,5 +1607,12 @@ mod tests {
             topology_epoch(&candidates, 0, 9).unwrap(),
             topology_epoch(&candidates, 1, 9).unwrap()
         );
+    }
+
+    #[test]
+    fn single_target_topology_does_not_schedule_rebalance_work() {
+        assert!(!topology_can_rebalance(0));
+        assert!(!topology_can_rebalance(1));
+        assert!(topology_can_rebalance(2));
     }
 }
