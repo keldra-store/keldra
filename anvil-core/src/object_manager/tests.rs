@@ -124,6 +124,36 @@ async fn seeded_object_manager(
     (temp, manager, bucket, claims)
 }
 
+#[tokio::test]
+async fn object_precondition_certifies_the_current_mutation_fence() {
+    let (_temp, manager, bucket, claims) = seeded_object_manager("precondition-fence").await;
+    let object_key = "operations/provision/operation.json";
+
+    let snapshot = manager
+        .object_mutation_precondition_snapshot(
+            &claims,
+            &bucket.name,
+            object_key,
+            AnvilAction::ObjectRead,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let expected_fence =
+        crate::metadata_journal::object_current_mutation_fence_logical_key(&bucket, object_key)
+            .unwrap();
+    let derived_head =
+        crate::metadata_journal::object_current_logical_key(&bucket, object_key).unwrap();
+    assert_eq!(snapshot.precondition.0, expected_fence);
+    assert_ne!(snapshot.precondition.0, derived_head);
+    assert!(matches!(
+        snapshot.precondition.1,
+        crate::mvcc_transaction::PredicateKind::Absent
+    ));
+    assert!(snapshot.object.is_none());
+}
+
 fn boundary_schema() -> CoreBoundarySchema {
     CoreBoundarySchema {
         schema: crate::core_store::CORE_BOUNDARY_SCHEMA_SCHEMA.to_string(),

@@ -1293,39 +1293,59 @@ impl ObjectManager {
         action: AnvilAction,
         transaction: Option<(&str, &str)>,
     ) -> Result<ObjectMutationPreconditionSnapshot, Status> {
-        // Reuse the public mutation authorization path, then capture the exact
-        // metadata row that must remain unchanged until transaction publication.
+        // Reuse the public mutation authorization path, then evaluate the
+        // semantic precondition against the object projection at the fixed
+        // transaction snapshot.
         self.current_object_for_mutation_precondition(claims, bucket_name, object_key, action)
             .await?;
         let bucket = self
             .get_tenant_bucket(claims.tenant_id, bucket_name)
             .await?;
-        let tuple_key = self
-            .core_store
-            .object_metadata_current_tuple_key(&bucket, object_key);
-        let logical_key = crate::mvcc_product::coremeta_logical_key(
-            crate::core_store::CF_OBJECT_HEADS,
-            crate::core_store::TABLE_OBJECT_HEAD_ROW,
-            &tuple_key,
-        )
-        .map_err(|error| Status::internal(error.to_string()))?;
+        let current_key = crate::metadata_journal::object_current_logical_key(&bucket, object_key)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let current_fence_key =
+            crate::metadata_journal::object_current_mutation_fence_logical_key(&bucket, object_key)
+                .map_err(|error| Status::internal(error.to_string()))?;
         let mvcc = self
             .persistence
             .mvcc()
             .map_err(|error| Status::internal(error.to_string()))?;
-        let payload = if let Some((transaction_id, principal)) = transaction {
-            mvcc.read_transaction_value(transaction_id, principal, &logical_key)
+        let snapshot_version = if let Some((transaction_id, _)) = transaction {
+            mvcc.open_transactions
+                .handle(transaction_id)
                 .map_err(|error| Status::internal(error.to_string()))?
+                .snapshot_version
         } else {
-            mvcc.read_latest_value(&logical_key)
+            mvcc.runtime
+                .applied_version()
                 .map_err(|error| Status::internal(error.to_string()))?
         };
-        let object = payload
+        let current_payload = if let Some((transaction_id, principal)) = transaction {
+            mvcc.read_transaction_value(transaction_id, principal, &current_key)
+                .map_err(|error| Status::internal(error.to_string()))?
+        } else {
+            mvcc.runtime
+                .read_at(&current_key, snapshot_version)
+                .map_err(|error| Status::internal(error.to_string()))?
+                .map(|row| row.value)
+        };
+        let object = current_payload
             .as_deref()
             .map(crate::core_store::decode_object_metadata_row)
             .transpose()
             .map_err(|error| Status::internal(error.to_string()))?;
-        let predicate = payload
+        // Current-head rows are cursor-dependent projections installed during
+        // apply and therefore are not part of compact-Raft certification.
+        // Certify the matching ordinary MVCC fence instead. Always observe the
+        // fence from the transaction's base snapshot: a fence already staged
+        // by an earlier same-key RPC in this transaction must not become a
+        // self-conflicting predicate.
+        let current_fence_payload = mvcc
+            .runtime
+            .read_at(&current_fence_key, snapshot_version)
+            .map_err(|error| Status::internal(error.to_string()))?
+            .map(|row| row.value);
+        let predicate = current_fence_payload
             .as_deref()
             .map(|value| {
                 crate::mvcc_transaction::PredicateKind::ValueHash(*blake3::hash(value).as_bytes())
@@ -1333,7 +1353,7 @@ impl ObjectManager {
             .unwrap_or(crate::mvcc_transaction::PredicateKind::Absent);
         Ok(ObjectMutationPreconditionSnapshot {
             object,
-            precondition: (logical_key, predicate),
+            precondition: (current_fence_key, predicate),
         })
     }
 
