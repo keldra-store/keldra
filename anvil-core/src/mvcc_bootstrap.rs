@@ -804,6 +804,7 @@ impl MvccSubsystem {
         };
         let replication_peers = peers
             .iter()
+            .filter(|peer| peer.raft_node_id != config.mvcc_raft_node_id)
             .map(|peer| ReplicationPeer {
                 cluster_id: config.mvcc_cluster_id.clone(),
                 node: NodeIncarnation {
@@ -1246,6 +1247,21 @@ fn validate_secure_peer_transport(config: &Config, peers: &[MvccPeerConfig]) -> 
     if config.allow_test_only_insecure_mvcc_transport {
         return Ok(());
     }
+    if peers.len() == 1 {
+        let peer = &peers[0];
+        let is_local_single_node = peer.cluster_id == config.mvcc_cluster_id
+            && peer.raft_node_id == config.mvcc_raft_node_id
+            && peer.node_id == config.node_id
+            && peer.incarnation == config.mvcc_node_incarnation;
+        if is_local_single_node {
+            // The sole member is applied through the in-process consensus
+            // handle; there is no peer transport to secure. This is the
+            // release-qualified v0.4 single-node topology and permits the
+            // documented local HTTP public endpoint without weakening any
+            // remote-node connection.
+            return Ok(());
+        }
+    }
     if let Some(peer) = peers
         .iter()
         .find(|peer| !peer.endpoint.starts_with("https://"))
@@ -1340,6 +1356,52 @@ mod tests {
             failure_domain: "zone-a".into(),
             voter: true,
         };
+        assert!(validate_secure_peer_transport(&config, &[peer]).is_err());
+    }
+
+    #[test]
+    fn single_local_node_does_not_require_peer_transport_tls() {
+        let config = Config {
+            node_id: "node-a".into(),
+            mvcc_cluster_id: "cluster-a".into(),
+            mvcc_raft_node_id: 7,
+            mvcc_node_incarnation: 3,
+            allow_test_only_insecure_mvcc_transport: false,
+            ..Config::default()
+        };
+        let peer = MvccPeerConfig {
+            cluster_id: "cluster-a".into(),
+            raft_node_id: 7,
+            node_id: "node-a".into(),
+            incarnation: 3,
+            endpoint: "http://127.0.0.1:50051".into(),
+            failure_domain: "local".into(),
+            voter: true,
+        };
+
+        validate_secure_peer_transport(&config, &[peer]).unwrap();
+    }
+
+    #[test]
+    fn sole_remote_node_still_requires_peer_transport_tls() {
+        let config = Config {
+            node_id: "node-a".into(),
+            mvcc_cluster_id: "cluster-a".into(),
+            mvcc_raft_node_id: 7,
+            mvcc_node_incarnation: 3,
+            allow_test_only_insecure_mvcc_transport: false,
+            ..Config::default()
+        };
+        let peer = MvccPeerConfig {
+            cluster_id: "cluster-a".into(),
+            raft_node_id: 8,
+            node_id: "node-b".into(),
+            incarnation: 1,
+            endpoint: "http://node-b.example:50051".into(),
+            failure_domain: "zone-b".into(),
+            voter: true,
+        };
+
         assert!(validate_secure_peer_transport(&config, &[peer]).is_err());
     }
 

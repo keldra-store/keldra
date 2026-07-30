@@ -59,6 +59,25 @@ docker run -d \
 
 `API_LISTEN_ADDR` is a bind address. `PUBLIC_API_ADDR` is a dialable endpoint and becomes part of routing identity, so it must not be `0.0.0.0` or an endpoint that can land on a different node. `ADMIN_LISTEN_ADDR` stays private; the server refuses a non-loopback admin bind unless `ALLOW_PUBLIC_ADMIN_LISTENER=true` explicitly acknowledges private-network protection.
 
+Readiness does not install authoritative lifecycle topology. Before creating a
+tenant or bucket on a fresh single-node volume, run the supported genesis
+operation with the matching release CLI:
+
+```bash
+docker exec \
+  -e ANVIL_BOOTSTRAP_CREDENTIAL_FILE=/var/lib/anvil/bootstrap/first-admin.json \
+  -e ANVIL_PUBLIC_ENDPOINT=http://127.0.0.1:50051 \
+  -e ANVIL_ADMIN_ENDPOINT=http://127.0.0.1:50052 \
+  node-eu-west-1-a \
+  anvil-admin mesh bootstrap-local --failure-domain eu-west-1-a
+```
+
+The operation installs and activates the configured region, cell, and local
+node through the authenticated control plane. It is idempotent only for the
+same authoritative topology. Provisioning must treat it as a mandatory
+first-node phase, after `/ready` and before tenant creation; environment
+variables alone are not topology records.
+
 ## Phase 3: Complete First-Boot Administration
 
 When the system realm is absent, startup initialises it before ordinary service. If `BOOTSTRAP_SYSTEM_ADMIN_APP_NAME` and `BOOTSTRAP_SYSTEM_ADMIN_CREDENTIAL_OUTPUT_PATH` are set, startup creates the first system administration application and writes its credential JSON. An advanced deployment can instead provide `BOOTSTRAP_SYSTEM_ADMIN_SUBJECT_KIND` and `BOOTSTRAP_SYSTEM_ADMIN_SUBJECT_ID` to grant initial authority to an existing subject.

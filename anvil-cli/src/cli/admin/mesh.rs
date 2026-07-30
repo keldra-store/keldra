@@ -1,6 +1,7 @@
 use super::common::{print_rpc_response, request_id_or_cli, with_auth};
 use crate::context::Context;
 use anvil::anvil_api as api;
+use anvil::anvil_api::admin_service_client::AdminServiceClient;
 use anvil::anvil_api::mesh_control_service_client::MeshControlServiceClient;
 use anyhow::Result;
 use base64::Engine;
@@ -8,6 +9,12 @@ use clap::Subcommand;
 
 #[derive(Subcommand)]
 pub enum MeshCommands {
+    /// Install this fresh node as an authoritative active single-node topology.
+    BootstrapLocal {
+        /// Failure-domain label for the local cell.
+        #[clap(long)]
+        failure_domain: Option<String>,
+    },
     /// Upsert a mesh region through the admin control plane.
     PutRegion {
         #[clap(long)]
@@ -88,6 +95,60 @@ pub(super) async fn handle_mesh_command(
 ) -> Result<()> {
     let mut client = MeshControlServiceClient::connect(ctx.profile.host.clone()).await?;
     match command {
+        MeshCommands::BootstrapLocal { failure_domain } => {
+            let mut admin_client = AdminServiceClient::connect(ctx.profile.host.clone()).await?;
+            let descriptor = admin_client
+                .get_local_node_descriptor(with_auth(api::GetLocalNodeDescriptorRequest {}, token)?)
+                .await?
+                .into_inner()
+                .node
+                .ok_or_else(|| anyhow::anyhow!("local node descriptor response was empty"))?;
+            let failure_domain = failure_domain
+                .clone()
+                .unwrap_or_else(|| descriptor.cell_id.clone());
+            print_rpc_response(
+                "mesh_bootstrap",
+                None,
+                None,
+                client.bootstrap_mesh_topology(with_auth(
+                    api::BootstrapMeshTopologyRequest {
+                        regions: vec![api::PutRegionRequest {
+                            region_id: descriptor.region.clone(),
+                            endpoint: descriptor.public_api_addr.clone(),
+                            state: "active".to_string(),
+                            options: None,
+                        }],
+                        cells: vec![api::PutCellRequest {
+                            region_id: descriptor.region.clone(),
+                            cell_id: descriptor.cell_id.clone(),
+                            failure_domain,
+                            state: "active".to_string(),
+                            options: None,
+                        }],
+                        nodes: vec![api::PutNodeRequest {
+                            node_id: descriptor.node_id,
+                            region_id: descriptor.region,
+                            cell_id: descriptor.cell_id,
+                            advertise_addr: descriptor.public_api_addr,
+                            state: "active".to_string(),
+                            capacity_json: "{}".to_string(),
+                            options: None,
+                            receipt_signing_public_key: descriptor.receipt_signing_public_key,
+                            capabilities: descriptor
+                                .capabilities
+                                .into_iter()
+                                .filter_map(|value| api::NodeCapability::try_from(value).ok())
+                                .filter_map(capability_name)
+                                .map(str::to_string)
+                                .collect(),
+                        }],
+                        canonical_coremeta_rows: Vec::new(),
+                    },
+                    token,
+                )?),
+            )
+            .await?;
+        }
         MeshCommands::PutRegion {
             region_id,
             endpoint,
@@ -255,5 +316,17 @@ fn default_write_options() -> api::WriteOptions {
         preconditions: Vec::new(),
         boundary_values: Vec::new(),
         execution: None,
+    }
+}
+
+fn capability_name(capability: api::NodeCapability) -> Option<&'static str> {
+    match capability {
+        api::NodeCapability::Object => Some("object"),
+        api::NodeCapability::Index => Some("index"),
+        api::NodeCapability::Personaldb => Some("personaldb"),
+        api::NodeCapability::Metadata => Some("metadata"),
+        api::NodeCapability::Gateway => Some("gateway"),
+        api::NodeCapability::Admin => Some("admin"),
+        api::NodeCapability::Unspecified => None,
     }
 }
