@@ -202,6 +202,21 @@ pub async fn run(
     keyring: Arc<EncryptionKeyring>,
     concurrency: usize,
 ) -> Result<()> {
+    let shard_target_count = match persistence.mvcc()?.live_shard_placement() {
+        Ok((targets, _, _)) => targets.len(),
+        Err(error) => {
+            warn!(
+                %error,
+                "Shard placement is not ready; starting background work in serialized mode"
+            );
+            0
+        }
+    };
+    let concurrency = effective_worker_concurrency(concurrency, shard_target_count);
+    info!(
+        concurrency,
+        shard_target_count, "Configured topology-aware background task concurrency"
+    );
     while let Err(error) = recover_interrupted_tasks(&persistence).await {
         warn!(%error, "Failed to recover interrupted background tasks; retrying");
         tokio::time::sleep(CLAIM_FATAL_DELAY).await;
@@ -308,7 +323,13 @@ pub async fn run(
 
                 match result {
                     Err(failure) => {
-                        error!("Task {} failed: {:?}", task.id, failure.error);
+                        error!(
+                            task_id = task.id,
+                            task_type = ?task.task_type,
+                            task_attempt = task.attempts,
+                            error = ?failure.error,
+                            "Background task execution failed"
+                        );
                         if is_task_lease_fencing_error(&failure.error) {
                             warn!(
                                 task_id = task.id,
@@ -379,6 +400,14 @@ pub async fn run(
                 }
             });
         }
+    }
+}
+
+fn effective_worker_concurrency(requested: usize, shard_target_count: usize) -> usize {
+    if shard_target_count < 2 {
+        1
+    } else {
+        requested.max(1)
     }
 }
 
@@ -1407,5 +1436,13 @@ mod tests {
             .unwrap();
         assert_eq!(lease.partition_family, "object_metadata");
         assert_eq!(lease.checkpoint_cursor, lease.source_cursor);
+    }
+
+    #[test]
+    fn single_target_topology_serializes_background_mvcc_work() {
+        assert_eq!(effective_worker_concurrency(4, 0), 1);
+        assert_eq!(effective_worker_concurrency(4, 1), 1);
+        assert_eq!(effective_worker_concurrency(4, 2), 4);
+        assert_eq!(effective_worker_concurrency(0, 3), 1);
     }
 }
