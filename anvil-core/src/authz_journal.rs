@@ -352,6 +352,16 @@ async fn write_authz_tuple_batch_mvcc(
         .first()
         .ok_or_else(|| anyhow!("authz tuple batch must not be empty"))?;
     let tenant_id = first.tenant_id;
+    // Every implicit tuple mutation advances the tenant's single authz head.
+    // Keep same-node writers from certifying snapshots of that head in
+    // parallel; partition assignment and MVCC fencing remain authoritative
+    // across nodes. Explicit transactions are owned by their caller and cannot
+    // safely hold a process-local guard across that external lifetime.
+    let _implicit_write_guard = if binding.is_none() {
+        Some(authz_head::tenant_write_lock(tenant_id)?.lock_owned().await)
+    } else {
+        None
+    };
     if binding.is_none()
         && let Some(options) = options
         && let Some(replay) = idempotency::replay(mvcc, &inputs, options).await?

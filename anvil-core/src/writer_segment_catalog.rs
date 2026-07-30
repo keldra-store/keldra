@@ -91,6 +91,49 @@ pub(crate) async fn write_writer_segment_catalog_record_with_assignment(
     )],
     assignment: Option<&crate::mvcc_worker_authority::AssignmentGuard>,
 ) -> Result<()> {
+    write_writer_segment_catalog_record_inner(
+        mvcc,
+        record,
+        additional_preconditions,
+        assignment,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn write_writer_segment_catalog_record_for_task(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    record: &WriterSegmentCatalogRecord,
+    additional_preconditions: &[(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )],
+    assignment: &crate::mvcc_worker_authority::AssignmentGuard,
+    idempotency_scope: &str,
+) -> Result<()> {
+    if idempotency_scope.trim().is_empty() {
+        bail!("writer task publication idempotency scope must not be empty");
+    }
+    write_writer_segment_catalog_record_inner(
+        mvcc,
+        record,
+        additional_preconditions,
+        Some(assignment),
+        Some(idempotency_scope),
+    )
+    .await
+}
+
+async fn write_writer_segment_catalog_record_inner(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    record: &WriterSegmentCatalogRecord,
+    additional_preconditions: &[(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )],
+    assignment: Option<&crate::mvcc_worker_authority::AssignmentGuard>,
+    idempotency_scope: Option<&str>,
+) -> Result<()> {
     validate_record(record)?;
     let write_lock = writer_lock(&record.family, &record.scope)?;
     let _guard = write_lock.lock().await;
@@ -108,7 +151,10 @@ pub(crate) async fn write_writer_segment_catalog_record_with_assignment(
         .read_latest_value(&head_key)?
         .map(|payload| head::decode(&payload, &record.family, &record.scope))
         .transpose()?;
-    let (mutations, mut predicates, transaction_id) = plan_mutation(record, current.as_ref())?;
+    let (mutations, mut predicates, base_transaction_id) = plan_mutation(record, current.as_ref())?;
+    let transaction_id = idempotency_scope.map_or(base_transaction_id.clone(), |scope| {
+        format!("{base_transaction_id}:{scope}")
+    });
     predicates.extend_from_slice(additional_preconditions);
     let principal = writer_realm(&record.family, &record.scope);
     let now_unix_ms = u64::try_from(chrono::Utc::now().timestamp_millis())

@@ -409,4 +409,17 @@ mod tests {
         );
         assert_ne!(left.active_schema_bindings_hash, ZERO_SHA256);
     }
+
+    #[tokio::test]
+    async fn write_locks_serialize_one_tenant_without_blocking_another() {
+        let first = tenant_write_lock(9_000_001).unwrap();
+        let same_tenant = tenant_write_lock(9_000_001).unwrap();
+        let other_tenant = tenant_write_lock(9_000_002).unwrap();
+        assert!(Arc::ptr_eq(&first, &same_tenant));
+        assert!(!Arc::ptr_eq(&first, &other_tenant));
+
+        let _guard = first.lock().await;
+        assert!(same_tenant.try_lock().is_err());
+        assert!(other_tenant.try_lock().is_ok());
+    }
 }

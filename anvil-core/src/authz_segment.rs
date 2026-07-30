@@ -30,6 +30,7 @@ use crate::{
     writer_segment_catalog::{
         WriterSegmentCatalogRecord, latest_writer_segment_catalog_record,
         read_writer_segment_catalog_record, write_writer_segment_catalog_record,
+        write_writer_segment_catalog_record_for_task,
     },
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -546,6 +547,27 @@ pub(crate) async fn publish_staged_authz_tuple_segment(
 ) -> Result<String> {
     write_writer_segment_catalog_record(mvcc, &staged.catalog_record, additional_preconditions)
         .await?;
+    Ok(staged.segment_ref)
+}
+
+pub(crate) async fn publish_staged_authz_tuple_segment_for_task(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    staged: StagedAuthzTupleSegment,
+    additional_preconditions: &[(
+        crate::mvcc_transaction::LogicalKey,
+        crate::mvcc_transaction::PredicateKind,
+    )],
+    assignment: &crate::mvcc_worker_authority::AssignmentGuard,
+    idempotency_scope: &str,
+) -> Result<String> {
+    write_writer_segment_catalog_record_for_task(
+        mvcc,
+        &staged.catalog_record,
+        additional_preconditions,
+        assignment,
+        idempotency_scope,
+    )
+    .await?;
     Ok(staged.segment_ref)
 }
 

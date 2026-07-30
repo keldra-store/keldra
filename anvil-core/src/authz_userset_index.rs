@@ -12,7 +12,7 @@ use crate::{
     persistence::AuthzTupleRecord,
     storage::Storage,
 };
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use chrono::Utc;
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -462,7 +462,7 @@ pub async fn write_derived_userset_index(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     index: &AuthzDerivedUsersetIndex,
 ) -> Result<()> {
-    write_derived_userset_index_with_predicates(storage, mvcc, index, &[], None).await
+    write_derived_userset_index_with_predicates(storage, mvcc, index, &[], None, None).await
 }
 
 pub(crate) async fn write_derived_userset_index_with_predicates(
@@ -474,6 +474,7 @@ pub(crate) async fn write_derived_userset_index_with_predicates(
         crate::mvcc_transaction::PredicateKind,
     )],
     task_publication_assignment: Option<crate::mvcc_worker_authority::AssignmentGuard>,
+    task_publication_idempotency_scope: Option<&str>,
 ) -> Result<()> {
     validate_derived_userset_index(index, index.tenant_id, &index.derived_index_id)?;
     let bytes = encode_derived_userset_index(index)?;
@@ -509,6 +510,7 @@ pub(crate) async fn write_derived_userset_index_with_predicates(
         &object_ref,
         additional_predicates,
         task_publication_assignment,
+        task_publication_idempotency_scope,
     )
     .await?;
     Ok(())
@@ -543,6 +545,7 @@ async fn write_derived_userset_index_row_mvcc(
         crate::mvcc_transaction::PredicateKind,
     )],
     task_publication_assignment: Option<crate::mvcc_worker_authority::AssignmentGuard>,
+    task_publication_idempotency_scope: Option<&str>,
 ) -> Result<()> {
     let row = AuthzDerivedUsersetIndexRow {
         tenant_id: index.tenant_id,
@@ -581,13 +584,18 @@ async fn write_derived_userset_index_row_mvcc(
     };
     let principal = format!("authz-derived-userset:tenant/{}", index.tenant_id);
     let now_unix_ms = u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default();
+    let base_transaction_id = derived_userset_index_transaction_id(index);
+    let transaction_id = scoped_publication_transaction_id(
+        &base_transaction_id,
+        task_publication_idempotency_scope,
+    )?;
     let handle = mvcc
         .open_transactions
         .begin(
             mvcc.runtime.as_ref(),
             mvcc.cluster_id(),
             &principal,
-            derived_userset_index_transaction_id(index),
+            transaction_id,
             std::time::Duration::from_secs(30),
             crate::mvcc_transaction::DurabilityLevel::Quorum,
             crate::mvcc_transaction::ReadConsistency::Linearized,
@@ -1027,6 +1035,38 @@ fn derived_userset_index_transaction_id(index: &AuthzDerivedUsersetIndex) -> Str
         "authz-derived-userset:{}:{}:{}:{}",
         index.tenant_id, index.derived_index_id, index.generation, index.index_hash
     )
+}
+
+fn scoped_publication_transaction_id(base: &str, scope: Option<&str>) -> Result<String> {
+    match scope {
+        Some(scope) if scope.trim().is_empty() => {
+            bail!("authorization publication idempotency scope must not be empty")
+        }
+        Some(scope) => Ok(format!("{base}:{scope}")),
+        None => Ok(base.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod publication_idempotency_tests {
+    use super::scoped_publication_transaction_id;
+
+    #[test]
+    fn task_retry_scope_selects_a_fresh_transaction_without_changing_direct_writes() {
+        assert_eq!(
+            scoped_publication_transaction_id("base", None).unwrap(),
+            "base"
+        );
+        assert_eq!(
+            scoped_publication_transaction_id("base", Some("lease-a")).unwrap(),
+            "base:lease-a"
+        );
+        assert_eq!(
+            scoped_publication_transaction_id("base", Some("lease-b")).unwrap(),
+            "base:lease-b"
+        );
+        assert!(scoped_publication_transaction_id("base", Some(" ")).is_err());
+    }
 }
 
 fn derived_userset_index_to_proto(

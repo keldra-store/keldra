@@ -18,6 +18,16 @@ impl AppState {
             .transpose()?
             .flatten()
             .map(ToOwned::to_owned);
+        let _implicit_authz_write_guard = if transaction_id.is_none() {
+            Some(
+                crate::authz_head::tenant_write_lock(claims.tenant_id)
+                    .map_err(|error| Status::internal(error.to_string()))?
+                    .lock_owned()
+                    .await,
+            )
+        } else {
+            None
+        };
         let input_hash = auth_mutation_input_hash("write-authz-tuple", &claims, &req);
         let implicit = if transaction_id.is_none() {
             Some(
@@ -154,6 +164,16 @@ impl AppState {
             .transpose()?
             .flatten()
             .map(ToOwned::to_owned);
+        let _implicit_authz_write_guard = if transaction_id.is_none() {
+            Some(
+                crate::authz_head::tenant_write_lock(claims.tenant_id)
+                    .map_err(|error| Status::internal(error.to_string()))?
+                    .lock_owned()
+                    .await,
+            )
+        } else {
+            None
+        };
         let input_hash = auth_mutation_input_hash("write-authz-tuples", &claims, &req);
         if req.mutations.is_empty() {
             return Err(Status::invalid_argument(
@@ -441,6 +461,16 @@ impl AppState {
             .transpose()?
             .flatten()
             .map(ToOwned::to_owned);
+        let _implicit_authz_write_guard = if transaction_id.is_none() {
+            Some(
+                crate::authz_head::tenant_write_lock(claims.tenant_id)
+                    .map_err(|error| Status::internal(error.to_string()))?
+                    .lock_owned()
+                    .await,
+            )
+        } else {
+            None
+        };
         let input_hash = auth_mutation_input_hash("put-authz-schema", &claims, &req);
         let transaction_principal =
             crate::object_manager::transaction_principal_from_claims(&claims);
@@ -574,6 +604,16 @@ impl AppState {
             .transpose()?
             .flatten()
             .map(ToOwned::to_owned);
+        let _implicit_authz_write_guard = if transaction_id.is_none() {
+            Some(
+                crate::authz_head::tenant_write_lock(claims.tenant_id)
+                    .map_err(|error| Status::internal(error.to_string()))?
+                    .lock_owned()
+                    .await,
+            )
+        } else {
+            None
+        };
         let input_hash = auth_mutation_input_hash("bind-authz-schema", &claims, &req);
         let transaction_principal =
             crate::object_manager::transaction_principal_from_claims(&claims);
@@ -761,6 +801,16 @@ impl AppState {
             .transpose()?
             .flatten()
             .map(ToOwned::to_owned);
+        let _implicit_authz_write_guard = if transaction_id.is_none() {
+            Some(
+                crate::authz_head::tenant_write_lock(claims.tenant_id)
+                    .map_err(|error| Status::internal(error.to_string()))?
+                    .lock_owned()
+                    .await,
+            )
+        } else {
+            None
+        };
         let input_hash = auth_mutation_input_hash("apply-authz-schema", &claims, &req);
         let transaction_principal =
             crate::object_manager::transaction_principal_from_claims(&claims);

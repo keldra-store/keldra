@@ -41,6 +41,12 @@ pub(crate) struct AuthzMaterializationOutcome {
 #[derive(Clone, Copy)]
 enum AuthzPublication<'a> {
     Direct,
+    Task { guard: &'a TaskExecutionGuard },
+}
+
+#[derive(Clone, Copy)]
+enum PreparedAuthzPublication<'a> {
+    Direct,
     Task {
         guard: &'a TaskExecutionGuard,
         source_head_predicate: &'a (
@@ -176,10 +182,6 @@ impl AuthzMaterializationOutcome {
         target_revision: u64,
         source_fence_token: u64,
         guard: &TaskExecutionGuard,
-        source_head_predicate: &(
-            crate::mvcc_transaction::LogicalKey,
-            crate::mvcc_transaction::PredicateKind,
-        ),
     ) -> Result<Self> {
         materialize_authz_state_at_revision(
             storage,
@@ -187,10 +189,7 @@ impl AuthzMaterializationOutcome {
             tenant_id,
             target_revision,
             source_fence_token,
-            AuthzPublication::Task {
-                guard,
-                source_head_predicate,
-            },
+            AuthzPublication::Task { guard },
         )
         .await
     }
@@ -204,14 +203,44 @@ fn materialize_authz_state_at_revision<'a>(
     source_fence_token: u64,
     publication: AuthzPublication<'a>,
 ) -> Pin<Box<dyn Future<Output = Result<AuthzMaterializationOutcome>> + Send + 'a>> {
-    Box::pin(materialize_authz_state_at_revision_inner(
-        storage,
-        mvcc,
-        tenant_id,
-        target_revision,
-        source_fence_token,
-        publication,
-    ))
+    Box::pin(async move {
+        // Tuple writers and the materializer both predicate publication on the
+        // tenant authz head. Capture the task predicate only after entering
+        // their shared tenant-local critical section. Capturing it beforehand
+        // lets an intervening tuple write make every deterministic retry stale.
+        let write_lock = authz_head::tenant_write_lock(tenant_id)?;
+        let _write_guard = write_lock.lock().await;
+        let task_source_head_predicate = match publication {
+            AuthzPublication::Direct => None,
+            AuthzPublication::Task { .. } => {
+                Some(authz_head::latest_mvcc_predicate(mvcc, tenant_id)?)
+            }
+        };
+        let source_fence_token = match publication {
+            AuthzPublication::Direct => source_fence_token,
+            AuthzPublication::Task { .. } => {
+                source_fence_token.max(super::latest_authz_journal_fence_token(mvcc, tenant_id)?)
+            }
+        };
+        let publication = match publication {
+            AuthzPublication::Direct => PreparedAuthzPublication::Direct,
+            AuthzPublication::Task { guard } => PreparedAuthzPublication::Task {
+                guard,
+                source_head_predicate: task_source_head_predicate
+                    .as_ref()
+                    .expect("task publication predicate was prepared"),
+            },
+        };
+        materialize_authz_state_at_revision_inner(
+            storage,
+            mvcc,
+            tenant_id,
+            target_revision,
+            source_fence_token,
+            publication,
+        )
+        .await
+    })
 }
 
 async fn materialize_authz_state_at_revision_inner(
@@ -220,7 +249,7 @@ async fn materialize_authz_state_at_revision_inner(
     tenant_id: i64,
     target_revision: u64,
     source_fence_token: u64,
-    publication: AuthzPublication<'_>,
+    publication: PreparedAuthzPublication<'_>,
 ) -> Result<AuthzMaterializationOutcome> {
     validate_target_revision(mvcc, tenant_id, target_revision)?;
     let lock = materialization_lock(tenant_id)?;
@@ -320,7 +349,7 @@ async fn initialize_authz_materialization(
     tenant_id: i64,
     target_revision: u64,
     source_fence_token: u64,
-    publication: AuthzPublication<'_>,
+    publication: PreparedAuthzPublication<'_>,
 ) -> Result<AuthzMaterializationOutcome> {
     // A node can observe several committed authorization revisions before the
     // asynchronous materializer gets its first lease.  Rebuilding only
@@ -349,22 +378,30 @@ async fn initialize_authz_materialization(
 async fn publish_staged_segment(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     staged: authz_segment::StagedAuthzTupleSegment,
-    publication: AuthzPublication<'_>,
+    publication: PreparedAuthzPublication<'_>,
 ) -> Result<String> {
     match publication {
-        AuthzPublication::Direct => {
+        PreparedAuthzPublication::Direct => {
             authz_segment::publish_staged_authz_tuple_segment(mvcc, staged, &[]).await
         }
-        AuthzPublication::Task {
+        PreparedAuthzPublication::Task {
             guard,
             source_head_predicate,
         } => {
             let source_head_predicate = source_head_predicate.clone();
+            let idempotency_scope = task_publication_idempotency_scope(guard).await?;
+            let assignment = guard.assignment().clone();
             guard
                 .publish_mvcc_with(move |task_lease_predicate| async move {
                     let preconditions = [source_head_predicate, task_lease_predicate];
-                    authz_segment::publish_staged_authz_tuple_segment(mvcc, staged, &preconditions)
-                        .await
+                    authz_segment::publish_staged_authz_tuple_segment_for_task(
+                        mvcc,
+                        staged,
+                        &preconditions,
+                        &assignment,
+                        &idempotency_scope,
+                    )
+                    .await
                 })
                 .await
         }
@@ -376,7 +413,7 @@ async fn publish_derived_userset_index(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     tenant_id: i64,
     target_revision: u64,
-    publication: AuthzPublication<'_>,
+    publication: PreparedAuthzPublication<'_>,
 ) -> Result<()> {
     let derived = crate::authz_userset_index::build_expected_derived_userset_index_at_revision(
         storage,
@@ -387,15 +424,16 @@ async fn publish_derived_userset_index(
     )
     .await?;
     match publication {
-        AuthzPublication::Direct => {
+        PreparedAuthzPublication::Direct => {
             crate::authz_userset_index::write_derived_userset_index(storage, mvcc, &derived).await
         }
-        AuthzPublication::Task {
+        PreparedAuthzPublication::Task {
             guard,
             source_head_predicate,
         } => {
             let source_head_predicate = source_head_predicate.clone();
             let assignment = guard.assignment().clone();
+            let idempotency_scope = task_publication_idempotency_scope(guard).await?;
             guard
                 .publish_mvcc_with(move |task_lease_predicate| async move {
                     let preconditions = [source_head_predicate, task_lease_predicate];
@@ -405,12 +443,25 @@ async fn publish_derived_userset_index(
                         &derived,
                         &preconditions,
                         Some(assignment),
+                        Some(&idempotency_scope),
                     )
                     .await
                 })
                 .await
         }
     }
+}
+
+async fn task_publication_idempotency_scope(guard: &TaskExecutionGuard) -> Result<String> {
+    let lease = guard.snapshot().await;
+    let lease_hash = lease
+        .lease_hash
+        .as_deref()
+        .ok_or_else(|| anyhow!("authorization task publication lease hash is missing"))?;
+    Ok(format!(
+        "task-lease-{}-{}-{lease_hash}",
+        lease.fence_token, lease.lease_epoch
+    ))
 }
 
 pub(crate) async fn rebuild_authz_materialization_at_revision(
