@@ -4,11 +4,31 @@ on:
   workflow_dispatch:
     inputs:
       source_commit:
-        description: Exact 40-character source commit to build
+        description: Exact 40-character source commit represented by the artifact
         required: true
         type: string
       image_tag:
         description: Candidate tag, for example v0.4.1-worka-v0.1.0-rc9-amd64
+        required: true
+        type: string
+      staging_release:
+        description: Draft GitHub release containing the qualified image archive
+        required: true
+        type: string
+      staging_asset:
+        description: Qualified .tar.zst image archive filename
+        required: true
+        type: string
+      expected_archive_sha256:
+        description: SHA-256 of the compressed image archive
+        required: true
+        type: string
+      expected_image_id:
+        description: Docker image ID, including the sha256: prefix
+        required: true
+        type: string
+      expected_server_sha256:
+        description: SHA-256 of /usr/local/bin/anvil-server in the image
         required: true
         type: string
 
@@ -21,11 +41,11 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  STAGING_RELEASE: v0.4.1-worka-v0.1.0-rc9-image-staging
-  STAGING_ASSET: anvil-v0.4.1-worka-v0.1.0-rc9-amd64.tar.zst
-  EXPECTED_ARCHIVE_SHA256: c23dd368110b581bbfcb6d78bc68ebd7958768d492e19da35bef0c7fac9a2c47
-  EXPECTED_IMAGE_ID: sha256:56cdc11005afb14958d2bb75ff44590f106d815be1a16ec8da3040b5a1dbe4d6
-  EXPECTED_SERVER_SHA256: c49e809a77e1c7b5fa3d00e51fab6a37a817a283c5020471aaf98a680330d677
+  STAGING_RELEASE: ${{ inputs.staging_release }}
+  STAGING_ASSET: ${{ inputs.staging_asset }}
+  EXPECTED_ARCHIVE_SHA256: ${{ inputs.expected_archive_sha256 }}
+  EXPECTED_IMAGE_ID: ${{ inputs.expected_image_id }}
+  EXPECTED_SERVER_SHA256: ${{ inputs.expected_server_sha256 }}
 
 jobs:
   publish-amd64:
@@ -54,6 +74,26 @@ jobs:
           fi
           if [[ ! "$IMAGE_TAG" =~ ^v[0-9A-Za-z][0-9A-Za-z._-]{0,126}-amd64$ ]]; then
             echo "image_tag must be a v-prefixed Docker tag ending in -amd64" >&2
+            exit 1
+          fi
+          if [[ ! "$STAGING_RELEASE" =~ ^v[0-9A-Za-z][0-9A-Za-z._-]{0,126}$ ]]; then
+            echo "staging_release must be a v-prefixed GitHub release tag" >&2
+            exit 1
+          fi
+          if [[ ! "$STAGING_ASSET" =~ ^[0-9A-Za-z][0-9A-Za-z._-]*\.tar\.zst$ ]]; then
+            echo "staging_asset must be a plain .tar.zst filename" >&2
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "expected_archive_sha256 must be a lowercase SHA-256" >&2
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "expected_image_id must be a sha256-prefixed lowercase digest" >&2
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_SERVER_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "expected_server_sha256 must be a lowercase SHA-256" >&2
             exit 1
           fi
           git fetch --no-tags --depth=256 origin \
