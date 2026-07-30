@@ -42,6 +42,7 @@ const CLAIM_TRANSIENT_MAX_DELAY: Duration = Duration::from_secs(2);
 const CLAIM_FATAL_DELAY: Duration = Duration::from_secs(5);
 const INTERRUPTED_TASK_RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
 const UNLEASED_RUNNING_TASK_GRACE: Duration = Duration::from_secs(30);
+const TASK_OUTCOME_PERSIST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerClaimError {
@@ -320,87 +321,106 @@ pub async fn run(
                 let _permit = permit;
                 let result =
                     execute_task_with_lease(&p, &core_store, &jm, &om, &task, &keyring).await;
-
-                match result {
-                    Err(failure) => {
-                        error!(
-                            task_id = task.id,
-                            task_type = ?task.task_type,
-                            task_attempt = task.attempts,
-                            error = ?failure.error,
-                            "Background task execution failed"
-                        );
-                        if is_task_lease_fencing_error(&failure.error) {
-                            warn!(
+                let task_finalization = async {
+                    match result {
+                        Err(failure) => {
+                            error!(
                                 task_id = task.id,
-                                error = %failure.error,
-                                "Stale task execution stopped without mutating queue state"
+                                task_type = ?task.task_type,
+                                task_attempt = task.attempts,
+                                error = ?failure.error,
+                                "Background task execution failed"
                             );
-                        } else if let Some(lease) = failure.lease {
+                            if is_task_lease_fencing_error(&failure.error) {
+                                warn!(
+                                    task_id = task.id,
+                                    error = %failure.error,
+                                    "Stale task execution stopped without mutating queue state"
+                                );
+                            } else if let Some(lease) = failure.lease {
+                                match execution_lease_precondition(&p, &core_store, &lease).await {
+                                    Ok(precondition) => {
+                                        if let Err(fail_err) = p
+                                            .fail_task_with_execution_guard(
+                                                task.id,
+                                                task.attempts,
+                                                &failure.error.to_string(),
+                                                precondition,
+                                            )
+                                            .await
+                                        {
+                                            warn!(
+                                                task_id = task.id,
+                                                %fail_err,
+                                                "Task failure queue mutation was rejected"
+                                            );
+                                        }
+                                    }
+                                    Err(fence_error) => {
+                                        warn!(
+                                            task_id = task.id,
+                                            %fence_error,
+                                            "Task failure was not recorded because its lease is stale"
+                                        );
+                                    }
+                                }
+                            } else {
+                                warn!(
+                                    task_id = task.id,
+                                    "Task failed before acquiring an execution lease; queue recovery will retry it"
+                                );
+                            }
+                        }
+                        Ok(lease) => {
                             match execution_lease_precondition(&p, &core_store, &lease).await {
+                                Err(error) => {
+                                    warn!(
+                                        task_id = task.id,
+                                        %error,
+                                        "Task completion rejected because its execution lease is stale"
+                                    );
+                                }
                                 Ok(precondition) => {
-                                    if let Err(fail_err) = p
-                                        .fail_task_with_execution_guard(
+                                    if let Err(complete_err) = p
+                                        .update_task_status_with_execution_guard(
                                             task.id,
                                             task.attempts,
-                                            &failure.error.to_string(),
+                                            TaskStatus::Completed,
                                             precondition,
                                         )
                                         .await
                                     {
-                                        warn!(
-                                            task_id = task.id,
-                                            %fail_err,
-                                            "Task failure queue mutation was rejected"
+                                        error!(
+                                            "Failed to mark task {} as completed: {}",
+                                            task.id, complete_err
                                         );
                                     }
                                 }
-                                Err(fence_error) => {
-                                    warn!(
-                                        task_id = task.id,
-                                        %fence_error,
-                                        "Task failure was not recorded because its lease is stale"
-                                    );
-                                }
-                            }
-                        } else {
-                            warn!(
-                                task_id = task.id,
-                                "Task failed before acquiring an execution lease; queue recovery will retry it"
-                            );
-                        }
-                    }
-                    Ok(lease) => {
-                        match execution_lease_precondition(&p, &core_store, &lease).await {
-                            Err(error) => {
-                                warn!(
-                                    task_id = task.id,
-                                    %error,
-                                    "Task completion rejected because its execution lease is stale"
-                                );
-                            }
-                            Ok(precondition) => {
-                                if let Err(complete_err) = p
-                                    .update_task_status_with_execution_guard(
-                                        task.id,
-                                        task.attempts,
-                                        TaskStatus::Completed,
-                                        precondition,
-                                    )
-                                    .await
-                                {
-                                    error!(
-                                        "Failed to mark task {} as completed: {}",
-                                        task.id, complete_err
-                                    );
-                                }
                             }
                         }
                     }
+                };
+                if !await_task_outcome_persistence(TASK_OUTCOME_PERSIST_TIMEOUT, task_finalization)
+                    .await
+                {
+                    error!(
+                        task_id = task.id,
+                        task_type = ?task.task_type,
+                        task_attempt = task.attempts,
+                        timeout_ms = TASK_OUTCOME_PERSIST_TIMEOUT.as_millis(),
+                        "Timed out persisting background task outcome; lease recovery will reclaim the attempt"
+                    );
                 }
             });
         }
     }
+}
+
+async fn await_task_outcome_persistence<F>(timeout: Duration, finalization: F) -> bool
+where
+    F: std::future::Future<Output = ()>,
+{
+    tokio::time::timeout(timeout, finalization).await.is_ok()
 }
 
 fn effective_worker_concurrency(requested: usize, _shard_target_count: usize) -> usize {
@@ -1249,6 +1269,33 @@ mod tests {
                 .max(max_seen);
         }
         assert!(max_seen <= CLAIM_CONTENTION_MAX_DELAY + CLAIM_CONTENTION_MAX_DELAY / 2);
+    }
+
+    #[tokio::test]
+    async fn timed_out_task_outcome_persistence_releases_the_worker_slot() {
+        let slots = Arc::new(Semaphore::new(1));
+        let permit = slots.clone().acquire_owned().await.unwrap();
+        let finalizer = tokio::spawn(async move {
+            let _permit = permit;
+            assert!(
+                !await_task_outcome_persistence(Duration::from_millis(10), std::future::pending(),)
+                    .await
+            );
+        });
+
+        finalizer.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), slots.acquire())
+            .await
+            .expect("timed-out finalization must not retain the worker slot")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn completed_task_outcome_persistence_reports_success() {
+        assert!(
+            await_task_outcome_persistence(Duration::from_secs(1), async {}).await,
+            "completed finalization must not be reported as timed out"
+        );
     }
 
     #[tokio::test]
