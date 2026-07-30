@@ -962,11 +962,21 @@ impl AppState {
 
         let index_storage_id =
             index_journal::index_storage_id(bucket.tenant_id, bucket.id, index.id);
-        let segment_ref =
-            typed_field_segment::latest_typed_field_segment_ref(&self.mvcc, &index_storage_id)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?
-                .ok_or_else(|| Status::failed_precondition("TypedJsonIndexNotMaterialised"))?;
+        let materialisation_deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_millis(req.lag_timeout_ms);
+        let segment_ref = loop {
+            if let Some(segment_ref) =
+                typed_field_segment::latest_typed_field_segment_ref(&self.mvcc, &index_storage_id)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?
+            {
+                break segment_ref;
+            }
+            if req.lag_timeout_ms == 0 || tokio::time::Instant::now() >= materialisation_deadline {
+                return Err(Status::failed_precondition("TypedJsonIndexNotMaterialised"));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
         let segment_header = typed_field_segment::read_typed_field_segment_header(
             &self.storage,
             &self.mvcc,

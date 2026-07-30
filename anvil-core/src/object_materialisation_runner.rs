@@ -345,9 +345,7 @@ impl ObjectMaterialisationExecutor for MvccObjectMaterialisationExecutor {
             job.job_id()? == job_id,
             "materialisation job identity mismatch"
         );
-        let payload = if job.requested_operations.extract_boundaries
-            || job.requested_operations.maintain_indexes
-        {
+        let payload = if job.requested_operations.extract_boundaries {
             tracing::debug!(job_id, "reading frozen object materialisation payload");
             self.payload(job).await?
         } else {
@@ -390,13 +388,19 @@ impl ObjectMaterialisationExecutor for MvccObjectMaterialisationExecutor {
                 created_at: object.created_at,
                 is_public_read: false,
             };
+            let source_cursor = u128::from(crate::watch_log::latest_object_watch_stream_cursor(
+                &self.mvcc,
+                job.tenant_id,
+                job.bucket_id,
+            )?);
             for frozen in &job.frozen_index_definitions {
                 self.mvcc.validate_assignment(assignment)?;
                 tracing::debug!(
                     job_id,
                     index_id = frozen.id,
                     index_kind = %frozen.kind,
-                    "building frozen object index"
+                    source_cursor,
+                    "rebuilding object index from latest committed metadata"
                 );
                 let index = IndexDefinition {
                     id: frozen.id,
@@ -413,12 +417,6 @@ impl ObjectMaterialisationExecutor for MvccObjectMaterialisationExecutor {
                     created_at: object.created_at,
                     updated_at: object.created_at,
                 };
-                let source = crate::index_builder::FrozenObjectIndexSource {
-                    object: object.clone(),
-                    payload: payload.clone(),
-                    boundary_values: boundaries.clone(),
-                    source_manifest_hash: job.source_manifest_hash.clone(),
-                };
                 let authority = crate::index_builder::IndexBuildAuthority::DirectRepair(
                     crate::index_builder::DirectRepairIndexBuildAuthority::for_assignment(
                         &self.mvcc, assignment,
@@ -426,42 +424,40 @@ impl ObjectMaterialisationExecutor for MvccObjectMaterialisationExecutor {
                 );
                 let outcome = match frozen.kind.as_str() {
                     "typed_json" => {
-                        crate::index_builder::build_frozen_typed_json_index(
+                        crate::index_builder::build_typed_json_index(
                             &self.mvcc.materialisation_storage,
+                            &self.mvcc,
                             &bucket,
                             &index,
                             self.mvcc.materialisation_signing_key.as_ref(),
-                            u128::from(job.originating_snapshot_version),
+                            source_cursor,
                             &self.mvcc.local_node.node_id,
                             authority,
-                            source,
                         )
                         .await?
                     }
                     "full_text" => {
-                        crate::index_builder::build_frozen_full_text_index(
+                        crate::index_builder::build_full_text_index(
                             &self.mvcc.materialisation_storage,
                             &bucket,
                             &index,
                             self.mvcc.materialisation_signing_key.as_ref(),
-                            u128::from(job.originating_snapshot_version),
+                            source_cursor,
                             &self.mvcc.local_node.node_id,
                             authority,
-                            source,
                         )
                         .await?
                     }
                     "vector" => {
-                        crate::index_builder::build_frozen_vector_index(
+                        crate::index_builder::build_vector_index(
                             &self.mvcc.materialisation_storage,
                             &bucket,
                             &index,
                             self.mvcc.materialisation_signing_key.as_ref(),
-                            u128::from(job.originating_snapshot_version),
+                            source_cursor,
                             &self.mvcc.local_node.node_id,
                             &self.mvcc.materialisation_embedding_providers,
                             authority,
-                            source,
                         )
                         .await?
                     }

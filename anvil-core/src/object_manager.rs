@@ -979,9 +979,33 @@ impl ObjectManager {
             if job.requested_operations.extract_boundaries
                 || job.requested_operations.maintain_indexes
             {
+                mvcc.reconcile_work_assignment(
+                    "object-materialisation",
+                    &job.assignment_logical_identity(),
+                )
+                .await
+                .map_err(|error| {
+                    Status::failed_precondition(format!(
+                        "object materialisation assignment is unavailable: {error}"
+                    ))
+                })?
+                .ok_or_else(|| {
+                    Status::unavailable(
+                        "object materialisation partition has no active compact-Raft owner",
+                    )
+                })?;
                 let job_id = job
                     .job_id()
                     .map_err(|error| Status::internal(error.to_string()))?;
+                tracing::info!(
+                    %job_id,
+                    transaction_id,
+                    tenant_id,
+                    bucket_id = bucket.id,
+                    frozen_index_count = job.frozen_index_definitions.len(),
+                    maintain_indexes = job.requested_operations.maintain_indexes,
+                    "staging object materialisation job"
+                );
                 let pending = crate::object_materialisation::ObjectMaterialisationResult {
                     schema: crate::object_materialisation::ObjectMaterialisationResult::SCHEMA
                         .into(),
