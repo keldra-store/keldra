@@ -22,6 +22,10 @@ concurrency:
 
 env:
   CARGO_TARGET_DIR: /home/github-runner/.cache/anvil/cargo-target
+  # The self-hosted release runner has the locked private Git dependencies in
+  # its persistent Cargo cache. Candidate publication must not depend on an
+  # unscoped personal token or refetch a mutable repository view.
+  CARGO_NET_OFFLINE: "true"
 
 jobs:
   publish-amd64:
