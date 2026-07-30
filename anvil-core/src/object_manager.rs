@@ -26,7 +26,7 @@ use futures_util::{Stream, StreamExt, TryStreamExt};
 use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::pin::Pin;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -1883,6 +1883,44 @@ pub(crate) fn local_object_manifest(
         | ObjectDataTarget::LogicalFile(_)
         | ObjectDataTarget::ObjectRef(_) => None,
     })
+}
+
+/// Read a payload represented directly by the MVCC object layer.
+///
+/// `None` means the object uses a legacy CoreStore representation and lets
+/// callers retain their existing CoreStore read path.
+pub(crate) async fn read_mvcc_object_payload(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    object: &crate::persistence::Object,
+) -> AnyhowResult<Option<Vec<u8>>> {
+    let target = object
+        .shard_map
+        .as_ref()
+        .context("object shard map is missing")
+        .and_then(object_data_target_from_shard_map)?;
+    match target {
+        ObjectDataTarget::MvccLocal(manifest) => mvcc
+            .local_objects
+            .read_range(&manifest, 0, manifest.object_length)
+            .map(Some),
+        ObjectDataTarget::MvccShards(manifest) => {
+            let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+            manifest
+                .read_range_chunks(&mvcc.replication_client, 0, manifest.object_length, {
+                    let bytes = bytes.clone();
+                    move |chunk| {
+                        let bytes = bytes.clone();
+                        async move {
+                            bytes.lock().unwrap().extend_from_slice(&chunk);
+                            Ok(())
+                        }
+                    }
+                })
+                .await?;
+            Ok(Some(Arc::try_unwrap(bytes).unwrap().into_inner().unwrap()))
+        }
+        ObjectDataTarget::LogicalFile(_) | ObjectDataTarget::ObjectRef(_) => Ok(None),
+    }
 }
 
 fn object_data_target_to_shard_map(target: &ObjectDataTarget) -> AnyhowResult<JsonValue> {

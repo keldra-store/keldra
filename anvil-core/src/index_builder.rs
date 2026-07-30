@@ -9,6 +9,7 @@ use crate::formats::{
     full_text::FullTextIndexDefinition,
     hash32,
     vector::{VectorIndexDefinition, VectorMetric, VectorPayload, VectorRecord},
+    writer::WriterFamily,
 };
 use crate::full_text_segment::{self, FullTextDocumentTableRow, FullTextSegmentWrite};
 use crate::index_partition_watch::{self, IndexPartitionWatchPayload};
@@ -42,7 +43,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 mod authority;
-mod helpers;
+pub(crate) mod helpers;
+#[cfg(test)]
+mod tests;
 pub(crate) use authority::{DirectRepairIndexBuildAuthority, IndexBuildAuthority};
 use authority::{IndexBuildOwnership, internal_ownership_idempotency_key};
 use helpers::*;
@@ -263,13 +266,22 @@ fn encode_deterministic_proto(message: &impl Message) -> Result<Vec<u8>> {
 async fn latest_index_segment_generation(
     mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     index_storage_id: &str,
+    writer_family: WriterFamily,
 ) -> Result<u64> {
-    Ok(
+    let locator_generation =
         index_coremeta::latest_index_segment_coremeta_record(mvcc, index_storage_id)
             .await?
             .map(|record| record.generation)
-            .unwrap_or(0),
+            .unwrap_or(0);
+    let catalog_generation = crate::writer_segment_catalog::latest_writer_segment_catalog_record(
+        mvcc,
+        writer_family.as_str(),
+        index_storage_id,
     )
+    .await?
+    .map(|record| record.generation)
+    .unwrap_or(0);
+    Ok(locator_generation.max(catalog_generation))
 }
 
 pub(crate) struct FrozenObjectIndexSource {
@@ -344,8 +356,12 @@ async fn build_full_text_index_from_source(
         .map_err(|error| anyhow!("invalid full text index definition: {error}"))?;
     let index_storage_id =
         index_journal::index_storage_id(index.tenant_id, index.bucket_id, index.id);
-    let latest_generation =
-        latest_index_segment_generation(authority.mvcc()?, &index_storage_id).await?;
+    let latest_generation = latest_index_segment_generation(
+        authority.mvcc()?,
+        &index_storage_id,
+        WriterFamily::FullText,
+    )
+    .await?;
     let latest_checkpoint_generation = latest_index_checkpoint_generation(
         authority.mvcc()?,
         &index_storage_id,
@@ -387,7 +403,7 @@ async fn build_full_text_index_from_source(
         }
         let payload = match &frozen_payload {
             Some((version_id, payload)) if *version_id == object.version_id => payload.clone(),
-            _ => read_object_payload(&core_store, &object).await?,
+            _ => read_object_payload(authority.mvcc()?, &core_store, &object).await?,
         };
         let extracted = extract_text_fields(&index.extractor, &object, &payload);
         let diagnostic_count = extracted.diagnostics.len();
@@ -654,8 +670,12 @@ async fn build_typed_json_index_from_source(
     let definition = parse_typed_json_build_definition(index)?;
     let index_storage_id =
         index_journal::index_storage_id(index.tenant_id, index.bucket_id, index.id);
-    let latest_generation =
-        latest_index_segment_generation(authority.mvcc()?, &index_storage_id).await?;
+    let latest_generation = latest_index_segment_generation(
+        authority.mvcc()?,
+        &index_storage_id,
+        WriterFamily::TypedMetadata,
+    )
+    .await?;
     let latest_checkpoint_generation = latest_index_checkpoint_generation(
         authority.mvcc()?,
         &index_storage_id,
@@ -908,8 +928,12 @@ pub(crate) async fn build_metadata_backed_index(
     }
     let index_storage_id =
         index_journal::index_storage_id(index.tenant_id, index.bucket_id, index.id);
-    let latest_generation =
-        latest_index_segment_generation(authority.mvcc()?, &index_storage_id).await?;
+    let latest_generation = latest_index_segment_generation(
+        authority.mvcc()?,
+        &index_storage_id,
+        WriterFamily::TypedMetadata,
+    )
+    .await?;
     let latest_checkpoint_generation = latest_index_checkpoint_generation(
         authority.mvcc()?,
         &index_storage_id,
@@ -1235,7 +1259,8 @@ async fn build_vector_index_with_policy(
     let index_storage_id =
         index_journal::index_storage_id(index.tenant_id, index.bucket_id, index.id);
     let latest_generation =
-        latest_index_segment_generation(authority.mvcc()?, &index_storage_id).await?;
+        latest_index_segment_generation(authority.mvcc()?, &index_storage_id, WriterFamily::Vector)
+            .await?;
     let latest_checkpoint_generation = latest_index_checkpoint_generation(
         authority.mvcc()?,
         &index_storage_id,
@@ -1277,7 +1302,7 @@ async fn build_vector_index_with_policy(
         }
         let payload = match &frozen_payload {
             Some((version_id, payload)) if *version_id == object.version_id => payload.clone(),
-            _ => read_object_payload(&core_store, &object).await?,
+            _ => read_object_payload(authority.mvcc()?, &core_store, &object).await?,
         };
         let extraction = extract_vectors(
             &definition.extractor,

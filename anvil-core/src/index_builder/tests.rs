@@ -1,4 +1,6 @@
 use super::*;
+use chrono::Utc;
+
 #[test]
 fn selector_matches_prefix_and_content_type() {
     let object = object("docs/a.txt", Some("text/plain"));

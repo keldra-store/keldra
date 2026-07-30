@@ -187,6 +187,46 @@ fn boundary_schema() -> CoreBoundarySchema {
     }
 }
 
+#[tokio::test]
+async fn mvcc_local_payload_is_readable_by_derived_index_builders() {
+    let (_temp, manager, bucket, _claims) = seeded_object_manager("derived-index-payload").await;
+    let mvcc = manager.installed_mvcc().unwrap();
+    let expected = br#"{"case_id":"case-1","status":"open"}"#;
+    let mut reader = &expected[..];
+    let ingest = mvcc.local_objects.persist(&mut reader).await.unwrap();
+    let object = crate::persistence::Object {
+        id: 1,
+        tenant_id: bucket.tenant_id,
+        bucket_id: bucket.id,
+        key: "cases/case-1.json".to_string(),
+        kind: Default::default(),
+        content_hash: ingest.manifest.object_hash.clone(),
+        size: i64::try_from(expected.len()).unwrap(),
+        etag: ingest.manifest.object_hash.clone(),
+        content_type: Some("application/json".to_string()),
+        version_id: uuid::Uuid::new_v4(),
+        mutation_id: uuid::Uuid::new_v4(),
+        index_policy_snapshot: "{}".to_string(),
+        user_metadata_hash: String::new(),
+        authz_revision: 1,
+        record_hash: String::new(),
+        created_at: chrono::Utc::now(),
+        deleted_at: None,
+        storage_class: None,
+        user_meta: None,
+        shard_map: Some(crate::mvcc_physical_payload::encode_shard_map(
+            &crate::mvcc_physical_payload::MvccPhysicalPayloadLocator::Local(ingest.manifest),
+        )),
+        checksum: None,
+        link: None,
+    };
+
+    assert_eq!(
+        read_mvcc_object_payload(mvcc, &object).await.unwrap(),
+        Some(expected.to_vec())
+    );
+}
+
 #[test]
 fn object_boundary_extraction_reads_metadata_path_and_body() {
     let values = extract_object_boundary_values(

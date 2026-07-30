@@ -426,7 +426,7 @@ pub(super) async fn build_typed_json_object_rows(
         if object.deleted_at.is_some() || !selector_matches(&index.selector, &object) {
             continue;
         }
-        let payload = match read_object_payload(core_store, &object).await {
+        let payload = match read_object_payload(mvcc, core_store, &object).await {
             Ok(payload) => payload,
             Err(error) => {
                 diagnostics.push(IndexBuildDiagnostic {
@@ -1199,9 +1199,13 @@ pub(super) fn merge_details(left: JsonValue, right: JsonValue) -> JsonValue {
 }
 
 pub(super) async fn read_object_payload(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
     core_store: &CoreStore,
     object: &Object,
 ) -> Result<Vec<u8>> {
+    if let Some(payload) = crate::object_manager::read_mvcc_object_payload(mvcc, object).await? {
+        return Ok(payload);
+    }
     let target = core_object_data_target_from_shard_map(object).with_context(|| {
         format!(
             "object {} version {} is not CoreStore-backed",
