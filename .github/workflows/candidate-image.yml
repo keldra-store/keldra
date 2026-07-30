@@ -29,12 +29,19 @@ jobs:
     runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 90
     steps:
+      - name: Checkout trusted workflow revision
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
       - name: Validate requested source and tag
         id: candidate
         shell: bash
         env:
           SOURCE_COMMIT: ${{ inputs.source_commit }}
           IMAGE_TAG: ${{ inputs.image_tag }}
+          SOURCE_BRANCH: worka/v0.1.0-anvil-rc9
         run: |
           set -euo pipefail
           if [[ ! "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
@@ -45,26 +52,14 @@ jobs:
             echo "image_tag must be a v-prefixed Docker tag ending in -amd64" >&2
             exit 1
           fi
+          git fetch --no-tags --depth=256 origin \
+            "refs/heads/${SOURCE_BRANCH}:refs/remotes/origin/${SOURCE_BRANCH}"
+          git merge-base --is-ancestor \
+            "$SOURCE_COMMIT" "refs/remotes/origin/${SOURCE_BRANCH}"
+          git checkout --detach "$SOURCE_COMMIT"
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
           printf 'image=ghcr.io/%s:%s\n' \
             "${GITHUB_REPOSITORY,,}" "$IMAGE_TAG" >> "$GITHUB_OUTPUT"
-
-      - name: Checkout exact source commit
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.source_commit }}
-          fetch-depth: 1
-          persist-credentials: false
-
-      - name: Verify exact checkout
-        shell: bash
-        env:
-          SOURCE_COMMIT: ${{ inputs.source_commit }}
-          WORKFLOW_COMMIT: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
-          git fetch --no-tags --depth=1 origin "$WORKFLOW_COMMIT"
-          git merge-base --is-ancestor "$SOURCE_COMMIT" "$WORKFLOW_COMMIT"
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
