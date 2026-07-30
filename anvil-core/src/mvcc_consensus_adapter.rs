@@ -298,7 +298,10 @@ pub(crate) fn from_consensus_durability(
     }
 }
 
-fn logical_key_hash(cluster_id: &str, key: &product::LogicalKey) -> consensus::LogicalKeyHash {
+pub(crate) fn logical_key_hash(
+    cluster_id: &str,
+    key: &product::LogicalKey,
+) -> consensus::LogicalKeyHash {
     consensus::LogicalKeyHash(domain_hash(
         b"anvil.mvcc.logical-key.v1",
         &[
