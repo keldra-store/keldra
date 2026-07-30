@@ -11,10 +11,11 @@ use serde_json::Value as JsonValue;
 mod projections;
 pub(crate) use projections::{
     CurrentObjectMetadataPage, ObjectMetadataPageCursor, ObjectVersionsMetadataPage,
-    object_current_history_key, object_current_key, object_current_page_bucket_prefix,
-    object_current_page_key_for_object, object_id_counter_key, object_key_catalog_key,
-    object_version_catalog_key, object_version_history_key, object_version_id_key,
-    object_version_key, object_version_page_bucket_prefix, object_version_page_key_for_object,
+    object_current_history_key, object_current_key, object_current_mutation_fence_key,
+    object_current_page_bucket_prefix, object_current_page_key_for_object, object_id_counter_key,
+    object_key_catalog_key, object_version_catalog_key, object_version_history_key,
+    object_version_id_key, object_version_key, object_version_mutation_fence_key,
+    object_version_page_bucket_prefix, object_version_page_key_for_object,
     object_version_page_prefix,
 };
 

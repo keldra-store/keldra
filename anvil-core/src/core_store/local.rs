@@ -933,10 +933,11 @@ pub(crate) use local_object_metadata::{
     decode_object_metadata_row_with_generation, encode_object_metadata_counter_at_generation,
     encode_object_metadata_row_at_generation_for_transaction,
     encode_object_metadata_row_at_generation_with_delete_marker_for_transaction,
-    object_current_history_key, object_current_key, object_current_page_bucket_prefix,
-    object_current_page_key_for_object, object_id_counter_key, object_key_catalog_key,
-    object_version_catalog_key, object_version_history_key, object_version_id_key,
-    object_version_key, object_version_page_bucket_prefix, object_version_page_key_for_object,
+    object_current_history_key, object_current_key, object_current_mutation_fence_key,
+    object_current_page_bucket_prefix, object_current_page_key_for_object, object_id_counter_key,
+    object_key_catalog_key, object_version_catalog_key, object_version_history_key,
+    object_version_id_key, object_version_key, object_version_mutation_fence_key,
+    object_version_page_bucket_prefix, object_version_page_key_for_object,
     object_version_page_prefix,
 };
 #[path = "local_pending_finalisation.rs"]

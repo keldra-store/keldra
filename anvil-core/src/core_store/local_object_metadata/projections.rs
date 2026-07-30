@@ -915,6 +915,30 @@ pub(crate) fn object_version_key(
     ])
 }
 
+pub(crate) fn object_current_mutation_fence_key(bucket: &Bucket, object_key: &str) -> Vec<u8> {
+    meta_tuple_key(&[
+        b"object-mutation-fence-current",
+        &bucket.tenant_id.to_be_bytes(),
+        &bucket.id.to_be_bytes(),
+        object_key.as_bytes(),
+    ])
+}
+
+pub(crate) fn object_version_mutation_fence_key(
+    bucket: &Bucket,
+    object_key: &str,
+    version_id: uuid::Uuid,
+) -> Vec<u8> {
+    let version_id = version_id.to_string();
+    meta_tuple_key(&[
+        b"object-mutation-fence-version",
+        &bucket.tenant_id.to_be_bytes(),
+        &bucket.id.to_be_bytes(),
+        object_key.as_bytes(),
+        version_id.as_bytes(),
+    ])
+}
+
 pub(crate) fn object_version_id_key(bucket: &Bucket, version_id: uuid::Uuid) -> Vec<u8> {
     let version_id = version_id.to_string();
     meta_tuple_key(&[
