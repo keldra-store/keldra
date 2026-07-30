@@ -215,7 +215,7 @@ pub async fn run(
     let concurrency = effective_worker_concurrency(concurrency, shard_target_count);
     info!(
         concurrency,
-        shard_target_count, "Configured topology-aware background task concurrency"
+        shard_target_count, "Configured background task concurrency"
     );
     while let Err(error) = recover_interrupted_tasks(&persistence).await {
         warn!(%error, "Failed to recover interrupted background tasks; retrying");
@@ -403,12 +403,8 @@ pub async fn run(
     }
 }
 
-fn effective_worker_concurrency(requested: usize, shard_target_count: usize) -> usize {
-    if shard_target_count < 2 {
-        1
-    } else {
-        requested.max(1)
-    }
+fn effective_worker_concurrency(requested: usize, _shard_target_count: usize) -> usize {
+    requested.max(1)
 }
 
 async fn recover_interrupted_tasks(persistence: &Persistence) -> Result<()> {
@@ -1439,9 +1435,9 @@ mod tests {
     }
 
     #[test]
-    fn single_target_topology_serializes_background_mvcc_work() {
-        assert_eq!(effective_worker_concurrency(4, 0), 1);
-        assert_eq!(effective_worker_concurrency(4, 1), 1);
+    fn background_concurrency_is_independent_of_durability_topology() {
+        assert_eq!(effective_worker_concurrency(4, 0), 4);
+        assert_eq!(effective_worker_concurrency(4, 1), 4);
         assert_eq!(effective_worker_concurrency(4, 2), 4);
         assert_eq!(effective_worker_concurrency(0, 3), 1);
     }
