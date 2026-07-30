@@ -178,6 +178,16 @@ pub async fn put_schema_revision(
     validate_schema_id(schema_id)?;
     crate::authz_schema_contract::validate_schema_set(&namespaces)?;
     crate::authz_schema_contract::canonicalize_schema_set(&mut namespaces);
+    // Schema and tuple mutations advance the same tenant authz head. Join the
+    // existing same-node writer guard for implicit publication so a derived
+    // materialization cannot capture a head predicate that this path changes
+    // concurrently. Explicit transactions retain caller-owned lifetimes and
+    // are still coordinated by the authoritative MVCC predicate.
+    let _implicit_write_guard = if caller_binding.is_none() {
+        Some(authz_head::tenant_write_lock(tenant_id)?.lock_owned().await)
+    } else {
+        None
+    };
     let canonical_schema_digest = schema_digest(&namespaces)?;
     let digest_key = schema_digest_tuple_key(tenant_id, schema_id, &canonical_schema_digest)?;
     if let Some(existing) = read_proto_row_latest_mvcc::<StoredAuthzSchemaRevision>(
@@ -340,6 +350,11 @@ pub async fn bind_schema(
     caller_binding: Option<crate::authz_journal::AuthzTransactionBinding<'_>>,
 ) -> Result<StoredAuthzSchemaBinding> {
     validate_realm_id(realm_id)?;
+    let _implicit_write_guard = if caller_binding.is_none() {
+        Some(authz_head::tenant_write_lock(tenant_id)?.lock_owned().await)
+    } else {
+        None
+    };
     let revision_key =
         schema_revision_tuple_key(tenant_id, &schema_ref.schema_id, schema_ref.schema_revision)?;
     let schema = match caller_binding {
@@ -1182,5 +1197,25 @@ mod tests {
             schema_digest(&[input]).unwrap(),
             schema_digest(&[published]).unwrap()
         );
+    }
+
+    #[test]
+    fn canonical_namespace_hash_replaces_client_hash_domain() {
+        let mut namespace = AuthzNamespaceSchema {
+            namespace: "document".to_string(),
+            relations: Vec::new(),
+            schema_json: r#"{"namespace":"document"}"#.to_string(),
+            schema_hash: "client-json-domain-hash".to_string(),
+            schema_version: 0,
+            authz_revision: 0,
+            applied_at: String::new(),
+        };
+        let client_hash = namespace.schema_hash.clone();
+        namespace.schema_hash = schema_digest(&[namespace.clone()]).unwrap();
+        assert!(!namespace.schema_hash.is_empty());
+        assert_ne!(namespace.schema_hash, client_hash);
+        assert_eq!(namespace.namespace, "document");
+        assert_eq!(namespace.schema_json, r#"{"namespace":"document"}"#);
+        assert!(namespace.relations.is_empty());
     }
 }

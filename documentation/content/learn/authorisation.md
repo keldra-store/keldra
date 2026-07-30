@@ -87,6 +87,16 @@ Schemas are important for audit and operations, but you must understand the curr
 
 That makes schemas a forward-compatible contract rather than decorative documentation. They let teams review the intended model, bind a revision to a realm, watch namespace changes, and prepare for richer validation. They are not currently a substitute for writing the relationship facts that checks can actually resolve.
 
+Anvil owns published namespace hashes. A client may submit `schema_hash`, but
+publication canonicalises the namespace semantics and replaces that value with
+the deterministic protobuf-domain hash used by this Anvil API generation.
+Clients must validate the returned non-empty hash and the canonical namespace,
+relations, rules, and allowed subjects. They must not compare it with a digest
+calculated over their input JSON or assume their submitted hash round-trips.
+For a whole schema revision, use the authoritative schema-reference digest.
+Changing the canonical encoding or hash domain requires an API compatibility
+change; it cannot silently reinterpret hashes returned by an earlier version.
+
 ## Caveats today
 
 The API and tuple records include a `caveat_hash` field. The current implementation validates that it is empty or a 32-byte hex hash and includes it in tuple matching. It does not currently store caveat expression bodies or evaluate request context such as time, device posture, purpose, or region.
