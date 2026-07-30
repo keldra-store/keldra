@@ -7,7 +7,7 @@ pub(super) enum ObjectReadAuthority {
 }
 
 impl ObjectManager {
-    pub(super) async fn get_tenant_bucket(
+    pub(in crate::object_manager) async fn get_tenant_bucket(
         &self,
         tenant_id: i64,
         bucket_name: &str,
