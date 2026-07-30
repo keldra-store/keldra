@@ -238,18 +238,6 @@ impl IndexService for AppState {
                 return Err(Status::internal("invalid create-index mutation outcome"));
             }
         };
-        access_control::stage_index_defaults(
-            &self.persistence,
-            &bucket,
-            &index.name,
-            &claims.sub,
-            &claims.sub,
-            "stage creator index owner",
-            &transaction.id,
-            &transaction.principal,
-        )
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
         commit_index_mutation(self, &transaction).await?;
 
         Ok(Response::new(IndexDefinitionResponse {

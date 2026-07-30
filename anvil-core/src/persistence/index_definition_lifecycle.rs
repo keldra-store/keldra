@@ -104,9 +104,7 @@ impl Persistence {
 
             match self
                 .create_index_definition_event_with_transaction(
-                    bucket.tenant_id,
-                    bucket.id,
-                    &bucket.name,
+                    bucket,
                     &index,
                     event_type,
                     transaction_id,

@@ -63,31 +63,13 @@ impl Persistence {
             .get_bucket_by_name(job.tenant_id, &job.bucket_name)
             .await?
             .ok_or_else(|| anyhow!("committed index finalization bucket is missing"))?;
-        if job.event_type == "create" {
-            let mut attempt = 0_u32;
-            loop {
-                let result = crate::access_control::grant_index_defaults(
-                    self,
-                    &bucket,
-                    &job.index_name,
-                    &job.creator_principal,
-                    &job.creator_principal,
-                    "grant committed index creator owner",
-                )
-                .await;
-                match result {
-                    Ok(()) => break,
-                    Err(error) if attempt < 7 && is_authz_certification_conflict(&error) => {
-                        attempt += 1;
-                        tokio::time::sleep(std::time::Duration::from_millis(
-                            10_u64.saturating_mul(1_u64 << attempt),
-                        ))
-                        .await;
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-        }
+        // Create authorization defaults are part of the same transaction as
+        // the index definition and this job.  Finalization must remain a
+        // derived-state operation: writing authorization state here both
+        // weakens atomicity and contends on the global authorization head.
+        //
+        // Older queued jobs retain `creator_principal` in their wire shape for
+        // recovery compatibility, but replaying them never rewrites authz.
         let frozen: IndexDefinition = serde_json::from_value(job.frozen_definition.clone())?;
         let Some(current) = self
             .get_index_definition(job.tenant_id, job.bucket_id, &job.index_name)
@@ -131,14 +113,15 @@ impl Persistence {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn create_index_definition_event_with_transaction(
         &self,
-        tenant_id: i64,
-        bucket_id: i64,
-        bucket_name: &str,
+        bucket: &Bucket,
         index: &IndexDefinition,
         event_type: &str,
         transaction_id: Option<&str>,
         transaction_principal: Option<&str>,
     ) -> Result<IndexDefinitionEvent> {
+        let tenant_id = bucket.tenant_id;
+        let bucket_id = bucket.id;
+        let bucket_name = bucket.name.as_str();
         let event = IndexDefinitionEvent {
             id: index_journal::next_index_definition_cursor_mvcc(
                 self.mvcc()?,
@@ -183,6 +166,23 @@ impl Persistence {
                 transaction_principal,
             )
             .await?;
+            if event_type == "create" {
+                let transaction_id =
+                    transaction_id.ok_or_else(|| anyhow!("index transaction id is required"))?;
+                let creator_principal = transaction_principal
+                    .ok_or_else(|| anyhow!("index transaction principal is required"))?;
+                crate::access_control::stage_index_defaults(
+                    self,
+                    bucket,
+                    &index.name,
+                    creator_principal,
+                    creator_principal,
+                    "stage creator index owner",
+                    transaction_id,
+                    creator_principal,
+                )
+                .await?;
+            }
             if matches!(event_type, "create" | "update") {
                 let transaction_id =
                     transaction_id.ok_or_else(|| anyhow!("index transaction id is required"))?;
@@ -928,30 +928,6 @@ impl Persistence {
             },
         )
         .await
-    }
-}
-
-fn is_authz_certification_conflict(error: &anyhow::Error) -> bool {
-    let message = error.to_string();
-    message.contains("authorization tuple transaction aborted:")
-        && (message.contains("PointConflict") || message.contains("PredicateConflict"))
-}
-
-#[cfg(test)]
-mod finalization_retry_tests {
-    use super::is_authz_certification_conflict;
-
-    #[test]
-    fn retries_only_definite_authz_certification_conflicts() {
-        assert!(is_authz_certification_conflict(&anyhow::anyhow!(
-            "authorization tuple transaction aborted: PointConflict {{ key_hash: [] }}"
-        )));
-        assert!(is_authz_certification_conflict(&anyhow::anyhow!(
-            "authorization tuple transaction aborted: PredicateConflict {{ key_hash: [] }}"
-        )));
-        assert!(!is_authz_certification_conflict(&anyhow::anyhow!(
-            "authorization tuple transaction timed out"
-        )));
     }
 }
 
