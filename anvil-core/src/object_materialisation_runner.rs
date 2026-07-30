@@ -2,6 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use sha2::{Digest as _, Sha256};
 use tokio::sync::watch;
 
 use crate::object_materialisation::ObjectMaterialisationJob;
@@ -153,6 +154,30 @@ pub struct MvccMaterialisationPublisher {
     mvcc: Arc<MvccSubsystem>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublicationTransactionAction {
+    StageAndCommit,
+    CommitOnly,
+    NextAttempt,
+}
+
+fn publication_transaction_action(state: &str) -> Result<PublicationTransactionAction> {
+    match state {
+        "open" => Ok(PublicationTransactionAction::StageAndCommit),
+        "committing" | "committed" => Ok(PublicationTransactionAction::CommitOnly),
+        "aborted" | "rolled_back" | "expired" => Ok(PublicationTransactionAction::NextAttempt),
+        state => anyhow::bail!("unknown materialisation transaction state `{state}`"),
+    }
+}
+
+fn validate_publication_bytes(actual: &[u8], expected: &[u8]) -> Result<()> {
+    anyhow::ensure!(
+        actual == expected,
+        "committed materialisation publication does not match expected output"
+    );
+    Ok(())
+}
+
 pub fn object_materialisation_outbox_partition(cluster_id: &str) -> Result<(u64, String)> {
     anyhow::ensure!(!cluster_id.trim().is_empty(), "cluster ID is required");
     let stream_partition = format!("mvcc/{cluster_id}/object-materialisation");
@@ -180,6 +205,7 @@ impl MvccMaterialisationPublisher {
         result.state = ObjectMaterialisationState::Complete;
         let result_key = result.result_key()?;
         let status_key = result.status_key()?;
+        let bytes = result.canonical_bytes()?;
         if let Some(existing) = self.mvcc.runtime.local_store().read_latest(&status_key)? {
             let existing_result: ObjectMaterialisationResult =
                 serde_json::from_slice(&existing.value)?;
@@ -189,38 +215,90 @@ impl MvccMaterialisationPublisher {
             );
             if existing_result.state == ObjectMaterialisationState::Complete {
                 anyhow::ensure!(
-                    existing_result.cluster_id == result.cluster_id
-                        && existing_result.target_logical_identity
-                            == result.target_logical_identity
-                        && existing_result.job_id == result.job_id,
-                    "materialisation target is already complete for another job"
+                    existing.value == bytes,
+                    "materialisation target is already complete with different output"
                 );
                 return Ok(());
             }
         }
         let principal = "system/object-materialisation";
-        let now = now_unix_ms();
-        let idempotency_key = format!(
-            "object-materialisation:{}:assignment-{}-{}",
+        let publication_digest = hex::encode(Sha256::digest(&bytes));
+        let base_idempotency_key = format!(
+            "object-materialisation:{}:assignment-{}-{}:result-{publication_digest}",
             result.job_id, assignment.partition_id, assignment.assignment_epoch
         );
-        let handle = self
-            .mvcc
-            .open_transactions
-            .begin(
-                self.mvcc.runtime.as_ref(),
-                result.cluster_id.clone(),
-                principal,
-                idempotency_key,
-                Duration::from_secs(300),
-                DurabilityLevel::Quorum,
-                ReadConsistency::Linearized,
-                now,
+        for attempt in 0..8_u8 {
+            let idempotency_key = format!("{base_idempotency_key}:attempt-{attempt}");
+            let now = now_unix_ms();
+            let handle = self
+                .mvcc
+                .open_transactions
+                .begin(
+                    self.mvcc.runtime.as_ref(),
+                    result.cluster_id.clone(),
+                    principal,
+                    idempotency_key,
+                    Duration::from_secs(300),
+                    DurabilityLevel::Quorum,
+                    ReadConsistency::Linearized,
+                    now,
+                )
+                .await?;
+            let status =
+                self.mvcc
+                    .open_transactions
+                    .status(&handle.transaction_id, principal, now)?;
+            match publication_transaction_action(status.state)? {
+                PublicationTransactionAction::StageAndCommit => {
+                    self.stage_publication(
+                        &handle.transaction_id,
+                        principal,
+                        &result,
+                        result_key.clone(),
+                        status_key.clone(),
+                        bytes.clone(),
+                        assignment,
+                        now,
+                    )?;
+                }
+                PublicationTransactionAction::CommitOnly => {}
+                PublicationTransactionAction::NextAttempt => continue,
+            }
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(10),
+                self.mvcc.open_transactions.commit(
+                    self.mvcc.runtime.as_ref(),
+                    &handle.transaction_id,
+                    principal,
+                    now_unix_ms(),
+                ),
             )
-            .await?;
-        let bytes = result.canonical_bytes()?;
+            .await
+            .context("materialisation commit reconciliation timed out")??;
+            match outcome.certification {
+                CertificationResult::Committed { .. } => {
+                    return self.validate_publication(&status_key, &bytes);
+                }
+                CertificationResult::Aborted { .. } => continue,
+            }
+        }
+        anyhow::bail!("materialisation publication exhausted its recovery attempts")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stage_publication(
+        &self,
+        transaction_id: &str,
+        principal: &str,
+        result: &ObjectMaterialisationResult,
+        result_key: crate::mvcc_transaction::LogicalKey,
+        status_key: crate::mvcc_transaction::LogicalKey,
+        bytes: Vec<u8>,
+        assignment: &crate::mvcc_worker_authority::AssignmentGuard,
+        now: u64,
+    ) -> Result<()> {
         self.mvcc.stage_product_mutations(
-            &handle.transaction_id,
+            transaction_id,
             principal,
             vec![
                 ProductMutation::put(result_key, bytes.clone()),
@@ -229,7 +307,7 @@ impl MvccMaterialisationPublisher {
             now,
         )?;
         self.mvcc
-            .stage_assignment_guard(&handle.transaction_id, principal, assignment, now)?;
+            .stage_assignment_guard(transaction_id, principal, assignment, now)?;
         let (outbox_partition_id, stream_partition) =
             object_materialisation_outbox_partition(&result.cluster_id)?;
         let event_payload = serde_json::to_vec(&serde_json::json!({
@@ -240,7 +318,7 @@ impl MvccMaterialisationPublisher {
             "index_marker": result.index_marker,
         }))?;
         self.mvcc.open_transactions.add_stream_event(
-            &handle.transaction_id,
+            transaction_id,
             crate::mvcc_outbox::StreamOutboxEvent::new(
                 outbox_partition_id,
                 format!("mvcc/{}/events", result.cluster_id),
@@ -249,22 +327,58 @@ impl MvccMaterialisationPublisher {
                 event_payload,
             )?,
             now,
-        )?;
-        let outcome = self
+        )
+    }
+
+    fn validate_publication(
+        &self,
+        status_key: &crate::mvcc_transaction::LogicalKey,
+        expected: &[u8],
+    ) -> Result<()> {
+        let published = self
             .mvcc
-            .open_transactions
-            .commit(
-                self.mvcc.runtime.as_ref(),
-                &handle.transaction_id,
-                principal,
-                now_unix_ms(),
-            )
-            .await?;
-        anyhow::ensure!(
-            matches!(outcome.certification, CertificationResult::Committed { .. }),
-            "materialisation result transaction conflicted"
+            .runtime
+            .local_store()
+            .read_latest(status_key)?
+            .context("committed materialisation publication is not locally readable")?;
+        validate_publication_bytes(&published.value, expected)
+    }
+}
+
+#[cfg(test)]
+mod publication_reconciliation_tests {
+    use super::{
+        PublicationTransactionAction, publication_transaction_action, validate_publication_bytes,
+    };
+
+    #[test]
+    fn open_transactions_stage_but_replayed_transactions_never_restage() {
+        assert_eq!(
+            publication_transaction_action("open").unwrap(),
+            PublicationTransactionAction::StageAndCommit
         );
-        Ok(())
+        for state in ["committing", "committed"] {
+            assert_eq!(
+                publication_transaction_action(state).unwrap(),
+                PublicationTransactionAction::CommitOnly
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_failures_advance_to_a_new_deterministic_attempt() {
+        for state in ["aborted", "rolled_back", "expired"] {
+            assert_eq!(
+                publication_transaction_action(state).unwrap(),
+                PublicationTransactionAction::NextAttempt
+            );
+        }
+    }
+
+    #[test]
+    fn committed_publication_requires_an_exact_match() {
+        validate_publication_bytes(b"expected", b"expected").unwrap();
+        assert!(validate_publication_bytes(b"different", b"expected").is_err());
     }
 }
 
