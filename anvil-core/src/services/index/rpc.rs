@@ -16,6 +16,7 @@ struct IndexMutationTransaction {
     principal: String,
     internal: bool,
     replayed: bool,
+    _authz_write_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 async fn begin_index_mutation(
@@ -36,6 +37,7 @@ async fn begin_index_mutation(
             principal,
             internal: false,
             replayed: false,
+            _authz_write_guard: None,
         });
     }
     let supplied = options
@@ -54,6 +56,14 @@ async fn begin_index_mutation(
     );
     let now = u64::try_from(chrono::Utc::now().timestamp_millis())
         .map_err(|_| Status::internal("index mutation timestamp predates Unix epoch"))?;
+    // Index definition publication and its creator-owner tuple share one
+    // atomic transaction. Hold the tenant authz revision's same-node guard
+    // from snapshot selection through commit so implicit tuple/materializer
+    // traffic cannot repeatedly invalidate this idempotent ensure operation.
+    let authz_write_guard = crate::authz_head::tenant_write_lock(claims.tenant_id)
+        .map_err(|error| Status::internal(error.to_string()))?
+        .lock_owned()
+        .await;
     let handle = state
         .mvcc
         .open_transactions
@@ -103,6 +113,7 @@ async fn begin_index_mutation(
         principal,
         internal: true,
         replayed: matches!(status.state, "committed" | "committing"),
+        _authz_write_guard: Some(authz_write_guard),
     })
 }
 
