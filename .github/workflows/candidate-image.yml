@@ -1,0 +1,123 @@
+name: Publish candidate image
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Exact 40-character source commit to build
+        required: true
+        type: string
+      image_tag:
+        description: Candidate tag, for example v0.4.1-worka-v0.1.0-rc9-amd64
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: anvil-candidate-image-${{ inputs.image_tag }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TARGET_DIR: /home/github-runner/.cache/anvil/cargo-target
+
+jobs:
+  publish-amd64:
+    name: Build and publish linux/amd64
+    runs-on: [self-hosted, linux, x64, worka-builder-2]
+    timeout-minutes: 90
+    steps:
+      - name: Checkout trusted workflow revision
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Validate requested source and tag
+        id: candidate
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          SOURCE_BRANCH: worka/v0.1.0-anvil-rc9
+        run: |
+          set -euo pipefail
+          if [[ ! "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "source_commit must be an exact lowercase 40-character Git SHA" >&2
+            exit 1
+          fi
+          if [[ ! "$IMAGE_TAG" =~ ^v[0-9A-Za-z][0-9A-Za-z._-]{0,126}-amd64$ ]]; then
+            echo "image_tag must be a v-prefixed Docker tag ending in -amd64" >&2
+            exit 1
+          fi
+          git fetch --no-tags --depth=256 origin \
+            "refs/heads/${SOURCE_BRANCH}:refs/remotes/origin/${SOURCE_BRANCH}"
+          git merge-base --is-ancestor \
+            "$SOURCE_COMMIT" "refs/remotes/origin/${SOURCE_BRANCH}"
+          git checkout --detach "$SOURCE_COMMIT"
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          printf 'image=ghcr.io/%s:%s\n' \
+            "${GITHUB_REPOSITORY,,}" "$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            cmake \
+            libclang-dev \
+            pkg-config \
+            libssl-dev \
+            protobuf-compiler
+
+      - name: Build candidate image
+        env:
+          ANVIL_IMAGE: ${{ steps.candidate.outputs.image }}
+          ANVIL_DOCKER_PLATFORM: linux/amd64
+          ANVIL_RUNTIME_BASE: debian:trixie-slim
+          ANVIL_BUILD_PROFILE: release
+          ANVIL_USE_NATIVE_CARGO: "1"
+          CARGO_BUILD_JOBS: "8"
+        run: ./scripts/build-image.sh
+
+      - name: Smoke check image binaries
+        env:
+          IMAGE: ${{ steps.candidate.outputs.image }}
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect "$IMAGE" --format '{{.Os}}/{{.Architecture}}')" = "linux/amd64"
+          timeout 30s docker run --platform linux/amd64 --rm "$IMAGE" anvil-server --version
+          timeout 30s docker run --platform linux/amd64 --rm "$IMAGE" anvil --version
+          timeout 30s docker run --platform linux/amd64 --rm "$IMAGE" anvil-admin --version
+
+      - name: Authenticate to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish immutable candidate
+        id: publish
+        shell: bash
+        env:
+          IMAGE: ${{ steps.candidate.outputs.image }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          docker push "$IMAGE"
+          digest="$(docker image inspect "$IMAGE" --format '{{index .RepoDigests 0}}')"
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+          {
+            printf '### Candidate image\n\n'
+            printf -- '- Source: `%s`\n' "$SOURCE_COMMIT"
+            printf -- '- Image: `%s`\n' "$IMAGE"
+            printf -- '- Digest: `%s`\n' "$digest"
+            printf -- '- Platform: `linux/amd64`\n'
+          } >> "$GITHUB_STEP_SUMMARY"
