@@ -286,7 +286,13 @@ impl MvccSubsystem {
             }
         };
         if !satisfied {
-            bail!("MVCC transaction predicate is false at its snapshot");
+            bail!(
+                "MVCC transaction predicate is false at its snapshot: transaction_id={} \
+                 table_id={} application_key={} predicate={kind:?} snapshot_version={snapshot}",
+                transaction_id,
+                key.table_id,
+                hex::encode(&key.application_key),
+            );
         }
         self.open_transactions.add_predicate(
             transaction_id,

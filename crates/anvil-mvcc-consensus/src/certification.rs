@@ -488,6 +488,37 @@ mod tests {
     }
 
     #[test]
+    fn absent_predicate_accepts_a_visible_tombstone_version() {
+        let key = LogicalKeyHash(hash(6));
+        let other = LogicalKeyHash(hash(7));
+        let mut state = CertificationState::new([1; 32]).unwrap();
+
+        let mut delete = command(1);
+        delete.written_point_keys = vec![key];
+        delete.written_points = vec![WrittenPoint {
+            key,
+            value_hash: None,
+        }];
+        state.apply(CommitVersion(1), &delete).unwrap();
+
+        let mut recreate = command(2);
+        recreate.predicates = vec![ExplicitPredicate {
+            key,
+            kind: PredicateKind::Absent,
+            observed_version: Some(CommitVersion(1)),
+        }];
+        recreate.written_point_keys = vec![other];
+        recreate.written_points = vec![WrittenPoint {
+            key: other,
+            value_hash: Some(hash(8)),
+        }];
+        assert!(matches!(
+            state.apply(CommitVersion(2), &recreate).unwrap(),
+            CertificationResult::Committed { .. }
+        ));
+    }
+
+    #[test]
     fn range_phantom_aborts() {
         let range = RangeConflictKey(hash(7));
         let mut state = CertificationState::new([1; 32]).unwrap();
