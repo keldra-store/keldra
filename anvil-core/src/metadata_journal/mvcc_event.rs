@@ -6,7 +6,8 @@ use anyhow::bail;
 use serde::{Deserialize, Serialize};
 
 const METADATA_HEAD_SCHEMA: &str = "anvil.object-metadata.journal-head.v2";
-const METADATA_EVENT_SCHEMA: &str = "anvil.object-metadata.journal-event.v2";
+pub(super) const METADATA_EVENT_SCHEMA: &str = "anvil.object-metadata.journal-event.v2";
+pub(super) const COMMITTED_METADATA_EVENT_SCHEMA: &str = "anvil.object-metadata.journal-event.v3";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct MetadataJournalHead {
@@ -17,7 +18,7 @@ pub(super) struct MetadataJournalHead {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct MetadataJournalEvent {
-    schema: String,
+    pub(super) schema: String,
     pub partition_sequence: u64,
     pub previous_event_hash: String,
     pub event_hash: String,
@@ -25,6 +26,38 @@ pub(super) struct MetadataJournalEvent {
     pub record_kind: String,
     pub payload_ref: String,
     pub payload: Vec<u8>,
+}
+
+pub(crate) fn committed_event_mutations(
+    bucket: &Bucket,
+    entry: &crate::object_journal_commit::ObjectJournalCommitEntry,
+    cursor: u64,
+) -> Result<Vec<ProductMutation>> {
+    let stream_id = object_metadata_stream_id(bucket.tenant_id, bucket.id);
+    let payload_ref = format!(
+        "inline:sha256:{}",
+        hex::encode(hash32(&entry.metadata_payload))
+    );
+    let mutation_id = entry.object.mutation_id.to_string();
+    let event = MetadataJournalEvent {
+        schema: COMMITTED_METADATA_EVENT_SCHEMA.into(),
+        partition_sequence: cursor,
+        previous_event_hash: String::new(),
+        event_hash: committed_event_hash(
+            cursor,
+            &mutation_id,
+            &entry.metadata_record_kind,
+            &payload_ref,
+        ),
+        mutation_id,
+        record_kind: entry.metadata_record_kind.clone(),
+        payload_ref,
+        payload: entry.metadata_payload.clone(),
+    };
+    Ok(vec![ProductMutation::put(
+        stream_logical_key(TABLE_STREAM_RECORD_INDEX_ROW, &stream_id, Some(cursor))?,
+        serde_json::to_vec(&event)?,
+    )])
 }
 
 pub(super) struct MetadataEventPlan {
@@ -144,13 +177,36 @@ pub(super) fn decode_head(payload: &[u8]) -> Result<MetadataJournalHead> {
 
 pub(super) fn decode_event(payload: &[u8]) -> Result<MetadataJournalEvent> {
     let event: MetadataJournalEvent = serde_json::from_slice(payload)?;
-    if event.schema != METADATA_EVENT_SCHEMA
-        || event.partition_sequence == 0
+    if !matches!(
+        event.schema.as_str(),
+        METADATA_EVENT_SCHEMA | COMMITTED_METADATA_EVENT_SCHEMA
+    ) || event.partition_sequence == 0
         || event.payload_ref != format!("inline:sha256:{}", hex::encode(hash32(&event.payload)))
     {
         bail!("object metadata journal event is invalid");
     }
     Ok(event)
+}
+
+pub(super) fn validate_committed_events(events: &[MetadataJournalEvent]) -> Result<()> {
+    let mut previous_sequence = 0;
+    for event in events {
+        if event.schema != COMMITTED_METADATA_EVENT_SCHEMA
+            || event.partition_sequence <= previous_sequence
+            || !event.previous_event_hash.is_empty()
+            || event.event_hash
+                != committed_event_hash(
+                    event.partition_sequence,
+                    &event.mutation_id,
+                    &event.record_kind,
+                    &event.payload_ref,
+                )
+        {
+            bail!("object metadata committed event facts are invalid or unordered");
+        }
+        previous_sequence = event.partition_sequence;
+    }
+    Ok(())
 }
 
 pub(super) fn validate_event_chain(
@@ -189,6 +245,22 @@ fn event_hash(
     hasher.update(METADATA_EVENT_SCHEMA.as_bytes());
     hasher.update(&sequence.to_be_bytes());
     for value in [previous_hash, mutation_id, record_kind, payload_ref] {
+        hasher.update(&(value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn committed_event_hash(
+    cursor: u64,
+    mutation_id: &str,
+    record_kind: &str,
+    payload_ref: &str,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(COMMITTED_METADATA_EVENT_SCHEMA.as_bytes());
+    hasher.update(&cursor.to_be_bytes());
+    for value in [mutation_id, record_kind, payload_ref] {
         hasher.update(&(value.len() as u64).to_be_bytes());
         hasher.update(value.as_bytes());
     }

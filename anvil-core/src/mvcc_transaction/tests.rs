@@ -358,6 +358,43 @@ fn bundle(with_object: bool) -> TransactionBundle {
     builder.build().unwrap()
 }
 
+#[test]
+fn exact_duplicate_physical_payload_evidence_is_coalesced() {
+    let mut builder = TransactionBundleBuilder::new(
+        "cluster",
+        "tx-shared-payload",
+        41,
+        "tenant/1/principal/app",
+        HierarchicalRangeStampScheme::new(),
+    );
+    let manifest = ObjectShardManifestReference {
+        object_hash: test_object_hash(),
+        manifest_hash: format!("sha256:{}", "b".repeat(64)),
+        object_length: 1024,
+        encoding_generation: 1,
+        data_shards: 2,
+        parity_shards: 2,
+        stripe_count: 1,
+    };
+    builder.add_shard_manifest(manifest.clone());
+    builder.add_shard_manifest(manifest);
+
+    let bundle = builder.build().unwrap();
+    assert_eq!(bundle.shard_manifests.len(), 1);
+
+    let mut job_builder = TransactionBundleBuilder::new(
+        "cluster",
+        "tx-shared-job",
+        41,
+        "tenant/1/principal/app",
+        HierarchicalRangeStampScheme::new(),
+    );
+    let job = br#"{"same":"content-addressed-job"}"#.to_vec();
+    job_builder.add_materialisation_job(job.clone());
+    job_builder.add_materialisation_job(job);
+    assert_eq!(job_builder.bundle.materialisation_jobs.len(), 1);
+}
+
 #[tokio::test]
 async fn one_certification_covers_unrelated_tables_and_partitions() {
     let coordinator = TransactionCoordinator::new(

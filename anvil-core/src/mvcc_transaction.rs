@@ -410,6 +410,13 @@ impl TransactionBundle {
                         )?;
                     (job.cluster_id, job.transaction_id)
                 }
+                Some(schema)
+                    if crate::object_journal_commit::ObjectJournalCommitJob::is_schema(schema) =>
+                {
+                    let job =
+                        crate::object_journal_commit::ObjectJournalCommitJob::decode(encoded_job)?;
+                    (job.cluster_id, job.transaction_id)
+                }
                 _ => {
                     let job = crate::object_materialisation::ObjectMaterialisationJob::decode(
                         encoded_job,
@@ -664,7 +671,11 @@ impl TransactionBundleBuilder {
 
     pub fn add_shard_manifest(&mut self, manifest: ObjectShardManifestReference) -> &mut Self {
         self.claim(manifest_resource(&manifest));
-        self.bundle.shard_manifests.push(manifest);
+        // Physical payloads are content addressed. Multiple logical writes in one
+        // transaction may therefore reference the same immutable object.
+        if !self.bundle.shard_manifests.contains(&manifest) {
+            self.bundle.shard_manifests.push(manifest);
+        }
         self
     }
 
@@ -685,7 +696,9 @@ impl TransactionBundleBuilder {
 
     pub fn add_materialisation_job(&mut self, job: Vec<u8>) -> &mut Self {
         self.claim(payload_resource(&job, false));
-        self.bundle.materialisation_jobs.push(job);
+        if !self.bundle.materialisation_jobs.contains(&job) {
+            self.bundle.materialisation_jobs.push(job);
+        }
         self
     }
 

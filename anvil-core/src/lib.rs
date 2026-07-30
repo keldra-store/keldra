@@ -120,6 +120,7 @@ pub mod mvcc_worker_authority;
 pub mod native_idempotency;
 pub mod node_identity;
 pub mod node_signing;
+pub mod object_journal_commit;
 pub mod object_link_finalization_job;
 pub mod object_links;
 pub mod object_manager;

@@ -1,6 +1,5 @@
 use super::*;
 use crate::persistence::ObjectWatchEvent;
-use crate::watch_log;
 
 pub(crate) async fn append_object_mutation_with_permit(
     storage: &Storage,
@@ -135,16 +134,13 @@ async fn append_object_put_mutations_with_permit_inner(
     }
     require_object_metadata_permit(bucket, permit)?;
     let mvcc = mvcc.ok_or_else(|| anyhow!("MVCC staging handle is required"))?;
-    let scope_partition = hex::encode(object_metadata_partition_id(bucket.tenant_id, bucket.id));
     let committed_by_principal = transaction_principal
         .map(str::to_owned)
         .unwrap_or_else(|| object_metadata_partition_principal(bucket));
 
-    let metadata_stream_id = object_metadata_stream_id(bucket.tenant_id, bucket.id);
-    let mut operations = Vec::with_capacity(objects.len() * 16);
-    let mut projection_mutations = Vec::new();
     let mut projection_predicates = Vec::new();
-    let mut watch_events = Vec::with_capacity(objects.len());
+    let mut mutation_fences = std::collections::BTreeMap::new();
+    let mut journal_entries = Vec::with_capacity(objects.len());
     for object in objects {
         let loaded = load_object_projection_snapshot(
             mvcc,
@@ -152,52 +148,38 @@ async fn append_object_put_mutations_with_permit_inner(
             object,
             transaction_principal.map(|principal| (transaction_id, principal)),
         )?;
-        projection_mutations.extend(plan_object_upsert(
-            bucket,
-            object,
-            &loaded.snapshot,
-            transaction_id,
-        )?);
         projection_predicates.extend(loaded.predicates);
-        watch_events.push(object_watch_event(
+        for fence in plan_object_mutation_fences(
             bucket,
             object,
-            ObjectJournalMutation::Put,
-        ));
-        operations.push(CoreMutationOperation::StreamAppend {
-            partition_id: scope_partition.clone(),
-            stream_id: metadata_stream_id.clone(),
-            record_kind: ObjectJournalMutation::Put.object_record_kind().to_string(),
-            payload: encode_object_version_body(&object_version_body(
+            loaded.snapshot.snapshot_version,
+            transaction_id,
+        )? {
+            mutation_fences.insert(fence.key.clone(), fence);
+        }
+        let watch_event = object_watch_event(bucket, object, ObjectJournalMutation::Put);
+        journal_entries.push(crate::object_journal_commit::ObjectJournalCommitEntry {
+            object: object.clone(),
+            metadata_record_kind: ObjectJournalMutation::Put.object_record_kind().to_string(),
+            metadata_payload: encode_object_version_body(&object_version_body(
                 bucket,
                 object,
                 ObjectJournalMutation::Put,
                 permit.fence_token,
             ))?,
-            idempotency_key: Some(format!("object-metadata:{}:put", object.mutation_id)),
+            watch_event,
+            projection_snapshot: Some(loaded.snapshot),
         });
     }
-    let operations = coalesce_coremeta_operations_last_write_wins(operations);
-    let event_plan = plan_metadata_events(
-        mvcc,
-        bucket,
-        operations,
-        transaction_principal.map(|principal| (transaction_id, principal)),
-    )?;
-    let watch_inputs = objects.iter().zip(&watch_events).collect::<Vec<_>>();
-    let watch_plan = watch_log::plan_object_watch_appends(
-        mvcc,
-        bucket,
-        &watch_inputs,
-        transaction_principal.map(|principal| (transaction_id, principal)),
-    )?;
-    let mutations = event_plan.mutations;
+    let journal_job = crate::object_journal_commit::ObjectJournalCommitJob::new(
+        mvcc.cluster_id(),
+        transaction_id,
+        bucket.clone(),
+        journal_entries,
+    )?
+    .canonical_bytes()?;
     let mut predicates = additions.predicates;
-    predicates.push(event_plan.head_predicate);
-    predicates.extend(watch_plan.predicates);
-    let mut mutations = mutations;
-    mutations.extend(watch_plan.mutations);
-    mutations.extend(projection_mutations);
+    let mut mutations = mutation_fences.into_values().collect::<Vec<_>>();
     mutations.append(&mut additions.mutations);
     predicates.extend(projection_predicates);
     if let Some(transaction_principal) = transaction_principal {
@@ -221,6 +203,8 @@ async fn append_object_put_mutations_with_permit_inner(
             mvcc.open_transactions
                 .add_stream_event(transaction_id, event, now_unix_ms)?;
         }
+        mvcc.open_transactions
+            .add_job(transaction_id, journal_job, now_unix_ms)?;
         return Ok(());
     }
     commit_object_metadata_plan(
@@ -231,6 +215,7 @@ async fn append_object_put_mutations_with_permit_inner(
         mutations,
         predicates,
         additions.outbox_events,
+        vec![journal_job],
     )
     .await?;
     Ok(())
@@ -248,56 +233,113 @@ mod active_path_contract {
     }
 }
 
-fn coalesce_coremeta_operations_last_write_wins(
-    operations: Vec<CoreMutationOperation>,
-) -> Vec<CoreMutationOperation> {
-    let mut last_coremeta_operation =
-        std::collections::BTreeMap::<(String, u16, Vec<u8>), usize>::new();
-    for (index, operation) in operations.iter().enumerate() {
-        let key = match operation {
-            CoreMutationOperation::CoreMetaPut {
-                cf,
-                table_id,
-                tuple_key,
-                ..
-            }
-            | CoreMutationOperation::CoreMetaDelete {
-                cf,
-                table_id,
-                tuple_key,
-                ..
-            } => Some((cf.clone(), *table_id, tuple_key.clone())),
-            CoreMutationOperation::StreamAppend { .. } => None,
+#[cfg(test)]
+mod committed_projection_tests {
+    use super::*;
+    use crate::core_store::decode_object_metadata_row;
+    use chrono::Utc;
+
+    #[test]
+    fn committed_object_projection_uses_the_raft_cursor_without_a_foreground_counter_cas() {
+        let bucket = Bucket {
+            id: 11,
+            tenant_id: 7,
+            name: "objects".into(),
+            region: "local".into(),
+            created_at: Utc::now(),
+            is_public_read: false,
         };
-        if let Some(key) = key {
-            last_coremeta_operation.insert(key, index);
+        let version_id = uuid::Uuid::new_v4();
+        let mutation_id = uuid::Uuid::new_v4();
+        let object = Object {
+            id: 1,
+            tenant_id: bucket.tenant_id,
+            bucket_id: bucket.id,
+            key: "leases/a.json".into(),
+            kind: Default::default(),
+            content_hash: "payload-hash".into(),
+            size: 4,
+            etag: "payload-hash".into(),
+            content_type: Some("application/json".into()),
+            version_id,
+            mutation_id,
+            index_policy_snapshot: "policy".into(),
+            user_metadata_hash: "metadata".into(),
+            authz_revision: 1,
+            record_hash: "record".into(),
+            created_at: Utc::now(),
+            deleted_at: None,
+            storage_class: Some("local".into()),
+            user_meta: None,
+            shard_map: None,
+            checksum: None,
+            link: None,
+        };
+        let snapshot = ObjectProjectionSnapshot {
+            snapshot_version: 3,
+            projection_generation: 4,
+            counter_max_id: 3,
+            current: None,
+            original: None,
+            delete_current_successor: None,
+        };
+        let entry = crate::object_journal_commit::ObjectJournalCommitEntry {
+            object: object.clone(),
+            metadata_record_kind: ObjectJournalMutation::Put.object_record_kind().into(),
+            metadata_payload: encode_object_version_body(&object_version_body(
+                &bucket,
+                &object,
+                ObjectJournalMutation::Put,
+                1,
+            ))
+            .unwrap(),
+            watch_event: object_watch_event(&bucket, &object, ObjectJournalMutation::Put),
+            projection_snapshot: Some(snapshot.clone()),
+        };
+        let cursor = crate::object_journal_commit::commit_cursor(9, 0, 0).unwrap();
+        let (committed, mutations) =
+            prepare_committed_entry(&bucket, &entry, cursor, "transaction").unwrap();
+
+        assert_eq!(committed.object.id, i64::try_from(cursor).unwrap());
+        assert_eq!(committed.watch_event.id, i64::try_from(cursor).unwrap());
+        assert_eq!(
+            decode_object_version_body(&committed.metadata_payload)
+                .unwrap()
+                .id,
+            i64::try_from(cursor).unwrap()
+        );
+        let projected = mutations
+            .iter()
+            .filter_map(|mutation| mutation.value.as_deref())
+            .find_map(|payload| decode_object_metadata_row(payload).ok())
+            .expect("committed mutations contain an object projection row");
+        assert_eq!(projected.id, i64::try_from(cursor).unwrap());
+
+        let fences =
+            plan_object_mutation_fences(&bucket, &object, snapshot.snapshot_version, "transaction")
+                .unwrap();
+        assert_eq!(fences.len(), 2);
+        assert_ne!(fences[0].key, fences[1].key);
+        assert_ne!(
+            fences[0].key,
+            object_current_logical_key(&bucket, &object.key).unwrap()
+        );
+        assert_ne!(
+            fences[1].key,
+            object_version_logical_key(&bucket, &object.key, object.version_id).unwrap()
+        );
+        for fence in fences {
+            let fenced = decode_object_metadata_row(
+                fence
+                    .value
+                    .as_deref()
+                    .expect("object mutation fences are certified writes"),
+            )
+            .unwrap();
+            assert_eq!(fenced.mutation_id, object.mutation_id);
+            assert_eq!(fenced.key, object.key);
         }
     }
-
-    operations
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, operation)| {
-            let keep = match &operation {
-                CoreMutationOperation::CoreMetaPut {
-                    cf,
-                    table_id,
-                    tuple_key,
-                    ..
-                }
-                | CoreMutationOperation::CoreMetaDelete {
-                    cf,
-                    table_id,
-                    tuple_key,
-                    ..
-                } => last_coremeta_operation
-                    .get(&(cf.clone(), *table_id, tuple_key.clone()))
-                    .is_some_and(|last_index| *last_index == index),
-                CoreMutationOperation::StreamAppend { .. } => true,
-            };
-            keep.then_some(operation)
-        })
-        .collect()
 }
 
 pub(super) async fn append_object_mutation_inner(
@@ -312,7 +354,6 @@ pub(super) async fn append_object_mutation_inner(
     audit_event: Option<&crate::tenant_audit::TenantAuditEvent>,
 ) -> Result<()> {
     let mvcc_transaction_id = transaction_id;
-    let scope_partition = hex::encode(object_metadata_partition_id(bucket.tenant_id, bucket.id));
     let implicit_transaction_id = format!(
         "object-metadata:{}:{}",
         object.mutation_id,
@@ -329,48 +370,30 @@ pub(super) async fn append_object_mutation_inner(
         object,
         transaction_principal.map(|principal| (transaction_id, principal)),
     )?;
-    let projection_mutations = match mutation {
-        ObjectJournalMutation::Put
-        | ObjectJournalMutation::Copy
-        | ObjectJournalMutation::DeleteMarker => {
-            plan_object_upsert(bucket, object, &loaded.snapshot, transaction_id)?
-        }
-        ObjectJournalMutation::DeleteVersion => {
-            plan_object_delete_version(bucket, object, &loaded.snapshot, transaction_id)?
-        }
-    };
     let projection_predicates = loaded.predicates;
-    let metadata_stream_id = object_metadata_stream_id(bucket.tenant_id, bucket.id);
+    let projection_snapshot = loaded.snapshot;
+    let mut mutations = plan_object_mutation_fences(
+        bucket,
+        object,
+        projection_snapshot.snapshot_version,
+        transaction_id,
+    )?;
     let event = object_watch_event(bucket, object, mutation);
     let object_payload =
         encode_object_version_body(&object_version_body(bucket, object, mutation, fence_token))?;
-    let mut operations = Vec::with_capacity(1);
-    operations.push(CoreMutationOperation::StreamAppend {
-        partition_id: scope_partition.clone(),
-        stream_id: metadata_stream_id.clone(),
-        record_kind: mutation.object_record_kind().to_string(),
-        payload: object_payload,
-        idempotency_key: Some(format!(
-            "object-metadata:{}:{}",
-            object.mutation_id,
-            mutation.event_name()
-        )),
-    });
-    let event_plan = plan_metadata_events(
-        mvcc,
-        bucket,
-        operations,
-        transaction_principal.map(|principal| (transaction_id, principal)),
-    )?;
-    let watch_plan = watch_log::plan_object_watch_appends(
-        mvcc,
-        bucket,
-        &[(object, &event)],
-        transaction_principal.map(|principal| (transaction_id, principal)),
-    )?;
-    let mut mutations = event_plan.mutations;
-    mutations.extend(watch_plan.mutations);
-    mutations.extend(projection_mutations);
+    let journal_job = crate::object_journal_commit::ObjectJournalCommitJob::new(
+        mvcc.cluster_id(),
+        transaction_id,
+        bucket.clone(),
+        vec![crate::object_journal_commit::ObjectJournalCommitEntry {
+            object: object.clone(),
+            metadata_record_kind: mutation.object_record_kind().to_string(),
+            metadata_payload: object_payload,
+            watch_event: event,
+            projection_snapshot: Some(projection_snapshot),
+        }],
+    )?
+    .canonical_bytes()?;
     let mut outbox_events = Vec::new();
     if let Some(audit_event) = audit_event {
         let audit_plan = crate::tenant_audit::tenant_audit_mvcc_plan(
@@ -381,8 +404,7 @@ pub(super) async fn append_object_mutation_inner(
         mutations.extend(audit_plan.mutations);
         outbox_events.extend(audit_plan.outbox_events);
     }
-    let mut predicates = vec![event_plan.head_predicate];
-    predicates.extend(watch_plan.predicates);
+    let mut predicates = Vec::new();
     predicates.extend(projection_predicates);
     if mvcc_transaction_id.is_some() {
         let transaction_principal = transaction_principal
@@ -400,6 +422,11 @@ pub(super) async fn append_object_mutation_inner(
                 u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
             )?;
         }
+        mvcc.open_transactions.add_job(
+            transaction_id,
+            journal_job,
+            u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+        )?;
         let now_unix_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default();
         for (key, kind) in predicates {
             mvcc.stage_predicate(
@@ -420,9 +447,59 @@ pub(super) async fn append_object_mutation_inner(
         mutations,
         predicates,
         outbox_events,
+        vec![journal_job],
     )
     .await?;
     Ok(())
+}
+
+pub(crate) fn prepare_committed_entry(
+    bucket: &Bucket,
+    entry: &crate::object_journal_commit::ObjectJournalCommitEntry,
+    cursor: u64,
+    transaction_id: &str,
+) -> Result<(
+    crate::object_journal_commit::ObjectJournalCommitEntry,
+    Vec<crate::mvcc_product::ProductMutation>,
+)> {
+    if entry.projection_snapshot.is_none() {
+        return Ok((entry.clone(), Vec::new()));
+    }
+    let committed_id =
+        i64::try_from(cursor).context("object journal cursor exceeds committed object ID range")?;
+    let mut committed = entry.clone();
+    committed.object.id = committed_id;
+    committed.watch_event.id = committed_id;
+
+    let mut body = decode_object_version_body(&committed.metadata_payload)?;
+    if body.tenant_id != bucket.tenant_id
+        || body.bucket_id != bucket.id
+        || body.object_key != committed.object.key
+        || body.version_id != committed.object.version_id.to_string()
+        || body.mutation_id != committed.object.mutation_id.to_string()
+    {
+        bail!("object journal commit metadata payload scope mismatch");
+    }
+    body.id = committed_id;
+    committed.metadata_payload = encode_object_version_body(&body)?;
+
+    let mut snapshot = committed
+        .projection_snapshot
+        .clone()
+        .expect("projection presence checked above");
+    snapshot.projection_generation = cursor;
+    snapshot.counter_max_id = committed_id;
+    let projection_mutations = match ObjectJournalMutation::from_event_name(&body.event)? {
+        ObjectJournalMutation::Put
+        | ObjectJournalMutation::Copy
+        | ObjectJournalMutation::DeleteMarker => {
+            plan_object_upsert(bucket, &committed.object, &snapshot, transaction_id)?
+        }
+        ObjectJournalMutation::DeleteVersion => {
+            plan_object_delete_version(bucket, &committed.object, &snapshot, transaction_id)?
+        }
+    };
+    Ok((committed, projection_mutations))
 }
 
 async fn commit_object_metadata_plan(
@@ -436,6 +513,7 @@ async fn commit_object_metadata_plan(
         crate::mvcc_transaction::PredicateKind,
     )>,
     outbox_events: Vec<crate::mvcc_outbox::StreamOutboxEvent>,
+    materialisation_jobs: Vec<Vec<u8>>,
 ) -> Result<()> {
     let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default();
     let handle = mvcc
@@ -464,6 +542,10 @@ async fn commit_object_metadata_plan(
     for event in outbox_events {
         mvcc.open_transactions
             .add_stream_event(&handle.transaction_id, event, now)?;
+    }
+    for job in materialisation_jobs {
+        mvcc.open_transactions
+            .add_job(&handle.transaction_id, job, now)?;
     }
     let outcome = mvcc
         .open_transactions

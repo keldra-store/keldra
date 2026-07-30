@@ -982,6 +982,73 @@ fn materialisation_leases_retry_and_recover_after_expiry() {
 }
 
 #[test]
+fn materialisation_claims_oldest_snapshot_before_newer_hot_key_work() {
+    let temp = tempdir().unwrap();
+    let store = MvccStore::open(temp.path()).unwrap();
+    let job = |transaction_id: &str, snapshot: u64| ObjectMaterialisationJob {
+        schema: ObjectMaterialisationJob::SCHEMA.into(),
+        cluster_id: "cluster".into(),
+        transaction_id: transaction_id.into(),
+        tenant_id: 1,
+        bucket_id: 2,
+        bucket_name: "bucket".into(),
+        object_key: format!("objects/{transaction_id}"),
+        object_version_id: format!("version-{transaction_id}"),
+        target_logical_identity: format!(
+            "tenant/1/bucket/2/object/objects/{transaction_id}/version/version-{transaction_id}"
+        ),
+        representation: serde_json::json!({"schema": "local"}),
+        content_hash: format!("sha256:{transaction_id}"),
+        payload_length: 3,
+        frozen_object: serde_json::json!({
+            "version_id": format!("version-{transaction_id}"),
+            "content_hash": format!("sha256:{transaction_id}"),
+            "size": 3,
+        }),
+        source_manifest_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+            .into(),
+        content_type: Some("application/json".into()),
+        user_metadata: serde_json::json!({}),
+        index_policy_snapshot: serde_json::json!({}),
+        originating_snapshot_version: snapshot,
+        frozen_index_definitions: Vec::new(),
+        authz_revision: 1,
+        boundary_schema: None,
+        boundary_schema_generation: 0,
+        boundary_schema_hash: None,
+        requested_operations: crate::object_materialisation::ObjectMaterialisationOperations {
+            extract_boundaries: true,
+            maintain_indexes: true,
+        },
+        requested_at_unix_ms: snapshot,
+    };
+    let older = job("older", 10);
+    let newer = job("newer", 20);
+    store
+        .apply_certified_bundle(
+            1,
+            &bundle("older", |builder| {
+                builder.add_materialisation_job(older.canonical_bytes().unwrap());
+            }),
+        )
+        .unwrap();
+    store
+        .apply_certified_bundle(
+            2,
+            &bundle("newer", |builder| {
+                builder.add_materialisation_job(newer.canonical_bytes().unwrap());
+            }),
+        )
+        .unwrap();
+
+    let (_, claimed) = store
+        .claim_object_materialisation("worker", 100, 10)
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.job.transaction_id, "older");
+}
+
+#[test]
 fn rejects_a_bundle_from_another_cluster_before_writing() {
     let temp = tempdir().unwrap();
     let store = MvccStore::open(temp.path()).unwrap();

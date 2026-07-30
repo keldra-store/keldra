@@ -17,6 +17,7 @@ const OBJECT_WATCH_RECORD_KIND: u16 = 1;
 const OBJECT_WATCH_PAGE_MAX: usize = 1_000;
 const OBJECT_WATCH_HEAD_SCHEMA: &str = "anvil.object-watch.head.v2";
 const OBJECT_WATCH_EVENT_SCHEMA: &str = "anvil.object-watch.event.v2";
+const COMMITTED_OBJECT_WATCH_EVENT_SCHEMA: &str = "anvil.object-watch.event.v3";
 const OBJECT_WATCH_RECEIPT_SCHEMA: &str = "anvil.object-watch.receipt.v2";
 
 #[derive(Debug, Clone)]
@@ -98,6 +99,56 @@ pub struct ObjectWatchEventPage {
 pub(crate) struct ObjectWatchPlan {
     pub mutations: Vec<ProductMutation>,
     pub predicates: Vec<(LogicalKey, PredicateKind)>,
+}
+
+pub(crate) fn committed_event_mutations(
+    bucket: &Bucket,
+    object: &Object,
+    event: &ObjectWatchEvent,
+    cursor: u64,
+) -> Result<Vec<ProductMutation>> {
+    validate_event_scope(bucket, object, event)?;
+    let stream_id = object_watch_stream_id(bucket.tenant_id, bucket.id);
+    let record = object_watch_record(bucket, object, event, cursor)?.encode();
+    let payload_ref = format!("inline:sha256:{}", hex::encode(hash32(&record)));
+    let event_hash = committed_watch_event_hash(cursor, object.mutation_id, &payload_ref);
+    let envelope = ObjectWatchEnvelope {
+        schema: COMMITTED_OBJECT_WATCH_EVENT_SCHEMA.into(),
+        sequence: cursor,
+        previous_event_hash: String::new(),
+        event_hash: event_hash.clone(),
+        mutation_id: object.mutation_id.to_string(),
+        payload_ref,
+        record,
+    };
+    let receipt = ObjectWatchReceiptRow {
+        schema: OBJECT_WATCH_RECEIPT_SCHEMA.into(),
+        stream_id: stream_id.clone(),
+        sequence: cursor,
+        mutation_id: object.mutation_id.to_string(),
+        event_type: event.event_type.clone(),
+        event_hash,
+    };
+    let receipt_payload = serde_json::to_vec(&receipt)?;
+    Ok(vec![
+        ProductMutation::put(
+            stream_logical_key(TABLE_STREAM_RECORD_INDEX_ROW, &stream_id, Some(cursor))?,
+            serde_json::to_vec(&envelope)?,
+        ),
+        ProductMutation::put(
+            latest_receipt_key(bucket.tenant_id, bucket.id, object.version_id)?,
+            receipt_payload.clone(),
+        ),
+        ProductMutation::put(
+            exact_receipt_key(
+                bucket.tenant_id,
+                bucket.id,
+                object.version_id,
+                object.mutation_id,
+            )?,
+            receipt_payload,
+        ),
+    ])
 }
 
 /// Plan one or more contiguous watch records against the same fixed transaction
@@ -257,20 +308,21 @@ pub(crate) fn committed_object_watch_receipt_at_snapshot(
         .read_at(&event_key, snapshot)?
         .ok_or_else(|| anyhow!("object watch receipt has no immutable event row"))?;
     let envelope = decode_envelope(&event_row.value)?;
-    let previous_hash = if receipt.sequence == 1 {
-        String::new()
-    } else {
-        let previous_key = stream_logical_key(
-            TABLE_STREAM_RECORD_INDEX_ROW,
-            &receipt.stream_id,
-            Some(receipt.sequence - 1),
-        )?;
-        mvcc.runtime
-            .read_at(&previous_key, snapshot)?
-            .map(|row| decode_envelope(&row.value).map(|previous| previous.event_hash))
-            .transpose()?
-            .ok_or_else(|| anyhow!("object watch receipt event chain is incomplete"))?
-    };
+    let previous_hash =
+        if envelope.schema == COMMITTED_OBJECT_WATCH_EVENT_SCHEMA || receipt.sequence == 1 {
+            String::new()
+        } else {
+            let previous_key = stream_logical_key(
+                TABLE_STREAM_RECORD_INDEX_ROW,
+                &receipt.stream_id,
+                Some(receipt.sequence - 1),
+            )?;
+            mvcc.runtime
+                .read_at(&previous_key, snapshot)?
+                .map(|row| decode_envelope(&row.value).map(|previous| previous.event_hash))
+                .transpose()?
+                .ok_or_else(|| anyhow!("object watch receipt event chain is incomplete"))?
+        };
     validate_envelope(&envelope, receipt.sequence, &previous_hash)?;
     if envelope.event_hash != receipt.event_hash {
         bail!("object watch receipt event hash mismatch");
@@ -392,13 +444,23 @@ pub fn latest_object_watch_stream_cursor(
         &object_watch_stream_id(tenant_id, bucket_id),
         None,
     )?;
-    Ok(mvcc
+    if let Some(head) = mvcc
         .runtime
         .read_at(&key, snapshot)?
         .map(|row| decode_head(&row.value))
         .transpose()?
-        .map(|head| head.last_sequence)
-        .unwrap_or(0))
+    {
+        return Ok(head.last_sequence);
+    }
+    let stream_id = object_watch_stream_id(tenant_id, bucket_id);
+    let prefix =
+        stream_logical_key(TABLE_STREAM_RECORD_INDEX_ROW, &stream_id, None)?.application_key;
+    mvcc.runtime
+        .scan_table_prefix_at(TABLE_STREAM_RECORD_INDEX_ROW, &prefix, snapshot)?
+        .into_iter()
+        .map(|(key, _)| sequence_from_event_key(&key, &prefix))
+        .collect::<Result<Vec<_>>>()
+        .map(|sequences| sequences.into_iter().max().unwrap_or(0))
 }
 
 pub fn list_object_watch_event_page(
@@ -438,13 +500,11 @@ pub fn list_object_watch_event_page_at_snapshot(
     let after_sequence = u64::try_from(after_cursor)?;
     let stream_id = object_watch_stream_id(tenant_id, bucket_id);
     let head_key = stream_logical_key(TABLE_STREAM_HEAD_ROW, &stream_id, None)?;
-    let head = mvcc
+    let legacy_head = mvcc
         .runtime
         .read_at(&head_key, snapshot)?
         .map(|row| decode_head(&row.value))
-        .transpose()?
-        .map(|head| head.last_sequence)
-        .unwrap_or(0);
+        .transpose()?;
     let event_prefix =
         stream_logical_key(TABLE_STREAM_RECORD_INDEX_ROW, &stream_id, None)?.application_key;
     let mut rows = mvcc.runtime.scan_table_prefix_at(
@@ -459,7 +519,10 @@ pub fn list_object_watch_event_page_at_snapshot(
     rows.truncate(limit);
     let mut events = Vec::with_capacity(rows.len());
     let mut next_sequence = after_sequence;
-    let mut expected_previous_hash = if after_sequence == 0 {
+    let mut expected_previous_hash = if legacy_head
+        .as_ref()
+        .is_none_or(|head| after_sequence == 0 || after_sequence > head.last_sequence)
+    {
         String::new()
     } else {
         let previous_key = stream_logical_key(
@@ -475,10 +538,12 @@ pub fn list_object_watch_event_page_at_snapshot(
     };
     for (key, row) in rows {
         let sequence = sequence_from_event_key(&key, &event_prefix)?;
-        if sequence != next_sequence.saturating_add(1) {
+        let envelope = decode_envelope(&row.value)?;
+        if envelope.schema == OBJECT_WATCH_EVENT_SCHEMA
+            && sequence != next_sequence.saturating_add(1)
+        {
             bail!("object watch MVCC event sequence is discontinuous");
         }
-        let envelope = decode_envelope(&row.value)?;
         validate_envelope(&envelope, sequence, &expected_previous_hash)?;
         let (mut record, used) = WatchRecord::decode(&envelope.record)?;
         if used != envelope.record.len() {
@@ -494,14 +559,18 @@ pub fn list_object_watch_event_page_at_snapshot(
                 payload,
             )?);
         }
-        expected_previous_hash = envelope.event_hash;
+        expected_previous_hash = if envelope.schema == OBJECT_WATCH_EVENT_SCHEMA {
+            envelope.event_hash
+        } else {
+            String::new()
+        };
         next_sequence = sequence;
     }
     Ok(ObjectWatchEventPage {
         events,
         next_cursor: i64::try_from(next_sequence)
             .map_err(|_| anyhow!("object watch cursor exceeds i64"))?,
-        has_more: has_more && next_sequence < head,
+        has_more,
         snapshot_version: snapshot,
     })
 }
@@ -518,7 +587,10 @@ fn decode_head(payload: &[u8]) -> Result<ObjectWatchHead> {
 
 fn decode_envelope(payload: &[u8]) -> Result<ObjectWatchEnvelope> {
     let event: ObjectWatchEnvelope = serde_json::from_slice(payload)?;
-    if event.schema != OBJECT_WATCH_EVENT_SCHEMA {
+    if !matches!(
+        event.schema.as_str(),
+        OBJECT_WATCH_EVENT_SCHEMA | COMMITTED_OBJECT_WATCH_EVENT_SCHEMA
+    ) {
         bail!("object watch MVCC event schema mismatch");
     }
     Ok(event)
@@ -529,16 +601,18 @@ fn validate_envelope(
     sequence: u64,
     previous_hash: &str,
 ) -> Result<()> {
+    let mutation_id = uuid::Uuid::parse_str(&event.mutation_id)?;
+    let expected_hash = if event.schema == COMMITTED_OBJECT_WATCH_EVENT_SCHEMA {
+        committed_watch_event_hash(sequence, mutation_id, &event.payload_ref)
+    } else {
+        watch_event_hash(sequence, previous_hash, mutation_id, &event.payload_ref)
+    };
     if event.sequence != sequence
-        || event.previous_event_hash != previous_hash
+        || (event.schema == OBJECT_WATCH_EVENT_SCHEMA && event.previous_event_hash != previous_hash)
+        || (event.schema == COMMITTED_OBJECT_WATCH_EVENT_SCHEMA
+            && !event.previous_event_hash.is_empty())
         || event.payload_ref != format!("inline:sha256:{}", hex::encode(hash32(&event.record)))
-        || event.event_hash
-            != watch_event_hash(
-                sequence,
-                previous_hash,
-                uuid::Uuid::parse_str(&event.mutation_id)?,
-                &event.payload_ref,
-            )
+        || event.event_hash != expected_hash
     {
         bail!("object watch MVCC event hash chain is invalid");
     }
@@ -626,6 +700,15 @@ fn watch_event_hash(
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&sequence.to_be_bytes());
     bytes.extend_from_slice(previous_hash.as_bytes());
+    bytes.extend_from_slice(mutation_id.as_bytes());
+    bytes.extend_from_slice(payload_ref.as_bytes());
+    hex::encode(hash32(&bytes))
+}
+
+fn committed_watch_event_hash(cursor: u64, mutation_id: uuid::Uuid, payload_ref: &str) -> String {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(COMMITTED_OBJECT_WATCH_EVENT_SCHEMA.as_bytes());
+    bytes.extend_from_slice(&cursor.to_be_bytes());
     bytes.extend_from_slice(mutation_id.as_bytes());
     bytes.extend_from_slice(payload_ref.as_bytes());
     hex::encode(hash32(&bytes))

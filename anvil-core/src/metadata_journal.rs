@@ -1967,7 +1967,7 @@ pub(crate) use self::mvcc_projection::{
     read_metadata_product_at, read_metadata_product_latest,
 };
 
-mod mvcc_event;
+pub(crate) mod mvcc_event;
 use self::mvcc_event::*;
 
 mod object_mutation;
@@ -1975,14 +1975,16 @@ pub(crate) use self::object_mutation::{
     append_object_mutation_with_permit, append_object_mutation_with_permit_in_transaction,
     append_object_mutation_with_permit_in_transaction_and_audit,
     append_object_put_mutations_with_permit_in_transaction,
-    commit_object_put_mutations_with_permit,
+    commit_object_put_mutations_with_permit, prepare_committed_entry,
 };
 
 mod object_projection;
 pub(crate) use self::object_projection::{
     ObjectProjectionSnapshot, ObjectVersionSnapshot, load_object_projection_snapshot,
-    object_current_logical_key, object_id_counter_logical_key, object_version_logical_key,
-    plan_object_delete_version, plan_object_upsert,
+    object_current_logical_key, object_current_mutation_fence_logical_key,
+    object_id_counter_logical_key, object_version_logical_key,
+    object_version_mutation_fence_logical_key, plan_object_delete_version,
+    plan_object_mutation_fences, plan_object_upsert,
 };
 
 mod version_sort;

@@ -5,22 +5,23 @@ use crate::core_store::{
     decode_object_metadata_row_with_generation, encode_object_metadata_counter_at_generation,
     encode_object_metadata_row_at_generation_for_transaction,
     encode_object_metadata_row_at_generation_with_delete_marker_for_transaction,
-    object_current_history_key, object_current_key, object_current_page_key_for_object,
-    object_id_counter_key, object_key_catalog_key, object_version_catalog_key,
-    object_version_history_key, object_version_id_key, object_version_key,
-    object_version_page_key_for_object, object_version_page_prefix,
+    object_current_history_key, object_current_key, object_current_mutation_fence_key,
+    object_current_page_key_for_object, object_id_counter_key, object_key_catalog_key,
+    object_version_catalog_key, object_version_history_key, object_version_id_key,
+    object_version_key, object_version_mutation_fence_key, object_version_page_key_for_object,
+    object_version_page_prefix,
 };
 use crate::mvcc_product::{ProductMutation, coremeta_logical_key};
 use crate::mvcc_transaction::{LogicalKey, PredicateKind, WriteOperation};
 use anyhow::bail;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ObjectVersionSnapshot {
     pub object: Object,
     pub row_generation: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ObjectProjectionSnapshot {
     pub snapshot_version: u64,
     pub projection_generation: u64,
@@ -53,25 +54,27 @@ pub(crate) fn load_object_projection_snapshot(
         .unwrap_or(mvcc.runtime.applied_version()?);
     let current_key = object_current_logical_key(bucket, &object.key)?;
     let original_key = object_version_logical_key(bucket, &object.key, object.version_id)?;
-    let counter_key = object_id_counter_logical_key(bucket)?;
+    let current_fence_key = object_current_mutation_fence_logical_key(bucket, &object.key)?;
+    let version_fence_key =
+        object_version_mutation_fence_logical_key(bucket, &object.key, object.version_id)?;
     let mut predicates = Vec::new();
-    let current_payload = read_observed(
+    let current_payload = read_snapshot_value(mvcc, &current_key, snapshot_version, transaction)?;
+    let original_payload = read_snapshot_value(mvcc, &original_key, snapshot_version, transaction)?;
+    // Cursor-dependent projection rows are derived only after compact-Raft
+    // assigns the commit version, so their hashes do not cross the
+    // certification boundary. Predicate on ordinary MVCC fence rows instead:
+    // every mutation writes both fences before certification, preserving
+    // exact per-object CAS without a bucket-wide counter or global lock.
+    read_observed(
         mvcc,
-        &current_key,
+        &current_fence_key,
         snapshot_version,
         transaction,
         &mut predicates,
     )?;
-    let original_payload = read_observed(
+    read_observed(
         mvcc,
-        &original_key,
-        snapshot_version,
-        transaction,
-        &mut predicates,
-    )?;
-    let counter_payload = read_observed(
-        mvcc,
-        &counter_key,
+        &version_fence_key,
         snapshot_version,
         transaction,
         &mut predicates,
@@ -88,23 +91,11 @@ pub(crate) fn load_object_projection_snapshot(
             object,
             row_generation,
         });
-    let counter_max_id = counter_payload
-        .as_deref()
-        .map(|payload| decode_object_metadata_max_id(payload, bucket))
-        .transpose()?
-        .unwrap_or(0);
     let delete_current_successor = if current
         .as_ref()
         .is_some_and(|current| current.version_id == object.version_id)
     {
-        latest_surviving_version(
-            mvcc,
-            bucket,
-            object,
-            snapshot_version,
-            transaction,
-            &mut predicates,
-        )?
+        latest_surviving_version(mvcc, bucket, object, snapshot_version, transaction)?
     } else {
         None
     };
@@ -112,13 +103,29 @@ pub(crate) fn load_object_projection_snapshot(
         snapshot: ObjectProjectionSnapshot {
             snapshot_version,
             projection_generation: snapshot_version.saturating_add(1).max(1),
-            counter_max_id,
+            // The legacy bucket-wide counter is now a commit-time derived
+            // projection. Reading it in every foreground transaction made
+            // unrelated object keys certify against one shared row.
+            counter_max_id: 0,
             current,
             original,
             delete_current_successor,
         },
         predicates,
     })
+}
+
+fn read_snapshot_value(
+    mvcc: &crate::mvcc_bootstrap::MvccSubsystem,
+    key: &LogicalKey,
+    snapshot: u64,
+    transaction: Option<(&str, &str)>,
+) -> Result<Option<Vec<u8>>> {
+    if let Some((transaction_id, principal)) = transaction {
+        mvcc.read_transaction_value(transaction_id, principal, key)
+    } else {
+        Ok(mvcc.runtime.read_at(key, snapshot)?.map(|row| row.value))
+    }
 }
 
 fn read_observed(
@@ -148,7 +155,6 @@ fn latest_surviving_version(
     deletion: &Object,
     snapshot: u64,
     transaction: Option<(&str, &str)>,
-    predicates: &mut Vec<(LogicalKey, PredicateKind)>,
 ) -> Result<Option<Object>> {
     let application_prefix = crate::mvcc_product::coremeta_application_prefix(
         CF_OBJECT_VERSIONS,
@@ -207,6 +213,52 @@ pub(crate) fn object_version_logical_key(
         TABLE_OBJECT_VERSION_META_ROW,
         &object_version_key(bucket, object_key, version_id),
     )
+}
+
+pub(crate) fn object_current_mutation_fence_logical_key(
+    bucket: &Bucket,
+    object_key: &str,
+) -> Result<crate::mvcc_transaction::LogicalKey> {
+    coremeta_logical_key(
+        CF_OBJECT_VERSIONS,
+        TABLE_OBJECT_VERSION_META_ROW,
+        &object_current_mutation_fence_key(bucket, object_key),
+    )
+}
+
+pub(crate) fn object_version_mutation_fence_logical_key(
+    bucket: &Bucket,
+    object_key: &str,
+    version_id: uuid::Uuid,
+) -> Result<crate::mvcc_transaction::LogicalKey> {
+    coremeta_logical_key(
+        CF_OBJECT_VERSIONS,
+        TABLE_OBJECT_VERSION_META_ROW,
+        &object_version_mutation_fence_key(bucket, object_key, version_id),
+    )
+}
+
+pub(crate) fn plan_object_mutation_fences(
+    bucket: &Bucket,
+    object: &Object,
+    snapshot_version: u64,
+    transaction_id: &str,
+) -> Result<Vec<ProductMutation>> {
+    let payload = encode_object_metadata_row_at_generation_for_transaction(
+        object,
+        snapshot_version,
+        transaction_id,
+    )?;
+    Ok(vec![
+        ProductMutation::put(
+            object_current_mutation_fence_logical_key(bucket, &object.key)?,
+            payload.clone(),
+        ),
+        ProductMutation::put(
+            object_version_mutation_fence_logical_key(bucket, &object.key, object.version_id)?,
+            payload,
+        ),
+    ])
 }
 
 pub(crate) fn object_id_counter_logical_key(

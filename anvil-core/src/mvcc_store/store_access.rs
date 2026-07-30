@@ -412,8 +412,47 @@ impl MvccStore {
         let meta_cf = self.cf(CF_META)?;
         let materialisation_cf = self.cf(CF_MATERIALISATION)?;
         let outbox_cf = self.cf(CF_OUTBOX)?;
+        let mut committed_writes = bundle.writes.clone();
+        // Object projection facts are derived in canonical job/entry order at
+        // apply time. Multiple mutations in one certified transaction may
+        // intentionally advance the same projection row; retain the final
+        // derived value without masking overlap with an explicitly certified
+        // bundle write (the duplicate check below still rejects that).
+        let mut committed_object_writes = BTreeMap::new();
+        let mut journal_job_ordinal = 0;
+        for encoded_job in &bundle.materialisation_jobs {
+            let schema = serde_json::from_slice::<serde_json::Value>(encoded_job)?
+                .get("schema")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            if !schema
+                .as_deref()
+                .is_some_and(crate::object_journal_commit::ObjectJournalCommitJob::is_schema)
+            {
+                continue;
+            }
+            let job = crate::object_journal_commit::ObjectJournalCommitJob::decode(encoded_job)?;
+            for mutation in job.committed_mutations(commit_version, journal_job_ordinal)? {
+                let write = match mutation.value {
+                    Some(value) => WriteOperation::Put {
+                        key: mutation.key,
+                        value,
+                    },
+                    None => WriteOperation::Delete { key: mutation.key },
+                };
+                committed_object_writes.insert(write.key().clone(), write);
+            }
+            journal_job_ordinal += 1;
+        }
+        committed_writes.extend(committed_object_writes.into_values());
+        committed_writes.sort_by(|left, right| left.key().cmp(right.key()));
+        for pair in committed_writes.windows(2) {
+            if pair[0].key() == pair[1].key() {
+                bail!("certified bundle derives duplicate committed object journal keys");
+            }
+        }
         let mut batch = WriteBatch::default();
-        for write in &bundle.writes {
+        for write in &committed_writes {
             let key = write.key();
             let logical_key = self.key(&encode_logical_key(key)?);
             let versioned_key = self.key(&encode_versioned_key(key, commit_version)?);
@@ -536,6 +575,14 @@ impl MvccStore {
                     bail!("Hugging Face ingestion postcommit job identity collision");
                 }
                 batch.put_cf(materialisation_cf, key, record);
+                continue;
+            }
+            if schema
+                .as_deref()
+                .is_some_and(crate::object_journal_commit::ObjectJournalCommitJob::is_schema)
+            {
+                // Object journal facts were installed into this same RocksDB
+                // batch above using the Raft-assigned commit version.
                 continue;
             }
             if schema.as_deref() == Some(ObjectLinkFinalizationJob::SCHEMA) {

@@ -68,7 +68,15 @@ pub(super) fn implicit_native_transaction_key(
         identity.update(&(value.len() as u64).to_be_bytes());
         identity.update(value);
     }
-    Ok(format!("implicit-native:{}", identity.finalize().to_hex()))
+    // The native mutation response is the durable business-idempotency
+    // boundary. Transactions are terminal after commit or rollback, so a
+    // retry that races response materialisation must use a fresh transaction
+    // identity instead of reopening the terminal transaction.
+    Ok(format!(
+        "implicit-native:{}:attempt:{}",
+        identity.finalize().to_hex(),
+        uuid::Uuid::new_v4()
+    ))
 }
 
 pub(super) async fn stage_implicit_native_response<T>(
@@ -168,22 +176,41 @@ mod implicit_transaction_tests {
     }
 
     #[test]
-    fn implicit_transaction_identity_is_stable_and_binds_all_target_parameters() {
+    fn implicit_transaction_attempt_identity_is_fresh_and_binds_business_identity() {
         let first = NativeIdempotencyTarget::new("UploadPart", "bucket", "object")
             .with_parameters(serde_json::json!({"upload_id":"one","part_number":1}));
         let changed = NativeIdempotencyTarget::new("UploadPart", "bucket", "object")
             .with_parameters(serde_json::json!({"upload_id":"one","part_number":2}));
+        let first_attempt = implicit_native_transaction_key(&context("retry"), &first).unwrap();
+        let second_attempt = implicit_native_transaction_key(&context("retry"), &first).unwrap();
+        assert_ne!(first_attempt, second_attempt);
         assert_eq!(
-            implicit_native_transaction_key(&context("retry"), &first).unwrap(),
-            implicit_native_transaction_key(&context("retry"), &first).unwrap()
+            first_attempt
+                .split_once(":attempt:")
+                .map(|(business_identity, _)| business_identity),
+            second_attempt
+                .split_once(":attempt:")
+                .map(|(business_identity, _)| business_identity),
         );
         assert_ne!(
-            implicit_native_transaction_key(&context("retry"), &first).unwrap(),
-            implicit_native_transaction_key(&context("retry"), &changed).unwrap()
+            implicit_native_transaction_key(&context("retry"), &first)
+                .unwrap()
+                .split_once(":attempt:")
+                .map(|(business_identity, _)| business_identity),
+            implicit_native_transaction_key(&context("retry"), &changed)
+                .unwrap()
+                .split_once(":attempt:")
+                .map(|(business_identity, _)| business_identity),
         );
         assert_ne!(
-            implicit_native_transaction_key(&context("retry"), &first).unwrap(),
-            implicit_native_transaction_key(&context("other"), &first).unwrap()
+            implicit_native_transaction_key(&context("retry"), &first)
+                .unwrap()
+                .split_once(":attempt:")
+                .map(|(business_identity, _)| business_identity),
+            implicit_native_transaction_key(&context("other"), &first)
+                .unwrap()
+                .split_once(":attempt:")
+                .map(|(business_identity, _)| business_identity),
         );
     }
 }

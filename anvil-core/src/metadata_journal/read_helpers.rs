@@ -114,10 +114,7 @@ pub(super) fn read_all_metadata_journal_records(
     let stream_id = object_metadata_stream_id(bucket.tenant_id, bucket.id);
     let head_key =
         crate::mvcc_product::stream_logical_key(TABLE_STREAM_HEAD_ROW, &stream_id, None)?;
-    let Some(head_payload) = read_metadata_product_at(mvcc, &head_key, snapshot)? else {
-        return Ok(Vec::new());
-    };
-    let head = decode_head(&head_payload)?;
+    let head_payload = read_metadata_product_at(mvcc, &head_key, snapshot)?;
     let prefix =
         crate::mvcc_product::stream_logical_key(TABLE_STREAM_RECORD_INDEX_ROW, &stream_id, None)?;
     let mut events = mvcc
@@ -131,19 +128,35 @@ pub(super) fn read_all_metadata_journal_records(
         .map(|(_, row)| decode_event(&row.value))
         .collect::<Result<Vec<_>>>()?;
     events.sort_by_key(|event| event.partition_sequence);
-    validate_event_chain(&events, 0, String::new())?;
-    if events
-        .last()
-        .map(|event| event.partition_sequence)
-        .unwrap_or(0)
-        != head.last_sequence
-        || events
+    if let Some(head_payload) = head_payload {
+        let head = decode_head(&head_payload)?;
+        let legacy_events = events
+            .iter()
+            .filter(|event| event.schema == METADATA_EVENT_SCHEMA)
+            .cloned()
+            .collect::<Vec<_>>();
+        let committed_events = events
+            .iter()
+            .filter(|event| event.schema == COMMITTED_METADATA_EVENT_SCHEMA)
+            .cloned()
+            .collect::<Vec<_>>();
+        validate_event_chain(&legacy_events, 0, String::new())?;
+        validate_committed_events(&committed_events)?;
+        if legacy_events
             .last()
-            .map(|event| event.event_hash.as_str())
-            .unwrap_or("")
-            != head.last_event_hash
-    {
-        bail!("object metadata journal head does not match its event chain");
+            .map(|event| event.partition_sequence)
+            .unwrap_or(0)
+            != head.last_sequence
+            || legacy_events
+                .last()
+                .map(|event| event.event_hash.as_str())
+                .unwrap_or("")
+                != head.last_event_hash
+        {
+            bail!("object metadata journal head does not match its event chain");
+        }
+    } else {
+        validate_committed_events(&events)?;
     }
     events
         .into_iter()

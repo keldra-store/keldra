@@ -4,7 +4,7 @@
 //! certified bundle and advances the node's locally applied version.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::Path,
     sync::{Arc, Mutex},
 };
