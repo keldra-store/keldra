@@ -216,10 +216,9 @@ async fn test_git_source_query_apis_use_latest_index_and_enforce_read_authz() {
 }
 
 #[tokio::test]
-// Internal-only: verifies durable Git pack ingest and object readback on the
-// single-node topology supported by 0.4.0. Git query/index freshness is a
-// separate, explicitly unqualified capability in this release.
-async fn test_put_git_pack_stores_normal_object_and_is_s3_readable() {
+// Internal-only: verifies private pack readback and that the sealed postcommit
+// task can materialize the index without weakening public object authorization.
+async fn test_private_git_pack_postcommit_materializes_index_and_is_s3_readable() {
     let mut cluster = isolated_test_cluster(
         "git pack ingest on the 0.4.0 single-node topology",
         &["test-region-1"],
@@ -286,6 +285,26 @@ async fn test_put_git_pack_stores_normal_object_and_is_s3_readable() {
         .unwrap()
         .into_bytes();
     assert_eq!(got.as_ref(), pack.as_slice());
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if anvil::git_source_query::read_latest_git_source_index(
+                &cluster.states[0].storage,
+                &cluster.states[0].mvcc,
+                1,
+                &repository_id,
+            )
+            .await
+            .unwrap()
+            .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("private GitSource postcommit task materializes its index");
 }
 
 fn authorized<T>(message: T, token: &str) -> Request<T> {

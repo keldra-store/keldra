@@ -78,6 +78,55 @@ impl ObjectManager {
         link_mode: ObjectLinkReadMode,
         consistency: ObjectReadConsistency,
     ) -> Result<ObjectReadResult, Status> {
+        self.get_object_with_link_mode_for_tenant_authorized(
+            claims,
+            route_tenant_id,
+            bucket_name,
+            object_key,
+            version_id,
+            range,
+            link_mode,
+            consistency,
+            ObjectReadAuthority::Caller,
+        )
+        .await
+    }
+
+    pub(crate) async fn get_object_version_for_internal_task(
+        &self,
+        tenant_id: i64,
+        bucket_name: String,
+        object_key: String,
+        version_id: uuid::Uuid,
+        commit_version: u64,
+    ) -> Result<ObjectReadResult, Status> {
+        self.get_object_with_link_mode_for_tenant_authorized(
+            None,
+            Some(tenant_id),
+            bucket_name,
+            object_key,
+            Some(version_id),
+            None,
+            ObjectLinkReadMode::Follow,
+            ObjectReadConsistency::AtCommitVersion(commit_version),
+            ObjectReadAuthority::CommittedInternalTask,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn get_object_with_link_mode_for_tenant_authorized(
+        &self,
+        claims: Option<auth::Claims>,
+        route_tenant_id: Option<i64>,
+        bucket_name: String,
+        object_key: String,
+        version_id: Option<uuid::Uuid>,
+        range: Option<CoreByteRange>,
+        link_mode: ObjectLinkReadMode,
+        consistency: ObjectReadConsistency,
+        authority: ObjectReadAuthority,
+    ) -> Result<ObjectReadResult, Status> {
         let _latency = self
             .observability
             .latency_guard(OBJECT_READ_LATENCY, &[("api", "native")]);
@@ -96,13 +145,15 @@ impl ObjectManager {
             .get_authorized_bucket(claims.as_ref(), route_tenant_id, &bucket_name)
             .await?;
 
-        self.require_object_read_access(
-            claims.as_ref(),
-            &bucket,
-            &object_key,
-            consistency.authz_revision(),
-        )
-        .await?;
+        if authority == ObjectReadAuthority::Caller {
+            self.require_object_read_access(
+                claims.as_ref(),
+                &bucket,
+                &object_key,
+                consistency.authz_revision(),
+            )
+            .await?;
+        }
 
         let mut object = match version_id {
             Some(version_id) => {
@@ -1936,37 +1987,6 @@ impl ObjectManager {
         )
         .await?;
         Ok(())
-    }
-
-    pub(super) async fn get_tenant_bucket(
-        &self,
-        tenant_id: i64,
-        bucket_name: &str,
-    ) -> Result<Bucket, Status> {
-        if let Some(locator) = self
-            .persistence
-            .get_mesh_bucket_locator(tenant_id, bucket_name)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            && locator.status != crate::mesh_directory::BucketLocatorStatus::Deleted
-            && locator.home_region.as_str() != self.region.as_str()
-        {
-            return Err(self.remote_bucket_status(locator.home_region.as_str()));
-        }
-
-        let bucket = bucket_journal::read_current_bucket_mvcc(
-            self.installed_mvcc()?,
-            tenant_id,
-            bucket_name,
-        )
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found("Bucket not found"))?;
-
-        if bucket.region != self.region {
-            return Err(self.remote_bucket_status(&bucket.region));
-        }
-
-        Ok(bucket)
     }
 }
 

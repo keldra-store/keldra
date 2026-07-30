@@ -1,6 +1,6 @@
 use crate::anvil_api::git_source_service_server::GitSourceService;
 use crate::anvil_api::*;
-use crate::object_manager::{ObjectLinkReadMode, ObjectReadConsistency, ObjectWriteOptions};
+use crate::object_manager::ObjectWriteOptions;
 use crate::{
     AppState, access_control, auth, authz_journal, git_pack, git_source_index, git_source_manifest,
     git_source_query, git_source_watch,
@@ -555,7 +555,10 @@ impl AppState {
             )?
             .ok_or_else(|| anyhow::anyhow!("GitSource postcommit assignment changed"))?;
         let lease_owner = guard.lease_owner(&worker_id);
-        let result = self.execute_git_source_postcommit(&record.job).await;
+        self.mvcc.validate_assignment(&guard)?;
+        let result = self
+            .execute_git_source_postcommit(&record.job, record.commit_version)
+            .await;
         match result {
             Ok(()) => {
                 self.mvcc.validate_assignment(&guard)?;
@@ -585,6 +588,7 @@ impl AppState {
     async fn execute_git_source_postcommit(
         &self,
         job: &crate::git_source_postcommit_job::GitSourcePostCommitJob,
+        commit_version: u64,
     ) -> anyhow::Result<()> {
         crate::mvcc_fault_injection::hit(
             crate::mvcc_fault_injection::FaultPoint::GitSourcePostCommitBeforeEffects,
@@ -592,15 +596,12 @@ impl AppState {
         let version_id = uuid::Uuid::parse_str(&job.pack_object_version_id)?;
         let object = self
             .object_manager
-            .get_object_with_link_mode_for_tenant(
-                None,
-                Some(job.tenant_id),
+            .get_object_version_for_internal_task(
+                job.tenant_id,
                 job.bucket_name.clone(),
                 job.object_key.clone(),
-                Some(version_id),
-                None,
-                ObjectLinkReadMode::Follow,
-                ObjectReadConsistency::Latest,
+                version_id,
+                commit_version,
             )
             .await
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;

@@ -1,5 +1,41 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ObjectReadAuthority {
+    Caller,
+    CommittedInternalTask,
+}
+
+impl ObjectManager {
+    pub(super) async fn get_tenant_bucket(
+        &self,
+        tenant_id: i64,
+        bucket_name: &str,
+    ) -> Result<Bucket, Status> {
+        if let Some(locator) = self
+            .persistence
+            .get_mesh_bucket_locator(tenant_id, bucket_name)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            && locator.status != crate::mesh_directory::BucketLocatorStatus::Deleted
+            && locator.home_region.as_str() != self.region.as_str()
+        {
+            return Err(self.remote_bucket_status(locator.home_region.as_str()));
+        }
+        let bucket = bucket_journal::read_current_bucket_mvcc(
+            self.installed_mvcc()?,
+            tenant_id,
+            bucket_name,
+        )
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found("Bucket not found"))?;
+        if bucket.region != self.region {
+            return Err(self.remote_bucket_status(&bucket.region));
+        }
+        Ok(bucket)
+    }
+}
+
 pub(super) fn object_data_read_status(error: anyhow::Error) -> Status {
     crate::services::core_store_status::availability_status(&error)
         .unwrap_or_else(|| Status::internal(format!("Object data unavailable: {error}")))
