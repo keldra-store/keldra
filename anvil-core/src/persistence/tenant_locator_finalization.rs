@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 
 use crate::{
     mvcc_open_transactions::TransactionRuntime,
@@ -30,9 +30,17 @@ impl Persistence {
         };
         let job: TenantLocatorFinalizationJob = serde_json::from_slice(&row.value)?;
         job.validate()?;
-        let guard = mvcc
-            .claim_assignment("control-plane", mvcc.cluster_id())?
-            .ok_or_else(|| anyhow!("tenant locator finalization is not assigned to this node"))?;
+        let Some(guard) = mvcc
+            .reconcile_work_assignment(
+                "tenant-locator-finalization",
+                &job.assignment_logical_identity(),
+            )
+            .await?
+        else {
+            // Another compact-Raft owner is responsible for this tenant. This
+            // is ordinary multi-node scheduling, not a failed finalization.
+            return Ok(false);
+        };
         self.write_mesh_tenant_locators(&job.tenant, &job.idempotency_key, &job.home_region)
             .await?;
         mvcc.validate_assignment(&guard)?;

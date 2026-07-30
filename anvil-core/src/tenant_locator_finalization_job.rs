@@ -40,10 +40,37 @@ impl TenantLocatorFinalizationJob {
         })
     }
 
+    pub fn assignment_logical_identity(&self) -> String {
+        format!("tenant:{}", self.tenant.id)
+    }
+
     pub fn mutation(&self) -> Result<ProductMutation> {
         Ok(ProductMutation {
             key: self.logical_key()?,
             value: Some(serde_json::to_vec(self)?),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job() -> TenantLocatorFinalizationJob {
+        TenantLocatorFinalizationJob {
+            cluster_id: "cluster".into(),
+            transaction_id: "transaction".into(),
+            tenant: Tenant {
+                id: 42,
+                name: "tenant".into(),
+            },
+            idempotency_key: "idempotency".into(),
+            home_region: "region".into(),
+        }
+    }
+
+    #[test]
+    fn assignment_identity_is_stable_per_tenant() {
+        assert_eq!(job().assignment_logical_identity(), "tenant:42");
     }
 }
