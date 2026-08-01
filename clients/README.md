@@ -1,32 +1,16 @@
-# Anvil Clients
+# Anvil Rust client
 
-This directory contains native API client packages generated from the public projection of `anvil-core/proto/anvil.proto`. The current release ships the Rust client only; the TypeScript and Python packages are kept as source previews.
+Anvil 0.5 ships one client package: the Rust crate in `clients/rust`, published
+as `anvil-storage` when its API dependencies are publishable.
 
-## Rust / crates.io
-
-Package: `anvil-storage`
+The client is a thin authenticated transport for the 0.5 object API. It exposes
+exact-path reads, immutable and conditional writes, deletes, bulk operations,
+and the pinned atomic-program invocation surface. It does not recreate the retired
+transaction, admin, indexing, gateway, PersonalDB, Python, or TypeScript APIs.
 
 ```sh
 cargo test -p anvil-storage
-cargo publish --dry-run -p anvil-storage
 ```
 
-The package ships generated protocol bindings, bearer-token helpers, and typed service-client constructors.
-
-## TypeScript / npm
-
-Not published in this release.
-
-## Python / PyPI
-
-Not published in this release.
-
-## Synchronising proto files
-
-After editing `anvil-core/proto/anvil.proto`, run:
-
-```sh
-scripts/sync-client-protos.sh
-```
-
-This writes the public client proto projection into each client package before release. Node-to-node CoreStore internals are intentionally omitted from client packages.
+Protocol types come from the workspace `anvil-api` crate. There are no copied
+client proto files and no proto-synchronisation script.

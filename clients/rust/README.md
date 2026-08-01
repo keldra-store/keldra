@@ -1,16 +1,40 @@
 # anvil-storage
 
-Rust gRPC client package for Anvil's native API.
-
-The crate ships generated protocol bindings from the public `proto/anvil.proto` projection, a bearer-token interceptor, and typed service-client constructors. Node-to-node CoreStore protocols are not part of this public client surface.
+Thin authenticated Rust transport for the breaking Anvil 0.5 API.
 
 ```rust,no_run
-use anvil_storage::{AnvilClient, proto::ListBucketsRequest};
+use anvil_storage::v1::{HeadObjectRequest, ObjectAddress, object_head};
 
-# async fn example(endpoint: String, token: String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-let anvil = AnvilClient::connect_with_bearer(endpoint, token).await?;
-let response = anvil.buckets().list_buckets(ListBucketsRequest {}).await?;
-println!("{:?}", response.into_inner());
+# async fn example() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+let mut client = anvil_storage::connect("http://127.0.0.1:50051", "secret").await?;
+let head = client
+    .head_object(HeadObjectRequest {
+        address: Some(ObjectAddress {
+            tenant: "acme".into(),
+            bucket: "documents".into(),
+            path: "reports/annual.pdf".into(),
+        }),
+    })
+    .await?
+    .into_inner();
+match head.state {
+    Some(object_head::State::Present(present)) => {
+        println!("present at version {}", present.version);
+    }
+    Some(object_head::State::Deleted(deleted)) => {
+        println!("deleted at version {}", deleted.version);
+    }
+    Some(object_head::State::NeverExisted(_)) => println!("never existed"),
+    None => return Err("server returned an empty object state".into()),
+}
 # Ok(())
 # }
 ```
+
+The client intentionally adds no domain orchestration. Use one-path CAS,
+`BulkWrite`, or a pinned atomic program.
+
+A program definition is an ordinary immutable object at
+`_anvil/programs/{name}@{version}`. Write it with `PutObject` or
+`PublishObject` and an absent condition. The normal path authorization rules
+apply; there is no separate program registry API.
