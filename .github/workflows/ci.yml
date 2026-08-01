@@ -108,7 +108,7 @@ jobs:
       ANVIL_IMAGE: anvil:test-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
       ANVIL_BUILD_PROFILE: ci
       ANVIL_USE_NATIVE_CARGO: '0'
-      ANVIL_RUNTIME_BASE: debian:bookworm-slim
+      ANVIL_RUNTIME_BASE: debian:trixie-slim
       CARGO_BUILD_JOBS: '8'
     strategy:
       fail-fast: false

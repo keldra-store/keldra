@@ -130,7 +130,7 @@ iid_file="$(mktemp -t anvil-image.XXXXXX)"
 trap 'rm -f "${iid_file}"' EXIT
 docker build \
   --platform "${platform}" \
-  --build-arg "ANVIL_RUNTIME_BASE=${ANVIL_RUNTIME_BASE:-debian:bookworm-slim}" \
+  --build-arg "ANVIL_RUNTIME_BASE=${ANVIL_RUNTIME_BASE:-debian:trixie-slim}" \
   --iidfile "${iid_file}" \
   -f anvil/Dockerfile.prebuilt \
   -t "${image}" \

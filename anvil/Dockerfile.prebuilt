@@ -1,17 +1,16 @@
-ARG ANVIL_RUNTIME_BASE=debian:bookworm-slim
+ARG ANVIL_RUNTIME_BASE=debian:trixie-slim
 FROM ${ANVIL_RUNTIME_BASE}
 
 RUN set -eux; \
     apt-get update; \
-    apt-get install -y --no-install-recommends ca-certificates; \
+    apt-get install -y --no-install-recommends ca-certificates libstdc++6; \
     rm -rf /var/lib/apt/lists/*
 
-RUN useradd --uid 10001 --create-home --home-dir /var/lib/anvil --shell /usr/sbin/nologin anvil
+RUN useradd --uid 10001 --no-create-home --home-dir /var/lib/anvil --shell /usr/sbin/nologin anvil \
+    && install -d -o anvil -g anvil /var/lib/anvil
 
 COPY tmp/docker-bin/anvil-server /usr/local/bin/anvil-server
 COPY tmp/docker-bin/anvil /usr/local/bin/anvil
-
-RUN chown -R anvil:anvil /var/lib/anvil
 
 ENV ANVIL_LISTEN=0.0.0.0:50051 \
     ANVIL_DATA_DIR=/var/lib/anvil \

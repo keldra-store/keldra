@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # Stage 1: Build the binaries with the release toolchain used by CI.
-FROM rust:1.96-bookworm AS builder
+FROM rust:1.96-trixie AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -34,19 +34,19 @@ RUN --mount=type=cache,id=anvil-cargo-registry,target=/usr/local/cargo/registry,
 
 # Stage 2: Create the final runtime image. Rust tooling is deliberately not
 # present in the shipped server image.
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd --uid 10001 --create-home --home-dir /var/lib/anvil --shell /usr/sbin/nologin anvil
+RUN useradd --uid 10001 --no-create-home --home-dir /var/lib/anvil --shell /usr/sbin/nologin anvil \
+    && install -d -o anvil -g anvil /var/lib/anvil
 
 # Copy the compiled binaries from the builder stage.
 COPY --from=builder /usr/local/anvil-build/anvil-server /usr/local/bin/anvil-server
 COPY --from=builder /usr/local/anvil-build/anvil /usr/local/bin/anvil
-
-RUN chown -R anvil:anvil /var/lib/anvil
 
 ENV ANVIL_LISTEN=0.0.0.0:50051 \
     ANVIL_DATA_DIR=/var/lib/anvil \
