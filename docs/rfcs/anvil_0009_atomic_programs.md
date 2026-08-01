@@ -305,10 +305,31 @@ identity and credential, and adds the ordinary tuple:
 system:_anvil#bootstrap_admin@app:<bootstrap-app-id>
 ```
 
-It then records durable completion. Repeating startup must never mint another
-bootstrap administrator. A later distributed capability replicates the
-bootstrap identity metadata, system schema, binding, tuples, and completion
-state to joining nodes; joining nodes therefore do not run cluster bootstrap.
+Bootstrap generates a high-entropy credential document at the operator's
+explicit output path or, by default:
+
+```text
+<data-dir>/system-bootstrap-credential.json
+```
+
+The file is created without replacement at mode `0600`, flushed durably, and
+contains the system tenant, stable bootstrap application ID, client ID, and
+client secret. Anvil logs the exact path and tells the administrator to copy it
+to their secret store and delete this generated copy; it never logs the secret.
+Only a salted verifier is stored in Anvil.
+
+The credential file is durable before one atomic metadata write installs the
+schema, binding, application/verifier, `bootstrap_admin` tuple, authorization
+revision, and permanent versioned bootstrap-complete marker. A crash before
+that metadata write may resume only from the exact existing secure output file;
+it must not generate a different administrator or overwrite the file. A crash
+after the metadata write observes the marker and never bootstraps again.
+
+Deleting the copied credential file does not delete the completion marker.
+Repeating bootstrap must fail and must never mint another bootstrap
+administrator. A later distributed capability replicates the bootstrap
+identity metadata, system schema, binding, tuples, and completion state to
+joining nodes; joining nodes therefore do not run cluster bootstrap.
 
 Long-lived client credentials are exchanged at a separate unauthenticated
 boundary for a short-lived signed token. The token fixes the storage tenant and
@@ -1085,29 +1106,24 @@ remaining time background finalization.
 The confirmed shape above intentionally does not invent answers to these
 remaining questions:
 
-1. **Bootstrap credential handoff.** Explicit bootstrap requires an exact safe
-   way to establish the first long-lived credential. The implementation must
-   choose between generating it into an operator-selected create-once file or
-   consuming an operator-supplied credential file, including crash recovery and
-   file-permission rules. It must not print a reusable secret to ordinary logs.
-2. **Expanded authorization intent.** The executor must authorize reads, puts,
+1. **Expanded authorization intent.** The executor must authorize reads, puts,
    and deletes using their distinct system-realm permissions. The bounded
    program representation must expose exact operation intent for every
    expanded path rather than collapsing put and delete into one `ReadWrite`
    label.
-3. **Expired invocation IDs.** Bounded receipts mean old replay evidence is
+2. **Expired invocation IDs.** Bounded receipts mean old replay evidence is
    eventually gone. The API must decide whether expired IDs are recognisable
    and rejected, carry a time/window component, or may be treated as new. It
    must not claim indefinite idempotency without indefinite state.
-4. **Single-source watch retention.** The implementation must fix the 0.5.0
+3. **Single-source watch retention.** The implementation must fix the 0.5.0
    journal's entry/byte or time bounds, pruning trigger, durable source epoch,
    and exact `RESUME_EXPIRED` boundary.
-5. **Program representation.** The first release must choose a small bounded
+4. **Program representation.** The first release must choose a small bounded
    interpreter format or compiled built-in handlers. Canonical identity is
    already the immutable program object's full address plus pinned content
    hash; the implementation must not grow both representation mechanisms in
    0.5.0.
-6. **Authorization retention.** Exact-revision checks and idempotent tuple
+5. **Authorization retention.** Exact-revision checks and idempotent tuple
    mutation receipts require finite advertised retention. The implementation
    must fix the bounds, expired-revision result, pruning trigger, and recovery
    rule without retaining every historical authorization state forever.
