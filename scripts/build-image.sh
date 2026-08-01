@@ -3,34 +3,31 @@ set -euo pipefail
 
 image="${ANVIL_IMAGE:-anvil:test}"
 build_profile="${ANVIL_BUILD_PROFILE:-ci}"
+stage_dir="tmp/docker-bin"
+
+# A failed host build must not leave an older binary available for an
+# accidental direct Dockerfile.prebuilt invocation.
+rm -rf "${stage_dir}"
+mkdir -p "${stage_dir}"
 
 case "${build_profile}" in
   release)
     cargo_profile_args=(--release)
     bin_profile_dir="release"
-    default_test_tools=0
     ;;
   ci)
     cargo_profile_args=(--profile ci)
     bin_profile_dir="ci"
-    default_test_tools=1
     ;;
   dev|debug)
     cargo_profile_args=()
     bin_profile_dir="debug"
-    default_test_tools=1
     ;;
   *)
     echo "unsupported ANVIL_BUILD_PROFILE=${build_profile}; expected release, ci, or dev" >&2
     exit 2
     ;;
 esac
-
-include_test_tools="${ANVIL_INCLUDE_TEST_TOOLS:-${default_test_tools}}"
-if [[ "${include_test_tools}" != "0" && "${include_test_tools}" != "1" ]]; then
-  echo "ANVIL_INCLUDE_TEST_TOOLS must be 0 or 1" >&2
-  exit 2
-fi
 
 case "${ANVIL_DOCKER_PLATFORM:-}" in
   "")
@@ -83,11 +80,8 @@ fi
 
 build_args=(
   -p anvil-server --bin anvil-server
-  -p anvil-storage-cli --bin anvil --bin anvil-admin
+  -p anvil-storage-cli --bin anvil
 )
-if [[ "${include_test_tools}" == "1" ]]; then
-  build_args+=(--features anvil-server/root-publication-test-control)
-fi
 
 if [[ "$use_zig" == "1" ]]; then
   if ! command -v cargo-zigbuild >/dev/null 2>&1; then
@@ -113,10 +107,6 @@ target_dir="$(
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])'
 )"
 bin_dir="${target_dir}/${target}/${bin_profile_dir}"
-stage_dir="tmp/docker-bin"
-
-rm -rf "${stage_dir}"
-mkdir -p "${stage_dir}"
 stage_binary() {
   local source="$1"
   local destination="$2"
@@ -134,7 +124,6 @@ stage_binary() {
 }
 stage_binary "${bin_dir}/anvil-server" "${stage_dir}/anvil-server"
 stage_binary "${bin_dir}/anvil" "${stage_dir}/anvil"
-stage_binary "${bin_dir}/anvil-admin" "${stage_dir}/anvil-admin"
 
 echo "[anvil] packaging runtime image ${image} platform=${platform}"
 iid_file="$(mktemp -t anvil-image.XXXXXX)"
@@ -142,7 +131,6 @@ trap 'rm -f "${iid_file}"' EXIT
 docker build \
   --platform "${platform}" \
   --build-arg "ANVIL_RUNTIME_BASE=${ANVIL_RUNTIME_BASE:-debian:bookworm-slim}" \
-  --build-arg "ANVIL_INCLUDE_TEST_TOOLS=${include_test_tools}" \
   --iidfile "${iid_file}" \
   -f anvil/Dockerfile.prebuilt \
   -t "${image}" \

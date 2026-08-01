@@ -17,20 +17,19 @@ WORKDIR /usr/src/anvil
 
 COPY . .
 
-# Build the server, public CLI, and admin CLI in release mode. BuildKit cache
-# mounts keep Cargo's registry, git checkout cache, and target directory outside
-# the image layer so repeat local/CI Docker builds reuse compiled dependencies.
+# Build the 0.5 server and CLI in release mode. BuildKit cache mounts keep
+# Cargo's registry, git checkout cache, and target directory outside the image
+# layer so repeat local/CI Docker builds reuse compiled dependencies.
 RUN --mount=type=cache,id=anvil-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=anvil-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=anvil-cargo-target-release,target=/usr/src/anvil/target,sharing=locked \
     cargo build --release --locked \
         -p anvil-server --bin anvil-server \
-        -p anvil-storage-cli --bin anvil --bin anvil-admin \
+        -p anvil-storage-cli --bin anvil \
     && mkdir -p /usr/local/anvil-build \
     && cp \
         target/release/anvil-server \
         target/release/anvil \
-        target/release/anvil-admin \
         /usr/local/anvil-build/
 
 # Stage 2: Create the final runtime image. Rust tooling is deliberately not
@@ -39,7 +38,6 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
-    curl \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --uid 10001 --create-home --home-dir /var/lib/anvil --shell /usr/sbin/nologin anvil
@@ -47,20 +45,18 @@ RUN useradd --uid 10001 --create-home --home-dir /var/lib/anvil --shell /usr/sbi
 # Copy the compiled binaries from the builder stage.
 COPY --from=builder /usr/local/anvil-build/anvil-server /usr/local/bin/anvil-server
 COPY --from=builder /usr/local/anvil-build/anvil /usr/local/bin/anvil
-COPY --from=builder /usr/local/anvil-build/anvil-admin /usr/local/bin/anvil-admin
 
-RUN mkdir -p /var/lib/anvil-bootstrap \
-    && chown -R anvil:anvil /var/lib/anvil /var/lib/anvil-bootstrap
+RUN chown -R anvil:anvil /var/lib/anvil
 
-ENV STORAGE_PATH=/var/lib/anvil
+ENV ANVIL_LISTEN=0.0.0.0:50051 \
+    ANVIL_DATA_DIR=/var/lib/anvil \
+    ANVIL_NODE_ID=1 \
+    ANVIL_MAX_ATOMIC_COMMIT_ENTRIES=4096 \
+    ANVIL_MAX_ATOMIC_COMMIT_BYTES=16777216
 USER anvil
 WORKDIR /var/lib/anvil
 
-# Expose the public and administrative gRPC listeners.
+# The bearer token must be supplied as ANVIL_API_TOKEN when the container starts.
 EXPOSE 50051
-EXPOSE 50052
 
-HEALTHCHECK --interval=30s --timeout=5s --retries=5 CMD curl -fsS http://127.0.0.1:50051/ready || exit 1
-
-# Set the default command to run the anvil server
 CMD ["anvil-server"]

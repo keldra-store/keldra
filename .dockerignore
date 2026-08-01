@@ -2,3 +2,8 @@
 target/
 .git/
 anvil-data/
+tmp/*
+!tmp/docker-bin/
+tmp/docker-bin/*
+!tmp/docker-bin/anvil-server
+!tmp/docker-bin/anvil
