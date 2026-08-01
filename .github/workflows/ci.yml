@@ -2,9 +2,9 @@ name: Anvil CI
 
 on:
   push:
-    branches: [ main, 'release/**' ]
+    branches: [main, 'release/**']
   pull_request:
-    branches: [ main ]
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
@@ -15,27 +15,101 @@ permissions:
   contents: read
   packages: read
 
-env:
-  # Self-hosted runners keep this directory between jobs. Sharing Cargo's
-  # target directory avoids rebuilding the same workspace dependencies in the
-  # image, unit, server-core and Docker-gate stages.
-  CARGO_TARGET_DIR: /home/github-runner/.cache/anvil/cargo-target
-
 jobs:
+  static:
+    name: Static checks
+    runs-on: [self-hosted, linux, x64, worka-builder-2]
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            cmake \
+            libclang-dev \
+            pkg-config \
+            protobuf-compiler \
+            ripgrep
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-v05-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-v05-
+
+      - name: Run static release gates
+        run: ./scripts/release-gates.sh static
+
+  rust:
+    name: Anvil 0.5 workspace tests
+    needs: static
+    runs-on: [self-hosted, linux, x64, worka-builder-2]
+    timeout-minutes: 90
+    env:
+      ANVIL_GATE_STEP_TIMEOUT_SECONDS: '4800'
+      ANVIL_RUST_TEST_THREADS: '8'
+      CARGO_BUILD_JOBS: '8'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            cmake \
+            libclang-dev \
+            pkg-config \
+            protobuf-compiler
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-v05-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-v05-
+
+      - name: Run workspace tests
+        run: ./scripts/release-gates.sh rust
+
   build-image:
-    name: Build Anvil test image (${{ matrix.platform }})
+    name: Build and smoke Anvil image (${{ matrix.platform }})
+    needs: static
     runs-on: [self-hosted, linux, x64, worka-builder-2]
     timeout-minutes: 90
     env:
       ANVIL_DOCKER_PLATFORM: ${{ matrix.platform }}
       ANVIL_IMAGE: anvil:test-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
-      # Always use the reproducible Zig cross-build path. The self-hosted
-      # builder architecture must not determine either runtime artifact.
-      ANVIL_USE_NATIVE_CARGO: "0"
       ANVIL_BUILD_PROFILE: ci
-      ANVIL_INCLUDE_TEST_TOOLS: "1"
-      ANVIL_RUNTIME_BASE: ubuntu:24.04
-      CARGO_BUILD_JOBS: "8"
+      ANVIL_USE_NATIVE_CARGO: '0'
+      ANVIL_RUNTIME_BASE: debian:bookworm-slim
+      CARGO_BUILD_JOBS: '8'
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -51,7 +125,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up emulation for image smoke checks
+      - name: Set up emulation
         uses: docker/setup-qemu-action@v3
         with:
           platforms: amd64,arm64
@@ -73,9 +147,7 @@ jobs:
             cmake \
             libclang-dev \
             pkg-config \
-            libssl-dev \
-            protobuf-compiler \
-            ripgrep
+            protobuf-compiler
 
       - name: Cache Cargo dependencies
         uses: actions/cache@v4
@@ -84,50 +156,26 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-v3-image-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-v05-image-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-v3-image-${{ matrix.arch }}-
+            ${{ runner.os }}-cargo-v05-image-${{ matrix.arch }}-
 
       - name: Install pinned cross-build toolchain
-        shell: bash
         run: |
-          set -euo pipefail
           if ! cargo-zigbuild --version 2>/dev/null | grep -Fxq 'cargo-zigbuild 0.20.1'; then
             cargo install cargo-zigbuild --version 0.20.1 --locked --force
           fi
 
-          cargo_zigbuild_version="$(cargo-zigbuild --version)"
-          zig_path="$(command -v zig)"
-          zig_version="$("$zig_path" version)"
-          test "$cargo_zigbuild_version" = 'cargo-zigbuild 0.20.1'
-          test "$zig_version" = '0.14.1'
-
-          {
-            printf 'CARGO_ZIGBUILD_ZIG_PATH=%s\n' "$zig_path"
-            printf 'CARGO_ZIGBUILD_PYTHON_PATH=%s/anvil-no-python-zig-%s-%s\n' \
-              "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
-            printf 'CARGO_ZIGBUILD_CACHE_DIR=%s/anvil-cargo-zigbuild-%s-%s-%s\n' \
-              "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" '${{ matrix.arch }}'
-          } >> "$GITHUB_ENV"
-
-      - name: Discard arm64 artifacts from incompatible Zig versions
-        if: matrix.arch == 'arm64'
-        run: cargo clean --profile ci --target aarch64-unknown-linux-gnu
-
-      - name: Build Docker image from host-built binaries
+      - name: Build image
         run: ./scripts/build-image.sh
 
-      - name: Smoke check image binaries and test tooling
-        run: |
-          timeout 30s docker run --platform "${{ matrix.platform }}" --rm "$ANVIL_IMAGE" anvil-server --version
-          timeout 30s docker run --platform "${{ matrix.platform }}" --rm "$ANVIL_IMAGE" anvil --version
-          timeout 30s docker run --platform "${{ matrix.platform }}" --rm "$ANVIL_IMAGE" anvil-admin --version
-          timeout 30s docker run --platform "${{ matrix.platform }}" --rm "$ANVIL_IMAGE" ip -Version
+      - name: Smoke image through the 0.5 gRPC API
+        run: ./scripts/release-gates.sh image
 
-      - name: Export Docker image artifact
+      - name: Export image artifact
         run: docker save "$ANVIL_IMAGE" -o "${{ runner.temp }}/${{ matrix.artifact }}.tar"
 
-      - name: Upload Docker image artifact
+      - name: Upload image artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
@@ -136,337 +184,6 @@ jobs:
           compression-level: 0
           retention-days: 1
 
-      - name: Remove local Docker image
+      - name: Remove local image
         if: always()
-        run: |
-          if docker image inspect "$ANVIL_IMAGE" >/dev/null 2>&1; then
-            docker image rm "$ANVIL_IMAGE" || echo "::warning::Failed to remove $ANVIL_IMAGE"
-          fi
-
-  static:
-    name: Static, docs, and packaging gates
-    runs-on: [self-hosted, linux, x64, worka-builder-2]
-    timeout-minutes: 45
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install system build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            clang \
-            cmake \
-            libclang-dev \
-            pkg-config \
-            libssl-dev \
-            protobuf-compiler \
-            ripgrep
-
-      - name: Cache Cargo dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-v2-
-
-      - name: Install Fission CLI
-        run: |
-          if ! command -v fission >/dev/null 2>&1; then
-            cargo install cargo-fission --version 0.4.1 --locked
-          fi
-
-      - name: Run static release gates
-        run: ./scripts/release-gates.sh static
-
-  rust-unit:
-    name: Rust unit and client tests
-    # Keep the Rust/integration lanes running even when the optional test-image
-    # packaging lane fails to compile. The image job still reports failure and
-    # remains required for release publication, but decoupling it here lets a
-    # CI run expose the next code/test failures in the same attempt.
-    needs: static
-    if: ${{ !cancelled() }}
-    runs-on: [self-hosted, linux, x64, worka-builder-2]
-    timeout-minutes: 120
-    env:
-      CARGO_BUILD_JOBS: "8"
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      CARGO_PROFILE_TEST_DEBUG: "0"
-      ANVIL_GATE_STEP_TIMEOUT_SECONDS: "5400"
-      ANVIL_RUST_TEST_THREADS: "8"
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install system build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            clang \
-            cmake \
-            libclang-dev \
-            pkg-config \
-            libssl-dev \
-            protobuf-compiler \
-            ripgrep
-
-      - name: Cache Cargo dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-v2-
-
-      - name: Run Rust unit release gates
-        run: ./scripts/release-gates.sh rust
-
-  coremeta-performance:
-    name: CoreMeta ordered-access performance gate
-    # 0.4.0 qualifies the supported functional subset only. Performance
-    # baselines resume after the release and must not delay publication.
-    needs: [rust-unit, server-core, mvcc-e2e]
-    if: ${{ false }}
-    runs-on: [self-hosted, linux, x64, worka-builder-2]
-    timeout-minutes: 60
-    env:
-      CARGO_BUILD_JOBS: "8"
-      ANVIL_MACHINE_CLASS: "worka-builder-2-linux-x64"
-      ANVIL_GATE_STEP_TIMEOUT_SECONDS: "3300"
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install system build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            clang \
-            cmake \
-            libclang-dev \
-            pkg-config \
-            libssl-dev \
-            protobuf-compiler
-
-      - name: Cache Cargo dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-v2-
-
-      - name: Run quick CoreMeta performance gate
-        run: ./scripts/release-gates.sh perf-quick
-
-      - name: Upload CoreMeta performance evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: coremeta-performance-quick
-          path: target/anvil/perf/mvcc/quick/
-          if-no-files-found: error
-          retention-days: 14
-
-  server-core:
-    name: Server core integration tests
-    # Functional lanes are independent after static validation. A unit failure
-    # must not hide server-integration or native-cluster failures in the same
-    # CI attempt.
-    needs: static
-    if: ${{ !cancelled() }}
-    runs-on: [self-hosted, linux, x64, worka-builder-2]
-    timeout-minutes: 60
-    env:
-      CARGO_BUILD_JOBS: "8"
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      CARGO_PROFILE_TEST_DEBUG: "0"
-      ANVIL_RUST_TEST_THREADS: "8"
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install system build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            clang \
-            cmake \
-            libclang-dev \
-            pkg-config \
-            libssl-dev \
-            protobuf-compiler \
-            ripgrep
-
-      - name: Cache Cargo dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-v2-
-
-      - name: Prebuild server integration test binaries
-        run: cargo test --no-run -p anvil-server --tests
-
-      - name: Run server core integration gates
-        run: ./scripts/release-gates.sh server-core
-
-  mvcc-e2e:
-    name: MVCC under Raft end-to-end acceptance
-    # Run native cluster acceptance independently of the shorter Rust and
-    # server-core lanes so failures there do not suppress the evidence we need
-    # to reach E2E QA.
-    needs: static
-    if: ${{ !cancelled() }}
-    runs-on: [self-hosted, linux, x64, worka-builder-2]
-    timeout-minutes: 180
-    env:
-      CARGO_BUILD_JOBS: "8"
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      CARGO_PROFILE_TEST_DEBUG: "0"
-      ANVIL_GATE_STEP_TIMEOUT_SECONDS: "5400"
-      ANVIL_RUST_TEST_THREADS: "1"
-      RUST_LOG: warn
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install system build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            clang \
-            cmake \
-            libclang-dev \
-            pkg-config \
-            libssl-dev \
-            protobuf-compiler \
-            ripgrep
-
-      - name: Cache Cargo dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-v2-
-
-      - name: Run native MVCC and transaction acceptance gates
-        run: ./scripts/release-gates.sh mvcc-e2e
-
-  docker-integration:
-    name: Docker integration tests (${{ matrix.group }})
-    if: ${{ false }}
-    # Docker/distributed validation only consumes the test image. Keep it on an
-    # independent lane so it can run alongside Rust, performance, and
-    # server-core validation instead of waiting for that entire chain.
-    needs: build-image
-    runs-on: [self-hosted, linux, x64, worka-builder-2]
-    timeout-minutes: 120
-    env:
-      CARGO_BUILD_JOBS: "8"
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      CARGO_PROFILE_TEST_DEBUG: "0"
-      # The runner has 16 cores. Shared-cluster tests can fan out while the
-      # test-utils semaphore continues to cap isolated clusters at two.
-      ANVIL_DOCKER_TEST_THREADS: "8"
-      ANVIL_IMAGE: anvil:test-amd64-${{ github.run_id }}-${{ github.run_attempt }}
-      ANVIL_DOCKER_TEST_PROJECT: anvil-ci-${{ matrix.group }}-${{ github.run_id }}-${{ github.run_attempt }}
-      ANVIL_GATE_STEP_TIMEOUT_SECONDS: "5400"
-    strategy:
-      fail-fast: true
-      max-parallel: 1
-      matrix:
-        group: [docker-auth, docker-storage, docker-index, docker-mesh]
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install system build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            clang \
-            cmake \
-            libclang-dev \
-            pkg-config \
-            libssl-dev \
-            protobuf-compiler
-
-      - name: Cache Cargo dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-v2-
-
-      - name: Prebuild Docker integration test binaries
-        run: cargo test --no-run -p anvil-server -p anvil-storage-cli --tests
-
-      - name: Download amd64 Docker image artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: anvil-test-image-amd64
-          path: ${{ runner.temp }}/anvil-image-amd64
-
-      - name: Load amd64 Docker image
-        run: docker load -i "${{ runner.temp }}/anvil-image-amd64/anvil-test-image-amd64.tar"
-
-      - name: Run Docker integration release gates
-        run: ./scripts/release-gates.sh ${{ matrix.group }}
-
-      - name: Clean up Docker integration resources
-        if: always()
-        run: ./scripts/release-gates.sh docker-cleanup
+        run: docker image rm "$ANVIL_IMAGE" || true

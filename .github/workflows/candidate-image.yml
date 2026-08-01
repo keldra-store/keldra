@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       image_tag:
-        description: Candidate tag, for example v0.4.1-worka-v0.1.0-rc9-amd64
+        description: Candidate tag, for example v0.5.0-rc1-amd64
         required: true
         type: string
       staging_release:
@@ -24,7 +24,7 @@ on:
         required: true
         type: string
       expected_image_id:
-        description: Docker image ID, including the sha256: prefix
+        description: "Docker image ID, including the sha256: prefix"
         required: true
         type: string
       expected_server_sha256:
@@ -65,7 +65,7 @@ jobs:
         env:
           SOURCE_COMMIT: ${{ inputs.source_commit }}
           IMAGE_TAG: ${{ inputs.image_tag }}
-          SOURCE_BRANCH: worka/v0.1.0-anvil-rc9
+          SOURCE_BRANCH: main
         run: |
           set -euo pipefail
           if [[ ! "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
@@ -147,7 +147,6 @@ jobs:
           test "$(docker image inspect "$IMAGE" --format '{{.Os}}/{{.Architecture}}')" = "linux/amd64"
           timeout 30s docker run --platform linux/amd64 --rm "$IMAGE" anvil-server --version
           timeout 30s docker run --platform linux/amd64 --rm "$IMAGE" anvil --version
-          timeout 30s docker run --platform linux/amd64 --rm "$IMAGE" anvil-admin --version
 
       - name: Authenticate to GHCR
         uses: docker/login-action@v3

@@ -19,8 +19,7 @@ pattern="${db_a}|${db_b}|${db_c}|${db_d}|${db_e}|${db_f}|${db_g}|${db_h}"
 if rg -n -i -uu "$pattern" . \
   -g '!target/**' \
   -g '!**/.git/**' \
-  -g '!docs/**' \
-  -g '!documentation/**'; then
+  -g '!docs/**'; then
   echo "External relational metadata-store reference found; Anvil must be self-contained." >&2
   exit 1
 fi
