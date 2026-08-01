@@ -55,10 +55,10 @@ Materialising that decision into serving structures is deterministic and
 idempotent. It may be retried by recovery workers; it is not a second commit.
 
 Raft is used only for bounded distributed decisions: executor nomination,
-program-registry identity, compact atomic-batch commits, and a monotonically
-advancing finalized-through checkpoint. Object bodies, complete version
-descriptors, path inventories, locks, and prepared bundles remain in
-distributed storage outside Raft.
+compact atomic-batch commits, and a monotonically advancing finalized-through
+checkpoint. Object bodies, program definitions, complete version descriptors,
+path inventories, locks, and prepared bundles remain in distributed storage
+outside Raft.
 
 ## 2. Why this boundary exists
 
@@ -200,7 +200,7 @@ Path policies are capability admission rules:
 
 - `MUTABLE`: ordinary versioned `Put`, `Delete`, and CAS are allowed;
 - `IMMUTABLE`: only create-once publication is allowed; and
-- `PROGRAM_ONLY`: only an explicitly registered atomic API may publish the
+- `PROGRAM_ONLY`: only an explicitly invoked atomic program may publish the
   path.
 
 Every path written by an atomic program is `PROGRAM_ONLY`. This is what makes a
@@ -213,6 +213,20 @@ never expanded into Raft state.
 An atomic program is an immutable, bounded server capability. An invocation
 supplies a stable invocation ID, a pinned program identity, and bounded input.
 It does not supply arbitrary code or a transaction plan.
+
+A program definition is an ordinary immutable Anvil object whose exact path is
+under the reserved `_anvil/programs/` prefix. For example:
+
+```text
+_anvil/programs/import_osv@1
+```
+
+The definition is created through the ordinary object write API using the
+`Absent` condition. The same Zanzibar path authorisation used for every other
+object decides whether the caller may write it. There is no program registry,
+registry root, registration RPC, or Anvil-defined administrator role. The
+nominated executor loads the exact program object and verifies its pinned
+content hash before execution.
 
 A program definition records at least:
 
@@ -232,8 +246,9 @@ maximum_execution_work
 
 All possible paths must be derivable from validated input before locks are
 taken. Execution may use a subset, but it cannot discover a new path later.
-Every expanded path is authorised as the invoking caller; registration grants
-no definer privilege.
+Every expanded path is authorised as the invoking caller. Permission to write
+a program definition grants no privilege over paths that the program later
+reads or writes.
 
 Programs are deterministic. Clocks, randomness, generated IDs, and timestamps
 needed in output are explicit inputs or deterministic derivations from the
@@ -343,10 +358,13 @@ CommitBatch {
 }
 ```
 
-The command contains no object body, complete version descriptor, path list, or
-lock record. Raft validates the current nomination fence, pinned program
-identity, invocation replay state still retained by the core, bounded command
-shape, and bundle/durability identities.
+The command contains no object body, program definition, complete version
+descriptor, path list, or lock record. Before proposing it, the executor has
+already loaded the named program object, verified its content hash, and
+authorised its expanded paths. Raft validates the current nomination fence,
+invocation replay state still retained by the core, bounded command shape, and
+bundle/durability identities. It records the pinned program identity and hash;
+it does not maintain or consult a program registry.
 
 The committed Raft log index `C` of `CommitBatch` is the batch's commit cursor.
 It is assigned by consensus, not by the client. Committing `CommitBatch` is the
@@ -417,9 +435,8 @@ FinalizedThrough { commit_log_index }
 The checkpoint advances monotonically only when every earlier `CommitBatch` is
 recoverably finalized under the cluster's agreed criterion. Once a checkpoint
 is included in a Raft snapshot, older batch commands may be compacted. The
-snapshot retains the current executor nomination, current program-registry
-identity, finalized-through index, and only the bounded replay state still
-inside its advertised window.
+snapshot retains the current executor nomination, finalized-through index, and
+only the bounded replay state still inside its advertised window.
 
 The tail has hard entry and byte limits. If finalization cannot advance and the
 tail reaches its bound, Anvil applies backpressure to new atomic-program
