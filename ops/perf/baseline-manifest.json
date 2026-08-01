@@ -1,112 +1,95 @@
 {
-  "schema": "anvil.perf.baseline_manifest.v1",
-  "dataset_id": "anvil-corestore-baseline-v1",
-  "seed": "anvil-corestore-baseline-v1-seed-42",
-  "hardware_profile": {
-    "name": "release-10-node-nvme",
-    "nodes": 10,
-    "cells": 5,
-    "regions": 1,
-    "disk_class": "nvme",
-    "network_gbps": 10
+  "schema": "anvil.perf.osv_import.v2",
+  "measured": false,
+  "passed": false,
+  "target_seconds": 150.0,
+  "corpus": {
+    "path": null,
+    "expected_sha256": null,
+    "observed_sha256": null,
+    "archive_bytes": null
   },
-  "warmup": {
-    "duration_seconds": 300,
-    "discard_metrics": true,
-    "sample_traces_per_scenario": 0
-  },
-  "run": {
-    "duration_seconds": 1800,
-    "discard_metrics": false,
-    "sample_traces_per_scenario": 1000
-  },
-  "object_distribution": {
-    "tenant_count": 100000,
-    "project_count": 1000,
-    "small_weights": {
-      "1KiB": 40,
-      "4KiB": 35,
-      "16KiB": 20,
-      "64KiB": 5
-    },
-    "medium_weights": {
-      "256KiB": 50,
-      "1MiB": 35,
-      "4MiB": 15
-    },
-    "large_weights": {
-      "128MiB": 80,
-      "1GiB": 19,
-      "5GiB": 1
-    },
-    "key_algorithm": "corestore-key-fixed-v1 mapped to /tenant/{tenant}/project/{project}/object/{ordinal}",
-    "metadata_algorithm": "deterministic tenant/project/content_type/day from seed and ordinal"
-  },
-  "query_corpus": {
-    "text_generator": "markov-fixed-v1",
-    "query_selector": "query-selector-fixed-v1",
-    "term_queries": 1000,
-    "boolean_queries": 1000,
-    "phrase_queries": 500,
-    "field_queries": 500,
-    "selectivity_buckets": [
-      0.0001,
-      0.001,
-      0.01,
-      0.1
+  "schema_shape": {
+    "developer_defence_schema": "developer-defence.source-raw-record-head.v1",
+    "source": "osv",
+    "bucket": "dd-source-osv-raw",
+    "leaf_path": "raw/osv/{sha256(trimmed id)}/record.json",
+    "head_path": "raw/osv/{sha256(trimmed id)}/current.json",
+    "writes_per_source_record": 2,
+    "phases": [
+      "bulk canonical raw leaves and retain returned versions",
+      "bulk canonical heads referring to those versions"
     ]
   },
-  "vector_corpus": {
-    "generator": "deterministic-normalized-random-v1",
-    "dimensions": [
-      384,
-      768
-    ],
-    "oracle_sample_size": 100000,
-    "recall_k": 20,
-    "distance": "cosine"
+  "software": {
+    "anvil_commit": null,
+    "developer_defence_schema_source_commit": "ac838a79e5b9fd4aed08d1ac7786e5374b01b733"
   },
-  "authz_graph": {
-    "generator": "authz-graph-fixed-v1",
-    "tenants": 100000,
-    "subjects": 1000000,
-    "objects": 10000000,
-    "direct_relation_ratio": 0.55,
-    "computed_userset_ratio": 0.3,
-    "tuple_to_userset_ratio": 0.15,
-    "max_traversal_depth": 8
+  "workload": {
+    "endpoint": null,
+    "tenant": null,
+    "bucket": "dd-source-osv-raw",
+    "durability_class": null,
+    "node_count": 1,
+    "batch_size_operations": null,
+    "maximum_batch_payload_bytes": null,
+    "write_concurrency": null,
+    "verification_concurrency": null,
+    "clean_target_asserted": true
   },
-  "personaldb": {
-    "generator": "personaldb-changeset-fixed-v1",
-    "groups": 10000,
-    "actors_per_group": 8,
-    "changeset_size_weights": {
-      "1KiB": 40,
-      "4KiB": 40,
-      "16KiB": 15,
-      "64KiB": 5
+  "parsing": {
+    "archive_entries": null,
+    "json_documents": null,
+    "accepted_source_records_n": null,
+    "malformed_documents": null,
+    "oversized_documents": null,
+    "decompressed_json_bytes": null
+  },
+  "result": {
+    "source_records_n": null,
+    "logical_mutations_m": null,
+    "raw_payload_bytes": null,
+    "head_payload_bytes": null,
+    "total_payload_bytes": null,
+    "leaf_bulk_requests": null,
+    "head_bulk_requests": null,
+    "bulk_requests": null,
+    "batch_fill_average_operations": null,
+    "replayed_mutations": null,
+    "end_to_end_seconds": null,
+    "source_records_per_second": null,
+    "logical_mutations_per_second": null,
+    "bulk_request_latency_ms": {
+      "sample_count": null,
+      "mean_ms": null,
+      "p50_ms": null,
+      "p95_ms": null,
+      "p99_ms": null
     },
-    "conflict_ratio_bps": 300,
-    "snapshot_every_changesets": 1000
-  },
-  "references": {
-    "minio": {
-      "image": "minio/minio:RELEASE.2026-06-13T11-33-47Z",
-      "config": "single-node-nvme-or-distributed-matching-anvil",
-      "versioning": true
+    "leaf_request_latency_ms": {
+      "sample_count": null,
+      "mean_ms": null,
+      "p50_ms": null,
+      "p95_ms": null,
+      "p99_ms": null
     },
-    "external_comparisons": [
-      {
-        "name": "s3-compatible-cloud",
-        "required": false,
-        "skip_reason_required_when_absent": true
-      }
-    ]
+    "head_request_latency_ms": {
+      "sample_count": null,
+      "mean_ms": null,
+      "p50_ms": null,
+      "p95_ms": null,
+      "p99_ms": null
+    }
   },
-  "pass_fail": {
-    "object_thresholds": "section-26.2",
-    "non_object_thresholds": "section-26.3",
-    "regression_threshold_percent": 10,
-    "minimum_valid_samples_per_metric": 1000
-  }
+  "verification": {
+    "expected_object_count": null,
+    "verified_object_count": null,
+    "duration_seconds": null
+  },
+  "limitations": [
+    "This qualifies Developer Defence's raw OSV leaf/head persistence shape; normalised shard construction and snapshot publication are outside this storage gate.",
+    "The current Anvil 0.5 server validates but does not honour ordinary-write durability_class; the harness sends and reports it, so results remain diagnostic until the server implements that boundary.",
+    "Independent verification uses current object heads and exact receipt versions; it does not download payload bytes again.",
+    "Anvil 0.5 has no list, count, or batch-head API: verification proves every expected exact version exists, but --confirm-clean-target remains the operator's assertion that no extra paths exist."
+  ]
 }

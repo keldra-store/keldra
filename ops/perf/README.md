@@ -1,108 +1,95 @@
-# Anvil performance stack
+# Anvil 0.5 OSV import qualification
 
-This directory contains the local performance stack used to investigate slow release gates and request-level latency. GreptimeDB and Grafana run in Docker; Anvil itself runs on the host through the normal Rust test harness.
+The executable `anvil-osv-qualification` measures the ordinary `BulkWrite`
+path against Developer Defence's real raw OSV object shape. It never invokes
+an atomic program.
 
-## Performance inventory
+This repository contains no OSV corpus and no measured result. A run is valid
+only when the operator explicitly supplies and hashes the corpus, identifies
+the Anvil revision, and points the tool at a clean single-node target.
 
-- `anvil/tests/performance_tests.rs` is the broad, environment-gated CoreStore
-  and gRPC timing suite. It emits baseline-compatible summaries but is not an
-  asymptotic complexity gate.
-- `anvil-core/src/perf_baseline.rs` defines the full-system baseline manifest,
-  deterministic generators, and summary schema.
-- `scripts/bench-authz-mutations.sh` is a focused diagnostic command, not a
-  release gate.
-- `scripts/release-gates.sh` owns the executable release groups. `perf-quick`
-  and `perf-release` capture the MVCC-under-Raft benchmark evidence defined by
-  the current architecture.
-- `anvil-core/benches/mvcc_rfc.rs` exercises transaction shapes, durability
-  levels, streaming erasure coding, bundle persistence, Raft certification,
-  local MVCC application, and snapshot reads.
+## Qualified shape
 
-## Start GreptimeDB and Grafana
+For each accepted JSON document, the tool reproduces the schema observed at
+Developer Defence revision
+`ac838a79e5b9fd4aed08d1ac7786e5374b01b733`:
 
-```sh
-docker compose -f ops/perf/docker-compose.yml up -d
-```
+1. JCS-canonicalise the source JSON and write
+   `raw/osv/{sha256(trimmed id)}/record.json`.
+2. Retain the returned Anvil version, JCS-canonicalise a
+   `developer-defence.source-raw-record-head.v1` document referring to it, and
+   write `raw/osv/{sha256(trimmed id)}/current.json` with an absent
+   precondition.
 
-Grafana listens on <http://127.0.0.1:3000>. The local credentials are `admin` / `admin`; anonymous admin access is enabled for this local-only stack.
+The dependency makes two bulk phases necessary: head payloads cannot be built
+until leaf receipts provide their versions. If `N` is the number of accepted
+source JSON documents, the logical mutation count is exactly `M = 2N`.
+Normalised shard construction and snapshot publication are intentionally not
+part of this storage qualification.
 
-GreptimeDB listens on:
+## Run the gate
 
-- HTTP line protocol: <http://127.0.0.1:4000>
-- MySQL protocol for Grafana: `127.0.0.1:4002`
-
-## Run the focused performance suite
-
-Use absolute output paths. Cargo integration tests execute with the package manifest as the current directory, so relative `target/...` paths can otherwise end up below `anvil/target/...`.
+Build or start one Anvil node with an empty data directory. Then run:
 
 ```sh
-ANVIL_RUN_PERF_TESTS=1 \
-ANVIL_PERF_TRACE=1 \
-ANVIL_TEST_TIMINGS=1 \
-ANVIL_PERF_GREPTIME_URL='http://127.0.0.1:4000/v1/influxdb/write?db=public' \
-ANVIL_PERF_TRACE_FILE="$(pwd)/target/anvil/perf/anvil.line" \
-ANVIL_PERF_REPORT_PATH="$(pwd)/target/anvil/perf/performance-summary.json" \
-cargo test -p anvil-server --test performance_tests -- --nocapture --test-threads=1
+cargo run -p anvil-osv-qualification --release -- \
+  --endpoint http://127.0.0.1:50051 \
+  --bearer-token-file /absolute/path/to/token \
+  --tenant dd-osv-qualification \
+  --corpus /absolute/path/to/osv-corpus.zip \
+  --corpus-sha256 <64-lowercase-hex-digits> \
+  --anvil-commit <40-hex-digit-revision> \
+  --durability-class local \
+  --batch-size 256 \
+  --concurrency 4 \
+  --confirm-clean-target \
+  --output /absolute/path/to/result.json
 ```
 
-The suite records two layers:
+Omit `--bearer-token-file` only when the node was deliberately started without
+authentication. The token is neither printed nor stored in the report.
 
-- method-level timings for CoreStore primitives such as blob put/get, append/read stream, CAS ref, fences, and mutation batches;
-- end-to-end gRPC timings for bucket creation, object writes, object reads, listing, index creation, and caught-up index queries.
+The tool verifies the ZIP hash before connecting. The 150-second timer includes
+ZIP reading, JSON parsing, JCS encoding, both write phases, every `BulkWrite`
+response. Hash verification, connection establishment, and post-ingest
+read-back are outside that timer. After the timed interval, bounded `HeadObject`
+calls verify that every leaf and head is current at the exact version returned
+by its receipt.
 
-## Summarise local output
+Anvil 0.5 currently has no list, count, or batch-head operation. Read-back can
+therefore prove that all expected `2N` exact versions exist, but cannot prove
+the absence of unrelated extra paths. `--confirm-clean-target` is the
+operator's explicit assertion covering that missing API capability.
 
-```sh
-scripts/analyze-perf.py \
-  --summary target/anvil/perf/performance-summary.json \
-  --line target/anvil/perf/anvil.line \
-  --release-log target/anvil/logs/release-gates.log
+The process exits non-zero if the import exceeds 150 seconds, any item fails,
+any operation is replayed on the asserted-clean target, or read-back does not
+verify all `2N` objects. JSON is always printed for a completed measured run;
+`--output` writes the same report to a file.
+
+The server defines the meaning of `durability_class`. The tool sends and reports
+the value. The current Anvil 0.5 server validates but does not honour that class
+for ordinary writes, so current results are diagnostic and cannot be release
+evidence. Once implemented, the timed response boundary must include the
+documented durability mapping.
+
+## Comparing batching
+
+Each batch size or concurrency point needs a fresh target because the head
+objects are create-only on first import. Retain one report per run and compare
+only identical corpus hashes, schema revisions, durability classes, Anvil
+revisions, and hardware.
+
+For any pinned corpus:
+
+```text
+required source records/second = N / 150
+required logical mutations/second = 2N / 150
 ```
 
-This prints the slowest measured cases, request paths, internal spans, and release-gate slow-test warnings.
+Run with `--batch-size 1 --concurrency 1` to exercise the worst-case
+one-operation-per-request shape. Its reported mean and p50/p95/p99 request
+latencies show whether the 10 ms one-operation target is achievable; the hard
+qualification gate remains the full-corpus 150-second limit.
 
-## Capture MVCC-under-Raft performance evidence
-
-The `mvcc_rfc` harness records the phase boundaries required by
-`docs/rfcs/mvcc_under_raft.md`: stripe encoding, shard streaming, remote
-persistence, Raft certification, local MVCC application, reads, and total
-transaction time. It covers metadata, inline-object, streaming-erasure,
-single-key, ten-key, cross-table, and durability-level transaction shapes.
-
-Run the default pull-request profile with:
-
-```sh
-./scripts/release-gates.sh perf
-```
-
-Run the larger scheduled/release profile with:
-
-```sh
-./scripts/release-gates.sh perf-release
-```
-
-The quick profile runs each shape once. The release profile runs five samples by
-default; override that with `ANVIL_MVCC_PERF_ITERATIONS`. Evidence is retained
-under `target/anvil/perf/mvcc/<quick|release>/`: `run.log` contains the phase
-samples and `metadata.txt` records the exact commit and toolchain.
-
-This harness captures evidence; it does not yet impose hardware-independent
-latency thresholds. Compare like-for-like machines and retain the results with
-release evidence. The remaining RFC-required contention, group-commit,
-reconnect, retained-history, and garbage-collection workloads must be added
-before treating the performance section of the RFC as complete.
-
-## Capture a macOS Time Profiler trace
-
-For CPU-level analysis, run the same performance suite under Instruments through `xctrace`:
-
-```sh
-ANVIL_RUN_PERF_TESTS=1 \
-ANVIL_PERF_TRACE=1 \
-ANVIL_TEST_TIMINGS=1 \
-ANVIL_PERF_TRACE_FILE="$(pwd)/target/anvil/perf/anvil.line" \
-ANVIL_PERF_REPORT_PATH="$(pwd)/target/anvil/perf/performance-summary.json" \
-ops/perf/run-xctrace.sh target/anvil/perf/anvil-time-profile.trace
-```
-
-Open the resulting `.trace` file in Instruments and inspect the hot call stacks for the slow cases reported by `scripts/analyze-perf.py`.
+`baseline-manifest.json` is an unmeasured field template, not a performance
+claim. Never fill it with estimated or synthetic values.
