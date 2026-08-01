@@ -1,50 +1,63 @@
-#![recursion_limit = "512"]
-
-use anvil::run;
-use clap::Parser;
 use std::net::SocketAddr;
-use tracing::info;
+use std::path::PathBuf;
 
-use anvil::config::Config;
+use anvil::{ServerConfig, serve};
+use anyhow::Result;
+use clap::Parser;
+use tracing_subscriber::EnvFilter;
 
-const ANVIL_TOKIO_WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
+#[derive(Debug, Parser)]
+#[command(name = "anvil-server", version, about = "Anvil 0.5 object server")]
+struct Arguments {
+    #[arg(long, env = "ANVIL_LISTEN", default_value = "127.0.0.1:50051")]
+    listen: SocketAddr,
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(ANVIL_TOKIO_WORKER_STACK_BYTES)
-        .build()?
-        .block_on(async_main())
+    #[arg(long, env = "ANVIL_DATA_DIR", default_value = "anvil-data")]
+    data_dir: PathBuf,
+
+    #[arg(long, env = "ANVIL_NODE_ID", default_value_t = 1)]
+    node_id: u16,
+
+    #[arg(long, env = "ANVIL_MAX_ATOMIC_COMMIT_ENTRIES", default_value_t = 4_096)]
+    max_atomic_commit_entries: u32,
+
+    #[arg(
+        long,
+        env = "ANVIL_MAX_ATOMIC_COMMIT_BYTES",
+        default_value_t = 16 * 1024 * 1024_u64
+    )]
+    max_atomic_commit_bytes: u64,
+
+    #[arg(
+        long,
+        env = "ANVIL_API_TOKEN",
+        hide_env_values = true,
+        default_value = ""
+    )]
+    api_token: String,
+
+    #[arg(long, env = "ANVIL_INSECURE_NO_AUTH", default_value_t = false)]
+    insecure_no_auth: bool,
+
+    #[arg(long, env = "ANVIL_MAX_BLOB_BYTES", default_value_t = 16 * 1024 * 1024 * 1024_u64)]
+    max_blob_bytes: u64,
 }
 
-async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
-
-    let mut config = Config::parse();
-    // The process-backed integration fixture needs real child processes and
-    // independent listeners, but deliberately uses loopback h2c rather than
-    // provisioning certificates. Keep this escape hatch out of release
-    // builds: production peer transport remains TLS-only.
-    #[cfg(debug_assertions)]
-    if std::env::var_os("ANVIL_TEST_ALLOW_INSECURE_MVCC_TRANSPORT").is_some() {
-        config.allow_test_only_insecure_mvcc_transport = true;
-    }
-    config.validate_admin_listener_bind()?;
-
-    let addr = config
-        .api_listen_addr
-        .parse::<SocketAddr>()
-        .expect("Invalid gRPC bind address");
-    let admin_addr = config
-        .admin_listen_addr
-        .parse::<SocketAddr>()
-        .expect("Invalid admin gRPC bind address");
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    let admin_listener = tokio::net::TcpListener::bind(admin_addr).await?;
-
-    info!("Anvil server (gRPC & S3) listening on {}", addr);
-    info!("Anvil admin server (gRPC) listening on {}", admin_addr);
-
-    run(listener, admin_listener, config).await?;
-    Ok(())
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
+    let arguments = Arguments::parse();
+    serve(ServerConfig {
+        listen: arguments.listen,
+        data_dir: arguments.data_dir,
+        node_id: arguments.node_id,
+        max_atomic_commit_entries: arguments.max_atomic_commit_entries,
+        max_atomic_commit_bytes: arguments.max_atomic_commit_bytes,
+        api_token: arguments.api_token,
+        insecure_no_auth: arguments.insecure_no_auth,
+        max_blob_bytes: arguments.max_blob_bytes,
+    })
+    .await
 }
