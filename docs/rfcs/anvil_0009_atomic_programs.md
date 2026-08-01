@@ -17,7 +17,9 @@ small core:
 - ordinary `Put`, `Delete`, and compare-and-swap;
 - non-atomic bulk transport for independent writes;
 - explicit bounded atomic-program APIs for paths marked `PROGRAM_ONLY`; and
-- an unordered, resumable `WatchPrefix` invalidation feed.
+- an unordered, resumable `WatchPrefix` invalidation feed; and
+- realm-scoped Zanzibar schemas, relationship tuples, and permission checks
+  used both by Anvil itself and by applications.
 
 Ordinary `Put`, `Delete`, CAS, and bulk operations are never transactions. They
 do not accept a transaction ID, do not stage work for a later client commit,
@@ -97,6 +99,8 @@ There is no general transaction class between them.
    sequence.
 8. Ingest the pinned Developer Defence OSV corpus into the Developer Defence
    schema on one node in at most 150 seconds.
+9. Use one Zanzibar authorization engine for Anvil's own request decisions and
+   for application-defined relationship realms.
 
 ## 4. Non-goals
 
@@ -111,6 +115,8 @@ Anvil 0.5.0 does not provide:
 - path-derived routing or coordination ownership;
 - SQL predicates, joins, foreign keys, or uniqueness constraints;
 - automatic payload merging;
+- hard-coded roles, path-prefix ACLs, or a second administrator authorization
+  system;
 - a global watch order or delivery of every intermediate version;
 - atomic visibility of external effects;
 - indexes or protocol gateways in the 0.5.0 core release; or
@@ -207,6 +213,170 @@ Every path written by an atomic program is `PROGRAM_ONLY`. This is what makes a
 local lock table at one singleton executor sufficient: no ordinary writer can
 bypass it. Prefixes may select policy, but prefixes are never locks and are
 never expanded into Raft state.
+
+### 5.4 Core Zanzibar authorization
+
+Zanzibar authorization is part of the 0.5 storage core. It is not an index,
+gateway, compatibility feature, or optional policy plug-in. Anvil uses the same
+schema, tuple, revision, and evaluator primitives that it exposes to
+applications.
+
+Authentication establishes an immutable caller identity:
+
+```text
+Caller {
+  storage_tenant
+  subject = namespace:id
+}
+```
+
+The tenant in an ordinary object address must equal the authenticated caller's
+storage tenant. Clients cannot select another tenant by changing a request
+field. Anonymous access, where enabled by a later capability, is represented by
+the explicit reserved public subject and is evaluated normally; it is not an
+authorization bypass.
+
+An authorization realm is identified by:
+
+```text
+AuthzScope {
+  storage_tenant
+  realm
+}
+```
+
+The default application realm name is `default`. A realm is a scope, not a
+registry entry or an object that must be created first. It begins to exist when
+an immutable schema revision is bound to that scope. Namespace, object,
+relation, and userset identities remain structurally inside their realm;
+implementations must not emulate isolation by exposing realm prefixes in
+namespace strings. A userset cannot cross a realm.
+
+There is one protected system scope whose identity is reserved to Anvil:
+
+```text
+storage tenant = Anvil's internal system tenant
+realm          = _anvil/system
+schema         = anvil-system
+```
+
+The system realm is otherwise an ordinary realm. Its schema revisions,
+binding, tuples, revision, snapshots, and permission evaluation use the same
+types, storage operations, limits, and evaluator as every application realm.
+There is no separate ACL engine and no hard-coded administrator role that
+short-circuits checks.
+
+Only Anvil's internal bootstrap and system operations may target the reserved
+system scope for mutation. Public realm APIs reject that scope even if a caller
+spells it explicitly. This protects mutation authority, not representation:
+internal system writes still execute the same validated schema/binding/tuple
+operations as third-party writes.
+
+The system schema models the resources Anvil currently exposes. The 0.5.0
+schema includes the system root, storage tenants, buckets, exact objects, and
+authorization realms. Later capability releases add their own resource
+namespaces to a new immutable system-schema revision; they do not add a second
+authorization mechanism.
+
+Every public request is mapped to a system-realm permission check for the
+authenticated subject. In particular:
+
+- object `Get` and `Head` check exact-object `get`, with an explicit bucket
+  `get_object` fallback;
+- object `Put`, `Publish`, and each `BulkWrite` put check exact-object `put`,
+  with an explicit bucket `put_object` fallback;
+- object `Delete` and each bulk delete check exact-object `delete`, with an
+  explicit bucket `delete_object` fallback;
+- bucket-policy mutation checks the bucket's policy-management permission;
+- loading an atomic program checks the program definition as an exact object,
+  and every expanded read, put, or delete path is checked as the invoking
+  caller before locks are acquired; and
+- custom realm schema, tuple, read, and check requests are authorized against
+  the corresponding system `authz_realm` resource.
+
+The bucket fallback is evaluated structurally from the exact object address.
+Anvil must not write a `parent_bucket` tuple for every object merely to recover
+information already present in that address.
+
+The protected `authz_realm` resource exposes relations and derived permissions
+for its owner, schema administrators, tuple writers, checkers, and auditors.
+Binding the first schema is the custom-realm creation boundary. It also grants
+the creating caller ownership and records the realm's parent storage tenant in
+the protected system realm. Subsequent authority comes from Zanzibar tuples,
+not from an `admin` flag. Schema publication is tenant-wide; realm binding and
+realm operations are authorized independently.
+
+#### 5.4.1 Schemas and bindings
+
+A storage tenant owns immutable, canonical schema revisions:
+
+```text
+SchemaRef {
+  schema_id
+  schema_revision
+  schema_digest
+}
+```
+
+The exact same canonical schema content is an idempotent replay. Different
+content advances that schema ID's revision. A realm binding selects one exact
+schema reference and has a monotonically increasing binding generation. First
+binding accepts an absent or zero expected generation; rebinding requires an
+exact generation CAS. Tuple mutation is validated against, and conditional on,
+the observed binding so a concurrent rebind cannot admit a batch under the
+wrong schema.
+
+The bounded schema language has:
+
+- direct relations, which accept tuples and declare allowed subject selectors;
+- permissions, which never accept tuples and are bounded unions of
+  same-object inheritance and tuple-to-userset rewrites;
+- selectors for any canonical ID in a namespace, one exact subject,
+  same-resource ID, one userset relation, and the explicit public subject; and
+- complete validation of referenced namespaces, relations, and userset
+  targets before publication.
+
+There are no caveats in 0.5.0. A hash field without stored expressions and
+request-context evaluation is not caveat support and is omitted.
+
+#### 5.4.2 Tuple batches, revisions, and checks
+
+A tuple mutation batch belongs to one realm, contains at most the configured
+hard maximum, and applies all-or-nothing in one durable metadata write. Every
+mutation targets a direct relation and is validated before any mutation is
+written. Add and remove are idempotent set operations.
+
+Each storage tenant has one monotonically increasing authorization revision.
+One schema publication, binding change, or tuple batch advances it once; every
+tuple in one batch shares that revision. An optional expected revision is an
+exact CAS. A bounded operation ID and canonical input fingerprint make a lost
+tuple-batch response safely replayable and reject reuse with different input.
+
+Checks and batch checks pin one authoritative storage snapshot and one exact
+authorization revision for the complete graph walk. A batch check evaluates
+all its questions at the same revision. Consistency choices are:
+
+```text
+LATEST       evaluate the current authoritative revision
+AT_LEAST(r)  evaluate current state only if it is at least r
+EXACT(r)     evaluate the retained snapshot at exactly r
+```
+
+The response returns the one revision it evaluated; there is no duplicate
+"zookie" field containing the same number. Historical snapshots and operation
+receipts have explicit bounded retention. A request for an expired exact
+revision fails rather than silently evaluating a different state.
+
+Evaluation is deterministic, fail-closed, cycle-safe, and bounded by schema
+size, tuple count, recursion depth, graph nodes, and total work. Missing realm
+bindings and undeclared relations deny or fail validation; there is no
+schema-less compatibility fallback.
+
+Authorization tuples and schema bodies are data-plane metadata, not Raft
+commands. They are stored and atomically updated beside other authoritative
+metadata. Raft may decide placement or leadership needed by the distributed
+metadata plane, but tuple cardinality, schema bodies, and permission walks do
+not enter the Raft log.
 
 ## 6. Atomic programs
 
@@ -647,6 +817,56 @@ InvokeAtomicProgramResult {
 }
 ```
 
+Authorization uses a separate bounded service surface over the same core
+repository Anvil consults internally:
+
+```text
+PutAuthzSchema {
+  schema_id
+  namespaces[]
+}
+
+BindAuthzSchema {
+  scope
+  schema_ref
+  expected_binding_generation?
+}
+
+MutateAuthzTuples {
+  scope
+  operation_id
+  expected_revision?
+  mutations[] = Add(tuple) | Remove(tuple)
+}
+
+ReadAuthzTuples {
+  scope
+  filters
+  consistency
+  page_token?
+}
+
+CheckPermission {
+  scope
+  subject
+  object
+  relation
+  consistency
+}
+
+CheckPermissions {
+  scope
+  checks[]
+  consistency
+}
+```
+
+There is deliberately no `CreateRealm`, `DeleteRealm`, `ApplySchema`, writable
+permission tuple, caller-supplied publication metadata, realm-encoded
+namespace, or duplicate revision token. The API exposes immutable schema
+publication, binding CAS, atomic tuple-set mutation, tuple inspection, and
+revision-pinned evaluation directly.
+
 Required stable outcome classes include:
 
 ```text
@@ -675,7 +895,8 @@ Anvil 0.5 is delivered as capabilities, not as layers of compatibility code.
 
 1. **0.5.0 Core:** opaque versioned objects, ordinary CAS/immutable/bulk
    writes, bounded atomic programs, executor nomination and recovery,
-   `WatchPrefix`, authentication, durability, and required operator evidence.
+   `WatchPrefix`, authentication, realm-scoped Zanzibar authorization,
+   durability, and required operator evidence.
 2. **Index capability release:** current-state indexes and their builders use
    the core read/version/watch contracts. They are rebuilt from source and are
    never part of an atomic core commit.
@@ -780,6 +1001,10 @@ remaining questions:
    already the immutable program object's full address plus pinned content
    hash; the implementation must not grow both representation mechanisms in
    0.5.0.
+7. **Authorization retention.** Exact-revision checks and idempotent tuple
+   mutation receipts require finite advertised retention. The implementation
+   must fix the bounds, expired-revision result, pruning trigger, and recovery
+   rule without retaining every historical authorization state forever.
 
 These are release blockers for the affected capability. They do not justify
 reintroducing transactions, path-derived routing, payloads in Raft, or
@@ -792,6 +1017,27 @@ The 0.5.0 core is not release-qualified until tests demonstrate:
 - ordinary `Put`, `Delete`, CAS, and bulk have no transaction lifecycle;
 - bulk partial success and idempotent retry of unknown items;
 - ordinary APIs cannot mutate `PROGRAM_ONLY` paths;
+- authenticated tenant identity cannot be replaced by an object or authz scope
+  supplied in the request;
+- the system realm and a third-party realm use the same schema, tuple,
+  revision, snapshot, and evaluator implementation;
+- public APIs cannot read, bind, or mutate the reserved system realm;
+- system bootstrap uses validated system-realm tuples rather than a bypass
+  role;
+- object, bucket-policy, program-definition, expanded program-path, and custom
+  realm operations are denied unless the corresponding system-realm check
+  allows them;
+- custom realms are isolated by structural scope and usersets cannot cross
+  realms;
+- immutable schema replay, changed-content revision, binding-generation CAS,
+  and failure on a concurrent rebind;
+- whole-batch tuple validation, one durable mutation, one shared revision,
+  expected-revision conflict, idempotent replay, and input mismatch;
+- direct, exact, same-resource, userset, and explicit-public selectors;
+- inherited and tuple-to-userset evaluation, cycle termination, hard work
+  bounds, fail-closed missing bindings, and same-revision batch checks;
+- exact-object authorization with structural bucket fallback and no mandatory
+  parent tuple per stored object;
 - deterministic bounded path expansion and per-path authorisation;
 - canonical exact-path lock ordering, cancellation, and contention bounds;
 - any current voter or learner can be nominated executor;
@@ -822,6 +1068,13 @@ The common path stays simple: one exact-path operation or a non-atomic transport
 batch. Applications pay singleton execution, multi-path locking, remote durable
 preparation, and one Raft decision only when they invoke an explicit atomic
 capability.
+
+Authorization has one model rather than an operational ACL layer beside a
+product tuple layer. The protected system realm governs Anvil requests; custom
+realms govern application relationships. Protection changes who may mutate the
+system scope, not how that scope is stored or evaluated. Schema and tuple
+cardinality stay outside Raft, and structural object addresses avoid one
+authorization tuple per stored path.
 
 The singleton is intentionally a KISS trade-off. It removes distributed locks,
 path-derived ownership and routing, cross-owner commit, and certification. It
