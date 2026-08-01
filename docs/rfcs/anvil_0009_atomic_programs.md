@@ -231,9 +231,7 @@ content hash before execution.
 A program definition records at least:
 
 ```text
-program_id
-program_version
-program_hash
+definition_schema_version
 input_schema_hash
 possible_read_path_templates[]
 possible_write_path_templates[]
@@ -346,8 +344,7 @@ semantically like:
 CommitBatch {
   invocation_id
   input_fingerprint
-  program_id
-  program_version
+  program_path_hash
   program_hash
   executor_node_id
   executor_nomination_log_index
@@ -363,8 +360,8 @@ descriptor, path list, or lock record. Before proposing it, the executor has
 already loaded the named program object, verified its content hash, and
 authorised its expanded paths. Raft validates the current nomination fence,
 invocation replay state still retained by the core, bounded command shape, and
-bundle/durability identities. It records the pinned program identity and hash;
-it does not maintain or consult a program registry.
+bundle/durability identities. It records the pinned object-path identity and
+content hash; it does not maintain or consult a program registry.
 
 The committed Raft log index `C` of `CommitBatch` is the batch's commit cursor.
 It is assigned by consensus, not by the client. Committing `CommitBatch` is the
@@ -632,8 +629,7 @@ Atomic program invocation is a separate explicit capability:
 ```text
 InvokeAtomicProgram {
   invocation_id
-  program_id
-  program_version
+  program_address
   program_hash
   input
   durability
@@ -641,6 +637,7 @@ InvokeAtomicProgram {
 
 InvokeAtomicProgramResult {
   invocation_id
+  program_address
   program_hash
   executor_nomination_log_index
   commit_log_index
@@ -779,8 +776,10 @@ remaining questions:
    storage-source replacement, journal handoff, source-epoch translation, and
    the point at which a token becomes `RESUME_EXPIRED`.
 6. **Program representation.** The first release must choose a small bounded
-   interpreter format or compiled built-in handlers and define canonical
-   program identity. It must not grow both mechanisms in 0.5.0.
+   interpreter format or compiled built-in handlers. Canonical identity is
+   already the immutable program object's full address plus pinned content
+   hash; the implementation must not grow both representation mechanisms in
+   0.5.0.
 
 These are release blockers for the affected capability. They do not justify
 reintroducing transactions, path-derived routing, payloads in Raft, or
