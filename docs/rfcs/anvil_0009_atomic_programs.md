@@ -28,10 +28,16 @@ transport and bounded server work, but each item succeeds or fails
 independently.
 
 An atomic program is different because it deliberately changes several exact
-paths under one visibility decision. Calls to an explicit atomic API may arrive
-at any node. That node proxies the call to the cluster's one currently nominated
-atomic-program executor. Any current Raft voter or learner is eligible to be
-that singleton executor.
+paths under one visibility decision. Anvil 0.5.0 is a single-node release. Its
+sole node is the nominated atomic-program executor and executes explicit atomic
+API calls locally. There is no 0.5.0 peer transport, request proxy, or claim of
+node-loss availability.
+
+A later 0.5.x distributed capability may admit multiple nodes. When it does,
+calls may arrive at any node and be proxied to the cluster's one currently
+nominated executor. Any current Raft voter or learner must then be eligible for
+nomination. That extension does not change the ordinary or atomic API boundary
+defined here.
 
 The executor nomination is a Raft decision. The Raft log index at which the
 nomination commits is the executor's fence and epoch. Executor placement and
@@ -45,22 +51,25 @@ For each atomic batch, the nominated executor:
 3. reads their current committed state;
 4. executes the deterministic bounded program;
 5. prepares every payload, immutable version descriptor, and the complete
-   batch bundle on distributed storage;
+   batch bundle on storage satisfying the requested durability;
 6. waits for the configured durability requirement;
 7. proposes one compact `CommitBatch` command containing identities, hashes,
    durable references, and its nomination log index, but no application
    payload; and
 8. treats the committed `CommitBatch` entry as the visibility decision.
 
-All current voters and learners receive the committed decision through Raft.
-Materialising that decision into serving structures is deterministic and
-idempotent. It may be retried by recovery workers; it is not a second commit.
+In 0.5.0 the sole node receives the committed decision through its one-node
+Raft group. Materialising that decision into serving structures is
+deterministic and idempotent. It may be retried by recovery workers; it is not
+a second commit. A later distributed capability applies the same decision on
+every current voter and learner.
 
-Raft is used only for bounded distributed decisions: executor nomination,
-compact atomic-batch commits, and a monotonically advancing finalized-through
+Raft is used only for bounded decisions: executor nomination, compact
+atomic-batch commits, and a monotonically advancing finalized-through
 checkpoint. Object bodies, program definitions, complete version descriptors,
-path inventories, locks, and prepared bundles remain in distributed storage
-outside Raft.
+path inventories, locks, and prepared bundles remain in the byte plane outside
+Raft. The 0.5.0 byte plane is local to its one node; a later distributed byte
+plane must preserve this separation.
 
 ## 2. Why this boundary exists
 
@@ -93,7 +102,8 @@ There is no general transaction class between them.
 3. Support genuine bounded multi-path invariants without exposing arbitrary
    transactions.
 4. Keep application payloads and path cardinality out of Raft.
-5. Make executor failover safe with one simple Raft fence.
+5. Keep the executor fence valid in the 0.5.0 one-node topology and reusable by
+   a later distributed capability without adding distributed locks.
 6. Keep Raft state and replay receipts explicitly bounded.
 7. Provide reliable invalidation watches without inventing a global event
    sequence.
@@ -112,6 +122,8 @@ Anvil 0.5.0 does not provide:
 - arbitrary client-supplied read/write plans;
 - range or prefix locks;
 - a distributed lock service;
+- multi-node membership, peer transport, executor proxying, replicated
+  durability, or node-loss availability;
 - path-derived routing or coordination ownership;
 - SQL predicates, joins, foreign keys, or uniqueness constraints;
 - automatic payload merging;
@@ -182,7 +194,34 @@ Their implementation must still make one path's version/head change atomic and
 must durably couple the corresponding source invalidation with that change.
 That single-path storage property is not a transaction API.
 
-### 5.2 Bulk transport
+### 5.2 Durability choice
+
+Every write request retains one per-request durability choice. It is a closed
+choice, not an opaque policy name:
+
+```text
+LOCAL
+REPLICATED
+```
+
+`LOCAL` is the only satisfiable choice in the single-node 0.5.0 release. A
+successful response means the payload and authoritative metadata required by
+that operation have completed the node's configured synchronous durable write.
+For an atomic program, all prepared artifacts are locally durable before the
+one-node Raft group accepts `CommitBatch`.
+
+`REPLICATED` is a valid stable request value but 0.5.0 returns
+`DURABILITY_UNAVAILABLE` without publishing the mutation because one node
+cannot honestly satisfy it. It must never silently degrade to `LOCAL`.
+
+A later distributed 0.5.x capability makes `REPLICATED` operational. Before
+acknowledging an ordinary mutation or proposing an atomic `CommitBatch`, it
+must wait for durable acknowledgements from at least the cluster-configured
+number `N` of distinct storage nodes. The later capability must define the
+replica or erasure-fragment evidence precisely; accepting the enum today does
+not invent that evidence. Unknown durability values are invalid requests.
+
+### 5.3 Bulk transport
 
 `BulkWrite` carries many independent ordinary commands in one bounded request:
 
@@ -200,21 +239,35 @@ Bulk transport is the normal Developer Defence import path. Independent OSV
 records must not pay one RPC, one consensus round, or one fsync each merely
 because the importer was written as a loop.
 
-### 5.3 Path policy
+### 5.4 Path policy
 
 Path policies are capability admission rules:
 
 - `MUTABLE`: ordinary versioned `Put`, `Delete`, and CAS are allowed;
 - `IMMUTABLE`: only create-once publication is allowed; and
-- `PROGRAM_ONLY`: only an explicitly invoked atomic program may publish the
+- `PROGRAM_ONLY`: only an explicitly invoked atomic program may mutate the
   path.
 
-Every path written by an atomic program is `PROGRAM_ONLY`. This is what makes a
+Every expanded domain path whose state may influence an atomic program, and
+every path it may write or delete, is `PROGRAM_ONLY`. This is what makes a
 local lock table at one singleton executor sufficient: no ordinary writer can
-bypass it. Prefixes may select policy, but prefixes are never locks and are
-never expanded into Raft state.
+change a dependency while a program is preparing. An ordinary `Get` remains
+allowed subject to Zanzibar authorization.
 
-### 5.4 Core Zanzibar authorization
+An ordinary `Put`, `Delete`, or CAS against such a path fails with
+`PROGRAM_CONCURRENCY_VIOLATION` whether or not a program is executing at that
+instant. A competing atomic program instead waits for the same exact-path lock,
+then reads the newly committed state and recalculates. The lock itself is not
+persistent: it is held only for one invocation and is released after commit,
+definitive failure, cancellation, or executor loss.
+
+Path policy is the lasting admission boundary, not the lock. In 0.5.0 policy
+may only become stricter, so a path admitted to `PROGRAM_ONLY` does not later
+return to ordinary mutation. A one-path atomic program remains a valid way to
+change such a path. Prefixes may select policy, but prefixes are never locks
+and are never expanded into Raft state.
+
+### 5.5 Core Zanzibar authorization
 
 Zanzibar authorization is part of the 0.5 storage core. It is not an index,
 gateway, compatibility feature, or optional policy plug-in. Anvil uses the same
@@ -235,6 +288,34 @@ storage tenant. Clients cannot select another tenant by changing a request
 field. Anonymous access, where enabled by a later capability, is represented by
 the explicit reserved public subject and is evaluated normally; it is not an
 authorization bypass.
+
+System bootstrap is an explicit operator action. A fresh 0.5.0 node does not
+guess that it should bootstrap and does not create authority merely because its
+data directory is empty. The operator starts the intended first node with:
+
+```text
+--run-system-bootstrap
+```
+
+That one operation publishes and binds the system schema through the ordinary
+authorization repository, establishes one durable bootstrap application
+identity and credential, and adds the ordinary tuple:
+
+```text
+system:_anvil#bootstrap_admin@app:<bootstrap-app-id>
+```
+
+It then records durable completion. Repeating startup must never mint another
+bootstrap administrator. A later distributed capability replicates the
+bootstrap identity metadata, system schema, binding, tuples, and completion
+state to joining nodes; joining nodes therefore do not run cluster bootstrap.
+
+Long-lived client credentials are exchanged at a separate unauthenticated
+boundary for a short-lived signed token. The token fixes the storage tenant and
+stable application subject installed as `Caller`. Protected typed provisioning
+operations create storage tenants, applications, buckets, and their validated
+system-realm ownership or grant tuples. They do not expose public mutation of
+the reserved system scope or add an administrator bypass.
 
 An authorization realm is identified by:
 
@@ -306,7 +387,7 @@ the protected system realm. Subsequent authority comes from Zanzibar tuples,
 not from an `admin` flag. Schema publication is tenant-wide; realm binding and
 realm operations are authorized independently.
 
-#### 5.4.1 Schemas and bindings
+#### 5.5.1 Schemas and bindings
 
 A storage tenant owns immutable, canonical schema revisions:
 
@@ -339,7 +420,7 @@ The bounded schema language has:
 There are no caveats in 0.5.0. A hash field without stored expressions and
 request-context evaluation is not caveat support and is omitted.
 
-#### 5.4.2 Tuple batches, revisions, and checks
+#### 5.5.2 Tuple batches, revisions, and checks
 
 A tuple mutation batch belongs to one realm, contains at most the configured
 hard maximum, and applies all-or-nothing in one durable metadata write. Every
@@ -438,9 +519,10 @@ AtomicExecutor {
 }
 ```
 
-Any current cluster voter or learner may be nominated. Eligibility is not
+In 0.5.0 the sole node nominates itself. A later distributed capability permits
+any current cluster voter or learner to be nominated; eligibility is not
 derived from object paths or payload placement. A request received elsewhere
-is authenticated normally, then proxied to the current executor without
+is then authenticated normally and proxied to the current executor without
 changing the caller identity or capability checks.
 
 The nomination's committed Raft log index is the epoch. There is no separately
@@ -451,7 +533,7 @@ entries through `E`, including every earlier committed batch. Every
 `CommitBatch` proposed by that executor names `E`. Raft rejects it if `E` is no
 longer the current nomination.
 
-After a new nomination commits:
+When a later distributed capability commits a new nomination:
 
 - the old executor may finish local computation or leave prepared orphans, but
   it cannot commit them;
@@ -459,15 +541,20 @@ After a new nomination commits:
   entry; and
 - retry with the same invocation ID goes to the new executor.
 
-This one fence makes local in-memory locks safe across failover. Two processes
-may temporarily believe they are executor, but only the current nomination can
-make a batch visible.
+This one fence is retained in 0.5.0 even though only one executor exists. It is
+therefore already the rule a later distributed capability uses to make local
+in-memory locks safe across failover: two processes may temporarily believe
+they are executor, but only the current nomination can make a batch visible.
 
 ### 7.1 Exact-path lock table
 
 The executor expands the full possible path set, canonicalises each
 `(tenant, bucket, path)`, sorts it, and acquires the exact-path locks in that
 order. Locks exist only in executor memory while an invocation runs.
+
+Every expanded path is locked, including a path the program only reads. Since
+all such paths are `PROGRAM_ONLY`, every possible mutator uses this same table.
+Ordinary mutations fail admission rather than waiting on these locks.
 
 Sorted acquisition prevents local deadlock. Deadlines, cancellation, fair
 waiting, and hard execution limits bound contention. A crash needs no lock
@@ -493,7 +580,7 @@ While holding its exact-path locks, the current executor:
 5. creates every immutable payload and version descriptor;
 6. creates one canonical bundle describing all old-head expectations and new
    heads;
-7. writes all payloads, descriptors, and the bundle to distributed storage in
+7. writes all payloads, descriptors, and the bundle to the byte plane in
    an invisible prepared namespace; and
 8. waits until the configured durability class is satisfied.
 
@@ -502,8 +589,14 @@ repeated by content hash. An unreferenced preparation is an orphan eligible for
 bounded garbage collection after its executor fence is stale or its preparation
 deadline passes.
 
-The entire recoverable result is remote and durable before consensus. Raft is
-not used to carry or reconstruct payload bytes.
+For `LOCAL` in 0.5.0, the entire recoverable result is synchronously durable on
+the sole node before consensus. This protects process restart and ordinary
+machine restart, but does not claim survival of permanent loss of that node or
+disk. `REPLICATED` fails before consensus in 0.5.0.
+
+When a later distributed capability implements `REPLICATED`, the entire
+recoverable result must satisfy its configured remote acknowledgement count
+before consensus. Raft is never used to carry or reconstruct payload bytes.
 
 ### 8.2 Compact Raft commit
 
@@ -544,21 +637,23 @@ receipt described in section 10.
 
 ## 9. Visibility and idempotent finalization
 
-All current Raft voters and learners learn each committed `CommitBatch`.
-Applying that decision advances a node's logical committed view from all-old to
-all-new for the batch. A node must never expose only a subset of the new heads.
+In 0.5.0 the sole node learns each committed `CommitBatch`. Applying that
+decision advances its logical committed view from all-old to all-new for the
+batch; it must never expose only a subset of the new heads. A later distributed
+capability applies the same rule independently at every current voter and
+learner.
 
-The prepared bundle is the complete description of the change. A node that has
-learned commit `C` but cannot yet fetch and verify its bundle cannot claim that
-its serving view includes `C`: it must continue under an explicitly stale-read
-contract, proxy, or return an availability error. Until it has the bundle it
-does not know the affected path inventory, so it cannot safely claim a current
-view while selectively serving pre-`C` values. Section 16 leaves the public
-freshness choice explicit rather than disguising it as finalization.
+The prepared bundle is the complete description of the change. In 0.5.0 the
+same node prepares, commits, fetches, and verifies it. If that node learns
+commit `C` but cannot verify its local bundle, it returns an availability or
+data-loss error rather than serving a falsely current partial view. A later
+distributed capability must separately choose its follower freshness and proxy
+contract before adding followers.
 
 Finalization materialises committed versions and heads from the durable bundle
-into normal distributed and node-local serving structures. It is keyed by
-`(C, bundle_hash)` and is idempotent:
+into serving structures. In 0.5.0 the entire bundle, its receipt, and required
+invalidations are installed in one local atomic metadata write. Finalization is
+keyed by `(C, bundle_hash)` and is idempotent:
 
 - repeating finalization produces the same versions and heads;
 - a conflicting bundle for `C` is corruption;
@@ -566,10 +661,10 @@ into normal distributed and node-local serving structures. It is keyed by
 - finalization never decides whether the batch committed.
 
 Atomic visibility comes from the one committed Raft decision plus the complete
-durable bundle. It does not depend on one former owner installing every path in
-one local storage-engine batch. Node-local indexes or caches may use an atomic
-overlay while finalization catches up, but that is an implementation detail and
-not a second source of truth.
+durable bundle. The 0.5.0 implementation may use its one local storage-engine
+batch directly. A later distributed capability may use an atomic overlay while
+finalization catches up, but that overlay is an implementation detail and not a
+second source of truth.
 
 Ordinary sequential reads remain read committed rather than snapshot reads. A
 caller can read path A, an atomic batch can commit, and a later independent read
@@ -587,7 +682,7 @@ one learned commit boundary does not expose a partial batch.
 | After durable preparation but before `CommitBatch` | No new state is visible; retry may reuse the prepared content. |
 | After `CommitBatch` but before finalization | The batch is committed and visible logically; recovery fetches and finalizes the bundle. |
 | After finalization but before response | Retry returns the retained receipt. |
-| Old executor proposes after renomination | Raft rejects its stale nomination log index. |
+| Old executor proposes after renomination in a later distributed cluster | Raft rejects its stale nomination log index. |
 | A node cannot fetch a committed bundle | It must not serve a partial or falsely current view. |
 
 ### 10.2 Bounded Raft tail
@@ -599,11 +694,14 @@ Raft periodically commits:
 FinalizedThrough { commit_log_index }
 ```
 
-The checkpoint advances monotonically only when every earlier `CommitBatch` is
-recoverably finalized under the cluster's agreed criterion. Once a checkpoint
-is included in a Raft snapshot, older batch commands may be compacted. The
-snapshot retains the current executor nomination, finalized-through index, and
-only the bounded replay state still inside its advertised window.
+In 0.5.0 the checkpoint advances monotonically only after the sole node has
+atomically installed every earlier `CommitBatch`, including versions, heads,
+receipt, and invalidations, and has durably advanced its applied commit cursor.
+Once a checkpoint is included in a Raft snapshot, older batch commands may be
+compacted. The snapshot retains the current executor nomination,
+finalized-through index, and only the bounded replay state still inside its
+advertised window. A later distributed capability must define a new
+cluster-wide finalized-through criterion before it adds followers.
 
 The tail has hard entry and byte limits. If finalization cannot advance and the
 tail reaches its bound, Anvil applies backpressure to new atomic-program
@@ -642,8 +740,9 @@ head change and source invalidation. An atomic batch derives its source
 invalidations idempotently from the committed bundle; finalization cannot be
 declared complete while required invalidations are missing.
 
-There is no global watch counter. A prefix watch fans out to the relevant
-storage sources and merges their journals.
+There is no global watch counter. In 0.5.0 there is one storage source and one
+bounded journal. A later distributed capability fans a prefix watch out to the
+relevant storage sources and merges their journals.
 
 ### 11.1 Event semantics
 
@@ -679,12 +778,14 @@ one monotonically advancing path version; deletion must not reset identity.
 A consumer that requires every mutation uses an explicit append/audit
 capability, not `WatchPrefix`.
 
-### 11.2 Opaque vector checkpoints
+### 11.2 Opaque checkpoints
 
-Because sources are independently ordered, a resume point is a vector, exposed
-only as a versioned opaque token. The token is integrity-protected and bound to
-the authenticated tenant, bucket, exact prefix, source topology/epochs,
-retention window, and per-source offsets. Clients must not parse or compare it.
+In 0.5.0 a resume point contains the sole source's epoch and local offset. It is
+exposed only as a versioned opaque token so a later distributed capability can
+extend it to a source vector without changing the API. The token is
+integrity-protected and bound to the authenticated tenant, bucket, exact
+prefix, source epoch, retention window, and offset. Clients must not parse or
+compare it.
 
 The stream has invalidations and checkpoint barriers:
 
@@ -692,9 +793,10 @@ The stream has invalidations and checkpoint barriers:
 WatchMessage = Invalidate(...) | Checkpoint { resume_token }
 ```
 
-`Checkpoint(T)` means that every retained source-journal record covered by
-vector `T` has been represented by at least one preceding invalidation. It does
-not mean that those invalidations form a global order or a single timestamp.
+`Checkpoint(T)` means that every retained source-journal record through the
+token's offset has been represented by at least one preceding invalidation. In
+a later distributed capability it covers every component of the source vector.
+It never means that invalidations form a global order or timestamp.
 
 The consumer stores `T` only after all preceding invalidations have been
 durably applied. A crash before storing it causes duplicates on reconnect. A
@@ -702,9 +804,9 @@ server must never advance a checkpoint over an invalidation it silently
 dropped.
 
 New subscriptions explicitly choose `NOW` or the retained beginning; an empty
-token has no ambiguous resume meaning. If any token component is older than its
-source's retention floor, or its source epoch can no longer be translated, the
-server returns `RESUME_EXPIRED` and requires a full prefix rebuild. It must not
+token has no ambiguous resume meaning. If the token offset is older than the
+source's retention floor, or its source epoch is not current, the server
+returns `RESUME_EXPIRED` and requires a full prefix rebuild. It must not
 silently skip to the current tail.
 
 This contract is sufficient for future current-state index builders: reread
@@ -730,8 +832,8 @@ balance @ version 9:
   {"currency":"GBP","balance_minor":70,"last_entry_id":"op-41"}
 ```
 
-The request may arrive at any node. That node proxies it to the current
-singleton executor nominated at Raft index 811. The executor:
+In 0.5.0 the request arrives at the sole node, which is the singleton executor
+nominated at Raft index 811. The executor:
 
 1. verifies the program and caller;
 2. sorts and locks the two exact paths locally;
@@ -748,15 +850,15 @@ balance @ version 10:
   {"currency":"GBP","balance_minor":95,"last_entry_id":"op-42"}
 ```
 
-6. writes both payloads, both version descriptors, and one bundle to
-   distributed storage and waits for configured durability;
+6. writes both payloads, both version descriptors, and one bundle to local
+   durable storage and waits for `LOCAL` durability;
 7. proposes one compact `CommitBatch` naming executor fence 811 and the bundle
    hash; and
 8. makes both versions visible when that command commits at Raft index 8,842.
 
-Every current voter and learner learns commit 8,842. Finalizers may materialise
-its heads more than once, but the result remains ledger-entry version 1 and
-balance version 10.
+The sole node learns commit 8,842. Its finalizer may materialise the heads more
+than once, but the result remains ledger-entry version 1 and balance version
+10.
 
 No path prefix or tenant aggregate is assigned a writer or coordinator. Only
 these two exact paths are locked. A concurrent command touching the same
@@ -779,12 +881,14 @@ Get {
 
 Put {
   command_id, tenant, bucket, path, bytes,
-  condition = Any | Absent | Version(v), durability
+  condition = Any | Absent | Version(v),
+  durability = LOCAL | REPLICATED
 }
 
 Delete {
   command_id, tenant, bucket, path,
-  condition = Any | Version(v), durability
+  condition = Any | Version(v),
+  durability = LOCAL | REPLICATED
 }
 
 BulkWrite {
@@ -802,7 +906,7 @@ InvokeAtomicProgram {
   program_address
   program_hash
   input
-  durability
+  durability = LOCAL | REPLICATED
 }
 
 InvokeAtomicProgramResult {
@@ -877,7 +981,7 @@ ASSERTION_FAILED
 IDEMPOTENCY_INPUT_MISMATCH
 EXECUTOR_MOVED
 PROGRAM_VERSION_MISMATCH
-PROGRAM_POLICY_VIOLATION
+PROGRAM_CONCURRENCY_VIOLATION
 RESOURCE_LIMIT
 DURABILITY_UNAVAILABLE
 FINALIZATION_LAG
@@ -886,8 +990,8 @@ RESUME_EXPIRED
 ```
 
 `EXECUTOR_MOVED` is retryable with the same invocation ID while its replay
-window remains valid. Assertion, policy, version, and input-mismatch failures
-are not automatically retryable.
+window remains valid. Assertion, concurrency, version, and input-mismatch
+failures are not automatically retryable.
 
 ## 14. Capability release sequence
 
@@ -896,7 +1000,8 @@ Anvil 0.5 is delivered as capabilities, not as layers of compatibility code.
 1. **0.5.0 Core:** opaque versioned objects, ordinary CAS/immutable/bulk
    writes, bounded atomic programs, executor nomination and recovery,
    `WatchPrefix`, authentication, realm-scoped Zanzibar authorization,
-   durability, and required operator evidence.
+   single-node `LOCAL` durability, a stable unavailable `REPLICATED` request
+   value, and required operator evidence.
 2. **Index capability release:** current-state indexes and their builders use
    the core read/version/watch contracts. They are rebuilt from source and are
    never part of an atomic core commit.
@@ -905,6 +1010,12 @@ Anvil 0.5 is delivered as capabilities, not as layers of compatibility code.
 
 Exact post-0.5.0 version numbers belong to the release plan; this RFC fixes the
 sequence rather than inventing dates.
+
+A later, discrete 0.5.x distribution capability adds membership, peer
+transport, executor proxying/failover, replicated byte placement, and genuine
+`REPLICATED` acknowledgements from at least configured `N` nodes. It is not
+silently folded into an index or gateway implementation, and it does not widen
+the 0.5.0 image's claims.
 
 No 0.4 RPC is retained merely because generated clients or old gateway code
 used it. There is no dual read, dual write, in-place upgrade, mixed-version
@@ -974,34 +1085,29 @@ remaining time background finalization.
 The confirmed shape above intentionally does not invent answers to these
 remaining questions:
 
-1. **Durability evidence.** Each durability class needs an exact, independently
-   verifiable rule for when payloads, descriptors, and bundle are safe enough
-   for `CommitBatch`. In particular, a node-local preparation cannot support
-   executor-loss recovery after commit unless the API explicitly accepts that
-   availability/loss boundary.
-2. **Finalized-through evidence.** The cluster needs a precise criterion for
-   proposing `FinalizedThrough`: which distributed facts and which current
-   voters/learners must acknowledge, how membership removal affects the
-   minimum, and how a lagging node installs a compacted snapshot. This cannot be
-   replaced by a timeout.
-3. **Follower read freshness.** Each node can move its own serving view from
-   all-old to all-new atomically, but the public contract must choose whether a
-   read may be stale while that node is behind Raft, must proxy, or must perform
-   a freshness barrier. `CommitBatch` alone does not answer cross-node read
-   latency.
-4. **Expired invocation IDs.** Bounded receipts mean old replay evidence is
+1. **Bootstrap credential handoff.** Explicit bootstrap requires an exact safe
+   way to establish the first long-lived credential. The implementation must
+   choose between generating it into an operator-selected create-once file or
+   consuming an operator-supplied credential file, including crash recovery and
+   file-permission rules. It must not print a reusable secret to ordinary logs.
+2. **Expanded authorization intent.** The executor must authorize reads, puts,
+   and deletes using their distinct system-realm permissions. The bounded
+   program representation must expose exact operation intent for every
+   expanded path rather than collapsing put and delete into one `ReadWrite`
+   label.
+3. **Expired invocation IDs.** Bounded receipts mean old replay evidence is
    eventually gone. The API must decide whether expired IDs are recognisable
    and rejected, carry a time/window component, or may be treated as new. It
    must not claim indefinite idempotency without indefinite state.
-5. **Watch source topology.** Opaque vector tokens need a specified rule for
-   storage-source replacement, journal handoff, source-epoch translation, and
-   the point at which a token becomes `RESUME_EXPIRED`.
-6. **Program representation.** The first release must choose a small bounded
+4. **Single-source watch retention.** The implementation must fix the 0.5.0
+   journal's entry/byte or time bounds, pruning trigger, durable source epoch,
+   and exact `RESUME_EXPIRED` boundary.
+5. **Program representation.** The first release must choose a small bounded
    interpreter format or compiled built-in handlers. Canonical identity is
    already the immutable program object's full address plus pinned content
    hash; the implementation must not grow both representation mechanisms in
    0.5.0.
-7. **Authorization retention.** Exact-revision checks and idempotent tuple
+6. **Authorization retention.** Exact-revision checks and idempotent tuple
    mutation receipts require finite advertised retention. The implementation
    must fix the bounds, expired-revision result, pruning trigger, and recovery
    rule without retaining every historical authorization state forever.
@@ -1010,20 +1116,32 @@ These are release blockers for the affected capability. They do not justify
 reintroducing transactions, path-derived routing, payloads in Raft, or
 unbounded logs.
 
+The later distributed capability separately must define replicated durability
+evidence for configured `N`, cluster-wide finalized-through evidence,
+follower-read freshness/proxying, snapshot installation, and multi-source watch
+epoch handoff. None is silently claimed by the single-node 0.5.0 release.
+
 ## 17. Correctness and operational evidence
 
 The 0.5.0 core is not release-qualified until tests demonstrate:
 
 - ordinary `Put`, `Delete`, CAS, and bulk have no transaction lifecycle;
 - bulk partial success and idempotent retry of unknown items;
-- ordinary APIs cannot mutate `PROGRAM_ONLY` paths;
+- ordinary APIs reject `PROGRAM_ONLY` mutation specifically as
+  `PROGRAM_CONCURRENCY_VIOLATION`;
+- all expanded mutable dependencies, including read-only dependencies, require
+  `PROGRAM_ONLY`, while locks are released at invocation end;
+- `LOCAL` completes the configured synchronous local write, `REPLICATED`
+  returns `DURABILITY_UNAVAILABLE` without mutation, and every other value is
+  invalid;
 - authenticated tenant identity cannot be replaced by an object or authz scope
   supplied in the request;
 - the system realm and a third-party realm use the same schema, tuple,
   revision, snapshot, and evaluator implementation;
 - public APIs cannot read, bind, or mutate the reserved system realm;
-- system bootstrap uses validated system-realm tuples rather than a bypass
-  role;
+- system bootstrap runs only under `--run-system-bootstrap`, uses validated
+  system-realm tuples rather than a bypass role, and cannot mint a second
+  bootstrap administrator;
 - object, bucket-policy, program-definition, expanded program-path, and custom
   realm operations are denied unless the corresponding system-realm check
   allows them;
@@ -1040,12 +1158,12 @@ The 0.5.0 core is not release-qualified until tests demonstrate:
   parent tuple per stored object;
 - deterministic bounded path expansion and per-path authorisation;
 - canonical exact-path lock ordering, cancellation, and contention bounds;
-- any current voter or learner can be nominated executor;
-- the nomination Raft log index fences the former executor;
-- complete remote preparation and durability before every `CommitBatch`;
+- the sole node nominates itself and every `CommitBatch` names that nomination
+  log index;
+- complete synchronous local preparation before every 0.5.0 `CommitBatch`;
 - application payload bytes never enter Raft;
 - crashes at every row of the failure table;
-- all-old/all-new visibility at each node's learned commit boundary;
+- all-old/all-new visibility at the sole node's learned commit boundary;
 - idempotent finalization and corruption detection for conflicting bundles;
 - finalized-through compaction and hard backpressure at the Raft-tail bound;
 - bounded orphan cleanup and bounded receipt retention;
@@ -1054,7 +1172,7 @@ The 0.5.0 core is not release-qualified until tests demonstrate:
 - explicit rebuild after `RESUME_EXPIRED`; and
 - the pinned Developer Defence 150-second benchmark.
 
-Metrics expose executor nomination and proxying, lock wait, program execution,
+Metrics expose executor nomination, lock wait, program execution,
 prepare bytes and latency, durability wait, Raft commit latency, unfinalized
 tail entries/bytes, finalized-through lag, finalization retries, orphan bytes,
 receipt-window usage, watch-journal retention/lag, bulk throughput, and
@@ -1065,9 +1183,9 @@ opaque payloads.
 ## 18. Consequences
 
 The common path stays simple: one exact-path operation or a non-atomic transport
-batch. Applications pay singleton execution, multi-path locking, remote durable
-preparation, and one Raft decision only when they invoke an explicit atomic
-capability.
+batch. Applications pay singleton execution, multi-path locking, synchronous
+local preparation, and one Raft decision only when they invoke an explicit
+atomic capability.
 
 Authorization has one model rather than an operational ACL layer beside a
 product tuple layer. The protected system realm governs Anvil requests; custom
