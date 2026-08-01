@@ -233,8 +233,8 @@ pub enum MutationError {
     PreconditionFailed { current: Option<VersionId> },
     #[error("path belongs to a create-once namespace")]
     Immutable,
-    #[error("path may only be written through an invoked atomic program")]
-    ProgramOnly,
+    #[error("ordinary mutation cannot write a PROGRAM_ONLY path")]
+    ProgramConcurrencyViolation,
     #[error("command id was reused with different input")]
     IdempotencyConflict,
     #[error("invalid command id")]

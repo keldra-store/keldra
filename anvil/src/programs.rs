@@ -542,7 +542,9 @@ fn mutation_status(error: anvil_store::MutationError) -> Status {
     match error {
         anvil_store::MutationError::PreconditionFailed { .. }
         | anvil_store::MutationError::Immutable
-        | anvil_store::MutationError::ProgramOnly => Status::failed_precondition(error.to_string()),
+        | anvil_store::MutationError::ProgramConcurrencyViolation => {
+            Status::failed_precondition(error.to_string())
+        }
         anvil_store::MutationError::IdempotencyConflict => {
             Status::already_exists(error.to_string())
         }

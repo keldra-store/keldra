@@ -790,7 +790,7 @@ impl Store {
             .map_err(Clone::clone)?;
         let program_definition = is_program_definition_path(key.path());
         if policy.is_program_only(key.path()) && !program_definition {
-            return Err(MutationError::ProgramOnly);
+            return Err(MutationError::ProgramConcurrencyViolation);
         }
         if program_definition
             && current.is_none()
@@ -1794,7 +1794,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn program_only_policy_blocks_every_direct_write_kind() {
+    async fn program_only_policy_reports_concurrency_violation_for_every_direct_write_kind() {
         let (_temporary, store) = store().await;
         store
             .set_bucket_policy(
@@ -1817,7 +1817,7 @@ mod tests {
                 ))
                 .await
                 .unwrap_err(),
-            MutationError::ProgramOnly
+            MutationError::ProgramConcurrencyViolation
         );
         let blob = store.stage_blob(b"value").await.unwrap();
         assert_eq!(
@@ -1832,7 +1832,7 @@ mod tests {
                 })
                 .await
                 .unwrap_err(),
-            MutationError::ProgramOnly
+            MutationError::ProgramConcurrencyViolation
         );
         assert_eq!(
             store
@@ -1844,7 +1844,7 @@ mod tests {
                 })
                 .await
                 .unwrap_err(),
-            MutationError::ProgramOnly
+            MutationError::ProgramConcurrencyViolation
         );
         assert!(
             store

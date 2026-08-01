@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use anvil_atomic_program::{
     AtomicProgramEngine, AtomicWriteBundle, CommandReceipt, EmissionPayload, EngineError,
-    ExecutionLease, HeadPrecondition, InvocationContext, ObjectPath, ObservedHead,
-    ProgramDefinition, ProgramInvocation, ProgramSnapshot, StateReader, StoredValue,
+    ExecutionLease, ExpandedProgramPath, HeadPrecondition, InvocationContext, ObjectPath,
+    ObservedHead, ProgramDefinition, ProgramInvocation, ProgramSnapshot, StateReader, StoredValue,
     VersionedDocument,
 };
 use rocksdb::{DB, IteratorMode, WriteBatch, WriteOptions};
@@ -225,6 +225,7 @@ pub struct VerifiedProgramDefinition {
 pub struct StoreProgramEngine {
     program_hash: ProgramHash,
     inner: AtomicProgramEngine<Store>,
+    store: Store,
     policy_gate: Arc<tokio::sync::RwLock<()>>,
 }
 
@@ -248,7 +249,7 @@ impl StoreProgramEngine {
         &self,
         context: &InvocationContext,
         invocation: &ProgramInvocation,
-    ) -> Result<Vec<anvil_atomic_program::ExpandedProgramPath>, EngineError> {
+    ) -> Result<Vec<ExpandedProgramPath>, EngineError> {
         self.inner.expanded_paths(context, invocation)
     }
 
@@ -258,11 +259,33 @@ impl StoreProgramEngine {
         invocation: &ProgramInvocation,
     ) -> Result<ProgramExecutionLease, EngineError> {
         let policy_guard = self.policy_gate.clone().read_owned().await;
+        let dependencies = self.inner.expanded_paths(context, invocation)?;
+        self.validate_dependency_policies(&dependencies)?;
         Ok(ProgramExecutionLease {
             program_hash: self.program_hash,
             inner: self.inner.prepare(context, invocation).await?,
             _policy_guard: policy_guard,
         })
+    }
+
+    fn validate_dependency_policies(
+        &self,
+        dependencies: &[ExpandedProgramPath],
+    ) -> Result<(), EngineError> {
+        for dependency in dependencies {
+            let policy = self
+                .store
+                .bucket_policy(&dependency.path.tenant, &dependency.path.bucket)
+                .map_err(|error| EngineError::Read(error.to_string()))?;
+            let path = dependency.path.path.as_str();
+            if !policy.is_program_only(path) {
+                return Err(EngineError::InvalidInvocation(format!(
+                    "atomic-program dependency {:?} must use PROGRAM_ONLY policy",
+                    dependency.path
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -639,6 +662,7 @@ impl Store {
         Ok(StoreProgramEngine {
             program_hash: program.hash,
             inner,
+            store: self.clone(),
             policy_gate: self.policy_gate.clone(),
         })
     }
@@ -1306,7 +1330,81 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_only_program_path_does_not_require_program_only_policy() {
+    async fn mutable_read_only_program_dependency_is_rejected_before_execution() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap()
+            .with_prepared_artifact_repository(Arc::new(MemoryRemoteRepository::default()));
+        let config_path = ObjectPath::new("tenant", "bucket", "configuration/current").unwrap();
+        let config = store
+            .put(PutRequest {
+                key: object_key(&config_path).unwrap(),
+                bytes: serde_json::to_vec(&json!({"enabled": true})).unwrap(),
+                content_type: Some("application/json".into()),
+                precondition: Precondition::Absent,
+                command_id: Some("install-mutable-configuration".into()),
+                durability_class: "test-default".into(),
+            })
+            .await
+            .unwrap();
+        configure_policy(&store).await;
+
+        let mut definition = definition();
+        definition.documents.push(DocumentSpec {
+            name: "configuration".into(),
+            path: PathTemplate::new("{tenant}", "bucket", "configuration/current"),
+            cardinality: Cardinality::One,
+            access: DocumentAccess::ReadOnly,
+            allow_initial_json: false,
+        });
+        definition.caps.max_paths = 3;
+        let bytes = serde_json::to_vec(&definition).unwrap();
+        let verified = VerifiedProgramDefinition::from_bytes(
+            &bytes,
+            ProgramHash::for_definition_bytes(&bytes),
+        )
+        .unwrap();
+
+        let mut invocation = invocation("read-mutable-configuration", ExpectedHead::Absent);
+        invocation.bindings.insert(
+            "configuration".into(),
+            vec![PathBinding {
+                path: config_path.clone(),
+                template_values: Default::default(),
+                expected_head: ExpectedHead::Version {
+                    version: config.version.0.to_string(),
+                },
+                initial_json: None,
+            }],
+        );
+
+        let error = store
+            .program_engine(&verified)
+            .unwrap()
+            .prepare(&InvocationContext::new("tenant").unwrap(), &invocation)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            EngineError::InvalidInvocation(message)
+                if message.contains("configuration/current") && message.contains("PROGRAM_ONLY")
+        ));
+        assert_eq!(
+            store.head(&object_key(&counter_path()).unwrap()).unwrap(),
+            None
+        );
+        assert_eq!(
+            store.head(&object_key(&config_path).unwrap()).unwrap(),
+            Some(Head {
+                version: config.version,
+                deleted: false,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn immutable_read_only_program_dependency_still_requires_program_only_policy() {
         let temporary = tempfile::tempdir().unwrap();
         let store = Store::open(StoreOptions::new(temporary.path(), 1))
             .await
@@ -1324,7 +1422,17 @@ mod tests {
             })
             .await
             .unwrap();
-        configure_policy(&store).await;
+        store
+            .set_bucket_policy(
+                "tenant",
+                "bucket",
+                BucketPolicy {
+                    create_once_prefixes: vec!["configuration".into()],
+                    program_only_prefixes: vec!["managed".into()],
+                },
+            )
+            .await
+            .unwrap();
 
         let mut definition = definition();
         definition.documents.push(DocumentSpec {
@@ -1355,20 +1463,21 @@ mod tests {
             }],
         );
 
-        let engine = store.program_engine(&verified).unwrap();
-        let lease = engine
+        let error = store
+            .program_engine(&verified)
+            .unwrap()
             .prepare(&InvocationContext::new("tenant").unwrap(), &invocation)
             .await
-            .unwrap();
-        let prepared = store.prepare_program_bundle(&lease).await.unwrap();
-        let applied_commit = commit(&prepared, None, 1);
-        let applied = store
-            .apply_program_bundle(lease, &prepared, applied_commit)
-            .await
-            .unwrap();
-
-        assert!(applied.published_versions.contains_key(&counter_path()));
-        assert!(!applied.published_versions.contains_key(&config_path));
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            EngineError::InvalidInvocation(message)
+                if message.contains("configuration/current") && message.contains("PROGRAM_ONLY")
+        ));
+        assert_eq!(
+            store.head(&object_key(&counter_path()).unwrap()).unwrap(),
+            None
+        );
         assert_eq!(
             store.head(&object_key(&config_path).unwrap()).unwrap(),
             Some(Head {

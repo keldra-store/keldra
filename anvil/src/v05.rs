@@ -752,7 +752,9 @@ fn api_failure(error: MutationError) -> MutationFailure {
             current.map(|value| value.0),
         ),
         MutationError::Immutable => (MutationFailureCode::Immutable, None),
-        MutationError::ProgramOnly => (MutationFailureCode::ProgramOnly, None),
+        MutationError::ProgramConcurrencyViolation => {
+            (MutationFailureCode::ProgramConcurrencyViolation, None)
+        }
         MutationError::IdempotencyConflict => (MutationFailureCode::IdempotencyInputMismatch, None),
         MutationError::InvalidCommandId
         | MutationError::InvalidPolicy(_)
@@ -770,7 +772,9 @@ fn status(error: MutationError) -> Status {
     match error {
         MutationError::PreconditionFailed { .. }
         | MutationError::Immutable
-        | MutationError::ProgramOnly => Status::failed_precondition(error.to_string()),
+        | MutationError::ProgramConcurrencyViolation => {
+            Status::failed_precondition(error.to_string())
+        }
         MutationError::IdempotencyConflict => Status::already_exists(error.to_string()),
         MutationError::InvalidCommandId | MutationError::InvalidPolicy(_) => {
             Status::invalid_argument(error.to_string())
