@@ -63,7 +63,8 @@ message PutObjectRequest {
   string content_type = 3;
   WriteCondition condition = 4;
   string command_id = 5;
-  // Opaque deployment-defined identifier. The API does not define classes.
+  // Must be exactly `local` or `replicated`. Anvil 0.5.0 returns
+  // DURABILITY_UNAVAILABLE for `replicated`.
   string durability_class = 6;
 }
 
@@ -74,7 +75,8 @@ message PublishObjectRequest {
   string content_type = 3;
   WriteCondition condition = 4;
   string command_id = 5;
-  // Opaque deployment-defined identifier. The API does not define classes.
+  // Must be exactly `local` or `replicated`. Anvil 0.5.0 returns
+  // DURABILITY_UNAVAILABLE for `replicated`.
   string durability_class = 6;
 }
 
@@ -83,7 +85,8 @@ message DeleteObjectRequest {
   // Delete accepts Any or Version only. Absent is a put/create condition.
   WriteCondition condition = 2;
   string command_id = 3;
-  // Opaque deployment-defined identifier. The API does not define classes.
+  // Must be exactly `local` or `replicated`. Anvil 0.5.0 returns
+  // DURABILITY_UNAVAILABLE for `replicated`.
   string durability_class = 4;
 }
 
@@ -232,7 +235,8 @@ message InvokeProgramRequest {
   bytes program_hash = 3;
   // Canonical JSON object containing arguments, inputs, blobs and bindings.
   bytes input_json = 4;
-  // Opaque deployment-defined identifier. The API does not define classes.
+  // Must be exactly `local` or `replicated`. Anvil 0.5.0 returns
+  // DURABILITY_UNAVAILABLE for `replicated`.
   string durability_class = 5;
 }
 

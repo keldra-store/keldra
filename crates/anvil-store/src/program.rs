@@ -26,6 +26,7 @@ const COMMIT_CURSOR_PREFIX: &[u8] = b"cursor/";
 const COMMIT_BUNDLE_PREFIX: &[u8] = b"bundle/";
 const ARTIFACT_PREFIX: u8 = b'a';
 const EVIDENCE_PREFIX: u8 = b'e';
+const LOCAL_DURABILITY_CLASS: &str = "local";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -916,7 +917,7 @@ mod tests {
         let prepared = store.prepare_program_bundle(&lease).await.unwrap();
 
         assert!(matches!(
-            prepared.durability.scope,
+            &prepared.durability.scope,
             ProgramDurabilityScope::ExecutorLocal {
                 node_id: 1,
                 synced: true
@@ -924,6 +925,45 @@ mod tests {
         ));
         assert_eq!(
             prepared.remote_durability_evidence_hash().unwrap_err(),
+            ProgramStoreError::ExecutorLocalDurability
+        );
+
+        let wrong_class = ProgramCommit {
+            previous_commit_cursor: None,
+            commit_cursor: 1,
+            bundle_ref: PreparedBundleRef(prepared.bundle.hash),
+            bundle_hash: prepared.hash,
+            program_hash: prepared.program_hash,
+            durability_class: ProgramDurabilityClassHash::for_class("replicated"),
+            durability_evidence_hash: prepared.durability_evidence_hash,
+        };
+        assert_eq!(
+            verify_prepared_commit(&prepared, &wrong_class).unwrap_err(),
+            ProgramStoreError::DurabilityClassMismatch
+        );
+
+        let local_commit = ProgramCommit {
+            durability_class: ProgramDurabilityClassHash::for_class(LOCAL_DURABILITY_CLASS),
+            ..wrong_class
+        };
+        let applied = store
+            .apply_program_bundle(lease, &prepared, local_commit)
+            .await
+            .unwrap();
+        assert_eq!(store.applied_program_receipt(1).unwrap(), Some(applied));
+    }
+
+    #[test]
+    fn unsynced_executor_local_evidence_cannot_satisfy_local_commit() {
+        assert_eq!(
+            verify_commit_durability(
+                &ProgramDurabilityScope::ExecutorLocal {
+                    node_id: 1,
+                    synced: false,
+                },
+                ProgramDurabilityClassHash::for_class(LOCAL_DURABILITY_CLASS),
+            )
+            .unwrap_err(),
             ProgramStoreError::ExecutorLocalDurability
         );
     }
@@ -1881,13 +1921,7 @@ fn verify_loaded_commit(
         return Err(ProgramStoreError::PreparedBundleMismatch);
     }
 
-    let ProgramDurabilityScope::ConfiguredRemote { class } = &loaded.evidence.scope else {
-        return Err(ProgramStoreError::ExecutorLocalDurability);
-    };
-    if ProgramDurabilityClassHash::for_class(class) != commit.durability_class {
-        return Err(ProgramStoreError::DurabilityClassMismatch);
-    }
-    Ok(())
+    verify_commit_durability(&loaded.evidence.scope, commit.durability_class)
 }
 
 fn verify_prepared_commit(
@@ -1903,10 +1937,25 @@ fn verify_prepared_commit(
         return Err(ProgramStoreError::PreparedBundleMismatch);
     }
 
-    let ProgramDurabilityScope::ConfiguredRemote { class } = &prepared.durability.scope else {
-        return Err(ProgramStoreError::ExecutorLocalDurability);
+    verify_commit_durability(&prepared.durability.scope, commit.durability_class)
+}
+
+fn verify_commit_durability(
+    scope: &ProgramDurabilityScope,
+    committed_class: ProgramDurabilityClassHash,
+) -> Result<(), ProgramStoreError> {
+    let expected_class = match scope {
+        ProgramDurabilityScope::ExecutorLocal { synced: true, .. } => {
+            ProgramDurabilityClassHash::for_class(LOCAL_DURABILITY_CLASS)
+        }
+        ProgramDurabilityScope::ExecutorLocal { synced: false, .. } => {
+            return Err(ProgramStoreError::ExecutorLocalDurability);
+        }
+        ProgramDurabilityScope::ConfiguredRemote { class } => {
+            ProgramDurabilityClassHash::for_class(class)
+        }
     };
-    if ProgramDurabilityClassHash::for_class(class) != commit.durability_class {
+    if expected_class != committed_class {
         return Err(ProgramStoreError::DurabilityClassMismatch);
     }
     Ok(())

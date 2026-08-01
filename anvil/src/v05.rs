@@ -32,6 +32,8 @@ const MAX_BULK_ITEMS: usize = 1_000;
 const MAX_BULK_BYTES: usize = 64 * 1024 * 1024;
 const MAX_BATCH_GET_ITEMS: usize = 1_000;
 const MAX_BATCH_GET_BYTES: usize = 64 * 1024 * 1024;
+const LOCAL_DURABILITY_CLASS: &str = "local";
+const REPLICATED_DURABILITY_CLASS: &str = "replicated";
 
 #[derive(Clone)]
 pub struct ObjectServiceImpl {
@@ -420,11 +422,13 @@ impl ObjectService for ObjectServiceImpl {
         request: Request<InvokeProgramRequest>,
     ) -> Result<Response<InvokeProgramResponse>, Status> {
         let caller = authenticated_caller(&request)?;
-        let program = object_key(request.into_inner().program)?;
+        let request = request.into_inner();
+        require_durability_class(&request.durability_class)?;
+        let program = object_key(request.program)?;
         self.authorize_object(&caller, &program, ObjectPermission::Get)
             .await?;
         Err(Status::unimplemented(
-            "the program definition's full object address is unresolved; no bucket is inferred",
+            "expanded program paths do not identify put versus delete authorization",
         ))
     }
 }
@@ -785,12 +789,15 @@ fn status(error: MutationError) -> Status {
 }
 
 fn require_durability_class(value: &str) -> Result<(), Status> {
-    if value.trim().is_empty() || value.len() > 256 {
-        return Err(Status::invalid_argument(
-            "durability_class must contain between 1 and 256 bytes",
-        ));
+    match value {
+        LOCAL_DURABILITY_CLASS => Ok(()),
+        REPLICATED_DURABILITY_CLASS => Err(Status::unavailable(
+            "replicated durability is unavailable in Anvil 0.5.0",
+        )),
+        _ => Err(Status::invalid_argument(
+            "durability_class must be exactly `local` or `replicated`",
+        )),
     }
-    Ok(())
 }
 
 fn enforce_batch_get_payload_limit(declared_payload_bytes: u64) -> Result<(), Status> {
@@ -877,7 +884,7 @@ mod tests {
                     }),
                     bytes: vec![0; 2],
                     command_id: "command".into(),
-                    durability_class: "configured".into(),
+                    durability_class: LOCAL_DURABILITY_CLASS.into(),
                     ..Default::default()
                 },
             )),
@@ -889,7 +896,7 @@ mod tests {
     }
 
     #[test]
-    fn bulk_conversion_preserves_each_opaque_durability_class() {
+    fn bulk_conversion_preserves_local_durability_class() {
         let operations = [
             BulkOperation {
                 operation: Some(anvil_api::v1::bulk_operation::Operation::Put(
@@ -897,7 +904,7 @@ mod tests {
                         address: address("put"),
                         bytes: b"value".to_vec(),
                         command_id: "put-command".into(),
-                        durability_class: "put-opaque".into(),
+                        durability_class: LOCAL_DURABILITY_CLASS.into(),
                         ..Default::default()
                     },
                 )),
@@ -911,7 +918,7 @@ mod tests {
                             length: 5,
                         }),
                         command_id: "publish-command".into(),
-                        durability_class: "publish-opaque".into(),
+                        durability_class: LOCAL_DURABILITY_CLASS.into(),
                         ..Default::default()
                     },
                 )),
@@ -921,7 +928,7 @@ mod tests {
                     DeleteObjectRequest {
                         address: address("delete"),
                         command_id: "delete-command".into(),
-                        durability_class: "delete-opaque".into(),
+                        durability_class: LOCAL_DURABILITY_CLASS.into(),
                         ..Default::default()
                     },
                 )),
@@ -938,16 +945,45 @@ mod tests {
                 },
             )
             .collect::<Vec<_>>();
-        assert_eq!(classes, ["put-opaque", "publish-opaque", "delete-opaque"]);
+        assert_eq!(classes, ["local", "local", "local"]);
     }
 
     #[test]
-    fn durability_class_shape_is_bounded_without_interpreting_names() {
-        assert!(require_durability_class("x").is_ok());
-        assert!(require_durability_class(&"x".repeat(256)).is_ok());
-        assert!(require_durability_class("").is_err());
-        assert!(require_durability_class("  ").is_err());
-        assert!(require_durability_class(&"x".repeat(257)).is_err());
+    fn durability_class_is_a_closed_exact_choice() {
+        assert!(require_durability_class(LOCAL_DURABILITY_CLASS).is_ok());
+        assert_eq!(
+            require_durability_class(REPLICATED_DURABILITY_CLASS)
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unavailable
+        );
+        for invalid in ["", " local", "local ", "LOCAL", "configured"] {
+            assert_eq!(
+                require_durability_class(invalid).unwrap_err().code(),
+                tonic::Code::InvalidArgument
+            );
+        }
+    }
+
+    #[test]
+    fn replicated_bulk_item_reports_durability_unavailable() {
+        let operation = BulkOperation {
+            operation: Some(anvil_api::v1::bulk_operation::Operation::Delete(
+                DeleteObjectRequest {
+                    address: address("delete"),
+                    command_id: "delete-command".into(),
+                    durability_class: REPLICATED_DURABILITY_CLASS.into(),
+                    ..Default::default()
+                },
+            )),
+        };
+
+        let error = batch_operation(operation, u64::MAX).unwrap_err();
+        let failure = api_request_failure(error);
+        assert_eq!(
+            failure.code,
+            MutationFailureCode::DurabilityUnavailable as i32
+        );
     }
 
     #[test]

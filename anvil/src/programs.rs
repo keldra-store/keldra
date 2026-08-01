@@ -25,6 +25,8 @@ use tonic::Status;
 const LEADER_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const MAX_PROGRAM_INPUT_BYTES: usize = 16 * 1024 * 1024;
 const PROGRAM_PATH_PREFIX: &str = "_anvil/programs/";
+const LOCAL_DURABILITY_CLASS: &str = "local";
+const REPLICATED_DURABILITY_CLASS: &str = "replicated";
 
 #[derive(Clone)]
 pub(crate) struct ProgramCoordinator {
@@ -187,23 +189,12 @@ impl ProgramCoordinator {
                 .prepare_program_bundle(&lease)
                 .await
                 .map_err(program_store_status)?;
-            let evidence_hash = prepared
-                .remote_durability_evidence_hash()
-                .map_err(program_store_status)?;
-            match &prepared.durability.scope {
-                ProgramDurabilityScope::ConfiguredRemote { class } if class == durability_class => {
-                }
-                ProgramDurabilityScope::ConfiguredRemote { .. } => {
-                    return Err(Status::failed_precondition(
-                        "prepared durability evidence does not match the requested class",
-                    ));
-                }
-                ProgramDurabilityScope::ExecutorLocal { .. } => {
-                    return Err(Status::unavailable(
-                        "atomic commit requires remotely recoverable prepared artifacts",
-                    ));
-                }
-            }
+            let evidence_hash = accepted_program_evidence_hash(
+                &prepared.durability.scope,
+                prepared.durability_evidence_hash,
+                durability_class,
+                self.node,
+            )?;
 
             let _commit_guard = self.commit_gate.lock().await;
             let decision_state = self.decisions.state().map_err(decision_status)?;
@@ -384,12 +375,47 @@ fn validate_program_request(
             "program input exceeds {MAX_PROGRAM_INPUT_BYTES} bytes"
         )));
     }
-    if durability_class.trim().is_empty() || durability_class.len() > 256 {
-        return Err(Status::invalid_argument(
-            "durability_class must contain between 1 and 256 bytes",
-        ));
+    require_program_durability_class(durability_class)
+}
+
+fn require_program_durability_class(value: &str) -> Result<(), Status> {
+    match value {
+        LOCAL_DURABILITY_CLASS => Ok(()),
+        REPLICATED_DURABILITY_CLASS => Err(Status::unavailable(
+            "replicated durability is unavailable in Anvil 0.5.0",
+        )),
+        _ => Err(Status::invalid_argument(
+            "durability_class must be exactly `local` or `replicated`",
+        )),
     }
-    Ok(())
+}
+
+fn accepted_program_evidence_hash(
+    scope: &ProgramDurabilityScope,
+    evidence_hash: ProgramDurabilityEvidenceHash,
+    requested_class: &str,
+    executor: NodeId,
+) -> Result<ProgramDurabilityEvidenceHash, Status> {
+    match scope {
+        ProgramDurabilityScope::ExecutorLocal {
+            node_id,
+            synced: true,
+        } if requested_class == LOCAL_DURABILITY_CLASS && u64::from(*node_id) == executor.0 => {
+            Ok(evidence_hash)
+        }
+        ProgramDurabilityScope::ExecutorLocal { synced: false, .. } => Err(Status::unavailable(
+            "local atomic preparation was not synchronously durable",
+        )),
+        ProgramDurabilityScope::ExecutorLocal { .. } => Err(Status::failed_precondition(
+            "executor-local durability evidence does not belong to the nominated executor",
+        )),
+        ProgramDurabilityScope::ConfiguredRemote { class } if class == requested_class => {
+            Ok(evidence_hash)
+        }
+        ProgramDurabilityScope::ConfiguredRemote { .. } => Err(Status::failed_precondition(
+            "prepared durability evidence does not match the requested class",
+        )),
+    }
 }
 
 fn program_path_hash(key: &ObjectKey) -> [u8; 32] {
@@ -628,10 +654,76 @@ mod tests {
     #[test]
     fn only_nonempty_reserved_program_paths_are_accepted() {
         let valid = ObjectKey::new("tenant", "bucket", "_anvil/programs/import_osv@1").unwrap();
-        assert!(validate_program_request(&valid, "invoke-1", b"{}", "remote").is_ok());
+        assert!(
+            validate_program_request(&valid, "invoke-1", b"{}", LOCAL_DURABILITY_CLASS).is_ok()
+        );
 
         let outside = ObjectKey::new("tenant", "bucket", "programs/import_osv@1").unwrap();
-        assert!(validate_program_request(&outside, "invoke-1", b"{}", "remote").is_err());
+        assert!(
+            validate_program_request(&outside, "invoke-1", b"{}", LOCAL_DURABILITY_CLASS).is_err()
+        );
+    }
+
+    #[test]
+    fn program_durability_class_is_a_closed_exact_choice() {
+        let key = ObjectKey::new("tenant", "bucket", "_anvil/programs/import_osv@1").unwrap();
+        assert!(validate_program_request(&key, "invoke-1", b"{}", LOCAL_DURABILITY_CLASS).is_ok());
+        assert_eq!(
+            validate_program_request(&key, "invoke-1", b"{}", REPLICATED_DURABILITY_CLASS,)
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unavailable
+        );
+        for invalid in ["", " local", "local ", "LOCAL", "remote"] {
+            assert_eq!(
+                validate_program_request(&key, "invoke-1", b"{}", invalid)
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::InvalidArgument
+            );
+        }
+    }
+
+    #[test]
+    fn local_durability_requires_synced_evidence_from_the_executor() {
+        let evidence_hash = ProgramDurabilityEvidenceHash([7; 32]);
+        assert_eq!(
+            accepted_program_evidence_hash(
+                &ProgramDurabilityScope::ExecutorLocal {
+                    node_id: 3,
+                    synced: true,
+                },
+                evidence_hash,
+                LOCAL_DURABILITY_CLASS,
+                NodeId(3),
+            )
+            .unwrap(),
+            evidence_hash
+        );
+
+        let unsynced = accepted_program_evidence_hash(
+            &ProgramDurabilityScope::ExecutorLocal {
+                node_id: 3,
+                synced: false,
+            },
+            evidence_hash,
+            LOCAL_DURABILITY_CLASS,
+            NodeId(3),
+        )
+        .unwrap_err();
+        assert_eq!(unsynced.code(), tonic::Code::Unavailable);
+
+        let wrong_node = accepted_program_evidence_hash(
+            &ProgramDurabilityScope::ExecutorLocal {
+                node_id: 4,
+                synced: true,
+            },
+            evidence_hash,
+            LOCAL_DURABILITY_CLASS,
+            NodeId(3),
+        )
+        .unwrap_err();
+        assert_eq!(wrong_node.code(), tonic::Code::FailedPrecondition);
     }
 
     #[test]
