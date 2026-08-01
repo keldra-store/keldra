@@ -66,11 +66,11 @@ any operation is replayed on the asserted-clean target, or read-back does not
 verify all `2N` objects. JSON is always printed for a completed measured run;
 `--output` writes the same report to a file.
 
-The server defines the meaning of `durability_class`. The tool sends and reports
-the value. The current Anvil 0.5 server validates but does not honour that class
-for ordinary writes, so current results are diagnostic and cannot be release
-evidence. Once implemented, the timed response boundary must include the
-documented durability mapping.
+`durability_class` is a closed choice. Exact `local` performs the write with
+single-node durability and is the value used by this qualification. Exact
+`replicated` returns `DURABILITY_UNAVAILABLE` without a mutation in Anvil 0.5.0;
+every other value is invalid. The tool sends and records the selected value, and
+the timed response boundary includes the requested durability work.
 
 ## Comparing batching
 

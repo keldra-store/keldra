@@ -74,7 +74,7 @@ struct Args {
     #[arg(long)]
     anvil_commit: String,
 
-    /// Deployment-defined class sent on every write and copied into the report.
+    /// Exact `local` or `replicated`; 0.5.0 can qualify only `local`.
     #[arg(long)]
     durability_class: String,
 
@@ -282,7 +282,7 @@ async fn main() -> Result<()> {
         },
         limitations: vec![
             "This qualifies Developer Defence's raw OSV leaf/head persistence shape; normalised shard construction and snapshot publication are outside this storage gate.",
-            "The current Anvil 0.5 server validates but does not honour ordinary-write durability_class; the harness sends and reports it, so results remain diagnostic until the server implements that boundary.",
+            "Anvil 0.5 accepts exactly local or replicated durability: local performs the write, replicated returns DURABILITY_UNAVAILABLE without mutation, and every other value is invalid. This single-node qualification uses local.",
             "Independent verification uses current object heads and exact receipt versions; it does not download payload bytes again.",
             "Anvil 0.5 has no list, count, or batch-head API: verification proves every expected exact version exists, but --confirm-clean-target remains the operator's assertion that no extra paths exist.",
         ],
