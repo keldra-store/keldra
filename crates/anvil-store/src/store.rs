@@ -36,11 +36,12 @@ pub(crate) const CF_AUTHZ_SCHEMAS: &str = "authz_schemas";
 pub(crate) const CF_AUTHZ_BINDINGS: &str = "authz_bindings";
 pub(crate) const CF_AUTHZ_TUPLES: &str = "authz_tuples";
 pub(crate) const CF_AUTHZ_RECEIPTS: &str = "authz_receipts";
+pub(crate) const CF_CREDENTIALS: &str = "credentials";
 pub(crate) const VERSION_HIGH_WATERMARK_KEY: &[u8] = b"version_high_watermark";
 const LOCAL_INVALIDATION_OFFSET_KEY: &[u8] = b"local_invalidation_offset";
 const FORMAT_MARKER_NAME: &str = ".anvil-format";
 const FORMAT_MARKER: &[u8] = b"anvil-store-format:0.5\n";
-const COLUMN_FAMILIES: &[&str] = &[
+pub(crate) const COLUMN_FAMILIES: &[&str] = &[
     CF_HEADS,
     CF_VERSIONS,
     CF_RECEIPTS,
@@ -55,6 +56,7 @@ const COLUMN_FAMILIES: &[&str] = &[
     CF_AUTHZ_BINDINGS,
     CF_AUTHZ_TUPLES,
     CF_AUTHZ_RECEIPTS,
+    CF_CREDENTIALS,
 ];
 
 #[derive(Clone, Debug)]

@@ -15,6 +15,16 @@ struct Arguments {
     #[arg(long, env = "ANVIL_DATA_DIR", default_value = "anvil-data")]
     data_dir: PathBuf,
 
+    #[arg(long, env = "ANVIL_RUN_SYSTEM_BOOTSTRAP", default_value_t = false)]
+    run_system_bootstrap: bool,
+
+    #[arg(
+        long,
+        env = "ANVIL_SYSTEM_BOOTSTRAP_CREDENTIAL_OUTPUT",
+        requires = "run_system_bootstrap"
+    )]
+    system_bootstrap_credential_output: Option<PathBuf>,
+
     #[arg(long, env = "ANVIL_NODE_ID", default_value_t = 1)]
     node_id: u16,
 
@@ -52,6 +62,8 @@ async fn main() -> Result<()> {
     serve(ServerConfig {
         listen: arguments.listen,
         data_dir: arguments.data_dir,
+        run_system_bootstrap: arguments.run_system_bootstrap,
+        system_bootstrap_credential_output: arguments.system_bootstrap_credential_output,
         node_id: arguments.node_id,
         max_atomic_commit_entries: arguments.max_atomic_commit_entries,
         max_atomic_commit_bytes: arguments.max_atomic_commit_bytes,

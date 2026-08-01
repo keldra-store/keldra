@@ -6,6 +6,7 @@
 
 mod authz;
 mod blob;
+mod bootstrap;
 mod clock;
 mod key;
 mod model;
@@ -21,6 +22,10 @@ pub use authz::{
     TupleBatchReceipt, TupleBatchRequest, TupleMutation, TupleMutationKind,
 };
 pub use blob::{BlobReader, BlobRef, BlobStore, BlobUpload};
+pub use bootstrap::{
+    ApplicationCredential, CredentialRepository, SYSTEM_BOOTSTRAP_VERSION, SYSTEM_SCHEMA_ID,
+    SystemBootstrapError, SystemBootstrapRequest, SystemBootstrapState, system_schema,
+};
 pub use clock::VersionClock;
 pub use key::ObjectKey;
 pub use model::{

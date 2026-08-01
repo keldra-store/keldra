@@ -634,7 +634,7 @@ mod tests {
     use super::*;
     use crate::authorization::storage_tenant_resource;
     use anvil_authz::{RealmId, TupleSubject};
-    use anvil_store::{AuthzScope, Store, StoreOptions};
+    use anvil_store::{AuthzScope, Store, StoreOptions, SystemBootstrapRequest};
 
     fn test_caller() -> Caller {
         let manager = crate::authentication::JwtManager::new("test signing secret").unwrap();
@@ -749,14 +749,20 @@ mod tests {
         let store = Store::open(StoreOptions::new(directory.path(), 3))
             .await
             .unwrap();
+        store
+            .bootstrap_system(SystemBootstrapRequest {
+                app_id: "bootstrap-app".into(),
+                client_id: "bootstrap-client".into(),
+                client_secret: "bootstrap-secret-with-at-least-32-bytes".into(),
+            })
+            .unwrap();
         let repository = store.authz();
-        crate::authorization::ensure_system_realm(&repository).unwrap();
         let system = SystemAuthorizer::new(repository.clone()).load().unwrap();
         let caller = test_caller();
         repository
             .mutate_tuples(TupleBatchRequest {
                 scope: AuthzScope::system(),
-                principal: ObjectRef::opaque("app", "_anvil/bootstrap").unwrap(),
+                principal: ObjectRef::opaque("app", "bootstrap-app").unwrap(),
                 expected_revision: Some(system.revision),
                 expected_binding_generation: system.binding_generation,
                 operation_id: Some("seed-acme-owner".into()),
@@ -773,7 +779,7 @@ mod tests {
         let service = AuthzServiceImpl::new(repository.clone());
 
         let system_caller =
-            Caller::from_authenticated_application(StorageTenantId::system(), "bootstrap-admin")
+            Caller::from_authenticated_application(StorageTenantId::system(), "bootstrap-app")
                 .unwrap();
         let protected_publication = service
             .put_schema(request(

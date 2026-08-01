@@ -1,18 +1,11 @@
-use anvil_authz::{
-    AllowedSubject, Authorization, AuthorizationCheck, ExactPath, NamespaceDefinition, ObjectRef,
-    RelationDefinition, RewriteRule, Schema,
-};
+use anvil_authz::{Authorization, AuthorizationCheck, ExactPath, ObjectRef};
 use std::sync::{Arc, RwLock};
 
 use anvil_store::{
-    AuthzConsistency, AuthzRepository, AuthzRevision, AuthzScope, AuthzStoreError,
-    BindSchemaRequest, ObjectKey, PublishSchemaRequest, RealmSnapshot, SchemaId, StorageTenantId,
+    AuthzConsistency, AuthzRepository, AuthzRevision, AuthzScope, AuthzStoreError, ObjectKey,
+    RealmSnapshot, StorageTenantId,
 };
 
-pub(crate) const SYSTEM_STORAGE_TENANT: &str = "_anvil";
-pub(crate) const SYSTEM_SCHEMA_ID: &str = "anvil-system";
-pub(crate) const SYSTEM_NAMESPACE: &str = "system";
-pub(crate) const SYSTEM_OBJECT_ID: &str = "_anvil";
 pub(crate) const STORAGE_TENANT_NAMESPACE: &str = "storage_tenant";
 pub(crate) const BUCKET_NAMESPACE: &str = "bucket";
 pub(crate) const OBJECT_NAMESPACE: &str = "object";
@@ -168,34 +161,6 @@ impl SystemAuthorization {
     }
 }
 
-/// Installs or advances the protected realm through the exact same immutable
-/// schema publication and binding operations used by customer realms. This is
-/// bootstrap authority, not an authorization bypass.
-pub(crate) fn ensure_system_realm(repository: &AuthzRepository) -> Result<(), AuthzStoreError> {
-    let system_tenant = StorageTenantId::system();
-    let published = repository.publish_schema(PublishSchemaRequest {
-        storage_tenant: system_tenant.clone(),
-        schema_id: SchemaId::parse(SYSTEM_SCHEMA_ID)?,
-        schema: system_schema(),
-        expected_revision: None,
-    })?;
-    let scope = AuthzScope::system();
-    let existing = repository.get_binding(&scope)?;
-    if existing
-        .as_ref()
-        .is_some_and(|binding| binding.schema_ref == published.schema_ref)
-    {
-        return Ok(());
-    }
-    repository.bind_schema(BindSchemaRequest {
-        scope,
-        schema_ref: published.schema_ref,
-        expected_generation: existing.map(|binding| binding.generation).or(Some(0)),
-        expected_revision: Some(repository.tenant_revision(&system_tenant)?),
-    })?;
-    Ok(())
-}
-
 impl RealmPermission {
     fn relation(self) -> &'static str {
         match self {
@@ -223,102 +188,6 @@ impl ObjectPermission {
             Self::Delete => "delete_object",
         }
     }
-}
-
-pub(crate) fn system_schema() -> Schema {
-    Schema::new([
-        NamespaceDefinition::new(
-            SYSTEM_NAMESPACE,
-            [
-                direct("bootstrap_admin", APP_NAMESPACE),
-                direct("admin", APP_NAMESPACE),
-                permission("manage_system", ["bootstrap_admin", "admin"]),
-            ],
-        ),
-        NamespaceDefinition::new(
-            STORAGE_TENANT_NAMESPACE,
-            [
-                direct("owner", APP_NAMESPACE),
-                direct("admin", APP_NAMESPACE),
-                direct("reader", APP_NAMESPACE),
-                direct("manage_tenant_grant", APP_NAMESPACE),
-                direct("read_tenant_grant", APP_NAMESPACE),
-                direct("manage_buckets_grant", APP_NAMESPACE),
-                direct("manage_authz_grant", APP_NAMESPACE),
-                permission("manage_tenant", ["owner", "admin", "manage_tenant_grant"]),
-                permission(
-                    "read_tenant",
-                    ["owner", "admin", "reader", "read_tenant_grant"],
-                ),
-                permission("manage_buckets", ["owner", "admin", "manage_buckets_grant"]),
-                permission("manage_authz", ["owner", "admin", "manage_authz_grant"]),
-            ],
-        ),
-        NamespaceDefinition::new(
-            BUCKET_NAMESPACE,
-            [
-                direct("owner", APP_NAMESPACE),
-                direct("admin", APP_NAMESPACE),
-                direct("reader", APP_NAMESPACE),
-                direct("writer", APP_NAMESPACE),
-                direct("get_object_grant", APP_NAMESPACE),
-                direct("put_object_grant", APP_NAMESPACE),
-                direct("delete_object_grant", APP_NAMESPACE),
-                direct("manage_policy_grant", APP_NAMESPACE),
-                permission("get_object", ["owner", "reader", "get_object_grant"]),
-                permission("put_object", ["owner", "writer", "put_object_grant"]),
-                permission("delete_object", ["owner", "writer", "delete_object_grant"]),
-                permission("manage_policy", ["owner", "admin", "manage_policy_grant"]),
-            ],
-        ),
-        NamespaceDefinition::new(
-            OBJECT_NAMESPACE,
-            [
-                direct("owner", APP_NAMESPACE),
-                direct("reader", APP_NAMESPACE),
-                direct("writer", APP_NAMESPACE),
-                direct("get_grant", APP_NAMESPACE),
-                direct("put_grant", APP_NAMESPACE),
-                direct("delete_grant", APP_NAMESPACE),
-                permission("get", ["owner", "reader", "get_grant"]),
-                permission("put", ["owner", "writer", "put_grant"]),
-                permission("delete", ["owner", "writer", "delete_grant"]),
-            ],
-        ),
-        NamespaceDefinition::new(
-            AUTHZ_REALM_NAMESPACE,
-            [
-                RelationDefinition::direct(
-                    "parent_tenant",
-                    [AllowedSubject::any_object(STORAGE_TENANT_NAMESPACE)],
-                ),
-                direct("owner", APP_NAMESPACE),
-                direct("schema_admin", APP_NAMESPACE),
-                direct("tuple_writer", APP_NAMESPACE),
-                direct("checker", APP_NAMESPACE),
-                direct("auditor", APP_NAMESPACE),
-                permission_via_parent(
-                    "bind_schema",
-                    ["owner", "schema_admin"],
-                    "parent_tenant",
-                    "manage_authz",
-                ),
-                permission_via_parent(
-                    "write_tuples",
-                    ["owner", "tuple_writer"],
-                    "parent_tenant",
-                    "manage_authz",
-                ),
-                permission_via_parent(
-                    "check",
-                    ["owner", "checker", "auditor"],
-                    "parent_tenant",
-                    "read_tenant",
-                ),
-                permission_via_parent("list", ["owner", "auditor"], "parent_tenant", "read_tenant"),
-            ],
-        ),
-    ])
 }
 
 pub(crate) fn caller_subject(subject_id: &str) -> anvil_authz::Result<ObjectRef> {
@@ -396,39 +265,12 @@ pub(crate) fn allows_authz_realm(
     ))
 }
 
-fn direct(name: &str, subject_namespace: &str) -> RelationDefinition {
-    RelationDefinition::direct(name, [AllowedSubject::any_object(subject_namespace)])
-}
-
-fn permission<const N: usize>(name: &str, inherited: [&str; N]) -> RelationDefinition {
-    RelationDefinition::permission(
-        name,
-        inherited.map(|relation| RewriteRule::Inherit {
-            relation: relation.to_owned(),
-        }),
-    )
-}
-
-fn permission_via_parent<const N: usize>(
-    name: &str,
-    inherited: [&str; N],
-    tuple_relation: &str,
-    target_relation: &str,
-) -> RelationDefinition {
-    let mut rules = inherited
-        .map(|relation| RewriteRule::Inherit {
-            relation: relation.to_owned(),
-        })
-        .to_vec();
-    rules.push(RewriteRule::computed(tuple_relation, target_relation));
-    RelationDefinition::permission(name, rules)
-}
-
 #[cfg(test)]
 mod tests {
     use anvil_authz::{AuthorizationLimits, RealmId, Tuple};
     use anvil_store::{
-        AuthzScope, Store, StoreOptions, TupleBatchRequest, TupleMutation, TupleMutationKind,
+        AuthzScope, Store, StoreOptions, SystemBootstrapRequest, TupleBatchRequest, TupleMutation,
+        TupleMutationKind, system_schema,
     };
 
     use super::*;
@@ -733,13 +575,19 @@ mod tests {
         let store = Store::open(StoreOptions::new(directory.path(), 1))
             .await
             .unwrap();
+        store
+            .bootstrap_system(SystemBootstrapRequest {
+                app_id: "bootstrap-app".into(),
+                client_id: "bootstrap-client".into(),
+                client_secret: "bootstrap-secret-with-at-least-32-bytes".into(),
+            })
+            .unwrap();
         let repository = store.authz();
-        ensure_system_realm(&repository).unwrap();
         let authorizer = SystemAuthorizer::new(repository.clone());
         let alice = caller_subject("alice").unwrap();
 
         let before = authorizer.load().unwrap();
-        assert_eq!(before.revision, AuthzRevision(2));
+        assert_eq!(before.revision, AuthzRevision(3));
         assert!(
             !before
                 .allows_storage_tenant(&alice, "acme", StorageTenantPermission::ManageAuthz)
@@ -749,7 +597,7 @@ mod tests {
         repository
             .mutate_tuples(TupleBatchRequest {
                 scope: AuthzScope::system(),
-                principal: caller_subject("_anvil/bootstrap").unwrap(),
+                principal: caller_subject("bootstrap-app").unwrap(),
                 expected_revision: Some(before.revision),
                 expected_binding_generation: before.binding_generation,
                 operation_id: Some("cache-refresh".into()),
@@ -765,7 +613,7 @@ mod tests {
             .unwrap();
 
         let after = authorizer.load().unwrap();
-        assert_eq!(after.revision, AuthzRevision(3));
+        assert_eq!(after.revision, AuthzRevision(4));
         assert!(
             after
                 .allows_storage_tenant(&alice, "acme", StorageTenantPermission::ManageAuthz)

@@ -2,6 +2,7 @@ pub mod authentication;
 mod authorization;
 mod authz_api;
 mod authz_service;
+mod bootstrap;
 mod programs;
 mod v05;
 
@@ -21,6 +22,8 @@ pub use v05::ObjectServiceImpl;
 pub struct ServerConfig {
     pub listen: SocketAddr,
     pub data_dir: PathBuf,
+    pub run_system_bootstrap: bool,
+    pub system_bootstrap_credential_output: Option<PathBuf>,
     pub node_id: u16,
     pub max_atomic_commit_entries: u32,
     pub max_atomic_commit_bytes: u64,
@@ -36,12 +39,14 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     let store = Store::open(StoreOptions::new(&config.data_dir, config.node_id))
         .await
         .with_context(|| format!("open Anvil data at {}", config.data_dir.display()))?;
+    bootstrap::enforce(
+        &store,
+        &config.data_dir,
+        config.run_system_bootstrap,
+        config.system_bootstrap_credential_output.as_deref(),
+    )
+    .await?;
     let authz_repository = store.authz();
-    let bootstrap_repository = authz_repository.clone();
-    tokio::task::spawn_blocking(move || authorization::ensure_system_realm(&bootstrap_repository))
-        .await
-        .context("join protected authorization bootstrap")?
-        .context("install protected authorization realm")?;
     let programs = programs::ProgramCoordinator::open(
         store.clone(),
         &config.data_dir,

@@ -1063,6 +1063,110 @@ impl AuthzRepository {
         Ok(())
     }
 
+    /// Stages the first protected system realm without publishing any part of
+    /// it. The bootstrap repository commits this batch together with the
+    /// credential and completion marker.
+    pub(crate) fn stage_initial_system_realm(
+        &self,
+        batch: &mut WriteBatch,
+        schema_id: SchemaId,
+        schema: Schema,
+        bootstrap_application: ObjectRef,
+    ) -> Result<(), AuthzStoreError> {
+        schema_id.validate()?;
+        validate_principal(&bootstrap_application)?;
+        let tenant = StorageTenantId::system();
+        let scope = AuthzScope::system();
+        let canonical = canonical_schema(schema, self.limits.evaluator)?;
+        let canonical_bytes = serde_json::to_vec(&canonical).map_err(storage_error)?;
+        let schema_ref = SchemaRef {
+            schema_id,
+            schema_revision: 1,
+            schema_digest: SchemaDigest(*blake3::hash(&canonical_bytes).as_bytes()),
+        };
+        let schema_key = schema_revision_key(&tenant, &schema_ref);
+        let latest_key = schema_latest_key(&tenant, &schema_ref.schema_id);
+        let digest_key =
+            schema_digest_key(&tenant, &schema_ref.schema_id, schema_ref.schema_digest);
+        let binding_key = binding_key(&scope);
+        if self.tenant_revision(&tenant)? != AuthzRevision::ZERO
+            || self
+                .read_json::<StoredSchema>(CF_AUTHZ_SCHEMAS, &schema_key)?
+                .is_some()
+            || self
+                .read_json::<u64>(CF_AUTHZ_SCHEMAS, &latest_key)?
+                .is_some()
+            || self
+                .read_json::<SchemaRef>(CF_AUTHZ_SCHEMAS, &digest_key)?
+                .is_some()
+            || self
+                .read_json::<RealmBinding>(CF_AUTHZ_BINDINGS, &binding_key)?
+                .is_some()
+        {
+            return Err(AuthzStoreError::InvalidInput(
+                "protected system authorization state is already initialized".into(),
+            ));
+        }
+
+        let bootstrap_tuple = Tuple::new(
+            ObjectRef::opaque("system", SYSTEM_STORAGE_TENANT_ID)?,
+            "bootstrap_admin",
+            bootstrap_application,
+        );
+        let tuple_key = tuple_key(&scope, &bootstrap_tuple)?;
+        if self
+            .read_json::<StoredTuple>(CF_AUTHZ_TUPLES, &tuple_key)?
+            .is_some()
+        {
+            return Err(AuthzStoreError::InvalidInput(
+                "protected system authorization state is already initialized".into(),
+            ));
+        }
+        Authorization::new(
+            scope.realm.clone(),
+            canonical.clone(),
+            [bootstrap_tuple.clone()],
+            self.limits.evaluator,
+        )?;
+
+        let stored_schema = StoredSchema {
+            schema_ref: schema_ref.clone(),
+            schema: canonical,
+            published_at_revision: AuthzRevision(1),
+        };
+        let binding = RealmBinding {
+            scope,
+            schema_ref: schema_ref.clone(),
+            generation: 1,
+            authz_revision: AuthzRevision(2),
+            tuple_count: 1,
+        };
+        batch.put_cf(
+            self.cf(CF_AUTHZ_SCHEMAS)?,
+            schema_key,
+            encode_json(&stored_schema)?,
+        );
+        batch.put_cf(self.cf(CF_AUTHZ_SCHEMAS)?, latest_key, encode_json(&1_u64)?);
+        batch.put_cf(
+            self.cf(CF_AUTHZ_SCHEMAS)?,
+            digest_key,
+            encode_json(&schema_ref)?,
+        );
+        batch.put_cf(
+            self.cf(CF_AUTHZ_BINDINGS)?,
+            binding_key,
+            encode_json(&binding)?,
+        );
+        batch.put_cf(
+            self.cf(CF_AUTHZ_TUPLES)?,
+            tuple_key,
+            encode_json(&StoredTuple {
+                tuple: bootstrap_tuple,
+            })?,
+        );
+        self.stage_tenant_revision(batch, &tenant, AuthzRevision(3))
+    }
+
     fn read_json<T: DeserializeOwned>(
         &self,
         cf: &'static str,
@@ -1081,13 +1185,13 @@ impl AuthzRepository {
         })
     }
 
-    fn lock_writes(&self) -> Result<std::sync::MutexGuard<'_, ()>, AuthzStoreError> {
+    pub(crate) fn lock_writes(&self) -> Result<std::sync::MutexGuard<'_, ()>, AuthzStoreError> {
         self.write_lock
             .lock()
             .map_err(|_| AuthzStoreError::Storage("authorization write lock poisoned".into()))
     }
 
-    fn write(&self, batch: WriteBatch) -> Result<(), AuthzStoreError> {
+    pub(crate) fn write(&self, batch: WriteBatch) -> Result<(), AuthzStoreError> {
         let mut options = WriteOptions::default();
         options.set_sync(self.sync_writes);
         self.db.write_opt(batch, &options).map_err(storage_error)
