@@ -1,0 +1,545 @@
+syntax = "proto3";
+
+package anvil.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// The deliberately small Anvil 0.5 capability surface. Ordinary object calls
+// are independent. Only InvokeProgram requests atomic multi-path visibility.
+service ObjectService {
+  rpc UploadBlob(stream UploadBlobChunk) returns (BlobRef);
+  rpc PutObject(PutObjectRequest) returns (MutationReceipt);
+  rpc PublishObject(PublishObjectRequest) returns (MutationReceipt);
+  rpc DeleteObject(DeleteObjectRequest) returns (MutationReceipt);
+  rpc HeadObject(HeadObjectRequest) returns (ObjectHead);
+  rpc GetObject(GetObjectRequest) returns (stream ObjectChunk);
+  rpc BulkWrite(BulkWriteRequest) returns (BulkWriteResponse);
+  rpc BatchGet(BatchGetRequest) returns (BatchGetResponse);
+  rpc SetBucketPolicy(SetBucketPolicyRequest) returns (BucketPolicy);
+  rpc InvokeProgram(InvokeProgramRequest) returns (InvokeProgramResponse);
+}
+
+// Realm-scoped Zanzibar authorization. Schemas are immutable tenant-owned
+// values; bindings and tuple sets are the mutable authorization state.
+service AuthzService {
+  rpc PutSchema(PutSchemaRequest) returns (PutSchemaResponse);
+  rpc BindSchema(BindSchemaRequest) returns (BindSchemaResponse);
+  rpc GetBinding(GetBindingRequest) returns (GetBindingResponse);
+  rpc GetSchema(GetSchemaRequest) returns (GetSchemaResponse);
+  rpc MutateTuples(MutateTuplesRequest) returns (MutateTuplesResponse);
+  rpc ReadTuples(ReadTuplesRequest) returns (ReadTuplesResponse);
+  rpc CheckPermission(CheckPermissionRequest) returns (CheckPermissionResponse);
+  rpc CheckPermissions(CheckPermissionsRequest) returns (CheckPermissionsResponse);
+}
+
+message ObjectAddress {
+  string tenant = 1;
+  string bucket = 2;
+  string path = 3;
+}
+
+message BlobRef {
+  bytes blake3_hash = 1;
+  uint64 length = 2;
+}
+
+message UploadBlobChunk {
+  bytes bytes = 1;
+}
+
+// A version condition is Anvil's ordinary one-path compare-and-swap. It does
+// not opt the request into an atomic program.
+message WriteCondition {
+  oneof condition {
+    bool any = 1;
+    bool absent = 2;
+    uint64 version = 3;
+  }
+}
+
+message PutObjectRequest {
+  ObjectAddress address = 1;
+  bytes bytes = 2;
+  string content_type = 3;
+  WriteCondition condition = 4;
+  string command_id = 5;
+  // Opaque deployment-defined identifier. The API does not define classes.
+  string durability_class = 6;
+}
+
+// Publishes a blob uploaded through UploadBlob without sending its bytes again.
+message PublishObjectRequest {
+  ObjectAddress address = 1;
+  BlobRef blob = 2;
+  string content_type = 3;
+  WriteCondition condition = 4;
+  string command_id = 5;
+  // Opaque deployment-defined identifier. The API does not define classes.
+  string durability_class = 6;
+}
+
+message DeleteObjectRequest {
+  ObjectAddress address = 1;
+  // Delete accepts Any or Version only. Absent is a put/create condition.
+  WriteCondition condition = 2;
+  string command_id = 3;
+  // Opaque deployment-defined identifier. The API does not define classes.
+  string durability_class = 4;
+}
+
+message MutationReceipt {
+  string command_id = 1;
+  bytes fingerprint = 2;
+  uint64 version = 3;
+  bool deleted = 4;
+  bool replayed = 5;
+}
+
+message HeadObjectRequest {
+  ObjectAddress address = 1;
+}
+
+// Exact path state. A tombstone has a version and is not the same as a path
+// for which no version has ever existed.
+message ObjectHead {
+  oneof state {
+    PresentObject present = 1;
+    DeletedObject deleted = 2;
+    NeverExisted never_existed = 3;
+  }
+}
+
+message PresentObject {
+  uint64 version = 1;
+  BlobRef blob = 2;
+  string content_type = 3;
+}
+
+message DeletedObject {
+  uint64 version = 1;
+}
+
+message NeverExisted {}
+
+message GetObjectRequest {
+  ObjectAddress address = 1;
+  // Absence selects the current head; presence selects that exact version.
+  optional uint64 version = 2;
+}
+
+// A GetObject stream begins with exactly one head. Bytes follow only for a
+// PresentObject state.
+message ObjectChunk {
+  oneof value {
+    ObjectHead head = 1;
+    bytes bytes = 2;
+  }
+}
+
+// Bulk operations are independent. The server enforces finite item and byte
+// limits; one failed operation does not roll back another successful one.
+message BulkWriteRequest {
+  repeated BulkOperation operations = 1;
+}
+
+message BulkOperation {
+  oneof operation {
+    PutObjectRequest put = 1;
+    PublishObjectRequest publish = 2;
+    DeleteObjectRequest delete = 3;
+  }
+}
+
+message BulkWriteResponse {
+  repeated BulkOutcome outcomes = 1;
+}
+
+message BulkOutcome {
+  uint32 index = 1;
+  oneof outcome {
+    MutationReceipt receipt = 2;
+    MutationFailure failure = 3;
+  }
+}
+
+message MutationFailure {
+  MutationFailureCode code = 1;
+  string message = 2;
+  optional uint64 current_version = 3;
+}
+
+enum MutationFailureCode {
+  MUTATION_FAILURE_CODE_UNSPECIFIED = 0;
+  MUTATION_FAILURE_CODE_CONDITION_FAILED = 1;
+  MUTATION_FAILURE_CODE_IMMUTABLE = 2;
+  MUTATION_FAILURE_CODE_IDEMPOTENCY_INPUT_MISMATCH = 3;
+  MUTATION_FAILURE_CODE_INVALID = 4;
+  MUTATION_FAILURE_CODE_INTERNAL = 5;
+  MUTATION_FAILURE_CODE_PROGRAM_ONLY = 6;
+  MUTATION_FAILURE_CODE_DURABILITY_UNAVAILABLE = 7;
+  MUTATION_FAILURE_CODE_RESOURCE_LIMIT = 8;
+  MUTATION_FAILURE_CODE_AUTHORIZATION_DENIED = 9;
+}
+
+// Batch reads are independent and bounded by server item and byte limits.
+message BatchGetRequest {
+  repeated GetObjectRequest objects = 1;
+}
+
+message BatchGetResponse {
+  repeated BatchGetOutcome outcomes = 1;
+}
+
+message BatchGetOutcome {
+  uint32 index = 1;
+  ObjectAddress address = 2;
+  oneof outcome {
+    BatchGetObject object = 3;
+    string error = 4;
+  }
+}
+
+message BatchGetObject {
+  ObjectHead head = 1;
+  // Empty for DeletedObject and NeverExisted. A present empty object is
+  // distinguished by its PresentObject head.
+  bytes bytes = 2;
+}
+
+message SetBucketPolicyRequest {
+  string tenant = 1;
+  string bucket = 2;
+  BucketPolicy policy = 3;
+}
+
+// Prefixes are bucket-relative. Anything below an immutable prefix is
+// write-once; anything below a program-only prefix is writable only through a
+// pinned atomic program. Overlap validation belongs to the server.
+message BucketPolicy {
+  repeated string immutable_path_prefixes = 1;
+  repeated string program_only_path_prefixes = 2;
+}
+
+// This is the only public operation in this service with atomic multi-path
+// visibility. A program definition is an ordinary immutable object at the
+// bucket-relative path `_anvil/programs/{name}@{version}`. It is
+// written through PutObject or PublishObject and governed by the same path
+// authorization as every other object. The invocation pins that ordinary
+// object's full address and content hash.
+message InvokeProgramRequest {
+  ObjectAddress program = 1;
+  string invocation_id = 2;
+  bytes program_hash = 3;
+  // Canonical JSON object containing arguments, inputs, blobs and bindings.
+  bytes input_json = 4;
+  // Opaque deployment-defined identifier. The API does not define classes.
+  string durability_class = 5;
+}
+
+message ProgramPathReceipt {
+  ObjectAddress address = 1;
+  uint64 version = 2;
+  bool deleted = 3;
+}
+
+message InvokeProgramResponse {
+  string invocation_id = 1;
+  ObjectAddress program = 2;
+  bytes program_hash = 3;
+  bytes input_fingerprint = 4;
+  uint64 executor_nomination_log_index = 5;
+  uint64 commit_log_index = 6;
+  string bundle_ref = 7;
+  bytes bundle_hash = 8;
+  repeated ProgramPathReceipt path_receipts = 9;
+  // Canonical JSON object containing the pinned program's named outputs.
+  bytes output_json = 10;
+  bool replayed = 11;
+  google.protobuf.Timestamp replay_guarantee_expires_at = 12;
+}
+
+// The structural boundary for an authorization graph. `default` is the
+// conventional application realm. `_anvil/system` is deliberately
+// representable here because Anvil uses the same data model internally;
+// public calls targeting that reserved scope are rejected by the server. For
+// every public call, storage_tenant must equal the authenticated caller's
+// immutable storage tenant; spelling another tenant never changes identity.
+message AuthzScope {
+  string storage_tenant = 1;
+  string realm = 2;
+}
+
+// A canonical immutable schema identity. The server assigns the revision and
+// digest; clients never publish either as metadata.
+message SchemaRef {
+  string schema_id = 1;
+  uint64 schema_revision = 2;
+  bytes schema_digest = 3;
+}
+
+// Identifiers, namespaces, relations, schema IDs, and realm IDs are limited
+// to 256 UTF-8 bytes. Opaque object IDs and exact paths are limited to 4096
+// UTF-8 bytes. A realm is carried only by AuthzScope, never in a namespace.
+message ObjectRef {
+  string namespace = 1;
+  oneof id {
+    string opaque_id = 2;
+    ObjectAddress exact_path = 3;
+  }
+}
+
+message Userset {
+  ObjectRef object = 1;
+  string relation = 2;
+}
+
+// A tuple subject is either one typed object or one userset in the request's
+// realm. The reserved public principal is the object `app:_anvil/public`;
+// schemas must still opt into it with PublicSubjectSelector.
+message Subject {
+  oneof kind {
+    ObjectRef object = 1;
+    Userset userset = 2;
+  }
+}
+
+message NamespaceDefinition {
+  string name = 1;
+  repeated RelationDefinition relations = 2;
+}
+
+message RelationDefinition {
+  string name = 1;
+  oneof kind {
+    DirectRelation direct = 2;
+    Permission permission = 3;
+  }
+}
+
+// Direct relations are the only schema members that accept tuples.
+message DirectRelation {
+  repeated SubjectSelector allowed_subjects = 1;
+}
+
+// A permission is a bounded union of its rules and cannot accept tuples.
+message Permission {
+  repeated PermissionRule rules = 1;
+}
+
+message SubjectSelector {
+  oneof selector {
+    // Any canonical non-public object in this namespace.
+    AnyObjectSelector any_object = 1;
+    AnyUsersetSelector any_userset = 2;
+    Subject exact = 3;
+    SameResourceIdSelector same_resource_id = 4;
+    PublicSubjectSelector public = 5;
+  }
+}
+
+message AnyObjectSelector {
+  string namespace = 1;
+}
+
+message AnyUsersetSelector {
+  string namespace = 1;
+  string relation = 2;
+}
+
+message SameResourceIdSelector {
+  string namespace = 1;
+}
+
+message PublicSubjectSelector {}
+
+message PermissionRule {
+  oneof rule {
+    InheritRule inherit = 1;
+    TupleToUsersetRule tuple_to_userset = 2;
+  }
+}
+
+message InheritRule {
+  string relation = 1;
+}
+
+message TupleToUsersetRule {
+  string tuple_relation = 1;
+  string target_relation = 2;
+}
+
+// A 0.5 schema contains at most 256 namespaces, 256 members per namespace,
+// and 256 selectors or rules per member. Publication canonicalizes the body:
+// replaying identical content returns the same SchemaRef, while changed
+// content creates the next immutable revision for the schema ID.
+message PutSchemaRequest {
+  string schema_id = 1;
+  repeated NamespaceDefinition namespaces = 2;
+}
+
+message PutSchemaResponse {
+  SchemaRef schema_ref = 1;
+  // Tenant-wide authorization revision evaluated or advanced by this call.
+  uint64 revision = 2;
+  bool replayed = 3;
+}
+
+message SchemaBinding {
+  AuthzScope scope = 1;
+  SchemaRef schema_ref = 2;
+  uint64 generation = 3;
+}
+
+message BindSchemaRequest {
+  AuthzScope scope = 1;
+  SchemaRef schema_ref = 2;
+  // First binding accepts absence or zero. Rebinding requires the exact
+  // current generation.
+  optional uint64 expected_binding_generation = 3;
+}
+
+message BindSchemaResponse {
+  SchemaBinding binding = 1;
+  uint64 revision = 2;
+}
+
+message GetBindingRequest {
+  AuthzScope scope = 1;
+}
+
+message GetBindingResponse {
+  SchemaBinding binding = 1;
+}
+
+// Schema lookup is exact: callers obtain a complete immutable reference from
+// PutSchema or GetBinding rather than asking for an implicit latest revision.
+message GetSchemaRequest {
+  SchemaRef schema_ref = 1;
+}
+
+message GetSchemaResponse {
+  SchemaRef schema_ref = 1;
+  repeated NamespaceDefinition namespaces = 2;
+}
+
+message RelationTuple {
+  ObjectRef object = 1;
+  string relation = 2;
+  Subject subject = 3;
+}
+
+message TupleMutation {
+  oneof operation {
+    RelationTuple add = 1;
+    RelationTuple remove = 2;
+  }
+}
+
+// The non-empty batch is one all-or-nothing set mutation in one realm. Add
+// and remove are idempotent. The 0.5 hard limit is 1000 mutations and the
+// operation ID is limited to 128 UTF-8 bytes. Reusing an operation ID with a
+// different canonical input is rejected.
+message MutateTuplesRequest {
+  AuthzScope scope = 1;
+  string operation_id = 2;
+  // When present, this is an exact CAS against the tenant-wide authorization
+  // revision. A mismatch rejects the complete batch.
+  optional uint64 expected_revision = 3;
+  repeated TupleMutation mutations = 4;
+}
+
+message MutateTuplesResponse {
+  // One tenant-wide authorization revision covers the complete batch.
+  uint64 revision = 1;
+  bool replayed = 2;
+}
+
+// Object filters select either one namespace or one exact typed object.
+message ObjectFilter {
+  oneof selection {
+    string namespace = 1;
+    ObjectRef exact = 2;
+  }
+}
+
+// Omitted fields are wildcards. Supplying an exact Subject matches that typed
+// object or userset only.
+message TupleFilter {
+  ObjectFilter object = 1;
+  optional string relation = 2;
+  Subject subject = 3;
+}
+
+message AuthzConsistency {
+  // Latest evaluates the current authoritative revision. AtLeast evaluates
+  // current state only when it has reached the requested revision. Exact uses
+  // that retained revision and fails if its retention window has expired.
+  oneof requirement {
+    LatestConsistency latest = 1;
+    AtLeastRevision at_least = 2;
+    ExactRevision exact = 3;
+  }
+}
+
+message LatestConsistency {}
+
+message AtLeastRevision {
+  uint64 revision = 1;
+}
+
+message ExactRevision {
+  uint64 revision = 1;
+}
+
+// An absent consistency value means latest. page_size zero selects the server
+// default of 100; the 0.5 hard maximum is 1000. page_token is opaque and
+// limited to 128 KiB. A returned token pins its continuation to the same
+// filters and revision; an expired retained revision fails rather than moving.
+message ReadTuplesRequest {
+  AuthzScope scope = 1;
+  TupleFilter filter = 2;
+  AuthzConsistency consistency = 3;
+  uint32 page_size = 4;
+  string page_token = 5;
+}
+
+message ReadTuplesResponse {
+  repeated RelationTuple tuples = 1;
+  uint64 revision = 2;
+  string next_page_token = 3;
+}
+
+message PermissionCheck {
+  Subject subject = 1;
+  ObjectRef object = 2;
+  // May name either a direct relation or a derived permission.
+  string relation = 3;
+}
+
+message CheckPermissionRequest {
+  AuthzScope scope = 1;
+  PermissionCheck check = 2;
+  AuthzConsistency consistency = 3;
+}
+
+message CheckPermissionResponse {
+  bool allowed = 1;
+  uint64 revision = 2;
+}
+
+message PermissionResult {
+  bool allowed = 1;
+}
+
+// At most 1000 checks. The server pins one authoritative snapshot, so every
+// result is evaluated at the single returned revision and retains input order.
+message CheckPermissionsRequest {
+  AuthzScope scope = 1;
+  repeated PermissionCheck checks = 2;
+  AuthzConsistency consistency = 3;
+}
+
+message CheckPermissionsResponse {
+  repeated PermissionResult results = 1;
+  uint64 revision = 2;
+}
