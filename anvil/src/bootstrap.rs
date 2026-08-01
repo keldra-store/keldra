@@ -63,9 +63,10 @@ pub(crate) async fn enforce(
         )
     })?;
     let logged_output = fs::canonicalize(&output).unwrap_or_else(|_| output.clone());
-    tracing::warn!(
-        path = %logged_output.display(),
-        "system bootstrap credential is durable, but bootstrap metadata is not yet committed; after bootstrap completes, copy this file to a secret store, then delete this generated copy"
+    eprintln!(
+        "system bootstrap credential is durable at {}; bootstrap metadata is not yet committed; \
+         after bootstrap completes, copy this file to a secret store, then delete this generated copy",
+        logged_output.display()
     );
     let request = SystemBootstrapRequest {
         app_id: credential.app_id,
@@ -78,9 +79,10 @@ pub(crate) async fn enforce(
         .context("join atomic system bootstrap")?
         .context("commit atomic system bootstrap")?;
 
-    tracing::warn!(
-        path = %logged_output.display(),
-        "system bootstrap completed; copy this credential file to a secret store, then delete this generated copy"
+    eprintln!(
+        "system bootstrap completed; copy the credential file at {} to a secret store, then \
+         delete this generated copy",
+        logged_output.display()
     );
     Ok(())
 }
