@@ -4,6 +4,8 @@
 //! elsewhere. This module only creates, validates, reads, and atomically
 //! replaces `${data_dir}/node-identity.json`.
 
+pub(crate) mod rotation;
+
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
