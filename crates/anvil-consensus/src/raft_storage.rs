@@ -155,10 +155,18 @@ impl DurableStore {
         let meta_cf = self.cf(CF_META)?;
         let mut batch = WriteBatch::default();
         for entry in entries {
-            batch.put_cf(log_cf, log_key(entry.log_id.index), codec::encode(entry)?);
+            batch.put_cf(
+                log_cf,
+                log_key(entry.log_id.index),
+                codec::encode_record(entry)?,
+            );
         }
         let last = entries.last().expect("non-empty entries");
-        batch.put_cf(meta_cf, KEY_LAST_LOG_ID, codec::encode(&last.log_id)?);
+        batch.put_cf(
+            meta_cf,
+            KEY_LAST_LOG_ID,
+            codec::encode_record(&last.log_id)?,
+        );
         self.sync_write(batch)
     }
 
@@ -178,7 +186,7 @@ impl DurableStore {
             if index >= end {
                 break;
             }
-            entries.push(codec::decode(&bytes)?);
+            entries.push(codec::decode_record(&bytes)?);
         }
         Ok(entries)
     }
@@ -209,7 +217,11 @@ impl DurableStore {
             self.scan_logs(from - 1..from)?.into_iter().next()
         };
         if let Some(previous) = previous {
-            batch.put_cf(meta_cf, KEY_LAST_LOG_ID, codec::encode(&previous.log_id)?);
+            batch.put_cf(
+                meta_cf,
+                KEY_LAST_LOG_ID,
+                codec::encode_record(&previous.log_id)?,
+            );
         } else {
             batch.delete_cf(meta_cf, KEY_LAST_LOG_ID);
         }
@@ -236,7 +248,11 @@ impl DurableStore {
         for entry in self.scan_logs(..=through.index)? {
             batch.delete_cf(log_cf, log_key(entry.log_id.index));
         }
-        batch.put_cf(meta_cf, KEY_LAST_PURGED_LOG_ID, codec::encode(&through)?);
+        batch.put_cf(
+            meta_cf,
+            KEY_LAST_PURGED_LOG_ID,
+            codec::encode_record(&through)?,
+        );
         if self
             .last_log_id()?
             .is_some_and(|last| last.index <= through.index)
@@ -263,7 +279,7 @@ impl DurableStore {
             batch.put_cf(
                 applied_cf,
                 log_key(entry.log_id.index),
-                codec::encode(entry)?,
+                codec::encode_record(entry)?,
             );
         }
         self.sync_write(batch)
@@ -276,7 +292,7 @@ impl DurableStore {
             .iterator_cf(self.cf(CF_APPLIED)?, rocksdb::IteratorMode::Start)
         {
             let (_, bytes) = item?;
-            entries.push(codec::decode(&bytes)?);
+            entries.push(codec::decode_record(&bytes)?);
         }
         Ok(entries)
     }
@@ -293,8 +309,16 @@ impl DurableStore {
         let meta_cf = self.cf(CF_META)?;
         let applied_cf = self.cf(CF_APPLIED)?;
         let mut batch = WriteBatch::default();
-        batch.put_cf(meta_cf, KEY_SNAPSHOT_META, codec::encode(&snapshot.meta)?);
-        batch.put_cf(meta_cf, KEY_SNAPSHOT_DATA, &snapshot.data);
+        batch.put_cf(
+            meta_cf,
+            KEY_SNAPSHOT_META,
+            codec::encode_record(&snapshot.meta)?,
+        );
+        batch.put_cf(
+            meta_cf,
+            KEY_SNAPSHOT_DATA,
+            codec::wrap_record(&snapshot.data)?,
+        );
 
         let through = snapshot.meta.last_log_id.map(|log_id| log_id.index);
         for entry in self.scan_applied()? {
@@ -312,7 +336,7 @@ impl DurableStore {
             (None, None) => Ok(None),
             (Some(meta), Some(data)) => Ok(Some(DurableSnapshot {
                 meta,
-                data: data.to_vec(),
+                data: codec::record_payload(&data)?.to_vec(),
             })),
             _ => Err(DurableStorageError::IncompleteSnapshot),
         }
@@ -321,7 +345,7 @@ impl DurableStore {
     fn read_meta<T: DeserializeOwned>(&self, key: &[u8]) -> Result<Option<T>, DurableStorageError> {
         self.db
             .get_cf(self.cf(CF_META)?, key)?
-            .map(|bytes| codec::decode(&bytes).map_err(Into::into))
+            .map(|bytes| codec::decode_record(&bytes).map_err(Into::into))
             .transpose()
     }
 
@@ -335,7 +359,7 @@ impl DurableStore {
             .lock()
             .map_err(|_| DurableStorageError::WriterPoisoned)?;
         let mut batch = WriteBatch::default();
-        batch.put_cf(self.cf(CF_META)?, key, codec::encode(value)?);
+        batch.put_cf(self.cf(CF_META)?, key, codec::encode_record(value)?);
         self.sync_write(batch)
     }
 
@@ -381,5 +405,117 @@ fn range_end(range: &impl RangeBounds<u64>) -> u64 {
         Bound::Included(value) => value.saturating_add(1),
         Bound::Excluded(value) => *value,
         Bound::Unbounded => u64::MAX,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use openraft::{CommittedLeaderId, EntryPayload, StoredMembership};
+
+    use super::*;
+
+    const LEGACY_STORAGE_CONFIG: &[u8] = &[
+        0x04, 0x00, 0x00, 0x00, // max_commit_entries
+        0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, // max_commit_bytes
+    ];
+    const LEGACY_LOG_ID: &[u8] = &[
+        0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // leader term
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // leader node id
+        0x0b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // log index
+    ];
+    const LEGACY_BLANK_LOG_ENTRY: &[u8] = &[
+        0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // leader term
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // leader node id
+        0x0b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // log index
+        0x00, 0x00, 0x00, 0x00, // EntryPayload::Blank
+    ];
+
+    fn config() -> StorageConfig {
+        StorageConfig {
+            max_commit_entries: 4,
+            max_commit_bytes: 65_536,
+        }
+    }
+
+    fn blank_entry(term: u64, index: u64) -> RaftEntry {
+        RaftEntry {
+            log_id: LogId::new(CommittedLeaderId::new(term, 1), index),
+            payload: EntryPayload::Blank,
+        }
+    }
+
+    #[test]
+    fn released_raw_records_open_without_migration() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DurableStore::open(directory.path(), config()).unwrap();
+        let mut legacy = WriteBatch::default();
+        legacy.put_cf(
+            store.cf(CF_META).unwrap(),
+            KEY_STORAGE_CONFIG,
+            LEGACY_STORAGE_CONFIG,
+        );
+        legacy.put_cf(store.cf(CF_META).unwrap(), KEY_LAST_LOG_ID, LEGACY_LOG_ID);
+        legacy.put_cf(
+            store.cf(CF_LOG).unwrap(),
+            log_key(11),
+            LEGACY_BLANK_LOG_ENTRY,
+        );
+        store.sync_write(legacy).unwrap();
+        drop(store);
+
+        let reopened = DurableStore::open(directory.path(), config()).unwrap();
+        assert_eq!(
+            reopened.last_log_id().unwrap(),
+            Some(LogId::new(CommittedLeaderId::new(7, 1), 11))
+        );
+        assert_eq!(
+            reopened.scan_logs(11..12).unwrap(),
+            vec![blank_entry(7, 11)]
+        );
+    }
+
+    #[test]
+    fn new_storage_records_are_enveloped_without_changing_snapshot_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DurableStore::open(directory.path(), config()).unwrap();
+
+        let raw_config = codec::encode(&config()).unwrap();
+        let stored_config = store
+            .db
+            .get_cf(store.cf(CF_META).unwrap(), KEY_STORAGE_CONFIG)
+            .unwrap()
+            .unwrap();
+        let expected_config = codec::wrap_record(&raw_config).unwrap();
+        assert_eq!(&*stored_config, expected_config.as_slice());
+
+        let entry = blank_entry(3, 0);
+        store.append_logs(std::slice::from_ref(&entry)).unwrap();
+        let stored_entry = store
+            .db
+            .get_cf(store.cf(CF_LOG).unwrap(), log_key(0))
+            .unwrap()
+            .unwrap();
+        let expected_entry = codec::wrap_record(&codec::encode(&entry).unwrap()).unwrap();
+        assert_eq!(&*stored_entry, expected_entry.as_slice());
+
+        let snapshot_body = b"unchanged Raft snapshot wire bytes".to_vec();
+        let snapshot = DurableSnapshot {
+            meta: SnapshotMeta {
+                last_log_id: Some(entry.log_id),
+                last_membership: StoredMembership::default(),
+                snapshot_id: "storage-envelope-test".into(),
+            },
+            data: snapshot_body.clone(),
+        };
+        store.save_snapshot(&snapshot, false).unwrap();
+
+        let stored_body = store
+            .db
+            .get_cf(store.cf(CF_META).unwrap(), KEY_SNAPSHOT_DATA)
+            .unwrap()
+            .unwrap();
+        let expected_body = codec::wrap_record(&snapshot_body).unwrap();
+        assert_eq!(&*stored_body, expected_body.as_slice());
+        assert_eq!(store.load_snapshot().unwrap().unwrap().data, snapshot_body);
     }
 }

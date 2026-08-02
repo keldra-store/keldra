@@ -4,10 +4,20 @@ use thiserror::Error;
 
 pub(crate) const MAX_ENCODED_BYTES: usize = 64 * 1024 * 1024;
 
+const RECORD_MAGIC: &[u8; 8] = b"ANVLREC\0";
+const RECORD_FORMAT_V1: u8 = 1;
+const RECORD_LENGTH_BYTES: usize = std::mem::size_of::<u32>();
+const RECORD_HEADER_BYTES: usize = RECORD_MAGIC.len() + 1 + RECORD_LENGTH_BYTES;
+const MAX_RECORD_BYTES: usize = RECORD_HEADER_BYTES + MAX_ENCODED_BYTES;
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub(crate) enum CodecError {
     #[error("encoded consensus value exceeds {MAX_ENCODED_BYTES} bytes")]
     TooLarge,
+    #[error("unsupported consensus record format version {0}")]
+    UnsupportedRecordVersion(u8),
+    #[error("invalid consensus record envelope: {0}")]
+    InvalidRecord(&'static str),
     #[error("consensus binary codec error: {0}")]
     Invalid(String),
 }
@@ -48,11 +58,82 @@ pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecError>
         .map_err(|error| CodecError::Invalid(error.to_string()))
 }
 
+/// Encode a value for durable consensus storage.
+///
+/// `encode` remains the raw payload codec because state-machine accounting and
+/// compatibility fixtures depend on those exact bytes. Callers add this
+/// self-identifying envelope at each durable record or versioned wire boundary.
+pub(crate) fn encode_record<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, CodecError> {
+    wrap_record(&encode(value)?)
+}
+
+/// Decode a durable record, accepting the released 0.5.0 raw-bincode layout.
+pub(crate) fn decode_record<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecError> {
+    decode(record_payload(bytes)?)
+}
+
+/// Wrap an already encoded payload without changing its bytes.
+pub(crate) fn wrap_record(payload: &[u8]) -> Result<Vec<u8>, CodecError> {
+    if payload.len() > MAX_ENCODED_BYTES {
+        return Err(CodecError::TooLarge);
+    }
+
+    let payload_len = u32::try_from(payload.len()).map_err(|_| CodecError::TooLarge)?;
+    let mut record = Vec::with_capacity(RECORD_HEADER_BYTES + payload.len());
+    record.extend_from_slice(RECORD_MAGIC);
+    record.push(RECORD_FORMAT_V1);
+    record.extend_from_slice(&payload_len.to_be_bytes());
+    record.extend_from_slice(payload);
+    Ok(record)
+}
+
+/// Return the unchanged payload from a current envelope or a bounded legacy
+/// 0.5.0 raw record.
+pub(crate) fn record_payload(bytes: &[u8]) -> Result<&[u8], CodecError> {
+    if bytes.len() > MAX_RECORD_BYTES {
+        return Err(CodecError::TooLarge);
+    }
+    if !bytes.starts_with(RECORD_MAGIC) {
+        if bytes.len() > MAX_ENCODED_BYTES {
+            return Err(CodecError::TooLarge);
+        }
+        return Ok(bytes);
+    }
+    if bytes.len() < RECORD_HEADER_BYTES {
+        return Err(CodecError::InvalidRecord("truncated header"));
+    }
+
+    let version = bytes[RECORD_MAGIC.len()];
+    if version != RECORD_FORMAT_V1 {
+        return Err(CodecError::UnsupportedRecordVersion(version));
+    }
+
+    let length_start = RECORD_MAGIC.len() + 1;
+    let length_end = length_start + RECORD_LENGTH_BYTES;
+    let payload_len = u32::from_be_bytes(
+        bytes[length_start..length_end]
+            .try_into()
+            .expect("record length field has a fixed width"),
+    ) as usize;
+    if payload_len > MAX_ENCODED_BYTES {
+        return Err(CodecError::TooLarge);
+    }
+    if bytes.len() != RECORD_HEADER_BYTES + payload_len {
+        return Err(CodecError::InvalidRecord(
+            "payload length does not match header",
+        ));
+    }
+    Ok(&bytes[RECORD_HEADER_BYTES..])
+}
+
 #[cfg(test)]
 mod tests {
+    use openraft::{CommittedLeaderId, EntryPayload, LogId};
+
     use crate::{
         BundleHash, BundleRef, Command, CommitBatch, DurabilityClass, DurabilityEvidenceHash,
         InvocationFingerprint, InvocationId, NodeId, ProgramHash, ProgramPathHash,
+        raft_storage::{RaftEntry, StorageConfig},
     };
 
     use super::*;
@@ -82,5 +163,78 @@ mod tests {
         // inventory, program definition, or prepared bundle immediately
         // visible in the consensus crate's tests.
         assert!(encode(&command).unwrap().len() < 512);
+    }
+
+    #[test]
+    fn durable_record_envelope_preserves_the_raw_payload() {
+        let value = StorageConfig {
+            max_commit_entries: 4,
+            max_commit_bytes: 65_536,
+        };
+        let raw = encode(&value).unwrap();
+        let record = encode_record(&value).unwrap();
+
+        assert_eq!(encoded_len(&value).unwrap(), raw.len() as u64);
+        assert_eq!(record_payload(&record).unwrap(), raw);
+        assert_eq!(decode_record::<StorageConfig>(&record).unwrap(), value);
+        assert_eq!(record.len(), raw.len() + RECORD_HEADER_BYTES);
+    }
+
+    #[test]
+    fn legacy_raw_storage_fixtures_remain_readable_and_frozen() {
+        const LEGACY_STORAGE_CONFIG: &[u8] = &[
+            0x04, 0x00, 0x00, 0x00, // max_commit_entries
+            0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, // max_commit_bytes
+        ];
+        const LEGACY_BLANK_LOG_ENTRY: &[u8] = &[
+            0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // leader term
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // leader node id
+            0x0b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // log index
+            0x00, 0x00, 0x00, 0x00, // EntryPayload::Blank
+        ];
+
+        let config = StorageConfig {
+            max_commit_entries: 4,
+            max_commit_bytes: 65_536,
+        };
+        let entry = RaftEntry {
+            log_id: LogId::new(CommittedLeaderId::new(7, 1), 11),
+            payload: EntryPayload::Blank,
+        };
+
+        assert_eq!(encode(&config).unwrap(), LEGACY_STORAGE_CONFIG);
+        assert_eq!(encode(&entry).unwrap(), LEGACY_BLANK_LOG_ENTRY);
+        assert_eq!(
+            decode_record::<StorageConfig>(LEGACY_STORAGE_CONFIG).unwrap(),
+            config
+        );
+        assert_eq!(
+            decode_record::<RaftEntry>(LEGACY_BLANK_LOG_ENTRY).unwrap(),
+            entry
+        );
+    }
+
+    #[test]
+    fn malformed_or_unknown_envelopes_fail_closed() {
+        let mut unknown = wrap_record(b"value").unwrap();
+        unknown[RECORD_MAGIC.len()] = RECORD_FORMAT_V1 + 1;
+        assert_eq!(
+            record_payload(&unknown),
+            Err(CodecError::UnsupportedRecordVersion(RECORD_FORMAT_V1 + 1))
+        );
+
+        let mut wrong_length = wrap_record(b"value").unwrap();
+        wrong_length.pop();
+        assert_eq!(
+            record_payload(&wrong_length),
+            Err(CodecError::InvalidRecord(
+                "payload length does not match header"
+            ))
+        );
+
+        assert_eq!(
+            record_payload(RECORD_MAGIC),
+            Err(CodecError::InvalidRecord("truncated header"))
+        );
     }
 }
