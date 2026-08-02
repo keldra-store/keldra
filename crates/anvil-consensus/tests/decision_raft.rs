@@ -3,11 +3,27 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anvil_consensus::{
-    ATOMIC_REPLAY_RETENTION_MILLIS, ApplyError, ApplyResult, BundleHash, BundleRef, Command,
-    CommitBatch, DecisionRaft, DecisionRaftError, DurabilityClass, DurabilityEvidenceHash,
-    InMemoryPeerTransport, InvocationFingerprint, InvocationId, NodeId, PeerNode, ProgramHash,
-    ProgramPathHash,
+    ATOMIC_REPLAY_RETENTION_MILLIS, ApplyError, ApplyResult, BundleHash, BundleRef,
+    CLUSTER_CONTROL_COMMAND_VERSION, CapabilityRange, ClusterId, Command, CommitBatch,
+    DecisionRaft, DecisionRaftError, DurabilityClass, DurabilityEvidenceHash, ErasureCodeProfile,
+    InMemoryPeerTransport, InvocationFingerprint, InvocationId, JoinCapabilityHash,
+    JwtSigningKeyFingerprint, MembershipTransitionKind, NodeDescriptor, NodeId, NodeState,
+    PeerAddress, PeerNode, PeerSpkiSha256, ProgramHash, ProgramPathHash,
 };
+
+fn joining_descriptor(node_id: u64) -> NodeDescriptor {
+    NodeDescriptor {
+        node_id: NodeId(node_id),
+        peer_address: PeerAddress(format!("memory://{node_id}")),
+        storage_weight_millionths: 1_000_000,
+        state: NodeState::Joining,
+        current_peer_spki_sha256: PeerSpkiSha256([node_id as u8; 32]),
+        overlap_peer_spki_sha256: None,
+        join_capability_hash: Some(JoinCapabilityHash([(node_id + 32) as u8; 32])),
+        supported_protocol: CapabilityRange { min: 1, max: 1 },
+        supported_storage_format: CapabilityRange { min: 1, max: 1 },
+    }
+}
 
 fn batch(nomination_log_index: u64, id: u8) -> CommitBatch {
     CommitBatch {
@@ -265,6 +281,291 @@ async fn three_nodes_elect_replicate_add_learners_and_replace_a_failed_leader() 
 
     second.shutdown().await.unwrap();
     third.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn add_crash_recovery_retains_transition_until_fixed_voters_are_committed() {
+    let first_directory = tempfile::tempdir().unwrap();
+    let second_directory = tempfile::tempdir().unwrap();
+    let third_directory = tempfile::tempdir().unwrap();
+    let transport = InMemoryPeerTransport::new();
+
+    let first = open_peer(first_directory.path(), 1, &transport).await;
+    let second = open_peer(second_directory.path(), 2, &transport).await;
+    let third = open_peer(third_directory.path(), 3, &transport).await;
+    transport.register(1, first.clone()).unwrap();
+    transport.register(2, second.clone()).unwrap();
+    transport.register(3, third.clone()).unwrap();
+    first
+        .initialize_genesis(BTreeMap::from([(1, PeerNode::new("memory://1"))]))
+        .await
+        .unwrap();
+    first.wait_for_leader(Duration::from_secs(5)).await.unwrap();
+    first
+        .submit(Command::InitializeCluster {
+            cluster_id: ClusterId([7; 16]),
+        })
+        .await
+        .unwrap();
+
+    let first_add = first
+        .submit(Command::BeginAddNode {
+            format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+            descriptor: joining_descriptor(1),
+        })
+        .await
+        .unwrap();
+    first
+        .submit(Command::CompleteMembershipTransition {
+            format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+            started_log_index: first_add.log_index,
+        })
+        .await
+        .unwrap();
+    first
+        .submit(Command::CompleteMembershipTransition {
+            format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+            started_log_index: first_add.log_index,
+        })
+        .await
+        .unwrap();
+
+    let second_add = first
+        .submit(Command::BeginAddNode {
+            format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+            descriptor: joining_descriptor(2),
+        })
+        .await
+        .unwrap();
+    first
+        .add_learner(2, PeerNode::new("memory://2"), true)
+        .await
+        .unwrap();
+    assert!(matches!(
+        first
+            .submit(Command::NominateExecutor {
+                executor: NodeId(2)
+            })
+            .await,
+        Err(DecisionRaftError::Rejected(
+            ApplyError::ExecutorNotActiveMember {
+                executor: NodeId(2)
+            }
+        ))
+    ));
+    let activated = first
+        .submit(Command::CompleteMembershipTransition {
+            format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+            started_log_index: second_add.log_index,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        activated.result,
+        ApplyResult::MembershipTransitionAdvanced(_)
+    ));
+    assert_eq!(
+        first
+            .state()
+            .unwrap()
+            .cluster_control()
+            .transition()
+            .unwrap()
+            .kind,
+        MembershipTransitionKind::Add
+    );
+
+    first.shutdown().await.unwrap();
+    transport.unregister(1).unwrap();
+    drop(first);
+    let first = open_peer(first_directory.path(), 1, &transport).await;
+    transport.register(1, first.clone()).unwrap();
+    first.wait_for_leader(Duration::from_secs(5)).await.unwrap();
+    let recovered = first.state().unwrap();
+    assert_eq!(
+        recovered.cluster_control().nodes()[&NodeId(2)].state,
+        NodeState::Active
+    );
+    assert_eq!(
+        recovered
+            .cluster_control()
+            .transition()
+            .unwrap()
+            .started_log_index,
+        second_add.log_index
+    );
+    assert!(matches!(
+        first
+            .submit(Command::CompleteMembershipTransition {
+                format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+                started_log_index: second_add.log_index,
+            })
+            .await,
+        Err(DecisionRaftError::Rejected(
+            ApplyError::VoterTargetMismatch {
+                expected: 2,
+                actual: 1
+            }
+        ))
+    ));
+    first
+        .change_membership(BTreeSet::from([1, 2]), false)
+        .await
+        .unwrap();
+    first
+        .submit(Command::CompleteMembershipTransition {
+            format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+            started_log_index: second_add.log_index,
+        })
+        .await
+        .unwrap();
+    assert!(
+        first
+            .state()
+            .unwrap()
+            .cluster_control()
+            .transition()
+            .is_none()
+    );
+
+    let third_add = first
+        .submit(Command::BeginAddNode {
+            format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+            descriptor: joining_descriptor(3),
+        })
+        .await
+        .unwrap();
+    first
+        .add_learner(3, PeerNode::new("memory://3"), true)
+        .await
+        .unwrap();
+    first
+        .submit(Command::CompleteMembershipTransition {
+            format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+            started_log_index: third_add.log_index,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        first
+            .submit(Command::CompleteMembershipTransition {
+                format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+                started_log_index: third_add.log_index,
+            })
+            .await,
+        Err(DecisionRaftError::Rejected(
+            ApplyError::VoterTargetMismatch {
+                expected: 3,
+                actual: 2
+            }
+        ))
+    ));
+    first
+        .change_membership(BTreeSet::from([1, 2, 3]), false)
+        .await
+        .unwrap();
+    first
+        .submit(Command::CompleteMembershipTransition {
+            format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+            started_log_index: third_add.log_index,
+        })
+        .await
+        .unwrap();
+    assert_eq!(first.state().unwrap().cluster_control().voter_target(), 3);
+    assert!(
+        first
+            .state()
+            .unwrap()
+            .cluster_control()
+            .transition()
+            .is_none()
+    );
+
+    first.shutdown().await.unwrap();
+    second.shutdown().await.unwrap();
+    third.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_retains_cluster_control_and_immutable_genesis_values() {
+    let directory = tempfile::tempdir().unwrap();
+    let raft = open(directory.path()).await;
+    raft.ensure_one_node().await.unwrap();
+    raft.wait_for_leader(Duration::from_secs(5)).await.unwrap();
+    raft.submit(Command::InitializeCluster {
+        cluster_id: ClusterId([12; 16]),
+    })
+    .await
+    .unwrap();
+    let fingerprint = JwtSigningKeyFingerprint([13; 32]);
+    raft.submit(Command::BindJwtSigningKeyFingerprint {
+        format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+        fingerprint,
+    })
+    .await
+    .unwrap();
+    let profile = ErasureCodeProfile {
+        data_shards: 2,
+        parity_shards: 1,
+        stripe_unit: 16 * 1024,
+    };
+    raft.submit(Command::BindErasureCodeProfile {
+        format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+        profile,
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        raft.submit(Command::BeginAddNode {
+            format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+            descriptor: joining_descriptor(1),
+        })
+        .await,
+        Err(DecisionRaftError::Rejected(
+            ApplyError::RaftMemberAddressMismatch { node_id: NodeId(1) }
+        ))
+    ));
+    let mut descriptor = joining_descriptor(1);
+    descriptor.peer_address = PeerAddress("anvil-local://1".into());
+    let add = raft
+        .submit(Command::BeginAddNode {
+            format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+            descriptor,
+        })
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        raft.submit(Command::CompleteMembershipTransition {
+            format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+            started_log_index: add.log_index,
+        })
+        .await
+        .unwrap();
+    }
+    raft.snapshot(Duration::from_secs(5)).await.unwrap();
+    raft.shutdown().await.unwrap();
+    drop(raft);
+
+    let raft = open(directory.path()).await;
+    raft.ensure_one_node().await.unwrap();
+    raft.wait_for_leader(Duration::from_secs(5)).await.unwrap();
+    let state = raft.state().unwrap();
+    assert_eq!(state.cluster_id(), Some(ClusterId([12; 16])));
+    assert_eq!(
+        state.cluster_control().jwt_signing_key_fingerprint(),
+        Some(fingerprint)
+    );
+    assert_eq!(
+        state.cluster_control().erasure_code_profile(),
+        Some(profile)
+    );
+    assert_eq!(
+        state.cluster_control().nodes()[&NodeId(1)].state,
+        NodeState::Active
+    );
+    assert!(state.cluster_control().used_node_ids().contains(NodeId(1)));
+    assert!(state.cluster_control().transition().is_none());
+    raft.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

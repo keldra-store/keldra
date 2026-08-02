@@ -9,7 +9,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 
-use openraft::BasicNode;
 use openraft::error::{
     InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError, Unreachable,
 };
@@ -18,12 +17,13 @@ use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
+use openraft::{BasicNode, ChangeMembers};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
 use crate::codec;
 use crate::raft::{DecisionRaft, DecisionRaftConfig, DecisionRaftError, map_client_write_error};
-use crate::types::MAX_RAFT_NODE_ID;
+use crate::types::{MAX_RAFT_NODE_ID, MembershipTransitionKind, NodeId, NodeState};
 
 const PEER_RPC_SCHEMA_VERSION: u16 = 1;
 
@@ -225,6 +225,28 @@ impl DecisionRaft {
         blocking: bool,
     ) -> Result<(), DecisionRaftError> {
         validate_node(node_id, &node)?;
+        let decisions = self.state()?;
+        let cluster = decisions.cluster_control();
+        if !cluster.nodes().is_empty() {
+            let transition = cluster.transition().ok_or_else(|| {
+                DecisionRaftError::Configuration(
+                    "a learner can be added only during an ADD transition".into(),
+                )
+            })?;
+            if transition.kind != MembershipTransitionKind::Add
+                || transition.node_id != NodeId(node_id)
+            {
+                return Err(DecisionRaftError::Configuration(format!(
+                    "node {node_id} is not the current ADD transition"
+                )));
+            }
+            let descriptor = &cluster.nodes()[&NodeId(node_id)];
+            if descriptor.peer_address.0 != node.address {
+                return Err(DecisionRaftError::Configuration(format!(
+                    "node {node_id} address does not match its admitted descriptor"
+                )));
+            }
+        }
         self.raft
             .add_learner(node_id, BasicNode::new(node.address), blocking)
             .await
@@ -249,8 +271,76 @@ impl DecisionRaft {
         {
             return Err(invalid_node_id(node_id));
         }
+        let decisions = self.state()?;
+        let cluster = decisions.cluster_control();
+        if !cluster.nodes().is_empty() {
+            let expected_voters = cluster
+                .transition()
+                .filter(|transition| transition.kind == MembershipTransitionKind::Remove)
+                .map_or_else(
+                    || cluster.voter_target(),
+                    |_| {
+                        cluster
+                            .active_node_count()
+                            .saturating_sub(1)
+                            .min(crate::FIXED_VOTER_TARGET)
+                    },
+                );
+            if voters.len() != expected_voters {
+                return Err(DecisionRaftError::Configuration(format!(
+                    "cluster requires exactly {expected_voters} voters, not {}",
+                    voters.len()
+                )));
+            }
+            for voter in &voters {
+                let node_id = NodeId(*voter);
+                let Some(descriptor) = cluster.nodes().get(&node_id) else {
+                    return Err(DecisionRaftError::Configuration(format!(
+                        "voter {voter} has no admitted node descriptor"
+                    )));
+                };
+                if descriptor.state != NodeState::Active {
+                    return Err(DecisionRaftError::Configuration(format!(
+                        "voter {voter} is not ACTIVE"
+                    )));
+                }
+                if cluster.transition().is_some_and(|transition| {
+                    transition.kind == MembershipTransitionKind::Remove
+                        && transition.node_id == node_id
+                }) {
+                    return Err(DecisionRaftError::Configuration(format!(
+                        "voter {voter} is being removed"
+                    )));
+                }
+            }
+        }
         self.raft
             .change_membership(voters, retain_removed_as_learners)
+            .await
+            .map(|_| ())
+            .map_err(map_client_write_error)
+    }
+
+    /// Remove one non-voter after its descriptor has entered REMOVE handoff.
+    pub async fn remove_learner(&self, node_id: u64) -> Result<(), DecisionRaftError> {
+        if !(1..=MAX_RAFT_NODE_ID).contains(&node_id) {
+            return Err(invalid_node_id(node_id));
+        }
+        let state = self.state()?;
+        let transition = state.cluster_control().transition().ok_or_else(|| {
+            DecisionRaftError::Configuration(
+                "a learner can be removed only during its REMOVE transition".into(),
+            )
+        })?;
+        if transition.kind != MembershipTransitionKind::Remove
+            || transition.node_id != NodeId(node_id)
+        {
+            return Err(DecisionRaftError::Configuration(format!(
+                "node {node_id} is not the current REMOVE transition"
+            )));
+        }
+        self.raft
+            .change_membership(ChangeMembers::RemoveNodes(BTreeSet::from([node_id])), false)
             .await
             .map(|_| ())
             .map_err(map_client_write_error)
