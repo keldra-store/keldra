@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq as _;
 use thiserror::Error;
 
-use crate::{ObjectKey, VersionId};
+use crate::{ObjectKey, ReferenceDelta, VersionId};
 
 /// Release defaults for the one source-local 0.5.0 invalidation journal.
 pub const DEFAULT_WATCH_MAX_ENTRIES: u64 = 1_000_000;
@@ -225,6 +225,25 @@ pub struct ObjectHeadChange {
     pub exact_path: String,
     pub path_version: VersionId,
     pub kind: ObjectHeadChangeKind,
+    /// Exact logical content-reference effects selected by this mutation.
+    /// Public watches ignore these; peer replication consumes them from the
+    /// same ordered source journal.
+    #[serde(default)]
+    pub reference_deltas: Vec<ReferenceDelta>,
+}
+
+/// Deletion of one retained immutable descriptor that did not necessarily
+/// move the current object head.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetainedVersionDeletedChange {
+    pub offset: u64,
+    pub tenant_id: u64,
+    pub bucket_id: u64,
+    pub exact_path: String,
+    pub deleted_version: VersionId,
+    pub resulting_head_version: Option<VersionId>,
+    #[serde(default)]
+    pub reference_deltas: Vec<ReferenceDelta>,
 }
 
 /// One typed record in a source-local change journal.
@@ -237,6 +256,7 @@ pub struct ObjectHeadChange {
 #[serde(tag = "kind", content = "record", rename_all = "snake_case")]
 pub enum LocalChange {
     ObjectHead(ObjectHeadChange),
+    RetainedVersionDeleted(RetainedVersionDeletedChange),
 }
 
 impl LocalChange {
@@ -247,6 +267,7 @@ impl LocalChange {
         exact_path: String,
         path_version: VersionId,
         deleted: bool,
+        reference_deltas: Vec<ReferenceDelta>,
     ) -> Self {
         Self::ObjectHead(ObjectHeadChange {
             offset,
@@ -259,12 +280,41 @@ impl LocalChange {
             } else {
                 ObjectHeadChangeKind::Put
             },
+            reference_deltas,
+        })
+    }
+
+    pub(crate) fn retained_version_deleted(
+        offset: u64,
+        tenant_id: u64,
+        bucket_id: u64,
+        exact_path: String,
+        deleted_version: VersionId,
+        resulting_head_version: Option<VersionId>,
+        reference_deltas: Vec<ReferenceDelta>,
+    ) -> Self {
+        Self::RetainedVersionDeleted(RetainedVersionDeletedChange {
+            offset,
+            tenant_id,
+            bucket_id,
+            exact_path,
+            deleted_version,
+            resulting_head_version,
+            reference_deltas,
         })
     }
 
     pub fn offset(&self) -> u64 {
         match self {
             Self::ObjectHead(change) => change.offset,
+            Self::RetainedVersionDeleted(change) => change.offset,
+        }
+    }
+
+    pub fn reference_deltas(&self) -> &[ReferenceDelta] {
+        match self {
+            Self::ObjectHead(change) => &change.reference_deltas,
+            Self::RetainedVersionDeleted(change) => &change.reference_deltas,
         }
     }
 
@@ -276,6 +326,7 @@ impl LocalChange {
     pub fn into_object_head(self) -> Option<ObjectHeadChange> {
         match self {
             Self::ObjectHead(change) => Some(change),
+            Self::RetainedVersionDeleted(_) => None,
             _ => None,
         }
     }
@@ -527,8 +578,15 @@ mod tests {
 
     #[test]
     fn current_local_changes_have_an_explicit_format_and_type_tag() {
-        let expected =
-            LocalChange::object_head(7, 11, 12, "documents/one".into(), VersionId(41), false);
+        let expected = LocalChange::object_head(
+            7,
+            11,
+            12,
+            "documents/one".into(),
+            VersionId(41),
+            false,
+            Vec::new(),
+        );
         let encoded = encode_local_change(&expected).unwrap();
         let value = serde_json::from_slice::<serde_json::Value>(&encoded).unwrap();
         assert_eq!(value["format"], LOCAL_CHANGE_FORMAT);
@@ -567,8 +625,15 @@ mod tests {
 
     #[test]
     fn unknown_local_change_formats_fail_instead_of_falling_back_to_v050() {
-        let change =
-            LocalChange::object_head(9, 11, 12, "documents/three".into(), VersionId(43), false);
+        let change = LocalChange::object_head(
+            9,
+            11,
+            12,
+            "documents/three".into(),
+            VersionId(43),
+            false,
+            Vec::new(),
+        );
         let encoded = encode_local_change(&change).unwrap();
         let mut value = serde_json::from_slice::<serde_json::Value>(&encoded).unwrap();
         value["format"] = serde_json::json!(LOCAL_CHANGE_FORMAT + 1);

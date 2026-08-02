@@ -103,8 +103,9 @@ impl Store {
             BTreeMap::<Vec<u8>, Result<ObjectVersioning, MutationError>>::new();
         let mut results = BTreeMap::<usize, Result<MutationReceipt, MutationError>>::new();
         let mut batch_high_watermark = None;
-        let mut pending_invalidations = Vec::new();
+        let mut pending_changes = Vec::new();
         for (index, operation) in prepared {
+            let mut reference_deltas = Vec::new();
             let outcome = self
                 .evaluate_operation(
                     &operation,
@@ -119,6 +120,7 @@ impl Store {
                     &pruned_receipts,
                     &mut receipt_status,
                     now,
+                    &mut reference_deltas,
                 )
                 .await;
             if let Ok(receipt) = &outcome
@@ -129,12 +131,13 @@ impl Store {
                         current.max(receipt.version)
                     }),
                 );
-                pending_invalidations.push((
-                    operation.identity(),
-                    operation.key().path().to_owned(),
-                    receipt.version,
-                    receipt.deleted,
-                ));
+                pending_changes.push(PendingLocalChange::ObjectHead {
+                    identity: operation.identity(),
+                    exact_path: operation.key().path().to_owned(),
+                    path_version: receipt.version,
+                    deleted: receipt.deleted,
+                    reference_deltas,
+                });
             }
             results.insert(index, outcome);
         }
@@ -143,7 +146,7 @@ impl Store {
             if receipt_status != initial_receipt_status {
                 self.stage_mutation_receipt_status(&mut batch, receipt_status)?;
             }
-            self.stage_local_invalidations(&mut batch, &pending_invalidations)?;
+            self.stage_local_changes(&mut batch, &pending_changes)?;
             if let Some(high_watermark) = batch_high_watermark {
                 batch.put_cf(
                     self.cf(CF_METADATA)?,
@@ -160,7 +163,7 @@ impl Store {
         })();
         match persistence {
             Ok(()) => {
-                if !pending_invalidations.is_empty() {
+                if !pending_changes.is_empty() {
                     self.notify_local_invalidations();
                 }
             }
@@ -180,10 +183,10 @@ impl Store {
             .collect()
     }
 
-    pub(crate) fn stage_local_invalidations(
+    pub(crate) fn stage_local_changes(
         &self,
         batch: &mut WriteBatch,
-        changes: &[(BucketIdentity, String, VersionId, bool)],
+        changes: &[PendingLocalChange],
     ) -> Result<(), MutationError> {
         if changes.is_empty() {
             return Ok(());
@@ -201,18 +204,42 @@ impl Store {
             IteratorMode::From(&first_old_key, Direction::Forward),
         );
         let mut appended = VecDeque::new();
-        for (identity, exact_path, version, deleted) in changes {
+        for pending in changes {
             status.tail = status.tail.checked_add(1).ok_or_else(|| {
                 MutationError::Storage("local invalidation offset is exhausted".into())
             })?;
-            let change = LocalChange::object_head(
-                status.tail,
-                identity.tenant_id.0,
-                identity.bucket_id.0,
-                exact_path.clone(),
-                *version,
-                *deleted,
-            );
+            let change = match pending {
+                PendingLocalChange::ObjectHead {
+                    identity,
+                    exact_path,
+                    path_version,
+                    deleted,
+                    reference_deltas,
+                } => LocalChange::object_head(
+                    status.tail,
+                    identity.tenant_id.0,
+                    identity.bucket_id.0,
+                    exact_path.clone(),
+                    *path_version,
+                    *deleted,
+                    reference_deltas.clone(),
+                ),
+                PendingLocalChange::RetainedVersionDeleted {
+                    identity,
+                    exact_path,
+                    deleted_version,
+                    resulting_head_version,
+                    reference_deltas,
+                } => LocalChange::retained_version_deleted(
+                    status.tail,
+                    identity.tenant_id.0,
+                    identity.bucket_id.0,
+                    exact_path.clone(),
+                    *deleted_version,
+                    *resulting_head_version,
+                    reference_deltas.clone(),
+                ),
+            };
             let encoded = encode_local_change(&change).map_err(storage_error)?;
             status.retained_entries = status.retained_entries.checked_add(1).ok_or_else(|| {
                 MutationError::Storage("local invalidation entry count is exhausted".into())
@@ -576,6 +603,7 @@ impl Store {
         pruned_receipts: &BTreeSet<Vec<u8>>,
         receipt_status: &mut MutationReceiptStatus,
         now_unix_millis: u64,
+        reference_deltas: &mut Vec<ReferenceDelta>,
     ) -> Result<MutationReceipt, MutationError> {
         let key = operation.key();
         let encoded_key = operation.encoded_head_key();
@@ -804,6 +832,22 @@ impl Store {
         }
         for (key, state) in blob_reference_updates {
             self.stage_blob_reference_update(batch, pending_blob_references, key, state)?;
+        }
+        if versioning == ObjectVersioning::Unversioned && references_changed {
+            if let Some(reference) = old_blob {
+                reference_deltas.push(ReferenceDelta {
+                    blob: reference,
+                    change: -1,
+                });
+            }
+        }
+        if let Some(reference) = new_blob
+            && (versioning == ObjectVersioning::Enabled || references_changed)
+        {
+            reference_deltas.push(ReferenceDelta {
+                blob: reference,
+                change: 1,
+            });
         }
         if versioning == ObjectVersioning::Unversioned
             && let Some(previous) = current_version.as_ref()

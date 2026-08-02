@@ -32,6 +32,7 @@ impl Store {
                     invalidation.key.path().to_owned(),
                     invalidation.minimum_path_version,
                     invalidation.state_hint == InvalidationStateHint::Deleted,
+                    Vec::new(),
                 ))
             }
         }
@@ -416,6 +417,50 @@ mod tests {
             error
                 .to_string()
                 .contains("local change offset 2 is missing")
+        );
+    }
+
+    #[tokio::test]
+    async fn object_changes_retain_exact_reference_effects() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        for (command, bytes) in [("first", b"first".as_slice()), ("second", b"second")] {
+            store
+                .put(PutRequest {
+                    key: ObjectKey::new("tenant", "bucket", "object").unwrap(),
+                    bytes: bytes.to_vec(),
+                    content_type: None,
+                    mode: PutMode::Put,
+                    command_id: Some(command.into()),
+                    durability: Durability::Local,
+                })
+                .await
+                .unwrap();
+        }
+
+        let changes = store.scan_local_changes(0, 10).unwrap();
+        assert_eq!(changes.len(), 2);
+        assert_eq!(
+            changes[0].reference_deltas(),
+            &[ReferenceDelta {
+                blob: blob_reference_for_bytes(b"first"),
+                change: 1,
+            }]
+        );
+        assert_eq!(
+            changes[1].reference_deltas(),
+            &[
+                ReferenceDelta {
+                    blob: blob_reference_for_bytes(b"first"),
+                    change: -1,
+                },
+                ReferenceDelta {
+                    blob: blob_reference_for_bytes(b"second"),
+                    change: 1,
+                },
+            ]
         );
     }
 }

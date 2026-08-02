@@ -27,7 +27,8 @@ use crate::{
     AWAITING_PUBLISH, BatchOperation, BatchOutcome, BlobReader, BlobRef, BlobReferenceState,
     BlobStore, BucketPolicy, DeleteRequest, DeleteRetainedVersionOutcome, Durability, Head,
     MutationError, MutationReceipt, Object, ObjectKey, ObjectVersioning, Precondition,
-    PublishRequest, PutMode, PutRequest, SMALL_BLOB_MAX_BYTES, Version, VersionClock, VersionId,
+    PublishRequest, PutMode, PutRequest, ReferenceDelta, SMALL_BLOB_MAX_BYTES, Version,
+    VersionClock, VersionId,
 };
 
 const PROGRAM_DEFINITION_PREFIX: &str = "_anvil/programs/";
@@ -128,6 +129,24 @@ impl Default for MutationReceiptRetention {
 struct MutationReceiptStatus {
     entries: u64,
     bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum PendingLocalChange {
+    ObjectHead {
+        identity: BucketIdentity,
+        exact_path: String,
+        path_version: VersionId,
+        deleted: bool,
+        reference_deltas: Vec<ReferenceDelta>,
+    },
+    RetainedVersionDeleted {
+        identity: BucketIdentity,
+        exact_path: String,
+        deleted_version: VersionId,
+        resulting_head_version: Option<VersionId>,
+        reference_deltas: Vec<ReferenceDelta>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -689,8 +708,8 @@ impl Store {
 
 mod blob_references;
 mod mutations;
-mod reference_deltas;
 mod reads;
+mod reference_deltas;
 mod watch_journal;
 
 pub(crate) fn is_program_definition_path(path: &str) -> bool {

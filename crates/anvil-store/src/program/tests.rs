@@ -273,6 +273,13 @@ async fn ordinary_blob_plane_attests_executor_local_durability() {
     let counter_key = object_key(&counter_path()).unwrap();
     assert_eq!(invalidations[0].exact_path, counter_key.path());
     assert_eq!(
+        invalidations[0].reference_deltas,
+        [ReferenceDelta {
+            blob: applied_blob.clone(),
+            change: 1,
+        }]
+    );
+    assert_eq!(
         invalidations[0].path_version,
         store.head(&counter_key).unwrap().unwrap().version
     );

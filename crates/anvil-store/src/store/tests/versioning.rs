@@ -405,6 +405,37 @@ async fn retained_version_deletion_never_reveals_an_older_value() {
             .collect::<Vec<_>>(),
         vec![second.version, tombstone]
     );
+    let retained_deletions = store
+        .scan_local_changes(0, 20)
+        .unwrap()
+        .into_iter()
+        .filter_map(|change| match change {
+            LocalChange::RetainedVersionDeleted(change) => Some(change),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(retained_deletions.len(), 2);
+    assert_eq!(retained_deletions[0].deleted_version, first.version);
+    assert_eq!(retained_deletions[0].resulting_head_version, None);
+    assert_eq!(
+        retained_deletions[0].reference_deltas,
+        [ReferenceDelta {
+            blob: blob_reference_for_bytes(b"first"),
+            change: -1,
+        }]
+    );
+    assert_eq!(retained_deletions[1].deleted_version, third.version);
+    assert_eq!(
+        retained_deletions[1].resulting_head_version,
+        Some(tombstone)
+    );
+    assert_eq!(
+        retained_deletions[1].reference_deltas,
+        [ReferenceDelta {
+            blob: blob_reference_for_bytes(b"third"),
+            change: -1,
+        }]
+    );
     assert_eq!(
         store
             .delete_retained_version(&key("a"), tombstone)

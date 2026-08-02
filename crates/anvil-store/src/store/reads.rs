@@ -323,28 +323,31 @@ impl Store {
             ));
         }
 
+        let now = now_unix_millis()?;
         let mut batch = WriteBatch::default();
         let mut pending_references = PendingBlobReferences::new();
+        let mut reference_deltas = Vec::new();
         if let Some(reference) = version_blob_reference(&target)? {
-            let (reference_key, state) = self.prepare_blob_reference_retirement(
-                &reference,
-                &pending_references,
-                now_unix_millis()?,
-            )?;
+            let (reference_key, state) =
+                self.prepare_blob_reference_retirement(&reference, &pending_references, now)?;
             self.stage_blob_reference_update(
                 &mut batch,
                 &mut pending_references,
                 reference_key,
                 state,
             )?;
+            reference_deltas.push(ReferenceDelta {
+                blob: reference,
+                change: -1,
+            });
         }
         batch.delete_cf(
             self.cf(CF_VERSIONS)?,
             version_key(identity, key, version_id),
         );
 
-        let (outcome, invalidation) = if head.version != version_id {
-            (DeleteRetainedVersionOutcome::DeletedNonCurrent, None)
+        let (outcome, resulting_head_version, head_change) = if head.version != version_id {
+            (DeleteRetainedVersionOutcome::DeletedNonCurrent, None, None)
         } else {
             if target.deleted {
                 return Err(MutationError::CurrentTombstoneCannotBeDeleted);
@@ -355,7 +358,7 @@ impl Store {
                 blob: None,
                 content_type: None,
                 deleted: true,
-                committed_at_unix_millis: now_unix_millis()?,
+                committed_at_unix_millis: now,
             };
             batch.put_cf(
                 self.cf(CF_VERSIONS)?,
@@ -376,23 +379,35 @@ impl Store {
                 VERSION_HIGH_WATERMARK_KEY,
                 serde_json::to_vec(&tombstone_id).map_err(storage_error)?,
             );
-            self.stage_local_invalidations(
-                &mut batch,
-                &[(identity, key.path().to_owned(), tombstone_id, true)],
-            )?;
             (
                 DeleteRetainedVersionOutcome::ReplacedCurrentWithTombstone {
                     version: tombstone_id,
                 },
                 Some(tombstone_id),
+                Some(PendingLocalChange::ObjectHead {
+                    identity,
+                    exact_path: key.path().to_owned(),
+                    path_version: tombstone_id,
+                    deleted: true,
+                    reference_deltas: Vec::new(),
+                }),
             )
         };
+        let mut changes = vec![PendingLocalChange::RetainedVersionDeleted {
+            identity,
+            exact_path: key.path().to_owned(),
+            deleted_version: version_id,
+            resulting_head_version,
+            reference_deltas,
+        }];
+        if let Some(head_change) = head_change {
+            changes.push(head_change);
+        }
+        self.stage_local_changes(&mut batch, &changes)?;
         let mut options = WriteOptions::default();
         options.set_sync(self.sync_writes);
         self.db.write_opt(batch, &options).map_err(storage_error)?;
-        if invalidation.is_some() {
-            self.notify_local_invalidations();
-        }
+        self.notify_local_invalidations();
         Ok(outcome)
     }
 

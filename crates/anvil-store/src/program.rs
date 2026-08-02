@@ -13,10 +13,14 @@ use thiserror::Error;
 
 use crate::key::BucketIdentity;
 use crate::store::{
-    CF_HEADS, CF_METADATA, CF_VERSIONS, PendingBlobReferences, VERSION_HIGH_WATERMARK_KEY,
-    is_program_definition_path, now_unix_millis, version_blob_reference, version_key,
+    CF_HEADS, CF_METADATA, CF_VERSIONS, PendingBlobReferences, PendingLocalChange,
+    VERSION_HIGH_WATERMARK_KEY, is_program_definition_path, now_unix_millis,
+    version_blob_reference, version_key,
 };
-use crate::{BlobRef, Head, MutationError, ObjectKey, ObjectVersioning, Store, Version, VersionId};
+use crate::{
+    BlobRef, Head, MutationError, ObjectKey, ObjectVersioning, ReferenceDelta, Store, Version,
+    VersionId,
+};
 
 const PREPARED_BUNDLE_FORMAT: u16 = 4;
 const DURABILITY_EVIDENCE_FORMAT: u16 = 1;
@@ -1108,10 +1112,11 @@ impl Store {
         };
 
         let mut batch = WriteBatch::default();
-        let mut invalidations = Vec::with_capacity(record.writes.len());
+        let mut changes = Vec::with_capacity(record.writes.len());
         let mut pending_blob_references = PendingBlobReferences::new();
         let publication_at_unix_millis = now_unix_millis().map_err(program_mutation_error)?;
         for write in &record.writes {
+            let mut reference_deltas = Vec::new();
             let key = object_key(&write.path)?;
             let identity = *identities
                 .get(&(write.path.tenant.clone(), write.path.bucket.clone()))
@@ -1164,6 +1169,10 @@ impl Store {
                             state,
                         )
                         .map_err(program_mutation_error)?;
+                        reference_deltas.push(ReferenceDelta {
+                            blob: reference.clone(),
+                            change: -1,
+                        });
                     }
                 }
                 if let Some(reference) = new_blob.as_ref()
@@ -1183,6 +1192,10 @@ impl Store {
                         state,
                     )
                     .map_err(program_mutation_error)?;
+                    reference_deltas.push(ReferenceDelta {
+                        blob: reference.clone(),
+                        change: 1,
+                    });
                 }
                 if versioning == ObjectVersioning::Unversioned
                     && let Some(previous) = old_version
@@ -1207,12 +1220,13 @@ impl Store {
                 })
                 .map_err(program_storage_error)?,
             );
-            invalidations.push((
+            changes.push(PendingLocalChange::ObjectHead {
                 identity,
-                key.path().to_owned(),
-                write.version.id,
-                write.version.deleted,
-            ));
+                exact_path: key.path().to_owned(),
+                path_version: write.version.id,
+                deleted: write.version.deleted,
+                reference_deltas,
+            });
         }
         let bundle_reference = BlobRef::from(loaded.bundle);
         if let Some((reference_key, state)) = self
@@ -1231,7 +1245,7 @@ impl Store {
             )
             .map_err(program_mutation_error)?;
         }
-        self.stage_local_invalidations(&mut batch, &invalidations)
+        self.stage_local_changes(&mut batch, &changes)
             .map_err(program_mutation_error)?;
         let allocated_high = record.writes.iter().map(|write| write.version.id).max();
         if let Some(allocated) = allocated_high {
@@ -1249,7 +1263,7 @@ impl Store {
             serde_json::to_vec(&applied).map_err(program_storage_error)?,
         );
         self.write_program_batch(batch)?;
-        if !invalidations.is_empty() {
+        if !changes.is_empty() {
             self.notify_local_invalidations();
         }
         if let Some(allocated) = allocated_high {
