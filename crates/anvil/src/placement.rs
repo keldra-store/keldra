@@ -10,6 +10,31 @@ use anvil_consensus::{ClusterId, NodeId};
 
 const HASH_CONTEXT: &str = "anvil.storage/weighted-hrw/v1";
 
+/// Stable domain byte in the weighted-HRW wire tuple.
+///
+/// These values are part of the 0.5.1 placement format. Reserved future
+/// values are named now so a later capability cannot accidentally reuse an
+/// existing ownership domain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum PlacementKind {
+    TenantNameClaim = 1,
+    TenantOrBucketRecord = 2,
+    Object = 3,
+    ZanzibarRealm = 4,
+    Credential = 5,
+    SmallContent = 6,
+    LargeFragment = 7,
+    FuturePersonalDb = 8,
+    FutureIndex = 9,
+}
+
+impl PlacementKind {
+    const fn wire_byte(self) -> u8 {
+        self as u8
+    }
+}
+
 /// One active placement candidate and its configured storage-capacity ratio.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PlacementNode {
@@ -36,7 +61,7 @@ impl PlacementNode {
 /// Callers provide one candidate per active node. Lower node ID is the final
 /// tie-break, making even a quantized-score tie deterministic.
 pub(crate) fn rank_nodes(
-    placement_kind: u8,
+    placement_kind: PlacementKind,
     cluster_id: ClusterId,
     key: &[u8],
     nodes: &[PlacementNode],
@@ -72,7 +97,7 @@ fn compare_score(left: &ScoredNode, right: &ScoredNode) -> Ordering {
 }
 
 fn score_denominator(
-    placement_kind: u8,
+    placement_kind: PlacementKind,
     cluster_id: ClusterId,
     key: &[u8],
     node_id: NodeId,
@@ -82,9 +107,14 @@ fn score_denominator(
 }
 
 /// Return `r` for the exact open-interval midpoint `H = (2r + 1) / 2^65`.
-fn hash_midpoint(placement_kind: u8, cluster_id: ClusterId, key: &[u8], node_id: NodeId) -> u64 {
+fn hash_midpoint(
+    placement_kind: PlacementKind,
+    cluster_id: ClusterId,
+    key: &[u8],
+    node_id: NodeId,
+) -> u64 {
     let mut hasher = blake3::Hasher::new_derive_key(HASH_CONTEXT);
-    hasher.update(&[placement_kind]);
+    hasher.update(&[placement_kind.wire_byte()]);
     hasher.update(&cluster_id.into_bytes());
     hasher.update(
         &u64::try_from(key.len())
@@ -171,6 +201,19 @@ mod tests {
             NodeId(node_id),
             NonZeroU32::new(weight_millionths).expect("test weight must be positive"),
         )
+    }
+
+    #[test]
+    fn placement_domain_bytes_are_frozen() {
+        assert_eq!(PlacementKind::TenantNameClaim.wire_byte(), 1);
+        assert_eq!(PlacementKind::TenantOrBucketRecord.wire_byte(), 2);
+        assert_eq!(PlacementKind::Object.wire_byte(), 3);
+        assert_eq!(PlacementKind::ZanzibarRealm.wire_byte(), 4);
+        assert_eq!(PlacementKind::Credential.wire_byte(), 5);
+        assert_eq!(PlacementKind::SmallContent.wire_byte(), 6);
+        assert_eq!(PlacementKind::LargeFragment.wire_byte(), 7);
+        assert_eq!(PlacementKind::FuturePersonalDb.wire_byte(), 8);
+        assert_eq!(PlacementKind::FutureIndex.wire_byte(), 9);
     }
 
     fn ids(nodes: Vec<PlacementNode>) -> Vec<u64> {
@@ -265,17 +308,17 @@ mod tests {
 
         for (node_id, expected_hash_word, expected_denominator) in vectors {
             assert_eq!(
-                hash_midpoint(3, cluster, key, NodeId(node_id)),
+                hash_midpoint(PlacementKind::Object, cluster, key, NodeId(node_id)),
                 expected_hash_word
             );
             assert_eq!(
-                score_denominator(3, cluster, key, NodeId(node_id)),
+                score_denominator(PlacementKind::Object, cluster, key, NodeId(node_id)),
                 expected_denominator
             );
         }
 
         let ranked = rank_nodes(
-            3,
+            PlacementKind::Object,
             cluster,
             key,
             &[
@@ -295,8 +338,18 @@ mod tests {
         let second = [first[2], first[0], first[1]];
 
         assert_eq!(
-            ids(rank_nodes(8, cluster, b"stable-key", &first)),
-            ids(rank_nodes(8, cluster, b"stable-key", &second))
+            ids(rank_nodes(
+                PlacementKind::FuturePersonalDb,
+                cluster,
+                b"stable-key",
+                &first,
+            )),
+            ids(rank_nodes(
+                PlacementKind::FuturePersonalDb,
+                cluster,
+                b"stable-key",
+                &second,
+            ))
         );
     }
 
@@ -307,7 +360,12 @@ mod tests {
         let mut counts = BTreeMap::<u64, usize>::new();
 
         for key_number in 0_u64..50_000 {
-            let winner = rank_nodes(5, cluster, &key_number.to_be_bytes(), &candidates)[0];
+            let winner = rank_nodes(
+                PlacementKind::Credential,
+                cluster,
+                &key_number.to_be_bytes(),
+                &candidates,
+            )[0];
             *counts.entry(winner.node_id().0).or_default() += 1;
         }
 
@@ -333,8 +391,10 @@ mod tests {
 
         for key_number in 0_u64..20_000 {
             let key = key_number.to_be_bytes();
-            let before = rank_nodes(1, cluster, &key, &original)[0].node_id();
-            let after = rank_nodes(1, cluster, &key, &expanded)[0].node_id();
+            let before =
+                rank_nodes(PlacementKind::TenantNameClaim, cluster, &key, &original)[0].node_id();
+            let after =
+                rank_nodes(PlacementKind::TenantNameClaim, cluster, &key, &expanded)[0].node_id();
             if before != after {
                 moved += 1;
                 assert_eq!(after, NodeId(4));

@@ -347,6 +347,12 @@ Placement is derived independently for each logical item:
 | Future PersonalDB | tenant ID and PersonalDB ID | one database primary |
 | Future index | tenant ID and index ID | one index owner |
 
+The stable `placement_kind` wire byte is, in the same order: tenant-name claim
+`1`, tenant-or-bucket record `2`, exact object `3`, Zanzibar realm `4`,
+credential `5`, small content `6`, large fragment `7`, reserved future
+PersonalDB `8`, and reserved future index `9`. These domain bytes are part of
+the placement format and are never inferred from a Rust enum discriminant.
+
 There is no metadata-primary service. “Coordinator” means only the current
 rank-zero node for one exact logical key. The next ranked nodes hold that
 key's complete logical replicas where replication applies.

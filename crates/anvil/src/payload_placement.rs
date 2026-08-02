@@ -10,7 +10,7 @@ use anvil_consensus::{ClusterId, NodeId};
 use anvil_store::{BlobRef, Durability, ErasureProfile, SMALL_BLOB_MAX_BYTES};
 use thiserror::Error;
 
-use crate::placement::{PlacementNode, rank_nodes};
+use crate::placement::{PlacementKind, PlacementNode, rank_nodes};
 
 /// Desired placement for one content-addressed payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -217,16 +217,21 @@ impl LargePayloadPlacement {
 
 /// Select the desired payload owners from the active placement set.
 ///
-/// The caller supplies the protocol's payload placement kind. Input nodes are
-/// defensively deduplicated by stable node ID before an owner is assigned.
+/// The content size selects the protocol's fixed payload placement domain.
+/// Input nodes are defensively deduplicated by stable node ID before an owner
+/// is assigned.
 pub(crate) fn select_payload_placement(
-    placement_kind: u8,
     cluster_id: ClusterId,
     content: &BlobRef,
     profile: ErasureProfile,
     active_nodes: &[PlacementNode],
 ) -> PayloadPlacement {
     let key = content_placement_key(content);
+    let placement_kind = if content.length <= SMALL_BLOB_MAX_BYTES as u64 {
+        PlacementKind::SmallContent
+    } else {
+        PlacementKind::LargeFragment
+    };
     let ranked = distinct_ranked_nodes(placement_kind, cluster_id, &key, active_nodes);
 
     if content.length <= SMALL_BLOB_MAX_BYTES as u64 {
@@ -264,7 +269,7 @@ fn content_placement_key(content: &BlobRef) -> [u8; 40] {
 }
 
 fn distinct_ranked_nodes(
-    placement_kind: u8,
+    placement_kind: PlacementKind,
     cluster_id: ClusterId,
     key: &[u8],
     active_nodes: &[PlacementNode],
@@ -282,8 +287,6 @@ mod tests {
     use std::num::NonZeroU32;
 
     use super::*;
-
-    const PLACEMENT_KIND: u8 = 6;
 
     fn cluster_id() -> ClusterId {
         ClusterId(*b"payload-place-v1")
@@ -344,10 +347,8 @@ mod tests {
         let mut reversed = first.clone();
         reversed.reverse();
 
-        let first =
-            select_payload_placement(PLACEMENT_KIND, cluster_id(), &content, profile(), &first);
-        let reversed =
-            select_payload_placement(PLACEMENT_KIND, cluster_id(), &content, profile(), &reversed);
+        let first = select_payload_placement(cluster_id(), &content, profile(), &first);
+        let reversed = select_payload_placement(cluster_id(), &content, profile(), &reversed);
 
         assert_eq!(small_owners(first), [3, 13, 29]);
         assert_eq!(small_owners(reversed), [3, 13, 29]);
@@ -356,7 +357,6 @@ mod tests {
     #[test]
     fn large_weighted_ordinal_vector_is_frozen() {
         let placement = select_payload_placement(
-            PLACEMENT_KIND,
             cluster_id(),
             &content(SMALL_BLOB_MAX_BYTES as u64 + 1),
             profile(),
@@ -365,22 +365,15 @@ mod tests {
 
         assert_eq!(
             large_assignments(placement),
-            [(0, 53), (1, 3), (2, 29), (3, 7), (4, 13), (5, 41)]
+            [(0, 13), (1, 3), (2, 7), (3, 41), (4, 61), (5, 53)]
         );
     }
 
     #[test]
     fn insufficient_membership_reports_both_layouts_under_redundant() {
         let active = [node(2, 1_000_000), node(5, 2_000_000)];
-        let small = select_payload_placement(
-            PLACEMENT_KIND,
-            cluster_id(),
-            &content(17),
-            profile(),
-            &active,
-        );
+        let small = select_payload_placement(cluster_id(), &content(17), profile(), &active);
         let large = select_payload_placement(
-            PLACEMENT_KIND,
             cluster_id(),
             &content(SMALL_BLOB_MAX_BYTES as u64 + 1),
             profile(),
@@ -409,7 +402,6 @@ mod tests {
             node(11, 750_000),
         ];
         let placement = select_payload_placement(
-            PLACEMENT_KIND,
             cluster_id(),
             &content(SMALL_BLOB_MAX_BYTES as u64 + 1),
             profile(),
@@ -428,15 +420,8 @@ mod tests {
     #[test]
     fn complete_membership_meets_m_plus_one_and_k_plus_m_counts() {
         let active = nodes();
-        let small = select_payload_placement(
-            PLACEMENT_KIND,
-            cluster_id(),
-            &content(1),
-            profile(),
-            &active,
-        );
+        let small = select_payload_placement(cluster_id(), &content(1), profile(), &active);
         let large = select_payload_placement(
-            PLACEMENT_KIND,
             cluster_id(),
             &content(SMALL_BLOB_MAX_BYTES as u64 + 1),
             profile(),
@@ -452,7 +437,6 @@ mod tests {
     #[test]
     fn local_requires_metadata_and_the_rank_zero_complete_source_only() {
         let placement = select_payload_placement(
-            PLACEMENT_KIND,
             cluster_id(),
             &content(SMALL_BLOB_MAX_BYTES as u64 + 1),
             profile(),
@@ -477,13 +461,7 @@ mod tests {
 
     #[test]
     fn replicated_small_requires_every_m_plus_one_selected_owner() {
-        let placement = select_payload_placement(
-            PLACEMENT_KIND,
-            cluster_id(),
-            &content(11),
-            profile(),
-            &nodes(),
-        );
+        let placement = select_payload_placement(cluster_id(), &content(11), profile(), &nodes());
         let PayloadPlacement::Small(small) = &placement else {
             panic!("expected small placement")
         };
@@ -511,7 +489,6 @@ mod tests {
     #[test]
     fn default_two_plus_one_requires_three_distinct_final_shards() {
         let placement = select_payload_placement(
-            PLACEMENT_KIND,
             cluster_id(),
             &content(SMALL_BLOB_MAX_BYTES as u64 + 1),
             ErasureProfile::default(),
@@ -545,7 +522,6 @@ mod tests {
     #[test]
     fn wrong_ordinal_and_duplicate_node_evidence_never_inflate_readiness() {
         let placement = select_payload_placement(
-            PLACEMENT_KIND,
             cluster_id(),
             &content(SMALL_BLOB_MAX_BYTES as u64 + 1),
             ErasureProfile::default(),

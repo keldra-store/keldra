@@ -7,7 +7,7 @@
 use anvil_consensus::{ClusterId, NodeId};
 
 use crate::mutable_record_quorum::MutableRecordQuorum;
-use crate::placement::{PlacementNode, rank_nodes};
+use crate::placement::{PlacementKind, PlacementNode, rank_nodes};
 
 /// The ranked replica nodes and acknowledgement rule for one mutable record.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -22,7 +22,7 @@ impl MutableRecordReplicaGroup {
     /// `placement_kind` and `key` are already encoded by the caller. Active
     /// membership supplies exactly one [`PlacementNode`] per node.
     pub(crate) fn select(
-        placement_kind: u8,
+        placement_kind: PlacementKind,
         cluster_id: ClusterId,
         key: &[u8],
         active_nodes: &[PlacementNode],
@@ -80,7 +80,7 @@ mod tests {
 
     use super::*;
 
-    const PLACEMENT_KIND: u8 = 3;
+    const PLACEMENT_KIND: PlacementKind = PlacementKind::Object;
     const PLACEMENT_KEY: &[u8] = b"already-encoded-mutable-record-key";
 
     fn cluster_id() -> ClusterId {
