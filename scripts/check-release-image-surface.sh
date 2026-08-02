@@ -3,22 +3,35 @@ set -euo pipefail
 
 release_workflow=".github/workflows/release.yml"
 
-if grep -REn 'docker[[:space:]]+push|imagetools[[:space:]]+create' .github/workflows; then
-  echo "release workflows must not publish or assemble public per-architecture tags" >&2
+if grep -REn 'docker[[:space:]]+push' .github/workflows; then
+  echo "release workflows must push platform images without public per-architecture tags" >&2
   exit 1
 fi
 
 for required in \
   'final_image="${repository}:${RELEASE_TAG}"' \
-  '--platform linux/amd64,linux/arm64' \
+  'runner: worka-builder-2' \
+  'runner: ubuntu-24.04-arm' \
+  '--platform "$ANVIL_DOCKER_PLATFORM"' \
+  '--provenance=false' \
+  '--sbom=false' \
+  'push-by-digest=true' \
+  'name-canonical=true' \
+  'docker buildx imagetools create' \
   '--tag "$final_image"' \
-  '--push'
+  '"${repository}@${amd64_digest}"' \
+  '"${repository}@${arm64_digest}"'
 do
   if ! grep -Fq -- "${required}" "${release_workflow}"; then
     echo "release workflow is missing the single-image invariant: ${required}" >&2
     exit 1
   fi
 done
+
+if [[ "$(grep -Fc 'docker buildx imagetools create' "${release_workflow}")" != "1" ]]; then
+  echo "release workflow must assemble exactly one multi-architecture image" >&2
+  exit 1
+fi
 
 if grep -Fq 'source_tag_image' "${release_workflow}"; then
   echo "release workflow must not publish a second image tag" >&2

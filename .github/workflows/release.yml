@@ -112,8 +112,11 @@ jobs:
   build-image:
     name: Build release image (${{ matrix.platform }})
     needs: release-context
-    runs-on: [self-hosted, linux, x64, worka-builder-2]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
     env:
       ANVIL_IMAGE: anvil:release-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
       ANVIL_DOCKER_PLATFORM: ${{ matrix.platform }}
@@ -123,31 +126,88 @@ jobs:
         include:
           - platform: linux/amd64
             arch: amd64
+            runner: worka-builder-2
           - platform: linux/arm64
             arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
       - name: Checkout release commit
         uses: actions/checkout@v4
         with:
           ref: ${{ needs.release-context.outputs.commit }}
 
-      - name: Set up emulation
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: amd64,arm64
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build release image
-        run: ./scripts/build-image.sh
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push release image by digest
+        id: build
+        env:
+          DIGEST_FILE: ${{ runner.temp }}/anvil-image-digest-${{ matrix.arch }}.txt
+        run: |
+          set -euo pipefail
+          repository="ghcr.io/${GITHUB_REPOSITORY,,}"
+          metadata_file="${RUNNER_TEMP}/anvil-image-metadata-${{ matrix.arch }}.json"
+
+          docker buildx build \
+            --platform "$ANVIL_DOCKER_PLATFORM" \
+            --provenance=false \
+            --sbom=false \
+            --output "type=image,name=${repository},push=true,push-by-digest=true,name-canonical=true" \
+            --metadata-file "$metadata_file" \
+            --file anvil/Dockerfile \
+            .
+
+          digest="$(
+            python3 -c '
+          import json, sys
+          with open(sys.argv[1], encoding="utf-8") as metadata:
+              print(json.load(metadata).get("containerimage.digest", ""))
+          ' "$metadata_file"
+          )"
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "native ${ANVIL_DOCKER_PLATFORM} build did not report a valid digest" >&2
+            exit 1
+          fi
+          printf '%s\n' "$digest" >"$DIGEST_FILE"
+          printf 'repository=%s\ndigest=%s\n' "$repository" "$digest" >>"$GITHUB_OUTPUT"
+
+      - name: Pull exact release image digest
+        env:
+          IMAGE_REPOSITORY: ${{ steps.build.outputs.repository }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker pull --platform "$ANVIL_DOCKER_PLATFORM" "${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
+          docker tag "${IMAGE_REPOSITORY}@${IMAGE_DIGEST}" "$ANVIL_IMAGE"
 
       - name: Smoke release image through gRPC
         run: ./scripts/release-gates.sh image
 
+      - name: Upload tested release image digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: anvil-release-digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/anvil-image-digest-${{ matrix.arch }}.txt
+          if-no-files-found: error
+          retention-days: 2
+
       - name: Remove local image
         if: always()
-        run: docker image rm "$ANVIL_IMAGE" || true
+        env:
+          IMAGE_REPOSITORY: ${{ steps.build.outputs.repository }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          docker image rm "$ANVIL_IMAGE" || true
+          if [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            docker image rm "${IMAGE_REPOSITORY}@${IMAGE_DIGEST}" || true
+          fi
 
   publish:
     name: Publish Anvil 0.5 image and release
@@ -163,10 +223,11 @@ jobs:
         with:
           ref: ${{ needs.release-context.outputs.commit }}
 
-      - name: Set up emulation
-        uses: docker/setup-qemu-action@v3
+      - name: Download tested release image digests
+        uses: actions/download-artifact@v4
         with:
-          platforms: amd64,arm64
+          pattern: anvil-release-digest-*
+          path: ${{ runner.temp }}/anvil-image-digests
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -186,30 +247,40 @@ jobs:
           set -euo pipefail
           repository="ghcr.io/${GITHUB_REPOSITORY,,}"
           final_image="${repository}:${RELEASE_TAG}"
+          amd64_digest="$(tr -d '[:space:]' < \
+            "${RUNNER_TEMP}/anvil-image-digests/anvil-release-digest-amd64/anvil-image-digest-amd64.txt")"
+          arm64_digest="$(tr -d '[:space:]' < \
+            "${RUNNER_TEMP}/anvil-image-digests/anvil-release-digest-arm64/anvil-image-digest-arm64.txt")"
 
-          docker buildx build \
-            --platform linux/amd64,linux/arm64 \
-            --provenance=false \
-            --sbom=false \
+          for digest in "$amd64_digest" "$arm64_digest"; do
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "tested release artifact did not contain a valid digest" >&2
+              exit 1
+            fi
+          done
+
+          docker buildx imagetools create \
             --tag "$final_image" \
-            --push \
-            --file anvil/Dockerfile \
-            .
+            "${repository}@${amd64_digest}" \
+            "${repository}@${arm64_digest}"
 
           raw_manifest="$(docker buildx imagetools inspect --raw "$final_image")"
-          python3 -c '
-          import json, sys
+          AMD64_DIGEST="$amd64_digest" ARM64_DIGEST="$arm64_digest" python3 -c '
+          import json, os, sys
           manifest = json.load(sys.stdin)
-          platforms = sorted(
+          published = {
               "{}/{}".format(
                   item.get("platform", {}).get("os"),
                   item.get("platform", {}).get("architecture"),
-              )
+              ): item.get("digest")
               for item in manifest.get("manifests", [])
-          )
-          expected = ["linux/amd64", "linux/arm64"]
-          if platforms != expected:
-              raise SystemExit(f"published platforms {platforms!r} != {expected!r}")
+          }
+          expected = {
+              "linux/amd64": os.environ["AMD64_DIGEST"],
+              "linux/arm64": os.environ["ARM64_DIGEST"],
+          }
+          if published != expected:
+              raise SystemExit(f"published platform digests {published!r} != {expected!r}")
           ' <<<"$raw_manifest"
           inspection="$(docker buildx imagetools inspect "$final_image")"
           digest="$(awk '$1 == "Digest:" { print $2; exit }' <<<"$inspection")"

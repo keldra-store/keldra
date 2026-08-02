@@ -101,7 +101,7 @@ jobs:
   build-image:
     name: Build and smoke Anvil image (${{ matrix.platform }})
     needs: static
-    runs-on: [self-hosted, linux, x64, worka-builder-2]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     env:
       ANVIL_DOCKER_PLATFORM: ${{ matrix.platform }}
@@ -112,16 +112,13 @@ jobs:
         include:
           - platform: linux/amd64
             arch: amd64
+            runner: worka-builder-2
           - platform: linux/arm64
             arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Set up emulation
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: amd64,arm64
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
