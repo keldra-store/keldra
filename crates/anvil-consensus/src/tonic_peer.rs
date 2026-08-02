@@ -1,4 +1,4 @@
-//! Tonic adapter for the three OpenRaft peer RPCs.
+//! Tonic adapter for OpenRaft traffic and the transient serving-lease RPC.
 //!
 //! The caller supplies the already-configured mandatory-mTLS connector and
 //! yields [`crate::AcceptedPeerTls`] streams to Tonic on the server. Tonic puts
@@ -17,7 +17,6 @@ use tonic::codegen::http::Uri;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
 
-use crate::DecisionRaft;
 use crate::codec;
 use crate::peer::{
     PEER_RPC_SCHEMA_VERSION, PeerNode, PeerRpc, PeerRpcError, PeerRpcKind, PeerTransport,
@@ -27,6 +26,9 @@ use crate::peer_tls::{
     CommittedPeerPinProvider, PeerTlsConnector, PeerTlsError, authorize_peer_rpc,
 };
 use crate::types::{ClusterId, MAX_RAFT_NODE_ID, NodeId, PeerSpkiSha256};
+use crate::{
+    DecisionRaft, ServingLeaseError, ServingLeaseGrant, ServingLeaseIssuer, ServingLeaseRequest,
+};
 
 mod wire {
     tonic::include_proto!("anvil.peer.v1");
@@ -40,6 +42,7 @@ const MAX_WIRE_MESSAGE_BYTES: usize = codec::MAX_ENCODED_BYTES + 128;
 pub struct TonicRaftPeerService {
     raft: DecisionRaft,
     pins: Arc<dyn CommittedPeerPinProvider>,
+    serving_leases: ServingLeaseIssuer,
 }
 
 /// Generated Tonic service with Anvil's explicit message bounds applied.
@@ -47,7 +50,11 @@ pub type TonicRaftPeerServer = wire::raft_peer_server::RaftPeerServer<TonicRaftP
 
 impl TonicRaftPeerService {
     pub fn new(raft: DecisionRaft, pins: Arc<dyn CommittedPeerPinProvider>) -> Self {
-        Self { raft, pins }
+        Self {
+            raft,
+            pins,
+            serving_leases: ServingLeaseIssuer::new(),
+        }
     }
 
     pub fn into_server(self) -> TonicRaftPeerServer {
@@ -104,6 +111,48 @@ impl TonicRaftPeerService {
             payload,
         }))
     }
+
+    async fn issue_serving_lease(
+        &self,
+        mut request: Request<wire::RaftRequest>,
+    ) -> Result<Response<wire::RaftResponse>, Status> {
+        let presented_pin = request
+            .extensions()
+            .get::<PeerSpkiSha256>()
+            .copied()
+            .ok_or_else(|| Status::unauthenticated("peer mTLS identity is missing"))?;
+        let cluster_id = parse_cluster_id(&request.get_ref().cluster_id)?;
+        let source_node_id = NodeId(request.get_ref().source_node_id);
+        let authenticated = authorize_peer_rpc(
+            self.pins.as_ref(),
+            cluster_id,
+            source_node_id,
+            PeerRpcKind::ServingLease,
+            presented_pin,
+        )
+        .map_err(map_peer_authorization_error)?;
+        request.extensions_mut().insert(authenticated);
+
+        let envelope = request.into_inner();
+        validate_wire_request(&envelope)?;
+        let lease_request: ServingLeaseRequest = codec::decode(&envelope.payload)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        if lease_request.cluster_id != cluster_id {
+            return Err(Status::invalid_argument(
+                "serving lease payload cluster does not match its peer envelope",
+            ));
+        }
+        let grant = self
+            .serving_leases
+            .grant(&self.raft, lease_request)
+            .await
+            .map_err(map_serving_lease_error)?;
+        let payload = codec::encode(&grant).map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(wire::RaftResponse {
+            schema_version: WIRE_SCHEMA_VERSION,
+            payload,
+        }))
+    }
 }
 
 #[tonic::async_trait]
@@ -127,6 +176,13 @@ impl wire::raft_peer_server::RaftPeer for TonicRaftPeerService {
         request: Request<wire::RaftRequest>,
     ) -> Result<Response<wire::RaftResponse>, Status> {
         self.handle(request, PeerRpcKind::InstallSnapshot).await
+    }
+
+    async fn grant_serving_lease(
+        &self,
+        request: Request<wire::RaftRequest>,
+    ) -> Result<Response<wire::RaftResponse>, Status> {
+        self.issue_serving_lease(request).await
     }
 }
 
@@ -226,6 +282,11 @@ impl TonicPeerTransport {
             PeerRpcKind::AppendEntries => client.append_entries(request).await,
             PeerRpcKind::Vote => client.vote(request).await,
             PeerRpcKind::InstallSnapshot => client.install_snapshot(request).await,
+            PeerRpcKind::ServingLease => {
+                return Err(PeerTransportError::Protocol(
+                    "serving leases require the typed peer method".into(),
+                ));
+            }
         }
         .map_err(map_tonic_error)?
         .into_inner();
@@ -241,6 +302,40 @@ impl TonicPeerTransport {
             ));
         }
         Ok(response.payload)
+    }
+
+    /// Request one transient serving grant from the current leader over the
+    /// same cached mandatory-mTLS channel used by Raft.
+    pub async fn request_serving_lease(
+        &self,
+        target: u64,
+        node: &PeerNode,
+        request: ServingLeaseRequest,
+    ) -> Result<ServingLeaseGrant, PeerTransportError> {
+        if request.cluster_id != self.cluster_id {
+            return Err(PeerTransportError::Protocol(
+                "serving lease request belongs to another cluster".into(),
+            ));
+        }
+        let payload = codec::encode(&request)
+            .map_err(|error| PeerTransportError::Protocol(error.to_string()))?;
+        let channel = self.channel(target, &node.address)?;
+        let mut client = wire::raft_peer_client::RaftPeerClient::new(channel)
+            .max_decoding_message_size(MAX_WIRE_MESSAGE_BYTES)
+            .max_encoding_message_size(MAX_WIRE_MESSAGE_BYTES);
+        let response = client
+            .grant_serving_lease(wire::RaftRequest {
+                schema_version: WIRE_SCHEMA_VERSION,
+                cluster_id: self.cluster_id.into_bytes().to_vec(),
+                source_node_id: self.source_node_id.0,
+                payload,
+            })
+            .await
+            .map_err(map_tonic_error)?
+            .into_inner();
+        validate_wire_response(&response)?;
+        codec::decode(&response.payload)
+            .map_err(|error| PeerTransportError::Protocol(error.to_string()))
     }
 }
 
@@ -309,6 +404,53 @@ fn map_peer_rpc_error(error: PeerRpcError) -> Status {
     }
 }
 
+fn validate_wire_request(request: &wire::RaftRequest) -> Result<(), Status> {
+    if request.schema_version != WIRE_SCHEMA_VERSION {
+        return Err(Status::failed_precondition(format!(
+            "unsupported peer schema {}",
+            request.schema_version
+        )));
+    }
+    if request.payload.len() > codec::MAX_ENCODED_BYTES {
+        return Err(Status::resource_exhausted(
+            "peer payload exceeds the consensus limit",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_wire_response(response: &wire::RaftResponse) -> Result<(), PeerTransportError> {
+    if response.schema_version != WIRE_SCHEMA_VERSION {
+        return Err(PeerTransportError::Protocol(format!(
+            "peer returned unsupported schema {}",
+            response.schema_version
+        )));
+    }
+    if response.payload.len() > codec::MAX_ENCODED_BYTES {
+        return Err(PeerTransportError::Protocol(
+            "peer response exceeds the consensus limit".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn map_serving_lease_error(error: ServingLeaseError) -> Status {
+    match error {
+        ServingLeaseError::CutoverInProgress
+        | ServingLeaseError::LeaderQuorumProofStale
+        | ServingLeaseError::Consensus(_) => Status::unavailable(error.to_string()),
+        ServingLeaseError::ClusterNotInitialized
+        | ServingLeaseError::ActivePlacementUnavailable
+        | ServingLeaseError::ClusterMismatch { .. }
+        | ServingLeaseError::ActivePlacementMismatch { .. }
+        | ServingLeaseError::GrantLifetimeTooLong { .. }
+        | ServingLeaseError::RaftTermRegressed { .. }
+        | ServingLeaseError::GrantArrivedAfterExpiry
+        | ServingLeaseError::RequestSuperseded
+        | ServingLeaseError::ClockRangeExceeded => Status::failed_precondition(error.to_string()),
+    }
+}
+
 fn map_tonic_error(error: Status) -> PeerTransportError {
     match error.code() {
         tonic::Code::Unavailable | tonic::Code::DeadlineExceeded => {
@@ -331,7 +473,11 @@ mod tests {
     use tonic::transport::server::TcpIncoming;
 
     use super::*;
-    use crate::{CommittedPeerPins, PeerTlsAcceptor, PeerTlsConfig, PeerTlsIdentity};
+    use crate::{
+        CLUSTER_CONTROL_COMMAND_VERSION, CapabilityRange, Command, CommittedPeerPins,
+        JoinCapabilityHash, NodeDescriptor, NodeState, PeerAddress, PeerTlsAcceptor, PeerTlsConfig,
+        PeerTlsIdentity,
+    };
 
     const CERT_ONE: &[u8] = include_bytes!("../tests/fixtures/peer-one.cert.pem");
     const KEY_ONE: &[u8] = include_bytes!("../tests/fixtures/peer-one.key.pem");
@@ -460,6 +606,50 @@ mod tests {
         pins
     }
 
+    async fn initialize_serving_state(raft: &DecisionRaft) -> ServingLeaseRequest {
+        raft.ensure_one_node().await.unwrap();
+        raft.wait_for_leader(std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        raft.submit(Command::InitializeCluster {
+            cluster_id: TEST_CLUSTER_ID,
+        })
+        .await
+        .unwrap();
+        let begun = raft
+            .submit(Command::BeginAddNode {
+                format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+                descriptor: NodeDescriptor {
+                    node_id: NodeId(2),
+                    peer_address: PeerAddress("anvil-local://2".into()),
+                    storage_weight_millionths: 1_000_000,
+                    state: NodeState::Joining,
+                    current_peer_spki_sha256: PeerSpkiSha256([2; 32]),
+                    overlap_peer_spki_sha256: None,
+                    join_capability_hash: Some(JoinCapabilityHash([3; 32])),
+                    supported_protocol: CapabilityRange { min: 1, max: 1 },
+                    supported_storage_format: CapabilityRange { min: 1, max: 1 },
+                },
+            })
+            .await
+            .unwrap();
+        raft.submit(Command::CompleteMembershipTransition {
+            format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+            started_log_index: begun.log_index,
+        })
+        .await
+        .unwrap();
+        ServingLeaseRequest {
+            cluster_id: TEST_CLUSTER_ID,
+            active_placement_log_id: raft
+                .state()
+                .unwrap()
+                .cluster_control()
+                .active_placement_log_id()
+                .unwrap(),
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn vote_crosses_real_mtls_and_authority_is_rechecked_on_the_cached_connection() {
         let pins = configured_pins();
@@ -571,6 +761,23 @@ mod tests {
                 PeerRpcKind::InstallSnapshot,
             ]
         );
+        drop(transport);
+        peer.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serving_grant_rpc_crosses_mtls_and_starts_the_fixed_cutover() {
+        let pins = configured_pins();
+        let peer = start_peer(pins.clone()).await;
+        let request = initialize_serving_state(&peer.raft).await;
+        let transport = transport(pins.clone());
+        let node = PeerNode::new(peer.address.clone());
+
+        assert!(matches!(
+            transport.request_serving_lease(2, &node, request).await,
+            Err(PeerTransportError::Unreachable(_))
+        ));
+        assert_eq!(pins.take_seen(), vec![PeerRpcKind::ServingLease]);
         drop(transport);
         peer.stop().await;
     }

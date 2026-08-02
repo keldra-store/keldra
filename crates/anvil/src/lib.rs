@@ -104,6 +104,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         leader_timeout: DECISION_LEADER_TIMEOUT,
     })
     .await?;
+    let serving_transport = peer_runtime.serving_transport();
     // The private listener must be accepting before an existing multi-node
     // group can elect a leader after a coordinated restart.
     let mut peer_server = peer_runtime
@@ -127,6 +128,13 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         erasure.stripe_unit_bytes = config.erasure_profile.stripe_unit(),
         "cluster erasure-code profile is ready"
     );
+    let serving_fence = serving_fence::ServingFenceRuntime::start(
+        decisions.clone(),
+        serving_transport,
+        DECISION_LEADER_TIMEOUT,
+    )
+    .await
+    .context("establish initial serving fence after cutover")?;
     let programs =
         programs::ProgramCoordinator::start(store.clone(), decisions.clone(), local_node).await?;
     cluster_startup::reconcile_system_bootstrap(
@@ -166,8 +174,11 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES);
     let tokens = config.token_manager;
-    let authenticate =
-        move |request: tonic::Request<()>| request_rate_limits.authenticate(&tokens, request);
+    let authenticated_authority = serving_fence.authority();
+    let authenticate = move |request: tonic::Request<()>| {
+        let request = authenticated_authority.require(request)?;
+        request_rate_limits.authenticate(&tokens, request)
+    };
     let object_service =
         tonic::service::interceptor::InterceptedService::new(object_service, authenticate.clone());
     let authz_service =
@@ -175,6 +186,11 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     let administration_service = tonic::service::interceptor::InterceptedService::new(
         AdministrationServiceServer::new(administration_service),
         authenticate,
+    );
+    let credential_authority = serving_fence.authority();
+    let credential_service = tonic::service::interceptor::InterceptedService::new(
+        CredentialServiceServer::new(credential_service),
+        move |request| credential_authority.require(request),
     );
 
     let blob_gc_task = spawn_blob_gc(store);
@@ -185,9 +201,10 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
             .add_service(object_service)
             .add_service(authz_service)
             .add_service(administration_service)
-            // Deliberately not intercepted: this one service exchanges durable
-            // long-lived credentials for the bearer token used everywhere else.
-            .add_service(CredentialServiceServer::new(credential_service))
+            // Deliberately not bearer-authenticated: this service exchanges
+            // durable long-lived credentials for that bearer token. It still
+            // requires the node-wide serving fence.
+            .add_service(credential_service)
             .serve_with_shutdown(config.listen, async move {
                 let _ = public_stopped.await;
             }),
@@ -233,6 +250,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     {
         tracing::error!(%error, "blob garbage-collection task stopped unexpectedly");
     }
+    serving_fence.shutdown().await;
     let shutdown_result = decisions
         .shutdown()
         .await

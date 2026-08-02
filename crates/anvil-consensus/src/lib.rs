@@ -32,7 +32,7 @@ pub use raft::{
 pub use serving_lease::{
     PendingServingLeaseRequest, SERVING_LEASE_CUTOVER_WAIT, SERVING_LEASE_MAX_LIFETIME,
     SERVING_LEASE_RENEW_INTERVAL, ServingLease, ServingLeaseError, ServingLeaseGrant,
-    ServingLeaseRequest, ServingLeaseState,
+    ServingLeaseIssuer, ServingLeaseRequest, ServingLeaseState,
 };
 pub use state_machine::{ApplyError, StateMachine};
 pub use tonic_peer::{TonicPeerTransport, TonicRaftPeerServer, TonicRaftPeerService};

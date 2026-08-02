@@ -45,6 +45,7 @@ pub enum PeerRpcKind {
     AppendEntries,
     Vote,
     InstallSnapshot,
+    ServingLease,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -367,6 +368,9 @@ impl DecisionRaft {
                     decode_peer(&rpc.payload)?;
                 encode_peer(&self.raft.install_snapshot(request).await)
             }
+            PeerRpcKind::ServingLease => Err(PeerRpcError::Codec(
+                "serving leases use the typed peer handler".into(),
+            )),
         }
     }
 }

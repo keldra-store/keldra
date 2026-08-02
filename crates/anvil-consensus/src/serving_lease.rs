@@ -3,6 +3,7 @@
 //! Leases never enter Raft. The leader reuses only a fresh linearizable quorum
 //! proof, and each recipient measures expiry from its own request-start time.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use openraft::LogId;
@@ -88,6 +89,28 @@ pub struct ServingLeaseState {
     active_placement_log_id: LogId<u64>,
     highest_raft_term: u64,
     current: Option<ServingLease>,
+}
+
+/// Leader-local cutover guard shared by every serving-grant RPC handler.
+///
+/// It is transient and bounded to one observed leader/placement identity. A
+/// restart, leadership term change, or placement change conservatively starts
+/// the fixed cutover wait again.
+#[derive(Clone, Default)]
+pub struct ServingLeaseIssuer {
+    cutover: Arc<tokio::sync::Mutex<ServingLeaseCutover>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ServingLeaseIssuerIdentity {
+    cluster_id: ClusterId,
+    raft_term: u64,
+    active_placement_log_id: LogId<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ServingLeaseCutover {
+    observed: Option<(ServingLeaseIssuerIdentity, BootTimeInstant)>,
 }
 
 impl ServingLeaseState {
@@ -195,6 +218,51 @@ impl ServingLeaseState {
 
     pub fn has_valid_lease(&self) -> bool {
         self.valid_lease().is_some()
+    }
+}
+
+impl ServingLeaseIssuer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Obtain a quorum-backed grant and withhold it until the fixed cutover
+    /// wait for this exact leader term and placement has elapsed.
+    pub async fn grant(
+        &self,
+        raft: &DecisionRaft,
+        request: ServingLeaseRequest,
+    ) -> Result<ServingLeaseGrant, ServingLeaseError> {
+        let grant = raft.grant_serving_lease(request).await?;
+        let now = BootTimeInstant::now()?;
+        let identity = ServingLeaseIssuerIdentity {
+            cluster_id: grant.cluster_id,
+            raft_term: grant.raft_term,
+            active_placement_log_id: grant.active_placement_log_id,
+        };
+        if !self.cutover.lock().await.permits(identity, now)? {
+            return Err(ServingLeaseError::CutoverInProgress);
+        }
+        Ok(grant)
+    }
+}
+
+impl ServingLeaseCutover {
+    fn permits(
+        &mut self,
+        identity: ServingLeaseIssuerIdentity,
+        now: BootTimeInstant,
+    ) -> Result<bool, ServingLeaseError> {
+        match self.observed {
+            Some((observed, ready_at)) if observed == identity => Ok(now >= ready_at),
+            _ => {
+                let ready_at = now
+                    .checked_add(SERVING_LEASE_CUTOVER_WAIT)
+                    .ok_or(ServingLeaseError::ClockRangeExceeded)?;
+                self.observed = Some((identity, ready_at));
+                Ok(false)
+            }
+        }
     }
 }
 
@@ -315,6 +383,10 @@ pub enum ServingLeaseError {
     GrantArrivedAfterExpiry,
     #[error("the serving lease request names an older applied placement")]
     RequestSuperseded,
+    #[error("the fixed serving lease cutover wait is still in progress")]
+    CutoverInProgress,
+    #[error("serving lease boot-clock range is exhausted")]
+    ClockRangeExceeded,
 }
 
 #[cfg(test)]
@@ -341,5 +413,56 @@ mod tests {
             Err(ServingLeaseError::LeaderQuorumProofStale)
         ));
         raft.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn issuer_waits_for_each_new_term_or_placement_exactly_once() {
+        let cluster_id = ClusterId([4; 16]);
+        let first = ServingLeaseIssuerIdentity {
+            cluster_id,
+            raft_term: 3,
+            active_placement_log_id: LogId::new(openraft::CommittedLeaderId::new(2, 1), 7),
+        };
+        let second_term = ServingLeaseIssuerIdentity {
+            raft_term: 4,
+            ..first
+        };
+        let second_placement = ServingLeaseIssuerIdentity {
+            active_placement_log_id: LogId::new(openraft::CommittedLeaderId::new(4, 1), 8),
+            ..second_term
+        };
+        let start = BootTimeInstant(Duration::from_secs(10));
+        let mut cutover = ServingLeaseCutover::default();
+
+        assert!(!cutover.permits(first, start).unwrap());
+        assert!(
+            !cutover
+                .permits(
+                    first,
+                    BootTimeInstant(start.0 + SERVING_LEASE_CUTOVER_WAIT - Duration::from_nanos(1))
+                )
+                .unwrap()
+        );
+        assert!(
+            cutover
+                .permits(first, BootTimeInstant(start.0 + SERVING_LEASE_CUTOVER_WAIT))
+                .unwrap()
+        );
+        assert!(
+            !cutover
+                .permits(
+                    second_term,
+                    BootTimeInstant(start.0 + SERVING_LEASE_CUTOVER_WAIT)
+                )
+                .unwrap()
+        );
+        assert!(
+            !cutover
+                .permits(
+                    second_placement,
+                    BootTimeInstant(start.0 + SERVING_LEASE_CUTOVER_WAIT * 2),
+                )
+                .unwrap()
+        );
     }
 }

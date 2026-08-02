@@ -41,6 +41,7 @@ pub(crate) struct OpenPeerConfig<'a> {
 pub(crate) struct PeerRuntime {
     identity: Arc<PeerTlsIdentity>,
     pins: Arc<RaftCommittedPeerPins>,
+    transport: TonicPeerTransport,
     clear_pins_on_drop: bool,
 }
 
@@ -204,6 +205,10 @@ pub(crate) async fn open(config: OpenPeerConfig<'_>) -> Result<(DecisionRaft, Pe
 }
 
 impl PeerRuntime {
+    pub(crate) fn serving_transport(&self) -> TonicPeerTransport {
+        self.transport.clone()
+    }
+
     pub(crate) async fn start(
         mut self,
         peer_listen: SocketAddr,
@@ -275,16 +280,14 @@ async fn open_with_identity(
     let connector =
         PeerTlsConnector::new(tls_identity.clone(), pins.clone(), PeerTlsConfig::default())
             .context("configure mandatory peer mTLS connector")?;
-    let transport = Arc::new(
-        TonicPeerTransport::new(identity.cluster_id(), config.node_id, connector)
-            .context("configure private Raft transport")?,
-    );
+    let transport = TonicPeerTransport::new(identity.cluster_id(), config.node_id, connector)
+        .context("configure private Raft transport")?;
     let decisions = DecisionRaft::open_with_transport(
         config.data_dir.join("decisions"),
         config.node_id.0,
         config.max_commit_entries,
         config.max_commit_bytes,
-        transport,
+        Arc::new(transport.clone()),
     )
     .await
     .context("open bounded decision Raft with private transport")?;
@@ -294,6 +297,7 @@ async fn open_with_identity(
         PeerRuntime {
             identity: tls_identity,
             pins,
+            transport,
             clear_pins_on_drop: true,
         },
     ))
@@ -573,12 +577,24 @@ impl CommittedPeerPinProvider for RaftCommittedPeerPins {
         &self,
         cluster_id: ClusterId,
         node_id: NodeId,
-        _kind: PeerRpcKind,
+        kind: PeerRpcKind,
     ) -> Option<CommittedPeerPins> {
         if cluster_id != self.cluster_id {
             return None;
         }
-        self.pins(node_id)
+        if kind != PeerRpcKind::ServingLease {
+            return self.pins(node_id);
+        }
+        let decisions = self.decisions.read().ok()?.clone()?;
+        let state = decisions.state().ok()?;
+        if state.cluster_id()? != self.cluster_id {
+            return None;
+        }
+        let descriptor = state.cluster_control().nodes().get(&node_id)?;
+        (descriptor.state == NodeState::Active).then_some(CommittedPeerPins {
+            current: descriptor.current_peer_spki_sha256,
+            overlap: descriptor.overlap_peer_spki_sha256,
+        })
     }
 }
 
@@ -587,6 +603,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+    use crate::serving_fence::ServingFenceRuntime;
 
     #[test]
     fn concrete_listener_is_the_default_advertised_address() {
@@ -622,7 +639,10 @@ mod tests {
     #[tokio::test]
     async fn fresh_genesis_persists_identity_and_active_descriptor() {
         let directory = tempfile::tempdir().unwrap();
-        let advertised = PeerAddress("127.0.0.1:50052".into());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer_listen = listener.local_addr().unwrap();
+        drop(listener);
+        let advertised = PeerAddress(peer_listen.to_string());
         let (decisions, runtime) = open(OpenPeerConfig {
             data_dir: directory.path(),
             node_id: NodeId(1),
@@ -649,15 +669,24 @@ mod tests {
                 & 0o7777,
             0o600
         );
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let peer_listen = listener.local_addr().unwrap();
-        drop(listener);
+        let serving_transport = runtime.serving_transport();
         let mut peer_server = runtime.start(peer_listen, decisions.clone()).await.unwrap();
         // Plain TCP cannot reach a Tonic handler, and one rejected handshake
         // must not take the private listener down.
         drop(tokio::net::TcpStream::connect(peer_listen).await.unwrap());
         tokio::time::sleep(Duration::from_millis(25)).await;
         assert!(!peer_server.task_mut().is_finished());
+        let serving = ServingFenceRuntime::start(
+            decisions.clone(),
+            serving_transport,
+            Duration::from_secs(8),
+        )
+        .await
+        .unwrap();
+        assert!(serving.authority().has_valid_lease());
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        assert!(serving.authority().has_valid_lease());
+        serving.shutdown().await;
         peer_server.shutdown().await.unwrap();
         decisions.shutdown().await.unwrap();
     }
