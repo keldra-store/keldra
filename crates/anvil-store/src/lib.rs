@@ -8,6 +8,7 @@ mod authz;
 mod blob;
 mod bootstrap;
 mod clock;
+mod erasure;
 mod key;
 mod model;
 mod program;
@@ -33,6 +34,7 @@ pub use bootstrap::{
     SystemBootstrapState, TenantApplicationRole, system_schema,
 };
 pub use clock::VersionClock;
+pub use erasure::{ErasureCodec, ErasureError, ErasureProfile};
 pub use key::ObjectKey;
 pub use model::{
     BatchOperation, BatchOutcome, BucketPolicy, DeleteRequest, DeleteRetainedVersionOutcome,
