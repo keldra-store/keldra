@@ -12,7 +12,7 @@ use openraft::{
     AnyError, BasicNode, EntryPayload, ErrorSubject, ErrorVerb, LogId, LogState, OptionalSend,
     RaftLogReader, RaftSnapshotBuilder, Snapshot, SnapshotMeta, StorageError, StorageIOError,
     StoredMembership, Vote,
-    error::{ClientWriteError, InitializeError, RaftError},
+    error::{CheckIsLeaderError, ClientWriteError, InitializeError, RaftError},
     storage::{LogFlushed, RaftLogStorage, RaftStateMachine},
 };
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,9 @@ use crate::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// The response is part of OpenRaft's persisted protocol. Boxing one variant
+// merely to reduce the enum's stack size would change its released encoding.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum DecisionApplyResult {
     Applied(ApplyResult),
     Rejected(ApplyError),
@@ -349,6 +352,70 @@ pub struct CommittedDecision {
     pub result: ApplyResult,
 }
 
+/// Maximum age of one successful linearizable leader-quorum confirmation.
+pub const LEADER_QUORUM_PROOF_MAX_AGE: Duration = Duration::from_millis(500);
+
+/// A recent confirmation that this node was the Raft leader and reached a
+/// voter quorum.
+///
+/// The confirmation time is deliberately process-local and is never suitable
+/// for persistence or transport. A grant issuer must call [`Self::is_fresh`]
+/// immediately before emitting authority derived from this proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LeaderQuorumProof {
+    pub raft_term: u64,
+    confirmed_at: QuorumProofInstant,
+}
+
+impl LeaderQuorumProof {
+    pub fn is_fresh(&self) -> bool {
+        quorum_proof_now().is_ok_and(|now| {
+            now.0
+                .checked_sub(self.confirmed_at.0)
+                .is_some_and(|age| age <= LEADER_QUORUM_PROOF_MAX_AGE)
+        })
+    }
+}
+
+/// A process-local Linux boot-time reading. It includes suspended time so a
+/// proof obtained before host suspension cannot become usable after resume.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QuorumProofInstant(Duration);
+
+#[cfg(target_os = "linux")]
+fn quorum_proof_now() -> Result<QuorumProofInstant, DecisionRaftError> {
+    let mut reading = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    // SAFETY: `reading` points to writable storage for one `timespec`, and
+    // CLOCK_BOOTTIME does not retain the pointer after this call.
+    let result = unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, reading.as_mut_ptr()) };
+    if result != 0 {
+        return Err(DecisionRaftError::Unavailable(format!(
+            "CLOCK_BOOTTIME failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    // SAFETY: a successful clock_gettime call initialized the entire value.
+    let reading = unsafe { reading.assume_init() };
+    let seconds = u64::try_from(reading.tv_sec).map_err(|_| {
+        DecisionRaftError::Unavailable("CLOCK_BOOTTIME returned an invalid value".into())
+    })?;
+    let nanoseconds = u32::try_from(reading.tv_nsec)
+        .ok()
+        .filter(|value| *value < 1_000_000_000)
+        .ok_or_else(|| {
+            DecisionRaftError::Unavailable("CLOCK_BOOTTIME returned an invalid value".into())
+        })?;
+    Ok(QuorumProofInstant(Duration::new(seconds, nanoseconds)))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn quorum_proof_now() -> Result<QuorumProofInstant, DecisionRaftError> {
+    Err(DecisionRaftError::Unavailable(
+        "leader quorum proofs require Linux CLOCK_BOOTTIME".into(),
+    ))
+}
+
 impl From<DurableStorageError> for DecisionRaftError {
     fn from(error: DurableStorageError) -> Self {
         Self::Storage(error.to_string())
@@ -622,6 +689,7 @@ pub struct DecisionRaft {
     pub(crate) raft: openraft::Raft<DecisionRaftConfig>,
     store: DurableStore,
     machine: Arc<Mutex<MachineState>>,
+    leader_quorum_proof: Arc<tokio::sync::Mutex<Option<LeaderQuorumProof>>>,
 }
 
 impl DecisionRaft {
@@ -694,6 +762,7 @@ impl DecisionRaft {
             raft,
             store,
             machine,
+            leader_quorum_proof: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 
@@ -706,6 +775,65 @@ impl DecisionRaft {
 
     pub fn current_leader(&self) -> Option<u64> {
         self.raft.metrics().borrow().current_leader
+    }
+
+    /// Confirm that this node is the current leader through a linearizable
+    /// voter-quorum round, reusing one successful proof for no more than 500
+    /// milliseconds.
+    ///
+    /// The mutex is intentionally held across the confirmation so concurrent
+    /// callers share one quorum round instead of starting duplicate rounds.
+    pub async fn confirm_leadership(&self) -> Result<LeaderQuorumProof, DecisionRaftError> {
+        let mut cached = self.leader_quorum_proof.lock().await;
+        if let Some(proof) = *cached
+            && proof.is_fresh()
+            && self.local_leader_term() == Some(proof.raft_term)
+        {
+            return Ok(proof);
+        }
+        *cached = None;
+
+        // Timestamp the start rather than the completion. This is conservative
+        // if the quorum round is delayed and prevents scheduler delay or host
+        // suspension after the network result from extending authority.
+        let confirmation_started_at = quorum_proof_now()?;
+        let read_log_id = self
+            .raft
+            .ensure_linearizable()
+            .await
+            .map_err(map_check_is_leader_error)?;
+        let Some(current_term) = self.local_leader_term() else {
+            return Err(DecisionRaftError::Unavailable(
+                "leadership changed after quorum confirmation".into(),
+            ));
+        };
+        let raft_term = read_log_id
+            .map(|log_id| log_id.leader_id.term)
+            .unwrap_or(current_term);
+        if current_term != raft_term {
+            return Err(DecisionRaftError::Unavailable(
+                "Raft term changed after quorum confirmation".into(),
+            ));
+        }
+
+        let proof = LeaderQuorumProof {
+            raft_term,
+            confirmed_at: confirmation_started_at,
+        };
+        if !proof.is_fresh() {
+            return Err(DecisionRaftError::Unavailable(
+                "leader quorum confirmation exceeded its 500 millisecond reuse window".into(),
+            ));
+        }
+        *cached = Some(proof);
+        Ok(proof)
+    }
+
+    fn local_leader_term(&self) -> Option<u64> {
+        let metrics = self.raft.metrics();
+        let metrics = metrics.borrow();
+        (metrics.running_state.is_ok() && metrics.current_leader == Some(self.node_id))
+            .then_some(metrics.current_term)
     }
 
     /// Initialize a pristine single-node cluster, or leave an already initialized
@@ -1030,6 +1158,19 @@ fn validate_voters(
 
 pub(crate) fn map_client_write_error(
     error: RaftError<u64, ClientWriteError<u64, BasicNode>>,
+) -> DecisionRaftError {
+    if let Some(forward) = error.forward_to_leader::<BasicNode>() {
+        DecisionRaftError::ForwardToLeader {
+            leader_id: forward.leader_id,
+            leader_address: forward.leader_node.as_ref().map(|node| node.addr.clone()),
+        }
+    } else {
+        DecisionRaftError::Unavailable(error.to_string())
+    }
+}
+
+fn map_check_is_leader_error(
+    error: RaftError<u64, CheckIsLeaderError<u64, BasicNode>>,
 ) -> DecisionRaftError {
     if let Some(forward) = error.forward_to_leader::<BasicNode>() {
         DecisionRaftError::ForwardToLeader {

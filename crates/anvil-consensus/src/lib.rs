@@ -23,7 +23,10 @@ pub use peer_tls::{
     ConnectedPeerTls, DEFAULT_PEER_TLS_HANDSHAKE_TIMEOUT, PeerTlsAcceptor, PeerTlsConfig,
     PeerTlsConnector, PeerTlsError, PeerTlsIdentity, authorize_peer_rpc, peer_spki_sha256,
 };
-pub use raft::{CommittedDecision, DecisionRaft, DecisionRaftError};
+pub use raft::{
+    CommittedDecision, DecisionRaft, DecisionRaftError, LEADER_QUORUM_PROOF_MAX_AGE,
+    LeaderQuorumProof,
+};
 pub use state_machine::{ApplyError, StateMachine};
 pub use types::{
     ATOMIC_REPLAY_RETENTION_MILLIS, ApplyResult, BundleHash, BundleRef,

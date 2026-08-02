@@ -71,6 +71,101 @@ async fn wait_until(mut condition: impl FnMut() -> bool) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn successful_leader_quorum_proof_is_reused_only_while_fresh() {
+    let directory = tempfile::tempdir().unwrap();
+    let raft = open(directory.path()).await;
+    raft.ensure_one_node().await.unwrap();
+    raft.wait_for_leader(Duration::from_secs(5)).await.unwrap();
+
+    let first = raft.confirm_leadership().await.unwrap();
+    assert!(first.is_fresh());
+    assert_eq!(raft.confirm_leadership().await.unwrap(), first);
+
+    tokio::time::sleep(anvil_consensus::LEADER_QUORUM_PROOF_MAX_AGE + Duration::from_millis(25))
+        .await;
+    assert!(!first.is_fresh());
+    let refreshed = raft.confirm_leadership().await.unwrap();
+    assert!(refreshed.is_fresh());
+    assert_ne!(refreshed, first);
+
+    raft.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_callers_share_one_refreshed_leader_quorum_proof() {
+    let directory = tempfile::tempdir().unwrap();
+    let raft = open(directory.path()).await;
+    raft.ensure_one_node().await.unwrap();
+    raft.wait_for_leader(Duration::from_secs(5)).await.unwrap();
+    let expired = raft.confirm_leadership().await.unwrap();
+    tokio::time::sleep(anvil_consensus::LEADER_QUORUM_PROOF_MAX_AGE + Duration::from_millis(25))
+        .await;
+
+    let calls = (0..16)
+        .map(|_| {
+            let raft = raft.clone();
+            tokio::spawn(async move { raft.confirm_leadership().await.unwrap() })
+        })
+        .collect::<Vec<_>>();
+    let mut refreshed = Vec::with_capacity(calls.len());
+    for call in calls {
+        refreshed.push(call.await.unwrap());
+    }
+    assert!(refreshed.iter().all(|proof| *proof == refreshed[0]));
+    assert_ne!(refreshed[0], expired);
+
+    raft.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn follower_cannot_obtain_a_leader_quorum_proof() {
+    let first_directory = tempfile::tempdir().unwrap();
+    let second_directory = tempfile::tempdir().unwrap();
+    let transport = InMemoryPeerTransport::new();
+    let first = open_peer(first_directory.path(), 1, &transport).await;
+    let second = open_peer(second_directory.path(), 2, &transport).await;
+    transport.register(1, first.clone()).unwrap();
+    transport.register(2, second.clone()).unwrap();
+
+    first
+        .initialize_genesis(BTreeMap::from([(1, PeerNode::new("memory://1"))]))
+        .await
+        .unwrap();
+    first.wait_for_leader(Duration::from_secs(5)).await.unwrap();
+    first
+        .add_learner(2, PeerNode::new("memory://2"), true)
+        .await
+        .unwrap();
+    wait_until(|| second.current_leader() == Some(1)).await;
+
+    assert!(matches!(
+        second.confirm_leadership().await,
+        Err(DecisionRaftError::ForwardToLeader {
+            leader_id: Some(1),
+            ..
+        })
+    ));
+
+    first.shutdown().await.unwrap();
+    second.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stopped_raft_cannot_reuse_a_cached_leader_quorum_proof() {
+    let directory = tempfile::tempdir().unwrap();
+    let raft = open(directory.path()).await;
+    raft.ensure_one_node().await.unwrap();
+    raft.wait_for_leader(Duration::from_secs(5)).await.unwrap();
+    assert!(raft.confirm_leadership().await.unwrap().is_fresh());
+
+    raft.shutdown().await.unwrap();
+    assert!(matches!(
+        raft.confirm_leadership().await,
+        Err(DecisionRaftError::Unavailable(_))
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_node_decisions_keep_original_commit_cursors_across_restart_and_snapshot() {
     let directory = tempfile::tempdir().unwrap();
     let raft = open(directory.path()).await;
