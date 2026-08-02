@@ -24,7 +24,7 @@ use anvil_api::v1::authz_service_server::AuthzServiceServer;
 use anvil_api::v1::credential_service_server::CredentialServiceServer;
 use anvil_api::v1::object_service_server::ObjectServiceServer;
 use anvil_consensus::{ATOMIC_REPLAY_RETENTION_MILLIS, DecisionRaft, NodeId};
-use anvil_store::{MutationReceiptRetention, Store, StoreOptions, WatchRetention};
+use anvil_store::{ErasureProfile, MutationReceiptRetention, Store, StoreOptions, WatchRetention};
 use anyhow::{Context, Result};
 use tonic::transport::Server;
 
@@ -53,6 +53,7 @@ pub struct ServerConfig {
     pub token_manager: JwtManager,
     pub rate_limits: RateLimitConfig,
     pub max_blob_bytes: u64,
+    pub erasure_profile: ErasureProfile,
     pub awaiting_publish_ttl_seconds: u64,
     pub mutation_receipt_retention_seconds: u64,
     pub max_mutation_receipt_entries: u64,
@@ -104,6 +105,13 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         .context("elect decision leader")?;
     let cluster_id = cluster_startup::ensure_genesis_identity(&decisions).await?;
     tracing::info!(cluster.id = %hex::encode(cluster_id.0), "cluster identity is ready");
+    cluster_startup::ensure_erasure_code_profile(&decisions, config.erasure_profile).await?;
+    tracing::info!(
+        erasure.data_shards = config.erasure_profile.data_shards(),
+        erasure.parity_shards = config.erasure_profile.parity_shards(),
+        erasure.stripe_unit_bytes = config.erasure_profile.stripe_unit(),
+        "cluster erasure-code profile is ready"
+    );
     let local_node = NodeId(u64::from(config.node_id));
     let programs =
         programs::ProgramCoordinator::start(store.clone(), decisions.clone(), local_node).await?;

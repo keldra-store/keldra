@@ -1,8 +1,9 @@
 use anvil_consensus::{
-    ApplyResult, ClusterId, Command, DecisionRaft, NodeId, SYSTEM_BOOTSTRAP_VERSION,
+    ApplyResult, CLUSTER_CONTROL_COMMAND_VERSION, ClusterId, Command, DecisionRaft,
+    ErasureCodeProfile, NodeId, SYSTEM_BOOTSTRAP_VERSION,
     SystemBootstrapState as ConsensusBootstrapState,
 };
-use anvil_store::{Store, SystemBootstrapState as LocalBootstrapState};
+use anvil_store::{ErasureProfile, Store, SystemBootstrapState as LocalBootstrapState};
 use anyhow::{Context, Result, bail};
 use uuid::Uuid;
 
@@ -41,6 +42,46 @@ pub(crate) async fn ensure_genesis_identity(decisions: &DecisionRaft) -> Result<
             )
         }
         result => bail!("cluster identity command returned unexpected result {result:?}"),
+    }
+}
+
+/// Bind the startup-selected immutable erasure geometry to this cluster.
+///
+/// Genesis and an in-place 0.5.0 upgrade bind an absent value exactly once.
+/// Every later restart must present the already committed profile.
+pub(crate) async fn ensure_erasure_code_profile(
+    decisions: &DecisionRaft,
+    requested: ErasureProfile,
+) -> Result<()> {
+    let requested = ErasureCodeProfile {
+        data_shards: requested.data_shards(),
+        parity_shards: requested.parity_shards(),
+        stripe_unit: requested.stripe_unit(),
+    };
+    if let Some(committed) = decisions.state()?.cluster_control().erasure_code_profile() {
+        anyhow::ensure!(
+            committed == requested,
+            "configured erasure-code profile {}+{} with {}-byte stripes does not match the committed cluster profile {}+{} with {}-byte stripes",
+            requested.data_shards,
+            requested.parity_shards,
+            requested.stripe_unit,
+            committed.data_shards,
+            committed.parity_shards,
+            committed.stripe_unit,
+        );
+        return Ok(());
+    }
+
+    let committed = decisions
+        .submit(Command::BindErasureCodeProfile {
+            format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+            profile: requested,
+        })
+        .await
+        .context("commit immutable cluster erasure-code profile")?;
+    match committed.result {
+        ApplyResult::ErasureCodeProfileBound(profile) if profile == requested => Ok(()),
+        result => bail!("erasure-code profile command returned unexpected result {result:?}"),
     }
 }
 
@@ -235,6 +276,47 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("--run-system-bootstrap"));
+    }
+
+    #[tokio::test]
+    async fn erasure_profile_is_bound_once_and_restart_configuration_must_match() {
+        let temporary = tempfile::tempdir().unwrap();
+        let decisions = DecisionRaft::open(temporary.path().join("decisions"), 1, 16, 64 * 1024)
+            .await
+            .unwrap();
+        decisions.ensure_one_node().await.unwrap();
+        decisions
+            .wait_for_leader(Duration::from_secs(10))
+            .await
+            .unwrap();
+        ensure_genesis_identity(&decisions).await.unwrap();
+
+        let profile = ErasureProfile::default();
+        ensure_erasure_code_profile(&decisions, profile)
+            .await
+            .unwrap();
+        ensure_erasure_code_profile(&decisions, profile)
+            .await
+            .unwrap();
+        assert_eq!(
+            decisions
+                .state()
+                .unwrap()
+                .cluster_control()
+                .erasure_code_profile(),
+            Some(ErasureCodeProfile {
+                data_shards: 2,
+                parity_shards: 1,
+                stripe_unit: 16 * 1024,
+            })
+        );
+
+        let mismatch = ErasureProfile::new(4, 2, 16 * 1024).unwrap();
+        let error = ensure_erasure_code_profile(&decisions, mismatch)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("does not match the committed"));
+        decisions.shutdown().await.unwrap();
     }
 
     async fn open_runtime(root: &Path) -> (Store, DecisionRaft, ProgramCoordinator) {

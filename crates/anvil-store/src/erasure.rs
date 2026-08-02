@@ -20,6 +20,10 @@ const HEADER_BYTES: usize = HEADER_BODY_BYTES + 4;
 const FRAME_PREFIX_BYTES: usize = 4 + 4;
 const MAX_GALOIS_8_SHARDS: u16 = 256;
 
+pub const DEFAULT_ERASURE_DATA_SHARDS: u16 = 2;
+pub const DEFAULT_ERASURE_PARITY_SHARDS: u16 = 1;
+pub const DEFAULT_ERASURE_STRIPE_UNIT_BYTES: u32 = 16 * 1024;
+
 /// One immutable cluster erasure profile.
 ///
 /// The profile is supplied by cluster configuration; it is intentionally not
@@ -30,6 +34,16 @@ pub struct ErasureProfile {
     data_shards: u16,
     parity_shards: u16,
     stripe_unit: u32,
+}
+
+impl Default for ErasureProfile {
+    fn default() -> Self {
+        Self {
+            data_shards: DEFAULT_ERASURE_DATA_SHARDS,
+            parity_shards: DEFAULT_ERASURE_PARITY_SHARDS,
+            stripe_unit: DEFAULT_ERASURE_STRIPE_UNIT_BYTES,
+        }
+    }
 }
 
 impl ErasureProfile {
@@ -574,6 +588,14 @@ mod tests {
 
     fn first_payload_offset() -> usize {
         HEADER_BYTES + FRAME_PREFIX_BYTES
+    }
+
+    #[test]
+    fn default_profile_is_two_data_one_parity_with_sixteen_kibibyte_stripes() {
+        let profile = ErasureProfile::default();
+        assert_eq!(profile.data_shards(), 2);
+        assert_eq!(profile.parity_shards(), 1);
+        assert_eq!(profile.stripe_unit(), 16 * 1024);
     }
 
     #[test]

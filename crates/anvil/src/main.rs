@@ -117,6 +117,27 @@ struct Arguments {
 
     #[arg(
         long,
+        env = "ANVIL_ERASURE_DATA_SHARDS",
+        default_value_t = anvil_store::DEFAULT_ERASURE_DATA_SHARDS
+    )]
+    erasure_data_shards: u16,
+
+    #[arg(
+        long,
+        env = "ANVIL_ERASURE_PARITY_SHARDS",
+        default_value_t = anvil_store::DEFAULT_ERASURE_PARITY_SHARDS
+    )]
+    erasure_parity_shards: u16,
+
+    #[arg(
+        long,
+        env = "ANVIL_ERASURE_STRIPE_UNIT_BYTES",
+        default_value_t = anvil_store::DEFAULT_ERASURE_STRIPE_UNIT_BYTES
+    )]
+    erasure_stripe_unit_bytes: u32,
+
+    #[arg(
+        long,
         env = "ANVIL_AWAITING_PUBLISH_TTL_SECONDS",
         default_value_t = anvil_store::DEFAULT_AWAITING_PUBLISH_TTL_SECONDS
     )]
@@ -158,9 +179,21 @@ struct Arguments {
     watch_max_bytes: u64,
 }
 
+impl Arguments {
+    fn erasure_profile(&self) -> Result<anvil_store::ErasureProfile> {
+        anvil_store::ErasureProfile::new(
+            self.erasure_data_shards,
+            self.erasure_parity_shards,
+            self.erasure_stripe_unit_bytes,
+        )
+        .context("validate erasure-code profile")
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let arguments = Arguments::parse();
+    let erasure_profile = arguments.erasure_profile()?;
     let signing_key =
         load_token_signing_key(&arguments.token_signing_key_file).with_context(|| {
             format!(
@@ -197,6 +230,7 @@ async fn main() -> Result<()> {
             keyed_cleanup_interval: arguments.rate_limit_keyed_cleanup_interval,
         },
         max_blob_bytes: arguments.max_blob_bytes,
+        erasure_profile,
         awaiting_publish_ttl_seconds: arguments.awaiting_publish_ttl_seconds,
         mutation_receipt_retention_seconds: arguments.mutation_receipt_retention_seconds,
         max_mutation_receipt_entries: arguments.max_mutation_receipt_entries,
@@ -216,6 +250,62 @@ async fn main() -> Result<()> {
                 "OpenTelemetry shutdown failed after the server stopped"
             );
             Err(server_error)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(extra: &[&str]) -> Arguments {
+        let mut arguments = vec![
+            "anvil-server",
+            "--token-signing-key-file",
+            "test-signing-key",
+        ];
+        arguments.extend_from_slice(extra);
+        Arguments::try_parse_from(arguments).unwrap()
+    }
+
+    #[test]
+    fn erasure_profile_defaults_to_two_plus_one() {
+        let profile = parse(&[]).erasure_profile().unwrap();
+        assert_eq!(profile, anvil_store::ErasureProfile::default());
+    }
+
+    #[test]
+    fn erasure_profile_accepts_a_valid_startup_override() {
+        let profile = parse(&[
+            "--erasure-data-shards",
+            "4",
+            "--erasure-parity-shards",
+            "2",
+            "--erasure-stripe-unit-bytes",
+            "32768",
+        ])
+        .erasure_profile()
+        .unwrap();
+        assert_eq!(profile.data_shards(), 4);
+        assert_eq!(profile.parity_shards(), 2);
+        assert_eq!(profile.stripe_unit(), 32 * 1024);
+    }
+
+    #[test]
+    fn erasure_profile_rejects_invalid_startup_geometry() {
+        for extra in [
+            vec!["--erasure-data-shards", "0"],
+            vec!["--erasure-parity-shards", "0"],
+            vec![
+                "--erasure-data-shards",
+                "255",
+                "--erasure-parity-shards",
+                "2",
+            ],
+            vec!["--erasure-stripe-unit-bytes", "0"],
+        ] {
+            let error = parse(&extra).erasure_profile().unwrap_err();
+            assert!(error.to_string().contains("validate erasure-code profile"));
         }
     }
 }

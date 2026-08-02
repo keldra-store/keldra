@@ -35,7 +35,10 @@ pub use bootstrap::{
     SystemBootstrapState, TenantApplicationRole, system_schema,
 };
 pub use clock::VersionClock;
-pub use erasure::{ErasureCodec, ErasureError, ErasureProfile};
+pub use erasure::{
+    DEFAULT_ERASURE_DATA_SHARDS, DEFAULT_ERASURE_PARITY_SHARDS, DEFAULT_ERASURE_STRIPE_UNIT_BYTES,
+    ErasureCodec, ErasureError, ErasureProfile,
+};
 pub use key::ObjectKey;
 pub use model::{
     BatchOperation, BatchOutcome, BucketPolicy, DeleteRequest, DeleteRetainedVersionOutcome,
