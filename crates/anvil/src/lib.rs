@@ -4,9 +4,10 @@ mod authorization;
 mod authz_api;
 mod authz_service;
 mod bootstrap;
+mod cluster_startup;
 mod credential_service;
-pub mod observability;
 mod mutable_record_quorum;
+pub mod observability;
 mod placement;
 mod programs;
 mod serving_fence;
@@ -83,14 +84,6 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     )
     .await
     .with_context(|| format!("open Anvil data at {}", config.data_dir.display()))?;
-    bootstrap::enforce(
-        &store,
-        &config.data_dir,
-        config.run_system_bootstrap,
-        config.system_bootstrap_credential_output.as_deref(),
-    )
-    .await?;
-    let authz_repository = store.authz();
     let decisions = DecisionRaft::open(
         config.data_dir.join("decisions"),
         u64::from(config.node_id),
@@ -107,12 +100,21 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         .wait_for_leader(DECISION_LEADER_TIMEOUT)
         .await
         .context("elect decision leader")?;
-    let programs = programs::ProgramCoordinator::start(
-        store.clone(),
-        decisions.clone(),
-        NodeId(u64::from(config.node_id)),
+    let cluster_id = cluster_startup::ensure_genesis_identity(&decisions).await?;
+    tracing::info!(cluster.id = %hex::encode(cluster_id.0), "cluster identity is ready");
+    let local_node = NodeId(u64::from(config.node_id));
+    let programs =
+        programs::ProgramCoordinator::start(store.clone(), decisions.clone(), local_node).await?;
+    cluster_startup::reconcile_system_bootstrap(
+        &store,
+        &decisions,
+        local_node,
+        &config.data_dir,
+        config.run_system_bootstrap,
+        config.system_bootstrap_credential_output.as_deref(),
     )
     .await?;
+    let authz_repository = store.authz();
     // A committed bundle may have spent longer than the inactivity grace on
     // disk while this process was down. Recovery must pin/finalize every Raft
     // decision before startup GC considers ordinary awaiting blobs.
