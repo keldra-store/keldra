@@ -68,7 +68,7 @@ The Anvil 0.5 process metric vocabulary covers:
   successful, failed, and replayed operation counts, and request latency; and
 - blob garbage-collection run, removal, and failure counts.
 
-The Developer Defence qualification tool separately writes a measured JSON
+The OSV qualification tool separately writes a measured JSON
 report. It is benchmark output, not an OTLP process metric.
 
 Two requested signals are deliberately not approximated in 0.5.0.
@@ -79,7 +79,7 @@ state solely to manufacture those numbers. Separate durability-wait and
 finalized-through-lag instruments are also absent. Garbage-collection results
 and combined preparation timing are the bounded alternatives.
 
-The qualification tool's report is the end-to-end Developer Defence ingest
+The qualification tool's report is the end-to-end OSV ingest
 measurement. Its `result` section records `end_to_end_seconds`, source records
 and logical mutations per second, `total_payload_bytes`, and bulk-request
 latency quantiles for the exact pinned corpus run. Byte throughput is derived

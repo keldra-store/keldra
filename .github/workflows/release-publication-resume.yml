@@ -32,7 +32,7 @@ concurrency:
 jobs:
   publish:
     name: Resume 0.5 publication from validated image
-    runs-on: [self-hosted, linux, x64, worka-builder-2]
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Checkout workflow revision

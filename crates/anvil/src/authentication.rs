@@ -576,11 +576,11 @@ mod tests {
     #[test]
     fn verified_token_establishes_tenant_and_canonical_app_subject() {
         let manager = JwtManager::new(TEST_SIGNING_SECRET).unwrap();
-        let token = manager.mint(tenant("worka"), "app-7").unwrap();
+        let token = manager.mint(tenant("acme"), "app-7").unwrap();
 
         let caller = manager.verify(&token).unwrap();
 
-        assert_eq!(caller.storage_tenant().as_str(), "worka");
+        assert_eq!(caller.storage_tenant().as_str(), "acme");
         assert_eq!(caller.subject().namespace, "app");
         assert_eq!(caller.subject().id, ObjectId::Opaque("app-7".to_owned()));
     }
@@ -588,7 +588,7 @@ mod tests {
     #[test]
     fn interceptor_inserts_only_verified_identity() {
         let manager = JwtManager::new(TEST_SIGNING_SECRET).unwrap();
-        let token = manager.mint(tenant("worka"), "app-7").unwrap();
+        let token = manager.mint(tenant("acme"), "app-7").unwrap();
         let mut request = Request::new(());
         request.metadata_mut().insert(
             "authorization",
@@ -598,7 +598,7 @@ mod tests {
         let request = manager.authenticate(request).unwrap();
         let caller = request.extensions().get::<Caller>().unwrap();
 
-        assert_eq!(caller.storage_tenant().as_str(), "worka");
+        assert_eq!(caller.storage_tenant().as_str(), "acme");
         assert_eq!(caller.subject().id, ObjectId::Opaque("app-7".to_owned()));
     }
 
@@ -606,7 +606,7 @@ mod tests {
     fn wrong_key_missing_token_and_duplicate_headers_fail_closed() {
         let issuer = JwtManager::new(TEST_SIGNING_SECRET).unwrap();
         let verifier = JwtManager::new(b"fedcba9876543210fedcba9876543210").unwrap();
-        let token = issuer.mint(tenant("worka"), "app-7").unwrap();
+        let token = issuer.mint(tenant("acme"), "app-7").unwrap();
         assert!(verifier.verify(&token).is_err());
 
         let missing = verifier.authenticate(Request::new(())).unwrap_err();
@@ -628,22 +628,22 @@ mod tests {
         let limits = RequestRateLimits::new(test_rate_config());
 
         let alice = limits
-            .authenticate(&manager, bearer_request(&manager, "worka", "alice"))
+            .authenticate(&manager, bearer_request(&manager, "acme", "alice"))
             .unwrap();
         assert_eq!(
             alice.extensions().get::<Caller>().unwrap().storage_tenant(),
-            &tenant("worka")
+            &tenant("acme")
         );
 
         let repeated = limits
-            .authenticate(&manager, bearer_request(&manager, "worka", "alice"))
+            .authenticate(&manager, bearer_request(&manager, "acme", "alice"))
             .unwrap_err();
         assert_eq!(repeated.code(), tonic::Code::ResourceExhausted);
         assert!(repeated.message().contains("retry after"));
 
         // A distinct authenticated application has independent keyed state.
         limits
-            .authenticate(&manager, bearer_request(&manager, "worka", "bob"))
+            .authenticate(&manager, bearer_request(&manager, "acme", "bob"))
             .unwrap();
         // The same application ID in a different tenant is also a distinct
         // immutable caller identity.
@@ -674,7 +674,7 @@ mod tests {
         let missing = limits.authenticate(&manager, Request::new(())).unwrap_err();
         assert_eq!(missing.code(), tonic::Code::Unauthenticated);
         let rejected = limits
-            .authenticate(&manager, bearer_request(&manager, "worka", "alice"))
+            .authenticate(&manager, bearer_request(&manager, "acme", "alice"))
             .unwrap_err();
         assert_eq!(rejected.code(), tonic::Code::ResourceExhausted);
         assert!(rejected.message().contains("server"));
@@ -685,7 +685,7 @@ mod tests {
         let manager = JwtManager::new(TEST_SIGNING_SECRET).unwrap();
         let claims = AccessTokenClaims {
             sub: "client-7".to_owned(),
-            storage_tenant: "worka".to_owned(),
+            storage_tenant: "acme".to_owned(),
             exp: 1,
             jti: uuid::Uuid::new_v4().to_string(),
             aud: ACCESS_TOKEN_AUDIENCE.to_owned(),
@@ -704,24 +704,24 @@ mod tests {
     #[test]
     fn access_and_put_tokens_have_strictly_separate_purposes() {
         let manager = JwtManager::new(TEST_SIGNING_SECRET).unwrap();
-        let caller = Caller::from_authenticated_application(tenant("worka"), "app-7").unwrap();
-        let header = br#"{"address":{"tenant":"worka","bucket":"objects","path":"a"}}"#;
+        let caller = Caller::from_authenticated_application(tenant("acme"), "app-7").unwrap();
+        let header = br#"{"address":{"tenant":"acme","bucket":"objects","path":"a"}}"#;
         let (put_token, expires_at) = manager
             .mint_put_token(&caller, header, PUT_TOKEN_LIFETIME)
             .unwrap();
         let verified = manager.verify_put_token(&put_token).unwrap();
 
         assert!(verified.belongs_to(&caller));
-        assert_eq!(verified.storage_tenant, "worka");
+        assert_eq!(verified.storage_tenant, "acme");
         assert_eq!(verified.subject, caller.subject().clone());
         assert_eq!(verified.header, header);
         assert_eq!(verified.expires_at_unix_seconds, expires_at);
         assert!(!verified.token_id.is_empty());
 
-        let other = Caller::from_authenticated_application(tenant("worka"), "app-8").unwrap();
+        let other = Caller::from_authenticated_application(tenant("acme"), "app-8").unwrap();
         assert!(!verified.belongs_to(&other));
 
-        let access_token = manager.mint(tenant("worka"), "app-7").unwrap();
+        let access_token = manager.mint(tenant("acme"), "app-7").unwrap();
         assert!(manager.verify(&put_token).is_err());
         assert!(manager.verify_put_token(&access_token).is_err());
     }
@@ -729,7 +729,7 @@ mod tests {
     #[test]
     fn put_token_admission_lifetime_is_exactly_five_minutes() {
         let manager = JwtManager::new(TEST_SIGNING_SECRET).unwrap();
-        let caller = Caller::from_authenticated_application(tenant("worka"), "app-7").unwrap();
+        let caller = Caller::from_authenticated_application(tenant("acme"), "app-7").unwrap();
 
         assert!(matches!(
             manager.mint_put_token(&caller, b"{}", Duration::from_secs(60)),
@@ -740,10 +740,10 @@ mod tests {
     #[test]
     fn token_fields_cannot_encode_an_invalid_tenant_or_subject() {
         let manager = JwtManager::new(TEST_SIGNING_SECRET).unwrap();
-        assert!(manager.mint(tenant("worka"), "subject\nsmuggling").is_err());
+        assert!(manager.mint(tenant("acme"), "subject\nsmuggling").is_err());
         assert!(
             manager
-                .mint(tenant("worka"), anvil_authz::PUBLIC_SUBJECT_ID)
+                .mint(tenant("acme"), anvil_authz::PUBLIC_SUBJECT_ID)
                 .is_err()
         );
     }

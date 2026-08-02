@@ -3,7 +3,6 @@ name = "anvil-store"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-repository.workspace = true
 rust-version.workspace = true
 description = "The small versioned object kernel for Anvil"
 publish = false

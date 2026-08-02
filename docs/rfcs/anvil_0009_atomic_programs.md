@@ -106,8 +106,8 @@ There is no general transaction class between them.
 6. Keep Raft state and committed-invocation replay explicitly bounded.
 7. Provide reliable invalidation watches without inventing a global event
    sequence.
-8. Ingest the pinned Developer Defence OSV corpus into the Developer Defence
-   schema on one node in at most 150 seconds.
+8. Ingest the pinned OSV corpus into the qualification schema on one node in at
+   most 150 seconds.
 9. Use one Zanzibar authorization engine for Anvil's own request decisions and
    for application-defined relationship realms.
 
@@ -410,7 +410,7 @@ Some items may succeed while others fail. Retrying an unknown item uses its
 original command ID and input fingerprint. The server bounds item count,
 encoded bytes, response bytes, concurrency, and total work.
 
-Bulk transport is the normal Developer Defence import path. Independent OSV
+Bulk transport is the normal OSV import path. Independent OSV
 records must not pay one RPC, one consensus round, or one fsync each merely
 because the importer was written as a loop.
 
@@ -1318,7 +1318,7 @@ used it. There is no dual read, dual write, in-place upgrade, mixed-version
 rolling upgrade, or automatic data-directory conversion. Migration is explicit
 export from the old deployment and import through 0.5 capabilities.
 
-## 15. Developer Defence performance contract
+## 15. OSV import performance contract
 
 Performance is measured immediately after the functionally qualified 0.5.0
 release. The first published result is the baseline for profiling and focused
@@ -1330,14 +1330,14 @@ The benchmark manifest records:
 - source-record count `N`;
 - logical path-mutation count `M`;
 - encoded input and stored byte counts;
-- Developer Defence schema/program versions;
+- qualification schema/program versions;
 - durability configuration;
 - hardware and storage layout;
 - client concurrency and batch size; and
 - p50, p95, p99, and end-to-end time.
 
-The pinned corpus must ingest into the real Developer Defence schema on one
-node in at most 150 seconds. Required sustained rates are:
+The pinned corpus must ingest into the qualification schema on one node in at
+most 150 seconds. Required sustained rates are:
 
 ```text
 source records/second = N / 150
@@ -1370,7 +1370,7 @@ Performance qualification requires:
   a shared bounded batch;
 - average small-command/request overhead at or below the documented 10 ms
   target on qualification hardware, with percentiles reported separately;
-- the full pinned Developer Defence import in at most 150 seconds; and
+- the full pinned OSV import in at most 150 seconds; and
 - retry, crash, durability, finalization, and watch-journal work included in
   the benchmark rather than measured later as hidden debt.
 
@@ -1508,7 +1508,7 @@ The 0.5.0 core is not functionally release-qualified until tests demonstrate:
 - delete/recreate invalidation using monotonic path versions;
 - explicit rebuild after `RESUME_EXPIRED`.
 
-Immediately after functional release, the pinned Developer Defence import
+Immediately after functional release, the pinned OSV import
 establishes the performance baseline against the 150-second contract in
 section 15. A miss starts profiling and focused tuning; it does not retroactively
 change the functional evidence or move the immutable 0.5.0 tag.
@@ -1518,7 +1518,7 @@ prepared bytes, Raft commit latency, unfinalized tail entries/bytes,
 finalization retries, garbage-collection runs/removals/failures, replay-window
 usage, watch-journal retention and observed consumer lag, and bulk operation,
 byte, outcome, and request-latency measurements. The qualification tool records
-end-to-end Developer Defence ingest time and throughput in its JSON report;
+end-to-end OSV ingest time and throughput in its JSON report;
 those benchmark results are not OTLP process metrics. Exact lock-wait timing,
 separate durability-wait timing, finalized-through lag, and instantaneous
 orphan-byte inventory are explicit 0.5.0 limitations; Anvil does not add scans

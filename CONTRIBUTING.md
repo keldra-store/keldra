@@ -61,8 +61,8 @@ git push origin refs/tags/0.5.0
 ```
 
 The tag-triggered workflow reruns the static, Rust, and per-architecture image
-gates, then publishes the single multi-architecture image
-`ghcr.io/worka-ai/anvil:0.5.0` and creates the GitHub release. Do not publish
+gates, then publishes the single multi-architecture image for the repository
+and creates the GitHub release. Do not publish
 public architecture-specific or `v`-prefixed image tags.
 
 Use Cargo's shared target directory and locking. Do not create ad-hoc target

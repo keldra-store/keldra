@@ -3,7 +3,6 @@ name = "anvil-consensus"
 version = "0.5.0"
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/worka-ai/anvil"
 rust-version = "1.96.0"
 description = "Bounded consensus decisions for Anvil atomic programs"
 publish = false

@@ -26,15 +26,14 @@ that budget but cannot extend it; expiry returns gRPC `DEADLINE_EXCEEDED`.
 
 ## Implementation status
 
-The complete 0.5.0 capability is in release qualification. The production
+The complete 0.5.0 capability is released. The production
 surface includes authenticated object/CAS/bulk operations, immutable and
 `PROGRAM_ONLY` policy, typed Zanzibar administration and application realms,
 explicit bootstrap and credential exchange, public atomic-program invocation
 and recovery, and bounded resumable `WatchPrefix`. Functional release evidence
 includes the full local suite, crash/manual QA, and both container
-architectures. The pinned Developer Defence OSV import is the immediate
-post-release performance baseline; misses are profiled and corrected after the
-immutable 0.5.0 tag rather than delaying its functional release.
+architectures. A pinned OSV import is the post-release performance baseline;
+misses are profiled and corrected without rewriting the immutable 0.5.0 tag.
 
 ## Deliberate 0.5 break
 
@@ -107,7 +106,7 @@ already-issued tokens remain valid until their one-hour expiry.
 - `crates/anvil-atomic-program`: the one bounded JSON program interpreter.
 - `crates/anvil-consensus`: compact executor nomination and publication decisions.
 - `crates/anvil-api`: the single generated gRPC contract shared by server and clients.
-- `anvil`: server transport and integration.
+- `crates/anvil`: server transport and integration.
 - `clients/rust`: thin authenticated Rust transport.
 - `docs/rfcs/anvil_0009_atomic_programs.md`: complete 0.5 architecture and invariants.
 - `docs/known-limitations.md`: explicit 0.5.0 limitations that operators and clients must account for.
@@ -137,9 +136,9 @@ ANVIL_IMAGE=anvil:0.5.0-local-arm64 ./scripts/release-gates.sh image
 
 Each image is compiled from source inside a `rust:1.96-trixie` builder for its
 target platform and runs on `debian:trixie-slim`. Release publication rebuilds
-the same Dockerfile as the single public multi-platform image
-`ghcr.io/worka-ai/anvil:0.5.0`. There are no public architecture-specific or
-`v`-prefixed image tags.
+the same Dockerfile as one public multi-platform image. Its repository follows
+`ghcr.io/OWNER/anvil:0.5.0`, where `OWNER` is the GitHub repository owner.
+There are no public architecture-specific or `v`-prefixed image tags.
 
 ## First start
 

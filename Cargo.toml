@@ -22,9 +22,8 @@ keywords = ["object-store", "storage", "compare-and-swap", "distributed-systems"
 categories = ["database-implementations"]
 authors = ["Anvil maintainers <maintainers@anvil.storage>"]
 license = "Apache-2.0"
-homepage = "https://github.com/worka-ai/anvil"
-repository = "https://github.com/worka-ai/anvil"
-documentation = "https://github.com/worka-ai/anvil/blob/0.5.0/docs/rfcs/anvil_0009_atomic_programs.md"
+homepage = "https://anvil.storage"
+documentation = "https://anvil.storage"
 rust-version = "1.96.0"
 
 [profile.ci]
