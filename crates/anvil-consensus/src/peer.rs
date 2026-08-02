@@ -25,7 +25,7 @@ use crate::codec;
 use crate::raft::{DecisionRaft, DecisionRaftConfig, DecisionRaftError, map_client_write_error};
 use crate::types::{MAX_RAFT_NODE_ID, MembershipTransitionKind, NodeId, NodeState};
 
-const PEER_RPC_SCHEMA_VERSION: u16 = 1;
+pub(crate) const PEER_RPC_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerNode {

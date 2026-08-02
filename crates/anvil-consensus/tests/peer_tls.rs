@@ -2,52 +2,18 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
 use anvil_consensus::{
-    CommittedPeerPinProvider, CommittedPeerPins, DEFAULT_PEER_TLS_HANDSHAKE_TIMEOUT, NodeId,
-    PeerRpcKind, PeerSpkiSha256, PeerTlsAcceptor, PeerTlsConfig, PeerTlsConnector, PeerTlsError,
-    PeerTlsIdentity, authorize_peer_rpc,
+    ClusterId, CommittedPeerPinProvider, CommittedPeerPins, DEFAULT_PEER_TLS_HANDSHAKE_TIMEOUT,
+    NodeId, PeerRpcKind, PeerSpkiSha256, PeerTlsAcceptor, PeerTlsConfig, PeerTlsConnector,
+    PeerTlsError, PeerTlsIdentity, authorize_peer_rpc,
 };
 use rustls::HandshakeKind;
 use tokio::net::TcpListener;
 
-const CERT_ONE: &[u8] = br#"-----BEGIN CERTIFICATE-----
-MIIBiDCCAS+gAwIBAgIUBpJAQ4cuYCJY3MUr3nrYZNGndFIwCgYIKoZIzj0EAwIw
-GTEXMBUGA1UEAwwOYW52aWwtcGVlci1vbmUwIBcNMjYwODAyMTc1ODAxWhgPMjEy
-NjA3MDkxNzU4MDFaMBkxFzAVBgNVBAMMDmFudmlsLXBlZXItb25lMFkwEwYHKoZI
-zj0CAQYIKoZIzj0DAQcDQgAEMigBrGBgRsaeRVKksJstx5sRCoGReN/oqwivQp5S
-M9WKp+IOG4xjnTxJ20px1RMoLNbD9OcfMFgi/rW0EKSEr6NTMFEwHQYDVR0OBBYE
-FKsE3oFrKlZbya3xw8tE2sdCyHd8MB8GA1UdIwQYMBaAFKsE3oFrKlZbya3xw8tE
-2sdCyHd8MA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDRwAwRAIgM90XVQOd
-8WbLrStdJaLcQEvCUbA09VhmnPtYE+2sHIwCIA/GyPPbWXoTKls9ftUrWdfvLzAf
-GJN03xvysAiHhk9S
------END CERTIFICATE-----
-"#;
-
-const KEY_ONE: &[u8] = br#"-----BEGIN PRIVATE KEY-----
-MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgIDVYsQiKeb+5igf2
-FWZoJxHoYIU35IJeWhaOYs7b8cGhRANCAAQyKAGsYGBGxp5FUqSwmy3HmxEKgZF4
-3+irCK9CnlIz1Yqn4g4bjGOdPEnbSnHVEygs1sP05x8wWCL+tbQQpISv
------END PRIVATE KEY-----
-"#;
-
-const CERT_TWO: &[u8] = br#"-----BEGIN CERTIFICATE-----
-MIIBiDCCAS+gAwIBAgIUf5n6LrQEla3eKawcyn3sQOQ7QkswCgYIKoZIzj0EAwIw
-GTEXMBUGA1UEAwwOYW52aWwtcGVlci10d28wIBcNMjYwODAyMTc1ODAxWhgPMjEy
-NjA3MDkxNzU4MDFaMBkxFzAVBgNVBAMMDmFudmlsLXBlZXItdHdvMFkwEwYHKoZI
-zj0CAQYIKoZIzj0DAQcDQgAE93y1cLO+GxaXebXlyDlH4XrXK18VXiHr2x0jNrwE
-WA2BNo/KcAJlja4wH86uBViH1YXPjX2S+ouDq9/c6fNOqqNTMFEwHQYDVR0OBBYE
-FCjps4Bo9leCpW75eic8Xfg4FqdkMB8GA1UdIwQYMBaAFCjps4Bo9leCpW75eic8
-Xfg4FqdkMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDRwAwRAIgY0qPNVtW
-uAu09bg/59VhvfoGAi9cltsqsmcubQoOz2oCICiOvfJpde/NOt7EI/SFDgv+2+TF
-tGXw1iSrAveGPYpF
------END CERTIFICATE-----
-"#;
-
-const KEY_TWO: &[u8] = br#"-----BEGIN PRIVATE KEY-----
-MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg8USeg2m+n4dza2J9
-FYK0tWK9mU+EGFbKroOxJxJRs6ShRANCAAT3fLVws74bFpd5teXIOUfhetcrXxVe
-IevbHSM2vARYDYE2j8pwAmWNrjAfzq4FWIfVhc+NfZL6i4Or39zp806q
------END PRIVATE KEY-----
-"#;
+const CERT_ONE: &[u8] = include_bytes!("fixtures/peer-one.cert.pem");
+const KEY_ONE: &[u8] = include_bytes!("fixtures/peer-one.key.pem");
+const CERT_TWO: &[u8] = include_bytes!("fixtures/peer-two.cert.pem");
+const KEY_TWO: &[u8] = include_bytes!("fixtures/peer-two.key.pem");
+const TEST_CLUSTER_ID: ClusterId = ClusterId([9; 16]);
 
 #[derive(Default)]
 struct TestPins {
@@ -74,9 +40,13 @@ impl CommittedPeerPinProvider for TestPins {
 
     fn authorized_rpc_pins(
         &self,
+        cluster_id: ClusterId,
         node_id: NodeId,
         _kind: PeerRpcKind,
     ) -> Option<CommittedPeerPins> {
+        if cluster_id != TEST_CLUSTER_ID {
+            return None;
+        }
         self.entries
             .read()
             .unwrap()
@@ -130,6 +100,7 @@ async fn accepts_mutual_tls_and_exposes_the_client_pin() {
         assert_eq!(accepted.presented_spki_sha256, expected_first_pin);
         authorize_peer_rpc(
             server_pins.as_ref(),
+            TEST_CLUSTER_ID,
             NodeId(1),
             PeerRpcKind::Vote,
             accepted.presented_spki_sha256,
@@ -235,7 +206,14 @@ fn every_rpc_rechecks_state_and_accepts_exactly_one_overlap() {
         true,
     );
     assert!(
-        authorize_peer_rpc(&pins, node, PeerRpcKind::AppendEntries, first.spki_sha256(),).is_ok()
+        authorize_peer_rpc(
+            &pins,
+            TEST_CLUSTER_ID,
+            node,
+            PeerRpcKind::AppendEntries,
+            first.spki_sha256(),
+        )
+        .is_ok()
     );
 
     pins.set(
@@ -247,7 +225,13 @@ fn every_rpc_rechecks_state_and_accepts_exactly_one_overlap() {
         false,
     );
     assert!(matches!(
-        authorize_peer_rpc(&pins, node, PeerRpcKind::AppendEntries, first.spki_sha256(),),
+        authorize_peer_rpc(
+            &pins,
+            TEST_CLUSTER_ID,
+            node,
+            PeerRpcKind::AppendEntries,
+            first.spki_sha256(),
+        ),
         Err(PeerTlsError::Unauthorized)
     ));
 }

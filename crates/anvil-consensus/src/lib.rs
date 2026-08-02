@@ -12,6 +12,7 @@ mod peer_tls;
 mod raft;
 mod raft_storage;
 mod state_machine;
+mod tonic_peer;
 mod types;
 
 pub use peer::{
@@ -28,6 +29,7 @@ pub use raft::{
     LeaderQuorumProof,
 };
 pub use state_machine::{ApplyError, StateMachine};
+pub use tonic_peer::{TonicPeerTransport, TonicRaftPeerServer, TonicRaftPeerService};
 pub use types::{
     ATOMIC_REPLAY_RETENTION_MILLIS, ApplyResult, BundleHash, BundleRef,
     CLUSTER_CONTROL_COMMAND_VERSION, CapabilityRange, ClusterControlState, ClusterId, Command,

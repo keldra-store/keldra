@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package anvil.peer.v1;
+
+// Private, mTLS-only transport for the compact Anvil decision Raft group.
+service RaftPeer {
+  rpc AppendEntries(RaftRequest) returns (RaftResponse);
+  rpc Vote(RaftRequest) returns (RaftResponse);
+  rpc InstallSnapshot(RaftRequest) returns (RaftResponse);
+}
+
+// Versioned envelope around Anvil's bounded consensus codec payload.
+message RaftRequest {
+  uint32 schema_version = 1;
+  bytes cluster_id = 2;
+  uint64 source_node_id = 3;
+  bytes payload = 4;
+}
+
+message RaftResponse {
+  uint32 schema_version = 1;
+  bytes payload = 2;
+}

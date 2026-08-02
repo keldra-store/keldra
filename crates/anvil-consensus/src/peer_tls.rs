@@ -20,12 +20,14 @@ use rustls::{
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tonic::transport::server::Connected;
 
 use crate::peer::PeerRpcKind;
-use crate::types::{NodeId, PeerSpkiSha256};
+use crate::types::{ClusterId, NodeId, PeerSpkiSha256};
 
 const PEER_ALPN: &[u8] = b"anvil-peer/1";
 pub const DEFAULT_PEER_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -71,17 +73,24 @@ impl CommittedPeerPins {
 /// Reads peer authorization from the latest locally applied committed state.
 ///
 /// Implementations own cluster identity, applied-index, membership-state, and
-/// RPC-class policy. `authorized_rpc_pins` must read those facts and both pins
-/// from one committed-state snapshot. Returning `None` denies the RPC.
+/// RPC-class policy. `authorized_rpc_pins` must reject a different cluster ID
+/// and read those facts and both pins from one committed-state snapshot.
+/// Returning `None` denies the RPC.
 pub trait CommittedPeerPinProvider: Send + Sync + 'static {
     fn connection_pins(&self, node_id: NodeId) -> Option<CommittedPeerPins>;
 
-    fn authorized_rpc_pins(&self, node_id: NodeId, kind: PeerRpcKind) -> Option<CommittedPeerPins>;
+    fn authorized_rpc_pins(
+        &self,
+        cluster_id: ClusterId,
+        node_id: NodeId,
+        kind: PeerRpcKind,
+    ) -> Option<CommittedPeerPins>;
 }
 
 /// Identity attached to a Tonic request after its per-RPC committed check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthenticatedPeer {
+    pub cluster_id: ClusterId,
     pub node_id: NodeId,
     pub spki_sha256: PeerSpkiSha256,
 }
@@ -93,17 +102,19 @@ pub struct AuthenticatedPeer {
 /// close.
 pub fn authorize_peer_rpc(
     provider: &dyn CommittedPeerPinProvider,
+    claimed_cluster_id: ClusterId,
     claimed_node_id: NodeId,
     kind: PeerRpcKind,
     presented_spki_sha256: PeerSpkiSha256,
 ) -> Result<AuthenticatedPeer, PeerTlsError> {
     let authorized = provider
-        .authorized_rpc_pins(claimed_node_id, kind)
+        .authorized_rpc_pins(claimed_cluster_id, claimed_node_id, kind)
         .is_some_and(|pins| pins.contains(presented_spki_sha256));
     if !authorized {
         return Err(PeerTlsError::Unauthorized);
     }
     Ok(AuthenticatedPeer {
+        cluster_id: claimed_cluster_id,
         node_id: claimed_node_id,
         spki_sha256: presented_spki_sha256,
     })
@@ -186,6 +197,48 @@ pub fn peer_spki_sha256(certificate: &CertificateDer<'_>) -> Result<PeerSpkiSha2
 pub struct AcceptedPeerTls {
     pub stream: tokio_rustls::server::TlsStream<TcpStream>,
     pub presented_spki_sha256: PeerSpkiSha256,
+}
+
+impl Connected for AcceptedPeerTls {
+    type ConnectInfo = PeerSpkiSha256;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        self.presented_spki_sha256
+    }
+}
+
+impl AsyncRead for AcceptedPeerTls {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_read(context, buffer)
+    }
+}
+
+impl AsyncWrite for AcceptedPeerTls {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        buffer: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        std::pin::Pin::new(&mut self.stream).poll_write(context, buffer)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_shutdown(context)
+    }
 }
 
 /// Mandatory-mTLS acceptor for a Tonic `serve_with_incoming` adapter.
