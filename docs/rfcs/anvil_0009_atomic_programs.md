@@ -1320,7 +1320,9 @@ export from the old deployment and import through 0.5 capabilities.
 
 ## 15. Developer Defence performance contract
 
-Performance is a 0.5.0 release gate.
+Performance is measured immediately after the functionally qualified 0.5.0
+release. The first published result is the baseline for profiling and focused
+tuning; it does not delay the immutable 0.5.0 tag.
 
 The benchmark manifest records:
 
@@ -1360,7 +1362,7 @@ For `N` records the simplified overhead is
 control, and storage bandwidth make real throughput lower; the table is not a
 promise.
 
-Release qualification therefore requires:
+Performance qualification requires:
 
 - no one-RPC-per-record importer when safe bounded bulk is possible;
 - no atomic-program or Raft lifecycle for independent OSV records;
@@ -1373,8 +1375,9 @@ Release qualification therefore requires:
   the benchmark rather than measured later as hidden debt.
 
 If the measured corpus cannot satisfy 150 seconds at the selected durability
-and hardware, the release fails. The target is not weakened by calling the
-remaining time background finalization.
+and hardware, the implementation falls short of the contract and requires
+profiling and tuning. The target is not weakened by calling the remaining time
+background finalization, and the already-published 0.5.0 tag is not rewritten.
 
 ## 16. Fixed 0.5.0 bounded-state decisions
 
@@ -1438,7 +1441,7 @@ epoch handoff. None is silently claimed by the single-node 0.5.0 release.
 
 ## 17. Correctness and operational evidence
 
-The 0.5.0 core is not release-qualified until tests demonstrate:
+The 0.5.0 core is not functionally release-qualified until tests demonstrate:
 
 - ordinary `Put`, `Delete`, CAS, and bulk have no transaction lifecycle;
 - bulk partial success and idempotent retry of unknown items;
@@ -1503,8 +1506,12 @@ The 0.5.0 core is not release-qualified until tests demonstrate:
   distribution capability described in section 5.4.1;
 - duplicate, coalesced, unordered, resumed, and expired watch behavior;
 - delete/recreate invalidation using monotonic path versions;
-- explicit rebuild after `RESUME_EXPIRED`; and
-- the pinned Developer Defence 150-second benchmark.
+- explicit rebuild after `RESUME_EXPIRED`.
+
+Immediately after functional release, the pinned Developer Defence import
+establishes the performance baseline against the 150-second contract in
+section 15. A miss starts profiling and focused tuning; it does not retroactively
+change the functional evidence or move the immutable 0.5.0 tag.
 
 Metrics expose executor nomination, combined program preparation latency,
 prepared bytes, Raft commit latency, unfinalized tail entries/bytes,

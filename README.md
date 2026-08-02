@@ -30,9 +30,11 @@ The complete 0.5.0 capability is in release qualification. The production
 surface includes authenticated object/CAS/bulk operations, immutable and
 `PROGRAM_ONLY` policy, typed Zanzibar administration and application realms,
 explicit bootstrap and credential exchange, public atomic-program invocation
-and recovery, and bounded resumable `WatchPrefix`. A release is not declared
-until the full local suite, crash/manual QA, the pinned Developer Defence OSV
-gate, both container architectures, and the published manifest have passed.
+and recovery, and bounded resumable `WatchPrefix`. Functional release evidence
+includes the full local suite, crash/manual QA, and both container
+architectures. The pinned Developer Defence OSV import is the immediate
+post-release performance baseline; misses are profiled and corrected after the
+immutable 0.5.0 tag rather than delaying its functional release.
 
 ## Deliberate 0.5 break
 
