@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anvil_authz::{
     Authorization, AuthorizationCheck, AuthorizationLimits, ExactPath, NamespaceDefinition,
@@ -16,6 +17,9 @@ use crate::store::{
 };
 
 pub const SYSTEM_STORAGE_TENANT_ID: &str = "_anvil";
+pub const DEFAULT_AUTHZ_RECEIPT_RETENTION_SECONDS: u64 = 24 * 60 * 60;
+pub const DEFAULT_AUTHZ_RECEIPT_MAX_ENTRIES: usize = 4_096;
+pub const DEFAULT_AUTHZ_RECEIPT_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ID_BYTES: usize = 256;
 const MAX_OPERATION_ID_BYTES: usize = 128;
 
@@ -264,6 +268,8 @@ pub struct TupleBatchReceipt {
     pub binding_generation: u64,
     pub mutation_count: usize,
     pub replayed: bool,
+    /// Zero only for internal mutations that did not request idempotency.
+    pub replay_guarantee_expires_at_unix_millis: u64,
 }
 
 /// Internal composition used by first realm binding. Callers provide only the
@@ -283,12 +289,14 @@ pub struct AtomicRealmBinding {
     pub system_grant: TupleBatchReceipt,
 }
 
-/// Current-state consistency. Historical snapshots are deliberately absent;
-/// 0.5 does not accept `EXACT(r)` and never substitutes a different revision.
+/// Current-state consistency. Anvil 0.5 retains exactly the current
+/// authorization revision, so `Exact(current)` works and an older exact
+/// revision has a stable expired result rather than silently moving forward.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthzConsistency {
     Latest,
     AtLeast(AuthzRevision),
+    Exact(AuthzRevision),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -311,6 +319,9 @@ pub struct AuthzStoreLimits {
     pub max_mutations_per_batch: usize,
     pub max_checks_per_batch: usize,
     pub max_operation_id_bytes: usize,
+    pub receipt_retention_millis: u64,
+    pub max_receipt_entries: usize,
+    pub max_receipt_bytes: u64,
     pub evaluator: AuthorizationLimits,
 }
 
@@ -320,6 +331,9 @@ impl Default for AuthzStoreLimits {
             max_mutations_per_batch: 1_000,
             max_checks_per_batch: 1_000,
             max_operation_id_bytes: MAX_OPERATION_ID_BYTES,
+            receipt_retention_millis: DEFAULT_AUTHZ_RECEIPT_RETENTION_SECONDS * 1_000,
+            max_receipt_entries: DEFAULT_AUTHZ_RECEIPT_MAX_ENTRIES,
+            max_receipt_bytes: DEFAULT_AUTHZ_RECEIPT_MAX_BYTES,
             evaluator: AuthorizationLimits::default(),
         }
     }
@@ -348,6 +362,13 @@ pub enum AuthzStoreError {
         required: AuthzRevision,
         current: AuthzRevision,
     },
+    #[error("AUTHZ_REVISION_EXPIRED: requested {requested:?}, current {current:?}")]
+    RevisionExpired {
+        requested: AuthzRevision,
+        current: AuthzRevision,
+    },
+    #[error("authorization tuple receipt capacity is exhausted by unexpired guarantees")]
+    ReceiptCapacity,
     #[error("operation id is already bound to different tuple input")]
     OperationMismatch,
     #[error("authorization validation failed: {0}")]
@@ -406,8 +427,21 @@ struct StoredTuple {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredTupleReceipt {
+    format: u16,
+    operation_id: String,
+    created_at_unix_millis: u64,
+    expires_at_unix_millis: u64,
     fingerprint: [u8; 32],
     receipt: TupleBatchReceipt,
+}
+
+const STORED_TUPLE_RECEIPT_FORMAT: u16 = 1;
+
+#[derive(Default)]
+struct TupleReceiptInventory {
+    retained_entries: usize,
+    retained_bytes: u64,
+    expired_keys: Vec<Vec<u8>>,
 }
 
 impl AuthzRepository {
@@ -689,13 +723,23 @@ impl AuthzRepository {
         })
     }
 
-    fn prepare_tuple_batch(
+    pub(crate) fn prepare_tuple_batch(
         &self,
         request: &TupleBatchRequest,
         batch: &mut WriteBatch,
     ) -> Result<TupleBatchReceipt, AuthzStoreError> {
         let canonical_mutations = self.validate_mutation_request(request)?;
         let fingerprint = tuple_fingerprint(request, &canonical_mutations)?;
+        if request.operation_id.is_some()
+            && (self.limits.receipt_retention_millis == 0
+                || self.limits.max_receipt_entries == 0
+                || self.limits.max_receipt_bytes == 0)
+        {
+            return Err(AuthzStoreError::InvalidInput(
+                "authorization tuple receipt limits must all be non-zero".into(),
+            ));
+        }
+        let now = current_unix_millis()?;
 
         if let Some(operation_id) = request.operation_id.as_deref()
             && let Some(stored) = self.read_json::<StoredTupleReceipt>(
@@ -707,20 +751,30 @@ impl AuthzRepository {
                 )?,
             )?
         {
-            validate_tuple_receipt(&stored.receipt, request)?;
-            if stored.fingerprint != fingerprint {
-                return Err(AuthzStoreError::OperationMismatch);
+            validate_stored_tuple_receipt(&stored, request)?;
+            if stored.expires_at_unix_millis > now {
+                if stored.fingerprint != fingerprint {
+                    return Err(AuthzStoreError::OperationMismatch);
+                }
+                if stored.receipt.scope != request.scope
+                    || stored.receipt.mutation_count != canonical_mutations.len()
+                {
+                    return Err(AuthzStoreError::Storage(
+                        "persisted authorization tuple receipt is inconsistent".into(),
+                    ));
+                }
+                let mut receipt = stored.receipt;
+                receipt.replayed = true;
+                return Ok(receipt);
             }
-            if stored.receipt.scope != request.scope
-                || stored.receipt.mutation_count != canonical_mutations.len()
-            {
-                return Err(AuthzStoreError::Storage(
-                    "persisted authorization tuple receipt is inconsistent".into(),
-                ));
-            }
-            let mut receipt = stored.receipt;
-            receipt.replayed = true;
-            return Ok(receipt);
+            batch.delete_cf(
+                self.cf(CF_AUTHZ_RECEIPTS)?,
+                receipt_key(
+                    &request.scope.storage_tenant,
+                    &request.principal,
+                    operation_id,
+                )?,
+            );
         }
 
         let binding = self.get_binding(&request.scope)?.ok_or_else(|| {
@@ -796,6 +850,14 @@ impl AuthzRepository {
         }
 
         let authz_revision = next_revision(current)?;
+        let replay_guarantee_expires_at_unix_millis = if request.operation_id.is_some() {
+            now.checked_add(self.limits.receipt_retention_millis)
+                .ok_or_else(|| {
+                    AuthzStoreError::Storage("authorization tuple receipt expiry overflow".into())
+                })?
+        } else {
+            0
+        };
         let receipt = TupleBatchReceipt {
             scope: request.scope.clone(),
             principal: request.principal.clone(),
@@ -803,6 +865,7 @@ impl AuthzRepository {
             binding_generation: binding.generation,
             mutation_count: canonical_mutations.len(),
             replayed: false,
+            replay_guarantee_expires_at_unix_millis,
         };
         let mut updated_binding = binding;
         updated_binding.tuple_count = tuple_count;
@@ -813,20 +876,87 @@ impl AuthzRepository {
         );
         self.stage_tenant_revision(batch, &request.scope.storage_tenant, authz_revision)?;
         if let Some(operation_id) = request.operation_id.as_deref() {
-            batch.put_cf(
-                self.cf(CF_AUTHZ_RECEIPTS)?,
-                receipt_key(
-                    &request.scope.storage_tenant,
-                    &request.principal,
-                    operation_id,
-                )?,
-                encode_json(&StoredTupleReceipt {
-                    fingerprint,
-                    receipt: receipt.clone(),
-                })?,
-            );
+            let key = receipt_key(
+                &request.scope.storage_tenant,
+                &request.principal,
+                operation_id,
+            )?;
+            let stored = StoredTupleReceipt {
+                format: STORED_TUPLE_RECEIPT_FORMAT,
+                operation_id: operation_id.to_owned(),
+                created_at_unix_millis: now,
+                expires_at_unix_millis: replay_guarantee_expires_at_unix_millis,
+                fingerprint,
+                receipt: receipt.clone(),
+            };
+            let encoded = encode_json(&stored)?;
+            let encoded_bytes = receipt_record_bytes(&key, &encoded)?;
+            let inventory = self.tuple_receipt_inventory(now)?;
+            let next_entries = inventory
+                .retained_entries
+                .checked_add(1)
+                .ok_or(AuthzStoreError::ReceiptCapacity)?;
+            let next_bytes = inventory
+                .retained_bytes
+                .checked_add(encoded_bytes)
+                .ok_or(AuthzStoreError::ReceiptCapacity)?;
+            if next_entries > self.limits.max_receipt_entries
+                || next_bytes > self.limits.max_receipt_bytes
+            {
+                return Err(AuthzStoreError::ReceiptCapacity);
+            }
+            for expired_key in inventory.expired_keys {
+                batch.delete_cf(self.cf(CF_AUTHZ_RECEIPTS)?, expired_key);
+            }
+            batch.put_cf(self.cf(CF_AUTHZ_RECEIPTS)?, key, encoded);
         }
         Ok(receipt)
+    }
+
+    fn tuple_receipt_inventory(
+        &self,
+        now_unix_millis: u64,
+    ) -> Result<TupleReceiptInventory, AuthzStoreError> {
+        if self.limits.receipt_retention_millis == 0
+            || self.limits.max_receipt_entries == 0
+            || self.limits.max_receipt_bytes == 0
+        {
+            return Err(AuthzStoreError::InvalidInput(
+                "authorization tuple receipt limits must all be non-zero".into(),
+            ));
+        }
+        let mut inventory = TupleReceiptInventory::default();
+        for item in self
+            .db
+            .iterator_cf(self.cf(CF_AUTHZ_RECEIPTS)?, IteratorMode::Start)
+        {
+            let (key, encoded) = item.map_err(storage_error)?;
+            let stored = decode_json::<StoredTupleReceipt>(&encoded)?;
+            validate_stored_tuple_receipt_shape(&stored)?;
+            let expected_key = receipt_key(
+                &stored.receipt.scope.storage_tenant,
+                &stored.receipt.principal,
+                &stored.operation_id,
+            )?;
+            if key.as_ref() != expected_key.as_slice() {
+                return Err(AuthzStoreError::Storage(
+                    "persisted authorization tuple receipt key is inconsistent".into(),
+                ));
+            }
+            if stored.expires_at_unix_millis <= now_unix_millis {
+                inventory.expired_keys.push(key.to_vec());
+                continue;
+            }
+            inventory.retained_entries = inventory
+                .retained_entries
+                .checked_add(1)
+                .ok_or(AuthzStoreError::ReceiptCapacity)?;
+            inventory.retained_bytes = inventory
+                .retained_bytes
+                .checked_add(receipt_record_bytes(&key, &encoded)?)
+                .ok_or(AuthzStoreError::ReceiptCapacity)?;
+        }
+        Ok(inventory)
     }
 
     fn validate_mutation_request(
@@ -892,13 +1022,27 @@ impl AuthzRepository {
             }
             Some(revision) => revision,
         };
-        if let AuthzConsistency::AtLeast(required) = consistency
-            && revision < required
-        {
-            return Err(AuthzStoreError::RevisionNotAvailable {
-                required,
-                current: revision,
-            });
+        match consistency {
+            AuthzConsistency::Latest => {}
+            AuthzConsistency::AtLeast(required) if revision < required => {
+                return Err(AuthzStoreError::RevisionNotAvailable {
+                    required,
+                    current: revision,
+                });
+            }
+            AuthzConsistency::Exact(requested) if requested < revision => {
+                return Err(AuthzStoreError::RevisionExpired {
+                    requested,
+                    current: revision,
+                });
+            }
+            AuthzConsistency::Exact(required) if required > revision => {
+                return Err(AuthzStoreError::RevisionNotAvailable {
+                    required,
+                    current: revision,
+                });
+            }
+            AuthzConsistency::AtLeast(_) | AuthzConsistency::Exact(_) => {}
         }
         let binding = snapshot
             .get_cf(self.cf(CF_AUTHZ_BINDINGS)?, binding_key(scope))
@@ -1332,12 +1476,45 @@ fn validate_tuple_receipt(
         || receipt.principal != request.principal
         || receipt.authz_revision.0 == 0
         || receipt.binding_generation == 0
+        || receipt.replay_guarantee_expires_at_unix_millis == 0
     {
         return Err(AuthzStoreError::Storage(
             "persisted authorization tuple receipt is inconsistent".into(),
         ));
     }
     Ok(())
+}
+
+fn validate_stored_tuple_receipt(
+    stored: &StoredTupleReceipt,
+    request: &TupleBatchRequest,
+) -> Result<(), AuthzStoreError> {
+    validate_stored_tuple_receipt_shape(stored)?;
+    if request.operation_id.as_deref() != Some(stored.operation_id.as_str()) {
+        return Err(AuthzStoreError::Storage(
+            "persisted authorization tuple receipt operation id is inconsistent".into(),
+        ));
+    }
+    validate_tuple_receipt(&stored.receipt, request)
+}
+
+fn validate_stored_tuple_receipt_shape(stored: &StoredTupleReceipt) -> Result<(), AuthzStoreError> {
+    if stored.format != STORED_TUPLE_RECEIPT_FORMAT
+        || validate_component(&stored.operation_id, "operation id", MAX_OPERATION_ID_BYTES).is_err()
+        || stored.created_at_unix_millis == 0
+        || stored.expires_at_unix_millis <= stored.created_at_unix_millis
+        || stored.receipt.replay_guarantee_expires_at_unix_millis != stored.expires_at_unix_millis
+        || stored.receipt.replayed
+        || stored.receipt.authz_revision == AuthzRevision::ZERO
+        || stored.receipt.binding_generation == 0
+        || stored.receipt.mutation_count == 0
+    {
+        return Err(AuthzStoreError::Storage(
+            "persisted authorization tuple receipt is inconsistent".into(),
+        ));
+    }
+    stored.receipt.scope.validate()?;
+    validate_principal(&stored.receipt.principal)
 }
 
 fn validate_stored_schema(
@@ -1385,6 +1562,23 @@ fn next_revision(current: AuthzRevision) -> Result<AuthzRevision, AuthzStoreErro
         .checked_add(1)
         .map(AuthzRevision)
         .ok_or_else(|| AuthzStoreError::Storage("authorization revision overflow".into()))
+}
+
+fn current_unix_millis() -> Result<u64, AuthzStoreError> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| AuthzStoreError::Storage("system clock predates the Unix epoch".into()))?
+        .as_millis();
+    u64::try_from(millis)
+        .map_err(|_| AuthzStoreError::Storage("Unix time exceeds u64 milliseconds".into()))
+}
+
+fn receipt_record_bytes(key: &[u8], value: &[u8]) -> Result<u64, AuthzStoreError> {
+    let bytes = key
+        .len()
+        .checked_add(value.len())
+        .ok_or(AuthzStoreError::ReceiptCapacity)?;
+    u64::try_from(bytes).map_err(|_| AuthzStoreError::ReceiptCapacity)
 }
 
 fn tuple_fingerprint(
@@ -1767,6 +1961,17 @@ mod tests {
             .unwrap();
         assert_eq!(result.revision, AuthzRevision(4));
         assert_eq!(result.allowed, vec![true]);
+        assert_eq!(
+            repository
+                .realm_snapshot(&realm, AuthzConsistency::Exact(AuthzRevision(4)))
+                .unwrap()
+                .revision,
+            AuthzRevision(4)
+        );
+        assert!(matches!(
+            repository.realm_snapshot(&realm, AuthzConsistency::Exact(AuthzRevision(3))),
+            Err(AuthzStoreError::RevisionExpired { .. })
+        ));
         assert!(matches!(
             repository.realm_snapshot(&realm, AuthzConsistency::AtLeast(AuthzRevision(5))),
             Err(AuthzStoreError::RevisionNotAvailable { .. })
@@ -1783,6 +1988,125 @@ mod tests {
             .unwrap();
         assert_eq!(durable.revision, AuthzRevision(4));
         assert_eq!(durable.tuples.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn unexpired_tuple_receipts_are_never_evicted_to_admit_new_work() {
+        let (_directory, store) = store().await;
+        let mut limits = AuthzStoreLimits::default();
+        limits.max_receipt_entries = 1;
+        let repository = store.authz_with_limits(limits);
+        let acme = tenant("acme");
+        let realm = scope("acme", "default");
+        let published = publish(
+            &repository,
+            acme.clone(),
+            "documents",
+            document_schema(false),
+            AuthzRevision::ZERO,
+        );
+        bind(
+            &repository,
+            realm.clone(),
+            published.schema_ref,
+            AuthzRevision(1),
+        );
+        let first_request = TupleBatchRequest {
+            scope: realm.clone(),
+            principal: principal("writer"),
+            expected_revision: Some(AuthzRevision(2)),
+            expected_binding_generation: 1,
+            operation_id: Some("first".into()),
+            mutations: vec![TupleMutation {
+                kind: TupleMutationKind::Add,
+                tuple: viewer_tuple("one", "alice"),
+            }],
+        };
+        let first = repository.mutate_tuples(first_request.clone()).unwrap();
+        assert!(first.replay_guarantee_expires_at_unix_millis > current_unix_millis().unwrap());
+
+        let second = repository.mutate_tuples(TupleBatchRequest {
+            scope: realm.clone(),
+            principal: principal("writer"),
+            expected_revision: Some(AuthzRevision(3)),
+            expected_binding_generation: 1,
+            operation_id: Some("second".into()),
+            mutations: vec![TupleMutation {
+                kind: TupleMutationKind::Add,
+                tuple: viewer_tuple("two", "bob"),
+            }],
+        });
+        assert!(matches!(second, Err(AuthzStoreError::ReceiptCapacity)));
+        assert_eq!(repository.tenant_revision(&acme).unwrap(), AuthzRevision(3));
+        assert!(repository.mutate_tuples(first_request).unwrap().replayed);
+    }
+
+    #[tokio::test]
+    async fn an_expired_tuple_operation_id_may_be_used_as_new_and_is_rebounded() {
+        let (_directory, store) = store().await;
+        let repository = store.authz();
+        let acme = tenant("acme");
+        let realm = scope("acme", "default");
+        let published = publish(
+            &repository,
+            acme,
+            "documents",
+            document_schema(false),
+            AuthzRevision::ZERO,
+        );
+        bind(
+            &repository,
+            realm.clone(),
+            published.schema_ref,
+            AuthzRevision(1),
+        );
+        repository
+            .mutate_tuples(TupleBatchRequest {
+                scope: realm.clone(),
+                principal: principal("writer"),
+                expected_revision: Some(AuthzRevision(2)),
+                expected_binding_generation: 1,
+                operation_id: Some("reusable".into()),
+                mutations: vec![TupleMutation {
+                    kind: TupleMutationKind::Add,
+                    tuple: viewer_tuple("one", "alice"),
+                }],
+            })
+            .unwrap();
+
+        let key = receipt_key(&tenant("acme"), &principal("writer"), "reusable").unwrap();
+        let mut expired = repository
+            .read_json::<StoredTupleReceipt>(CF_AUTHZ_RECEIPTS, &key)
+            .unwrap()
+            .unwrap();
+        expired.created_at_unix_millis = 1;
+        expired.expires_at_unix_millis = 2;
+        expired.receipt.replay_guarantee_expires_at_unix_millis = 2;
+        repository
+            .db
+            .put_cf(
+                repository.cf(CF_AUTHZ_RECEIPTS).unwrap(),
+                &key,
+                encode_json(&expired).unwrap(),
+            )
+            .unwrap();
+
+        let reused = repository
+            .mutate_tuples(TupleBatchRequest {
+                scope: realm,
+                principal: principal("writer"),
+                expected_revision: Some(AuthzRevision(3)),
+                expected_binding_generation: 1,
+                operation_id: Some("reusable".into()),
+                mutations: vec![TupleMutation {
+                    kind: TupleMutationKind::Add,
+                    tuple: viewer_tuple("two", "bob"),
+                }],
+            })
+            .unwrap();
+        assert!(!reused.replayed);
+        assert_eq!(reused.authz_revision, AuthzRevision(4));
+        assert!(reused.replay_guarantee_expires_at_unix_millis > current_unix_millis().unwrap());
     }
 
     #[tokio::test]
@@ -2096,15 +2420,15 @@ mod tests {
     }
 
     #[test]
-    fn ids_and_consistency_surface_are_deliberately_narrow() {
+    fn ids_and_current_only_exact_consistency_are_deliberately_narrow() {
         for invalid in ["", ".", "..", "a/b", "a:b", "a#b", "a\n"] {
             assert!(StorageTenantId::parse(invalid).is_err());
             assert!(SchemaId::parse(invalid).is_err());
         }
         let latest = AuthzConsistency::Latest;
         let at_least = AuthzConsistency::AtLeast(AuthzRevision(9));
+        let exact = AuthzConsistency::Exact(AuthzRevision(9));
         assert_ne!(latest, at_least);
-        // There is intentionally no EXACT variant: this repository retains
-        // only authoritative current state, never historical snapshots.
+        assert_ne!(at_least, exact);
     }
 }
