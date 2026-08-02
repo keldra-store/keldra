@@ -115,6 +115,35 @@ impl StateMachine {
         }
     }
 
+    /// Convert the exact version-two enveloped snapshot written before active
+    /// placement changes carried their own committed Raft log ID.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_v2_snapshot(
+        max_commit_entries: u32,
+        max_commit_bytes: u64,
+        cluster_id: Option<ClusterId>,
+        system_bootstrap: SystemBootstrapState,
+        cluster_control: ClusterControlState,
+        executor: Option<ExecutorNomination>,
+        committed_invocations: BTreeMap<u64, CommittedInvocation>,
+        committed_invocation_bytes: u64,
+        last_commit_cursor: Option<u64>,
+        finalized_through: Option<u64>,
+    ) -> Self {
+        Self {
+            max_commit_entries,
+            max_commit_bytes,
+            cluster_id,
+            system_bootstrap,
+            cluster_control,
+            executor,
+            committed_invocations,
+            committed_invocation_bytes,
+            last_commit_cursor,
+            finalized_through,
+        }
+    }
+
     pub fn max_commit_entries(&self) -> u32 {
         self.max_commit_entries
     }
@@ -253,7 +282,11 @@ impl StateMachine {
             Command::CompleteMembershipTransition {
                 format_version,
                 started_log_index,
-            } => self.complete_membership_transition(*format_version, *started_log_index),
+            } => self.complete_membership_transition(
+                *format_version,
+                *started_log_index,
+                committed_log_index,
+            ),
             Command::StagePeerSpkiOverlap {
                 format_version,
                 node_id,

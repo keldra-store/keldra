@@ -137,6 +137,83 @@ fn add_is_bounded_fenced_and_sets_the_fixed_voter_target() {
 }
 
 #[test]
+fn active_placement_log_id_changes_only_with_active_placement() {
+    let mut state = StateMachine::new(16, 64 * 1024).unwrap();
+    initialize(&mut state);
+    assert_eq!(state.cluster_control().active_placement_log_id(), None);
+
+    let first = joining(1);
+    begin_add(&mut state, 2, first.clone());
+    assert_eq!(state.cluster_control().active_placement_log_id(), None);
+    let replay = state
+        .apply(
+            3,
+            &Command::BeginAddNode {
+                format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+                descriptor: first,
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        replay,
+        ApplyResult::MembershipTransitionBegun(ref transition)
+            if transition.started_log_index == 2
+    ));
+    assert_eq!(state.cluster_control().active_placement_log_id(), None);
+
+    assert!(matches!(
+        state
+            .apply(
+                4,
+                &Command::CompleteMembershipTransition {
+                    format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+                    started_log_index: 2,
+                },
+            )
+            .unwrap(),
+        ApplyResult::MembershipTransitionAdvanced(_)
+    ));
+    assert_eq!(state.cluster_control().active_placement_log_id(), Some(4));
+    complete(&mut state, 5, 2);
+    assert_eq!(state.cluster_control().active_placement_log_id(), Some(4));
+
+    begin_add(&mut state, 10, joining(2));
+    state
+        .apply(
+            11,
+            &Command::CompleteMembershipTransition {
+                format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+                started_log_index: 10,
+            },
+        )
+        .unwrap();
+    assert_eq!(state.cluster_control().active_placement_log_id(), Some(11));
+    complete(&mut state, 12, 10);
+    assert_eq!(state.cluster_control().active_placement_log_id(), Some(11));
+
+    let reweight = Command::BeginReweightNode {
+        format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+        node_id: NodeId(1),
+        storage_weight_millionths: 2_000_000,
+    };
+    state.apply(20, &reweight).unwrap();
+    state.apply(21, &reweight).unwrap();
+    assert_eq!(state.cluster_control().active_placement_log_id(), Some(11));
+    complete(&mut state, 22, 20);
+    assert_eq!(state.cluster_control().active_placement_log_id(), Some(22));
+
+    let remove = Command::BeginRemoveNode {
+        format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+        node_id: NodeId(1),
+    };
+    state.apply(30, &remove).unwrap();
+    state.apply(31, &remove).unwrap();
+    assert_eq!(state.cluster_control().active_placement_log_id(), Some(22));
+    complete(&mut state, 32, 30);
+    assert_eq!(state.cluster_control().active_placement_log_id(), Some(32));
+}
+
+#[test]
 fn one_compact_transition_serializes_add_remove_and_reweight() {
     let mut state = StateMachine::new(16, 64 * 1024).unwrap();
     initialize(&mut state);

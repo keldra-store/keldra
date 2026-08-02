@@ -71,6 +71,40 @@ struct LegacyMachineStatePreClusterControl {
     snapshot_generation: u64,
 }
 
+/// Exact cluster-control layout in unreleased version-two snapshots.
+#[derive(Debug, Serialize, Deserialize)]
+struct LegacyClusterControlStateV2 {
+    nodes: BTreeMap<crate::NodeId, crate::NodeDescriptor>,
+    used_node_ids: crate::UsedNodeIds,
+    transition: Option<crate::MembershipTransition>,
+    jwt_signing_key_fingerprint: Option<crate::JwtSigningKeyFingerprint>,
+    erasure_code_profile: Option<crate::ErasureCodeProfile>,
+}
+
+/// Exact state-machine layout in unreleased version-two snapshots.
+#[derive(Debug, Serialize, Deserialize)]
+struct LegacyStateMachineV2 {
+    max_commit_entries: u32,
+    max_commit_bytes: u64,
+    cluster_id: Option<crate::ClusterId>,
+    system_bootstrap: crate::SystemBootstrapState,
+    cluster_control: LegacyClusterControlStateV2,
+    executor: Option<ExecutorNomination>,
+    committed_invocations: BTreeMap<u64, CommittedInvocation>,
+    committed_invocation_bytes: u64,
+    last_commit_cursor: Option<u64>,
+    finalized_through: Option<u64>,
+}
+
+/// Exact outer layout in unreleased version-two snapshots.
+#[derive(Debug, Serialize, Deserialize)]
+struct LegacyMachineStateV2 {
+    decisions: LegacyStateMachineV2,
+    last_applied_log_id: Option<LogId<u64>>,
+    membership: StoredMembership<u64, BasicNode>,
+    snapshot_generation: u64,
+}
+
 /// Exact state-machine layout written by Anvil 0.5.0 snapshots.
 #[derive(Debug, Serialize, Deserialize)]
 struct LegacyStateMachineV050 {
@@ -121,6 +155,37 @@ impl From<LegacyMachineStatePreClusterControl> for MachineState {
                 decisions.max_commit_bytes,
                 decisions.cluster_id,
                 decisions.system_bootstrap,
+                decisions.executor,
+                decisions.committed_invocations,
+                decisions.committed_invocation_bytes,
+                decisions.last_commit_cursor,
+                decisions.finalized_through,
+            ),
+            last_applied_log_id: legacy.last_applied_log_id,
+            membership: legacy.membership,
+            snapshot_generation: legacy.snapshot_generation,
+        }
+    }
+}
+
+impl From<LegacyMachineStateV2> for MachineState {
+    fn from(legacy: LegacyMachineStateV2) -> Self {
+        let decisions = legacy.decisions;
+        let cluster_control = decisions.cluster_control;
+        Self {
+            decisions: StateMachine::from_v2_snapshot(
+                decisions.max_commit_entries,
+                decisions.max_commit_bytes,
+                decisions.cluster_id,
+                decisions.system_bootstrap,
+                crate::ClusterControlState {
+                    nodes: cluster_control.nodes,
+                    used_node_ids: cluster_control.used_node_ids,
+                    transition: cluster_control.transition,
+                    jwt_signing_key_fingerprint: cluster_control.jwt_signing_key_fingerprint,
+                    erasure_code_profile: cluster_control.erasure_code_profile,
+                    active_placement_log_id: None,
+                },
                 decisions.executor,
                 decisions.committed_invocations,
                 decisions.committed_invocation_bytes,
@@ -391,7 +456,7 @@ impl RaftSnapshotBuilder<DecisionRaftConfig> for OpenRaftSnapshotBuilder {
             .validate_cluster_membership()
             .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Read, error))?;
         let data =
-            codec::encode_record_at_version(&snapshot_state, codec::SNAPSHOT_RECORD_FORMAT_V2)
+            codec::encode_record_at_version(&snapshot_state, codec::SNAPSHOT_RECORD_FORMAT_V3)
                 .map_err(|error| {
                     storage_error(ErrorSubject::StateMachine, ErrorVerb::Read, error)
                 })?;
@@ -778,7 +843,10 @@ fn decode_machine_snapshot(data: &[u8]) -> Result<MachineState, codec::CodecErro
     match version {
         None => codec::decode::<LegacyMachineStateV050>(payload).map(Into::into),
         Some(1) => codec::decode::<LegacyMachineStatePreClusterControl>(payload).map(Into::into),
-        Some(codec::SNAPSHOT_RECORD_FORMAT_V2) => codec::decode(payload),
+        Some(codec::SNAPSHOT_RECORD_FORMAT_V2) => {
+            codec::decode::<LegacyMachineStateV2>(payload).map(Into::into)
+        }
+        Some(codec::SNAPSHOT_RECORD_FORMAT_V3) => codec::decode(payload),
         Some(version) => Err(codec::CodecError::UnsupportedRecordVersion(version)),
     }
 }
@@ -1028,6 +1096,13 @@ mod snapshot_compatibility_tests {
             migrated.decisions.system_bootstrap(),
             crate::SystemBootstrapState::Missing
         );
+        assert_eq!(
+            migrated
+                .decisions
+                .cluster_control()
+                .active_placement_log_id(),
+            None
+        );
 
         let pre_cluster_control = LegacyMachineStatePreClusterControl {
             decisions: LegacyStateMachinePreClusterControl {
@@ -1056,19 +1131,67 @@ mod snapshot_compatibility_tests {
             Some(crate::ClusterId([9; 16]))
         );
         assert!(migrated.decisions.cluster_control().nodes().is_empty());
+        assert_eq!(
+            migrated
+                .decisions
+                .cluster_control()
+                .active_placement_log_id(),
+            None
+        );
 
-        let current = MachineState::new(config).unwrap();
+        let v2_last_applied = LogId::new(openraft::CommittedLeaderId::new(3, 1), 73);
+        let v2 = LegacyMachineStateV2 {
+            decisions: LegacyStateMachineV2 {
+                max_commit_entries: config.max_commit_entries,
+                max_commit_bytes: config.max_commit_bytes,
+                cluster_id: Some(crate::ClusterId([7; 16])),
+                system_bootstrap: crate::SystemBootstrapState::Missing,
+                cluster_control: LegacyClusterControlStateV2 {
+                    nodes: BTreeMap::new(),
+                    used_node_ids: crate::UsedNodeIds::default(),
+                    transition: None,
+                    jwt_signing_key_fingerprint: None,
+                    erasure_code_profile: None,
+                },
+                executor: None,
+                committed_invocations: BTreeMap::new(),
+                committed_invocation_bytes: codec::encoded_len(
+                    &BTreeMap::<u64, CommittedInvocation>::new(),
+                )
+                .unwrap(),
+                last_commit_cursor: None,
+                finalized_through: None,
+            },
+            last_applied_log_id: Some(v2_last_applied),
+            membership: StoredMembership::default(),
+            snapshot_generation: 9,
+        };
+        let v2_record =
+            codec::encode_record_at_version(&v2, codec::SNAPSHOT_RECORD_FORMAT_V2).unwrap();
+        let migrated = decode_machine_snapshot(&v2_record).unwrap();
+        assert_eq!(migrated.last_applied_log_id, Some(v2_last_applied));
+        assert_eq!(
+            migrated
+                .decisions
+                .cluster_control()
+                .active_placement_log_id(),
+            None,
+            "v2 migration must not invent placement lineage from last_applied"
+        );
+
+        let mut current = MachineState::new(config).unwrap();
+        current.decisions.cluster_control.active_placement_log_id = Some(41);
         let current_record =
-            codec::encode_record_at_version(&current, codec::SNAPSHOT_RECORD_FORMAT_V2).unwrap();
+            codec::encode_record_at_version(&current, codec::SNAPSHOT_RECORD_FORMAT_V3).unwrap();
         assert_eq!(decode_machine_snapshot(&current_record).unwrap(), current);
 
         let unsupported =
-            codec::encode_record_at_version(&current, codec::SNAPSHOT_RECORD_FORMAT_V2 + 1)
+            codec::encode_record_at_version(&current, codec::SNAPSHOT_RECORD_FORMAT_V3 + 1)
                 .unwrap();
         assert_eq!(
             decode_machine_snapshot(&unsupported),
             Err(codec::CodecError::UnsupportedRecordVersion(
-                codec::SNAPSHOT_RECORD_FORMAT_V2 + 1
+                codec::SNAPSHOT_RECORD_FORMAT_V3 + 1
             ))
         );
 

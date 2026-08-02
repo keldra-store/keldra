@@ -7,6 +7,7 @@ pub(crate) const MAX_ENCODED_BYTES: usize = 64 * 1024 * 1024;
 const RECORD_MAGIC: &[u8; 8] = b"ANVLREC\0";
 const RECORD_FORMAT_V1: u8 = 1;
 pub(crate) const SNAPSHOT_RECORD_FORMAT_V2: u8 = 2;
+pub(crate) const SNAPSHOT_RECORD_FORMAT_V3: u8 = 3;
 const RECORD_LENGTH_BYTES: usize = std::mem::size_of::<u32>();
 const RECORD_HEADER_BYTES: usize = RECORD_MAGIC.len() + 1 + RECORD_LENGTH_BYTES;
 const MAX_RECORD_BYTES: usize = RECORD_HEADER_BYTES + MAX_ENCODED_BYTES;

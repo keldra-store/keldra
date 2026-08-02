@@ -534,14 +534,26 @@ async fn snapshot_retains_cluster_control_and_immutable_genesis_values() {
         })
         .await
         .unwrap();
-    for _ in 0..2 {
-        raft.submit(Command::CompleteMembershipTransition {
+    let activated = raft
+        .submit(Command::CompleteMembershipTransition {
             format_version: CLUSTER_CONTROL_COMMAND_VERSION,
             started_log_index: add.log_index,
         })
         .await
         .unwrap();
-    }
+    raft.submit(Command::CompleteMembershipTransition {
+        format_version: CLUSTER_CONTROL_COMMAND_VERSION,
+        started_log_index: add.log_index,
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        raft.state()
+            .unwrap()
+            .cluster_control()
+            .active_placement_log_id(),
+        Some(activated.log_index)
+    );
     raft.snapshot(Duration::from_secs(5)).await.unwrap();
     raft.shutdown().await.unwrap();
     drop(raft);
@@ -565,6 +577,10 @@ async fn snapshot_retains_cluster_control_and_immutable_genesis_values() {
     );
     assert!(state.cluster_control().used_node_ids().contains(NodeId(1)));
     assert!(state.cluster_control().transition().is_none());
+    assert_eq!(
+        state.cluster_control().active_placement_log_id(),
+        Some(activated.log_index)
+    );
     raft.shutdown().await.unwrap();
 }
 

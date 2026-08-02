@@ -146,6 +146,7 @@ impl StateMachine {
         &mut self,
         format_version: u16,
         started_log_index: u64,
+        committed_log_index: u64,
     ) -> Result<ApplyResult, ApplyError> {
         self.require_cluster_control(format_version)?;
         let transition = self
@@ -159,7 +160,7 @@ impl StateMachine {
                 requested: started_log_index,
             });
         }
-        let finished = match transition.kind {
+        let (finished, active_placement_changed) = match transition.kind {
             MembershipTransitionKind::Add => {
                 let descriptor = self
                     .cluster_control
@@ -174,9 +175,9 @@ impl StateMachine {
                     NodeState::Joining => {
                         descriptor.state = NodeState::Active;
                         descriptor.join_capability_hash = None;
-                        false
+                        (false, true)
                     }
-                    NodeState::Active => true,
+                    NodeState::Active => (true, false),
                 }
             }
             MembershipTransitionKind::Remove => {
@@ -191,7 +192,7 @@ impl StateMachine {
                     return Err(ApplyError::MembershipTransitionStateMismatch);
                 }
                 self.cluster_control.nodes.remove(&transition.node_id);
-                true
+                (true, true)
             }
             MembershipTransitionKind::Reweight => {
                 let target_weight = transition
@@ -206,9 +207,12 @@ impl StateMachine {
                     return Err(ApplyError::MembershipTransitionStateMismatch);
                 }
                 descriptor.storage_weight_millionths = target_weight;
-                true
+                (true, true)
             }
         };
+        if active_placement_changed {
+            self.cluster_control.active_placement_log_id = Some(committed_log_index);
+        }
         if finished {
             self.cluster_control.transition = None;
             Ok(ApplyResult::MembershipTransitionFinished { started_log_index })

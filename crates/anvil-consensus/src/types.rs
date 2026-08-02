@@ -142,6 +142,7 @@ pub struct ClusterControlState {
     pub(crate) transition: Option<MembershipTransition>,
     pub(crate) jwt_signing_key_fingerprint: Option<JwtSigningKeyFingerprint>,
     pub(crate) erasure_code_profile: Option<ErasureCodeProfile>,
+    pub(crate) active_placement_log_id: Option<u64>,
 }
 
 impl ClusterControlState {
@@ -163,6 +164,14 @@ impl ClusterControlState {
 
     pub fn erasure_code_profile(&self) -> Option<ErasureCodeProfile> {
         self.erasure_code_profile
+    }
+
+    /// Committed Raft log index of the latest change to active placement.
+    ///
+    /// `None` is fail-closed legacy state: no placement generation may be
+    /// inferred from a snapshot's unrelated last-applied log index.
+    pub fn active_placement_log_id(&self) -> Option<u64> {
+        self.active_placement_log_id
     }
 
     pub fn active_node_count(&self) -> usize {
