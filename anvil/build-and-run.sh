@@ -4,9 +4,8 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"
 
-: "${ANVIL_API_TOKEN:?ANVIL_API_TOKEN must be set}"
+: "${ANVIL_TOKEN_SIGNING_KEY_FILE:?ANVIL_TOKEN_SIGNING_KEY_FILE must name a mode-0600 file}"
 export ANVIL_IMAGE="${ANVIL_IMAGE:-anvil:local}"
-export ANVIL_BUILD_PROFILE="${ANVIL_BUILD_PROFILE:-release}"
 
 ./scripts/build-image.sh
 docker compose -f anvil/docker-compose.yml up --detach

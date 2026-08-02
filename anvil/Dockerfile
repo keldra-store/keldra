@@ -1,12 +1,15 @@
 # syntax=docker/dockerfile:1.7
 
-# Stage 1: Build the binaries with the release toolchain used by CI.
-FROM rust:1.96-trixie AS builder
+# Build inside the requested image platform. An amd64 image is compiled in the
+# amd64 trixie builder and an arm64 image is compiled in the arm64 builder.
+FROM --platform=$TARGETPLATFORM rust:1.96-trixie AS builder
+ARG TARGETARCH
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     clang \
+    cmake \
     libclang-dev \
     pkg-config \
     libssl-dev \
@@ -22,7 +25,7 @@ COPY . .
 # layer so repeat local/CI Docker builds reuse compiled dependencies.
 RUN --mount=type=cache,id=anvil-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=anvil-cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=anvil-cargo-target-release,target=/usr/src/anvil/target,sharing=locked \
+    --mount=type=cache,id=anvil-cargo-target-${TARGETARCH}-release,target=/usr/src/anvil/target,sharing=locked \
     cargo build --release --locked \
         -p anvil-server --bin anvil-server \
         -p anvil-storage-cli --bin anvil \
@@ -32,9 +35,9 @@ RUN --mount=type=cache,id=anvil-cargo-registry,target=/usr/local/cargo/registry,
         target/release/anvil \
         /usr/local/anvil-build/
 
-# Stage 2: Create the final runtime image. Rust tooling is deliberately not
-# present in the shipped server image.
-FROM debian:trixie-slim
+# Rust tooling is deliberately absent from the matching target-platform
+# runtime image.
+FROM --platform=$TARGETPLATFORM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -51,12 +54,21 @@ COPY --from=builder /usr/local/anvil-build/anvil /usr/local/bin/anvil
 ENV ANVIL_LISTEN=0.0.0.0:50051 \
     ANVIL_DATA_DIR=/var/lib/anvil \
     ANVIL_NODE_ID=1 \
+    ANVIL_TOKEN_SIGNING_KEY_FILE=/run/secrets/anvil-token-signing-key \
     ANVIL_MAX_ATOMIC_COMMIT_ENTRIES=4096 \
-    ANVIL_MAX_ATOMIC_COMMIT_BYTES=16777216
+    ANVIL_MAX_ATOMIC_COMMIT_BYTES=16777216 \
+    ANVIL_AWAITING_PUBLISH_TTL_SECONDS=86400 \
+    ANVIL_MUTATION_RECEIPT_RETENTION_SECONDS=86400 \
+    ANVIL_MAX_MUTATION_RECEIPT_ENTRIES=2000000 \
+    ANVIL_MAX_MUTATION_RECEIPT_BYTES=536870912 \
+    ANVIL_WATCH_MAX_ENTRIES=1000000 \
+    ANVIL_WATCH_MAX_BYTES=536870912
 USER anvil
 WORKDIR /var/lib/anvil
 
-# The bearer token must be supplied as ANVIL_API_TOKEN when the container starts.
+# Mount a distinct mode-0600 signing key at the configured path. On the first
+# start only, set ANVIL_RUN_SYSTEM_BOOTSTRAP=true and then copy and delete the
+# generated /var/lib/anvil/system-bootstrap-credential.json file.
 EXPOSE 50051
 
 CMD ["anvil-server"]

@@ -2,43 +2,15 @@
 set -euo pipefail
 
 image="${ANVIL_IMAGE:-anvil:test}"
-build_profile="${ANVIL_BUILD_PROFILE:-ci}"
-stage_dir="tmp/docker-bin"
-
-# A failed host build must not leave an older binary available for an
-# accidental direct Dockerfile.prebuilt invocation.
-rm -rf "${stage_dir}"
-mkdir -p "${stage_dir}"
-
-case "${build_profile}" in
-  release)
-    cargo_profile_args=(--release)
-    bin_profile_dir="release"
-    ;;
-  ci)
-    cargo_profile_args=(--profile ci)
-    bin_profile_dir="ci"
-    ;;
-  dev|debug)
-    cargo_profile_args=()
-    bin_profile_dir="debug"
-    ;;
-  *)
-    echo "unsupported ANVIL_BUILD_PROFILE=${build_profile}; expected release, ci, or dev" >&2
-    exit 2
-    ;;
-esac
 
 case "${ANVIL_DOCKER_PLATFORM:-}" in
   "")
     case "$(uname -m)" in
       arm64|aarch64)
         platform="linux/arm64"
-        target="aarch64-unknown-linux-gnu"
         ;;
       x86_64|amd64)
         platform="linux/amd64"
-        target="x86_64-unknown-linux-gnu"
         ;;
       *)
         echo "unsupported host architecture: $(uname -m)" >&2
@@ -48,11 +20,9 @@ case "${ANVIL_DOCKER_PLATFORM:-}" in
     ;;
   linux/arm64)
     platform="linux/arm64"
-    target="aarch64-unknown-linux-gnu"
     ;;
   linux/amd64)
     platform="linux/amd64"
-    target="x86_64-unknown-linux-gnu"
     ;;
   *)
     echo "unsupported ANVIL_DOCKER_PLATFORM=${ANVIL_DOCKER_PLATFORM}" >&2
@@ -60,79 +30,14 @@ case "${ANVIL_DOCKER_PLATFORM:-}" in
     ;;
 esac
 
-target="${ANVIL_ZIG_TARGET:-$target}"
-use_zig=1
-if [[ "${ANVIL_USE_NATIVE_CARGO:-0}" == "1" ]]; then
-  host_triple="$(rustc -vV | awk '/^host: / { print $2 }')"
-  if [[ "$(uname -s)" != "Linux" || "$target" != "$host_triple" ]]; then
-    echo "ANVIL_USE_NATIVE_CARGO=1 is only valid on Linux when the requested target matches the host" >&2
-    exit 2
-  fi
-  use_zig=0
-fi
-
-if command -v rustup >/dev/null 2>&1; then
-  if ! rustup target list --installed | grep -Fxq "${target}"; then
-    echo "[anvil] installing Rust std target ${target}"
-    rustup target add "${target}"
-  fi
-fi
-
-build_args=(
-  -p anvil-server --bin anvil-server
-  -p anvil-storage-cli --bin anvil
-)
-
-if [[ "$use_zig" == "1" ]]; then
-  if ! command -v cargo-zigbuild >/dev/null 2>&1; then
-    echo "cargo-zigbuild is required when building a Linux image from this host/target combination" >&2
-    echo "install with: cargo install cargo-zigbuild" >&2
-    exit 2
-  fi
-
-  if ! command -v zig >/dev/null 2>&1; then
-    echo "zig is required when building a Linux image from this host/target combination" >&2
-    exit 2
-  fi
-
-  echo "[anvil] building Linux binaries with cargo-zigbuild target=${target} profile=${build_profile}"
-  cargo zigbuild "${cargo_profile_args[@]}" --locked --target "${target}" "${build_args[@]}"
-else
-  echo "[anvil] building Linux binaries with cargo target=${target} profile=${build_profile}"
-  cargo build "${cargo_profile_args[@]}" --locked --target "${target}" "${build_args[@]}"
-fi
-
-target_dir="$(
-  cargo metadata --format-version 1 --no-deps \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])'
-)"
-bin_dir="${target_dir}/${target}/${bin_profile_dir}"
-stage_binary() {
-  local source="$1"
-  local destination="$2"
-  if [[ "$(uname -s)" == "Darwin" ]]; then
-    cp -c "${source}" "${destination}"
-  elif cp --help 2>&1 | grep -q -- '--reflink'; then
-    cp --reflink=auto "${source}" "${destination}"
-  else
-    cp "${source}" "${destination}"
-  fi
-  if [[ "${build_profile}" == "dev" ]] && command -v zig >/dev/null 2>&1; then
-    zig objcopy --strip-debug "${destination}" "${destination}.stripped"
-    mv "${destination}.stripped" "${destination}"
-  fi
-}
-stage_binary "${bin_dir}/anvil-server" "${stage_dir}/anvil-server"
-stage_binary "${bin_dir}/anvil" "${stage_dir}/anvil"
-
-echo "[anvil] packaging runtime image ${image} platform=${platform}"
+echo "[anvil] building ${image} in the ${platform} trixie builder"
 iid_file="$(mktemp -t anvil-image.XXXXXX)"
 trap 'rm -f "${iid_file}"' EXIT
-docker build \
+docker buildx build \
   --platform "${platform}" \
-  --build-arg "ANVIL_RUNTIME_BASE=${ANVIL_RUNTIME_BASE:-debian:trixie-slim}" \
+  --load \
   --iidfile "${iid_file}" \
-  -f anvil/Dockerfile.prebuilt \
+  --file anvil/Dockerfile \
   -t "${image}" \
   .
 
