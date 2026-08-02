@@ -1,7 +1,7 @@
 # ANVIL-0010: Single-Cluster Distribution in Anvil 0.5.1
 
-Status: Accepted architecture, with the explicitly unresolved decisions in
-section 24 blocking the affected implementation.
+Status: Accepted architecture. Section 24 records the final implementation
+decisions approved before release work continued.
 
 Audience: Anvil implementors, operators, client authors, and reviewers
 
@@ -133,6 +133,17 @@ persisted with the cluster identity and data directory. A restart must present
 exactly the identity already recorded in that directory. A data directory
 belonging to another cluster or node is rejected.
 
+Each data directory stores this identity and its peer credentials in one
+bounded, versioned `node-identity.json` file. The file is mode `0600` and
+contains the stable cluster and node IDs, the peer identity currently presented
+on new connections, and at most one overlap identity. Each peer identity holds
+one self-signed certificate and its private-key PEM. Initial creation never
+replaces an existing file. Rotation writes a bounded same-directory temporary
+file, synchronizes it, atomically renames it over the current file, and
+synchronizes the parent directory. Startup rejects symlinks, non-regular files,
+wrong permissions, oversized or malformed input, and any stable-ID mismatch.
+Private-key material is never logged.
+
 The committed descriptor of an admitted node contains only bounded data:
 
 ```text
@@ -188,6 +199,7 @@ There is one OpenRaft group for the cluster. Its application state contains:
 - cluster identity and correctness-critical cluster configuration;
 - admitted node descriptors and their `JOINING` or `ACTIVE` state;
 - voter and learner membership;
+- the Raft log ID of the active weighted-placement membership;
 - at most one in-progress membership operation;
 - system-bootstrap state;
 - the current atomic-executor nomination and nomination log index;
@@ -371,7 +383,7 @@ confirmed its own leadership with a voter quorum. A lease names:
 ServingLease {
   cluster_id
   raft_term
-  active_membership_log_id
+  active_placement_log_id
   maximum_local_lifetime
 }
 ```
@@ -380,9 +392,18 @@ Lease renewal is transient peer traffic. It does not append a periodic Raft
 entry. A recipient measures its lifetime with its local monotonic clock and
 never extends it without a fresh leader grant.
 
+A successful linearizable quorum confirmation may be reused for at most 500
+milliseconds. A grant issued after that confirmation expires is rejected until
+the leader confirms again; Anvil does not perform a quorum round trip for every
+recipient or ordinary request.
+
 A node may coordinate current heads, accept mutable operations, grant positive
 Zanzibar results, or run as atomic executor only while it has a valid lease for
-the exact active-membership log ID it has applied. Expiry fails those operations
+the exact active-placement log ID it has applied. The bounded
+`active_placement_log_id` is the Raft log ID of the command that activates an
+add, remove, or reweight. It is not a managed counter. Unlike OpenRaft's voter
+membership log ID, it therefore changes when a weight change alters HRW
+ownership. Expiry fails those operations
 closed. Exact immutable content reads by verified content identity may continue
 when doing so does not disclose a path or require a positive authorization
 decision.
@@ -468,6 +489,10 @@ the generated copy. The private key is not retained in Raft or in an
 authoritative cluster-side record; only its SPKI fingerprint is committed.
 A `JOINING` identity can invoke only join, Raft catch-up, and state-transfer
 operations until activation.
+
+The joining node consumes that bundle into its mode-`0600`
+`node-identity.json`. The copied bundle is input, not a second durable identity
+or certificate store.
 
 ### 11.1 Online certificate rotation
 
@@ -627,7 +652,7 @@ Each candidate carries one versioned internal stamp:
 MutationStamp {
   predecessor_version?
   mutation_fingerprint
-  active_membership_log_id
+  active_placement_log_id
   serving_fence_term
   source_id
   source_journal_position
@@ -646,6 +671,12 @@ version alone.
 
 Remote replication uses typed, versioned mutations. Peers never expose raw
 column-family reads or writes.
+
+An authoritative 0.5.0 head without a `MutationStamp` is a committed baseline,
+not an uncommitted candidate. Upgrade does not rewrite it. The first 0.5.1
+mutation names that head's version as its predecessor and stores the first
+stamp. Joining replicas receive the baseline during state transfer before they
+can become ACTIVE.
 
 ### 13.1 Column-family treatment
 
@@ -790,8 +821,8 @@ length remain the end-to-end verification.
 The default `2+1` profile uses 1.5 times the payload capacity and tolerates one
 missing shard. All three shards are required for a non-degraded write, so one
 unavailable owner pauses new `REPLICATED` writes under that profile. The exact
-meaning of fixed `2+1` acknowledgement evidence when the final profile is not
-`2+1` remains unresolved in section 24.
+general rule is `K+1` durable final shards before a `REPLICATED` success, as
+fixed in section 24.1; background placement still converges to `K+M`.
 
 `LOCAL` and `REPLICATED` are response-evidence choices, not persistent object
 durability classes. Content identity and final placement are identical under
@@ -853,7 +884,8 @@ delay can retain excess bytes but cannot delete live content.
 
 The source journal compacts only through a prefix every required current
 destination has durably advanced beyond. If its configured bound is reached,
-affected reference-changing mutations stop rather than dropping events. A
+every mutation that must append a source record stops rather than dropping an
+event, creating an offset gap, or allowing the journal to grow without bound. A
 temporary source outage pauses GC until its tail is again proven current. An
 unrecoverable source-journal loss keeps GC disabled while authoritative version
 descriptors rebuild counts. This keeps replay state proportional to cluster
@@ -931,9 +963,10 @@ node serializes schema binding, tuple batches, revision changes, and checks;
 the next ranked nodes hold complete logical replicas of that same realm. A
 check therefore evaluates one coherent local revision and never scatters a
 Zanzibar graph across nodes. The protected system realm is one such aggregate.
-This aggregate boundary and the handling of bounded administration operations
-that must change it together with another aggregate remain subject to the
-approval in section 24.
+This aggregate boundary is normative. Bounded administration operations that
+must change it together with another placement aggregate execute through the
+existing Raft-nominated atomic executor. They do not introduce a second
+transaction coordinator or a raw cross-node RocksDB transaction.
 
 The realm coordinator, not only the public ingress, evaluates the current
 authoritative revision. A stale positive authorization cache can never grant.
@@ -958,8 +991,16 @@ the secret key is provisioned to nodes out of band.
 Within one 0.5.1 cluster, a tenant name is a replicated create-if-absent claim
 owned by weighted HRW over its canonical name. The claim is cluster-wide, not
 node-local. Tenant deletion retains a reserved tombstone; releasing or
-transferring a name requires a deliberate privileged operation and never
-happens as an incidental object deletion.
+transferring a name to another tenant is forbidden and never happens as an
+incidental object deletion. A rename adds the new claim while retaining the old
+claim or tombstone bound to its original stable tenant ID.
+
+External tenant names are canonical lowercase ASCII DNS labels: one through 63
+characters, containing only `a` through `z`, `0` through `9`, and interior
+hyphens, with an alphanumeric first and last character. Input is rejected
+rather than lowercased or Unicode-normalized. Unicode, punycode aliases, and
+confusable display spellings are not tenant identifiers. `_anvil` is the one
+reserved system-tenant exception and cannot be registered by a client.
 
 Tenant name is the one identity intended eventually to be unique across a
 multi-region mesh. That prevents another region from registering a visually or
@@ -969,9 +1010,9 @@ the tenant and need no mesh-global registry.
 
 An isolated cluster cannot prove mesh-wide uniqueness before a mesh exists.
 The later mesh capability must introduce one mesh-wide tenant-name authority
-and route regional tenant creation through it. The exact canonicalization rule
-that must be frozen before 0.5.1 accepts distributed tenant creation is
-unresolved in section 24.
+and route regional tenant creation through it. Human-facing display names, if
+added later, are separate non-authoritative metadata and never participate in
+identity or authorization.
 
 ## 18. Distributed `ListObjects`
 
@@ -1242,10 +1283,10 @@ replica acknowledgements, fragment under-redundancy and repair, authorization
 revision/latency, journal floors and lag, watch expiry, executor nomination,
 and atomic finalization lag.
 
-## 24. Explicit unresolved decisions
+## 24. Resolved implementation decisions
 
-Implementation must stop for approval at these boundaries rather than invent a
-patch or parallel mechanism.
+The following choices are normative. They close the boundaries at which
+implementation previously had to stop.
 
 ### 24.1 Payload acknowledgement thresholds
 
@@ -1261,23 +1302,18 @@ Small payloads converge to `M + 1` complete copies and `REPLICATED` waits for
 all of them as defined in section 14.1. The pure-Rust codec and inline integrity
 format are also resolved.
 
-One clarification still blocks `REPLICATED` for a non-default final profile.
-Exactly three fragments of a final `K=4, M=2` encoding cannot reconstruct the
-object. Therefore "`REPLICATED` always means `2+1` regardless of eventual
-cluster EC configuration" must be resolved as either fixing the final fragment
-profile itself at `2+1`, or creating a distinct temporary recoverable
-representation before convergence. The implementation must not silently treat
-three arbitrary fragments of a profile with `K > 3` as a successful write.
-Crash-safe continuation after a response and reference deltas follow section
-14.3.
+For a large payload, `REPLICATED` waits for `K + 1` distinct final shards. This
+is the general form of the default profile's `2+1`: enough final shards to
+reconstruct after one selected owner is lost. It creates no temporary encoding
+or second payload representation. Placement still converges to all `K + M`
+final shards. Crash-safe continuation after a response and reference deltas
+follow section 14.3.
 
 ### 24.2 Tenant-name canonicalization
 
-Cluster-wide reservation and future mesh-wide uniqueness are accepted. The
-canonical input is not. Before distributed tenant creation ships, approval is
-required for the exact case, character, Unicode/ASCII, normalization, display,
-confusable, and release/transfer rules. Bytewise uniqueness over inconsistent
-client spellings is not sufficient for the stated anti-phishing goal.
+Tenant identifiers use the lowercase ASCII DNS-label rule in section 17.
+Noncanonical input is rejected, `_anvil` is reserved, and a claim is never
+reassigned to another stable tenant.
 
 ### 24.3 Zanzibar aggregate and cross-aggregate administration
 
@@ -1288,11 +1324,26 @@ cluster-wide authorization coordinator.
 
 Provisioning can atomically change a name claim, tenant or bucket record,
 credential, and protected-realm tuples in the current one-node store. Those
-records have different distributed placement keys. Approval is required for
-whether bounded administration operations use the existing singleton atomic
-executor internally, or use another explicitly specified recovery protocol.
-They must not become an accidental raw cross-node RocksDB transaction or a
-partially visible sequence.
+records have different distributed placement keys. Bounded cross-aggregate
+administration uses the existing singleton atomic executor internally. It must
+not become an accidental raw cross-node RocksDB transaction or a partially
+visible sequence.
+
+### 24.4 Serving and upgrade fences
+
+Raft state stores one `active_placement_log_id`, assigned from the activating
+Raft log entry rather than a new counter. A leader may reuse a successful
+linearizable quorum proof for no more than 500 milliseconds when issuing
+two-second serving leases. Existing unstamped 0.5.0 heads are committed
+baselines and acquire a predecessor-linked stamp on their first mutation.
+
+### 24.5 Bounded journal behavior
+
+Reference effects use the single ordered source journal and destination cursor
+protocol in section 14.3. When cursor-safe compaction cannot free enough space,
+all mutations that require a source-journal append apply backpressure. Anvil
+does not drop only the reference effect, omit an index/watch event, create a
+gap, or add an unbounded secondary log.
 
 ## 25. Upgrade behavior
 
