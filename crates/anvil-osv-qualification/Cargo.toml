@@ -3,9 +3,8 @@ name = "anvil-osv-qualification"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-repository.workspace = true
 rust-version.workspace = true
-description = "Executable Developer Defence OSV import qualification for Anvil 0.5"
+description = "Executable OSV import qualification for Anvil 0.5"
 publish = false
 
 [dependencies]

@@ -3,7 +3,6 @@ use std::time::Duration;
 use serde::Serialize;
 
 pub const QUALIFICATION_SCHEMA: &str = "anvil.perf.osv_import.v3";
-pub const DD_SCHEMA_SOURCE_COMMIT: &str = "ac838a79e5b9fd4aed08d1ac7786e5374b01b733";
 pub const TARGET_SECONDS: f64 = 150.0;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
@@ -118,15 +117,15 @@ pub struct SchemaShapeReport {
 impl Default for SchemaShapeReport {
     fn default() -> Self {
         Self {
-            source_definition_schema: "developer-defence.source-definition.v2",
-            source_record_schema: "developer-defence.osv-source-record.v1",
-            snapshot_manifest_schema: "developer-defence.osv-snapshot-manifest.v1",
+            source_definition_schema: "anvil.osv.source-definition.v1",
+            source_record_schema: "anvil.osv.source-record.v1",
+            snapshot_manifest_schema: "anvil.osv.snapshot-manifest.v1",
             source: "osv",
-            bucket: "dd-source-osv-raw",
+            bucket: "anvil-osv-qualification",
             source_definition_path: "entities/source-definition/{sha256(source-definition\\0osv)}/current.json",
             shard_path: "shards/v1/{records_sha256[0..2]}/{records_sha256}.ndjson.zst",
             manifest_path: "snapshots/{snapshot_id}/manifest.json",
-            shard_format: "developer-defence.osv-source-record.ndjson.v1",
+            shard_format: "anvil.osv.source-record.ndjson.v1",
             shard_compression: "zstd-6",
             manifest_is_authoritative: true,
             per_object_user_metadata: false,
@@ -142,7 +141,6 @@ impl Default for SchemaShapeReport {
 #[derive(Debug, Serialize)]
 pub struct SoftwareReport<'a> {
     pub anvil_commit: &'a str,
-    pub developer_defence_schema_source_commit: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -317,7 +315,7 @@ mod tests {
         assert_eq!(encoded["per_object_user_metadata"], false);
         assert_eq!(
             encoded["snapshot_manifest_schema"],
-            "developer-defence.osv-snapshot-manifest.v1"
+            "anvil.osv.snapshot-manifest.v1"
         );
     }
 }

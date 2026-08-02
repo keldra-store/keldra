@@ -12,15 +12,15 @@
     "snapshot_id": null
   },
   "schema_shape": {
-    "source_definition_schema": "developer-defence.source-definition.v2",
-    "source_record_schema": "developer-defence.osv-source-record.v1",
-    "snapshot_manifest_schema": "developer-defence.osv-snapshot-manifest.v1",
+    "source_definition_schema": "anvil.osv.source-definition.v1",
+    "source_record_schema": "anvil.osv.source-record.v1",
+    "snapshot_manifest_schema": "anvil.osv.snapshot-manifest.v1",
     "source": "osv",
-    "bucket": "dd-source-osv-raw",
+    "bucket": "anvil-osv-qualification",
     "source_definition_path": "entities/source-definition/{sha256(source-definition\\0osv)}/current.json",
     "shard_path": "shards/v1/{records_sha256[0..2]}/{records_sha256}.ndjson.zst",
     "manifest_path": "snapshots/{snapshot_id}/manifest.json",
-    "shard_format": "developer-defence.osv-source-record.ndjson.v1",
+    "shard_format": "anvil.osv.source-record.ndjson.v1",
     "shard_compression": "zstd-6",
     "manifest_is_authoritative": true,
     "per_object_user_metadata": false,
@@ -31,13 +31,12 @@
     ]
   },
   "software": {
-    "anvil_commit": null,
-    "developer_defence_schema_source_commit": "ac838a79e5b9fd4aed08d1ac7786e5374b01b733"
+    "anvil_commit": null
   },
   "workload": {
     "endpoint": null,
     "tenant": null,
-    "bucket": "dd-source-osv-raw",
+    "bucket": "anvil-osv-qualification",
     "source_url": "https://osv-vulnerabilities.storage.googleapis.com/all.zip",
     "source_cadence_hours": 6,
     "durability_class": "local",
