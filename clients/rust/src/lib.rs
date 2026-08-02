@@ -1,8 +1,7 @@
-//! Thin Rust transport for Anvil 0.5.
+//! Authenticated Rust client for Anvil 0.5 object storage.
 //!
-//! Domain-specific retry loops deliberately do not live here. Callers send
-//! one-path CAS operations, independent bulk operations, or invoke a
-//! pinned atomic program.
+//! The crate provides ready-to-use object, authorization, and administration
+//! clients, upload helpers, and the complete generated protocol surface.
 
 use anvil_api::v1::administration_service_client::AdministrationServiceClient;
 use anvil_api::v1::authz_service_client::AuthzServiceClient;

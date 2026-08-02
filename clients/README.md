@@ -1,16 +1,15 @@
-# Anvil Rust client
+# Anvil clients
 
-Anvil 0.5 ships one client package: the Rust crate in `clients/rust`, published
-as `anvil-storage` when its API dependencies are publishable.
+The official Rust client is published as
+[`anvil-storage`](https://crates.io/crates/anvil-storage). It provides
+authenticated access to Anvil's object, authorization, administration, bulk,
+watch, and atomic-program APIs.
 
-The client is a thin authenticated transport for the 0.5 object API. It exposes
-exact-path reads, immutable and conditional writes, deletes, bulk operations,
-and the pinned atomic-program invocation surface. It does not recreate the retired
-transaction, admin, indexing, gateway, PersonalDB, Python, or TypeScript APIs.
+See the [Rust client quickstart](rust/README.md) for a copy-and-paste example.
 
 ```sh
 cargo test -p anvil-storage
 ```
 
-Protocol types come from the workspace `anvil-api` crate. There are no copied
-client proto files and no proto-synchronisation script.
+Protocol types are generated from the canonical Anvil protobuf API and exposed
+through `anvil_storage::v1`.

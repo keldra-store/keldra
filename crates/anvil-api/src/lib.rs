@@ -1,4 +1,4 @@
-//! Generated types for the intentionally breaking Anvil 0.5 API.
+//! Generated Rust types for the Anvil 0.5 gRPC API.
 
 pub mod v1 {
     tonic::include_proto!("anvil.v1");
@@ -257,7 +257,7 @@ mod tests {
             kind: Some(subject::Kind::Userset(members)),
         };
         let publication = PutSchemaRequest {
-            schema_id: "worka".into(),
+            schema_id: "acme".into(),
             namespaces: vec![schema],
         };
         let consistency = AuthzConsistency {

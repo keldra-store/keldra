@@ -3,10 +3,14 @@ name = "anvil-api"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-repository.workspace = true
 rust-version.workspace = true
-description = "The deliberately small Anvil 0.5 gRPC API"
-publish = false
+description = "Rust gRPC API types for Anvil object storage"
+homepage.workspace = true
+documentation = "https://docs.rs/anvil-api"
+readme = "README.md"
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 prost = "0.14"

@@ -2,19 +2,18 @@
 name = "anvil-storage"
 version.workspace = true
 edition.workspace = true
-description = "Rust client for the intentionally small Anvil 0.5 API"
+description = "Authenticated Rust client for Anvil object storage"
 rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
-repository.workspace = true
-documentation.workspace = true
+documentation = "https://docs.rs/anvil-storage"
 readme = "README.md"
 authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-anvil-api = { path = "../../crates/anvil-api" }
+anvil-api = { version = "0.5.0", path = "../../crates/anvil-api" }
 tokio-stream = "0.1"
 tonic = { version = "0.14", default-features = false, features = ["transport", "tls-native-roots"] }
 
