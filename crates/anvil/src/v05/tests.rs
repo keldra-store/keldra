@@ -465,7 +465,10 @@ fn bulk_metrics_partition_success_failure_and_replay_outcomes() {
 #[test]
 fn watch_lag_is_an_observation_against_the_current_journal_tail() {
     let status = WatchJournalStatus {
-        source_epoch: [0; 32],
+        source_id: anvil_store::SourceId {
+            node_id: 1,
+            source_epoch: [0; 32],
+        },
         tail: 19,
         retention_floor: 4,
         retained_entries: 15,

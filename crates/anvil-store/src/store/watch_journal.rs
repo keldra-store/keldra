@@ -90,7 +90,10 @@ impl Store {
             ));
         }
         Ok(WatchJournalStatus {
-            source_epoch: self.watch_source_epoch,
+            source_id: SourceId {
+                node_id: self.node_id,
+                source_epoch: self.watch_source_epoch,
+            },
             tail,
             retention_floor,
             retained_entries,
@@ -277,20 +280,45 @@ impl Store {
         after_offset: u64,
         limit: usize,
     ) -> Result<Vec<LocalChange>, MutationError> {
+        let status = self
+            .local_watch_status()
+            .map_err(|error| MutationError::Storage(error.to_string()))?;
+        if after_offset < status.retention_floor {
+            return Err(MutationError::Storage(format!(
+                "local change cursor {after_offset} is below retention floor {}",
+                status.retention_floor
+            )));
+        }
+        if after_offset > status.tail {
+            return Err(MutationError::Storage(format!(
+                "local change cursor {after_offset} is beyond journal tail {}",
+                status.tail
+            )));
+        }
         let limit = limit.min(MAX_LOCAL_INVALIDATION_SCAN_RECORDS);
-        let Some(first_offset) = after_offset.checked_add(1).filter(|_| limit > 0) else {
+        if limit == 0 || after_offset == status.tail {
             return Ok(Vec::new());
-        };
+        }
+        let first_offset = after_offset + 1;
+        let through = after_offset.saturating_add(limit as u64).min(status.tail);
+        let expected_records = usize::try_from(through - after_offset)
+            .expect("local change scan is bounded by a usize limit");
         let first_key = invalidation_key(first_offset);
         let iterator = self.db.iterator_cf(
             self.cf(CF_LOCAL_INVALIDATIONS)?,
             IteratorMode::From(&first_key, Direction::Forward),
         );
-        let mut changes = Vec::with_capacity(limit);
-        for entry in iterator.take(limit) {
+        let mut changes = Vec::with_capacity(expected_records);
+        for entry in iterator.take(expected_records) {
             let (key, encoded) = entry.map_err(storage_error)?;
             let stored_offset = offset_from_key(&key)
                 .ok_or_else(|| MutationError::Storage("local change key is malformed".into()))?;
+            let expected_offset = first_offset + changes.len() as u64;
+            if stored_offset != expected_offset {
+                return Err(MutationError::Storage(format!(
+                    "local change offset {expected_offset} is missing"
+                )));
+            }
             let change = self.decode_local_change_record(&encoded)?;
             if change.offset() != stored_offset {
                 return Err(MutationError::Storage(
@@ -298,6 +326,12 @@ impl Store {
                 ));
             }
             changes.push(change);
+        }
+        if changes.len() != expected_records {
+            let missing = first_offset + changes.len() as u64;
+            return Err(MutationError::Storage(format!(
+                "local change offset {missing} is missing"
+            )));
         }
         Ok(changes)
     }
@@ -348,5 +382,40 @@ mod tests {
             .materialize_local_change(StoredLocalChange::V050(legacy_invalidation()))
             .unwrap_err();
         assert!(error.to_string().contains("has no stable identity mapping"));
+    }
+
+    #[tokio::test]
+    async fn local_change_scan_rejects_a_missing_middle_record() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(temporary.path(), 1))
+            .await
+            .unwrap();
+        for index in 1..=3 {
+            store
+                .put(PutRequest {
+                    key: ObjectKey::new("tenant", "bucket", format!("object-{index}")).unwrap(),
+                    bytes: vec![index],
+                    content_type: None,
+                    mode: PutMode::PutIfAbsent,
+                    command_id: Some(format!("put-{index}")),
+                    durability: Durability::Local,
+                })
+                .await
+                .unwrap();
+        }
+        store
+            .db
+            .delete_cf(
+                store.cf(CF_LOCAL_INVALIDATIONS).unwrap(),
+                invalidation_key(2),
+            )
+            .unwrap();
+
+        let error = store.scan_local_changes(0, 10).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("local change offset 2 is missing")
+        );
     }
 }

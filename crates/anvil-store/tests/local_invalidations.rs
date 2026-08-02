@@ -189,7 +189,8 @@ async fn watch_starts_resume_and_checkpoint_across_unrelated_paths_and_restart()
     .unwrap();
     seed_bucket_identity(&store);
     let scope = WatchScope::new("tenant", "bucket", "matching").unwrap();
-    let initial_epoch = store.local_watch_status().unwrap().source_epoch;
+    let initial_source = store.local_watch_status().unwrap().source_id;
+    assert_eq!(initial_source.node_id, 1);
     let now = store.start_watch(&scope, WatchStart::Now).unwrap();
     assert_eq!(now.offset(), 0);
     let initial_token = store.watch_checkpoint(&scope, now).unwrap();
@@ -233,8 +234,8 @@ async fn watch_starts_resume_and_checkpoint_across_unrelated_paths_and_restart()
     .await
     .unwrap();
     assert_eq!(
-        reopened.local_watch_status().unwrap().source_epoch,
-        initial_epoch
+        reopened.local_watch_status().unwrap().source_id,
+        initial_source
     );
     assert_eq!(
         reopened
@@ -320,6 +321,20 @@ async fn entry_retention_prunes_in_the_head_batch_and_expires_stale_tokens() {
     assert_eq!(status.retention_floor, 1);
     assert_eq!(status.retained_entries, 2);
     assert!(store.read_local_change(1).unwrap().is_none());
+    assert!(
+        store
+            .scan_local_changes(0, 10)
+            .unwrap_err()
+            .to_string()
+            .contains("below retention floor 1")
+    );
+    assert!(
+        store
+            .scan_local_changes(status.tail + 1, 10)
+            .unwrap_err()
+            .to_string()
+            .contains("beyond journal tail 3")
+    );
     assert_eq!(
         store
             .start_watch(&scope, WatchStart::Resume(stale))

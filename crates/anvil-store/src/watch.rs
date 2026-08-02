@@ -139,9 +139,16 @@ pub struct WatchPage {
     pub checkpoint: WatchCursor,
 }
 
+/// Stable identity for one node-local source journal incarnation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SourceId {
+    pub node_id: u16,
+    pub source_epoch: [u8; 32],
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WatchJournalStatus {
-    pub source_epoch: [u8; 32],
+    pub source_id: SourceId,
     /// Highest offset ever allocated, including entries already pruned.
     pub tail: u64,
     /// Lowest valid resume cursor. Entries through this offset were pruned.
