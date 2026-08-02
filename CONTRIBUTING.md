@@ -32,6 +32,9 @@ Run the same static and Rust gates used by CI:
 ./scripts/release-gates.sh all
 ```
 
+Rust source files have an absolute 2,000-line limit. Split larger units into
+semantic modules; the static release gate enforces this policy.
+
 For a focused server, client, and CLI test run:
 
 ```sh

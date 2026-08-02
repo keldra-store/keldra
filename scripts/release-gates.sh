@@ -25,6 +25,7 @@ run_step() {
 }
 
 static_gates() {
+  run_step "Rust source file size" ./scripts/check-rust-file-size.sh
   run_step "Rust formatting" cargo fmt --all -- --check
   run_step "locked workspace metadata" cargo metadata --locked --no-deps --format-version 1
   run_step "no external database gate" ./scripts/check-no-external-db.sh
