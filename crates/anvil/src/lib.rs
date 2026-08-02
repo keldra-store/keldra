@@ -11,6 +11,7 @@ mod mutable_record_replica_group;
 mod node_identity;
 pub mod observability;
 mod payload_placement;
+mod peer_runtime;
 mod placement;
 mod programs;
 mod serving_fence;
@@ -24,7 +25,7 @@ use anvil_api::v1::administration_service_server::AdministrationServiceServer;
 use anvil_api::v1::authz_service_server::AuthzServiceServer;
 use anvil_api::v1::credential_service_server::CredentialServiceServer;
 use anvil_api::v1::object_service_server::ObjectServiceServer;
-use anvil_consensus::{ATOMIC_REPLAY_RETENTION_MILLIS, DecisionRaft, NodeId};
+use anvil_consensus::{ATOMIC_REPLAY_RETENTION_MILLIS, NodeId};
 use anvil_store::{ErasureProfile, MutationReceiptRetention, Store, StoreOptions, WatchRetention};
 use anyhow::{Context, Result};
 use tonic::transport::Server;
@@ -44,6 +45,8 @@ const _: () = assert!(MAX_GRPC_MESSAGE_BYTES >= MIN_AUTHZ_BATCH_MESSAGE_BYTES);
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub listen: SocketAddr,
+    pub peer_listen: SocketAddr,
+    pub peer_advertise: Option<String>,
     pub data_dir: PathBuf,
     pub run_system_bootstrap: bool,
     pub system_bootstrap_credential_output: Option<PathBuf>,
@@ -80,6 +83,8 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         config.max_mutation_receipt_bytes,
     )
     .context("validate mutation receipt retention")?;
+    let peer_address =
+        peer_runtime::peer_address(config.peer_listen, config.peer_advertise.as_deref())?;
     let store = Store::open(
         StoreOptions::new(&config.data_dir, config.node_id)
             .with_watch_retention(watch_retention)
@@ -88,18 +93,22 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     )
     .await
     .with_context(|| format!("open Anvil data at {}", config.data_dir.display()))?;
-    let decisions = DecisionRaft::open(
-        config.data_dir.join("decisions"),
-        u64::from(config.node_id),
-        config.max_atomic_commit_entries,
-        config.max_atomic_commit_bytes,
-    )
-    .await
-    .context("open bounded atomic decision Raft")?;
-    decisions
-        .ensure_one_node()
-        .await
-        .context("bootstrap one-node decision Raft")?;
+    let local_node = NodeId(u64::from(config.node_id));
+    let (decisions, peer_runtime) = peer_runtime::open(peer_runtime::OpenPeerConfig {
+        data_dir: &config.data_dir,
+        node_id: local_node,
+        peer_address,
+        run_system_bootstrap: config.run_system_bootstrap,
+        max_commit_entries: config.max_atomic_commit_entries,
+        max_commit_bytes: config.max_atomic_commit_bytes,
+        leader_timeout: DECISION_LEADER_TIMEOUT,
+    })
+    .await?;
+    // The private listener must be accepting before an existing multi-node
+    // group can elect a leader after a coordinated restart.
+    let mut peer_server = peer_runtime
+        .start(config.peer_listen, decisions.clone())
+        .await?;
     decisions
         .wait_for_leader(DECISION_LEADER_TIMEOUT)
         .await
@@ -113,7 +122,6 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         erasure.stripe_unit_bytes = config.erasure_profile.stripe_unit(),
         "cluster erasure-code profile is ready"
     );
-    let local_node = NodeId(u64::from(config.node_id));
     let programs =
         programs::ProgramCoordinator::start(store.clone(), decisions.clone(), local_node).await?;
     cluster_startup::reconcile_system_bootstrap(
@@ -166,24 +174,59 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
 
     let blob_gc_task = spawn_blob_gc(store);
     tracing::info!(address = %config.listen, "Anvil 0.5 server listening");
-    let server_result = Server::builder()
-        .add_service(object_service)
-        .add_service(authz_service)
-        .add_service(administration_service)
-        // Deliberately not intercepted: this one service exchanges durable
-        // long-lived credentials for the bearer token used everywhere else.
-        .add_service(CredentialServiceServer::new(credential_service))
-        .serve_with_shutdown(config.listen, async {
-            if let Err(error) = tokio::signal::ctrl_c().await {
-                tracing::error!(%error, "failed to install shutdown signal");
-            }
-        })
-        .await;
-    blob_gc_task.abort();
-    if let Err(error) = blob_gc_task.await {
-        if !error.is_cancelled() {
-            tracing::error!(%error, "blob garbage-collection task stopped unexpectedly");
+    let (stop_public, public_stopped) = tokio::sync::oneshot::channel();
+    let mut public_server = Box::pin(
+        Server::builder()
+            .add_service(object_service)
+            .add_service(authz_service)
+            .add_service(administration_service)
+            // Deliberately not intercepted: this one service exchanges durable
+            // long-lived credentials for the bearer token used everywhere else.
+            .add_service(CredentialServiceServer::new(credential_service))
+            .serve_with_shutdown(config.listen, async move {
+                let _ = public_stopped.await;
+            }),
+    );
+    enum FirstStop {
+        Signal(std::io::Result<()>),
+        Public(Result<(), tonic::transport::Error>),
+        Peer(Result<Result<()>, tokio::task::JoinError>),
+    }
+    let first_stop = tokio::select! {
+        signal = tokio::signal::ctrl_c() => FirstStop::Signal(signal),
+        public = &mut public_server => FirstStop::Public(public),
+        peer = peer_server.task_mut() => FirstStop::Peer(peer),
+    };
+    let server_result = match first_stop {
+        FirstStop::Signal(signal) => {
+            let _ = stop_public.send(());
+            let public = public_server.await.context("serve public listener");
+            let peer = peer_server.shutdown().await;
+            signal.context("wait for shutdown signal")?;
+            public?;
+            peer
         }
+        FirstStop::Public(public) => {
+            let peer = peer_server.shutdown().await;
+            public.context("serve public listener")?;
+            peer
+        }
+        FirstStop::Peer(peer) => {
+            peer_server.record_completed();
+            let _ = stop_public.send(());
+            let public = public_server.await.context("serve public listener");
+            let peer = peer
+                .context("join private peer server task")?
+                .context("serve private peer listener");
+            peer?;
+            public
+        }
+    };
+    blob_gc_task.abort();
+    if let Err(error) = blob_gc_task.await
+        && !error.is_cancelled()
+    {
+        tracing::error!(%error, "blob garbage-collection task stopped unexpectedly");
     }
     let shutdown_result = decisions
         .shutdown()

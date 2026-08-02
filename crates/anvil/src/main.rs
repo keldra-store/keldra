@@ -14,6 +14,12 @@ struct Arguments {
     #[arg(long, env = "ANVIL_LISTEN", default_value = "127.0.0.1:50051")]
     listen: SocketAddr,
 
+    #[arg(long, env = "ANVIL_PEER_LISTEN", default_value = "127.0.0.1:50052")]
+    peer_listen: SocketAddr,
+
+    #[arg(long, env = "ANVIL_PEER_ADVERTISE")]
+    peer_advertise: Option<String>,
+
     #[arg(long, env = "ANVIL_DATA_DIR", default_value = "anvil-data")]
     data_dir: PathBuf,
 
@@ -208,6 +214,8 @@ async fn main() -> Result<()> {
     })?;
     let server_result = serve(ServerConfig {
         listen: arguments.listen,
+        peer_listen: arguments.peer_listen,
+        peer_advertise: arguments.peer_advertise,
         data_dir: arguments.data_dir,
         run_system_bootstrap: arguments.run_system_bootstrap,
         system_bootstrap_credential_output: arguments.system_bootstrap_credential_output,
@@ -270,8 +278,32 @@ mod tests {
 
     #[test]
     fn erasure_profile_defaults_to_two_plus_one() {
-        let profile = parse(&[]).erasure_profile().unwrap();
+        let arguments = parse(&[]);
+        let profile = arguments.erasure_profile().unwrap();
         assert_eq!(profile, anvil_store::ErasureProfile::default());
+        assert_eq!(
+            arguments.peer_listen,
+            "127.0.0.1:50052".parse::<SocketAddr>().unwrap()
+        );
+        assert!(arguments.peer_advertise.is_none());
+    }
+
+    #[test]
+    fn peer_listener_and_advertised_address_are_explicit_startup_options() {
+        let arguments = parse(&[
+            "--peer-listen",
+            "0.0.0.0:60052",
+            "--peer-advertise",
+            "anvil-1.internal:60052",
+        ]);
+        assert_eq!(
+            arguments.peer_listen,
+            "0.0.0.0:60052".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            arguments.peer_advertise.as_deref(),
+            Some("anvil-1.internal:60052")
+        );
     }
 
     #[test]

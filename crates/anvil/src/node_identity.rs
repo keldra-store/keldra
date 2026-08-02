@@ -12,6 +12,10 @@ use std::path::{Path, PathBuf};
 use anvil_consensus::{
     ClusterId, NodeId, PeerSpkiSha256, PeerTlsAcceptor, PeerTlsConfig, PeerTlsIdentity,
 };
+use rcgen::{
+    CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+    KeyUsagePurpose,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -148,6 +152,8 @@ pub(crate) enum NodeIdentityError {
     Invalid(&'static str),
     #[error("unsupported local node identity format version {0}")]
     UnsupportedFormat(u16),
+    #[error("peer identity generation failed: {0}")]
+    Generation(String),
     #[error(
         "local node identity mismatch: expected cluster {expected_cluster:?} node {expected_node:?}, found cluster {found_cluster:?} node {found_node:?}"
     )]
@@ -163,6 +169,38 @@ pub(crate) enum NodeIdentityError {
 
 pub(crate) fn identity_path(data_dir: &Path) -> PathBuf {
     data_dir.join(NODE_IDENTITY_FILE_NAME)
+}
+
+/// Generate the cluster-managed self-signed identity for one admitted node.
+pub(crate) fn generate(
+    cluster_id: ClusterId,
+    node_id: NodeId,
+) -> Result<LocalNodeIdentity, NodeIdentityError> {
+    if cluster_id.0 == [0; 16] || !(1..=MAX_NODE_ID).contains(&node_id.0) {
+        return Err(NodeIdentityError::Invalid(
+            "stable cluster and node IDs must be valid before certificate generation",
+        ));
+    }
+    let mut parameters = CertificateParams::new(Vec::<String>::new())
+        .map_err(|error| NodeIdentityError::Generation(error.to_string()))?;
+    parameters.is_ca = IsCa::NoCa;
+    parameters.distinguished_name = DistinguishedName::new();
+    parameters.distinguished_name.push(
+        DnType::CommonName,
+        format!("anvil-peer-{}-{}", hex::encode(cluster_id.0), node_id.0),
+    );
+    parameters.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    parameters.extended_key_usages = vec![
+        ExtendedKeyUsagePurpose::ServerAuth,
+        ExtendedKeyUsagePurpose::ClientAuth,
+    ];
+    let key_pair =
+        KeyPair::generate().map_err(|error| NodeIdentityError::Generation(error.to_string()))?;
+    let certificate = parameters
+        .self_signed(&key_pair)
+        .map_err(|error| NodeIdentityError::Generation(error.to_string()))?;
+    let peer = PersistedPeerIdentity::new(certificate.pem(), key_pair.serialize_pem())?;
+    LocalNodeIdentity::new(cluster_id, node_id, peer, None)
 }
 
 /// Create the final identity file directly and never replace an existing path.
@@ -194,6 +232,27 @@ pub(crate) fn load(
 ) -> Result<LocalNodeIdentity, NodeIdentityError> {
     let identity = decode(&read_private_file(&identity_path(data_dir))?)?;
     require_stable_identity(&identity, expected_cluster, expected_node)?;
+    Ok(identity)
+}
+
+/// Load the stable node identity before the local Raft state is opened.
+///
+/// The configured node ID is still checked immediately. The caller must then
+/// compare the returned cluster ID with the committed Raft cluster identity
+/// before exposing either listener.
+pub(crate) fn load_for_node(
+    data_dir: &Path,
+    expected_node: NodeId,
+) -> Result<LocalNodeIdentity, NodeIdentityError> {
+    let identity = decode(&read_private_file(&identity_path(data_dir))?)?;
+    if identity.node_id != expected_node {
+        return Err(NodeIdentityError::StableIdentityMismatch {
+            expected_cluster: identity.cluster_id,
+            expected_node,
+            found_cluster: identity.cluster_id,
+            found_node: identity.node_id,
+        });
+    }
     Ok(identity)
 }
 
@@ -485,6 +544,27 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn startup_load_checks_node_before_raft_supplies_the_cluster_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let expected = identity(peer_one());
+        create(directory.path(), &expected).unwrap();
+
+        assert_eq!(
+            load_for_node(directory.path(), NodeId(17)).unwrap(),
+            expected
+        );
+        assert!(matches!(
+            load_for_node(directory.path(), NodeId(18)),
+            Err(NodeIdentityError::StableIdentityMismatch {
+                expected_node: NodeId(18),
+                found_node: NodeId(17),
+                ..
+            })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn create_never_replaces_an_existing_identity() {
         let directory = tempfile::tempdir().unwrap();
         let first = identity(peer_one());
@@ -637,5 +717,19 @@ mod tests {
         let rendered = format!("{:?}", identity(peer_one()));
         assert!(rendered.contains("<redacted>"));
         assert!(!rendered.contains("MIGHAgEA"));
+    }
+
+    #[test]
+    fn generated_cluster_identity_is_a_valid_distinct_keypair() {
+        let first = generate(ClusterId([3; 16]), NodeId(9)).unwrap();
+        let second = generate(ClusterId([3; 16]), NodeId(10)).unwrap();
+
+        assert_eq!(first.cluster_id(), ClusterId([3; 16]));
+        assert_eq!(first.node_id(), NodeId(9));
+        assert!(first.overlap_peer_identity().is_none());
+        assert_ne!(
+            validate_peer_identity(first.presented_peer_identity()).unwrap(),
+            validate_peer_identity(second.presented_peer_identity()).unwrap(),
+        );
     }
 }

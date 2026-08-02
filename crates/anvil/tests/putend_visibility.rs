@@ -153,10 +153,16 @@ fn test_server_config(
     listen: SocketAddr,
     token_manager: JwtManager,
 ) -> ServerConfig {
+    let mut peer_listen = unused_loopback_address();
+    while peer_listen == listen {
+        peer_listen = unused_loopback_address();
+    }
     ServerConfig {
         listen,
+        peer_listen,
+        peer_advertise: None,
         data_dir: directory.path().to_owned(),
-        run_system_bootstrap: false,
+        run_system_bootstrap: true,
         system_bootstrap_credential_output: None,
         node_id: 1,
         max_atomic_commit_entries: 128,
