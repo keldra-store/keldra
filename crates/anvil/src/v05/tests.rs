@@ -609,6 +609,16 @@ fn batch_get_payload_limit_accepts_the_boundary_and_rejects_larger_totals() {
 }
 
 #[test]
+fn source_journal_capacity_is_a_resource_limit() {
+    let error = status(MutationError::SourceJournalCapacity);
+    assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    assert_eq!(
+        api_failure(MutationError::SourceJournalCapacity).code,
+        MutationFailureCode::ResourceLimit as i32
+    );
+}
+
+#[test]
 fn watch_errors_expose_a_stable_resume_expired_outcome() {
     let expired = watch_status(WatchError::ResumeExpired);
     assert_eq!(expired.code(), tonic::Code::FailedPrecondition);

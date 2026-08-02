@@ -1,6 +1,38 @@
 use super::*;
 
 impl Store {
+    /// Advances the highest contiguous source offset known durable at every
+    /// consumer that currently constrains reference delivery. The value is
+    /// monotonic for one running process and is reconstructed from destination
+    /// cursors after restart rather than becoming another durable side plane.
+    pub async fn advance_source_journal_safe_through(
+        &self,
+        offset: u64,
+    ) -> Result<(), MutationError> {
+        let _commit_guard = self.commit_lock.lock().await;
+        let status = self
+            .local_watch_status()
+            .map_err(|error| MutationError::Storage(error.to_string()))?;
+        let current = self
+            .source_journal_safe_through
+            .load(std::sync::atomic::Ordering::Acquire);
+        if offset < current {
+            return Err(MutationError::Storage(format!(
+                "source journal safe-through cursor regressed from {current} to {offset}"
+            )));
+        }
+        if offset > status.tail {
+            return Err(MutationError::Storage(format!(
+                "source journal safe-through cursor {offset} is beyond tail {}",
+                status.tail
+            )));
+        }
+        self.source_journal_safe_through
+            .store(offset, std::sync::atomic::Ordering::Release);
+        self.enforce_local_watch_retention()
+            .map_err(|error| MutationError::Storage(error.to_string()))
+    }
+
     fn materialize_local_change(
         &self,
         stored: StoredLocalChange,

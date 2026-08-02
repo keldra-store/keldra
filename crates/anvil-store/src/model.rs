@@ -254,6 +254,8 @@ pub enum MutationError {
     DurabilityUnavailable,
     #[error("mutation receipt capacity is exhausted by unexpired guarantees")]
     ReceiptCapacity,
+    #[error("source journal capacity is exhausted before required consumers are durable")]
+    SourceJournalCapacity,
     #[error("object versioning is not enabled for this bucket")]
     ObjectVersioningNotEnabled,
     #[error("the current tombstone is the path's CAS/ABA fence and cannot be deleted")]

@@ -309,12 +309,18 @@ async fn entry_retention_prunes_in_the_head_batch_and_expires_stale_tokens() {
     let stale = store
         .watch_checkpoint(&scope, store.start_watch(&scope, WatchStart::Now).unwrap())
         .unwrap();
-    for (path, command) in [("a", "a"), ("b", "b"), ("c", "c")] {
+    for (path, command) in [("a", "a"), ("b", "b")] {
         store
             .put(put(path, path.as_bytes(), command))
             .await
             .unwrap();
     }
+    assert_eq!(
+        store.put(put("c", b"c", "c")).await.unwrap_err(),
+        anvil_store::MutationError::SourceJournalCapacity
+    );
+    store.advance_source_journal_safe_through(1).await.unwrap();
+    store.put(put("c", b"c", "c")).await.unwrap();
 
     let status = store.local_watch_status().unwrap();
     assert_eq!(status.tail, 3);
@@ -356,7 +362,7 @@ async fn entry_retention_prunes_in_the_head_batch_and_expires_stale_tokens() {
 }
 
 #[tokio::test]
-async fn byte_retention_is_hard_even_when_one_record_exceeds_the_bound() {
+async fn an_event_larger_than_the_journal_bound_rejects_the_whole_mutation() {
     let temporary = tempfile::tempdir().unwrap();
     let store = Store::open(
         StoreOptions::new(temporary.path(), 1)
@@ -367,17 +373,64 @@ async fn byte_retention_is_hard_even_when_one_record_exceeds_the_bound() {
     seed_bucket_identity(&store);
     let scope = WatchScope::new("tenant", "bucket", "").unwrap();
     let before = store.start_watch(&scope, WatchStart::Now).unwrap();
-    store.put(put("record", b"value", "record")).await.unwrap();
+    assert_eq!(
+        store
+            .put(put("record", b"value", "record"))
+            .await
+            .unwrap_err(),
+        anvil_store::MutationError::SourceJournalCapacity
+    );
 
     let status = store.local_watch_status().unwrap();
-    assert_eq!(status.tail, 1);
-    assert_eq!(status.retention_floor, 1);
+    assert_eq!(status.tail, 0);
+    assert_eq!(status.retention_floor, 0);
     assert_eq!(status.retained_entries, 0);
     assert_eq!(status.retained_bytes, 0);
-    assert_eq!(
-        store.scan_watch_page(&scope, before, 10).await.unwrap_err(),
-        WatchError::ResumeExpired
+    assert!(
+        store
+            .scan_watch_page(&scope, before, 10)
+            .await
+            .unwrap()
+            .invalidations
+            .is_empty()
     );
+}
+
+#[tokio::test]
+async fn safe_through_cursor_is_monotonic_bounded_and_reconstructed_fail_closed() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(
+        StoreOptions::new(temporary.path(), 1)
+            .with_watch_retention(WatchRetention::new(2, 1024 * 1024).unwrap()),
+    )
+    .await
+    .unwrap();
+    seed_bucket_identity(&store);
+    store.put(put("a", b"a", "a")).await.unwrap();
+    store.put(put("b", b"b", "b")).await.unwrap();
+
+    assert!(store.advance_source_journal_safe_through(3).await.is_err());
+    store.advance_source_journal_safe_through(1).await.unwrap();
+    assert!(store.advance_source_journal_safe_through(0).await.is_err());
+    store.put(put("c", b"c", "c")).await.unwrap();
+    assert_eq!(store.local_watch_status().unwrap().retention_floor, 1);
+
+    drop(store);
+    let reopened = Store::open(
+        StoreOptions::new(temporary.path(), 1)
+            .with_watch_retention(WatchRetention::new(2, 1024 * 1024).unwrap()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        reopened.put(put("d", b"d", "d")).await.unwrap_err(),
+        anvil_store::MutationError::SourceJournalCapacity
+    );
+    reopened
+        .advance_source_journal_safe_through(2)
+        .await
+        .unwrap();
+    reopened.put(put("d", b"d", "d")).await.unwrap();
 }
 
 #[tokio::test]

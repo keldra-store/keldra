@@ -216,6 +216,10 @@ pub struct Store {
     awaiting_publish_ttl_millis: u64,
     watch_source_epoch: [u8; 32],
     watch_token_key: [u8; 32],
+    /// Highest source-journal offset known safe for retention compaction.
+    /// Restart initializes this to the durable floor and waits for current
+    /// destination cursors before allowing any further compaction.
+    pub(crate) source_journal_safe_through: Arc<std::sync::atomic::AtomicU64>,
     watch_notify: tokio::sync::watch::Sender<()>,
     #[cfg(test)]
     policy_lookup_count: Arc<std::sync::atomic::AtomicUsize>,
@@ -440,12 +444,17 @@ impl Store {
             awaiting_publish_ttl_millis,
             watch_source_epoch,
             watch_token_key,
+            source_journal_safe_through: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             watch_notify: tokio::sync::watch::channel(()).0,
             #[cfg(test)]
             policy_lookup_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             test_identity_lock: Arc::new(std::sync::Mutex::new(())),
         };
+        let durable_floor = store.local_watch_status()?.retention_floor;
+        store
+            .source_journal_safe_through
+            .store(durable_floor, std::sync::atomic::Ordering::Release);
         store.enforce_local_watch_retention()?;
         Ok(store)
     }

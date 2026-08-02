@@ -168,10 +168,9 @@ impl Store {
                 }
             }
             Err(error) => {
-                let message = error.to_string();
                 for result in results.values_mut() {
                     if result.is_ok() {
-                        *result = Err(MutationError::Storage(message.clone()));
+                        *result = Err(error.clone());
                     }
                 }
             }
@@ -198,6 +197,9 @@ impl Store {
             .local_watch_status()
             .map_err(|error| MutationError::Storage(error.to_string()))?;
         let old_tail = status.tail;
+        let safe_through = self
+            .source_journal_safe_through
+            .load(std::sync::atomic::Ordering::Acquire);
         let first_old_key = invalidation_key(status.retention_floor.saturating_add(1));
         let mut old_entries = self.db.iterator_cf(
             journal,
@@ -259,34 +261,22 @@ impl Store {
             let pruned = status.retention_floor.checked_add(1).ok_or_else(|| {
                 MutationError::Storage("local invalidation retention floor is exhausted".into())
             })?;
-            let encoded = if pruned <= old_tail {
-                let (stored_key, encoded) = old_entries
-                    .next()
-                    .ok_or_else(|| {
-                        MutationError::Storage(format!(
-                            "retained local invalidation offset {pruned} is missing"
-                        ))
-                    })?
-                    .map_err(storage_error)?;
-                if offset_from_key(&stored_key) != Some(pruned) {
-                    return Err(MutationError::Storage(format!(
+            if pruned > old_tail || pruned > safe_through {
+                return Err(MutationError::SourceJournalCapacity);
+            }
+            let (stored_key, encoded) = old_entries
+                .next()
+                .ok_or_else(|| {
+                    MutationError::Storage(format!(
                         "retained local invalidation offset {pruned} is missing"
-                    )));
-                }
-                encoded.to_vec()
-            } else {
-                let (offset, encoded) = appended.pop_front().ok_or_else(|| {
-                    MutationError::Storage(
-                        "local invalidation retention accounting is inconsistent".into(),
-                    )
-                })?;
-                if offset != pruned {
-                    return Err(MutationError::Storage(
-                        "local invalidation retention offsets are inconsistent".into(),
-                    ));
-                }
-                encoded
-            };
+                    ))
+                })?
+                .map_err(storage_error)?;
+            if offset_from_key(&stored_key) != Some(pruned) {
+                return Err(MutationError::Storage(format!(
+                    "retained local invalidation offset {pruned} is missing"
+                )));
+            }
             batch.delete_cf(journal, invalidation_key(pruned));
             status.retention_floor = pruned;
             status.retained_entries -= 1;
@@ -343,8 +333,12 @@ impl Store {
             return Ok(());
         }
         let mut batch = WriteBatch::default();
-        while status.retained_entries > self.watch_retention.max_entries
-            || status.retained_bytes > self.watch_retention.max_bytes
+        let safe_through = self
+            .source_journal_safe_through
+            .load(std::sync::atomic::Ordering::Acquire);
+        while (status.retained_entries > self.watch_retention.max_entries
+            || status.retained_bytes > self.watch_retention.max_bytes)
+            && status.retention_floor < safe_through
         {
             let offset = status.retention_floor.checked_add(1).ok_or_else(|| {
                 WatchError::Storage("local invalidation retention floor is exhausted".into())

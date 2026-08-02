@@ -1682,7 +1682,9 @@ fn api_failure(error: MutationError) -> MutationFailure {
         | MutationError::InvalidPolicy(_)
         | MutationError::BlobNotFound => (MutationFailureCode::Invalid, None),
         MutationError::DurabilityUnavailable => (MutationFailureCode::DurabilityUnavailable, None),
-        MutationError::ReceiptCapacity => (MutationFailureCode::ResourceLimit, None),
+        MutationError::ReceiptCapacity | MutationError::SourceJournalCapacity => {
+            (MutationFailureCode::ResourceLimit, None)
+        }
         MutationError::Storage(_) => (MutationFailureCode::Internal, None),
     };
     MutationFailure {
@@ -1714,7 +1716,9 @@ fn status(error: MutationError) -> Status {
         MutationError::DurabilityUnavailable => {
             Status::unavailable(format!("DURABILITY_UNAVAILABLE: {error}"))
         }
-        MutationError::ReceiptCapacity => Status::resource_exhausted(error.to_string()),
+        MutationError::ReceiptCapacity | MutationError::SourceJournalCapacity => {
+            Status::resource_exhausted(error.to_string())
+        }
         MutationError::Storage(_) => Status::internal(error.to_string()),
     }
 }
@@ -1759,6 +1763,7 @@ fn read_failure(error: MutationError) -> ReadFailure {
         | MutationError::InvalidCommandId
         | MutationError::DurabilityUnavailable
         | MutationError::ReceiptCapacity
+        | MutationError::SourceJournalCapacity
         | MutationError::InvalidPolicy(_) => ReadFailureCode::Internal,
     };
     ReadFailure {

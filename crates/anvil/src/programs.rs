@@ -768,7 +768,8 @@ fn mutation_status(error: anvil_store::MutationError) -> Status {
         anvil_store::MutationError::DurabilityUnavailable => {
             Status::unavailable(format!("DURABILITY_UNAVAILABLE: {error}"))
         }
-        anvil_store::MutationError::ReceiptCapacity => {
+        anvil_store::MutationError::ReceiptCapacity
+        | anvil_store::MutationError::SourceJournalCapacity => {
             Status::resource_exhausted(format!("RESOURCE_LIMIT: {error}"))
         }
         anvil_store::MutationError::Storage(_) => Status::internal(error.to_string()),
