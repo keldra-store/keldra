@@ -6,6 +6,7 @@ pub(crate) const MAX_ENCODED_BYTES: usize = 64 * 1024 * 1024;
 
 const RECORD_MAGIC: &[u8; 8] = b"ANVLREC\0";
 const RECORD_FORMAT_V1: u8 = 1;
+pub(crate) const SNAPSHOT_RECORD_FORMAT_V2: u8 = 2;
 const RECORD_LENGTH_BYTES: usize = std::mem::size_of::<u32>();
 const RECORD_HEADER_BYTES: usize = RECORD_MAGIC.len() + 1 + RECORD_LENGTH_BYTES;
 const MAX_RECORD_BYTES: usize = RECORD_HEADER_BYTES + MAX_ENCODED_BYTES;
@@ -67,6 +68,14 @@ pub(crate) fn encode_record<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>,
     wrap_record(&encode(value)?)
 }
 
+/// Encode a value under an explicitly selected durable record format.
+pub(crate) fn encode_record_at_version<T: Serialize + ?Sized>(
+    value: &T,
+    version: u8,
+) -> Result<Vec<u8>, CodecError> {
+    wrap_record_at_version(&encode(value)?, version)
+}
+
 /// Decode a durable record, accepting the released 0.5.0 raw-bincode layout.
 pub(crate) fn decode_record<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecError> {
     decode(record_payload(bytes)?)
@@ -74,6 +83,10 @@ pub(crate) fn decode_record<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, Code
 
 /// Wrap an already encoded payload without changing its bytes.
 pub(crate) fn wrap_record(payload: &[u8]) -> Result<Vec<u8>, CodecError> {
+    wrap_record_at_version(payload, RECORD_FORMAT_V1)
+}
+
+fn wrap_record_at_version(payload: &[u8], version: u8) -> Result<Vec<u8>, CodecError> {
     if payload.len() > MAX_ENCODED_BYTES {
         return Err(CodecError::TooLarge);
     }
@@ -81,7 +94,7 @@ pub(crate) fn wrap_record(payload: &[u8]) -> Result<Vec<u8>, CodecError> {
     let payload_len = u32::try_from(payload.len()).map_err(|_| CodecError::TooLarge)?;
     let mut record = Vec::with_capacity(RECORD_HEADER_BYTES + payload.len());
     record.extend_from_slice(RECORD_MAGIC);
-    record.push(RECORD_FORMAT_V1);
+    record.push(version);
     record.extend_from_slice(&payload_len.to_be_bytes());
     record.extend_from_slice(payload);
     Ok(record)
@@ -90,6 +103,16 @@ pub(crate) fn wrap_record(payload: &[u8]) -> Result<Vec<u8>, CodecError> {
 /// Return the unchanged payload from a current envelope or a bounded legacy
 /// 0.5.0 raw record.
 pub(crate) fn record_payload(bytes: &[u8]) -> Result<&[u8], CodecError> {
+    let (version, payload) = record_version_and_payload(bytes)?;
+    match version {
+        None | Some(RECORD_FORMAT_V1) => Ok(payload),
+        Some(version) => Err(CodecError::UnsupportedRecordVersion(version)),
+    }
+}
+
+/// Return an envelope's explicit format and unchanged payload. Raw 0.5.0
+/// records have no version.
+pub(crate) fn record_version_and_payload(bytes: &[u8]) -> Result<(Option<u8>, &[u8]), CodecError> {
     if bytes.len() > MAX_RECORD_BYTES {
         return Err(CodecError::TooLarge);
     }
@@ -97,16 +120,13 @@ pub(crate) fn record_payload(bytes: &[u8]) -> Result<&[u8], CodecError> {
         if bytes.len() > MAX_ENCODED_BYTES {
             return Err(CodecError::TooLarge);
         }
-        return Ok(bytes);
+        return Ok((None, bytes));
     }
     if bytes.len() < RECORD_HEADER_BYTES {
         return Err(CodecError::InvalidRecord("truncated header"));
     }
 
     let version = bytes[RECORD_MAGIC.len()];
-    if version != RECORD_FORMAT_V1 {
-        return Err(CodecError::UnsupportedRecordVersion(version));
-    }
 
     let length_start = RECORD_MAGIC.len() + 1;
     let length_end = length_start + RECORD_LENGTH_BYTES;
@@ -123,7 +143,7 @@ pub(crate) fn record_payload(bytes: &[u8]) -> Result<&[u8], CodecError> {
             "payload length does not match header",
         ));
     }
-    Ok(&bytes[RECORD_HEADER_BYTES..])
+    Ok((Some(version), &bytes[RECORD_HEADER_BYTES..]))
 }
 
 #[cfg(test)]
@@ -236,5 +256,51 @@ mod tests {
             record_payload(RECORD_MAGIC),
             Err(CodecError::InvalidRecord("truncated header"))
         );
+    }
+
+    #[test]
+    fn released_command_discriminants_are_unchanged() {
+        let commands = [
+            Command::NominateExecutor {
+                executor: NodeId(1),
+            },
+            Command::CommitBatch(CommitBatch {
+                executor: NodeId(1),
+                nomination_log_index: 2,
+                program_path_hash: ProgramPathHash([3; 32]),
+                program_hash: ProgramHash([4; 32]),
+                invocation_id: InvocationId([5; 32]),
+                input_fingerprint: InvocationFingerprint([6; 32]),
+                bundle_ref: BundleRef {
+                    hash: [7; 32],
+                    length: 8,
+                },
+                bundle_hash: BundleHash([9; 32]),
+                durability_class: DurabilityClass([10; 32]),
+                durability_evidence_hash: DurabilityEvidenceHash([11; 32]),
+                proposal_at_unix_millis: 12,
+                replay_expires_at_unix_millis: 13,
+            }),
+            Command::FinalizedThrough {
+                executor: NodeId(1),
+                nomination_log_index: 2,
+                through_commit_cursor: 3,
+            },
+            Command::InitializeCluster {
+                cluster_id: crate::ClusterId([4; 16]),
+            },
+            Command::CompleteSystemBootstrap {
+                executor: NodeId(1),
+                nomination_log_index: 2,
+                bootstrap_version: 1,
+            },
+        ];
+
+        for (expected, command) in commands.into_iter().enumerate() {
+            assert_eq!(
+                &encode(&command).unwrap()[..4],
+                &(expected as u32).to_le_bytes()
+            );
+        }
     }
 }

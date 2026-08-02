@@ -22,7 +22,7 @@ use crate::{
     ApplyError, ApplyResult, Command, CommittedInvocation, ExecutorNomination, StateMachine, codec,
     peer::{PeerNetworkFactory, PeerTransport, UnreachablePeerTransport},
     raft_storage::{DurableSnapshot, DurableStorageError, DurableStore, RaftEntry, StorageConfig},
-    types::MAX_RAFT_NODE_ID,
+    types::{MAX_RAFT_NODE_ID, MembershipTransitionKind, NodeState},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +43,29 @@ openraft::declare_raft_types!(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct MachineState {
     decisions: StateMachine,
+    last_applied_log_id: Option<LogId<u64>>,
+    membership: StoredMembership<u64, BasicNode>,
+    snapshot_generation: u64,
+}
+
+/// Exact state-machine layout in version-one enveloped snapshots.
+#[derive(Debug, Serialize, Deserialize)]
+struct LegacyStateMachinePreClusterControl {
+    max_commit_entries: u32,
+    max_commit_bytes: u64,
+    cluster_id: Option<crate::ClusterId>,
+    system_bootstrap: crate::SystemBootstrapState,
+    executor: Option<ExecutorNomination>,
+    committed_invocations: BTreeMap<u64, CommittedInvocation>,
+    committed_invocation_bytes: u64,
+    last_commit_cursor: Option<u64>,
+    finalized_through: Option<u64>,
+}
+
+/// Exact outer layout in version-one enveloped snapshots.
+#[derive(Debug, Serialize, Deserialize)]
+struct LegacyMachineStatePreClusterControl {
+    decisions: LegacyStateMachinePreClusterControl,
     last_applied_log_id: Option<LogId<u64>>,
     membership: StoredMembership<u64, BasicNode>,
     snapshot_generation: u64,
@@ -89,6 +112,28 @@ impl From<LegacyMachineStateV050> for MachineState {
     }
 }
 
+impl From<LegacyMachineStatePreClusterControl> for MachineState {
+    fn from(legacy: LegacyMachineStatePreClusterControl) -> Self {
+        let decisions = legacy.decisions;
+        Self {
+            decisions: StateMachine::from_pre_cluster_control_snapshot(
+                decisions.max_commit_entries,
+                decisions.max_commit_bytes,
+                decisions.cluster_id,
+                decisions.system_bootstrap,
+                decisions.executor,
+                decisions.committed_invocations,
+                decisions.committed_invocation_bytes,
+                decisions.last_commit_cursor,
+                decisions.finalized_through,
+            ),
+            last_applied_log_id: legacy.last_applied_log_id,
+            membership: legacy.membership,
+            snapshot_generation: legacy.snapshot_generation,
+        }
+    }
+}
+
 impl MachineState {
     fn new(config: StorageConfig) -> Result<Self, ApplyError> {
         Ok(Self {
@@ -107,6 +152,102 @@ impl MachineState {
                 "snapshot state-machine configuration does not match this node".into(),
             ));
         }
+        Ok(())
+    }
+
+    fn validate_cluster_membership(&self) -> Result<(), String> {
+        let cluster = self.decisions.cluster_control();
+        if cluster.nodes().is_empty() {
+            // Released 0.5.0 state has OpenRaft membership but no descriptors.
+            if cluster.transition().is_some() {
+                return Err("membership transition has no admitted node descriptor".into());
+            }
+            return Ok(());
+        }
+
+        let membership = self.membership.membership();
+        for (raft_node_id, raft_node) in membership.nodes() {
+            let node_id = crate::NodeId(*raft_node_id);
+            let descriptor = cluster.nodes().get(&node_id).ok_or_else(|| {
+                format!("Raft member {raft_node_id} has no admitted node descriptor")
+            })?;
+            if descriptor.peer_address.0 != raft_node.addr {
+                return Err(format!(
+                    "Raft member {raft_node_id} address does not match its admitted descriptor"
+                ));
+            }
+        }
+
+        for (node_id, descriptor) in cluster.nodes() {
+            if descriptor.node_id != *node_id {
+                return Err(format!(
+                    "admitted node {} is stored under descriptor key {}",
+                    descriptor.node_id.0, node_id.0
+                ));
+            }
+            if !cluster.used_node_ids().contains(*node_id) {
+                return Err(format!(
+                    "admitted node {} is absent from the never-reuse bitmap",
+                    node_id.0
+                ));
+            }
+            let is_member = membership.get_node(&node_id.0).is_some();
+            let transition = cluster
+                .transition()
+                .filter(|transition| transition.node_id == *node_id);
+            let membership_optional = matches!(
+                (
+                    transition.map(|transition| transition.kind),
+                    descriptor.state
+                ),
+                (Some(MembershipTransitionKind::Add), NodeState::Joining)
+                    | (Some(MembershipTransitionKind::Remove), NodeState::Active)
+            );
+            if !is_member && !membership_optional {
+                return Err(format!(
+                    "admitted node {} is not present in OpenRaft membership",
+                    node_id.0
+                ));
+            }
+            if descriptor.state == NodeState::Joining
+                && !matches!(
+                    transition.map(|transition| transition.kind),
+                    Some(MembershipTransitionKind::Add)
+                )
+            {
+                return Err(format!(
+                    "JOINING node {} is not the current ADD transition",
+                    node_id.0
+                ));
+            }
+        }
+
+        if let Some(transition) = cluster.transition()
+            && !cluster.nodes().contains_key(&transition.node_id)
+        {
+            return Err(format!(
+                "membership transition references missing node {}",
+                transition.node_id.0
+            ));
+        }
+
+        match cluster.transition() {
+            None => validate_fixed_voters(membership, &self.decisions)
+                .map_err(|error| error.to_string())?,
+            Some(transition) if transition.kind == MembershipTransitionKind::Reweight => {
+                validate_fixed_voters(membership, &self.decisions)
+                    .map_err(|error| error.to_string())?;
+            }
+            Some(transition) if transition.kind == MembershipTransitionKind::Add => {
+                let descriptor = &cluster.nodes()[&transition.node_id];
+                if descriptor.state == NodeState::Joining {
+                    validate_fixed_voters(membership, &self.decisions)
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+            Some(_) => {}
+        }
+
         Ok(())
     }
 }
@@ -246,8 +387,14 @@ impl RaftSnapshotBuilder<DecisionRaftConfig> for OpenRaftSnapshotBuilder {
         })?;
         let mut snapshot_state = current.clone();
         snapshot_state.snapshot_generation = snapshot_state.snapshot_generation.saturating_add(1);
-        let data = codec::encode_record(&snapshot_state)
+        snapshot_state
+            .validate_cluster_membership()
             .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Read, error))?;
+        let data =
+            codec::encode_record_at_version(&snapshot_state, codec::SNAPSHOT_RECORD_FORMAT_V2)
+                .map_err(|error| {
+                    storage_error(ErrorSubject::StateMachine, ErrorVerb::Read, error)
+                })?;
         let meta = SnapshotMeta {
             last_log_id: snapshot_state.last_applied_log_id,
             last_membership: snapshot_state.membership.clone(),
@@ -360,6 +507,13 @@ impl RaftStateMachine<DecisionRaftConfig> for OpenRaftStateMachine {
                 "snapshot body does not match metadata or fixed cluster configuration",
             ));
         }
+        state.validate_cluster_membership().map_err(|error| {
+            storage_error(
+                ErrorSubject::Snapshot(Some(meta.signature())),
+                ErrorVerb::Read,
+                error,
+            )
+        })?;
 
         let mut current = self.machine.lock().map_err(|_| {
             storage_error(
@@ -610,6 +764,9 @@ fn load_machine(store: &DurableStore) -> Result<MachineState, DecisionRaftError>
         apply_entry(&mut state, &entry)
             .map_err(|error| DecisionRaftError::Storage(error.to_string()))?;
     }
+    state
+        .validate_cluster_membership()
+        .map_err(DecisionRaftError::Storage)?;
     Ok(state)
 }
 
@@ -617,11 +774,12 @@ fn load_machine(store: &DurableStore) -> Result<MachineState, DecisionRaftError>
 /// A body beginning with the record magic is always treated as an envelope, so
 /// malformed or unknown current records cannot silently fall back to legacy.
 fn decode_machine_snapshot(data: &[u8]) -> Result<MachineState, codec::CodecError> {
-    let payload = codec::record_payload(data)?;
-    if payload.len() != data.len() {
-        codec::decode(payload)
-    } else {
-        codec::decode::<LegacyMachineStateV050>(payload).map(Into::into)
+    let (version, payload) = codec::record_version_and_payload(data)?;
+    match version {
+        None => codec::decode::<LegacyMachineStateV050>(payload).map(Into::into),
+        Some(1) => codec::decode::<LegacyMachineStatePreClusterControl>(payload).map(Into::into),
+        Some(codec::SNAPSHOT_RECORD_FORMAT_V2) => codec::decode(payload),
+        Some(version) => Err(codec::CodecError::UnsupportedRecordVersion(version)),
     }
 }
 
@@ -643,7 +801,7 @@ fn apply_entry(
             DecisionApplyResult::Noop
         }
         EntryPayload::Normal(command) => {
-            match validate_membership_command(&state.membership, command)
+            match validate_membership_command(&state.membership, &state.decisions, command)
                 .and_then(|()| state.decisions.apply(entry.log_id.index, command))
             {
                 Ok(result) => DecisionApplyResult::Applied(result),
@@ -657,19 +815,147 @@ fn apply_entry(
 
 fn validate_membership_command(
     membership: &StoredMembership<u64, BasicNode>,
+    decisions: &StateMachine,
     command: &Command,
 ) -> Result<(), ApplyError> {
+    if let Command::BeginAddNode { descriptor, .. } = command {
+        for (raft_node_id, raft_node) in membership.membership().nodes() {
+            let node_id = crate::NodeId(*raft_node_id);
+            if node_id == descriptor.node_id {
+                if raft_node.addr != descriptor.peer_address.0 {
+                    return Err(ApplyError::RaftMemberAddressMismatch { node_id });
+                }
+            } else if !decisions.cluster_control().nodes().contains_key(&node_id) {
+                return Err(ApplyError::RaftMemberDescriptorMissing { node_id });
+            }
+        }
+    }
     let executor = match command {
         Command::NominateExecutor { executor } => Some(*executor),
         Command::CommitBatch(batch) => Some(batch.executor),
         Command::FinalizedThrough { executor, .. } => Some(*executor),
         Command::InitializeCluster { .. } => None,
         Command::CompleteSystemBootstrap { executor, .. } => Some(*executor),
+        Command::BeginAddNode { .. }
+        | Command::BeginRemoveNode { .. }
+        | Command::BeginReweightNode { .. }
+        | Command::CompleteMembershipTransition { .. }
+        | Command::StagePeerSpkiOverlap { .. }
+        | Command::PromotePeerSpkiOverlap { .. }
+        | Command::ClearPeerSpkiOverlap { .. }
+        | Command::BindJwtSigningKeyFingerprint { .. }
+        | Command::BindErasureCodeProfile { .. } => None,
     };
     if let Some(executor) = executor
         && membership.membership().get_node(&executor.0).is_none()
     {
         return Err(ApplyError::ExecutorNotCurrentMember { executor });
+    }
+    if let Some(executor) = executor
+        && !decisions.cluster_control().nodes().is_empty()
+        && decisions
+            .cluster_control()
+            .nodes()
+            .get(&executor)
+            .is_none_or(|descriptor| descriptor.state != NodeState::Active)
+    {
+        return Err(ApplyError::ExecutorNotActiveMember { executor });
+    }
+    if let Command::CompleteMembershipTransition {
+        started_log_index, ..
+    } = command
+    {
+        let transition = decisions
+            .cluster_control()
+            .transition()
+            .ok_or(ApplyError::NoMembershipTransition)?;
+        if transition.started_log_index != *started_log_index {
+            return Err(ApplyError::MembershipTransitionFenceMismatch {
+                expected: transition.started_log_index,
+                requested: *started_log_index,
+            });
+        }
+        let raft_membership = membership.membership();
+        match transition.kind {
+            MembershipTransitionKind::Add => {
+                if raft_membership.get_node(&transition.node_id.0).is_none() {
+                    return Err(ApplyError::TransitionNodeNotCurrentMember {
+                        node_id: transition.node_id,
+                    });
+                }
+                let descriptor = decisions
+                    .cluster_control()
+                    .nodes()
+                    .get(&transition.node_id)
+                    .ok_or(ApplyError::MembershipTransitionStateMismatch)?;
+                if descriptor.state == NodeState::Active {
+                    validate_fixed_voters(raft_membership, decisions)?;
+                }
+            }
+            MembershipTransitionKind::Reweight => {
+                if raft_membership.get_node(&transition.node_id.0).is_none() {
+                    return Err(ApplyError::TransitionNodeNotCurrentMember {
+                        node_id: transition.node_id,
+                    });
+                }
+                validate_fixed_voters(raft_membership, decisions)?;
+            }
+            MembershipTransitionKind::Remove => {
+                if raft_membership.get_node(&transition.node_id.0).is_some() {
+                    return Err(ApplyError::RemovingNodeIsStillMember {
+                        node_id: transition.node_id,
+                    });
+                }
+                validate_voters(
+                    raft_membership,
+                    decisions,
+                    decisions
+                        .cluster_control()
+                        .active_node_count()
+                        .saturating_sub(1)
+                        .min(crate::FIXED_VOTER_TARGET),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_fixed_voters(
+    membership: &openraft::Membership<u64, BasicNode>,
+    decisions: &StateMachine,
+) -> Result<(), ApplyError> {
+    validate_voters(
+        membership,
+        decisions,
+        decisions.cluster_control().voter_target(),
+    )
+}
+
+fn validate_voters(
+    membership: &openraft::Membership<u64, BasicNode>,
+    decisions: &StateMachine,
+    expected: usize,
+) -> Result<(), ApplyError> {
+    let voters = membership
+        .voter_ids()
+        .collect::<std::collections::BTreeSet<_>>();
+    if voters.len() != expected {
+        return Err(ApplyError::VoterTargetMismatch {
+            expected: expected as u16,
+            actual: voters.len() as u16,
+        });
+    }
+    for voter in voters {
+        let node_id = crate::NodeId(voter);
+        if decisions
+            .cluster_control()
+            .nodes()
+            .get(&node_id)
+            .is_none_or(|descriptor| descriptor.state != NodeState::Active)
+        {
+            return Err(ApplyError::VoterNotActive { node_id });
+        }
     }
     Ok(())
 }
@@ -705,10 +991,14 @@ fn write_error(error: DurableStorageError) -> StorageError<u64> {
 
 #[cfg(test)]
 mod snapshot_compatibility_tests {
+    use std::collections::BTreeSet;
+
+    use openraft::Membership;
+
     use super::*;
 
     #[test]
-    fn snapshot_wire_distinguishes_current_envelopes_from_raw_v050_state() {
+    fn snapshot_wire_migrates_raw_v050_and_enveloped_pre_cluster_control_state() {
         let config = StorageConfig {
             max_commit_entries: 4,
             max_commit_bytes: 64 * 1024,
@@ -739,9 +1029,48 @@ mod snapshot_compatibility_tests {
             crate::SystemBootstrapState::Missing
         );
 
+        let pre_cluster_control = LegacyMachineStatePreClusterControl {
+            decisions: LegacyStateMachinePreClusterControl {
+                max_commit_entries: config.max_commit_entries,
+                max_commit_bytes: config.max_commit_bytes,
+                cluster_id: Some(crate::ClusterId([9; 16])),
+                system_bootstrap: crate::SystemBootstrapState::Missing,
+                executor: None,
+                committed_invocations: BTreeMap::new(),
+                committed_invocation_bytes: codec::encoded_len(
+                    &BTreeMap::<u64, CommittedInvocation>::new(),
+                )
+                .unwrap(),
+                last_commit_cursor: None,
+                finalized_through: None,
+            },
+            last_applied_log_id: None,
+            membership: StoredMembership::default(),
+            snapshot_generation: 8,
+        };
+        let pre_cluster_control_record = codec::encode_record(&pre_cluster_control).unwrap();
+        let migrated = decode_machine_snapshot(&pre_cluster_control_record).unwrap();
+        assert_eq!(migrated.snapshot_generation, 8);
+        assert_eq!(
+            migrated.decisions.cluster_id(),
+            Some(crate::ClusterId([9; 16]))
+        );
+        assert!(migrated.decisions.cluster_control().nodes().is_empty());
+
         let current = MachineState::new(config).unwrap();
-        let current_record = codec::encode_record(&current).unwrap();
+        let current_record =
+            codec::encode_record_at_version(&current, codec::SNAPSHOT_RECORD_FORMAT_V2).unwrap();
         assert_eq!(decode_machine_snapshot(&current_record).unwrap(), current);
+
+        let unsupported =
+            codec::encode_record_at_version(&current, codec::SNAPSHOT_RECORD_FORMAT_V2 + 1)
+                .unwrap();
+        assert_eq!(
+            decode_machine_snapshot(&unsupported),
+            Err(codec::CodecError::UnsupportedRecordVersion(
+                codec::SNAPSHOT_RECORD_FORMAT_V2 + 1
+            ))
+        );
 
         let mut malformed_current = current_record;
         malformed_current.pop();
@@ -749,5 +1078,85 @@ mod snapshot_compatibility_tests {
             decode_machine_snapshot(&malformed_current),
             Err(codec::CodecError::InvalidRecord(_))
         ));
+    }
+
+    #[test]
+    fn snapshot_state_cross_validates_descriptors_against_openraft_membership() {
+        let config = StorageConfig {
+            max_commit_entries: 4,
+            max_commit_bytes: 64 * 1024,
+        };
+        let mut state = MachineState::new(config).unwrap();
+        state
+            .decisions
+            .apply(
+                0,
+                &Command::InitializeCluster {
+                    cluster_id: crate::ClusterId([1; 16]),
+                },
+            )
+            .unwrap();
+        state
+            .decisions
+            .apply(
+                1,
+                &Command::BeginAddNode {
+                    format_version: crate::CLUSTER_CONTROL_COMMAND_VERSION,
+                    descriptor: crate::NodeDescriptor {
+                        node_id: crate::NodeId(1),
+                        peer_address: crate::PeerAddress("memory://1".into()),
+                        storage_weight_millionths: 1_000_000,
+                        state: NodeState::Joining,
+                        current_peer_spki_sha256: crate::PeerSpkiSha256([1; 32]),
+                        overlap_peer_spki_sha256: None,
+                        join_capability_hash: Some(crate::JoinCapabilityHash([2; 32])),
+                        supported_protocol: crate::CapabilityRange { min: 1, max: 1 },
+                        supported_storage_format: crate::CapabilityRange { min: 1, max: 1 },
+                    },
+                },
+            )
+            .unwrap();
+        for log_index in [2, 3] {
+            state
+                .decisions
+                .apply(
+                    log_index,
+                    &Command::CompleteMembershipTransition {
+                        format_version: crate::CLUSTER_CONTROL_COMMAND_VERSION,
+                        started_log_index: 1,
+                    },
+                )
+                .unwrap();
+        }
+        state.membership = StoredMembership::new(
+            None,
+            Membership::new(
+                vec![BTreeSet::from([1])],
+                BTreeMap::from([(1, BasicNode::new("memory://1"))]),
+            ),
+        );
+        assert_eq!(state.validate_cluster_membership(), Ok(()));
+
+        state.membership = StoredMembership::new(
+            None,
+            Membership::new(
+                vec![BTreeSet::from([1])],
+                BTreeMap::from([(1, BasicNode::new("memory://wrong"))]),
+            ),
+        );
+        assert!(
+            state
+                .validate_cluster_membership()
+                .unwrap_err()
+                .contains("address does not match")
+        );
+
+        state.membership = StoredMembership::default();
+        assert!(
+            state
+                .validate_cluster_membership()
+                .unwrap_err()
+                .contains("not present in OpenRaft membership")
+        );
     }
 }

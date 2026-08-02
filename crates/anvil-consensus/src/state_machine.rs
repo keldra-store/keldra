@@ -787,6 +787,10 @@ pub enum ApplyError {
     NodeMembershipTransitionInProgress { node_id: NodeId },
     #[error("transition node {node_id:?} is not a current Raft voter or learner")]
     TransitionNodeNotCurrentMember { node_id: NodeId },
+    #[error("Raft member {node_id:?} has no admitted node descriptor")]
+    RaftMemberDescriptorMissing { node_id: NodeId },
+    #[error("Raft member {node_id:?} address does not match its admitted descriptor")]
+    RaftMemberAddressMismatch { node_id: NodeId },
     #[error("node {node_id:?} cannot complete removal while it remains a Raft member")]
     RemovingNodeIsStillMember { node_id: NodeId },
     #[error("Raft voter target requires {expected} voters, not {actual}")]
