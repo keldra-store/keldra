@@ -8,6 +8,7 @@ mod cluster_startup;
 mod credential_service;
 mod mutable_record_quorum;
 mod mutable_record_replica_group;
+mod node_identity;
 pub mod observability;
 mod payload_placement;
 mod placement;
