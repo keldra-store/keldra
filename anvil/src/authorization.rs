@@ -10,6 +10,7 @@ pub(crate) const STORAGE_TENANT_NAMESPACE: &str = "storage_tenant";
 pub(crate) const BUCKET_NAMESPACE: &str = "bucket";
 pub(crate) const OBJECT_NAMESPACE: &str = "object";
 pub(crate) const AUTHZ_REALM_NAMESPACE: &str = "authz_realm";
+#[cfg(test)]
 pub(crate) const APP_NAMESPACE: &str = "app";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,6 +33,8 @@ pub(crate) enum RealmPermission {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StorageTenantPermission {
     Read,
+    ManageTenant,
+    ManageBuckets,
     ManageAuthz,
 }
 
@@ -39,6 +42,8 @@ impl StorageTenantPermission {
     fn relation(self) -> &'static str {
         match self {
             Self::Read => "read_tenant",
+            Self::ManageTenant => "manage_tenant",
+            Self::ManageBuckets => "manage_buckets",
             Self::ManageAuthz => "manage_authz",
         }
     }
@@ -137,6 +142,19 @@ impl SystemAuthorization {
         allows_bucket_policy(&self.authorization, subject, tenant, bucket)
     }
 
+    /// Prefix watches can reveal every matching child path, so an exact-path
+    /// grant on the prefix itself is insufficient. The caller must hold the
+    /// corresponding bucket-wide object permission.
+    pub(crate) fn allows_bucket_objects(
+        &self,
+        subject: &ObjectRef,
+        tenant: &str,
+        bucket: &str,
+        permission: ObjectPermission,
+    ) -> anvil_authz::Result<bool> {
+        allows_bucket_objects(&self.authorization, subject, tenant, bucket, permission)
+    }
+
     pub(crate) fn allows_realm(
         &self,
         subject: &ObjectRef,
@@ -157,6 +175,14 @@ impl SystemAuthorization {
             subject.clone(),
             storage_tenant_resource(tenant)?,
             permission.relation(),
+        ))
+    }
+
+    pub(crate) fn allows_manage_system(&self, subject: &ObjectRef) -> anvil_authz::Result<bool> {
+        self.authorization.check(&AuthorizationCheck::new(
+            subject.clone(),
+            ObjectRef::opaque("system", anvil_store::SYSTEM_STORAGE_TENANT_ID)?,
+            "manage_system",
         ))
     }
 }
@@ -190,6 +216,7 @@ impl ObjectPermission {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn caller_subject(subject_id: &str) -> anvil_authz::Result<ObjectRef> {
     ObjectRef::opaque(APP_NAMESPACE, subject_id)
 }
@@ -248,6 +275,20 @@ pub(crate) fn allows_bucket_policy(
         subject.clone(),
         bucket_resource(tenant, bucket)?,
         "manage_policy",
+    ))
+}
+
+pub(crate) fn allows_bucket_objects(
+    authorization: &Authorization,
+    subject: &ObjectRef,
+    tenant: &str,
+    bucket: &str,
+    permission: ObjectPermission,
+) -> anvil_authz::Result<bool> {
+    authorization.check(&AuthorizationCheck::new(
+        subject.clone(),
+        bucket_resource(tenant, bucket)?,
+        permission.bucket_relation(),
     ))
 }
 
@@ -339,6 +380,79 @@ mod tests {
 
         assert!(allows_object(&authorization, &alice, &parent, ObjectPermission::Get).unwrap());
         assert!(!allows_object(&authorization, &alice, &child, ObjectPermission::Get).unwrap());
+    }
+
+    #[test]
+    fn prefix_watch_authority_requires_a_bucket_wide_read_grant() {
+        let exact_reader = caller_subject("exact-reader").unwrap();
+        let bucket_reader = caller_subject("bucket-reader").unwrap();
+        let prefix = key("reports");
+        let authorization = Authorization::new(
+            RealmId::system(),
+            system_schema(),
+            [
+                Tuple::new(
+                    object_resource(&prefix).unwrap(),
+                    "reader",
+                    exact_reader.clone(),
+                ),
+                Tuple::new(
+                    bucket_resource("acme", "objects").unwrap(),
+                    "reader",
+                    bucket_reader.clone(),
+                ),
+            ],
+            AuthorizationLimits::default(),
+        )
+        .unwrap();
+
+        assert!(
+            !allows_bucket_objects(
+                &authorization,
+                &exact_reader,
+                "acme",
+                "objects",
+                ObjectPermission::Get,
+            )
+            .unwrap()
+        );
+        assert!(
+            allows_bucket_objects(
+                &authorization,
+                &bucket_reader,
+                "acme",
+                "objects",
+                ObjectPermission::Get,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn object_listing_denies_an_exact_path_only_reader() {
+        let exact_reader = caller_subject("exact-reader").unwrap();
+        let authorization = Authorization::new(
+            RealmId::system(),
+            system_schema(),
+            [Tuple::new(
+                object_resource(&key("reports/visible.json")).unwrap(),
+                "reader",
+                exact_reader.clone(),
+            )],
+            AuthorizationLimits::default(),
+        )
+        .unwrap();
+
+        assert!(
+            !allows_bucket_objects(
+                &authorization,
+                &exact_reader,
+                "acme",
+                "objects",
+                ObjectPermission::Get,
+            )
+            .unwrap()
+        );
     }
 
     #[test]

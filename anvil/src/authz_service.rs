@@ -9,6 +9,7 @@ use anvil_store::{
     TupleMutationKind,
 };
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, UNIX_EPOCH};
 use tonic::{Request, Response, Status};
 
 use crate::authentication::Caller;
@@ -261,6 +262,11 @@ impl AuthzService for AuthzServiceImpl {
         Ok(Response::new(api::MutateTuplesResponse {
             revision: receipt.authz_revision.0,
             replayed: receipt.replayed,
+            replay_guarantee_expires_at: Some(
+                (UNIX_EPOCH
+                    + Duration::from_millis(receipt.replay_guarantee_expires_at_unix_millis))
+                .into(),
+            ),
         }))
     }
 
@@ -310,7 +316,7 @@ impl AuthzService for AuthzServiceImpl {
         let offset = match page_token {
             Some(token) if token.revision != revision => {
                 return Err(Status::failed_precondition(
-                    "authorization tuple page revision is no longer current",
+                    "AUTHZ_REVISION_EXPIRED: authorization tuple page revision is no longer current",
                 ));
             }
             Some(token) => token.offset,
@@ -523,6 +529,8 @@ fn authz_store_status(error: AuthzStoreError) -> Status {
         AuthzStoreError::RevisionNotAvailable { .. } => {
             Status::failed_precondition(error.to_string())
         }
+        AuthzStoreError::RevisionExpired { .. } => Status::failed_precondition(error.to_string()),
+        AuthzStoreError::ReceiptCapacity => Status::resource_exhausted(error.to_string()),
         AuthzStoreError::Storage(_) => Status::internal(error.to_string()),
     }
 }
@@ -637,7 +645,8 @@ mod tests {
     use anvil_store::{AuthzScope, Store, StoreOptions, SystemBootstrapRequest};
 
     fn test_caller() -> Caller {
-        let manager = crate::authentication::JwtManager::new("test signing secret").unwrap();
+        let manager =
+            crate::authentication::JwtManager::new(b"0123456789abcdef0123456789abcdef").unwrap();
         let token = manager
             .mint(StorageTenantId::parse("acme").unwrap(), "alice")
             .unwrap();
@@ -741,6 +750,61 @@ mod tests {
                 ..Default::default()
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn every_public_authz_rpc_requires_an_installed_caller() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreOptions::new(directory.path(), 3))
+            .await
+            .unwrap();
+        let service = AuthzServiceImpl::new(store.authz());
+
+        let put = service
+            .put_schema(Request::new(api::PutSchemaRequest::default()))
+            .await
+            .unwrap_err();
+        let bind = service
+            .bind_schema(Request::new(api::BindSchemaRequest::default()))
+            .await
+            .unwrap_err();
+        let get_binding = service
+            .get_binding(Request::new(api::GetBindingRequest::default()))
+            .await
+            .unwrap_err();
+        let get_schema = service
+            .get_schema(Request::new(api::GetSchemaRequest::default()))
+            .await
+            .unwrap_err();
+        let mutate = service
+            .mutate_tuples(Request::new(api::MutateTuplesRequest::default()))
+            .await
+            .unwrap_err();
+        let read = service
+            .read_tuples(Request::new(api::ReadTuplesRequest::default()))
+            .await
+            .unwrap_err();
+        let check = service
+            .check_permission(Request::new(api::CheckPermissionRequest::default()))
+            .await
+            .unwrap_err();
+        let checks = service
+            .check_permissions(Request::new(api::CheckPermissionsRequest::default()))
+            .await
+            .unwrap_err();
+
+        for status in [
+            put,
+            bind,
+            get_binding,
+            get_schema,
+            mutate,
+            read,
+            check,
+            checks,
+        ] {
+            assert_eq!(status.code(), tonic::Code::Unauthenticated);
+        }
     }
 
     #[tokio::test]

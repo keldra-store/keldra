@@ -279,9 +279,9 @@ pub(crate) fn consistency_from_api(
         Some(api::authz_consistency::Requirement::AtLeast(value)) => {
             Ok(AuthzConsistency::AtLeast(AuthzRevision(value.revision)))
         }
-        Some(api::authz_consistency::Requirement::Exact(_)) => Err(Status::unimplemented(
-            "exact authorization revisions require the unresolved 0.5 retention contract",
-        )),
+        Some(api::authz_consistency::Requirement::Exact(value)) => {
+            Ok(AuthzConsistency::Exact(AuthzRevision(value.revision)))
+        }
     }
 }
 
@@ -713,6 +713,17 @@ mod tests {
         };
         let domain_check = check_from_api(check.clone()).unwrap();
         assert_eq!(check_to_api(&domain_check), check);
+    }
+
+    #[test]
+    fn exact_consistency_is_preserved_at_the_transport_boundary() {
+        let consistency = consistency_from_api(Some(api::AuthzConsistency {
+            requirement: Some(api::authz_consistency::Requirement::Exact(
+                api::ExactRevision { revision: 42 },
+            )),
+        }))
+        .unwrap();
+        assert_eq!(consistency, AuthzConsistency::Exact(AuthzRevision(42)));
     }
 
     #[test]
