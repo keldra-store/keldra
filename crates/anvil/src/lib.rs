@@ -9,6 +9,7 @@ mod credential_service;
 mod mutable_record_quorum;
 mod mutable_record_replica_group;
 pub mod observability;
+mod payload_placement;
 mod placement;
 mod programs;
 mod serving_fence;
