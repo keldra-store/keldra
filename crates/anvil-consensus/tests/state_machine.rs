@@ -9,6 +9,10 @@ fn node(node_id: u64) -> NodeId {
     NodeId(node_id)
 }
 
+fn cluster(seed: u8) -> [u8; 16] {
+    [seed; 16]
+}
+
 #[derive(Clone, Copy)]
 struct Program {
     path_hash: ProgramPathHash,
@@ -86,10 +90,176 @@ fn configuration_requires_both_hard_bounds() {
     let state = StateMachine::new(8, 64 * 1024).unwrap();
     assert_eq!(state.max_commit_entries(), 8);
     assert_eq!(state.max_commit_bytes(), 64 * 1024);
+    assert_eq!(state.cluster_id(), None);
+    assert!(!state.system_bootstrap().is_complete());
+    assert_eq!(state.system_bootstrap().version(), None);
+    assert_eq!(state.system_bootstrap().committed_log_index(), None);
     assert_eq!(state.executor(), None);
     assert_eq!(state.unfinalized_commit_len(), 0);
     assert_eq!(state.unfinalized_commit_bytes().unwrap(), 0);
     assert_eq!(state.finalized_through(), None);
+}
+
+#[test]
+fn cluster_identity_is_validated_and_initialized_exactly_once() {
+    let mut state = StateMachine::new(8, 64 * 1024).unwrap();
+    assert_eq!(
+        state.apply(
+            1,
+            &Command::InitializeCluster {
+                cluster_id: cluster(0).into(),
+            },
+        ),
+        Err(ApplyError::InvalidClusterId)
+    );
+
+    let identity = cluster(7);
+    assert_eq!(
+        state
+            .apply(
+                2,
+                &Command::InitializeCluster {
+                    cluster_id: identity.into(),
+                },
+            )
+            .unwrap(),
+        ApplyResult::ClusterInitialized {
+            cluster_id: identity.into(),
+        }
+    );
+    assert_eq!(state.cluster_id().map(|id| id.into_bytes()), Some(identity));
+
+    // Applying the same logical initialization at another committed index is
+    // an idempotent success and cannot replace the stable identity.
+    assert_eq!(
+        state
+            .apply(
+                3,
+                &Command::InitializeCluster {
+                    cluster_id: identity.into(),
+                },
+            )
+            .unwrap(),
+        ApplyResult::ClusterInitialized {
+            cluster_id: identity.into(),
+        }
+    );
+
+    let conflicting = cluster(8);
+    assert_eq!(
+        state.apply(
+            4,
+            &Command::InitializeCluster {
+                cluster_id: conflicting.into(),
+            },
+        ),
+        Err(ApplyError::ClusterIdentityConflict {
+            current: identity.into(),
+            requested: conflicting.into(),
+        })
+    );
+    assert_eq!(state.cluster_id().map(|id| id.into_bytes()), Some(identity));
+}
+
+#[test]
+fn system_bootstrap_completion_is_fenced_versioned_and_idempotent() {
+    let mut state = StateMachine::new(8, 64 * 1024).unwrap();
+    let first_executor = node(3);
+    let next_executor = node(4);
+    nominate(&mut state, 1, first_executor);
+
+    assert_eq!(
+        state.apply(
+            2,
+            &Command::CompleteSystemBootstrap {
+                executor: first_executor,
+                nomination_log_index: 1,
+                bootstrap_version: 1,
+            },
+        ),
+        Err(ApplyError::ClusterNotInitialized)
+    );
+
+    state
+        .apply(
+            3,
+            &Command::InitializeCluster {
+                cluster_id: cluster(9).into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        state.apply(
+            4,
+            &Command::CompleteSystemBootstrap {
+                executor: first_executor,
+                nomination_log_index: 1,
+                bootstrap_version: 0,
+            },
+        ),
+        Err(ApplyError::UnsupportedSystemBootstrapVersion { requested: 0 })
+    );
+    assert_eq!(
+        state.apply(
+            5,
+            &Command::CompleteSystemBootstrap {
+                executor: first_executor,
+                nomination_log_index: 2,
+                bootstrap_version: 1,
+            },
+        ),
+        Err(ApplyError::NominationFenceMismatch {
+            expected: 1,
+            requested: 2,
+        })
+    );
+
+    let completed = state
+        .apply(
+            6,
+            &Command::CompleteSystemBootstrap {
+                executor: first_executor,
+                nomination_log_index: 1,
+                bootstrap_version: 1,
+            },
+        )
+        .unwrap();
+    let ApplyResult::SystemBootstrapCompleted(completed) = completed else {
+        unreachable!()
+    };
+    assert!(completed.is_complete());
+    assert_eq!(completed.version(), Some(1));
+    assert_eq!(completed.committed_log_index(), Some(6));
+
+    nominate(&mut state, 7, next_executor);
+    let replayed = state
+        .apply(
+            8,
+            &Command::CompleteSystemBootstrap {
+                executor: next_executor,
+                nomination_log_index: 7,
+                bootstrap_version: 1,
+            },
+        )
+        .unwrap();
+    let ApplyResult::SystemBootstrapCompleted(replayed) = replayed else {
+        unreachable!()
+    };
+    assert_eq!(replayed, completed);
+    assert_eq!(replayed.committed_log_index(), Some(6));
+
+    assert_eq!(
+        state.apply(
+            9,
+            &Command::CompleteSystemBootstrap {
+                executor: next_executor,
+                nomination_log_index: 7,
+                bootstrap_version: 2,
+            },
+        ),
+        Err(ApplyError::UnsupportedSystemBootstrapVersion { requested: 2 })
+    );
+    assert_eq!(state.system_bootstrap(), completed);
 }
 
 #[test]

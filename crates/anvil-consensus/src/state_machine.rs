@@ -7,7 +7,8 @@ use crate::{
     ATOMIC_REPLAY_RETENTION_MILLIS, ApplyResult, Command, CommitBatch, CommitResult,
     CommittedBatch, CommittedInvocation, ExecutorNomination, InvocationId,
     MAX_COMMITTED_INVOCATION_BYTES, MAX_COMMITTED_INVOCATIONS, NodeId, ProgramHash,
-    ProgramPathHash, codec,
+    ProgramPathHash, SYSTEM_BOOTSTRAP_VERSION, codec,
+    types::{ClusterId, SystemBootstrapState},
 };
 
 /// Pure deterministic state for Anvil's compact consensus log.
@@ -23,6 +24,8 @@ use crate::{
 pub struct StateMachine {
     max_commit_entries: u32,
     max_commit_bytes: u64,
+    cluster_id: Option<ClusterId>,
+    system_bootstrap: SystemBootstrapState,
     executor: Option<ExecutorNomination>,
     committed_invocations: BTreeMap<u64, CommittedInvocation>,
     committed_invocation_bytes: u64,
@@ -45,6 +48,8 @@ impl StateMachine {
         Ok(Self {
             max_commit_entries,
             max_commit_bytes,
+            cluster_id: None,
+            system_bootstrap: SystemBootstrapState::Missing,
             executor: None,
             committed_invocations: BTreeMap::new(),
             committed_invocation_bytes,
@@ -53,12 +58,46 @@ impl StateMachine {
         })
     }
 
+    /// Convert the exact state-machine body written by Anvil 0.5.0.
+    ///
+    /// Snapshot decoding owns the legacy wire type; this constructor only
+    /// supplies the two fields introduced after that release.
+    pub(crate) fn from_v050_snapshot(
+        max_commit_entries: u32,
+        max_commit_bytes: u64,
+        executor: Option<ExecutorNomination>,
+        committed_invocations: BTreeMap<u64, CommittedInvocation>,
+        committed_invocation_bytes: u64,
+        last_commit_cursor: Option<u64>,
+        finalized_through: Option<u64>,
+    ) -> Self {
+        Self {
+            max_commit_entries,
+            max_commit_bytes,
+            cluster_id: None,
+            system_bootstrap: SystemBootstrapState::Missing,
+            executor,
+            committed_invocations,
+            committed_invocation_bytes,
+            last_commit_cursor,
+            finalized_through,
+        }
+    }
+
     pub fn max_commit_entries(&self) -> u32 {
         self.max_commit_entries
     }
 
     pub fn max_commit_bytes(&self) -> u64 {
         self.max_commit_bytes
+    }
+
+    pub fn cluster_id(&self) -> Option<ClusterId> {
+        self.cluster_id
+    }
+
+    pub fn system_bootstrap(&self) -> SystemBootstrapState {
+        self.system_bootstrap
     }
 
     pub fn executor(&self) -> Option<ExecutorNomination> {
@@ -147,6 +186,75 @@ impl StateMachine {
             } => {
                 self.advance_finalization(*executor, *nomination_log_index, *through_commit_cursor)
             }
+            Command::InitializeCluster { cluster_id } => self.initialize_cluster(*cluster_id),
+            Command::CompleteSystemBootstrap {
+                executor,
+                nomination_log_index,
+                bootstrap_version,
+            } => self.complete_system_bootstrap(
+                *executor,
+                *nomination_log_index,
+                *bootstrap_version,
+                committed_log_index,
+            ),
+        }
+    }
+
+    fn initialize_cluster(&mut self, cluster_id: ClusterId) -> Result<ApplyResult, ApplyError> {
+        validate_cluster_id(cluster_id)?;
+        if let Some(current) = self.cluster_id {
+            if current != cluster_id {
+                return Err(ApplyError::ClusterIdentityConflict {
+                    current,
+                    requested: cluster_id,
+                });
+            }
+            return Ok(ApplyResult::ClusterInitialized {
+                cluster_id: current,
+            });
+        }
+
+        self.cluster_id = Some(cluster_id);
+        Ok(ApplyResult::ClusterInitialized { cluster_id })
+    }
+
+    fn complete_system_bootstrap(
+        &mut self,
+        executor: NodeId,
+        nomination_log_index: u64,
+        bootstrap_version: u16,
+        committed_log_index: u64,
+    ) -> Result<ApplyResult, ApplyError> {
+        if bootstrap_version != SYSTEM_BOOTSTRAP_VERSION {
+            return Err(ApplyError::UnsupportedSystemBootstrapVersion {
+                requested: bootstrap_version,
+            });
+        }
+        if self.cluster_id.is_none() {
+            return Err(ApplyError::ClusterNotInitialized);
+        }
+        self.require_executor(executor, nomination_log_index)?;
+
+        match self.system_bootstrap {
+            SystemBootstrapState::Missing => {
+                let completed = SystemBootstrapState::Complete {
+                    version: bootstrap_version,
+                    committed_log_index,
+                };
+                self.system_bootstrap = completed;
+                Ok(ApplyResult::SystemBootstrapCompleted(completed))
+            }
+            completed @ SystemBootstrapState::Complete { version, .. }
+                if version == bootstrap_version =>
+            {
+                Ok(ApplyResult::SystemBootstrapCompleted(completed))
+            }
+            SystemBootstrapState::Complete {
+                version: current, ..
+            } => Err(ApplyError::SystemBootstrapVersionConflict {
+                current,
+                requested: bootstrap_version,
+            }),
         }
     }
 
@@ -371,6 +479,13 @@ fn validate_node(node: NodeId) -> Result<(), ApplyError> {
     Ok(())
 }
 
+fn validate_cluster_id(cluster_id: ClusterId) -> Result<(), ApplyError> {
+    if cluster_id.0 == [0; 16] {
+        return Err(ApplyError::InvalidClusterId);
+    }
+    Ok(())
+}
+
 fn validate_program(
     program_path_hash: ProgramPathHash,
     program_hash: ProgramHash,
@@ -520,4 +635,17 @@ pub enum ApplyError {
         last_commit_cursor: u64,
         requested: u64,
     },
+    #[error("cluster identity must be non-zero")]
+    InvalidClusterId,
+    #[error("cluster identity is already {current:?}, not {requested:?}")]
+    ClusterIdentityConflict {
+        current: ClusterId,
+        requested: ClusterId,
+    },
+    #[error("cluster identity has not been initialized")]
+    ClusterNotInitialized,
+    #[error("system-bootstrap version {requested} is unsupported")]
+    UnsupportedSystemBootstrapVersion { requested: u16 },
+    #[error("system bootstrap is already complete at version {current}, not {requested}")]
+    SystemBootstrapVersionConflict { current: u16, requested: u16 },
 }

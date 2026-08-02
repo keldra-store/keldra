@@ -3,10 +3,30 @@ use serde::{Deserialize, Serialize};
 pub const ATOMIC_REPLAY_RETENTION_MILLIS: u64 = 24 * 60 * 60 * 1_000;
 pub const MAX_COMMITTED_INVOCATIONS: u32 = 4_096;
 pub const MAX_COMMITTED_INVOCATION_BYTES: u64 = 16 * 1024 * 1024;
+pub const SYSTEM_BOOTSTRAP_VERSION: u16 = 1;
 
 /// Stable identity of one Raft voter or learner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub u64);
+
+/// Stable identity of one Anvil cluster.
+///
+/// The identity is generated once when the Raft group is created and retained
+/// in every state-machine snapshot. An all-zero value is reserved as invalid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ClusterId(pub [u8; 16]);
+
+impl From<[u8; 16]> for ClusterId {
+    fn from(value: [u8; 16]) -> Self {
+        Self(value)
+    }
+}
+
+impl ClusterId {
+    pub fn into_bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
 
 /// Compact identity of a canonical reserved program object path.
 ///
@@ -58,6 +78,42 @@ pub struct InvocationFingerprint(pub [u8; 32]);
 pub struct ExecutorNomination {
     pub executor: NodeId,
     pub nomination_log_index: u64,
+}
+
+/// Whether Anvil's protected system identity has been durably bootstrapped.
+///
+/// `committed_log_index` is the original completion decision and is preserved
+/// when an idempotent retry is applied at a later log index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SystemBootstrapState {
+    Missing,
+    Complete {
+        version: u16,
+        committed_log_index: u64,
+    },
+}
+
+impl SystemBootstrapState {
+    pub fn is_complete(self) -> bool {
+        matches!(self, Self::Complete { .. })
+    }
+
+    pub fn version(self) -> Option<u16> {
+        match self {
+            Self::Missing => None,
+            Self::Complete { version, .. } => Some(version),
+        }
+    }
+
+    pub fn committed_log_index(self) -> Option<u64> {
+        match self {
+            Self::Missing => None,
+            Self::Complete {
+                committed_log_index,
+                ..
+            } => Some(committed_log_index),
+        }
+    }
 }
 
 /// A compact request to commit one already prepared atomic-program batch.
@@ -135,6 +191,18 @@ pub enum Command {
         nomination_log_index: u64,
         through_commit_cursor: u64,
     },
+    /// Set the stable cluster identity exactly once. This variant is appended
+    /// to preserve all command discriminants released in Anvil 0.5.0.
+    InitializeCluster {
+        cluster_id: ClusterId,
+    },
+    /// Record that the nominated executor has durably written the protected
+    /// system identity. This variant is appended for 0.5.0 compatibility.
+    CompleteSystemBootstrap {
+        executor: NodeId,
+        nomination_log_index: u64,
+        bootstrap_version: u16,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,4 +210,6 @@ pub enum ApplyResult {
     ExecutorNominated(ExecutorNomination),
     BatchCommitted(CommitResult),
     FinalizationAdvanced { through_commit_cursor: u64 },
+    ClusterInitialized { cluster_id: ClusterId },
+    SystemBootstrapCompleted(SystemBootstrapState),
 }

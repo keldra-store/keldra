@@ -1,29 +1,31 @@
-//! Deferred distributed-consensus capability.
+//! Transport-neutral peer networking for the compact decision Raft group.
 //!
-//! This module is intentionally not compiled by Anvil 0.5.0. The base release
-//! has exactly one Raft member and a private network implementation that can
-//! only report an unreachable peer. Keeping the peer protocol, transport,
-//! inbound handlers, and membership mutation here prevents those later
-//! capabilities from leaking into the base release surface.
+//! This module owns only Raft RPC transport and membership mutation. TLS,
+//! admission, cluster descriptors, storage routing, and public APIs belong to
+//! higher layers.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, RwLock};
 
-use async_trait::async_trait;
-use openraft::{BasicNode, RaftError};
+use openraft::BasicNode;
 use openraft::error::{
-    InstallSnapshotError, NetworkError, RPCError, RemoteError, Unreachable,
+    InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError, Unreachable,
 };
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
-    InstallSnapshotResponse, VoteRequest, VoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
+    VoteRequest, VoteResponse,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
 use crate::codec;
 use crate::raft::{DecisionRaft, DecisionRaftConfig, DecisionRaftError, map_client_write_error};
+
+const PEER_RPC_SCHEMA_VERSION: u16 = 1;
+const MAX_CLUSTER_NODE_ID: u64 = 1_023;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerNode {
@@ -60,14 +62,17 @@ pub enum PeerTransportError {
     Protocol(String),
 }
 
-#[async_trait]
+/// One object-safe transport call without requiring an async-trait macro.
+pub type PeerTransportFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Vec<u8>, PeerTransportError>> + Send + 'a>>;
+
+/// Transport used by OpenRaft to reach one registered peer.
+///
+/// Implementations are responsible only for carrying the bounded envelope.
+/// Authentication and encryption are intentionally outside this foundation.
 pub trait PeerTransport: Send + Sync + 'static {
-    async fn send(
-        &self,
-        target: u64,
-        node: &PeerNode,
-        rpc: PeerRpc,
-    ) -> Result<Vec<u8>, PeerTransportError>;
+    fn send<'a>(&'a self, target: u64, node: &'a PeerNode, rpc: PeerRpc)
+    -> PeerTransportFuture<'a>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -108,6 +113,7 @@ impl PeerNetwork {
         &mut self,
         kind: PeerRpcKind,
         request: &Req,
+        option: RPCOption,
     ) -> Result<Resp, RPCError<u64, BasicNode, RaftError<u64, AppError>>>
     where
         Req: Serialize,
@@ -116,24 +122,26 @@ impl PeerNetwork {
     {
         let payload =
             codec::encode(request).map_err(|error| RPCError::Network(NetworkError::new(&error)))?;
-        let response = self
-            .transport
-            .send(
-                self.target,
-                &PeerNode::new(self.node.addr.clone()),
-                PeerRpc {
-                    schema_version: 1,
-                    kind,
-                    payload,
-                },
-            )
+        let node = PeerNode::new(self.node.addr.clone());
+        let call = self.transport.send(
+            self.target,
+            &node,
+            PeerRpc {
+                schema_version: PEER_RPC_SCHEMA_VERSION,
+                kind,
+                payload,
+            },
+        );
+        let response = tokio::time::timeout(option.hard_ttl(), call)
             .await
-            .map_err(|error| match error {
-                PeerTransportError::Unreachable(_) => {
-                    RPCError::Unreachable(Unreachable::new(&error))
-                }
-                PeerTransportError::Protocol(_) => RPCError::Network(NetworkError::new(&error)),
-            })?;
+            .map_err(|_| {
+                let error = PeerTransportError::Unreachable(format!(
+                    "peer {} did not respond before the Raft RPC deadline",
+                    self.target
+                ));
+                RPCError::Unreachable(Unreachable::new(&error))
+            })?
+            .map_err(map_transport_error)?;
         let remote: Result<Resp, RaftError<u64, AppError>> = codec::decode(&response)
             .map_err(|error| RPCError::Network(NetworkError::new(&error)))?;
         remote.map_err(|error| {
@@ -146,40 +154,60 @@ impl PeerNetwork {
     }
 }
 
+fn map_transport_error<AppError>(
+    error: PeerTransportError,
+) -> RPCError<u64, BasicNode, RaftError<u64, AppError>>
+where
+    AppError: std::error::Error,
+{
+    match &error {
+        PeerTransportError::Unreachable(_) => RPCError::Unreachable(Unreachable::new(&error)),
+        PeerTransportError::Protocol(_) => RPCError::Network(NetworkError::new(&error)),
+    }
+}
+
 impl RaftNetwork<DecisionRaftConfig> for PeerNetwork {
     async fn append_entries(
         &mut self,
         rpc: AppendEntriesRequest<DecisionRaftConfig>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
-        self.call(PeerRpcKind::AppendEntries, &rpc).await
+        self.call(PeerRpcKind::AppendEntries, &rpc, option).await
     }
 
     async fn install_snapshot(
         &mut self,
         rpc: InstallSnapshotRequest<DecisionRaftConfig>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<
         InstallSnapshotResponse<u64>,
         RPCError<u64, BasicNode, RaftError<u64, InstallSnapshotError>>,
     > {
-        self.call(PeerRpcKind::InstallSnapshot, &rpc).await
+        self.call(PeerRpcKind::InstallSnapshot, &rpc, option).await
     }
 
     async fn vote(
         &mut self,
         rpc: VoteRequest<u64>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<VoteResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
-        self.call(PeerRpcKind::Vote, &rpc).await
+        self.call(PeerRpcKind::Vote, &rpc, option).await
     }
 }
 
 impl DecisionRaft {
-    pub async fn initialize_peers(
+    /// Initialize a pristine Raft group with an explicit genesis membership.
+    pub async fn initialize_genesis(
         &self,
         members: BTreeMap<u64, PeerNode>,
     ) -> Result<(), DecisionRaftError> {
+        validate_members(&members)?;
+        if !members.contains_key(&self.node_id) {
+            return Err(DecisionRaftError::Configuration(format!(
+                "genesis membership does not contain local node {}",
+                self.node_id
+            )));
+        }
         let members = members
             .into_iter()
             .map(|(node_id, node)| (node_id, BasicNode::new(node.address)))
@@ -196,6 +224,7 @@ impl DecisionRaft {
         node: PeerNode,
         blocking: bool,
     ) -> Result<(), DecisionRaftError> {
+        validate_node(node_id, &node)?;
         self.raft
             .add_learner(node_id, BasicNode::new(node.address), blocking)
             .await
@@ -208,6 +237,18 @@ impl DecisionRaft {
         voters: BTreeSet<u64>,
         retain_removed_as_learners: bool,
     ) -> Result<(), DecisionRaftError> {
+        if voters.is_empty() {
+            return Err(DecisionRaftError::Configuration(
+                "Raft voter membership must not be empty".into(),
+            ));
+        }
+        if let Some(node_id) = voters
+            .iter()
+            .copied()
+            .find(|node_id| !(1..=MAX_CLUSTER_NODE_ID).contains(node_id))
+        {
+            return Err(invalid_node_id(node_id));
+        }
         self.raft
             .change_membership(voters, retain_removed_as_learners)
             .await
@@ -216,7 +257,7 @@ impl DecisionRaft {
     }
 
     pub async fn handle_peer_rpc(&self, rpc: PeerRpc) -> Result<Vec<u8>, PeerRpcError> {
-        if rpc.schema_version != 1 {
+        if rpc.schema_version != PEER_RPC_SCHEMA_VERSION {
             return Err(PeerRpcError::UnsupportedSchema(rpc.schema_version));
         }
         if rpc.payload.len() > codec::MAX_ENCODED_BYTES {
@@ -240,10 +281,117 @@ impl DecisionRaft {
     }
 }
 
+fn validate_members(members: &BTreeMap<u64, PeerNode>) -> Result<(), DecisionRaftError> {
+    if members.is_empty() {
+        return Err(DecisionRaftError::Configuration(
+            "genesis membership must not be empty".into(),
+        ));
+    }
+    for (node_id, node) in members {
+        validate_node(*node_id, node)?;
+    }
+    Ok(())
+}
+
+fn validate_node(node_id: u64, node: &PeerNode) -> Result<(), DecisionRaftError> {
+    if !(1..=MAX_CLUSTER_NODE_ID).contains(&node_id) {
+        return Err(invalid_node_id(node_id));
+    }
+    if node.address.is_empty() {
+        return Err(DecisionRaftError::Configuration(format!(
+            "peer node {node_id} has an empty address"
+        )));
+    }
+    Ok(())
+}
+
+fn invalid_node_id(node_id: u64) -> DecisionRaftError {
+    DecisionRaftError::Configuration(format!(
+        "peer node id {node_id} is outside the supported range 1..={MAX_CLUSTER_NODE_ID}"
+    ))
+}
+
 fn decode_peer<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, PeerRpcError> {
     codec::decode(bytes).map_err(|error| PeerRpcError::Codec(error.to_string()))
 }
 
 fn encode_peer<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, PeerRpcError> {
     codec::encode(value).map_err(|error| PeerRpcError::Codec(error.to_string()))
+}
+
+/// Bounded, process-local transport for exercising the real OpenRaft network
+/// path without inventing a production wire protocol.
+#[derive(Clone, Default)]
+pub struct InMemoryPeerTransport {
+    peers: Arc<RwLock<BTreeMap<u64, DecisionRaft>>>,
+}
+
+impl InMemoryPeerTransport {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(&self, node_id: u64, raft: DecisionRaft) -> Result<(), PeerTransportError> {
+        let mut peers = self
+            .peers
+            .write()
+            .map_err(|_| PeerTransportError::Protocol("peer registry lock poisoned".into()))?;
+        if peers.contains_key(&node_id) {
+            return Err(PeerTransportError::Protocol(format!(
+                "peer {node_id} is already registered"
+            )));
+        }
+        peers.insert(node_id, raft);
+        Ok(())
+    }
+
+    pub fn unregister(&self, node_id: u64) -> Result<(), PeerTransportError> {
+        self.peers
+            .write()
+            .map_err(|_| PeerTransportError::Protocol("peer registry lock poisoned".into()))?
+            .remove(&node_id);
+        Ok(())
+    }
+}
+
+impl PeerTransport for InMemoryPeerTransport {
+    fn send<'a>(
+        &'a self,
+        target: u64,
+        _node: &'a PeerNode,
+        rpc: PeerRpc,
+    ) -> PeerTransportFuture<'a> {
+        Box::pin(async move {
+            let peer = self
+                .peers
+                .read()
+                .map_err(|_| PeerTransportError::Protocol("peer registry lock poisoned".into()))?
+                .get(&target)
+                .cloned()
+                .ok_or_else(|| {
+                    PeerTransportError::Unreachable(format!("peer {target} is not registered"))
+                })?;
+            peer.handle_peer_rpc(rpc)
+                .await
+                .map_err(|error| PeerTransportError::Protocol(error.to_string()))
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct UnreachablePeerTransport;
+
+impl PeerTransport for UnreachablePeerTransport {
+    fn send<'a>(
+        &'a self,
+        target: u64,
+        _node: &'a PeerNode,
+        _rpc: PeerRpc,
+    ) -> PeerTransportFuture<'a> {
+        Box::pin(async move {
+            Err(PeerTransportError::Unreachable(format!(
+                "peer {target} has no configured transport"
+            )))
+        })
+    }
 }

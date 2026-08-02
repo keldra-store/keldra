@@ -12,21 +12,15 @@ use openraft::{
     AnyError, BasicNode, EntryPayload, ErrorSubject, ErrorVerb, LogId, LogState, OptionalSend,
     RaftLogReader, RaftSnapshotBuilder, Snapshot, SnapshotMeta, StorageError, StorageIOError,
     StoredMembership, Vote,
-    error::{
-        ClientWriteError, InitializeError, InstallSnapshotError, RPCError, RaftError, Unreachable,
-    },
-    network::{RPCOption, RaftNetwork, RaftNetworkFactory},
-    raft::{
-        AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
-        InstallSnapshotResponse, VoteRequest, VoteResponse,
-    },
+    error::{ClientWriteError, InitializeError, RaftError},
     storage::{LogFlushed, RaftLogStorage, RaftStateMachine},
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    ApplyError, ApplyResult, Command, StateMachine, codec,
+    ApplyError, ApplyResult, Command, CommittedInvocation, ExecutorNomination, StateMachine, codec,
+    peer::{PeerNetworkFactory, PeerTransport, UnreachablePeerTransport},
     raft_storage::{DurableSnapshot, DurableStorageError, DurableStore, RaftEntry, StorageConfig},
 };
 
@@ -53,6 +47,47 @@ struct MachineState {
     snapshot_generation: u64,
 }
 
+/// Exact state-machine layout written by Anvil 0.5.0 snapshots.
+#[derive(Debug, Serialize, Deserialize)]
+struct LegacyStateMachineV050 {
+    max_commit_entries: u32,
+    max_commit_bytes: u64,
+    executor: Option<ExecutorNomination>,
+    committed_invocations: BTreeMap<u64, CommittedInvocation>,
+    committed_invocation_bytes: u64,
+    last_commit_cursor: Option<u64>,
+    finalized_through: Option<u64>,
+}
+
+/// Exact outer state layout written by Anvil 0.5.0 snapshots.
+#[derive(Debug, Serialize, Deserialize)]
+struct LegacyMachineStateV050 {
+    decisions: LegacyStateMachineV050,
+    last_applied_log_id: Option<LogId<u64>>,
+    membership: StoredMembership<u64, BasicNode>,
+    snapshot_generation: u64,
+}
+
+impl From<LegacyMachineStateV050> for MachineState {
+    fn from(legacy: LegacyMachineStateV050) -> Self {
+        let decisions = legacy.decisions;
+        Self {
+            decisions: StateMachine::from_v050_snapshot(
+                decisions.max_commit_entries,
+                decisions.max_commit_bytes,
+                decisions.executor,
+                decisions.committed_invocations,
+                decisions.committed_invocation_bytes,
+                decisions.last_commit_cursor,
+                decisions.finalized_through,
+            ),
+            last_applied_log_id: legacy.last_applied_log_id,
+            membership: legacy.membership,
+            snapshot_generation: legacy.snapshot_generation,
+        }
+    }
+}
+
 impl MachineState {
     fn new(config: StorageConfig) -> Result<Self, ApplyError> {
         Ok(Self {
@@ -77,7 +112,7 @@ impl MachineState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum DecisionRaftError {
-    #[error("Raft node identity must be non-zero")]
+    #[error("Raft node identity must be between 1 and 1023")]
     InvalidNodeId,
     #[error("consensus configuration rejected: {0}")]
     Configuration(String),
@@ -116,69 +151,6 @@ impl From<DurableStorageError> for DecisionRaftError {
 impl From<codec::CodecError> for DecisionRaftError {
     fn from(error: codec::CodecError) -> Self {
         Self::Storage(error.to_string())
-    }
-}
-
-/// OpenRaft requires a network factory even for a one-member group. This
-/// implementation is private and deliberately cannot carry a peer message.
-/// Any call into it means the 0.5.0 single-node invariant was violated.
-#[derive(Clone, Default)]
-struct SingleNodeNetworkFactory;
-
-struct UnreachablePeer {
-    target: u64,
-}
-
-impl RaftNetworkFactory<DecisionRaftConfig> for SingleNodeNetworkFactory {
-    type Network = UnreachablePeer;
-
-    async fn new_client(&mut self, target: u64, _node: &BasicNode) -> Self::Network {
-        UnreachablePeer { target }
-    }
-}
-
-impl UnreachablePeer {
-    fn reject<AppError>(&self) -> RPCError<u64, BasicNode, RaftError<u64, AppError>>
-    where
-        AppError: std::error::Error,
-    {
-        let error = std::io::Error::other(format!(
-            "Anvil 0.5.0 has one Raft member; peer {} is unreachable",
-            self.target
-        ));
-        RPCError::Unreachable(Unreachable::new(&error))
-    }
-}
-
-impl RaftNetwork<DecisionRaftConfig> for UnreachablePeer {
-    async fn append_entries(
-        &mut self,
-        rpc: AppendEntriesRequest<DecisionRaftConfig>,
-        _option: RPCOption,
-    ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
-        let _ = rpc;
-        Err(self.reject())
-    }
-
-    async fn install_snapshot(
-        &mut self,
-        rpc: InstallSnapshotRequest<DecisionRaftConfig>,
-        _option: RPCOption,
-    ) -> Result<
-        InstallSnapshotResponse<u64>,
-        RPCError<u64, BasicNode, RaftError<u64, InstallSnapshotError>>,
-    > {
-        let _ = rpc;
-        Err(self.reject())
-    }
-
-    async fn vote(
-        &mut self,
-        rpc: VoteRequest<u64>,
-        _option: RPCOption,
-    ) -> Result<VoteResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
-        let _ = rpc;
-        Err(self.reject())
     }
 }
 
@@ -273,7 +245,7 @@ impl RaftSnapshotBuilder<DecisionRaftConfig> for OpenRaftSnapshotBuilder {
         })?;
         let mut snapshot_state = current.clone();
         snapshot_state.snapshot_generation = snapshot_state.snapshot_generation.saturating_add(1);
-        let data = codec::encode(&snapshot_state)
+        let data = codec::encode_record(&snapshot_state)
             .map_err(|error| storage_error(ErrorSubject::StateMachine, ErrorVerb::Read, error))?;
         let meta = SnapshotMeta {
             last_log_id: snapshot_state.last_applied_log_id,
@@ -369,7 +341,7 @@ impl RaftStateMachine<DecisionRaftConfig> for OpenRaftStateMachine {
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<u64>> {
         let data = snapshot.into_inner();
-        let state: MachineState = codec::decode(&data).map_err(|error| {
+        let state = decode_machine_snapshot(&data).map_err(|error| {
             storage_error(
                 ErrorSubject::Snapshot(Some(meta.signature())),
                 ErrorVerb::Read,
@@ -426,20 +398,44 @@ impl RaftStateMachine<DecisionRaftConfig> for OpenRaftStateMachine {
 /// Running compact decision consensus service.
 #[derive(Clone)]
 pub struct DecisionRaft {
-    node_id: u64,
-    raft: openraft::Raft<DecisionRaftConfig>,
+    pub(crate) node_id: u64,
+    pub(crate) raft: openraft::Raft<DecisionRaftConfig>,
     store: DurableStore,
     machine: Arc<Mutex<MachineState>>,
 }
 
 impl DecisionRaft {
+    /// Open a Raft node with no reachable peers.
+    ///
+    /// This remains the small convenience used by the one-node 0.5.0 server
+    /// and focused storage tests. Multi-node callers use
+    /// [`Self::open_with_transport`].
     pub async fn open(
         path: impl AsRef<Path>,
         node_id: u64,
         max_commit_entries: u32,
         max_commit_bytes: u64,
     ) -> Result<Self, DecisionRaftError> {
-        if node_id == 0 {
+        Self::open_with_transport(
+            path,
+            node_id,
+            max_commit_entries,
+            max_commit_bytes,
+            Arc::new(UnreachablePeerTransport),
+        )
+        .await
+    }
+
+    /// Open a Raft node whose OpenRaft network is backed by the supplied
+    /// transport. Opening never initializes membership.
+    pub async fn open_with_transport(
+        path: impl AsRef<Path>,
+        node_id: u64,
+        max_commit_entries: u32,
+        max_commit_bytes: u64,
+        transport: Arc<dyn PeerTransport>,
+    ) -> Result<Self, DecisionRaftError> {
+        if !(1..=1_023).contains(&node_id) {
             return Err(DecisionRaftError::InvalidNodeId);
         }
         StateMachine::new(max_commit_entries, max_commit_bytes)
@@ -462,7 +458,7 @@ impl DecisionRaft {
         let raft = openraft::Raft::new(
             node_id,
             Arc::new(config),
-            SingleNodeNetworkFactory,
+            PeerNetworkFactory { transport },
             OpenRaftLogStore {
                 store: store.clone(),
             },
@@ -479,6 +475,17 @@ impl DecisionRaft {
             store,
             machine,
         })
+    }
+
+    pub async fn is_initialized(&self) -> Result<bool, DecisionRaftError> {
+        self.raft
+            .is_initialized()
+            .await
+            .map_err(|error| DecisionRaftError::Unavailable(error.to_string()))
+    }
+
+    pub fn current_leader(&self) -> Option<u64> {
+        self.raft.metrics().borrow().current_leader
     }
 
     /// Initialize a pristine single-node cluster, or leave an already initialized
@@ -578,7 +585,7 @@ impl DecisionRaft {
 fn load_machine(store: &DurableStore) -> Result<MachineState, DecisionRaftError> {
     let mut state = match store.load_snapshot()? {
         Some(snapshot) => {
-            let state: MachineState = codec::decode(&snapshot.data)?;
+            let state = decode_machine_snapshot(&snapshot.data)?;
             if state.last_applied_log_id != snapshot.meta.last_log_id
                 || state.membership != snapshot.meta.last_membership
             {
@@ -603,6 +610,18 @@ fn load_machine(store: &DurableStore) -> Result<MachineState, DecisionRaftError>
             .map_err(|error| DecisionRaftError::Storage(error.to_string()))?;
     }
     Ok(state)
+}
+
+/// Decode a self-identifying current snapshot or the released raw 0.5.0 body.
+/// A body beginning with the record magic is always treated as an envelope, so
+/// malformed or unknown current records cannot silently fall back to legacy.
+fn decode_machine_snapshot(data: &[u8]) -> Result<MachineState, codec::CodecError> {
+    let payload = codec::record_payload(data)?;
+    if payload.len() != data.len() {
+        codec::decode(payload)
+    } else {
+        codec::decode::<LegacyMachineStateV050>(payload).map(Into::into)
+    }
 }
 
 fn apply_entry(
@@ -643,6 +662,8 @@ fn validate_membership_command(
         Command::NominateExecutor { executor } => Some(*executor),
         Command::CommitBatch(batch) => Some(batch.executor),
         Command::FinalizedThrough { executor, .. } => Some(*executor),
+        Command::InitializeCluster { .. } => None,
+        Command::CompleteSystemBootstrap { executor, .. } => Some(*executor),
     };
     if let Some(executor) = executor
         && membership.membership().get_node(&executor.0).is_none()
@@ -652,7 +673,7 @@ fn validate_membership_command(
     Ok(())
 }
 
-fn map_client_write_error(
+pub(crate) fn map_client_write_error(
     error: RaftError<u64, ClientWriteError<u64, BasicNode>>,
 ) -> DecisionRaftError {
     if let Some(forward) = error.forward_to_leader::<BasicNode>() {
@@ -679,4 +700,53 @@ fn read_error(error: DurableStorageError) -> StorageError<u64> {
 
 fn write_error(error: DurableStorageError) -> StorageError<u64> {
     storage_error(ErrorSubject::Store, ErrorVerb::Write, error)
+}
+
+#[cfg(test)]
+mod snapshot_compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_wire_distinguishes_current_envelopes_from_raw_v050_state() {
+        let config = StorageConfig {
+            max_commit_entries: 4,
+            max_commit_bytes: 64 * 1024,
+        };
+        let empty_invocations = BTreeMap::new();
+        let legacy = LegacyMachineStateV050 {
+            decisions: LegacyStateMachineV050 {
+                max_commit_entries: config.max_commit_entries,
+                max_commit_bytes: config.max_commit_bytes,
+                executor: None,
+                committed_invocation_bytes: codec::encoded_len(&empty_invocations).unwrap(),
+                committed_invocations: empty_invocations,
+                last_commit_cursor: None,
+                finalized_through: None,
+            },
+            last_applied_log_id: None,
+            membership: StoredMembership::default(),
+            snapshot_generation: 7,
+        };
+
+        let legacy_raw = codec::encode(&legacy).unwrap();
+        assert_eq!(codec::record_payload(&legacy_raw).unwrap(), legacy_raw);
+        let migrated = decode_machine_snapshot(&legacy_raw).unwrap();
+        assert_eq!(migrated.snapshot_generation, 7);
+        assert_eq!(migrated.decisions.cluster_id(), None);
+        assert_eq!(
+            migrated.decisions.system_bootstrap(),
+            crate::SystemBootstrapState::Missing
+        );
+
+        let current = MachineState::new(config).unwrap();
+        let current_record = codec::encode_record(&current).unwrap();
+        assert_eq!(decode_machine_snapshot(&current_record).unwrap(), current);
+
+        let mut malformed_current = current_record;
+        malformed_current.pop();
+        assert!(matches!(
+            decode_machine_snapshot(&malformed_current),
+            Err(codec::CodecError::InvalidRecord(_))
+        ));
+    }
 }

@@ -1,9 +1,12 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anvil_consensus::{
     ATOMIC_REPLAY_RETENTION_MILLIS, ApplyError, ApplyResult, BundleHash, BundleRef, Command,
     CommitBatch, DecisionRaft, DecisionRaftError, DurabilityClass, DurabilityEvidenceHash,
-    InvocationFingerprint, InvocationId, NodeId, ProgramHash, ProgramPathHash,
+    InMemoryPeerTransport, InvocationFingerprint, InvocationId, NodeId, PeerNode, ProgramHash,
+    ProgramPathHash,
 };
 
 fn batch(nomination_log_index: u64, id: u8) -> CommitBatch {
@@ -28,6 +31,27 @@ fn batch(nomination_log_index: u64, id: u8) -> CommitBatch {
 
 async fn open(path: &std::path::Path) -> DecisionRaft {
     DecisionRaft::open(path, 1, 4, 64 * 1024).await.unwrap()
+}
+
+async fn open_peer(
+    path: &std::path::Path,
+    node_id: u64,
+    transport: &InMemoryPeerTransport,
+) -> DecisionRaft {
+    DecisionRaft::open_with_transport(path, node_id, 4, 64 * 1024, Arc::new(transport.clone()))
+        .await
+        .unwrap()
+}
+
+async fn wait_until(mut condition: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !condition() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "condition did not become true before timeout"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -158,4 +182,87 @@ async fn one_node_decisions_keep_original_commit_cursors_across_restart_and_snap
         Some(second.invocation)
     );
     raft.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_nodes_elect_replicate_add_learners_and_replace_a_failed_leader() {
+    let first_directory = tempfile::tempdir().unwrap();
+    let second_directory = tempfile::tempdir().unwrap();
+    let third_directory = tempfile::tempdir().unwrap();
+    let transport = InMemoryPeerTransport::new();
+
+    let first = open_peer(first_directory.path(), 1, &transport).await;
+    let second = open_peer(second_directory.path(), 2, &transport).await;
+    let third = open_peer(third_directory.path(), 3, &transport).await;
+    transport.register(1, first.clone()).unwrap();
+    transport.register(2, second.clone()).unwrap();
+    transport.register(3, third.clone()).unwrap();
+
+    first
+        .initialize_genesis(BTreeMap::from([(1, PeerNode::new("memory://1"))]))
+        .await
+        .unwrap();
+    assert_eq!(
+        first.wait_for_leader(Duration::from_secs(5)).await.unwrap(),
+        1
+    );
+
+    first
+        .add_learner(2, PeerNode::new("memory://2"), true)
+        .await
+        .unwrap();
+    let nomination = first
+        .submit(Command::NominateExecutor {
+            executor: NodeId(2),
+        })
+        .await
+        .unwrap();
+    let ApplyResult::ExecutorNominated(nomination) = nomination.result else {
+        panic!("nomination returned the wrong domain result")
+    };
+    wait_until(|| second.state().unwrap().executor() == Some(nomination)).await;
+
+    first
+        .add_learner(3, PeerNode::new("memory://3"), true)
+        .await
+        .unwrap();
+    wait_until(|| third.state().unwrap().executor() == Some(nomination)).await;
+
+    first
+        .change_membership(BTreeSet::from([1, 2, 3]), false)
+        .await
+        .unwrap();
+    wait_until(|| second.current_leader() == Some(1) && third.current_leader() == Some(1)).await;
+
+    first.shutdown().await.unwrap();
+    transport.unregister(1).unwrap();
+
+    wait_until(|| {
+        second.current_leader() == third.current_leader()
+            && second.current_leader().is_some_and(|leader| leader != 1)
+    })
+    .await;
+    let replacement = match second.current_leader() {
+        Some(2) => &second,
+        Some(3) => &third,
+        leader => panic!("unexpected replacement leader {leader:?}"),
+    };
+    let replacement_nomination = replacement
+        .submit(Command::NominateExecutor {
+            executor: NodeId(3),
+        })
+        .await
+        .unwrap();
+    let ApplyResult::ExecutorNominated(replacement_nomination) = replacement_nomination.result
+    else {
+        panic!("replacement nomination returned the wrong domain result")
+    };
+    wait_until(|| {
+        second.state().unwrap().executor() == Some(replacement_nomination)
+            && third.state().unwrap().executor() == Some(replacement_nomination)
+    })
+    .await;
+
+    second.shutdown().await.unwrap();
+    third.shutdown().await.unwrap();
 }
