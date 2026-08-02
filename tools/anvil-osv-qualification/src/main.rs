@@ -3,7 +3,7 @@ use std::{
     fs::File,
     io::{Cursor, Read},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, mpsc as std_mpsc},
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
@@ -419,8 +419,10 @@ impl ShardBuilder {
 }
 
 struct ShardCompressor {
-    sender: Option<std_mpsc::SyncSender<ShardBuilder>>,
-    workers: Vec<thread::JoinHandle<Result<()>>>,
+    worker_count: usize,
+    output: mpsc::Sender<PreparedShard>,
+    pending: Vec<thread::JoinHandle<Result<PreparedShard>>>,
+    next_job_index: u64,
 }
 
 impl ShardCompressor {
@@ -429,42 +431,57 @@ impl ShardCompressor {
             worker_count > 0,
             "shard compression requires at least one worker"
         );
-        // A rendezvous channel gives each worker work directly. There is no
-        // queue of sealed 64 MiB builders in addition to the workers that are
-        // actively compressing one.
-        let (sender, receiver) = std_mpsc::sync_channel::<ShardBuilder>(0);
-        let receiver = Arc::new(Mutex::new(receiver));
-        let mut workers = Vec::with_capacity(worker_count);
-        for index in 0..worker_count {
-            let receiver = receiver.clone();
-            let output = output.clone();
-            let worker = thread::Builder::new()
-                .name(format!("osv-shard-compressor-{index}"))
-                .spawn(move || compress_shards(receiver, output))
-                .context("start OSV shard compression worker")?;
-            workers.push(worker);
-        }
-        drop(output);
         Ok(Self {
-            sender: Some(sender),
-            workers,
+            worker_count,
+            output,
+            pending: Vec::with_capacity(worker_count),
+            next_job_index: 0,
         })
     }
 
-    fn submit(&self, builder: ShardBuilder) -> Result<()> {
-        self.sender
-            .as_ref()
-            .context("OSV shard compressor is already closed")?
-            .send(builder)
-            .map_err(|_| anyhow::anyhow!("OSV shard compression workers stopped unexpectedly"))
+    fn submit(&mut self, builder: ShardBuilder) -> Result<()> {
+        let job_index = self.next_job_index;
+        self.next_job_index += 1;
+        let worker = match thread::Builder::new()
+            .name(format!("osv-shard-compressor-{job_index}"))
+            .spawn(move || builder.finish().context("compress OSV shard"))
+        {
+            Ok(worker) => worker,
+            Err(error) => {
+                // Existing jobs precede this one, so join the entire wave and
+                // return their first input-order error before the spawn error.
+                self.join_wave()?;
+                return Err(error).context("start OSV shard compression worker");
+            }
+        };
+        self.pending.push(worker);
+        if self.pending.len() == self.worker_count {
+            self.flush_wave()?;
+        }
+        Ok(())
     }
 
     fn finish(mut self) -> Result<()> {
-        drop(self.sender.take());
+        self.flush_wave()
+    }
+
+    fn flush_wave(&mut self) -> Result<()> {
+        let shards = self.join_wave()?;
+        for shard in shards {
+            self.output.blocking_send(shard).map_err(|_| {
+                anyhow::anyhow!("OSV shard consumer stopped before parsing completed")
+            })?;
+        }
+        Ok(())
+    }
+
+    fn join_wave(&mut self) -> Result<Vec<PreparedShard>> {
+        let workers = std::mem::take(&mut self.pending);
+        let mut shards = Vec::with_capacity(workers.len());
         let mut first_error = None;
-        for worker in self.workers {
+        for worker in workers {
             match worker.join() {
-                Ok(Ok(())) => {}
+                Ok(Ok(shard)) => shards.push(shard),
                 Ok(Err(error)) => {
                     if first_error.is_none() {
                         first_error = Some(error);
@@ -478,28 +495,10 @@ impl ShardCompressor {
                 }
             }
         }
-        first_error.map_or(Ok(()), Err)
-    }
-}
-
-fn compress_shards(
-    receiver: Arc<Mutex<std_mpsc::Receiver<ShardBuilder>>>,
-    output: mpsc::Sender<PreparedShard>,
-) -> Result<()> {
-    loop {
-        let builder = {
-            let receiver = receiver
-                .lock()
-                .map_err(|_| anyhow::anyhow!("OSV shard compression queue was poisoned"))?;
-            match receiver.recv() {
-                Ok(builder) => builder,
-                Err(_) => return Ok(()),
-            }
-        };
-        let shard = builder.finish().context("compress OSV shard")?;
-        output
-            .blocking_send(shard)
-            .map_err(|_| anyhow::anyhow!("OSV shard consumer stopped before parsing completed"))?;
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(shards),
+        }
     }
 }
 
@@ -1320,7 +1319,7 @@ fn parse_archive(
     };
     let mut builders = BTreeMap::<String, ShardBuilder>::new();
     let mut next_indices = BTreeMap::<String, u64>::new();
-    let compressor = ShardCompressor::start(compression_workers, sender)?;
+    let mut compressor = ShardCompressor::start(compression_workers, sender)?;
 
     let parsing = (|| -> Result<ParsingReport> {
         for index in 0..archive.len() {
@@ -1384,7 +1383,7 @@ fn parse_archive(
                 push_record_into_shards(
                     prepared,
                     target_bytes,
-                    &compressor,
+                    &mut compressor,
                     &mut builders,
                     &mut next_indices,
                 )?;
@@ -1409,7 +1408,7 @@ fn parse_archive(
 fn push_record_into_shards(
     prepared: PreparedRecord,
     target_bytes: usize,
-    compressor: &ShardCompressor,
+    compressor: &mut ShardCompressor,
     builders: &mut BTreeMap<String, ShardBuilder>,
     next_indices: &mut BTreeMap<String, u64>,
 ) -> Result<()> {
@@ -1811,7 +1810,7 @@ mod tests {
             .unwrap();
         let builders = test_shard_builders();
         let (sender, mut receiver) = mpsc::channel(builders.len());
-        let compressor = ShardCompressor::start(3, sender).unwrap();
+        let mut compressor = ShardCompressor::start(3, sender).unwrap();
         for builder in builders {
             compressor.submit(builder).unwrap();
         }
@@ -1821,18 +1820,65 @@ mod tests {
         while let Some(shard) = receiver.blocking_recv() {
             actual.push(shard);
         }
-        actual.sort_unstable_by_key(|shard| shard.shard_index);
         assert_eq!(actual, expected);
     }
 
     #[test]
-    fn shard_compression_worker_reports_a_stopped_consumer_without_hanging() {
+    fn shard_compression_flushes_a_partial_wave_in_submission_order() {
+        let expected = test_shard_builders()
+            .into_iter()
+            .take(5)
+            .map(ShardBuilder::finish)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let builders = test_shard_builders();
+        let (sender, mut receiver) = mpsc::channel(builders.len());
+        let mut compressor = ShardCompressor::start(3, sender).unwrap();
+        for builder in builders.into_iter().take(5) {
+            compressor.submit(builder).unwrap();
+        }
+        assert_eq!(compressor.pending.len(), 2);
+        compressor.finish().unwrap();
+
+        let mut actual = Vec::new();
+        while let Some(shard) = receiver.blocking_recv() {
+            actual.push(shard);
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn shard_compression_rejects_zero_workers() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let error = match ShardCompressor::start(0, sender) {
+            Ok(_) => panic!("zero compression workers must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "shard compression requires at least one worker"
+        );
+    }
+
+    #[test]
+    fn shard_compression_never_retains_more_than_one_bounded_wave() {
+        let builders = test_shard_builders();
+        let (sender, _receiver) = mpsc::channel(builders.len());
+        let mut compressor = ShardCompressor::start(3, sender).unwrap();
+        for builder in builders {
+            compressor.submit(builder).unwrap();
+            assert!(compressor.pending.len() < compressor.worker_count);
+        }
+        compressor.finish().unwrap();
+    }
+
+    #[test]
+    fn shard_compression_reports_a_stopped_consumer_without_hanging() {
         let builder = test_shard_builders().remove(0);
         let (sender, receiver) = mpsc::channel(1);
         drop(receiver);
-        let compressor = ShardCompressor::start(1, sender).unwrap();
-        compressor.submit(builder).unwrap();
-        let error = compressor.finish().unwrap_err();
+        let mut compressor = ShardCompressor::start(1, sender).unwrap();
+        let error = compressor.submit(builder).unwrap_err();
         assert!(
             error
                 .to_string()
