@@ -2,15 +2,15 @@
 resolver = "3"
 
 members = [
-    "anvil",
-    "anvil-cli",
     "clients/rust",
+    "crates/anvil",
     "crates/anvil-api",
     "crates/anvil-authz",
     "crates/anvil-atomic-program",
+    "crates/anvil-cli",
     "crates/anvil-consensus",
+    "crates/anvil-osv-qualification",
     "crates/anvil-store",
-    "tools/anvil-osv-qualification",
 ]
 
 [workspace.package]

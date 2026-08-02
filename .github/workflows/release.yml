@@ -161,7 +161,7 @@ jobs:
             --sbom=false \
             --output "type=image,name=${repository},push=true,push-by-digest=true,name-canonical=true" \
             --metadata-file "$metadata_file" \
-            --file anvil/Dockerfile \
+            --file crates/anvil/Dockerfile \
             .
 
           digest="$(

@@ -37,7 +37,7 @@ docker buildx build \
   --platform "${platform}" \
   --load \
   --iidfile "${iid_file}" \
-  --file anvil/Dockerfile \
+  --file crates/anvil/Dockerfile \
   -t "${image}" \
   .
 

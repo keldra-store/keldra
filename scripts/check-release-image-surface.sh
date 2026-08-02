@@ -50,26 +50,26 @@ fi
 
 if grep -REn --exclude='check-release-image-surface.sh' \
   'CARGO_TARGET_DIR|--target-dir' \
-  .cargo .github/workflows anvil scripts
+  .cargo .github/workflows crates/anvil scripts
 then
   echo "release tooling must use Cargo's configured target directory" >&2
   exit 1
 fi
 
-if [[ -e anvil/Dockerfile.prebuilt ]]; then
+if [[ -e crates/anvil/Dockerfile.prebuilt ]]; then
   echo "the prebuilt-binary image path must remain removed" >&2
   exit 1
 fi
 
 if grep -REn \
   'Dockerfile\.prebuilt|cargo-zigbuild|zigbuild|tmp/docker-bin|ANVIL_ZIG_TARGET|ANVIL_USE_NATIVE_CARGO|ANVIL_RUNTIME_BASE' \
-  .github/workflows scripts/build-image.sh README.md .dockerignore anvil/build-and-run.sh
+  .github/workflows scripts/build-image.sh README.md .dockerignore crates/anvil/build-and-run.sh
 then
   echo "image tooling must build from source in the target-platform Dockerfile" >&2
   exit 1
 fi
 
-grep -Fq 'FROM --platform=$TARGETPLATFORM rust:1.96-trixie AS builder' anvil/Dockerfile
-grep -Fq 'FROM --platform=$TARGETPLATFORM debian:trixie-slim' anvil/Dockerfile
-grep -Fq -- '--file anvil/Dockerfile' scripts/build-image.sh
-grep -Fq -- '--file anvil/Dockerfile' "${release_workflow}"
+grep -Fq 'FROM --platform=$TARGETPLATFORM rust:1.96-trixie AS builder' crates/anvil/Dockerfile
+grep -Fq 'FROM --platform=$TARGETPLATFORM debian:trixie-slim' crates/anvil/Dockerfile
+grep -Fq -- '--file crates/anvil/Dockerfile' scripts/build-image.sh
+grep -Fq -- '--file crates/anvil/Dockerfile' "${release_workflow}"

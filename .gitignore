@@ -9,8 +9,8 @@ GEMINI.md
 anvil-data
 
 # Local Anvil runtime state and secrets
-anvil/.env
-anvil/anvil-data/
+crates/anvil/.env
+crates/anvil/anvil-data/
 
 # Client package build outputs
 clients/typescript/dist/

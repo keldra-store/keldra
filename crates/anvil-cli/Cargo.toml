@@ -19,7 +19,7 @@ name = "anvil"
 path = "src/main.rs"
 
 [dependencies]
-anvil-storage = { path = "../clients/rust" }
+anvil-storage = { path = "../../clients/rust" }
 anyhow = "1"
 blake3 = "1.8"
 clap = { version = "4.5", features = ["derive", "env"] }

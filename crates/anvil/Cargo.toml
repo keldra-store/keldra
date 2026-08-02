@@ -23,11 +23,11 @@ name = "anvil-server"
 path = "src/main.rs"
 
 [dependencies]
-anvil-api = { path = "../crates/anvil-api" }
-anvil-atomic-program = { path = "../crates/anvil-atomic-program" }
-anvil-authz = { path = "../crates/anvil-authz" }
-anvil-consensus = { path = "../crates/anvil-consensus" }
-anvil-store = { path = "../crates/anvil-store" }
+anvil-api = { path = "../anvil-api" }
+anvil-atomic-program = { path = "../anvil-atomic-program" }
+anvil-authz = { path = "../anvil-authz" }
+anvil-consensus = { path = "../anvil-consensus" }
+anvil-store = { path = "../anvil-store" }
 anyhow = "1"
 blake3 = "1.8"
 clap = { version = "4.5", features = ["derive", "env"] }
